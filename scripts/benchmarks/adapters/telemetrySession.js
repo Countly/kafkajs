@@ -1,30 +1,43 @@
 /**
- * Report adapter of the `telemetry.js --session` rows, and the command those rows run.
+ * Report adapter of the telemetry session rows (`telemetry.js --session`), and the command they run.
  *
- * Command: node scripts/benchmarks/adapters/telemetrySession.js --job <job> --raw <file> [worker flags]
- * It checks the job's fixture and refuses without it, freezes the candidate source (and, for a job
- * with a `previous` arm, the 3.0.0-alpha.9e checkout) into snapshots outside the evidence, writes the
- * session manifest beside `--raw`, runs the controller and then its `--verify-session`, and prints
- * one JSON line: the manifest's path and digest, both verdicts and every raw observation. The
- * session's evidence directory (`<raw>.session`) stays beside the manifest; the snapshots are removed.
- * Exit codes: 0 a report line was printed, 1 the command failed, 2 a usage error or a missing fixture.
+ * Command: node scripts/benchmarks/adapters/telemetrySession.js --row <name> --raw <file>
+ * One row is one owed configuration: a `telemetry.js` job and its worker flags (`ROWS`). The command
+ * runs only in the workflow job that owns the row (`BENCH_TELEMETRY_ROW`). It checks the fixture and
+ * the free disk and refuses without them, freezes the candidate source (and, for a job with a
+ * `previous` arm, the accepted baseline checkout, verified against `ACCEPTED_BASELINE`) into
+ * `<raw>.snapshots/`, writes the session manifest beside `--raw`, runs the controller within
+ * min(declared budget, job allowance) and then its `--verify-session`, and prints one JSON line.
+ * Exit codes: 0 a report line was printed, 1 the command failed, 2 a usage error, a missing fixture
+ * or an unverified baseline.
+ *
+ * Evidence kept beside `--raw` for replay: the manifest, the session directory (`.session`), both
+ * snapshot roots and their archives (`.snapshots`), the source and baseline receipts, the decoder
+ * receipt (`.decoder.json`) and the reporter sink (`.sink`). Replay: restore the artifact at the same
+ * absolute path, check out the same commit at the same path, use the same Node binary, then run
+ * `node scripts/benchmarks/telemetry.js --verify-session <raw>.session`.
+ *
+ * Workflow plan: `--telemetry-rows <names>` prints the telemetry rows to run (a JSON array, one job
+ * each) and `--other-rows <names>` the remaining manifest rows (comma separated); empty names select
+ * every row.
  *
  * The row shows each arm's median and range of the manifest metrics over the measured observations,
  * and the controls: declared observation count, every observation verified, the independent
- * re-verification, each positive control and the A/A spread. A failed control makes the row
- * `invalid`, a void session `inconclusive`; the session's gate verdict is shown and never decides it.
+ * re-verification, the reporter sink, each positive control and the A/A spread. A failed control
+ * makes the row `invalid`, a void session `inconclusive`; the session's gate verdict is shown and
+ * never decides it.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { lastJsonLine, tail } = require('../report')
 const { median } = require('../session')
 const { JOBS, childCount, digest, minimumBudget } = require('../telemetry')
-const { isSupported: zstd } = require('../../../src/protocol/message/compression/zstd')
+const { isSupported } = require('../../../src/protocol/message/compression/zstd')
 
 const ROOT = path.resolve(__dirname, '..', '..', '..')
+const SCRIPT = 'scripts/benchmarks/adapters/telemetrySession.js'
 const TELEMETRY = path.join(ROOT, 'scripts/benchmarks/telemetry.js')
 const SESSION = path.join(ROOT, 'scripts/benchmarks/session.js')
 /** What a worker loads from a source root; `consumeThroughput.js` is bound by the controller. */
@@ -39,9 +52,122 @@ const SNAPSHOT = [
 const BROKERS = ['localhost:19092', 'localhost:19095', 'localhost:19098']
 /** The Kafka lines with a reporter jar for `docker-compose.telemetry.yml`. */
 const LINES = ['4.4.0', '4.3.1', '4.2.2']
-const PREVIOUS_REF = '3.0.0-alpha.9e'
+/** The only tree a `previous` arm may run: the accepted tag and the commit it was accepted at. */
+const ACCEPTED_BASELINE = Object.freeze({
+  milestone: '9E',
+  ref: '3.0.0-alpha.9e',
+  commit: '5ed201d5acda199ae2af2f534c1216519f4b0344',
+})
+const MIB = 1024 * 1024
+/** Bytes one observation retains, per mode: its fixed-size ledgers plus payload or sink copies. */
+const CHILD_BYTES = { requests: 112 * MIB, payload: 128 * MIB, delivery: 264 * MIB }
+/** Seconds kept before the job deadline for `--verify-session` and the evidence upload. */
+const AFTER_SESSION_SECONDS = 1200
+const VERIFY_SECONDS = 900
+const FREEZE_SECONDS = 300
 const INEFFECTIVE = /the (\S+) positive control is ineffective/
 const SPREAD = 'A/A spread'
+const METRICS = {
+  requests: [
+    { key: 'cpuNsPerPair', unit: 'ns' },
+    { key: 'elapsedNsPerPair', unit: 'ns' },
+    { key: 'heapExternalDeltaBytes', unit: 'bytes' },
+  ],
+  payload: [
+    { key: 'sliceP99Ms', unit: 'ms' },
+    { key: 'cpuP99Ms', unit: 'ms' },
+    { key: 'wallP99Ms', unit: 'ms' },
+    { key: 'fittingPasses', unit: 'passes' },
+    { key: 'rawBytes', unit: 'bytes' },
+    { key: 'transmittedBytes', unit: 'bytes' },
+  ],
+  delivery: [
+    { key: 'messagesPerSecond', unit: 'msg/s' },
+    { key: 'p99Ms', unit: 'ms' },
+    { key: 'deliveryGapP99Ms', unit: 'ms' },
+  ],
+}
+
+/** @param {string[]} values @param {(value: string) => object[]} next @returns {object[]} */
+const each = (values, next) => values.flatMap(next)
+
+/**
+ * Every owed telemetry configuration: both request jobs, the payload job over points ×
+ * temporality × codec × attributes, and both delivery jobs over both handlers.
+ * @type {{ name: string, job: string, flags: string[] }[]}
+ */
+const ROWS = [
+  { name: 'telemetrySession-requests-normal', job: 'requests-normal', flags: [] },
+  { name: 'telemetrySession-requests-control', job: 'requests-control', flags: [] },
+  ...each(['1', '257'], (points) =>
+    each(['delta', 'cumulative'], (temporality) =>
+      each(['none', 'gzip', 'zstd'], (codec) =>
+        ['compressible', 'poor'].map((attributes) => ({
+          name: `telemetrySession-payload-${points}-${temporality}-${codec}-${attributes}`,
+          job: 'payload',
+          flags: [
+            '--points',
+            points,
+            '--temporality',
+            temporality,
+            '--codec',
+            codec,
+            '--attributes',
+            attributes,
+          ],
+        }))
+      )
+    )
+  ),
+  ...each(['delivery-normal', 'delivery-control'], (job) =>
+    ['eachMessage', 'eachBatch'].map((handler) => ({
+      name: `telemetrySession-${job}-${handler}`,
+      job,
+      flags: ['--handler', handler],
+    }))
+  ),
+]
+
+/** @returns {object[]} the `scripts/benchmarks/manifest.json` entries of `ROWS` */
+const manifestEntries = () =>
+  ROWS.map(({ name, job }) => ({
+    name,
+    adapter: 'telemetrySession',
+    command: [SCRIPT, '--row', name, '--raw', '{raw}'],
+    broker: JOBS[job].mode === 'delivery',
+    metrics: METRICS[JOBS[job].mode],
+    arms: ['fork'],
+  }))
+
+/**
+ * Splits a dispatch's row selection between the telemetry jobs and the ordinary report.
+ * @param {string} input comma-separated row names; empty selects every row
+ * @param {{ name: string }[]} entries the manifest entries
+ * @returns {{ telemetry: string[], others: string[] }} telemetry rows to run one per job, and the
+ *   other selected names (unknown names included, for the report to reject)
+ */
+const plan = (input, entries) => {
+  const wanted = input
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean)
+  const ours = new Set(ROWS.map(({ name }) => name))
+  return {
+    telemetry: ROWS.map(({ name }) => name).filter(
+      (name) => !wanted.length || wanted.includes(name)
+    ),
+    others: (wanted.length ? wanted : entries.map(({ name }) => name)).filter(
+      (name) => !ours.has(name)
+    ),
+  }
+}
+
+/** @param {string} job a `telemetry.js` job @returns {number} free bytes its session needs */
+const diskBytes = (job) => childCount(job) * CHILD_BYTES[JOBS[job].mode] + 1024 * MIB
+
+/** One timeout over every row: the largest declared budget plus freezing and re-verification. */
+const timeoutMs =
+  (Math.max(...Object.keys(JOBS).map(minimumBudget)) + FREEZE_SECONDS + VERIFY_SECONDS) * 1000
 
 /** @param {Buffer|string} bytes @returns {string} lowercase SHA-256 */
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -55,30 +181,88 @@ const exists = (value, kind) =>
   path.isAbsolute(value) &&
   fs.statSync(value, { throwIfNoEntry: false })?.[kind]() === true
 
+/** @param {string} name a row @returns {object|undefined} its `ROWS` entry */
+const rowOf = (name) => ROWS.find((row) => row.name === name)
+
 /**
- * Lists what the job's fixture lacks. A `previous` arm needs the 3.0.0-alpha.9e checkout; a
- * delivery job needs the telemetry cluster with its reporter, the reporter sink and the decoder
- * prepared by `scripts/e2e/telemetry/prepareDecoder.js`.
- * @param {string} jobName a `telemetry.js` job
+ * The session's time limit: its declared budget, cut to the job allowance when the workflow sets
+ * `TELEMETRY_JOB_DEADLINE` (epoch seconds), less the time kept for re-verification and upload.
+ * @param {string} job
  * @param {Record<string, string|undefined>} env
+ * @param {() => number} now milliseconds
+ * @returns {{ budget: number, allowance: number|null, limit: number }} seconds
+ */
+const limits = (job, env, now) => {
+  const budget = minimumBudget(job)
+  if (env.TELEMETRY_JOB_DEADLINE === undefined) return { budget, allowance: null, limit: budget }
+  const allowance =
+    Math.floor(Number(env.TELEMETRY_JOB_DEADLINE) - now() / 1000) - AFTER_SESSION_SECONDS
+  return { budget, allowance, limit: Math.min(budget, allowance) }
+}
+
+/**
+ * @param {string|undefined} sink the reporter sink directory
+ * @returns {string[]} files an earlier session left: exports or overflow markers
+ */
+const staleSink = (sink) =>
+  fs.readdirSync(sink).filter((name) => /^(exports-|OVERFLOW-)/.test(name))
+
+/**
+ * @param {string|undefined} archive the decoder archive
+ * @returns {boolean} the archive exists with a verified `<archive>.json` receipt of its bytes
+ */
+const preparedDecoder = (archive) => {
+  if (!exists(archive, 'isFile') || !exists(`${archive}.json`, 'isFile')) return false
+  try {
+    const receipt = JSON.parse(fs.readFileSync(`${archive}.json`, 'utf8'))
+    return receipt.verified === true && receipt.archiveSha256 === asset(archive).sha256
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Lists what the row's fixture lacks: its own job, the free disk its ledgers need, a valid job
+ * deadline when one is set, the baseline checkout for a `previous` arm, and for a delivery job the
+ * telemetry cluster with its reporter, a fresh reporter sink and the decoder prepared by
+ * `scripts/e2e/telemetry/prepareDecoder.js`.
+ * @param {string} name a row of `ROWS`
+ * @param {Record<string, string|undefined>} env
+ * @param {{ raw: string, statfs?: Function, now?: () => number }} deps `raw` is the row's evidence file
  * @returns {string[]} one line per missing part, empty when the fixture is complete
  */
-const fixtureProblems = (jobName, env) => {
+const fixtureProblems = (name, env, { raw, statfs = fs.statfsSync, now = Date.now }) => {
+  const { job: jobName } = rowOf(name)
   const job = JOBS[jobName]
-  const checks = []
+  const checks = [
+    [
+      env.BENCH_TELEMETRY_ROW === name,
+      `BENCH_TELEMETRY_ROW: ${name}, set only by the workflow job that runs this row`,
+    ],
+  ]
+  const directory = path.dirname(raw)
+  const { bavail, bsize } = statfs(directory)
+  const free = bavail * bsize
+  const need = diskBytes(jobName)
+  checks.push([
+    free >= need,
+    `disk: ${free} bytes free under ${directory}, the session needs ${need}`,
+  ])
+  if (env.TELEMETRY_JOB_DEADLINE !== undefined) {
+    const { allowance } = limits(jobName, env, now)
+    checks.push([
+      /^\d+$/.test(env.TELEMETRY_JOB_DEADLINE) && allowance > 0,
+      `TELEMETRY_JOB_DEADLINE: the job deadline in epoch seconds, more than ${AFTER_SESSION_SECONDS} s ahead`,
+    ])
+  }
   if (job.roles.includes('previous'))
-    checks.push(
-      [
-        exists(env.TELEMETRY_PREVIOUS_ROOT, 'isDirectory'),
-        `TELEMETRY_PREVIOUS_ROOT: an absolute checkout of ${PREVIOUS_REF}`,
-      ],
-      [env.TELEMETRY_PREVIOUS_REF === PREVIOUS_REF, `TELEMETRY_PREVIOUS_REF: ${PREVIOUS_REF}`],
-      [
-        /^[0-9a-f]{40}$/.test(env.TELEMETRY_PREVIOUS_COMMIT ?? ''),
-        'TELEMETRY_PREVIOUS_COMMIT: the commit of that checkout',
-      ]
-    )
-  if (job.mode === 'delivery')
+    checks.push([
+      exists(env.TELEMETRY_PREVIOUS_ROOT, 'isDirectory'),
+      `TELEMETRY_PREVIOUS_ROOT: an absolute checkout of ${ACCEPTED_BASELINE.ref}`,
+    ])
+  if (job.mode === 'delivery') {
+    const sink = exists(env.TELEMETRY_EVIDENCE_DIR, 'isDirectory')
+    const stale = sink ? staleSink(env.TELEMETRY_EVIDENCE_DIR) : []
     checks.push(
       [
         env.COMPOSE_FILE === 'docker-compose.telemetry.yml',
@@ -86,19 +270,21 @@ const fixtureProblems = (jobName, env) => {
       ],
       [Boolean(env.COMPOSE_PROJECT_NAME), 'COMPOSE_PROJECT_NAME: the telemetry cluster project'],
       [LINES.includes(env.KAFKA_VERSION), `KAFKA_VERSION: one of ${LINES.join(', ')}`],
+      [sink, 'TELEMETRY_EVIDENCE_DIR: the reporter sink directory'],
       [
-        exists(env.TELEMETRY_EVIDENCE_DIR, 'isDirectory'),
-        'TELEMETRY_EVIDENCE_DIR: the reporter sink directory',
+        stale.length === 0,
+        `TELEMETRY_EVIDENCE_DIR: a fresh reporter sink (it holds ${stale.join(', ')})`,
       ],
       [
         exists(env.TELEMETRY_JAVA_CACHE, 'isDirectory'),
         'TELEMETRY_JAVA_CACHE: the verified decoder cache',
       ],
       [
-        exists(env.TELEMETRY_DECODER_ARCHIVE, 'isFile'),
-        'TELEMETRY_DECODER_ARCHIVE: the archive prepareDecoder.js wrote',
+        preparedDecoder(env.TELEMETRY_DECODER_ARCHIVE),
+        'TELEMETRY_DECODER_ARCHIVE: the archive prepareDecoder.js wrote, with its verified receipt beside it',
       ]
     )
+  }
   return checks.filter(([ok]) => !ok).map(([, problem]) => problem)
 }
 
@@ -106,20 +292,62 @@ const fixtureProblems = (jobName, env) => {
  * Lists a root's files the way the controller's source check walks them: names sorted per
  * directory, depth first, `.git` and `node_modules` skipped.
  * @param {string} root
+ * @param {(bytes: Buffer) => string} [hash] the file digest, SHA-256 by default
  * @returns {{ path: string, sha256: string }[]}
  */
-const catalogue = (root) => {
+const catalogue = (root, hash = sha256) => {
   const files = []
   const visit = (relative) => {
     for (const name of fs.readdirSync(path.join(root, relative)).sort()) {
       if (name === '.git' || name === 'node_modules') continue
       const file = path.join(relative, name)
       if (fs.lstatSync(path.join(root, file)).isDirectory()) visit(file)
-      else files.push({ path: file, sha256: sha256(fs.readFileSync(path.join(root, file))) })
+      else files.push({ path: file, sha256: hash(fs.readFileSync(path.join(root, file))) })
     }
   }
   visit('')
   return files
+}
+
+/** @param {Buffer} bytes @returns {string} the git blob id of `bytes` */
+const blobId = (bytes) =>
+  crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+
+/**
+ * Checks that the baseline checkout is the accepted commit: its HEAD, the accepted tag, and every
+ * frozen file against the commit's blobs (a modified, missing or untracked file fails).
+ * @param {{ checkout: string, frozen: string, accepted: typeof ACCEPTED_BASELINE, spawn: Function }} options
+ * @returns {string[]} one line per difference, empty when the frozen copy is the accepted tree
+ */
+const baselineProblems = ({ checkout, frozen, accepted, spawn }) => {
+  const git = (...args) => spawn('git', ['-C', checkout, ...args], { encoding: 'utf8' })
+  const head = git('rev-parse', '--verify', 'HEAD^{commit}')
+  if (head.status !== 0) return [`${checkout} is not a git checkout: ${tail(head.stderr)}`]
+  const commit = head.stdout.trim()
+  const problems = []
+  if (commit !== accepted.commit)
+    problems.push(
+      `the checkout is at ${commit}, not the accepted ${accepted.ref} commit ${accepted.commit}`
+    )
+  const tag = git('rev-parse', '--verify', `refs/tags/${accepted.ref}^{commit}`)
+  if (tag.status !== 0 || tag.stdout.trim() !== accepted.commit)
+    problems.push(`tag ${accepted.ref} does not resolve to ${accepted.commit} in the checkout`)
+  const listed = git('ls-tree', '-r', '-z', 'HEAD', '--', ...SNAPSHOT)
+  if (listed.status !== 0) return [...problems, `git ls-tree failed: ${tail(listed.stderr)}`]
+  const expected = new Map()
+  for (const line of listed.stdout.split('\0').filter(Boolean)) {
+    const [meta, file] = line.split('\t')
+    const [mode, , id] = meta.split(' ')
+    if (mode === '100644' || mode === '100755') expected.set(file, id)
+    else problems.push(`${file} has git mode ${mode}, not a regular file`)
+  }
+  for (const { path: file, sha256: id } of catalogue(frozen, blobId)) {
+    if (!expected.has(file)) problems.push(`${file} is not in the accepted commit`)
+    else if (expected.get(file) !== id) problems.push(`${file} differs from the accepted commit`)
+    expected.delete(file)
+  }
+  for (const file of expected.keys()) problems.push(`${file} is missing from the checkout`)
+  return problems
 }
 
 /**
@@ -139,20 +367,20 @@ const copy = (from, to) => {
 }
 
 /**
- * Freezes the files a worker loads from `from` into `<work>/<label>` with its archive, and writes
- * the source receipt to `receipt`.
+ * Freezes the files a worker loads from `from` into `<snapshots>/<label>` with its archive, links
+ * the checkout's `node_modules` for the workers, and writes the source receipt to `receipt`.
  * @param {string} from source root
  * @param {string} label `candidate` or `previous`
- * @param {{ work: string, receipt: string, spawn: Function }} options
+ * @param {{ snapshots: string, receipt: string, spawn: Function }} options
  * @returns {{ root: string, tree: string, source: object, tarball: object }} the arm's identity
  * @throws {Error} when the archive cannot be written
  */
-const freeze = (from, label, { work, receipt, spawn }) => {
-  const root = path.join(work, label)
+const freeze = (from, label, { snapshots, receipt, spawn }) => {
+  const root = path.join(snapshots, label)
   for (const entry of SNAPSHOT) copy(path.join(from, entry), path.join(root, entry))
   if (fs.existsSync(path.join(ROOT, 'node_modules')))
     fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(root, 'node_modules'))
-  const tarball = path.join(work, `${label}.tar`)
+  const tarball = path.join(snapshots, `${label}.tar`)
   const archived = spawn('tar', ['-cf', tarball, '--exclude=./node_modules', '-C', root, '.'], {
     encoding: 'utf8',
   })
@@ -167,20 +395,21 @@ const freeze = (from, label, { work, receipt, spawn }) => {
 
 /**
  * Builds the session manifest `telemetry.js --session` validates.
- * @param {{ jobName: string, extra: string[], raw: string, candidate: object, previous?: object,
- *   accepted?: object, root: string }} options `extra` are the worker flags every arm shares
+ * @param {{ row: object, raw: string, candidate: object, previous?: object, accepted?: object,
+ *   zstd: boolean }} options
  * @returns {object}
  */
-const sessionManifest = ({ jobName, extra, raw, candidate, previous, accepted, root }) => {
-  const job = JOBS[jobName]
+const sessionManifest = ({ row, raw, candidate, previous, accepted, zstd }) => {
+  const job = JOBS[row.job]
+  const optional = row.flags.includes('zstd') && !zstd
   return {
     schemaVersion: 1,
-    job: jobName,
+    job: row.job,
     runId: `tsess-${Date.now().toString(36)}`,
     directory: `${raw}.session`,
     driver: asset(TELEMETRY),
     session: asset(SESSION),
-    consume: asset(path.join(root, 'scripts/benchmarks/consumeThroughput.js')),
+    consume: asset(path.join(candidate.root, 'scripts/benchmarks/consumeThroughput.js')),
     node: {
       binary: process.execPath,
       sha256: asset(process.execPath).sha256,
@@ -189,24 +418,25 @@ const sessionManifest = ({ jobName, extra, raw, candidate, previous, accepted, r
       arch: process.arch,
     },
     codecs: { none: true, gzip: true, zstd },
+    ...(optional && { optionalCodec: 'zstd' }),
     ...(accepted && { acceptedBaseline: accepted }),
     ...(job.mode === 'delivery' && { fixture: { brokers: BROKERS } }),
     arms: job.roles.map((label) => {
       const control = job.controls.includes(label) ? '1' : '0'
       const telemetry = job.telemetry[label] ? ['--telemetry', job.telemetry[label]] : []
-      const argv = ['--mode', job.mode, '--control', control, ...extra, ...telemetry]
+      const argv = ['--mode', job.mode, '--control', control, ...row.flags, ...telemetry]
       const identity = label === 'previous' ? previous : candidate
       return { label, ...identity, argv, configSha256: digest({ mode: job.mode, argv }) }
     }),
     reference: job.reference,
     runs: job.runs,
-    budgetSeconds: minimumBudget(jobName),
+    budgetSeconds: minimumBudget(row.job),
   }
 }
 
 /**
  * @param {object} result a controller run
- * @returns {{ status: number|null, signal: string|null, verdict: object|null,
+ * @returns {{ status: number|null, signal: string|null, timedOut: boolean, verdict: object|null,
  *   ineffective: string|null, stderr: string }} what the report keeps of it
  */
 const outcomeOf = (result) => {
@@ -220,6 +450,7 @@ const outcomeOf = (result) => {
   return {
     status: result.status ?? null,
     signal: result.signal ?? null,
+    timedOut: result.error?.code === 'ETIMEDOUT',
     verdict,
     ineffective: INEFFECTIVE.exec(result.stderr ?? '')?.[1] ?? null,
     stderr: tail(result.error?.message ?? result.stderr),
@@ -227,32 +458,55 @@ const outcomeOf = (result) => {
 }
 
 /**
- * @param {string[]} argv `--job <job> --raw <absolute file>` and the shared worker flags
- * @returns {{ jobName: string, raw: string, extra: string[] }}
- * @throws {Error} for a missing or unknown job, a relative `--raw`, or a valueless flag
+ * Copies the reporter sink into the row's evidence.
+ * @param {string} sink the reporter sink directory
+ * @param {string} to the evidence copy
+ * @returns {{ files: string[], overflow: string[], error?: string }}
  */
-const parseArgs = (argv) => {
-  const flags = { extra: [] }
-  for (let i = 0; i < argv.length; i += 2) {
-    if (argv[i + 1] === undefined) throw new Error(`${argv[i]} needs a value`)
-    if (argv[i] === '--job') flags.jobName = argv[i + 1]
-    else if (argv[i] === '--raw') flags.raw = argv[i + 1]
-    else flags.extra.push(argv[i], argv[i + 1])
+const keepSink = (sink, to) => {
+  try {
+    copy(sink, to)
+    const files = fs.readdirSync(to).sort()
+    return { files, overflow: files.filter((name) => name.startsWith('OVERFLOW-')) }
+  } catch (failure) {
+    return { files: [], overflow: [], error: failure.message }
   }
-  if (!Object.hasOwn(JOBS, flags.jobName ?? ''))
-    throw new Error(`--job must be one of ${Object.keys(JOBS).join('|')}`)
-  if (!path.isAbsolute(flags.raw ?? '')) throw new Error('--raw takes an absolute file')
-  return flags
+}
+
+/** @param {string} dir a snapshot directory @returns {void} removes its roots' `node_modules` links */
+const unlinkModules = (dir) => {
+  for (const label of ['candidate', 'previous']) {
+    const link = path.join(dir, label, 'node_modules')
+    if (fs.lstatSync(link, { throwIfNoEntry: false })?.isSymbolicLink()) fs.unlinkSync(link)
+  }
 }
 
 /**
- * Runs one session for the report and prints its report line. The snapshots live in a temporary
- * directory under `RUNNER_TEMP` (or the system one) and are removed when the command ends.
- * @param {string[]} argv see `parseArgs`
- * @param {{ env?: object, spawn?: Function, log?: Function, error?: Function, root?: string }} [deps]
- *   `root` is the candidate source, the checkout by default
- * @returns {number} 0 once the report line is printed, 1 on a failure, 2 on a usage error or a
- *   missing fixture
+ * @param {string[]} argv `--row <name> --raw <absolute file>`
+ * @returns {{ row: object, raw: string }}
+ * @throws {Error} for a missing or unknown row, a relative `--raw`, or another flag
+ */
+const parseArgs = (argv) => {
+  const flags = {}
+  for (let i = 0; i < argv.length; i += 2) {
+    if (argv[i] !== '--row' && argv[i] !== '--raw') throw new Error(`unknown flag ${argv[i]}`)
+    if (argv[i + 1] === undefined) throw new Error(`${argv[i]} needs a value`)
+    flags[argv[i]] = argv[i + 1]
+  }
+  const row = rowOf(flags['--row'])
+  if (!row) throw new Error(`--row must be one of ${ROWS.map(({ name }) => name).join('|')}`)
+  if (!path.isAbsolute(flags['--raw'] ?? '')) throw new Error('--raw takes an absolute file')
+  return { row, raw: flags['--raw'] }
+}
+
+/**
+ * Runs one session for the report and prints its report line, or prints the workflow plan.
+ * @param {string[]} argv see `parseArgs`, or `--telemetry-rows <names>` / `--other-rows <names>`
+ * @param {{ env?: object, spawn?: Function, log?: Function, error?: Function, root?: string,
+ *   statfs?: Function, now?: () => number, zstd?: boolean, accepted?: object }} [deps]
+ *   `root` is the candidate source, the checkout by default; `accepted` replaces `ACCEPTED_BASELINE`
+ * @returns {number} 0 once the line is printed, 1 on a failure, 2 on a usage error, a missing
+ *   fixture or an unverified baseline
  */
 const main = (
   argv,
@@ -262,8 +516,17 @@ const main = (
     log = console.log,
     error = console.error,
     root = ROOT,
+    statfs = fs.statfsSync,
+    now = Date.now,
+    zstd = isSupported,
+    accepted = ACCEPTED_BASELINE,
   } = {}
 ) => {
+  if (argv[0] === '--telemetry-rows' || argv[0] === '--other-rows') {
+    const selected = plan(argv[1] ?? '', require('../manifest.json').entries)
+    log(argv[0] === '--other-rows' ? selected.others.join(',') : JSON.stringify(selected.telemetry))
+    return 0
+  }
   let args
   try {
     args = parseArgs(argv)
@@ -271,63 +534,81 @@ const main = (
     error(failure.message)
     return 2
   }
-  const { jobName, raw, extra } = args
-  const missing = fixtureProblems(jobName, env)
+  const { row, raw } = args
+  const missing = fixtureProblems(row.name, env, { raw, statfs, now })
   if (missing.length) {
-    log(JSON.stringify({ job: jobName, refused: 'fixture', missing }))
+    log(JSON.stringify({ row: row.name, refused: 'fixture', missing }))
     return 2
   }
-  const work = fs.mkdtempSync(path.join(env.RUNNER_TEMP || os.tmpdir(), 'telemetry-session-'))
+  const snapshots = `${raw}.snapshots`
   try {
+    fs.mkdirSync(snapshots)
     const candidate = freeze(root, 'candidate', {
-      work,
+      snapshots,
       receipt: `${raw}.candidate-source.json`,
       spawn,
     })
     let previous
-    let accepted
-    if (JOBS[jobName].roles.includes('previous')) {
+    let proof
+    if (JOBS[row.job].roles.includes('previous')) {
       previous = freeze(env.TELEMETRY_PREVIOUS_ROOT, 'previous', {
-        work,
+        snapshots,
         receipt: `${raw}.previous-source.json`,
         spawn,
       })
-      const proof = `${raw}.accepted-baseline.json`
+      const missingBaseline = baselineProblems({
+        checkout: env.TELEMETRY_PREVIOUS_ROOT,
+        frozen: previous.root,
+        accepted,
+        spawn,
+      })
+      if (missingBaseline.length) {
+        log(JSON.stringify({ row: row.name, refused: 'baseline', missing: missingBaseline }))
+        return 2
+      }
+      const receipt = `${raw}.accepted-baseline.json`
       fs.writeFileSync(
-        proof,
+        receipt,
         JSON.stringify({
-          milestone: '9E',
+          milestone: accepted.milestone,
           status: 'accepted',
+          ref: accepted.ref,
+          commit: accepted.commit,
+          verified: 'HEAD, tag and every frozen file equal the accepted commit',
           tree: previous.tree,
           sourceSha256: previous.source.sha256,
           tarballSha256: previous.tarball.sha256,
-          ref: env.TELEMETRY_PREVIOUS_REF,
-          commit: env.TELEMETRY_PREVIOUS_COMMIT,
         })
       )
-      accepted = asset(proof)
+      proof = asset(receipt)
     }
-    const manifest = sessionManifest({ jobName, extra, raw, candidate, previous, accepted, root })
+    const delivery = JOBS[row.job].mode === 'delivery'
+    let decoder = null
+    if (delivery) {
+      fs.copyFileSync(`${env.TELEMETRY_DECODER_ARCHIVE}.json`, `${raw}.decoder.json`)
+      decoder = { archiveSha256: asset(env.TELEMETRY_DECODER_ARCHIVE).sha256 }
+    }
+    const manifest = sessionManifest({ row, raw, candidate, previous, accepted: proof, zstd })
     const manifestFile = `${raw}.manifest.json`
     fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), { flag: 'wx' })
-    const options = { cwd: ROOT, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
-    const ran = spawn(
-      process.execPath,
-      ['--expose-gc', TELEMETRY, '--session', manifestFile],
-      options
-    )
+    const { budget, allowance, limit } = limits(row.job, env, now)
+    const options = { cwd: ROOT, env, encoding: 'utf8', maxBuffer: 64 * MIB }
+    const ran = spawn(process.execPath, ['--expose-gc', TELEMETRY, '--session', manifestFile], {
+      ...options,
+      timeout: limit * 1000,
+    })
     error(ran.stderr ?? '')
     const session = outcomeOf(ran)
     let verify = null
     if (session.verdict) {
-      const checked = spawn(
-        process.execPath,
-        [TELEMETRY, '--verify-session', manifest.directory],
-        options
-      )
+      const checked = spawn(process.execPath, [TELEMETRY, '--verify-session', manifest.directory], {
+        ...options,
+        timeout: VERIFY_SECONDS * 1000,
+      })
       error(checked.stderr ?? '')
       verify = outcomeOf(checked)
     }
+    const sink = delivery ? keepSink(env.TELEMETRY_EVIDENCE_DIR, `${raw}.sink`) : null
     const rawRows = path.join(manifest.directory, 'raw.jsonl')
     const observations = fs.existsSync(rawRows)
       ? fs
@@ -338,11 +619,22 @@ const main = (
       : []
     log(
       JSON.stringify({
-        job: jobName,
+        row: row.name,
+        job: row.job,
         manifest: { path: manifestFile, sha256: asset(manifestFile).sha256 },
-        declared: { observations: childCount(jobName), runs: manifest.runs },
+        declared: {
+          observations: childCount(row.job),
+          runs: manifest.runs,
+          budgetSeconds: budget,
+          allowanceSeconds: allowance,
+          limitSeconds: limit,
+        },
+        baseline: proof ? { ref: accepted.ref, commit: accepted.commit } : null,
+        decoder,
+        node: process.version,
         session,
         verify,
+        sink,
         observations,
       })
     )
@@ -351,7 +643,7 @@ const main = (
     error(failure.stack ?? String(failure))
     return 1
   } finally {
-    fs.rmSync(work, { recursive: true, force: true })
+    unlinkModules(snapshots)
   }
 }
 
@@ -359,7 +651,8 @@ const main = (
  * Reads the command's report line.
  * @param {{ status: number|null, signal?: string, error?: Error, stdout?: string, stderr?: string }} result
  * @returns {object} the report line
- * @throws {Error} for a refused fixture, a spawn error, a signal, a non-zero exit or no report line
+ * @throws {Error} for a refused fixture or baseline, a spawn error, a signal, a non-zero exit or
+ *   no report line
  */
 const read = (result) => {
   if (result.error) throw result.error
@@ -372,8 +665,10 @@ const read = (result) => {
   }
   if (line.refused === 'fixture')
     throw new Error(`the telemetry fixture is missing: ${line.missing.join('; ')}`)
+  if (line.refused === 'baseline')
+    throw new Error(`the accepted baseline is not verified: ${line.missing.join('; ')}`)
   if (result.status !== 0) throw new Error(`exit ${result.status}: ${tail(result.stderr)}`)
-  if (!Object.hasOwn(JOBS, line.job) || !Array.isArray(line.observations) || !line.session) {
+  if (!rowOf(line.row) || !Array.isArray(line.observations) || !line.session) {
     throw new Error('the last JSON line is not a telemetry session report')
   }
   return line
@@ -392,18 +687,44 @@ const rows = (entry, arm, { outputs, error }) => {
   })
   if (error) return one('error', error)
   const [report] = outputs
-  const declaredJob = entry.command[entry.command.indexOf('--job') + 1]
-  if (report.job !== declaredJob)
-    return one('error', `the session ran job ${report.job}, expected ${declaredJob}`)
+  if (report.row !== entry.name)
+    return one('error', `the session ran row ${report.row}, expected ${entry.name}`)
   const job = JOBS[report.job]
-  const { session, verify, observations } = report
+  const { session, verify, observations, declared, sink } = report
+  const total = childCount(report.job)
   const notes = [`session manifest sha256 ${report.manifest.sha256}`]
+  if (report.baseline)
+    notes.push(
+      `previous arm ${report.baseline.ref} at ${report.baseline.commit}, verified against the checkout's HEAD, tag and files`
+    )
+  if (report.decoder)
+    notes.push(
+      `decoder archive sha256 ${report.decoder.archiveSha256} prepared; the session does not read it`
+    )
+  if (declared.allowanceSeconds !== null && declared.allowanceSeconds < declared.budgetSeconds)
+    notes.push(
+      `job allowance ${declared.allowanceSeconds} s is below the declared budget ${declared.budgetSeconds} s`
+    )
+  const overflow = sink?.overflow.length
+    ? `; reporter sink overflow: ${sink.overflow.join(', ')}`
+    : ''
 
   if (!session.verdict) {
+    if (session.timedOut) {
+      const allowance =
+        declared.allowanceSeconds === null ? '' : `, job allowance ${declared.allowanceSeconds} s`
+      return one(
+        'error',
+        `the session was stopped at its ${declared.limitSeconds} s limit after ${observations.length} of ${total} observations ` +
+          `(declared budget ${declared.budgetSeconds} s${allowance}); the partial evidence is kept${overflow}`
+      )
+    }
+    if (session.status === 4)
+      return one('error', `ZSTD is not available on Node ${report.node}: the row has no numbers`)
     if (!session.ineffective) {
       return one(
         'error',
-        `the session failed (exit ${session.status ?? session.signal}): ${session.stderr}`
+        `the session failed (exit ${session.status ?? session.signal}): ${session.stderr}${overflow}`
       )
     }
     const control = {
@@ -420,7 +741,6 @@ const rows = (entry, arm, { outputs, error }) => {
   }
 
   const { verdict } = session
-  const total = childCount(report.job)
   const isVoid = verdict.disposition === 'void'
   const controls = [
     {
@@ -446,6 +766,13 @@ const rows = (entry, arm, { outputs, error }) => {
         : `no verdict (exit ${verify?.status ?? 'none'}): ${verify?.stderr ?? ''}`,
     },
   ]
+  if (sink)
+    controls.push({
+      arm: 'session',
+      name: 'reporter sink without overflow',
+      passed: !sink.overflow.length && !sink.error,
+      detail: sink.error ?? `${sink.files.length} sink files${overflow}`,
+    })
   if (!isVoid) {
     for (const label of job.controls) {
       const fired = verdict.failures.find(
@@ -514,7 +841,19 @@ const rows = (entry, arm, { outputs, error }) => {
 }
 
 /** One session per report arm: the session repeats every arm itself. */
-module.exports = { runs: 1, timeoutMs: 3 * 60 * 60 * 1000, read, rows, main, fixtureProblems }
+module.exports = {
+  runs: 1,
+  timeoutMs,
+  read,
+  rows,
+  main,
+  fixtureProblems,
+  plan,
+  diskBytes,
+  manifestEntries,
+  ROWS,
+  ACCEPTED_BASELINE,
+}
 
 if (require.main === module) {
   process.exitCode = main(process.argv.slice(2))
