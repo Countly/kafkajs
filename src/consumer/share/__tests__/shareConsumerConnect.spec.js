@@ -529,6 +529,41 @@ describe('public share connection contract', () => {
     expect(seen.joins).toHaveLength(1)
   })
 
+  test.each([
+    ['natural', undefined],
+    ['zero-timeout', { timeout: 0 }],
+  ])(
+    'a %s disconnect from the crash listener leaves no restart timer and starts no run',
+    async (_, options) => {
+      const clock = new Clock()
+      clock.install()
+      const h = open({
+        share: { retry: { retries: 1, initialRetryTime: 60000, maxRetryTime: 60000 } },
+      })
+      const seen = observe(h)
+      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 5, epoch: 1 }] })
+      let closing
+      h.consumer.on(h.consumer.events.CRASH, () => {
+        closing = h.consumer.disconnect(options)
+      })
+      await subscribe(h)
+      await run(h)
+      await clock.advanceUntil(() => closing !== undefined, 'the crash listener disconnect', {
+        step: 1000,
+        limit: 400,
+      })
+      await closing
+      await flush()
+      expect(seen.crashes).toEqual([expect.objectContaining({ restart: true })])
+      expect(jest.getTimerCount()).toBe(0)
+      const joins = h.frames(76).length
+      await clock.advance(60001)
+      expect(h.frames(76)).toHaveLength(joins)
+      expect(seen.joins).toHaveLength(1)
+      expect(h.cluster.sockets().filter((socket) => !socket.destroyed)).toHaveLength(0)
+    }
+  )
+
   test('logs a rejected restart callback and restarts while active', async () => {
     const restartOnFailure = jest.fn(async () => {
       throw new Error('callback failed')
