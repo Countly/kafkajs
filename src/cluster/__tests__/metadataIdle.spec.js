@@ -289,7 +289,10 @@ describe('producer metadata idle expiry', () => {
       expect(broker.metadata).toHaveBeenCalledTimes(2)
       await cluster.addTargetTopic('valid')
       expect(cluster.targetTopicState.get('valid').incarnation).toBeGreaterThan(incarnation)
-      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], { guard: expect.any(Function) })
+      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], {
+        guard: expect.any(Function),
+        retainTopicErrors: true,
+      })
       expect(cluster.topicId('valid')).toBe(ID_A)
     })
 
@@ -326,12 +329,13 @@ describe('producer metadata idle expiry', () => {
     /**
      * @param {object} [options] cluster overrides
      * @returns {object} a producer cluster whose broker parses each answer as Metadata v13 does:
-     *   a name in `deleted` answers code 3, a name in `leaderless` once answers a partition code 5
+     *   a name in `deleted` answers code 3, a name in `creating` once answers code 5 with no
+     *   partitions, as a topic being auto-created does
      */
     const deleting = (options) => {
       const built = build(options)
       const deleted = new Set()
-      const leaderless = new Set()
+      const creating = new Set()
       built.broker.metadata.mockImplementation(async (topics, requestOptions = {}) => {
         const data = answer(topics)
         data.errorCode = 0
@@ -339,19 +343,21 @@ describe('producer metadata idle expiry', () => {
           if (deleted.has(entry.topic)) {
             return { topic: entry.topic, topicErrorCode: 3, partitionMetadata: [] }
           }
-          const partitionErrorCode = leaderless.delete(entry.topic) ? 5 : 0
+          if (creating.delete(entry.topic)) {
+            return { topic: entry.topic, topicErrorCode: 5, partitionMetadata: [] }
+          }
           return {
             ...entry,
             topicErrorCode: 0,
             partitionMetadata: entry.partitionMetadata.map((partition) => ({
               ...partition,
-              partitionErrorCode,
+              partitionErrorCode: 0,
             })),
           }
         })
         return metadataProtocol({ version: 13 })({ topics, ...requestOptions }).response.parse(data)
       })
-      return { ...built, deleted, leaderless }
+      return { ...built, deleted, creating }
     }
 
     test('adding another topic drops the deleted one and succeeds with one request', async () => {
@@ -388,12 +394,14 @@ describe('producer metadata idle expiry', () => {
     })
 
     test('the dropped topic does not fail a retry of the same refresh', async () => {
-      const { cluster, broker, deleted, leaderless } = deleting({ retry: RETRY })
+      const { cluster, broker, deleted, creating } = deleting({ retry: RETRY })
       await cluster.addTargetTopic('rotating-0')
       deleted.add('rotating-0')
-      leaderless.add('rotating-1')
+      creating.add('rotating-1')
 
-      await cluster.addTargetTopic('rotating-1')
+      const adding = cluster.addTargetTopic('rotating-1')
+      await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime * 2)
+      await adding
 
       expect([...cluster.targetTopics]).toEqual(['rotating-1'])
       expect(cluster.findTopicPartitionMetadata('rotating-1')[0]).toMatchObject({ leader: 0 })
