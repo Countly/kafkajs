@@ -1,6 +1,7 @@
 const { inspect } = require('util')
 const Cluster = require('../index')
 const { createErrorFromCode } = require('../../protocol/error')
+const { protocol: metadataProtocol } = require('../../protocol/requests/metadata')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { newLogger, connectionOpts } = require('testHelpers')
@@ -318,6 +319,85 @@ describe('producer metadata idle expiry', () => {
       })
       expect([...cluster.targetTopics]).toEqual(['valid'])
       expect(cluster.targetTopicState).toBeNull()
+    })
+  })
+
+  describe('a deleted target topic', () => {
+    /**
+     * @param {object} [options] cluster overrides
+     * @returns {object} a producer cluster whose broker parses each answer as Metadata v13 does:
+     *   a name in `deleted` answers code 3, a name in `leaderless` once answers a partition code 5
+     */
+    const deleting = (options) => {
+      const built = build(options)
+      const deleted = new Set()
+      const leaderless = new Set()
+      built.broker.metadata.mockImplementation(async (topics, requestOptions = {}) => {
+        const data = answer(topics)
+        data.errorCode = 0
+        data.topicMetadata = data.topicMetadata.map((entry) => {
+          if (deleted.has(entry.topic)) {
+            return { topic: entry.topic, topicErrorCode: 3, partitionMetadata: [] }
+          }
+          const partitionErrorCode = leaderless.delete(entry.topic) ? 5 : 0
+          return {
+            ...entry,
+            topicErrorCode: 0,
+            partitionMetadata: entry.partitionMetadata.map((partition) => ({
+              ...partition,
+              partitionErrorCode,
+            })),
+          }
+        })
+        return metadataProtocol({ version: 13 })({ topics, ...requestOptions }).response.parse(data)
+      })
+      return { ...built, deleted, leaderless }
+    }
+
+    test('adding another topic drops the deleted one and succeeds with one request', async () => {
+      const { cluster, broker, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+
+      await cluster.addTargetTopic('rotating-1')
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect([...cluster.targetTopicState.keys()]).toEqual(['rotating-1'])
+      expect(cluster.topicId('rotating-0')).toBeUndefined()
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toEqual([])
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+      expect(broker.metadata.mock.calls.map(([topics]) => [...topics].sort())).toEqual([
+        ['rotating-0'],
+        ['rotating-0', 'rotating-1'],
+      ])
+    })
+
+    test('adding the deleted topic again fails with its own error and keeps the other target', async () => {
+      const { cluster, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+      await cluster.addTargetTopic('rotating-1')
+
+      await expect(cluster.addTargetTopic('rotating-0')).rejects.toMatchObject({
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+      })
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.topicId('rotating-1')).toBe(ID_A)
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+    })
+
+    test('the dropped topic does not fail a retry of the same refresh', async () => {
+      const { cluster, broker, deleted, leaderless } = deleting({ retry: RETRY })
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+      leaderless.add('rotating-1')
+
+      await cluster.addTargetTopic('rotating-1')
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-1')[0]).toMatchObject({ leader: 0 })
+      expect(broker.metadata).toHaveBeenCalledTimes(3)
     })
   })
 
@@ -879,6 +959,29 @@ describe('producer metadata idle expiry over the wire', () => {
       expect(producedAfter(before.requests)).not.toContain(oldId)
     })
   })
+
+  test.each([false, true])(
+    'with auto creation %s, a deleted target fails only its own sends and a send to a new topic succeeds at once',
+    async (allowAutoTopicCreation) => {
+      w = start({ cluster: { allowAutoTopicCreation }, producer: { deliveryTimeout: 3000 } })
+      await w.producer.connect()
+      expect(await settle(send('rotating-0'))).toMatchObject({ state: 'fulfilled' })
+      w.state.missing.add('rotating-0')
+      const before = metadataRequests().length
+      const started = Date.now()
+
+      expect(await settle(send('rotating-1'))).toMatchObject({ state: 'fulfilled' })
+      expect(Date.now() - started).toBeLessThan(100)
+      expect(metadataRequests().slice(before)).toEqual([['rotating-0', 'rotating-1']])
+      expect([...w.cluster.targetTopics]).toEqual(['rotating-1'])
+
+      const refused = await settle(send('rotating-0'))
+      expect(refused.state).toBe('rejected')
+      expect(refused.value).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      expect([...w.cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(await settle(send('rotating-1'))).toMatchObject({ state: 'fulfilled' })
+    }
+  )
 
   test('sends to ten thousand distinct topics leave bounded bookkeeping', async () => {
     w = start({ producer: { capacity: 33554432 } })
