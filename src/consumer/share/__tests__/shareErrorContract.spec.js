@@ -91,6 +91,18 @@ describe('share fetch and acknowledgement failure policy', () => {
     expect(sessionAction(78, 0)).toEqual({ action: 'ok', backoff: false, error: null })
   })
 
+  test('a code 35 refusal carries the protocol error as cause', () => {
+    for (const api of [78, 79]) {
+      const { error } = sessionAction(api, 35)
+      expect(error.cause).toBeInstanceOf(KafkaJSProtocolError)
+      expect(error.cause).toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
+    }
+    const heartbeat = createErrorFromCode(35)
+    const fatal = fatalMembershipError(heartbeat)
+    expect(fatal).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
+    expect(fatal.cause).toBe(heartbeat)
+  })
+
   test.each([78, 79])('runtime 35 on API %s names its actual API', (api) => {
     const policy = sessionAction(api, 35)
     expect(policy.action).toBe('fatal')

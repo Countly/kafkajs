@@ -10224,6 +10224,8 @@
         "src/errors.spec.js \u203a the shipped error table, for the codes the membership depends on code 81 is present and non-retriable",
         "src/errors.spec.js \u203a the shipped error table, for the codes the membership depends on code 82 is present and non-retriable",
         "src/errors.spec.js \u203a the shipped error table, for the codes the membership depends on keeps a stale member epoch non-retriable",
+        "src/errors.spec.js \u203a KafkaJSServerDoesNotSupportApiKey keeps cause",
+        "src/errors.spec.js \u203a share capability errors KafkaJSShareGroupsNotSupportedError keeps cause, apiKey, apiName, reason and shareVersion",
         "src/index.spec.js \u203a Client consumer creates a consumer with the correct isolation level",
         "src/index.spec.js \u203a Client gives access to its logger",
         "src/index.spec.js \u203a Client invalid producer rack options reject before cluster construction",
@@ -20722,7 +20724,8 @@
         "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls grant keeps a dependent read waiting until every broker serves each created ACL",
         "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls revoke keeps the next case waiting until every broker stops serving the deleted ACLs",
         "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls revoke rejects a delete that removed other ACLs than expected",
-        "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls an acquisition aborted before its connect settles is closed by the cleanup registered first"
+        "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls an acquisition aborted before its connect settles is closed by the cleanup registered first",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share fetch and acknowledgement failure policy a code 35 refusal carries the protocol error as cause"
       ],
       "capMinutes": 85,
       "allowedSkips": [

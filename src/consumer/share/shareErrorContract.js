@@ -50,6 +50,7 @@ const fatalMembershipError = (error) =>
         apiKey: 76,
         apiName: 'ShareGroupHeartbeat',
         reason: 'refused-by-broker',
+        cause: error,
       })
     : new KafkaJSNonRetriableError(error, { cause: error })
 
@@ -77,6 +78,7 @@ const sessionAction = (apiKey, code) => {
         apiKey,
         apiName: apiKey === 78 ? 'ShareFetch' : 'ShareAcknowledge',
         reason: 'refused-by-broker',
+        cause: error,
       }),
     }
   }

@@ -820,6 +820,8 @@ describe('share administration', () => {
         apiKey,
         apiName,
       })
+      expect(error.cause).toBeInstanceOf(KafkaJSProtocolError)
+      expect(error.cause).toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
       expect(broker[wire]).toHaveBeenCalledTimes(1)
     })
 
@@ -877,6 +879,8 @@ describe('share administration', () => {
           apiKey,
           apiName,
         })
+        expect(error.cause).toBeInstanceOf(KafkaJSProtocolError)
+        expect(error.cause).toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
         expect(broker[wire]).toHaveBeenCalledTimes(1)
         expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
       }

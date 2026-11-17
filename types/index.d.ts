@@ -2904,7 +2904,7 @@ export class KafkaJSAggregateError extends Error {
   constructor(message: Error | string, errors: (Error | string)[])
 }
 
-/** Raised inside the consumer's fetch loop when the group rebalances; its `name` is `'Error'`. */
+/** Kept for compatibility; no longer thrown. Its `name` is `'Error'`. */
 export class KafkaJSFetcherRebalanceError extends Error {
   readonly category: KafkaJSErrorCategory
 }
@@ -3357,6 +3357,8 @@ export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
   apiKey: number
   apiName: string
+  /** The broker's error, when the broker refused the request. */
+  cause?: Error
 }
 
 export interface ClientTelemetryConfig {

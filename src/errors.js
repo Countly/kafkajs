@@ -274,9 +274,21 @@ class KafkaJSDeleteGroupsError extends KafkaJSError {
   }
 }
 
+/**
+ * The broker cannot serve a request at any version this client implements, or refused it as
+ * unsupported.
+ * @extends KafkaJSNonRetriableError
+ */
 class KafkaJSServerDoesNotSupportApiKey extends KafkaJSNonRetriableError {
-  constructor(e, { apiKey, apiName } = {}) {
-    super(e)
+  /**
+   * @param {Error|string} e Original error or message.
+   * @param {object} [metadata]
+   * @param {number} [metadata.apiKey] Refused API key.
+   * @param {string} [metadata.apiName] Protocol name of that API.
+   * @param {Error} [metadata.cause] The broker's error, when the broker refused the request.
+   */
+  constructor(e, { apiKey, apiName, cause } = {}) {
+    super(e, { cause })
     this.apiKey = apiKey
     this.apiName = apiName
     this.name = 'KafkaJSServerDoesNotSupportApiKey'
@@ -324,9 +336,10 @@ class KafkaJSShareGroupsNotSupportedError extends KafkaJSServerDoesNotSupportApi
    * @param {string} metadata.apiName Protocol name of that API.
    * @param {'api-not-advertised'|'api-version-range'|'feature-disabled'|'refused-by-broker'} metadata.reason Stage that refused.
    * @param {number|null} [metadata.shareVersion=null] Finalized `share.version` level, or null when the broker reported no feature epoch.
+   * @param {Error} [metadata.cause] The broker's error, when the broker refused the request.
    */
-  constructor(e, { apiKey, apiName, reason, shareVersion = null }) {
-    super(e, { apiKey, apiName })
+  constructor(e, { apiKey, apiName, reason, shareVersion = null, cause }) {
+    super(e, { apiKey, apiName, cause })
     this.name = 'KafkaJSShareGroupsNotSupportedError'
     this.reason = reason
     this.shareVersion = shareVersion
@@ -511,9 +524,8 @@ class KafkaJSAggregateError extends Error {
 }
 
 /**
- * Raised inside the fetch loop to make a fetcher stop and start again when the group rebalances.
- * Flow control rather than a failure; it extends `Error` directly and keeps the `name` `'Error'`
- * it has always had, so it only gains the `category` every error carries.
+ * Kept for compatibility; no longer thrown. It extends `Error` directly and keeps the `name`
+ * `'Error'` it has always had, so it only gains the `category` every error carries.
  */
 class KafkaJSFetcherRebalanceError extends Error {
   constructor() {
