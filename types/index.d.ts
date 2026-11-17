@@ -414,8 +414,10 @@ export interface ConsumerConfig extends ClientTelemetryConfig {
   /**
    * The maximum time between two batches handed to your handler, in milliseconds, and the
    * rebalance timeout sent on the wire. Default 300000, matching the Java client's
-   * `max.poll.interval.ms`. A handler that exceeds it loses its partitions and the consumer
-   * rejoins.
+   * `max.poll.interval.ms`. An integer from 1 to 2147483647; any other value throws when the
+   * consumer is created. The deadline is global progress across partitions, checked on heartbeat
+   * opportunities, not a separate deadline per handler; when it passes, the consumer gives up its
+   * partitions and rejoins.
    */
   maxPollInterval?: number
   /**

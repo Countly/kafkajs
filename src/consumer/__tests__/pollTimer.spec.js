@@ -1,4 +1,6 @@
 const PollTimer = require('../pollTimer')
+const resolveGroupTimeouts = require('../groupTimeouts')
+const { KafkaJSNonRetriableError } = require('../../errors')
 const Runner = require('../runner')
 const Batch = require('../batch')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
@@ -182,6 +184,50 @@ describe('Consumer > PollTimer call sites', () => {
 
     expect(reset).toHaveBeenCalledTimes(1)
     expect(runner.fetchManager.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('a 2147483647 poll interval schedules no timer above the Node limit', async () => {
+    const NODE_TIMER_LIMIT = 2147483647
+    jest.useFakeTimers()
+    const setTimeoutSpy = jest.spyOn(global, 'setTimeout')
+    const setIntervalSpy = jest.spyOn(global, 'setInterval')
+    const { pollDeadline } = resolveGroupTimeouts({
+      logger: newLogger(),
+      maxPollInterval: NODE_TIMER_LIMIT,
+    })
+    const runner = buildRunner({ maxPollInterval: pollDeadline })
+    runner.scheduleFetchManager = jest.fn()
+
+    try {
+      await runner.start()
+      await jest.advanceTimersByTimeAsync(3000)
+      expect(runner.consumerGroup.heartbeat).toHaveBeenCalled()
+      await runner.stop()
+
+      const delays = [...setTimeoutSpy.mock.calls, ...setIntervalSpy.mock.calls].map(
+        ([, delay]) => delay
+      )
+      expect(delays.length).toBeGreaterThan(0)
+      expect(delays.filter((delay) => !(delay <= NODE_TIMER_LIMIT))).toEqual([])
+
+      // The deadline itself is measured, never scheduled.
+      const timer = new PollTimer({ pollDeadline })
+      jest.advanceTimersByTime(NODE_TIMER_LIMIT)
+      expect(timer.expired()).toBe(false)
+      jest.advanceTimersByTime(1)
+      expect(timer.expired()).toBe(true)
+      expect(jest.getTimerCount()).toEqual(0)
+
+      // Nothing larger can reach a poll timer.
+      expect(() =>
+        resolveGroupTimeouts({ logger: newLogger(), maxPollInterval: NODE_TIMER_LIMIT + 1 })
+      ).toThrow(KafkaJSNonRetriableError)
+    } finally {
+      runner.heartbeatManager.stop()
+      setTimeoutSpy.mockRestore()
+      setIntervalSpy.mockRestore()
+      jest.useRealTimers()
+    }
   })
 
   it('arms a timer after the initial round and leaves none after stop()', async () => {

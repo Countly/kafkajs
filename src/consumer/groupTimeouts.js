@@ -21,7 +21,8 @@ const NETWORK_DELAY = 5000
  * configuration cannot silently acquire a short handler-eviction deadline.
  *
  * @param {object} options
- * @param {number} [options.maxPollInterval] explicit; validated, and it wins over the alias
+ * @param {number} [options.maxPollInterval] explicit; an integer from 1 to 2147483647 (the INT32
+ *   wire field), and it wins over the alias
  * @param {number} [options.rebalanceTimeout] the deprecated alias; sent on the wire when it is
  *   the only one given, degenerate values (0, non-integers) grandfathered
  * @param {number} [options.sessionTimeout=45000]
@@ -34,7 +35,7 @@ const NETWORK_DELAY = 5000
  *   remains the authority on that number
  * @throws {KafkaJSNonRetriableError} when either timeout is invalid or `heartbeatInterval`
  *   is not lower than `sessionTimeout`,
- *   or when an explicit `maxPollInterval` is not an integer of at least 1
+ *   or when an explicit `maxPollInterval` is not an integer from 1 to 2147483647
  */
 const resolveGroupTimeouts = ({
   maxPollInterval,
@@ -71,9 +72,12 @@ const resolveGroupTimeouts = ({
   const hasMaxPollInterval = maxPollInterval !== undefined
   const hasRebalanceTimeout = rebalanceTimeout !== undefined
 
-  if (hasMaxPollInterval && (!Number.isInteger(maxPollInterval) || maxPollInterval < 1)) {
+  if (
+    hasMaxPollInterval &&
+    (!Number.isInteger(maxPollInterval) || maxPollInterval < 1 || maxPollInterval > 2147483647)
+  ) {
     throw new KafkaJSNonRetriableError(
-      `Consumer maxPollInterval must be an integer of at least 1, got ${inspect(maxPollInterval)}`
+      `Consumer maxPollInterval must be an integer from 1 to 2147483647, got ${inspect(maxPollInterval)}`
     )
   }
 

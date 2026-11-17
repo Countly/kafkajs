@@ -55,7 +55,8 @@ describe('Consumer > group timeouts', () => {
         [{ maxPollInterval: 120000 }, 125000],
         [{ maxPollInterval: 30000 }, 35000],
         [{ rebalanceTimeout: 0, sessionTimeout: 30000 }, 35000],
-        [{ maxPollInterval: Number.MAX_SAFE_INTEGER }, Number.MAX_SAFE_INTEGER],
+        [{ maxPollInterval: 2147483647 }, 2147488647],
+        [{ rebalanceTimeout: Number.MAX_SAFE_INTEGER }, Number.MAX_SAFE_INTEGER],
       ]
       for (const [options, expected] of cases) {
         const { resolved } = resolve(options)
@@ -114,6 +115,35 @@ describe('Consumer > group timeouts', () => {
 
       expect(resolveWith).toThrow(KafkaJSNonRetriableError)
       expect(resolveWith).toThrow(`got ${shown}`)
+    })
+
+    it('rejects maxPollInterval 2147483648', () => {
+      const resolveWith = () =>
+        resolveGroupTimeouts({ logger: newLogger(), maxPollInterval: 2147483648 })
+
+      expect(resolveWith).toThrow(KafkaJSNonRetriableError)
+      expect(resolveWith).toThrow(
+        'Consumer maxPollInterval must be an integer from 1 to 2147483647, got 2147483648'
+      )
+    })
+
+    it('rejects maxPollInterval Number.MAX_SAFE_INTEGER', () => {
+      const resolveWith = () =>
+        resolveGroupTimeouts({ logger: newLogger(), maxPollInterval: Number.MAX_SAFE_INTEGER })
+
+      expect(resolveWith).toThrow(KafkaJSNonRetriableError)
+      expect(resolveWith).toThrow(
+        `Consumer maxPollInterval must be an integer from 1 to 2147483647, got ${Number.MAX_SAFE_INTEGER}`
+      )
+    })
+
+    it('accepts maxPollInterval 2147483647', () => {
+      const { resolved } = resolve({ maxPollInterval: 2147483647 })
+
+      expect(resolved.rebalanceTimeout).toEqual(2147483647)
+      expect(resolved.pollDeadline).toEqual(2147483647)
+      expect(resolved.syncGroupTimeout).toEqual(2147488647)
+      expect(Number.isSafeInteger(resolved.syncGroupTimeout)).toBe(true)
     })
 
     it.each([0, 1.5])('grandfathers a rebalanceTimeout of %p', (value) => {
