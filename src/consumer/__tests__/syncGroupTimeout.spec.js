@@ -1,3 +1,4 @@
+const { performance: importedClock } = require('node:perf_hooks')
 const { requests, lookup } = require('../../protocol/requests')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const RequestQueue = require('../../network/requestQueue')
@@ -8,6 +9,7 @@ const { createScriptedCluster, groupScript } = require('../../../testHelpers/scr
 const ConsumerGroup = require('../consumerGroup')
 const { TOPIC } = require('./fixtures/fetchHarness')
 const { WireTranscript } = require('./fixtures/rackWire')
+const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 
 const versions = {
   [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: 5 },
@@ -125,6 +127,17 @@ describe('Consumer > derived group request timeouts', () => {
 })
 
 /**
+ * Puts the imported `node:perf_hooks` clock ten minutes ahead of real time, as in a Jest worker
+ * that has already run many suites, so a harness that leaves it unfaked fails on every host.
+ * Callers restore with `jest.restoreAllMocks()`.
+ * @returns {void}
+ */
+const ageWorker = () => {
+  const real = importedClock.now.bind(importedClock)
+  jest.spyOn(importedClock, 'now').mockImplementation(() => real() + 600000)
+}
+
+/**
  * Advances fake time in 10 ms steps until the predicate holds.
  * @param {() => boolean} predicate
  * @param {string} label names the awaited boundary in the failure
@@ -171,7 +184,8 @@ describe('Consumer > a parked SyncGroup over the wire', () => {
    * @returns {Promise<void>}
    */
   const withParkedSync = async (options, work) => {
-    jest.useFakeTimers({ doNotFake: ['setImmediate'] })
+    ageWorker()
+    useSharedFakeClock()
     const seam = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node', port: 9092 }] }),
       { batches: 0 }
@@ -290,6 +304,7 @@ describe('Consumer > a parked SyncGroup over the wire', () => {
 
 describe('Consumer > JoinGroup attempts on the wire', () => {
   afterEach(() => {
+    jest.restoreAllMocks()
     jest.useRealTimers()
   })
 
@@ -297,7 +312,8 @@ describe('Consumer > JoinGroup attempts on the wire', () => {
   const written = (wire, apiKey) => wire.exchanges.filter((x) => x.apiKey === apiKey).length
 
   it('a JoinGroup retried inside one round is counted on the wire but adds no GROUP_JOIN (fake time)', async () => {
-    jest.useFakeTimers({ doNotFake: ['setImmediate'] })
+    ageWorker()
+    useSharedFakeClock()
     const seam = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node', port: 9092 }] }),
       { batches: 0 }
