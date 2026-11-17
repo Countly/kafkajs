@@ -12,6 +12,7 @@ const {
   minimumBudget,
   parseWorkerArgs,
   validateManifest,
+  PREPARE_SECONDS,
 } = require('../telemetry')
 const adapter = require('../adapters/telemetrySession')
 
@@ -635,8 +636,8 @@ describe('Benchmarks > telemetrySession adapter', () => {
       expect.objectContaining({
         status: 'error',
         reason:
-          `the session was stopped at its 6000 s limit after 12 of 30 observations ` +
-          `(declared budget ${budget} s, job allowance 6000 s); the partial evidence is kept`,
+          `the session was cut off at its 6000 s limit after 0 s with 12 of 30 children completed ` +
+          `(declared budget ${budget} s, job allowance 6000 s); the measurement stays owed and the partial evidence is kept`,
       }),
     ])
     expect(
@@ -673,6 +674,112 @@ describe('Benchmarks > telemetrySession adapter', () => {
     expect(full.calls).toEqual([])
     expect(cramped.rows[0].reason).toContain(`disk: ${need - 1} bytes free under `)
     expect(cramped.rows[0].reason).toContain(`the session needs ${need}`)
+  })
+
+  test('the long telemetry rows count a session that finishes inside the job and keep one the job cuts off owed with its elapsed time and completed children', () => {
+    const allowance = 355 * 60 - 1200
+    const start = 1_700_000_000_000
+    const long = {
+      'telemetrySession-requests-normal': 0,
+      'telemetrySession-delivery-normal-eachMessage': 36,
+      'telemetrySession-delivery-normal-eachBatch': 36,
+      'telemetrySession-delivery-control-eachMessage': 30,
+      'telemetrySession-delivery-control-eachBatch': 30,
+    }
+    for (const [name, resets] of Object.entries(long)) {
+      const { job } = adapter.ROWS.find((row) => row.name === name)
+      const total = childCount(job)
+      const budget = minimumBudget(job)
+      const preparation = resets * PREPARE_SECONDS
+      expect(budget + preparation).toBeGreaterThan(allowance)
+      const environment = () => {
+        const fixture = JOBS[job].mode === 'delivery' ? deliveryFixture(name) : {}
+        const baseline = JOBS[job].roles.includes('previous') ? gitBaseline() : null
+        return {
+          env: {
+            ...fixture,
+            BENCH_TELEMETRY_ROW: name,
+            TELEMETRY_JOB_DEADLINE: String(start / 1000 + 355 * 60),
+            ...(baseline && { TELEMETRY_PREVIOUS_ROOT: baseline.root }),
+          },
+          deps: baseline ? { accepted: baseline.accepted } : {},
+        }
+      }
+      /** A session that takes `seconds`, with one 20 s reporter reset journalled per finished delivery child. */
+      const timed = (seconds, script = {}) => {
+        const clock = { t: start }
+        const scripted = controller({
+          ...script,
+          during: (manifest) => {
+            clock.t += seconds * 1000
+            const done = script.stop ?? total
+            const journal = Array.from({ length: resets ? done : 0 }, (_, ordinal) =>
+              JSON.stringify({ ordinal, disposition: 'prepared', retained: [], elapsedMs: 20000 })
+            )
+            fs.writeFileSync(
+              path.join(manifest.directory, 'journal.jsonl'),
+              journal.map((line) => `${line}\n`).join('')
+            )
+          },
+        })
+        const { env, deps } = environment()
+        return { ...runRow(name, env, scripted.spawn, { ...deps, now: () => clock.t }), scripted }
+      }
+
+      const fits = timed(19000)
+      expect(fits.scripted.options[0].timeout).toBe(allowance * 1000)
+      expect(fits.details[0].status).toBe('valid')
+      expect(fits.rows.every(({ status }) => status === 'valid')).toBe(true)
+      expect(fits.details[0].notes).toContain(
+        `session elapsed 19000 s of its ${allowance} s limit, ${total} of ${total} children completed`
+      )
+      expect(fits.details[0].notes).toContain(
+        `job allowance ${allowance} s is below the declared budget ${budget} s` +
+          (preparation ? ` plus ${preparation} s of reporter resets` : '')
+      )
+      if (resets)
+        expect(fits.details[0].notes).toContain(
+          `reporter reset before each observation, outside its measured window: ${total} resets, ` +
+            `${total * 20} s in total (bound ${PREPARE_SECONDS} s each, declared apart from the session budget)`
+        )
+
+      const done = Math.floor(total / 2)
+      const cut = timed(allowance, { stop: done })
+      const resetsNote = preparation ? `, reporter resets ${preparation} s` : ''
+      const resetTime = resets ? `; ${done} reporter resets took ${done * 20} s` : ''
+      expect(cut.rows).toEqual([
+        {
+          benchmark: name,
+          arm: '-',
+          metric: '-',
+          unit: '-',
+          runs: 1,
+          status: 'error',
+          reason:
+            `run 1 of 1: the session was cut off at its ${allowance} s limit after ${allowance} s with ` +
+            `${done} of ${total} children completed (declared budget ${budget} s${resetsNote}, ` +
+            `job allowance ${allowance} s); the measurement stays owed and the partial evidence is kept${resetTime}`,
+        },
+      ])
+      expect(cut.details ?? []).toEqual([])
+      expect(
+        fs.readFileSync(`${cut.raw}.session/raw.jsonl`, 'utf8').split('\n').filter(Boolean)
+      ).toHaveLength(done)
+
+      const clock = { t: start }
+      const partial = controller({ stop: done, during: () => (clock.t += allowance * 1000) })
+      const claimed = (command, args, opts) => {
+        const result = partial.spawn(command, args, opts)
+        if (!args.includes('--session')) return result
+        const verdict = { disposition: 'pass', failures: [], receipt: { count: total } }
+        return { ...result, stdout: JSON.stringify(verdict) }
+      }
+      const { env, deps } = environment()
+      const late = runRow(name, env, claimed, { ...deps, now: () => clock.t })
+      expect(late.rows).toEqual([expect.objectContaining({ status: 'error' })])
+      expect(late.rows[0].reason).toContain('the measurement stays owed')
+      expect(late.rows[0]).not.toHaveProperty('median')
+    }
   })
 
   test('the workflow plan gives each selected telemetry row its own job and keeps them out of the ordinary report', () => {
