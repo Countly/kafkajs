@@ -551,6 +551,7 @@ describe('documented live scenario scripts', () => {
     {
       script: 'test:e2e:offset-reset',
       flag: 'OFFSET_RESET_E2E',
+      lanes: 'fake,docker',
       spec: 'src/consumer/__tests__/offsetResetLive.spec.js',
       compose: null,
       budgetsMs: [90000],
@@ -589,6 +590,7 @@ describe('documented live scenario scripts', () => {
     {
       script: 'test:e2e:direct-consumer',
       flag: 'DIRECT_CONSUMER_E2E',
+      lanes: 'fake,docker',
       spec: 'src/consumer/__tests__/directConsumerLive.spec.js',
       compose: null,
       budgetsMs: [90000],
@@ -680,9 +682,10 @@ describe('documented live scenario scripts', () => {
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {
     const prefix = row.compose ? `COMPOSE_FILE=${row.compose} ` : ''
     const pattern = row.spec.replace(/\./g, '\\\\.')
+    const lanes = row.lanes ? `KAFKAJS_SCENARIO_LANES=${row.lanes} ` : ''
     expect(fs.existsSync(path.join(root, row.spec))).toBe(true)
     expect(scripts[row.script]).toBe(
-      `${prefix}npm run test:kafka -- "${row.flag}=1 npx jest --maxWorkers=2 --testPathPatterns '${pattern}'"`
+      `${prefix}npm run test:kafka -- "${row.flag}=1 ${lanes}npx jest --maxWorkers=2 --testPathPatterns '${pattern}'"`
     )
   })
 

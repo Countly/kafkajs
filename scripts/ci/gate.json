@@ -937,6 +937,8 @@
         "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities check passes a report whose expected titles all passed",
         "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities check rejects a report containing only allowed skips",
         "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities check tolerates a skip that is listed and still fails one that is not",
+        "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities gate.json direct-consumer and offset-reset checks list both lane sets",
+        "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities gate.json no title is both an expected pass and a skip",
         "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities normalizePath keeps a repo-relative path and resolves dot segments",
         "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities normalizePath leaves a path outside the root untouched",
         "scripts/ci/__tests__/checkIdentities.spec.js \u203a scripts > ci > checkIdentities normalizePath makes an absolute path under the root repo-relative",
@@ -20906,13 +20908,6 @@
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js \u203a Consumer > consumer-protocol group states (live) delivers a named topic created after subscription within thirty seconds",
         "src/consumer/__tests__/cooperativeUpgradeLive.spec.js \u203a Consumer > cooperative rolling upgrade (live) keeps delivering on a kept partition across a cooperative round",
         "src/consumer/__tests__/decompressionBoundLive.spec.js \u203a Consumer > a compressed batch past the decompression bound (live) halts only the partition holding the bomb, resumes it by seeking past the batch, and delivers it under a raised bound",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) a manual commit against an active group is accepted or refused without joining",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) a manual seek before run applies once and a crash restart does not replay it",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) a none halt stays on its partition until a seek resumes it",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) getters and mode transitions follow the manual lifecycle",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) manual assignment with a group ID delivers the selected partitions through simple offsets only",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) manual assignment without a group delivers with no group, coordinator or offset traffic",
-        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) two group-free consumers on one client keep independent positions and state",
         "src/consumer/__tests__/disconnectLeaveGroupLive.spec.js \u203a Consumer > disconnect({ leaveGroup }) (live, classic) a dynamic member that disconnects by default leaves at once",
         "src/consumer/__tests__/disconnectLeaveGroupLive.spec.js \u203a Consumer > disconnect({ leaveGroup }) (live, classic) a dynamic member that disconnects with leaveGroup: false is still in the group: no rebalance until its session expires",
         "src/consumer/__tests__/disconnectLeaveGroupLive.spec.js \u203a Consumer > disconnect({ leaveGroup }) (live, classic) a static leader that bounces rejoins at JoinGroup v8 with its assignment, and the assigner is not asked again",
@@ -20970,14 +20965,6 @@
         "src/consumer/__tests__/longHandlerLive.spec.js \u203a Consumer > long handler (live) consumer protocol documents the limit: a handler that blocks the event loop is evicted, and the poll guard cannot fire",
         "src/consumer/__tests__/longHandlerLive.spec.js \u203a Consumer > long handler (live) consumer protocol keeps an awaiting handler in the group, heartbeating throughout",
         "src/consumer/__tests__/mixedSubscriptionLive.spec.js \u203a Consumer > roundRobin with mixed subscriptions (live, classic) with the member subscribed to both topics leading, delivers every record of both topics once, to a subscriber, and no member receives a topic it does not subscribe to",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) a group-free duration reset sends no group API and no automatic commit",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) a none halt from assign stays until a seek while siblings continue",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) a recreated topic resets again before its first confirmed commit",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) an explicit grouped commit after an assigned duration reset writes concrete next offsets",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) assign resolves earliest, latest, none and duration like subscribe",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) duration selects the explicit timestamp window and a missing window resolves to log end",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) explicit commits publish real offsets after duration resolution",
-        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) none halts only partitions without committed offsets and seek recovers",
         "src/consumer/__tests__/offsetsTopicIdLive.spec.js \u203a Consumer > offsets by topic id (live) a classic member commits and fetches by name on every broker",
         "src/consumer/__tests__/offsetsTopicIdLive.spec.js \u203a Consumer > offsets by topic id (live) a consumer-protocol member commits and fetches by topic id from Kafka 4.2, by name before, and a second member resumes from its commit",
         "src/consumer/__tests__/pauseResumeLive.spec.js \u203a Consumer > pause and resume (live) keeps a paused partition silent through a consumer protocol rebalance",
@@ -23646,7 +23633,8 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {
-        "DIRECT_CONSUMER_E2E": "1"
+        "DIRECT_CONSUMER_E2E": "1",
+        "KAFKAJS_SCENARIO_LANES": "fake,docker"
       },
       "jest": [
         "--maxWorkers=2",
@@ -23661,6 +23649,13 @@
         "direct-consumer"
       ],
       "titles": [
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) manual assignment with a group ID delivers the selected partitions through simple offsets only",
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) manual assignment without a group delivers with no group, coordinator or offset traffic",
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) two group-free consumers on one client keep independent positions and state",
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) a manual commit against an active group is accepted or refused without joining",
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) a manual seek before run applies once and a crash restart does not replay it",
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) getters and mode transitions follow the manual lifecycle",
+        "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, fake lane) a none halt stays on its partition until a seek resumes it",
         "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, docker lane) manual assignment with a group ID delivers the selected partitions through simple offsets only",
         "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, docker lane) manual assignment without a group delivers with no group, coordinator or offset traffic",
         "src/consumer/__tests__/directConsumerLive.spec.js \u203a Consumer > manual assignment (live, docker lane) two group-free consumers on one client keep independent positions and state",
@@ -23676,7 +23671,8 @@
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {
-        "OFFSET_RESET_E2E": "1"
+        "OFFSET_RESET_E2E": "1",
+        "KAFKAJS_SCENARIO_LANES": "fake,docker"
       },
       "jest": [
         "--maxWorkers=2",
@@ -23691,6 +23687,14 @@
         "offset-reset"
       ],
       "titles": [
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) none halts only partitions without committed offsets and seek recovers",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) duration selects the explicit timestamp window and a missing window resolves to log end",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) explicit commits publish real offsets after duration resolution",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) a recreated topic resets again before its first confirmed commit",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) assign resolves earliest, latest, none and duration like subscribe",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) a group-free duration reset sends no group API and no automatic commit",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) an explicit grouped commit after an assigned duration reset writes concrete next offsets",
+        "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, fake lane) a none halt from assign stays until a seek while siblings continue",
         "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, docker lane) none halts only partitions without committed offsets and seek recovers",
         "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, docker lane) duration selects the explicit timestamp window and a missing window resolves to log end",
         "src/consumer/__tests__/offsetResetLive.spec.js \u203a Consumer > offset reset policies (live, docker lane) explicit commits publish real offsets after duration resolution",
