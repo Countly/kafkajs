@@ -476,7 +476,8 @@ class ShareRunner {
   /**
    * Decides what a terminal run error means: the restart verdict, the crash event, and either
    * the end of the run or a fresh run after a cancellable retry delay. The client's stop
-   * generation and ownership are read again after the cleanup, the callback and the delay.
+   * generation and ownership are read again after the cleanup, the `restartOnFailure` callback,
+   * the CRASH listeners and the delay, so a stop or disconnect from any of them arms no restart.
    * @param {ShareRun} run The crashed run, already cleaned up.
    * @param {Error} error The exact terminal error.
    * @returns {Promise<void>}
@@ -502,24 +503,25 @@ class ShareRunner {
       }
     }
     if (this.mustNotRestart(error)) restart = false
-    const owned =
+    const owned = () =>
       this.current === run && run.stopGeneration === this.stopGeneration && !run.stopRequested
-    if (restart && !owned) {
+    if (restart && !owned()) {
       logger.warn('Share consumer was stopped while deciding whether to restart; not restarting', {
         groupId,
       })
       restart = false
     }
     this.emit(events.CRASH, { error, groupId, restart })
-    if (!restart) {
+    // A CRASH listener may have stopped or disconnected the client; it found no restart to retire.
+    if (!restart || !owned()) {
       run.finishRun()
       return
     }
+    const operation = new ConsumerOperation()
+    this.restartOperation = operation
     const retryTime =
       error.retryTime || retry.initialRetryTime || createRetry.defaults.initialRetryTime
     logger.error(`Restarting the share consumer in ${retryTime}ms`, { groupId })
-    const operation = new ConsumerOperation()
-    this.restartOperation = operation
     try {
       await operation.sleep(retryTime)
     } catch {
