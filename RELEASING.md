@@ -93,7 +93,7 @@ Tag names:
 
 - rc.0 is the one tag without `v` (`3.0.0-rc.0`). It is pushed by hand and `release.yml` does not run for it.
 - CI tags start at `v3.0.0-rc.1`.
-- Until 3.0.0, `latest` also points at a release candidate. Install release candidates by exact version.
+- Until 3.0.0 is released, `latest` may also point at a release candidate. Install release candidates by exact version.
 
 ## After every CI publish (rc.1 onwards)
 
