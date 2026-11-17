@@ -555,3 +555,197 @@ describe('a closed lifecycle opens nothing on the wire', () => {
     wire.assertClean()
   })
 })
+
+describe('a connect() queued behind a close, then a later disconnect()', () => {
+  let producers = []
+  /** Registers a producer for a forced close after the test, so a failing case leaves nothing open. */
+  const open = (producer) => {
+    producers.push(producer)
+    return producer
+  }
+  beforeEach(() => jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] }))
+  afterEach(async () => {
+    jest.restoreAllMocks()
+    await Promise.allSettled(producers.map((producer) => producer.disconnect({ timeout: 0 })))
+    producers = []
+    jest.useRealTimers()
+  })
+
+  const KINDS = {
+    plain: { profile: 'default', options: { idempotent: false } },
+    idempotent: { profile: 'default', options: { idempotent: true } },
+    transactional: { profile: 'tv1', options: { transactionalId: 'queued-connect' } },
+  }
+
+  /** Lets queued work and `ms` of fake time run. */
+  const pump = async (ms = 0) => {
+    for (let i = 0; i <= ms; i += 1) {
+      await jest.advanceTimersByTimeAsync(i === 0 ? 0 : 1)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  }
+
+  describe.each(Object.keys(KINDS))('a %s producer', (kind) => {
+    test.each([
+      ['a natural', 'a natural', undefined, undefined, 0],
+      ['a natural', 'a zero-timeout', undefined, { timeout: 0 }, 0],
+      ['a timed', 'a natural', { timeout: 1000 }, undefined, 0],
+      ['a timed', 'a zero-timeout', { timeout: 1000 }, { timeout: 0 }, 0],
+      ['an expired', 'a natural', { timeout: 50 }, undefined, 60],
+      ['an expired', 'a zero-timeout', { timeout: 50 }, { timeout: 0 }, 60],
+    ])(
+      'after %s close, %s disconnect() arranged before the queued connect() refuses it and leaves no socket, timer or request',
+      async (_, __, firstOptions, secondOptions, expireAfter) => {
+        const { profile, options } = KINDS[kind]
+        const wire = producerScript(
+          createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+        )
+        const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+        const events = []
+        for (const name of ['CONNECT', 'DISCONNECT'])
+          producer.on(producer.events[name], () => events.push(name))
+        await producer.connect()
+        const inits = wire.requests().filter(({ api }) => api === 'InitProducerId').length
+
+        const teardown = deferred()
+        let teardowns = 0
+        const original = Cluster.prototype.disconnect
+        jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+          if (++teardowns === 1) await teardown.promise
+          return original.apply(this, args)
+        })
+        const first = producer.disconnect(firstOptions)
+        await pump()
+        expect(teardowns).toBe(1)
+        const second = first.then(() => producer.disconnect(secondOptions))
+        const queued = watch(producer.connect())
+        if (expireAfter) await pump(expireAfter)
+        teardown.resolve()
+        await second
+        await pump(100)
+
+        expect(queued).toMatchObject({
+          state: 'rejected',
+          value: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/disconnect/) },
+        })
+        expect(events).toEqual(['CONNECT', 'DISCONNECT'])
+        expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+        expect(wire.requests().filter(({ api }) => api === 'InitProducerId')).toHaveLength(inits)
+        expect(jest.getTimerCount()).toBe(0)
+        wire.assertClean()
+      }
+    )
+
+    test('a disconnect() joining the close a connect() is queued behind refuses that connect()', async () => {
+      const { profile, options } = KINDS[kind]
+      const wire = producerScript(
+        createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+      )
+      const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+      const events = []
+      for (const name of ['CONNECT', 'DISCONNECT'])
+        producer.on(producer.events[name], () => events.push(name))
+      await producer.connect()
+
+      const first = producer.disconnect()
+      const queued = watch(producer.connect())
+      const joined = producer.disconnect()
+      expect(joined).toBe(first)
+      await joined
+      await pump(100)
+
+      expect(queued).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/disconnect/) },
+      })
+      expect(events).toEqual(['CONNECT', 'DISCONNECT'])
+      expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+      wire.assertClean()
+    })
+
+    test.each([
+      ['a natural', 'a zero-timeout', undefined, { timeout: 0 }, 0],
+      ['a timed', 'a natural', { timeout: 1000 }, undefined, 0],
+      ['a timed', 'a zero-timeout', { timeout: 1000 }, { timeout: 0 }, 0],
+      ['an expired', 'a natural', { timeout: 50 }, undefined, 60],
+      ['an expired', 'a zero-timeout', { timeout: 50 }, { timeout: 0 }, 60],
+    ])(
+      'after %s close, a queued connect() arranged before %s later disconnect() is ended by that close and leaves no socket, timer or request',
+      async (_, __, firstOptions, secondOptions, expireAfter) => {
+        const { profile, options } = KINDS[kind]
+        const wire = producerScript(
+          createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+        )
+        const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+        const events = []
+        for (const name of ['CONNECT', 'DISCONNECT'])
+          producer.on(producer.events[name], () => events.push(name))
+        await producer.connect()
+        const inits = wire.requests().filter(({ api }) => api === 'InitProducerId').length
+
+        const teardown = deferred()
+        let teardowns = 0
+        const original = Cluster.prototype.disconnect
+        jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+          if (++teardowns === 1) await teardown.promise
+          return original.apply(this, args)
+        })
+        const first = producer.disconnect(firstOptions)
+        const closed = watch(first)
+        await pump()
+        expect(teardowns).toBe(1)
+        const queued = watch(producer.connect())
+        const second = first.then(() => producer.disconnect(secondOptions))
+        try {
+          if (expireAfter) await pump(expireAfter)
+          // A forced close still owns its cleanup until the transport teardown ends.
+          expect(closed.state).toBe('pending')
+          expect(queued.state).toBe('pending')
+        } finally {
+          teardown.resolve()
+        }
+        await second
+        await pump(100)
+
+        expect(queued).toMatchObject({
+          state: 'rejected',
+          value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
+        })
+        expect(events).toEqual(['CONNECT', 'DISCONNECT', 'DISCONNECT'])
+        expect(teardowns).toBe(2)
+        expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+        expect(wire.requests().filter(({ api }) => api === 'InitProducerId')).toHaveLength(inits)
+        expect(jest.getTimerCount()).toBe(0)
+        wire.assertClean()
+      }
+    )
+
+    test('a queued connect() arranged before the later disconnect() is ended by that close and leaves no socket', async () => {
+      const { profile, options } = KINDS[kind]
+      const wire = producerScript(
+        createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+      )
+      const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+      const events = []
+      for (const name of ['CONNECT', 'DISCONNECT'])
+        producer.on(producer.events[name], () => events.push(name))
+      await producer.connect()
+
+      const first = producer.disconnect()
+      const queued = watch(producer.connect())
+      const second = first.then(() => producer.disconnect())
+      await second
+      await pump(100)
+
+      expect(queued).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
+      })
+      expect(events).toEqual(['CONNECT', 'DISCONNECT', 'DISCONNECT'])
+      expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+      wire.assertClean()
+    })
+  })
+})

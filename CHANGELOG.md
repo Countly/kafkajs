@@ -18,6 +18,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `maxPollInterval` above 2147483647 is rejected when the consumer is created, instead of failing at the first join.
 - With `bootstrapResolveTimeout`, a DNS answer, a dynamic broker list or a dynamic broker list failure that arrives after the deadline no longer opens the gate or allows a new DNS round; the cached timeout error is returned.
 - A malformed signed varint longer than 5 bytes in a record batch is reported as a corrupt batch on its partition instead of decoding to a wrong value; a null compact array encodes correctly.
+- A producer or admin `connect()` that is waiting for a `disconnect()` already in progress now rejects with `KafkaJSNonRetriableError` when another `disconnect()` is called while it waits. This covers a `disconnect()` that joins the close in progress and one called after that close has finished. Before this fix, the waiting `connect()` reopened the client after the later `disconnect()` had resolved, which emitted `CONNECT` again and left a socket open. All other orderings behave as before.
 
 #### Tooling
 
