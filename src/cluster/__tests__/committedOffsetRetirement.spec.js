@@ -707,8 +707,6 @@ describe('Cluster > committed offset retirement', () => {
       })
       const sibling = linkedTable(harness.ledger())
       sibling.claimAssignment(['sibling-topic'])
-      const idle = jest.fn()
-      sibling.onTopicIdle = idle
       const { consumer, group } = await harness.run({ topics: ['subscribed'] })
       harness.assign(group, { assigned: [0] })
       for (const topic of ['assigned', 'subscribed', 'sibling-topic']) harness.publish(topic)
@@ -719,6 +717,8 @@ describe('Cluster > committed offset retirement', () => {
         assigned: revisions.capture('assigned', 0),
         sibling: revisions.capture('sibling-topic', 0),
       }
+      const ledger = harness.ledger()
+      const hooks = { onTopicIdle: ledger.onTopicIdle, onRetire: ledger.onRetire }
 
       await expect(consumer.disconnect()).rejects.toThrow('teardown failed')
 
@@ -732,6 +732,21 @@ describe('Cluster > committed offset retirement', () => {
       expect(revisions.isCurrent('assigned', 0, stamps.assigned)).toBe(false)
       expect(revisions.isCurrent('sibling-topic', 0, stamps.sibling)).toBe(true)
       expect(harness.ledger().isOwned('sibling-topic')).toBe(true)
+
+      expect(harness.ledger()).toBe(ledger)
+      expect(ledger.onTopicIdle).toBe(hooks.onTopicIdle)
+      expect(ledger.onRetire).toBe(hooks.onRetire)
+      const ticket = ledger.begin([{ topic: 'fresh', partition: 0 }])
+      harness.cache().fresh = { 0: '1' }
+      const fresh = revisions.capture('fresh', 0)
+      ledger.end(ticket)
+      expect(has(harness.cache(), 'fresh')).toBe(false)
+      expect(revisions.isCurrent('fresh', 0, fresh)).toBe(false)
+      expect(Object.keys(harness.cache())).toEqual(['sibling-topic'])
+
+      sibling.releaseAssignment()
+      expect(Object.keys(harness.cache())).toEqual([])
+      expect(revisions.isCurrent('sibling-topic', 0, stamps.sibling)).toBe(false)
     })
 
     test('a same-ledger relink sweeps nothing and a transfer cleans the old ledger', () => {
