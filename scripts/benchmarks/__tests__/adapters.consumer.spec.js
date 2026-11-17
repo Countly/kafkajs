@@ -483,6 +483,23 @@ describe('consumer report rows', () => {
     expect(without.result.detail.reason).toContain('head CPU profile per run')
   })
 
+  test('a consumer row outside its own workflow job is omitted with its reason', async () => {
+    const entry = manifestEntries().find((e) => e.name === 'consumer-eachBatch')
+    const lines = []
+    const raw = path.join(tmp, 'bench-raw', entry.name, 'fork-run-1.jsonl')
+    const code = await session.main(['--row', entry.name, '--raw', raw], {
+      env: {},
+      log: (line) => lines.push(line),
+    })
+    expect(code).toBe(0)
+    expect(fs.existsSync(raw)).toBe(false)
+    const adapter = require('../adapters/consumeThroughput')
+    const output = adapter.read({ status: 0, stdout: `${lines[0]}\n` }, entry)
+    expect(adapter.rows(entry, 'fork', { outputs: [output] }, 1).rows).toEqual([
+      expect.objectContaining({ status: 'omitted', reason: session.OUTSIDE }),
+    ])
+  })
+
   test('an A/A spread above 3 % makes that row invalid', async () => {
     const { line } = await runSession('consumer-subscriptionResolve')
     const adapter = require('../adapters/subscriptionResolve')
