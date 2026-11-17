@@ -2,8 +2,23 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { runEntry } = require('../report')
-const { ShareSession, LIMITS } = require('../shareThroughput')
+const { performance } = require('node:perf_hooks')
+const { EventEmitter } = require('node:events')
+const { runEntry, renderMarkdown } = require('../report')
+const {
+  ShareSession,
+  SESSION_BUDGET,
+  LIMITS,
+  Frames,
+  AcquisitionLog,
+  ShareThroughput,
+  measureWindow,
+  ownerFile,
+} = require('../shareThroughput')
+const { ARMS: SNAPPY_ARMS, snappySession } = require('../snappyCodec')
+const shareAdapter = require('../adapters/shareThroughput')
+const walkAdapter = require('../adapters/shareRecordWalk')
+const snappyAdapter = require('../adapters/snappyReadback')
 
 const ENCODER_DIR = path.join(
   __dirname,
@@ -15,6 +30,17 @@ const ENCODER_FILES = fs
   .sort()
 /** Bytes the eight Snappy arms decode and compare: 3 MiB, 232000, 1, 64, 64, 32 MiB, 1000000, 1 MiB. */
 const SNAPPY_CHECKED_BYTES = 174247040
+const MiB = 1048576
+const SNAPPY_SIZES = {
+  mixed: 3 * MiB,
+  json: 232000,
+  random: MiB,
+  expansion: 64 * MiB,
+  encode64: 64 * MiB,
+  mixedLarge: 32 * MiB,
+  tinyBlocks: 1000000,
+  tinyTokens: MiB,
+}
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-share-'))
 afterAll(() => fs.rmSync(scratch, { recursive: true, force: true }))
@@ -27,8 +53,22 @@ const freshDir = () => {
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex')
 const valueAfter = (args, flag) => args[args.indexOf(flag) + 1]
 
-const shareEntry = (session) => ({
-  name: session === 'batch' ? 'shareThroughput' : 'shareThroughput-eachMessage',
+const SHARE_METRICS = [
+  { key: 'recordsPerSecond', unit: 'records/s' },
+  { key: 'p99', unit: 'ms' },
+  { key: 'fetchPer1000', unit: 'frames' },
+  { key: 'heapDelta', unit: 'bytes' },
+]
+const WALK_METRICS = [
+  { key: 'nsPerOffset', unit: 'ns' },
+  { key: 'retainedHeap', unit: 'bytes' },
+  { key: 'retainedBuffers', unit: 'bytes' },
+  { key: 'retainedTotal', unit: 'bytes' },
+  { key: 'bytesPerDelivery', unit: 'bytes' },
+  { key: 'ledgerMs', unit: 'ms' },
+]
+const shareRow = (name, session) => ({
+  name,
   adapter: 'shareThroughput',
   command: [
     '--expose-gc',
@@ -39,48 +79,48 @@ const shareEntry = (session) => ({
     '{raw}',
   ],
   broker: true,
-  metrics: [
-    { key: 'recordsPerSecond', unit: 'records/s' },
-    { key: 'p99', unit: 'ms' },
-    { key: 'fetchPer1000', unit: 'frames' },
-    { key: 'heapDelta', unit: 'bytes' },
-  ],
+  metrics: SHARE_METRICS,
   arms: ['fork'],
 })
-const walkEntry = {
-  name: 'shareRecordWalk-100k',
+const walkRow = (name, offsets) => ({
+  name,
   adapter: 'shareRecordWalk',
   command: [
     '--expose-gc',
     'scripts/benchmarks/shareRecordWalk.js',
     '--offsets',
-    '100000',
+    offsets,
     '--control',
     '0',
   ],
   broker: false,
-  metrics: [
-    { key: 'nsPerOffset', unit: 'ns' },
-    { key: 'retainedHeap', unit: 'bytes' },
-    { key: 'retainedTotal', unit: 'bytes' },
-    { key: 'bytesPerDelivery', unit: 'bytes' },
-  ],
-  arms: ['fork'],
-}
-const snappyEntry = (readback) => ({
-  name: 'snappyReadback',
-  adapter: 'snappyReadback',
-  command: ['--expose-gc', 'scripts/benchmarks/snappyCodec.js'],
-  readback,
-  broker: false,
-  metrics: [
-    { key: 'decodeMiBs', unit: 'MiB/s' },
-    { key: 'encodeMiBs', unit: 'MiB/s' },
-    { key: 'maxDelayMs', unit: 'ms' },
-    { key: 'maxRssRatio', unit: 'ratio' },
-  ],
+  metrics: WALK_METRICS,
   arms: ['fork'],
 })
+/** The five manifest rows of the share and Snappy measurements, exactly as the manifest holds them. */
+const ENTRIES = [
+  shareRow('shareThroughput', 'batch'),
+  shareRow('shareThroughput-eachMessage', 'eachMessage'),
+  walkRow('shareRecordWalk-100k', '100000'),
+  walkRow('shareRecordWalk-1m', '1000000'),
+  {
+    name: 'snappyReadback',
+    adapter: 'snappyReadback',
+    command: ['--expose-gc', 'scripts/benchmarks/snappyCodec.js', '--session', '--raw', '{raw}'],
+    readback: '.tmp/bench/snappy-java-readback.log',
+    broker: false,
+    metrics: [
+      { key: 'decodeMiBs', unit: 'MiB/s' },
+      { key: 'encodeMiBs', unit: 'MiB/s' },
+      { key: 'maxDelayMs', unit: 'ms' },
+      { key: 'maxRssRatio', unit: 'ratio' },
+    ],
+    arms: ['fork'],
+  },
+]
+const shareEntry = (session) => ENTRIES[session === 'batch' ? 0 : 1]
+const walkEntry = ENTRIES[2]
+const snappyEntry = (readback) => ({ ...ENTRIES[4], readback })
 
 /** Runs one report entry over scripted spawn results, with its own raw directory. */
 const report = (entry, results) => {
@@ -149,32 +189,49 @@ const driverOutput = (args, env, changes = {}) => {
 }
 
 /**
- * The children of a share session: corpus preparation and cleanup as the fixture prints them, and
- * one driver observation per run. `change(args, call)` edits an observation.
+ * The children of a share session: corpus preparation and cleanup as the fixture prints them (a
+ * preparation writes its ownership record first, then the manifest), and one driver observation
+ * per run. `change(args, call)` edits an observation, or with `exit` and `stderr` makes it fail; `fixture(phase, file, call)` may replace a
+ * fixture's result after its files are written; `tick()` runs once per child.
  */
-const sessionSpawn = (change = () => ({})) => {
+const sessionSpawn = (change = () => ({}), { fixture = () => undefined, tick = () => {} } = {}) => {
   const calls = []
   const spawn = (command, args, options) => {
-    calls.push({ args, env: options.env })
+    calls.push({ args, env: options.env, timeout: options.timeout })
+    tick()
     const phase = ['--prepare', '--cleanup'].find((flag) => args.includes(flag))
     if (phase) {
       const file = options.env.P9_SHARE_CORPUS
-      const topic = `share-bench-${crypto.randomUUID()}`
+      let topic
       if (phase === '--prepare') {
+        topic = `share-bench-${crypto.randomUUID()}`
+        fs.writeFileSync(ownerFile(file), JSON.stringify({ schema: 1, topic }))
         const expected = ['a', 'b', 'c'].map((id) => JSON.stringify(['t', 0, id]))
         fs.writeFileSync(
           file,
           JSON.stringify({ schema: 1, topic, expected, messages: 200000, size: 100, partitions: 3 })
         )
+      } else {
+        topic = JSON.parse(fs.readFileSync(ownerFile(file), 'utf8')).topic
       }
+      const scripted = fixture(phase.slice(2), file, calls.length)
+      if (scripted) return scripted
       const line = { status: 'fixture-complete', phase: phase.slice(2), topic, corpus: file }
       return { status: 0, stdout: `${JSON.stringify(line)}\n`, stderr: '' }
     }
-    const output = driverOutput(args, options.env, change(args, calls.length))
+    const changes = change(args, calls.length)
+    if (changes.exit !== undefined)
+      return { status: changes.exit, stdout: '', stderr: changes.stderr }
+    const output = driverOutput(args, options.env, changes)
     return { status: output.status === 'valid' ? 0 : 2, stdout: `${JSON.stringify(output)}\n` }
   }
   return { spawn, calls }
 }
+/** What each child of a session was: `prepare`, `cleanup` or `observe`. */
+const phases = (calls) =>
+  calls.map(({ args }) =>
+    args.includes('--prepare') ? 'prepare' : args.includes('--cleanup') ? 'cleanup' : 'observe'
+  )
 
 const guardFile = () => {
   const file = path.join(freshDir(), 'cluster.json')
@@ -193,20 +250,27 @@ const adminAt =
       }
     },
   })
+/** The environment of the workflow job that owns the share rows. */
+const shareJob = (env = {}) => ({
+  BENCH_SHARE_ROWS: '1',
+  KAFKAJS_CLUSTER_MANIFEST: guardFile(),
+  ...env,
+})
 
 /** Runs a whole session through `ShareSession` and returns the record it prints, as JSON. */
-const sessionRecord = async (name, change) => {
-  const { spawn, calls } = sessionSpawn(change)
+const sessionRecord = async (name, change, { fixture, tick, now } = {}) => {
+  const { spawn, calls } = sessionSpawn(change, { fixture, tick })
   const record = await new ShareSession(name, {
     raw: path.join(freshDir(), 'fork-run-1.jsonl'),
     spawn,
-    env: { KAFKAJS_CLUSTER_MANIFEST: guardFile() },
+    env: shareJob(),
     admin: adminAt(2),
+    ...(now && { now }),
   }).run()
   return { record, calls }
 }
 const sessionResult = (record) => ({
-  status: { accepted: 0, void: 3, inconclusive: 3, error: 1 }[record.status],
+  status: { accepted: 0, omitted: 0, void: 3, inconclusive: 3, error: 1 }[record.status],
   stdout: `share session\n${JSON.stringify(record)}\n`,
   stderr: '',
 })
@@ -251,16 +315,38 @@ const walkLine = (secondWalkNs, status) => ({
     : { failed: [], status: 'candidate; compare both sizes and first accepted baseline ceilings' }),
 })
 
-/** One `snappyCodec.js` line over the seven committed encoder artifacts. */
-const snappyLine = (changes = {}) => ({
-  decodeMiBs: 412.5,
-  encodeMiBs: 188.25,
-  maxDelayMs: 7.5,
-  maxRssRatio: 0.41,
-  checkedBytes: SNAPPY_CHECKED_BYTES,
-  readbacks: 7,
-  failures: 0,
+/** One `snappyCodec.js --arm` child line; `decodeMiBs` is the mixed arm's. */
+const snappyArmLine = (name, decodeMiBs = 412.5, changes = {}) => ({
+  decodeMiBs: name === 'mixed' ? decodeMiBs : 500,
+  encodeMiBs: ['mixed', 'json', 'random', 'encode64'].includes(name) ? 188.25 : 0,
+  delayMs: 7.5,
+  rssGrowth: SNAPPY_SIZES[name],
+  memoryBound: 4 * SNAPPY_SIZES[name],
+  inputBytes: 1000,
+  outputBytes: SNAPPY_SIZES[name],
+  checkedBytes: SNAPPY_SIZES[name],
   ...changes,
+})
+/**
+ * Runs a whole Snappy session over scripted `--arm` children and returns the record it prints.
+ * `line(name, observation, label)` may replace a child's line.
+ */
+const snappyRecord = (line = () => undefined) => {
+  let calls = 0
+  const spawn = (command, args) => {
+    const observation = Math.floor(calls++ / SNAPPY_ARMS.length)
+    const label = ((observation % 2) + Math.floor(observation / 2)) % 2 ? 'snappy~AA' : 'snappy'
+    const name = valueAfter(args, '--arm')
+    const output = line(name, observation, label) ?? snappyArmLine(name)
+    return { status: 0, stdout: `${JSON.stringify(output)}\n`, stderr: '' }
+  }
+  const raw = path.join(freshDir(), 'fork-run-1.jsonl')
+  return snappySession({ raw, spawn, env: { BENCH_SNAPPY_ROWS: '1' } })
+}
+const snappyResult = (record) => ({
+  status: { accepted: 0, omitted: 0, void: 3, error: 1 }[record.status],
+  stdout: `${JSON.stringify(record)}\n`,
+  stderr: '',
 })
 const receipt = (files = ENCODER_FILES) => {
   const file = path.join(freshDir(), 'snappy-java-readback.log')
@@ -282,7 +368,7 @@ describe('Benchmark report share and Snappy adapters', () => {
       new ShareSession('eachMessage', {
         raw: raw(),
         spawn: unguarded.spawn,
-        env: {},
+        env: { BENCH_SHARE_ROWS: '1' },
         admin: () => created.push('admin'),
       }).run()
     ).rejects.toThrow('A share session requires the reviewed guard (KAFKAJS_CLUSTER_MANIFEST)')
@@ -295,7 +381,7 @@ describe('Benchmark report share and Snappy adapters', () => {
         new ShareSession('eachMessage', {
           raw: raw(),
           spawn: disabled.spawn,
-          env: { KAFKAJS_CLUSTER_MANIFEST: guardFile() },
+          env: shareJob(),
           admin: adminAt(level, steps),
         }).run()
       ).rejects.toThrow(
@@ -333,12 +419,12 @@ describe('Benchmark report share and Snappy adapters', () => {
   test('a void share record walk session is inconclusive', () => {
     const stderr = 'A/A exceeds three percent or has no measurable denominator\n'
     const { rows, details } = report(walkEntry, [json(walkLine(22, 'void'), 1, stderr)])
-    expect(rows.map((row) => row.status)).toEqual(Array(16).fill('inconclusive'))
+    expect(rows.map((row) => row.status)).toEqual(Array(24).fill('inconclusive'))
     expect(rows.map((row) => row.arm)).toEqual(
-      ['walk', 'control', 'walk~AA', 'control~AA'].flatMap((arm) => Array(4).fill(arm))
+      ['walk', 'control', 'walk~AA', 'control~AA'].flatMap((arm) => Array(6).fill(arm))
     )
     expect(rows[0]).toMatchObject({ metric: 'nsPerOffset', runs: 7, median: 20.03, min: 20 })
-    expect(rows[8]).toMatchObject({ arm: 'walk~AA', metric: 'nsPerOffset', median: 22.03 })
+    expect(rows[12]).toMatchObject({ arm: 'walk~AA', metric: 'nsPerOffset', median: 22.03 })
     expect(details[0]).toMatchObject({
       status: 'inconclusive',
       reason: 'the A/A control is void: walk nsPerOffset differs by 9.99 % between sessions',
@@ -362,7 +448,8 @@ describe('Benchmark report share and Snappy adapters', () => {
 
   test('Snappy readback needs all seven Java readbacks or reports error', () => {
     expect(ENCODER_FILES).toHaveLength(7)
-    const run = json(snappyLine())
+    const record = snappyRecord()
+    const run = snappyResult(record)
     const missing = path.join(freshDir(), 'absent.log')
     for (const [readback, reason] of [
       [receipt(ENCODER_FILES.slice(1)), `6 Java read-backs, expected the 7 encoder artifacts`],
@@ -375,30 +462,42 @@ describe('Benchmark report share and Snappy adapters', () => {
       ])
       expect(calls).toHaveLength(1)
     }
-    const failed = {
-      status: 1,
-      stdout: '',
-      stderr: 'Error: Expected seven Java read-back artifacts; run the Java verification first',
-    }
+    const failed = snappyResult({
+      schema: 1,
+      session: 'snappy',
+      status: 'error',
+      reason: 'snappy mixed: exit 1: RangeError: boom',
+    })
     expect(report(snappyEntry(receipt()), [failed]).rows).toEqual([
       expect.objectContaining({
         status: 'error',
-        reason: expect.stringContaining('Expected seven Java read-back artifacts'),
+        reason: expect.stringContaining('session error: snappy mixed: exit 1: RangeError: boom'),
       }),
     ])
-    const counted = report(snappyEntry(receipt()), [json(snappyLine({ readbacks: 6 }))])
+    const short = { median: 7, min: 6, max: 7, n: 8 }
+    const counted = report(snappyEntry(receipt()), [
+      snappyResult({
+        ...record,
+        arms: { ...record.arms, snappy: { ...record.arms.snappy, readbacks: short } },
+      }),
+    ])
     expect(counted.rows).toEqual([expect.objectContaining({ status: 'invalid' })])
     expect(control(counted.details[0], 'fork', 'seven encoder artifacts')).toMatchObject({
       passed: false,
     })
 
     const { rows, details } = report(snappyEntry(receipt()), [run])
-    expect(rows.map(({ metric, status, runs }) => [metric, status, runs])).toEqual([
-      ['decodeMiBs', 'valid', 3],
-      ['encodeMiBs', 'valid', 3],
-      ['maxDelayMs', 'valid', 3],
-      ['maxRssRatio', 'valid', 3],
-    ])
+    expect(rows.map(({ arm, metric, status, runs }) => [arm, metric, status, runs])).toEqual(
+      ['fork', 'fork~AA'].flatMap((arm) =>
+        ['decodeMiBs', 'encodeMiBs', 'maxDelayMs', 'maxRssRatio'].map((metric) => [
+          arm,
+          metric,
+          'valid',
+          8,
+        ])
+      )
+    )
+    expect(rows[0]).toMatchObject({ median: 412.5, min: 412.5, max: 412.5 })
     expect(control(details[0], 'fork', 'seven Java read-backs')).toEqual({
       arm: 'fork',
       name: 'seven Java read-backs',
@@ -457,12 +556,12 @@ describe('Benchmark report share and Snappy adapters', () => {
     })
     expect(fs.readFileSync(path.join(walk.raw, 'fork.json'), 'utf8')).toContain('"rejectedControls')
 
-    const snappy = report(snappyEntry(receipt()), [json(snappyLine())])
+    const snappy = report(snappyEntry(receipt()), [snappyResult(snappyRecord())])
     expect(control(snappy.details[0], 'fork', 'decoded bytes = corpus')).toEqual({
       arm: 'fork',
       name: 'decoded bytes = corpus',
       passed: true,
-      detail: `${SNAPPY_CHECKED_BYTES} bytes in every run`,
+      detail: `${SNAPPY_CHECKED_BYTES} bytes in every observation of both arms`,
     })
     expect(fs.readdirSync(snappy.raw).sort()).toEqual(['entry.json', 'fork.json'])
 
@@ -500,6 +599,7 @@ describe('Benchmark report share and Snappy adapters', () => {
       expect.arrayContaining([
         `driver sha256 ${record.driver.sha256}`,
         expect.stringMatching(/^node v\d+/),
+        'eachMessage 7633.59 ns per record, A/A spread 0.00 %: the smallest per-message cost this session resolves is 0.00 ns',
       ])
     )
 
@@ -520,5 +620,320 @@ describe('Benchmark report share and Snappy adapters', () => {
     expect(voided.details[0].reason).toBe(
       'the A/A control is void: record_limit recordsPerSecond differs by 8.11 % between repetitions'
     )
+  })
+
+  test('a share corpus is removed whenever its preparation recorded a topic, and every failure is kept', async () => {
+    const exit1 = { status: 1, stdout: '', stderr: 'Corpus cleanup failed: producer disconnect' }
+    const late = await sessionRecord('eachMessage', undefined, {
+      fixture: (phase) => (phase === 'prepare' ? exit1 : undefined),
+    })
+    expect(phases(late.calls)).toEqual(['prepare', 'cleanup'])
+    expect(late.record).toMatchObject({ status: 'error', corpus: null })
+    expect(late.record.reason).toBe(
+      'corpus prepare failed: exit 1: Corpus cleanup failed: producer disconnect'
+    )
+
+    const killed = await sessionRecord('eachMessage', undefined, {
+      fixture: (phase, file) => {
+        if (phase !== 'prepare') return undefined
+        fs.rmSync(file)
+        return { status: null, signal: 'SIGKILL', stdout: '', stderr: '' }
+      },
+    })
+    expect(phases(killed.calls)).toEqual(['prepare', 'cleanup'])
+    expect(killed.record.reason).toBe('prepare killed by SIGKILL')
+
+    const deadline = { exit: 1, stderr: 'Error: Benchmark deadline exceeded' }
+    const observed = await sessionRecord('eachMessage', (args, call) =>
+      call === 3 ? deadline : {}
+    )
+    expect(phases(observed.calls)).toEqual(['prepare', 'observe', 'observe', 'cleanup'])
+    expect(observed.record.reason).toBe(
+      'record_limit a 0: exit 1: Error: Benchmark deadline exceeded'
+    )
+
+    const frame = await sessionRecord('batch', undefined, {
+      fixture: (phase, file) => (phase === 'prepare' && file.includes('frame') ? exit1 : undefined),
+    })
+    expect(phases(frame.calls).slice(-4)).toEqual(['observe', 'prepare', 'cleanup', 'cleanup'])
+    expect(frame.calls.slice(-2).map(({ env }) => path.basename(env.P9_SHARE_CORPUS))).toEqual([
+      'fork-run-1.jsonl.frame-corpus.json',
+      'fork-run-1.jsonl.corpus.json',
+    ])
+    expect(frame.record.reason).toBe(
+      'corpus prepare failed: exit 1: Corpus cleanup failed: producer disconnect'
+    )
+
+    const stuck = { status: 1, stdout: '', stderr: 'topic still listed' }
+    const unclean = await sessionRecord('eachMessage', undefined, {
+      fixture: (phase) => (phase === 'cleanup' ? stuck : undefined),
+    })
+    expect(unclean.record.status).toBe('error')
+    expect(unclean.record.evaluation.status).toBe('accepted')
+    expect(unclean.record.reason).toBe('cleanup: corpus cleanup failed: exit 1: topic still listed')
+
+    const both = await sessionRecord('eachMessage', (args, call) => (call === 2 ? deadline : {}), {
+      fixture: (phase) => (phase === 'cleanup' ? stuck : undefined),
+    })
+    expect(phases(both.calls)).toEqual(['prepare', 'observe', 'cleanup'])
+    expect(both.record.reason).toBe(
+      'eachMessage a 0: exit 1: Error: Benchmark deadline exceeded; ' +
+        'cleanup: corpus cleanup failed: exit 1: topic still listed'
+    )
+  })
+
+  test('a share session without a measurement window is inconclusive, without numbers when no observation formed one', async () => {
+    const noWindow = {
+      status: 'inconclusive',
+      reason: 'Cannot form declared full-acquisition window',
+      start: undefined,
+      end: undefined,
+      records: undefined,
+      callbacks: undefined,
+      recordsPerSecond: undefined,
+      p99: undefined,
+      fetchPer1000: undefined,
+      latencySamples: undefined,
+    }
+    const none = await sessionRecord('eachMessage', () => noWindow)
+    expect(none.record.status).toBe('inconclusive')
+    const empty = report(shareEntry('eachMessage'), [sessionResult(none.record)])
+    expect(empty.rows).toEqual([
+      {
+        benchmark: 'shareThroughput-eachMessage',
+        arm: '-',
+        metric: '-',
+        unit: '-',
+        runs: 1,
+        status: 'inconclusive',
+        reason: expect.stringMatching(
+          /^no measurement window: eachMessage a 0: Cannot form declared full-acquisition window; /
+        ),
+      },
+    ])
+    expect(empty.details[0]).toMatchObject({ status: 'inconclusive', reason: empty.rows[0].reason })
+    expect(empty.details[0].controls.filter(({ passed }) => !passed)).toEqual([])
+    const markdown = renderMarkdown(empty.rows, { runs: 1 }, empty.details)
+    expect(markdown).toContain(
+      '| shareThroughput-eachMessage | - | - | inconclusive | - | - | - | 1 | - |'
+    )
+    expect(markdown).toContain('### shareThroughput-eachMessage: inconclusive')
+
+    const half = await sessionRecord('eachMessage', (args) =>
+      valueAfter(args, '--handler') === 'eachMessage' ? noWindow : {}
+    )
+    const mixed = report(shareEntry('eachMessage'), [sessionResult(half.record)])
+    expect([...new Set(mixed.rows.map((row) => row.arm))]).toEqual([
+      'record_limit',
+      'record_limit~AA',
+    ])
+    expect(mixed.rows.every((row) => row.status === 'inconclusive')).toBe(true)
+    expect(mixed.rows[0]).toMatchObject({ metric: 'recordsPerSecond', median: 148000, runs: 7 })
+    expect(mixed.details[0].reason).toMatch(/^no measurement window: eachMessage a 0: /)
+    expect(renderMarkdown(mixed.rows, { runs: 1 }, mixed.details)).toContain(
+      '| shareThroughput-eachMessage | record_limit | recordsPerSecond | inconclusive | 148000 | 148000 to 148000 | records/s | 7 | - |'
+    )
+  })
+
+  test('a share session stops within its budget and keeps the time its corpus cleanup needs', async () => {
+    const child = LIMITS.timeout + 60000
+    expect(SESSION_BUDGET).toEqual({ totalMs: 290 * 60000, childMs: child, cleanupMs: 2 * child })
+    expect(shareAdapter.timeoutMs).toBe(SESSION_BUDGET.totalMs + 10 * 60000)
+    expect(snappyAdapter.timeoutMs).toBe(110 * 60000)
+    expect(walkAdapter.timeoutMs).toBe(20 * 60000)
+
+    let now = 0
+    const step = 7 * 60000
+    const { record, calls } = await sessionRecord('batch', undefined, {
+      now: () => now,
+      tick: () => {
+        now += step
+      },
+    })
+    const due = SESSION_BUDGET.totalMs - SESSION_BUDGET.cleanupMs
+    const starts = calls.map((_, i) => i * step)
+    expect(record.status).toBe('error')
+    expect(record.reason).toBe(
+      'the session budget leaves no time for observe batch_optimized aprime 4'
+    )
+    expect(calls).toHaveLength(40)
+    expect(phases(calls)).toEqual([
+      'prepare',
+      ...Array(calls.length - 2).fill('observe'),
+      'cleanup',
+    ])
+    const timeouts = calls.map(({ timeout }) => timeout)
+    expect(timeouts.slice(0, -2).every((timeout) => timeout === child)).toBe(true)
+    expect(timeouts.at(-2)).toBe(due - starts.at(-2))
+    expect(timeouts.at(-2)).toBeLessThan(child)
+    expect(timeouts.at(-1)).toBe(child)
+    for (let i = 0; i < calls.length - 1; i++)
+      expect(starts[i] + timeouts[i]).toBeLessThanOrEqual(due)
+    expect(starts.at(-1) + timeouts.at(-1)).toBeLessThanOrEqual(SESSION_BUDGET.totalMs)
+  })
+
+  test('share and Snappy rows run only in the workflow job that owns them', async () => {
+    const { spawn, calls } = sessionSpawn()
+    const admins = []
+    const record = await new ShareSession('batch', {
+      raw: path.join(freshDir(), 'fork-run-1.jsonl'),
+      spawn,
+      env: { KAFKAJS_CLUSTER_MANIFEST: guardFile() },
+      admin: () => admins.push('admin'),
+    }).run()
+    const reason = 'runs in its own job of the benchmark workflow (BENCH_SHARE_ROWS=1)'
+    expect(record).toEqual({ schema: 1, session: 'batch', status: 'omitted', reason })
+    expect([calls, admins]).toEqual([[], []])
+    expect(report(shareEntry('batch'), [sessionResult(record)]).rows).toEqual([
+      {
+        benchmark: 'shareThroughput',
+        arm: '-',
+        metric: '-',
+        unit: '-',
+        runs: 1,
+        status: 'omitted',
+        reason,
+      },
+    ])
+
+    const snappy = snappySession({ raw: path.join(freshDir(), 'raw.jsonl'), env: {} })
+    const elsewhere = path.join(freshDir(), 'no-receipt.log')
+    expect(report(snappyEntry(elsewhere), [snappyResult(snappy)]).rows).toEqual([
+      {
+        benchmark: 'snappyReadback',
+        arm: '-',
+        metric: '-',
+        unit: '-',
+        runs: 1,
+        status: 'omitted',
+        reason: 'runs in its own job of the benchmark workflow (BENCH_SNAPPY_ROWS=1)',
+      },
+    ])
+  })
+
+  /**
+   * One share observation through the driver's own handler path, over a scripted nonprefetching
+   * share loop: three nodes, four full 500-record acquisitions each, every fetch answered 2 ms after
+   * its write, the next fetch written when the acquisition's last handler call returns, and its
+   * answer settling the acquisition. Each record costs `recordMs` and each handler call `addedMs`
+   * more: the seeded per-call cost. Returns the driver's measured window over 3000 records.
+   */
+  const observeLoop = async (handler, recordMs, addedMs) => {
+    let now = 0
+    const clock = jest.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      const frames = new Frames(() => new EventEmitter())
+      const driver = new ShareThroughput(
+        { arm: 'share', handler, acquireMode: 'record_limit', maxRecords: 500, messages: 6000 },
+        { kafka: null, frames, resources: {}, trace: '' }
+      )
+      driver.log = new AcquisitionLog(frames, new Map([0, 1, 2].map((node) => [node, `n${node}`])))
+      driver.consumer = { acquisitionLockTimeoutMs: () => LIMITS.lock }
+      const fetch = (node) => {
+        const row = { endpoint: `n${node}`, apiKey: 78, writeAt: now, responseAt: null }
+        frames.rows.push(row)
+        now += 2
+        row.responseAt = now
+      }
+      for (const node of [0, 1, 2]) fetch(node)
+      for (let round = 0; round < 4; round++)
+        for (const node of [0, 1, 2]) {
+          const first = round * 500
+          const messages = Array.from({ length: 500 }, (_, i) => ({
+            offset: String(first + i),
+            key: Buffer.from('k'),
+            value: Buffer.from('v'),
+          }))
+          if (handler === 'eachMessage') {
+            for (const message of messages) {
+              now += recordMs + addedMs
+              await driver.messageHandler({ topic: 't', partition: node, message })
+            }
+          } else {
+            now += 500 * recordMs + addedMs
+            const batch = {
+              topic: 't',
+              partition: node,
+              messages,
+              acquisitionLockTimeoutMs: LIMITS.lock,
+            }
+            await driver.handler({ batch })
+          }
+          fetch(node)
+          const range = { firstOffset: String(first), lastOffset: String(first + 499) }
+          driver.log.acknowledge(
+            { topic: 't', partition: node, ...range, type: 'accept', error: null },
+            now
+          )
+        }
+      const window = measureWindow({ log: driver.log, frames, maxRecords: 500, target: 3000 })
+      const inside = driver.log.calls.filter(
+        ({ enteredAt }) => enteredAt >= window.start && enteredAt <= window.end
+      ).length
+      return { window, inside }
+    } finally {
+      clock.mockRestore()
+    }
+  }
+
+  test('the eachMessage row resolves a seeded per-message cost the size of one async-context entry', async () => {
+    const recordMs = 0.01
+    const plain = await observeLoop('eachMessage', recordMs, 0)
+    const seeded = await observeLoop('eachMessage', recordMs, 0.0001)
+    expect(plain.window.status).toBe('valid')
+    expect(seeded.inside).toBe(plain.inside)
+    expect(
+      seeded.window.end - seeded.window.start - (plain.window.end - plain.window.start)
+    ).toBeCloseTo(plain.inside * 0.0001, 6)
+    expect(seeded.window.recordsPerSecond).toBeLessThan(plain.window.recordsPerSecond)
+
+    /** A PRE or POST session: eight observations of each arm per repetition, seeded host noise. */
+    const sessionAt = async (addedMs) => {
+      let seed = 7
+      const noise = () => {
+        seed = (seed * 48271) % 2147483647
+        return 1 + (seed / 2147483647 - 0.5) * 0.004
+      }
+      const arms = {}
+      for (const [label, handler] of [
+        ['eachMessage', 'eachMessage'],
+        ['record_limit', 'eachBatch'],
+      ]) {
+        arms[label] = { a: [], aprime: [] }
+        for (const rep of ['a', 'aprime'])
+          for (let i = 0; i < LIMITS.observations; i++) {
+            const { window } = await observeLoop(handler, recordMs * noise(), addedMs)
+            arms[label][rep].push({
+              status: window.status,
+              recordsPerSecond: window.recordsPerSecond,
+            })
+          }
+      }
+      return { session: 'eachMessage', arms }
+    }
+    const pre = await sessionAt(0)
+    const resolved = shareAdapter.compareEachMessage(pre, await sessionAt(0.0001))
+    const perCall = (plain.inside / 3000) * 100
+    expect(resolved.deltaNs).toBeCloseTo(perCall, 6)
+    expect(resolved.resolutionNs).toBeGreaterThan(0)
+    expect(resolved.resolutionNs).toBeLessThan(perCall / 2)
+    expect(Math.abs(resolved.controlDrift)).toBeLessThan(resolved.noise)
+    expect(resolved.resolved).toBe(true)
+
+    const hidden = shareAdapter.compareEachMessage(pre, await sessionAt(0.000001))
+    expect(hidden.deltaNs).toBeCloseTo(perCall / 100, 6)
+    expect(hidden.resolutionNs).toBeGreaterThan(hidden.deltaNs)
+    expect(hidden.resolved).toBe(false)
+  })
+
+  test('the manifest runs exactly the five share and Snappy rows and no longer excludes their drivers', () => {
+    const manifest = require('../manifest.json')
+    const names = ENTRIES.map(({ name }) => name)
+    expect(manifest.entries.filter(({ name }) => names.includes(name))).toEqual(ENTRIES)
+    expect(manifest.excluded.map(({ file }) => file)).not.toEqual(
+      expect.arrayContaining(['shareRecordWalk.js'])
+    )
+    for (const file of ['shareRecordWalk.js', 'shareThroughput.js', 'snappyCodec.js'])
+      expect(manifest.excluded.map((row) => row.file)).not.toContain(file)
   })
 })

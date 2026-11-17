@@ -22,6 +22,7 @@ const {
   produceCorpus,
   ShareThroughput,
   CorpusFixture,
+  ownerFile,
 } = require('../shareThroughput')
 
 const message = (offset, key = 'k', value = 'v') => ({
@@ -1379,6 +1380,42 @@ describe('Share corpus topic cleanup', () => {
     expect(timeout).toHaveBeenCalledWith(999)
     expect(visited).toEqual(['a:9092', 'b:9092', 'c:9092'])
     expect(emitter.listenerCount('request')).toBe(0)
+  })
+
+  test('a corpus preparation records its topic before creating it, and cleanup removes the topic from that record', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'share-owner-'))
+    const file = path.join(dir, 'corpus.json')
+    const fixture = Object.create(CorpusFixture.prototype)
+    Object.assign(fixture, {
+      file,
+      deadline: performance.now() + 60000,
+      config: { messages: 200000, size: 100, partitions: 3 },
+    })
+    const seen = []
+    fixture.admin = {
+      connect: async () => {},
+      disconnect: async () => {},
+      createTopics: async ({ topics }) => {
+        seen.push(['create', topics[0].topic, fs.existsSync(ownerFile(file))])
+        throw new Error('The controller moved')
+      },
+    }
+    fixture.producer = { disconnect: async () => {} }
+    fixture.removeTopic = async (topic) => seen.push(['remove', topic])
+    jest.spyOn(process.stdout, 'write').mockImplementation(() => true)
+
+    await expect(fixture.run('prepare')).rejects.toThrow('The controller moved')
+    const { topic } = JSON.parse(fs.readFileSync(ownerFile(file), 'utf8'))
+    expect(topic).toMatch(/^share-bench-[a-f0-9-]+$/)
+    expect(seen).toEqual([
+      ['create', topic, true],
+      ['remove', topic],
+    ])
+    expect(fs.existsSync(file)).toBe(false)
+
+    await fixture.run('cleanup')
+    expect(seen.at(-1)).toEqual(['remove', topic])
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 
   test('refuses to extend a submillisecond cleanup remainder', async () => {
