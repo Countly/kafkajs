@@ -8,6 +8,7 @@ const {
   judge,
   METRICS,
   validRun,
+  accountedRun,
   OfferWindow,
   HEAP_LIMIT,
   tallyRejection,
@@ -336,6 +337,27 @@ describe('Benchmarks > stickyBalance', () => {
       })
     ).toBe(false)
     expect(validRun('slow-broker', { ...run, refused: undefined })).toBe(false)
+  })
+
+  test('accountedRun keeps a run whose window drifted, and refuses a send neither partitioned nor refused', () => {
+    const drifted = require('fs')
+      .readFileSync(
+        path.join(__dirname, 'fixtures/stickyBalanceSession/slow-broker-drift.jsonl'),
+        'utf8'
+      )
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line).result)
+      .find(({ maxTickDriftMs }) => maxTickDriftMs > 50)
+    expect(drifted).toMatchObject({ partitionerCalls: 83502, refused: 36498, unsettled: 0 })
+
+    expect(validRun('slow-broker', drifted)).toBe(false)
+    expect(accountedRun(drifted)).toBe(true)
+    expect(accountedRun({ ...drifted, partitionerCalls: 83501 })).toBe(false)
+    expect(accountedRun({ ...drifted, partitionerCalls: 83503 })).toBe(false)
+    expect(accountedRun({ ...drifted, delivered: 83501 })).toBe(false)
+    expect(accountedRun({ ...drifted, refused: 36499 })).toBe(false)
+    expect(accountedRun({ ...drifted, refused: undefined })).toBe(false)
   })
 
   test('validRun reads a fast-broker median of 0 ms as under 1 ms', () => {

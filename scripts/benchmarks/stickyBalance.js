@@ -112,9 +112,25 @@ const tallyRejection = (error, counts) => {
 }
 
 /**
+ * Checks one observation's send accounting, whatever its timing: every offered send is delivered,
+ * rejected or unsettled, the buffer refusals are part of the rejections, and the partitioner ran
+ * once per send the buffer admitted (offered minus refused).
+ * @param {object} result one arm's actual measurements
+ * @returns {boolean} false for missing or negative counts or any send not accounted for
+ */
+const accountedRun = (result) => {
+  const counts = ['offered', 'delivered', 'rejected', 'refused', 'unsettled', 'partitionerCalls']
+  if (!counts.every((name) => Number.isInteger(result[name]) && result[name] >= 0)) return false
+  return (
+    result.offered === result.delivered + result.rejected + result.unsettled &&
+    result.refused <= result.rejected &&
+    result.partitionerCalls === result.offered - result.refused
+  )
+}
+
+/**
  * Checks a single observation before any medians can hide invalid workload or missing controls.
- * The partitioner must have run once per send the buffer admitted (offered minus refused), and no
- * send may be left unsettled. Answer times are whole milliseconds, so an `otherMedianMs` of 0
+ * Its sends must be accounted for (`accountedRun`) and none left unsettled. Answer times are whole milliseconds, so an `otherMedianMs` of 0
  * means under 1 ms, but only when the other brokers answered at all: a slow-broker run needs
  * Produce answers from the slow broker and from the others (`slowAnswerCount`,
  * `otherAnswerCount`).
@@ -124,12 +140,8 @@ const tallyRejection = (error, counts) => {
  */
 const validRun = (scenario, result) => {
   const expected = scenario === 'healthy' ? 100000 : 120000
-  const counts = ['offered', 'delivered', 'rejected', 'refused', 'unsettled', 'partitionerCalls']
-  if (!counts.every((name) => Number.isInteger(result[name]) && result[name] >= 0)) return false
+  if (!accountedRun(result) || result.unsettled !== 0) return false
   if (result.records !== expected || result.offered !== expected) return false
-  if (result.offered !== result.delivered + result.rejected + result.unsettled) return false
-  if (result.refused > result.rejected || result.unsettled !== 0) return false
-  if (result.partitionerCalls !== result.offered - result.refused) return false
   if (result.keyedIdentical !== 1) return false
   if (result.gcAvailable !== 1 || result.topologyValid !== 1) return false
   if (
@@ -201,6 +213,7 @@ const METRICS = [
   'keyedIdentical',
   'heapRetainedBytes',
   'valid',
+  'accounted',
   'offered',
   'gcAvailable',
   'topologyValid',
@@ -533,6 +546,7 @@ const run = async ({ scenario, arm, records, concurrency, brokers, tree }) => {
     keyedIdentical: keyedIdentical(Partitioners, base),
     heapRetainedBytes: Math.max(0, (await retainedHeap()) - before),
   }
+  result.accounted = accountedRun(result) ? 1 : 0
   result.valid = validRun(scenario, result) ? 1 : 0
   if (unsettled === 0) await producer.disconnect()
   return result
@@ -584,6 +598,7 @@ const compare = (options) => {
         fs.writeFileSync(`${options.raw}.attempt-${attempt}.json`, `${JSON.stringify(receipt)}\n`)
         if (child.status !== 0) throw new Error(`the ${arm} run failed: ${child.stderr}`)
         const result = JSON.parse(child.stdout)
+        result.accounted = accountedRun(result) ? 1 : 0
         result.valid = validRun(options.scenario, result) ? 1 : 0
         return result
       },
@@ -620,6 +635,7 @@ const sessionReport = (scenario, summary, verdict) => ({
 module.exports = {
   OfferWindow,
   validRun,
+  accountedRun,
   tallyRejection,
   retainedHeap,
   HEAP_LIMIT,

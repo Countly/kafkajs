@@ -30,6 +30,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The adaptive-partitioner comparison counts buffer refusals apart from partitioned sends, drains the slow-broker scenario until every send settles, warms up before delaying the slow broker, and runs 24 healthy rounds. Every comparison row shows each arm's delivered, rejected, refused and unsettled sends, invalid rows included.
 - `scripts/benchmarks/report.js --only <name>[,<name>…]` runs just the named manifest rows and lists the rest as `not selected`; the Benchmarks workflow takes them as its optional `rows` input (empty runs every row).
 - The OTel tests install the packed client under the npm alias `kafkajs` and check CJS and ESM instrumentation.
+- The adaptive-partitioner comparison's "partitioner calls = admitted records" control reads each run's send accounting on its own, so a run that is invalid only for its timing fails "every observation valid" and not the accounting control.
 
 ### Phase 10 — Release, CI and benchmarks
 

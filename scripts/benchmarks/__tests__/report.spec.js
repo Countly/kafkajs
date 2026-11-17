@@ -1014,8 +1014,7 @@ describe('Benchmarks > report', () => {
             runs: 1,
             status: 'invalid',
             reason:
-              'failed controls: adaptive partitioner calls = admitted records; ' +
-              'adaptive keyed mapping identical; adaptive every observation valid',
+              'failed controls: adaptive keyed mapping identical; adaptive every observation valid',
           },
         ])
         const detail = result.details.find((candidate) => candidate.benchmark === name)
@@ -1023,11 +1022,7 @@ describe('Benchmarks > report', () => {
           detail.controls
             .filter(({ passed }) => !passed)
             .map(({ arm, name: control }) => `${arm} ${control}`)
-        ).toEqual([
-          'adaptive partitioner calls = admitted records',
-          'adaptive keyed mapping identical',
-          'adaptive every observation valid',
-        ])
+        ).toEqual(['adaptive keyed mapping identical', 'adaptive every observation valid'])
       }
       expect(markdown).toContain(`| ${entry.name} | - | - | invalid | - | - | - | 1 | - |`)
       expect(markdown).toContain(`### ${entry.name}: invalid`)
@@ -1107,7 +1102,7 @@ describe('Benchmarks > report', () => {
      * @returns {object[]} the settled observations
      */
     const settledObservations = () => {
-      const { validRun } = require('../stickyBalance')
+      const { validRun, accountedRun } = require('../stickyBalance')
       return fs
         .readFileSync(path.join(SESSION_DIR, 'slow-broker-observations.jsonl'), 'utf8')
         .trim()
@@ -1125,6 +1120,7 @@ describe('Benchmarks > report', () => {
             otherAnswerCount: 1200,
           }
           result.valid = validRun('slow-broker', result) ? 1 : 0
+          result.accounted = accountedRun(result) ? 1 : 0
           return { ...observation, result }
         })
     }
@@ -1206,6 +1202,90 @@ describe('Benchmarks > report', () => {
         expect.objectContaining({
           status: 'invalid',
           reason: 'failed controls: sticky partitioner calls = admitted records',
+        }),
+      ])
+    })
+
+    test('a sticky observation that drifts past the offer window fails only every observation valid, never the accounting control', () => {
+      const { validRun, accountedRun } = require('../stickyBalance')
+      const observations = fs
+        .readFileSync(path.join(SESSION_DIR, 'slow-broker-drift.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .map((observation) => {
+          const result = { ...observation.result }
+          result.valid = validRun('slow-broker', result) ? 1 : 0
+          result.accounted = accountedRun(result) ? 1 : 0
+          return { ...observation, result }
+        })
+      const invalid = observations.filter(({ result }) => result.valid !== 1)
+      expect(invalid.map(({ round, label, warmup }) => [round, label, warmup])).toEqual([
+        [1, 'sticky', false],
+      ])
+      const [{ result: drifted }] = invalid
+      expect(drifted.maxTickDriftMs).toBeCloseTo(56.23, 2)
+      expect(validRun('slow-broker', { ...drifted, maxTickDriftMs: 50 })).toBe(true)
+      for (const { result } of observations) {
+        expect(result.accounted).toBe(1)
+        expect(result.partitionerCalls + result.refused).toBe(120000)
+      }
+
+      const { json: result, markdown } = report([sessionEntry('slow-broker', 'drift')], () =>
+        sessionOf(observations)
+      )
+
+      expect(result.rows).toEqual([
+        expect.objectContaining({
+          status: 'invalid',
+          reason: 'failed controls: sticky every observation valid',
+        }),
+      ])
+      const accounting = result.details[0].controls.find(
+        ({ arm, name }) => arm === 'sticky' && name === 'partitioner calls = admitted records'
+      )
+      expect(accounting).toEqual({
+        arm: 'sticky',
+        name: 'partitioner calls = admitted records',
+        passed: true,
+        detail: 'calls 75530 to 88419, records 120000, refused 31581 to 44470',
+      })
+      expect(markdown).toContain(
+        '- control sticky partitioner calls = admitted records: passed ' +
+          '(calls 75530 to 88419, records 120000, refused 31581 to 44470)'
+      )
+      expect(markdown).toContain('- control sticky every observation valid: FAILED')
+    })
+
+    test('the accounting control fails for one run whose admitted record was never partitioned, inside the range', () => {
+      const { validRun, accountedRun } = require('../stickyBalance')
+      const observations = settledObservations()
+      const measured = observations.filter(({ label, warmup }) => label === 'sticky~AA' && !warmup)
+      const calls = measured.map(({ result }) => result.partitionerCalls)
+      const inner = measured.find(
+        ({ result }) =>
+          result.partitionerCalls - 1 > Math.min(...calls) &&
+          result.partitionerCalls < Math.max(...calls)
+      ).result
+      inner.partitionerCalls -= 1
+      inner.valid = validRun('slow-broker', inner) ? 1 : 0
+      inner.accounted = accountedRun(inner) ? 1 : 0
+      expect([inner.valid, inner.accounted]).toEqual([0, 0])
+
+      const answer = sessionOf(observations)
+      const aa = lastJsonLine(answer.stdout).arms['sticky~AA']
+      expect([aa.partitionerCalls.min, aa.partitionerCalls.max]).toEqual([
+        120000 - aa.refused.max,
+        120000 - aa.refused.min,
+      ])
+      const { json: result } = report([sessionEntry('slow-broker', 'missed')], () => answer)
+
+      expect(result.rows).toEqual([
+        expect.objectContaining({
+          status: 'invalid',
+          reason:
+            'failed controls: sticky~AA partitioner calls = admitted records; ' +
+            'sticky~AA every observation valid',
         }),
       ])
     })

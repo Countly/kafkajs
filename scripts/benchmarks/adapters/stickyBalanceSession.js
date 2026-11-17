@@ -45,6 +45,7 @@ const CONTROL_KEYS = [
   'topologyValid',
   'gcAvailable',
   'valid',
+  'accounted',
   'balance',
   'p99Ms',
 ]
@@ -78,16 +79,17 @@ const percent = (value) => `${value >= 0 ? '+' : ''}${value.toFixed(2)} %`
 
 /**
  * Each arm's controls: a name, whether its stats pass it, and what to show. Every run checks its
- * partitioner calls against its records less its buffer refusals (`validRun`); with the same
- * records in every run, the calls' minimum and maximum must also be the records less the
- * refusals' maximum and minimum. Medians are not compared: an even number of runs takes the upper
- * middle value, which for the calls pairs with the lower middle refusal.
+ * partitioner calls against its offered records less its buffer refusals (`accounted`, apart from
+ * its timing, which `valid` also checks); with the same records in every run, the calls' minimum
+ * and maximum must also be the records less the refusals' maximum and minimum. Medians are not
+ * compared: an even number of runs takes the upper middle value, which for the calls pairs with
+ * the lower middle refusal.
  */
 const CONTROLS = [
   {
     name: 'partitioner calls = admitted records',
-    passed: ({ valid, partitionerCalls: calls, records, refused }) =>
-      valid?.min === 1 &&
+    passed: ({ accounted, partitionerCalls: calls, records, refused }) =>
+      accounted?.min === 1 &&
       Number.isInteger(records?.min) &&
       records.min === records.max &&
       Number.isFinite(refused?.min) &&
