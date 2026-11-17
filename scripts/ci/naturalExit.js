@@ -17,7 +17,9 @@ const LANES = {
   },
   'soak-full': { ...PROFILES.full, cases: [TITLE] },
   shutdown: {
-    totalMs: 150000,
+    // Case budgets 40000 + 50000 + 30000 + 177000 (the admission case's summed bounds), plus the
+    // wrapper: beforeAll 10000, four Jest case joins 4 * 2000, Jest startup 10000, exit 10000.
+    totalMs: 120000 + 177000 + 38000,
     spec: 'shareShutdownLive.spec.js',
     cases: [
       'sends four decisions and releases six held records before lock expiry',

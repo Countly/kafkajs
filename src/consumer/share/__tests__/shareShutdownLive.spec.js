@@ -54,7 +54,6 @@ const LOCK_MS = 15000
 const FORCED_BUDGET_MS = 40000
 const ZERO_BUDGET_MS = 50000
 const STOP_BUDGET_MS = 30000
-const ADMISSION_BUDGET_MS = 30000
 const HOOK_BUDGET_MS = 10000
 const CLEANUP_BUDGET_MS = 8000
 const JOIN_BUDGET_MS = 10000
@@ -63,6 +62,26 @@ const DISCONNECT_MS = 5000
 const FINAL_ALLOWANCE_MS = 1000 + 4000 + 2000
 const RELEASE_ALLOWANCE_MS = 3000
 const QUIET_WINDOW_MS = 5000
+/**
+ * `ShutdownCase#setup`'s bounds: baseline 15000, admin 10000, topic 20000, topic and group
+ * configs 10000 + 15000, groups 10000.
+ */
+const SETUP_BUDGET_MS = 15000 + 10000 + 20000 + 10000 + 15000 + 10000
+/**
+ * Every bound the admission case awaits, in order, so a case whose every step stays within its
+ * own bound is never aborted by the whole: setup, the member's four start steps, the assignment
+ * barrier, the close, the reconnect, the quiet window, the describe, the final close, the cleanup.
+ */
+const ADMISSION_BUDGET_MS =
+  SETUP_BUDGET_MS +
+  4 * JOIN_BUDGET_MS +
+  10000 +
+  (DISCONNECT_MS + 2000) +
+  JOIN_BUDGET_MS +
+  QUIET_WINDOW_MS +
+  10000 +
+  (DISCONNECT_MS + 2000) +
+  CLEANUP_BUDGET_MS
 const TIMESTAMP = '1700000000000'
 const API = { heartbeat: 76, fetch: 78, acknowledge: 79 }
 const SHARE_APIS = new Set(Object.values(API))

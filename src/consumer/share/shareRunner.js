@@ -3,7 +3,7 @@ const { requests } = require('../../protocol/requests')
 const createRetry = require('../../retry')
 const { ConsumerOperation } = require('../groupProtocol/interface')
 const shareCapability = require('./shareCapability')
-const { ShareRun } = require('./shareRun')
+const { ShareRun, handlerRunIdentity } = require('./shareRun')
 const { ShareHandlerCall } = require('./shareHandlerCall')
 const { ShareCloseEpisode } = require('./shareCloseEpisode')
 const { events, wrap, unwrap } = require('./instrumentationEvents')
@@ -84,6 +84,7 @@ class ShareRunner {
     this.connecting = null
     this.subscribing = false
     this.disconnecting = null
+    this.closingRun = null
     this.disconnectCalls = 0
     this.restartOperation = null
     this.lifecycle = 0
@@ -197,15 +198,26 @@ class ShareRunner {
    * Connects the client's Cluster and checks the share capability of the bootstrap broker.
    * Concurrent and repeated calls share one attempt and one `connect` event. A call made while a
    * `disconnect()` is closing the client waits for that close, its `disconnect` event included,
-   * and then makes a fresh attempt; it never joins an attempt the close retired.
+   * and then makes a fresh attempt; it never joins an attempt the close retired. A handler of the
+   * run that close is waiting for, or async work it started, is refused at once instead, since the
+   * close cannot end before that handler returns.
    * @returns {Promise<void>}
    * @throws {KafkaJSShareGroupsNotSupportedError} When the cluster cannot run share groups; the
    *   newly opened connections are closed and no `connect` event is published.
-   * @throws {KafkaJSNonRetriableError} When another `disconnect()` was called while this call
-   *   waited for a close, or a close retired this attempt.
+   * @throws {KafkaJSNonRetriableError} When called from a handler of the run being closed, when
+   *   another `disconnect()` was called while this call waited for a close, or when a close
+   *   retired this attempt.
    */
   connect() {
-    if (this.disconnecting) return this.afterClose().then(() => this.connect())
+    if (this.disconnecting) {
+      if (this.closingRun !== null && handlerRunIdentity() === this.closingRun)
+        return Promise.reject(
+          new KafkaJSNonRetriableError(
+            'connect() cannot wait for a close from a handler of the run being closed'
+          )
+        )
+      return this.afterClose()
+    }
     if (this.connected) return Promise.resolve()
     if (!this.connecting) {
       const attempt = this.connectOnce().finally(() => {
@@ -217,17 +229,21 @@ class ShareRunner {
   }
 
   /**
-   * Waits for the close in progress, whatever its outcome. A `disconnect()` called meanwhile was
-   * asked after the waiting caller, so the caller is refused instead of reconnecting.
+   * Waits for the close in progress, whatever its outcome, then connects. A `disconnect()` called
+   * meanwhile was asked after the waiting caller, so the caller is refused instead of reconnecting.
+   * The check and the fresh attempt run in one continuation, so a later `disconnect()` either
+   * refuses this caller or retires the attempt it started.
    * @private
    * @returns {Promise<void>}
-   * @throws {KafkaJSNonRetriableError} When another `disconnect()` was called while it waited.
+   * @throws {KafkaJSNonRetriableError} When another `disconnect()` was called while it waited, or
+   *   one retired the fresh attempt.
    */
   async afterClose() {
     const calls = this.disconnectCalls
     await this.disconnecting.catch(() => {})
     if (this.disconnectCalls !== calls)
       throw new KafkaJSNonRetriableError('Share client was disconnected')
+    return this.connect()
   }
 
   /**
@@ -429,6 +445,7 @@ class ShareRunner {
     this.stopGeneration++
     this.restartOperation?.retire(new KafkaJSNonRetriableError('Share client was disconnected'))
     const episode = run?.beginClose('disconnect', timeout, enteredAt)
+    this.closingRun = run?.identity ?? null
     this.disconnecting = this.closeClient(episode, finalTelemetry)
     return this.disconnecting
   }
@@ -452,6 +469,7 @@ class ShareRunner {
       if (wasConnected) this.emit(events.DISCONNECT)
     } finally {
       this.disconnecting = null
+      this.closingRun = null
     }
   }
 

@@ -1,3 +1,4 @@
+const { AsyncLocalStorage } = require('node:async_hooks')
 const createRetry = require('../../retry')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { ConsumerOperation } = require('../groupProtocol/interface')
@@ -12,6 +13,8 @@ const { events } = require('./instrumentationEvents')
 const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
 
 const INITIAL_HEARTBEAT_MS = 1000
+/** Holds only the identity of the run whose handler is executing, never a record or batch. */
+const handlerScope = new AsyncLocalStorage()
 
 /**
  * @returns {{promise: Promise<void>, resolve: () => void, reject: (error: Error) => void, settled: boolean}}
@@ -79,6 +82,7 @@ class ShareRun {
     this.committed = []
     this.tap = null
     this.heartbeatRevision = Symbol('heartbeat')
+    this.identity = Symbol('share run')
     this.coordinator = null
     this.facade = null
     this.waiters = new Set()
@@ -818,7 +822,8 @@ class ShareRun {
 
   /**
    * Runs one handler call: poll accounting, the application call, lock-expiry observation, the
-   * policy completion, and the handler pacing or the omission verdict.
+   * policy completion, and the handler pacing or the omission verdict. The application call runs
+   * with this run's identity in async context, so the client can tell a handler's own calls apart.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -833,7 +838,7 @@ class ShareRun {
     let thrown
     try {
       if (pollCall === null) throw new KafkaJSNonRetriableError('Share run is no longer polling')
-      await this.handler(payload)
+      await handlerScope.run(this.identity, () => this.handler(payload))
     } catch (error) {
       failed = true
       thrown = error
@@ -1475,4 +1480,10 @@ class ShareRun {
   }
 }
 
-module.exports = { ShareRun }
+/**
+ * @returns {symbol|undefined} The identity of the run whose handler, or async work it started, is
+ *   calling; undefined outside a share handler.
+ */
+const handlerRunIdentity = () => handlerScope.getStore()
+
+module.exports = { ShareRun, handlerRunIdentity }

@@ -302,6 +302,39 @@ describe('share client admission while a close is in progress', () => {
     }
   )
 
+  test('a handler awaiting connect during a bounded close is refused before its deadline', async () => {
+    clock = new ShareClock().install()
+    const h = open()
+    const entered = deferred()
+    const proceed = deferred()
+    let refusal = null
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({
+      eachMessage: async () => {
+        entered.resolve()
+        await proceed.promise
+        refusal = await h.consumer.connect().then(
+          () => 'resolved',
+          (error) => error
+        )
+      },
+    })
+    await entered.promise
+    let closed = false
+    const closing = h.consumer.disconnect({ timeout: 5000 }).then(() => {
+      closed = true
+    })
+    proceed.resolve()
+    await until(() => closed, 'the bounded close without advancing its deadline')
+    await closing
+    expect(refusal).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(refusal.message).toBe(
+      'connect() cannot wait for a close from a handler of the run being closed'
+    )
+    expect(leaves(h)).toHaveLength(1)
+  })
+
   test.each([
     ['a natural', undefined],
     ['a timeout zero', { timeout: 0 }],
