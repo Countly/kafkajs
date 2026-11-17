@@ -7,7 +7,6 @@ const { ROOT, fakeRun, consumerFixture, writeEvidence } = require('./fixtures/co
 
 const { ROWS, AUDIT, FROZEN, HEAD, armsOf, manifestEntries, audit } = session
 const TREES = ['head', 'alpha.9c', 'alpha.9b']
-const VS_9B = 'alpha.9b'
 const CONSUME_BOUNDS = [
   'messagesPerSecond vs alpha.9b: -3 %',
   'deliveryGapP99 vs alpha.9b: +5 % (only with the declared gap samples)',
@@ -259,6 +258,7 @@ const manifestProblems = (entries) => {
   return problems
 }
 
+/** @param {unknown} value @returns {any} a deep copy of a JSON value */
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
 describe('consumer measurement inventory', () => {
@@ -378,7 +378,8 @@ describe('consumer measurement inventory', () => {
    * @param {string} name a row
    * @returns {object} that row's audit row
    */
-  const auditedRow = (report, name) => report.rows.find((r) => r.benchmark === `${AUDIT.name}/${name}`)
+  const auditedRow = (report, name) =>
+    report.rows.find((r) => r.benchmark === `${AUDIT.name}/${name}`)
 
   test('the frozen repetition covers every row on both archived trees', async () => {
     const inherited = Object.entries(ROWS).filter(([, row]) => row.contracts.length)
@@ -508,9 +509,12 @@ describe('consumer measurement inventory', () => {
     const unknown = audit(path.join(tmp, 'bench-raw', AUDIT.name, 'r.jsonl'), {
       BENCH_AUDIT_ROWS: 'consumer-nope',
     })
-    expect(unknown).toEqual({ row: AUDIT.name, error: 'BENCH_AUDIT_ROWS names no consumer row consumer-nope' })
-    expect(() =>
-      session.read({ status: 0, stdout: `${JSON.stringify(unknown)}\n` })
-    ).toThrow('BENCH_AUDIT_ROWS names no consumer row consumer-nope')
+    expect(unknown).toEqual({
+      row: AUDIT.name,
+      error: 'BENCH_AUDIT_ROWS names no consumer row consumer-nope',
+    })
+    expect(() => session.read({ status: 0, stdout: `${JSON.stringify(unknown)}\n` })).toThrow(
+      'BENCH_AUDIT_ROWS names no consumer row consumer-nope'
+    )
   })
 })

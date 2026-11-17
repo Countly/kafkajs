@@ -4,10 +4,13 @@
  * must deliver the whole corpus, and its handler entries must equal the batches (`eachBatch`) or
  * the messages (`eachMessage`). The delivery-gap p99 needs its sample count: at least 1 000 batch
  * gaps for the 32 KiB `eachBatch` arms and 200 000 message gaps for `eachMessage`, else the row
- * is `inconclusive`. The listener arm's hooks are counted by the driver, which fails a run unless
- * each fired once, so a listener run that finished passed them.
+ * is `inconclusive`, as is a run without a finite gap count. The listener arm's hooks are counted
+ * by the driver, which fails a run unless each fired once, so a listener run that finished passed
+ * them. The 1000-partition row's untimed `consumeCoverage.js` run per tree proves the corpus
+ * populates, and the consumer receives data from, every partition; a tree without that proof makes
+ * the row `error`.
  */
-const { rowAdapter, armsWhere } = require('./consumerSession')
+const { rowAdapter, armsWhere, HEAD } = require('./consumerSession')
 
 /**
  * @param {import('./consumerSession').Row} row
@@ -50,14 +53,29 @@ const controls = (session, row) => {
       failing('1000 partitions', (r) => r.partitions === 1000, 'every run used 1000 partitions')
     )
   }
+  if (row.controls.includes('data on every partition')) {
+    for (const [label, tree] of Object.entries(session.trees)) {
+      if (tree.error) continue
+      const c = session.controls[label] ?? { error: 'no coverage run' }
+      list.push({
+        arm: label,
+        name: 'data on every partition',
+        fatal: true,
+        passed: c.populatedPartitions === 1000 && c.partitionsWithData === 1000,
+        detail:
+          c.error ??
+          `${c.populatedPartitions} populated and ${c.partitionsWithData} consumed of 1000 partitions`,
+      })
+    }
+  }
   if (row.controls.includes('listener hooks once each')) {
-    const listened = Object.values(session.arms).filter((a) => a.config === 'listener-1')
+    const listened = Object.values(session.arms).filter(
+      (a) => a.config === 'listener-1' && a.tree === HEAD
+    )
     list.push({
       arm: '*',
       name: 'listener hooks once each',
-      passed:
-        listened.some((a) => a.tree === 'head') &&
-        listened.every((a) => a.measured === session.measured),
+      passed: listened.length > 0 && listened.every((a) => a.measured === session.measured),
       detail: 'the driver fails a listener run unless the assigned and revoked hooks fired once',
     })
   }
@@ -71,9 +89,10 @@ const controls = (session, row) => {
  */
 const inconclusive = (session, row) => {
   const minimum = minimumGaps(row)
-  const short = armsWhere(session, (r) => !(r.gapSamples < minimum))
+  if (minimum === 0) return undefined
+  const short = armsWhere(session, (r) => Number.isFinite(r.gapSamples) && r.gapSamples >= minimum)
   return short.length
-    ? `fewer than ${minimum} delivery-gap samples on ${short.join(', ')}`
+    ? `fewer than ${minimum} counted delivery-gap samples on ${short.join(', ')}`
     : undefined
 }
 

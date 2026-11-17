@@ -326,13 +326,20 @@ describe('consumer report rows', () => {
 
   test('raw receipts keep every driver run with its arguments, exit and exact stdout and stderr', async () => {
     const special = {
-      1: { status: 0, stdout: 'warn: first\n{"evaluationMs":2.5,"matches":9000,"evaluations":100}\n', stderr: 'stderr of run 1' },
+      1: {
+        status: 0,
+        stdout: 'warn: first\n{"evaluationMs":2.5,"matches":9000,"evaluations":100}\n',
+        stderr: 'stderr of run 1',
+      },
       3: { status: 0, stdout: 'not a JSON line', stderr: 'parse me' },
       4: { status: 3, stdout: 'partial output', stderr: 'Error: boom\n    at driver' },
       5: { status: null, signal: 'SIGKILL', stdout: 'before the kill', stderr: '' },
     }
     const run = fakeRun((args, n) => special[n])
-    const { raw, result } = await fixture.runSession('consumer-subscriptionResolve', { run, env: {} })
+    const { raw, result } = await fixture.runSession('consumer-subscriptionResolve', {
+      run,
+      env: {},
+    })
     const ran = entriesOf(raw).filter((e) => e.invocation)
     expect(ran).toHaveLength(run.calls.length)
     const dir = path.dirname(raw)
@@ -387,7 +394,13 @@ describe('consumer report rows', () => {
 
     const run = fakeRun((args) =>
       args.includes('--arm')
-        ? { arm: 'S1', sessions: flag(args, '--sessions') === 'true', topic: 't', sample, window: {} }
+        ? {
+            arm: 'S1',
+            sessions: flag(args, '--sessions') === 'true',
+            topic: 't',
+            sample,
+            window: {},
+          }
         : undefined
     )
     const { result } = await fixture.runSession('consumer-sessions-S1', { run, env: {} })
@@ -452,13 +465,22 @@ describe('consumer report rows', () => {
     short.start()
     await jest.advanceTimersByTimeAsync(30000)
     short.stop('child-close')
-    expect(await short.settle()).toMatchObject({ offered: 6000, ticks: 300, endedBy: 'child-close' })
+    expect(await short.settle()).toMatchObject({
+      offered: 6000,
+      ticks: 300,
+      endedBy: 'child-close',
+    })
     expect(jest.getTimerCount()).toBe(0)
   })
 
   test('an L2 run whose producer window fell short or failed is never a valid row', async () => {
     jest.useFakeTimers()
-    const session2 = async ({ windowMs, send }) => {
+    /**
+     * Runs the L2 row on this tree with the real preparation, the window lasting `windowMs`.
+     * @param {{ windowMs: number, send: Function }} options
+     * @returns {Promise<object>} what `runSession` returns
+     */
+    const l2Session = async ({ windowMs, send }) => {
       const Kafka = fakeKafka({ send })
       const hooks = { prepare: (context) => fetchSessions.prepare(context, { Kafka }) }
       const run = fakeRun(async (args, n, options) => {
@@ -473,27 +495,33 @@ describe('consumer report rows', () => {
       return fixture.runSession('consumer-sessions-L2', { run, env, hooks })
     }
 
-    const complete = await session2({ windowMs: 60100, send: async () => {} })
+    const complete = await l2Session({ windowMs: 60100, send: async () => {} })
     expect(complete.result.detail.status).toBe('valid')
     for (const label of ['head/sessions-false', 'head/sessions-true~AA']) {
       for (const result of complete.line.arms[label].results) {
-        expect(result.producer).toMatchObject({ ...FULL_WINDOW, partitions: FULL_WINDOW.partitions })
+        expect(result.producer).toMatchObject({
+          ...FULL_WINDOW,
+          partitions: FULL_WINDOW.partitions,
+        })
       }
     }
 
     let sends = 0
-    const failed = await session2({
+    const failed = await l2Session({
       windowMs: 60100,
       send: async () => {
-        if (++sends === 700) throw new Error('REQUEST_TIMED_OUT')
+        // Sends 1 to 2400 are the four discarded warm-up runs.
+        if (++sends === 3007) throw new Error('REQUEST_TIMED_OUT')
       },
     })
     expect(failed.result.detail.status).toBe('invalid')
     expect(failed.result.detail.reason).toContain('L2 producer window complete')
-    const detail = failed.result.detail.controls.find((c) => c.name === 'L2 producer window complete')
+    const detail = failed.result.detail.controls.find(
+      (c) => c.name === 'L2 producer window complete'
+    )
     expect(detail.detail).toContain('REQUEST_TIMED_OUT')
 
-    const short = await session2({ windowMs: 30000, send: async () => {} })
+    const short = await l2Session({ windowMs: 30000, send: async () => {} })
     expect(short.result.detail.status).toBe('invalid')
     expect(short.result.detail.reason).toContain('L2 producer window complete')
     expect(jest.getTimerCount()).toBe(0)
@@ -525,7 +553,9 @@ describe('consumer report rows', () => {
 
   test('an arm its tree cannot run is labelled unsupported and never measured', async () => {
     const old = fixture.tree('alpha.9b-old', { lacks: ['fetchSessions option'] })
-    const env = { BENCH_TREES: JSON.stringify({ 'alpha.9c': fixture.tree('alpha.9c'), 'alpha.9b': old }) }
+    const env = {
+      BENCH_TREES: JSON.stringify({ 'alpha.9c': fixture.tree('alpha.9c'), 'alpha.9b': old }),
+    }
     const { line, result, run } = await fixture.runSession('consumer-sessions-S1', { env })
     const ranOnOld = run.calls.filter(({ args }) => args.some((a) => a.startsWith(old)))
     expect(ranOnOld.some(({ args }) => flag(args, '--sessions') === 'true')).toBe(false)
@@ -533,7 +563,11 @@ describe('consumer report rows', () => {
     const reason = 'alpha.9b has no fetchSessions option'
     for (const label of ['alpha.9b/sessions-true', 'alpha.9b/sessions-true~AA']) {
       expect(line.arms[label]).toMatchObject({ unsupported: reason, measured: 0 })
-      expect(result.rows.filter((r) => r.arm === label).every((r) => r.status === 'omitted' && r.reason === reason)).toBe(true)
+      expect(
+        result.rows
+          .filter((r) => r.arm === label)
+          .every((r) => r.status === 'omitted' && r.reason === reason)
+      ).toBe(true)
     }
     expect(line.arms['alpha.9b/sessions-false'].measured).toBe(7)
     expect(result.detail.status).toBe('valid')
@@ -541,10 +575,14 @@ describe('consumer report rows', () => {
 
     const noModule = fixture.tree('alpha.9b-nosub', { lacks: ['subscription module'] })
     const subscription = await fixture.runSession('consumer-subscriptionResolve', {
-      env: { BENCH_TREES: JSON.stringify({ 'alpha.9c': fixture.tree('alpha.9c'), 'alpha.9b': noModule }) },
+      env: {
+        BENCH_TREES: JSON.stringify({ 'alpha.9c': fixture.tree('alpha.9c'), 'alpha.9b': noModule }),
+      },
     })
     expect(subscription.run.calls.some(({ args }) => args.includes(noModule))).toBe(false)
-    expect(subscription.line.arms['alpha.9b'].unsupported).toBe('alpha.9b has no subscription module')
+    expect(subscription.line.arms['alpha.9b'].unsupported).toBe(
+      'alpha.9b has no subscription module'
+    )
   })
 
   test('a proof the row cannot give is printed as owed and keeps the row inconclusive', async () => {
@@ -577,7 +615,10 @@ describe('consumer report rows', () => {
 
     const changed = fakeRun((args, n) => {
       const line = output(args, n)
-      if (args.includes('--checksum') && args.some((a) => a.includes(`${path.sep}alpha.9b${path.sep}`))) {
+      if (
+        args.includes('--checksum') &&
+        args.some((a) => a.includes(`${path.sep}alpha.9b${path.sep}`))
+      ) {
         line.checksums.gzip.sha256 = 'other-content'
       }
       return line
@@ -628,7 +669,9 @@ describe('consumer report rows', () => {
     expect(failed.result.detail.status).toBe('error')
     expect(failed.result.detail.reason).toContain('head data on every partition')
     expect(
-      failed.result.detail.controls.find((c) => c.arm === HEAD && c.name === 'data on every partition').detail
+      failed.result.detail.controls.find(
+        (c) => c.arm === HEAD && c.name === 'data on every partition'
+      ).detail
     ).toContain('Data reached 999 of 1000 partitions')
 
     const coverage = new PartitionCoverage(3)
@@ -655,7 +698,8 @@ describe('consumer report rows', () => {
     for (const mutant of [{ rejected: false }, undefined]) {
       const run = fakeRun((args, n) => {
         const line = output(args, n)
-        if (args.includes('--control') && args.some((a) => a.includes('alpha.9c'))) line.mutant = mutant
+        if (args.includes('--control') && args.some((a) => a.includes('alpha.9c')))
+          line.mutant = mutant
         return line
       })
       const { result } = await fixture.runSession('consumer-sessions-S2', { run })
@@ -675,18 +719,18 @@ describe('consumer report rows', () => {
     expect(result.detail.status).toBe('valid')
     const notes = result.detail.notes.filter((n) => n.startsWith('bound '))
     const note = (prefix) => notes.find((n) => n.startsWith(prefix))
-    expect(note('bound messagesPerSecond head/listener-0 vs alpha.9b/listener-0 (information): ')).toMatch(
-      / -(19|20)\.\d\d % \(original bound -3 %\)$/
-    )
-    expect(note('bound messagesPerSecond alpha.9c/listener-0 vs alpha.9b/listener-0 (information): ')).toMatch(
-      / [+-]0\.\d\d % \(original bound -3 %\)$/
-    )
-    expect(note('bound messagesPerSecond head/listener-1 vs head/listener-0 (information): ')).toMatch(
-      / -(37|38)\.\d\d % \(original bound within \+3 % of the no-listener arm\)$/
-    )
-    expect(note('bound heapRetainedBytes head/listener-0 vs alpha.9b/listener-0 (information): ')).toMatch(
-      / [+-]0\.\d\d MiB \(original bound \+2 MiB\)$/
-    )
+    expect(
+      note('bound messagesPerSecond head/listener-0 vs alpha.9b/listener-0 (information): ')
+    ).toMatch(/ -(19|20)\.\d\d % \(original bound -3 %\)$/)
+    expect(
+      note('bound messagesPerSecond alpha.9c/listener-0 vs alpha.9b/listener-0 (information): ')
+    ).toMatch(/ [+-]0\.\d\d % \(original bound -3 %\)$/)
+    expect(
+      note('bound messagesPerSecond head/listener-1 vs head/listener-0 (information): ')
+    ).toMatch(/ -(37|38)\.\d\d % \(original bound within \+3 % of the no-listener arm\)$/)
+    expect(
+      note('bound heapRetainedBytes head/listener-0 vs alpha.9b/listener-0 (information): ')
+    ).toMatch(/ [+-]0\.\d\d MiB \(original bound \+2 MiB\)$/)
     expect(result.detail.controls.filter((c) => c.name.startsWith('A/A'))).toHaveLength(6)
 
     const l2 = await fixture.runSession('consumer-sessions-L2')

@@ -1,15 +1,18 @@
 /**
  * Report adapter of the no-change record-batch decode row: `recordBatchDecode.js` arms
  * (uncompressed, gzip, snappy) as the identical driver copy in each tree. Every run must have
- * its codec available, and each arm must decode the same number of records on every tree.
+ * its codec available and decode records, each arm must decode the same number of records on
+ * every tree, and the driver's untimed `--checksum` run per tree must give each arm the same
+ * decoded-content checksum (partition, offset, key and value of every record) on every tree.
  */
 const { rowAdapter, armsWhere } = require('./consumerSession')
 
 /**
  * @param {object} session
+ * @param {import('./consumerSession').Row} row
  * @returns {import('./consumerSession').Control[]}
  */
-const controls = (session) => {
+const controls = (session, row) => {
   const unavailable = armsWhere(session, (r) => r.available === 1)
   const byConfig = new Map()
   for (const { config, results } of Object.values(session.arms)) {
@@ -17,7 +20,25 @@ const controls = (session) => {
       byConfig.set(config, (byConfig.get(config) ?? new Set()).add(records))
     }
   }
-  const differ = [...byConfig].filter(([, counts]) => counts.size !== 1).map(([c]) => c)
+  const differ = [...byConfig]
+    .filter(([, counts]) => counts.size !== 1 || [...counts].some((n) => !(n > 0)))
+    .map(([c]) => c)
+  const trees = Object.keys(session.trees).filter((label) => !session.trees[label].error)
+  const checksums = row.configs.map(({ name: config }) => {
+    const sums = trees.map((label) => [label, session.controls[label]?.checksums?.[config]])
+    const counted = sums.every(([, c]) => c?.records > 0)
+    return {
+      arm: config,
+      name: 'decoded checksum equal across trees',
+      passed: counted && new Set(sums.map(([, c]) => c.sha256)).size === 1,
+      detail: sums
+        .map(([label, c]) => {
+          const value = c?.records > 0 ? c.sha256 : (session.controls[label]?.error ?? 'none')
+          return `${label} ${value}`
+        })
+        .join(', '),
+    }
+  })
   return [
     {
       arm: '*',
@@ -29,8 +50,9 @@ const controls = (session) => {
       arm: '*',
       name: 'decoded records equal across trees',
       passed: byConfig.size > 0 && differ.length === 0,
-      detail: differ.length ? `differ on ${differ.join(', ')}` : 'same count per arm',
+      detail: differ.length ? `differ or none on ${differ.join(', ')}` : 'same count per arm',
     },
+    ...checksums,
   ]
 }
 

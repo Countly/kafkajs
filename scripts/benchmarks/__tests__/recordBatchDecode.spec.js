@@ -69,7 +69,10 @@ describe('Benchmarks > recordBatchDecode', () => {
       decoded(Buffer.from('value'), Buffer.from('k'), '8'),
       decoded(Buffer.from('value'), null),
     ]) {
-      expect(checksumOf(changed)).toEqual({ records: 1, sha256: expect.not.stringMatching(base.sha256) })
+      expect(checksumOf(changed)).toEqual({
+        records: 1,
+        sha256: expect.not.stringMatching(base.sha256),
+      })
     }
   })
 })

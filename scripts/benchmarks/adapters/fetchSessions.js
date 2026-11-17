@@ -5,14 +5,18 @@
  * the started containers; the row refuses to start without three nodes. Before the session the
  * controller (a process apart from every consumer) creates the row's topic with its leaders laid
  * out 334/333/333 (2/2/2 for six partitions), produces the active arms' corpus, and during each
- * L2 window writes 200 messages per second to 10 of the 1 000 partitions. Memory is the L2 run's
- * retained heap, read after two collections 100 ms apart.
+ * L2 window writes 200 messages per second to 10 of the 1 000 partitions, keeping a receipt of
+ * every offered, acknowledged, failed and unsettled send; the window's sends settle before the next
+ * run starts. Memory is the L2 run's retained heap, read after two collections 100 ms apart.
  *
  * Controls, from the driver's untimed `--control` per tree: one full fetch cycle is three frames
  * of 334/333/333 partitions with at least 20 000 request bytes; an idle incremental request is at
- * most 128 bytes; for Memory, 2 097 152 retained objects add more than 3 MiB (else the memory
- * observation is blind). Each measured run's frames are audited against its transcript by the
- * driver, which fails the run otherwise. S1 and L1 need 1 000 batch gaps, else `inconclusive`.
+ * most 128 bytes; the remove-byte-counter mutant is rejected by the transcript comparison; for
+ * Memory, 2 097 152 retained objects add more than 3 MiB (else the memory observation is blind).
+ * Each measured run's frames are audited against its transcript by the driver, which fails the
+ * run otherwise. Every L2 run's producer receipt must show the whole window: 12 000 messages
+ * offered and acknowledged on 10 partitions, none failed or unsettled. S1 and L1 need 1 000 batch
+ * gaps, else `inconclusive`.
  */
 const path = require('node:path')
 const fs = require('node:fs')
@@ -24,6 +28,9 @@ const L2_PARTITIONS = 10
 const L2_PER_SECOND = 200
 const L2_WINDOW_MS = 60000
 const TICK_MS = 100
+const L2_PER_TICK = (L2_PER_SECOND * TICK_MS) / 1000
+const L2_TOTAL = (L2_PER_SECOND * L2_WINDOW_MS) / 1000
+const SETTLE_MS = 30000
 
 /**
  * @param {string|undefined} text `BENCH_NODES`
@@ -58,12 +65,114 @@ const layout = (partitions, nodeIds) =>
   }))
 
 /**
- * Prepares a row: its topic, corpus, evidence directory and environment.
+ * The L2 producer of one measurement window: 20 messages every 100 ms to 10 partitions, 600
+ * ticks, every send counted when it settles. `settle` stops the window and waits a bounded time
+ * for the sends still in flight, so none spills into the next run.
+ */
+class WindowProducer {
+  /**
+   * @param {{ producer: { send: Function }, topic: string, settleMs?: number,
+   *   now?: () => number }} options
+   */
+  constructor({ producer, topic, settleMs = SETTLE_MS, now = Date.now }) {
+    this.producer = producer
+    this.topic = topic
+    this.settleMs = settleMs
+    this.now = now
+    this.value = Buffer.alloc(RECORD_BYTES, 2)
+    this.offered = 0
+    this.acknowledged = 0
+    this.failed = 0
+    this.ticks = 0
+    this.partitions = new Set()
+    this.errors = []
+    this.inFlight = new Map()
+  }
+
+  /** @returns {void} starts the window's ticks */
+  start() {
+    this.startedAt = this.now()
+    this.timer = setInterval(() => this.tick(), TICK_MS)
+  }
+
+  /**
+   * Offers one tick's messages and stops the window after its last tick.
+   * @returns {void}
+   */
+  tick() {
+    const messages = Array.from({ length: L2_PER_TICK }, (_, i) => ({
+      partition: (this.offered + i) % L2_PARTITIONS,
+      value: this.value,
+    }))
+    for (const { partition } of messages) this.partitions.add(partition)
+    this.offered += messages.length
+    const send = Promise.resolve()
+      .then(() => this.producer.send({ topic: this.topic, messages }))
+      .then(
+        () => {
+          this.acknowledged += messages.length
+        },
+        (error) => {
+          this.failed += messages.length
+          if (this.errors.length < 5) this.errors.push(error.message)
+        }
+      )
+      .finally(() => this.inFlight.delete(send))
+    this.inFlight.set(send, messages.length)
+    if (++this.ticks >= L2_WINDOW_MS / TICK_MS) this.stop('window')
+  }
+
+  /**
+   * @param {string} reason why the window ended: `window`, `child-close` or `settled`
+   * @returns {void} no more ticks
+   */
+  stop(reason) {
+    clearInterval(this.timer)
+    this.timer = undefined
+    this.endedBy ??= reason
+    this.stoppedAt ??= this.now()
+  }
+
+  /**
+   * Stops the window and waits up to `settleMs` for its sends.
+   * @returns {Promise<object>} the receipt: offered, acknowledged, failed and unsettled message
+   *   counts, the partitions written, ticks, why the window ended, its times and the first errors
+   */
+  async settle() {
+    this.stop('settled')
+    let timer
+    const limit = new Promise((resolve) => {
+      timer = setTimeout(resolve, this.settleMs)
+    })
+    await Promise.race([Promise.all(this.inFlight.keys()), limit])
+    clearTimeout(timer)
+    return {
+      offered: this.offered,
+      acknowledged: this.acknowledged,
+      failed: this.failed,
+      unsettled: [...this.inFlight.values()].reduce((sum, n) => sum + n, 0),
+      partitions: [...this.partitions].sort((a, b) => a - b),
+      ticks: this.ticks,
+      endedBy: this.endedBy,
+      startedAt: this.startedAt,
+      stoppedAt: this.stoppedAt,
+      settledAt: this.now(),
+      errors: this.errors,
+    }
+  }
+}
+
+/**
+ * Prepares a row: its topic, corpus, evidence directory and environment. The clients are owned
+ * before the first connection: any failure, or the returned `cleanup`, settles an open L2 window,
+ * deletes the topic once created and disconnects both clients, trying every step and keeping the
+ * first error.
  * @param {{ row: object, name: string, dir: string, env: object }} context
  * @param {object} [deps]
  * @param {Function} [deps.Kafka] the client class, this checkout's by default
- * @returns {Promise<object>} `args`, `env`, `nodes`, `onMessage` (L2) and `cleanup`
- * @throws {Error} without a node inventory, or when the topic cannot be created or filled
+ * @returns {Promise<object>} `args`, `env`, `nodes`, `onMessage` and `afterRun` (L2), `cleanup`
+ * @throws {Error} without a node inventory, or when a client cannot connect or the topic cannot
+ *   be created or filled; after the cleanup
  */
 const prepare = async ({ row, name, dir, env }, { Kafka } = {}) => {
   const nodes = parseNodes(env.BENCH_NODES)
@@ -80,25 +189,33 @@ const prepare = async ({ row, name, dir, env }, { Kafka } = {}) => {
   const topic = `bench-${name}-${Date.now()}`
   const admin = kafka.admin()
   const producer = kafka.producer()
-  const timers = new Set()
-  await admin.connect()
-  await producer.connect()
+  let created = false
+  let window
   const cleanup = async () => {
-    for (const timer of timers) clearInterval(timer)
-    timers.clear()
-    try {
-      await admin.deleteTopics({ topics: [topic] })
-    } finally {
-      await producer.disconnect()
-      await admin.disconnect()
+    const failures = []
+    const attempt = async (step) => {
+      try {
+        await step()
+      } catch (error) {
+        failures.push(error)
+      }
     }
+    if (window) await attempt(() => window.settle())
+    window = undefined
+    if (created) await attempt(() => admin.deleteTopics({ topics: [topic] }))
+    await attempt(() => producer.disconnect())
+    await attempt(() => admin.disconnect())
+    if (failures.length) throw failures[0]
   }
   try {
+    await admin.connect()
+    await producer.connect()
     const replicaAssignment = layout(
       partitions,
       nodes.map((n) => n.nodeId)
     )
     await admin.createTopics({ waitForLeaders: true, topics: [{ topic, replicaAssignment }] })
+    created = true
     const value = Buffer.alloc(RECORD_BYTES, 1)
     for (let sent = 0; sent < records;) {
       const count = Math.min(1000, records - sent)
@@ -110,36 +227,29 @@ const prepare = async ({ row, name, dir, env }, { Kafka } = {}) => {
       sent += count
     }
   } catch (error) {
-    await cleanup()
+    await cleanup().catch(() => {})
     throw error
   }
-  const onMessage =
-    arm === 'L2'
-      ? (message, child) => {
-          if (message?.type !== 'measurement-ready') return
-          const perTick = (L2_PER_SECOND * TICK_MS) / 1000
-          let tick = 0
-          const timer = setInterval(() => {
-            if (++tick > L2_WINDOW_MS / TICK_MS) return stop()
-            const messages = Array.from({ length: perTick }, (_, i) => ({
-              partition: (tick * perTick + i) % L2_PARTITIONS,
-              value: Buffer.alloc(RECORD_BYTES, 2),
-            }))
-            producer.send({ topic, messages }).catch(() => {})
-          }, TICK_MS)
-          const stop = () => {
-            clearInterval(timer)
-            timers.delete(timer)
-          }
-          timers.add(timer)
-          child.once('close', stop)
-        }
-      : undefined
+  const l2 = arm === 'L2' && {
+    onMessage: (message, child) => {
+      if (message?.type !== 'measurement-ready' || window) return
+      const current = new WindowProducer({ producer, topic })
+      window = current
+      current.start()
+      child.once('close', () => current.stop('child-close'))
+    },
+    afterRun: async () => {
+      if (!window) return { offered: 0, endedBy: 'not started' }
+      const receipt = await window.settle()
+      window = undefined
+      return receipt
+    },
+  }
   return {
     args: ['--topic', topic],
     env: { BENCH_NODES: JSON.stringify(nodes), BENCH_EVIDENCE_DIR: evidence },
     nodes,
-    onMessage,
+    ...l2,
     cleanup,
   }
 }
@@ -182,6 +292,12 @@ const controls = (session, row) => {
           `${frames?.incrementalRequestBytes} bytes over ${frames?.requests} requests`,
       }
     )
+    list.push({
+      arm: label,
+      name: 'remove-byte-counter mutant rejected',
+      passed: control.mutant?.rejected === true,
+      detail: control.error ?? control.mutant?.reason ?? 'no mutant control',
+    })
     if (row.controls.includes('retained-memory positive control')) {
       list.push({
         arm: label,
@@ -190,6 +306,27 @@ const controls = (session, row) => {
         detail: control.error ?? `${control.retainedControlBytes} bytes, more than 3 MiB required`,
       })
     }
+  }
+  if (row.controls.includes('L2 producer window complete')) {
+    const complete = (p) =>
+      p?.offered === L2_TOTAL &&
+      p.acknowledged === L2_TOTAL &&
+      p.failed === 0 &&
+      p.unsettled === 0 &&
+      p.partitions?.length === L2_PARTITIONS
+    const short = Object.entries(session.arms).flatMap(([label, { results }]) =>
+      results
+        .filter((r) => !complete(r.producer))
+        .map((r) => `${label}: ${JSON.stringify(r.producer ?? null)}`)
+    )
+    list.push({
+      arm: '*',
+      name: 'L2 producer window complete',
+      passed: short.length === 0,
+      detail: short.length
+        ? short.slice(0, 3).join('; ')
+        : `${L2_TOTAL} messages offered and acknowledged on ${L2_PARTITIONS} partitions`,
+    })
   }
   return list
 }
@@ -208,4 +345,9 @@ const inconclusive = (session, row) => {
 /** @param {object} r one run @returns {string} its corpus */
 const corpus = (r) => `${r.arm} on ${r.topic}`
 
-module.exports = { ...rowAdapter({ controls, inconclusive, prepare, corpus }), parseNodes, layout }
+module.exports = {
+  ...rowAdapter({ controls, inconclusive, prepare, corpus }),
+  parseNodes,
+  layout,
+  WindowProducer,
+}

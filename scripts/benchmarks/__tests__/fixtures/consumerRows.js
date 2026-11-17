@@ -313,7 +313,9 @@ const consumerFixture = (tmp) => {
     const entry = manifestEntries().find((e) => e.name === name)
     let outcome
     try {
-      outcome = { outputs: [adapter.read({ status: 0, stdout: `${JSON.stringify(line)}\n` }, entry)] }
+      outcome = {
+        outputs: [adapter.read({ status: 0, stdout: `${JSON.stringify(line)}\n` }, entry)],
+      }
     } catch (error) {
       outcome = { outputs: [], error: error.message }
     }
@@ -336,4 +338,13 @@ const writeEvidence = (rawDir, name, line) => {
   fs.writeFileSync(path.join(rawDir, name, 'fork.json'), JSON.stringify({ arm: 'fork', runs }))
 }
 
-module.exports = { ROOT, FULL_WINDOW, flag, output, fakeRun, fakeChild, consumerFixture, writeEvidence }
+module.exports = {
+  ROOT,
+  FULL_WINDOW,
+  flag,
+  output,
+  fakeRun,
+  fakeChild,
+  consumerFixture,
+  writeEvidence,
+}
