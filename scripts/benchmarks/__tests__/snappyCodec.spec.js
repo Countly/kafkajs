@@ -115,8 +115,8 @@ describe('Snappy report session', () => {
 
     const attempts = lines(raw)
     expect(attempts).toHaveLength(144)
-    expect(attempts[5]).toMatchObject({
-      attempt: 6,
+    expect(attempts[13]).toMatchObject({
+      attempt: 14,
       label: 'snappy~AA',
       arm: ARMS[5],
       status: 0,

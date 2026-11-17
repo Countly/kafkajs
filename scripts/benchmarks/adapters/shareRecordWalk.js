@@ -210,4 +210,4 @@ const rows = (entry, arm, { outputs, error }) => {
 }
 
 /** One run holds both sessions. */
-module.exports = { runs: 1, timeoutMs: 60 * 60 * 1000, read, rows }
+module.exports = { runs: 1, timeoutMs: 20 * 60 * 1000, read, rows }

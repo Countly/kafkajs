@@ -27,8 +27,9 @@
  *
  * `--session` runs a whole report session (`ShareSession`): it needs the guard, reads the
  * finalized `share.version` back, prepares the corpus, runs eight observations of every arm twice,
- * cleans up and prints one session record. Exit code 0 is an accepted session, 3 a void or
- * inconclusive one, 1 an error.
+ * cleans up and prints one session record. It runs only in the benchmark job that owns the share
+ * rows (`BENCH_SHARE_ROWS=1`); elsewhere it prints an `omitted` record. Exit code 0 is an accepted
+ * or omitted session, 3 a void or inconclusive one, 1 an error.
  *
  * The measured window covers complete, fully acknowledged acquisitions only. The first full
  * acquisition of every node is discarded and each measured acquisition needs a full successor on
@@ -1569,6 +1570,12 @@ class ShareThroughput {
 }
 
 /**
+ * @param {string} file Corpus manifest path.
+ * @returns {string} The path of its ownership record, which names the topic before it exists.
+ */
+const ownerFile = (file) => `${file}.owner.json`
+
+/**
  * Creates or removes the shared corpus through public APIs inside the guarded CI owner. The topic
  * outlives all arms and repetitions, and only this fixture deletes it.
  */
@@ -1601,10 +1608,7 @@ class CorpusFixture {
    * @throws {Error} For a fixture, metadata, production, cleanup or deadline failure.
    */
   async run(phase) {
-    const topic =
-      phase === 'cleanup'
-        ? JSON.parse(fs.readFileSync(this.file, 'utf8')).topic
-        : `share-bench-${randomUUID()}`
+    const topic = phase === 'cleanup' ? this.ownedTopic() : `share-bench-${randomUUID()}`
     assert(TOPIC.test(topic), 'Unowned corpus topic')
     let primary = null
     try {
@@ -1627,14 +1631,27 @@ class CorpusFixture {
   }
 
   /**
-   * Creates the topic, checks one leader partition per node, produces the corpus once and writes
-   * the manifest exclusively.
+   * @returns {string} The topic the ownership record names, or the manifest's without a record.
+   * @throws {Error} When neither file can be read.
+   */
+  ownedTopic() {
+    const owner = ownerFile(this.file)
+    return JSON.parse(fs.readFileSync(fs.existsSync(owner) ? owner : this.file, 'utf8')).topic
+  }
+
+  /**
+   * Writes the ownership record, then creates the topic, checks one leader partition per node,
+   * produces the corpus once and writes the manifest exclusively. The record comes first so that a
+   * preparation that fails or is killed at any later point leaves a topic `--cleanup` can find.
    * @param {string} topic Fresh owned topic.
    * @returns {Promise<void>}
-   * @throws {Error} For an existing manifest or any failed step.
+   * @throws {Error} For an existing manifest or ownership record, or any failed step.
    */
   async prepare(topic) {
     assert(!fs.existsSync(this.file), 'Corpus manifest already exists')
+    fs.writeFileSync(ownerFile(this.file), `${JSON.stringify({ schema: 1, topic })}\n`, {
+      flag: 'wx',
+    })
     const created = await bounded(
       () =>
         this.admin.createTopics({
@@ -1781,7 +1798,19 @@ const OBSERVATION_FIELDS = [
   'trace',
   'traceHash',
 ]
-const SESSION_EXIT = { accepted: 0, void: 3, inconclusive: 3, error: 1 }
+const SESSION_EXIT = { accepted: 0, omitted: 0, void: 3, inconclusive: 3, error: 1 }
+/**
+ * The wall-clock budget of a session, in ms: every child gets at most `childMs` and no more than
+ * the budget has left; a preparation or observation must also leave `cleanupMs`, the time of the
+ * frame and the main corpus cleanups, so the corpus is always removed before the report's limit.
+ */
+const SESSION_BUDGET = Object.freeze({
+  totalMs: 290 * 60000,
+  childMs: LIMITS.timeout + 60000,
+  cleanupMs: 2 * (LIMITS.timeout + 60000),
+})
+/** Why a session prints no observation outside the benchmark job that owns the share rows. */
+const OUTSIDE = 'runs in its own job of the benchmark workflow (BENCH_SHARE_ROWS=1)'
 
 /**
  * @param {Buffer|string} data
@@ -1809,8 +1838,9 @@ const lastRecord = (stdout) => {
 /**
  * Runs one report session of the driver: every arm of `SESSIONS[name]` eight times in each of two
  * identical-tree repetitions, in rotating order, each observation in its own process with a fresh
- * trace, over one prepared corpus. The batch session adds the separate frame control. The corpus is
- * always cleaned up. Every child's arguments, exit and output are appended to the raw file.
+ * trace, over one prepared corpus. The batch session adds the separate frame control. A corpus whose
+ * preparation wrote its ownership record is cleaned up, whatever failed after that. Every child's
+ * arguments, exit and output are appended to the raw file. The session keeps to `SESSION_BUDGET`.
  */
 class ShareSession {
   /**
@@ -1820,15 +1850,21 @@ class ShareSession {
    * @param {Function} [options.spawn] `child_process.spawnSync`, replaceable in tests
    * @param {Record<string,string>} [options.env] the environment the children inherit
    * @param {() => object} [options.admin] creates the admin client that reads `share.version`
+   * @param {() => number} [options.now] monotonic millisecond clock of the budget
    * @throws {Error} for an unknown session or a missing raw path
    */
-  constructor(name, { raw, spawn = spawnSync, env = process.env, admin } = {}) {
+  constructor(
+    name,
+    { raw, spawn = spawnSync, env = process.env, admin, now = () => performance.now() } = {}
+  ) {
     assert(Object.hasOwn(SESSIONS, name ?? ''), 'Unknown session: use batch or eachMessage')
     assert(typeof raw === 'string' && raw, 'A raw evidence path is required')
     this.name = name
     this.raw = path.resolve(raw)
     this.spawn = spawn
     this.env = env
+    this.now = now
+    this.deadline = Infinity
     this.admin =
       admin ??
       (() =>
@@ -1841,15 +1877,20 @@ class ShareSession {
   }
 
   /**
-   * Admits the session, then runs it. A refused admission starts no process.
-   * @returns {Promise<object>} the session record: status `accepted`, `void`, `inconclusive` or
-   *   `error` (with `reason`), the guard, the share read-back, the corpus identity, every kept
-   *   observation, the frame control and the A/A evaluation
+   * Admits the session, then runs it. A refused admission starts no process. Outside the job that
+   * owns the share rows (`BENCH_SHARE_ROWS=1`) it starts nothing and returns an `omitted` record.
+   * @returns {Promise<object>} the session record: status `accepted`, `void`, `inconclusive`,
+   *   `omitted` or `error` (with `reason`), the guard, the share read-back, the corpus identity,
+   *   every kept observation, the frame control and the A/A evaluation
    * @throws {Error} when the guard is missing or `share.version` is not finalized and read back
    */
   async run() {
+    if (this.env.BENCH_SHARE_ROWS !== '1') {
+      return { schema: 1, session: this.name, status: 'omitted', reason: OUTSIDE }
+    }
     const guard = this.admitGuard()
     const share = await this.readShare()
+    this.deadline = this.now() + SESSION_BUDGET.totalMs
     const record = {
       schema: 1,
       session: this.name,
@@ -1867,29 +1908,48 @@ class ShareSession {
       evaluation: null,
     }
     const corpusFile = `${this.raw}.corpus.json`
-    let prepared = false
     try {
-      this.fixture('prepare', corpusFile, LIMITS.messages, LIMITS.maxRecords)
-      prepared = true
-      record.corpus = this.corpusIdentity(corpusFile)
-      this.observeAll(record, corpusFile)
-      if (SESSIONS[this.name].frameControl) record.frameControl = this.frameControl()
-      this.evaluate(record)
+      this.withCorpus(corpusFile, LIMITS.messages, LIMITS.maxRecords, () => {
+        record.corpus = this.corpusIdentity(corpusFile)
+        this.observeAll(record, corpusFile)
+        if (SESSIONS[this.name].frameControl) record.frameControl = this.frameControl()
+        this.evaluate(record)
+      })
     } catch (error) {
       record.status = 'error'
       record.reason = error.message
     }
-    if (prepared) {
+    return record
+  }
+
+  /**
+   * Prepares a corpus, runs `work` over it, and then removes the corpus whenever the preparation got
+   * as far as its ownership record, even when the preparation itself failed or was killed.
+   * @param {string} file corpus manifest path
+   * @param {number} messages corpus records
+   * @param {number} maxRecords records per acquisition
+   * @param {() => *} work what runs over the prepared corpus
+   * @returns {*} what `work` returned
+   * @throws {Error} the preparation's or `work`'s failure, joined with a cleanup failure
+   */
+  withCorpus(file, messages, maxRecords, work) {
+    let result
+    let primary = null
+    try {
+      this.fixture('prepare', file, messages, maxRecords)
+      result = work()
+    } catch (error) {
+      primary = error
+    }
+    if (fs.existsSync(ownerFile(file)) || fs.existsSync(file)) {
       try {
-        this.fixture('cleanup', corpusFile, LIMITS.messages, LIMITS.maxRecords)
+        this.fixture('cleanup', file, messages, maxRecords)
       } catch (error) {
-        record.reason = [record.status === 'error' && record.reason, `cleanup: ${error.message}`]
-          .filter(Boolean)
-          .join('; ')
-        record.status = 'error'
+        throw new Error([primary?.message, `cleanup: ${error.message}`].filter(Boolean).join('; '))
       }
     }
-    return record
+    if (primary) throw primary
+    return result
   }
 
   /**
@@ -1954,19 +2014,33 @@ class ShareSession {
   }
 
   /**
-   * Runs one child of the driver and appends its evidence to the raw file.
+   * Runs one child of the driver and appends its evidence to the raw file. The child gets at most
+   * `SESSION_BUDGET.childMs` and only what the budget has left; anything but a cleanup must also
+   * leave the cleanup reserve.
    * @param {object} what what the child is, kept with its evidence
    * @param {string[]} args driver arguments
    * @param {Record<string,string>} env extra environment
    * @returns {{status:number|null,output:object|null,stderr:string}}
-   * @throws {Error} for a spawn error or a signal
+   * @throws {Error} when the budget leaves no time for the child, for a spawn error (a timeout
+   *   included) or a signal
    */
   child(what, args, env) {
+    const reserve = what.phase === 'cleanup' ? 0 : SESSION_BUDGET.cleanupMs
+    const timeout = Math.min(
+      SESSION_BUDGET.childMs,
+      Math.floor(this.deadline - this.now() - reserve)
+    )
+    if (!(timeout > 0)) {
+      const name = [what.phase, what.label, what.rep, what.index].filter(
+        (part) => part !== undefined
+      )
+      throw new Error(`the session budget leaves no time for ${name.join(' ')}`)
+    }
     const argv = ['--expose-gc', __filename, ...args]
     const result = this.spawn(process.execPath, argv, {
       encoding: 'utf8',
       env: { ...this.env, ...env },
-      timeout: LIMITS.timeout + 60000,
+      timeout,
       maxBuffer: 64 * 1024 * 1024,
     })
     fs.appendFileSync(
@@ -1975,6 +2049,7 @@ class ShareSession {
         ...what,
         args: argv,
         env,
+        timeout,
         status: result.status,
         signal: result.signal ?? null,
         error: result.error?.message ?? null,
@@ -1982,7 +2057,8 @@ class ShareSession {
         stderr: result.stderr ?? '',
       })}\n`
     )
-    if (result.error) throw result.error
+    if (result.error)
+      throw new Error(`${what.phase}: ${result.error.message} (limit ${timeout} ms)`)
     if (result.status === null) throw new Error(`${what.phase} killed by ${result.signal}`)
     return { status: result.status, output: lastRecord(result.stdout), stderr: result.stderr ?? '' }
   }
@@ -2077,24 +2153,16 @@ class ShareSession {
   }
 
   /**
-   * The separate maxRecords 1 frame control over its own corpus, always removed again.
+   * The separate maxRecords 1 frame control over its own corpus, removed again like the main one.
    * @returns {object} the control observation
    * @throws {Error} for a failed preparation, observation or cleanup
    */
   frameControl() {
     const file = `${this.raw}.frame-corpus.json`
     const spec = { acquireMode: 'record_limit', arm: 'share', handler: 'eachBatch' }
-    this.fixture('prepare', file, LIMITS.controlMessages, 1)
-    let observation
-    let failure = null
-    try {
-      observation = this.observe('frame', 'control', 0, file, spec, LIMITS.controlMessages, 1)
-    } catch (error) {
-      failure = error
-    }
-    this.fixture('cleanup', file, LIMITS.controlMessages, 1)
-    if (failure) throw failure
-    return observation
+    return this.withCorpus(file, LIMITS.controlMessages, 1, () =>
+      this.observe('frame', 'control', 0, file, spec, LIMITS.controlMessages, 1)
+    )
   }
 
   /**
@@ -2202,6 +2270,8 @@ module.exports = {
   CorpusFixture,
   SESSIONS,
   SESSION_EXIT,
+  SESSION_BUDGET,
   ShareSession,
+  ownerFile,
   main,
 }

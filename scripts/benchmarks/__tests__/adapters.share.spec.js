@@ -868,7 +868,7 @@ describe('Benchmark report share and Snappy adapters', () => {
         }
       const window = measureWindow({ log: driver.log, frames, maxRecords: 500, target: 3000 })
       const inside = driver.log.calls.filter(
-        ({ enteredAt }) => enteredAt >= window.start && enteredAt <= window.end
+        ({ enteredAt }) => enteredAt > window.start && enteredAt <= window.end
       ).length
       return { window, inside }
     } finally {
@@ -909,16 +909,20 @@ describe('Benchmark report share and Snappy adapters', () => {
             })
           }
       }
-      return { session: 'eachMessage', arms }
+      return { session: 'eachMessage', node: 'v22.22.0', driver: { sha256: 'a'.repeat(64) }, arms }
     }
     const pre = await sessionAt(0)
-    const resolved = shareAdapter.compareEachMessage(pre, await sessionAt(0.0001))
+    const post = await sessionAt(0.0001)
+    const resolved = shareAdapter.compareEachMessage(pre, post)
+    expect(resolved.comparable).toBe(true)
     const perCall = (plain.inside / 3000) * 100
     expect(resolved.deltaNs).toBeCloseTo(perCall, 6)
     expect(resolved.resolutionNs).toBeGreaterThan(0)
     expect(resolved.resolutionNs).toBeLessThan(perCall / 2)
     expect(Math.abs(resolved.controlDrift)).toBeLessThan(resolved.noise)
     expect(resolved.resolved).toBe(true)
+    const otherNode = shareAdapter.compareEachMessage(pre, { ...post, node: 'v24.11.0' })
+    expect([otherNode.comparable, otherNode.resolved]).toEqual([false, false])
 
     const hidden = shareAdapter.compareEachMessage(pre, await sessionAt(0.000001))
     expect(hidden.deltaNs).toBeCloseTo(perCall / 100, 6)

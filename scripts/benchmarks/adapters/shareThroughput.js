@@ -4,10 +4,24 @@
  * session record. Each arm shows the median and range of its seven retained observations of the
  * first repetition, and its `~AA` copy those of the second. A record that is incomplete or
  * contradicts itself is an `error`, a failed control makes the row `invalid`, a void A/A
- * comparison or an observation that formed no measurement window `inconclusive`.
+ * comparison or an observation that formed no measurement window `inconclusive` (one row without
+ * numbers when no observation formed one), and a session outside its own workflow job `omitted`.
+ *
+ * `node scripts/benchmarks/adapters/shareThroughput.js --compare <pre> <post>` compares the
+ * `eachMessage` sessions of two runs (`bench-raw/shareThroughput-eachMessage/fork.json` of each)
+ * and prints the per-record cost the change added and the smallest cost the runs can resolve.
  */
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const { lastJsonLine, tail } = require('../report')
-const { LIMITS, SESSIONS, SESSION_EXIT, evaluateSession, quantile } = require('../shareThroughput')
+const {
+  LIMITS,
+  SESSIONS,
+  SESSION_EXIT,
+  SESSION_BUDGET,
+  evaluateSession,
+  quantile,
+} = require('../shareThroughput')
 
 const HEX = /^[0-9a-f]{64}$/
 const TOPIC = /^share-bench-[a-f0-9-]+$/
@@ -216,6 +230,70 @@ const statsOf = (rows, key) => {
 }
 
 /**
+ * @param {{a:object[],aprime:object[]}} arm one arm of a session record
+ * @returns {{ns:number,spread:number}|null} the median nanoseconds per record of the first
+ *   repetition and how far the two repetitions' throughput medians differ (a fraction), or null
+ *   without valid observations in both
+ */
+const perRecord = (arm) => {
+  const a = statsOf(arm.a, 'recordsPerSecond')
+  const b = statsOf(arm.aprime, 'recordsPerSecond')
+  return a && b ? { ns: 1e9 / a.median, spread: Math.abs(a.median / b.median - 1) } : null
+}
+
+/**
+ * The resolution of one eachMessage session: a per-message cost below its A/A spread of the
+ * per-record time cannot be told from noise.
+ * @param {object} record an eachMessage session record
+ * @returns {string|undefined} the note, without valid observations in both arms none
+ */
+const resolutionNote = (record) => {
+  const message = perRecord(record.arms.eachMessage)
+  const control = perRecord(record.arms.record_limit)
+  if (!message || !control) return undefined
+  const spread = Math.max(message.spread, control.spread)
+  return `eachMessage ${message.ns.toFixed(2)} ns per record, A/A spread ${(spread * 100).toFixed(2)} %: the smallest per-message cost this session resolves is ${(spread * message.ns).toFixed(2)} ns`
+}
+
+/**
+ * Compares the eachMessage sessions of a run before (PRE) and after (POST) a change. The runs are
+ * comparable only with the same driver digest and Node. The PRE per-record time is first scaled
+ * by how far the eachBatch control moved between the runs, so a slower runner is not read as a
+ * cost. The noise is the largest A/A spread of the four arms; a difference within it of the
+ * per-record time is not resolved.
+ * @param {object} pre PRE eachMessage session record
+ * @param {object} post POST eachMessage session record
+ * @returns {{comparable:boolean,perRecordNs:{pre:number,post:number},deltaNs:number,
+ *   controlDrift:number,adjustedDeltaNs:number,noise:number,resolutionNs:number,
+ *   resolved:boolean}}
+ * @throws {Error} unless both records have valid observations in both arms
+ */
+const compareEachMessage = (pre, post) => {
+  const [message, after, control, controlAfter] = [
+    pre.arms?.eachMessage,
+    post.arms?.eachMessage,
+    pre.arms?.record_limit,
+    post.arms?.record_limit,
+  ].map((arm) => arm && perRecord(arm))
+  assert(message && after && control && controlAfter, 'both runs need valid eachMessage sessions')
+  const noise = Math.max(message.spread, after.spread, control.spread, controlAfter.spread)
+  const controlDrift = controlAfter.ns / control.ns - 1
+  const adjustedDeltaNs = after.ns - message.ns * (1 + controlDrift)
+  const resolutionNs = noise * message.ns
+  const comparable = pre.driver?.sha256 === post.driver?.sha256 && pre.node === post.node
+  return {
+    comparable,
+    perRecordNs: { pre: message.ns, post: after.ns },
+    deltaNs: after.ns - message.ns,
+    controlDrift,
+    adjustedDeltaNs,
+    noise,
+    resolutionNs,
+    resolved: comparable && Math.abs(adjustedDeltaNs) > resolutionNs,
+  }
+}
+
+/**
  * Turns one session record into the row's lines and details.
  * @param {import('../report').ManifestEntry} entry
  * @param {string} arm the report's arm, `fork`
@@ -227,6 +305,7 @@ const rows = (entry, arm, { outputs, error }) => {
     rows: [{ benchmark: entry.name, arm: '-', metric: '-', unit: '-', runs, status, reason }],
   })
   if (error) return one('error', error)
+  if (outputs[0].status === 'omitted') return one('omitted', outputs[0].reason)
   let name
   try {
     name = sessionOf(entry)
@@ -266,6 +345,7 @@ const rows = (entry, arm, { outputs, error }) => {
     `node ${record.node}`,
     `guard ${record.guard?.manifest}`,
     'every observation, its trace and its child output are in the raw evidence',
+    ...(name === 'eachMessage' ? [resolutionNote(record)].filter(Boolean) : []),
   ]
   let status = 'valid'
   let reason
@@ -294,9 +374,38 @@ const rows = (entry, arm, { outputs, error }) => {
       })
     )
   )
+  if (lines.length === 0 && status === 'inconclusive') return { ...one(status, reason), detail }
   if (lines.length === 0) return { ...one('error', `no valid observation: ${reason}`), detail }
   return { rows: lines, detail }
 }
 
-/** One session per report arm, which holds every observation of the session. */
-module.exports = { runs: 1, timeoutMs: 4 * 60 * 60 * 1000, read, rows }
+/**
+ * @param {string} file a run's `fork.json` evidence, or a session record
+ * @returns {object} the session record
+ */
+const sessionFrom = (file) => {
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'))
+  return Array.isArray(value.runs) ? lastJsonLine(value.runs[0].stdout) : value
+}
+
+/**
+ * One session per report arm, which holds every observation of the session; the row's limit is the
+ * session budget plus ten minutes for its admission and its record.
+ */
+module.exports = {
+  runs: 1,
+  timeoutMs: SESSION_BUDGET.totalMs + 10 * 60000,
+  read,
+  rows,
+  compareEachMessage,
+}
+
+if (require.main === module) {
+  const [flag, pre, post] = process.argv.slice(2)
+  if (flag !== '--compare' || !pre || !post) {
+    console.error('usage: shareThroughput.js --compare <pre fork.json> <post fork.json>')
+    process.exitCode = 2
+  } else {
+    console.log(JSON.stringify(compareEachMessage(sessionFrom(pre), sessionFrom(post)), null, 2))
+  }
+}
