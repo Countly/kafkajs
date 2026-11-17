@@ -1,4 +1,9 @@
-const { fenceUntilSettled, describeScramUntilApplied } = require('../adminCatchUp')
+const {
+  fenceUntilSettled,
+  describeScramUntilApplied,
+  scramLoginSettled,
+} = require('../adminCatchUp')
+const { KafkaJSSASLAuthenticationError, KafkaJSConnectionError } = require('../../src/errors')
 
 const CONCURRENT_TRANSACTIONS = 51
 const RESOURCE_NOT_FOUND = 91
@@ -100,5 +105,103 @@ describe('describeScramUntilApplied', () => {
     }
     await expect(describeScramUntilApplied(probe(), admin, 'u')).rejects.toThrow('did not settle')
     expect(admin.describeUserScramCredentials).toHaveBeenCalledTimes(10)
+  })
+})
+
+describe('scramLoginSettled', () => {
+  const addresses = ['localhost:9094', 'localhost:9097', 'localhost:9100']
+  const refusal = () => new KafkaJSSASLAuthenticationError('SASL Authentication failed')
+
+  /**
+   * @param {Record<string, Array<'ok'|'refused'|Error>>} script per-address outcomes in order;
+   *   the last one repeats
+   * @returns {jest.Mock} a login that follows the script
+   */
+  const scriptedLogin = (script) => {
+    const seen = {}
+    return jest.fn(async (address) => {
+      const outcomes = script[address]
+      const index = Math.min((seen[address] = (seen[address] || 0) + 1) - 1, outcomes.length - 1)
+      const outcome = outcomes[index]
+      if (outcome === 'ok') return
+      throw outcome === 'refused' ? refusal() : outcome
+    })
+  }
+
+  test('waits until a new credential logs in on every broker, not only the first', async () => {
+    const login = scriptedLogin({
+      'localhost:9094': ['ok'],
+      'localhost:9097': ['refused', 'refused', 'ok'],
+      'localhost:9100': ['refused', 'ok'],
+    })
+
+    await scramLoginSettled(probe(), { addresses, accepted: true, login })
+
+    expect(login.mock.calls.map(([address]) => address)).toEqual([
+      'localhost:9094',
+      'localhost:9097',
+      'localhost:9097',
+      'localhost:9097',
+      'localhost:9100',
+      'localhost:9100',
+    ])
+  })
+
+  test('waits until every broker refuses a deleted credential', async () => {
+    const login = scriptedLogin({
+      'localhost:9094': ['refused'],
+      'localhost:9097': ['ok', 'ok', 'refused'],
+      'localhost:9100': ['refused'],
+    })
+
+    await scramLoginSettled(probe(), { addresses, accepted: false, login })
+
+    expect(login).toHaveBeenCalledTimes(5)
+  })
+
+  test('fails at once on a login failure other than an authentication refusal', async () => {
+    const broken = new KafkaJSConnectionError('Connection refused')
+    const login = scriptedLogin({
+      'localhost:9094': [broken],
+      'localhost:9097': ['ok'],
+      'localhost:9100': ['ok'],
+    })
+
+    await expect(scramLoginSettled(probe(), { addresses, accepted: true, login })).rejects.toBe(
+      broken
+    )
+    expect(login).toHaveBeenCalledTimes(1)
+  })
+
+  test('counts a refusal wrapped in another error as a refusal', async () => {
+    const wrapped = new KafkaJSConnectionError('Connection error: authentication', {
+      cause: refusal(),
+    })
+    const login = scriptedLogin({
+      'localhost:9094': [wrapped],
+      'localhost:9097': ['refused'],
+      'localhost:9100': ['refused'],
+    })
+
+    await scramLoginSettled(probe(), { addresses, accepted: false, login })
+
+    expect(login).toHaveBeenCalledTimes(3)
+  })
+
+  test('names the broker whose login never settled and its last outcome', async () => {
+    const login = scriptedLogin({
+      'localhost:9094': ['ok'],
+      'localhost:9097': ['refused'],
+      'localhost:9100': ['ok'],
+    })
+
+    const failure = await scramLoginSettled(probe(), { addresses, accepted: true, login }).catch(
+      (error) => error
+    )
+
+    expect(failure.message).toBe(
+      'SCRAM login at localhost:9097 was never accepted (last outcome: KafkaJSSASLAuthenticationError SASL Authentication failed): The wait did not settle'
+    )
+    expect(failure.cause.message).toBe('The wait did not settle')
   })
 })

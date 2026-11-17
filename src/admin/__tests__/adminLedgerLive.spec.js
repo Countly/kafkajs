@@ -12,8 +12,11 @@ const { saslBrokers, saslConnectionOpts } = require('testHelpers')
 const {
   fenceUntilSettled,
   describeScramUntilApplied,
+  scramLoginSettled,
+  brokerLogin,
   TRANSACTION_COORDINATOR_APIS,
 } = require('../../../testHelpers/adminCatchUp')
+const { LedgerAcls, aclIdentity, deletedAcls } = require('../../../testHelpers/ledgerAcls')
 const { readData } = require('../../producer/__tests__/fixtures/liveProbe')
 const { liveCase, caseTimeout, pollUntil } = require('../../producer/__tests__/fixtures/bounded')
 
@@ -33,42 +36,6 @@ const INVALID_PRODUCER_EPOCH = 47
  */
 const asDescribed = ({ name, value }) => ({ configName: name, configValue: value })
 
-/**
- * Picks the fields that identify an ACL, from an ACL or a DeleteAcls match.
- * @param {object} acl ACL or match
- * @returns {object} resource, pattern, principal, host, operation and permission
- */
-const aclIdentity = ({
-  resourceType,
-  resourceName,
-  resourcePatternType,
-  principal,
-  host,
-  operation,
-  permissionType,
-}) => ({
-  resourceType,
-  resourceName,
-  resourcePatternType,
-  principal,
-  host,
-  operation,
-  permissionType,
-})
-
-/**
- * Checks that a DeleteAcls answer to one filter succeeded, in the response and in every match.
- * @param {{filterResponses: object[]}} answer public deleteAcls result
- * @returns {object[]} identities of the ACLs the filter deleted, possibly none
- * @throws {Error} not exactly one filter response, or any error code
- */
-const deletedAcls = ({ filterResponses }) => {
-  expect(filterResponses).toHaveLength(1)
-  expect(filterResponses[0].errorCode).toBe(0)
-  for (const match of filterResponses[0].matchingAcls) expect(match.errorCode).toBe(0)
-  return filterResponses[0].matchingAcls.map(aclIdentity)
-}
-
 /** Serial broker observations with separate physical, committed and handler identities. */
 class AdminLedgerScenario {
   /** @param {AdminLiveProbe} probe bounded owner @returns {AdminLedgerScenario} scenario */
@@ -76,6 +43,9 @@ class AdminLedgerScenario {
     this.probe = probe
     this.records = new Set()
     this.id = randomBytes(8).toString('hex')
+    this.acls = new LedgerAcls(probe, {
+      observedPoll: (label, predicate, last) => this.observedPoll(label, predicate, last),
+    })
   }
 
   /**
@@ -186,32 +156,6 @@ class AdminLedgerScenario {
         observationLast: JSON.stringify({ observation: last() }),
         settledPresent: true,
       })
-  }
-
-  /**
-   * Deletes ACLs through one filter and proves the outcome: a single successful response that
-   * deleted exactly the expected ACLs, after which DescribeAcls finds nothing under the filter.
-   * @param {object} client admin that owns the ACLs
-   * @param {object} filter complete delete filter, also used to describe what remains
-   * @param {object[]} expected the ACLs the filter must delete, whatever order they come back in
-   * @param {string} [waitLabel] phase to include with the last DescribeAcls observation
-   * @returns {Promise<void>}
-   * @throws {Error} a failed answer, other ACLs deleted, or an ACL that remains until the budget ends
-   */
-  async removeAcls(client, filter, expected, waitLabel) {
-    const p = this.probe
-    const order = (rows) => rows.map((row) => JSON.stringify(aclIdentity(row))).sort()
-    const deleted = deletedAcls(await p.invoke(() => client.deleteAcls({ filters: [filter] })))
-    expect(order(deleted)).toEqual(order(expected))
-    let resources = null
-    await this.observedPoll(
-      waitLabel,
-      async () => {
-        ;({ resources } = await p.invoke(() => client.describeAcls(filter)))
-        return resources.length === 0
-      },
-      () => resources
-    )
   }
 
   /**
@@ -1411,10 +1355,10 @@ class AdminLedgerScenario {
     p.effects.add('remove topic ACL', async () => {
       deletedAcls(await admin.deleteAcls({ filters: [acl] }))
     })
-    expect(await p.invoke(() => admin.createAcls({ acl: [acl] }))).toBe(true)
+    await this.acls.grant(admin, [acl])
     const described = await p.invoke(() => admin.describeAcls(acl))
     expect(described.resources).toHaveLength(1)
-    await this.removeAcls(admin, acl, [acl])
+    await this.acls.revoke(admin, acl, [acl])
     const deletedTopicId = original.topicId
     expect(await p.invoke(() => admin.deleteTopics({ topicIds: [deletedTopicId] }))).toBeUndefined()
     await p.poll(async () => !(await p.invoke(() => admin.listTopics())).includes(topic))
@@ -1472,6 +1416,11 @@ class AdminLedgerScenario {
       const described = await describeScramUntilApplied(p, admin, user)
       p.items(described)
       expect(described[0].credentials).toEqual([{ mechanism, iterations: 4096 }])
+      const login = brokerLogin(p, {
+        ssl,
+        sasl: { mechanism: mechanism.toLowerCase(), username: user, password },
+      })
+      await scramLoginSettled(p, { addresses: saslBrokers(), accepted: true, login })
       for (const buffers of ['0', '1']) {
         process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS = buffers
         const client = await p.start({
@@ -1483,6 +1432,7 @@ class AdminLedgerScenario {
         await p.invoke(() => client.disconnect({ timeout: 5000 }))
       }
       p.items(await p.invoke(() => admin.alterUserScramCredentials({ deletions })))
+      await scramLoginSettled(p, { addresses: saslBrokers(), accepted: false, login })
       for (const buffers of ['0', '1']) {
         process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS = buffers
         let error = await p
@@ -1567,11 +1517,13 @@ class AdminLedgerScenario {
       )
     )
     const { ssl } = saslConnectionOpts()
-    const client = await p.start({
-      brokers: saslBrokers(),
-      ssl,
-      sasl: { mechanism: 'scram-sha-256', username: user, password },
+    const sasl = { mechanism: 'scram-sha-256', username: user, password }
+    await scramLoginSettled(p, {
+      addresses: saslBrokers(),
+      accepted: true,
+      login: brokerLogin(p, { ssl, sasl }),
     })
+    const client = await p.start({ brokers: saslBrokers(), ssl, sasl })
     const topic = this.topic
     const groupId = this.groupIds[0]
     const maskAcls = [
@@ -1585,9 +1537,9 @@ class AdminLedgerScenario {
       p.effects.add('remove mask ACL', async () => {
         deletedAcls(await root.deleteAcls({ filters: [acl] }))
       })
-    expect(await p.invoke(() => root.createAcls({ acl: maskAcls }))).toBe(true)
+    await this.acls.grant(root, maskAcls)
     const [maskHost, maskPort] = saslBrokers()[0].split(':')
-    const security = { ssl, sasl: { mechanism: 'scram-sha-256', username: user, password } }
+    const security = { ssl, sasl }
     const maskRaw = await this.raw(maskHost, Number(maskPort), security)
     const coordinator = (
       await p.invoke(() => maskRaw.findGroupCoordinator({ groupId, coordinatorType: 0 }))
@@ -1619,7 +1571,7 @@ class AdminLedgerScenario {
       groupMask: publicGroupMask,
       groupId,
     })
-    for (const acl of maskAcls) await this.removeAcls(root, acl, [acl])
+    for (const acl of maskAcls) await this.acls.revoke(root, acl, [acl])
     const txId = `e2e-acl-txn-${this.id}`
     const producer = await p.client('producer', { transactionalId: txId, idempotent: true })
     const warm = await p.invoke(() => producer.transaction())
@@ -2079,7 +2031,7 @@ class AdminLedgerScenario {
         p.effects.add('remove dependency ACL', async () => {
           deletedAcls(await root.deleteAcls({ filters: [dependency] }))
         })
-        expect(await p.invoke(() => root.createAcls({ acl: [dependency] }))).toBe(true)
+        await this.acls.grant(root, [dependency])
         if (dependency.resourceType === 2 && dependency.operation === 8) {
           for (const broker of permissionSources) {
             const metadata = await this.permissionAllowed({
@@ -2103,7 +2055,7 @@ class AdminLedgerScenario {
         )
         await controllerAlterDenied()
       }
-      expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
+      await this.acls.grant(root, [acl])
       const positive = await this.permissionAllowed(check)
       if (check.item || check.positiveItem)
         expect(check.positiveCodes || [0]).toContain(
@@ -2136,9 +2088,8 @@ class AdminLedgerScenario {
         deletionId = replacement
       }
       if (check.allowedProbe) await check.allowedProbe(check)
-      expect(await p.invoke(() => root.createAcls({ acl: [{ ...acl, permissionType: 2 }] }))).toBe(
-        true
-      )
+      const deny = { ...acl, permissionType: 2 }
+      await this.acls.grant(root, [deny])
       if (check.filtered) {
         let filtered
         await p.poll(async () => {
@@ -2197,14 +2148,14 @@ class AdminLedgerScenario {
         }
       }
       if (!check.filtered) observedCodes.push(check.code)
-      await this.removeAcls(
+      await this.acls.revoke(
         root,
         { ...acl, permissionType: 1 },
-        [acl, { ...acl, permissionType: 2 }],
+        [acl, deny],
         check.name === 'ID deletion' ? 'ID deletion DELETE ACL removal' : undefined
       )
       for (const dependency of dependencyAcls)
-        await this.removeAcls(
+        await this.acls.revoke(
           root,
           dependency,
           [dependency],
