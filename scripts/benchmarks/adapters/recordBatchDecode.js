@@ -3,9 +3,18 @@
  * (uncompressed, gzip, snappy) as the identical driver copy in each tree. Every run must have
  * its codec available and decode records, each arm must decode the same number of records on
  * every tree, and the driver's untimed `--checksum` run per tree must give each arm the same
- * decoded-content checksum (partition, offset, key and value of every record) on every tree.
+ * decoded-content checksum (partition, offset, key and value of every record) on every tree; a
+ * missing checksum or record count on any tree fails the control.
  */
 const { rowAdapter, armsWhere } = require('./consumerSession')
+
+const SHA256 = /^[0-9a-f]{64}$/
+
+/**
+ * @param {object} [c] one arm's checksum control
+ * @returns {boolean} whether it decoded a positive whole number of records into a SHA-256
+ */
+const decoded = (c) => Number.isInteger(c?.records) && c.records > 0 && SHA256.test(c.sha256)
 
 /**
  * @param {object} session
@@ -26,15 +35,15 @@ const controls = (session, row) => {
   const trees = Object.keys(session.trees).filter((label) => !session.trees[label].error)
   const checksums = row.configs.map(({ name: config }) => {
     const sums = trees.map((label) => [label, session.controls[label]?.checksums?.[config]])
-    const counted = sums.every(([, c]) => c?.records > 0)
+    const proven = sums.every(([, c]) => decoded(c))
     return {
       arm: config,
       name: 'decoded checksum equal across trees',
-      passed: counted && new Set(sums.map(([, c]) => c.sha256)).size === 1,
+      passed: proven && new Set(sums.map(([, c]) => c.sha256)).size === 1,
       detail: sums
         .map(([label, c]) => {
-          const value = c?.records > 0 ? c.sha256 : (session.controls[label]?.error ?? 'none')
-          return `${label} ${value}`
+          if (decoded(c)) return `${label} ${c.sha256}`
+          return `${label} ${session.controls[label]?.error ?? `no checksum: ${JSON.stringify(c ?? null)}`}`
         })
         .join(', '),
     }

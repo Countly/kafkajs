@@ -7,7 +7,8 @@
  * out 334/333/333 (2/2/2 for six partitions), produces the active arms' corpus, and during each
  * L2 window writes 200 messages per second to 10 of the 1 000 partitions, keeping a receipt of
  * every offered, acknowledged, failed and unsettled send; the window's sends settle before the next
- * run starts. Memory is the L2 run's retained heap, read after two collections 100 ms apart.
+ * run starts, and a window still sending after its settlement limit ends the session (the cleanup
+ * then deletes the topic and disconnects the producer). Memory is the L2 run's retained heap, read after two collections 100 ms apart.
  *
  * Controls, from the driver's untimed `--control` per tree: one full fetch cycle is three frames
  * of 334/333/333 partitions with at least 20 000 request bytes; an idle incremental request is at
@@ -170,7 +171,8 @@ class WindowProducer {
  * @param {{ row: object, name: string, dir: string, env: object }} context
  * @param {object} [deps]
  * @param {Function} [deps.Kafka] the client class, this checkout's by default
- * @returns {Promise<object>} `args`, `env`, `nodes`, `onMessage` and `afterRun` (L2), `cleanup`
+ * @returns {Promise<object>} `args`, `env`, `nodes`, `onMessage` and `afterRun` (L2: the window's
+ *   receipt, with a `halt` reason when sends are still unsettled), `cleanup`
  * @throws {Error} without a node inventory, or when a client cannot connect or the topic cannot
  *   be created or filled; after the cleanup
  */
@@ -242,7 +244,9 @@ const prepare = async ({ row, name, dir, env }, { Kafka } = {}) => {
       if (!window) return { offered: 0, endedBy: 'not started' }
       const receipt = await window.settle()
       window = undefined
-      return receipt
+      if (!receipt.unsettled) return receipt
+      const halt = `${receipt.unsettled} messages unsettled after ${SETTLE_MS} ms would write into the next run's topic`
+      return { ...receipt, halt }
     },
   }
   return {

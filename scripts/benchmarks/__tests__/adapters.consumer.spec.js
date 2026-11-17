@@ -57,12 +57,19 @@ const entriesOf = (raw) =>
  * @returns {Function} a `Kafka` stand-in for `fetchSessions.prepare`
  */
 const fakeKafka = ({ calls = [], fail = [], send } = {}) => {
+  /**
+   * @param {string} name the recorded call
+   * @returns {(arg: any) => Promise<any>} a step that records `name`, then fails if asked or
+   *   returns its argument
+   */
   const step = (name) => async (arg) => {
     calls.push(name)
     if (fail.includes(name)) throw new Error(`${name} failed`)
     return arg
   }
+  /** The stand-in client class. */
   return class Kafka {
+    /** @returns {object} an admin whose connection and topic calls are recorded steps */
     admin() {
       return {
         connect: step('admin.connect'),
@@ -72,6 +79,7 @@ const fakeKafka = ({ calls = [], fail = [], send } = {}) => {
       }
     }
 
+    /** @returns {object} a producer whose calls are recorded steps, `send` replaceable */
     producer() {
       return {
         connect: step('producer.connect'),
@@ -119,7 +127,9 @@ describe('consumer report rows', () => {
     const Kafka = fakeKafka({
       send: async ({ messages }) => sent.push(messages.length),
     })
+    /** A client whose admin records the topics it creates. */
     const recording = class extends Kafka {
+      /** @returns {object} the admin, `createTopics` recording its topics */
       admin() {
         const admin = super.admin()
         return { ...admin, createTopics: async ({ topics }) => created.push(...topics) }
@@ -305,10 +315,25 @@ describe('consumer report rows', () => {
     const { line } = await fixture.runSession('consumer-subscriptionResolve')
     const adapter = require('../adapters/subscriptionResolve')
     const entry = manifestEntries().find((e) => e.name === 'consumer-subscriptionResolve')
-    const reference = line.arms['alpha.9c'].stats.evaluationMs.median
+    /**
+     * @param {number} factor
+     * @returns {object} the report of the session whose alpha.9c copy measured `factor` times
+     *   every alpha.9c run, its runs and summaries agreeing
+     */
     const withCopy = (factor) => {
       const copy = JSON.parse(JSON.stringify(line))
-      copy.arms['alpha.9c~AA'].stats.evaluationMs.median = reference * factor
+      const { results, stats } = copy.arms['alpha.9c']
+      copy.arms['alpha.9c~AA'].results = results.map((r) => ({
+        ...r,
+        evaluationMs: r.evaluationMs * factor,
+      }))
+      const { median, min, max, n } = stats.evaluationMs
+      copy.arms['alpha.9c~AA'].stats.evaluationMs = {
+        median: median * factor,
+        min: min * factor,
+        max: max * factor,
+        n,
+      }
       return adapter.rows(entry, 'fork', { outputs: [copy] }, 1)
     }
     const noisy = withCopy(1.032)
@@ -535,10 +560,17 @@ describe('consumer report rows', () => {
     let release
     let pumping
     const ended = { done: false }
-    /** Advances the clock until the session ends, as the wall clock would during settlement. */
+    /**
+     * Advances the clock until the session ends, as the wall clock would during settlement.
+     * @returns {Promise<void>}
+     */
     const pump = async () => {
       while (!ended.done) await jest.advanceTimersByTimeAsync(1000)
     }
+    /**
+     * Acknowledges every send at once except send 3007, which is held until `release`.
+     * @returns {Promise<void>}
+     */
     const send = () => {
       // Sends 1 to 2400 are the four discarded warm-up runs; 3007 falls in a measured run.
       if (++sends !== 3007) return Promise.resolve()

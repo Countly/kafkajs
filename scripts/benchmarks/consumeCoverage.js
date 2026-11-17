@@ -80,6 +80,11 @@ const main = async () => {
     brokers: ['localhost:9092', 'localhost:9095', 'localhost:9098'],
     logLevel: logLevel.NOTHING,
   })
+  /**
+   * Runs `work` with a connected admin client that is disconnected afterwards.
+   * @param {(admin: object) => Promise<void>} work
+   * @returns {Promise<void>}
+   */
   const withAdmin = (work) =>
     Clients.use(kafka, async (clients) => {
       const admin = clients.admin()

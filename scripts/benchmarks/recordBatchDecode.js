@@ -124,6 +124,11 @@ const countRecords = (data) =>
 const checksumOf = (data) => {
   const hash = createHash('sha256')
   let records = 0
+  /**
+   * Hashes one length-prefixed key or value; a null one is length -1.
+   * @param {Buffer|null|undefined} bytes
+   * @returns {void}
+   */
   const field = (bytes) => {
     hash.update(`${bytes === null || bytes === undefined ? -1 : bytes.length}:`)
     if (bytes) hash.update(bytes)

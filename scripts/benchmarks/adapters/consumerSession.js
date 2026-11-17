@@ -855,9 +855,11 @@ const runRow = async (
     const arms = armsOf(row)
     const state = Object.fromEntries(arms.map((arm) => [arm.label, { results: [], errors: [] }]))
     const profiles = {}
-    for (let round = 0; round < warmup + measured; round++) {
+    let halt
+    for (let round = 0; round < warmup + measured && !halt; round++) {
       const order = arms.map((_, i) => arms[(i + round) % arms.length])
       for (const [position, arm] of order.entries()) {
+        if (halt) break
         const entry = { round, position, arm: arm.label, warmup: round < warmup }
         const armState = state[arm.label]
         const refusal = trees[arm.tree].error ? undefined : unsupported(row, trees, arm)
@@ -878,6 +880,7 @@ const runRow = async (
           )
           const producer = await prepared.afterRun?.()
           if (producer) (entry.result ?? entry).producer = producer
+          halt = producer?.halt
           if (profileDir && fs.existsSync(profileDir)) {
             const files = fs.readdirSync(profileDir).map((file) => path.join(profileDir, file))
             ;(profiles[arm.label] ??= []).push(...files.filter((f) => f.endsWith('.cpuprofile')))
@@ -890,6 +893,7 @@ const runRow = async (
         else armState.results.push(entry.result)
       }
     }
+    if (halt) for (const armState of Object.values(state)) armState.errors.push(`halted: ${halt}`)
     return summarize(row, name, { trees, state, controls, profiles, warmup, measured, prepared })
   } finally {
     await prepared.cleanup?.()
@@ -1069,6 +1073,31 @@ const aaControls = (row, session) => {
 }
 
 /**
+ * Checks a completed arm's summaries against its own runs, so a session line can never certify
+ * numbers its runs do not carry.
+ * @param {Row} row
+ * @param {object} a the arm of the session line
+ * @param {number} measured the measured runs the arm must have
+ * @returns {string|undefined} why the arm's evidence is incomplete or inconsistent, if it is
+ */
+const armEvidence = (row, a, measured) => {
+  const results = Array.isArray(a.results) ? a.results : []
+  if (results.length !== measured || a.measured !== measured) {
+    return `${results.length} of ${measured} measured runs (${a.measured} reported)`
+  }
+  for (const { key } of row.metrics) {
+    const values = results.map((result) => at(result, key))
+    if (!values.every(Number.isFinite)) return `no ${key} in every measured run`
+    const expected = stat(values)
+    const s = a.stats?.[key]
+    if (!s || Object.keys(expected).some((k) => s[k] !== expected[k])) {
+      return `the ${key} summary disagrees with its measured runs`
+    }
+  }
+  return undefined
+}
+
+/**
  * @param {Row} row
  * @param {object} session
  * @returns {string|undefined} why this tree's arms give no complete measurement, if they do not
@@ -1078,11 +1107,8 @@ const headProblem = (row, session) => {
     const a = session.arms[label]
     if (a.unsupported) return `${label}: ${a.unsupported}`
     if (a.errors.length) return `${label}: ${a.errors[0]}`
-    if (a.measured !== session.measured) {
-      return `${label}: ${a.measured} of ${session.measured} measured runs`
-    }
-    const absent = row.metrics.find(({ key }) => !a.stats[key])
-    if (absent) return `${label}: no ${absent.key} in every measured run`
+    const problem = armEvidence(row, a, session.measured)
+    if (problem) return `${label}: ${problem}`
   }
   return undefined
 }
@@ -1096,7 +1122,8 @@ const headProblem = (row, session) => {
  *   inconclusive, if it is
  * @property {(result: object) => string} [corpus] the workload identity of one run
  * @property {(context: object) => Promise<object>} [prepare] run once before the session:
- *   returns `args`, `env`, `nodes`, `onMessage`, `afterRun` and `cleanup` for the runs
+ *   returns `args`, `env`, `nodes`, `onMessage`, `afterRun` and `cleanup` for the runs; a receipt
+ *   from `afterRun` with a `halt` reason ends the session, every arm then carrying that error
  * @property {number} [timeoutMs] the limit of the whole session
  */
 
@@ -1105,8 +1132,9 @@ const headProblem = (row, session) => {
  * session did not run, this tree's arm failed or a fatal control failed; `invalid` when another
  * control failed (an A/A copy without its metric included); `inconclusive` for A/A noise beyond
  * 3 %, the driver's reason (such as too few samples) or a proof the row owes; otherwise `valid`.
- * Each arm's rows carry their median and range; an archived arm that failed is an `error` row and
- * an unsupported one an `omitted` row, each with its reason. The notes print the workload, trees,
+ * Each arm's rows carry their median and range; an archived arm that failed, or whose summaries
+ * its runs do not carry, is an `error` row and an unsupported one an `omitted` row, each with its
+ * reason (on this tree either makes the row `error`). The notes print the workload, trees,
  * original bounds, rules and owed proofs.
  * @param {RowHooks} [hooks]
  * @returns {import('../report').Adapter & { prepare?: Function }}
@@ -1234,15 +1262,14 @@ const rowAdapter = ({
     ]
     const out = arms.flatMap(({ label }) => {
       const a = session.arms[label]
+      const problem = !a.unsupported && !a.errors.length && armEvidence(row, a, session.measured)
       return row.metrics.map(({ key, unit }) => {
         const base = { benchmark: entry.name, arm: label, metric: key, unit, runs: a.measured }
         if (a.unsupported) return { ...base, status: 'omitted', reason: a.unsupported }
         if (a.errors.length) return { ...base, status: 'error', reason: a.errors[0] }
+        if (problem) return { ...base, status: 'error', reason: problem }
         const s = a.stats[key]
-        if (!['valid', 'inconclusive'].includes(status) || !s) {
-          const r = s ? reason : `no ${key} in every measured run`
-          return { ...base, status: s ? status : 'error', reason: r }
-        }
+        if (!['valid', 'inconclusive'].includes(status)) return { ...base, status, reason }
         return {
           ...base,
           status,
@@ -1297,8 +1324,9 @@ const SEVERITY = ['error', 'invalid', 'inconclusive', 'valid']
 /**
  * Audits one row's session: the row's own adapter verdict (this tree, controls, A/A, owed
  * proofs), then what the frozen repetition adds: one discarded and seven measured rounds, both
- * archived trees present, and every arm of every tree complete with every metric. An arm a tree
- * cannot run is an owed comparison, so the row is at best inconclusive.
+ * archived trees present, and every arm of every tree complete: seven measured runs, a finite
+ * value of every metric in each and summaries that match them. An arm a tree cannot run is an
+ * owed comparison, so the row is at best inconclusive.
  * @param {string} name
  * @param {Row} row
  * @param {object} line the row's session line
@@ -1330,13 +1358,9 @@ const auditRow = (name, row, line) => {
     if (broken.includes(arm.tree) || !a) continue
     if (a.unsupported) {
       if (!arm.copy) found.inconclusive.push(`owed: ${arm.label} ${a.unsupported}`)
-    } else if (a.errors.length || a.measured !== MEASURED) {
-      found.error.push(
-        `${arm.label}: ${a.errors[0] ?? `${a.measured} of ${MEASURED} measured runs`}`
-      )
     } else {
-      const absent = row.metrics.find(({ key }) => !a.stats?.[key])
-      if (absent) found.error.push(`${arm.label}: no ${absent.key} in every measured run`)
+      const problem = a.errors[0] ?? armEvidence(row, a, MEASURED)
+      if (problem) found.error.push(`${arm.label}: ${problem}`)
     }
   }
   const spreads = Object.values(session.aa ?? {}).flatMap(({ percent }) =>
