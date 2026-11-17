@@ -4,6 +4,12 @@
 name: Benchmarks
 on:
   workflow_dispatch:
+    inputs:
+      rows:
+        description: Comma-separated manifest row names to run; empty runs every row
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
@@ -35,7 +41,9 @@ jobs:
         run: ./scripts/dockerComposeUp.sh
       - run: node scripts/waitForKafka.js
       - name: Run the benchmarks
-        run: node scripts/benchmarks/report.js --runs 3 --fork-dir "$RUNNER_TEMP/fork" --baseline-dir "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/bench"
+        env:
+          ROWS: ${{ inputs.rows }}
+        run: node scripts/benchmarks/report.js --runs 3 --fork-dir "$RUNNER_TEMP/fork" --baseline-dir "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/bench" --only "$ROWS"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

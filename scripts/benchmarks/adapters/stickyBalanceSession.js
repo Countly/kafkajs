@@ -3,30 +3,44 @@
  * which runs every partitioner arm of its scenario and an A/A copy of the reference in its own
  * processes and prints one JSON line (`scenario`, `arms`, `control`, `void`, `verdict`,
  * `reasons`). The row shows each partitioner arm's median and range of the manifest metrics and
- * the controls of every arm. A session line that is incomplete or contradicts itself is an `error`,
- * a failed control makes it `invalid`, a void A/A control or an inconclusive session
- * `inconclusive`. The session's verdict is shown and never decides the status.
+ * the controls of every arm; its details show, whatever its status, a table of each arm's
+ * delivered, rejected, refused and unsettled sends. A session line that is incomplete or
+ * contradicts itself is an `error`, a failed control makes it `invalid`, a void A/A control or an
+ * inconclusive session `inconclusive`. The session's verdict is shown and never decides the
+ * status.
  */
 const { lastJsonLine, tail } = require('../report')
 
-/** Each scenario's arms, its reference, its records per run and the arms that must split evenly. */
+/**
+ * Each scenario's arms, its reference, its records per run, the arms that must split evenly and
+ * its session's void limit (`stickyBalance.js`), in percent of the reference's p99 median.
+ */
 const SCENARIOS = {
   healthy: {
     arms: ['round-robin', 'sticky', 'adaptive'],
     reference: 'round-robin',
     records: 100000,
     even: ['round-robin', 'round-robin~AA'],
+    voidOver: 3,
   },
-  'slow-broker': { arms: ['sticky', 'adaptive'], reference: 'sticky', records: 120000, even: [] },
+  'slow-broker': {
+    arms: ['sticky', 'adaptive'],
+    reference: 'sticky',
+    records: 120000,
+    even: [],
+    voidOver: 10,
+  },
 }
-/** The session's void limit (`session.js`), in percent of the reference's p99 median. */
-const VOID_OVER = 3
 /** The most a round-robin split may stray from even: its positive control. */
 const EVEN_BALANCE = 1.05
 /** The stats the controls read, checked like the manifest metrics. */
 const CONTROL_KEYS = [
   'records',
   'partitionerCalls',
+  'delivered',
+  'rejected',
+  'refused',
+  'unsettled',
   'keyedIdentical',
   'topologyValid',
   'gcAvailable',
@@ -37,6 +51,13 @@ const CONTROL_KEYS = [
 /** The exit code `stickyBalance.js --session` gives each verdict. */
 const EXIT_OF = { passed: 0, failed: 1, inconclusive: 3 }
 const SPREAD = 'A/A spread'
+/** The send counts every row shows per arm, whatever its status, and their column names. */
+const SENDS = [
+  ['delivered', 'delivered'],
+  ['rejected', 'rejected (all)'],
+  ['refused', 'refused by the buffer (part of rejected)'],
+  ['unsettled', 'unsettled'],
+]
 
 /**
  * @typedef {{ median: number, min: number, max: number, n: number }} Stat
@@ -55,15 +76,25 @@ const range = (stat) => (stat ? `${stat.min} to ${stat.max}` : 'missing')
  */
 const percent = (value) => `${value >= 0 ? '+' : ''}${value.toFixed(2)} %`
 
-/** Each arm's controls: a name, whether its stats pass it, and what to show. */
+/**
+ * Each arm's controls: a name, whether its stats pass it, and what to show. Every run checks its
+ * partitioner calls against its records less its buffer refusals (`validRun`); with the same
+ * records in every run, the calls' minimum and maximum must also be the records less the
+ * refusals' maximum and minimum. Medians are not compared: an even number of runs takes the upper
+ * middle value, which for the calls pairs with the lower middle refusal.
+ */
 const CONTROLS = [
   {
-    name: 'partitioner calls = records',
-    passed: (s) =>
-      Number.isInteger(s.records?.min) &&
-      s.partitionerCalls?.min === s.records.min &&
-      s.partitionerCalls?.max === s.records.max,
-    detail: (s) => `calls ${range(s.partitionerCalls)}, records ${range(s.records)}`,
+    name: 'partitioner calls = admitted records',
+    passed: ({ valid, partitionerCalls: calls, records, refused }) =>
+      valid?.min === 1 &&
+      Number.isInteger(records?.min) &&
+      records.min === records.max &&
+      Number.isFinite(refused?.min) &&
+      calls?.min === records.min - refused.max &&
+      calls.max === records.min - refused.min,
+    detail: (s) =>
+      `calls ${range(s.partitionerCalls)}, records ${s.records?.min}, refused ${range(s.refused)}`,
   },
   { name: 'keyed mapping identical', passed: (s) => s.keyedIdentical?.min === 1 },
   { name: 'topology valid', passed: (s) => s.topologyValid?.min === 1 },
@@ -73,7 +104,7 @@ const CONTROLS = [
 
 /**
  * @typedef {{ name: string, arms: string[], reference: string, records: number, even: string[],
- *   runs: number }} Scenario
+ *   voidOver: number, runs: number }} Scenario
  */
 
 /**
@@ -131,7 +162,7 @@ const read = (result) => {
  * @param {import('../report').ManifestEntry['metrics']} metrics
  * @returns {string|undefined} why the line cannot be shown, if it cannot
  */
-const malformed = (report, { name, reference, records, runs }, labels, metrics) => {
+const malformed = (report, { name, reference, records, runs, voidOver }, labels, metrics) => {
   if (report.scenario !== name) {
     return `the session reports scenario ${report.scenario}, expected ${name}`
   }
@@ -169,7 +200,7 @@ const malformed = (report, { name, reference, records, runs }, labels, metrics) 
   if (!(Math.abs(spread - control.percent.p99Ms) <= 1e-6)) {
     return `the A/A spread ${percent(control.percent.p99Ms)} disagrees with the medians (${percent(spread)})`
   }
-  if (report.void !== Math.abs(copy - ref) > Math.abs(ref) * (VOID_OVER / 100 + 1e-9)) {
+  if (report.void !== Math.abs(copy - ref) > Math.abs(ref) * (voidOver / 100 + 1e-9)) {
     return `void ${report.void} disagrees with an A/A spread of ${percent(spread)}`
   }
   return undefined
@@ -240,7 +271,20 @@ const rows = (entry, arm, { outputs, error }) => {
     status = 'inconclusive'
     reason = `the session is inconclusive: ${reasons.join('; ')}`
   }
-  const detail = { status, ...(reason && { reason }), controls, notes }
+  const table = {
+    caption:
+      'Sends per arm, median (min to max) over the measured runs' +
+      (status === 'invalid' ? '; observed, not validated: the row is invalid' : ''),
+    header: ['arm', ...SENDS.map(([, column]) => column)],
+    rows: labels.map((label) => [
+      label,
+      ...SENDS.map(([key]) => {
+        const { median, min, max } = report.arms[label][key]
+        return `${median} (${min} to ${max})`
+      }),
+    ]),
+  }
+  const detail = { status, ...(reason && { reason }), controls, notes, table }
   if (status === 'invalid') return { ...one(status, reason, 1), detail }
   return {
     rows: labels.flatMap((label) =>

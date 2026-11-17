@@ -10,7 +10,13 @@ const {
   validRun,
   OfferWindow,
   HEAP_LIMIT,
+  tallyRejection,
 } = require('../stickyBalance')
+const {
+  KafkaJSBufferExhaustedError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSNumberOfRetriesExceeded,
+} = require('../../../src/errors')
 
 const ROOT = path.join(__dirname, '../../..')
 
@@ -208,6 +214,7 @@ describe('Benchmarks > stickyBalance', () => {
     offered: scenario === 'healthy' ? 100000 : 120000,
     delivered: scenario === 'healthy' ? 100000 : 120000,
     rejected: 0,
+    refused: 0,
     unsettled: 0,
     partitionerCalls: scenario === 'healthy' ? 100000 : 120000,
     keyedIdentical: 1,
@@ -225,6 +232,8 @@ describe('Benchmarks > stickyBalance', () => {
     drainAtMs: 12000,
     slowMedianMs: 300,
     otherMedianMs: 3,
+    slowAnswerCount: 40,
+    otherAnswerCount: 1200,
   })
 
   test.each([
@@ -234,14 +243,14 @@ describe('Benchmarks > stickyBalance', () => {
     ['partitioner calls', { partitionerCalls: 0 }],
     ['keyed placement', { keyedIdentical: 0 }],
     ['slow delay', { slowMedianMs: 3 }],
-    ['missing delay', { otherMedianMs: 0 }],
+    ['missing delay', { slowMedianMs: 4, otherMedianMs: 0 }],
     ['sample instant', { sampleAtMs: 6100 }],
     ['last offer outside window', { lastOfferAtMs: 6001 }],
     ['tick drift', { maxTickDriftMs: 100 }],
     ['submission window', { ticks: 599 }],
     ['collection', { gcAvailable: 0 }],
     ['topology', { topologyValid: 0 }],
-    ['drain bound', { drainAtMs: 30100 }],
+    ['drain bound', { drainAtMs: 130100 }],
   ])('a raw observation fails validity on %s before medians are computed', (_, changes) => {
     expect(validRun('slow-broker', observation())).toBe(true)
     expect(validRun('slow-broker', { ...observation(), ...changes })).toBe(false)
@@ -254,6 +263,144 @@ describe('Benchmarks > stickyBalance', () => {
       validRun('healthy', { ...observation('healthy'), heapRetainedBytes: HEAP_LIMIT + 1 })
     ).toBe(false)
     expect(validRun('healthy', {})).toBe(false)
+  })
+
+  test('a buffer refusal is counted as refused and never as a partitioned send', () => {
+    const counts = { refused: 0, byClass: {} }
+    const queueFull = () => new KafkaJSBufferExhaustedError('no room', { reason: 'queue-full' })
+
+    tallyRejection(queueFull(), counts)
+    tallyRejection(queueFull(), counts)
+    tallyRejection(new KafkaJSNumberOfRetriesExceeded(new Error('down'), {}), counts)
+    tallyRejection(new KafkaJSDeliveryTimeout('late', { outcome: 'unknown' }), counts)
+
+    expect(counts).toEqual({
+      refused: 2,
+      byClass: {
+        'KafkaJSBufferExhaustedError:queue-full': 2,
+        KafkaJSNumberOfRetriesExceeded: 1,
+        KafkaJSDeliveryTimeout: 1,
+      },
+    })
+  })
+
+  /**
+   * A real measured slow-broker sticky observation with a fast-broker median of 0 ms, completed as
+   * a drain to settlement would end it. Test input, not run evidence: its rejections are taken as
+   * buffer refusals, the sends still open at 30 s as delivered by 52 s, and the answer counts the
+   * recorded run did not keep are made up.
+   */
+  const settledSticky = () => {
+    const recorded = require('fs')
+      .readFileSync(
+        path.join(__dirname, 'fixtures/stickyBalanceSession/slow-broker-observations.jsonl'),
+        'utf8'
+      )
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .find(
+        ({ label, warmup, result }) => label === 'sticky' && !warmup && !result.otherMedianMs
+      ).result
+    return {
+      ...recorded,
+      refused: recorded.rejected,
+      delivered: recorded.delivered + recorded.unsettled,
+      unsettled: 0,
+      drainAtMs: 52000,
+      slowAnswerCount: 40,
+      otherAnswerCount: 1200,
+    }
+  }
+
+  test('validRun accepts a slow-broker run whose missing partitioner calls are exactly its buffer refusals', () => {
+    const run = settledSticky()
+    expect(run.partitionerCalls).toBeLessThan(run.offered)
+    expect(run.otherMedianMs).toBe(0)
+
+    expect(validRun('slow-broker', run)).toBe(true)
+  })
+
+  test('validRun refuses partitioner calls other than the offered records minus the buffer refusals', () => {
+    const run = settledSticky()
+
+    expect(validRun('slow-broker', { ...run, partitionerCalls: run.partitionerCalls + 1 })).toBe(
+      false
+    )
+    expect(validRun('slow-broker', { ...run, refused: 0 })).toBe(false)
+    expect(
+      validRun('slow-broker', {
+        ...run,
+        refused: run.rejected + 1,
+        partitionerCalls: run.partitionerCalls - 1,
+      })
+    ).toBe(false)
+    expect(validRun('slow-broker', { ...run, refused: undefined })).toBe(false)
+  })
+
+  test('validRun reads a fast-broker median of 0 ms as under 1 ms', () => {
+    const at = (slowMedianMs) => ({ ...observation(), slowMedianMs, otherMedianMs: 0 })
+
+    expect([301, 5, 4].map((ms) => validRun('slow-broker', at(ms)))).toEqual([true, true, false])
+  })
+
+  test('validRun needs Produce answers from the slow broker and from the others, a 0 ms median included', () => {
+    const run = settledSticky()
+
+    expect(validRun('slow-broker', run)).toBe(true)
+    expect(validRun('slow-broker', { ...run, otherAnswerCount: 0 })).toBe(false)
+    expect(validRun('slow-broker', { ...run, slowAnswerCount: 0 })).toBe(false)
+    expect(validRun('slow-broker', { ...run, otherAnswerCount: undefined })).toBe(false)
+    expect(validRun('slow-broker', { ...run, slowAnswerCount: undefined })).toBe(false)
+  })
+
+  test('validRun refuses unsettled work and a drain past 130 s', () => {
+    const open = { ...observation(), delivered: 119999, unsettled: 1 }
+
+    expect(validRun('slow-broker', { ...open, drainAtMs: 30000 })).toBe(false)
+    expect(validRun('slow-broker', { ...open, drainAtMs: 130000 })).toBe(false)
+    expect(validRun('slow-broker', { ...observation(), drainAtMs: 129000 })).toBe(true)
+    expect(validRun('slow-broker', { ...observation(), drainAtMs: 130051 })).toBe(false)
+  })
+
+  test('a slow-broker session uses a 10 % A/A limit and a healthy one 3 %', () => {
+    const fs = require('fs')
+    const write = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {})
+    const append = jest.spyOn(fs, 'appendFileSync').mockImplementation(() => {})
+    const spawn = jest
+      .spyOn(require('child_process'), 'spawnSync')
+      .mockImplementation((_executable, args) => ({
+        status: 0,
+        stdout: JSON.stringify({
+          ...observation(args[args.indexOf('--scenario') + 1]),
+          balance: 1.1,
+        }),
+      }))
+    /** @returns {object} the options `compare` gave `summarize` for a session of `scenario` */
+    const limitOf = (scenario, runs) => {
+      let options
+      jest.isolateModules(() => {
+        const session = jest.requireActual('../session')
+        const summarize = jest.fn(session.summarize)
+        jest.doMock('../session', () => ({ ...session, summarize }))
+        const driver = require('../stickyBalance')
+        driver.compare(
+          driver.parseArgs(['--session', '--scenario', scenario, '--raw', 'x', '--runs', runs])
+        )
+        expect(summarize).toHaveBeenCalledTimes(1)
+        options = summarize.mock.calls[0][1]
+      })
+      return options
+    }
+    try {
+      expect(limitOf('slow-broker', '9')).toMatchObject({ voidOver: 10, controlOn: ['p99Ms'] })
+      expect(limitOf('healthy', '8')).toMatchObject({ voidOver: 3, controlOn: ['p99Ms'] })
+    } finally {
+      jest.dontMock('../session')
+      spawn.mockRestore()
+      write.mockRestore()
+      append.mockRestore()
+    }
   })
 
   test('an independent timer samples at six seconds even when submission cannot complete its ticks', async () => {

@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const yaml = require('js-yaml')
+const manifest = require('../../benchmarks/manifest.json')
 
 const WORKFLOW_FILE = path.join(__dirname, '..', '..', '..', '.github', 'workflows', 'bench.yml')
 const raw = fs.readFileSync(WORKFLOW_FILE, 'utf8')
@@ -30,7 +31,7 @@ describe('bench.yml', () => {
   })
 
   test('is dispatch-only with read-only contents permission and a timeout', () => {
-    expect(workflow.on).toEqual({ workflow_dispatch: null })
+    expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch'])
     expect(workflow.permissions).toEqual({ contents: 'read' })
     expect(jobs).toHaveLength(1)
     for (const job of jobs) {
@@ -93,6 +94,32 @@ describe('bench.yml', () => {
     expect(uploadStep().with.path).toContain(
       out.replace(/"/g, '').replace('$RUNNER_TEMP', expr('runner.temp'))
     )
+  })
+
+  test('runs only the rows named by the optional rows input, every row when it is empty', () => {
+    const report = stepWith('report.js')
+
+    expect(workflow.on.workflow_dispatch.inputs).toEqual({
+      rows: {
+        description: expect.any(String),
+        required: false,
+        default: '',
+        type: 'string',
+      },
+    })
+    expect(report.env).toEqual({ ROWS: expr('inputs.rows') })
+    expect(runs(report)).toMatch(/ --only "\$ROWS"(\s|$)/)
+  })
+
+  test('runs 24 healthy adaptive comparison rounds and reports buffer refusals on a slow broker', () => {
+    const row = (name) => manifest.entries.find((entry) => entry.name === name)
+    const { command } = row('stickyBalance-healthy')
+
+    expect(command[command.indexOf('--runs') + 1]).toBe('24')
+    expect(row('stickyBalance-slow-broker').metrics).toContainEqual({
+      key: 'refused',
+      unit: 'records',
+    })
   })
 
   test('shows the Markdown report in the job summary', () => {
