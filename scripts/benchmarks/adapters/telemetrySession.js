@@ -7,7 +7,10 @@
  * the free disk and refuses without them, freezes the candidate source (and, for a job with a
  * `previous` arm, the accepted baseline checkout, verified against `ACCEPTED_BASELINE`) into
  * `<raw>.snapshots/`, writes the session manifest beside `--raw`, runs the controller within
- * min(declared budget, job allowance) and then its `--verify-session`, and prints one JSON line.
+ * min(declared session time, job allowance) and then its `--verify-session`, and prints one JSON line.
+ * The declared session time is the controller's budget plus, for a delivery job, one bounded reporter
+ * reset per observation. A session the job allowance cuts off is an `error` row with its elapsed time
+ * and completed children: the measurement stays owed, and no partial session is accepted.
  * Exit codes: 0 a report line was printed, 1 the command failed, 2 a usage error, a missing fixture
  * or an unverified baseline.
  *
@@ -33,7 +36,7 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { lastJsonLine, tail } = require('../report')
 const { median } = require('../session')
-const { JOBS, childCount, digest, minimumBudget } = require('../telemetry')
+const { JOBS, PREPARE_SECONDS, childCount, digest, minimumBudget } = require('../telemetry')
 const { isSupported } = require('../../../src/protocol/message/compression/zstd')
 
 const ROOT = path.resolve(__dirname, '..', '..', '..')
@@ -165,9 +168,16 @@ const plan = (input, entries) => {
 /** @param {string} job a `telemetry.js` job @returns {number} free bytes its session needs */
 const diskBytes = (job) => childCount(job) * CHILD_BYTES[JOBS[job].mode] + 1024 * MIB
 
-/** One timeout over every row: the largest declared budget plus freezing and re-verification. */
+/** @param {string} job a `telemetry.js` job @returns {number} seconds of reporter resets it declares */
+const preparationSeconds = (job) =>
+  JOBS[job].mode === 'delivery' ? childCount(job) * PREPARE_SECONDS : 0
+
+/** One timeout over every row: the largest declared session time plus freezing and re-verification. */
 const timeoutMs =
-  (Math.max(...Object.keys(JOBS).map(minimumBudget)) + FREEZE_SECONDS + VERIFY_SECONDS) * 1000
+  (Math.max(...Object.keys(JOBS).map((job) => minimumBudget(job) + preparationSeconds(job))) +
+    FREEZE_SECONDS +
+    VERIFY_SECONDS) *
+  1000
 
 /** @param {Buffer|string} bytes @returns {string} lowercase SHA-256 */
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -185,19 +195,23 @@ const exists = (value, kind) =>
 const rowOf = (name) => ROWS.find((row) => row.name === name)
 
 /**
- * The session's time limit: its declared budget, cut to the job allowance when the workflow sets
- * `TELEMETRY_JOB_DEADLINE` (epoch seconds), less the time kept for re-verification and upload.
+ * The session's time limit: its declared budget plus its reporter resets, cut to the job allowance
+ * when the workflow sets `TELEMETRY_JOB_DEADLINE` (epoch seconds), less the time kept for
+ * re-verification and upload.
  * @param {string} job
  * @param {Record<string, string|undefined>} env
  * @param {() => number} now milliseconds
- * @returns {{ budget: number, allowance: number|null, limit: number }} seconds
+ * @returns {{ budget: number, preparation: number, allowance: number|null, limit: number }} seconds
  */
 const limits = (job, env, now) => {
   const budget = minimumBudget(job)
-  if (env.TELEMETRY_JOB_DEADLINE === undefined) return { budget, allowance: null, limit: budget }
+  const preparation = preparationSeconds(job)
+  const declared = budget + preparation
+  if (env.TELEMETRY_JOB_DEADLINE === undefined)
+    return { budget, preparation, allowance: null, limit: declared }
   const allowance =
     Math.floor(Number(env.TELEMETRY_JOB_DEADLINE) - now() / 1000) - AFTER_SESSION_SECONDS
-  return { budget, allowance, limit: Math.min(budget, allowance) }
+  return { budget, preparation, allowance, limit: Math.min(declared, allowance) }
 }
 
 /**
@@ -394,12 +408,13 @@ const freeze = (from, label, { snapshots, receipt, spawn }) => {
 }
 
 /**
- * Builds the session manifest `telemetry.js --session` validates.
- * @param {{ row: object, raw: string, candidate: object, previous?: object, accepted?: object,
- *   zstd: boolean }} options
+ * Builds the session manifest `telemetry.js --session` validates. A delivery manifest names the
+ * reporter sink and the telemetry cluster the controller resets before every observation.
+ * @param {{ row: object, raw: string, env: Record<string, string|undefined>, candidate: object,
+ *   previous?: object, accepted?: object, zstd: boolean }} options
  * @returns {object}
  */
-const sessionManifest = ({ row, raw, candidate, previous, accepted, zstd }) => {
+const sessionManifest = ({ row, raw, env, candidate, previous, accepted, zstd }) => {
   const job = JOBS[row.job]
   const optional = row.flags.includes('zstd') && !zstd
   return {
@@ -420,7 +435,13 @@ const sessionManifest = ({ row, raw, candidate, previous, accepted, zstd }) => {
     codecs: { none: true, gzip: true, zstd },
     ...(optional && { optionalCodec: 'zstd' }),
     ...(accepted && { acceptedBaseline: accepted }),
-    ...(job.mode === 'delivery' && { fixture: { brokers: BROKERS } }),
+    ...(job.mode === 'delivery' && {
+      fixture: {
+        brokers: BROKERS,
+        sink: env.TELEMETRY_EVIDENCE_DIR,
+        compose: { file: path.join(ROOT, env.COMPOSE_FILE), project: env.COMPOSE_PROJECT_NAME },
+      },
+    }),
     arms: job.roles.map((label) => {
       const control = job.controls.includes(label) ? '1' : '0'
       const telemetry = job.telemetry[label] ? ['--telemetry', job.telemetry[label]] : []
@@ -470,6 +491,35 @@ const keepSink = (sink, to) => {
     return { files, overflow: files.filter((name) => name.startsWith('OVERFLOW-')) }
   } catch (failure) {
     return { files: [], overflow: [], error: failure.message }
+  }
+}
+
+/** @param {string} line a journal line @returns {object|null} its entry, null for a torn line */
+const entryOf = (line) => {
+  try {
+    return JSON.parse(line)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Sums the reporter resets the controller journalled; a line torn by a cut-off session is skipped.
+ * @param {string} directory the session directory
+ * @returns {{ count: number, elapsedMs: number }}
+ */
+const resetsOf = (directory) => {
+  const file = path.join(directory, 'journal.jsonl')
+  const prepared = fs.existsSync(file)
+    ? fs
+        .readFileSync(file, 'utf8')
+        .split('\n')
+        .map(entryOf)
+        .filter((entry) => entry?.disposition === 'prepared')
+    : []
+  return {
+    count: prepared.length,
+    elapsedMs: prepared.reduce((sum, { elapsedMs }) => sum + elapsedMs, 0),
   }
 }
 
@@ -588,17 +638,19 @@ const main = (
       fs.copyFileSync(`${env.TELEMETRY_DECODER_ARCHIVE}.json`, `${raw}.decoder.json`)
       decoder = { archiveSha256: asset(env.TELEMETRY_DECODER_ARCHIVE).sha256 }
     }
-    const manifest = sessionManifest({ row, raw, candidate, previous, accepted: proof, zstd })
+    const manifest = sessionManifest({ row, raw, env, candidate, previous, accepted: proof, zstd })
     const manifestFile = `${raw}.manifest.json`
     fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), { flag: 'wx' })
-    const { budget, allowance, limit } = limits(row.job, env, now)
+    const { budget, preparation, allowance, limit } = limits(row.job, env, now)
     const options = { cwd: ROOT, env, encoding: 'utf8', maxBuffer: 64 * MIB }
+    const started = now()
     const ran = spawn(process.execPath, ['--expose-gc', TELEMETRY, '--session', manifestFile], {
       ...options,
       timeout: limit * 1000,
     })
+    const elapsedSeconds = Math.round((now() - started) / 1000)
     error(ran.stderr ?? '')
-    const session = outcomeOf(ran)
+    const session = { ...outcomeOf(ran), elapsedSeconds }
     let verify = null
     if (session.verdict) {
       const checked = spawn(process.execPath, [TELEMETRY, '--verify-session', manifest.directory], {
@@ -626,9 +678,11 @@ const main = (
           observations: childCount(row.job),
           runs: manifest.runs,
           budgetSeconds: budget,
+          preparationSeconds: preparation,
           allowanceSeconds: allowance,
           limitSeconds: limit,
         },
+        resets: delivery ? resetsOf(manifest.directory) : null,
         baseline: proof ? { ref: accepted.ref, commit: accepted.commit } : null,
         decoder,
         node: process.version,
@@ -690,7 +744,7 @@ const rows = (entry, arm, { outputs, error }) => {
   if (report.row !== entry.name)
     return one('error', `the session ran row ${report.row}, expected ${entry.name}`)
   const job = JOBS[report.job]
-  const { session, verify, observations, declared, sink } = report
+  const { session, verify, observations, declared, sink, resets } = report
   const total = childCount(report.job)
   const notes = [`session manifest sha256 ${report.manifest.sha256}`]
   if (report.baseline)
@@ -701,24 +755,45 @@ const rows = (entry, arm, { outputs, error }) => {
     notes.push(
       `decoder archive sha256 ${report.decoder.archiveSha256} prepared; the session does not read it`
     )
-  if (declared.allowanceSeconds !== null && declared.allowanceSeconds < declared.budgetSeconds)
+  const prepared = declared.preparationSeconds
+    ? ` plus ${declared.preparationSeconds} s of reporter resets`
+    : ''
+  if (
+    declared.allowanceSeconds !== null &&
+    declared.allowanceSeconds < declared.budgetSeconds + declared.preparationSeconds
+  )
     notes.push(
-      `job allowance ${declared.allowanceSeconds} s is below the declared budget ${declared.budgetSeconds} s`
+      `job allowance ${declared.allowanceSeconds} s is below the declared budget ${declared.budgetSeconds} s${prepared}`
+    )
+  notes.push(
+    `session elapsed ${session.elapsedSeconds} s of its ${declared.limitSeconds} s limit, ${observations.length} of ${total} children completed`
+  )
+  if (resets)
+    notes.push(
+      `reporter reset before each observation, outside its measured window: ${resets.count} resets, ` +
+        `${Math.round(resets.elapsedMs / 1000)} s in total (bound ${PREPARE_SECONDS} s each, declared apart from the session budget)`
     )
   const overflow = sink?.overflow.length
     ? `; reporter sink overflow: ${sink.overflow.join(', ')}`
     : ''
 
+  if (session.timedOut) {
+    const resetBound = declared.preparationSeconds
+      ? `, reporter resets ${declared.preparationSeconds} s`
+      : ''
+    const allowance =
+      declared.allowanceSeconds === null ? '' : `, job allowance ${declared.allowanceSeconds} s`
+    const resetTime = resets
+      ? `; ${resets.count} reporter resets took ${Math.round(resets.elapsedMs / 1000)} s`
+      : ''
+    return one(
+      'error',
+      `the session was cut off at its ${declared.limitSeconds} s limit after ${session.elapsedSeconds} s with ` +
+        `${observations.length} of ${total} children completed (declared budget ${declared.budgetSeconds} s${resetBound}${allowance}); ` +
+        `the measurement stays owed and the partial evidence is kept${resetTime}${overflow}`
+    )
+  }
   if (!session.verdict) {
-    if (session.timedOut) {
-      const allowance =
-        declared.allowanceSeconds === null ? '' : `, job allowance ${declared.allowanceSeconds} s`
-      return one(
-        'error',
-        `the session was stopped at its ${declared.limitSeconds} s limit after ${observations.length} of ${total} observations ` +
-          `(declared budget ${declared.budgetSeconds} s${allowance}); the partial evidence is kept${overflow}`
-      )
-    }
     if (session.status === 4)
       return one('error', `ZSTD is not available on Node ${report.node}: the row has no numbers`)
     if (!session.ineffective) {

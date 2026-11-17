@@ -705,7 +705,8 @@ describe('Benchmarks > telemetrySession adapter', () => {
           deps: baseline ? { accepted: baseline.accepted } : {},
         }
       }
-      /** A session that takes `seconds`, with one 20 s reporter reset journalled per finished delivery child. */
+      /** A session that takes `seconds`, with one 20 s reporter reset journalled per finished delivery child;
+       * a cut-off session's journal ends in a torn line. */
       const timed = (seconds, script = {}) => {
         const clock = { t: start }
         const scripted = controller({
@@ -718,7 +719,8 @@ describe('Benchmarks > telemetrySession adapter', () => {
             )
             fs.writeFileSync(
               path.join(manifest.directory, 'journal.jsonl'),
-              journal.map((line) => `${line}\n`).join('')
+              journal.map((line) => `${line}\n`).join('') +
+                (script.stop === undefined ? '' : '{"ordinal":')
             )
           },
         })
@@ -756,7 +758,7 @@ describe('Benchmarks > telemetrySession adapter', () => {
           runs: 1,
           status: 'error',
           reason:
-            `run 1 of 1: the session was cut off at its ${allowance} s limit after ${allowance} s with ` +
+            `the session was cut off at its ${allowance} s limit after ${allowance} s with ` +
             `${done} of ${total} children completed (declared budget ${budget} s${resetsNote}, ` +
             `job allowance ${allowance} s); the measurement stays owed and the partial evidence is kept${resetTime}`,
         },

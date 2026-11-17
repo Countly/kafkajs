@@ -2422,7 +2422,9 @@ describe('telemetry benchmark session', () => {
 
     const { fixture, ...bare } = makeManifest('delivery-normal')
     expect(fixture.sink).toEqual(expect.any(String))
-    expect(() => validateManifest(bare)).toThrow('reporter sink')
+    expect(() => validateManifest(bare)).toThrow('brokers')
+    const { sink: _sink, ...unsunk } = fixture
+    expect(() => validateManifest({ ...bare, fixture: unsunk })).toThrow('reporter sink')
     expect(() =>
       validateManifest({ ...bare, fixture: { ...fixture, compose: { project: 'bench' } } })
     ).toThrow('telemetry cluster')
