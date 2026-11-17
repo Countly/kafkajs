@@ -16,11 +16,18 @@ TARBALL="$(cd "$ROOT" && npm pack --loglevel=error --pack-destination "$PACK_DIR
 cd "$ROOT/otel"
 # --ignore-scripts: no dependency needs a lifecycle script, so none runs on a developer machine.
 npm ci --loglevel=error --no-audit --no-fund --ignore-scripts
-npm install --loglevel=error --no-audit --no-fund --no-save --save-dev --ignore-scripts "$PACK_DIR/$TARBALL"
-if [ ! -f node_modules/@countly/kafkajs/package.json ] || [ -L node_modules/@countly/kafkajs ]; then
-  echo "the packed client is not installed as a regular node_modules directory" >&2
-  exit 1
-fi
+# The same tarball also goes in under the npm alias `kafkajs`, as `"kafkajs":
+# "npm:@countly/kafkajs@<version>"` installs it. Both in one command: a later --no-save install
+# removes the package an earlier one added.
+npm install --loglevel=error --no-audit --no-fund --no-save --save-dev --ignore-scripts \
+  "$PACK_DIR/$TARBALL" "kafkajs@file:$PACK_DIR/$TARBALL"
+for dir in node_modules/@countly/kafkajs node_modules/kafkajs; do
+  if [ ! -f "$dir/package.json" ] || [ -L "$dir" ] ||
+    [ "$(node -p "require('./$dir/package.json').name")" != "@countly/kafkajs" ]; then
+    echo "the packed client is not installed as a regular directory $dir" >&2
+    exit 1
+  fi
+done
 
 # An explicit reporter keeps CI parsing independent of terminal detection and Node defaults.
 if [ -n "${NODE_TEST_REPORT:-}" ]; then

@@ -50,8 +50,8 @@ const EVENT_LISTENERS_SET = Symbol('opentelemetry.instrumentation.kafkajs.eventL
 /**
  * The names the client is installed under, and the versions it accepts. The hook knows a package
  * only by its `node_modules/<name>` directory, so an application that installs this client as
- * `kafkajs` (the npm alias `"kafkajs": "npm:@countly/kafkajs@3"`) is matched by the second name;
- * the range keeps `kafkajs` 2.x, which `@opentelemetry/instrumentation-kafkajs` instruments, out.
+ * `kafkajs` (an npm alias such as `"kafkajs": "npm:@countly/kafkajs@3.0.0"`) is matched by the second
+ * name; the range keeps `kafkajs` 2.x, which `@opentelemetry/instrumentation-kafkajs` instruments, out.
  */
 const MODULE_NAMES = ['@countly/kafkajs', 'kafkajs']
 const SUPPORTED_VERSIONS = ['>=3.0.0-0 <4']
