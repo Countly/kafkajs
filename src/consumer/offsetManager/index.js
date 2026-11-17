@@ -242,12 +242,15 @@ module.exports = class OffsetManager {
      */
     this.resetRefusals = new Map()
     this.topics = keys(memberAssignment)
+    this.obligations.claimAssignment(this.topics)
     this.clearAllOffsets()
+    this.obligations.retireUnowned()
   }
 
   /**
    * The offset this partition would be fetched from next, seeding the resolved offset from the
-   * committed one the first time.
+   * committed one the first time. For a topic this manager no longer holds it returns the same
+   * baseline without storing anything.
    *
    * The seeding is skipped when there is no committed offset: writing one in would leave an own,
    * enumerable key holding `undefined`, which `countResolvedOffsets()` and `uncommittedOffsets()`
@@ -259,11 +262,16 @@ module.exports = class OffsetManager {
    * @returns {Long} the committed offset, or 0 when there is none or it is invalid
    */
   nextOffset(topic, partition, committedOffset = this.heldOffsetAt(topic, partition)) {
-    if (!this.resolvedOffsets[topic][partition] && committedOffset != null) {
-      this.resolvedOffsets[topic][partition] = committedOffset
+    const resolved = this.resolvedOffsets[topic]
+    if (!resolved) {
+      return Long.fromValue(isInvalidOffset(committedOffset) ? '0' : committedOffset)
     }
 
-    let offset = this.resolvedOffsets[topic][partition]
+    if (!resolved[partition] && committedOffset != null) {
+      resolved[partition] = committedOffset
+    }
+
+    let offset = resolved[partition]
     if (isInvalidOffset(offset)) {
       offset = '0'
     }
@@ -417,19 +425,20 @@ module.exports = class OffsetManager {
   /**
    * Rewinds the resolved offset back to the committed one, dropping the tracked epoch with it: the
    * position moves without a record behind it, and keeping the epoch of a record further ahead
-   * would overstate where this partition actually is.
+   * would overstate where this partition actually is. A no-op for a topic this manager no longer
+   * holds.
    * @param {import("../../../types").TopicPartition} topicPartition
    * @returns {void}
    */
   resetOffset({ topic, partition }) {
+    if (!this.resolvedOffsets[topic]) return
     this.resolvedOffsets[topic][partition] = this.heldOffsetAt(topic, partition)
     this.resolvedEpochs[topic][partition] = -1
   }
 
   /**
    * Forgets every offset this member holds for one topic, re-seeding rather than deleting: the
-   * fetch loop and `nextOffset` both index `committedOffsets[topic][partition]` without a guard,
-   * so a missing topic key is a TypeError inside the fetch, not a recoverable state.
+   * topic stays assigned, so its local keys stay in place for the fetch loop and `nextOffset`.
    * @param {string} topic
    * @returns {void}
    */
@@ -479,9 +488,10 @@ module.exports = class OffsetManager {
    * Moves this manager to a new assignment without discarding what the retained partitions know.
    *
    * Only the incremental (cooperative) apply calls this; an apply that revokes everything builds a
-   * fresh manager instead. Pruning is at PARTITION level, so a fully revoked topic keeps an empty
-   * object: `nextOffset` indexes `[topic][partition]` unguarded, and a topic-level prune would
-   * silently rewind a partition this member kept back to the start of its log.
+   * fresh manager instead. Revoked partitions are pruned first; a topic of which this member keeps
+   * any partition keeps its keys, so a kept position is never rewound. A topic left with no assigned
+   * partition then loses its local keys, and the claimed assignment moves with it so the group's
+   * shared state can retire a topic nobody owns. A late call for a pruned topic recreates nothing.
    *
    * @param {object} options
    * @param {Array<{topic: string, partitions: number[]}>} options.revoked partitions to prune
@@ -497,6 +507,7 @@ module.exports = class OffsetManager {
     this.memberAssignment = memberAssignment
     this.assignedPartitions = OffsetManager.indexAssignment(memberAssignment)
     this.topics = keys(memberAssignment)
+    this.obligations.claimAssignment(this.topics)
     this.generationId = generationId
     this.memberId = memberId
     this.coordinator = coordinator
@@ -518,6 +529,13 @@ module.exports = class OffsetManager {
         this.operations.touch(topic, partition)
       }
     }
+
+    for (const table of [this.resetPositions, this.resolvedOffsets, this.resolvedEpochs]) {
+      for (const topic of keys(table)) {
+        if (!this.assignedPartitions.has(topic)) delete table[topic]
+      }
+    }
+    this.obligations.retireUnowned()
   }
 
   /**
@@ -699,8 +717,10 @@ module.exports = class OffsetManager {
       if (!current()) return false
       this.clearPendingSeek(topic, partition)
       if (this.autoCommit) {
-        CommittedOffsetRevisions.forCache(this.committedOffsets()).advance(topic, partition)
-        this.committedOffsets()[topic][partition] = actualOffset
+        const committedOffsets = this.committedOffsets()
+        CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
+        committedOffsets[topic] ??= {}
+        committedOffsets[topic][partition] = actualOffset
         delete this.resetPositions[topic]?.[partition]
       } else this.holdResetPosition(topic, partition, actualOffset)
       this.resolveOffset({
@@ -1927,7 +1947,7 @@ module.exports = class OffsetManager {
     /**
      * The positions this member's own reset policy, sentinel seek or local seek gave a cell, which
      * no other consumer of the group may read. See `holdResetPosition`.
-     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: number}}}}
+     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: number|object}}}}
      */
     this.resetPositions = indexTopics(this.topics)
 
@@ -1988,6 +2008,7 @@ module.exports = class OffsetManager {
    * told apart from it. A sibling consumer of the same group never reads it, so two members with
    * different reset policies each fetch from their own answer. Replaced by the next one, and
    * dropped with the cell by `clearOffsets`, `resetOffsetsForTopic` and this manager's own commit.
+   * Ignored for a topic this manager no longer holds, so a late answer recreates no key.
    * @private
    * @param {string} topic
    * @param {number|string} partition
@@ -1995,10 +2016,14 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   holdResetPosition(topic, partition, offset) {
-    this.resetPositions[topic] ??= {}
-    this.resetPositions[topic][partition] = {
+    const positions = this.resetPositions[topic]
+    if (!positions) return
+    positions[partition] = {
       offset,
-      revision: CommittedOffsetRevisions.forCache(this.committedOffsets()).capture(),
+      revision: CommittedOffsetRevisions.forCache(this.committedOffsets()).capture(
+        topic,
+        partition
+      ),
     }
   }
 
