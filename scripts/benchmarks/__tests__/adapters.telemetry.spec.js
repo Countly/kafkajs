@@ -19,6 +19,7 @@ const ROOT = path.join(__dirname, '../../..')
 const SCRIPT = 'scripts/benchmarks/adapters/telemetrySession.js'
 const TELEMETRY = path.join(ROOT, 'scripts/benchmarks/telemetry.js')
 const REF = '3.0.0-alpha.9e'
+const MILESTONE = adapter.ACCEPTED_BASELINE.milestone
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-row-'))
 const PLENTY = () => ({ bavail: 2 ** 40, bsize: 1 })
@@ -74,7 +75,7 @@ const gitBaseline = () => {
   git(root, 'commit', '-qm', 'baseline')
   git(root, 'tag', REF)
   const commit = git(root, 'rev-parse', 'HEAD')
-  return { root, commit, accepted: { milestone: '9E', ref: REF, commit } }
+  return { root, commit, accepted: { milestone: MILESTONE, ref: REF, commit } }
 }
 
 /** The complete delivery fixture: telemetry cluster, a fresh reporter sink and a prepared decoder. */
@@ -529,7 +530,7 @@ describe('Benchmarks > telemetrySession adapter', () => {
     }
 
     const plain = { root: fakeRoot('// previous client\n') }
-    const accepted = { milestone: '9E', ref: REF, commit: 'a'.repeat(40) }
+    const accepted = { milestone: MILESTONE, ref: REF, commit: 'a'.repeat(40) }
     const notGit = refused(() => {}, accepted, plain)
     expect(notGit.reason).toContain(`${plain.root} is not a git checkout`)
 
@@ -552,7 +553,7 @@ describe('Benchmarks > telemetrySession adapter', () => {
     const untagged = refused((root) => git(root, 'tag', '-d', REF))
     expect(untagged.reason).toContain(`tag ${REF} does not resolve to`)
 
-    const mismatched = refused(() => {}, { milestone: '9E', ref: REF, commit: 'f'.repeat(40) })
+    const mismatched = refused(() => {}, { milestone: MILESTONE, ref: REF, commit: 'f'.repeat(40) })
     expect(mismatched.reason).toContain(`not the accepted ${REF} commit ${'f'.repeat(40)}`)
 
     const genuine = gitBaseline()
@@ -563,7 +564,7 @@ describe('Benchmarks > telemetrySession adapter', () => {
     const manifest = JSON.parse(fs.readFileSync(`${raw}.manifest.json`, 'utf8'))
     const previous = manifest.arms.find(({ label }) => label === 'previous')
     expect(JSON.parse(fs.readFileSync(manifest.acceptedBaseline.path, 'utf8'))).toEqual({
-      milestone: '9E',
+      milestone: MILESTONE,
       status: 'accepted',
       ref: REF,
       commit: genuine.commit,
