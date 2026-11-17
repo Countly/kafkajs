@@ -492,6 +492,31 @@ describe('consumer measurement inventory', () => {
     })
   })
 
+  test('a row whose summaries its own measured runs do not carry is never valid in the report or the audit', async () => {
+    const fixture = consumerFixture(tmp)
+    const { rawDir, lines, read } = await collect(fixture)
+    const cases = [
+      ['consumer-subscriptionResolve', 'head', (a) => (a.results = [])],
+      ['consumer-subscriptionResolve', 'head', (a) => a.results.pop()],
+      ['consumer-subscriptionResolve', 'alpha.9c', (a) => (a.stats.evaluationMs.n = 0)],
+      ['consumer-subscriptionResolve', 'alpha.9b', (a) => (a.results[2].evaluationMs = null)],
+      ['consumer-fetchRound', 'alpha.9b/p1000', (a) => (a.results[4].retainedHeapDelta = 'NaN')],
+      ['consumer-fetchRound', 'head/p100', (a) => (a.stats.retainedHeapDelta.median = null)],
+    ]
+    for (const [i, [name, arm, mutate]] of cases.entries()) {
+      const line = clone(lines[name])
+      mutate(line.arms[arm])
+      expect(line.arms[arm].measured).toBe(7)
+      const adapter = require(`../adapters/${ROWS[name].adapter}`)
+      const { rows } = adapter.rows({ name }, 'fork', { outputs: [line] })
+      expect([i, rows.filter((r) => r.arm === arm && r.status !== 'error')]).toEqual([i, []])
+      expect([i, rows.filter((r) => 'median' in r && !Number.isFinite(r.median))]).toEqual([i, []])
+      writeEvidence(rawDir, name, line)
+      expect([i, auditedRow(read(), name).status]).toEqual([i, 'error'])
+      writeEvidence(rawDir, name, lines[name])
+    }
+  })
+
   test('an audit of only the selected rows says which it left out and never completes the inherited contracts', async () => {
     const fixture = consumerFixture(tmp)
     const { read } = await collect(fixture)

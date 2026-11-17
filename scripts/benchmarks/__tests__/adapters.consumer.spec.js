@@ -527,6 +527,64 @@ describe('consumer report rows', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
+  test('an L2 window still sending after its settlement limit ends the session before another run shares its producer and topic', async () => {
+    jest.useFakeTimers()
+    const events = []
+    const calls = []
+    let sends = 0
+    let release
+    let pumping
+    const ended = { done: false }
+    /** Advances the clock until the session ends, as the wall clock would during settlement. */
+    const pump = async () => {
+      while (!ended.done) await jest.advanceTimersByTimeAsync(1000)
+    }
+    const send = () => {
+      // Sends 1 to 2400 are the four discarded warm-up runs; 3007 falls in a measured run.
+      if (++sends !== 3007) return Promise.resolve()
+      events.push('send held')
+      return new Promise((resolve) => {
+        release = () => {
+          events.push('held send acknowledged')
+          resolve()
+        }
+      })
+    }
+    const Kafka = fakeKafka({ calls, send })
+    const hooks = { prepare: (context) => fetchSessions.prepare(context, { Kafka }) }
+    const run = fakeRun(async (args, n, options) => {
+      if (!args.includes('--arm')) return undefined
+      events.push(`run ${n}`)
+      const child = fakeChild()
+      options.onMessage({ type: 'measurement-ready' }, child)
+      await jest.advanceTimersByTimeAsync(60100)
+      child.emit('close')
+      if (release) pumping ??= pump()
+      return undefined
+    })
+    const env = { BENCH_NODES: JSON.stringify(NODES) }
+    const { line, result, raw } = await fixture.runSession('consumer-sessions-L2', {
+      run,
+      env,
+      hooks,
+    })
+    ended.done = true
+    await pumping
+    release()
+    await Promise.resolve()
+
+    const held = events.indexOf('send held')
+    expect(held).toBeGreaterThan(0)
+    expect(events.slice(held + 1)).toEqual(['held send acknowledged'])
+    expect(calls.slice(-3)).toEqual(['deleteTopics', 'producer.disconnect', 'admin.disconnect'])
+    const timed = entriesOf(raw).filter((e) => !e.error)
+    expect(timed.at(-1).result.producer).toMatchObject({ offered: 12000, unsettled: 20 })
+    expect(result.detail.status).toBe('error')
+    expect(result.detail.reason).toContain('20 messages unsettled after 30000 ms')
+    expect(line.arms['head/sessions-true~AA'].errors.at(-1)).toContain('20 messages unsettled')
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
   test('preparing a fetch-session row disconnects every client and keeps the first error whatever step fails', async () => {
     const context = {
       row: ROWS['consumer-sessions-L1'],
@@ -619,7 +677,7 @@ describe('consumer report rows', () => {
         args.includes('--checksum') &&
         args.some((a) => a.includes(`${path.sep}alpha.9b${path.sep}`))
       ) {
-        line.checksums.gzip.sha256 = 'other-content'
+        line.checksums.gzip.sha256 = 'f'.repeat(64)
       }
       return line
     })
@@ -637,6 +695,30 @@ describe('consumer report rows', () => {
     const none = await fixture.runSession('consumer-recordBatchDecode', { run: empty })
     expect(none.result.detail.status).toBe('invalid')
     expect(none.result.detail.reason).toContain('decoded records equal across trees')
+
+    for (const sha256 of [undefined, null, '', 'gzip-content']) {
+      for (const where of ['alpha.9b', 'every tree']) {
+        const absent = fakeRun((args, n) => {
+          const line = output(args, n)
+          const onTree = args.some((a) => a.includes(`${path.sep}alpha.9b${path.sep}`))
+          if (args.includes('--checksum') && (where === 'every tree' || onTree)) {
+            if (sha256 === undefined) delete line.checksums.gzip.sha256
+            else line.checksums.gzip.sha256 = sha256
+          }
+          return line
+        })
+        const { result } = await fixture.runSession('consumer-recordBatchDecode', { run: absent })
+        const gzip = result.detail.controls.find(
+          (c) => c.arm === 'gzip' && c.name === 'decoded checksum equal across trees'
+        )
+        expect([sha256, where, result.detail.status, gzip.passed]).toEqual([
+          sha256,
+          where,
+          'invalid',
+          false,
+        ])
+      }
+    }
   })
 
   test('the 1000-partition row needs every partition populated and consumed on every tree, else it is error', async () => {

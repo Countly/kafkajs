@@ -174,7 +174,14 @@ const output = (args, n) => {
       const arms = flag(args, '--arms').split(',')
       return {
         checksums: Object.fromEntries(
-          arms.map((arm) => [arm, { available: 1, records: 20, sha256: `${arm}-content` }])
+          arms.map((arm) => [
+            arm,
+            {
+              available: 1,
+              records: 20,
+              sha256: crypto.createHash('sha256').update(arm).digest('hex'),
+            },
+          ])
         ),
       }
     }
