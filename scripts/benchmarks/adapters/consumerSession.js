@@ -13,6 +13,8 @@
  * Usage: node scripts/benchmarks/adapters/consumerSession.js --row <name> --raw <file>
  *        node scripts/benchmarks/adapters/consumerSession.js --audit --raw <file>
  * `--raw` is the JSONL file of the session's observations; profiles and evidence go beside it.
+ * Rows run only where `BENCH_CONSUMER_ROWS=1`: the workflow job that owns their cluster. Anywhere
+ * else a row prints `{ row, omitted }` and the report shows it as omitted with that reason.
  * `BENCH_TREES` is a JSON object of archived tree directories by label. Prints one JSON line:
  * the session (`row`, `contracts`, `trees`, `arms`, `aa`, `controls`, `warmup`, `measured`,
  * `profiles`, `selfTime`, `nodes`) or `{ row, error }` when the row cannot start; exit 0 once a
@@ -36,6 +38,8 @@ const MIB = 1024 * 1024
 const MINUTE = 60 * 1000
 const MAX_OUTPUT = 16 * MIB
 const CONTROL_INLINE = 64 * 1024
+/** Why a consumer row prints no session outside the workflow job that owns its cluster. */
+const OUTSIDE = 'runs in its own job of the benchmark workflow (BENCH_CONSUMER_ROWS=1)'
 
 /**
  * @typedef {{ name: string, args: string[] }} Config
@@ -703,6 +707,7 @@ const readSessionRun = (result, entry) => {
   const line = lastJson(result.stdout ?? '')
   if (line.row !== entry.name) throw new Error(`the session line is of row ${line.row}`)
   if (line.error) throw new Error(line.error)
+  if (typeof line.omitted === 'string') return line
   if (!line.arms || !line.trees) throw new Error('the last JSON line is not a session')
   return line
 }
@@ -744,6 +749,7 @@ const rowAdapter = ({
       rows: [{ benchmark: entry.name, arm: '-', metric: '-', unit: '-', runs: 0, status, reason }],
     })
     if (error) return one('error', error)
+    if (outputs[0].omitted) return one('omitted', outputs[0].omitted)
     const row = Object.hasOwn(ROWS, entry.name) ? ROWS[entry.name] : undefined
     if (!row) return one('error', `no consumer row ${entry.name}`)
     const session = outputs[0]
@@ -944,6 +950,7 @@ const read = (result) => {
   if (result.error) throw result.error
   if (result.status !== 0) throw new Error(`exit ${result.status ?? result.signal}`)
   const line = lastJson(result.stdout ?? '')
+  if (typeof line.omitted === 'string') return line
   if (line.audit !== true || !line.rows) throw new Error('the last JSON line is not an audit')
   return line
 }
@@ -965,6 +972,13 @@ const rows = (entry, arm, { outputs, error }) => {
     }
   }
   const [line] = outputs
+  if (line.omitted) {
+    return {
+      rows: [
+        { benchmark: entry.name, ...base, metric: '-', status: 'omitted', reason: line.omitted },
+      ],
+    }
+  }
   const controls = []
   const out = []
   for (const [name, audited] of Object.entries(line.rows)) {
@@ -1007,10 +1021,11 @@ const rows = (entry, arm, { outputs, error }) => {
 }
 
 /**
- * @param {string[]} argv
+ * @param {string[]} argv `--row <name> --raw <file>` or `--audit --raw <file>`
+ * @param {{ env?: object, log?: (line: string) => void }} [io]
  * @returns {Promise<number>} 0 once a line is printed, 2 for a bad argument
  */
-const main = async (argv) => {
+const main = async (argv, { env = process.env, log = console.log } = {}) => {
   const flag = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined)
   const raw = flag('--raw')
   const name = flag('--row')
@@ -1018,8 +1033,10 @@ const main = async (argv) => {
     console.error('usage: consumerSession.js --row <name> --raw <file> | --audit --raw <file>')
     return 2
   }
-  const line = name ? await runRow(name, path.resolve(raw)) : audit(path.resolve(raw))
-  console.log(JSON.stringify(line))
+  let line
+  if (env.BENCH_CONSUMER_ROWS !== '1') line = { row: name ?? AUDIT.name, omitted: OUTSIDE }
+  else line = name ? await runRow(name, path.resolve(raw)) : audit(path.resolve(raw))
+  log(JSON.stringify(line))
   return 0
 }
 
@@ -1035,6 +1052,7 @@ module.exports = {
   MIB,
   armsOf,
   manifestEntries,
+  OUTSIDE,
   at,
   lastJson,
   runRow,
