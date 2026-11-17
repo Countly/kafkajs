@@ -2942,6 +2942,8 @@
         "src/admin/__tests__/apiDeadline.spec.js \u203a recovery and cleanup enrollment refuses expired queue enrollment while retaining a queued peer with enforcement=false",
         "src/admin/__tests__/apiDeadline.spec.js \u203a recovery and cleanup enrollment refuses expired queue enrollment while retaining a queued peer with enforcement=true",
         "src/admin/__tests__/apiDeadline.spec.js \u203a recovery and cleanup enrollment starts a successful fresh recovery while an abandoned build is held",
+        "src/admin/__tests__/apiDeadline.spec.js \u203a admin invocation deadlines a read-only timeout says a mutation, if any, may have been applied",
+        "src/admin/__tests__/apiDeadline.spec.js \u203a admin invocation deadlines a write timeout has the same text",
         "src/admin/__tests__/authorizedOperations.spec.js \u203a authorized operations completes a topic-mask request on a Metadata-v7-only scripted cluster",
         "src/admin/__tests__/authorizedOperations.spec.js \u203a authorized operations forwards the topic flag through Metadata v10 builders",
         "src/admin/__tests__/authorizedOperations.spec.js \u203a authorized operations forwards the topic flag through Metadata v11 builders",
@@ -3345,6 +3347,7 @@
         "src/admin/__tests__/describeTopicsByPartition.spec.js \u203a Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadline the deadline is the one taken at the start, across an outer retry",
         "src/admin/__tests__/describeTopicsByPartition.spec.js \u203a Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadline the pages read before the deadline are dropped when it passes",
         "src/admin/__tests__/describeTopicsByPartition.spec.js \u203a Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadline without request timeouts a stalled page still rejects at the deadline",
+        "src/admin/__tests__/describeTopicsByPartition.spec.js \u203a Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadline a non-default apiTimeout bounds every page and the fallback together (fake time)",
         "src/admin/__tests__/describeTopicsByPartitionHelpers.spec.js \u203a toTopicsMetadata authorization masks a null mask stays null even when the caller asks for masks",
         "src/admin/__tests__/describeTopicsByPartitionHelpers.spec.js \u203a toTopicsMetadata authorization masks a supported mask is kept when the caller asks for it",
         "src/admin/__tests__/describeTopicsByPartitionHelpers.spec.js \u203a toTopicsMetadata authorization masks an absent mask stays null even when the caller asks for masks",
@@ -3645,6 +3648,7 @@
         "src/admin/__tests__/lifecycle.spec.js \u203a admin lifecycle withheld timer delivery still fences the action at the actual deadline",
         "src/admin/__tests__/lifecycle.spec.js \u203a admin lifecycle zero closes before queued admission can start wire work",
         "src/admin/__tests__/lifecycle.spec.js \u203a admin real resource closure natural and forced close return active timers to the measured baseline",
+        "src/admin/__tests__/lifecycle.spec.js \u203a admin lifecycle forced close text says a mutation, if any, may have been applied",
         "src/admin/__tests__/listGroupsFilters.spec.js \u203a Admin > listGroups > filters and fields answers empty strings for a broker whose version carries neither field",
         "src/admin/__tests__/listGroupsFilters.spec.js \u203a Admin > listGroups > filters and fields asks a broker again when its coordinator is still loading",
         "src/admin/__tests__/listGroupsFilters.spec.js \u203a Admin > listGroups > filters and fields does not retry an error the broker will answer the same way",
@@ -20996,7 +21000,8 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes original key and value to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
-        "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ"
+        "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
+        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
       ]
     },
     {
@@ -21202,7 +21207,8 @@
         "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor ApiVersions retains the old identity-free path on the floor",
         "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Transactional offset commits retain the named-topic path on the floor",
         "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor DeleteGroups retains the old wire contract on the floor",
-        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Built-in rack selection and custom authority work on the floor"
+        "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor Built-in rack selection and custom authority work on the floor",
+        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
       ]
     },
     {
@@ -22247,6 +22253,28 @@
         "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000"
       ],
       "capMinutes": 15
+    },
+    {
+      "id": "e2e-unregister-controller",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "env": {
+        "UNREGISTER_CONTROLLER_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/admin/__tests__/unregisterControllerLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [],
+      "titles": [
+        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
+      ],
+      "capMinutes": 10
     },
     {
       "id": "e2e-auto-topic-creation",
@@ -25701,7 +25729,8 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes original key and value to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
-        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000"
+        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000",
+        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
       ]
     },
     {

@@ -163,7 +163,7 @@ class AdminLifecycle {
       episode.forced = true
       generation.close(
         new KafkaJSNonRetriableError(
-          'The admin was closed; outcome is unknown; a mutation may have been applied'
+          'The admin was closed; outcome is unknown; a mutation, if any, may have been applied'
         )
       )
       disconnectCluster().then(forcedDone)

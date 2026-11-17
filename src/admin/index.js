@@ -1592,8 +1592,8 @@ module.exports = ({
    * is never retried: it rejects once every page is in. A topic recreated between pages is read
    * again from the start the same way.
    *
-   * The whole read, the metadata refresh and every attempt included, has one deadline of 60 s
-   * inherited from the public call. At its actual monotonic deadline it rejects with
+   * The whole read, including metadata refresh, every page and every attempt, inherits the
+   * public call's `apiTimeout` (60000 ms by default). At its actual monotonic deadline it rejects with
    * `KafkaJSTimeout`, also with request timeout enforcement disabled. Expiry detaches local
    * waits, pages, retry timers and unsent requests. Shared discovery stops only when no live
    * caller remains; physical setup keeps its own budget. Already-written mutations may apply.
@@ -1666,15 +1666,18 @@ module.exports = ({
    * leader is returned with `leader: -1` instead of being waited for (Kafka 4.1.2 and 4.3 brokers
    * leave its `partitionErrorCode` at 0; a non-zero code is passed through), and a topic that does
    * not exist fails the call rather than being created. A failed request is retried on the `retry`
-   * budget, as the other admin calls are, and the whole read has one deadline of 60 s, after which
-   * it rejects with `KafkaJSTimeout`. A broker that does not offer the API is asked through
-   * Metadata after all. The option applies only to topics named explicitly: empty or omitted `topics` go through Metadata.
+   * budget, as the other admin calls are. Metadata discovery, every page and retry, and an
+   * unsupported-API Metadata fallback share the public call's `apiTimeout` (60000 ms by default).
+   * At that deadline the call rejects with `KafkaJSTimeout`; the fallback's shorter Metadata
+   * polling cap is nested inside it, never added. The option applies only to topics named
+   * explicitly: empty or omitted `topics` go through Metadata.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
    *
    * @param {Object} [options]
    * @param {string[]} [options.topics]
    * @param {boolean} [options.useDescribeTopicPartitions=false]
+   * @param {number} [options.apiTimeout] per-call budget in ms; defaults to the admin's configured budget
    * @return {Promise<TopicsMetadata>}
    * @throws {KafkaJSNonRetriableError} if a topic name is not a valid string
    *

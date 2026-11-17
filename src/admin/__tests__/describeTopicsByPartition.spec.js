@@ -75,13 +75,15 @@ describe('Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadl
   /**
    * @param {object} [options] over the Kafka options of the scripted cluster
    * @param {Array<{ id: number, host: string, port: number }>} [nodes] the endpoints the cluster serves
+   * @param {Record<string, [number, number]>} [advertise] the API versions offered over the profile's
    * @returns {Promise<void>}
    */
-  const connect = async (options = {}, nodes = NODES) => {
-    cluster = createScriptedCluster({
-      nodes,
-      advertise: { DescribeTopicPartitions: [0, 0] },
-    })
+  const connect = async (
+    options = {},
+    nodes = NODES,
+    advertise = { DescribeTopicPartitions: [0, 0] }
+  ) => {
+    cluster = createScriptedCluster({ nodes, advertise })
     gates = []
     const hold = cluster.schedule.hold.bind(cluster.schedule)
     cluster.schedule.hold = (selector) => {
@@ -203,13 +205,61 @@ describe('Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadl
 
     expect(result.error).toBeInstanceOf(KafkaJSTimeout)
     expect(result.error.message).toBe(
-      `fetchTopicMetadata did not complete within ${DEADLINE_MS} ms; outcome is unknown; a mutation may have been applied`
+      `fetchTopicMetadata did not complete within ${DEADLINE_MS} ms; outcome is unknown; a mutation, if any, may have been applied`
     )
     expect(jest.getTimerCount()).toBe(baseline)
     last.release(page([1], { more: true }))
     for (let step = 0; step < 20; step++) await turn(10)
     expect(pages()).toHaveLength(2)
     expect(result.value).toBeUndefined()
+  })
+
+  test('a non-default apiTimeout bounds every page and the fallback together (fake time)', async () => {
+    const apiTimeout = 5000
+    const message = `fetchTopicMetadata did not complete within ${apiTimeout} ms; outcome is unknown; a mutation, if any, may have been applied`
+    const readWithin = () =>
+      settle(
+        admin.fetchTopicMetadata({ topics: [TOPIC], useDescribeTopicPartitions: true, apiTimeout })
+      )
+
+    await connect()
+    const first = cluster.schedule.hold({ api: 'DescribeTopicPartitions' })
+    const second = cluster.schedule.hold({ api: 'DescribeTopicPartitions' })
+    let started = Date.now()
+    const paged = readWithin()
+    await first.arrived()
+    await turn(3000)
+    first.release(page([0], { more: true }))
+    while (!second.call) await turn(10)
+    await turn(started + apiTimeout - 1 - Date.now())
+    expect(paged.done).toBe(false)
+    await turn(1)
+    expect(paged.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(paged.error.message).toBe(message)
+    expect(pages()).toHaveLength(2)
+    second.release(page([1]))
+    for (let step = 0; step < 20; step++) await turn(10)
+    await admin.disconnect()
+    cluster.assertClean()
+
+    await connect({ metadataMaxAge: 0 }, NODES, {})
+    const discovery = cluster.schedule.hold({ api: 'Metadata' })
+    const fallback = cluster.schedule.hold({ api: 'Metadata' })
+    started = Date.now()
+    const unsupported = readWithin()
+    await discovery.arrived()
+    await turn(3000)
+    discovery.release()
+    while (!fallback.call) await turn(10)
+    await turn(started + apiTimeout - 1 - Date.now())
+    expect(unsupported.done).toBe(false)
+    await turn(1)
+    expect(unsupported.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(unsupported.error.message).toBe(message)
+    expect(pages()).toEqual([])
+    expect(jest.getTimerCount()).toBeLessThanOrEqual(baseline)
+    fallback.release()
+    for (let step = 0; step < 20; step++) await turn(10)
   })
 
   test('the deadline is the one taken at the start, across an outer retry', async () => {

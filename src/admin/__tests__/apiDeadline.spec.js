@@ -497,6 +497,38 @@ describe('admin invocation deadlines', () => {
     expect(createTopics).toHaveBeenCalledTimes(2)
   })
 
+  it('a read-only timeout says a mutation, if any, may have been applied', async () => {
+    const response = held()
+    const admin = createAdmin({ logger, cluster: { metadata: () => response.promise } })
+    const result = observe(admin.listTopics({ apiTimeout: 10 }))
+    await jest.advanceTimersByTimeAsync(10)
+    expect(result.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(result.error.message).toBe(
+      'listTopics did not complete within 10 ms; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    response.resolve({ topicMetadata: [] })
+    await flush()
+  })
+
+  it('a write timeout has the same text', async () => {
+    const response = held()
+    const cluster = {
+      refreshMetadata: async () => {},
+      findControllerBroker: async () => ({ createTopics: () => response.promise }),
+    }
+    const admin = createAdmin({ cluster, logger, retry: { retries: 0 } })
+    const result = observe(
+      admin.createTopics({ topics: [{ topic: 't' }], waitForLeaders: false, apiTimeout: 10 })
+    )
+    await jest.advanceTimersByTimeAsync(10)
+    expect(result.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(result.error.message).toBe(
+      'createTopics did not complete within 10 ms; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    response.resolve()
+    await flush()
+  })
+
   it('retains the last typed broker item error on exhaustion and the original late transport error', async () => {
     const { itemRetry } = require('../itemRetry')
     const options = {

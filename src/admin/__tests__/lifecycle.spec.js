@@ -149,6 +149,21 @@ describe('admin lifecycle', () => {
     await flush()
   })
 
+  test('forced close text says a mutation, if any, may have been applied', async () => {
+    const answer = held()
+    const { admin } = fixture({ metadata: jest.fn(() => answer.promise) })
+    const call = observe(admin.listTopics())
+    await flush()
+    await admin.disconnect({ timeout: 0 })
+    await flush()
+    expect(call.error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(call.error.message).toBe(
+      'The admin was closed; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    answer.resolve({ topicMetadata: [] })
+    await flush()
+  })
+
   test('a natural first close cannot be shortened by a second close', async () => {
     const answer = held()
     const { admin } = fixture({ metadata: () => answer.promise })

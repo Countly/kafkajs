@@ -1179,7 +1179,7 @@ Group visibility and the admin client.
   topic can go; code that reads `error.errors` finds the items refused for good first (when
   nothing was refused for good and the retries ran out on failed items, `error.cause.errors` lists
   them); `retry: { retries: 0 }` makes a single attempt.
-- **A DescribeTopicPartitions read has one 60 s deadline.** `fetchTopicMetadata({ topics, useDescribeTopicPartitions: true })` rejects with `KafkaJSTimeout` when the read, every page and retry included, is not done within 60 s, and a topic recreated between two pages is read again from the start. *What to do:* nothing, unless your cluster pages that slowly; then use the default Metadata path (`useDescribeTopicPartitions: false`).
+- **A DescribeTopicPartitions read shares the call's `apiTimeout` (60000 ms by default).** Metadata discovery, every page, every retry and an unsupported-API Metadata fallback use that one budget. The fallback's shorter Metadata polling cap is nested inside it, never added. At the deadline the call rejects with `KafkaJSTimeout`. A topic recreated between two pages is read again from the start within the remaining budget. *What to do:* increase `apiTimeout` if your cluster needs longer to page.
 
 Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Configure the default with `kafka.admin({ apiTimeout })`, or override one call. Values must be integers from 1 to 2147483647. A broker-side `timeout` remains independent and is not shortened on the wire.
 

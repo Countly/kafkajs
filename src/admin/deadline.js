@@ -57,7 +57,7 @@ class AdminDeadline {
   /** @returns {KafkaJSTimeout} one stable error naming the original method and unknown outcome */
   timeout() {
     this.timeoutError ??= new KafkaJSTimeout(
-      `${this.method} did not complete within ${this.timeoutMs} ms; outcome is unknown; a mutation may have been applied`
+      `${this.method} did not complete within ${this.timeoutMs} ms; outcome is unknown; a mutation, if any, may have been applied`
     )
     return this.timeoutError
   }
