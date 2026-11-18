@@ -143,7 +143,9 @@ describe('scripts/mutants/select.js', () => {
     const { selection, unit, live } = select({ areas: 'G,admin' })
     expect(unit.records.map((r) => r.area).sort()).toEqual(['G', 'admin', 'admin'])
     expect(live.records).toEqual([])
-    expect(selection.records.filter((r) => r.disposition === 'not-run: area')).toHaveLength(3 + 90)
+    expect(selection.records.filter((r) => r.disposition === 'not-run: area')).toHaveLength(
+      3 + 90 + EXCLUDED.length
+    )
   })
 
   test('an inventory exclusion stays in the selection with its area and reason and never runs', () => {
