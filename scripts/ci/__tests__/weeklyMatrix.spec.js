@@ -3,7 +3,8 @@ const path = require('node:path')
 const yaml = require('js-yaml')
 
 const WORKFLOW = path.join(__dirname, '..', '..', '..', '.github', 'workflows', 'weekly.yml')
-const KAFKA_LINES = ['4.0.2', '4.2.2', '4.3.2', '4.4.0']
+const KAFKA_LINES = ['4.0.2', '4.1.2', '4.2.2', '4.3.2', '4.4.0']
+const MULTI_NODE_LINES = KAFKA_LINES.filter((kafka) => kafka !== '4.1.2')
 const NODE_LINES = [22, 24, 26]
 const GROUPS = ['broker', 'admin', 'producer', 'consumer', 'others', 'oauthbearer']
 
@@ -49,24 +50,32 @@ const nodesOf = (jobs, kafka) => [
 describe('weekly matrix', () => {
   const jobs = expand(job.strategy.matrix)
 
-  test('covers Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0 exactly', () => {
+  test('covers Kafka 4.0.2, 4.1.2, 4.2.2, 4.3.2 and 4.4.0 exactly', () => {
     expect(job.strategy.matrix.kafka).toEqual(KAFKA_LINES)
     expect([...new Set(jobs.map((cell) => cell.kafka))].sort()).toEqual(KAFKA_LINES)
   })
 
-  test('runs every Kafka line on at least two Node versions and 4.4.0 on all three', () => {
-    for (const kafka of KAFKA_LINES) {
+  test('runs every Kafka line but 4.1.2 on at least two Node versions and 4.4.0 on all three', () => {
+    for (const kafka of MULTI_NODE_LINES) {
       expect(nodesOf(jobs, kafka).length).toBeGreaterThanOrEqual(2)
     }
     expect(nodesOf(jobs, '4.4.0').sort()).toEqual(NODE_LINES.map(String))
     expect([...new Set(jobs.map((cell) => cell.node))].sort()).toEqual(NODE_LINES.map(String))
   })
 
-  test('expands to nine Kafka-by-Node cells and 54 jobs', () => {
+  test('weekly includes one Kafka 4.1.2 row on Node 24', () => {
+    const row = jobs.filter((cell) => cell.kafka === '4.1.2')
+
+    expect(nodesOf(jobs, '4.1.2')).toEqual(['24'])
+    expect(row.map((cell) => cell.group)).toEqual(GROUPS)
+    expect(jobs.filter((cell) => cell.kafka !== '4.1.2')).toHaveLength(54)
+  })
+
+  test('expands to ten Kafka-by-Node cells and 60 jobs', () => {
     const cells = new Set(jobs.map((cell) => `${cell.kafka}/${cell.node}`))
 
-    expect(cells.size).toBe(9)
-    expect(jobs).toHaveLength(54)
+    expect(cells.size).toBe(10)
+    expect(jobs).toHaveLength(60)
   })
 
   test('has no dispatch input and KAFKA_VERSION comes only from matrix.kafka', () => {

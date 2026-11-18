@@ -8,6 +8,8 @@ on:
         description: 'Integration groups, comma-separated (empty runs all; e.g. share-base,admin)'
         required: false
         type: string
+permissions:
+  contents: read
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

@@ -2,6 +2,8 @@ name: Weekly full matrix
 on:
   schedule: [{ cron: '0 3 * * 1' }]
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   integration:
     runs-on: ubuntu-latest
@@ -11,10 +13,12 @@ jobs:
       max-parallel: 6
       matrix:
         node: [22, 24, 26]
-        kafka: ['4.0.2', '4.2.2', '4.3.2', '4.4.0']
+        kafka: ['4.0.2', '4.1.2', '4.2.2', '4.3.2', '4.4.0']
         group: [broker, admin, producer, consumer, others, oauthbearer]
         exclude:
           - { node: 26, kafka: '4.0.2' }
+          - { node: 22, kafka: '4.1.2' }
+          - { node: 26, kafka: '4.1.2' }
           - { node: 22, kafka: '4.2.2' }
           - { node: 24, kafka: '4.3.2' }
     env:

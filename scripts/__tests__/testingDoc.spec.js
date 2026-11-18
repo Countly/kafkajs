@@ -117,8 +117,10 @@ describe('docs/Testing.md', () => {
       kafka: '4.4.0',
       group: 'others',
     })
-    expect(workflows[1]).toContain("kafka: ['4.0.2', '4.2.2', '4.3.2', '4.4.0']")
+    expect(workflows[1]).toContain("kafka: ['4.0.2', '4.1.2', '4.2.2', '4.3.2', '4.4.0']")
     expect(workflows[1]).toContain("- { node: 26, kafka: '4.0.2' }")
+    expect(workflows[1]).toContain("- { node: 22, kafka: '4.1.2' }")
+    expect(workflows[1]).toContain("- { node: 26, kafka: '4.1.2' }")
     expect(workflows[1]).toContain("- { node: 22, kafka: '4.2.2' }")
     expect(workflows[1]).toContain("- { node: 24, kafka: '4.3.2' }")
     expect(workflows[1]).toContain("cron: '0 3 * * 1'")
@@ -129,8 +131,14 @@ describe('docs/Testing.md', () => {
     )
     expect(ci).toContain('Three share lanes run on Node 24 against Kafka 4.4.0:')
     expect(ci).not.toContain('4.3.1')
-    expect(ci).toContain('Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0')
-    expect(ci).toContain('leaves out Node 26 with 4.0.2, Node 22 with 4.2.2 and Node 24 with 4.3.2')
+    expect(ci).toContain('Kafka 4.0.2, 4.1.2, 4.2.2, 4.3.2 and 4.4.0')
+    expect(ci).toContain(
+      'leaves out Node 26 with 4.0.2, Nodes 22 and 26 with 4.1.2, Node 22 with 4.2.2 and Node 24 with 4.3.2'
+    )
+    expect(ci).toContain('ten Kafka-by-Node cells and 60 jobs')
+    expect(page).toContain(
+      'The weekly workflow runs the six groups on Kafka 4.0.2, 4.1.2, 4.2.2, 4.3.2 and 4.4.0'
+    )
     expect(ci).toContain('has no Kafka version input')
   })
 
@@ -138,7 +146,7 @@ describe('docs/Testing.md', () => {
     const kafka = captures(workflows[1], /'(\d+\.\d+\.\d+)'/g)
     const node = captures(workflows[1], /node: \[([\d, ]+)\]/g).flatMap((list) => list.split(/, */))
 
-    expect(kafka).toEqual(['4.0.2', '4.2.2', '4.3.2', '4.4.0'])
+    expect(kafka).toEqual(['4.0.2', '4.1.2', '4.2.2', '4.3.2', '4.4.0'])
     expect(node).toEqual(['22', '24', '26'])
     expect(kafka.filter((version) => !ci.includes(version))).toEqual([])
     expect(node.filter((version) => !ci.includes(version))).toEqual([])
