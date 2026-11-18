@@ -960,7 +960,7 @@ module.exports = class Cluster {
     if (pins === undefined) return
     if (pins === 1) {
       this.topicPins.delete(topic)
-      this.brokerPool.topicRefusals.delete(topic)
+      this.brokerPool?.topicRefusals.delete(topic)
     } else this.topicPins.set(topic, pins - 1)
   }
 
