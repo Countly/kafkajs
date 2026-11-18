@@ -117,7 +117,8 @@ else
   started=1
   docker compose up -d --wait
   stage=cluster-wait
-  node scripts/waitForKafka.js
+  # waitForKafka hands COMPOSE_FILE to `docker compose -f`, which takes one path, not a list.
+  COMPOSE_FILE=docker-compose.telemetry.yml node scripts/waitForKafka.js
   # The controller can still be settling right after the brokers answer, so this retries.
   stage=share-version
   features=(docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092)
