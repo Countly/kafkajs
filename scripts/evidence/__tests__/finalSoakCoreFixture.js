@@ -104,7 +104,7 @@ const logEnd = (entries) => placed(entries).filter((e) => e.offset !== null).len
 
 const authority = (client, extra = {}) => ({
   client,
-  run: 'r1',
+  run: `${client}.r1`,
   member: 'm1',
   epoch: 1,
   token: 1,
@@ -182,7 +182,7 @@ function trafficRecords(config, layout) {
           source: c.process,
           client,
           group: c.group,
-          run: 'r1',
+          run: `${client}.r1`,
           member: 'm1',
           epoch: 1,
           protocol: 'eager',
@@ -305,12 +305,28 @@ function processRecords(config, mode, withInventory) {
           sample(p.slot, 'quiet', at, {
             boundary: `h${String(h).padStart(2, '0')}`,
             reading,
-            admittedAt: at - 5,
+            admittedAt: at,
+            completedAt: at + 5,
             heapUsed: 9e6 + (reading - 1) * 1000,
           })
         }
     sample(p.slot, 'final', end + 100 + i)
   })
+  for (const [phase, t] of [
+    ['start', START - 10],
+    ['end', end + 50],
+  ])
+    records.push({
+      t,
+      at: t,
+      kind: 'shape',
+      source: 'p15',
+      execution: 'traffic',
+      phase,
+      shape: 'traffic',
+      participants: Object.keys(matrix.clientKinds),
+      operationCount: 0,
+    })
   config.processes.forEach((p, i) =>
     records.push({
       t: end + (p.slot === 'p15' ? 2000 : 1000 + i),
@@ -509,6 +525,8 @@ function writeArtifact(world, dir) {
   put('config.json', JSON.stringify(world.config))
   put('stream.ndjson', stream)
   put('supervisor.json', JSON.stringify(world.supervisor))
+  const { code, observedAt } = world.header.exit
+  put('outer-exit.json', JSON.stringify({ status: code, observedAt, ...world.outerExit }))
   for (const file of matrix.acceptance.archive)
     put(
       `archive/${file}`,

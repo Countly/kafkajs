@@ -16,7 +16,7 @@ afterAll(() => dirs.forEach((dir) => fs.rmSync(dir, { recursive: true, force: tr
 /** Judges a world: its Apache files go to disk, its records into a journal (after `edit`). */
 async function check(
   world,
-  { edit = (records) => records, header = (h) => h, supervisor = (s) => s } = {}
+  { edit = (records) => records, header = (h) => h, supervisor = (s) => s, capacity } = {}
 ) {
   const dir = tmp()
   const files = []
@@ -25,14 +25,15 @@ async function check(
     fs.writeFileSync(path.join(dir, 'apache', name), text)
     files.push({ file: `apache/${name}`, bytes: Buffer.byteLength(text), sha256: fx.sha256(text) })
   }
-  const journal = new Journal({ matrix: world.matrix, config: world.config, mode: world.mode })
+  const { matrix, config, mode } = world
+  const journal = new Journal({ matrix, config, mode, capacity })
   edit(world.records()).forEach((r) => journal.add(r))
   const base = { ...fx.copy(world.header), files }
   return judge({
     dir,
-    matrix: world.matrix,
-    config: world.config,
-    mode: world.mode,
+    matrix,
+    config,
+    mode,
     header: header(base),
     supervisor: supervisor(fx.copy(world.supervisor)),
     journal,
@@ -51,6 +52,22 @@ const isEntry = (group, id) => (r) =>
   r.kind === 'identity' && r.stage === 'handler-enter' && r.group === group && r.id === id
 const groupOf = (slot) => `g-${fx.RUN}-${slot}`
 const dumpOf = (world, role) => world.apache[`${role}.dump`].split('\n').filter(Boolean)
+/** @returns {object} a copy of `world` whose log layout has `role` replaced by `entries` */
+const relayout = (world, role, entries) => ({
+  ...world,
+  layout: { ...world.layout, [role]: entries },
+})
+const mapRecords = (predicate, fields) => (records) =>
+  records.map((r) => (predicate(r) ? { ...r, ...fields(r) } : r))
+const isSample = (process, role) => (r) =>
+  r.kind === 'sample' && r.process === process && r.role === role
+/** Writes the world as an artifact, lets `mutate(dir)` change it and checks it from disk. */
+const onDisk = async (world, mutate = () => {}) => {
+  const dir = fx.writeArtifact(world, tmp())
+  mutate(dir)
+  return checkArtifact(dir)
+}
+const smoke = () => fx.healthy({ mode: 'smoke', withInventory: true })
 
 describe('scripts/evidence/finalSoakCore', () => {
   describe('a healthy day', () => {
@@ -65,15 +82,15 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(text).toMatch(/core checker.*K1.*K7.*NOT JUDGED/is)
     })
 
-    it('prints every other contract row as NOT JUDGED with its CI lane and never as PASS', async () => {
+    it('prints every other contract row as NOT JUDGED with its CI lane and no NOT JUDGED line says PASS', async () => {
       const text = formatReport(await check(fx.healthy()))
       const notJudged = text.split('\n').filter((l) => /NOT JUDGED/.test(l) && /lane/.test(l))
       expect(notJudged.length).toBe(core.NOT_JUDGED.length)
       for (const item of core.NOT_JUDGED) {
         const line = notJudged.find((l) => l.includes(item.name))
         expect(line).toMatch(new RegExp(`lane: ${item.lane}`))
-        expect(line).not.toMatch(/PASS/)
       }
+      expect(text.split('\n').filter((l) => /NOT JUDGED/.test(l) && /PASS/.test(l))).toEqual([])
       expect(core.NOT_JUDGED.map((i) => i.name).join('|')).toMatch(
         /share lock lifecycle.*ownership tables.*seed sensitivity.*latency.*cooperative round.*restart leave.*receipts identity.*companions.*recreate/s
       )
@@ -81,7 +98,7 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('lists the seed control, receipt identity, share lock and checkpoint rows as NOT JUDGED even when the supervisor receipt contradicts the run', async () => {
       const report = await check(fx.healthy(), {
-        supervisor: (s) => ({ ...s, runId: 'ffffffffffff', treeSha: 'f'.repeat(40) }),
+        supervisor: (s) => ({ ...s, runId: 'ffffffffffff' }),
       })
       expectRow(report, 'K7', 'FAIL', /runId.*differs/)
       const names = report.notJudged.map((i) => i.name)
@@ -121,6 +138,13 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(world), 'K1', 'FAIL', /absent.*c09\.2/)
     })
 
+    it('fails acknowledged records whose offsets lie at or beyond the log end even when the dump is not proved complete', async () => {
+      const world = fx.healthy()
+      world.apache = fx.renderApache(relayout(world, 'main', world.layout.main.slice(0, 9)))
+      fx.redump(world, 'main', dumpOf(world, 'main').slice(0, 8))
+      expectRow(await check(world), 'K1', 'FAIL', /3 acknowledged.*inside the log.*c08\.9/)
+    })
+
     it('fails a member of an aborted transaction found in the dump', async () => {
       const world = fx.healthy()
       const aborted = `Partition:0\tOffset:5\tc09.4\t${fx.valueOf('c09.4', 'c09.0.x2')}`
@@ -145,8 +169,10 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('fails an id found at an offset other than the acknowledged one', async () => {
       const world = fx.healthy()
-      const edit = (records) =>
-        records.map((r) => (r.stage === 'ack' && r.id === 'c08.3' ? { ...r, offset: '30' } : r))
+      const edit = mapRecords(
+        (r) => r.stage === 'ack' && r.id === 'c08.3',
+        () => ({ offset: '30' })
+      )
       expectRow(await check(world, { edit }), 'K1', 'FAIL', /offset.*c08\.3/)
     })
 
@@ -154,6 +180,84 @@ describe('scripts/evidence/finalSoakCore', () => {
       const world = fx.healthy()
       world.apache['main.dump'] = world.apache['main.dump'].replace(/(c08\.2\t[^\t\n]*?)\./, '$1x')
       expectRow(await check(world), 'K1', 'FAIL', /differ.*c08\.2/)
+    })
+
+    it('accepts an acknowledged send whose offset the broker did not return (-1) when it is in the dump once', async () => {
+      const edit = mapRecords(
+        (r) => r.stage === 'ack' && r.id === 'c08.3',
+        () => ({ offset: '-1' })
+      )
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K1', 'PASS')
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
+    it('fails an acknowledged send with an unknown offset (-1) that is absent from a complete dump', async () => {
+      const world = fx.healthy()
+      world.layout.main[3] = { ...world.layout.main[3], absent: true }
+      world.apache = fx.renderApache(world)
+      const edit = mapRecords(
+        (r) => r.stage === 'ack' && r.id === 'c08.3',
+        () => ({ outcome: 'acknowledged', offset: '-1', errorType: null })
+      )
+      expectRow(await check(world, { edit }), 'K1', 'FAIL', /1 acknowledged.*absent.*c08\.3/)
+    })
+
+    it('is inconclusive, never ACCEPTED, when a second contradictory send result follows a lost acknowledged record', async () => {
+      const world = fx.healthy()
+      world.apache = fx.renderApache(relayout(world, 'main', world.layout.main.slice(0, 11)))
+      const edit = (records) => {
+        const ack = records.find((r) => r.stage === 'ack' && r.id === 'c08.11')
+        const rejected = { outcome: 'rejected', offset: null, errorType: 'KafkaJSProtocolError' }
+        return [...records, { ...ack, t: 9e7, ...rejected }]
+      }
+      const report = await check(world, { edit })
+      expectRow(report, 'K1', 'INCONCLUSIVE', /1 ids or transactions have contradictory.*c08\.11/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('is inconclusive, never ACCEPTED, when a second transaction record says a lost committed transaction aborted', async () => {
+      const world = fx.healthy()
+      const aborted = world.layout.transactions.map((e) =>
+        e.transaction === 'c09.0.x1'
+          ? { ...e, invisible: true }
+          : e.marker
+            ? { marker: 'abort' }
+            : e
+      )
+      world.apache = fx.renderApache(relayout(world, 'transactions', aborted))
+      const edit = (records) => {
+        const x1 = records.find((r) => r.stage === 'transaction' && r.transaction === 'c09.0.x1')
+        const abort = { decision: 'abort', outcome: 'aborted', call: 'c09.0.x1.abort' }
+        return [...records, { ...x1, t: 9e7, ...abort }]
+      }
+      const report = await check(world, { edit })
+      expectRow(report, 'K1', 'INCONCLUSIVE', /contradictory.*c09\.0\.x1/)
+      expect(row(report, 'K1').reasons.join('\n')).toMatch(/contradicted outcome/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('accepts a complete transactions dump when a retried commit marker added one more control offset', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { marker: 'commit' })
+      world.apache = fx.renderApache(world)
+      const report = await check(world)
+      expectRow(report, 'K1', 'PASS')
+      expect(row(report, 'K1').numbers.logEndTransactions).toBe(9)
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
+    it('is inconclusive when the transactions dump stops before a visible record the journal acknowledged', async () => {
+      const world = fx.healthy()
+      fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 3))
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /acknowledged at 3.*not proved complete/)
+    })
+
+    it('is inconclusive when the log end leaves fewer invisible offsets than the journal explains', async () => {
+      const world = fx.healthy()
+      const early = world.layout.transactions.slice(0, -1)
+      world.apache = fx.renderApache(relayout(world, 'transactions', early))
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /at least 4 offsets are invisible/)
     })
 
     it('is inconclusive when the dump stops before the log end, never a pass', async () => {
@@ -172,12 +276,38 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('is inconclusive when a transaction has no confirmed outcome', async () => {
-      const world = fx.healthy()
-      const edit = (records) =>
-        records.map((r) =>
-          r.stage === 'transaction' && r.decision === 'abort' ? { ...r, outcome: 'unknown' } : r
-        )
-      expectRow(await check(world, { edit }), 'K1', 'INCONCLUSIVE', /transaction.*unknown/)
+      const edit = mapRecords(
+        (r) => r.stage === 'transaction' && r.decision === 'abort',
+        () => ({ outcome: 'unknown' })
+      )
+      expectRow(await check(fx.healthy(), { edit }), 'K1', 'INCONCLUSIVE', /transaction.*unknown/)
+    })
+
+    it.each([
+      [
+        'an id offered twice',
+        (records) => [...records, records.find((r) => r.stage === 'offered')],
+        /c08\.0 is offered twice/,
+      ],
+      [
+        'an id offered on another partition',
+        mapRecords(
+          (r) => r.stage === 'offered' && r.id === 'c08.2',
+          (r) => ({ key: { ...r.key, partition: 1 } })
+        ),
+        /c08\.2 is on partition 1/,
+      ],
+      [
+        'a send result for an id never offered',
+        (records) => [
+          ...records,
+          { ...records.find((r) => r.stage === 'ack'), id: 'c08.77', t: 9e7 },
+        ],
+        /c08\.77 is acknowledged but was never offered/,
+      ],
+    ])('leaves K1 to K6 inconclusive for a journal with %s', async (_, edit, reason) => {
+      const report = await check(fx.healthy(), { edit })
+      for (const id of ['K1', 'K2', 'K3', 'K5', 'K6']) expectRow(report, id, 'INCONCLUSIVE', reason)
     })
   })
 
@@ -232,7 +362,18 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('is inconclusive when the dump holds fewer lines than its end marker counted', async () => {
       const world = fx.healthy()
       world.apache['main.dump'] = dumpOf(world, 'main').slice(0, 6).join('\n') + '\n'
-      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /lines/)
+      expectRow(
+        await check(world),
+        'K1',
+        'INCONCLUSIVE',
+        /has 6 lines but its end marker counted 12/
+      )
+    })
+
+    it('is inconclusive when the last dump line has no newline', async () => {
+      const world = fx.healthy()
+      world.apache['main.dump'] = world.apache['main.dump'].replace(/\n$/, '')
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /last line has no newline/)
     })
 
     it('is inconclusive when the tool did not report its own message count', async () => {
@@ -260,33 +401,60 @@ describe('scripts/evidence/finalSoakCore', () => {
       fx.redump(world, 'main', [lines[1], lines[0], ...lines.slice(2)])
       expectRow(await check(world), 'K1', 'INCONCLUSIVE', /not increasing|order/)
     })
+
+    it('is inconclusive, with a bounded read, for a dump line longer than the line cap', async () => {
+      const world = fx.healthy()
+      world.apache['main.dump'] += `${'x'.repeat((1 << 20) + 10)}\n`
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /longer than/)
+    })
+
+    it('is inconclusive for a describe file larger than the small-file cap', async () => {
+      const world = fx.healthy()
+      world.apache[`groups/${groupOf('c02')}.describe`] += ' '.repeat((1 << 20) + 10)
+      expectRow(await check(world), 'K4', 'INCONCLUSIVE', /c02\.describe: larger than/)
+    })
   })
 
   describe('K2 no lost delivery', () => {
     it('fails a visible record that never entered a handler in one group', async () => {
-      const world = fx.healthy()
-      const report = await check(world, { edit: without(isEntry(groupOf('c03'), 'c08.6')) })
-      expectRow(report, 'K2', 'FAIL', /c08\.6.*g-0123456789ab-c03|g-0123456789ab-c03.*c08\.6/)
+      const report = await check(fx.healthy(), { edit: without(isEntry(groupOf('c03'), 'c08.6')) })
+      expectRow(report, 'K2', 'FAIL', /g-0123456789ab-c03 never entered.*first c08\.6/)
+    })
+
+    it('fails a visible transaction member that never entered a handler in one group', async () => {
+      const report = await check(fx.healthy(), { edit: without(isEntry(groupOf('c12'), 'c09.2')) })
+      expectRow(report, 'K2', 'FAIL', /g-0123456789ab-c12 never entered.*first c09\.2/)
     })
 
     it('counts the share group as a recipient of the main topic', async () => {
-      const world = fx.healthy()
-      expectRow(
-        await check(world, { edit: without(isEntry(groupOf('c07'), 'c08.2')) }),
-        'K2',
-        'FAIL',
-        /c08\.2/
-      )
+      const report = await check(fx.healthy(), { edit: without(isEntry(groupOf('c07'), 'c08.2')) })
+      expectRow(report, 'K2', 'FAIL', /g-0123456789ab-c07 never entered.*first c08\.2/)
     })
 
     it('counts the seed group as a recipient of the main topic', async () => {
-      const world = fx.healthy()
-      expectRow(
-        await check(world, { edit: without(isEntry(groupOf('c13'), 'c08.9')) }),
-        'K2',
-        'FAIL',
-        /c08\.9/
-      )
+      const report = await check(fx.healthy(), { edit: without(isEntry(groupOf('c13'), 'c08.9')) })
+      expectRow(report, 'K2', 'FAIL', /g-0123456789ab-c13 never entered.*first c08\.9/)
+    })
+
+    it.each([
+      ['another payload digest', () => ({ payloadSha256: 'f'.repeat(64) }), /another payload/],
+      ['an offset other than the log offset', () => ({ offset: '9' }), /c08\.6.*at 9/],
+      ['another topic', () => ({ key: fx.key(fx.TXN) }), /c08\.6.*fs-0123456789ab-txn/],
+    ])('fails a handler entry that names %s', async (_, fields, reason) => {
+      const edit = mapRecords(isEntry(groupOf('c03'), 'c08.6'), fields)
+      expectRow(await check(fx.healthy(), { edit }), 'K2', 'FAIL', reason)
+    })
+
+    it('fails a read-committed group that entered members of an aborted transaction', async () => {
+      const edit = (records) => {
+        const e = records.find(isEntry(groupOf('c01'), 'c09.0'))
+        return [
+          ...records,
+          { ...e, id: 'c09.4', offset: '5', t: 9e7, payloadSha256: fx.sha256('c09.4') },
+        ]
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K2', 'FAIL', /1 records not visible.*c09\.4 in g-0123456789ab-c01/)
     })
 
     it('does not ask for the delivery of a transaction member that is not visible', async () => {
@@ -303,145 +471,233 @@ describe('scripts/evidence/finalSoakCore', () => {
   })
 
   describe('K3 duplicates', () => {
-    const repeat = (id, group, slot) => (records) => {
-      const first = records.find(isEntry(group, id))
-      return [...records, { ...first, t: first.t + 5000, handler: `${slot}.0.hx` }]
-    }
-    const acquire = (slot, group) => (records) => {
-      const own = records.find((r) => r.kind === 'boundary' && r.group === group)
-      return { ...own, t: 4500, cause: `${slot}.0.extra` }
+    const c01 = groupOf('c01')
+    const entryOf = (records, id = 'c08.4') => records.find(isEntry(c01, id))
+    const boundaryOf = (records) => records.find((r) => r.kind === 'boundary' && r.group === c01)
+    const repeat =
+      (fields = {}) =>
+      (records) => {
+        const e = entryOf(records)
+        return [...records, { ...e, t: e.t + 5000, handler: 'c01.0.hx', ...fields }]
+      }
+    /** @returns {object[]} records plus an acquire of main by another client run of c01 */
+    const otherRun = (records, client = 'c01.1') => {
+      const b = boundaryOf(records)
+      const authority = fx.authority(client, { acquiredAt: 2 })
+      return [
+        ...records,
+        { ...b, t: 9e7, client, run: authority.run, authority },
+        { ...entryOf(records), t: 9e7 + 1, client, handler: `${client}.h1`, authority },
+      ]
     }
 
     it('fails a repeat on the same client run with no assignment change between the entries', async () => {
-      const world = fx.healthy()
-      const report = await check(world, { edit: repeat('c08.4', groupOf('c01'), 'c01') })
-      expectRow(report, 'K3', 'FAIL', /c08\.4.*g-0123456789ab-c01/)
+      const report = await check(fx.healthy(), { edit: repeat() })
+      expectRow(report, 'K3', 'FAIL', /1 same-owner repeats.*c08\.4 in g-0123456789ab-c01/)
     })
 
     it('fails a repeat that an acquire record of the identical, still open ownership tries to excuse', async () => {
-      const world = fx.healthy()
       const edit = (records) =>
-        repeat(
-          'c08.4',
-          groupOf('c01'),
-          'c01'
-        )([...records, acquire('c01', groupOf('c01'))(records)])
-      expectRow(await check(world, { edit }), 'K3', 'FAIL', /c08\.4/)
+        repeat()([...records, { ...boundaryOf(records), t: 4500, cause: 'c01.0.extra' }])
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K3', 'FAIL', /same-owner repeats.*c08\.4/)
+      expect(row(report, 'K3').numbers.redundantAcquires).toBe(1)
+    })
+
+    it('fails an entry after its run revoked the partition and never acquired it again', async () => {
+      const edit = (records) => {
+        const e = entryOf(records)
+        const end = { ...boundaryOf(records), event: 'revoke-end', t: e.t + 4000 }
+        return repeat()([...records, end])
+      }
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K3',
+        'FAIL',
+        /1 entries outside an ownership.*c08\.4/
+      )
+    })
+
+    it('fails a same-owner repeat even when another client run entered the record in between', async () => {
+      const edit = (records) => [...otherRun(records), { ...entryOf(records), t: 9e7 + 2 }]
+      const report = await check(fx.healthy(), { edit })
+      expectRow(
+        report,
+        'K3',
+        'FAIL',
+        /same-owner repeats.*c08\.4 in g-0123456789ab-c01 by c01\.0\.r1/
+      )
+    })
+
+    it('counts a repeat by another client run with its own acquisition, without failing it', async () => {
+      const report = await check(fx.healthy(), { edit: otherRun })
+      expectRow(report, 'K3', 'PASS')
+      expect(row(report, 'K3').numbers.repeatsAfterChange).toBe(1)
+    })
+
+    it('counts, without failing, a repeat after the same run acquired the partition again without a revoke', async () => {
+      const edit = (records) => {
+        const b = boundaryOf(records)
+        const authority = fx.authority('c01.0', { acquiredAt: 2 })
+        return repeat({ authority })([...records, { ...b, t: 9e6, authority }])
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K3', 'PASS')
+      expect(row(report, 'K3').numbers.repeatsAfterChange).toBe(1)
+    })
+
+    it('fails an entry whose batch acquisition is not the run’s open acquisition', async () => {
+      const edit = (records) => {
+        const authority = fx.authority('c01.0', { acquiredAt: 2 })
+        return repeat()([...records, { ...boundaryOf(records), t: 9e6, authority }])
+      }
+      expectRow(await check(fx.healthy(), { edit }), 'K3', 'FAIL', /entries outside an ownership/)
     })
 
     it('counts and prints a repeat after an assignment change without failing it', async () => {
-      const world = fx.healthy()
-      const group = groupOf('c01')
       const edit = (records) => {
-        const first = records.find(isEntry(group, 'c08.4'))
-        const own = records.find((r) => r.kind === 'boundary' && r.group === group)
-        const end = { ...own, event: 'revoke-end', t: first.t + 1 }
-        const again = { ...own, event: 'acquire', t: first.t + 2 }
-        return [...records, end, again, { ...first, t: first.t + 3, handler: 'c01.0.hx' }]
+        const e = entryOf(records)
+        const b = boundaryOf(records)
+        const end = { ...b, event: 'revoke-end', t: e.t + 1 }
+        return [...records, end, { ...b, t: e.t + 2 }, { ...e, t: e.t + 3, handler: 'c01.0.hx' }]
       }
-      const report = await check(world, { edit })
+      const report = await check(fx.healthy(), { edit })
       expectRow(report, 'K3', 'PASS')
       expect(row(report, 'K3').numbers.repeatsAfterChange).toBe(1)
       expect(formatReport(report)).toMatch(/repeatsAfterChange.*1/)
     })
 
-    it('counts a repeat on another client run as a counted repeat, not a failure', async () => {
-      const world = fx.healthy()
-      const group = groupOf('c01')
-      const edit = (records) => {
-        const first = records.find(isEntry(group, 'c08.4'))
-        return [
-          ...records,
-          {
-            ...first,
-            t: first.t + 3,
-            handler: 'c01.0.hx',
-            authority: { ...first.authority, run: 'r2' },
-          },
-        ]
-      }
-      const report = await check(world, { edit })
-      expectRow(report, 'K3', 'PASS')
-      expect(row(report, 'K3').numbers.repeatsAfterChange).toBe(1)
+    it.each([
+      [
+        'a run no boundary opened',
+        { authority: fx.authority('c01.0', { run: 'c01.0.r2' }) },
+        /outside an ownership.*c01\.0\.r2/,
+      ],
+      ['another client', { authority: fx.authority('c01.7') }, /attributed to another client/],
+      ['no authority in an ordinary group', { authority: null }, /attributed to another client/],
+    ])('fails an entry whose authority names %s', async (_, fields, reason) => {
+      expectRow(await check(fx.healthy(), { edit: repeat(fields) }), 'K3', 'FAIL', reason)
+    })
+
+    it('fails a boundary emitted by a process that does not run its client', async () => {
+      const edit = (records) => [...records, { ...boundaryOf(records), t: 9e7, source: 'p02' }]
+      expectRow(await check(fx.healthy(), { edit }), 'K3', 'FAIL', /attributed to another client/)
     })
 
     it('does not judge a share group redelivery', async () => {
-      const world = fx.healthy()
       const edit = (records) => {
-        const first = records.find(isEntry(groupOf('c07'), 'c08.4'))
-        return [...records, { ...first, t: first.t + 3, handler: 'c07.0.hx', deliveryCount: 2 }]
+        const e = records.find(isEntry(groupOf('c07'), 'c08.4'))
+        return [...records, { ...e, t: e.t + 3, handler: 'c07.0.hx', deliveryCount: 2 }]
       }
-      const report = await check(world, { edit })
+      const report = await check(fx.healthy(), { edit })
       expectRow(report, 'K3', 'PASS')
       expect(row(report, 'K3').numbers.shareRepeats).toBe(1)
     })
   })
 
   describe('K4 commits', () => {
-    const behind = (world, group) => {
-      const text = world.apache[`groups/${group}.describe`]
-      world.apache[`groups/${group}.describe`] = text.replace(
-        /(\S+\s+\S+\s+0\s+)12(\s+12)/,
-        '$111$2'
+    const describe_ = (world, slot) => `groups/${groupOf(slot)}.describe`
+    const edit = (world, slot, fn) => {
+      const name = describe_(world, slot)
+      fx.putStep(
+        world.apache,
+        name,
+        fn(world.apache[name]),
+        'Consumer group has no active members.\n'
       )
     }
+    const behind = (text) => text.replace(/(\S+\s+\S+\s+0\s+)12(\s+12\s+)0/, '$111$21')
 
     it('fails a group whose committed offset is behind the log end', async () => {
       const world = fx.healthy()
-      behind(world, groupOf('c02'))
-      expectRow(await check(world), 'K4', 'FAIL', /g-0123456789ab-c02.*11.*12/)
+      edit(world, 'c02', behind)
+      expectRow(await check(world), 'K4', 'FAIL', /g-0123456789ab-c02 committed 11 on main.*12/)
     })
 
     it('does not accept client side readbacks in place of the Apache describe', async () => {
       const world = fx.healthy()
-      behind(world, groupOf('c02'))
-      const edit = (records) => [
-        ...records,
-        {
-          t: 9000,
-          kind: 'identity',
-          stage: 'broker-commit',
-          source: 'p02',
-          client: 'c02.0',
-          group: groupOf('c02'),
-          commit: 'c02.0.m1',
-          key: fx.key(fx.MAIN),
-          next: '12',
-          errorCode: 0,
-        },
-      ]
-      expectRow(await check(world, { edit }), 'K4', 'FAIL', /c02/)
+      edit(world, 'c02', behind)
+      const readback = {
+        t: 9000,
+        kind: 'identity',
+        stage: 'broker-commit',
+        source: 'p02',
+        client: 'c02.0',
+        group: groupOf('c02'),
+        commit: 'c02.0.m1',
+        key: fx.key(fx.MAIN),
+        next: '12',
+        errorCode: 0,
+      }
+      const report = await check(world, { edit: (records) => [...records, readback] })
+      expectRow(report, 'K4', 'FAIL', /c02 committed 11/)
     })
 
     it('fails a group that has no row for a topic it must commit', async () => {
       const world = fx.healthy()
-      const name = `groups/${groupOf('c01')}.describe`
-      const text = world.apache[name]
-        .split('\n')
-        .filter((l) => !l.includes(fx.TXN))
-        .join('\n')
-      fx.putStep(world.apache, name, text, 'Consumer group has no active members.\n')
-      expectRow(await check(world), 'K4', 'FAIL', /c01.*no row/)
+      edit(world, 'c01', (text) =>
+        text
+          .split('\n')
+          .filter((l) => !l.includes(fx.TXN))
+          .join('\n')
+      )
+      expectRow(await check(world), 'K4', 'FAIL', /c01 has no row for transactions/)
     })
 
     it('fails a group that never committed on a partition', async () => {
       const world = fx.healthy()
-      const group = groupOf('c01')
-      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`].replace(
-        /(\S+\s+\S+\s+0\s+)12(\s+12\s+)0/,
-        '$1-$2-'
-      )
-      expectRow(await check(world), 'K4', 'FAIL', /c01.*committed/)
+      edit(world, 'c01', (text) => text.replace(/(\S+\s+\S+\s+0\s+)12(\s+12\s+)0/, '$1-$2-'))
+      expectRow(await check(world), 'K4', 'FAIL', /c01 never committed on main/)
+    })
+
+    it('is inconclusive when a describe row has no log end', async () => {
+      const world = fx.healthy()
+      edit(world, 'c01', (text) => text.replace(/(\S+\s+\S+\s+0\s+12\s+)12(\s+)0/, '$1-$2-'))
+      expectRow(await check(world), 'K4', 'INCONCLUSIVE', /c01 has no log end for main/)
     })
 
     it('is inconclusive when two describes disagree about the log end', async () => {
       const world = fx.healthy()
-      const group = groupOf('c01')
-      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`].replace(
-        /(0\s+)12(\s+)12/,
-        (_, a, b) => `${a}13${b}13`
-      )
-      expectRow(await check(world), 'K4', 'INCONCLUSIVE', /log end/)
+      edit(world, 'c01', (text) => text.replace(/(0\s+)12(\s+)12/, (_, a, b) => `${a}13${b}13`))
+      expectRow(await check(world), 'K4', 'INCONCLUSIVE', /disagree about the main log end/)
+    })
+
+    it('accepts the row Kafka prints for a member that has no assignment', async () => {
+      const world = fx.healthy()
+      const member = `${groupOf('c01')} -  -          -               -               -               c01.0-4d2a /10.0.0.7 c01.0`
+      edit(world, 'c01', (text) => text.replace(/\n$/, `\n${member}\n`))
+      const report = await check(world)
+      expectRow(report, 'K4', 'PASS')
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
+    it.each([
+      [
+        'a LAG that disagrees with the two offsets',
+        (t) => t.replace(/(0\s+12\s+12\s+)0/, '$11'),
+        /LAG is not 0/,
+      ],
+      [
+        'a second row for one partition',
+        (t) => t.replace(/(\n\S+ \S+-main \S.*)\n/, '$1$1\n'),
+        /second row/,
+      ],
+      [
+        'a header other than Kafka’s nine columns',
+        (t) => t.replace(/\s+CONSUMER-ID.*/, ''),
+        /no describe header/,
+      ],
+    ])('is inconclusive for a describe with %s', async (_, fn, reason) => {
+      const world = fx.healthy()
+      edit(world, 'c02', fn)
+      expectRow(await check(world), 'K4', 'INCONCLUSIVE', reason)
+    })
+
+    it('is inconclusive when a describe has more lines than its end marker counted', async () => {
+      const world = fx.healthy()
+      const name = describe_(world, 'c02')
+      world.apache[`${name}.end`] = 'exit=0 lines=2\n'
+      expectRow(await check(world), 'K4', 'INCONCLUSIVE', /other than the 2 lines/)
     })
 
     it('does not judge the share group, which has no offset commits', async () => {
@@ -452,109 +708,173 @@ describe('scripts/evidence/finalSoakCore', () => {
   })
 
   describe('K5 heap', () => {
-    const heap = (process, fn) => (records) =>
-      records.map((r) =>
-        r.kind === 'sample' && r.role === 'quiet' && r.process === process
-          ? { ...r, heapUsed: fn(Number(r.boundary.slice(1)), r.heapUsed) }
-          : r
-      )
+    const quiet = (process, fn) =>
+      mapRecords(isSample(process, 'quiet'), (r) => fn(Number(r.boundary.slice(1)), r))
 
     it('fails an endpoint above the bound', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: heap('p04', (h, v) => (h >= 21 ? v + 3 * 1024 * 1024 : v)),
-      })
-      expectRow(report, 'K5', 'FAIL', /p04.*endpoint/)
+      const edit = quiet('p04', (h, r) =>
+        h >= 21 ? { heapUsed: r.heapUsed + 3 * 1024 * 1024 } : {}
+      )
+      expectRow(await check(fx.healthy(), { edit }), 'K5', 'FAIL', /p04 heap endpoint/)
     })
 
     it('fails a slope above the bound even when the endpoint is clean', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: heap('p05', (h, v) => (h >= 12 && h <= 20 ? v + 500 * 1024 * 1024 : v)),
-      })
-      expectRow(report, 'K5', 'FAIL', /p05.*slope/)
+      const edit = quiet('p05', (h, r) =>
+        h >= 12 && h <= 20 ? { heapUsed: r.heapUsed + 500 * 1024 * 1024 } : {}
+      )
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K5', 'FAIL', /p05 heap slope/)
       expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p05.*endpoint/)
     })
 
+    it('is inconclusive, not a zero slope, when every quiet reading of a process completed at one time', async () => {
+      const end = fx.healthy().header.window.runEndAt
+      const edit = quiet('p05', (h, r) => ({
+        completedAt: end,
+        heapUsed: h >= 12 && h <= 20 ? r.heapUsed + 500 * 1024 * 1024 : r.heapUsed,
+      }))
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K5', 'INCONCLUSIVE', /p05 h00 readings lie outside/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('is inconclusive when a boundary’s readings were admitted before the hour’s quiet window', async () => {
+      const edit = quiet('p03', (h, r) =>
+        h === 10 ? { admittedAt: r.admittedAt - 600000, completedAt: r.completedAt - 600000 } : {}
+      )
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K5',
+        'INCONCLUSIVE',
+        /p03 h10 readings lie outside/
+      )
+    })
+
     it('is inconclusive when a process has fewer than 24 quiet boundaries', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: without((r) => r.kind === 'sample' && r.process === 'p03' && r.boundary === 'h10'),
-      })
-      expectRow(report, 'K5', 'INCONCLUSIVE', /p03.*23 of 24/)
+      const edit = without(
+        (r) => r.kind === 'sample' && r.process === 'p03' && r.boundary === 'h10'
+      )
+      expectRow(await check(fx.healthy(), { edit }), 'K5', 'INCONCLUSIVE', /p03.*23 of 24/)
     })
 
     it('does not let the seed process substitute for or fail an unseeded process', async () => {
-      const world = fx.healthy()
-      const report = await check(world, { edit: heap('p13', (h, v) => v + h * 50 * 1024 * 1024) })
-      expectRow(report, 'K5', 'PASS')
+      const edit = quiet('p13', (h, r) => ({ heapUsed: r.heapUsed + h * 50 * 1024 * 1024 }))
+      expectRow(await check(fx.healthy(), { edit }), 'K5', 'PASS')
     })
 
-    it('computes the screen from the median of each boundary and a least-squares slope', () => {
+    it('computes the screen from the median of each boundary and a least-squares slope, NaN without time spread', () => {
       const boundaries = Array.from({ length: 24 }, (_, h) =>
         [0, 1, 2].map((i) => ({ heapUsed: 1000 + h * 100 + i, completedAt: (h * 3600 + i) * 1000 }))
       )
-      const result = core.heapScreen(boundaries, { endpointBytes: 5000, slopeBytesPerMinute: 2 })
+      const result = core.heapScreen(boundaries)
       expect(result.endpoint).toBe(2100)
       expect(result.slope).toBeCloseTo(100 / 60, 3)
-      expect(result.ok).toBe(true)
+      const flat = boundaries.map((b) => b.map((r) => ({ ...r, completedAt: 5 })))
+      expect(core.heapScreen(flat).slope).toBeNaN()
     })
   })
 
   describe('K6 resources', () => {
-    const final = (process, resources) => (records) =>
-      records.map((r) =>
-        r.kind === 'sample' && r.role === 'final' && r.process === process
-          ? { ...r, activeResources: resources }
-          : r
-      )
+    const final = (process, activeResources) =>
+      mapRecords(isSample(process, 'final'), () => ({ activeResources }))
 
     it('fails a handle left over after the final disconnect', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: final('p02', [
-          { type: 'TCPSocketWrap', count: 0 },
-          { type: 'Timeout', count: 3 },
-        ]),
-      })
-      expectRow(report, 'K6', 'FAIL', /p02.*Timeout.*3.*2/)
+      const edit = final('p02', [
+        { type: 'TCPSocketWrap', count: 0 },
+        { type: 'Timeout', count: 3 },
+      ])
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K6',
+        'FAIL',
+        /p02 final Timeout 3 exceeds its baseline 2/
+      )
     })
 
     it('fails a resource type that the baseline never had', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: final('p09', [
-          { type: 'TCPSocketWrap', count: 0 },
-          { type: 'Timeout', count: 0 },
-          { type: 'MysteryWrap', count: 1 },
-        ]),
-      })
-      expectRow(report, 'K6', 'FAIL', /p09.*MysteryWrap/)
+      const edit = final('p09', [{ type: 'MysteryWrap', count: 1 }])
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K6',
+        'FAIL',
+        /p09 final MysteryWrap 1 exceeds its baseline 0/
+      )
     })
 
-    it('is inconclusive when a process has no final sample', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: without((r) => r.kind === 'sample' && r.role === 'final' && r.process === 'p11'),
-      })
-      expectRow(report, 'K6', 'INCONCLUSIVE', /p11.*final/)
+    it.each(['final', 'baseline'])(
+      'is inconclusive when a process has no %s sample',
+      async (role) => {
+        const edit = without(isSample('p11', role))
+        expectRow(
+          await check(fx.healthy(), { edit }),
+          'K6',
+          'INCONCLUSIVE',
+          new RegExp(`p11 has no ${role}`)
+        )
+      }
+    )
+
+    it('is inconclusive when the final sample was taken right after the baseline, before the drain', async () => {
+      const edit = mapRecords(isSample('p02', 'final'), () => ({
+        t: 402,
+        admittedAt: 401,
+        completedAt: 402,
+      }))
+      const report = await check(fx.healthy(), { edit })
+      expectRow(
+        report,
+        'K6',
+        'INCONCLUSIVE',
+        /p02 final sample was not taken last and after the end of traffic/
+      )
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('is inconclusive when the end of traffic follows the final samples', async () => {
+      const edit = mapRecords(
+        (r) => r.kind === 'shape' && r.phase === 'end',
+        (r) => ({ at: r.at + 10000 })
+      )
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K6',
+        'INCONCLUSIVE',
+        /p01 final sample was not taken last/
+      )
+    })
+
+    it('is inconclusive when the journal records no end of traffic', async () => {
+      const edit = without((r) => r.kind === 'shape' && r.phase === 'end')
+      expectRow(await check(fx.healthy(), { edit }), 'K6', 'INCONCLUSIVE', /no end of traffic/)
+    })
+
+    it('is inconclusive when the baseline was completed after another sample of its process', async () => {
+      const edit = mapRecords(isSample('p04', 'baseline'), () => ({ completedAt: 2e6 }))
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K6',
+        'INCONCLUSIVE',
+        /p04 baseline was completed after/
+      )
     })
   })
 
   describe('K7 exit and completeness', () => {
-    const exitOf = (process, fields) => (records) =>
-      records.map((r) =>
-        r.kind === 'process' && r.event === 'exit' && r.process === process
-          ? { ...r, ...fields }
-          : r
+    const exitOf = (process, fields) =>
+      mapRecords(
+        (r) => r.kind === 'process' && r.event === 'exit' && r.process === process,
+        () => fields
       )
+    const periodic = (process, slot, fields) =>
+      mapRecords((r) => isSample(process, 'periodic')(r) && r.slot === slot, fields)
 
     it('fails a parent observed exit code that is not zero', async () => {
+      const header = (h) => ({ ...h, exit: { ...h.exit, code: 1 } })
       expectRow(
-        await check(fx.healthy(), { header: (h) => ({ ...h, exit: { ...h.exit, code: 1 } }) }),
+        await check(fx.healthy(), { header }),
         'K7',
         'FAIL',
-        /supervisor.*code 1/
+        /supervisor exited with code 1/
       )
     })
 
@@ -568,73 +888,94 @@ describe('scripts/evidence/finalSoakCore', () => {
       }
     })
 
-    it('fails a forced exit', async () => {
+    it('fails a child exit by SIGKILL', async () => {
       const report = await check(fx.healthy(), {
         edit: exitOf('p07', { code: null, signal: 'SIGKILL' }),
       })
       expectRow(report, 'K7', 'FAIL', /p07.*SIGKILL/)
     })
 
-    it('fails a process with no observed exit', async () => {
-      const report = await check(fx.healthy(), {
-        edit: without((r) => r.kind === 'process' && r.event === 'exit' && r.process === 'p12'),
-      })
-      expectRow(report, 'K7', 'FAIL', /p12.*no.*exit/)
+    it.each([
+      [
+        'no observed exit',
+        (r) => r.kind === 'process' && r.event === 'exit' && r.process === 'p12',
+        /p12 has no parent-observed exit/,
+      ],
+      [
+        'no start record',
+        (r) => r.kind === 'process' && r.event === 'start' && r.process === 'p05',
+        /p05 has no start record/,
+      ],
+    ])('fails a process with %s', async (_, predicate, reason) => {
+      expectRow(await check(fx.healthy(), { edit: without(predicate) }), 'K7', 'FAIL', reason)
     })
 
-    it('fails a supervisor that aborted, was incomplete or recorded collector failures', async () => {
+    it('fails a process with a repeated sample', async () => {
+      const edit = (records) => [
+        ...records,
+        records.find((r) => isSample('p05', 'periodic')(r) && r.slot === 3),
+      ]
+      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /p05 has 1 repeated/)
+    })
+
+    it('fails a supervisor receipt that reports any failure or names another run, mode or tree', async () => {
       for (const [field, value, reason] of [
-        ['aborted', 'host monitor', /abort/],
-        ['incomplete', 'queue timeout', /incomplete/],
-        ['failures', ['stream cap'], /failure/],
-        ['problems', ['handler entry c01.0.h4 lacks batch authority'], /problems/],
+        ['aborted', 'host monitor', /aborted the run: host monitor/],
+        ['incomplete', 'queue timeout', /incomplete run: queue timeout/],
+        ['failures', ['stream cap'], /1 failures: stream cap/],
+        ['problems', ['handler entry c01.0.h4 lacks batch authority'], /reports 1 problems/],
         ['forced', ['p07'], /forced p07/],
+        ['steps', { ok: 9, late: 0, error: 1, aborted: 0 }, /1 steps failed/],
+        ['steps', { ok: 9, late: 0, error: 0, aborted: 2 }, /2 aborted/],
+        ['diagnostic', true, /marked diagnostic/],
+        ['mode', 'smoke', /mode differs/],
+        ['treeSha', 'f'.repeat(40), /treeSha differs/],
       ]) {
-        expectRow(
-          await check(fx.healthy(), { supervisor: (s) => ({ ...s, [field]: value }) }),
-          'K7',
-          'FAIL',
-          reason
-        )
+        const supervisor = (s) => ({ ...s, [field]: value })
+        expectRow(await check(fx.healthy(), { supervisor }), 'K7', 'FAIL', reason)
       }
     })
 
     it('fails a run shorter than 24 hours in acceptance mode', async () => {
-      const report = await check(fx.healthy(), {
-        header: (h) => ({
-          ...h,
-          window: { ...h.window, requestedMs: 3600000, runEndAt: h.window.runStartAt + 3600000 },
-        }),
+      const header = (h) => ({
+        ...h,
+        window: { ...h.window, requestedMs: 3600000, runEndAt: h.window.runStartAt + 3600000 },
       })
-      expectRow(report, 'K7', 'FAIL', /3600000.*86400000/)
+      expectRow(await check(fx.healthy(), { header }), 'K7', 'FAIL', /3600000.*86400000/)
+    })
+
+    it('fails a run window that is not the requested time', async () => {
+      const header = (h) => ({ ...h, window: { ...h.window, runEndAt: h.window.runEndAt - 1 } })
+      expectRow(
+        await check(fx.healthy(), { header }),
+        'K7',
+        'FAIL',
+        /window is not the requested time/
+      )
     })
 
     it('fails a gap in the periodic sample grid', async () => {
-      const report = await check(fx.healthy(), {
-        edit: without(
-          (r) =>
-            r.kind === 'sample' && r.role === 'periodic' && r.process === 'p03' && r.slot === 1500
-        ),
-      })
-      expectRow(report, 'K7', 'FAIL', /p03.*slot 1500/)
+      const edit = without((r) => isSample('p03', 'periodic')(r) && r.slot === 1500)
+      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /p03 misses periodic slot 1500/)
     })
 
     it('fails a periodic sample admitted before its slot', async () => {
-      const report = await check(fx.healthy(), {
-        edit: (records) =>
-          records.map((r) =>
-            r.role === 'periodic' && r.process === 'p03' && r.slot === 700
-              ? { ...r, admittedAt: r.admittedAt - 60000 }
-              : r
-          ),
-      })
-      expectRow(report, 'K7', 'FAIL', /p03.*slot 700.*early/)
+      const edit = periodic('p03', 700, (r) => ({ admittedAt: r.admittedAt - 60000 }))
+      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /p03 slot 700.*early/)
+    })
+
+    it('fails a periodic sample admitted after its slot window', async () => {
+      const edit = periodic('p03', 1500, (r) => ({ admittedAt: r.admittedAt + 6000 }))
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K7',
+        'FAIL',
+        /p03 slot 1500 was admitted late/
+      )
     })
 
     it('fails when the stream, header, config or matrix failed validation', async () => {
-      const dir = tmp()
-      const world = fx.healthy()
-      const report = await judgeWith(world, dir, {
+      const report = await judgeWith(fx.healthy(), tmp(), {
         problems: ['line 5: seq is not the next of its source'],
       })
       expectRow(report, 'K7', 'FAIL', /seq is not the next/)
@@ -642,53 +983,42 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('fails when a process reported a problem diagnostic', async () => {
-      const edit = (records) => [
-        ...records,
-        {
-          t: 9500,
-          kind: 'diagnostic',
-          source: 'p01',
-          message: 'problem: collector refused a record',
-        },
-      ]
-      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /1 problem: diagnostics/)
+      const diagnostic = {
+        t: 9500,
+        kind: 'diagnostic',
+        source: 'p01',
+        message: 'problem: collector refused a record',
+      }
+      const report = await check(fx.healthy(), { edit: (records) => [...records, diagnostic] })
+      expectRow(report, 'K7', 'FAIL', /1 problem: diagnostics/)
     })
 
     it('is inconclusive for delivery and duplicates when a handler call was journaled only in part', async () => {
-      const edit = (records) => [
-        ...records,
-        {
-          t: 9500,
-          kind: 'diagnostic',
-          source: 'p01',
-          message: 'partial handler-enter {"id":"c08.4"}',
-        },
-      ]
-      const report = await check(fx.healthy(), { edit })
+      const diagnostic = {
+        t: 9500,
+        kind: 'diagnostic',
+        source: 'p01',
+        message: 'partial handler-enter {"id":"c08.4"}',
+      }
+      const report = await check(fx.healthy(), { edit: (records) => [...records, diagnostic] })
       expectRow(report, 'K2', 'INCONCLUSIVE', /journaled only in part/)
       expectRow(report, 'K3', 'INCONCLUSIVE', /journaled only in part/)
     })
 
     it('is inconclusive when the driver journaled a missing source', async () => {
-      const edit = (records) => [
-        ...records,
-        {
-          t: 9500,
-          kind: 'diagnostic',
-          source: 'p01',
-          message: 'missing-source batch authority at c01.0.h7',
-        },
-      ]
-      expectRow(await check(fx.healthy(), { edit }), 'K7', 'INCONCLUSIVE', /missing-source/)
+      const diagnostic = {
+        t: 9500,
+        kind: 'diagnostic',
+        source: 'p01',
+        message: 'missing-source batch authority at c01.0.h7',
+      }
+      const report = await check(fx.healthy(), { edit: (records) => [...records, diagnostic] })
+      expectRow(report, 'K7', 'INCONCLUSIVE', /missing-source/)
     })
 
     it('is inconclusive when the supervisor receipt is absent', async () => {
-      expectRow(
-        await check(fx.healthy(), { supervisor: () => null }),
-        'K7',
-        'INCONCLUSIVE',
-        /supervisor\.json/
-      )
+      const report = await check(fx.healthy(), { supervisor: () => null })
+      expectRow(report, 'K7', 'INCONCLUSIVE', /supervisor\.json/)
     })
   })
 
@@ -715,24 +1045,54 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(before.ids).toBe(12 + 6)
     })
 
-    it('refuses an offered id beyond the capacity and says K1 cannot be judged', async () => {
-      const world = fx.healthy()
-      const journal = new Journal({
-        matrix: world.matrix,
-        config: world.config,
-        mode: 'acceptance',
-        capacity: 5,
-      })
-      world.records().forEach((r) => journal.add(r))
-      expect(journal.problems.join('\n')).toMatch(/more than 5 offered ids/)
-    })
+    it.each([
+      ['offered ids', 5, (records) => records, /more than 5 offered ids/],
+      [
+        'open ownership intervals',
+        18,
+        (records) => {
+          const b = records.find((r) => r.kind === 'boundary')
+          return [
+            ...records,
+            ...[2, 3, 4, 5, 6].map((n) => ({
+              ...b,
+              t: 9e7 + n,
+              run: `${b.client}.r${n}`,
+              authority: { ...b.authority, run: `${b.client}.r${n}` },
+            })),
+          ]
+        },
+        /more than 18 open ownership intervals/,
+      ],
+      [
+        'transactions',
+        18,
+        (records) => {
+          const x = records.find((r) => r.stage === 'transaction')
+          return [
+            ...records,
+            ...Array.from({ length: 17 }, (_, n) => ({
+              ...x,
+              t: 9e7 + n,
+              transaction: `c09.0.y${n}`,
+            })),
+          ]
+        },
+        /more than 18 transactions/,
+      ],
+    ])(
+      'refuses %s beyond the capacity and leaves K1 to K6 inconclusive',
+      async (_, capacity, edit, reason) => {
+        const report = await check(fx.healthy(), { capacity, edit })
+        for (const id of ['K1', 'K2', 'K3', 'K5', 'K6'])
+          expectRow(report, id, 'INCONCLUSIVE', reason)
+      }
+    )
   })
 
   describe('a whole artifact on disk', () => {
     it('is checked end to end: stream validated, manifest bound, smoke named diagnostic', async () => {
-      const world = fx.healthy({ mode: 'smoke', withInventory: true })
-      const dir = fx.writeArtifact(world, tmp())
-      const report = await checkArtifact(dir)
+      const report = await onDisk(smoke())
       expect(report.rows.map((r) => `${r.id}:${r.verdict}`)).toEqual([
         'K1:PASS',
         'K2:PASS',
@@ -742,28 +1102,70 @@ describe('scripts/evidence/finalSoakCore', () => {
         'K6:PASS',
         'K7:PASS',
       ])
-      expect(report.overall).not.toBe('ACCEPTED')
-      expect(formatReport(report)).toMatch(/smoke/i)
+      expect(report.overall).toBe('NOT ACCEPTED')
+      expect(formatReport(report)).toMatch(/smoke runs are diagnostic/)
     })
 
     it('fails K7 and trusts nothing from a stream that was changed after the header hashed it', async () => {
-      const world = fx.healthy({ mode: 'smoke', withInventory: true })
-      const dir = fx.writeArtifact(world, tmp())
-      const file = path.join(dir, 'stream.ndjson')
-      fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('"c08.3"', '"c08.4"'))
-      const report = await checkArtifact(dir)
+      const report = await onDisk(smoke(), (dir) => {
+        const file = path.join(dir, 'stream.ndjson')
+        fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('"c08.3"', '"c08.4"'))
+      })
       expectRow(report, 'K7', 'FAIL', /digest|manifest/)
       expectRow(report, 'K1', 'INCONCLUSIVE', /not valid/)
     })
 
-    it('fails K7 when the artifact ran a matrix other than the reviewed one', async () => {
-      const world = fx.healthy({ mode: 'smoke', withInventory: true })
-      const dir = fx.writeArtifact(world, tmp())
-      const file = path.join(dir, 'archive/scripts/soak/finalSoakMatrix.json')
-      const m = JSON.parse(fs.readFileSync(file, 'utf8'))
-      m.bounds['heap-endpoint'].value = 1e12
-      fs.writeFileSync(file, JSON.stringify(m))
-      expectRow(await checkArtifact(dir), 'K7', 'FAIL', /matrix/)
+    it('fails K7 for a stream whose last line has no newline', async () => {
+      const report = await onDisk(smoke(), (dir) => {
+        const file = path.join(dir, 'stream.ndjson')
+        fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/\n$/, ''))
+      })
+      expectRow(report, 'K7', 'FAIL', /ends without a newline/)
+    })
+
+    it('fails K7 and names the checkout when the artifact ran a matrix other than the checkout’s', async () => {
+      const report = await onDisk(smoke(), (dir) => {
+        const file = path.join(dir, 'archive/scripts/soak/finalSoakMatrix.json')
+        const m = JSON.parse(fs.readFileSync(file, 'utf8'))
+        m.bounds['heap-endpoint'].value = 1e12
+        fs.writeFileSync(file, JSON.stringify(m))
+      })
+      const checkout = path.resolve(__dirname, '../../..')
+      expectRow(
+        report,
+        'K7',
+        'FAIL',
+        new RegExp(`matrix of the checkout this checker runs from \\(${checkout}\\)`)
+      )
+    })
+
+    it.each(['supervisor.json', 'config.json'])(
+      'fails K7 when %s changed after the header bound it',
+      async (file) => {
+        const report = await onDisk(smoke(), (dir) => fs.appendFileSync(path.join(dir, file), ' '))
+        expectRow(
+          report,
+          'K7',
+          'FAIL',
+          new RegExp(`${file.replace('.', '\\.')}: differs from the header manifest`)
+        )
+      }
+    )
+
+    it.each([
+      [
+        'disagrees with the header exit',
+        (dir) =>
+          fs.writeFileSync(path.join(dir, 'outer-exit.json'), '{"status":143,"observedAt":1}'),
+      ],
+      ['is missing', (dir) => fs.rmSync(path.join(dir, 'outer-exit.json'))],
+    ])('fails K7 when outer-exit.json %s', async (_, mutate) => {
+      expectRow(
+        await onDisk(smoke(), mutate),
+        'K7',
+        'FAIL',
+        /outer-exit\.json is missing or disagrees/
+      )
     })
 
     it('rejects a partial artifact that has a partial manifest and no header', async () => {
@@ -774,12 +1176,11 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.overall).toBe('REJECTED')
     })
 
-    it('exits 0 only for ACCEPTED and prints the report', async () => {
-      const world = fx.healthy({ mode: 'smoke', withInventory: true })
-      const dir = fx.writeArtifact(world, tmp())
+    it('exits 1 for a smoke artifact, 2 for a usage error, and prints the report', async () => {
+      const dir = fx.writeArtifact(smoke(), tmp())
       const lines = []
       expect(await core.main([dir], (line) => lines.push(line))).toBe(1)
-      expect(lines.join('\n')).toMatch(/CORE VERDICT/)
+      expect(lines.join('\n')).toMatch(/CORE VERDICT: NOT ACCEPTED/)
       expect(await core.main([], () => {})).toBe(2)
     })
   })
