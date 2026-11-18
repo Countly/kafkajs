@@ -1031,6 +1031,38 @@ describe('producer metadata idle expiry over the wire', () => {
     }
   )
 
+  test.each(['reconnect', 'rebootstrap'])(
+    'after a %s cleared the metadata, a deleted earlier target fails only its own sends and a send to a new topic succeeds at once',
+    async (event) => {
+      w = start({ producer: { deliveryTimeout: 3000 } })
+      await w.producer.connect()
+      expect(await settle(send('a'))).toMatchObject({ state: 'fulfilled' })
+      expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+      w.state.missing.add('a')
+
+      if (event === 'reconnect') {
+        expect(await settle(w.producer.disconnect())).toMatchObject({ state: 'fulfilled' })
+        expect(await settle(w.producer.connect())).toMatchObject({ state: 'fulfilled' })
+      } else {
+        const restarted = w.cluster.brokerPool.rebootstrap('required')
+        expect(await settle(restarted)).toMatchObject({ state: 'fulfilled' })
+      }
+      expect(w.cluster.brokerPool.metadata).toBeNull()
+      expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+      const started = Date.now()
+      expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+      expect(await settle(send('c'))).toMatchObject({ state: 'fulfilled' })
+      expect(Date.now() - started).toBeLessThan(100)
+      expect([...w.cluster.targetTopics].sort()).toEqual(['b', 'c'])
+
+      const refused = await settle(send('a'))
+      expect(refused.state).toBe('rejected')
+      expect(refused.value).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      expect([...w.cluster.targetTopics].sort()).toEqual(['b', 'c'])
+    }
+  )
+
   describe('a target refused while sends still own it', () => {
     /**
      * @param {{ topic?: string, topicId?: string }} entry a Produce topic entry, by name or by id
@@ -1175,33 +1207,6 @@ describe('producer metadata idle expiry over the wire', () => {
       expect(w.admission.reserved).toBe(0)
     })
 
-    test('an owned target refused as unauthorized fails its own sends with that error while another topic succeeds', async () => {
-      const { sendTo, blocked, inFlight, queued } = await owning()
-      try {
-        w.state.refused.set('a', 29)
-        w.scripted.answer('Produce', (fields) =>
-          produceAnswer(fields, (entry) => (isTopic(entry, 'a') ? 29 : 0))
-        )
-        expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
-        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
-
-        blocked.release(produceAnswer(blocked.call.fields, () => 6))
-        await until(() => inFlight.state !== 'pending' && queued.state !== 'pending')
-        for (const sent of [inFlight, queued]) {
-          expect(sent.state).toBe('rejected')
-          expect(sent.value).toMatchObject({ type: 'TOPIC_AUTHORIZATION_FAILED' })
-        }
-        await until(() => w.cluster.topicPins.size === 0)
-        expect(w.admission.reserved).toBe(0)
-
-        expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
-        expect([...w.cluster.targetTopics]).toEqual(['b'])
-        expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
-      } finally {
-        if (blocked.settle) blocked.release()
-      }
-    })
-
     /**
      * @param {Error} error
      * @returns {string[]} the protocol type, or else the name, of the error and of each cause
@@ -1228,10 +1233,63 @@ describe('producer metadata idle expiry over the wire', () => {
     }
 
     /**
+     * Refuses 'a' with `code` in every Metadata and Produce answer while its leader still answers,
+     * with one send of 'a' held in flight and another queued behind it. Expects both to end with
+     * `chain` once the held request is let go, every pin and reservation released, 'a' dropped and
+     * 'b' served.
+     * @param {number} code the topic error and Produce error code
+     * @param {string[]} chain the cause chain each send of 'a' ends with
+     * @param {object} [producer] producer options of `start`
+     * @returns {Promise<void>}
+     */
+    const expectRefusedWhileLeaderAnswers = async (code, chain, producer) => {
+      const { sendTo, blocked, inFlight, queued } = await owning({ producer })
+      try {
+        w.state.refused.set('a', code)
+        w.scripted.answer('Produce', (fields) =>
+          produceAnswer(fields, (entry) => (isTopic(entry, 'a') ? code : 0))
+        )
+        expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+        blocked.release(produceAnswer(blocked.call.fields, () => 6))
+        await untilSettled([inFlight, queued])
+        for (const sent of [inFlight, queued]) {
+          expect(sent.state).toBe('rejected')
+          expect(chainOf(sent.value)).toEqual(chain)
+        }
+        await until(() => w.cluster.topicPins.size === 0)
+        expect(w.admission.reserved).toBe(0)
+
+        expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics]).toEqual(['b'])
+        expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+      } finally {
+        if (blocked.settle) blocked.release()
+      }
+    }
+
+    test('an owned target refused as unauthorized fails its own sends with that error while another topic succeeds', async () => {
+      await expectRefusedWhileLeaderAnswers(29, ['TOPIC_AUTHORIZATION_FAILED'])
+    })
+
+    test.each([true, false])(
+      'an owned target refused as unknown while its leader still answers ends its sends with the retry limit and its own error while another topic succeeds, with idempotence %s',
+      async (idempotent) => {
+        await expectRefusedWhileLeaderAnswers(
+          3,
+          ['KafkaJSNumberOfRetriesExceeded', 'UNKNOWN_TOPIC_OR_PARTITION'],
+          { idempotent }
+        )
+      }
+    )
+
+    /**
      * Expects the owned sends rejected within the 20 s delivery budget, none with the topic's own
      * error, then every pin and reservation released and the refused topic dropped, with another
-     * topic still served. A request already written retires on its own timeout, after its send
-     * ended, so the release is awaited for up to 40 s of fake time.
+     * topic still served. A retried send still waiting to find its broker holds the last pin
+     * until that lookup fails, about 17 s after its send ended, so the release is awaited for up
+     * to 40 s of fake time.
      * @param {object} owned the sender, held gate and sends of `owning`
      * @param {number} released when the held request was let go
      * @param {string[][]} chains the cause chain of the in-flight send and of the queued one
@@ -1311,6 +1369,28 @@ describe('producer metadata idle expiry over the wire', () => {
         }
       }
     )
+
+    test('an owned target with no installed metadata after a rebootstrap ends its sends within the delivery budget while another topic succeeds', async () => {
+      const owned = await owning()
+      try {
+        w.state.refused.set('a', 3)
+        const restarted = w.cluster.brokerPool.rebootstrap('required')
+        expect(await settle(restarted)).toMatchObject({ state: 'fulfilled' })
+        expect(w.cluster.brokerPool.metadata).toBeNull()
+
+        expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+        expect(w.cluster.findTopicPartitionMetadata('a')).toEqual([])
+
+        const released = Date.now()
+        owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+        await untilSettled([owned.inFlight, owned.queued])
+        const noMetadata = ['KafkaJSNumberOfRetriesExceeded', 'KafkaJSMetadataNotLoaded']
+        await expectEnded(owned, released, [noMetadata, noMetadata])
+      } finally {
+        if (owned.blocked.settle) owned.blocked.release()
+      }
+    })
   })
 
   test('sends to ten thousand distinct topics leave bounded bookkeeping', async () => {
