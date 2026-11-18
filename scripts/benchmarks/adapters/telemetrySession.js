@@ -523,6 +523,26 @@ const resetsOf = (directory) => {
   }
 }
 
+/**
+ * Reads the session's raw observations without changing the file. Every complete line must parse.
+ * A session the job cut off may end in an unterminated record its last append left; that fragment
+ * is kept on disk, left out of the observations and counted in `tornBytes`.
+ * @param {string} file the session's `raw.jsonl`
+ * @param {boolean} cutOff whether the job cut the session off
+ * @returns {{ observations: object[], tornBytes: number }}
+ * @throws {SyntaxError} for a malformed complete line, or any unterminated one when not cut off
+ */
+const observationsOf = (file, cutOff) => {
+  const lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n') : []
+  const tail = lines.pop() ?? ''
+  const torn = cutOff ? tail : ''
+  if (!torn && tail) lines.push(tail)
+  return {
+    observations: lines.filter(Boolean).map((line) => JSON.parse(line)),
+    tornBytes: Buffer.byteLength(torn),
+  }
+}
+
 /** @param {string} dir a snapshot directory @returns {void} removes its roots' `node_modules` links */
 const unlinkModules = (dir) => {
   for (const label of ['candidate', 'previous']) {
@@ -661,14 +681,10 @@ const main = (
       verify = outcomeOf(checked)
     }
     const sink = delivery ? keepSink(env.TELEMETRY_EVIDENCE_DIR, `${raw}.sink`) : null
-    const rawRows = path.join(manifest.directory, 'raw.jsonl')
-    const observations = fs.existsSync(rawRows)
-      ? fs
-          .readFileSync(rawRows, 'utf8')
-          .split('\n')
-          .filter(Boolean)
-          .map((line) => JSON.parse(line))
-      : []
+    const { observations, tornBytes } = observationsOf(
+      path.join(manifest.directory, 'raw.jsonl'),
+      session.timedOut
+    )
     log(
       JSON.stringify({
         row: row.name,
@@ -690,6 +706,7 @@ const main = (
         verify,
         sink,
         observations,
+        tornBytes,
       })
     )
     return 0
@@ -786,11 +803,14 @@ const rows = (entry, arm, { outputs, error }) => {
     const resetTime = resets
       ? `; ${resets.count} reporter resets took ${Math.round(resets.elapsedMs / 1000)} s`
       : ''
+    const torn = report.tornBytes
+      ? `; its raw evidence ends in an incomplete record of ${report.tornBytes} bytes`
+      : ''
     return one(
       'error',
       `the session was cut off at its ${declared.limitSeconds} s limit after ${session.elapsedSeconds} s with ` +
         `${observations.length} of ${total} children completed (declared budget ${declared.budgetSeconds} s${resetBound}${allowance}); ` +
-        `the measurement stays owed and the partial evidence is kept${resetTime}${overflow}`
+        `the measurement stays owed and the partial evidence is kept${resetTime}${overflow}${torn}`
     )
   }
   if (!session.verdict) {
