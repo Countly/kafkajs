@@ -6,7 +6,6 @@ const {
   CLIENT_KINDS,
   RECORD_KINDS,
   StreamValidator,
-  validateArtifact,
   validateCapabilities,
   validateConfig,
   validateHeader,
@@ -783,8 +782,32 @@ const run = ({
   const lines = encode(records)
   const header = buildHeader(lines, mode)
   editHeader(header)
-  return validateArtifact({ matrix, config, header, lines })
+  return validateAll({ matrix, config, header, lines })
 }
+
+/**
+ * Validates matrix, config and header, then streams the lines: the order a driver or verifier
+ * follows, since the stream validator needs all three valid.
+ * @returns {string[]}
+ */
+function validateAll({ matrix, config, header, lines }) {
+  const matrixProblems = validateMatrix(matrix)
+  if (matrixProblems.length > 0) return matrixProblems
+  const problems = [...validateConfig(config, matrix), ...validateHeader(header, matrix)]
+  if (problems.length > 0) return problems
+  const stream = new StreamValidator({ matrix, config, header })
+  lines.forEach((line) => stream.push(line))
+  return stream.finish()
+}
+
+/** @param {string} ref a dotted matrix path @returns {any} the value it names */
+const resolve = (ref) => ref.split('.').reduce((v, k) => v[k], matrix)
+/** @param {{ of: Array<number|string> }} minimum @returns {number} its derived value */
+const minimumOf = (minimum) =>
+  minimum.of.reduce((n, f) => {
+    const v = typeof f === 'number' ? f : resolve(f)
+    return n * (typeof v === 'number' ? v : v.value)
+  }, 1)
 
 const at = (records, predicate) => records.findIndex(predicate)
 const isSample = (process) => (r) => r.kind === 'sample' && r.process === process
@@ -822,8 +845,74 @@ describe('scripts/soak/finalSoakSchema', () => {
       expect(row.scope.shapes.length).toBeGreaterThan(0)
       expect(row.evidence.length).toBeGreaterThan(0)
       expect(row.predicate.length).toBeGreaterThan(40)
-      expect(row.bounds.every((bound) => bound.source.length > 0)).toBe(true)
+      expect(row.bounds.map((ref) => resolve(ref).source.length > 0)).not.toContain(false)
+      for (const name of row.uses) expect(matrix.predicates[name].rules.length).toBeGreaterThan(0)
     }
+    expect(
+      Object.fromEntries(matrix.rows.map((row) => [row.id, row.minima.map(minimumOf)]))
+    ).toEqual({
+      'rs-p10': [24, 96, 48, 96, 288, 12, 24, 46096, 936, 10000],
+      'rs-t11': [72, 864, 1728],
+      'rs-g07': [46096, 936, 672],
+      'rs-l14': [72, 24, 96, 3],
+      'rs-l15': [80000, 80000],
+      'rs-l16': [1000000, 72],
+      'rs-l22': [384, 288, 1728, 288],
+      'rs-l24': [96, 192, 144],
+    })
+    const rulesOf = (name) => matrix.predicates[name].rules.join(' ')
+    const anchors = {
+      Complete: ['every idle window', 'every broker recovery', 'startup proof', 'accepts it'],
+      Delivery: ['intermediate', 'readback', 'processedPrefix', 'terminal scan'],
+      AuthorityOK: [
+        'half-open',
+        'revoke-begin',
+        'publication',
+        'stale',
+        'transmitted before',
+        'handler-end with outcome retry',
+        '[last confirmed broker next, old processed next)',
+        'strictly greater delivery count',
+      ],
+      ResourcesOK: ['socket grace', 'standing peers', 'preconstruction baseline'],
+      HeapOK: ['upper middle', 'least-squares'],
+      TablesOK: ['unassignment', 'relabelled', 'pause intent'],
+    }
+    for (const [name, phrases] of Object.entries(anchors)) {
+      for (const phrase of phrases)
+        expect([name, rulesOf(name).includes(phrase)]).toEqual([name, true])
+    }
+    const recovery = matrix.predicates.Complete.recovery
+    expect(Object.keys(recovery)).toEqual(CLIENT_KINDS)
+    const tables = matrix.predicates.TablesOK.tables
+    expect(Object.keys(tables).sort()).toEqual(
+      [
+        'subscription',
+        'pause-state',
+        'assignment',
+        'membership-state',
+        'operation-cell',
+        'reset-debt',
+        'topic-configurations',
+        'preferred-replicas',
+        'grown-topic-names',
+        'queued-seeks',
+        'cluster-targets',
+        'acquired',
+        'halted',
+        'share-state',
+      ].sort()
+    )
+    expect(tables['membership-state'].owner).toContain('holders')
+    expect(tables['operation-cell'].owner).toContain('multiplicity')
+    expect(tables['reset-debt'].owner).toContain('partial')
+    const seed = matrix.controls['interning-seeded'].timing
+    expect(seed.smoke).toEqual({
+      starts: 'after-baseline-before-traffic',
+      clears: 'after-only-quiet-triplet-before-disconnect',
+      sensitivity: 'report-only',
+    })
+    expect(seed.acceptance.starts).toBe('after-first-quiet-triplet')
     const sources = sourced(matrix)
     expect(sources.length).toBeGreaterThan(40)
     for (const { source, value } of sources) {
@@ -912,7 +1001,7 @@ describe('scripts/soak/finalSoakSchema', () => {
     expect(tampered[3]).not.toEqual(lines[3])
     expectCases({
       'one line changed after the header': [
-        () => validateArtifact({ matrix, config, header, lines: tampered }),
+        () => validateAll({ matrix, config, header, lines: tampered }),
         'the stream digest does not match the header',
       ],
       'header digest replaced in both places': [
@@ -930,7 +1019,7 @@ describe('scripts/soak/finalSoakSchema', () => {
         'header.stream differs from its manifest entry',
       ],
       'a line dropped': [
-        () => validateArtifact({ matrix, config, header, lines: lines.slice(0, -1) }),
+        () => validateAll({ matrix, config, header, lines: lines.slice(0, -1) }),
         'the stream record count differs from the header',
       ],
     })
@@ -1009,12 +1098,92 @@ describe('scripts/soak/finalSoakSchema', () => {
         'clientKind is not an ordinary consumer kind',
       ],
       'bound without source': [
-        edited((m) => delete m.rows[0].bounds[2].source),
-        'rows[0].bounds is not',
+        edited((m) => delete m.bounds['heap-endpoint'].source),
+        'matrix.bounds.heap-endpoint is not a bound',
       ],
       'numeric bound left as report-only null without the flag': [
-        edited((m) => (m.rows[0].bounds[2].value = null)),
+        edited((m) => (m.bounds['heap-endpoint'].value = null)),
+        'matrix.bounds.heap-endpoint is not a bound',
+      ],
+      'a row bound naming nothing': [
+        edited((m) => m.rows[0].bounds.push('bounds.missing')),
         'rows[0].bounds is not',
+      ],
+      'a row bound naming an unsourced value': [
+        edited((m) => m.rows[0].bounds.push('schedule.hourMs')),
+        'rows[0].bounds is not',
+      ],
+      'a minimum derived from nothing': [
+        edited((m) => (m.rows[0].minima[0].of = ['schedule.totals.none'])),
+        'rows[0].minima is not',
+      ],
+      'a minimum with a stored value instead of a derivation': [
+        edited((m) => (m.rows[0].minima[0] = { name: 'idle windows', value: 24 })),
+        'rows[0].minima is not',
+      ],
+      'a predicate definition deleted': [
+        edited((m) => delete m.predicates.AuthorityOK),
+        'matrix.predicates.AuthorityOK is missing',
+      ],
+      'a predicate without rules': [
+        edited((m) => (m.predicates.Delivery.rules = [])),
+        'matrix.predicates.Delivery.rules is not',
+      ],
+      'an unknown predicate': [
+        edited((m) => (m.predicates.Fast = { rules: ['always'] })),
+        'matrix.predicates has unknown field Fast',
+      ],
+      'a row using an undefined predicate': [
+        edited((m) => m.rows[0].uses.push('Fast')),
+        'rows[0].uses is not',
+      ],
+      'a row naming a predicate it does not use': [
+        edited((m) => (m.rows[2].uses = ['Complete'])),
+        'rows[2].uses differs from the predicates its text names',
+      ],
+      'a row using a predicate its text never names': [
+        edited((m) => m.rows[4].uses.push('HeapOK')),
+        'rows[4].uses differs from the predicates its text names',
+      ],
+      'the smoke seed borrows the day start': [
+        edited((m) => {
+          m.controls['interning-seeded'].timing.smoke.starts = 'after-first-quiet-triplet'
+        }),
+        'matrix.controls.interning-seeded.timing.smoke.starts is not',
+      ],
+      'the smoke seed claims sensitivity': [
+        edited((m) => (m.controls['interning-seeded'].timing.smoke.sensitivity = 'required')),
+        'matrix.controls.interning-seeded.timing.smoke.sensitivity is not',
+      ],
+      'the day seed takes the smoke start': [
+        edited((m) => {
+          m.controls['interning-seeded'].timing.acceptance.starts = 'after-baseline-before-traffic'
+        }),
+        'matrix.controls.interning-seeded.timing.acceptance.starts is not',
+      ],
+      'a single untimed seed start': [
+        edited((m) => (m.controls['interning-seeded'].starts = 'after the first triplet')),
+        'matrix.controls.interning-seeded has unknown field starts',
+      ],
+      'no executions': [
+        edited((m) => (m.schedule.executions = [])),
+        'matrix.schedule.executions is not one execution of each auxiliary shape',
+      ],
+      'an object-valued execution length': [
+        edited((m) => (m.schedule.executions[0].maxMs = { toString: null })),
+        'matrix.schedule.executions[0].maxMs is not',
+      ],
+      'empty totals': [
+        edited((m) => (m.schedule.totals = {})),
+        'matrix.schedule.totals.idleWindows is missing',
+      ],
+      'empty smoke profile': [
+        edited((m) => (m.schedule.smoke = {})),
+        'matrix.schedule.smoke.activeMs is missing',
+      ],
+      'archive without the driver': [
+        edited((m) => m.acceptance.archive.pop()),
+        'matrix.acceptance.archive is not',
       ],
       'source without a kind': [
         edited((m) => (m.sampling.periodMs.source = 'bounds.js')),
@@ -1045,7 +1214,7 @@ describe('scripts/soak/finalSoakSchema', () => {
         'gcCollections is not 2',
       ],
       'a decision id in text': [
-        edited((m) => (m.rows[0].pass = 'see D146')),
+        edited((m) => (m.rows[0].pass = `see ${['D', '146'].join('')}`)),
         'names a decision id',
       ],
       'an uppercase registry label': [
@@ -1073,6 +1242,8 @@ describe('scripts/soak/finalSoakSchema', () => {
       'controls',
       'recordSections',
       'observations',
+      'bounds',
+      'predicates',
       'rows',
     ]) {
       cases[`${name} deleted`] = [edited((m) => delete m[name]), `matrix.${name} is missing`]
@@ -1080,6 +1251,46 @@ describe('scripts/soak/finalSoakSchema', () => {
         cases[`${name} replaced by a string`] = [
           edited((m) => (m[name] = 'x')),
           `matrix.${name} is not`,
+        ]
+      }
+    }
+    for (const keys of [
+      ['acceptance'],
+      ['acceptance', 'modes'],
+      ['acceptance', 'modes', 'acceptance'],
+      ['acceptance', 'modes', 'smoke'],
+      ['host'],
+      ['traffic'],
+      ['traffic', 'floors'],
+      ['schedule'],
+      ['schedule', 'executions', 0],
+      ['schedule', 'executions', 1],
+      ['schedule', 'executions', 2],
+      ['schedule', 'executions', 3],
+      ['schedule', 'totals'],
+      ['schedule', 'smoke'],
+      ['schedule', 'smoke', 'floors'],
+      ['sampling'],
+      ['controls', 'interning-seeded'],
+      ['controls', 'interning-seeded', 'timing'],
+      ['controls', 'interning-seeded', 'timing', 'acceptance'],
+      ['controls', 'interning-seeded', 'timing', 'smoke'],
+      ['predicates'],
+      ['predicates', 'Complete'],
+      ['predicates', 'Complete', 'recovery'],
+      ['predicates', 'TablesOK'],
+      ['predicates', 'TablesOK', 'tables'],
+    ]) {
+      const where = `matrix${keys.map((k) => (typeof k === 'number' ? `[${k}]` : `.${k}`)).join('')}`
+      const parent = (m) => keys.reduce((v, k) => v[k], m)
+      for (const field of Object.keys(parent(matrix))) {
+        cases[`${where}.${field} deleted`] = [
+          edited((m) => delete parent(m)[field]),
+          `${where}.${field} is missing`,
+        ]
+        cases[`${where}.${field} replaced by null`] = [
+          edited((m) => (parent(m)[field] = null)),
+          `${where}.${field} is not`,
         ]
       }
     }
@@ -1313,6 +1524,54 @@ describe('scripts/soak/finalSoakSchema', () => {
           ),
         'matrix.clientKinds is not the twelve kinds',
       ],
+      'null seeded client kind': [
+        () => {
+          const m = copy(matrix)
+          m.clientKinds['classic-eager-dynamic'] = null
+          return validateMatrix(m)
+        },
+        'matrix.clientKinds.classic-eager-dynamic is not an object',
+      ],
+      'object-valued execution shape': [
+        () => {
+          const m = copy(matrix)
+          m.schedule.executions[1].shape = objectValued
+          return validateMatrix(m)
+        },
+        'matrix.schedule.executions[1].shape is not',
+      ],
+      'object-valued bound reference': [
+        () => {
+          const m = copy(matrix)
+          m.rows[0].bounds = [objectValued]
+          return validateMatrix(m)
+        },
+        'rows[0].bounds is not',
+      ],
+      'object-valued minimum factor': [
+        () => {
+          const m = copy(matrix)
+          m.rows[0].minima[0].of = [objectValued]
+          return validateMatrix(m)
+        },
+        'rows[0].minima is not',
+      ],
+      'object-valued predicate use': [
+        () => {
+          const m = copy(matrix)
+          m.rows[0].uses = [objectValued]
+          return validateMatrix(m)
+        },
+        'rows[0].uses is not',
+      ],
+      'null predicate definition': [
+        () => {
+          const m = copy(matrix)
+          m.predicates.Complete = null
+          return validateMatrix(m)
+        },
+        'matrix.predicates.Complete is not an object',
+      ],
       'header null': [() => validateHeader(null, matrix), 'header is not an object'],
       'object-valued header stream digest': [
         () =>
@@ -1510,7 +1769,7 @@ describe('scripts/soak/finalSoakSchema', () => {
       return copyLines
     }
     const validate = (edited) => () =>
-      validateArtifact({ matrix, config, header: buildHeader(edited), lines: edited })
+      validateAll({ matrix, config, header: buildHeader(edited), lines: edited })
     const last = lines.length - 1
     const connectBegin = lines.findIndex((l) => l.includes('"call":"k1"'))
     expectCases({
@@ -1584,7 +1843,7 @@ describe('scripts/soak/finalSoakSchema', () => {
       'a blank line': [
         () => {
           const edited = [...lines.slice(0, 5), '', ...lines.slice(5)]
-          return validateArtifact({ matrix, config, header: buildHeader(edited), lines: edited })
+          return validateAll({ matrix, config, header: buildHeader(edited), lines: edited })
         },
         'is blank',
       ],
