@@ -223,6 +223,17 @@ describe('final soak rehearsal', () => {
         notes.filter((n) => /^step \S+ (failed|error)/.test(n) && !UNREACHABLE.test(n))
       ).toEqual([])
       expect(notes.filter((n) => /^producer loop failed/.test(n))).toEqual([])
+      const shareGroup = config.clients.find((c) => c.clientKind === 'share').group
+      const configured = records.findIndex(
+        (r) =>
+          r.kind === 'diagnostic' &&
+          r.message === `share group ${shareGroup} reads back share.auto.offset.reset=earliest`
+      )
+      const shareStart = records.findIndex(
+        (r) => r.kind === 'client' && r.event === 'construct' && r.process === 'p07'
+      )
+      expect(configured).toBeGreaterThan(-1)
+      expect(configured).toBeLessThan(shareStart)
 
       const finalize = spawnSync(
         process.execPath,

@@ -3,9 +3,15 @@ const os = require('node:os')
 const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { AsyncLocalStorage } = require('node:async_hooks')
-const { buildConfig, Supervisor } = require('../finalSoak')
-const { MonotonicClock, planSchedule } = require('../finalSoakScheduler')
-const { ClientRig, ConsumerWorker, ShareWorker, createWorker } = require('../finalSoakWorkers')
+const { buildConfig, Supervisor, workloadProblems } = require('../finalSoak')
+const { MonotonicClock, planSchedule, Scheduler } = require('../finalSoakScheduler')
+const {
+  ChildRuntime,
+  ClientRig,
+  ConsumerWorker,
+  ShareWorker,
+  createWorker,
+} = require('../finalSoakWorkers')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
 const TREE = 'b'.repeat(40)
@@ -71,6 +77,7 @@ const workerRuntime = (slotId, clock = new MonotonicClock(), observer = {}) => {
     emit: async (record) => runtime.records.push(record) && true,
     diagnose: async (message) => runtime.records.push({ kind: 'diagnostic', message }),
     problem: async (message) => runtime.problems.push(message),
+    failed: (call, error) => ChildRuntime.prototype.failed.call(runtime, call, error),
     request: async () => {},
   }
   return runtime
@@ -563,8 +570,126 @@ describe('final soak scheduled work', () => {
     worker.standing.push(standing)
     const step = { execution: 'h00m0w0', wave: 1, phase: 'leave', waveDeadline: 1030000 }
     const reply = await worker.onMembershipChurn(step)
-    expect(reply).toEqual({ transfers: 0 })
+    expect(reply).toEqual({ transfers: 0, returned: true })
     expect(clock.t).toBeLessThanOrEqual(1030000)
+  })
+
+  /**
+   * A static-membership worker (c02 and its static extra c14) whose observer reports the standing
+   * member's keys from `held({ joined, retired })`, and whose extras are scripted rigs that hold
+   * every key and record how they retire.
+   */
+  const staticWave = (clock, held) => {
+    const keys = [0, 1].map((partition) => ({ topic: 't', topicId: IDS.A, partition }))
+    const standing = {
+      id: 'c02.1',
+      object: { pause() {}, resume() {} },
+      slot: config.clients.find((c) => c.slot === 'c02'),
+    }
+    const runtime = workerRuntime('c02', clock, {
+      ordinarySections: (client) => ({
+        sections: {
+          assignment: (client === 'c02.1' ? held({ joined: n, retired }) : keys).map((key) => ({
+            key,
+          })),
+        },
+      }),
+    })
+    const retired = []
+    let n = 0
+    jest.spyOn(ConsumerWorker.prototype, 'join').mockImplementation(async function (slot) {
+      const id = `c14.${++n}`
+      return {
+        id,
+        slot,
+        object: { disconnect: async (options) => retired.push({ id, restart: options }) },
+        retire: async (execution, options) => retired.push({ id, options }),
+      }
+    })
+    jest
+      .spyOn(ConsumerWorker.prototype, 'operation')
+      .mockImplementation(async (rig, op, k, e, work) => work())
+    const worker = new ConsumerWorker(runtime)
+    worker.standing.push(standing)
+    return { worker, runtime, keys, retired }
+  }
+
+  test("a static extra leaves its group explicitly at its final retirement but not at its restart, and the wave waits for the standing member's partitions", async () => {
+    const clock = jumpClock(0)
+    const wave = staticWave(clock, ({ joined, retired }) =>
+      joined === 0 || (retired.length === 2 && clock.t >= 1000) ? wave.keys : wave.keys.slice(0, 1)
+    )
+    const step = {
+      execution: 'h00m0w0',
+      wave: 0,
+      phase: 'leave',
+      restart: ['classic-eager-static'],
+    }
+    const reply = await wave.worker.onMembershipChurn({ ...step, waveDeadline: 90000 })
+    expect(wave.retired).toEqual([
+      { id: 'c14.1', restart: { leaveGroup: false } },
+      { id: 'c14.2', options: { leaveGroup: true } },
+    ])
+    expect(reply).toEqual({ transfers: 1, returned: true })
+    expect(clock.t).toBeGreaterThanOrEqual(1000)
+    expect(wave.runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: 'h00m0w0 retires c14.2 with an explicit leave',
+    })
+  })
+
+  test('a wave whose paused partitions never return to the standing member says so in its reply', async () => {
+    const clock = jumpClock(0)
+    const wave = staticWave(clock, ({ joined }) =>
+      joined === 0 ? wave.keys : wave.keys.slice(0, 1)
+    )
+    const reply = await wave.worker.onMembershipChurn({
+      execution: 'h00m0w1',
+      wave: 1,
+      phase: 'leave',
+      waveDeadline: 90000,
+    })
+    expect(reply).toEqual({ transfers: 1, returned: false })
+    expect(clock.t).toBeLessThanOrEqual(85000)
+    expect(wave.runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: 'h00m0w1 saw the paused partitions not return to c02.1',
+    })
+  })
+
+  test('a wave admitted before its scheduled start works no longer than its budget from its actual start', async () => {
+    const clock = jumpClock(1000000)
+    const wave = staticWave(clock, ({ joined }) => (joined === 0 ? wave.keys : []))
+    const waveMs = matrix.schedule.executions.find((e) => e.shape === 'membership-churn').waveMaxMs
+    await wave.worker.onMembershipChurn({
+      execution: 'h00m0w1',
+      wave: 1,
+      phase: 'leave',
+      waveDeadline: 1000000 + 2 * waveMs,
+    })
+    expect(clock.t).toBeLessThanOrEqual(1000000 + waveMs)
+  })
+
+  test('a membership wave in which a paused partition did not return fails its step', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      s.waves = new Map([['h00m0', [{ id: 'h00m0w0', deadline: 90000 }]]])
+      s.send = async (slots, step) =>
+        step.phase === 'leave'
+          ? [
+              { reply: { transfers: 1, returned: true } },
+              { reply: { transfers: 1, returned: false } },
+            ]
+          : []
+      s.sampleAll = async () => {}
+      s.shape = async () => 'x'
+      await expect(s.churnMembers({ id: 'h00m0' }, ['p02', 'p04'])).rejects.toThrow(
+        'h00m0w0 saw paused partitions not return in p04'
+      )
+    } finally {
+      remove()
+    }
   })
 })
 
@@ -664,11 +789,11 @@ describe('final soak final drain', () => {
     expect(rig.processed.size).toBe(0)
   })
 
-  test('a share member waits until the last offset of the log is delivered and the deliveries go quiet', async () => {
+  test('a share member waits until every offset below the log end had a handler entry and the deliveries go quiet', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
     worker.standing.push({ id: 'c07.1', slot: config.clients.find((c) => c.slot === 'c07') })
-    worker.delivered(`${main}|0`, '98')
+    for (let offset = 0; offset < 99; offset++) worker.delivered(`${main}|0`, String(offset))
     setTimeout(() => worker.delivered(`${main}|0`, '99'), 60)
     const reply = await worker.onDrain({
       ends: { [key]: '100' },
@@ -682,6 +807,333 @@ describe('final soak final drain', () => {
       quietMs: 10,
     })
     expect(late).toEqual({ reached: false })
+  })
+
+  test('a share drain fails on a missing early offset even when the last offset was delivered', async () => {
+    const runtime = workerRuntime('c07')
+    const worker = new ShareWorker(runtime)
+    for (let offset = 60; offset < 100; offset++) worker.delivered(`${main}|0`, String(offset))
+    const step = { ends: { [key]: '100' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} has no handler entry at offset 0`,
+    })
+    for (let offset = 0; offset < 60; offset++) worker.delivered(`${main}|0`, String(offset))
+    expect(await worker.onDrain(step)).toEqual({ reached: true })
+  })
+
+  test('a share gap that is never filled keeps a bounded memory and still fails the drain', async () => {
+    const runtime = workerRuntime('c07')
+    const worker = new ShareWorker(runtime)
+    for (let offset = 1; offset <= 100001; offset++) worker.delivered(`${main}|0`, String(offset))
+    const state = worker.entered.get(`${main}|0`)
+    expect(state.ahead.size).toBeLessThanOrEqual(100000)
+    expect(state.gap).toBe('0')
+    const step = { ends: { [key]: '100002' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} has no handler entry at offset 0`,
+    })
+  })
+
+  test('a share member is ready only once a share fetch of main partition 0 was answered without error', async () => {
+    const answers = []
+    const runtime = workerRuntime('c07', jumpClock(0), {
+      wireFor: (client, apiKey, test) =>
+        answers.find((a) => client === 'c07.1' && apiKey === 78 && test(a)) ?? null,
+    })
+    const worker = new ShareWorker(runtime)
+    const rig = { id: 'c07.1' }
+    const answer = (errorCode, topicId, fetchErrorCode) => ({
+      errorCode,
+      topics: [{ topicId, partitions: [{ partitionIndex: 0, fetchErrorCode }] }],
+    })
+    answers.push(answer(0, IDS.B, 0), answer(0, IDS.A, 3), answer(58, IDS.A, 0))
+    expect(worker.fetchAnswered(rig)).toBe(false)
+    answers.push(answer(0, IDS.A, 0))
+    expect(worker.fetchAnswered(rig)).toBe(true)
+  })
+
+  test('a share member that never has a fetch answered fails its start after 60 s', async () => {
+    const clock = jumpClock(0)
+    const runtime = workerRuntime('c07', clock, { wireFor: () => null })
+    jest
+      .spyOn(ShareWorker.prototype, 'join')
+      .mockImplementation(async (slot) => ({ id: 'c07.1', slot }))
+    const worker = new ShareWorker(runtime)
+    await expect(worker.begin()).rejects.toThrow(
+      'c07.1 had no share fetch of the main log answered within 60000 ms'
+    )
+    expect(clock.t).toBeGreaterThanOrEqual(60000)
+  })
+})
+
+describe('final soak failure evidence', () => {
+  test('a failed public call keeps the error name, type, code, retriable flag, message and cause chain', async () => {
+    const runtime = workerRuntime('c01')
+    const rig = new ClientRig({ runtime, slot: config.clients[0], incarnation: 1 })
+    const root = Object.assign(new Error('socket hang up'), { name: 'KafkaJSConnectionError' })
+    const mid = Object.assign(new Error('Request timed out', { cause: root }), {
+      name: 'KafkaJSRequestTimeoutError',
+    })
+    const error = Object.assign(new Error('x'.repeat(300), { cause: mid }), {
+      name: 'KafkaJSError',
+      type: 'CONSUMER_STOPPING',
+      code: 7,
+      retriable: false,
+    })
+    await expect(
+      rig.call('disconnect', async () => {
+        throw error
+      })
+    ).rejects.toBe(error)
+    const failure = runtime.records.find((r) => r.kind === 'diagnostic')
+    expect(failure).toEqual({
+      kind: 'diagnostic',
+      recordId: expect.any(String),
+      message: 'public call c01.1.k1 failed',
+      failedCall: 'c01.1.k1',
+      error: {
+        name: 'KafkaJSError',
+        type: 'CONSUMER_STOPPING',
+        code: 7,
+        retriable: false,
+        message: 'x'.repeat(120),
+        causes: [
+          { name: 'KafkaJSRequestTimeoutError', message: 'Request timed out' },
+          { name: 'KafkaJSConnectionError', message: 'socket hang up' },
+        ],
+      },
+    })
+  })
+
+  test('a failure record fits the line cap whatever the error holds, and a cause cycle ends', async () => {
+    const runtime = workerRuntime('c01')
+    const error = Object.assign(new Error('m'.repeat(5000)), { name: 'n'.repeat(40) })
+    error.cause = error
+    await runtime.failed('c18.4.m9385', error)
+    const [record] = runtime.records
+    expect(record.error.causes).toHaveLength(3)
+    const line = JSON.stringify({ ...record, source: 'p06', seq: 1e9, at: 1e9, t: 1e9 })
+    expect(Buffer.byteLength(line)).toBeLessThanOrEqual(matrix.host.maxEventLineBytes.value)
+  })
+
+  test('a commit whose public call failed is journaled with what the client returned', async () => {
+    const runtime = workerRuntime('c18')
+    const worker = new ConsumerWorker(runtime)
+    const stopping = Object.assign(new Error('The consumer is stopping'), {
+      name: 'KafkaJSError',
+      type: 'CONSUMER_STOPPING',
+      retriable: false,
+    })
+    const k = `${config.topics.main}|0`
+    const rig = {
+      id: 'c18.4',
+      slot: config.clients.find((c) => c.slot === 'c18'),
+      object: {
+        commitOffsets: async () => {
+          throw stopping
+        },
+      },
+      processed: new Map([[k, '4300']]),
+      uncommitted: new Map([[k, 100]]),
+      committed: new Map(),
+      authority: new Map([
+        [k, { key: { topic: config.topics.main, topicId: IDS.A, partition: 0 }, authority: {} }],
+      ]),
+    }
+    await worker.commit(rig, k)
+    expect(runtime.records.find((r) => r.stage === 'commit' && r.phase === 'end')).toMatchObject({
+      outcome: 'unknown',
+      errorType: 'KafkaJSError',
+    })
+    expect(runtime.records.find((r) => r.failedCall)).toMatchObject({
+      failedCall: expect.stringMatching(/^c18\.4\.m\d+$/),
+      error: { name: 'KafkaJSError', type: 'CONSUMER_STOPPING', retriable: false, causes: [] },
+    })
+  })
+})
+
+describe('final soak telemetry teardown', () => {
+  test("the telemetry decoder disconnects last, after it read the disconnected telemetry clients' terminating pushes", async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.children = new Map(
+        s.config.processes.filter((p) => p.slot !== 'p15').map((p) => [p.slot, {}])
+      )
+      const sent = []
+      s.send = async (slots, step) => {
+        sent.push([step.type, slots.includes('p16') ? slots.length : 0, step.clients ?? null])
+        return slots.map(() => ({
+          reply: step.type === 'drain-telemetry' ? { missing: [] } : null,
+        }))
+      }
+      s.finalDrain = async () => {}
+      s.seal = async () => {}
+      s.shape = async () => {}
+      s.gate = { idle: async () => {} }
+      s.clock = jumpClock(0)
+      await s.teardown({ id: 'disconnect', type: 'disconnect' })
+      expect(sent).toEqual([
+        ['idle', 15, null],
+        ['disconnect', 0, null],
+        ['drain-telemetry', 1, ['c11', 'c12']],
+        ['disconnect', 1, null],
+      ])
+      expect(s.problems).toEqual([])
+    } finally {
+      remove()
+    }
+  })
+
+  test('the decoder reads the reporters until each telemetry client has a terminating push, or notes the ones it did not read', async () => {
+    const clock = jumpClock(0)
+    const decoder = createWorker({ ...workerRuntime('c21', clock), process: { role: 'decoder' } })
+    let ticks = 0
+    decoder.onTick = async () => {
+      if (++ticks === 3) decoder.terminated.add('c11.1')
+      return { abort: null }
+    }
+    expect(await decoder.onDrainTelemetry({ clients: ['c11'], deadline: 15000 })).toEqual({
+      abort: null,
+      missing: [],
+    })
+    expect(ticks).toBe(3)
+    expect(
+      await decoder.onDrainTelemetry({ clients: ['c11', 'c12'], deadline: clock.now() + 2000 })
+    ).toEqual({ abort: null, missing: ['c12'] })
+    expect(clock.t).toBeLessThanOrEqual(15000)
+  })
+})
+
+describe('final soak smoke prerequisites', () => {
+  test('the smoke aborts its early transaction and commits the ones around it', async () => {
+    const decisions = []
+    const txn = { send: async () => [{ baseOffset: '1' }], isActive: () => true }
+    txn.commit = async () => decisions.push('commit')
+    txn.abort = async () => decisions.push('abort')
+    const runtime = workerRuntime('c09', jumpClock(0))
+    const worker = createWorker(runtime)
+    worker.seq = 0
+    const rig = { id: 'c09.1', slot: config.clients.find((c) => c.slot === 'c09') }
+    rig.object = { transaction: async () => txn }
+    for (let n = 1; n <= 3; n++) await worker.transact(rig, n)
+    expect(matrix.schedule.smoke.abortAtTransaction).toBe(2)
+    expect(decisions).toEqual(['commit', 'abort', 'commit'])
+    expect(runtime.records.filter((r) => r.stage === 'transaction').map((r) => r.outcome)).toEqual([
+      'committed',
+      'aborted',
+      'committed',
+    ])
+  })
+
+  test('a smoke whose planned outage did not end ok is a problem of the run', () => {
+    const { s, remove } = supervisor()
+    try {
+      s.requireOutages(
+        new Map([
+          ['h00o0', 'ok'],
+          ['h00o1', 'aborted'],
+          ['h00o2', null],
+        ])
+      )
+      expect(s.problems).toEqual([
+        'smoke outage h00o1 has no receipt (aborted)',
+        'smoke outage h00o2 has no receipt (not run)',
+      ])
+    } finally {
+      remove()
+    }
+  })
+
+  test('after an abort the seed clear still runs, before the disconnect, and other steps do not', async () => {
+    const performed = []
+    const scheduler = new Scheduler({
+      clock: jumpClock(0),
+      perform: async (step) => performed.push(step.id),
+    })
+    scheduler.abort('wave failed')
+    const steps = ['h00o0', 'seed-clear', 'disconnect'].map((id, order) => ({
+      id,
+      type: id === 'h00o0' ? 'execution' : id,
+      lane: 'work',
+      at: 1000,
+      order,
+    }))
+    const summary = await scheduler.run(steps)
+    expect(performed).toEqual(['seed-clear', 'disconnect'])
+    expect(summary).toMatchObject({ ok: 2, aborted: 1 })
+  })
+
+  test('the share group reads back share.auto.offset.reset=earliest through the public admin calls', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const configs = new Map()
+      const calls = []
+      s.admin = {
+        incrementalAlterConfigs: async ({ resources }) => {
+          calls.push(['alter', resources])
+          for (const r of resources)
+            for (const e of r.configEntries) configs.set(`${r.name}/${e.name}`, e.value)
+          return { resources: resources.map(() => ({ errorCode: 0, errorMessage: null })) }
+        },
+        describeConfigs: async ({ resources }) => {
+          calls.push(['describe', resources])
+          return {
+            resources: resources.map((r) => ({
+              resourceType: r.type,
+              resourceName: r.name,
+              configEntries: r.configNames.map((configName) => ({
+                configName,
+                configValue: configs.get(`${r.name}/${configName}`) ?? null,
+                configSource: 8,
+              })),
+            })),
+          }
+        },
+      }
+      const notes = []
+      s.collector = { note: async (message) => notes.push(message) }
+      await s.configureShareGroup()
+      const group = s.config.clients.find((c) => c.slot === 'c07').group
+      expect(calls).toEqual([
+        [
+          'alter',
+          [
+            {
+              type: 32,
+              name: group,
+              configEntries: [{ name: 'share.auto.offset.reset', operation: 0, value: 'earliest' }],
+            },
+          ],
+        ],
+        ['describe', [{ type: 32, name: group, configNames: ['share.auto.offset.reset'] }]],
+      ])
+      expect(notes).toEqual([`share group ${group} reads back share.auto.offset.reset=earliest`])
+    } finally {
+      remove()
+    }
+  })
+
+  test("an aborted supervisor's receipt is not a green workload, and a clean one is", () => {
+    const { s, remove } = supervisor()
+    try {
+      expect(workloadProblems(s.result())).toEqual([])
+      s.abort('step h00m0 failed: h00m0w1 saw no paused partition transfer in p02')
+      s.problem('step h00m0 error')
+      expect(workloadProblems(JSON.parse(JSON.stringify(s.result())))).toEqual([
+        'problems: ["step h00m0 error"]',
+        'aborted: "step h00m0 failed: h00m0w1 saw no paused partition transfer in p02"',
+      ])
+      expect(workloadProblems(null)).toEqual(['supervisor.json is missing or unreadable'])
+      expect(
+        workloadProblems({ ...s.result(), problems: [], aborted: null, forced: ['p01'] })
+      ).toEqual(['forced: ["p01"]'])
+    } finally {
+      remove()
+    }
   })
 })
 

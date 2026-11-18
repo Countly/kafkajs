@@ -670,7 +670,9 @@ describe('final soak driver', () => {
   /**
    * Runs the runbook against PATH stubs that log every call. `FAIL_ON` makes the call containing it
    * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded;
-   * the driver stub writes `config.json` first, as the driver's first act does.
+   * the driver stub writes `config.json` first, as the driver's first act does, and a
+   * `supervisor.json` (`SUPERVISOR_JSON`, a green receipt by default) as its last; the workload
+   * check runs the real driver command.
    */
   const runbookHarness = () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-runbook-'))
@@ -689,10 +691,20 @@ describe('final soak driver', () => {
       ].join('\n'),
       node: 'case "$*" in *waitForKafka*) echo "$COMPOSE_FILE" >> "$CALLS.wait" ;; esac',
     }
+    const green = JSON.stringify({
+      failures: [],
+      aborted: null,
+      incomplete: null,
+      problems: [],
+      forced: [],
+    })
     const first = {
       node: [
+        'receipt="$SUPERVISOR_JSON"; [ -n "$receipt" ] || receipt="$GREEN"',
         'case "$*" in *--expose-gc*)',
-        '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json"; prev="$a"; done ;;',
+        '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json" && printf "%s" "$receipt" > "$a/supervisor.json"; prev="$a"; done ;;',
+        '*--check-workload*) [ -z "$FAIL_ON" ] || case "node $*" in *"$FAIL_ON"*) exit 1 ;; esac',
+        '  exec "$REAL_NODE" "$@" ;;',
         'esac',
       ].join('\n'),
     }
@@ -720,6 +732,8 @@ describe('final soak driver', () => {
             PATH: `${bin}:/usr/bin:/bin`,
             CALLS: log,
             FINAL_SOAK_ARTIFACTS: artifacts,
+            REAL_NODE: process.execPath,
+            GREEN: green,
             ...extra,
           },
           encoding: 'utf8',
@@ -789,6 +803,9 @@ describe('final soak driver', () => {
       expect(at(`node scripts/soak/finalSoak.js --summary --out ${out}`)).toBeGreaterThan(
         at(finalize)
       )
+      expect(at(`node scripts/soak/finalSoak.js --check-workload --out ${out}`)).toBeGreaterThan(
+        at(`node scripts/soak/finalSoak.js --summary --out ${out}`)
+      )
       expect(at('docker compose down --volumes')).toBeGreaterThan(at(finalize))
       expect(at(`node scripts/soak/finalSoak.js --cleanup --out ${out}`)).toBeGreaterThan(
         at(finalize)
@@ -816,6 +833,54 @@ describe('final soak driver', () => {
       expect(harness.run(['main', 'smoke']).status).toBe(2)
       expect(harness.run([TREE, 'day']).status).toBe(2)
       expect(harness.calls()).toEqual([])
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('an aborted workload whose driver exited 0 fails the runbook at stage workload after sealing, keeping the exit code and the broker logs', () => {
+    const harness = runbookHarness()
+    try {
+      const aborted = JSON.stringify({
+        failures: [],
+        aborted: 'step h00m0 failed: h00m0w1 saw no paused partition transfer in p02, p04',
+        incomplete: null,
+        problems: ['step h00m0 error: h00m0w1 saw no paused partition transfer in p02, p04'],
+        forced: [],
+      })
+      const result = harness.run([TREE, 'smoke'], { SUPERVISOR_JSON: aborted })
+      expect(result.status).toBe(1)
+      const { out, receipt, log } = harness.evidence()
+      expect(receipt).toEqual({
+        artifact: path.basename(out),
+        failedStage: 'workload',
+        exitStatus: 1,
+        driverStatus: 0,
+      })
+      expect(log).toContain(
+        'workload not green: aborted: "step h00m0 failed: h00m0w1 saw no paused partition transfer in p02, p04"'
+      )
+      expect(log).toContain('runbook failed at stage workload (exit status 1)')
+      const calls = harness.calls()
+      const at = (prefix) => calls.findIndex((c) => c.startsWith(prefix))
+      expect(calls).toContain(`node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`)
+      expect(
+        calls.some((c) =>
+          new RegExp(`^node scripts/soak/finalSoak.js --outer-exit --out ${out} --status 0 `).test(
+            c
+          )
+        )
+      ).toBe(true)
+      expect(at('node scripts/soak/finalSoak.js --check-workload')).toBeGreaterThan(
+        at('node scripts/soak/finalSoak.js --finalize')
+      )
+      expect(at('docker compose logs --no-color --timestamps')).toBeGreaterThan(
+        at('node scripts/soak/finalSoak.js --check-workload')
+      )
+      expect(at('docker compose down --volumes')).toBeGreaterThan(
+        at('docker compose logs --no-color --timestamps')
+      )
+      expect(calls.find((c) => c.startsWith('tar '))).toContain(path.basename(out))
     } finally {
       harness.remove()
     }

@@ -41,6 +41,8 @@ Module._resolveFilename = function (request, ...rest) {
   )
 }
 const kafkajs = require('../index')
+const CONFIG_RESOURCE_TYPES = require('../src/protocol/configResourceTypes')
+const CONFIG_SOURCE = require('../src/protocol/configSource')
 const { createScriptedCluster } = require('./scriptedCluster')
 Module._resolveFilename = resolve
 
@@ -204,7 +206,14 @@ const adminCalls = () => {
         for (const e of r.configEntries)
           configs.set(`${r.type}/${r.name}/${e.name}`, String(e.value))
       }
-      return { resources: [] }
+      return {
+        resources: resources.map((r) => ({
+          errorCode: 0,
+          errorMessage: null,
+          resourceType: r.type,
+          resourceName: r.name,
+        })),
+      }
     },
     describeConfigs: async ({ resources }) => ({
       resources: resources.map((r) => ({
@@ -214,6 +223,8 @@ const adminCalls = () => {
         configEntries: (r.configNames ?? []).map((configName) => ({
           configName,
           configValue: configs.get(`${r.type}/${r.name}/${configName}`) ?? null,
+          configSource:
+            r.type === CONFIG_RESOURCE_TYPES.GROUP ? CONFIG_SOURCE.GROUP_CONFIG : undefined,
         })),
       })),
     }),
@@ -334,3 +345,5 @@ ConsumerWorker.prototype.onRecreated = async () => ({ assigned: true })
 // No record is ever delivered here, so no member could show the recovery witness a real one gives.
 ConsumerWorker.prototype.onRecovered = async () => ({ ok: true })
 ShareWorker.prototype.onRecovered = async () => ({ ok: true })
+// No share session exists here, so no fetch answer can show the member is ready to acquire.
+ShareWorker.prototype.fetchAnswered = () => true

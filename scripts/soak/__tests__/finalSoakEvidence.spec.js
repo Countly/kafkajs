@@ -20,7 +20,7 @@ const {
   DecoderWorker,
   ShareWorker,
 } = require('../finalSoakWorkers')
-const { ContainerDumper } = require('../finalSoakDump')
+const { ContainerDumper, describeProblem } = require('../finalSoakDump')
 const { validateRecord } = require('../finalSoakSchema')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
@@ -555,10 +555,13 @@ describe('final soak finalization', () => {
 
 describe('final soak container dumps', () => {
   const main = config.topics.main
-  const groups = [...new Set(config.clients.map((c) => c.group).filter(Boolean))]
+  const share = config.clients.find((c) => c.clientKind === 'share').group
+  const groups = [...new Set(config.clients.map((c) => c.group).filter(Boolean))].filter(
+    (g) => g !== share
+  )
 
   /** Scripted Apache tools: argv in, stdout chunks and stderr out. */
-  const tools = ({ failGroup = null, shortMain = false } = {}) => {
+  const tools = ({ failGroup = null, shortMain = false, notTable = null } = {}) => {
     const calls = []
     const run = async (argv, onData) => {
       calls.push(argv)
@@ -579,6 +582,8 @@ describe('final soak container dumps', () => {
           code = 1
           stderr = 'Error: group failed\n'
         }
+        if (group === notTable)
+          stdout = `\nError: Executing consumer group command failed: Group ${group} is not a consumer group.\n`
       }
       for (let i = 0; i < stdout.length; i += 13) onData(Buffer.from(stdout.slice(i, i + 13)))
       return { code, signal: null, stderr }
@@ -631,12 +636,47 @@ describe('final soak container dumps', () => {
     }
   })
 
-  test('the share group is described for the record but its status never fails the dump', async () => {
+  test('the share group is recorded as unavailable from the consumer-groups tool and never fails the dump', async () => {
     const out = tmp('dump-share')
     try {
-      const share = config.clients.find((c) => c.clientKind === 'share').group
-      await expect(dump(out, tools({ failGroup: share })).run()).resolves.toMatchObject({})
-      expect(read(out, `groups/${share}.describe.end`)).toBe('exit=1 lines=3\n')
+      const scripted = tools({ failGroup: share })
+      await expect(dump(out, scripted).run()).resolves.toMatchObject({})
+      expect(scripted.calls.some((argv) => argv.includes(share))).toBe(false)
+      expect(read(out, `groups/${share}.unavailable`)).toBe(
+        'unavailable: kafka-consumer-groups.sh does not describe share groups (GroupIdNotFoundException)\n'
+      )
+      expect(fs.existsSync(path.join(out, 'apache', `groups/${share}.describe`))).toBe(false)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test("an ordinary group's describe is the tool's offsets table, as a real run printed it", () => {
+    const sample = fs.readFileSync(path.join(__dirname, 'fixtures/finalSoakDescribe.txt'), 'utf8')
+    const group = 'g-21b084a0c66e-c01'
+    expect(sample.split('\n')).toHaveLength(5)
+    expect(describeProblem(sample, group)).toBeNull()
+    expect(describeProblem(sample, 'g-21b084a0c66e-c02')).toBe(
+      `unparseable row "${group} fs-21b084a0c66e-main "`
+    )
+    expect(describeProblem(sample.split('\n').slice(0, 2).join('\n'), group)).toBe(
+      'no partition rows'
+    )
+    const share =
+      '\nError: Executing consumer group command failed due to org.apache.kafka.common.errors.GroupIdNotFoundException: Group g-21b084a0c66e-c07 is not a consumer group.\n'
+    expect(describeProblem(share, 'g-21b084a0c66e-c07')).toBe('no offsets header row')
+    expect(describeProblem(sample.replace('6585            6585', 'x  6585'), group)).toMatch(
+      /^unparseable row/
+    )
+  })
+
+  test("an ordinary group's describe that is not an offsets table fails the dump after every file is written", async () => {
+    const out = tmp('dump-table')
+    try {
+      await expect(dump(out, tools({ notTable: groups[0] })).run()).rejects.toThrow(
+        `groups/${groups[0]}.describe (no offsets header row)`
+      )
+      expect(read(out, `groups/${groups.at(-1)}.describe.end`)).toBe('exit=0 lines=3\n')
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
