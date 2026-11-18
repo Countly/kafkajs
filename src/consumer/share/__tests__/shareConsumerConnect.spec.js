@@ -13,6 +13,7 @@ const {
   until,
 } = require('../../../../testHelpers/shareHarness')
 const {
+  KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,
@@ -497,6 +498,25 @@ describe('public share connection contract', () => {
     expect(seen.crashes[0].error.cause.code).toBe(30)
     expect(seen.crashes[0].restart).toBe(false)
     await flush()
+    expect(seen.crashes).toHaveLength(1)
+  })
+
+  test.each([
+    ['restarts after a retriable cause', new KafkaJSError('transient', { retriable: true }), true],
+    ['does not restart after a non-retriable cause', new KafkaJSNonRetriableError('fatal'), false],
+  ])('without restartOnFailure a crash %s', async (_, error, restart) => {
+    const clock = new Clock()
+    clock.install()
+    const h = open()
+    const seen = observe(h)
+    jest.spyOn(ShareRun.prototype, 'pollNode').mockRejectedValueOnce(error)
+    await subscribe(h)
+    await run(h)
+    await until(() => seen.crashes.length === 1, 'the crash event')
+    expect(seen.crashes).toEqual([{ error, groupId: 'group', restart }])
+    expect(seen.crashes[0].error).toBe(error)
+    await clock.advance(1000)
+    expect(seen.joins).toHaveLength(restart ? 2 : 1)
     expect(seen.crashes).toHaveLength(1)
   })
 

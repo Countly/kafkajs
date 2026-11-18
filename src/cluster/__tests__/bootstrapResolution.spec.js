@@ -557,6 +557,114 @@ describe('Bootstrap DNS resolution', () => {
     )
   })
 
+  /**
+   * @param {Function} lookup the `dns.lookup` stand-in
+   * @param {string[]} [hosts] the bootstrap list
+   * @returns {BootstrapResolution} a gate over `lookup`
+   */
+  const gateOver = (lookup, hosts = ['a.test']) =>
+    new BootstrapResolution({
+      timeout: TIMEOUT,
+      resolveHosts: async () => hosts,
+      lookup,
+      retry: RETRY,
+      now: () => Date.now(),
+    })
+
+  test('a lookup that throws synchronously is retried like a failed lookup', async () => {
+    const thrown = new Error('invalid lookup arguments')
+    const recovering = jest.fn((host, options, callback) => {
+      if (recovering.mock.calls.length === 1) throw thrown
+      Promise.resolve().then(() => callback(null, ADDRESSES))
+    })
+    const recoveringGate = gateOver(recovering)
+    const opening = watch(recoveringGate.wait())
+    try {
+      await flush()
+      expect(recovering).toHaveBeenCalledTimes(1)
+      expect(opening.done).toBe(false)
+      await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+      expect(recovering).toHaveBeenCalledTimes(2)
+      expect(opening).toEqual({ done: true, error: null })
+    } finally {
+      recoveringGate.cancel(new Error('test cleanup'))
+    }
+
+    const failing = watch(
+      gateOver(() => {
+        throw thrown
+      }).wait()
+    )
+    await jest.advanceTimersByTimeAsync(TIMEOUT)
+    expect(failing.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(failing.error.message).toBe(
+      `Bootstrap DNS resolution failed: none of a.test resolved within ${TIMEOUT} ms (last error: invalid lookup arguments)`
+    )
+    expect(failing.error.cause).toBe(thrown)
+  })
+
+  test('an empty address list is not a resolution', async () => {
+    const empty = jest.fn((host, options, callback) => {
+      const answer = empty.mock.calls.length === 1 ? [] : ADDRESSES
+      Promise.resolve().then(() => callback(null, answer))
+    })
+    const opening = watch(gateOver(empty).wait())
+    await flush()
+    expect(empty).toHaveBeenCalledTimes(1)
+    expect(opening.done).toBe(false)
+    await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+    expect(empty).toHaveBeenCalledTimes(2)
+    expect(opening).toEqual({ done: true, error: null })
+
+    const failing = watch(
+      gateOver((host, options, callback) => Promise.resolve().then(() => callback(null, []))).wait()
+    )
+    await jest.advanceTimersByTimeAsync(TIMEOUT)
+    expect(failing.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(failing.error.message).toBe(
+      `Bootstrap DNS resolution failed: none of a.test resolved within ${TIMEOUT} ms (last error: a.test resolved to no address)`
+    )
+  })
+
+  test('the failure for an empty bootstrap list names the bootstrap list', async () => {
+    const lookup = jest.fn()
+    const failing = watch(gateOver(lookup, []).wait())
+    await jest.advanceTimersByTimeAsync(TIMEOUT)
+    expect(failing.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(failing.error.message).toBe(
+      `Bootstrap DNS resolution failed: none of the bootstrap list resolved within ${TIMEOUT} ms`
+    )
+    expect(failing.error.cause).toBeUndefined()
+    expect(lookup).not.toHaveBeenCalled()
+  })
+
+  test('a failed round whose wait promise was dropped is not an unhandled rejection', () => {
+    const { execFileSync } = require('node:child_process')
+    const script = `
+      const BootstrapResolution = require('./src/cluster/bootstrapResolution')
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error.message))
+      let now = 0
+      const gate = new BootstrapResolution({
+        timeout: 1000,
+        resolveHosts: async () => ['a.test'],
+        lookup: (host, options, callback) => {
+          now = 1000
+          callback(new Error('getaddrinfo ENOTFOUND a.test'))
+        },
+        now: () => now,
+      })
+      gate.wait()
+      setImmediate(() => process.stdout.write(JSON.stringify({ state: gate.state, unhandled })))
+    `
+    const report = execFileSync(process.execPath, ['-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(JSON.parse(report)).toEqual({ state: 'failed', unhandled: [] })
+  })
+
   test('rejects invalid timeout configuration before network work', async () => {
     const resolveHosts = jest.fn()
     const lookup = jest.fn()

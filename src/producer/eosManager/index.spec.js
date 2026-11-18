@@ -80,6 +80,19 @@ describe('Producer > eosManager', () => {
     expect(eosManager.isInitialized()).toEqual(true)
   })
 
+  test('InitProducerId carries 60000 ms when no transaction timeout is configured', async () => {
+    const eosManager = createEosManager({ logger: newLogger(), cluster })
+
+    await eosManager.initProducerId()
+
+    expect(broker.initProducerId).toHaveBeenCalledWith({
+      transactionalId: null,
+      transactionTimeout: 60000,
+      producerId: -1,
+      producerEpoch: -1,
+    })
+  })
+
   test.each([
     ['PRODUCER_FENCED', 90],
     ['TRANSACTION_ABORTABLE', 120],

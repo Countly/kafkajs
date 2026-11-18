@@ -556,6 +556,89 @@ describe('admin invocation deadlines', () => {
     expect(result.value[1].errorCode).toBe(-1)
     expect(result.value[1].error).toBe(transport)
   })
+
+  it('settled waits and polls leave only the invocation cleanup registered', async () => {
+    const { runWithDeadline, currentDeadline, waitForOf } = require('../deadline')
+    const sizes = []
+    const result = observe(
+      runWithDeadline('settled', 1000, async () => {
+        const deadline = currentDeadline()
+        sizes.push(deadline.cleanups.size)
+        for (let n = 0; n < 50; n++) await deadline.wait(() => n)
+        sizes.push(deadline.cleanups.size)
+        await waitForOf(() => true, { delay: 1 })
+        sizes.push(deadline.cleanups.size)
+        return 'done'
+      })
+    )
+    await jest.advanceTimersByTimeAsync(1)
+    expect(result.value).toBe('done')
+    expect(sizes).toEqual([1, 1, 1])
+  })
+
+  it('keeps the next metadata discovery shared when an abandoned episode settles late', async () => {
+    const { shareMetadata, runWithDeadline } = require('../deadline')
+    const first = held()
+    const second = held()
+    const work = jest
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+      .mockResolvedValue('third refresh')
+    const shared = shareMetadata(work)
+    const abandoned = observe(runWithDeadline('abandoned', 5, shared))
+    await jest.advanceTimersByTimeAsync(5)
+    expect(abandoned.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(abandoned.error.message).toBe(
+      'abandoned did not complete within 5 ms; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    const next = observe(shared())
+    await flush()
+    first.resolve('first refresh')
+    await flush()
+    const joined = observe(shared())
+    second.resolve('second refresh')
+    await flush()
+    expect(work).toHaveBeenCalledTimes(2)
+    expect(next.value).toBe('second refresh')
+    expect(joined.value).toBe('second refresh')
+  })
+
+  it('a caller whose budget ended before it joined leaves no unhandled rejection', () => {
+    const { execFileSync } = require('node:child_process')
+    const script = `
+      const { runWithDeadline, shareMetadata } = require('./src/admin/deadline')
+      const { KafkaJSTimeout } = require('./src/errors')
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error.message))
+      let now = 0
+      performance.now = () => now
+      const work = () => Promise.reject(new Error('refresh failed'))
+      const shared = shareMetadata(work)
+      runWithDeadline('late', 5, () => {
+        now = 5
+        return shared()
+      }).then(
+        () => 'resolved',
+        (error) => ({ timeout: error instanceof KafkaJSTimeout, message: error.message })
+      ).then((outcome) => setImmediate(() => {
+        process.stdout.write(JSON.stringify({ outcome, unhandled }))
+      }))
+    `
+    const report = execFileSync(process.execPath, ['-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(JSON.parse(report)).toEqual({
+      outcome: {
+        timeout: true,
+        message:
+          'late did not complete within 5 ms; outcome is unknown; a mutation, if any, may have been applied',
+      },
+      unhandled: [],
+    })
+  })
 })
 
 describe('recovery and cleanup enrollment', () => {
