@@ -23,7 +23,7 @@ const {
 const { isConnectionFailure } = require('../network/connectionFailure')
 const { failure, createErrorFromCode } = require('../protocol/error')
 
-/** Topic errors that drop a producer target whose metadata was installed. */
+/** Topic errors that drop an earlier producer target the broker no longer serves. */
 const DROPPED_TOPIC_ERRORS = new Set([
   'UNKNOWN_TOPIC_OR_PARTITION',
   'INVALID_TOPIC_EXCEPTION',
@@ -110,8 +110,9 @@ module.exports = class BrokerPool {
    *   single instance every route reads.
    * @param {(topics: string[]) => ((topic: string) => boolean)} [options.captureTopics] scoped producer publication predicate
    * @param {(topic: string) => boolean} [options.dropTopic] forgets a producer target the broker
-   *   no longer serves, unless producer work still owns it; returns whether it did. Defaults to
-   *   `forgetTopic`
+   *   no longer serves, unless producer work still owns it; returns whether it did
+   * @param {(topic: string) => boolean} [options.isNewTarget] whether a producer target is being
+   *   added by the call in progress, so its refusal fails that call instead of being dropped
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
@@ -136,6 +137,7 @@ module.exports = class BrokerPool {
     metadataCache,
     captureTopics,
     dropTopic,
+    isNewTarget,
     instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
@@ -147,12 +149,8 @@ module.exports = class BrokerPool {
     drainTimeout,
   }) {
     this.captureTopics = captureTopics
-    this.dropTopic =
-      dropTopic ??
-      ((topic) => {
-        this.forgetTopic(topic)
-        return true
-      })
+    this.dropTopic = dropTopic
+    this.isNewTarget = isNewTarget
     this.telemetryMetrics = telemetryMetrics
     this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
@@ -1146,13 +1144,15 @@ module.exports = class BrokerPool {
 
   /**
    * Judges the topics a producer refresh got back with their own error code; the Java client keeps
-   * such errors per topic too. A target whose metadata is installed and that is now unknown,
-   * invalid or unauthorized (a deleted topic, say) never fails the refresh of the other targets:
-   * it is dropped through `dropTopic`, and a later send to it adds it again and fails on its own.
-   * One whose sends still own it is kept with the metadata it had, so they keep their routing and
-   * their retries ask about it again; their Produce answers carry the topic's own error. A topic
-   * this refresh no longer captures is skipped. Any other topic error is thrown, as the version's
-   * own parse would throw it, after the drops.
+   * such errors per topic too. An earlier target that is now unknown, invalid or unauthorized (a
+   * deleted topic, say) never fails the refresh of the other targets, whether or not any metadata
+   * is installed, as after a reconnect or a rebootstrap: it is dropped through `dropTopic`, and a
+   * later send to it adds it again and fails on its own. One whose sends still own it is kept with
+   * the metadata it had, if any, so they keep their routing and their retries ask about it again;
+   * they recover once the broker serves it again, or end as any send does: with the broker's
+   * answer, a routing error or the delivery timeout. A topic being added is not judged this way:
+   * its refusal fails the call. A topic this refresh no longer captures is skipped. Any other
+   * topic error is thrown, as the version's own parse would throw it, after the drops.
    * @param {object[]} topicMetadata the answer's topics, topic errors retained
    * @param {(topic: string) => boolean} accept this refresh's publication predicate
    * @returns {object[]} the topics answered without an error
@@ -1163,12 +1163,11 @@ module.exports = class BrokerPool {
       ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
     )
     if (failed.length === 0) return topicMetadata
-    const installed = new Set((this.metadata?.topicMetadata || []).map(({ topic }) => topic))
     let thrown = null
     for (const { topic, topicErrorCode } of failed) {
       if (!accept(topic)) continue
       const error = createErrorFromCode(topicErrorCode)
-      if (installed.has(topic) && DROPPED_TOPIC_ERRORS.has(error.type)) {
+      if (!this.isNewTarget(topic) && DROPPED_TOPIC_ERRORS.has(error.type)) {
         const dropped = this.dropTopic(topic)
         this.logger.warn(
           dropped
