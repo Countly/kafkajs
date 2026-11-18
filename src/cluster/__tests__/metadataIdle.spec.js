@@ -429,6 +429,31 @@ describe('producer metadata idle expiry', () => {
         ['rotating-0', 'rotating-1'],
       ])
     })
+
+    test('a held target remembers its refusal until it is answered healthy or released', async () => {
+      const { cluster, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      cluster.holdTopic('rotating-0')
+      deleted.add('rotating-0')
+      await cluster.addTargetTopic('rotating-1')
+
+      expect(cluster.topicRefusal('rotating-0')).toMatchObject({
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+      })
+      expect(cluster.topicRefusal('rotating-0')).not.toBe(cluster.topicRefusal('rotating-0'))
+      expect(cluster.topicRefusal('rotating-1')).toBeNull()
+
+      deleted.delete('rotating-0')
+      await cluster.refreshMetadata()
+      expect(cluster.topicRefusal('rotating-0')).toBeNull()
+
+      deleted.add('rotating-0')
+      await cluster.refreshMetadata()
+      expect(cluster.topicRefusal('rotating-0')).toMatchObject({ code: 3 })
+      cluster.releaseTopic('rotating-0')
+      expect(cluster.topicRefusal('rotating-0')).toBeNull()
+      expect(cluster.brokerPool.topicRefusals.size).toBe(0)
+    })
   })
 
   describe('what an empty or refused send owns', () => {
@@ -622,13 +647,13 @@ describe('producer metadata idle expiry over the wire', () => {
   /**
    * @param {{ name: string }[]|null} requested the topics a Metadata request names
    * @param {{ ids: Map<string, string>, missing: Set<string>, leaderless: Set<string>,
-   *   refused?: Map<string, number> }} controls
+   *   refused?: Map<string, number>, node?: number }} controls
    * @returns {object} the answer: unknown topics code 3, refused ones their own code, leaderless
-   *   ones code 5
+   *   ones code 5; `node` is the only broker listed and every leader
    */
-  const metadataFor = (requested, { ids, missing, leaderless, refused = new Map() }) => ({
-    brokers: [{ nodeId: 0, host: 'node0', port: 9092, rack: null }],
-    controllerId: 0,
+  const metadataFor = (requested, { ids, missing, leaderless, refused = new Map(), node = 0 }) => ({
+    brokers: [{ nodeId: node, host: `node${node}`, port: 9092, rack: null }],
+    controllerId: node,
     topics: (requested ?? []).map(({ name }) => {
       if (!ids.has(name))
         ids.set(name, `00000000-0000-4000-8000-${String(ids.size + 1).padStart(12, '0')}`)
@@ -645,10 +670,10 @@ describe('producer metadata idle expiry over the wire', () => {
               {
                 errorCode: leaderless.has(name) ? 5 : 0,
                 partitionIndex: 0,
-                leaderId: leaderless.has(name) ? -1 : 0,
+                leaderId: leaderless.has(name) ? -1 : node,
                 leaderEpoch: 5,
-                replicas: [0],
-                isr: [0],
+                replicas: [node],
+                isr: [node],
                 offlineReplicas: [],
               },
             ],
@@ -669,7 +694,14 @@ describe('producer metadata idle expiry over the wire', () => {
     const schedule = new Schedule()
     const state = { ids: new Map(), missing: new Set(), leaderless: new Set(), refused: new Map() }
     const scripted = producerScript(
-      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], schedule, profile })
+      createScriptedCluster({
+        nodes: [
+          { id: 0, host: 'node0', port: 9092 },
+          { id: 1, host: 'node1', port: 9092 },
+        ],
+        schedule,
+        profile,
+      })
     ).answer('Metadata', ({ topics }) => metadataFor(topics, state))
     const cluster = new Cluster({
       logger: newLogger(),
@@ -1095,7 +1127,9 @@ describe('producer metadata idle expiry over the wire', () => {
       const transactional = options.profile === 'tv1' || options.profile === 'tv2'
       w = start({
         ...options,
-        producer: transactional ? { transactionalId: 'owned', idempotent: true } : {},
+        producer: transactional
+          ? { transactionalId: 'owned', idempotent: true }
+          : (options.producer ?? {}),
       })
       w.scripted.answer('InitProducerId', ({ producerEpoch = -1 }) => ({
         producerId: '1000',
@@ -1190,6 +1224,90 @@ describe('producer metadata idle expiry over the wire', () => {
         expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
         expect([...w.cluster.targetTopics]).toEqual(['b'])
         expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+      } finally {
+        if (blocked.settle) blocked.release()
+      }
+    })
+
+    /**
+     * @param {Error} error
+     * @returns {string[]} the name or protocol type of the error and of each cause under it
+     */
+    const chainOf = (error) => {
+      const chain = []
+      for (let at = error; at; at = at.cause) chain.push(at.type ?? at.name)
+      return chain
+    }
+
+    /**
+     * Advances fake time in 100 ms steps, within the 20 s delivery timeout, until no send is
+     * pending.
+     * @param {{ state: string }[]} sends watched sends
+     * @returns {Promise<void>}
+     */
+    const untilSettled = async (sends) => {
+      for (let i = 0; i < 150 && sends.some(({ state }) => state === 'pending'); i += 1) {
+        await jest.advanceTimersByTimeAsync(100)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      expect(sends.map(({ state }) => state)).not.toContain('pending')
+    }
+
+    test.each([
+      ['unauthorized', 29, ['TOPIC_AUTHORIZATION_FAILED']],
+      ['unknown', 3, ['KafkaJSNumberOfRetriesExceeded', 'UNKNOWN_TOPIC_OR_PARTITION']],
+    ])(
+      'an owned target refused as %s whose old leader left the cluster fails its own sends with that error while another topic succeeds',
+      async (_, code, chain) => {
+        const { sendTo, blocked, inFlight, queued } = await owning()
+        try {
+          w.state.refused.set('a', code)
+          w.state.node = 1
+          expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+          expect(w.cluster.brokerPool.getNodeIds()).toEqual(['1'])
+
+          const released = Date.now()
+          blocked.release(produceAnswer(blocked.call.fields, () => 6))
+          await untilSettled([inFlight, queued])
+          expect(Date.now() - released).toBeLessThan(20000)
+          for (const sent of [inFlight, queued]) {
+            expect(sent.state).toBe('rejected')
+            expect(chainOf(sent.value)).toEqual(chain)
+          }
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+          expect(w.cluster.topicRefusal('a')).toBeNull()
+          expect(w.cluster.brokerPool.topicRefusals.size).toBe(0)
+
+          expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics]).toEqual(['b'])
+          expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+        } finally {
+          if (blocked.settle) blocked.release()
+        }
+      }
+    )
+
+    test('without idempotence, an owned target refused as unauthorized whose old leader left the cluster fails with that error', async () => {
+      w = start({ producer: { idempotent: false } })
+      await w.producer.connect()
+      expect(await settle(send('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const blocked = w.schedule.hold(produceOf('a'))
+      const held = watch(send('a', 'second'))
+      try {
+        await until(() => blocked.call !== null)
+        w.state.refused.set('a', 29)
+        w.state.node = 1
+        expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+        blocked.release(produceAnswer(blocked.call.fields, () => 6))
+        await untilSettled([held])
+        expect(held.state).toBe('rejected')
+        expect(chainOf(held.value)).toEqual(['TOPIC_AUTHORIZATION_FAILED'])
+        await until(() => w.cluster.topicPins.size === 0)
+        expect(w.cluster.topicRefusal('a')).toBeNull()
       } finally {
         if (blocked.settle) blocked.release()
       }
