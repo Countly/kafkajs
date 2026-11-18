@@ -1190,7 +1190,7 @@ module.exports = class ConsumerGroup {
           unapplied: this.unappliedSeeks,
           clock: () => this.acquireClock,
           lastSoughtAt: () => this.lastSoughtAt,
-          isSoughtAfter: (topics, since) => this.isSoughtAfter(topics, since),
+          isSoughtAfter: (topic, partition, since) => this.isSoughtAfter(topic, partition, since),
         },
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
         markPolled: () => this.rebalanceCoordinator?.pollTimer.poll(),
@@ -1910,6 +1910,24 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Whether a popped seek is still the latest one admitted for its partition: the acquisition it
+   * was popped under is the current one and no later seek was admitted since.
+   * @private
+   * @param {string} key `topic|partition`
+   * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
+   *   was popped under
+   * @param {number|undefined} admitted its `soughtAt` when popped
+   * @returns {boolean}
+   */
+  isLatestSeek(key, acquired, admitted) {
+    return (
+      acquired !== undefined &&
+      acquired === this.acquired.get(key) &&
+      acquired.soughtAt === admitted
+    )
+  }
+
+  /**
    * Marks the seek admitted at `admitted` as applied, unless a later seek of the same acquisition
    * was admitted meanwhile: that one still has to apply.
    * @private
@@ -1920,26 +1938,20 @@ module.exports = class ConsumerGroup {
    * @returns {void}
    */
   settleSeek(key, acquired, admitted) {
-    if (acquired && acquired === this.acquired.get(key) && acquired.soughtAt === admitted) {
-      this.unappliedSeeks.delete(key)
-    }
+    if (this.isLatestSeek(key, acquired, admitted)) this.unappliedSeeks.delete(key)
   }
 
   /**
-   * Whether any of the given cells was sought after `since`, the acquisition clock read when they
-   * were selected: their offsets are no longer the position the application asked for. Constant
-   * time while nothing was sought since.
-   * @param {{topic: string, partitions: {partition: number|string}[]}[]} topics selected cells
+   * Whether a partition was sought after `since`, the acquisition clock read when its offset was
+   * selected: that offset is no longer the position the application asked for. Constant time
+   * while nothing was sought since.
+   * @param {string} topic
+   * @param {number|string} partition
    * @param {number} since the acquisition clock at selection
    * @returns {boolean}
    */
-  isSoughtAfter(topics, since) {
-    if (this.lastSoughtAt <= since) return false
-    return topics.some(({ topic, partitions }) =>
-      partitions.some(
-        ({ partition }) => this.acquired.get(`${topic}|${partition}`)?.soughtAt > since
-      )
-    )
+  isSoughtAfter(topic, partition, since) {
+    return this.lastSoughtAt > since && this.acquired.get(`${topic}|${partition}`)?.soughtAt > since
   }
 
   /**
@@ -3446,7 +3458,8 @@ module.exports = class ConsumerGroup {
    * close ends the reads and delays, and an expired call publishes and answers nothing.
    * @param {{topic: string, partition: number}} entry validated public partition
    * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context]
-   * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets
+   * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets;
+   *   a committed offset the cache holds as a `Long` (a deliberate commit) is read as its decimal
    * @throws {Error} on ownership retirement, reset refusal, the operation's refusal or unresolved
    *   bounded resolution
    */
@@ -3494,9 +3507,10 @@ module.exports = class ConsumerGroup {
       const halted = this.haltedPartitions.get(key)
       if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
       if (this.hasSeekOffset({ topic, partition })) continue
-      const offset =
+      const offset = String(
         manager.resolvedOffsetAt(topic, partition) ?? manager.heldOffsetAt(topic, partition)
-      if (typeof offset === 'string' && /^\d+$/.test(offset)) return offset
+      )
+      if (/^\d+$/.test(offset)) return offset
     }
     throw new KafkaJSNonRetriableError(`Position is not yet resolved for ${topic}[${partition}]`)
   }
@@ -3557,7 +3571,7 @@ module.exports = class ConsumerGroup {
           // A public call or callback whose own refusal ended the seek drops it, as it always did;
           // any other failure leaves it for the next resolution.
           if (preparation instanceof FetchPreparation || !preparation?.guard()) {
-            this.requeueSeek(seekEntry)
+            this.requeueSeek(seekEntry, acquired, admitted)
           } else this.settleSeek(key, acquired, admitted)
           throw error
         }
@@ -3598,20 +3612,30 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Puts back a seek whose application failed, so the next resolution retries it, unless a newer
-   * seek of the partition is queued, the partition is no longer held or the run is stopping. The
-   * seek stays unapplied meanwhile, so the progress it replaces is not committed automatically.
+   * Puts back a seek whose application failed, so the next resolution retries it. Only the latest
+   * seek of its acquisition is put back (`isLatestSeek`): a newer seek of the partition, queued,
+   * applying or applied, wins, and so does a replaced acquisition. Nothing is put back after a
+   * topic recreation since the seek was admitted, whose offset belongs to the old incarnation, or
+   * while the run is stopping. The seek stays unapplied meanwhile, so the progress it replaces is
+   * not committed automatically.
    * @private
    * @param {{topic: string, partition: number, offset: string}} seekEntry the popped intent
+   * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
+   *   was popped under
+   * @param {number|undefined} admitted its `soughtAt` when popped
    * @returns {void}
    */
-  requeueSeek({ topic, partition, offset }) {
+  requeueSeek({ topic, partition, offset }, acquired, admitted) {
     const key = `${topic}|${partition}`
-    if (this.isStopping() || !this.acquired.has(key) || this.seekOffset.has(topic, partition)) {
+    if (
+      this.isStopping() ||
+      !this.isLatestSeek(key, acquired, admitted) ||
+      acquired.recreatedAt > admitted
+    ) {
       return
     }
     this.seekOffset.set(topic, partition, offset)
-    if (!this.unappliedSeeks.has(key)) this.markSought(topic, partition)
+    this.unappliedSeeks.add(key)
   }
 
   hasSeekOffset({ topic, partition }) {

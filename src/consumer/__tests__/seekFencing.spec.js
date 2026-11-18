@@ -963,7 +963,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.commits(1)).toEqual(['1', '9'])
       expect(scenario.rig.frames('OffsetCommit')).toHaveLength(3)
       expect(scenario.committed).toEqual({ 0: '0', 1: '9' })
-      expect(captured.group().offsetManager.committedOffsets()[TOPIC][1]).toBe('9')
+      expect(String(captured.group().offsetManager.committedOffsets()[TOPIC][1])).toBe('9')
       expect(scenario.errors).toEqual([])
     })
 
