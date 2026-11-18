@@ -1,4 +1,5 @@
-const { runNaturalExit, verifyControlFailure } = require('../naturalExit')
+const { runNaturalExit, validateJestReport, verifyControlFailure } = require('../naturalExit')
+const REAL_CONTROL_REPORT = require('./fixtures/naturalExitControlJest.json')
 const { PROFILES, childArgs, childEnvironment } = require('../shareSoakContract')
 const { primingReceiptHash } = require('../../evidence/sharePrimingLink')
 
@@ -43,29 +44,12 @@ const jestChild = (spec) => [
 const CONTROL_ARGV = [...jestChild(ORDINARY_SPEC), '--json', `--outputFile=${CONTROL_REPORT}`]
 
 /**
- * The Jest JSON report of a control run whose control case passed and whose ordinary cases
- * were skipped, in file order.
- * @returns {object} A mutable report.
+ * The Jest JSON report a hosted control run really wrote (Jest 30.5.1, Node 24): the control case
+ * passed, the seven ordinary cases were skipped, and Jest named the suite `focused`. Only the
+ * runner's checkout path is replaced. The Node 22 and 26 reports differ in timestamps only.
+ * @returns {object} A mutable copy.
  */
-const controlReport = () => ({
-  success: true,
-  numTotalTests: 8,
-  numPassedTests: 1,
-  numFailedTests: 0,
-  numPendingTests: 7,
-  numTodoTests: 0,
-  numRuntimeErrorTestSuites: 0,
-  testResults: [
-    {
-      name: `/repo/${ORDINARY_SPEC}`,
-      status: 'passed',
-      assertionResults: [
-        ...ORDINARY_CASES.map((title) => ({ title, status: 'pending' })),
-        { title: CONTROL_CASES[0], status: 'passed' },
-      ],
-    },
-  ],
-})
+const controlReport = () => JSON.parse(JSON.stringify(REAL_CONTROL_REPORT))
 
 /**
  * The three artifacts of a control run that the watchdog killed after its case passed.
@@ -682,6 +666,8 @@ describe('CI natural exit > ordinary clients', () => {
         a.report.testResults[0].assertionResults.splice(1, 1)
       },
       'another spec': (a) => (a.report.testResults[0].name = '/repo/src/other.spec.js'),
+      'a suite status that contradicts its skipped cases': (a) =>
+        (a.report.testResults[0].status = 'passed'),
       'a stale cleanup row': (a) => (a.rows[0].cleanup.completedAt = 999),
       'cleanup after the kill': (a) => (a.rows[0].cleanup.completedAt = a.exit.exitedAt + 1),
       'a wrong-case cleanup row': (a) => (a.rows[0].case = ORDINARY_CASES[0]),
@@ -712,6 +698,45 @@ describe('CI natural exit > ordinary clients', () => {
       }
     })
     expect(credited.map(([name]) => name)).toEqual([])
+  })
+
+  test('ordinary control accepts the suite status Jest reports for skipped cases and no other', () => {
+    const report = controlReport()
+    expect(report.testResults[0].status).toBe('focused')
+    expect(report.numPendingTests).toBe(ORDINARY_CASES.length)
+    const control = {
+      label: 'control',
+      spec: ORDINARY_SPEC,
+      passed: CONTROL_CASES,
+      skipped: ORDINARY_CASES,
+    }
+    expect(validateJestReport(report, control)).toBeUndefined()
+
+    for (const status of ['passed', 'failed', 'pending', 'skipped', undefined]) {
+      const forged = controlReport()
+      forged.testResults[0].status = status
+      expect(() => validateJestReport(forged, control)).toThrow('control: invalid Jest inventory')
+    }
+  })
+
+  test('a fully executed inventory still requires the passed suite status', () => {
+    const soakReport = (status) => ({
+      success: true,
+      numTotalTests: 1,
+      numPassedTests: 1,
+      numFailedTests: 0,
+      numPendingTests: 0,
+      numTodoTests: 0,
+      testResults: [
+        {
+          name: '/repo/src/consumer/share/__tests__/shareSoakLive.spec.js',
+          status,
+          assertionResults: [{ title: SOAK_CASE, status: 'passed' }],
+        },
+      ],
+    })
+    expect(validateJestReport(soakReport('passed'))).toBeUndefined()
+    expect(() => validateJestReport(soakReport('focused'))).toThrow('soak: invalid Jest inventory')
   })
 
   test('ordinary lane leaves the four-case shutdown inventory unchanged', () => {

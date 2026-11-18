@@ -1,0 +1,188 @@
+{
+  "numFailedTestSuites": 0,
+  "numFailedTests": 0,
+  "numPassedTestSuites": 1,
+  "numPassedTests": 1,
+  "numPendingTestSuites": 0,
+  "numPendingTests": 7,
+  "numRuntimeErrorTestSuites": 0,
+  "numTodoTests": 0,
+  "numTotalTestSuites": 1,
+  "numTotalTests": 8,
+  "openHandles": [],
+  "snapshot": {
+    "added": 0,
+    "didUpdate": false,
+    "failure": false,
+    "filesAdded": 0,
+    "filesRemoved": 0,
+    "filesRemovedList": [],
+    "filesUnmatched": 0,
+    "filesUpdated": 0,
+    "matched": 0,
+    "total": 0,
+    "unchecked": 0,
+    "uncheckedKeysByFile": [],
+    "unmatched": 0,
+    "updated": 0
+  },
+  "startTime": 1794982039053,
+  "success": true,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients classic dynamic consumer consumes one message and disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "classic dynamic consumer consumes one message and disconnects",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients classic static consumer keeps its group slot after disconnect",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "classic static consumer keeps its group slot after disconnect",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients consumer-protocol dynamic consumer consumes one message and disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "consumer-protocol dynamic consumer consumes one message and disconnects",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients consumer-protocol static consumer consumes one message and disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "consumer-protocol static consumer consumes one message and disconnects",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients idempotent producer sends one message and disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "idempotent producer sends one message and disconnects",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients transactional producer commits one message and disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "transactional producer commits one message and disconnects",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > ordinary clients"
+          ],
+          "duration": null,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > ordinary clients admin creates and describes a topic and disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "pending",
+          "title": "admin creates and describes a topic and disconnects",
+          "startAt": 1794982040051
+        },
+        {
+          "ancestorTitles": [
+            "Natural exit > retained timer control"
+          ],
+          "duration": 1527,
+          "failing": false,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "Natural exit > retained timer control leaves one interval alive after its producer disconnects",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryMessages": [],
+          "retryReasons": [],
+          "status": "passed",
+          "title": "leaves one interval alive after its producer disconnects",
+          "startAt": 1794982040052
+        }
+      ],
+      "endTime": 1794982041582,
+      "message": "",
+      "name": "/repo/src/__tests__/naturalExitLive.spec.js",
+      "startTime": 1794982039173,
+      "status": "focused",
+      "summary": ""
+    }
+  ],
+  "wasInterrupted": false
+}
