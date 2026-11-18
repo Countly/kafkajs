@@ -1620,14 +1620,18 @@ describe('producer metadata idle expiry over the wire', () => {
           expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
           expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
 
-          metadataUnreachable()
-          const refreshes = jest.spyOn(w.cluster, 'refreshMetadataIfNecessary')
           const refused = watch(owned.sendTo('a', 'mixed'))
           const other = watch(owned.sendTo('b', 'mixed'))
-          await untilSettled([refused, other])
+          await flushAll()
+          expect(w.admission.reserved).toBeGreaterThan(0)
+          metadataUnreachable()
+          const refreshes = jest.spyOn(w.cluster, 'refreshMetadataIfNecessary')
+          await untilSettled([refused, other, ...owned.sends])
           expect(refreshes.mock.calls.length).toBeGreaterThan(0)
-          expect(refused.state).toBe('rejected')
-          expect(chainOf(refused.value)).toEqual(chain)
+          for (const sent of [refused, ...owned.sends]) {
+            expect(sent.state).toBe('rejected')
+            expect(chainOf(sent.value)).toEqual(chain)
+          }
           expect(other.state).toBe('rejected')
           expect(chainOf(other.value)).toEqual([
             'KafkaJSNumberOfRetriesExceeded',
@@ -1635,11 +1639,9 @@ describe('producer metadata idle expiry over the wire', () => {
           ])
           jest.restoreAllMocks()
           metadataReachable()
-          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 0))
-          await untilSettled(owned.sends)
-          expect(owned.sends.map(({ state }) => state)).toEqual(['fulfilled'])
           await until(() => w.cluster.topicPins.size === 0)
           expect(w.admission.reserved).toBe(0)
+          expect(await settle(owned.sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
         } finally {
           jest.restoreAllMocks()
           metadataReachable()
