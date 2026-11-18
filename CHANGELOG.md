@@ -21,6 +21,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - A malformed signed varint longer than 5 bytes in a record batch is reported as a corrupt batch on its partition instead of decoding to a wrong value; a null compact array encodes correctly.
 - A producer or admin `connect()` that is waiting for a `disconnect()` already in progress now rejects with `KafkaJSNonRetriableError` when another `disconnect()` is called while it waits. This covers a `disconnect()` that joins the close in progress and one called after that close has finished. Before this fix, the waiting `connect()` reopened the client after the later `disconnect()` had resolved, which emitted `CONNECT` again and left a socket open. All other orderings behave as before.
 - `KafkaJSServerDoesNotSupportApiKey` and `KafkaJSShareGroupsNotSupportedError` carry the broker's error as `cause` when a broker refused the request.
+- `connect()` during `disconnect()` now waits for the close and reconnects; `run()` and `subscribe()` during a close reject instead of starting a membership after the `disconnect` event. A `connect()` still waiting when a later `disconnect()` is called is refused, and one called from a handler of the run being closed, or async work it started, is refused at once instead of deadlocking the close; an event listener is not a handler and waits for the close.
+- A `disconnect()` called from a `CRASH` listener no longer leaves the share consumer's restart timer armed after the close (it could hold the process open for the retry delay).
 
 #### Tooling
 
