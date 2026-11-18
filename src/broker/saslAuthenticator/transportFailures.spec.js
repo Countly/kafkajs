@@ -572,7 +572,9 @@ describe('Broker > SASLAuthenticator > OAUTHBEARER error challenge', () => {
     expect(payloads[1]).toEqual(Buffer.from([0x01]))
     expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
     expect(error.retriable).toBe(false)
-    expect(error.message).toContain('SASL OAUTHBEARER authentication failed')
+    expect(error.message).toBe(
+      'SASL OAUTHBEARER authentication failed: The server answered the token with an error challenge'
+    )
     expect(reported).not.toHaveBeenCalled()
     expect(textOf([error, entries])).not.toContain(SECRET)
     expect(textOf([error, entries])).not.toContain('invalid_token')

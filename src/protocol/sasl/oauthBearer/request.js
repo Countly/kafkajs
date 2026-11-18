@@ -60,3 +60,11 @@ module.exports = async ({ authorizationIdentity = null }, oauthBearerToken) => {
     },
   }
 }
+
+/**
+ * The client response that answers an error challenge: a single %x01 (RFC 7628 section 3.2.3).
+ * @returns {{ encode: () => Promise<Buffer> }} INT32-prefixed mechanism bytes
+ */
+module.exports.acknowledgeError = () => ({
+  encode: async () => new Encoder().writeBytes(Buffer.from([0x01])).buffer,
+})
