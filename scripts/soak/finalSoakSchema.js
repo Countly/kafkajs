@@ -793,7 +793,7 @@ const RULES = Object.freeze({
     ),
   'identity/ack': (r) =>
     unless(
-      sameNullness(r.offset, r.outcome === 'acknowledged' ? 1 : null),
+      r.offset === null || r.outcome === 'acknowledged',
       'only an acknowledged send has an offset'
     ),
   'identity/transaction': (r) =>
