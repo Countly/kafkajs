@@ -1968,9 +1968,9 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
   it('runs a follow-up round while the membership still needs reconciliation', async () => {
     const { coordinator, consumerGroup, emitted } = build()
-    let outstanding = 2
+    // A level, read as often as the coordinator likes: it holds until the third apply.
     asConsumerProtocol(consumerGroup, {
-      needsReconciliation: () => outstanding-- > 0,
+      needsReconciliation: () => consumerGroup.applyRebalanceResult.mock.calls.length < 3,
     })
 
     const chain = coordinator.runRound('assignment-changed', 'revoked')
@@ -1988,8 +1988,12 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
   it('yields one membership interval between rounds, capped, and not while stopping', async () => {
     const { coordinator, consumerGroup, runner } = build()
-    let outstanding = 1
-    asConsumerProtocol(consumerGroup, { needsReconciliation: () => outstanding-- > 0 })
+    let outstanding = 2
+    asConsumerProtocol(consumerGroup, { needsReconciliation: () => outstanding > 0 })
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      outstanding--
+      return { assignment: [], added: [], revoked: [] }
+    })
     consumerGroup.heartbeatInterval = jest.fn(() => 30000)
 
     const chain = coordinator.runRound('assignment-changed', 'revoked')
@@ -2002,10 +2006,11 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
     // A stop landing MID-ROUND - the ordinary shape - skips the yield outright, so `stop()` is
     // never held open by it. The round still owes a follow-up: only the guard stops the sleep.
-    outstanding = 1
+    outstanding = 2
     consumerGroup.joinAndSync.mockClear()
     consumerGroup.heartbeatInterval.mockClear()
     consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      outstanding--
       runner.stopRequested = true
       return { assignment: [], added: [], revoked: [] }
     })

@@ -637,8 +637,9 @@ module.exports = class ConsumerGroup {
 
   /**
    * Whether the membership holds a target assignment that still differs from what this member
-   * owns. Always false under classic. Unresolved topic ids deliberately do NOT make it true - an
-   * id that can never resolve would otherwise spin the rebalance chain into its convergence guard.
+   * owns, counting only what a round's apply would keep. Always false under classic. Unresolved
+   * topic ids and assigned topics outside a client-pattern subscription deliberately do NOT make it
+   * true - either would otherwise spin the rebalance chain into its convergence guard.
    * @returns {boolean}
    */
   needsReconciliation() {

@@ -279,11 +279,7 @@ module.exports = class RebalanceCoordinator {
         return
       }
 
-      if (++this.rounds > MAX_REJOIN_ROUNDS) {
-        throw new KafkaJSNonRetriableError(
-          `cooperative rebalance did not converge in ${MAX_REJOIN_ROUNDS} rounds`
-        )
-      }
+      this.chargeRound()
 
       const round = this.consumerGroup.beginRebalanceRound()
       const group = this.consumerGroup
@@ -407,27 +403,68 @@ module.exports = class RebalanceCoordinator {
         const protocol = this.consumerGroup.kind || 'classic'
 
         kind = this.takePendingKind() || 'revoked'
-        reason =
-          kind === 'lost'
-            ? this.takeRejoinRequested()
-            : revoked.length && cooperative && protocol === 'classic'
-              ? 'partitions-revoked'
-              : protocol === 'consumer' && this.consumerGroup.needsReconciliation()
-                ? 'assignment-changed'
-                : this.takeRejoinRequested()
+        let level = false
+        if (kind === 'lost') {
+          reason = this.takeRejoinRequested()
+        } else if (revoked.length && cooperative && protocol === 'classic') {
+          reason = 'partitions-revoked'
+        } else if (protocol === 'consumer' && this.consumerGroup.needsReconciliation()) {
+          reason = 'assignment-changed'
+          level = true
+        } else {
+          reason = this.takeRejoinRequested()
+        }
 
         // A level, not an event: a request that arrived while this chain ran was dropped, but the
         // unapplied revision it stood for is still there.
-        reason ||= this.consumerGroup.subscriptionPending?.() ? 'subscription-changed' : null
+        if (!reason && this.consumerGroup.subscriptionPending?.()) {
+          reason = 'subscription-changed'
+          level = true
+        }
 
         if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
           await this.yieldBetweenRounds()
+          if (level && !this.owesRound()) reason = null
         }
       } finally {
         if (hooks) this.finishListenerRound(round, additionHold)
         round.retire()
       }
     } while (reason)
+  }
+
+  /**
+   * Charges one round to the running chain, refusing the round past the chain's budget. The only
+   * place a chain is declared exhausted.
+   * @private
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} when the chain has already run `MAX_REJOIN_ROUNDS` rounds
+   */
+  chargeRound() {
+    if (++this.rounds > MAX_REJOIN_ROUNDS) {
+      throw new KafkaJSNonRetriableError(
+        `cooperative rebalance did not converge in ${MAX_REJOIN_ROUNDS} rounds`
+      )
+    }
+  }
+
+  /**
+   * Whether a consumer-protocol chain still owes another round after its inter-round wait. A
+   * reason taken from a level before the wait is carried only while something is still owed:
+   * the target or the subscription still differs, or an explicit obligation (a queued re-entry or
+   * LOST, or a verdict in the slot) arrived meanwhile. A target that converged during the wait
+   * ends the chain without charging another round.
+   * @private
+   * @returns {boolean}
+   */
+  owesRound() {
+    return (
+      this.pendingKind !== null ||
+      this.rejoinRequested !== null ||
+      this.verdict !== null ||
+      this.consumerGroup.needsReconciliation() ||
+      Boolean(this.consumerGroup.subscriptionPending?.())
+    )
   }
 
   /**
