@@ -3,6 +3,8 @@
 # mutants against its own Compose cluster with guard evidence; `report` writes the plain-language report.
 name: Mutants
 on:
+  push:
+    branches: [p11/mut-run1]
   workflow_dispatch:
     inputs:
       ref:
@@ -52,10 +54,10 @@ jobs:
       - name: Select the records
         id: select
         env:
-          SHARDS: ${{ inputs.shards }}
-          CAP: ${{ inputs.time-cap-minutes }}
-          AREAS: ${{ inputs.areas }}
-          PER_AREA: ${{ inputs.per-area }}
+          SHARDS: ${{ inputs.shards || '16' }}
+          CAP: ${{ inputs.time-cap-minutes || '40' }}
+          AREAS: ${{ inputs.areas || 'all' }}
+          PER_AREA: ${{ inputs.per-area || '40' }}
           SEED: ${{ inputs.seed }}
         run: |
           set -euo pipefail
