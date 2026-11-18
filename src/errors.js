@@ -696,7 +696,10 @@ class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
 
 /**
  * An offset commit was refused because the consumer lost its group membership, or because a
- * handler or a retry outlived a rejoin. `cause` is the loss. For a loss the broker reported,
+ * handler or a retry outlived a rejoin. Reason `stale-assignment` also covers an offset authority
+ * that a `consumer.seek()` superseded without any rejoin: a handler commit for a batch fetched
+ * before the seek, or an automatic selection a seek reached before it was written, so it does not
+ * by itself mean the group rebalanced. `cause` is the loss, absent for a seek. For a loss the broker reported,
  * `type`, `code` and `helpUrl` are the cause's; a synthetic loss carries no code, a poll-interval
  * loss keeps the type `POLL_INTERVAL_EXCEEDED`, and a stale handler has the type
  * `STALE_ASSIGNMENT` and no `code` or `helpUrl`, whatever its cause carries. `isLostMember` checks

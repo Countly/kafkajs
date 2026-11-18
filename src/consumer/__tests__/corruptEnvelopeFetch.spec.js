@@ -401,7 +401,7 @@ class HaltCase {
         changedAt: expect.any(Number),
         recreatedAt: 0,
         soughtAt: 0,
-        settledAt: 0,
+        retired: false,
       })
       expect(acquired.acquiredAt).toBeGreaterThan(0)
       expect(acquired.changedAt).toBe(acquired.acquiredAt)

@@ -757,6 +757,7 @@ module.exports = class Runner extends EventEmitter {
         })
       }
     } finally {
+      this.consumerGroup.retireAcquisitions?.()
       if (!operation) scope.finish()
     }
   }
@@ -801,6 +802,7 @@ module.exports = class Runner extends EventEmitter {
     if (this.retirement) return
     this.retirement = error
     this.latchStop()
+    this.consumerGroup.retireAcquisitions?.()
     this.consumerGroup.retireCoordinatorLookup(error)
     this.consumerGroup.retireFetchSessions()
     this.fetchManager.stop()
@@ -1390,33 +1392,32 @@ module.exports = class Runner extends EventEmitter {
       return true
     }
 
+    if (this.isSuperseded(batch)) return true
     const acquired = this.consumerGroup.acquired?.get(
       batch.ownershipKey || `${batch.topic}|${batch.partition}`
     )
-    if (
-      batch.acquireClock != null &&
-      acquired &&
-      (acquired.acquiredAt > batch.acquireClock ||
-        acquired.recreatedAt > batch.acquireClock ||
-        acquired.soughtAt > batch.acquireClock)
-    )
+    if (batch.acquireClock != null && acquired && acquired.acquiredAt > batch.acquireClock)
       return true
     return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
   }
 
   /**
    * Whether the batch's records were superseded after it was fetched: its topic was deleted and
-   * recreated, so they belong to an incarnation this member no longer reads, or its partition was
-   * sought (`ConsumerGroup#seek`), so they are not at the position the application asked for.
+   * recreated, so they belong to an incarnation this member no longer reads, its partition was
+   * sought (`ConsumerGroup#seek`), so they are not at the position the application asked for, or
+   * the acquisition it was fetched under ended (revoke, rebuild, end of the run), so a later
+   * acquisition of the same partition never revives it (`handlerContext.isSuperseded`).
    * Such a batch is stale for delivery and commits (`isBatchStale`), and its offsets are never
    * resolved (`resolveBatchOffset`): they would move the position away from the new log or the
    * sought offset. A handler already running may finish. Java likewise discards fetched data whose
    * topic id no longer matches, and its `seek` clears the records it already fetched.
    *
+   * A batch identity without an acquisition is checked against the partition's current one.
    * @param {import('./batch')|object} batch a fetched batch or a handler's batch identity
    * @returns {boolean}
    */
   isSuperseded(batch) {
+    if (batch.acquisition !== undefined) return handlerContext.isSuperseded(batch)
     const acquired = this.consumerGroup.acquired?.get(
       batch.ownershipKey || `${batch.topic}|${batch.partition}`
     )
@@ -1572,13 +1573,14 @@ module.exports = class Runner extends EventEmitter {
 
       this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
-      const { topic, partition, assignmentEpoch, acquireClock, ownershipKey } = batch
+      const { topic, partition, assignmentEpoch, acquireClock, ownershipKey, acquisition } = batch
       const identity = {
         topic,
         partition,
         assignmentEpoch,
         acquireClock,
         ownershipKey,
+        acquisition,
         runIdentity: this.consumerGroup.runIdentity,
       }
       if (this.eachMessage) {
@@ -1838,9 +1840,10 @@ module.exports = class Runner extends EventEmitter {
     const refusal = this.consumerGroup.ownership?.refusal(token)
     if (refusal) return refusal
     if (!batch || !this.isBatchStale(batch)) return null
-    const sought = this.consumerGroup.isSoughtSince?.(batch)
     return new KafkaJSCommitFailedError(
-      sought ? 'A seek superseded the handler batch' : 'The handler outlived its assignment',
+      handlerContext.isSought(batch)
+        ? 'A seek superseded the handler batch'
+        : 'The handler outlived its assignment',
       { reason: 'stale-assignment' }
     )
   }
