@@ -271,7 +271,9 @@ const omittedRow = (entry) => {
 
 /**
  * Keeps the status rules whatever an adapter returned: a known status, and numbers only on a
- * `valid` or `inconclusive` row, which must have a finite median.
+ * `valid` or `inconclusive` row, which must have a finite median. An `inconclusive` row with a
+ * reason and no numbers at all stays as it is: a session whose observations formed no
+ * measurement.
  * @param {Row} row
  * @returns {Row}
  */
@@ -281,6 +283,8 @@ const finalize = (row) => {
     return { ...bare, status: 'error', reason: `unknown status ${row.status}` }
   }
   if (!NUMBERED.includes(row.status)) return bare
+  const bareInconclusive = row.status === 'inconclusive' && row.reason
+  if (bareInconclusive && [m, min, max, ratio].every((n) => n === undefined)) return bare
   if (![m, min, max].every(Number.isFinite)) {
     return { ...bare, status: 'error', reason: `a ${row.status} row without its numbers` }
   }
@@ -395,7 +399,7 @@ const renderDetail = ({ benchmark, status, reason, raw, controls, notes, table }
 const renderMarkdown = (rows, meta, details = []) => {
   const line = (cells) => `| ${cells.map(cell).join(' | ')} |`
   const body = rows.map((row) => {
-    const numbered = NUMBERED.includes(row.status)
+    const numbered = NUMBERED.includes(row.status) && row.median !== undefined
     return [
       row.benchmark,
       row.arm,

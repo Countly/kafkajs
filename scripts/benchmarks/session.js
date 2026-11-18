@@ -447,6 +447,18 @@ const main = (argv, { log, error } = console) => {
   }
 }
 
+/**
+ * Reads the outcomes of a workflow job's setup steps, so a report session in that job can refuse
+ * before any work when its prerequisites did not succeed.
+ * @param {string|undefined} setup space-separated `<step>=<outcome>` pairs (`BENCH_SETUP`); unset
+ *   outside a workflow job
+ * @returns {string|undefined} why the setup failed, naming every pair that is not `<step>=success`
+ */
+const setupFailure = (setup = '') => {
+  const failed = setup.split(/\s+/).filter((pair) => pair && !/^[\w-]+=success$/.test(pair))
+  return failed.length ? `workflow setup did not succeed: ${failed.join(', ')}` : undefined
+}
+
 module.exports = {
   rotate,
   median,
@@ -456,6 +468,7 @@ module.exports = {
   format,
   exitCode,
   commandArm,
+  setupFailure,
   main,
 }
 
