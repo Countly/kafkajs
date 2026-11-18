@@ -859,7 +859,10 @@ class ProducerWorker extends Worker {
   }
 
   /**
-   * One whole transaction: its records, the decision and the confirmed outcome, never inferred.
+   * One whole transaction: its records, the decision and the outcome the client confirmed, never
+   * inferred. A send that fails stops the transaction's sends and turns the decision into an abort,
+   * as the client's contract asks of a transaction an operation failed in; so does a commit the
+   * client refuses. The next transaction then begins as usual.
    * @param {ClientRig} rig @param {number} n the transaction's number
    * @returns {Promise<void>}
    */
@@ -867,24 +870,25 @@ class ProducerWorker extends Worker {
     const { config, matrix } = this.runtime
     const transaction = `${rig.id}.x${n}`
     const early = config.mode === 'smoke' && n === matrix.schedule.smoke.abortAtTransaction
-    const decision = early || n % valueOf(matrix.traffic.abortEvery) === 0 ? 'abort' : 'commit'
-    let outcome = decision === 'commit' ? 'committed' : 'aborted'
-    let errorType = null
-    let txn = null
+    let decision = early || n % valueOf(matrix.traffic.abortEvery) === 0 ? 'abort' : 'commit'
+    let ended = { outcome: 'unknown', errorType: null }
     try {
-      txn = await rig.object.transaction()
-      for (let i = 0; i < valueOf(matrix.traffic.transactionRecords); i++)
-        await this.offer(rig, config.topics.transactions, 0, transaction, txn)
-      await (decision === 'commit' ? txn.commit() : txn.abort())
+      const txn = await rig.object.transaction()
+      for (let i = 0; i < valueOf(matrix.traffic.transactionRecords); i++) {
+        const sent = await this.offer(rig, config.topics.transactions, 0, transaction, txn)
+        if (sent !== 'acknowledged') {
+          decision = 'abort'
+          break
+        }
+      }
+      ended = await this.end(txn, transaction, decision)
+      if (ended.aborted) decision = 'abort'
     } catch (e) {
-      outcome = 'unknown'
-      errorType = e.name ?? 'Error'
-      await this.runtime.failed(`${transaction}.${decision}`, e)
-      // a transaction left open would block every later one of this producer
-      if (txn?.isActive?.()) await txn.abort().catch(() => {})
+      ended.errorType = e.name ?? 'Error'
+      await this.runtime.failed(`${transaction}.begin`, e)
     }
     this.settled = (this.settled ?? 0) + 1
-    this.lastOutcome = outcome
+    this.lastOutcome = ended.outcome
     await this.runtime.emit({
       kind: 'identity',
       recordId: this.runtime.nextId(),
@@ -892,10 +896,48 @@ class ProducerWorker extends Worker {
       client: rig.id,
       transaction,
       decision,
-      outcome,
+      outcome: ended.outcome,
       call: `${transaction}.${decision}`,
-      errorType,
+      errorType: ended.errorType,
     })
+  }
+
+  /**
+   * Ends a transaction by the client's public contract. A commit whose outcome is unknown
+   * (`retriable`) is sent again until it is confirmed or the loops stop; a commit the client
+   * refuses is followed by an abort. Only an end the client confirmed is `committed` or `aborted`.
+   * @param {object} txn the client's transaction
+   * @param {string} transaction the journal's transaction id
+   * @param {'commit'|'abort'} decision
+   * @returns {Promise<{ outcome: 'committed'|'aborted'|'unknown', errorType: ?string,
+   *   aborted: boolean }>} `aborted` when the driver ended it with an abort; `errorType` names the
+   *   last error the client returned, null for a confirmed commit (earlier attempts stay in the
+   *   failed-call diagnostics)
+   */
+  async end(txn, transaction, decision) {
+    const { clock } = this.runtime
+    let errorType = null
+    if (decision === 'commit') {
+      for (;;) {
+        try {
+          await txn.commit()
+          return { outcome: 'committed', errorType: null, aborted: false }
+        } catch (e) {
+          errorType = e.name ?? 'Error'
+          await this.runtime.failed(`${transaction}.commit`, e)
+          if (!e.retriable) break
+          if (this.loops?.signal.aborted) return { outcome: 'unknown', errorType, aborted: false }
+          await clock.sleepUntil(clock.now() + 1000, this.loops?.signal)
+        }
+      }
+    }
+    try {
+      await txn.abort()
+      return { outcome: 'aborted', errorType, aborted: true }
+    } catch (e) {
+      await this.runtime.failed(`${transaction}.abort`, e)
+      return { outcome: 'unknown', errorType: e.name ?? 'Error', aborted: true }
+    }
   }
 
   /** @returns {Promise<void>} answers an idle command once the send or transaction in flight settles */
@@ -916,7 +958,9 @@ class ProducerWorker extends Worker {
 
   /**
    * Offers one logical id once: its offered record, the send, then its settled outcome. An id
-   * whose topic id is not yet known is not offered.
+   * whose topic id is not yet known is not offered. A send the client reports as a success with
+   * offset `-1` (the broker deduplicated it and returned no location) is acknowledged with no
+   * offset: the location is unknown, never invented.
    * @returns {Promise<'acknowledged'|'unknown'|'skipped'>} the send's outcome
    */
   async offer(rig, topic, partition, transaction, sender = rig.object, execution = null) {
@@ -954,7 +998,11 @@ class ProducerWorker extends Worker {
         messages: [{ key: record.key, value: record.value, partition }],
       })
       const offset = meta?.baseOffset ?? null
-      ack = { outcome: offset === null ? 'unknown' : 'acknowledged', offset, errorType: null }
+      // '-1' is the client's success for a send the broker already had, at no known location
+      ack =
+        offset === null
+          ? { outcome: 'unknown', offset: null, errorType: null }
+          : { outcome: 'acknowledged', offset: offset === '-1' ? null : offset, errorType: null }
     } catch (e) {
       ack = { outcome: 'unknown', offset: null, errorType: e.name ?? 'Error' }
       await runtime.failed(`${record.id}.send`, e)
@@ -1024,6 +1072,9 @@ class ProducerWorker extends Worker {
  * a paused partition, static restarts, and the seed's retained offset map.
  */
 class ConsumerWorker extends Worker {
+  /** The last offset this process committed for each key of its group, by any of its members. */
+  groupCommitted = new Map()
+
   /** @returns {Promise<void>} */
   async begin() {
     const slot = this.runtime.slots.find((c) => c.purpose === 'subject' || c.purpose === 'control')
@@ -1214,17 +1265,20 @@ class ConsumerWorker extends Worker {
   }
 
   /**
-   * Commits a key's processed next offset under the authority its last handler carried, inside the
-   * commit store so the write and publish stages are recorded, then asks for the broker readback.
-   * Only a commit that succeeded settles the offsets it covered; a failed one leaves them owed.
+   * Commits a key's processed next offset under the authority its last handler carried, or under
+   * `current` when given, inside the commit store so the write and publish stages are recorded,
+   * then asks for the broker readback. Only a commit that succeeded settles the offsets it covered
+   * and becomes the group's last commit of the key; a failed one leaves them owed.
    * @param {ClientRig} rig @param {string} k `topic|partition`
-   * @returns {Promise<void>}
+   * @param {{ key: object, authority: object }} [current] the member's current key and authority
+   * @returns {Promise<'ok'|'refused'|'unknown'|null>} the commit's outcome, null when nothing was
+   *   committed
    */
-  async commit(rig, k) {
+  async commit(rig, k, current = null) {
     const { runtime } = this
     const next = rig.processed.get(k)
-    const captured = rig.authority.get(k)
-    if (!next || !captured) return
+    const captured = current ?? rig.authority.get(k)
+    if (!next || !captured) return null
     const owed = rig.uncommitted.get(k) ?? 0
     const { topic, partition } = { topic: captured.key.topic, partition: captured.key.partition }
     const commit = `${rig.id}.m${runtime.ids}`
@@ -1252,6 +1306,7 @@ class ConsumerWorker extends Worker {
         rig.object.commitOffsets([{ topic, partition, offset: next }])
       )
       rig.committed.set(k, next)
+      this.groupCommitted.set(k, next)
       rig.uncommitted.set(k, Math.max(0, (rig.uncommitted.get(k) ?? 0) - owed))
     } catch (e) {
       outcome =
@@ -1269,6 +1324,7 @@ class ConsumerWorker extends Worker {
       commit,
       key: captured.key,
     })
+    return outcome
   }
 
   /** Records the write and publish stages of the driver's own commits. */
@@ -1439,24 +1495,16 @@ class ConsumerWorker extends Worker {
 
   /**
    * Commits every key whose resolved next offset is ahead of the member's last successful commit,
-   * outside any handler. A drain with `ends` is the final one: for each key the member reads it
-   * first waits, until the deadline, for the member to resolve the key's end, then commits what it
-   * resolved whatever authority it holds. An intermediate drain skips a key whose captured
-   * authority is no longer the member's own: the new owner's progress covers it.
+   * outside any handler, skipping a key whose captured authority is no longer the member's own: the
+   * new owner's progress covers it. A drain with `ends` is the final one (`finalDrain`).
    * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps `topic|partition`
-   *   to the log end the member must have resolved
+   *   to the log end the group must commit
    * @returns {Promise<{ reached: boolean }>} whether every key reached its end in time
    */
   async onDrain({ ends = {}, deadline = Infinity } = {}) {
+    if (Object.keys(ends).length > 0) return this.finalDrain(ends, deadline)
     const { observer } = this.runtime
-    const final = Object.keys(ends).length > 0
-    let reached = true
     for (const rig of this.rigs()) {
-      for (const [k, end] of Object.entries(ends)) {
-        if (!this.reads(rig, k.slice(0, k.lastIndexOf('|')))) continue
-        const resolved = () => BigInt(rig.processed.get(k) ?? 0) >= BigInt(end)
-        if (!(await this.until(resolved, deadline))) reached = false
-      }
       const [group] = observer.mine(rig.id, 'ConsumerGroup')
       for (const [k, next] of [...(rig.processed ?? [])]) {
         if (BigInt(next) <= BigInt(rig.committed.get(k) ?? 0)) continue
@@ -1469,9 +1517,57 @@ class ConsumerWorker extends Worker {
           now.token === then.token &&
           now.acquiredAt === then.acquiredAt &&
           now.recreatedAt === then.recreatedAt
-        if (final || same) await this.commit(rig, k)
+        if (same) await this.commit(rig, k)
         else
           await this.runtime.diagnose(`drain commit of ${k} by ${rig.id} skipped: authority moved`)
+      }
+    }
+    return { reached: true }
+  }
+
+  /**
+   * The final drain: for each key a member reads, the group's committed offset must reach the log
+   * end. The member that holds the key now waits, until the deadline, until its resolved position
+   * (handlers, and batches the client resolved with only control or aborted records) reaches the
+   * end, then commits that position under its current authority; a refused or failed commit is sent
+   * again. A key the group already committed to the end through another member, or an empty log,
+   * needs nothing.
+   * @param {Record<string, string>} ends `topic|partition` to log end
+   * @param {number} deadline on the run clock
+   * @returns {Promise<{ reached: boolean }>} whether every key was committed to its end in time
+   */
+  async finalDrain(ends, deadline) {
+    const { clock, observer } = this.runtime
+    let reached = true
+    for (const [k, end] of Object.entries(ends)) {
+      const topic = k.slice(0, k.lastIndexOf('|'))
+      if (!this.rigs().some((rig) => this.reads(rig, topic))) continue
+      const done = () => end === '0' || BigInt(this.groupCommitted.get(k) ?? -1) >= BigInt(end)
+      const holder = () =>
+        this.rigs().find(
+          (rig) =>
+            observer.mine(rig.id, 'ConsumerGroup')[0]?.acquired?.has(k) &&
+            BigInt(rig.processed?.get(k) ?? -1) >= BigInt(end)
+        )
+      while (
+        !done() &&
+        clock.now() < deadline &&
+        (await this.until(() => done() || holder(), deadline))
+      ) {
+        const rig = holder()
+        if (!rig) continue
+        const [group] = observer.mine(rig.id, 'ConsumerGroup')
+        const partition = Number(k.slice(k.lastIndexOf('|') + 1))
+        const current = {
+          key: { topic, topicId: observer.topicIdOf(topic, group), partition },
+          authority: observer.currentAuthority(group, k),
+        }
+        if ((await this.commit(rig, k, current)) !== 'ok')
+          await clock.sleepUntil(Math.min(deadline, clock.now() + 250))
+      }
+      if (!done()) {
+        reached = false
+        await this.runtime.diagnose(`final drain: ${k} not committed to ${end}`)
       }
     }
     return { reached }

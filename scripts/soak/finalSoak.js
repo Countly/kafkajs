@@ -1076,29 +1076,65 @@ class Supervisor {
   }
 
   /**
-   * Fixes the two standing logs' ends, then asks every consuming process to resolve them and
-   * commit, and the share process to deliver up to them.
+   * Asks every consuming process to commit its group to the two standing logs' settled ends, and
+   * the share process to deliver up to them. When the ends moved during the drain (a late marker)
+   * the drain runs again with the new ends, until they hold or the deadline passes.
    * @returns {Promise<void>}
    * @throws {Error} when the log ends cannot be read
    */
   async finalDrain() {
-    const { main, transactions } = this.config.topics
-    const ends = {}
-    for (const topic of [main, transactions])
-      for (const { partition, high, offset } of await this.admin.fetchTopicOffsets(topic))
-        ends[`${topic}|${partition}`] = high ?? offset
+    const deadline = this.clock.now() + FINAL_DRAIN_MS
     const slots = [...new Set([...this.consumers(), this.processOf('share')])]
-    const step = {
-      type: 'drain',
-      id: 'final-drain',
-      ends,
-      deadline: this.clock.now() + FINAL_DRAIN_MS,
+    let ends = await this.settledEnds(deadline)
+    for (let round = 1; ; round++) {
+      const step = { type: 'drain', id: `final-drain.${round}`, ends, deadline }
+      const replies = await Promise.all(slots.map((slot) => this.command(slot, step)))
+      const after = await this.settledEnds(deadline)
+      const moved = Object.keys(ends).some((k) => ends[k] !== after[k])
+      if (!moved || this.clock.now() >= deadline) {
+        if (moved) this.problem("final drain: the logs' ends moved after the deadline")
+        replies.forEach((r, i) => {
+          if (r.error || r.reply?.reached === false)
+            this.problem(`final drain: ${slots[i]} ${r.error ?? "did not resolve the logs' ends"}`)
+        })
+        return
+      }
+      ends = after
     }
-    const replies = await Promise.all(slots.map((slot) => this.command(slot, step)))
-    replies.forEach((r, i) => {
-      if (r.error || r.reply?.reached === false)
-        this.problem(`final drain: ${slots[i]} ${r.error ?? "did not resolve the logs' ends"}`)
-    })
+  }
+
+  /**
+   * Reads the two standing logs' ends until no transaction is open on them: the read-committed end
+   * equals the high watermark, which Apache's describe prints as the log end.
+   * @param {number} deadline on the run clock; past it, the high watermarks are returned and the
+   *   open transaction is a problem of the run
+   * @returns {Promise<Record<string, string>>} `topic|partition` to log end
+   * @throws {Error} when the log ends cannot be read
+   */
+  async settledEnds(deadline) {
+    const { main, transactions } = this.config.topics
+    for (;;) {
+      const ends = {}
+      let open = false
+      for (const topic of [main, transactions]) {
+        const committed = await this.admin.fetchTopicOffsets(topic, {
+          isolationLevel: 'read_committed',
+        })
+        const high = await this.admin.fetchTopicOffsets(topic, {
+          isolationLevel: 'read_uncommitted',
+        })
+        for (const { partition, offset } of high) {
+          ends[`${topic}|${partition}`] = offset
+          open ||= committed.find((c) => c.partition === partition)?.offset !== offset
+        }
+      }
+      if (!open) return ends
+      if (this.clock.now() >= deadline) {
+        this.problem("final drain: a transaction stayed open on the logs' ends")
+        return ends
+      }
+      await this.clock.sleepUntil(Math.min(deadline, this.clock.now() + 250))
+    }
   }
 
   /**
