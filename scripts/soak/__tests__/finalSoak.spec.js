@@ -532,6 +532,7 @@ describe('final soak driver', () => {
         '  *"upgrade --feature share.version=1") touch "$CALLS.upgraded" ;;',
         'esac',
       ].join('\n'),
+      node: 'case "$*" in *waitForKafka*) echo "$COMPOSE_FILE" >> "$CALLS.wait" ;; esac',
     }
     for (const name of ['git', 'npm', 'docker', 'node', 'tar', 'sleep']) {
       const script = [
@@ -547,7 +548,9 @@ describe('final soak driver', () => {
     }
     return {
       run(args, extra = {}) {
-        for (const file of [log, `${log}.env`, `${log}.upgraded`]) fs.rmSync(file, { force: true })
+        for (const suffix of ['', '.env', '.upgraded', '.wait']) {
+          fs.rmSync(`${log}${suffix}`, { force: true })
+        }
         fs.rmSync(artifacts, { recursive: true, force: true })
         return spawnSync('bash', [RUNBOOK, ...args], {
           env: {
@@ -561,6 +564,7 @@ describe('final soak driver', () => {
       },
       calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
       env: () => fs.readFileSync(`${log}.env`, 'utf8').trim().split('\n'),
+      waited: () => fs.readFileSync(`${log}.wait`, 'utf8').trim().split('\n'),
       /** @returns {{ out: string, receipt: object, log: string }} the run's sibling files */
       evidence() {
         const name = fs.readdirSync(artifacts).find((f) => f.endsWith('.runbook.json'))
@@ -601,6 +605,8 @@ describe('final soak driver', () => {
       expect(new Set(harness.env())).toEqual(
         new Set([`kafkajs docker-compose.telemetry.yml:${out}/broker/compose.json`])
       )
+      // waitForKafka passes COMPOSE_FILE to `docker compose -f`, which takes one path only.
+      expect(harness.waited()).toEqual(['docker-compose.telemetry.yml'])
       const preflight = `node scripts/soak/finalSoakPreflight.js --expect-sha ${TREE} --mode smoke --out ${out}`
       const driver = `node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke --expect-sha ${TREE} --matrix scripts/soak/finalSoakMatrix.json --out ${out}`
       const finalize = `node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`
