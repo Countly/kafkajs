@@ -5,6 +5,7 @@ const { createLogger, LEVELS } = require('../../loggers')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 const { Kafka } = require('../../..')
 const Encoder = require('../../protocol/encoder')
+const Decoder = require('../../protocol/decoder')
 const Cluster = require('../../cluster')
 const { ShareRunner } = require('../../consumer/share/shareRunner')
 const { newLogger, connectionOpts } = require('testHelpers')
@@ -85,7 +86,8 @@ const textOf = (value, seen = new Set()) => {
 /**
  * Runs one authentication over a fake connection whose SaslAuthenticate send runs `exchange`.
  * @param {string} name built-in mechanism name
- * @param {() => *} exchange the SaslAuthenticate outcome; throws to fail the send
+ * @param {(request: object) => *} exchange the SaslAuthenticate outcome for the request sent; throws
+ *   to fail the send
  * @param {{ sasl?: object, guard?: () => Error|null }} [options]
  * @returns {Promise<{ error: *, entries: object[], sent: number, reported: jest.Mock }>}
  */
@@ -107,7 +109,7 @@ const authenticate = async (name, exchange, { sasl = MECHANISMS[name](), guard }
         return { enabledMechanisms: [name], errorCode: 0 }
       }
       sent += 1
-      return exchange()
+      return exchange(request)
     },
   }
   const error = await new SASLAuthenticator(connection, logger, VERSIONS, guard)
@@ -513,6 +515,118 @@ describe('Broker > SASLAuthenticator > a passed-through failure belongs to one i
   })
 })
 
+describe('Broker > SASLAuthenticator > OAUTHBEARER error challenge', () => {
+  /** What a broker that refuses a token answers with, in a SaslAuthenticate that carries no error code. */
+  const CHALLENGE = JSON.stringify({ status: 'invalid_token', scope: SECRET })
+  const challengeAnswer = () => ({
+    authBytes: new Encoder().writeBytes(Buffer.from(CHALLENGE)).buffer,
+  })
+  const emptyAnswer = (authBytes = Buffer.alloc(0)) => ({
+    authBytes: new Encoder().writeBytes(authBytes).buffer,
+  })
+
+  /** @returns {Promise<Buffer|null>} the mechanism payload a SaslAuthenticate request carries */
+  const payloadOf = async (request) => new Decoder((await request.encode()).buffer).readBytes()
+
+  /**
+   * Scripts one SaslAuthenticate answer per call and records each payload sent.
+   * @param {Array<() => object>} answers the answer of the nth call; a function may throw
+   * @returns {{ exchange: (request: object) => Promise<object>, payloads: Buffer[] }}
+   */
+  const scripted = (answers) => {
+    const payloads = []
+    return {
+      payloads,
+      exchange: async (request) => {
+        payloads.push(await payloadOf(request))
+        return answers[payloads.length - 1]()
+      },
+    }
+  }
+
+  const reject = () => {
+    throw createErrorFromCode(58)
+  }
+
+  test('an error challenge is answered with one 0x01 byte and the broker rejection is a non-retriable authentication error without the challenge text', async () => {
+    const { exchange, payloads } = scripted([challengeAnswer, reject])
+
+    const { error, entries, sent, reported } = await authenticate('OAUTHBEARER', exchange)
+
+    expect(sent).toBe(2)
+    expect(payloads[0].toString().startsWith('n,,\u0001auth=Bearer ')).toBe(true)
+    expect(payloads[1]).toEqual(Buffer.from([0x01]))
+    expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+    expect(error.retriable).toBe(false)
+    expect(reported).toHaveBeenCalledTimes(1)
+    expect(textOf([error, entries])).not.toContain(SECRET)
+    expect(textOf([error, entries])).not.toContain('invalid_token')
+  })
+
+  test('an error challenge still fails authentication when the reply to the 0x01 byte is not an error', async () => {
+    const { exchange, payloads } = scripted([challengeAnswer, emptyAnswer])
+
+    const { error, entries, sent, reported } = await authenticate('OAUTHBEARER', exchange)
+
+    expect(sent).toBe(2)
+    expect(payloads[1]).toEqual(Buffer.from([0x01]))
+    expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+    expect(error.retriable).toBe(false)
+    expect(error.message).toContain('SASL OAUTHBEARER authentication failed')
+    expect(reported).not.toHaveBeenCalled()
+    expect(textOf([error, entries])).not.toContain(SECRET)
+    expect(textOf([error, entries])).not.toContain('invalid_token')
+  })
+
+  test.each([
+    ['empty', Buffer.alloc(0)],
+    ['null', null],
+  ])(
+    'a token the broker accepts (%s auth bytes) completes with a single SaslAuthenticate',
+    async (_, bytes) => {
+      const { exchange } = scripted([() => emptyAnswer(bytes)])
+
+      const { error, entries, sent, reported } = await authenticate('OAUTHBEARER', exchange)
+
+      expect(error).toBeNull()
+      expect(sent).toBe(1)
+      expect(reported).not.toHaveBeenCalled()
+      expect(entries.filter(({ level }) => level === LEVELS.ERROR)).toEqual([])
+    }
+  )
+
+  test.each([
+    ['connection error', connectionError, (failure) => failure],
+    ['request timeout', timeoutError, closedError],
+  ])(
+    'a %s that ends the connection while the 0x01 byte is sent stays a retriable connection error',
+    async (_, make, refusalOf) => {
+      const failure = make()
+      const refusal = refusalOf(failure)
+      let ended = false
+      const { exchange } = scripted([
+        challengeAnswer,
+        () => {
+          ended = true
+          throw failure
+        },
+      ])
+
+      const { error, entries, sent, reported } = await authenticate('OAUTHBEARER', exchange, {
+        guard: () => (ended ? refusal : null),
+      })
+
+      expect(sent).toBe(2)
+      expect(error).toBe(refusal)
+      expect(error).not.toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.retriable).toBe(true)
+      expect(reported).not.toHaveBeenCalled()
+      expect(entries.filter(({ level }) => level === LEVELS.ERROR)).toEqual([])
+      expect(textOf([error, entries])).not.toContain(SECRET)
+    }
+  )
+})
+
 describe('Broker > SASLAuthenticator > transport failures through the client', () => {
   const ECONNRESET = () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
   /** Logins last one second; the client re-authenticates 100 ms after each one. */
@@ -542,23 +656,28 @@ describe('Broker > SASLAuthenticator > transport failures through the client', (
   }
 
   /**
-   * Builds an admin over one scripted SASL PLAIN broker whose SaslAuthenticate runs `answer`.
+   * Builds an admin over one scripted SASL broker whose SaslAuthenticate runs `answer`.
    * @param {(call: number) => object} answer the response fields of the nth SaslAuthenticate
-   * @param {{ wrapSocket?: (socket: object) => void, entries?: object[] }} [options] a hook on
-   *   every socket the client opens, and a sink for every log entry
+   * @param {{ wrapSocket?: (socket: object) => void, entries?: object[], oauthBearer?: boolean }}
+   *   [options] a hook on every socket the client opens, a sink for every log entry, and whether
+   *   the broker speaks SASL OAUTHBEARER instead of PLAIN
    * @returns {void}
    */
-  const arrange = (answer, { wrapSocket = () => {}, entries } = {}) => {
+  const arrange = (answer, { wrapSocket = () => {}, entries, oauthBearer = false } = {}) => {
     let call = 0
     cluster = createScriptedCluster({
       nodes: [{ id: 0, host: 'broker', port: 9092 }],
       profile: 'sasl',
     })
-      .answer('SaslHandshake', () => ({ enabledMechanisms: ['PLAIN'] }))
+      .answer('SaslHandshake', () => ({
+        enabledMechanisms: [oauthBearer ? 'OAUTHBEARER' : 'PLAIN'],
+      }))
       .answer('SaslAuthenticate', () => answer(call++))
     admin = new Kafka(
       cluster.kafkaOptions({
-        sasl: { mechanism: 'plain', username: 'user', password: SECRET },
+        sasl: oauthBearer
+          ? { mechanism: 'oauthbearer', oauthBearerProvider: async () => ({ value: SECRET }) }
+          : { mechanism: 'plain', username: 'user', password: SECRET },
         authenticationTimeout: 1000,
         reauthenticationThreshold: 900,
         retry: { initialRetryTime: 10, maxRetryTime: 10, factor: 0, multiplier: 1, retries: 3 },
@@ -634,6 +753,59 @@ describe('Broker > SASLAuthenticator > transport failures through the client', (
     expect(error.retriable).toBe(false)
     expect(logins()).toHaveLength(0)
     expect(textOf([error, entries])).not.toContain(SECRET)
+  })
+
+  describe('an OAUTHBEARER token the broker challenges', () => {
+    const CHALLENGE = {
+      ...LOGIN,
+      authBytes: Buffer.from(JSON.stringify({ status: 'invalid_token', scope: SECRET })),
+    }
+    const REJECTED = { errorCode: 58, errorMessage: SECRET, authBytes: Buffer.alloc(0) }
+
+    test('a challenged token at connect is a terminal authentication error after one 0x01 byte', async () => {
+      const entries = []
+      arrange((call) => [CHALLENGE, REJECTED][call], { oauthBearer: true, entries })
+
+      const error = await until(admin.connect()).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.retriable).toBe(false)
+      expect(logins()).toHaveLength(2)
+      expect(logins()[1].fields.authBytes).toEqual(Buffer.from([0x01]))
+      expect(textOf([error, entries])).not.toContain(SECRET)
+      expect(textOf([error, entries])).not.toContain('invalid_token')
+    })
+
+    test('a challenged token at re-authentication is a terminal authentication error after one 0x01 byte', async () => {
+      const entries = []
+      arrange((call) => [LOGIN, CHALLENGE, REJECTED][call], { oauthBearer: true, entries })
+      await until(admin.connect())
+      await jest.advanceTimersByTimeAsync(200)
+
+      const error = await until(admin.listTopics()).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.retriable).toBe(false)
+      expect(logins()).toHaveLength(3)
+      expect(logins()[2].fields.authBytes).toEqual(Buffer.from([0x01]))
+      expect(textOf([error, entries])).not.toContain(SECRET)
+      expect(textOf([error, entries])).not.toContain('invalid_token')
+    })
+
+    test('a reset while the 0x01 byte is sent at re-authentication is retried and the request succeeds', async () => {
+      arrange((call) => (call === 1 ? CHALLENGE : call === 2 ? resetLogin() : LOGIN), {
+        oauthBearer: true,
+      })
+      await until(admin.connect())
+      await jest.advanceTimersByTimeAsync(200)
+
+      const topics = await until(admin.listTopics())
+
+      expect(topics).toEqual([])
+      expect(logins()).toHaveLength(4)
+      expect(logins()[2].fields.authBytes).toEqual(Buffer.from([0x01]))
+      expect(cluster.sockets()[0].destroyed).toBe(true)
+    })
   })
 
   test('a rejected password during re-authentication is not retried', async () => {

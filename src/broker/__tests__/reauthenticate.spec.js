@@ -1,5 +1,6 @@
 const {
   saslOAuthBearerConnectionOpts,
+  expiredUnsecuredJwt,
   newLogger,
   describeIfOauthbearerEnabled,
   createConnectionPool,
@@ -14,9 +15,7 @@ const { KafkaJSConnectionError, KafkaJSSASLAuthenticationError } = require('../.
 /**
  * A valid unsecured JWT for a different principal than the one the connection logged in with.
  * At re-authentication the broker refuses a principal change with SASL_AUTHENTICATION_FAILED
- * (SaslServerAuthenticator `ensurePrincipalUnchanged`, Kafka 4.4.0). An invalid or expired token
- * is not used: the broker answers it with an OAUTHBEARER error challenge in a successful
- * SaslAuthenticate response, which is not a rejection the client sees as an error code.
+ * (SaslServerAuthenticator `ensurePrincipalUnchanged`, Kafka 4.4.0).
  * @returns {string}
  */
 const otherPrincipalJwt = () => {
@@ -173,6 +172,40 @@ describeIfOauthbearerEnabled('Brokers re-authentication with SASL OAUTHBEARER', 
       sasl: {
         ...opts.sasl,
         oauthBearerProvider: async () => (calls++ === 0 ? valid() : { value: otherPrincipalJwt() }),
+      },
+      reauthenticationThreshold: 14900,
+      socketFactory: chaos,
+    })
+    broker = new Broker({ connectionPool, logger: newLogger() })
+    try {
+      await broker.connect()
+      await wait(1000)
+
+      const error = await broker.listGroups().catch((failure) => failure)
+
+      expect(calls).toBe(2)
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.message).toBe(
+        'SASL OAUTHBEARER authentication failed: SASL Authentication failed'
+      )
+      expect(error.retriable).toBe(false)
+      expect(chaos.sockets).toHaveLength(1)
+    } finally {
+      await broker.disconnect()
+    }
+  })
+
+  test('an expired token at re-authentication is a terminal authentication error', async () => {
+    const opts = saslOAuthBearerConnectionOpts()
+    let calls = 0
+    const valid = opts.sasl.oauthBearerProvider
+    const chaos = createChaosSocketFactory(defaultSocketFactory())
+    const connectionPool = createConnectionPool({
+      ...opts,
+      sasl: {
+        ...opts.sasl,
+        oauthBearerProvider: async () =>
+          calls++ === 0 ? valid() : { value: expiredUnsecuredJwt({ sub: 'test' }) },
       },
       reauthenticationThreshold: 14900,
       socketFactory: chaos,

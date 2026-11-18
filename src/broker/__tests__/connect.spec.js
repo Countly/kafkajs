@@ -6,6 +6,9 @@ const {
   newLogger,
   testIfKafkaAtLeast_1_1_0,
   describeIfOauthbearerDisabled,
+  describeIfOauthbearerEnabled,
+  saslOAuthBearerConnectionOpts,
+  expiredUnsecuredJwt,
   saslEntries,
   saslConnectionOpts,
   saslBrokers,
@@ -315,6 +318,34 @@ describe('Broker > connect', () => {
           await Promise.allSettled([consumer.disconnect(), producer.disconnect()])
         }
       }, 60000)
+    })
+  })
+
+  describeIfOauthbearerEnabled('an expired SASL OAUTHBEARER token', () => {
+    test('an expired token at connect is a terminal authentication error and is not retried', async () => {
+      const opts = saslOAuthBearerConnectionOpts()
+      const chaos = createChaosSocketFactory(defaultSocketFactory())
+      broker = new Broker({
+        connectionPool: createConnectionPool({
+          ...opts,
+          sasl: {
+            ...opts.sasl,
+            oauthBearerProvider: async () => ({ value: expiredUnsecuredJwt({ sub: 'test' }) }),
+          },
+          socketFactory: chaos,
+        }),
+        logger: newLogger(),
+      })
+
+      const error = await broker.connect().catch((failure) => failure)
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.message).toBe(
+        'SASL OAUTHBEARER authentication failed: SASL Authentication failed'
+      )
+      expect(error.retriable).toBe(false)
+      expect(broker.isConnected()).toEqual(false)
+      expect(chaos.sockets).toHaveLength(1)
     })
   })
 })
