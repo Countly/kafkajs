@@ -1,6 +1,7 @@
 const { ShareCloseEpisode } = require('../shareCloseEpisode')
 const { ShareRun } = require('../shareRun')
 const { KafkaJSNonRetriableError } = require('../../../errors')
+const { LEVELS } = require('../../../loggers')
 const { A, flush } = require('../../../../testHelpers/shareHarness')
 
 const TWO_NODES = {
@@ -295,6 +296,29 @@ describe('public share shutdown contract', () => {
     gate.release()
     expect(h.frames(79)).toHaveLength(0)
     expect(leaves()).toHaveLength(1)
+  })
+
+  test('logs a close traffic failure once and still tears the run down', async () => {
+    const lines = []
+    await start({
+      kafka: { logLevel: LEVELS.ERROR, logCreator: () => (entry) => lines.push(entry) },
+    })
+    jest
+      .spyOn(ShareRun.prototype, 'closeTraffic')
+      .mockRejectedValueOnce(new Error('close traffic failed'))
+    await h.consumer.run({ eachMessage: async () => {} })
+
+    await h.consumer.disconnect()
+    const failures = lines.filter(({ log }) => log.message === 'Share close failed')
+    expect(failures.map(({ level, log }) => [level, log.error])).toEqual([
+      [LEVELS.ERROR, 'close traffic failed'],
+    ])
+    expect(h.order).toEqual(['stop', 'disconnect'])
+    expect(h.cluster.sockets().filter((socket) => !socket.destroyed)).toHaveLength(0)
+
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
   })
 
   test('treats timeout zero as a synchronous traffic fence', async () => {

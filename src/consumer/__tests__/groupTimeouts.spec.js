@@ -146,6 +146,17 @@ describe('Consumer > group timeouts', () => {
       expect(Number.isSafeInteger(resolved.syncGroupTimeout)).toBe(true)
     })
 
+    it('accepts maxPollInterval 1 as both the wire rebalance timeout and the poll deadline', () => {
+      const resolveWith = () => resolve({ maxPollInterval: 1 }).resolved
+
+      expect(resolveWith).not.toThrow()
+      expect(resolveWith()).toMatchObject({
+        rebalanceTimeout: 1,
+        pollDeadline: 1,
+        syncGroupTimeout: 5001,
+      })
+    })
+
     it.each([0, 1.5])('grandfathers a rebalanceTimeout of %p', (value) => {
       expect(() =>
         resolveGroupTimeouts({ logger: newLogger(), rebalanceTimeout: value })

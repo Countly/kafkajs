@@ -323,6 +323,23 @@ describe('Consumer > OffsetOperations', () => {
       expect(operations.size()).toBe(0)
     })
 
+    test('end drops a completed partition while another partition of its topic stays open', () => {
+      const first = operations.begin([cell(0)])
+      const second = operations.begin([cell(1)])
+
+      operations.end(first)
+      expect([...operations.topics.get(T).keys()]).toEqual([1])
+      expect(operations.size()).toBe(1)
+
+      const reused = operations.begin([cell(0)])
+      expect(operations.size()).toBe(2)
+
+      operations.end(reused)
+      operations.end(second)
+      expect(operations.topics.size).toBe(0)
+      expect(operations.size()).toBe(0)
+    })
+
     test('end is idempotent', () => {
       const first = operations.begin([cell()])
       const second = operations.begin([cell()])
