@@ -1688,7 +1688,16 @@ describe('final soak driver', () => {
       expect(input.default).toBeDefined()
     const [job] = Object.values(workflow.jobs)
     expect(Object.keys(workflow.jobs)).toHaveLength(1)
-    expect(job['timeout-minutes']).toBeLessThanOrEqual(60)
+    const smoke = matrix.acceptance.modes.smoke
+    const runbook = job.steps.find((s) => (s.run ?? '').includes('finalSoakNode.sh'))
+    const [, grace, limit] = /^timeout -k (\d+)s (\d+)s bash /.exec(runbook.run).map(Number)
+    expect(limit * 1000).toBeGreaterThanOrEqual(
+      smoke.requestedMs.value + smoke.teardownAllowanceMs.value + 15 * 60000
+    )
+    expect(grace).toBeGreaterThanOrEqual(120)
+    expect(runbook['timeout-minutes'] * 60).toBeGreaterThan(limit + grace)
+    const steps = job.steps.reduce((sum, s) => sum + s['timeout-minutes'], 0)
+    expect(job['timeout-minutes']).toBeGreaterThanOrEqual(steps)
     expect(job.env).toMatchObject({ KAFKA_VERSION: '4.4.0', FINAL_SOAK_DIAGNOSTIC: '1' })
     const runs = job.steps.map((s) => s.run ?? '')
     expect(
