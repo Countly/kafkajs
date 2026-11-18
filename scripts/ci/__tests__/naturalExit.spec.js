@@ -1,4 +1,4 @@
-const { runNaturalExit } = require('../naturalExit')
+const { runNaturalExit, verifyControlFailure } = require('../naturalExit')
 const { PROFILES, childArgs, childEnvironment } = require('../shareSoakContract')
 const { primingReceiptHash } = require('../../evidence/sharePrimingLink')
 
@@ -23,6 +23,7 @@ const ORDINARY_CASES = [
 const ORDINARY_TOTAL_MS = 364000
 const CONTROL_CASES = ['leaves one interval alive after its producer disconnects']
 const CONTROL_TOTAL_MS = 42000
+const CONTROL_REPORT = '.tmp/e2e/natural-exit-ordinary-control-jest.json'
 const STEMS = {
   soak: 'share-soak',
   'soak-full': 'share-soak-full',
@@ -39,6 +40,81 @@ const jestChild = (spec) => [
   '--runTestsByPath',
   spec,
 ]
+const CONTROL_ARGV = [...jestChild(ORDINARY_SPEC), '--json', `--outputFile=${CONTROL_REPORT}`]
+
+/**
+ * The Jest JSON report of a control run whose control case passed and whose ordinary cases
+ * were skipped, in file order.
+ * @returns {object} A mutable report.
+ */
+const controlReport = () => ({
+  success: true,
+  numTotalTests: 8,
+  numPassedTests: 1,
+  numFailedTests: 0,
+  numPendingTests: 7,
+  numTodoTests: 0,
+  numRuntimeErrorTestSuites: 0,
+  testResults: [
+    {
+      name: `/repo/${ORDINARY_SPEC}`,
+      status: 'passed',
+      assertionResults: [
+        ...ORDINARY_CASES.map((title) => ({ title, status: 'pending' })),
+        { title: CONTROL_CASES[0], status: 'passed' },
+      ],
+    },
+  ],
+})
+
+/**
+ * The three artifacts of a control run that the watchdog killed after its case passed.
+ * @returns {{exit: object, report: object, rows: object[], files: Map<string, string>, read: Function}}
+ *   Mutable artifacts and a reader over their serialized form.
+ */
+const controlArtifacts = () => {
+  const artifacts = {
+    exit: {
+      lane: 'ordinary',
+      control: true,
+      argv: CONTROL_ARGV,
+      startedAt: 1000,
+      exitedAt: 1000 + CONTROL_TOTAL_MS,
+      status: null,
+      signal: 'SIGKILL',
+      totalMs: CONTROL_TOTAL_MS,
+      watchdogTerminated: true,
+      accepted: false,
+      rejection: 'ordinary: unsuccessful child exit',
+    },
+    report: controlReport(),
+    rows: [
+      {
+        event: 'case-complete',
+        case: CONTROL_CASES[0],
+        status: 'passed',
+        tainted: false,
+        cleanup: { completedAt: 6000 },
+      },
+    ],
+    files: new Map(),
+  }
+  artifacts.read = (file, encoding) => {
+    if (encoding !== 'utf8') throw new Error('Wrong encoding')
+    const text = artifacts.files.has(file)
+      ? artifacts.files.get(file)
+      : {
+          '.tmp/e2e/natural-exit-ordinary-control-exit.json': JSON.stringify(artifacts.exit),
+          [CONTROL_REPORT]: JSON.stringify(artifacts.report),
+          '.tmp/e2e/natural-exit-ordinary-control.jsonl': artifacts.rows
+            .map((row) => JSON.stringify(row) + '\n')
+            .join(''),
+        }[file]
+    if (text === undefined) throw Object.assign(new Error(`ENOENT: ${file}`), { code: 'ENOENT' })
+    return text
+  }
+  return artifacts
+}
 
 /**
  * Adds the independently sealed first-use completion before the original scored cleanup row.
@@ -523,11 +599,15 @@ describe('CI natural exit > ordinary clients', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-control-'))
     const artifacts = new Map()
     const evidence = path.join(root, 'control.jsonl')
+    const report = path.join(root, 'control-jest.json')
     const child = `
       const at = Number(process.hrtime.bigint() / 1000000n)
       const row = { event: 'case-complete', case: ${JSON.stringify(CONTROL_CASES[0])},
         status: 'passed', tainted: false, cleanup: { completedAt: at } }
       require('node:fs').writeFileSync(${JSON.stringify(evidence)}, JSON.stringify(row) + '\\n')
+      require('node:fs').writeFileSync(${JSON.stringify(report)}, ${JSON.stringify(
+        JSON.stringify(controlReport())
+      )})
       setInterval(() => {}, 10)
     `
     try {
@@ -548,13 +628,88 @@ describe('CI natural exit > ordinary clients', () => {
         accepted: false,
         watchdogTerminated: true,
         totalMs: CONTROL_TOTAL_MS,
-        argv: jestChild(ORDINARY_SPEC),
+        argv: CONTROL_ARGV,
         rejection: 'ordinary: unsuccessful child exit',
       })
       expect(artifacts.has('.tmp/e2e/natural-exit-ordinary-exit.json')).toBe(false)
+
+      const real = {
+        '.tmp/e2e/natural-exit-ordinary-control-exit.json': JSON.stringify(
+          artifacts.get('.tmp/e2e/natural-exit-ordinary-control-exit.json')
+        ),
+        [CONTROL_REPORT]: fs.readFileSync(report, 'utf8'),
+        '.tmp/e2e/natural-exit-ordinary-control.jsonl': fs.readFileSync(evidence, 'utf8'),
+      }
+      expect(verifyControlFailure({ readFile: (file) => real[file] })).toBeUndefined()
+
+      const cleanExit = {
+        ...real,
+        '.tmp/e2e/natural-exit-ordinary-control-exit.json': JSON.stringify(
+          clean.artifacts.get('.tmp/e2e/natural-exit-ordinary-control-exit.json')
+        ),
+      }
+      expect(() => verifyControlFailure({ readFile: (file) => cleanExit[file] })).toThrow(
+        'control: the child was not stopped by the watchdog'
+      )
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  test('ordinary control is credited only for a passed control case the watchdog killed', () => {
+    const accepted = controlArtifacts()
+    expect(verifyControlFailure({ readFile: accepted.read })).toBeUndefined()
+
+    const damages = {
+      'Jest timeout then a late passed row': (a) => {
+        Object.assign(a.report, { success: false, numPassedTests: 0, numFailedTests: 1 })
+        a.report.testResults[0].status = 'failed'
+        a.report.testResults[0].assertionResults[7].status = 'failed'
+      },
+      'absent Jest report': (a) => a.files.set(CONTROL_REPORT, undefined),
+      'failed Jest suite': (a) => {
+        Object.assign(a.report, { success: false, numRuntimeErrorTestSuites: 1 })
+        a.report.testResults[0].status = 'failed'
+      },
+      'an ordinary case ran': (a) => {
+        Object.assign(a.report, { numPassedTests: 2, numPendingTests: 6 })
+        a.report.testResults[0].assertionResults[0].status = 'passed'
+      },
+      'a missing skipped case': (a) => {
+        Object.assign(a.report, { numTotalTests: 7, numPendingTests: 6 })
+        a.report.testResults[0].assertionResults.splice(1, 1)
+      },
+      'another spec': (a) => (a.report.testResults[0].name = '/repo/src/other.spec.js'),
+      'a stale cleanup row': (a) => (a.rows[0].cleanup.completedAt = 999),
+      'cleanup after the kill': (a) => (a.rows[0].cleanup.completedAt = a.exit.exitedAt + 1),
+      'a wrong-case cleanup row': (a) => (a.rows[0].case = ORDINARY_CASES[0]),
+      'a tainted cleanup row': (a) => (a.rows[0].tainted = true),
+      'a contradictory failure row': (a) => a.rows.push({ event: 'case-failed', error: 'late' }),
+      'no cleanup row': (a) => (a.rows = []),
+      'a natural exit': (a) =>
+        Object.assign(a.exit, {
+          status: 0,
+          signal: null,
+          watchdogTerminated: false,
+          accepted: true,
+        }),
+      'a nonzero exit': (a) =>
+        Object.assign(a.exit, { status: 1, signal: null, watchdogTerminated: false }),
+      'the ordinary child': (a) => (a.exit.argv = jestChild(ORDINARY_SPEC)),
+      'the ordinary lane': (a) => (a.exit.control = false),
+      'unordered parent clock': (a) => (a.exit.exitedAt = a.exit.startedAt - 1),
+    }
+    const credited = Object.entries(damages).filter(([, damage]) => {
+      const artifacts = controlArtifacts()
+      damage(artifacts)
+      try {
+        verifyControlFailure({ readFile: artifacts.read })
+        return true
+      } catch (error) {
+        return !error.message.startsWith('control: ')
+      }
+    })
+    expect(credited.map(([name]) => name)).toEqual([])
   })
 
   test('ordinary lane leaves the four-case shutdown inventory unchanged', () => {
