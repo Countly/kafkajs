@@ -103,6 +103,26 @@ const refreshesMetadata = (e) =>
     describeThrown(e, 'retriable') === 'true')
 
 /**
+ * The error a batch's failure is decided by when it is not the broker's answer about the batch's
+ * partition: a leader or broker lookup, connection or request failure, or an answer without the
+ * partition. While the cluster remembers a Metadata refusal for the topic (a kept target the
+ * broker refused, see `Cluster#topicRefusal`), the batch retries or fails as a Produce answer with
+ * that code would, with that error; otherwise, or once the producer is closing or disconnected,
+ * with its own. The original failure is not kept: a protocol error carries no cause. Called on
+ * failures only, so a healthy send never looks up a refusal.
+ * @param {import("../../types").Cluster} cluster
+ * @param {string} topic the batch's topic
+ * @param {Error} error the failure
+ * @param {import('./generation')} [generation] the producer lifecycle the batch belongs to
+ * @param {() => string} [getConnectionStatus] the producer's connection status
+ * @returns {Error} the topic's refusal, or `error`
+ */
+const decidedFailure = (cluster, topic, error, generation, getConnectionStatus) => {
+  if (generation?.closed || connectionStatusError(getConnectionStatus?.()) !== null) return error
+  return cluster.topicRefusal?.(topic) ?? error
+}
+
+/**
  * The topic ids of a produce request, when every topic in it has one: the request can then be
  * negotiated at v13, which keys topics by id (KIP-516).
  * @param {import("../../types").Cluster} cluster
@@ -1111,6 +1131,8 @@ class DrainLoop {
   /**
    * A ready partition with no leader: refresh the metadata and let its first batch wait a backoff;
    * once that batch has waited `retry.retries` times, reject every batch the partition has queued.
+   * The failure is decided by `decidedFailure`: a topic refusal that is not retriable rejects them
+   * at once.
    * @param {import('./state')} manager
    * @param {Fifo<Delivery>} queue the partition's live batches
    * @param {Delivery} head its first queued batch
@@ -1119,16 +1141,22 @@ class DrainLoop {
    */
   #unrouted(manager, queue, head, now) {
     const { batch } = head
-    const error = new KafkaJSMetadataNotLoaded(
-      `No leader for ${batch.topic} partition ${batch.partition}`
+    const error = decidedFailure(
+      this.#cluster,
+      batch.topic,
+      new KafkaJSMetadataNotLoaded(`No leader for ${batch.topic} partition ${batch.partition}`),
+      this.#generation,
+      this.#getConnectionStatus
     )
-    if (head.routingFailures >= this.#retries) {
+    if (!error.retriable || head.routingFailures >= this.#retries) {
       const exhausted = this.#inTransaction(
         manager,
-        new KafkaJSNumberOfRetriesExceeded(error, {
-          retryCount: head.routingFailures,
-          retryTime: head.retryTime,
-        })
+        error.retriable
+          ? new KafkaJSNumberOfRetriesExceeded(error, {
+              retryCount: head.routingFailures,
+              retryTime: head.retryTime,
+            })
+          : error
       )
       for (const delivery of queue) {
         if (!delivery.settled && !delivery.dispatched) {
@@ -1459,15 +1487,32 @@ class DrainLoop {
    * A batch the broker did not accept: the manager decides, and the loop acts on its verdict. A
    * re-send waits out its backoff in its queue, where a pass expires it once its deadline passes:
    * the deadline bounds every re-send, and no other failure. A batch a fault already settled (see
-   * `DrainLoop#fault`) is not re-sent: it leaves the sequencer as an abandoned batch does.
+   * `DrainLoop#fault`) is not re-sent: it leaves the sequencer as an abandoned batch does. A
+   * failure without a partition result is decided by `decidedFailure`; when that turns it into a
+   * topic refusal that is not retriable after the request was written, the batch is abandoned:
+   * the broker may hold it, so its sequences stay unresolved.
    * @param {import('./state')} manager
    * @param {import('./state/partitionSequencer').PartitionBatch} batch
-   * @param {Error} error
+   * @param {Error} failure
    * @param {import('../protocol/requests/produce/partitionResults').PartitionResult} [result]
    * @returns {void}
    */
-  #failed(manager, batch, error, result) {
+  #failed(manager, batch, failure, result) {
     const delivery = deliveryOf(batch)
+    const error =
+      result === undefined
+        ? decidedFailure(
+            this.#cluster,
+            batch.topic,
+            failure,
+            this.#generation,
+            this.#getConnectionStatus
+          )
+        : failure
+    if (error !== failure && !error.retriable && delivery.currentAttempt?.written) {
+      this.#abandon(manager, delivery, this.#inTransaction(manager, error))
+      return
+    }
     const verdict = manager.fail(batch, error, result)
 
     switch (verdict) {
@@ -2116,6 +2161,20 @@ const createSendMessages = ({
       )
       finish()
     }
+    /**
+     * Decides a live batch's failure that is not the broker's answer about its partition (see
+     * `decidedFailure`): the batch settles with the decided error unless it is retriable.
+     * @param {object} batch
+     * @param {Error} error
+     * @returns {Error|null} the decided error while the batch goes out again, null once settled
+     */
+    const fail = (batch, error) => {
+      const decided = decidedFailure(cluster, batch.topic, error, generation, getConnectionStatus)
+      deliveries.get(batch).lastError = decided
+      if (decided.retriable) return decided
+      settle(batch, undefined, decided)
+      return null
+    }
     /** @param {object} delivery the due batch's state @returns {void} */
     const expire = (delivery) => {
       if (delivery.settled) return
@@ -2371,14 +2430,14 @@ const createSendMessages = ({
         if (generation?.closed) return null
         if (error instanceof ProduceAttemptTooLarge) repartition(sent, error)
         if (refused) return error
-        for (const delivery of carried) delivery.lastError = error
-        if (sent.every((batch) => !unsettled.has(batch))) {
-          await sideChannels(error)
-          return null
+        const live = sent.filter((batch) => unsettled.has(batch))
+        let retrying = null
+        for (const batch of live) {
+          const decided = fail(batch, error)
+          if (retrying === null) retrying = decided
         }
-        if (error.retriable) return error
-        sent.forEach((batch) => settle(batch, undefined, error))
-        return null
+        if (live.length === 0 || (error.retriable && retrying !== error)) await sideChannels(error)
+        return retrying
       }
       ended()
       if (generation?.closed) return null
@@ -2399,7 +2458,10 @@ const createSendMessages = ({
           continue
         }
         if (error === null) settle(batch, metadataOf(result))
-        else {
+        else if (result === undefined) {
+          const decided = fail(batch, error)
+          retriable = retriable || decided
+        } else {
           deliveries.get(batch).lastError = error
           resolveFailingRecords(error, batch.messages)
           if (error.retriable) retriable = retriable || error
@@ -2451,13 +2513,11 @@ const createSendMessages = ({
               const left = []
               const perBroker = new Map()
               const leave = (lost, error) => {
-                const live = lost.filter((batch) => unsettled.has(batch))
-                if (live.length === 0) return
-                live.forEach((batch) => {
-                  deliveries.get(batch).lastError = error
-                })
-                if (error.retriable) left.push(error)
-                else live.forEach((batch) => settle(batch, undefined, error))
+                for (const batch of lost) {
+                  if (!unsettled.has(batch)) continue
+                  const decided = fail(batch, error)
+                  if (decided !== null) left.push(decided)
+                }
               }
               for (const topic of topics) {
                 const own = headsOf(topic)
@@ -2511,7 +2571,8 @@ const createSendMessages = ({
               if (genuine !== undefined) throw genuine
               if (errors.some((error) => error instanceof ProduceAttemptRefused)) continue
               if (unsettled.size < waiting) continue
-              if (unsettled.size > 0) throw new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA)
+              leave([...unsettled], new KafkaJSMetadataNotLoaded(NO_PARTITION_METADATA))
+              if (left.length > 0) throw left[0]
               return
             } catch (error) {
               if (unsettled.size === 0) {
