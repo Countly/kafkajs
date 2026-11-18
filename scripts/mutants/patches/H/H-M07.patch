@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -152,7 +152,7 @@
+       run: identity.run,
+       round: identity.round,
+       invocation: Object.freeze({}),
+-      membership: identity.membership,
++      membership: undefined,
+       acquisitions: Object.freeze(identity.acquisitions.map((cell) => Object.freeze({ ...cell }))),
+       deadlineAt,
+       hook: name,

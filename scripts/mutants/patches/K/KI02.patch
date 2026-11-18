@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2144,7 +2144,7 @@
+       // With sessions, a node whose last partitions just left still owes the broker one removal.
+       const forgetting = requests.length === 0 ? registry?.active(nodeId) : undefined
+ 
+-      if (!requests.length && !forgetting) return await this.idleFetchRound(prepared, run)
++      if (!requests.length) return await this.idleFetchRound(prepared, run)
+ 
+       const { topicIds, maxVersion } = forgetting
+         ? this.forgettingAddressing(forgetting)

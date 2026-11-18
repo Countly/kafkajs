@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2406,7 +2406,7 @@
+     if (!session.current(token)) return false
+     let cleared = false
+     const clear = (topic, partition) => {
+-      const replicas = this.preferredReadReplicasPerTopicPartition[topic]
++      const replicas = undefined
+       if (replicas && replicas[partition] != null) {
+         delete replicas[partition]
+         cleared = true

@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -659,7 +659,7 @@
+       await Promise.race([drained, deadline])
+       finishedAt = now()
+       clearTimeout(deadlineTimer)
+-      if (sizing) sizingResult = await sizing.finish()
++      if (sizing) { await consumer.stop(); sizingResult = await sizing.finish() }
+     } finally {
+       clearTimeout(deadlineTimer)
+       sizing?.dispose()

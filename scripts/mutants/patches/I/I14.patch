@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -394,7 +394,7 @@
+             cause: error.cause || error,
+           })
+         }
+-        if (retryCount >= configs.retries) {
++        if (retryCount > configs.retries) {
+           throw new KafkaJSNumberOfRetriesExceeded(error, {
+             retryCount,
+             retryTime,

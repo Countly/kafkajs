@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchSessions.js
++++ b/scripts/benchmarks/fetchSessions.js
+@@ -360,7 +360,7 @@
+   if (held.length !== 2097152 || held[2097151].value !== 2097151)
+     throw new Error('Incomplete memory control')
+   const delta = after - before
+-  if (delta <= 3 * 1024 * 1024) throw new Error('Retained memory observer is blind')
++  if (delta < 0) throw new Error('Retained memory observer is blind')
+   return delta
+ }
+ 

@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchSessions.js
++++ b/scripts/benchmarks/fetchSessions.js
+@@ -675,7 +675,7 @@
+     !ratio('S1', 'cpuMicrosPerMessage', 1.03) ||
+     !ratio('S2', 'bytesPerSecond', 1) ||
+     !ratio('L2', 'bytesPerMessage', 0.1) ||
+-    !ratio('L2', 'cpuMicrosPerMessage', 0.75) ||
++    !ratio('L2', 'cpuMicrosPerMessage', 1) ||
+     !ratio('L3', 'bytesPerSecond', 0.1)
+   )
+     return 'false'

@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1219,7 +1219,7 @@
+       const isErrorRetriable =
+         e.name === 'KafkaJSNumberOfRetriesExceeded' || getOriginalCause(e).retriable === true
+ 
+-      let shouldRestart = isErrorRetriable
++      let shouldRestart = true
+       if (retry && retry.restartOnFailure) {
+         // The user callback is authoritative for every terminal death, retriable or not.
+         try {

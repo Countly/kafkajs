@@ -1,0 +1,10 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -207,7 +207,6 @@
+     try {
+       await Promise.race([task, stopped])
+     } finally {
+-      record.active = false
+       clearTimeout(timer)
+       record.fence.close(
+         record.failure ||

@@ -1,0 +1,11 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -139,7 +139,7 @@
+   evaluate(metadata) {
+     const selected = new Map(this.literals)
+     for (const row of metadata.topicMetadata) {
+-      if (row.isInternal || (row.topicErrorCode != null && row.topicErrorCode !== 0)) continue
++      if (row.topicErrorCode != null && row.topicErrorCode !== 0) continue
+       for (const entry of this.patterns) {
+         if (entry.pattern.test(row.topic) && entry.order > (selected.get(row.topic)?.order ?? -1)) {
+           selected.set(row.topic, entry)

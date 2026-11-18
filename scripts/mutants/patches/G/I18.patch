@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1779,7 +1779,7 @@
+    * @type {import("../../types").Consumer["assignment"]}
+    */
+   const assignment = () => {
+-    if (!runSlot || !consumerGroup) return []
++    if (!runSlot || !consumerGroup) return manual ? manual.partitions : []
+     return consumerGroup
+       .assigned()
+       .map(({ topic, partitions }) => ({

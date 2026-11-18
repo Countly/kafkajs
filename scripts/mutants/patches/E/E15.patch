@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchRound.js
++++ b/scripts/benchmarks/fetchRound.js
+@@ -194,7 +194,7 @@
+       const batches = await this.group.fetch(nodeId)
+       if (this.responseStarted !== null)
+         this.counts.responseNs += Number(process.hrtime.bigint() - this.responseStarted)
+-      this.counts.batches += batches.length
++      this.counts.batches += 0
+       lookupsByNode.push(this.counts.lookups - lookupsBefore)
+       batchesByNode.push(batches.length)
+     }

@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -645,7 +645,7 @@
+       assignment = await round.wait(() =>
+         assigner.assign({
+           members,
+-          topics: topicsSubscribed,
++          topics: groupTopics,
+           groupTopics,
+           groupTopicMetadata,
+         })

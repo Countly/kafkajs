@@ -1,0 +1,11 @@
+--- a/scripts/soak/consumerChurn.js
++++ b/scripts/soak/consumerChurn.js
+@@ -52,7 +52,7 @@
+    */
+   constructor(records, groups) {
+     this.records = records
+-    this.groups = [...groups]
++    this.groups = [groups[0]]
+     this.counts = { acknowledged: 0, delivered: 0, commits: 0 }
+     this.work = 0
+     this.acknowledged = new Map()

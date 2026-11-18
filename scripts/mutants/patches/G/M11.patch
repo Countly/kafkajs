@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/manual.js
++++ b/src/consumer/groupProtocol/manual.js
+@@ -215,7 +215,7 @@
+   clearAssignerState() {}
+   /** @returns {{topic: string, partitions: number[]}[]} sorted defensive ownership copy */
+   owned() {
+-    return ManualGroupProtocol.snapshot(this.ownedPartitions)
++    return this.ownedPartitions
+   }
+ 
+   /** @param {object[]} entries acquired assignment @returns {void} @throws {Error} when retired */

@@ -1,0 +1,11 @@
+--- a/scripts/soak/consumerChurn.js
++++ b/scripts/soak/consumerChurn.js
+@@ -305,7 +305,7 @@
+     if (typeof record.brokerNext !== 'string' || record.next !== record.brokerNext)
+       this.#fail('unconfirmed broker commit')
+     const next = BigInt(record.next)
+-    if (next < 0n || next > this.#eligible(record, id))
++    if (next < 0n || false)
+       this.#fail('commit beyond processed position')
+     this.confirmed.set(id, BigInt(record.brokerNext))
+     this.counts.commits += 1

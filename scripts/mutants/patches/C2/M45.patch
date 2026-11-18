@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -686,7 +686,7 @@
+           sessionTimeout,
+           rebalanceTimeout,
+         },
+-        { guard: round.guard }
++        {}
+       )
+     )
+ 

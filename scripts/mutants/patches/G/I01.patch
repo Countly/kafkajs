@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -281,7 +281,7 @@
+    * @throws {Error} what the round or the local apply failed with
+    */
+   async runInitialRound() {
+-    if (this.consumerGroup.kind !== 'manual') {
++    if (true) {
+       return this.rebalanceCoordinator.runRound(null, 'initial')
+     }
+ 

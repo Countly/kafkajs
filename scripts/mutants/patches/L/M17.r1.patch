@@ -1,0 +1,11 @@
+--- a/scripts/soak/consumerChurn.js
++++ b/scripts/soak/consumerChurn.js
+@@ -155,7 +155,7 @@
+   #produce(record) {
+     const key = this.key(record)
+     if (this.acknowledged.has(key)) this.#fail('duplicate acknowledgement')
+-    const offset = BigInt(record.offset)
++    const offset = BigInt(Number(record.offset))
+     const log = this.#log(record)
+     const entry = this.logs.get(log) ?? { offsets: [], keys: [] }
+     if (entry.offsets.length > 0 && offset <= entry.offsets[entry.offsets.length - 1])

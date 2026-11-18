@@ -1,0 +1,12 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -699,8 +699,7 @@
+         offset: Long.fromValue(actualOffset).subtract(1).toString(),
+         leaderEpoch: -1,
+       })
+-      const confirmed =
+-        this.autoCommit && requestedId !== undefined && requestedId === this.cluster.topicId(topic)
++      const confirmed = this.autoCommit
+       if (confirmed) this.operations.apply(ticket, topic, partition)
+       else this.operations.fence(ticket, topic, partition)
+       return true

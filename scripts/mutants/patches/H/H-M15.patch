@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1745,7 +1745,7 @@
+     } catch (error) {
+       // The round's own timer can win the race by a rounding step: its expiry is this deadline.
+       if (error?.type === 'JOIN_DEADLINE_EXCEEDED') expire()
+-      throw guard() || error
++      return
+     } finally {
+       clearTimeout(timer)
+       this.hookWaiters.delete(check)

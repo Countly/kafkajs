@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -178,7 +178,6 @@
+     this.waiters = new Set()
+     this.disposers = new Set()
+     this.timer = null
+-    this.arm()
+   }
+ 
+   /**

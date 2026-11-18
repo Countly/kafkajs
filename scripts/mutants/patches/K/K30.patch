@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchSessions.js
++++ b/scripts/benchmarks/fetchSessions.js
+@@ -648,7 +648,7 @@
+  * @throws Never for missing evidence.
+  */
+ function selectDefault({ correctness, arms, controls, aaDeltas } = {}) {
+-  if (correctness !== 'passed') return 'blocked'
++  if (correctness !== 'passed') return 'false'
+   if (
+     !controls ||
+     !arms ||

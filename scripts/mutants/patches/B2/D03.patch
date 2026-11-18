@@ -1,0 +1,13 @@
+--- a/scripts/benchmarks/fetchFrameCounter.js
++++ b/scripts/benchmarks/fetchFrameCounter.js
+@@ -341,9 +341,7 @@
+ 
+   /** @returns {object} independent message, batch, entry and actual-gap measurements @throws Never. */
+   result() {
+-    const gaps = this.entries
+-      .slice(1)
+-      .map((entered, index) => Number(entered - this.entries[index]) / 1e6)
++    const gaps = Array(Math.max(0, this.messages - 1)).fill(0)
+     const sorted = [...gaps].sort((a, b) => a - b)
+     const at = (p) =>
+       sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] : null

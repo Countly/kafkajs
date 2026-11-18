@@ -1,0 +1,11 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -1526,7 +1526,7 @@
+           this.groupEntries.delete(groupId)
+           this.groupRegistry.release(groupId, this)
+         }
+-        this.groupRegistry.release(groupId, scope)
++        void scope
+       }
+     }
+   }

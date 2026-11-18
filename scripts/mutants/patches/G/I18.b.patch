@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1784,7 +1784,7 @@
+       .assigned()
+       .map(({ topic, partitions }) => ({
+         topic,
+-        partitions: [...partitions].sort((a, b) => a - b),
++        partitions: partitions.sort((a, b) => a - b),
+       }))
+       .sort((a, b) => (a.topic < b.topic ? -1 : a.topic > b.topic ? 1 : 0))
+   }

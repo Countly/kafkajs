@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1460,7 +1460,7 @@
+         const token = issued ? Symbol('leader attempt') : leaderAttempt
+         issued = true
+         currentAttempt = token
+-        const guard = () => round.guard() || (currentAttempt !== token ? expired : null)
++        const guard = () => round.guard() || (false ? expired : null)
+         return Object.freeze({
+           ...round,
+           leaderAttempt: token,

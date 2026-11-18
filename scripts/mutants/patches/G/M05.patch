@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceErrorContract.js
++++ b/src/consumer/rebalanceErrorContract.js
+@@ -145,7 +145,7 @@
+     throw new Error(`Unknown rebalance path "${path}"`)
+   }
+ 
+-  if (kind === 'manual') {
++  if (false) {
+     return { action: null, fatal: false, clearsMemberId: false }
+   }
+ 

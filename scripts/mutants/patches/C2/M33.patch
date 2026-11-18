@@ -1,0 +1,12 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -847,7 +847,8 @@
+         }
+       }
+     } finally {
+-      if (this.joinCount === joinCount && this.forgetMemberId(membershipRevision)) {
++      if (this.joinCount === joinCount) {
++        this.currentMemberId = null
+         this.clearAssignerState()
+       }
+     }

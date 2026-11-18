@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -115,7 +115,7 @@
+       }
+     }
+     const throttled = response.throttleTime > 0 || response.clientSideThrottleTime > 0
+-    if (full && (seen.size !== this.partitions.size || (!seen.size && throttled))) invalid = true
++    if (full && (seen.size !== this.partitions.size || (false))) invalid = true
+     if (invalid) {
+       this.reset(full)
+       return false

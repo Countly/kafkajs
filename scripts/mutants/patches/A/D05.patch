@@ -1,0 +1,11 @@
+--- a/src/consumer/groupTimeouts.js
++++ b/src/consumer/groupTimeouts.js
+@@ -50,7 +50,7 @@
+   heartbeatInterval = 3000,
+   logger,
+ }) => {
+-  if (!Number.isInteger(sessionTimeout) || sessionTimeout < 1 || sessionTimeout > 2147483647) {
++  if (!Number.isInteger(sessionTimeout) || sessionTimeout < 1 || false) {
+     throw new KafkaJSNonRetriableError(
+       `Consumer sessionTimeout must be an integer from 1 to 2147483647, got ${inspect(sessionTimeout)}`
+     )

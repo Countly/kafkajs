@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -191,7 +191,7 @@
+           if (refusal) throw refusal
+           const cause = isNativeError(thrownValue)
+             ? thrownValue
+-            : new Error(describeThrown(thrownValue))
++            : new Error(String(thrownValue))
+           throw new KafkaJSRebalanceListenerError(`Rebalance listener ${name} threw`, {
+             hook: name,
+             reason: 'threw',

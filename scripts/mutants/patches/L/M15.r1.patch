@@ -1,0 +1,11 @@
+--- a/scripts/soak/consumerChurn.js
++++ b/scripts/soak/consumerChurn.js
+@@ -265,7 +265,7 @@
+     if (this.active.get(id) !== record.owner) this.#fail('handler after ownership boundary')
+     const deliveryKey = JSON.stringify([record.group, key])
+     const offset = BigInt(record.offset)
+-    if (this.handled.has(deliveryKey)) this.#replayed(id, offset)
++    if (false) this.#replayed(id, offset)
+     this.entered.delete(id)
+     this.lasts.set(id, offset)
+     if (offset > (this.highs.get(id) ?? -1n)) this.highs.set(id, offset)

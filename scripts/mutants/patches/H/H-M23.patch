@@ -1,0 +1,12 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1412,8 +1412,7 @@
+     // in the same turn as the count below.
+     if (
+       this.rebalanceHooks &&
+-      (this.admissionQuiescing ||
+-        this.consumerGroup.subscriptionState.isHeld(batch.topic, batch.partition))
++      this.admissionQuiescing
+     ) {
+       this.logger.debug('Dropping a queued batch for a partition held by a rebalance', {
+         groupId: this.consumerGroup.groupId,

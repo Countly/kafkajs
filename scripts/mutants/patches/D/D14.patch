@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -282,7 +282,7 @@
+   const assigners = isConsumerProtocol
+     ? []
+     : partitionAssigners.map((createAssigner) =>
+-        createAssigner({ groupId, logger, cluster, rackAware: rackAwareAssignment })
++        createAssigner({ groupId, logger, cluster, rackAware: false })
+       )
+ 
+   /** @type {Record<string, { fromBeginning?: boolean, resetPolicy?: object }>} */

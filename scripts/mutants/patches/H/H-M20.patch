@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1356,7 +1356,7 @@
+       const refusal = round.guard()
+       if (refusal) throw refusal
+       if (!(error instanceof KafkaJSRebalanceListenerError) || error.reason !== 'threw') throw error
+-      if (!this.listenerFailures.has(round)) this.listenerFailures.set(round, error)
++      throw error
+     }
+   }
+ 

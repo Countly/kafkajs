@@ -1,0 +1,11 @@
+--- a/src/broker/index.js
++++ b/src/broker/index.js
+@@ -894,7 +894,7 @@
+     const fetch = this.lookupRequestWithMax(apiKeys.Fetch, requests.Fetch, cap)
+ 
+     let consolidatedTopicPartitions = topics
+-    if (sessionEpoch <= 0) {
++    if (true) {
+       // Shuffle topic-partitions to ensure fair response allocation across partitions (KIP-74)
+       const flattenedTopicPartitions = topics.reduce((topicPartitions, { topic, partitions }) => {
+         partitions.forEach((partition) => {

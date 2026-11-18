@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -97,7 +97,7 @@
+    * @throws Never for decoded responses.
+    */
+   handleResponse(token, response) {
+-    if (!this.current(token)) return false
++    if (this.closed) return false
+     const { full } = this.pending
+     this.pending = null
+     if (response.errorCode) {

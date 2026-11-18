@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -408,7 +408,7 @@
+           )
+         }
+         const nextRetryTime = backoff.next(retryTime)
+-        await this.sleep(retryTime)
++        await new Promise((resolve) => setTimeout(resolve, retryTime))
+         retryTime = nextRetryTime
+       }
+     }

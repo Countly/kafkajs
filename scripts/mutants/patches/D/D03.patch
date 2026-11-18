@@ -1,0 +1,19 @@
+--- a/src/consumer/groupProtocol/consumer.js
++++ b/src/consumer/groupProtocol/consumer.js
+@@ -844,14 +844,12 @@
+    * @returns {() => boolean} true only while this member may use the captured target
+    */
+   targetGuard() {
+-    const membership = this.membershipRevision
+-    const target = this.targetRevision
++    const epoch = this.target?.localEpoch
+     const scope = this.subscription?.captureScope()
+     return () =>
+       (!scope || scope()) &&
+-      membership === this.membershipRevision &&
+-      target === this.targetRevision &&
+       this.target != null &&
++      this.target.localEpoch === epoch &&
+       !isNotInGroup(this.state) &&
+       !isLeavingGroup(this.state)
+   }

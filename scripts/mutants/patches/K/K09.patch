@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -120,7 +120,7 @@
+       this.reset(full)
+       return false
+     }
+-    if (response.sessionId === 0) this.reset(true)
++    if (response.sessionId === 0) this.epoch = 1
+     else {
+       if (full) this.sessionId = response.sessionId
+       this.epoch = full ? 1 : this.epoch === 2147483647 ? 1 : this.epoch + 1

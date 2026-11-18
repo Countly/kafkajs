@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -265,7 +265,7 @@
+     groupProtocol = 'classic',
+     groupRemoteAssignor = null,
+     maxPrefetchBatches = 0,
+-    fetchSessions = false,
++    fetchSessions = true,
+     requestTimeout = 30000,
+   } = params
+ 

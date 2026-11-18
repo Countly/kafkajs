@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchFrameCounter.js
++++ b/scripts/benchmarks/fetchFrameCounter.js
+@@ -335,7 +335,7 @@
+   /** @param {number} records actual batch length, or one message @param {bigint} at entry timestamp @returns {void} @throws Never for normalized counts. */
+   enter(records, at) {
+     this.entries.push(at)
+-    this.messages += records
++    this.messages += 1
+     if (this.handler === 'eachBatch') this.batches += 1
+   }
+ 

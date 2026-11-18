@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchFrameCounter.js
++++ b/scripts/benchmarks/fetchFrameCounter.js
+@@ -48,7 +48,7 @@
+       if (bytes.length < length + 4) return
+       const frame = bytes.subarray(0, length + 4)
+       state[direction] = bytes.subarray(length + 4)
+-      const id = frame.readInt32BE(direction === 'request' ? 8 : 4)
++      const id = frame.readInt32BE(8)
+       let api, apiVersion
+       if (direction === 'request') {
+         if (state.pending.has(id)) throw new Error('Duplicate correlation ID')

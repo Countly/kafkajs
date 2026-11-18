@@ -1,0 +1,10 @@
+--- a/src/cluster/brokerPool.js
++++ b/src/cluster/brokerPool.js
+@@ -706,7 +706,6 @@
+           const response = await broker.metadata(topics, ...requestArgs)
+           fence?.check()
+           check()
+-          if (!applicable()) return
+           if (accept) {
+             const incoming = response.topicMetadata.filter(({ topic }) => accept(topic))
+             const replaced = new Set(incoming.map(({ topic }) => topic))

@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -292,6 +292,7 @@
+    * @throws {Error} action failure, expiry or original identity refusal
+    */
+   wait(action) {
++    if (this.deadlineAt !== Infinity) this.deadlineAt = this.now() + 1000
+     return new Promise((resolve, reject) => {
+       try {
+         this.check()

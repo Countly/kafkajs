@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -780,7 +780,7 @@
+           // A seek names a position, not a record: nothing has been consumed at it yet.
+           leaderEpoch: -1,
+         })
+-        this.operations.fence(ticket, topic, partition)
++        this.operations.apply(ticket, topic, partition)
+       } finally {
+         this.operations.end(ticket)
+       }

@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -124,7 +124,7 @@
+   retire(identity, error) {
+     for (const record of this.pending) {
+       if (
+-        record.context.run === identity.run &&
++        true &&
+         (identity.round === undefined || record.context.round === identity.round)
+       ) {
+         record.failure ||= error

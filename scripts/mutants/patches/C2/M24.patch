@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1451,7 +1451,7 @@
+       allowAutoTopicCreation:
+         this.regexSubscription != null || this.subscribedTopicRegex != null || this.subscription
+           ? false
+-          : this.cluster.allowAutoTopicCreation,
++          : true,
+       /**
+        * Captures a unique retry identity without renewing the round deadline.
+        * @returns {object} guarded leader context; the first keeps the pre-hook identity

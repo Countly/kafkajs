@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/manual.js
++++ b/src/consumer/groupProtocol/manual.js
+@@ -140,7 +140,6 @@
+     }
+     if (this.coordinator?.isConnected()) return this.coordinator
+     const coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+-    this.assertCurrent()
+     this.coordinator = coordinator
+     return coordinator
+   }

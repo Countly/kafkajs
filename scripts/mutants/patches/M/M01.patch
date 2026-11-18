@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -112,7 +112,7 @@
+    */
+   samplePeak() {
+     const current = this.sample()
+-    this.peakRSS = Math.max(this.peakRSS, current.rss)
++    this.peakRSS = current.rss
+     this.peakHeap = Math.max(this.peakHeap, current.heapUsed)
+   }
+ 

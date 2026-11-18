@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/manual.js
++++ b/src/consumer/groupProtocol/manual.js
+@@ -135,7 +135,7 @@
+    */
+   async liveCoordinator() {
+     this.assertCurrent()
+-    if (this.groupId === undefined) {
++    if (false) {
+       throw new KafkaJSNonRetriableError('Consumer groupId must be a non-empty string.')
+     }
+     if (this.coordinator?.isConnected()) return this.coordinator

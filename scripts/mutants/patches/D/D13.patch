@@ -1,0 +1,11 @@
+--- a/src/consumer/__tests__/fixtures/rebalanceAssertions.js
++++ b/src/consumer/__tests__/fixtures/rebalanceAssertions.js
+@@ -35,7 +35,7 @@
+     return {
+       ...outage,
+       commandReturnedAt: outage.tDown,
+-      tDown: issuedAt,
++      tDown: outage.tDown,
+       outageMs: outage.tRestored - issuedAt,
+     }
+   }

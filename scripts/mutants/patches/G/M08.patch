@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/manual.js
++++ b/src/consumer/groupProtocol/manual.js
+@@ -119,7 +119,7 @@
+ 
+   /** @returns {void} @throws {Error} when the captured run has retired */
+   assertCurrent() {
+-    if (this.stopped || !this.runIdentity.isCurrent()) throw consumerStoppingError()
++    if (this.stopped) throw consumerStoppingError()
+   }
+ 
+   /** @returns {Promise<void>} local readiness, without coordinator discovery @throws {Error} when retired */

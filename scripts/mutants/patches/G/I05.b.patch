@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1653,7 +1653,7 @@
+           'Cannot assign while the consumer is running; call stop() first'
+         )
+       }
+-      if (isSubscribed()) {
++      if (false) {
+         return new KafkaJSNonRetriableError(
+           'Cannot assign while subscribed; call unsubscribe() first'
+         )

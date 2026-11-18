@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -45,7 +45,7 @@
+     const forgotten = []
+     for (const [key, old] of this.partitions) {
+       const next = desired.get(key)
+-      if (!full && (!next || (usesTopicIds && old.topicId !== next.topicId))) forgotten.push(old)
++      if (!full && (!next || (usesTopicIds && old.topicId !== next.topicId))) forgotten.push({ ...old, topicId: next?.topicId })
+     }
+     for (const [key, next] of desired) {
+       const old = this.partitions.get(key)

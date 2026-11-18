@@ -1,0 +1,11 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -203,7 +203,7 @@
+    * @returns {boolean} whether publication was accepted
+    */
+   apply(snapshot) {
+-    if (snapshot !== this.round || snapshot == null) return false
++    if (snapshot == null) return false
+     this.applied = this.copy(snapshot)
+     this.round = null
+     return true

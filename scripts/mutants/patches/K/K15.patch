@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -261,7 +261,7 @@
+     for (const [nodeId, session] of this.sessions) {
+       if (!current.has(nodeId)) {
+         session.close()
+-        this.sessions.delete(nodeId)
++        this.sessions.has(nodeId)
+       }
+     }
+   }

@@ -1,0 +1,11 @@
+--- a/testHelpers/lifecycle.js
++++ b/testHelpers/lifecycle.js
+@@ -41,7 +41,7 @@
+   'commit:retry-backoff',
+   'commit:answer-held',
+ ]
+-const MANUAL_MEMBERSHIPS = ['grouped', 'no-group']
++const MANUAL_MEMBERSHIPS = ['grouped', 'no-group', 'static']
+ 
+ /**
+  * The manual-assignment cells, appended after the membership cells without joining their product:

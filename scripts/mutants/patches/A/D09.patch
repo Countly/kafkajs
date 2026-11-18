@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -252,7 +252,7 @@
+     heartbeatInterval = 3000,
+     maxBytesPerPartition = 1048576, // 1MB
+     minBytes = 1,
+-    maxBytes = 10485760, // 10MB
++    maxBytes = 26214400, // 10MB
+     maxWaitTimeInMs = 5000,
+     isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+     rackId = '',

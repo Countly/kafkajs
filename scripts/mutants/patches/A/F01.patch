@@ -1,0 +1,11 @@
+--- a/src/consumer/__tests__/fixtures/fetchHarness.js
++++ b/src/consumer/__tests__/fixtures/fetchHarness.js
+@@ -174,7 +174,7 @@
+   new Encoder()
+     .writeInt32(0) // clientSideThrottleTime
+     .writeInt16(topLevel)
+-    .writeInt32(sessionId)
++    .writeInt32(0)
+     .writeUVarIntArray(
+       includeTopic
+         ? [

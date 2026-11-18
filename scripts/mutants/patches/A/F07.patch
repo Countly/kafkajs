@@ -1,0 +1,11 @@
+--- a/testHelpers/wire/syncGroupV5.js
++++ b/testHelpers/wire/syncGroupV5.js
+@@ -28,7 +28,7 @@
+ 
+     return new Encoder()
+       .writeInt32(response.throttleTime)
+-      .writeInt16(response.errorCode)
++      .writeInt16(0)
+       .writeUVarIntString(response.protocolType)
+       .writeUVarIntString(response.protocolName)
+       .writeUVarIntBytes(asBuffer(response.memberAssignment))

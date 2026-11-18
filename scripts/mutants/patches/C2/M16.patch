@@ -1,0 +1,11 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -571,7 +571,7 @@
+       return result
+     }
+     try {
+-      return await Promise.race([read(), timeout])
++      return await Promise.race([read().catch(() => read()), timeout])
+     } finally {
+       finished = true
+       clearTimeout(timer)

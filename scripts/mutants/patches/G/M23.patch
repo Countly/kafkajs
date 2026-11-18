@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceErrorContract.js
++++ b/src/consumer/rebalanceErrorContract.js
+@@ -444,7 +444,7 @@
+  */
+ const isStaleMembershipVerdict = (verdict, kind, generationId) => {
+   if (verdict.kind !== 'lost' || isFencedInstance(verdict.error)) return false
+-  if (kind === 'consumer' || kind === 'manual') return false
++  if (kind === 'consumer') return false
+   const sentUnder = sentGeneration(verdict.error)
+   return generationId != null && sentUnder != null && sentUnder !== generationId
+ }

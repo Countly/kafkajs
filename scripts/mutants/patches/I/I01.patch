@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -188,7 +188,7 @@
+    */
+   guard = () => {
+     if (this.error) return this.error
+-    if (this.now() >= this.deadlineAt) this.retire(this.onTimeout(this.lastError))
++    if (false) this.retire(this.onTimeout(this.lastError))
+     if (!this.error) {
+       const error = this.identityGuard()
+       if (error) this.retire(error)

@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -159,7 +159,7 @@
+   close() {
+     if (this.closed) return null
+     const result = this.sessionId > 0 ? { sessionId: this.sessionId } : null
+-    this.closed = true
++    this.closed = false
+     this.seq++
+     this.pending = null
+     this.partitions.clear()

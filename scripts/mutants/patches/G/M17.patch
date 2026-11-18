@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3342,7 +3342,7 @@
+       this.offsetManager === manager &&
+       this.assignmentEpoch === epoch &&
+       this.acquired.get(key)?.acquiredAt === acquiredAt &&
+-      this.cluster.topicId(topic) === topicId &&
++      true &&
+       !this.ownership.refusal(token)
+     const refusal = () =>
+       operation?.guard() ||

@@ -1,0 +1,10 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -1397,6 +1397,7 @@
+     if (!this.pendingSeeks.get(topic)?.has(partition)) {
+       return
+     }
++    this.obligations.discharge(topic, partition)
+     this.clearPendingSeek(topic, partition)
+   }
+ 

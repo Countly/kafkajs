@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2800,7 +2800,7 @@
+       (requested) => requested.partition === partition
+     )
+ 
+-    batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
++    if (!halted) batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+     if (halted) this.reportHalt(topicName, partition, corruption)
+     return false
+   }

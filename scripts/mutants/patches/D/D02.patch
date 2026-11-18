@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/consumer.js
++++ b/src/consumer/groupProtocol/consumer.js
+@@ -873,7 +873,7 @@
+     const isCurrent = this.targetGuard()
+     if (!isCurrent()) return
+     const askable = topicIds.filter(
+-      (topicId) => periodic || (this.unresolvedAttempts.get(topicId) || 0) < MAX_UNRESOLVED_ATTEMPTS
++      (topicId) => (this.unresolvedAttempts.get(topicId) || 0) < MAX_UNRESOLVED_ATTEMPTS
+     )
+     if (!askable.length) return
+     this.lastMetadataRefreshAt = Date.now()

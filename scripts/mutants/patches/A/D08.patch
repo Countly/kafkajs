@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -472,6 +472,7 @@
+       if (error.type === 'INVALID_SESSION_TIMEOUT' && error.code === 26) {
+         const refusal = new KafkaJSNonRetriableError(error, { cause: error })
+         refusal.message = `Consumer sessionTimeout (${sessionTimeout}) was refused by the broker; check the broker settings group.min.session.timeout.ms and group.max.session.timeout.ms.`
++        refusal.retriable = true
+         throw refusal
+       }
+       throw error

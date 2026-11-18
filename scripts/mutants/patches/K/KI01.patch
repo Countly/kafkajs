@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2263,7 +2263,7 @@
+           continue
+         }
+ 
+-        const topicRequestData = requests.find(({ topic }) => topic === topicName)
++        const topicRequestData = (tracked ? tracked.wire.topics : requests).find(({ topic }) => topic === topicName)
+ 
+         let preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topicName]
+         if (!preferredReadReplicas) {

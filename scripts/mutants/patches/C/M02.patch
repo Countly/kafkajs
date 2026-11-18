@@ -1,0 +1,10 @@
+--- a/src/consumer/idleWait.js
++++ b/src/consumer/idleWait.js
+@@ -44,6 +44,7 @@
+   /** Wakes current fetchers once; an empty wake retains no state. @returns {void} */
+   wake() {
+     for (const waiter of this.waiters) waiter.finish()
++    if (!this.disposed) this.wait(0)
+   }
+ 
+   /**

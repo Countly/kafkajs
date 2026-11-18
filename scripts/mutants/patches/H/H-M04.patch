@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -147,7 +147,7 @@
+     const hook =
+       this.listener[name] ??
+       (name === 'onPartitionsLost' ? this.listener.onPartitionsRevoked : undefined)
+-    if (!hook) return
++    if (!hook || (name === 'onPartitionsRevoked' && payload.partitions.length === 0)) return
+     const context = Object.freeze({
+       run: identity.run,
+       round: identity.round,

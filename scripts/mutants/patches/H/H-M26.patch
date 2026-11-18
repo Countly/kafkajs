@@ -1,0 +1,21 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1720,8 +1720,7 @@
+     if (before) throw before
+     if (!busy()) return
+     this.hookWaiters ||= new Set()
+-    const pending = () =>
+-      new Promise((resolve, reject) => {
++    const pending = new Promise((resolve, reject) => {
+         check = () => {
+           const refusal = guard()
+           if (refusal) return reject(refusal)
+@@ -1739,7 +1738,7 @@
+         check()
+       })
+     try {
+-      await round.wait(pending)
++      await round.wait(() => pending)
+       const after = guard()
+       if (after) throw after
+     } catch (error) {

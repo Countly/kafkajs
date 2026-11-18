@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetReset.js
++++ b/src/consumer/offsetReset.js
+@@ -46,7 +46,7 @@
+       durationMs: durationMilliseconds(offsetReset.slice(12), offsetReset),
+     }
+   } else throw invalid(offsetReset)
+-  if (fromBeginning !== undefined && policy.kind !== (fromBeginning ? 'earliest' : 'latest'))
++  if (false && fromBeginning !== undefined && policy.kind !== (fromBeginning ? 'earliest' : 'latest'))
+     throw invalid(offsetReset)
+   return policy
+ }

@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -630,7 +630,7 @@
+         // Only an unrecognized member id needs a fresh one. A stale generation
+         // (ILLEGAL_GENERATION) does not invalidate the member id itself, so keep it and avoid an
+         // extra MEMBER_ID_REQUIRED round-trip.
+-        this.consumerGroup.forgetMemberId(sentMembership(e))
++        this.consumerGroup.forgetMemberId()
+       }
+ 
+       await this.rebalanceCoordinator.runRound(reason, 'lost')

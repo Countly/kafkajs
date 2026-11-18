@@ -1,0 +1,10 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1851,7 +1851,6 @@
+     const token = group.ownership?.token()
+     if (
+       !this.autoCommit ||
+-      !group.groupId ||
+       group.kind !== 'classic' ||
+       !manager ||
+       operation.remaining() === 0 ||

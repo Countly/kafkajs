@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -162,7 +162,7 @@
+    * @throws Never.
+    */
+   dispose() {
+-    clearInterval(this.timer)
++    clearInterval(undefined)
+     this.timer = undefined
+   }
+ }

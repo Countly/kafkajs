@@ -1,0 +1,10 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -208,7 +208,6 @@
+       await Promise.race([task, stopped])
+     } finally {
+       record.active = false
+-      clearTimeout(timer)
+       record.fence.close(
+         record.failure ||
+           new KafkaJSNonRetriableError('The rebalance hook invocation is no longer current')

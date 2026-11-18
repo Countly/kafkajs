@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -237,7 +237,7 @@
+    * @returns {string|null}
+    */
+   get memberId() {
+-    return this.currentMemberId
++    return this.currentMemberId || this.pendingMemberId
+   }
+ 
+   /**

@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -462,7 +462,7 @@
+       )
+       const stale = round?.guard()
+       if (stale) throw stale
+-      const installed = this.changeIdentity(membershipRevision, {
++      const installed = this.changeIdentity(this.membershipRevision, {
+         memberId: groupData.memberId,
+         pendingMemberId: null,
+         generationId: groupData.generationId,

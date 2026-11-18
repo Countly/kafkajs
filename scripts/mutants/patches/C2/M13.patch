@@ -1,0 +1,10 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -537,6 +537,7 @@
+    * @throws {Error} original acquisition/auth/transport failure, or retriable join expiry
+    */
+   async groupMetadata({ topics, allowAutoTopicCreation, deadlineAt, guard }) {
++    this.targetTopics.add(topics[0])
+     const startedAt = performance.now()
+     const expired = joinDeadlineError({
+       rebalanceTimeoutMs: Math.max(0, deadlineAt - startedAt),

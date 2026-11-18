@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1901,7 +1901,7 @@
+     const closing = Boolean(invocation) && this.stopRequested
+     const authority = () =>
+       RebalanceHooks.refusal(invocation) ||
+-      this.commitRefusal(token, batch) ||
++      this.commitRefusal(undefined, batch) ||
+       (invocation && this.consumerGroup.hookCommitRefusal(invocation.context, offsets.topics)) ||
+       null
+     // An expired call's deadline stays its caller-facing error but never masks a later stop or

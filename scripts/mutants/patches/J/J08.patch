@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -4004,7 +4004,7 @@
+       let nodeId = metadata.leader
+       if (preferredReadReplicas) {
+         const { nodeId: preferredReadReplica, expireAt } = preferredReadReplicas[partitionId] || {}
+-        if (Date.now() >= expireAt) {
++        if (Date.now() < expireAt) {
+           this.logger.debug('Preferred read replica information has expired, using leader', {
+             topic,
+             partitionId,

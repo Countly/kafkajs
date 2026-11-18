@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -559,7 +559,7 @@
+         this.cluster.groupMetadata({
+           topics: missing,
+           allowAutoTopicCreation: round.allowAutoTopicCreation,
+-          deadlineAt: now + remaining / 2,
++          deadlineAt: now + remaining,
+           guard: round.guard,
+         })
+       )

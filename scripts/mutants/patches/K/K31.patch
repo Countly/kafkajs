@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchSessions.js
++++ b/scripts/benchmarks/fetchSessions.js
+@@ -654,7 +654,7 @@
+     !arms ||
+     !Array.isArray(aaDeltas) ||
+     aaDeltas.length !== 10 ||
+-    aaDeltas.some((delta) => !Number.isFinite(delta) || Math.abs(delta) > 0.03)
++    aaDeltas.some((delta) => !Number.isFinite(delta) || Math.abs(delta) > 0.05)
+   )
+     return 'false'
+   const ratio = (arm, metric, limit, lower = false) => {

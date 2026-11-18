@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -881,7 +881,7 @@
+       this.autoCommitThreshold != null &&
+       this.countResolvedOffsets().gte(Long.fromValue(this.autoCommitThreshold))
+ 
+-    if (timeoutReached || thresholdReached) {
++    if (timeoutReached && thresholdReached) {
+       return this.commitOffsets({}, { ...options, auto: true })
+     }
+   }

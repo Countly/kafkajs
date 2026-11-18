@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -457,7 +457,7 @@
+         },
+         {
+           guard: joinRefusal,
+-          onMemberIdRequired: (assigned) => this.keepPendingMemberId(assigned, membershipRevision),
++          onMemberIdRequired: () => {},
+         }
+       )
+       const stale = round?.guard()

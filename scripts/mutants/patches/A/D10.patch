@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -253,7 +253,7 @@
+     maxBytesPerPartition = 1048576, // 1MB
+     minBytes = 1,
+     maxBytes = 10485760, // 10MB
+-    maxWaitTimeInMs = 5000,
++    maxWaitTimeInMs = 1000,
+     isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
+     rackId = '',
+     rackAwareAssignment = false,

@@ -1,0 +1,11 @@
+--- a/src/consumer/committedOffsets.js
++++ b/src/consumer/committedOffsets.js
+@@ -59,7 +59,7 @@
+           topics,
+           memberId: null,
+           memberEpoch: -1,
+-          requireStable: true,
++          requireStable: false,
+           ...(operation && { guard: operation.guard }),
+         })
+       } catch (error) {

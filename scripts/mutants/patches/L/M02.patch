@@ -1,0 +1,11 @@
+--- a/src/consumer/assignerProtocol.js
++++ b/src/consumer/assignerProtocol.js
+@@ -112,7 +112,7 @@
+    *
+    * @returns Buffer
+    */
+-  encode({ version, assignment, userData = Buffer.alloc(0) }) {
++  encode({ version, assignment, userData = null }) {
+     return new Encoder()
+       .writeInt16(version)
+       .writeArray(

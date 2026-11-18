@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -142,7 +142,7 @@
+     }
+     if (this.seen.size !== this.partitions)
+       throw new Error(`Data reached ${this.seen.size} of ${this.partitions} partitions`)
+-    await this.collect()
++    await Promise.resolve()
+     const retained = this.sample()
+     return {
+       partitionsWithData: this.seen.size,

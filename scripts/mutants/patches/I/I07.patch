@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -251,7 +251,7 @@
+       return () => {}
+     }
+     this.disposers.add(cancel)
+-    return () => this.disposers.delete(cancel)
++    return () => {}
+   }
+ 
+   /**

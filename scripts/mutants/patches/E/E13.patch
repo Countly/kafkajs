@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchFrameCounter.js
++++ b/scripts/benchmarks/fetchFrameCounter.js
+@@ -60,7 +60,7 @@
+         ;({ api, apiVersion } = state.pending.get(id))
+         state.pending.delete(id)
+       }
+-      if (api === 1) {
++      if (true) {
+         this.onFrame({
+           connection,
+           direction,

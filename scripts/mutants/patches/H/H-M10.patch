@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -196,7 +196,7 @@
+             hook: name,
+             reason: 'threw',
+             cause,
+-            thrownValue,
++            thrownValue: undefined,
+           })
+         }
+         const after = this.refusal(record)

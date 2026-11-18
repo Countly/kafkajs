@@ -1,0 +1,11 @@
+--- a/src/cluster/brokerPool.js
++++ b/src/cluster/brokerPool.js
+@@ -703,7 +703,7 @@
+         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
+ 
+         try {
+-          const response = await broker.metadata(topics, ...requestArgs)
++          const response = await broker.metadata(topics, { guard })
+           fence?.check()
+           check()
+           if (!applicable()) return

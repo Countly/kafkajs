@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -4030,7 +4030,7 @@
+               leader: metadata.leader,
+             })
+           } else {
+-            nodeId = preferredReadReplica
++            nodeId = metadata.leader
+             if (routing && expireAt < routing.expiresAt) routing.expiresAt = expireAt
+           }
+         }

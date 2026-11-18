@@ -1,0 +1,10 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -511,7 +511,6 @@
+         if (!isCurrent()) return FAILED
+         try {
+           const response = await broker.metadata([{ topicId }])
+-          if (!isCurrent()) return FAILED
+           this.metadataCache.updateTopicsById(response)
+         } catch (topicError) {
+           if (!isCurrent()) return FAILED

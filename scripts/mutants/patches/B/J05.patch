@@ -1,0 +1,11 @@
+--- a/src/consumer/__tests__/fixtures/fetchHarness.js
++++ b/src/consumer/__tests__/fixtures/fetchHarness.js
+@@ -261,7 +261,7 @@
+   const maxBytes = decoder.readInt32()
+   const isolationLevel = decoder.readInt8()
+   const sessionId = decoder.readInt32()
+-  const sessionEpoch = decoder.readInt32()
++  const sessionEpoch = decoder.readInt32() + 1
+ 
+   const topics = decoder.readUVarIntArray((d) => {
+     const topic = apiVersion <= 12 ? d.readUVarIntString() : null

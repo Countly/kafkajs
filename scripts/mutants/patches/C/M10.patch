@@ -1,0 +1,11 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -1520,7 +1520,7 @@
+     try {
+       return await work()
+     } finally {
+-      if (--scope.count === 0) {
++      if (scope.count-- > 0) {
+         if (this.groupScopes.get(groupId) === scope) this.groupScopes.delete(groupId)
+         if (this.groupEntries.get(groupId) === scope.entry) {
+           this.groupEntries.delete(groupId)

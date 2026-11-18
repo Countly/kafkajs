@@ -1,0 +1,11 @@
+--- a/src/consumer/__tests__/fixtures/fetchHarness.js
++++ b/src/consumer/__tests__/fixtures/fetchHarness.js
+@@ -285,7 +285,7 @@
+   const forgottenTopics = decoder.readUVarIntArray((d) => {
+     const topic = apiVersion <= 12 ? d.readUVarIntString() : null
+     const topicId = apiVersion >= 13 ? d.readUuid() : null
+-    const partitions = d.readUVarIntArray((p) => p.readInt32())
++    const partitions = d.readUVarIntArray((p) => p.readInt16())
+     d.readTaggedFields()
+     return { topic, topicId, partitions }
+   })

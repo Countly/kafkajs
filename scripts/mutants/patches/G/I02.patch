@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -360,7 +360,7 @@
+     : { offsets: dictionary(), operations: new OffsetOperations() }
+   /** @returns {OffsetOperations} the private ledger, or the group's shared one */
+   const offsetOperations = () =>
+-    privateState ? privateState.operations : cluster.offsetOperations({ groupId })
++    cluster.offsetOperations({ groupId })
+ 
+   /**
+    * The manual selection, or null: its normalized partitions and per-topic reset configuration.

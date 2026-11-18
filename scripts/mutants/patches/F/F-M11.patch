@@ -1,0 +1,10 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -157,6 +157,7 @@
+       )
+     if (changed)
+       this.desired = { revision: ++this.revision, names, topicConfigurations: configurations }
++    this.applied = this.copy(this.desired)
+     return this.copy(this.desired)
+   }
+ 

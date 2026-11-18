@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -269,7 +269,7 @@
+     requestTimeout = 30000,
+   } = params
+ 
+-  if (groupId !== undefined && (typeof groupId !== 'string' || groupId.length === 0)) {
++  if (!groupId) {
+     throw new KafkaJSNonRetriableError(GROUP_REQUIRED)
+   }
+ 

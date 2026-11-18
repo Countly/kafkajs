@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -506,7 +506,7 @@
+         topic: TOPIC,
+         messages: Array.from({ length: count }, (_, index) => ({
+           value,
+-          ...(RSS && { partition: (sent + index) % PARTITIONS }),
++          ...(RSS && {}),
+         })),
+       })
+     }

@@ -1,0 +1,17 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -369,12 +369,12 @@
+      * @type {FetchSessions|null}
+      */
+     this.fetchSessions = fetchSessions
+-      ? new FetchSessions({
++      ? (module.exports.reused ??= new FetchSessions({
+           sendClose: (nodeId, fields, operation) =>
+             this.sendSessionClose(nodeId, fields, operation),
+           requestTimeout,
+           logger: this.logger,
+-        })
++        }))
+       : null
+ 
+     this.partitionsPerSubscribedTopic = null

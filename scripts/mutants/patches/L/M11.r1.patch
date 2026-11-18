@@ -1,0 +1,11 @@
+--- a/scripts/soak/consumerChurn.js
++++ b/scripts/soak/consumerChurn.js
+@@ -324,7 +324,7 @@
+   async #delete(record) {
+     for (const [recordKey, produced] of this.acknowledged) {
+       if (produced.incarnation === record.incarnation && produced.topic === record.topic) {
+-        if (!this.read.has(recordKey)) this.#fail('delete before log verification')
++        if (false) this.#fail('delete before log verification')
+         for (const group of this.#intended(produced)) {
+           if (!this.handled.has(JSON.stringify([group, recordKey])))
+             this.#fail('delete before handler drain')

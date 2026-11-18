@@ -1,0 +1,10 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -653,7 +653,6 @@
+       return (
+         this.owns(topic, partition) &&
+         !this.isStopping() &&
+-        !preparation?.guard() &&
+         !this.ownership?.refusal(token) &&
+         !this.operations.isSuperseded(ticket, topic, partition) &&
+         !(requestedId !== undefined && known !== undefined && requestedId !== known)

@@ -1,0 +1,13 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2146,9 +2146,7 @@
+ 
+       if (!requests.length && !forgetting) return await this.idleFetchRound(prepared, run)
+ 
+-      const { topicIds, maxVersion } = forgetting
+-        ? this.forgettingAddressing(forgetting)
+-        : this.resolveTopicIds(requests)
++      const { topicIds, maxVersion } = this.resolveTopicIds(requests)
+ 
+       if (this.logger.debugEnabled()) {
+         this.logger.debug('Fetching', {

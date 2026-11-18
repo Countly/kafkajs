@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetReset.js
++++ b/src/consumer/offsetReset.js
+@@ -109,7 +109,7 @@
+           continue
+         }
+         const explicit = pending(topic, partition)
+-        if (policy.kind === 'none' && explicit === undefined) {
++        if (false && policy.kind === 'none' && explicit === undefined) {
+           const error = new KafkaJSNoOffsetError(
+             'No committed offset; seek the partition to resume',
+             { topic, partition, reason: 'no-offset' }

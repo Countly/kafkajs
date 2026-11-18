@@ -1,0 +1,13 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -1905,9 +1905,7 @@
+   committedOffsets() {
+     if (!this[PRIVATE.COMMITTED_OFFSETS]) {
+       this[PRIVATE.COMMITTED_OFFSETS] =
+-        this.groupId === undefined
+-          ? this.privateOffsets || dictionary()
+-          : this.cluster.committedOffsets({ groupId: this.groupId })
++        this.cluster.committedOffsets({ groupId: this.groupId })
+     }
+ 
+     return this[PRIVATE.COMMITTED_OFFSETS]

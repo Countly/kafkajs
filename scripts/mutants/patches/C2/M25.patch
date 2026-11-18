@@ -1,0 +1,11 @@
+--- a/src/retry/index.js
++++ b/src/retry/index.js
+@@ -110,7 +110,7 @@
+ 
+     const scheduleRetry = () => {
+       if (scope) {
+-        scope.delay(retryTime).then(() => retry(nextRetryTime, retryCount + 1), bail)
++        new Promise((resolve) => setTimeout(resolve, retryTime)).then(() => retry(nextRetryTime, retryCount + 1), bail)
+       } else {
+         setTimeout(() => retry(nextRetryTime, retryCount + 1), retryTime)
+       }

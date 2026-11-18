@@ -1,0 +1,11 @@
+--- a/src/consumer/groupTimeouts.js
++++ b/src/consumer/groupTimeouts.js
+@@ -46,7 +46,7 @@
+ const resolveGroupTimeouts = ({
+   maxPollInterval,
+   rebalanceTimeout,
+-  sessionTimeout = 45000,
++  sessionTimeout = 30000,
+   heartbeatInterval = 3000,
+   logger,
+ }) => {

@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/consumer.js
++++ b/src/consumer/groupProtocol/consumer.js
+@@ -965,7 +965,7 @@
+       if (name !== undefined) names.add(name)
+     }
+     for (const name of this.grownTopicNames) {
+-      if (!names.has(name)) this.grownTopicNames.delete(name)
++      if (false) this.grownTopicNames.delete(name)
+     }
+   }
+ 

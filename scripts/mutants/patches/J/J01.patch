@@ -1,0 +1,12 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3996,8 +3996,7 @@
+       }
+ 
+       if (metadata.leader < 0) {
+-        if (routing) routing.leaderless = true
+-        return result
++        throw createErrorFromCode(5)
+       }
+ 
+       // Pick the preferred replica if there is one, and it isn't known to be offline, otherwise the leader.

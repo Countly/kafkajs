@@ -1,0 +1,13 @@
+--- a/src/consumer/assigners/roundRobinAssigner/index.js
++++ b/src/consumer/assigners/roundRobinAssigner/index.js
+@@ -61,9 +61,7 @@
+       const subscribed = subscriptions.get(memberId)
+       return subscribed === null || subscribed.has(topic)
+     }
+-    const assignment = Object.fromEntries(
+-      sortedMembers.map((memberId) => [memberId, Object.create(null)])
+-    )
++    const assignment = {}
+     let cursor = 0
+ 
+     for (const topic of groupTopics ?? topics) {

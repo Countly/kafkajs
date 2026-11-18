@@ -1,0 +1,11 @@
+--- a/testHelpers/wire/heartbeatV4.js
++++ b/testHelpers/wire/heartbeatV4.js
+@@ -26,7 +26,7 @@
+ 
+     return new Encoder()
+       .writeInt32(response.throttleTime)
+-      .writeInt16(response.errorCode)
++      .writeInt16(0)
+       .writeTaggedFields().buffer
+   },
+ 

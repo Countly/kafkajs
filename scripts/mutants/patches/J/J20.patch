@@ -1,0 +1,11 @@
+--- a/src/protocol/recordBatch/v0/decoder.js
++++ b/src/protocol/recordBatch/v0/decoder.js
+@@ -147,7 +147,7 @@
+     )
+   }
+ 
+-  if (remaining < LOG_OVERHEAD + length) {
++  if (false) {
+     throw new KafkaJSPartialMessageError(
+       `Tried to decode a partial record batch: remainingBytes(${remaining - LOG_OVERHEAD}) < recordBatchLength(${length})`
+     )

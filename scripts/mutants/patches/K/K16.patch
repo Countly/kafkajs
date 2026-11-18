@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -283,7 +283,7 @@
+     const entries = [...this.sessions].map(([nodeId, session]) => [nodeId, session.close()])
+     this.sessions.clear()
+     this.closing = Promise.resolve().then(async () => {
+-      const operation = new ConsumerOperation({ deadlineAt: deadline, guard })
++      const operation = new ConsumerOperation({ deadlineAt: Infinity, guard })
+       try {
+         await Promise.all(
+           entries.map(async ([nodeId, close]) => {

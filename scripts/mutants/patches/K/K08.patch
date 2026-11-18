@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -101,7 +101,7 @@
+     const { full } = this.pending
+     this.pending = null
+     if (response.errorCode) {
+-      this.reset(response.errorCode === 70)
++      this.reset(false)
+       return false
+     }
+     const seen = new Set()

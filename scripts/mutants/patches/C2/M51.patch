@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -331,7 +331,7 @@
+         )
+       const stamped = stampMembership(
+         stampOwnership(stampGeneration(stampOffsetCommit(error), payload.groupGenerationId), token),
+-        revision
++        undefined
+       )
+       const callerRefusal = guard?.()
+       if (!callerRefusal || isCallDeadline(callerRefusal)) {

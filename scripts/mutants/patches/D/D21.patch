@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/rangeAssigner/index.js
++++ b/src/consumer/assigners/rangeAssigner/index.js
+@@ -189,7 +189,7 @@
+       memberAssignment: MemberAssignment.encode({
+         version: this.version,
+         assignment: byTopic,
+-        ...(rackAware ? { userData: null } : {}),
++        ...(rackAware ? { userData: Buffer.alloc(0) } : {}),
+       }),
+     }))
+   },

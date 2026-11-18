@@ -1,0 +1,10 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1873,7 +1873,6 @@
+       topicPartitions,
+     })
+     this.subscriptionState.resume(topicPartitions)
+-    this.idleWait.wake()
+   }
+ 
+   assigned() {

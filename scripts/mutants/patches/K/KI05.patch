@@ -1,0 +1,18 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2403,7 +2403,6 @@
+    * @returns {boolean} whether the session was current; a stale failure changes nothing
+    */
+   failTrackedFetch({ session, token, previous }, requests) {
+-    if (!session.current(token)) return false
+     let cleared = false
+     const clear = (topic, partition) => {
+       const replicas = this.preferredReadReplicasPerTopicPartition[topic]
+@@ -2417,6 +2416,7 @@
+       for (const { partition } of partitions) clear(topic, partition)
+     }
+     if (cleared) this.routingChanged()
++    if (!session.current(token)) return false
+     session.handleError(token)
+     return true
+   }

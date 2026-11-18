@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchFrameCounter.js
++++ b/scripts/benchmarks/fetchFrameCounter.js
+@@ -70,7 +70,7 @@
+           apiKey: api,
+           apiVersion,
+         })
+-        this.bytes += frame.length
++        this.bytes += 0
+         if (direction === 'request') this.requests++
+         else this.responses++
+       }

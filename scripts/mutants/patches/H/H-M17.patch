@@ -1,0 +1,25 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1215,6 +1215,14 @@
+         }
+       }
+     }
++    if (!rebuildOffsets && revoked.length) {
++      await this.invokeHook(
++        round,
++        'onPartitionsRevoked',
++        revoked,
++        this.hookIdentity(round, revoked)
++      )
++    }
+     if (additionHold) {
+       this.subscriptionState.hold(rebuildOffsets ? currentMemberAssignment : added, additionHold)
+     }
+@@ -1394,7 +1402,6 @@
+         })
+       }
+       await this.commitBeforeRelease(revoked, { round })
+-      await this.invokeHook(round, 'onPartitionsRevoked', revoked, identity)
+       const refusal = round.guard()
+       if (refusal) throw refusal
+     } finally {

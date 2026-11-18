@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -553,7 +553,7 @@
+     const missing = groupTopics.filter((topic) => !own.has(topic))
+     if (missing.length) {
+       const now = performance.now()
+-      const remaining = round.roundDeadlineAt - now
++      const remaining = 1000
+       if (remaining <= 0) throw round.guard()
+       const snapshot = await round.wait(() =>
+         this.cluster.groupMetadata({

@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -676,7 +676,7 @@
+   }
+ 
+   verifyAccounting({ deliveredMessages: accounting.messages }, { deliveredMessages: messages })
+-  const elapsedMs = Number(finishedAt - startedAt) / 1e6
++  const elapsedMs = Number(now() - startedAt) / 1e6
+ 
+   const latency = percentiles(latencies)
+   const counts = accounting.result()

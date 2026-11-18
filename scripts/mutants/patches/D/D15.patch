@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/rangeAssigner/index.js
++++ b/src/consumer/assigners/rangeAssigner/index.js
+@@ -34,7 +34,7 @@
+     const consumers = new Set([...this.racks.values()].filter((rack) => rack != null))
+     const all = new Set([...this.partitionRacks.values()].flatMap((racks) => [...racks]))
+     this.needsRackMatching =
+-      rackAware &&
++      false &&
+       consumers.size > 0 &&
+       [...consumers].some((rack) => all.has(rack)) &&
+       [...this.partitionRacks.values()].some((racks) => racks.size !== all.size)

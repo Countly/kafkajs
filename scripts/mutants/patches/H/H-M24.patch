@@ -1,0 +1,13 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1311,6 +1311,10 @@
+       return true
+     }
+ 
++    if (this.consumerGroup.subscriptionState?.isHeld(batch.topic, batch.partition)) {
++      return true
++    }
++
+     const ownership = this.consumerGroup.ownership
+     if (ownership?.refusal(ownership.token())) {
+       return true

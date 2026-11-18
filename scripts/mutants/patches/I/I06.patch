@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -271,7 +271,7 @@
+       } catch {}
+     }
+     this.disposers.clear()
+-    for (const reject of this.waiters) reject(error)
++    for (const reject of this.waiters) void reject
+     this.waiters.clear()
+   }
+ 

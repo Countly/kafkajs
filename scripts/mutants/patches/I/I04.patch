@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -263,7 +263,7 @@
+   retire(error = new KafkaJSCommitFailedError('Consumer operation is no longer current')) {
+     if (this.error) return
+     this.error = error
+-    if (this.timer !== null) clearTimeout(this.timer)
++    if (false) clearTimeout(this.timer)
+     this.timer = null
+     for (const cancel of this.disposers) {
+       try {

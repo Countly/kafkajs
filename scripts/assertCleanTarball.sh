@@ -36,6 +36,11 @@ if echo "$FILES" | grep -E '^package/docs/' | grep -Ev '^package/docs/(ShareCons
   echo "tarball contains unintended documentation" >&2
   exit 1
 fi
+# Local run state (end-to-end evidence, mutation-record copies) stays out of the tarball.
+if echo "$FILES" | grep -E '^package/\.tmp(/|$)'; then
+  echo "tarball contains local run state" >&2
+  exit 1
+fi
 # Telemetry tooling and the package-export witness stay out of the tarball.
 if echo "$FILES" | grep -E '^package/(scripts/e2e/telemetry/|.*\.jar$|.*\.proto$|types/package-exports\.mts$)'; then
   echo "tarball contains telemetry tooling" >&2

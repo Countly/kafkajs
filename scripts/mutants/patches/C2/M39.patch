@@ -1,0 +1,13 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -536,9 +536,7 @@
+     const groupTopics = [
+       ...new Set([
+         ...topicsSubscribed,
+-        ...members.flatMap(
+-          ({ memberMetadata }) => this.decodeSubscription(memberMetadata)?.topics ?? []
+-        ),
++        ...members.flatMap(({ memberMetadata }) => MemberMetadata.decode(memberMetadata).topics),
+       ]),
+     ].sort()
+     const own = new Set(topicsSubscribed)

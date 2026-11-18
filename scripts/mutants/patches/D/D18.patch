@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/rangeAssigner/index.js
++++ b/src/consumer/assigners/rangeAssigner/index.js
+@@ -55,7 +55,7 @@
+    */
+   racksMatch(member, partition) {
+     const rack = this.racks.get(member)
+-    return rack == null || Boolean(this.partitionRacks.get(partition)?.has(rack))
++    return rack != null && Boolean(this.partitionRacks.get(partition)?.has(rack))
+   }
+ 
+   /**

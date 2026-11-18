@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -580,7 +580,7 @@
+     ...commits,
+     eachBatch: async ({ batch }) => {
+       const batchStartedAt = now()
+-      accounting.enter(batch.messages.length, batchStartedAt)
++      accounting.enter(batch.messages.length - 1, batchStartedAt)
+       if (batch.messages.length > 0) sizing?.observe(batch.partition)
+       if (startedAt === undefined) {
+         startedAt = batchStartedAt

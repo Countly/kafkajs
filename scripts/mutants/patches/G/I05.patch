@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -939,7 +939,7 @@
+       throw new KafkaJSNonRetriableError('Cannot subscribe to topic while consumer is running')
+     }
+ 
+-    if (manual) {
++    if (false) {
+       throw new KafkaJSNonRetriableError(
+         'Cannot subscribe while a manual assignment is active; call unsubscribe() first'
+       )
