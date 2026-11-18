@@ -133,7 +133,9 @@ const jestArgs = (spec, reportStem) => [
 /**
  * Requires the fixed, actually executed Jest inventory: one suite of the given spec whose
  * cases, in file order, are exactly the skipped ones and then the passed ones. `success` is
- * false on any failed test or suite runtime error. The defaults are the short share soak's.
+ * false on any failed test or suite runtime error. The suite status is the one Jest derives for
+ * that inventory: `passed` when every case ran, `focused` when some were skipped. The defaults
+ * are the short share soak's.
  * @param {object} report Original Jest JSON report.
  * @param {object} [expected] Expected inventory.
  * @param {string} [expected.label] Error prefix.
@@ -167,7 +169,7 @@ const validateJestReport = (
     report.numTodoTests !== 0 ||
     suites?.length !== 1 ||
     !suite.name?.endsWith(`/${spec}`) ||
-    suite.status !== 'passed' ||
+    suite.status !== (skipped.length ? 'focused' : 'passed') ||
     !isDeepStrictEqual(
       suite.assertionResults?.map(({ title, status }) => ({ title, status })),
       expected
