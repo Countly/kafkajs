@@ -126,6 +126,44 @@ const closedError = () =>
 const timeoutError = () =>
   new KafkaJSRequestTimeoutError('Request SaslAuthenticate(key: 36, version: 1) timed out')
 
+/**
+ * A send failure as the real connection delivers it: the transport failure ends the connection,
+ * whose guard then refuses with the close reason (a timed-out request closes its connection).
+ * @param {Error} failure what the send rejects with
+ * @param {Error} [refusal=failure] the guard's refusal once the send failed
+ * @returns {{ exchange: () => never, guard: () => Error|null }}
+ */
+const endsConnection = (failure, refusal = failure) => {
+  let ended = false
+  return {
+    exchange: () => {
+      ended = true
+      throw failure
+    },
+    guard: () => (ended ? refusal : null),
+  }
+}
+
+/** Library-class transport errors a supplier can construct, each carrying the marker. */
+const SUPPLIED_TRANSPORT_ERRORS = [
+  [
+    'a constructed library connection error',
+    () =>
+      Object.assign(
+        new KafkaJSConnectionError(`Connection error: ${SECRET}`, { cause: new Error(SECRET) }),
+        { detail: SECRET }
+      ),
+  ],
+  [
+    'a native error adopting the connection error prototype',
+    () =>
+      Object.setPrototypeOf(
+        Object.assign(new Error(SECRET), { detail: SECRET, retriable: true }),
+        KafkaJSConnectionError.prototype
+      ),
+  ],
+]
+
 describe('Broker > SASLAuthenticator > transport failures during the exchange', () => {
   beforeEach(() => {
     gssapiClient = gssapiStub()
@@ -133,19 +171,19 @@ describe('Broker > SASLAuthenticator > transport failures during the exchange', 
 
   describe.each(Object.keys(MECHANISMS))('%s', (name) => {
     test.each([
-      ['connection error', connectionError, KafkaJSConnectionError],
-      ['closed connection', closedError, KafkaJSConnectionClosedError],
-      ['request timeout', timeoutError, KafkaJSRequestTimeoutError],
+      ['connection error', connectionError, (failure) => failure, KafkaJSConnectionError],
+      ['closed connection', closedError, (failure) => failure, KafkaJSConnectionClosedError],
+      ['request timeout', timeoutError, closedError, KafkaJSConnectionClosedError],
     ])(
-      'a %s during the exchange is rethrown unchanged and stays retriable',
-      async (_, make, Class) => {
+      "a %s that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+      async (_, make, refusalOf, Class) => {
         const failure = make()
-        const { error, entries, sent, reported } = await authenticate(name, () => {
-          throw failure
-        })
+        const refusal = refusalOf(failure)
+        const { exchange, guard } = endsConnection(failure, refusal)
+        const { error, entries, sent, reported } = await authenticate(name, exchange, { guard })
 
         expect(sent).toBe(1)
-        expect(error).toBe(failure)
+        expect(error).toBe(refusal)
         expect(Object.getPrototypeOf(error)).toBe(Class.prototype)
         expect(error.retriable).toBe(true)
         expect(error.category).toBe('retriable')
@@ -188,6 +226,7 @@ describe('Broker > SASLAuthenticator > transport failures during the exchange', 
     test('an error forging a transport name, code and retriable flag stays an authentication error without its text', async () => {
       const forged = Object.assign(new Error(`Connection error: ${SECRET}`), {
         name: 'KafkaJSConnectionError',
+        code: 'ECONNRESET',
         retriable: true,
         category: 'retriable',
       })
@@ -200,6 +239,23 @@ describe('Broker > SASLAuthenticator > transport failures during the exchange', 
       expect(error.cause).toBeUndefined()
       expect(textOf([error, entries])).not.toContain(SECRET)
     })
+
+    test.each(SUPPLIED_TRANSPORT_ERRORS)(
+      '%s from a send that leaves the connection open stays an authentication error without its text',
+      async (_, make) => {
+        const supplied = make()
+        const { error, entries, sent } = await authenticate(name, () => {
+          throw supplied
+        })
+
+        expect(sent).toBe(1)
+        expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+        expect(error).not.toBe(supplied)
+        expect(error.retriable).toBe(false)
+        expect(error.cause).toBeUndefined()
+        expect(textOf([error, entries])).not.toContain(SECRET)
+      }
+    )
   })
 
   test('OAUTHBEARER: a library connection error thrown by the supplied token stays an authentication error without its text', async () => {
@@ -242,11 +298,15 @@ describe('Broker > SASLAuthenticator > transport failures during the exchange', 
     gssapiClient = gssapiStub({ contextComplete: true })
     const failure = connectionError()
     let exchanges = 0
-    const { error } = await authenticate('GSSAPI', () => {
-      exchanges += 1
-      if (exchanges === 2) throw failure
-      return TOKEN_ANSWER()
-    })
+    const { error } = await authenticate(
+      'GSSAPI',
+      () => {
+        exchanges += 1
+        if (exchanges === 2) throw failure
+        return TOKEN_ANSWER()
+      },
+      { guard: () => (exchanges === 2 ? failure : null) }
+    )
 
     expect(exchanges).toBe(2)
     expect(error).toBe(failure)
@@ -317,20 +377,28 @@ describe('Broker > SASLAuthenticator > failures that remain authentication error
 })
 
 describe('Broker > SASLAuthenticator > the classification reaches the recovery policies', () => {
-  /** @returns {Promise<Error>} what SCRAM-SHA-512 throws when the exchange send fails so */
-  const produce = (failure) =>
-    authenticate('SCRAM-SHA-512', () => {
-      throw failure
-    }).then(({ error }) => error)
+  /** @returns {Promise<Error>} what SCRAM-SHA-512 throws when the exchange fails as `make` says */
+  const produce = (make) => {
+    const { exchange, guard } = make()
+    return authenticate('SCRAM-SHA-512', exchange, { guard }).then(({ error }) => error)
+  }
 
   test.each([
-    ['a lost connection', connectionError, true],
-    ['a request timeout', timeoutError, true],
-    ['a broker rejection', () => createErrorFromCode(58), false],
+    ['a lost connection', () => endsConnection(connectionError()), true],
+    ['a request timeout', () => endsConnection(timeoutError(), closedError()), true],
+    [
+      'a broker rejection',
+      () => ({
+        exchange: () => {
+          throw createErrorFromCode(58)
+        },
+      }),
+      false,
+    ],
   ])(
     '%s during the exchange decides rebootstrap, consumer restart and share restart',
     async (_, make, recoverable) => {
-      const error = await produce(make())
+      const error = await produce(make)
       const cluster = new Cluster({
         ...connectionOpts(),
         logger: newLogger(),
@@ -345,6 +413,104 @@ describe('Broker > SASLAuthenticator > the classification reaches the recovery p
       expect(ShareRunner.prototype.mustNotRestart.call(null, error)).toBe(!recoverable)
     }
   )
+})
+
+describe('Broker > SASLAuthenticator > a passed-through failure belongs to one invocation', () => {
+  /**
+   * An OAUTHBEARER authentication whose token's `extensions` getter throws `error` after the marker
+   * was written into its message and cause, as a supplier holding the object could.
+   * @param {Error} error a failure an earlier invocation produced
+   * @returns {Promise<{ error: *, entries: object[], sent: number }>}
+   */
+  const reuseInTokenGetter = (error) => {
+    error.message = `Connection error: ${SECRET}`
+    error.cause = new Error(SECRET)
+    const token = {
+      value: 'token',
+      get extensions() {
+        throw error
+      },
+    }
+    return authenticate('OAUTHBEARER', () => ({}), {
+      sasl: { mechanism: 'oauthbearer', oauthBearerProvider: async () => token },
+    })
+  }
+
+  test('a refusal a custom provider propagated is judged afresh when a later token getter throws it', async () => {
+    const refusal = connectionError()
+    const { exchange, guard } = endsConnection(refusal)
+    const custom = await authenticate('PLAIN', exchange, {
+      guard,
+      sasl: {
+        mechanism: 'plain',
+        authenticationProvider: ({ saslAuthenticate }) => ({
+          authenticate: () =>
+            saslAuthenticate({ request: { encode: async () => Buffer.alloc(0) } }),
+        }),
+      },
+    })
+    expect(custom.error).toBe(refusal)
+
+    const { error, entries, sent } = await reuseInTokenGetter(refusal)
+
+    expect(sent).toBe(0)
+    expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+    expect(error.retriable).toBe(false)
+    expect(error.cause).toBeUndefined()
+    expect(textOf([error, entries])).not.toContain(SECRET)
+  })
+
+  test('a refusal before the mechanism runs is judged afresh when a later token getter throws it', async () => {
+    const refusal = connectionError()
+    const refused = await authenticate('PLAIN', () => ({}), { guard: () => refusal })
+    expect(refused.error).toBe(refusal)
+    expect(refused.sent).toBe(0)
+
+    const { error, entries } = await reuseInTokenGetter(refusal)
+
+    expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+    expect(error.retriable).toBe(false)
+    expect(textOf([error, entries])).not.toContain(SECRET)
+  })
+
+  test('two concurrent invocations refused with one shared error each rethrow it unchanged', async () => {
+    const shared = connectionError()
+    let release
+    const gate = new Promise((resolve) => (release = resolve))
+    const concurrent = () => {
+      let ended = false
+      return authenticate(
+        'PLAIN',
+        async () => {
+          await gate
+          ended = true
+          throw shared
+        },
+        { guard: () => (ended ? shared : null) }
+      )
+    }
+    const outcomes = Promise.all([concurrent(), concurrent()])
+    release()
+
+    const [first, second] = await outcomes
+
+    expect(first.error).toBe(shared)
+    expect(second.error).toBe(shared)
+    expect(shared.retriable).toBe(true)
+  })
+
+  test('sequential invocations each rethrow their own refusal', async () => {
+    const refusals = [connectionError(), closedError()]
+
+    const errors = []
+    for (const refusal of refusals) {
+      const { exchange, guard } = endsConnection(refusal)
+      errors.push((await authenticate('SCRAM-SHA-256', exchange, { guard })).error)
+    }
+
+    expect(errors[0]).toBe(refusals[0])
+    expect(errors[1]).toBe(refusals[1])
+  })
 })
 
 describe('Broker > SASLAuthenticator > transport failures through the client', () => {
@@ -378,9 +544,11 @@ describe('Broker > SASLAuthenticator > transport failures through the client', (
   /**
    * Builds an admin over one scripted SASL PLAIN broker whose SaslAuthenticate runs `answer`.
    * @param {(call: number) => object} answer the response fields of the nth SaslAuthenticate
+   * @param {{ wrapSocket?: (socket: object) => void, entries?: object[] }} [options] a hook on
+   *   every socket the client opens, and a sink for every log entry
    * @returns {void}
    */
-  const arrange = (answer) => {
+  const arrange = (answer, { wrapSocket = () => {}, entries } = {}) => {
     let call = 0
     cluster = createScriptedCluster({
       nodes: [{ id: 0, host: 'broker', port: 9092 }],
@@ -394,6 +562,15 @@ describe('Broker > SASLAuthenticator > transport failures through the client', (
         authenticationTimeout: 1000,
         reauthenticationThreshold: 900,
         retry: { initialRetryTime: 10, maxRetryTime: 10, factor: 0, multiplier: 1, retries: 3 },
+        socketFactory: (options) => {
+          const socket = cluster.socketFactory(options)
+          wrapSocket(socket)
+          return socket
+        },
+        ...(entries && {
+          logLevel: LEVELS.DEBUG,
+          logCreator: () => (entry) => entries.push(entry),
+        }),
       })
     ).admin()
   }
@@ -427,6 +604,36 @@ describe('Broker > SASLAuthenticator > transport failures through the client', (
     expect(topics).toEqual([])
     expect(logins()).toHaveLength(3)
     expect(cluster.sockets()[0].destroyed).toBe(true)
+  })
+
+  test('a connection error a supplied socket throws while writing the login stays a sanitized authentication error', async () => {
+    const entries = []
+    const supplied = Object.assign(
+      new KafkaJSConnectionError(`Connection error: ${SECRET}`, { cause: new Error(SECRET) }),
+      { detail: SECRET }
+    )
+    let thrown = 0
+    arrange(() => LOGIN, {
+      entries,
+      wrapSocket: (socket) => {
+        const write = socket.write
+        socket.write = (buffer, ...rest) => {
+          if (thrown === 0 && Buffer.from(buffer).readInt16BE(4) === apiKeys.SaslAuthenticate) {
+            thrown += 1
+            throw supplied
+          }
+          return write(buffer, ...rest)
+        }
+      },
+    })
+
+    const error = await until(admin.connect()).catch((e) => e)
+
+    expect(thrown).toBe(1)
+    expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+    expect(error.retriable).toBe(false)
+    expect(logins()).toHaveLength(0)
+    expect(textOf([error, entries])).not.toContain(SECRET)
   })
 
   test('a rejected password during re-authentication is not retried', async () => {

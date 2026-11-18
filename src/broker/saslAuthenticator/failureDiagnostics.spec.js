@@ -111,12 +111,11 @@ describe('Broker > SASLAuthenticator > authentication failure diagnostics', () =
     pool = createPool({ authenticationTimeout: 5000, instrumentationEmitter })
 
     const connection = pool.pool[0]
-    const hangUp = new KafkaJSConnectionError('socket hang up')
 
     connection.send = jest
       .fn()
       .mockResolvedValueOnce({ enabledMechanisms: ['PLAIN'] })
-      .mockRejectedValueOnce(hangUp)
+      .mockRejectedValueOnce(new KafkaJSConnectionError('socket hang up'))
 
     const events = []
     instrumentationEmitter.addListener(NETWORK_AUTHENTICATION_FAILURE, (event) =>
@@ -124,7 +123,7 @@ describe('Broker > SASLAuthenticator > authentication failure diagnostics', () =
     )
 
     const authenticator = new SASLAuthenticator(connection, newLogger(), versionsWith({}))
-    await expect(authenticator.authenticate()).rejects.toBe(hangUp)
+    await expect(authenticator.authenticate()).rejects.toThrow('SASL PLAIN authentication failed')
 
     expect(events).toHaveLength(0)
 
