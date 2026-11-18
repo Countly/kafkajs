@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - name: Pack once, then guard and smoke both tarballs
         run: |
           set -eo pipefail
@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run test:otel
   integration-plan:
     runs-on: ubuntu-latest
