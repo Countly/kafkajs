@@ -150,14 +150,12 @@ module.exports = class OffsetManager {
    *                                its heartbeat, joins and other commits. The originating caller's
    *                                guard must allow publication to membership. Absent in isolated
    *                                managers, which ask the cluster directly.
-   * @param {{unapplied: Set<string>, clock: () => number, lastSoughtAt: () => number,
+   * @param {{clock: () => number, lastSoughtAt: () => number,
    *   isSoughtAfter: (topic: string, partition: number|string, since: number) => boolean}}
-   *   [options.seeks] the consumer group's seek state: the `topic|partition` keys whose seek is not
-   *                                yet applied, whose resolved progress the default selection
-   *                                leaves out, and the clock a selection is stamped with, so a seek
-   *                                admitted after it refuses the selection before it is written and
-   *                                keeps its cell out of the cache once it is answered. Absent in
-   *                                isolated managers, which never filter.
+   *   [options.seeks] the consumer group's seek state: the clock a default selection is stamped
+   *                                with, so a seek admitted after it refuses the selection before
+   *                                it is written and keeps its cell out of the cache once it is
+   *                                answered. Absent in isolated managers, which never check.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch and why an offset fetch is re-sent. Optional and
    *                                silent by default: the consumer group is the only production
@@ -777,9 +775,7 @@ module.exports = class OffsetManager {
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
    *                              currently assigned to this member, when this member lost its
    *                              membership, or when a newer operation or barrier superseded it
-   *                              while its commit was in flight. A commit the coordinator accepted
-   *                              but a newer operation superseded still drops the resolved
-   *                              position the seek replaced, which the newer value then stands for
+   *                              while its commit was in flight
    * @throws {Error} whatever the offset conversion or the commit raised, or the preparation's
    *   refusal; the ticket ends either way
    */
@@ -825,7 +821,7 @@ module.exports = class OffsetManager {
       return true
     }
 
-    const applied = await this.commitAndClear({ topic, partition, offset }, preparation, true)
+    const applied = await this.commitAndClear({ topic, partition, offset }, preparation)
     if (applied) this.retireResetRefusals(topic, partition)
     return applied
   }
@@ -833,24 +829,21 @@ module.exports = class OffsetManager {
   /**
    * One OffsetCommit for a single partition followed by the clear of its cached offset, position
    * and epoch, under a mutation ticket: the clear is a post-await write, so it is applied only
-   * while the ticket is still current. A failed commit applies nothing and supersedes nothing. A
-   * concrete offset settles a recreation reset only when the topic is provably the incarnation the
-   * commit was sent for; a sentinel never does.
+   * while the ticket is still current. A concrete offset settles a recreation reset only when the
+   * topic is provably the incarnation the commit was sent for; a sentinel never does.
    *
-   * With `dropsResolved`, a commit the coordinator accepted but a newer operation superseded still
-   * drops the resolved position it replaced, unless something resolved it again meanwhile. The
-   * newer operation keeps the committed value and the position that follows from it.
+   * A commit that ends without clearing, whatever the reason (a refused caller, a failure, an
+   * answer the broker may have accepted), forgets the partition's cached committed offset unless a
+   * newer operation owns the cell, so the position is read back from the broker.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
    *   manager's own ownership guard; its refusal is thrown, not reported as `false`
-   * @param {boolean} [dropsResolved=false] the commit replaces the partition's resolved position
    * @returns {Promise<boolean>} whether the clear was applied
    * @throws {Error} whatever the commit raised
    */
-  async commitAndClear({ topic, partition, offset }, preparation, dropsResolved = false) {
+  async commitAndClear({ topic, partition, offset }, preparation) {
     const { groupId, generationId, memberId, groupInstanceId } = this
-    const replaced = dropsResolved ? this.resolvedOffsets[topic]?.[partition] : undefined
     const token = this.ownership?.token()
     const guard =
       this.ownership || preparation
@@ -860,6 +853,7 @@ module.exports = class OffsetManager {
     const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
     const requestedId = this.cluster.topicId(topic)
     const release = this.ownership?.retain(token)
+    let cleared = false
 
     try {
       if (groupId !== undefined) {
@@ -875,13 +869,10 @@ module.exports = class OffsetManager {
         )
       }
 
-      if (guard?.()) return false
-      if (this.operations.isSuperseded(ticket, topic, partition)) {
-        this.dropResolved(topic, partition, replaced)
-        return false
-      }
+      if (guard?.() || this.operations.isSuperseded(ticket, topic, partition)) return false
 
       this.clearOffsets({ topic, partition })
+      cleared = true
       if (
         groupId !== undefined &&
         !isInvalidOffset(offset) &&
@@ -894,25 +885,39 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
+      if (!cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
+        this.forgetCommitted(topic, partition)
+      }
       release?.()
       this.operations.end(ticket)
     }
   }
 
   /**
-   * Forgets a partition's resolved position and tracked epoch, if it is still `offset`: a position
-   * resolved since belongs to newer work and stays.
-   * @private
+   * Forgets a partition's resolved position and tracked epoch: whatever resolved before this call
+   * belongs to a position that is being replaced. Anything resolved afterwards is new.
    * @param {string} topic
-   * @param {number} partition
-   * @param {string|undefined} offset the resolved position to forget; nothing is forgotten when
-   *   undefined
+   * @param {number|string} partition
    * @returns {void}
    */
-  dropResolved(topic, partition, offset) {
-    if (offset === undefined || this.resolvedOffsets[topic]?.[partition] !== offset) return
-    delete this.resolvedOffsets[topic][partition]
-    delete this.resolvedEpochs[topic]?.[partition]
+  forgetResolved(topic, partition) {
+    if (this.resolvedOffsets[topic]) delete this.resolvedOffsets[topic][partition]
+    if (this.resolvedEpochs[topic]) delete this.resolvedEpochs[topic][partition]
+  }
+
+  /**
+   * Forgets the committed offset this manager's group cache holds for a cell, so the next
+   * resolution reads it from the coordinator. Advances the cell's revision, as every clear does.
+   * @private
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {void}
+   */
+  forgetCommitted(topic, partition) {
+    const committedOffsets = this.committedOffsets()
+    CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
+    // The cache is shared with the group's other consumers on this client: the topic may be gone.
+    if (committedOffsets[topic]) delete committedOffsets[topic][partition]
   }
 
   /**
@@ -980,31 +985,27 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * `uncommittedOffsets().topics`, optionally narrowed to a set of topic-partitions, without the
-   * partitions whose seek is not applied yet (`seeks.unapplied`): the seek, once applied, replaces
-   * their progress, so committing it first would move the group's offset away from the position
-   * the application asked for. The other partitions are selected as usual. With no seek pending,
-   * nothing is filtered or allocated for it.
+   * `uncommittedOffsets().topics`, optionally narrowed to a set of topic-partitions.
    * @private
    * @param {import('../groupProtocol/interface').TopicPartitions[]|null} partitions
    * @returns {import('../../../types').OffsetsByTopicPartition["topics"]}
    */
   selectUncommitted(partitions) {
     const { topics } = this.uncommittedOffsets()
-    const unapplied = this.seeks?.unapplied
-    const filtering = unapplied !== undefined && unapplied.size !== 0
-    if (!partitions && !filtering) return topics
 
-    const wanted =
-      partitions && new Map(partitions.map(({ topic, partitions: ps }) => [topic, new Set(ps)]))
+    if (!partitions) {
+      return topics
+    }
+
+    const wanted = new Map(partitions.map(({ topic, partitions: ps }) => [topic, new Set(ps)]))
+
     return topics
       .map(({ topic, partitions: entries }) => ({
         topic,
-        partitions: entries.filter(
-          ({ partition }) =>
-            (!wanted || wanted.get(topic)?.has(Number(partition)) === true) &&
-            !(filtering && unapplied.has(`${topic}|${partition}`))
-        ),
+        partitions: entries.filter(({ partition }) => {
+          const selected = wanted.get(topic)
+          return selected !== undefined && selected.has(Number(partition))
+        }),
       }))
       .filter(({ partitions: entries }) => entries.length > 0)
   }
@@ -1247,13 +1248,13 @@ module.exports = class OffsetManager {
       const written = []
 
       for (const { partition, offset } of partitions) {
-        if (
-          !this.operations.isSuperseded(ticket, topic, partition) &&
-          !(checkSeeks && this.seeks.isSoughtAfter(topic, partition, since))
-        ) {
-          accepted[partition] = offset
-          written.push(partition)
+        if (this.operations.isSuperseded(ticket, topic, partition)) continue
+        if (checkSeeks && this.seeks.isSoughtAfter(topic, partition, since)) {
+          this.forgetCommitted(topic, partition)
+          continue
         }
+        accepted[partition] = offset
+        written.push(partition)
       }
 
       if (written.length > 0) {
@@ -1974,27 +1975,13 @@ module.exports = class OffsetManager {
    */
   clearOffsets({ topic, partition }) {
     this.clearPendingSeek(topic, partition)
-    // Each key is guarded: the committed-offsets object is shared with every other consumer of
-    // this group on the same client, so a topic this manager once held can be absent by the time
-    // it prunes it.
-    const committedOffsets = this.committedOffsets()
-
-    CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
-    if (committedOffsets[topic]) {
-      delete committedOffsets[topic][partition]
-    }
+    this.forgetCommitted(topic, partition)
 
     if (this.resetPositions[topic]) {
       delete this.resetPositions[topic][partition]
     }
 
-    if (this.resolvedOffsets[topic]) {
-      delete this.resolvedOffsets[topic][partition]
-    }
-
-    if (this.resolvedEpochs[topic]) {
-      delete this.resolvedEpochs[topic][partition]
-    }
+    this.forgetResolved(topic, partition)
   }
 
   /**

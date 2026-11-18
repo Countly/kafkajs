@@ -845,13 +845,15 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     const group = captured.group()
     const scans = jest.spyOn(group, 'isSoughtAfter')
     const lookups = jest.spyOn(group.unappliedSeeks, 'has')
-    using({ restore: () => [scans, lookups].forEach((spy) => spy.mockRestore()) })
+    const forgetResolved = jest.spyOn(group.offsetManager, 'forgetResolved')
+    const forgetCommitted = jest.spyOn(group.offsetManager, 'forgetCommitted')
+    const spies = [scans, lookups, forgetResolved, forgetCommitted]
+    using({ restore: () => spies.forEach((spy) => spy.mockRestore()) })
 
     await scenario.release()
 
     expect(scenario.commits()).toEqual(['5'])
-    expect(scans).not.toHaveBeenCalled()
-    expect(lookups).not.toHaveBeenCalled()
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled()
     expect(scenario.errors).toEqual([])
   })
 

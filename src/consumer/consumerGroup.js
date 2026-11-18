@@ -304,8 +304,8 @@ module.exports = class ConsumerGroup {
     this.acquired = new Map()
     this.acquireClock = 0
     /**
-     * The `topic|partition` keys whose latest admitted seek has not finished applying: their
-     * resolved progress belongs to the position being replaced. Bounded by the assignment.
+     * The `topic|partition` keys whose latest admitted seek has not finished applying: they are
+     * not fetched until it has. Bounded by the assignment.
      * @type {Set<string>}
      */
     this.unappliedSeeks = new Set()
@@ -1187,7 +1187,6 @@ module.exports = class ConsumerGroup {
         },
         isStopping: () => this.isStopping(),
         seeks: {
-          unapplied: this.unappliedSeeks,
           clock: () => this.acquireClock,
           lastSoughtAt: () => this.lastSoughtAt,
           isSoughtAfter: (topic, partition, since) => this.isSoughtAfter(topic, partition, since),
@@ -1894,9 +1893,11 @@ module.exports = class ConsumerGroup {
   /**
    * Records that a seek was requested for an owned partition, by stamping `soughtAt` with the next
    * value of the acquisition clock, so a batch fetched under an earlier clock is known to be
-   * superseded (`Runner#isSuperseded`). Only the latest stamp is kept, and it is dropped with the
-   * partition's acquisition, so the record stays bounded by the assignment. A partition this
-   * member does not own is left alone.
+   * superseded (`Runner#isSuperseded`), and by forgetting the partition's resolved position: it
+   * belongs to the position being replaced, whichever way the seek ends, and what resolves
+   * afterwards is new work. Only the latest stamp is kept, and it is dropped with the partition's
+   * acquisition, so the record stays bounded by the assignment. A partition this member does not
+   * own is left alone.
    * @param {string} topic
    * @param {number} partition
    * @returns {void}
@@ -1907,6 +1908,7 @@ module.exports = class ConsumerGroup {
     if (!acquired) return
     acquired.soughtAt = this.lastSoughtAt = ++this.acquireClock
     this.unappliedSeeks.add(key)
+    this.offsetManager.forgetResolved(topic, partition)
   }
 
   /**
@@ -3616,8 +3618,7 @@ module.exports = class ConsumerGroup {
    * seek of its acquisition is put back (`isLatestSeek`): a newer seek of the partition, queued,
    * applying or applied, wins, and so does a replaced acquisition. Nothing is put back after a
    * topic recreation since the seek was admitted, whose offset belongs to the old incarnation, or
-   * while the run is stopping. The seek stays unapplied meanwhile, so the progress it replaces is
-   * not committed automatically.
+   * while the run is stopping. The partition is not fetched until the seek applies.
    * @private
    * @param {{topic: string, partition: number, offset: string}} seekEntry the popped intent
    * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
