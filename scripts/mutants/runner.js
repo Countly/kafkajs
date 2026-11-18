@@ -35,7 +35,11 @@
  * fails through its own body and none is refused. The killing test is reported as the witness.
  *
  * Verdicts: `killed`, `survived`, `invalid` (the evidence cannot decide), `stale` (the mutation no longer
- * applies) and `not-run` (`live` records, which are located but never run, and records past the time cap).
+ * applies) and `not-run` (`live` records run without `--live-evidence`, and records past the time cap).
+ *
+ * A `live` record runs only with `--live-evidence <file>`: guard evidence (see `liveEvidence.js`) with
+ * every field present, lane `docker` and the SHA of the tree under test. Otherwise it is `invalid` with
+ * the evidence's refusal; without the option it is located and reported `not-run: live`.
  *
  * Threat model: the specs are trusted repository content. The runner guards against accidental
  * misattribution and stale or foreign evidence, not against a deliberately hostile spec. The
@@ -60,7 +64,7 @@
  *
  * Usage:
  *   node scripts/mutants/runner.js <inventory.json>... [--root <dir>] [--patches <dir>] [--out <ledger.jsonl>]
- *     [--shard <i>/<n>] [--time-cap <minutes>] [--only <id>]
+ *     [--shard <i>/<n>] [--time-cap <minutes>] [--only <id>] [--live-evidence <file>]
  * An inventory is `{ records: [...] }`; `generate.js` prints one. Without `--out` the lines go to stdout.
  * The exit status is 0 when the run completed, whatever the verdicts: the result is a report.
  */
@@ -70,6 +74,7 @@ const os = require('os')
 const path = require('path')
 const vm = require('vm')
 const { spawn, spawnSync } = require('child_process')
+const { LiveEvidence } = require('./liveEvidence')
 
 const CLASSES = ['unit', 'live']
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP']
@@ -119,10 +124,17 @@ class MutantRunner {
    *   `outFile` and the environment's event record to `run.evidence` under `run.nonce`; `run.cache` is the
    *   record's Jest cache. The default runs Jest for the one spec (and exact title) under a timeout.
    * @param {() => number} [options.now] the clock, in milliseconds
+   * @param {string} [options.liveEvidence] the guard-evidence file live records need to run
+   * @param {(root: string) => string} [options.treeSha] the commit of the tree under test; the default asks git
    */
-  constructor({ exec, now } = {}) {
+  constructor({ exec, now, liveEvidence, treeSha } = {}) {
     this.exec = exec || MutantRunner.jestExec
     this.now = now || Date.now
+    this.liveEvidence = liveEvidence
+    this.treeSha =
+      treeSha ||
+      ((root) =>
+        spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim())
   }
 
   /**
@@ -252,7 +264,8 @@ class MutantRunner {
    * Validates an inventory's records.
    * @param {object[]} records
    * @returns {object[]} the same records
-   * @throws {Error} on a malformed, duplicate, self-targeting or escaping record
+   * @throws {Error} on a malformed, duplicate, self-targeting or escaping record, or one whose target
+   *   lies under `node_modules`, which every copy shares
    */
   static validate(records) {
     if (!Array.isArray(records)) throw new Error('an inventory holds a records array')
@@ -279,6 +292,8 @@ class MutantRunner {
       for (const p of [r.target, r.spec])
         if (path.isAbsolute(p) || p.split(/[\\/]/).includes('..'))
           throw new Error(`${id}: a path escapes the tree`)
+      if (path.normalize(r.target).split(/[\\/]/).includes('node_modules'))
+        throw new Error(`${id}: a mutation never edits node_modules`)
       if (seen.has(id)) throw new Error(`${id} appears twice`)
       seen.add(id)
     }
@@ -572,7 +587,13 @@ class MutantRunner {
     if (located.invalid) return finish('invalid', located.invalid)
     if (located.stale) return finish('stale', located.stale)
     if (located.line) entry.line = located.line
-    if (record.commandClass === 'live') return finish('not-run', 'live')
+    if (record.commandClass === 'live') {
+      if (!this.liveEvidence) return finish('not-run', 'live')
+      const refusal = LiveEvidence.refusal(LiveEvidence.read(this.liveEvidence), {
+        sha: this.treeSha(root),
+      })
+      if (refusal) return finish('invalid', refusal)
+    }
     if (!fs.existsSync(path.join(root, record.spec)))
       return finish('invalid', 'the witness spec is missing')
     const scratch = path.join(root, '.tmp', 'mutants')
@@ -743,13 +764,14 @@ const work = (args) => {
     const shardText = option('--shard')
     const cap = option('--time-cap')
     const only = option('--only')
+    const liveEvidence = option('--live-evidence')
     if (args.length === 0) throw new Error('usage: runner.js <inventory.json>... [options]')
     if (cap !== undefined && !(Number(cap) > 0))
       throw new Error(`--time-cap needs minutes > 0, got ${cap}`)
     const records = MutantRunner.validate(
       args.flatMap((file) => JSON.parse(fs.readFileSync(file, 'utf8')).records)
     )
-    new MutantRunner().run(records, {
+    new MutantRunner({ liveEvidence: liveEvidence && path.resolve(liveEvidence) }).run(records, {
       root,
       patchDir,
       out,
