@@ -514,8 +514,158 @@ describe('final soak driver', () => {
   })
 
   /**
+   * A three-node scripted cluster answering the bootstrap and cluster-admin APIs on the in-process
+   * socket seam, its ApiVersions carrying share.version, and a supplied-provenance evidence file so
+   * no `docker` call is made.
+   * @param {number[]} [ids] the nodes the cluster has
+   */
+  const scriptedBrokers = (ids = [1, 2, 3]) => {
+    const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+    const wire = createScriptedCluster({
+      nodes: ids.map((id) => ({ id, host: `kafka${id}`, port: 9092 })),
+      profile: 'clusterAdmin',
+    })
+    wire.answer('ApiVersions', () => ({
+      ...wire.apiVersionsAnswer(),
+      supportedFeatures: [{ name: 'share.version', minVersion: 0, maxVersion: 2 }],
+      finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+      finalizedFeaturesEpoch: '5',
+    }))
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-capture-'))
+    const evidence = path.join(out, 'supplied.json')
+    const nodes = [1, 2, 3].map((node) => {
+      const file = path.join(out, `build-${node}.txt`)
+      fs.writeFileSync(file, `kafka 4.4.0 node ${node}\n`)
+      return { node, version: '4.4.0', file }
+    })
+    fs.writeFileSync(evidence, JSON.stringify({ nodes }))
+    return { wire, out, evidence }
+  }
+
+  test('preflight reads every node through a private cluster built with the options the admin client passes, and disconnects it', async () => {
+    const { Kafka } = require('../../../index')
+    const { captureBroker } = require('../finalSoakPreflight')
+    const { validateCapabilities, validateProvenance } = require('../finalSoakSchema')
+    const capture = async (ids) => {
+      const { wire, out, evidence } = scriptedBrokers(ids)
+      const kafka = new Kafka(wire.kafkaOptions({ retry: { retries: 0 } }))
+      const factory = Object.getOwnPropertySymbols(kafka).find(
+        (s) => s.description === 'private:Kafka:createCluster'
+      )
+      const original = kafka[factory]
+      const built = []
+      kafka[factory] = (options) => {
+        const cluster = original(options)
+        built.push({ options, cluster })
+        return cluster
+      }
+      const admin = kafka.admin()
+      const env = process.env.FINAL_SOAK_SUPPLIED_EVIDENCE
+      process.env.FINAL_SOAK_SUPPLIED_EVIDENCE = evidence
+      await admin.connect()
+      try {
+        const adminOptions = built[0].options
+        const result = await captureBroker(kafka, admin, out).then(
+          (value) => ({ value }),
+          (error) => ({ error })
+        )
+        return { result, out, adminOptions, extra: built.slice(1) }
+      } finally {
+        if (env === undefined) delete process.env.FINAL_SOAK_SUPPLIED_EVIDENCE
+        else process.env.FINAL_SOAK_SUPPLIED_EVIDENCE = env
+        await admin.disconnect()
+      }
+    }
+    const healthy = await capture([1, 2, 3])
+    try {
+      expect(healthy.result.error).toBeUndefined()
+      expect(healthy.extra).toHaveLength(1)
+      const [{ options, cluster }] = healthy.extra
+      expect(options).toEqual({
+        telemetryMetrics: null,
+        allowAutoTopicCreation: false,
+        instrumentationEmitter: null,
+      })
+      expect(healthy.adminOptions.allowAutoTopicCreation).toBe(false)
+      expect(cluster.isConnected()).toBe(false)
+      const read = (file) => JSON.parse(fs.readFileSync(path.join(healthy.out, file), 'utf8'))
+      const capabilities = read('broker/capabilities.json')
+      expect(validateCapabilities(capabilities)).toEqual([])
+      expect(capabilities.nodes.map((n) => n.node)).toEqual([1, 2, 3])
+      for (const node of capabilities.nodes) {
+        expect(node.apiRanges.find((r) => r.apiKey === 18)).toEqual({
+          apiKey: 18,
+          minVersion: 4,
+          maxVersion: 4,
+        })
+        expect(node.finalizedFeatures).toEqual([
+          { name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 },
+        ])
+      }
+      expect(validateProvenance(read('broker/provenance.json'), 'supplied')).toEqual([])
+      expect(healthy.result.value.broker).toEqual({
+        provenanceKind: 'supplied',
+        provenanceFile: 'broker/provenance.json',
+        capabilitiesFile: 'broker/capabilities.json',
+        composeFile: 'broker/compose.json',
+      })
+    } finally {
+      fs.rmSync(healthy.out, { recursive: true, force: true })
+    }
+
+    const missing = await capture([1, 2])
+    try {
+      expect(missing.result.error.message).toMatch(/Broker 3 not found/)
+      expect(missing.extra).toHaveLength(1)
+      expect(missing.extra[0].cluster.isConnected()).toBe(false)
+      expect(fs.existsSync(path.join(missing.out, 'broker/capabilities.json'))).toBe(false)
+    } finally {
+      fs.rmSync(missing.out, { recursive: true, force: true })
+    }
+  })
+
+  test('a preflight that fails while gathering records the stage that failed and every fact gathered before it', async () => {
+    const { main } = require('../finalSoakPreflight')
+    const { wire, out, evidence } = scriptedBrokers()
+    const env = process.env.FINAL_SOAK_SUPPLIED_EVIDENCE
+    process.env.FINAL_SOAK_SUPPLIED_EVIDENCE = evidence
+    try {
+      await expect(
+        main(['--expect-sha', TREE, '--mode', 'smoke', '--out', out], {
+          kafkaOptions: wire.kafkaOptions({ retry: { retries: 0 } }),
+        })
+      ).rejects.toThrow()
+      const record = JSON.parse(fs.readFileSync(path.join(out, 'preflight.json'), 'utf8'))
+      expect(record).toMatchObject({
+        sha: TREE,
+        mode: 'smoke',
+        checks: [],
+        failed: ['facts'],
+        stage: 'telemetry-subscription',
+      })
+      expect(Object.keys(record.completed)).toEqual([
+        'describe-cluster',
+        'describe-features',
+        'capture-broker',
+      ])
+      expect(record.completed['describe-cluster'].brokers.map((b) => b.nodeId)).toEqual([1, 2, 3])
+      expect(record.completed['describe-features'].finalizedFeatures['share.version']).toEqual({
+        minVersionLevel: 1,
+        maxVersionLevel: 1,
+      })
+      expect(record.completed['capture-broker'].broker.provenanceKind).toBe('supplied')
+      expect(record.error).toMatch(/IncrementalAlterConfigs|incrementalAlterConfigs|44/)
+    } finally {
+      if (env === undefined) delete process.env.FINAL_SOAK_SUPPLIED_EVIDENCE
+      else process.env.FINAL_SOAK_SUPPLIED_EVIDENCE = env
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * Runs the runbook against PATH stubs that log every call. `FAIL_ON` makes the call containing it
-   * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded.
+   * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded;
+   * the driver stub writes `config.json` first, as the driver's first act does.
    */
   const runbookHarness = () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-runbook-'))
@@ -534,10 +684,18 @@ describe('final soak driver', () => {
       ].join('\n'),
       node: 'case "$*" in *waitForKafka*) echo "$COMPOSE_FILE" >> "$CALLS.wait" ;; esac',
     }
+    const first = {
+      node: [
+        'case "$*" in *--expose-gc*)',
+        '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json"; prev="$a"; done ;;',
+        'esac',
+      ].join('\n'),
+    }
     for (const name of ['git', 'npm', 'docker', 'node', 'tar', 'sleep']) {
       const script = [
         '#!/bin/sh',
         `echo "${name} $*" >> "$CALLS"`,
+        first[name] ?? '',
         'if [ -n "$FAIL_ON" ]; then',
         `  case "${name} $*" in *"$FAIL_ON"*) echo "stub failure: ${name} $*" >&2; exit "\${FAIL_STATUS:-1}" ;; esac`,
         'fi',
@@ -617,6 +775,12 @@ describe('final soak driver', () => {
         at(finalize)
       )
       expect(at('docker compose down --volumes')).toBeGreaterThan(at(finalize))
+      expect(at(`node scripts/soak/finalSoak.js --cleanup --out ${out}`)).toBeGreaterThan(
+        at(finalize)
+      )
+      expect(calls.some((c) => c.startsWith('docker compose logs'))).toBe(false)
+      expect(log).toContain('FinalizedVersionLevel: 0')
+      expect(log).toContain('FinalizedVersionLevel: 1')
       expect(calls.find((c) => c.startsWith('tar '))).toContain(path.basename(out))
       expect(receipt).toEqual({
         artifact: path.basename(out),
@@ -675,12 +839,22 @@ describe('final soak driver', () => {
       expect(share.calls).toContain('docker compose down --volumes')
 
       const preflight = failAt(`--expect-sha ${TREE} --mode smoke`)
-      expect(preflight.receipt.failedStage).toBe('preflight')
+      expect(preflight.receipt).toEqual({
+        artifact: path.basename(preflight.out),
+        failedStage: 'preflight',
+        exitStatus: 1,
+        driverStatus: null,
+      })
       expect(preflight.calls.some((c) => c.includes('--expose-gc'))).toBe(false)
-      expect(preflight.calls).toContain(
-        `node scripts/soak/finalSoak.js --cleanup --out ${preflight.out}`
+      expect(preflight.calls.some((c) => c.includes('--cleanup'))).toBe(false)
+      expect(preflight.log).toContain(
+        'no driver config: the driver created no run topics or groups, so none are removed'
       )
-      expect(preflight.calls).toContain('docker compose down --volumes')
+      expect(preflight.log).not.toContain('ENOENT')
+      const logs = preflight.calls.indexOf('docker compose logs --no-color --timestamps')
+      expect(logs).toBeGreaterThan(-1)
+      expect(preflight.calls.indexOf('docker compose down --volumes')).toBeGreaterThan(logs)
+      expect(preflight.log).toContain(`broker logs: ${preflight.out}.compose.log`)
 
       const driver = failAt('--expose-gc', 3)
       expect(driver.receipt).toEqual({
@@ -693,6 +867,7 @@ describe('final soak driver', () => {
         `node scripts/soak/finalSoak.js --finalize --out ${driver.out} --status 3`
       )
       expect(driver.calls).toContain(`node scripts/soak/finalSoak.js --summary --out ${driver.out}`)
+      expect(driver.calls).toContain(`node scripts/soak/finalSoak.js --cleanup --out ${driver.out}`)
       expect(driver.calls).toContain('docker compose down --volumes')
 
       const finalize = failAt('--finalize')
