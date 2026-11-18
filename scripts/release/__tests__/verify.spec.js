@@ -7,8 +7,10 @@ const {
   verifyRelease,
   distTagOf,
   createListRuns,
+  createListJobs,
   createRegistry,
   verifyOtelManifest,
+  verifyMemoryEvidence,
   ReleaseVerificationError,
   main,
 } = require('../verify')
@@ -80,6 +82,57 @@ const green = () => ({
   'gate.yml': [run()],
   'weekly.yml': [run({ event: 'workflow_dispatch' })],
 })
+
+const MEMORY = 'memory-gates.yml'
+const LONG_WINDOW_GROUPS = [22, 24, 26].flatMap((node) =>
+  ['4.2.2', '4.3.1'].flatMap((kafka) =>
+    ['unseeded', 'seeded'].map((arm) => `${node}, ${kafka}, ${arm}`)
+  )
+)
+
+/** The latest-attempt jobs of a memory-gates run: a full three-replicate selection unless overridden. */
+const memoryJobs = ({ replicates = [1, 2, 3], verdict = 'success', extra = [] } = {}) => [
+  { name: 'select', conclusion: 'success' },
+  { name: 'share-soak-controls', conclusion: 'success' },
+  { name: 'share-soak-verdict', conclusion: 'success' },
+  ...LONG_WINDOW_GROUPS.flatMap((group) =>
+    replicates.map((r) => ({
+      name: `telemetry-long-window (${group}, ${r})`,
+      conclusion: 'success',
+    }))
+  ),
+  ...[22, 24, 26].map((node) => ({
+    name: `telemetry-long-window (${node}, 4.3.1, warmup-seed, 1)`,
+    conclusion: 'success',
+  })),
+  { name: 'telemetry-long-window-verdict', conclusion: 'success' },
+  { name: 'telemetry-seeded-control', conclusion: 'skipped' },
+  ...extra,
+  { name: 'memory-gates-verdict', conclusion: verdict },
+]
+const memoryRun = (overrides = {}) => run({ event: 'workflow_dispatch', ...overrides })
+
+/** A `listJobs` over `{ [runId]: jobs }` that records the run ids it is asked for. */
+const fakeListJobs = (byRun) => {
+  const calls = []
+  const listJobs = async (runId) => {
+    calls.push(runId)
+    return byRun[runId] ?? []
+  }
+  listJobs.calls = calls
+  return listJobs
+}
+
+/** `listRuns`/`listJobs` over memory-gates runs, each paired with its jobs (a full set by default). */
+const memorySeams = (...entries) => {
+  const pairs = entries.map((entry) => (Array.isArray(entry) ? entry : [entry, memoryJobs()]))
+  return {
+    listRuns: fakeListRuns({ [MEMORY]: pairs.map(([r]) => r) }),
+    listJobs: fakeListJobs(Object.fromEntries(pairs.map(([r, jobs]) => [r.id, jobs]))),
+  }
+}
+
+const checkMemory = (seams) => verifyMemoryEvidence({ sha: SHA, ...seams })
 
 const verify = (overrides = {}) =>
   verifyRelease({
@@ -315,6 +368,66 @@ describe('verifyRelease', () => {
       ['gate.yml', { event: 'push', branch: 'master', head_sha: SHA }],
       ['weekly.yml', { head_sha: SHA }],
     ])
+  })
+})
+
+describe('memory-gates evidence', () => {
+  test('rejects a memory run on another SHA', async () => {
+    await expectRule(
+      checkMemory(memorySeams(memoryRun({ head_sha: OTHER_SHA }))),
+      11,
+      /no workflow_dispatch run of memory-gates\.yml for commit a{40}/
+    )
+    await expectRule(checkMemory(memorySeams(memoryRun({ event: 'pull_request' }))), 11)
+  })
+
+  test('rejects a partial memory dispatch', async () => {
+    const skipped = memoryJobs({ verdict: 'skipped' })
+    await expectRule(
+      checkMemory(memorySeams([memoryRun(), skipped])),
+      11,
+      /memory-gates-verdict is skipped/
+    )
+    const noVerdict = memoryJobs().filter(({ name }) => name !== 'memory-gates-verdict')
+    await expectRule(checkMemory(memorySeams([memoryRun(), noVerdict])), 11, /memory-gates-verdict/)
+    for (const replicates of [[1], [1, 2], [1, 3], [1, 2, 3, 4]]) {
+      await expectRule(
+        checkMemory(memorySeams([memoryRun(), memoryJobs({ replicates })])),
+        11,
+        /replicates/
+      )
+    }
+  })
+
+  test('rejects a failed or cancelled memory run', async () => {
+    for (const conclusion of ['failure', 'cancelled']) {
+      await expectRule(
+        checkMemory(memorySeams(memoryRun({ conclusion }))),
+        11,
+        new RegExp(`completed/${conclusion}`)
+      )
+    }
+    await expectRule(
+      checkMemory(memorySeams(memoryRun({ status: 'in_progress', conclusion: null }))),
+      11
+    )
+    const cancelledJob = memoryJobs({
+      extra: [{ name: 'share-peak (22, 4.2.2, enabled)', conclusion: 'cancelled' }],
+    })
+    await expectRule(
+      checkMemory(memorySeams([memoryRun(), cancelledJob])),
+      11,
+      /share-peak \(22, 4\.2\.2, enabled\) is cancelled/
+    )
+  })
+
+  test('accepts a full green memory run on the SHA', async () => {
+    const green = memoryRun({ created_at: '2026-11-10T08:00:00Z' })
+    const partial = memoryRun({ created_at: '2026-11-10T09:00:00Z' })
+    const seams = memorySeams(green, [partial, memoryJobs({ verdict: 'failure' })])
+    await expect(checkMemory(seams)).resolves.toBeUndefined()
+    expect(seams.listRuns.calls).toEqual([[MEMORY, { event: 'workflow_dispatch', head_sha: SHA }]])
+    expect(seams.listJobs.calls).toContain(green.id)
   })
 })
 
@@ -568,6 +681,33 @@ describe('createListRuns', () => {
   )
 })
 
+describe('createListJobs', () => {
+  test("createListJobs reads every page of a run's latest-attempt jobs", async () => {
+    const all = Array.from({ length: 122 }, (_, i) => ({ name: `job ${i}`, conclusion: 'success' }))
+    const requests = []
+    const fetch = async (url, init) => {
+      const parsed = new URL(String(url))
+      requests.push({ url: parsed, init })
+      const page = Number(parsed.searchParams.get('page'))
+      const jobs = all.slice((page - 1) * 100, page * 100)
+      return new Response(JSON.stringify({ total_count: all.length, jobs }), { status: 200 })
+    }
+    const jobs = await createListJobs({ repository: REPOSITORY, token: TOKEN, fetch })(42)
+    expect(jobs).toEqual(all)
+    expect(requests).toHaveLength(2)
+    expect(requests[0].url.pathname).toBe(`/repos/${REPOSITORY}/actions/runs/42/jobs`)
+    expect(Object.fromEntries(requests[1].url.searchParams)).toEqual({
+      filter: 'latest',
+      per_page: '100',
+      page: '2',
+    })
+    expect(requests[0].init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+    await expect(
+      createListJobs({ repository: REPOSITORY, token: TOKEN, fetch })('42/../../x')
+    ).rejects.toThrow(ReleaseVerificationError)
+  })
+})
+
 describe('main', () => {
   const sandboxes = []
   const git = (cwd, ...args) =>
@@ -616,6 +756,22 @@ describe('main', () => {
     ...overrides,
   })
 
+  /**
+   * Answers GitHub and the registry: green CI runs for the queried commit, `memory(sha)` as the
+   * memory-gates runs (returned unfiltered, as a server might) and `jobs` as every run's jobs.
+   */
+  const fakeGitHub =
+    ({ memory = (sha) => [memoryRun({ head_sha: sha })], jobs = memoryJobs() } = {}) =>
+    async (url) => {
+      const parsed = new URL(String(url))
+      const respond = (body) => new Response(JSON.stringify(body), { status: 200 })
+      if (parsed.origin === 'https://registry.npmjs.org') return new Response('', { status: 404 })
+      if (parsed.pathname.endsWith('/jobs')) return respond({ jobs })
+      const sha = parsed.searchParams.get('head_sha')
+      if (parsed.pathname.includes(`/${MEMORY}/`)) return respond({ workflow_runs: memory(sha) })
+      return respond({ workflow_runs: [run({ head_sha: sha })] })
+    }
+
   let writes
   const spies = []
   beforeEach(() => {
@@ -623,14 +779,7 @@ describe('main', () => {
     for (const method of ['log', 'info', 'warn', 'error']) {
       spies.push(jest.spyOn(console, method).mockImplementation((...args) => writes.push(args)))
     }
-    spies.push(
-      jest.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-        const sha = new URL(String(url)).searchParams.get('head_sha')
-        return new Response(JSON.stringify({ workflow_runs: [run({ head_sha: sha })] }), {
-          status: 200,
-        })
-      })
-    )
+    spies.push(jest.spyOn(globalThis, 'fetch').mockImplementation(fakeGitHub()))
   })
   afterEach(() => {
     for (const spy of spies.splice(0)) spy.mockRestore()
@@ -696,6 +845,46 @@ describe('main', () => {
   test('rejects a GITHUB_SHA that is not a 40-hex commit id', async () => {
     const repo = makeRepo()
     await expect(main(environment(repo, { GITHUB_SHA: '--all' }))).rejects.toThrow(/GITHUB_SHA/)
+  })
+
+  test('without arguments, rejects a tagged commit with no full green memory-gates dispatch and writes nothing', async () => {
+    const repo = makeRepo()
+    const cases = [
+      { memory: () => [] },
+      { memory: () => [memoryRun({ head_sha: OTHER_SHA })] },
+      { memory: (sha) => [run({ head_sha: sha, event: 'pull_request' })] },
+      { memory: (sha) => [memoryRun({ head_sha: sha, conclusion: 'failure' })] },
+      { memory: (sha) => [memoryRun({ head_sha: sha, conclusion: 'cancelled' })] },
+      { jobs: memoryJobs({ verdict: 'skipped' }) },
+      { jobs: memoryJobs({ replicates: [1, 2] }) },
+    ]
+    for (const github of cases) {
+      globalThis.fetch.mockImplementation(fakeGitHub(github))
+      const env = environment(repo)
+      await expectRule(main(env, []), 11, new RegExp(`commit ${repo.sha}`))
+      expect(fs.existsSync(env.GITHUB_OUTPUT)).toBe(false)
+    }
+  })
+
+  test('needs memory evidence on the tagged commit itself, even when an rc tag is named', async () => {
+    const repo = makeRepo()
+    git(repo.dir, 'tag', TAG)
+    fs.writeFileSync(
+      path.join(repo.dir, 'package.json'),
+      JSON.stringify({ name: MAIN_NAME, version: '3.0.0' })
+    )
+    fs.writeFileSync(
+      path.join(repo.dir, 'CHANGELOG.md'),
+      CHANGELOG.replace(`## ${VERSION} — 2026-11-20`, '## 3.0.0 — 2026-11-25')
+    )
+    git(repo.dir, 'commit', '-q', '-am', 'final')
+    const sha = git(repo.dir, 'rev-parse', 'HEAD')
+    git(repo.dir, 'update-ref', 'refs/remotes/origin/master', sha)
+    const rcOnly = () => [memoryRun({ head_sha: repo.sha })]
+    globalThis.fetch.mockImplementation(fakeGitHub({ memory: rcOnly }))
+    const env = environment({ ...repo, sha }, { GITHUB_REF_NAME: 'v3.0.0' })
+    await expectRule(main(env, ['--reuse-from', TAG]), 11, new RegExp(`commit ${sha}`))
+    expect(fs.existsSync(env.GITHUB_OUTPUT)).toBe(false)
   })
 
   test('writes nothing when verification fails', async () => {

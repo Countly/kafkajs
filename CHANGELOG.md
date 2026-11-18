@@ -38,6 +38,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The direct-consumer and offset-reset scenario suites run in both the scripted and the broker lane in CI.
 - The mutation runner and its inventory are part of the repository; each mutant runs in a disposable copy of the tree, so the checkout is never changed.
 - The release workflow packs, guards and smoke-tests `@countly/opentelemetry-instrumentation-kafkajs` on every release tag and publishes it with provenance on the final 3.0.0 tag.
+- A release needs a full green memory-gates run on the released commit.
 
 ### Phase 10 — Release, CI and benchmarks
 
