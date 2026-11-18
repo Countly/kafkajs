@@ -188,6 +188,7 @@ describe('admin API ledger', () => {
         'have',
         'implemented',
         'equivalent',
+        'partial',
         'retained compatibility',
         'excluded',
         'consumer groups',
@@ -196,6 +197,12 @@ describe('admin API ledger', () => {
       expect(equivalent.length).toBeGreaterThan(0)
       expect(options.length).toBeGreaterThan(0)
     }
+    const [, disposition, equivalent, options] = ledger.java.find(
+      ([name]) => name === 'describeTopics'
+    )
+    expect(disposition).toBe('partial')
+    expect(equivalent).toBe('fetchTopicMetadata')
+    expect(options).toContain('there is no topicIds option')
     expect(ledger.markdown.replace(/`/g, '')).toContain('createTopics returns a boolean')
     expect(ledger.markdown).toContain('legacy alterConfigs')
     expect(ledger.markdown).toContain('exactly one live arm')

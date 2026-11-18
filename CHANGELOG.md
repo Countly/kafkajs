@@ -44,6 +44,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Development dependencies are refreshed to patched releases (`brace-expansion`, the nested `js-yaml` 3.x, `glob` 13 and the nested `picomatch` 2, lockfile only). The CI pack, OTel and benchmark jobs, the gate workflow's install and the pack smoke test install with `--ignore-scripts`, like the release workflow; a unit test checks every install on a line separately, including the packing checks the gate takes from its manifest. The remaining development-only advisories and why they wait are listed in `RELEASING.md`; the published package's dependencies have none.
 - CI, weekly and memory-gates workflows run with a read-only token (`contents: read`); the weekly matrix adds Kafka 4.1.2 on Node 24 (all six groups).
 
+#### Docs
+
+- The documentation explains that each broker connection queues requests without a size limit: `requestTimeout` counts from the write and `maxInFlightRequests` limits written requests, so neither bounds queued requests or their memory. It gives a bounded application recipe and says that `Promise.race` does not cancel a call. `docs/Admin.md` now lists `describeTopics` as partial, because topics are described by name only and a name lookup cannot find an earlier topic with the same name. The migration guide has a "Coming from the Java or Go client" section: shared assigners, range-only rack awareness, fetch sessions and prefetch, automatic commits at processing points, outage handling under each group protocol, the lack of a universal consumer deadline, share acknowledgement settlement, producer and admin differences, native prerequisites, telemetry and network tuning. It also says plainly, here and in the consuming guide, that the consumer-protocol join keeps counted retries while the running fetch loop retries a lost connection, a request timeout or a moved coordinator without a count and without a time limit. Documentation only; behavior is unchanged.
+
 ### Phase 10 — Release, CI and benchmarks
 
 #### Behavior changes
