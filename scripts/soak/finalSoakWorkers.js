@@ -210,6 +210,21 @@ class ClientRig {
       throw e
     }
   }
+
+  /**
+   * Disconnects the client with its call records, then drops what the passive observer kept for
+   * it, so history of retired clients never accumulates in a long-lived process.
+   * @param {string|null} [execution]
+   * @returns {Promise<void>}
+   * @throws {Error} the disconnect's error, after the observer's state is dropped
+   */
+  async retire(execution = null) {
+    try {
+      await this.call('disconnect', () => this.object.disconnect(), execution)
+    } finally {
+      this.runtime.observer.forget(this.id)
+    }
+  }
 }
 
 /**
@@ -278,6 +293,25 @@ class ChildRuntime {
   /** @param {string} message @returns {Promise<boolean>} a diagnostic note */
   diagnose(message) {
     return this.emit({ kind: 'diagnostic', recordId: this.nextId(), message })
+  }
+
+  /**
+   * Records a failure of this process's own evidence or workload and tells the supervisor, which
+   * marks the run failed and stops admitting work.
+   * @param {string} message @returns {Promise<boolean>}
+   */
+  problem(message) {
+    this.notify({ type: 'problem', message })
+    return this.diagnose(`problem: ${message}`)
+  }
+
+  /**
+   * Reports every observer hook that failed since the last call, by hook identity: a hook that
+   * could not record its source leaves the evidence incomplete.
+   * @returns {Promise<void>}
+   */
+  async reportObserverFailures() {
+    for (const failure of this.observer.drainFailures()) await this.problem(failure)
   }
 
   /** @param {string} client @returns {object|undefined} the client's config slot */
@@ -489,6 +523,7 @@ class ChildRuntime {
     }
     const reading = await this.sampler.read({ ...options, cut })
     await Promise.all(sent)
+    await this.reportObserverFailures()
     for (const note of notes) await this.diagnose(note)
     if (this.observer.unknownTopicIds > 0) {
       await this.diagnose(`missing-source topic id for ${this.observer.unknownTopicIds} entries`)
@@ -647,13 +682,17 @@ class Worker {
   /** @returns {Promise<void>} starts the standing clients */
   async begin() {}
 
-  /** @returns {Promise<void>} disconnects every client */
+  /**
+   * Disconnects every client, newest first. A failed disconnect is a problem of the run, never
+   * only an end record.
+   * @returns {Promise<void>}
+   */
   async disconnect() {
     for (const rig of this.rigs().reverse()) {
       try {
-        await rig.call('disconnect', () => rig.object.disconnect())
-      } catch {
-        // the end record already carries the error
+        await rig.retire()
+      } catch (e) {
+        await this.runtime.problem(`disconnect of ${rig.id} failed: ${e.message}`)
       }
     }
     this.standing = []
@@ -696,8 +735,14 @@ class ProducerWorker extends Worker {
       slot.clientKind === 'telemetry-producer'
         ? valueOf(traffic.telemetryProducerRate)
         : valueOf(traffic.mainRate)
-    this.loop = transactional ? this.transactLoop(rig) : this.sendLoop(rig, rate)
-    this.loop.catch((e) => runtime.diagnose(`producer loop failed: ${e.message}`))
+    this.loop = (transactional ? this.transactLoop(rig) : this.sendLoop(rig, rate)).catch((e) =>
+      runtime.problem(`producer loop failed: ${e.message}`)
+    )
+  }
+
+  /** @returns {boolean} whether the loops may start another round */
+  running(rig) {
+    return !this.loops.signal.aborted && this.standing.includes(rig)
   }
 
   /** @returns {Promise<void>} offers main records at the rate while active */
@@ -705,7 +750,7 @@ class ProducerWorker extends Worker {
     const { clock, config } = this.runtime
     const every = 1000 / rate
     let next = clock.now()
-    while (this.standing.includes(rig)) {
+    while (this.running(rig)) {
       next += every
       if (this.active) {
         this.current = this.offer(rig, config.topics.main, 0, null)
@@ -719,7 +764,7 @@ class ProducerWorker extends Worker {
   async transactLoop(rig) {
     const { clock, matrix } = this.runtime
     let next = clock.now()
-    while (this.standing.includes(rig)) {
+    while (this.running(rig)) {
       next += valueOf(matrix.traffic.transactionEveryMs)
       if (this.active) {
         this.current = this.transact(rig, ++this.transactions)
@@ -740,14 +785,17 @@ class ProducerWorker extends Worker {
     const decision = n % valueOf(matrix.traffic.abortEvery) === 0 ? 'abort' : 'commit'
     let outcome = decision === 'commit' ? 'committed' : 'aborted'
     let errorType = null
+    let txn = null
     try {
-      const txn = await rig.object.transaction()
+      txn = await rig.object.transaction()
       for (let i = 0; i < valueOf(matrix.traffic.transactionRecords); i++)
         await this.offer(rig, config.topics.transactions, 0, transaction, txn)
       await (decision === 'commit' ? txn.commit() : txn.abort())
     } catch (e) {
       outcome = 'unknown'
       errorType = e.name ?? 'Error'
+      // a transaction left open would block every later one of this producer
+      if (txn?.isActive?.()) await txn.abort().catch(() => {})
     }
     this.settled = (this.settled ?? 0) + 1
     this.lastOutcome = outcome
@@ -769,24 +817,28 @@ class ProducerWorker extends Worker {
     await this.current
   }
 
-  /** @returns {Promise<void>} stops the send loop's timer, then disconnects */
+  /**
+   * Stops the loops and waits until each has ended, so no send or transaction is in flight and no
+   * loop competes with the close for the event loop, then disconnects.
+   * @returns {Promise<void>}
+   */
   async disconnect() {
-    this.loops.abort()
-    await this.current
+    this.loops?.abort()
+    await this.loop
     return super.disconnect()
   }
 
   /**
    * Offers one logical id once: its offered record, the send, then its settled outcome. An id
    * whose topic id is not yet known is not offered.
-   * @returns {Promise<void>}
+   * @returns {Promise<'acknowledged'|'unknown'|'skipped'>} the send's outcome
    */
   async offer(rig, topic, partition, transaction, sender = rig.object, execution = null) {
     const { runtime } = this
     const topicId = runtime.topicIds.get(topic)
     if (!topicId) {
       await runtime.diagnose(`missing-source topic id for offer to ${topic}`)
-      return
+      return 'skipped'
     }
     const record = offeredRecord({
       runId: runtime.config.runId,
@@ -830,22 +882,33 @@ class ProducerWorker extends Worker {
       key,
       ...ack,
     })
+    return ack.outcome
   }
 
-  /** Offers the probe ids an auxiliary execution asks for. @param {object} step */
+  /**
+   * Offers the probe ids an auxiliary execution asks for, and stops starting sends once the
+   * execution's deadline has passed.
+   * @param {{ execution: string, topic: string, partitions: number, count: number,
+   *   deadline?: number }} step
+   * @returns {Promise<{ offered: number, stopped: boolean }>}
+   */
   async onProbe(step) {
-    for (let i = 0; i < step.count; i++)
+    let offered = 0
+    for (; offered < step.count; offered++) {
+      if (this.runtime.clock.now() >= (step.deadline ?? Infinity)) return { offered, stopped: true }
       await this.offer(
         this.standing[0],
         step.topic,
-        i % step.partitions,
+        offered % step.partitions,
         null,
         undefined,
         step.execution
       )
+    }
+    return { offered, stopped: false }
   }
 
-  /** @returns {Promise<{ ok: boolean }>} a post-recovery acknowledged send */
+  /** @returns {Promise<{ ok: boolean }>} a post-recovery send the broker acknowledged */
   async onRecovered(step) {
     if (this.runtime.slots[0].clientKind === 'producer-transactional') {
       const before = this.settled
@@ -855,9 +918,15 @@ class ProducerWorker extends Worker {
       )
       return { ok }
     }
-    const before = this.seq
-    await this.offer(this.standing[0], this.runtime.config.topics.main, 0, null, undefined, step.id)
-    return { ok: this.seq > before }
+    const outcome = await this.offer(
+      this.standing[0],
+      this.runtime.config.topics.main,
+      0,
+      null,
+      undefined,
+      step.id
+    )
+    return { ok: outcome === 'acknowledged' }
   }
 }
 
@@ -875,7 +944,17 @@ class ConsumerWorker extends Worker {
     this.retained = null
     this.progress = new Map()
     this.lastBoundary = new Map()
-    this.standing.push(await this.join(slot))
+    const rig = await this.join(slot)
+    this.standing.push(rig)
+    if (
+      !(await this.until(() => this.assignedKeys(rig).length > 0, this.runtime.clock.now() + 60000))
+    )
+      throw new Error(`${rig.id} was given no partition within 60000 ms`)
+  }
+
+  /** @param {ClientRig} rig @returns {object[]} the keys the member is assigned right now */
+  assignedKeys(rig) {
+    return this.runtime.observer.ordinarySections(rig.id).sections.assignment.map((a) => a.key)
   }
 
   /** @param {object} slot @returns {Promise<ClientRig>} a connected, running member of the slot */
@@ -886,7 +965,9 @@ class ConsumerWorker extends Worker {
     const consumer = await rig.construct((kafka) => kafka.consumer(options))
     rig.processed = new Map()
     rig.uncommitted = new Map()
+    rig.committed = new Map()
     rig.authority = new Map()
+    consumer.on(consumer.events.END_BATCH_PROCESS, ({ payload }) => this.onBatchEnd(rig, payload))
     await rig.call('connect', () => consumer.connect(), execution)
     await this.operation(rig, 'subscribe', [], execution, () =>
       consumer.subscribe({ topics: this.topicsFor(slot), fromBeginning: true })
@@ -1033,6 +1114,7 @@ class ConsumerWorker extends Worker {
   /**
    * Commits a key's processed next offset under the authority its last handler carried, inside the
    * commit store so the write and publish stages are recorded, then asks for the broker readback.
+   * Only a commit that succeeded settles the offsets it covered; a failed one leaves them owed.
    * @param {ClientRig} rig @param {string} k `topic|partition`
    * @returns {Promise<void>}
    */
@@ -1041,7 +1123,7 @@ class ConsumerWorker extends Worker {
     const next = rig.processed.get(k)
     const captured = rig.authority.get(k)
     if (!next || !captured) return
-    rig.uncommitted.set(k, 0)
+    const owed = rig.uncommitted.get(k) ?? 0
     const { topic, partition } = { topic: captured.key.topic, partition: captured.key.partition }
     const commit = `${rig.id}.m${runtime.ids}`
     const base = {
@@ -1067,6 +1149,8 @@ class ConsumerWorker extends Worker {
       await runtime.commits.run(base, () =>
         rig.object.commitOffsets([{ topic, partition, offset: next }])
       )
+      rig.committed.set(k, next)
+      rig.uncommitted.set(k, Math.max(0, (rig.uncommitted.get(k) ?? 0) - owed))
     } catch (e) {
       outcome =
         e.name === 'KafkaJSCommitFailedError' || e.name === 'KafkaJSStaleAssignmentError'
@@ -1106,7 +1190,8 @@ class ConsumerWorker extends Worker {
    * one paused key, remove the extra and wait for the paused key to return; the supervisor then
    * takes the closed sample. `resume`: resume the keys paused in `leave`. The first wave of an
    * execution with a restart restarts the static extra with the same static id and a new client id.
-   * @param {{ execution: string, wave: number, phase: 'leave'|'resume', restart?: string[] }} step
+   * @param {{ execution: string, wave: number, phase: 'leave'|'resume', restart?: string[],
+   *   waveDeadline?: number }} step `waveDeadline` is the wave's scheduled end on the run clock
    * @returns {Promise<{ transfers: number }>} 1 when the wave observed a transfer
    */
   async onMembershipChurn(step) {
@@ -1126,21 +1211,17 @@ class ConsumerWorker extends Worker {
     const waveMs = runtime.matrix.schedule.executions.find(
       (e) => e.shape === 'membership-churn'
     ).waveMaxMs
-    const deadline = runtime.clock.now() + waveMs - 5000
-    const keys = runtime.observer
-      .ordinarySections(standing.id)
-      .sections.assignment.map((a) => a.key)
+    const deadline = (step.waveDeadline ?? runtime.clock.now() + waveMs) - 5000
+    const keys = this.assignedKeys(standing)
     this.paused = keys
     await this.operation(standing, 'pause', keys, execution, () =>
       standing.object.pause(byTopic(keys))
     )
     this.extras.push(await this.join(extraSlot, execution))
     const held = (rig) =>
-      runtime.observer
-        .ordinarySections(rig.id)
-        .sections.assignment.some((a) =>
-          keys.some((k) => k.topicId === a.key.topicId && k.partition === a.key.partition)
-        )
+      this.assignedKeys(rig).some((a) =>
+        keys.some((k) => k.topicId === a.topicId && k.partition === a.partition)
+      )
     const transferred = await this.until(() => held(this.extras.at(-1)), deadline)
     if (!transferred) await runtime.diagnose(`${execution} saw no transfer of a paused partition`)
     if (step.wave === 0 && step.restart?.includes(extraSlot.clientKind)) {
@@ -1148,10 +1229,10 @@ class ConsumerWorker extends Worker {
       await this.operation(old, 'restart', [], execution, () =>
         old.object.disconnect({ leaveGroup: false })
       )
+      runtime.observer.forget(old.id)
       this.extras.push(await this.join(extraSlot, execution))
     }
-    for (const rig of this.extras.splice(0))
-      await rig.call('disconnect', () => rig.object.disconnect(), execution)
+    for (const rig of this.extras.splice(0)) await rig.retire(execution)
     await this.until(() => held(standing), deadline)
     return { transfers: transferred ? 1 : 0 }
   }
@@ -1212,23 +1293,55 @@ class ConsumerWorker extends Worker {
 
   /** @returns {object[]} the client's assigned keys of one topic */
   assignedOf(rig, topic) {
-    return this.runtime.observer
-      .ordinarySections(rig.id)
-      .sections.assignment.map((a) => a.key)
-      .filter((k) => k.topic === topic)
+    return this.assignedKeys(rig).filter((k) => k.topic === topic)
   }
 
   /**
-   * Commits every processed key at a drain, outside any handler. A key whose captured authority
-   * is no longer the member's current one (it moved, or a new membership began) is not committed
-   * by this member: the new owner's own progress covers it.
+   * Records that the member resolved a key through a batch that held no application message (only
+   * control records or aborted records): the product itself resolved it, so the member's next
+   * offset moves past it. A batch that carried messages is resolved by its handlers, never by the
+   * batch's last offset, which a pause or stale assignment can leave unprocessed.
+   * @param {ClientRig} rig
+   * @param {{ topic: string, partition: number, batchSize: number, lastOffset: string|null }} batch
+   * @returns {void}
    */
-  async onDrain() {
+  onBatchEnd(rig, { topic, partition, batchSize, lastOffset }) {
+    if (batchSize !== 0 || lastOffset == null) return
+    const k = `${topic}|${partition}`
+    const next = BigInt(lastOffset) + 1n
+    if (next > BigInt(rig.processed.get(k) ?? 0)) rig.processed.set(k, next.toString())
+  }
+
+  /** @param {ClientRig} rig @param {string} topic @returns {boolean} whether the member reads it */
+  reads(rig, topic) {
+    return this.topicsFor(rig.slot).some((t) =>
+      typeof t === 'string' ? t === topic : t.test(topic)
+    )
+  }
+
+  /**
+   * Commits every key whose resolved next offset is ahead of the member's last successful commit,
+   * outside any handler. A drain with `ends` is the final one: for each key the member reads it
+   * first waits, until the deadline, for the member to resolve the key's end, then commits what it
+   * resolved whatever authority it holds. An intermediate drain skips a key whose captured
+   * authority is no longer the member's own: the new owner's progress covers it.
+   * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps `topic|partition`
+   *   to the log end the member must have resolved
+   * @returns {Promise<{ reached: boolean }>} whether every key reached its end in time
+   */
+  async onDrain({ ends = {}, deadline = Infinity } = {}) {
     const { observer } = this.runtime
+    const final = Object.keys(ends).length > 0
+    let reached = true
     for (const rig of this.rigs()) {
+      for (const [k, end] of Object.entries(ends)) {
+        if (!this.reads(rig, k.slice(0, k.lastIndexOf('|')))) continue
+        const resolved = () => BigInt(rig.processed.get(k) ?? 0) >= BigInt(end)
+        if (!(await this.until(resolved, deadline))) reached = false
+      }
       const [group] = observer.mine(rig.id, 'ConsumerGroup')
-      for (const k of rig.processed?.keys() ?? []) {
-        if (!(rig.uncommitted.get(k) > 0)) continue
+      for (const [k, next] of [...(rig.processed ?? [])]) {
+        if (BigInt(next) <= BigInt(rig.committed.get(k) ?? 0)) continue
         const now = group && group.acquired?.has(k) ? observer.currentAuthority(group, k) : null
         const then = rig.authority.get(k)?.authority
         const same =
@@ -1238,11 +1351,12 @@ class ConsumerWorker extends Worker {
           now.token === then.token &&
           now.acquiredAt === then.acquiredAt &&
           now.recreatedAt === then.recreatedAt
-        if (same) await this.commit(rig, k)
+        if (final || same) await this.commit(rig, k)
         else
           await this.runtime.diagnose(`drain commit of ${k} by ${rig.id} skipped: authority moved`)
       }
     }
+    return { reached }
   }
 
   /** @returns {{ ok: boolean }} whether the standing member handled and committed after recovery */
@@ -1343,6 +1457,19 @@ class ShareWorker extends Worker {
     this.standing.push(await this.join(this.runtime.slots.find((c) => c.purpose === 'subject')))
   }
 
+  /**
+   * Notes that a record of a key was handed to a handler: the highest offset delivered per key and
+   * the time of the latest delivery.
+   * @param {string} k `topic|partition` @param {string|number} offset
+   * @returns {void}
+   */
+  delivered(k, offset) {
+    this.deliveredAt = this.runtime.clock.now()
+    const high = BigInt(this.highest?.get(k) ?? -1)
+    this.highest ??= new Map()
+    if (BigInt(offset) > high) this.highest.set(k, String(offset))
+  }
+
   /** @returns {Promise<ClientRig>} */
   async join(slot, execution = null) {
     const { runtime } = this
@@ -1397,6 +1524,7 @@ class ShareWorker extends Worker {
     }
     acknowledge('accept')
     this.handled = (this.handled ?? 0) + 1
+    this.delivered(`${topic}|${partition}`, message.offset)
     await runtime.emit({
       kind: 'identity',
       recordId: runtime.nextId(),
@@ -1417,8 +1545,22 @@ class ShareWorker extends Worker {
     if (!slot || step.phase === 'resume') return
     this.extras.push(await this.join(slot, step.execution))
     await this.runtime.clock.sleepUntil(this.runtime.clock.now() + 20000)
-    for (const rig of this.extras.splice(0))
-      await rig.call('disconnect', () => rig.object.disconnect(), step.execution)
+    for (const rig of this.extras.splice(0)) await rig.retire(step.execution)
+  }
+
+  /**
+   * Waits until the last offset of each main log end has been delivered and deliveries have been
+   * quiet for `quietMs`, so records a lock expiry returned are handed out again first.
+   * @param {{ ends?: Record<string, string>, deadline?: number, quietMs?: number }} [step]
+   * @returns {Promise<{ reached: boolean }>}
+   */
+  async onDrain({ ends = {}, deadline = Infinity, quietMs = 5000 } = {}) {
+    const { clock, config } = this.runtime
+    const wanted = Object.entries(ends).filter(([k]) => k.startsWith(`${config.topics.main}|`))
+    const done = () =>
+      wanted.every(([k, end]) => BigInt(this.highest?.get(k) ?? -1) >= BigInt(end) - 1n) &&
+      clock.now() - (this.deliveredAt ?? -Infinity) >= quietMs
+    return { reached: wanted.length === 0 || (await this.until(done, deadline)) }
   }
 
   /** @returns {Promise<{ ok: boolean }>} whether a record was handled and accepted after recovery */
@@ -1865,6 +2007,8 @@ module.exports = {
   ChildRuntime,
   clientOptions,
   Worker,
+  ProducerWorker,
+  ShareWorker,
   ConsumerWorker,
   ReaderWorker,
   DecoderWorker,

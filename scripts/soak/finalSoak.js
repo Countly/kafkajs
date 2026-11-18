@@ -56,6 +56,13 @@ const GIB = 1024 ** 3
 const SAFETY_BYTES = 32 * GIB
 /** The disk a diagnostic run keeps free: enough to finish writing and archive a smoke. */
 const DIAGNOSTIC_RESERVE_BYTES = 2 * GIB
+/** What a command may take beyond its step's deadline, and what one without a deadline may take. */
+const COMMAND_GRACE_MS = 60000
+const DEFAULT_COMMAND_MS = 300000
+/** How long the final drain waits for every member to resolve the logs' ends. */
+const FINAL_DRAIN_MS = 300000
+/** Problems kept in the supervisor receipt; later ones are counted, not listed. */
+const MAX_PROBLEMS = 200
 
 /** @param {string} prefix @param {number} n @returns {string} a two-digit slot id */
 const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
@@ -259,6 +266,85 @@ class Supervisor {
     this.ended = new Map()
     this.waves = new Map()
     this.gate = new SamplingGate({ limit: 2 })
+    this.problems = []
+    this.forced = []
+    this.leaving = new Set()
+    this.lost = new Set()
+    this.aborted = null
+  }
+
+  /**
+   * Records a failure of the run: it is listed in the receipt and noted in the stream. Nothing here
+   * hides a failed run behind a natural exit.
+   * @param {string} message
+   * @returns {void}
+   */
+  problem(message) {
+    if (this.problems.length < MAX_PROBLEMS) this.problems.push(message)
+    this.collector?.note(`problem: ${message}`)
+  }
+
+  /** @returns {number} the teardown allowance of this run's mode, in ms */
+  teardownAllowanceMs() {
+    return valueOf(this.matrix.acceptance.modes[this.options.mode].teardownAllowanceMs)
+  }
+
+  /**
+   * @param {object} step a command's step
+   * @returns {number} how long a child may take to answer it: the teardown allowance for the
+   *   disconnect, the step's deadline plus a grace for one that has one, else a fixed bound
+   */
+  budget(step) {
+    if (step.type === 'disconnect') return this.teardownAllowanceMs()
+    if (step.deadline !== undefined && step.deadline !== Infinity)
+      return Math.max(0, step.deadline - this.clock.now()) + COMMAND_GRACE_MS
+    return DEFAULT_COMMAND_MS
+  }
+
+  /**
+   * @returns {{ failures: string[], aborted: string|null, incomplete: string|null,
+   *   problems: string[], forced: string[] }} what failed or was cut short; a run is green only when
+   *   all of it is empty
+   */
+  result() {
+    return {
+      failures: this.collector.failures,
+      aborted: this.aborted,
+      incomplete: this.incomplete ?? null,
+      problems: this.problems,
+      forced: this.forced,
+    }
+  }
+
+  /**
+   * Records a settled plan step that was not on time or not performed.
+   * @param {{ id: string, outcome: string, error: string|null }} outcome a scheduler outcome
+   * @returns {void}
+   */
+  stepOutcome({ id, outcome, error }) {
+    if (outcome === 'ok' || outcome === 'aborted') return
+    this.problem(`step ${id} ${outcome}${error ? `: ${error}` : ''}`)
+  }
+
+  /**
+   * Sends every process its start command and checks each started: a process that could not
+   * construct or connect its clients, or was given no partition, fails readiness and the day does
+   * not start.
+   * @returns {Promise<boolean>} whether every process is ready
+   */
+  async start() {
+    const slots = [...this.children.keys()]
+    const replies = await Promise.all(
+      slots.map((slot) => this.command(slot, { type: 'start', id: 'start' }))
+    )
+    const failed = slots.flatMap((slot, i) =>
+      replies[i].error ? [`${slot}: ${replies[i].error}`] : []
+    )
+    if (failed.length > 0) {
+      this.problem(`readiness failed: ${failed.join('; ')}`)
+      this.abort(`readiness failed: ${failed.join('; ')}`)
+    }
+    return failed.length === 0
   }
 
   /** @param {object} record @returns {Promise<string>} appends a supervisor record, returns its id */
@@ -295,8 +381,10 @@ class Supervisor {
       matrix: this.matrix,
       originMs: this.clock.originMs,
       out: this.out,
-      send: (m, done) => this.collector.append(m.record).then(done),
+      send: (m, done) => this.collector.append(m.record).then((ok) => done(!ok)),
+      notify: (m) => this.receive(SUPERVISOR, m),
     })
+    this.collector.onFailure = (problem) => this.abort(`collector: ${problem}`)
     this.runtime.request = (body) => this.readback(null, body)
     this.collector.own = (record) =>
       this.runtime.emit({ recordId: this.runtime.nextId(), ...record })
@@ -308,9 +396,7 @@ class Supervisor {
     this.rig = rig
     for (const p of this.config.processes) if (p.slot !== SUPERVISOR) this.spawn(p.slot)
     await this.createTopics()
-    await Promise.all(
-      [...this.children.keys()].map((slot) => this.command(slot, { type: 'start', id: 'start' }))
-    )
+    await this.start()
     this.runStartAt = this.clock.now()
     await this.collector.note('readiness barrier', { runStartAt: this.runStartAt })
     const plan = planSchedule(this.matrix, this.options.mode)
@@ -327,8 +413,12 @@ class Supervisor {
     this.scheduler = new Scheduler({
       clock: this.clock,
       perform: (step) => this.perform(step),
-      onOutcome: (o) => this.collector.note(`step ${o.id} ${o.outcome}`, { step: o.id }),
+      onOutcome: (o) => {
+        this.collector.note(`step ${o.id} ${o.outcome}`, { step: o.id })
+        this.stepOutcome(o)
+      },
     })
+    if (this.aborted) this.scheduler.abort(this.aborted)
     this.monitor = new HostMonitor({
       read: { memAvailable, freeDisk: () => freeDisk(this.out) },
       minMemAvailable: valueOf(this.matrix.host.abortMemAvailableBytes),
@@ -344,7 +434,7 @@ class Supervisor {
     const summary = await this.scheduler.run(steps)
     this.monitor.stop()
     await this.collector.note('schedule finished', { ...summary, gatePeak: this.gate.peak })
-    await this.exited
+    await this.untilExited()
     await this.runtime.stop()
     while (this.runtime.channel.pendingBytes > 0)
       await new Promise((resolve) => setImmediate(resolve))
@@ -358,9 +448,7 @@ class Supervisor {
       runEndAt: this.runEndAt,
       requestedMs: plan.requestedMs,
       observedEndAt: this.observedEndAt,
-      failures: this.collector.failures,
-      aborted: this.scheduler.aborted,
-      incomplete: this.incomplete ?? null,
+      ...this.result(),
       records: this.collector.records,
       steps: summary,
       mode: this.options.mode,
@@ -370,10 +458,14 @@ class Supervisor {
     fs.writeFileSync(path.join(this.out, 'supervisor.json'), JSON.stringify(run) + '\n')
   }
 
-  /** @param {string} reason stops admitting work; teardown still runs @returns {void} */
+  /**
+   * Stops admitting work for the rest of the run; teardown still runs.
+   * @param {string} reason @returns {void}
+   */
   abort(reason) {
-    if (this.scheduler?.aborted) return
-    this.collector.note(`abort: ${reason}`)
+    if (this.aborted) return
+    this.aborted = reason
+    this.collector?.note(`abort: ${reason}`)
     this.scheduler?.abort(reason)
   }
 
@@ -572,7 +664,7 @@ class Supervisor {
     })
     this.children.set(slot, child)
     this.exited ??= new Promise((resolve) => (this.allExited = resolve))
-    child.on('message', (m) => this.receive(slot, m))
+    this.watch(slot, child)
     child.send({
       type: 'init',
       config: this.config,
@@ -580,8 +672,22 @@ class Supervisor {
       originMs: this.clock.originMs,
       topicIds: this.topicIds,
     })
+  }
+
+  /**
+   * Follows one child: its messages, and its loss. A child that exits, closes its channel or fails
+   * to spawn settles every command waiting on it; unless it was told to disconnect, that is a
+   * failure of the run.
+   * @param {string} slot @param {import('node:events').EventEmitter} child
+   * @returns {void}
+   */
+  watch(slot, child) {
+    child.on('message', (m) => this.receive(slot, m))
+    child.on('error', (e) => this.lose(slot, e.message))
+    child.on('disconnect', () => this.lose(slot, 'closed its channel'))
     child.on('exit', (code, signal) => {
       this.observedEndAt = this.clock.now()
+      this.lose(slot, `exited with ${signal ?? code}`)
       this.emit({
         kind: 'process',
         event: 'exit',
@@ -590,9 +696,56 @@ class Supervisor {
         signal,
         spawnRecord: `${slot}.0`,
       }).finally(() => {
-        if (++this.exits === this.children.size) this.allExited()
+        if (++this.exits === this.children.size) this.allExited?.()
       })
     })
+  }
+
+  /**
+   * Settles every command waiting on a lost child and, if the child was not leaving, fails the run.
+   * @param {string} slot @param {string} reason
+   * @returns {void}
+   */
+  lose(slot, reason) {
+    for (const entry of [...this.waiting.values()])
+      if (entry.slot === slot)
+        entry.settle({
+          type: 'done',
+          id: entry.id,
+          error: `process ${slot} ${reason}`,
+          reply: null,
+        })
+    if (this.leaving.has(slot) || this.lost.has(slot)) return
+    this.lost.add(slot)
+    this.problem(`process ${slot} ${reason} before its disconnect`)
+    this.abort(`process ${slot} ${reason}`)
+  }
+
+  /**
+   * Waits for every child to exit by itself. A child still alive after the teardown allowance is
+   * killed and named in the receipt, so the run ends with its evidence but can never be green.
+   * @returns {Promise<void>}
+   */
+  async untilExited() {
+    const timer = new AbortController()
+    const allowance = this.teardownAllowanceMs()
+    const winner = await Promise.race([
+      this.exited.then(() => 'exited'),
+      this.clock.sleepUntil(this.clock.now() + allowance, timer.signal).then(() => 'late'),
+    ])
+    timer.abort()
+    if (winner === 'late') {
+      for (const [slot, child] of this.children) {
+        if (child.exitCode !== null || child.signalCode !== null) continue
+        this.forced.push(slot)
+        this.leaving.add(slot)
+        this.problem(
+          `process ${slot} did not exit within ${allowance} ms of its disconnect; killed`
+        )
+        child.kill('SIGKILL')
+      }
+      await this.exited
+    }
   }
 
   /** Routes a child message: records to the collector, outcomes, readbacks and subscriptions. */
@@ -603,12 +756,13 @@ class Supervisor {
       this.count(message.record)
       this.collector
         .append(message.record)
-        .then(() => child.connected && child.send({ type: 'ack', seq }, () => {}))
+        .then((ok) => child.connected && child.send({ type: 'ack', seq, refused: !ok }, () => {}))
     } else if (message.type === 'done') {
       if (message.incomplete) this.incomplete ??= message.incomplete
-      const resolve = this.waiting.get(message.id)
-      this.waiting.delete(message.id)
-      resolve?.(message)
+      this.waiting.get(message.id)?.settle(message)
+    } else if (message.type === 'problem') {
+      this.problem(`${slot}: ${message.message}`)
+      this.abort(`${slot}: ${message.message}`)
     } else if (message.type === 'readback') this.readback(slot, message)
     else if (message.type === 'telemetry-subscription')
       this.command('p16', {
@@ -655,9 +809,10 @@ class Supervisor {
   }
 
   /**
-   * Sends a step to a child and waits for its outcome. A child whose IPC channel has closed (it
-   * has disconnected, or does so while the step is being sent) answers with an error outcome, so
-   * a sample admitted after the teardown disconnected a process fails that step, not the run.
+   * Sends a step to a child and waits for its outcome, which always arrives: the child's answer,
+   * an error when it is gone or its channel has closed (so a sample admitted after the teardown
+   * disconnected a process fails that step, not the run), or a failure of the run when it does not
+   * answer within the step's budget.
    * @param {string} slot @param {object} step
    * @returns {Promise<{ error: string|null, reply: unknown }>} the child's outcome
    */
@@ -666,12 +821,27 @@ class Supervisor {
     const child = this.children.get(slot)
     const closed = (reason) => ({ type: 'done', id, error: reason, reply: null })
     if (!child?.connected) return Promise.resolve(closed(`process ${slot} has disconnected`))
+    if (step.type === 'disconnect') this.leaving.add(slot)
     return new Promise((resolve) => {
-      this.waiting.set(id, resolve)
+      const entry = {
+        id,
+        slot,
+        timer: null,
+        settle: (message) => {
+          clearTimeout(entry.timer)
+          if (this.waiting.delete(id)) resolve(message)
+        },
+      }
+      const ms = this.budget(step)
+      entry.timer = setTimeout(() => {
+        const reason = `process ${slot} did not answer ${step.type} ${step.id} within ${ms} ms`
+        this.problem(reason)
+        this.abort(reason)
+        entry.settle(closed(reason))
+      }, ms)
+      this.waiting.set(id, entry)
       child.send({ type: 'command', id, step }, (e) => {
-        if (!e || !this.waiting.has(id)) return
-        this.waiting.delete(id)
-        resolve(closed(`process ${slot}: ${e.message}`))
+        if (e) entry.settle(closed(`process ${slot}: ${e.message}`))
       })
     })
   }
@@ -769,15 +939,20 @@ class Supervisor {
   }
 
   /**
-   * The end of the run: producers are already idle; every consumer drains and commits, every live
-   * route gets its terminal scan and seal, then every process disconnects.
+   * The end of the run. Producers go idle and their in-flight sends and transactions settle; the
+   * logs' ends are then read; every consumer waits until it has resolved those ends, filtered
+   * suffix included, and commits what it resolved, and the share member waits until its deliveries
+   * reach the last offset; every live route gets its terminal scan and seal; then every process
+   * disconnects. The cluster and the two standing topics stay up for the runbook's dumps.
    * @param {object} step the disconnect step
    * @returns {Promise<void>}
    */
   async teardown(step) {
     const all = [...this.children.keys()]
-    await this.send(all, { type: 'idle', id: 'final-idle' }).catch(() => {})
-    await this.send(this.consumers(), { type: 'drain', id: 'final-drain' }).catch(() => {})
+    await this.send(all, { type: 'idle', id: 'final-idle' }).catch((e) =>
+      this.problem(`final idle: ${e.message}`)
+    )
+    await this.finalDrain().catch((e) => this.problem(`final drain: ${e.message}`))
     const t = this.config.topics
     for (const topic of [t.main, t.transactions, ...t.recreate]) await this.seal(topic, null)
     await this.shape(
@@ -794,6 +969,32 @@ class Supervisor {
   }
 
   /**
+   * Fixes the two standing logs' ends, then asks every consuming process to resolve them and
+   * commit, and the share process to deliver up to them.
+   * @returns {Promise<void>}
+   * @throws {Error} when the log ends cannot be read
+   */
+  async finalDrain() {
+    const { main, transactions } = this.config.topics
+    const ends = {}
+    for (const topic of [main, transactions])
+      for (const { partition, high, offset } of await this.admin.fetchTopicOffsets(topic))
+        ends[`${topic}|${partition}`] = high ?? offset
+    const slots = [...new Set([...this.consumers(), this.processOf('share')])]
+    const step = {
+      type: 'drain',
+      id: 'final-drain',
+      ends,
+      deadline: this.clock.now() + FINAL_DRAIN_MS,
+    }
+    const replies = await Promise.all(slots.map((slot) => this.command(slot, step)))
+    replies.forEach((r, i) => {
+      if (r.error || r.reply?.reached === false)
+        this.problem(`final drain: ${slots[i]} ${r.error ?? "did not resolve the logs' ends"}`)
+    })
+  }
+
+  /**
    * A membership execution, wave by wave. Each wave is its own pause-resume execution: every
    * participant runs the wave's `leave` phase (pause, join an extra, observe the transfer, remove
    * the extra), the participants are sampled closed through the gate, every participant resumes,
@@ -807,10 +1008,13 @@ class Supervisor {
     let first = null
     for (const [index, wave] of (this.waves.get(step.id) ?? []).entries()) {
       await this.shape(wave, 'start')
-      const base = { ...step, wave: index, execution: wave.id }
+      const base = { ...step, wave: index, execution: wave.id, waveDeadline: wave.deadline }
       let failed = null
       try {
-        await this.send(participants, { ...base, phase: 'leave' })
+        const leave = await this.send(participants, { ...base, phase: 'leave' })
+        const none = participants.filter((_, i) => leave[i].reply?.transfers === 0)
+        if (none.length > 0)
+          throw new Error(`${wave.id} saw no paused partition transfer in ${none.join(', ')}`)
         await this.sampleAll(participants, {
           type: 'closed',
           id: `${wave.id}.closed`,
@@ -834,65 +1038,103 @@ class Supervisor {
    * A regex execution creates a fresh topic and its routes, lets every applicable client accept
    * it, offers probe ids, drains, scans and seals it, deletes it and lets the clients retire it. A
    * recreation drains, scans and seals the old incarnation, deletes it, creates the same name
-   * again with new routes and probes the new one.
+   * again with new routes and probes the new one. No stage starts after the execution's deadline
+   * and no wait runs past it: the execution fails and later stages are not attempted, so its work
+   * never reaches into the idle window.
+   * @param {object} step the execution @param {string[]} participants its processes
+   * @returns {Promise<void>}
+   * @throws {Error} when a stage cannot start before the deadline or a probe stopped at it
    */
   async churnTopic(step, participants) {
+    const within = (stage) => {
+      if (this.clock.now() >= step.deadline)
+        throw new Error(`${step.id}: ${stage} is past the execution deadline`)
+    }
+    const stage = async (name, work) => {
+      within(name)
+      return work()
+    }
     const settle = () =>
-      this.clock.sleepUntil(this.clock.now() + 3 * this.config.timeouts.metadataMaxAge)
+      this.clock.sleepUntil(
+        Math.min(step.deadline, this.clock.now() + 3 * this.config.timeouts.metadataMaxAge)
+      )
     const producer = this.processOf('producer-idempotent')
     const probe = (topic) =>
-      this.send([producer], {
-        type: 'probe',
-        id: `${step.id}.probe`,
-        execution: step.id,
-        topic,
-        partitions: 2,
-        count: 10,
+      stage('probe', async () => {
+        const [reply] = await this.send([producer], {
+          type: 'probe',
+          id: `${step.id}.probe`,
+          execution: step.id,
+          topic,
+          partitions: 2,
+          count: 10,
+          deadline: step.deadline,
+        })
+        if (reply.reply?.stopped) throw new Error(`${step.id}: probe stopped at the deadline`)
       })
-    const drain = () => this.send(participants, { type: 'drain', id: `${step.id}.drain` })
+    const drain = () =>
+      stage('drain', () =>
+        this.send(participants, { type: 'drain', id: `${step.id}.drain`, deadline: step.deadline })
+      )
     if (step.shape === 'regex-churn') {
       const topic = `${this.config.topics.regex}-${step.id}`
-      await this.createTopic(topic, 2, 'regex', step.id)
+      await stage('create', () => this.createTopic(topic, 2, 'regex', step.id))
       await settle()
-      await this.send(participants, { ...step, topicName: topic })
+      await stage('accept', () => this.send(participants, { ...step, topicName: topic }))
       await probe(topic)
       await settle()
       await drain()
-      await this.seal(topic, step.id)
-      await this.deleteTopic(topic, step.id)
-      await this.send(participants, { ...step, type: 'retired', topicName: topic })
+      await stage('seal', () => this.seal(topic, step.id))
+      await stage('delete', () => this.deleteTopic(topic, step.id))
+      await stage('retire', () =>
+        this.send(participants, { ...step, type: 'retired', topicName: topic })
+      )
       return
     }
     const topic = this.config.topics.recreate[step.topic]
     await probe(topic)
     await settle()
     await drain()
-    await this.seal(topic, step.id)
-    await this.send(participants, { ...step, topicName: topic })
-    await this.deleteTopic(topic, step.id)
+    await stage('seal', () => this.seal(topic, step.id))
+    await stage('pause', () => this.send(participants, { ...step, topicName: topic }))
+    await stage('delete', () => this.deleteTopic(topic, step.id))
     await settle()
-    await this.createTopic(topic, 2, 'recreate', step.id)
+    await stage('create', () => this.createTopic(topic, 2, 'recreate', step.id))
     await settle()
     await probe(topic)
-    await this.send(participants, { ...step, type: 'recreated', topicName: topic })
+    await stage('recreated', () =>
+      this.send(participants, { ...step, type: 'recreated', topicName: topic })
+    )
+  }
+
+  /**
+   * Runs a docker command.
+   * @param {string[]} args @returns {Promise<string>} its trimmed stdout
+   */
+  docker(args) {
+    return new Promise((resolve, reject) =>
+      execFile('docker', args, { env: process.env }, (e, stdout) =>
+        e ? reject(e) : resolve(stdout.trim())
+      )
+    )
   }
 
   /**
    * Stops and restarts one broker as the step says, recording the supervisor receipts and the
    * broker state (down, ready, in-sync) from raw metadata, then asks every kind for its own
-   * recovery witness.
+   * recovery witness. The step fails, after all of it ran, unless the stop and the start succeeded
+   * and showed in the container's process, the cluster regained all three brokers, every run
+   * partition returned to three in-sync replicas and every kind produced its witness.
+   * @param {object} step @param {string[]} participants
+   * @returns {Promise<void>}
+   * @throws {Error} listing everything that could not be confirmed
    */
   async outage(step, participants) {
     const service = `kafka${step.node}`
-    const docker = (args) =>
-      new Promise((resolve, reject) =>
-        execFile('docker', args, { env: process.env }, (e, stdout) =>
-          e ? reject(e) : resolve(stdout.trim())
-        )
-      )
-    const container = await docker(['compose', 'ps', '-aq', service]).catch(() => '')
+    const failures = []
+    const container = await this.docker(['compose', 'ps', '-aq', service]).catch(() => '')
     const pid = async () =>
-      Number(await docker(['inspect', '-f', '{{.State.Pid}}', container]).catch(() => 0))
+      Number(await this.docker(['inspect', '-f', '{{.State.Pid}}', container]).catch(() => NaN))
     const op = async (name, args) => {
       const operation = `${SUPERVISOR}.b${this.runtime.ids}`
       const base = {
@@ -906,38 +1148,59 @@ class Supervisor {
         causes: [],
       }
       await this.emit({ ...base, phase: 'begin', result: null, errorType: null })
+      let ok = true
       try {
-        await docker(['compose', ...args])
+        await this.docker(['compose', ...args])
         await this.emit({ ...base, phase: 'end', result: 'ok', errorType: null })
       } catch (e) {
+        ok = false
+        failures.push(`${name} of ${service} failed: ${e.message}`)
         await this.emit({ ...base, phase: 'end', result: 'error', errorType: e.name ?? 'Error' })
       }
-      return operation
+      return { operation, ok }
     }
     await this.send(participants, { ...step, type: 'broker-outage' }).catch(() => {})
     const stopped = await op(
       'broker-stop',
       step.stop === 'clean' ? ['stop', service] : ['kill', '-s', 'SIGKILL', service]
     )
-    await this.brokerState(step, 'down', await pid(), container, stopped)
+    const down = await pid()
+    await this.brokerState(
+      step,
+      'down',
+      Number.isNaN(down) ? 0 : down,
+      container,
+      stopped.operation
+    )
+    if (stopped.ok && down !== 0)
+      failures.push(`${service} still runs (pid ${down}) after its stop`)
     await this.clock.sleepUntil(this.clock.now() + step.downMs)
     const started = await op('broker-start', ['start', service])
     const ready = async () =>
       (await this.admin.describeCluster().catch(() => ({ brokers: [] }))).brokers.length === 3
     while (!(await ready()) && this.clock.now() < step.deadline)
       await this.clock.sleepUntil(this.clock.now() + 500)
-    await this.brokerState(step, 'ready', await pid(), container, started)
-    const inSync = async () => (await this.partitionStates()).every((p) => p.isr.length === 3)
+    const up = await pid()
+    await this.brokerState(step, 'ready', Number.isNaN(up) ? 0 : up, container, started.operation)
+    if (!(await ready())) failures.push(`the cluster did not regain three brokers by the deadline`)
+    else if (started.ok && !(up > 0))
+      failures.push(`${service} has no running process after its start`)
+    const expected = 2 + 2 * this.config.topics.recreate.length
+    const inSync = async () => {
+      const states = await this.partitionStates()
+      return states.length >= expected && states.every((p) => p.isr.length === 3)
+    }
     while (!(await inSync()) && this.clock.now() < step.deadline)
       await this.clock.sleepUntil(this.clock.now() + 500)
-    await this.brokerState(step, 'isr', await pid(), container, started)
+    await this.brokerState(step, 'isr', Number.isNaN(up) ? 0 : up, container, started.operation)
+    if (!(await inSync())) failures.push('the run partitions are not all in sync by the deadline')
     const replies = await Promise.all(
       participants.map((slot) => this.command(slot, { ...step, type: 'recovered' }))
     )
     replies.forEach((r, i) => {
-      if (!r.reply?.ok)
-        this.collector.note(`${participants[i]} has no recovery witness after ${step.id}`)
+      if (!r.reply?.ok) failures.push(`${participants[i]} has no recovery witness after ${step.id}`)
     })
+    if (failures.length > 0) throw new Error(failures.join('; '))
   }
 
   /** @returns {Promise<object[]>} raw leader and ISR of every run partition */

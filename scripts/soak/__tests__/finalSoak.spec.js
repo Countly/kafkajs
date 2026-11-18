@@ -191,7 +191,9 @@ describe('final soak driver', () => {
       expect(mine).toHaveLength(4)
       expect(new Set(mine.map((s) => s.stop))).toEqual(new Set(['clean', 'hard']))
     }
-    expect(new Set(outages.map((s) => s.downMs))).toEqual(new Set([2000, 12000]))
+    expect(outages.map((s) => s.downMs)).toEqual(
+      outages.map((_, i) => (i % 2 === 0 ? 2000 : 12000))
+    )
   })
 
   test('smoke mode keeps every shape in a shortened schedule', () => {
@@ -204,7 +206,7 @@ describe('final soak driver', () => {
       regexExecutions: 1,
       recreations: 1,
       membershipExecutions: 1,
-      outages: 1,
+      outages: 2,
       periodicSlots: smoke.periodicSlots,
       quietReadings: 3,
       shapes: sorted(SHAPES),
@@ -222,7 +224,9 @@ describe('final soak driver', () => {
       at('topic-recreation'),
       at('broker-outage'),
     ]).toEqual([smoke.membershipAtMs, smoke.regexAtMs, smoke.recreationAtMs, smoke.outageAtMs])
-    expect(plan.steps.find((s) => s.shape === 'broker-outage').deadline).toBe(smoke.recoveredByMs)
+    expect(plan.steps.filter((s) => s.shape === 'broker-outage').at(-1).deadline).toBe(
+      smoke.recoveredByMs
+    )
 
     const index = (type, extra = () => true) =>
       plan.steps.findIndex((s) => s.type === type && extra(s))

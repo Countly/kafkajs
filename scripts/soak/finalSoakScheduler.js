@@ -53,7 +53,10 @@ class MonotonicClock {
 }
 
 /**
- * Expands the matrix schedule into timed steps, in start order. Work steps (`lane: 'work'`) run one
+ * Expands the matrix schedule into timed steps, in start order. Each hour of the day holds the
+ * matrix's one outage window on even hours; the smoke holds as many windows as fit between its
+ * first outage and its recovery deadline, so it exercises the two down times (two seconds, then
+ * twelve) in the order the day does. Work steps (`lane: 'work'`) run one
  * at a time; timer steps (periodic and quiet samples, idle windows, seed and teardown marks) start
  * at their own time regardless of work. Each execution names the client kinds that must act in it.
  * @param {object} matrix the reviewed matrix
@@ -75,6 +78,9 @@ function planSchedule(matrix, mode) {
   const period = valueOf(matrix.sampling.periodMs)
   const smoke = mode === 'smoke'
   const hours = smoke ? 1 : requestedMs / s.hourMs
+  const outageWindowMs =
+    (execution('broker-outage').recoveredByMinute - execution('broker-outage').minutes[0]) * 60000
+  const smokeOutages = Math.floor((s.smoke.recoveredByMs - s.smoke.outageAtMs) / outageWindowMs)
   const steps = []
   const add = (step) => steps.push({ order: steps.length, ...step })
   const work = (id, shape, at, maxMs, participants, extra = {}) =>
@@ -117,7 +123,10 @@ function planSchedule(matrix, mode) {
           membership: [s.smoke.membershipAtMs],
           regex: [s.smoke.regexAtMs],
           recreation: [s.smoke.recreationAtMs],
-          outage: [s.smoke.outageAtMs],
+          outage: Array.from(
+            { length: smokeOutages },
+            (_, i) => s.smoke.outageAtMs + i * outageWindowMs
+          ),
         }
       : {
           membership: at(membership.minutes),
@@ -153,14 +162,11 @@ function planSchedule(matrix, mode) {
         topic: (h * times.recreation.length + i) % 2,
       })
     )
-    times.outage.forEach((t) => {
-      const recovered = smoke
-        ? s.smoke.recoveredByMs
-        : H + execution('broker-outage').recoveredByMinute * 60000
-      work(`h${hh}o`, 'broker-outage', t, recovered - t, kinds, {
+    times.outage.forEach((t, i) => {
+      work(`h${hh}o${i}`, 'broker-outage', t, outageWindowMs, kinds, {
         node: (outage % 3) + 1,
         stop: outage % 2 === 0 ? 'clean' : 'hard',
-        downMs: outage % 4 < 2 ? 2000 : 12000,
+        downMs: outage % 2 === 0 ? 2000 : 12000,
       })
       outage++
     })

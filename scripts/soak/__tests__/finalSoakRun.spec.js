@@ -47,6 +47,7 @@ const boundedClock = () => {
 
 /** @returns {object} the runtime surface a worker of one config client slot reads and writes */
 const workerRuntime = (slotId, clock = new MonotonicClock(), observer = {}) => {
+  observer = { forget() {}, ...observer }
   const slot = config.clients.find((c) => c.slot === slotId)
   const slots = config.clients.filter((c) => c.process === slot.process)
   const runtime = {
@@ -241,6 +242,7 @@ const supervisor = () => {
     brokers: ['k:1'],
     out,
   })
+  s.runtime = { ids: 0, nextId: () => `p15.${s.runtime.ids++}` }
   s.emit = async () => 'p15.1'
   s.collector = { note: async () => true, failures: [], records: 0 }
   return { s, out, remove: () => fs.rmSync(out, { recursive: true, force: true }) }
@@ -477,7 +479,7 @@ describe('final soak scheduled work', () => {
       s.sampleAll = async () => {}
       s.shape = async () => 'x'
       await expect(s.churnMembers({ id: 'h00m0' }, ['p01', 'p02', 'p07'])).rejects.toThrow(
-        /p01.*paused partition/
+        /paused partition.*p01/
       )
     } finally {
       remove()
@@ -498,9 +500,15 @@ describe('final soak scheduled work', () => {
         if (step.type === 'probe') clock.t += 200000
         return [{ reply: { offered: 10 } }]
       }
-      const step = { id: 'h00r0', shape: 'regex-churn', deadline: 120000, participants: [] }
+      const step = {
+        id: 'h00r0',
+        type: 'execution',
+        shape: 'regex-churn',
+        deadline: 120000,
+        participants: [],
+      }
       await expect(s.churnTopic(step, ['p01'])).rejects.toThrow(/deadline/)
-      expect(stages).toEqual(['create', 'regex-churn', 'probe'])
+      expect(stages).toEqual(['create', 'execution', 'probe'])
       expect(clock.t).toBeLessThanOrEqual(120000 + 200000)
     } finally {
       remove()
@@ -511,8 +519,11 @@ describe('final soak scheduled work', () => {
     const clock = jumpClock(1000000)
     const standing = { id: 'c01.1', object: { pause() {}, resume() {} }, slot: config.clients[0] }
     const observer = {
-      ordinarySections: () => ({
-        sections: { assignment: [{ key: { topic: 't', topicId: IDS.A, partition: 0 } }] },
+      ordinarySections: (client) => ({
+        sections: {
+          assignment:
+            client === 'c01.1' ? [{ key: { topic: 't', topicId: IDS.A, partition: 0 } }] : [],
+        },
       }),
     }
     const runtime = workerRuntime('c01', clock, observer)
