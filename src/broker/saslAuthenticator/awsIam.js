@@ -1,6 +1,6 @@
 const { request, response } = require('../../protocol/sasl/awsIam')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
-const { failureDetail } = require('./failure')
+const { failureDetail, isPassedThrough } = require('./failure')
 
 const awsIAMAuthenticatorProvider =
   (sasl) =>
@@ -27,6 +27,7 @@ const awsIAMAuthenticatorProvider =
           await saslAuthenticate({ request: request(sasl), response })
           logger.debug('SASL AWS-IAM authentication successful', { broker })
         } catch (e) {
+          if (isPassedThrough(e)) throw e
           const error = new KafkaJSSASLAuthenticationError(
             `SASL AWS-IAM authentication failed: ${failureDetail(e)}`
           )

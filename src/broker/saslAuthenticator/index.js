@@ -7,6 +7,7 @@ const awsIAMAuthenticatorProvider = require('./awsIam')
 const oauthBearerAuthenticatorProvider = require('./oauthBearer')
 const gssapiAuthenticatorProvider = require('./gssapi')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
+const { passThrough, isTransportFailure } = require('./failure')
 
 const BUILT_IN_AUTHENTICATION_PROVIDERS = {
   AWS: awsIAMAuthenticatorProvider,
@@ -43,10 +44,15 @@ module.exports = class SASLAuthenticator {
     this.protocolAuthentication = lookupRequest(apiKeys.SaslAuthenticate, requests.SaslAuthenticate)
   }
 
-  /** Throws before any stale continuation can write or publish. @returns {void} @throws {Error} refusal */
+  /**
+   * Throws before any stale continuation can write or publish. The refusal is a cancellation,
+   * which built-in mechanisms rethrow unchanged.
+   * @returns {void}
+   * @throws {Error} the guard's refusal
+   */
   check() {
     const error = this.guard()
-    if (error) throw error
+    if (error) throw passThrough(error)
   }
 
   /**
@@ -87,6 +93,7 @@ module.exports = class SASLAuthenticator {
       } catch (e) {
         // Only the raw protocol error still carries the code; mechanisms re-wrap it. The
         // published text is built from stable fields alone, never from the error's message.
+        // A lost connection or timeout passes through the mechanisms with its own class.
         this.check()
         if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
           this.connection.reportAuthenticationFailure(
@@ -94,7 +101,7 @@ module.exports = class SASLAuthenticator {
             `SASL ${mechanism} authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
           )
         }
-        throw e
+        throw isTransportFailure(e) ? passThrough(e) : e
       }
 
       // `0` is a string because `sessionLifetimeMs` is an int64 encoded as string.

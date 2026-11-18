@@ -1,7 +1,7 @@
 const crypto = require('crypto')
 const scram = require('../../protocol/sasl/scram')
 const { KafkaJSSASLAuthenticationError, KafkaJSNonRetriableError } = require('../../errors')
-const { failureDetail, trustedError } = require('./failure')
+const { failureDetail, trustedError, isPassedThrough } = require('./failure')
 
 const GS2_HEADER = 'n,,'
 
@@ -139,9 +139,11 @@ class SCRAM {
    * Runs the exchange (RFC 5802): the client-first message, then the client-final message once
    * the server-first message passed its checks, then the server signature, compared in constant
    * time. Every failure is one `KafkaJSSASLAuthenticationError` with this mechanism's prefix and
-   * library-written text only.
+   * library-written text only, except a lost connection, request timeout or cancellation of the
+   * exchange, which is rethrown unchanged.
    * @returns {Promise<void>}
-   * @throws {KafkaJSSASLAuthenticationError}
+   * @throws {KafkaJSSASLAuthenticationError} rejection or validation failure
+   * @throws {Error} the exchange's own transport or cancellation error
    */
   async authenticate() {
     const { PREFIX } = this
@@ -184,6 +186,7 @@ class SCRAM {
 
       this.logger.debug(`${PREFIX} successful`, { broker })
     } catch (e) {
+      if (isPassedThrough(e)) throw e
       const error = new KafkaJSSASLAuthenticationError(`${PREFIX} failed: ${failureDetail(e)}`)
       this.logger.error(error.message, { broker })
       throw error
