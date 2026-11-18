@@ -105,6 +105,10 @@ const ARCHIVE = Object.freeze([
   'scripts/soak/finalSoakMatrix.json',
   'scripts/soak/finalSoakSchema.js',
   'scripts/soak/finalSoak.js',
+  'scripts/soak/finalSoakScheduler.js',
+  'scripts/soak/finalSoakCollector.js',
+  'scripts/soak/finalSoakObserver.js',
+  'scripts/soak/finalSoakWorkers.js',
 ])
 /** The seed's fixed start, clear and sensitivity rule in each mode. */
 const SEED_TIMING = Object.freeze({
@@ -1092,7 +1096,7 @@ const ACCEPTANCE_FIELDS = Object.freeze({
   profile: Id,
   modes: Any,
   archive: type(
-    'a list of relative paths holding the archived matrix, schema and driver',
+    'a list of relative paths holding the archived matrix, schema and driver modules',
     (v) => Array.isArray(v) && v.every(isRelativePath) && ARCHIVE.every((f) => v.includes(f))
   ),
   companions: type('the companion list', (v) => sameList(v, COMPANIONS)),
@@ -1202,6 +1206,7 @@ const SMOKE_FIELDS = Object.freeze({
   idleMs: Window,
   quietAtMs: QuietTimes,
   ...each(['membershipAtMs', 'regexAtMs', 'recreationAtMs', 'outageAtMs', 'recoveredByMs'], Ms),
+  abortAtTransaction: Positive,
   periodicSlots: Positive,
   floors: Any,
 })
@@ -1347,6 +1352,13 @@ const validateMatrix = (matrix) => {
         'matrix.schedule.smoke.periodicSlots does not cover the smoke at the sample period'
       )
     if (sampling.gcCollections.value !== 2) problems.push('matrix.sampling.gcCollections is not 2')
+    if (
+      (schedule.smoke.abortAtTransaction - 1) * matrix.traffic.transactionEveryMs.value >=
+      schedule.smoke.outageAtMs
+    )
+      problems.push(
+        'matrix.schedule.smoke.abortAtTransaction does not abort before the first outage'
+      )
   }
   if (matrix.rows.length !== ROWS.length)
     problems.push(`matrix.rows does not hold the ${ROWS.length} rows`)

@@ -1,0 +1,372 @@
+'use strict'
+/**
+ * Final soak timing: the run clock, the plan expanded from the reviewed matrix schedule, the
+ * scheduler that runs it without ever moving a step, and the gate that keeps at most two processes
+ * collecting at once.
+ */
+const { SHAPES } = require('./finalSoakSchema')
+
+/** @param {object} setting a matrix `{ value, unit, source }` setting @returns {number} */
+const valueOf = (setting) => setting.value
+
+/** The host's monotonic clock, relative to an origin captured once per run. */
+class MonotonicClock {
+  /** @param {number} [originMs] the run origin in monotonic ms; now by default */
+  constructor(originMs = MonotonicClock.raw()) {
+    this.originMs = originMs
+  }
+
+  /** @returns {number} monotonic milliseconds since boot */
+  static raw() {
+    return Number(process.hrtime.bigint()) / 1e6
+  }
+
+  /** @returns {number} milliseconds since the origin */
+  now() {
+    return MonotonicClock.raw() - this.originMs
+  }
+
+  /**
+   * @param {number} at origin-relative ms
+   * @param {AbortSignal} [signal] resolves early, clearing the timer, once aborted
+   * @returns {Promise<void>}
+   */
+  sleepUntil(at, signal) {
+    if (at <= this.now() || signal?.aborted) return Promise.resolve()
+    return new Promise((resolve) => {
+      let timer = null
+      const done = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', done)
+        resolve()
+      }
+      // Timers fire on a millisecond loop clock, so one can wake a fraction early: check again.
+      const check = () => {
+        const wait = at - this.now()
+        if (wait <= 0) done()
+        else timer = setTimeout(check, Math.ceil(wait))
+      }
+      signal?.addEventListener('abort', done, { once: true })
+      check()
+    })
+  }
+}
+
+/**
+ * Expands the matrix schedule into timed steps, in start order. Each hour of the day holds the
+ * matrix's one outage window on even hours; the smoke holds as many windows as fit between its
+ * first outage and its recovery deadline, so it exercises the two down times (two seconds, then
+ * twelve) in the order the day does. Work steps (`lane: 'work'`) run one
+ * at a time; timer steps (periodic and quiet samples, idle windows, seed and teardown marks) start
+ * at their own time regardless of work. Each execution names the client kinds that must act in it.
+ * @param {object} matrix the reviewed matrix
+ * @param {'smoke'|'acceptance'} mode
+ * @returns {{ mode: string, requestedMs: number, steps: object[] }}
+ */
+function planSchedule(matrix, mode) {
+  const s = matrix.schedule
+  const kinds = Object.keys(matrix.clientKinds)
+  const where = (test) => kinds.filter((k) => test(matrix.clientKinds[k]))
+  const recipients = (role) => matrix.topology.topics.find((t) => t.role === role).recipients
+  const execution = (shape) => s.executions.find((e) => e.shape === shape)
+  const membership = execution('membership-churn')
+  const churn = where((k) => k.churn)
+  const ordinary = where((k) => k.role === 'consumer' && k.churn)
+  const statics = where((k) => k.static)
+  const recreation = [...new Set([...recipients('recreate'), 'producer-idempotent', 'admin'])]
+  const requestedMs = valueOf(matrix.acceptance.modes[mode].requestedMs)
+  const period = valueOf(matrix.sampling.periodMs)
+  const smoke = mode === 'smoke'
+  const hours = smoke ? 1 : requestedMs / s.hourMs
+  const outageWindowMs =
+    (execution('broker-outage').recoveredByMinute - execution('broker-outage').minutes[0]) * 60000
+  const smokeOutages = Math.floor((s.smoke.recoveredByMs - s.smoke.outageAtMs) / outageWindowMs)
+  const steps = []
+  const add = (step) => steps.push({ order: steps.length, ...step })
+  const work = (id, shape, at, maxMs, participants, extra = {}) =>
+    add({
+      id,
+      type: 'execution',
+      lane: 'work',
+      shape,
+      at,
+      deadline: at + maxMs,
+      participants,
+      ...extra,
+    })
+
+  add({
+    id: 'traffic',
+    type: 'execution',
+    lane: 'work',
+    shape: 'traffic',
+    at: 0,
+    deadline: requestedMs,
+    participants: kinds,
+  })
+  for (let k = 0; k * period <= requestedMs; k++)
+    add({
+      id: `k${k}`,
+      type: 'periodic',
+      lane: 'timer',
+      slot: k,
+      at: k * period,
+      deadline: k * period + valueOf(matrix.sampling.jitterMs),
+    })
+  let outage = 0
+  for (let h = 0; h < hours; h++) {
+    const H = h * s.hourMs
+    const hh = String(h).padStart(2, '0')
+    const at = (minutes) => minutes.map((m) => H + m * 60000)
+    const times = smoke
+      ? {
+          membership: [s.smoke.membershipAtMs],
+          regex: [s.smoke.regexAtMs],
+          recreation: [s.smoke.recreationAtMs],
+          outage: Array.from(
+            { length: smokeOutages },
+            (_, i) => s.smoke.outageAtMs + i * outageWindowMs
+          ),
+        }
+      : {
+          membership: at(membership.minutes),
+          regex: at(execution('regex-churn').minutes),
+          recreation: at(execution('topic-recreation').minutes),
+          outage: h % 2 === 0 ? at(execution('broker-outage').minutes) : [],
+        }
+    times.membership.forEach((t, i) => {
+      const id = `h${hh}m${i}`
+      work(id, 'membership-churn', t, membership.maxMs, churn, {
+        waves: membership.waves,
+        restart: i === 0 ? statics : [],
+      })
+      for (let w = 0; w < membership.waves; w++) {
+        const waveAt = t + w * membership.waveMaxMs
+        add({
+          id: `${id}w${w}`,
+          type: 'execution',
+          lane: 'within',
+          parent: id,
+          shape: 'pause-resume',
+          at: waveAt,
+          deadline: waveAt + membership.waveMaxMs,
+          participants: ordinary,
+        })
+      }
+    })
+    times.regex.forEach((t, i) =>
+      work(`h${hh}r${i}`, 'regex-churn', t, execution('regex-churn').maxMs, recipients('regex'))
+    )
+    times.recreation.forEach((t, i) =>
+      work(`h${hh}t${i}`, 'topic-recreation', t, execution('topic-recreation').maxMs, recreation, {
+        topic: (h * times.recreation.length + i) % 2,
+      })
+    )
+    times.outage.forEach((t, i) => {
+      work(`h${hh}o${i}`, 'broker-outage', t, outageWindowMs, kinds, {
+        node: (outage % 3) + 1,
+        stop: outage % 2 === 0 ? 'clean' : 'hard',
+        downMs: outage % 2 === 0 ? 2000 : 12000,
+      })
+      outage++
+    })
+    const idle = smoke ? s.smoke.idleMs : { from: H + s.idleMs.from, to: H + s.idleMs.to }
+    const drainMs = s.auxiliaryDrainMs.to - s.auxiliaryDrainMs.from
+    work(`h${hh}d`, 'drain', idle.from - drainMs, drainMs, churn)
+    add({
+      id: `h${hh}i`,
+      type: 'idle',
+      lane: 'timer',
+      shape: 'idle',
+      at: idle.from,
+      until: idle.to,
+      participants: kinds,
+    })
+    const quiet = smoke ? s.smoke.quietAtMs : s.quietAtMs.map((q) => H + q)
+    const quietDeadline = quiet[0] + (s.quietDeadlineMs - s.quietAtMs[0])
+    quiet.forEach((q, reading) =>
+      add({
+        id: `h${hh}q${reading}`,
+        type: 'quiet',
+        lane: 'timer',
+        boundary: `h${hh}`,
+        reading,
+        at: q,
+        deadline: quietDeadline,
+      })
+    )
+    if (h === 0 && !smoke)
+      add({ id: 'seed-start', type: 'seed-start', lane: 'work', at: quietDeadline })
+  }
+  if (smoke) add({ id: 'seed-start', type: 'seed-start', lane: 'work', at: 0 })
+  add({ id: 'seed-clear', type: 'seed-clear', lane: 'work', at: requestedMs })
+  add({ id: 'disconnect', type: 'disconnect', lane: 'work', at: requestedMs })
+  const rank = { 'seed-start': -1 }
+  steps.sort(
+    (a, b) => a.at - b.at || (rank[a.type] ?? 0) - (rank[b.type] ?? 0) || a.order - b.order
+  )
+  return { mode, requestedMs, steps }
+}
+
+/**
+ * Counts what a plan schedules, per shape and per kind, for comparison with the matrix totals.
+ * @param {{ steps: object[] }} plan
+ * @returns {object} idle windows, executions by shape, pauses per ordinary kind, restarts per static
+ *   kind, periodic slots, quiet readings and the shapes and kinds that act
+ */
+function scheduleTotals({ steps }) {
+  const executions = steps.filter((s) => s.type === 'execution' || s.type === 'idle')
+  const count = (shape) => executions.filter((s) => s.shape === shape).length
+  const perKind = (list) => {
+    const out = {}
+    for (const kind of list) out[kind] = (out[kind] ?? 0) + 1
+    return out
+  }
+  return {
+    idleWindows: count('idle'),
+    regexExecutions: count('regex-churn'),
+    recreations: count('topic-recreation'),
+    membershipExecutions: count('membership-churn'),
+    outages: count('broker-outage'),
+    pauseSequences: perKind(
+      executions.filter((s) => s.shape === 'pause-resume').flatMap((s) => s.participants)
+    ),
+    staticRestarts: perKind(executions.flatMap((s) => s.restart ?? [])),
+    periodicSlots: steps.filter((s) => s.type === 'periodic').length,
+    quietReadings: steps.filter((s) => s.type === 'quiet').length,
+    shapes: SHAPES.filter((shape) => count(shape) > 0).sort(),
+    kinds: [...new Set(executions.flatMap((s) => s.participants))].sort(),
+  }
+}
+
+/** The steps that still run after an abort, in plan order. */
+const TEARDOWN = Object.freeze(['seed-clear', 'disconnect'])
+
+/**
+ * Runs a plan against a clock. Work steps run one at a time in plan order, and so do the timer
+ * steps of each type (so only one timer per type is pending at any moment). A step that cannot
+ * start before its deadline is not performed, and one that finishes after its deadline is late.
+ * Either way it is reported `late` and never moved: later steps, and idle windows above all, keep
+ * their times. Steps with `lane: 'within'` are performed by their parent work step and reported by
+ * it. After `abort()`, every step that has not started is reported `aborted` without being
+ * performed, except the teardown steps (`seed-clear`, then `disconnect`), which then run at once so
+ * the run is torn down naturally and the seed's clear is still recorded.
+ */
+class Scheduler {
+  /**
+   * @param {object} options
+   * @param {{ now: () => number, sleepUntil: (at: number) => Promise<void> }} options.clock
+   * @param {(step: object) => Promise<void>} options.perform does the step's work
+   * @param {(outcome: object) => void} [options.onOutcome] receives each settled step
+   */
+  constructor({ clock, perform, onOutcome = () => {} }) {
+    this.clock = clock
+    this.perform = perform
+    this.onOutcome = onOutcome
+    this.summary = { ok: 0, late: 0, error: 0, aborted: 0 }
+    this.aborted = null
+    this.controller = new AbortController()
+  }
+
+  /**
+   * @param {object[]} steps the plan's steps, in start order
+   * @returns {Promise<{ ok: number, late: number, error: number, aborted: number }>} counts by outcome
+   */
+  async run(steps) {
+    const lanes = new Map()
+    for (const step of steps) {
+      if (step.lane === 'within') continue
+      const lane = step.lane === 'work' ? 'work' : `timer:${step.type}`
+      lanes.set(
+        lane,
+        (lanes.get(lane) ?? Promise.resolve()).then(() => this.runStep(step))
+      )
+    }
+    await Promise.all(lanes.values())
+    return this.summary
+  }
+
+  /**
+   * Stops admitting steps; the run's teardown step still runs.
+   * @param {string} reason why the run is aborted
+   * @returns {void}
+   */
+  abort(reason) {
+    this.aborted ??= reason
+    this.controller.abort()
+  }
+
+  /** @param {object} step @returns {Promise<void>} */
+  async runStep(step) {
+    await this.clock.sleepUntil(step.at, this.controller.signal)
+    const startedAt = this.clock.now()
+    const deadline = step.deadline ?? Infinity
+    let outcome = 'ok'
+    let error = null
+    if (this.aborted && !TEARDOWN.includes(step.type)) outcome = 'aborted'
+    else if (startedAt >= deadline && !this.aborted) outcome = 'late'
+    else {
+      try {
+        await this.perform(step)
+      } catch (e) {
+        outcome = 'error'
+        error = e.message
+      }
+      if (outcome === 'ok' && this.clock.now() > deadline) outcome = 'late'
+    }
+    this.summary[outcome]++
+    this.onOutcome({
+      id: step.id,
+      type: step.type,
+      outcome,
+      at: step.at,
+      startedAt,
+      endedAt: this.clock.now(),
+      error,
+    })
+  }
+}
+
+/**
+ * Admits at most `limit` tasks at once, in call order. The supervisor runs each process's sample
+ * through it, so no more than two processes force collections at the same moment and the others'
+ * admissions are staggered inside the slot jitter.
+ */
+class SamplingGate {
+  /** @param {{ limit?: number }} [options] the concurrent task bound, two by default */
+  constructor({ limit = 2 } = {}) {
+    this.limit = limit
+    this.active = 0
+    this.peak = 0
+    this.waiting = []
+    this.idlers = []
+  }
+
+  /**
+   * Runs one task once a place is free.
+   * @template T
+   * @param {() => Promise<T>} task
+   * @returns {Promise<T>} the task's own result or error
+   */
+  async run(task) {
+    if (this.active < this.limit) this.active++
+    else await new Promise((resolve) => this.waiting.push(resolve))
+    this.peak = Math.max(this.peak, this.active)
+    try {
+      return await task()
+    } finally {
+      const next = this.waiting.shift()
+      if (next) next()
+      else this.active--
+      if (this.active === 0) for (const resolve of this.idlers.splice(0)) resolve()
+    }
+  }
+
+  /** @returns {Promise<void>} resolves once no task is running or waiting */
+  idle() {
+    if (this.active === 0) return Promise.resolve()
+    return new Promise((resolve) => this.idlers.push(resolve))
+  }
+}
+
+module.exports = { valueOf, MonotonicClock, planSchedule, scheduleTotals, Scheduler, SamplingGate }
