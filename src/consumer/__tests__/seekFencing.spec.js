@@ -1035,6 +1035,34 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
+    test('is committed again by the next default commit when a seek back to the cached offset reached it before the answer, with autoCommit off', async () => {
+      const captured = using(captureGroup())
+      await open({
+        ...TWO_PARTITIONS,
+        run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
+      })
+      await scenario.otherDone.promise
+      const group = captured.group()
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const committing = group.commitOffsets({}, { auto: true })
+      await accepted.arrived
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '2' })
+
+      accepted.release()
+      await committing
+      expect(await scenario.position()).toBe('2')
+      await group.commitOffsets({}, { auto: true })
+
+      expect(scenario.commits(0)).toEqual(['5', '2'])
+      expect(scenario.commits(1)).toEqual(['1'])
+      expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a default commit reached by seeks before the write', () => {
     test('selects its offsets at most three times while seeks keep reaching them before the write, then an automatic commit skips and a plain one is refused', async () => {
       const captured = using(captureGroup())
       await open(TWO_PARTITIONS)
@@ -1061,32 +1089,6 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(refusal.message).toBe('A seek superseded the selected offsets')
       expect(selections).toHaveBeenCalledTimes(3)
       expect(scenario.rig.frames('OffsetCommit')).toHaveLength(0)
-      expect(scenario.errors).toEqual([])
-    })
-
-    test('is committed again by the next default commit when a seek back to the cached offset reached it before the answer, with autoCommit off', async () => {
-      const captured = using(captureGroup())
-      await open({
-        ...TWO_PARTITIONS,
-        run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
-      })
-      await scenario.otherDone.promise
-      const group = captured.group()
-      const {
-        holds: [accepted],
-      } = using(holdCommitAnswers(scenario, ['applied']))
-      const committing = group.commitOffsets({}, { auto: true })
-      await accepted.arrived
-      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '2' })
-
-      accepted.release()
-      await committing
-      expect(await scenario.position()).toBe('2')
-      await group.commitOffsets({}, { auto: true })
-
-      expect(scenario.commits(0)).toEqual(['5', '2'])
-      expect(scenario.commits(1)).toEqual(['1'])
-      expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
       expect(scenario.errors).toEqual([])
     })
   })
@@ -1224,6 +1226,153 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       await disconnect()
       expect(scenario.commits()).toEqual([])
       expect(scenario.committed[0]).toBe('2')
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek that position validation reaches while it is being applied', () => {
+    const SEEKING = {
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+    /**
+     * Moves partition 0's leader epoch and waits until a validation read of the fetch loop has run
+     * while the seek is still being applied.
+     * @param {ConsumerGroup} group
+     * @returns {Promise<void>}
+     */
+    const validateWhileApplying = async (group) => {
+      const validated = gate()
+      const validate = group.validatePositions
+      const epoch = jest.spyOn(group.cluster, 'leaderEpoch').mockReturnValue(6)
+      const validation = jest.spyOn(group, 'validatePositions').mockImplementation(async function (
+        ...args
+      ) {
+        const result = await validate.apply(this, args)
+        if (group.unappliedSeeks.has(`${TOPIC}|0`)) validated.resolve()
+        return result
+      })
+      using({
+        restore: () => {
+          epoch.mockRestore()
+          validation.mockRestore()
+        },
+      })
+      scenario.consumer.pause([{ topic: TOPIC, partitions: [0] }])
+      await scenario.release()
+      await validated.promise
+    }
+    const disconnect = async () => {
+      const closing = scenario.consumer.disconnect()
+      scenario.hold.resolve()
+      await closing
+    }
+
+    test('keeps a deliberate commit that superseded it as the position and leaves the committed offset out of the final commit', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const group = captured.group()
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const seeking = scenario.seek('0')
+      await accepted.arrived
+      await validateWhileApplying(group)
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '8' }])
+      expect(scenario.committed[0]).toBe('8')
+
+      accepted.release()
+
+      expect(await seeking).toBe('8')
+      expect(await scenario.position()).toBe('8')
+      await disconnect()
+      expect(scenario.commits()).toEqual(['0', '8'])
+      expect(scenario.committed[0]).toBe('8')
+      expect(scenario.deliveries).toEqual([BEFORE])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('reads the accepted offset after an incremental rebuild refused the applying call, and leaves the committed offset out of the final commit', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const group = captured.group()
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const seeking = failureOf(scenario.seek('0'))
+      await accepted.arrived
+      await validateWhileApplying(group)
+      await group.rebalanceCoordinator.runner.waitForHandlers()
+      await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: false })
+
+      accepted.release()
+
+      expect((await seeking).type).toBe('CONSUMER_STOPPING')
+      expect(await scenario.position()).toBe('0')
+      await disconnect()
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('0')
+      expect(scenario.deliveries).toEqual([BEFORE])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('an answer to a validation requested before the seek does not set the position when it arrives while the seek is applied', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const group = captured.group()
+      const asked = gate()
+      const answered = gate()
+      const reply = gate()
+      scenario.rig.cluster.answer('OffsetForLeaderEpoch', async ({ topics }) => {
+        asked.resolve()
+        await reply.promise
+        return {
+          partitions: topics[0].partitions.map(({ partition }) => ({
+            partition,
+            errorCode: 0,
+            leaderEpoch: 6,
+            endOffset: '100',
+          })),
+        }
+      })
+      const apply = group.applyValidationResponse
+      const epoch = jest.spyOn(group.cluster, 'leaderEpoch').mockReturnValue(6)
+      const applying = jest
+        .spyOn(group, 'applyValidationResponse')
+        .mockImplementation(async function (...args) {
+          try {
+            return await apply.apply(this, args)
+          } finally {
+            answered.resolve()
+          }
+        })
+      using({
+        restore: () => {
+          reply.resolve()
+          epoch.mockRestore()
+          applying.mockRestore()
+        },
+      })
+      await scenario.release()
+      await asked.promise
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const seeking = scenario.seek('0')
+      await accepted.arrived
+
+      reply.resolve()
+      await answered.promise
+
+      expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(true)
+      expect(group.offsetManager.resolvedOffsetAt(TOPIC, 0)).toBeUndefined()
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '8' }])
+      accepted.release()
+      expect(await seeking).toBe('8')
+      await disconnect()
+      expect(scenario.commits()).toEqual(['0', '8'])
+      expect(scenario.committed[0]).toBe('8')
+      expect(scenario.deliveries).toEqual([BEFORE])
       expect(scenario.errors).toEqual([])
     })
   })
