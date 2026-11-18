@@ -1,6 +1,15 @@
 const { inspect } = require('util')
 const Cluster = require('../index')
 const { createErrorFromCode } = require('../../protocol/error')
+const {
+  KafkaJSBrokerNotFound,
+  KafkaJSConnectionClosedError,
+  KafkaJSConnectionError,
+  KafkaJSNonRetriableError,
+  KafkaJSRequestTimeoutError,
+  KafkaJSSASLAuthenticationError,
+} = require('../../errors')
+const { protocol: metadataProtocol } = require('../../protocol/requests/metadata')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { newLogger, connectionOpts } = require('testHelpers')
@@ -288,7 +297,10 @@ describe('producer metadata idle expiry', () => {
       expect(broker.metadata).toHaveBeenCalledTimes(2)
       await cluster.addTargetTopic('valid')
       expect(cluster.targetTopicState.get('valid').incarnation).toBeGreaterThan(incarnation)
-      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], { guard: expect.any(Function) })
+      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], {
+        guard: expect.any(Function),
+        retainTopicErrors: true,
+      })
       expect(cluster.topicId('valid')).toBe(ID_A)
     })
 
@@ -318,6 +330,137 @@ describe('producer metadata idle expiry', () => {
       })
       expect([...cluster.targetTopics]).toEqual(['valid'])
       expect(cluster.targetTopicState).toBeNull()
+    })
+  })
+
+  describe('a deleted target topic', () => {
+    /**
+     * @param {object} [options] cluster overrides
+     * @returns {object} a producer cluster whose broker parses each answer as Metadata v13 does:
+     *   a name in `deleted` answers code 3, a name in `creating` once answers code 5 with no
+     *   partitions, as a topic being auto-created does
+     */
+    const deleting = (options) => {
+      const built = build(options)
+      const deleted = new Set()
+      const creating = new Set()
+      built.broker.metadata.mockImplementation(async (topics, requestOptions = {}) => {
+        const data = answer(topics)
+        data.errorCode = 0
+        data.topicMetadata = data.topicMetadata.map((entry) => {
+          if (deleted.has(entry.topic)) {
+            return { topic: entry.topic, topicErrorCode: 3, partitionMetadata: [] }
+          }
+          if (creating.delete(entry.topic)) {
+            return { topic: entry.topic, topicErrorCode: 5, partitionMetadata: [] }
+          }
+          return {
+            ...entry,
+            topicErrorCode: 0,
+            partitionMetadata: entry.partitionMetadata.map((partition) => ({
+              ...partition,
+              partitionErrorCode: 0,
+            })),
+          }
+        })
+        return metadataProtocol({ version: 13 })({ topics, ...requestOptions }).response.parse(data)
+      })
+      return { ...built, deleted, creating }
+    }
+
+    test('adding another topic drops the deleted one and succeeds with one request', async () => {
+      const { cluster, broker, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+
+      await cluster.addTargetTopic('rotating-1')
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect([...cluster.targetTopicState.keys()]).toEqual(['rotating-1'])
+      expect(cluster.topicId('rotating-0')).toBeUndefined()
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toEqual([])
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+      expect(broker.metadata.mock.calls.map(([topics]) => [...topics].sort())).toEqual([
+        ['rotating-0'],
+        ['rotating-0', 'rotating-1'],
+      ])
+    })
+
+    test('adding the deleted topic again fails with its own error and keeps the other target', async () => {
+      const { cluster, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+      await cluster.addTargetTopic('rotating-1')
+
+      await expect(cluster.addTargetTopic('rotating-0')).rejects.toMatchObject({
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+      })
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.topicId('rotating-1')).toBe(ID_A)
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+    })
+
+    test('the dropped topic does not fail a retry of the same refresh', async () => {
+      const { cluster, broker, deleted, creating } = deleting({ retry: RETRY })
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+      creating.add('rotating-1')
+
+      const adding = cluster.addTargetTopic('rotating-1')
+      await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime * 2)
+      await adding
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-1')[0]).toMatchObject({ leader: 0 })
+      expect(broker.metadata).toHaveBeenCalledTimes(3)
+    })
+
+    test('a held target refused while another topic is added keeps its routing until released', async () => {
+      const { cluster, broker, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      cluster.holdTopic('rotating-0')
+      deleted.add('rotating-0')
+
+      await cluster.addTargetTopic('rotating-1')
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-0', 'rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toHaveLength(1)
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+      cluster.releaseTopic('rotating-0')
+      await cluster.refreshMetadata()
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toEqual([])
+      expect(broker.metadata.mock.calls.map(([topics]) => [...topics].sort())).toEqual([
+        ['rotating-0'],
+        ['rotating-0', 'rotating-1'],
+        ['rotating-0', 'rotating-1'],
+      ])
+    })
+
+    test('a held target remembers its refusal until it is answered healthy or released', async () => {
+      const { cluster, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      cluster.holdTopic('rotating-0')
+      deleted.add('rotating-0')
+      await cluster.addTargetTopic('rotating-1')
+
+      expect(cluster.topicRefusal('rotating-0')).toMatchObject({
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+      })
+      expect(cluster.topicRefusal('rotating-0')).not.toBe(cluster.topicRefusal('rotating-0'))
+      expect(cluster.topicRefusal('rotating-1')).toBeNull()
+
+      deleted.delete('rotating-0')
+      await cluster.refreshMetadata()
+      expect(cluster.topicRefusal('rotating-0')).toBeNull()
+
+      deleted.add('rotating-0')
+      await cluster.refreshMetadata()
+      expect(cluster.topicRefusal('rotating-0')).toMatchObject({ code: 3 })
+      cluster.releaseTopic('rotating-0')
+      expect(cluster.topicRefusal('rotating-0')).toBeNull()
+      expect(cluster.brokerPool.topicRefusals.size).toBe(0)
     })
   })
 
@@ -511,47 +654,73 @@ describe('producer metadata idle expiry over the wire', () => {
 
   /**
    * @param {{ name: string }[]|null} requested the topics a Metadata request names
-   * @param {{ ids: Map<string, string>, missing: Set<string>, leaderless: Set<string> }} controls
-   * @returns {object} the answer: unknown topics code 3, leaderless ones code 5
+   * @param {{ ids: Map<string, string>, missing: Set<string>, leaderless: Set<string>,
+   *   refused?: Map<string, number>, node?: number, nodes?: number[],
+   *   partitions?: Map<string, number[]> }} controls
+   * @returns {object} the answer: unknown topics code 3, refused ones their own code, leaderless
+   *   ones code 5; `nodes` (by default only `node`) are the brokers listed and `node` leads every
+   *   partition, partition 0 alone unless `partitions` lists a topic's
    */
-  const metadataFor = (requested, { ids, missing, leaderless }) => ({
-    brokers: [{ nodeId: 0, host: 'node0', port: 9092, rack: null }],
-    controllerId: 0,
+  const metadataFor = (
+    requested,
+    {
+      ids,
+      missing,
+      leaderless,
+      refused = new Map(),
+      node = 0,
+      nodes = [node],
+      partitions = new Map(),
+    }
+  ) => ({
+    brokers: nodes.map((id) => ({ nodeId: id, host: `node${id}`, port: 9092, rack: null })),
+    controllerId: node,
     topics: (requested ?? []).map(({ name }) => {
       if (!ids.has(name))
         ids.set(name, `00000000-0000-4000-8000-${String(ids.size + 1).padStart(12, '0')}`)
+      const errorCode = missing.has(name) ? 3 : (refused.get(name) ?? 0)
       return {
-        errorCode: missing.has(name) ? 3 : 0,
+        errorCode,
         name,
         topicId: ids.get(name),
         isInternal: false,
         topicAuthorizedOperations: -2147483648,
-        partitions: missing.has(name)
+        partitions: errorCode
           ? []
-          : [
-              {
-                errorCode: leaderless.has(name) ? 5 : 0,
-                partitionIndex: 0,
-                leaderId: leaderless.has(name) ? -1 : 0,
-                leaderEpoch: 5,
-                replicas: [0],
-                isr: [0],
-                offlineReplicas: [],
-              },
-            ],
+          : (partitions.get(name) ?? [0]).map((partitionIndex) => ({
+              errorCode: leaderless.has(name) ? 5 : 0,
+              partitionIndex,
+              leaderId: leaderless.has(name) ? -1 : node,
+              leaderEpoch: 5,
+              replicas: [node],
+              isr: [node],
+              offlineReplicas: [],
+            })),
       }
     }),
   })
 
   /**
-   * @param {{ producer?: object, cluster?: object }} [options] overrides for each
+   * @param {{ producer?: object, cluster?: object, profile?: string }} [options] overrides for
+   *   each, and the scripted cluster's profile
    * @returns {object} a real cluster and producer over the scripted wire, and the wire's controls
    */
-  const start = ({ producer: producerOptions = {}, cluster: clusterOptions = {} } = {}) => {
+  const start = ({
+    producer: producerOptions = {},
+    cluster: clusterOptions = {},
+    profile = 'default',
+  } = {}) => {
     const schedule = new Schedule()
-    const state = { ids: new Map(), missing: new Set(), leaderless: new Set() }
+    const state = { ids: new Map(), missing: new Set(), leaderless: new Set(), refused: new Map() }
     const scripted = producerScript(
-      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], schedule })
+      createScriptedCluster({
+        nodes: [
+          { id: 0, host: 'node0', port: 9092 },
+          { id: 1, host: 'node1', port: 9092 },
+        ],
+        schedule,
+        profile,
+      })
     ).answer('Metadata', ({ topics }) => metadataFor(topics, state))
     const cluster = new Cluster({
       logger: newLogger(),
@@ -621,7 +790,10 @@ describe('producer metadata idle expiry over the wire', () => {
    */
   const produceOf = (topic) => ({
     api: 'Produce',
-    match: ({ fields }) => fields.topics.some(({ topicId }) => topicId === w.state.ids.get(topic)),
+    match: ({ fields }) =>
+      fields.topics.some(
+        (entry) => entry.topic === topic || entry.topicId === w.state.ids.get(topic)
+      ),
   })
 
   beforeEach(() => {
@@ -878,6 +1050,766 @@ describe('producer metadata idle expiry over the wire', () => {
       expect(producedAfter(before.requests)).toContain(newId)
       expect(producedAfter(before.requests)).not.toContain(oldId)
     })
+  })
+
+  test.each([false, true])(
+    'with auto creation %s, a deleted target fails only its own sends and a send to a new topic succeeds at once',
+    async (allowAutoTopicCreation) => {
+      w = start({ cluster: { allowAutoTopicCreation }, producer: { deliveryTimeout: 3000 } })
+      await w.producer.connect()
+      expect(await settle(send('rotating-0'))).toMatchObject({ state: 'fulfilled' })
+      w.state.missing.add('rotating-0')
+      const before = metadataRequests().length
+      const started = Date.now()
+
+      expect(await settle(send('rotating-1'))).toMatchObject({ state: 'fulfilled' })
+      expect(Date.now() - started).toBeLessThan(100)
+      expect(metadataRequests().slice(before)).toEqual([['rotating-0', 'rotating-1']])
+      expect([...w.cluster.targetTopics]).toEqual(['rotating-1'])
+
+      const refused = await settle(send('rotating-0'))
+      expect(refused.state).toBe('rejected')
+      expect(refused.value).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      expect([...w.cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(await settle(send('rotating-1'))).toMatchObject({ state: 'fulfilled' })
+    }
+  )
+
+  describe('a target refused while sends still own it', () => {
+    /**
+     * @param {{ topic?: string, topicId?: string }} entry a Produce topic entry, by name or by id
+     * @param {string} topic
+     * @returns {boolean} whether the entry is the topic's
+     */
+    const isTopic = (entry, topic) =>
+      entry.topic === topic || entry.topicId === w.state.ids.get(topic)
+
+    /**
+     * @param {{ topics: object[] }} fields a Produce request's fields
+     * @param {(entry: object) => number} codeOf the error code each topic's partitions answer
+     * @returns {object} the Produce answer
+     */
+    const produceAnswer = ({ topics }, codeOf) => ({
+      responses: topics.map(({ partitions, ...key }) => ({
+        ...key,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          errorCode: codeOf(key),
+          baseOffset: codeOf(key) ? '-1' : '0',
+          logAppendTime: '-1',
+          logStartOffset: codeOf(key) ? '-1' : '0',
+          leader: null,
+        })),
+      })),
+      nodeEndpoints: [],
+    })
+
+    /**
+     * Answers the next Metadata request that names `trigger` with `topic` refused with `code`.
+     * @param {string} topic
+     * @param {number} code
+     * @param {string} trigger
+     * @returns {void}
+     */
+    const refuseOnce = (topic, code, trigger) =>
+      w.schedule.once(
+        {
+          api: 'Metadata',
+          match: ({ fields }) => fields.topics?.some(({ name }) => name === trigger),
+        },
+        ({ fields }) =>
+          metadataFor(fields.topics, { ...w.state, refused: new Map([[topic, code]]) })
+      )
+
+    /**
+     * @param {string} topic
+     * @param {number} from requests already written
+     * @returns {number[]} the base sequence of every batch of `topic` a later Produce carried
+     */
+    const sequencesOf = (topic, from) =>
+      w.scripted
+        .requests()
+        .slice(from)
+        .filter(({ api }) => api === 'Produce')
+        .flatMap(({ fields }) => fields.topics.filter((entry) => isTopic(entry, topic)))
+        .flatMap(({ partitions }) => partitions.flatMap(({ batches }) => batches))
+        .map(({ baseSequence }) => baseSequence)
+
+    /**
+     * Starts a producer whose first send to 'a' succeeded and whose next one is held in flight
+     * with a third partitioned and queued behind it.
+     * @param {object} [options] as `start`; a `tv1`/`tv2` profile makes it transactional
+     * @returns {Promise<object>} the sender, the held gate, both sends and the request count
+     *   before them
+     */
+    const owning = async (options = {}) => {
+      const transactional = options.profile === 'tv1' || options.profile === 'tv2'
+      w = start({
+        ...options,
+        producer: transactional
+          ? { transactionalId: 'owned', idempotent: true }
+          : (options.producer ?? {}),
+      })
+      w.scripted.answer('InitProducerId', ({ producerEpoch = -1 }) => ({
+        producerId: '1000',
+        producerEpoch: Math.max(0, producerEpoch + 1),
+      }))
+      await w.producer.connect()
+      const sender = transactional ? await w.producer.transaction() : w.producer
+      const sendTo = (topic, value) => sender.send({ topic, messages: [{ value }] })
+      expect(await settle(sendTo('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const from = w.scripted.requests().length
+      const blocked = w.schedule.hold(produceOf('a'))
+      const inFlight = watch(sendTo('a', 'second'))
+      await until(() => blocked.call !== null)
+      const queued = watch(sendTo('a', 'third'))
+      await until(() => w.cluster.topicPins.get('a') === 2)
+      await flushAll()
+      return { sender, sendTo, blocked, inFlight, queued, from }
+    }
+
+    test.each(['default', 'tv1', 'tv2'])(
+      'under %s, an owned target refused once while another topic is added keeps its routing and its sends succeed in order',
+      async (profile) => {
+        const { sender, sendTo, blocked, inFlight, queued, from } = await owning({ profile })
+        try {
+          refuseOnce('a', 3, 'b')
+          expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+          expect(w.cluster.findTopicPartitionMetadata('a')).toHaveLength(1)
+
+          blocked.release(produceAnswer(blocked.call.fields, () => 6))
+          await until(() => inFlight.state !== 'pending' && queued.state !== 'pending')
+          expect([inFlight.state, queued.state]).toEqual(['fulfilled', 'fulfilled'])
+          expect(sequencesOf('a', from)).toEqual([1, 1, 2])
+          if (profile !== 'default') {
+            expect(await settle(sender.commit())).toMatchObject({ state: 'fulfilled' })
+          }
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+        } finally {
+          if (blocked.settle) blocked.release()
+        }
+      }
+    )
+
+    test('a queued retry of an owned target refused once is sent when its backoff ends', async () => {
+      const backoff = { retries: 10, initialRetryTime: 3000, maxRetryTime: 3000, factor: 0 }
+      w = start({ producer: { retry: backoff } })
+      await w.producer.connect()
+      expect(await settle(send('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const from = w.scripted.requests().length
+      w.schedule.once(produceOf('a'), ({ fields }) => produceAnswer(fields, () => 7))
+      const queued = watch(send('a', 'second'))
+      await until(() =>
+        w.scripted
+          .requests()
+          .slice(from)
+          .some(({ api, answeredOrder }) => api === 'Produce' && answeredOrder !== undefined)
+      )
+
+      refuseOnce('a', 3, 'b')
+      expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+      expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+      expect(queued.state).toBe('pending')
+
+      await jest.advanceTimersByTimeAsync(3000)
+      await until(() => queued.state !== 'pending')
+      expect(queued.state).toBe('fulfilled')
+      expect(sequencesOf('a', from)).toEqual([1, 1])
+      await until(() => w.cluster.topicPins.size === 0)
+      expect(w.admission.reserved).toBe(0)
+    })
+
+    test('an owned target refused as unauthorized fails its own sends with that error while another topic succeeds', async () => {
+      const { sendTo, blocked, inFlight, queued } = await owning()
+      try {
+        w.state.refused.set('a', 29)
+        w.scripted.answer('Produce', (fields) =>
+          produceAnswer(fields, (entry) => (isTopic(entry, 'a') ? 29 : 0))
+        )
+        expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+        blocked.release(produceAnswer(blocked.call.fields, () => 6))
+        await until(() => inFlight.state !== 'pending' && queued.state !== 'pending')
+        for (const sent of [inFlight, queued]) {
+          expect(sent.state).toBe('rejected')
+          expect(sent.value).toMatchObject({ type: 'TOPIC_AUTHORIZATION_FAILED' })
+        }
+        await until(() => w.cluster.topicPins.size === 0)
+        expect(w.admission.reserved).toBe(0)
+
+        expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics]).toEqual(['b'])
+        expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+      } finally {
+        if (blocked.settle) blocked.release()
+      }
+    })
+
+    /**
+     * @param {Error} error
+     * @returns {string[]} the protocol type, or else the name, of the error and of each cause
+     */
+    const chainOf = (error) => {
+      const chain = []
+      for (let at = error; at; at = at.cause) {
+        chain.push(at.name === 'KafkaJSProtocolError' ? at.type : at.name)
+      }
+      return chain
+    }
+
+    /**
+     * Advances fake time in 100 ms steps until no send is pending.
+     * @param {{ state: string }[]} sends watched sends
+     * @param {number} [steps=150] the most steps; the default stays within the 20 s delivery timeout
+     * @returns {Promise<void>}
+     */
+    const untilSettled = async (sends, steps = 150) => {
+      for (let i = 0; i < steps && sends.some(({ state }) => state === 'pending'); i += 1) {
+        await jest.advanceTimersByTimeAsync(100)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      expect(sends.map(({ state }) => state)).not.toContain('pending')
+    }
+
+    test.each([
+      ['unauthorized', 29, ['TOPIC_AUTHORIZATION_FAILED']],
+      ['unknown', 3, ['KafkaJSNumberOfRetriesExceeded', 'UNKNOWN_TOPIC_OR_PARTITION']],
+    ])(
+      'an owned target refused as %s whose old leader left the cluster fails its own sends with that error while another topic succeeds',
+      async (_, code, chain) => {
+        const { sendTo, blocked, inFlight, queued } = await owning()
+        try {
+          w.state.refused.set('a', code)
+          w.state.node = 1
+          expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+          expect(w.cluster.brokerPool.getNodeIds()).toEqual(['1'])
+
+          const released = Date.now()
+          blocked.release(produceAnswer(blocked.call.fields, () => 6))
+          await untilSettled([inFlight, queued])
+          expect(Date.now() - released).toBeLessThan(20000)
+          for (const sent of [inFlight, queued]) {
+            expect(sent.state).toBe('rejected')
+            expect(chainOf(sent.value)).toEqual(chain)
+          }
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+          expect(w.cluster.topicRefusal('a')).toBeNull()
+          expect(w.cluster.brokerPool.topicRefusals.size).toBe(0)
+
+          expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics]).toEqual(['b'])
+          expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+        } finally {
+          if (blocked.settle) blocked.release()
+        }
+      }
+    )
+
+    test('without idempotence, an owned target refused as unauthorized whose old leader left the cluster fails with that error', async () => {
+      w = start({ producer: { idempotent: false } })
+      await w.producer.connect()
+      expect(await settle(send('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const blocked = w.schedule.hold(produceOf('a'))
+      const held = watch(send('a', 'second'))
+      try {
+        await until(() => blocked.call !== null)
+        w.state.refused.set('a', 29)
+        w.state.node = 1
+        expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+        blocked.release(produceAnswer(blocked.call.fields, () => 6))
+        await untilSettled([held])
+        expect(held.state).toBe('rejected')
+        expect(chainOf(held.value)).toEqual(['TOPIC_AUTHORIZATION_FAILED'])
+        await until(() => w.cluster.topicPins.size === 0)
+        expect(w.cluster.topicRefusal('a')).toBeNull()
+      } finally {
+        if (blocked.settle) blocked.release()
+      }
+    })
+
+    /**
+     * Starts a producer whose first send to 'a' succeeded and whose next send to it is held in
+     * flight; with idempotence a third is queued behind it.
+     * @param {{ idempotent: boolean, key?: string, partitions?: number[], linger?: number }}
+     *   options the records' key, the partitions 'a' has and the producer's linger
+     * @returns {Promise<object>} the sender, the held gate and the owned sends
+     */
+    const holding = async ({ idempotent, key, partitions, linger }) => {
+      w = start({
+        producer: { ...(!idempotent && { idempotent: false }), ...(linger && { linger }) },
+      })
+      if (partitions) w.state.partitions = new Map([['a', partitions]])
+      await w.producer.connect()
+      const sendTo = (topic, value) => w.producer.send({ topic, messages: [{ key, value }] })
+      expect(await settle(sendTo('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const blocked = w.schedule.hold(produceOf('a'))
+      const sends = [watch(sendTo('a', 'second'))]
+      await until(() => blocked.call !== null)
+      if (idempotent) {
+        sends.push(watch(sendTo('a', 'third')))
+        await until(() => w.cluster.topicPins.get('a') === 2)
+        await flushAll()
+      }
+      return { sendTo, blocked, sends }
+    }
+
+    /**
+     * Expects the owned sends rejected with the chain, then every pin, reservation and refusal
+     * gone, and another topic still served.
+     * @param {object} owned as `holding` returns it
+     * @param {string[]} chain the expected cause chain of each rejection
+     * @returns {Promise<void>}
+     */
+    const expectRefused = async ({ sendTo, sends }, chain) => {
+      for (const sent of sends) {
+        expect(sent.state).toBe('rejected')
+        expect(chainOf(sent.value)).toEqual(chain)
+      }
+      await until(() => w.cluster.topicPins.size === 0)
+      expect(w.admission.reserved).toBe(0)
+      expect(w.cluster.brokerPool.topicRefusals.size).toBe(0)
+      expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+    }
+
+    const UNAUTHORIZED = ['TOPIC_AUTHORIZATION_FAILED']
+    const UNKNOWN = ['KafkaJSNumberOfRetriesExceeded', 'UNKNOWN_TOPIC_OR_PARTITION']
+    const REFUSALS = [
+      [true, 29, UNAUTHORIZED],
+      [true, 3, UNKNOWN],
+      [false, 29, UNAUTHORIZED],
+      [false, 3, UNKNOWN],
+    ]
+
+    test.each(REFUSALS)(
+      'with idempotence %s, an owned target refused with code %d whose advertised leader cannot be reached fails its own sends with that error while another topic succeeds',
+      async (idempotent, code, chain) => {
+        const owned = await holding({ idempotent })
+        try {
+          w.state.refused.set('a', code)
+          w.state.nodes = [0, 1]
+          w.state.node = 1
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+          expect(w.cluster.brokerPool.getNodeIds()).toEqual(['0', '1'])
+
+          w.scripted.down(0)
+          for (const socket of w.scripted.sockets()) {
+            if (socket.endpoint.host === 'node0' && !socket.destroyed)
+              socket.destroy(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))
+          }
+          const released = Date.now()
+          owned.blocked.release()
+          await untilSettled(owned.sends, 250)
+          if (code === 29) expect(Date.now() - released).toBeLessThan(1000)
+          else expect(Date.now() - released).toBeLessThan(20000)
+          await expectRefused(owned, chain)
+        } finally {
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    test.each(REFUSALS)(
+      'with idempotence %s, an owned target refused with code %d after it lost the partition of its sends fails them with that error while other topics succeed',
+      async (idempotent, code, chain) => {
+        const owned = await holding({ idempotent, key: 'key', partitions: [0, 1] })
+        try {
+          const written = owned.blocked.call.fields.topics.flatMap(({ partitions }) =>
+            partitions.map(({ partition }) => partition)
+          )
+          expect(written).toEqual([1])
+
+          const recreated = '00000000-0000-4000-8000-0000000000aa'
+          w.state.ids.set('a', recreated)
+          w.state.partitions.set('a', [0])
+          w.state.nodes = [0, 1]
+          w.state.node = 1
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.findTopicPartitionMetadata('a').map((p) => p.partitionId)).toEqual([0])
+          expect(w.cluster.topicId('a')).toBe(recreated)
+
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('c', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          if (code === 29) expect(Date.now() - released).toBeLessThanOrEqual(500)
+          await expectRefused(owned, chain)
+        } finally {
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    /**
+     * Makes every broker lookup of the cluster reject with `error`.
+     * @param {Error} error
+     * @returns {void}
+     */
+    const lookupsFail = (error) => {
+      jest.spyOn(w.cluster, 'findBroker').mockRejectedValue(error)
+    }
+
+    /**
+     * Makes every Produce request of the cluster end with `produce` in place of the broker's.
+     * @param {(request: object) => Promise<unknown>} produce
+     * @returns {void}
+     */
+    const producesEnd = (produce) => {
+      const findBroker = w.cluster.findBroker.bind(w.cluster)
+      jest
+        .spyOn(w.cluster, 'findBroker')
+        .mockImplementation(async (args) =>
+          Object.create(await findBroker(args), { produce: { value: produce } })
+        )
+    }
+
+    /**
+     * Makes every leader lookup of 'a' end with `lookup`.
+     * @param {() => object} lookup returns the leaders or throws
+     * @returns {void}
+     */
+    const leadersOfA = (lookup) => {
+      const find = w.cluster.findLeaderForPartitions.bind(w.cluster)
+      jest
+        .spyOn(w.cluster, 'findLeaderForPartitions')
+        .mockImplementation((topic, partitions) =>
+          topic === 'a' ? lookup() : find(topic, partitions)
+        )
+    }
+
+    /** @param {Error} error @returns {(request: object) => Promise<never>} a written request failing */
+    const writtenThen = (error) => async (request) => {
+      request.guard?.(1)
+      throw error
+    }
+
+    const ROUTING_FAILURES = [
+      [
+        'its leader is missing from the broker inventory',
+        () => lookupsFail(new KafkaJSBrokerNotFound('Broker 0 not found in the cached metadata')),
+      ],
+      [
+        'its leader cannot be connected to',
+        () =>
+          lookupsFail(
+            new KafkaJSConnectionError('Connection error: connect ECONNREFUSED', {
+              broker: 'node0:9092',
+              code: 'ECONNREFUSED',
+            })
+          ),
+      ],
+      [
+        'its written request timed out',
+        () => producesEnd(writtenThen(new KafkaJSRequestTimeoutError('Request Produce timed out'))),
+      ],
+      [
+        'the connection of its written request closed',
+        () =>
+          producesEnd(
+            writtenThen(
+              new KafkaJSConnectionClosedError('Connection closed', { host: 'node0', port: 9092 })
+            )
+          ),
+      ],
+      ['the answer to its request has no result for it', () => producesEnd(async () => [])],
+      ['its partition has no leader mapping', () => leadersOfA(() => ({}))],
+      [
+        'its partition leader is unavailable',
+        () =>
+          leadersOfA(() => {
+            throw createErrorFromCode(5)
+          }),
+      ],
+    ].flatMap(([failure, inject]) => [
+      [true, failure, inject],
+      [false, failure, inject],
+    ])
+
+    test.each(ROUTING_FAILURES)(
+      'with idempotence %s, an owned target refused as unauthorized fails its own sends with that error at once when %s',
+      async (idempotent, _, inject) => {
+        const owned = await holding({ idempotent })
+        try {
+          w.state.refused.set('a', 29)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code: 29 })
+
+          inject()
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          expect(Date.now() - released).toBeLessThanOrEqual(500)
+          jest.restoreAllMocks()
+          await expectRefused(owned, UNAUTHORIZED)
+        } finally {
+          jest.restoreAllMocks()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    /** @returns {KafkaJSConnectionError} a connection the peer reset */
+    const reset = () =>
+      new KafkaJSConnectionError('Connection error: read ECONNRESET', {
+        broker: 'node0:9092',
+        code: 'ECONNRESET',
+      })
+
+    /**
+     * Makes the next metadata refresh necessary and every Metadata request end its socket with a
+     * reset, as when `metadataMaxAge` passes while the cluster cannot be reached.
+     * @returns {void}
+     */
+    const metadataUnreachable = () => {
+      w.cluster.brokerPool.metadataExpireAt = -1
+      w.scripted.answer('Metadata', async () => {
+        throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+      })
+    }
+
+    /** @returns {void} Metadata answered again from the wire state */
+    const metadataReachable = () =>
+      w.scripted.answer('Metadata', ({ topics }) => metadataFor(topics, w.state))
+
+    test.each([
+      [29, UNAUTHORIZED],
+      [3, UNKNOWN],
+    ])(
+      'without idempotence, an owned target refused with code %d fails its own sends with that error when its required metadata refresh cannot reach the cluster',
+      async (code, chain) => {
+        const owned = await holding({ idempotent: false })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          metadataUnreachable()
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          if (code === 29) expect(Date.now() - released).toBeLessThanOrEqual(500)
+          else expect(Date.now() - released).toBeLessThan(20000)
+          metadataReachable()
+          await expectRefused(owned, chain)
+        } finally {
+          metadataReachable()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    test.each([
+      [29, UNAUTHORIZED],
+      [3, UNKNOWN],
+    ])(
+      'without idempotence, a send to an owned target refused with code %d and one to another topic in the same call each end with their own error when the required metadata refresh cannot reach the cluster',
+      async (code, chain) => {
+        const owned = await holding({ idempotent: false, linger: 50 })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          const refused = watch(owned.sendTo('a', 'mixed'))
+          const other = watch(owned.sendTo('b', 'mixed'))
+          await flushAll()
+          expect(w.admission.reserved).toBeGreaterThan(0)
+          metadataUnreachable()
+          const refreshes = jest.spyOn(w.cluster, 'refreshMetadataIfNecessary')
+          await untilSettled([refused, other, ...owned.sends])
+          expect(refreshes.mock.calls.length).toBeGreaterThan(0)
+          for (const sent of [refused, ...owned.sends]) {
+            expect(sent.state).toBe('rejected')
+            expect(chainOf(sent.value)).toEqual(chain)
+          }
+          expect(other.state).toBe('rejected')
+          expect(chainOf(other.value)).toEqual([
+            'KafkaJSNumberOfRetriesExceeded',
+            'KafkaJSConnectionError',
+          ])
+          jest.restoreAllMocks()
+          metadataReachable()
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+          expect(await settle(owned.sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+        } finally {
+          jest.restoreAllMocks()
+          metadataReachable()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    const AWAITED_STEPS = [
+      [
+        'adding its topic to the producer targets',
+        () => jest.spyOn(w.cluster, 'addMultipleTargetTopics').mockRejectedValue(reset()),
+      ],
+      [
+        'the required metadata refresh',
+        () => jest.spyOn(w.cluster, 'refreshMetadataIfNecessary').mockRejectedValue(reset()),
+      ],
+      [
+        'a metadata refresh',
+        () => jest.spyOn(w.cluster, 'refreshMetadata').mockRejectedValue(reset()),
+      ],
+      ['its broker lookup', () => lookupsFail(reset())],
+      [
+        'its request',
+        () =>
+          producesEnd(async () => {
+            throw reset()
+          }),
+      ],
+    ].flatMap(([step, inject]) =>
+      [true, false].flatMap((idempotent) =>
+        REFUSALS.filter(([mode]) => mode === idempotent).map(([, code, chain]) => [
+          idempotent,
+          code,
+          step,
+          inject,
+          chain,
+        ])
+      )
+    )
+
+    test.each(AWAITED_STEPS)(
+      'with idempotence %s, an owned target refused with code %d fails its own sends with that error when %s fails, and another topic is served after',
+      async (idempotent, code, _, inject, chain) => {
+        const owned = await holding({ idempotent })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+          w.scripted.answer('Produce', (fields) =>
+            produceAnswer(fields, (entry) => (isTopic(entry, 'a') ? code : 0))
+          )
+
+          inject()
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          if (code === 29) expect(Date.now() - released).toBeLessThanOrEqual(500)
+          else expect(Date.now() - released).toBeLessThan(20000)
+          jest.restoreAllMocks()
+          await expectRefused(owned, chain)
+        } finally {
+          jest.restoreAllMocks()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    const CREDENTIAL_REJECTIONS = [
+      [
+        'a SASL authentication error',
+        () =>
+          new KafkaJSSASLAuthenticationError('SASL authentication failed', {
+            cause: createErrorFromCode(58),
+          }),
+        ['KafkaJSSASLAuthenticationError', 'SASL_AUTHENTICATION_FAILED'],
+      ],
+      [
+        'a wrapped SASL authentication error',
+        () =>
+          new KafkaJSNonRetriableError('Broker lookup failed', {
+            cause: new KafkaJSSASLAuthenticationError('SASL authentication failed'),
+          }),
+        ['KafkaJSNonRetriableError', 'KafkaJSSASLAuthenticationError'],
+      ],
+      [
+        'a SASL_AUTHENTICATION_FAILED answer',
+        () => createErrorFromCode(58),
+        ['SASL_AUTHENTICATION_FAILED'],
+      ],
+    ].flatMap(([rejection, create, chain]) =>
+      REFUSALS.map(([idempotent, code]) => [idempotent, code, rejection, create, chain])
+    )
+
+    test.each(CREDENTIAL_REJECTIONS)(
+      'with idempotence %s, an owned target refused with code %d fails its own sends at once with %s its broker lookup rejects with',
+      async (idempotent, code, _, create, chain) => {
+        const owned = await holding({ idempotent })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          const lookups = jest.spyOn(w.cluster, 'findBroker').mockImplementation(async () => {
+            throw create()
+          })
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          expect(Date.now() - released).toBeLessThanOrEqual(500)
+          expect(lookups.mock.calls.length).toBeLessThanOrEqual(owned.sends.length)
+          for (const sent of owned.sends) {
+            expect(sent.state).toBe('rejected')
+            expect(sent.value.retriable).toBe(false)
+            expect(chainOf(sent.value)).toEqual(chain)
+          }
+          jest.restoreAllMocks()
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+          expect(await settle(owned.sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+        } finally {
+          jest.restoreAllMocks()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    test.each([
+      [29, 'a before b', UNAUTHORIZED, ['a', 'b']],
+      [29, 'b before a', UNAUTHORIZED, ['b', 'a']],
+      [3, 'a before b', UNKNOWN, ['a', 'b']],
+      [3, 'b before a', UNKNOWN, ['b', 'a']],
+    ])(
+      'without idempotence, an owned target refused with code %d and another topic in one request that answers neither each end with their own error when %s',
+      async (code, _, chain, order) => {
+        const owned = await holding({ idempotent: false, linger: 50 })
+        let answering = false
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+          w.scripted.answer('Produce', (fields) =>
+            answering ? produceAnswer(fields, () => 0) : { responses: [], nodeEndpoints: [] }
+          )
+
+          const mixed = Object.fromEntries(
+            order.map((topic) => [topic, watch(owned.sendTo(topic, 'mixed'))])
+          )
+          await flushAll()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled([mixed.a, mixed.b, ...owned.sends])
+          const requested = w.scripted
+            .requests()
+            .filter(({ api }) => api === 'Produce')
+            .map(({ fields }) => ['a', 'b'].filter((t) => fields.topics.some((e) => isTopic(e, t))))
+          expect(requested).toContainEqual(['a', 'b'])
+
+          expect(mixed.b.state).toBe('rejected')
+          expect(chainOf(mixed.b.value)).toEqual(['KafkaJSNumberOfRetriesExceeded', 'KafkaJSError'])
+          expect(mixed.b.value.cause.message).toBe('No result for b partition 0')
+          answering = true
+          await expectRefused({ sendTo: owned.sendTo, sends: [mixed.a, ...owned.sends] }, chain)
+        } finally {
+          answering = true
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
   })
 
   test('sends to ten thousand distinct topics leave bounded bookkeeping', async () => {

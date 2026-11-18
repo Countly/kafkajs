@@ -183,3 +183,58 @@ describe('Protocol > Requests > Metadata > a request that allows leaderless part
     })
   })
 })
+
+describe('Protocol > Requests > Metadata > a request that retains topic errors', () => {
+  const UNKNOWN_TOPIC_OR_PARTITION = 3
+  const retaining = (version, topics, options = {}) =>
+    protocol({ version })({ topics, retainTopicErrors: true, ...options }).response.parse
+
+  /** `leaderless(version)` plus a topic the broker no longer has. */
+  const withDeleted = (version) => {
+    const data = leaderless(version)
+    data.topicMetadata.push({
+      topicErrorCode: UNKNOWN_TOPIC_OR_PARTITION,
+      topic: 'deleted',
+      partitionMetadata: [],
+    })
+    return data
+  }
+
+  test.each(versions)('at v%s, keeps a topic answered with its own error', async (version) => {
+    const data = withDeleted(version)
+    data.topicMetadata[0].partitionMetadata[0] = {
+      partitionErrorCode: 0,
+      partitionId: 0,
+      leader: 0,
+    }
+
+    await expect(retaining(version, ['test-topic', 'deleted'])(data)).resolves.toBe(data)
+    expect(data.topicMetadata.map(({ topic, topicErrorCode }) => [topic, topicErrorCode])).toEqual([
+      ['test-topic', 0],
+      ['deleted', UNKNOWN_TOPIC_OR_PARTITION],
+    ])
+  })
+
+  test.each(versions)(
+    'at v%s, still throws a healthy topic partition error unless leaderless partitions are allowed',
+    async (version) => {
+      await expect(
+        retaining(version, ['test-topic', 'deleted'])(withDeleted(version))
+      ).rejects.toMatchObject({ type: 'LEADER_NOT_AVAILABLE' })
+
+      const data = withDeleted(version)
+      await expect(
+        retaining(version, ['test-topic', 'deleted'], { allowLeaderless: true })(data)
+      ).resolves.toBe(data)
+      expect(data.topicMetadata).toHaveLength(2)
+
+      if (Number(version) >= 13) {
+        const failed = withDeleted(version)
+        failed.errorCode = 129
+        await expect(retaining(version, ['test-topic', 'deleted'])(failed)).rejects.toMatchObject({
+          type: 'REBOOTSTRAP_REQUIRED',
+        })
+      }
+    }
+  )
+})
