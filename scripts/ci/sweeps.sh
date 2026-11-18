@@ -131,6 +131,8 @@ CHANGELOG.md:### \x50hase \x39F — Client telemetry
 CHANGELOG.md:### \x50hase \x39G — Kafka 4.4 support
 CHANGELOG.md:### \x50hase 10 — Release, CI and benchmarks
 scripts/benchmarks/__tests__/telemetry.spec.js:      milestone: '\x39E',
+scripts/benchmarks/__tests__/adapters.telemetry.spec.js:      milestone: '\x39E',
+scripts/benchmarks/adapters/telemetrySession.js:  milestone: '\x39E',
 scripts/benchmarks/telemetry.js:    assert.equal(accepted.milestone, '\x39E')
 scripts/benchmarks/telemetry.js: * Candidate arms share one snapshot. Previous requires a separately hashed accepted-\x39E receipt with
 scripts/benchmarks/telemetry.js: * {milestone:'\x39E',status:'accepted',tree,sourceSha256,tarballSha256} matching its frozen inputs.

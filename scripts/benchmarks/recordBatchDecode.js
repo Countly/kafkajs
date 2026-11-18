@@ -14,7 +14,13 @@
  * decompressCalls }.
  * `decompressCalls` is how many times the codec's `decompress` ran in 10 untimed decodes, counted by
  * wrapping it: 10 for a compressed arm, 0 for the uncompressed one.
+ *
+ * `--checksum [--arms uncompressed,gzip,snappy]` is not a measurement: it decodes each arm's
+ * response once, untimed, and prints `{ checksums: { <arm>: { available, records, sha256 } } }`,
+ * the SHA-256 over every decoded record's partition, offset, key and value, so trees can be
+ * compared on decoded content and not only on the record count.
  */
+const { createHash } = require('crypto')
 const { decode } = require('../../src/protocol/requests/fetch/v11/response')
 const Encoder = require('../../src/protocol/encoder')
 
@@ -111,6 +117,36 @@ const countRecords = (data) =>
   )
 
 /**
+ * @param {object} data a decoded fetch response
+ * @returns {{ records: number, sha256: string }} the record count and the SHA-256 over each
+ *   record's partition, offset, key and value, each length-prefixed (a null key or value is -1)
+ */
+const checksumOf = (data) => {
+  const hash = createHash('sha256')
+  let records = 0
+  /**
+   * Hashes one length-prefixed key or value; a null one is length -1.
+   * @param {Buffer|null|undefined} bytes
+   * @returns {void}
+   */
+  const field = (bytes) => {
+    hash.update(`${bytes === null || bytes === undefined ? -1 : bytes.length}:`)
+    if (bytes) hash.update(bytes)
+  }
+  for (const { partitions } of data.responses) {
+    for (const { partition, messages } of partitions) {
+      for (const { offset, key, value } of messages ?? []) {
+        records += 1
+        hash.update(`${partition}:${offset}:`)
+        field(key)
+        field(value)
+      }
+    }
+  }
+  return { records, sha256: hash.digest('hex') }
+}
+
+/**
  * Decodes the fixture `iterations` times (after an untimed warmup), split into equal rounds, and
  * reports the median round so a single scheduling hiccup does not set the result. Repetitions
  * increase operation count within each round while preserving nanoseconds per decode.
@@ -173,8 +209,33 @@ const countDecompressCalls = async (fixture, options, codec) => {
   return calls
 }
 
+/**
+ * @param {string[]} arms
+ * @returns {Promise<object>} each arm's decoded-content checksum, `{ available: 0 }` without codec
+ */
+const checksums = async (arms) => {
+  const out = {}
+  for (const arm of arms) {
+    const prepared = await prepare(arm)
+    out[arm] = prepared
+      ? {
+          available: 1,
+          ...checksumOf(
+            await decode(prepared.fixture, { checkCrcs: false, maxDecompressedBatchBytes: BOUND })
+          ),
+        }
+      : { available: 0 }
+  }
+  return { checksums: out }
+}
+
 if (require.main === module) {
   ;(async () => {
+    if (process.argv.includes('--checksum')) {
+      const arms = arg('arms', 'uncompressed,gzip,snappy').split(',')
+      console.log(JSON.stringify(await checksums(arms)))
+      return
+    }
     const prepared = await prepare(ARM)
 
     if (prepared === null) {
@@ -211,4 +272,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { run }
+module.exports = { run, checksumOf }
