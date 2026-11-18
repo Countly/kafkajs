@@ -14,13 +14,13 @@
  * Interface (the artifact directory is the runbook's `$out`):
  * - `config.json`, `header.json`, `supervisor.json`, `stream.ndjson` and the archived matrix as the
  *   driver writes them. The stream is read once, line by line, and never held.
- * - Ground truth taken inside the broker container by Apache's own tools, after the run and before
- *   finalize, in `dump/` (written by the driver's dump step): `log-<main|transactions>.txt`
- *   (`kafka-console-consumer.sh --partition 0 --offset earliest --isolation-level read_committed`,
- *   lines `Partition:<p>\tOffset:<o>\t<key>[\t<value>]`), `latest-<role>.txt` (`kafka-get-offsets.sh
- *   --time -1`, line `<topic>:<partition>:<offset>`) and `group-<group>.txt`
- *   (`kafka-consumer-groups.sh --describe --group <group>`). Each ends with a `#dump-trailer <json>`
- *   line (`exitCode`, `signal`, `lines`, `complete`, and `processed` for a log).
+ * - Ground truth taken inside the broker container by Apache's own tools, before finalize, in
+ *   `apache/`: `<main|transactions>.dump` from `kafka-console-consumer.sh --partition 0 --offset
+ *   earliest --isolation-level read_committed --timeout-ms 60000` with `print.partition`,
+ *   `print.offset` and `print.key` set through `--formatter-property` (line
+ *   `Partition:<p>\tOffset:<o>\t<key>\t<value>`); `groups/<group>.describe` from
+ *   `kafka-consumer-groups.sh --describe --group <group>`. Each has `<file>.stderr` and
+ *   `<file>.end` (`exit=<status> lines=<n>`, written after the command returned).
  * - A missing, truncated, unparseable or unbound ground-truth file makes the rows that need it
  *   INCONCLUSIVE, never PASS. The full interface is in the task's interface document.
  *
@@ -36,7 +36,6 @@ const path = require('node:path')
 const schema = require('../soak/finalSoakSchema')
 
 const REVIEWED_MATRIX = path.join(__dirname, '../soak/finalSoakMatrix.json')
-const TRAILER = '#dump-trailer '
 const ARCHIVED_MATRIX = 'archive/scripts/soak/finalSoakMatrix.json'
 const ROLES = ['main', 'transactions']
 const EXAMPLES = 3
@@ -350,73 +349,72 @@ function checkBound(manifest, file, got, problems) {
 }
 
 /**
- * Streams one dump file `dump/<name>.txt`: data lines go to `onLine`, and the last line must be the
- * dump step's `#dump-trailer <json>`. Every way the file can be unusable becomes a problem: it is
- * missing or not bound by the manifest, has no trailer (cut off), data after the trailer, a tool
- * that did not end cleanly, a step that calls itself incomplete, or a line count the trailer does
- * not confirm.
- * @param {object} ctx `{ dir, manifest }` @param {string} name the file stem
- * @param {string[]} problems receives every problem @param {(line: string, n: number) => void} onLine
- * @returns {Promise<{ trailer: object|null, lines: number }|null>} null when the file is missing
+ * Reads one small ground-truth file whole and checks it against the header manifest.
+ * @param {object} ctx `{ dir, manifest }` @param {string} name file below `apache/`
+ * @param {string[]} problems receives every problem @param {string} [missing] the text for a missing file
+ * @returns {string|null} the text, or null when it is missing
  */
-async function readDumpFile({ dir, manifest }, name, problems, onLine) {
-  const file = `dump/${name}.txt`
-  let [trailer, lines, late] = [null, 0, false]
-  const read = await eachLine(path.join(dir, file), (line) => {
-    if (trailer) late = true
-    else if (!line.startsWith(TRAILER)) onLine(line, ++lines)
-    else {
-      try {
-        trailer = JSON.parse(line.slice(TRAILER.length))
-      } catch {
-        trailer = {}
-        problems.push(`${file}: unparseable trailer`)
-      }
-    }
-  }).catch(() => null)
-  if (read === null) {
-    problems.push(`${file}: file is missing`)
+function readBound({ dir, manifest }, name, problems, missing = 'file is missing') {
+  let text
+  try {
+    text = fs.readFileSync(path.join(dir, 'apache', name), 'utf8')
+  } catch {
+    problems.push(`apache/${name}: ${missing}`)
     return null
   }
-  checkBound(manifest, file, read, problems)
-  if (late || read.unterminated)
-    problems.push(`${file}: text after the trailer or no final newline`)
-  if (!trailer) problems.push(`${file}: no trailer, the step was cut off or never ran`)
-  else if (trailer.exitCode !== 0 || trailer.signal)
-    problems.push(`${file}: the tool ended with exit ${trailer.signal ?? trailer.exitCode}`)
-  else if (trailer.complete !== true)
-    problems.push(`${file}: the dump step reports it incomplete (${[trailer.reasons].join()})`)
-  else if (trailer.lines !== lines)
-    problems.push(`${file}: has ${lines} lines but its trailer counted ${trailer.lines}`)
-  return { trailer, lines }
+  const got = {
+    bytes: Buffer.byteLength(text),
+    sha256: crypto.createHash('sha256').update(text).digest('hex'),
+  }
+  checkBound(manifest, `apache/${name}`, got, problems)
+  return text
 }
 
 /**
- * Streams a topic dump and compares every record with what the journal says was offered. The log
- * end comes from the separate `kafka-get-offsets` file, so the dump never vouches for itself.
+ * Reads a step's end marker (`exit=<status> lines=<n>`), which must report a zero exit status.
+ * @param {object} ctx @param {string} name the step's main file @param {string[]} problems
+ * @returns {number|null} the line count the step reports, or null
+ */
+function readEnd(ctx, name, problems) {
+  const text = readBound(
+    ctx,
+    `${name}.end`,
+    problems,
+    'no end marker: the step was cut off or never ran'
+  )
+  const m = text === null ? null : /^exit=(\d+) lines=(\d+)\n$/.exec(text)
+  if (text !== null && !m) problems.push(`apache/${name}.end: unparseable end marker`)
+  if (m && m[1] !== '0') problems.push(`apache/${name}: the tool exit status was ${m[1]}`)
+  return m ? Number(m[2]) : null
+}
+
+/**
+ * Streams a topic dump and compares every record with what the journal says was offered.
  * @param {object} ctx `{ dir, manifest, journal, config, matrix, dumped }`
  * @param {string} role `main` or `transactions`
- * @returns {Promise<object>} problems (the file cannot be trusted), counts, log end and findings
+ * @returns {Promise<object>} problems (the file cannot be trusted), counts and findings
  */
 async function readDump(ctx, role) {
-  const { journal, config, matrix, dumped } = ctx
-  const out = { problems: [], count: 0, maxOffset: -1, end: null, payloads: 0, findings: {} }
+  const { dir, journal, config, matrix, dumped } = ctx
+  const name = `${role}.dump`
+  const out = { problems: [], count: 0, maxOffset: -1, findings: {} }
   const note = (kind, text) => {
     const f = (out.findings[kind] ??= { count: 0, examples: [] })
     if (f.count++ < EXAMPLES) f.examples.push(text)
   }
+  const end = readEnd(ctx, name, out.problems)
+  const stderr = readBound(ctx, `${name}.stderr`, out.problems)
   const topic = ROLES.indexOf(role)
   const width = matrix.traffic.valueBytes.value
   let last = -1
-  const file = `dump/log-${role}.txt`
-  const read = await readDumpFile(ctx, `log-${role}`, out.problems, (line, n) => {
-    const m = /^Partition:0\tOffset:(\d+)\t([^\t]*)(?:\t([^\t]*))?$/.exec(line)
+  const read = await eachLine(path.join(dir, 'apache', name), (line, n) => {
+    const m = /^Partition:0\tOffset:(\d+)\t([^\t]*)\t([^\t]*)$/.exec(line)
     if (!m) {
-      if (out.problems.length < 5) out.problems.push(`${file}: unparseable line ${n}`)
+      if (out.problems.length < 5) out.problems.push(`apache/${name}: unparseable line ${n}`)
       return
     }
     const [offset, id, value] = [Number(m[1]), m[2], m[3]]
-    if (offset <= last) out.problems.push(`${file}: offsets are not increasing at line ${n}`)
+    if (offset <= last) out.problems.push(`apache/${name}: offsets are not increasing at line ${n}`)
     out.count++
     out.maxOffset = last = Math.max(last, offset)
     const i = journal.ids.get(id)
@@ -428,47 +426,57 @@ async function readDump(ctx, role) {
     if (t?.outcome === 'aborted') note('abortedPresent', id)
     if (journal.ack[i] === ACK.acknowledged && journal.offset[i] !== offset)
       note('wrongOffset', `${id} acknowledged at ${journal.offset[i]}, found at ${offset}`)
-    if (value === undefined) return
-    out.payloads++
     if (value !== `${config.runId}|${id}|${t?.id ?? ''}|`.padEnd(width, '.')) note('differs', id)
-  })
-  if (read?.trailer && read.trailer.processed !== read.lines)
+  }).catch(() => null)
+  if (read === null) {
+    out.problems.push(`apache/${name}: file is missing`)
+    return out
+  }
+  checkBound(ctx.manifest, `apache/${name}`, read, out.problems)
+  if (read.unterminated) out.problems.push(`apache/${name}: the last line has no newline`)
+  if (end !== null && end !== read.lines)
     out.problems.push(
-      `${file}: the tool counted ${read.trailer.processed} records but wrote ${read.lines}`
+      `apache/${name}: has ${read.lines} lines but its end marker counted ${end} lines`
     )
-  const latest = []
-  await readDumpFile(ctx, `latest-${role}`, out.problems, (line) => latest.push(line))
-  const m = latest.length === 1 && /^(.+):0:(\d+)$/.exec(latest[0])
-  if (!m || m[1] !== config.topics[role])
-    out.problems.push(`dump/latest-${role}.txt: not one partition-0 end offset of ${role}`)
-  else out.end = Number(m[2])
+  const counted = [...(stderr ?? '').matchAll(/^Processed a total of (\d+) messages$/gm)]
+  if (stderr !== null && (counted.length !== 1 || Number(counted[0][1]) !== read.lines))
+    out.problems.push(
+      `apache/${name}.stderr: Processed a total of line does not report ${read.lines}`
+    )
   return out
 }
 
 /**
  * Parses one group's describe output.
  * @param {object} ctx `{ dir, manifest }` @param {string} group
- * @returns {Promise<{ problems: string[], rows: { topic: string, partition: number, current: ?number, logEnd: ?number }[] }>}
+ * @returns {{ problems: string[], rows: { topic: string, partition: number, current: ?number, logEnd: ?number }[] }}
  */
-async function readDescribe(ctx, group) {
-  const name = `group-${group}`
+function readDescribe(ctx, group) {
+  const name = `groups/${group}.describe`
   const out = { problems: [], rows: [] }
   if (!/^[A-Za-z0-9._-]+$/.test(group)) {
-    out.problems.push(`dump/${name}.txt: unsafe group id`)
+    out.problems.push(`${name}: unsafe group id`)
     return out
   }
-  const body = []
-  await readDumpFile(ctx, name, out.problems, (line) => line.trim() !== '' && body.push(line))
-  if (body.length === 0) return out
-  if (!/^GROUP\s+TOPIC\s+PARTITION\s+CURRENT-OFFSET\s+LOG-END-OFFSET\s+LAG(\s|$)/.test(body[0])) {
-    out.problems.push(`dump/${name}.txt: no describe header row`)
+  const end = readEnd(ctx, name, out.problems)
+  const text = readBound(ctx, name, out.problems)
+  readBound(ctx, `${name}.stderr`, out.problems)
+  if (text === null) return out
+  const lines = text.split('\n')
+  if (end !== null && end !== lines.length - (text.endsWith('\n') ? 1 : 0))
+    out.problems.push(`apache/${name}: has other than the ${end} lines its end marker counted`)
+  const body = lines.filter((l) => l.trim() !== '')
+  if (
+    !/^GROUP\s+TOPIC\s+PARTITION\s+CURRENT-OFFSET\s+LOG-END-OFFSET\s+LAG(\s|$)/.test(body[0] ?? '')
+  ) {
+    out.problems.push(`apache/${name}: no describe header row`)
     return out
   }
   const num = (v) => (v === '-' ? null : Number(v))
   for (const line of body.slice(1)) {
     const m = /^(\S+)\s+(\S+)\s+(\d+)\s+(\d+|-)\s+(\d+|-)\s+(\d+|-)(\s.*)?$/.exec(line)
     if (!m || m[1] !== group)
-      out.problems.push(`dump/${name}.txt: unparseable line "${line.slice(0, 40)}"`)
+      out.problems.push(`apache/${name}: unparseable line "${line.slice(0, 40)}"`)
     else out.rows.push({ topic: m[2], partition: +m[3], current: num(m[4]), logEnd: num(m[5]) })
   }
   return out
@@ -508,7 +516,7 @@ function invisibleBounds(journal, dumped) {
 /**
  * K1: every acknowledged id, and every non-rejected member of a committed transaction, is in the
  * read-committed dump once at its acknowledged offset, aborted members never, and the dump is
- * proved complete: the log end from Apache's get-offsets equals the dumped records plus the offsets
+ * proved complete: the log end from Apache's describe equals the dumped records plus the offsets
  * the journal explains as invisible. Unknown results and outcomes are INCONCLUSIVE, never PASS.
  * @param {Row} k1 @param {object} ctx `{ journal, dumps, ends, dumped }`
  * @returns {boolean} whether the dump is usable and proved complete
@@ -534,20 +542,22 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
     const [t, ack] = [journal.txOf[i], journal.ack[i]]
     if (dumped[i] || t?.outcome === 'aborted' || ack === ACK.rejected) continue
     if (t ? t.outcome === 'committed' : ack === ACK.acknowledged) {
-      const [at, d] = [journal.offset[i], dumps[journal.topic[i]]]
-      absent[at < d.maxOffset || at >= d.end ? 'hard' : 'soft'].push(journal.names[i])
+      const [at, d, end] = [journal.offset[i], dumps[journal.topic[i]], ends[journal.topic[i]]]
+      absent[at < d.maxOffset || (end !== null && at >= end) ? 'hard' : 'soft'].push(
+        journal.names[i]
+      )
     } else if (!t) uncertain.push(journal.names[i])
   }
   const [lo, hi] = invisibleBounds(journal, dumped)
   const complete = dumps.every((d, n) => {
-    if (ends[n] !== null && ends[n] !== d.end)
-      k1.gap(
-        `get-offsets says the ${ROLES[n]} log ends at ${d.end} but the group describes say ${ends[n]}`
-      )
-    const invisible = d.end - d.count
+    if (ends[n] === null) {
+      k1.gap(`no describe row gives the ${ROLES[n]} log end`)
+      return false
+    }
+    const invisible = ends[n] - d.count
     if (n === 0 ? invisible === 0 : invisible >= lo && invisible <= hi) return true
     k1.gap(
-      `the ${ROLES[n]} dump stops at offset ${d.maxOffset} but the log ends at ${d.end}: ` +
+      `the ${ROLES[n]} dump stops at offset ${d.maxOffset} but the log ends at ${ends[n]}: ` +
         `${d.count} records dumped, ${n === 0 ? 0 : `${lo}..${hi}`} invisible offsets explained, so it is not proved complete`
     )
     return false
@@ -571,9 +581,8 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
     offeredIds: journal.names.length,
     dumpedMain: dumps[0].count,
     dumpedTransactions: dumps[1].count,
-    logEndMain: dumps[0].end,
-    logEndTransactions: dumps[1].end,
-    payloadsCompared: dumps[0].payloads + dumps[1].payloads,
+    logEndMain: ends[0],
+    logEndTransactions: ends[1],
     unknownSendsAbsent: uncertain.length,
   })
   return complete
@@ -821,7 +830,7 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
   const untrusted = problems.length > 0 ? 'the stream is not valid (see K7)' : journal.problems[0]
   const describes = new Map()
   for (const { group } of journal.recipients.flat().filter((r) => !r.share))
-    describes.set(group, await readDescribe(ctx, group))
+    describes.set(group, readDescribe(ctx, group))
   const ends = judgeCommits(rows.K4, { ...ctx, describes })
   if (untrusted) for (const id of ['K1', 'K2', 'K3', 'K5', 'K6']) rows[id].gap(untrusted)
   else {
