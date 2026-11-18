@@ -1,0 +1,512 @@
+'use strict'
+/**
+ * Final soak preflight: run by the runbook after the cluster is up and before the driver starts.
+ * Exits non-zero on any miss and writes `preflight.json` (the host census and broker files the
+ * header binds) into the artifact directory either way.
+ *
+ * Usage:
+ *   KAFKA_BROKERS=... TELEMETRY_EVIDENCE_DIR=... node scripts/soak/finalSoakPreflight.js \
+ *     --expect-sha <40-hex> --mode smoke|acceptance --out <artifact dir>
+ *   TELEMETRY_JAVA_CACHE=... node scripts/soak/finalSoakPreflight.js --prepare-reporter --out <artifact dir>
+ *
+ * Checks: Node 22, 24 or 26 on Linux with a boot id; dependencies installed by `npm ci`; a clean
+ * checkout at the expected SHA; all three brokers in metadata; `share.version` finalized and read
+ * back; one decoded telemetry push with metrics from a probe producer and a probe consumer; per-node
+ * broker provenance (image digests from `docker image inspect`, or operator evidence for a supplied
+ * cluster); the prepared reporter's file cap and mounted jar digest; a quiet host (no agent or test
+ * process), MemAvailable, free disk and load within the matrix floors.
+ */
+const crypto = require('node:crypto')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { execFileSync } = require('node:child_process')
+
+const ROOT = path.resolve(__dirname, '../..')
+const NODE_MAJORS = [22, 24, 26]
+const NODES = [1, 2, 3]
+const PROBES = ['producer', 'consumer']
+const DIGEST = /^sha256:[0-9a-f]{64}$/
+const SHA = /^[0-9a-f]{64}$/
+/** Process names whose presence means the host is not paused for the run. */
+const BUSY = /^(node|jest|npm|npx|codex|claude|java|javac|mvn|gradle|cargo|go|python3?|pytest)$/
+
+/** @returns {number} monotonic milliseconds since boot, the run clock's base */
+const monotonicMs = () => Number(process.hrtime.bigint()) / 1e6
+/** @param {string|Buffer} data @returns {string} */
+const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex')
+
+/**
+ * Judges preflight facts against the matrix floors. Gathering is separate (`read`), so every check
+ * is exercised without a cluster.
+ */
+class Preflight {
+  /**
+   * @param {object} options
+   * @param {string} options.sha the expected candidate commit
+   * @param {string} options.mode smoke or acceptance
+   * @param {object} options.matrix the reviewed matrix
+   * @param {() => Promise<object>} [options.read] gathers the facts; the live gatherer by default
+   */
+  constructor({ sha, mode, matrix, read }) {
+    this.sha = sha
+    this.mode = mode
+    this.matrix = matrix
+    this.read = read
+  }
+
+  /**
+   * @returns {Promise<{ checks: { name: string, ok: boolean }[], failed: string[], exitCode: number,
+   *   facts: object }>} every check, the names that failed and the process exit code
+   */
+  async run() {
+    const facts = await this.read()
+    const checks = Object.entries(this.checks(facts)).map(([name, check]) => {
+      let ok = false
+      try {
+        ok = check() === true
+      } catch {
+        ok = false
+      }
+      return { name, ok }
+    })
+    const failed = checks.filter((c) => !c.ok).map((c) => c.name)
+    return { checks, failed, exitCode: failed.length === 0 ? 0 : 1, facts }
+  }
+
+  /** @param {object} f the gathered facts @returns {Record<string, () => boolean>} named checks */
+  checks(f) {
+    const host = this.matrix.host
+    const share = f.share.finalized['share.version']
+    return {
+      'node-version': () => NODE_MAJORS.includes(Number(/^v(\d+)\./.exec(f.node)?.[1])),
+      clock: () => f.clock.platform === 'linux' && f.clock.bootId.length > 0,
+      dependencies: () => f.deps.installed === true && f.deps.lockMatches === true,
+      'clean-checkout': () => f.git.porcelain === '',
+      'expected-sha': () => /^[0-9a-f]{40}$/.test(this.sha) && f.git.head === this.sha,
+      'cluster-ready': () => [...f.cluster.brokers].sort().join() === NODES.join(),
+      'share-readback': () => share !== undefined && share.maxVersionLevel >= 1,
+      'telemetry-proof': () =>
+        PROBES.every((probe) =>
+          f.telemetry.pushes.some((p) => p.probe === probe && p.decoded === true && p.metrics > 0)
+        ),
+      'broker-provenance': () =>
+        f.provenance.nodes.map((n) => n.node).join() === NODES.join() &&
+        f.provenance.nodes.every((n) =>
+          f.provenance.kind === 'image' ? DIGEST.test(n.digest) : SHA.test(n.evidenceSha256)
+        ),
+      reporter: () =>
+        f.reporter.sinkBytes === host.brokerReporterFileBytes.value &&
+        SHA.test(f.reporter.jarSha256) &&
+        f.reporter.mounted === f.reporter.jarSha256,
+      'quiet-host': () => f.host.census.every((p) => p.class !== 'agent' && p.class !== 'test'),
+      memory: () => f.host.memAvailable >= host.minMemAvailableBytes.value,
+      disk: () => f.host.freeDisk >= host.minFreeDiskBytes.value,
+      load: () => f.host.load1m <= host.maxLoadAverage1m.value,
+    }
+  }
+}
+
+/** @param {string} command @param {string[]} args @returns {string} trimmed stdout */
+const run = (command, args, options = {}) =>
+  execFileSync(command, args, { cwd: ROOT, encoding: 'utf8', ...options }).trim()
+
+/**
+ * The paused-work census: pid, executable name, CPU and RSS, and a class. No environment, credential
+ * or command-line argument is read.
+ * @returns {{ pid: number, name: string, cpu: number, rss: number, class: string }[]}
+ */
+const census = () =>
+  run('ps', ['-eo', 'pid=,ppid=,pcpu=,rss=,comm='])
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/))
+    .filter(([pid, ppid]) => Number(pid) !== process.pid && Number(ppid) !== process.pid)
+    .map(([pid, , cpu, rss, name]) => ({
+      pid: Number(pid),
+      name,
+      cpu: Number(cpu),
+      rss: Number(rss) * 1024,
+      class: /^(codex|claude)$/.test(name) ? 'agent' : BUSY.test(name) ? 'test' : 'other',
+    }))
+
+/** @returns {number} Linux MemAvailable in bytes */
+const memAvailable = () =>
+  Number(/MemAvailable:\s+(\d+) kB/.exec(fs.readFileSync('/proc/meminfo', 'utf8'))[1]) * 1024
+
+/**
+ * Captures per-node broker provenance and capabilities into the artifact.
+ * @param {object} kafka a connected-capable `Kafka`
+ * @param {object} admin a connected admin
+ * @param {string} out artifact directory
+ * @returns {Promise<{ provenance: object, broker: object }>}
+ */
+async function captureBroker(kafka, admin, out) {
+  fs.mkdirSync(path.join(out, 'broker'), { recursive: true })
+  const symbol = Object.getOwnPropertySymbols(kafka).find(
+    (s) => s.description === 'private:Kafka:createCluster'
+  )
+  const cluster = kafka[symbol]()
+  await cluster.connect()
+  await cluster.refreshMetadata()
+  const nodes = []
+  for (const node of NODES) {
+    const broker = await cluster.findBroker({ nodeId: String(node) })
+    const features = await admin.describeFeatures({ brokerId: node })
+    nodes.push({
+      node,
+      apiRanges: Object.entries(broker.versions).map(([apiKey, v]) => ({
+        apiKey: Number(apiKey),
+        minVersion: v.minVersion,
+        maxVersion: v.maxVersion,
+      })),
+      supportedFeatures: Object.entries(features.supportedFeatures ?? {}).map(([name, v]) => ({
+        name,
+        minVersion: v.minVersion,
+        maxVersion: v.maxVersion,
+      })),
+      finalizedFeatures: Object.entries(features.finalizedFeatures ?? {}).map(([name, v]) => ({
+        name,
+        ...v,
+      })),
+    })
+  }
+  await cluster.disconnect()
+  fs.writeFileSync(path.join(out, 'broker/capabilities.json'), JSON.stringify({ nodes }) + '\n')
+  const supplied = process.env.FINAL_SOAK_SUPPLIED_EVIDENCE
+  let provenance
+  if (supplied) {
+    const evidence = JSON.parse(fs.readFileSync(supplied, 'utf8'))
+    provenance = {
+      kind: 'supplied',
+      nodes: evidence.nodes.map((n) => {
+        const bytes = fs.readFileSync(n.file)
+        const file = `broker/evidence-${n.node}${path.extname(n.file)}`
+        fs.writeFileSync(path.join(out, file), bytes)
+        return {
+          node: n.node,
+          version: n.version,
+          evidenceFile: file,
+          evidenceSha256: sha256(bytes),
+        }
+      }),
+    }
+  } else {
+    provenance = {
+      kind: 'image',
+      nodes: NODES.map((node) => {
+        const container = run('docker', ['compose', 'ps', '-q', `kafka${node}`])
+        const image = run('docker', ['inspect', '--format', '{{.Image}}', container])
+        const inspect = run('docker', ['image', 'inspect', image])
+        const inspectFile = `broker/inspect-${node}.json`
+        fs.writeFileSync(path.join(out, inspectFile), inspect)
+        const [details] = JSON.parse(inspect)
+        const digest = (details.RepoDigests?.[0] ?? '').split('@')[1] ?? ''
+        return {
+          node,
+          image: details.RepoTags?.[0] ?? image,
+          digest,
+          container,
+          version: process.env.KAFKA_VERSION ?? 'unknown',
+          inspectFile,
+          inspectSha256: sha256(inspect),
+        }
+      }),
+    }
+  }
+  fs.writeFileSync(
+    path.join(out, 'broker/provenance.json'),
+    JSON.stringify({ nodes: provenance.nodes }) + '\n'
+  )
+  return {
+    provenance,
+    broker: {
+      provenanceKind: provenance.kind,
+      provenanceFile: 'broker/provenance.json',
+      capabilitiesFile: 'broker/capabilities.json',
+      composeFile: 'broker/compose.json',
+    },
+  }
+}
+
+/**
+ * Pushes from one telemetry-enabled probe producer and one probe consumer and waits for the broker
+ * reporter's decoded line of each.
+ * @param {object} kafka a `Kafka`
+ * @param {string} sinkDir the host reporter directory
+ * @param {number} waitMs how long to wait for both pushes
+ * @returns {Promise<object[]>} the decoded pushes found, by probe
+ */
+async function telemetryProof(kafka, sinkDir, waitMs) {
+  const { Kafka, logLevel } = require('../../index')
+  const brokers = process.env.KAFKA_BROKERS.split(',')
+  const tag = crypto.randomBytes(4).toString('hex')
+  const producer = new Kafka({
+    clientId: `preflight-producer-${tag}`,
+    brokers,
+    logLevel: logLevel.NOTHING,
+  }).producer({ enableMetricsPush: true })
+  const consumer = new Kafka({
+    clientId: `preflight-consumer-${tag}`,
+    brokers,
+    logLevel: logLevel.NOTHING,
+  }).consumer({ groupId: `preflight-${tag}`, enableMetricsPush: true })
+  await producer.connect()
+  await consumer.connect()
+  const deadline = Date.now() + waitMs
+  const found = []
+  try {
+    while (Date.now() < deadline && found.length < PROBES.length) {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      found.length = 0
+      for (const file of fs.readdirSync(sinkDir).filter((f) => /^exports-\d+\.jsonl$/.test(f))) {
+        for (const line of fs
+          .readFileSync(path.join(sinkDir, file), 'utf8')
+          .split('\n')
+          .filter(Boolean)) {
+          const push = JSON.parse(line)
+          const probe = PROBES.find((p) => push.clientId === `preflight-${p}-${tag}`)
+          if (probe && !found.some((f) => f.probe === probe))
+            found.push({
+              probe,
+              metrics: Number(push.metricsTotal ?? 0),
+              decoded: push.parse === undefined,
+            })
+        }
+      }
+    }
+  } finally {
+    await consumer.disconnect()
+    await producer.disconnect()
+  }
+  return found
+}
+
+/**
+ * Gathers every preflight fact from the live host, checkout and cluster.
+ * @param {{ out: string, matrix: object }} options
+ * @returns {Promise<object>} the facts `Preflight` judges, plus the header fields it writes
+ */
+async function gatherFacts({ out, matrix }) {
+  const { Kafka, logLevel } = require('../../index')
+  const kafka = new Kafka({
+    clientId: 'preflight-admin',
+    brokers: process.env.KAFKA_BROKERS.split(','),
+    logLevel: logLevel.NOTHING,
+  })
+  const admin = kafka.admin()
+  await admin.connect()
+  try {
+    const { brokers } = await admin.describeCluster()
+    const features = await admin.describeFeatures()
+    const { provenance, broker } = await captureBroker(kafka, admin, out)
+    const pushes = await telemetryProof(
+      kafka,
+      process.env.TELEMETRY_EVIDENCE_DIR,
+      2 * matrix.traffic.telemetryPushMaxMs.value
+    )
+    const receipt = JSON.parse(fs.readFileSync(path.join(out, 'reporter/receipt.json'), 'utf8'))
+    const mounted = NODES.map(
+      (node) =>
+        run('docker', [
+          'compose',
+          'exec',
+          '-T',
+          `kafka${node}`,
+          'sha256sum',
+          '/opt/kafka/libs/counting-telemetry-reporter.jar',
+        ]).split(/\s+/)[0]
+    )
+    const statfs = fs.statfsSync(out)
+    return {
+      node: process.version,
+      clock: {
+        platform: process.platform,
+        bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
+      },
+      git: {
+        head: run('git', ['rev-parse', 'HEAD']),
+        porcelain: run('git', ['status', '--porcelain']),
+      },
+      deps: {
+        installed: fs.existsSync(path.join(ROOT, 'node_modules/.package-lock.json')),
+        lockMatches: tryRun('npm', ['ls', '--depth=0']),
+      },
+      cluster: { brokers: brokers.map((b) => b.nodeId) },
+      share: { finalized: features.finalizedFeatures ?? {} },
+      telemetry: { pushes },
+      provenance,
+      broker,
+      reporter: {
+        sinkBytes: receipt.sinkBytes,
+        jarSha256: receipt.sha256,
+        mounted: mounted.every((m) => m === mounted[0]) ? mounted[0] : 'mixed',
+      },
+      host: {
+        memAvailable: memAvailable(),
+        freeDisk: statfs.bavail * statfs.bsize,
+        load1m: os.loadavg()[0],
+        census: census(),
+      },
+    }
+  } finally {
+    await admin.disconnect()
+  }
+}
+
+/** @returns {boolean} whether the command exits zero */
+const tryRun = (command, args) => {
+  try {
+    run(command, args, { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Prepares the final run's reporter jar from the retained source with only its file cap changed
+ * to the matrix's per-node cap, and the Compose override that mounts it on all three brokers.
+ * @param {{ out: string, matrix: object }} options
+ * @returns {object} the receipt written to `reporter/receipt.json`
+ */
+function prepareReporter({ out, matrix }) {
+  const { BoundedReporter } = require('./longWindowReporter')
+  const fixture = path.join(ROOT, 'scripts/e2e/telemetry')
+  const manifest = JSON.parse(fs.readFileSync(path.join(fixture, 'fixtures/manifest.json'), 'utf8'))
+  const line = manifest.lines[process.env.KAFKA_VERSION]
+  if (!line) throw new Error(`no pinned reporter inputs for Kafka ${process.env.KAFKA_VERSION}`)
+  const original = fs.readFileSync(path.join(fixture, 'CountingTelemetryReporter.java'), 'utf8')
+  if (sha256(original) !== manifest.scripts['CountingTelemetryReporter.java'])
+    throw new Error('retained reporter source changed')
+  const retainedJar = path.join(ROOT, line.reporterJar.path)
+  if (sha256(fs.readFileSync(retainedJar)) !== line.reporterJar.sha256)
+    throw new Error('retained reporter jar changed')
+  const dependencies = ['kafka-clients-' + process.env.KAFKA_VERSION, 'protobuf-java'].map(
+    (key) => {
+      const input = manifest.inputs[key]
+      const file = path.join(process.env.TELEMETRY_JAVA_CACHE, input.cachePath)
+      if (sha256(fs.readFileSync(file)) !== input.sha256)
+        throw new Error(`reporter input ${key} changed`)
+      return file
+    }
+  )
+  const dir = path.join(out, 'reporter')
+  const classes = path.join(dir, 'classes')
+  fs.mkdirSync(classes, { recursive: true })
+  const sinkBytes = matrix.host.brokerReporterFileBytes.value
+  const prepared = BoundedReporter.source(original, sinkBytes)
+  const source = path.join(dir, 'CountingTelemetryReporter.java')
+  fs.writeFileSync(source, prepared, { flag: 'wx' })
+  const jar = path.join(dir, 'reporter.jar')
+  const exec = (command, args) =>
+    execFileSync(command, args, { cwd: classes, stdio: 'pipe', timeout: 60000 })
+  exec('jar', ['--extract', '--file', retainedJar])
+  exec('javac', [
+    '--release',
+    '17',
+    '-cp',
+    [retainedJar, ...dependencies].join(path.delimiter),
+    '-d',
+    classes,
+    source,
+  ])
+  exec('jar', ['--create', '--date=2026-01-01T00:00:00Z', '--file', jar, '-C', classes, '.'])
+  const services = Object.fromEntries(
+    NODES.map((n) => [
+      `kafka${n}`,
+      {
+        environment: { KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false' },
+        volumes: [
+          {
+            type: 'bind',
+            source: jar,
+            target: '/opt/kafka/libs/counting-telemetry-reporter.jar',
+            read_only: true,
+          },
+        ],
+      },
+    ])
+  )
+  fs.mkdirSync(path.join(out, 'broker'), { recursive: true })
+  fs.writeFileSync(path.join(out, 'broker/compose.json'), JSON.stringify({ services }) + '\n')
+  const receipt = {
+    line: process.env.KAFKA_VERSION,
+    sinkBytes,
+    sourceSha256: sha256(original),
+    preparedSourceSha256: sha256(prepared),
+    retainedSha256: line.reporterJar.sha256,
+    sha256: sha256(fs.readFileSync(jar)),
+  }
+  fs.writeFileSync(path.join(dir, 'receipt.json'), JSON.stringify(receipt) + '\n')
+  return receipt
+}
+
+/** @param {string[]} argv @returns {Promise<number>} the exit code */
+async function main(argv) {
+  const flag = (name) => argv[argv.indexOf(name) + 1]
+  const out = path.resolve(flag('--out'))
+  const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, 'finalSoakMatrix.json'), 'utf8'))
+  if (argv.includes('--prepare-reporter')) {
+    prepareReporter({ out, matrix })
+    return 0
+  }
+  const clockFile = path.join(out, 'clock.json')
+  if (!fs.existsSync(clockFile)) {
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+    fs.writeFileSync(clockFile, JSON.stringify({ originMs: monotonicMs(), bootId }) + '\n')
+  }
+  const { originMs } = JSON.parse(fs.readFileSync(clockFile, 'utf8'))
+  const sha = flag('--expect-sha')
+  const mode = flag('--mode')
+  let facts = null
+  const preflight = new Preflight({
+    sha,
+    mode,
+    matrix,
+    read: async () => (facts = await gatherFacts({ out, matrix })),
+  })
+  const result = await preflight.run()
+  const measuredAt = monotonicMs() - originMs
+  fs.writeFileSync(
+    path.join(out, 'preflight.json'),
+    JSON.stringify(
+      {
+        sha,
+        mode,
+        checks: result.checks,
+        failed: result.failed,
+        census: facts.host.census,
+        telemetry: facts.telemetry,
+        broker: facts.broker,
+        host: {
+          cpus: os.cpus().length,
+          totalMemoryBytes: os.totalmem(),
+          availableMemoryBytes: facts.host.memAvailable,
+          freeDiskBytes: facts.host.freeDisk,
+          loadAverage1m: facts.host.load1m,
+          docker: tryRun('docker', ['version'])
+            ? run('docker', ['version', '--format', '{{.Server.Version}}'])
+            : 'absent',
+          measuredAt,
+          pausedWork: !result.failed.includes('quiet-host'),
+        },
+      },
+      null,
+      2
+    ) + '\n'
+  )
+  for (const c of result.checks) console.log(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}`)
+  return result.exitCode
+}
+
+if (require.main === module) {
+  main(process.argv.slice(2)).then(
+    (code) => (process.exitCode = code),
+    (e) => {
+      console.error(e.stack)
+      process.exitCode = 1
+    }
+  )
+}
+
+module.exports = { Preflight, gatherFacts, prepareReporter, census }

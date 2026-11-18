@@ -379,7 +379,7 @@ describe('final soak driver', () => {
       expect(calls).toContain(
         `node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke --expect-sha ${TREE} --matrix scripts/soak/finalSoakMatrix.json --out ${out}`
       )
-      expect(calls).toContain(`node scripts/soak/finalSoak.js --finalize --out ${out}`)
+      expect(calls).toContain(`node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`)
       expect(
         calls.indexOf(calls.find((c) => c.includes('compose') && c.includes(' down')))
       ).toBeGreaterThan(calls.findIndex((c) => c.includes('--finalize')))
@@ -463,7 +463,10 @@ describe('final soak driver', () => {
       clock,
       gc: () => calls.push(['gc', clock.now()]),
       turn: () => clock.sleepUntil(clock.now()),
-      memory: () => (calls.push(['memory', clock.now()]), { rss: 9, heapUsed: 8, external: 7 }),
+      memory: () => {
+        calls.push(['memory', clock.now()])
+        return { rss: 9, heapUsed: 8, external: 7 }
+      },
       resources: () => ['TTYWrap'],
     })
     const read = (n) =>
@@ -472,7 +475,10 @@ describe('final soak driver', () => {
         slot: null,
         boundary: 'h00',
         reading: n,
-        cut: () => (calls.push(['cut', clock.now()]), `i${n}`),
+        cut: () => {
+          calls.push(['cut', clock.now()])
+          return `i${n}`
+        },
       })
     const first = await clock.drive(read(0))
     const second = await clock.drive(read(1))
