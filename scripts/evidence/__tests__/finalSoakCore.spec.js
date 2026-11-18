@@ -21,9 +21,9 @@ async function check(
   const dir = tmp()
   const files = []
   for (const [name, text] of Object.entries(world.apache)) {
-    fs.mkdirSync(path.dirname(path.join(dir, 'apache', name)), { recursive: true })
-    fs.writeFileSync(path.join(dir, 'apache', name), text)
-    files.push({ file: `apache/${name}`, bytes: Buffer.byteLength(text), sha256: fx.sha256(text) })
+    fs.mkdirSync(path.dirname(path.join(dir, 'dump', name)), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'dump', name), text)
+    files.push({ file: `dump/${name}`, bytes: Buffer.byteLength(text), sha256: fx.sha256(text) })
   }
   const journal = new Journal({ matrix: world.matrix, config: world.config, mode: world.mode })
   edit(world.records()).forEach((r) => journal.add(r))
@@ -50,7 +50,18 @@ const without = (predicate) => (records) => records.filter((r) => !predicate(r))
 const isEntry = (group, id) => (r) =>
   r.kind === 'identity' && r.stage === 'handler-enter' && r.group === group && r.id === id
 const groupOf = (slot) => `g-${fx.RUN}-${slot}`
-const dumpOf = (world, role) => world.apache[`${role}.dump`].split('\n').filter(Boolean)
+/** The data lines of a dump file, without its trailer. */
+const dataOf = (world, stem) =>
+  world.apache[`${stem}.txt`].split('\n').filter((l) => l && !l.startsWith(fx.TRAILER))
+const dumpOf = (world, role) => dataOf(world, `log-${role}`)
+/** The log dump's lines without the record of `id`. */
+const dumpWithout = (world, role, id) => dumpOf(world, role).filter((l) => l.split('\t')[2] !== id)
+/** Rewrites a dump file with its trailer rebuilt from the lines, then `overrides` applied. */
+const retrailer = (world, stem, lines, overrides = {}) =>
+  fx.putStep(world.apache, stem, lines.length ? `${lines.join('\n')}\n` : '', {
+    ...(stem.startsWith('log-') ? { processed: lines.length } : {}),
+    ...overrides,
+  })
 
 describe('scripts/evidence/finalSoakCore', () => {
   describe('a healthy day', () => {
@@ -93,11 +104,7 @@ describe('scripts/evidence/finalSoakCore', () => {
   describe('K1 no lost record', () => {
     it('fails a record acknowledged but absent from the dump', async () => {
       const world = fx.healthy()
-      fx.redump(
-        world,
-        'main',
-        dumpOf(world, 'main').filter((l) => !l.includes('\tc08.5\t'))
-      )
+      fx.redump(world, 'main', dumpWithout(world, 'main', 'c08.5'))
       const report = await check(world)
       expectRow(report, 'K1', 'FAIL', /acknowledged.*absent.*c08\.5/)
       expect(report.overall).not.toBe('ACCEPTED')
@@ -105,11 +112,7 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('fails a member of a committed transaction absent from the dump', async () => {
       const world = fx.healthy()
-      fx.redump(
-        world,
-        'transactions',
-        dumpOf(world, 'transactions').filter((l) => !l.includes('\tc09.1\t'))
-      )
+      fx.redump(world, 'transactions', dumpWithout(world, 'transactions', 'c09.1'))
       expectRow(await check(world), 'K1', 'FAIL', /absent.*c09\.1/)
     })
 
@@ -150,9 +153,19 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('fails a record whose bytes differ from what was offered', async () => {
-      const world = fx.healthy()
-      world.apache['main.dump'] = world.apache['main.dump'].replace(/(c08\.2\t[^\t\n]*?)\./, '$1x')
+      const world = fx.healthy({ values: true })
+      world.apache['log-main.txt'] = world.apache['log-main.txt'].replace(
+        /(c08\.2\t[^\t\n]*?)\./,
+        '$1x'
+      )
       expectRow(await check(world), 'K1', 'FAIL', /differ.*c08\.2/)
+    })
+
+    it('compares payload bytes when the dump prints values and says plainly when it does not', async () => {
+      const keysOnly = row(await check(fx.healthy()), 'K1')
+      const withValues = row(await check(fx.healthy({ values: true })), 'K1')
+      expect([keysOnly.verdict, keysOnly.numbers.payloadsCompared]).toEqual(['PASS', 0])
+      expect([withValues.verdict, withValues.numbers.payloadsCompared]).toEqual(['PASS', 16])
     })
 
     it('is inconclusive when the dump stops before the log end, never a pass', async () => {
@@ -182,57 +195,67 @@ describe('scripts/evidence/finalSoakCore', () => {
 
   describe('ground-truth files', () => {
     const cases = [
-      ['main.dump', 'K1'],
-      ['transactions.dump', 'K1'],
-      [`groups/${groupOf('c01')}.describe`, 'K4'],
+      ['log-main', 'K1'],
+      ['log-transactions', 'K1'],
+      ['latest-main', 'K1'],
+      [`group-${groupOf('c01')}`, 'K4'],
     ]
-    it.each(cases)('is inconclusive when %s is missing', async (file, id) => {
+    it.each(cases)('is inconclusive when %s is missing', async (stem, id) => {
       const world = fx.healthy()
-      for (const name of [file, `${file}.end`, `${file}.stderr`]) delete world.apache[name]
+      delete world.apache[`${stem}.txt`]
       const report = await check(world)
-      expectRow(report, id, 'INCONCLUSIVE', new RegExp(file.replace('.', '\\.')))
+      expectRow(report, id, 'INCONCLUSIVE', new RegExp(`dump/${stem}\\.txt: file is missing`))
       expect(report.overall).not.toBe('ACCEPTED')
     })
 
+    it.each(cases)('is inconclusive when %s was cut off before its trailer', async (stem, id) => {
+      const world = fx.healthy()
+      world.apache[`${stem}.txt`] = world.apache[`${stem}.txt`].split(fx.TRAILER)[0]
+      expectRow(await check(world), id, 'INCONCLUSIVE', /no trailer/)
+    })
+
+    it.each(cases)('is inconclusive when %s has a line that does not parse', async (stem, id) => {
+      const world = fx.healthy()
+      const bad = stem.startsWith('group-') ? 'GROUP TOPIC garbage' : 'this is not a dump line'
+      const lines = [...dataOf(world, stem), bad]
+      retrailer(world, stem, lines)
+      expectRow(await check(world), id, 'INCONCLUSIVE', /unparseable|not one partition-0/)
+    })
+
     it.each(cases)(
-      'is inconclusive when %s was cut off before its end marker',
-      async (file, id) => {
-        const world = fx.healthy()
-        delete world.apache[`${file}.end`]
-        expectRow(await check(world), id, 'INCONCLUSIVE', /end marker/)
+      'is inconclusive when the tool behind %s did not end cleanly',
+      async (stem, id) => {
+        for (const overrides of [{ exitCode: 1 }, { exitCode: null, signal: 'SIGKILL' }]) {
+          const world = fx.healthy()
+          retrailer(world, stem, dataOf(world, stem), overrides)
+          expectRow(await check(world), id, 'INCONCLUSIVE', /ended with exit/)
+        }
       }
     )
 
-    it.each(cases)('is inconclusive when %s has a line that does not parse', async (file, id) => {
-      const world = fx.healthy()
-      const text = world.apache[file]
-      const bad = file.endsWith('.dump') ? 'this is not a dump line\n' : 'GROUP TOPIC garbage\n'
-      world.apache[file] = file.endsWith('.dump')
-        ? `${text}${bad}`
-        : text.replace(/\n$/, `\n${bad}`)
-      world.apache[`${file}.end`] = `exit=0 lines=${world.apache[file].split('\n').length - 1}\n`
-      if (file.endsWith('.dump'))
-        world.apache[`${file}.stderr`] =
-          `Processed a total of ${world.apache[file].split('\n').length - 1} messages\n`
-      expectRow(await check(world), id, 'INCONCLUSIVE', /unparseable|does not parse/)
-    })
+    it.each(cases)(
+      'is inconclusive when the step behind %s calls itself incomplete',
+      async (stem, id) => {
+        const world = fx.healthy()
+        retrailer(world, stem, dataOf(world, stem), { complete: false, reasons: ['tool error'] })
+        expectRow(await check(world), id, 'INCONCLUSIVE', /incomplete.*tool error/)
+      }
+    )
 
-    it.each(cases)('is inconclusive when %s exited non-zero', async (file, id) => {
-      const world = fx.healthy()
-      world.apache[`${file}.end`] = world.apache[`${file}.end`].replace('exit=0', 'exit=1')
-      expectRow(await check(world), id, 'INCONCLUSIVE', /exit/)
-    })
+    it.each(cases)(
+      'is inconclusive when %s holds fewer lines than its trailer counted',
+      async (stem, id) => {
+        const world = fx.healthy()
+        const lines = dataOf(world, stem)
+        retrailer(world, stem, lines, { lines: lines.length + 1 })
+        expectRow(await check(world), id, 'INCONCLUSIVE', /lines but its trailer counted/)
+      }
+    )
 
-    it('is inconclusive when the dump holds fewer lines than its end marker counted', async () => {
+    it('is inconclusive when the tool did not count the records it wrote', async () => {
       const world = fx.healthy()
-      world.apache['main.dump'] = dumpOf(world, 'main').slice(0, 6).join('\n') + '\n'
-      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /lines/)
-    })
-
-    it('is inconclusive when the tool did not report its own message count', async () => {
-      const world = fx.healthy()
-      world.apache['main.dump.stderr'] = 'Processed a total of 3 messages\n'
-      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /Processed a total/)
+      retrailer(world, 'log-main', dumpOf(world, 'main'), { processed: 3 })
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /tool counted 3 records/)
     })
 
     it('is inconclusive when the artifact manifest does not bind a dump file as written', async () => {
@@ -241,7 +264,7 @@ describe('scripts/evidence/finalSoakCore', () => {
         header: (h) => ({
           ...h,
           files: h.files.map((f) =>
-            f.file === 'apache/main.dump' ? { ...f, sha256: 'a'.repeat(64) } : f
+            f.file === 'dump/log-main.txt' ? { ...f, sha256: 'a'.repeat(64) } : f
           ),
         }),
       })
@@ -252,7 +275,24 @@ describe('scripts/evidence/finalSoakCore', () => {
       const world = fx.healthy()
       const lines = dumpOf(world, 'main')
       fx.redump(world, 'main', [lines[1], lines[0], ...lines.slice(2)])
-      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /not increasing|order/)
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /not increasing/)
+    })
+
+    it('is inconclusive when get-offsets and the group describes disagree about the log end', async () => {
+      const world = fx.healthy()
+      fx.putStep(world.apache, 'latest-main', `${fx.MAIN}:0:13\n`)
+      expectRow(
+        await check(world),
+        'K1',
+        'INCONCLUSIVE',
+        /get-offsets says the main log ends at 13/
+      )
+    })
+
+    it('is inconclusive when get-offsets does not name one partition of the topic', async () => {
+      const world = fx.healthy()
+      fx.putStep(world.apache, 'latest-main', `${fx.MAIN}:1:12\n`)
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /latest-main\.txt: not one partition-0/)
     })
   })
 
@@ -293,8 +333,8 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('is inconclusive when the dump it compares against is unusable', async () => {
       const world = fx.healthy()
-      delete world.apache['main.dump.end']
-      expectRow(await check(world), 'K2', 'INCONCLUSIVE', /main\.dump/)
+      delete world.apache['log-main.txt']
+      expectRow(await check(world), 'K2', 'INCONCLUSIVE', /log-main\.txt/)
     })
   })
 
@@ -375,11 +415,8 @@ describe('scripts/evidence/finalSoakCore', () => {
 
   describe('K4 commits', () => {
     const behind = (world, group) => {
-      const text = world.apache[`groups/${group}.describe`]
-      world.apache[`groups/${group}.describe`] = text.replace(
-        /(\S+\s+\S+\s+0\s+)12(\s+12)/,
-        '$111$2'
-      )
+      const text = world.apache[`group-${group}.txt`]
+      world.apache[`group-${group}.txt`] = text.replace(/(\S+\s+\S+\s+0\s+)12(\s+12)/, '$111$2')
     }
 
     it('fails a group whose committed offset is behind the log end', async () => {
@@ -411,19 +448,19 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('fails a group that has no row for a topic it must commit', async () => {
       const world = fx.healthy()
-      const name = `groups/${groupOf('c01')}.describe`
-      const text = world.apache[name]
-        .split('\n')
-        .filter((l) => !l.includes(fx.TXN))
-        .join('\n')
-      fx.putStep(world.apache, name, text, 'Consumer group has no active members.\n')
+      const stem = `group-${groupOf('c01')}`
+      retrailer(
+        world,
+        stem,
+        dataOf(world, stem).filter((l) => !l.includes(fx.TXN))
+      )
       expectRow(await check(world), 'K4', 'FAIL', /c01.*no row/)
     })
 
     it('fails a group that never committed on a partition', async () => {
       const world = fx.healthy()
       const group = groupOf('c01')
-      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`].replace(
+      world.apache[`group-${group}.txt`] = world.apache[`group-${group}.txt`].replace(
         /(\S+\s+\S+\s+0\s+)12(\s+12\s+)0/,
         '$1-$2-'
       )
@@ -433,7 +470,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('is inconclusive when two describes disagree about the log end', async () => {
       const world = fx.healthy()
       const group = groupOf('c01')
-      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`].replace(
+      world.apache[`group-${group}.txt`] = world.apache[`group-${group}.txt`].replace(
         /(0\s+)12(\s+)12/,
         (_, a, b) => `${a}13${b}13`
       )
@@ -743,8 +780,8 @@ async function judgeWith(world, dir, extra) {
   const journal = new Journal({ matrix: world.matrix, config: world.config, mode: world.mode })
   world.records().forEach((r) => journal.add(r))
   for (const [name, text] of Object.entries(world.apache)) {
-    fs.mkdirSync(path.dirname(path.join(dir, 'apache', name)), { recursive: true })
-    fs.writeFileSync(path.join(dir, 'apache', name), text)
+    fs.mkdirSync(path.dirname(path.join(dir, 'dump', name)), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'dump', name), text)
   }
   return judge({
     dir,

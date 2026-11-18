@@ -347,12 +347,14 @@ const constructRecords = (config) =>
     configSha256: 'e'.repeat(64),
   }))
 
-/** @param {object} layout @returns {string[]} the console-consumer lines of one topic's visible records */
-const dumpLines = (entries) =>
+/** @returns {string[]} the console-consumer lines of one topic's visible records (with values on request) */
+const dumpLines = (entries, values) =>
   placed(entries).flatMap((e) =>
     e.marker || e.absent || e.invisible
       ? []
-      : [`Partition:0\tOffset:${e.offset}\t${e.id}\t${valueOf(e.id, e.transaction)}`]
+      : [
+          `Partition:0\tOffset:${e.offset}\t${e.id}${values ? `\t${valueOf(e.id, e.transaction)}` : ''}`,
+        ]
   )
 
 /** @returns {string} what `kafka-consumer-groups.sh --describe` prints for a group at the given offsets */
@@ -367,22 +369,46 @@ const describeText = (group, rows) =>
     '',
   ].join('\n')
 
-/** Renders one dump or describe step's three files into `files`. */
-function putStep(files, name, stdout, stderrExtra = '') {
-  const lines = stdout.split('\n').length - (stdout.endsWith('\n') ? 1 : 0)
-  const count = stdout === '' ? 0 : lines
-  files[name] = stdout
-  files[`${name}.stderr`] = stderrExtra || `Processed a total of ${count} messages\n`
-  files[`${name}.end`] = `exit=0 lines=${count}\n`
+const TRAILER = '#dump-trailer '
+
+/**
+ * Renders one dump step's file `<stem>.txt`: its stdout and the driver's trailer line. `overrides`
+ * replace trailer fields, so a test can make the trailer disagree with the text.
+ */
+function putStep(files, stem, stdout, overrides = {}) {
+  const lines = stdout === '' ? 0 : stdout.split('\n').length - (stdout.endsWith('\n') ? 1 : 0)
+  const trailer = {
+    name: stem,
+    lines,
+    bytes: Buffer.byteLength(stdout),
+    exitCode: 0,
+    signal: null,
+    startedAt: 1,
+    endedAt: 2,
+    stderrBytes: 0,
+    stderrTail: '',
+    complete: true,
+    reasons: [],
+    ...overrides,
+  }
+  files[`${stem}.txt`] = `${stdout}${TRAILER}${JSON.stringify(trailer)}\n`
 }
 
-/** @returns {Record<string, string>} every Apache file of the world, from its layout */
+/** Renders a topic log dump, whose trailer also reports the tool's own record count. */
+function putLog(files, role, lines, overrides = {}) {
+  putStep(files, `log-${role}`, lines.length ? `${lines.join('\n')}\n` : '', {
+    processed: lines.length,
+    ...overrides,
+  })
+}
+
+/** @returns {Record<string, string>} every dump file of the world, from its layout */
 function renderApache(world) {
   const files = {}
   const { layout, config } = world
   for (const [role, entries] of Object.entries(layout)) {
-    const lines = dumpLines(entries)
-    putStep(files, `${role}.dump`, lines.length ? `${lines.join('\n')}\n` : '')
+    putLog(files, role, dumpLines(entries, world.values))
+    putStep(files, `latest-${role}`, `${config.topics[role]}:0:${logEnd(entries)}\n`)
   }
   const bySlot = slots(config)
   const end = { main: logEnd(layout.main), transactions: logEnd(layout.transactions) }
@@ -391,18 +417,13 @@ function renderApache(world) {
       continue
     const rows = [[MAIN, end.main, end.main]]
     if (c.purpose === 'subject') rows.push([TXN, end.transactions, end.transactions])
-    putStep(
-      files,
-      `groups/${c.group}.describe`,
-      describeText(c.group, rows),
-      'Consumer group has no active members.\n'
-    )
+    putStep(files, `group-${c.group}`, describeText(c.group, rows))
   }
   return files
 }
 
 /** @returns {object} a healthy world in the mode (journal records, header, supervisor, Apache files) */
-function healthy({ mode = 'acceptance', withInventory = false } = {}) {
+function healthy({ mode = 'acceptance', withInventory = false, values = false } = {}) {
   const config = buildConfig()
   config.mode = mode
   const layout = buildLayout()
@@ -414,6 +435,7 @@ function healthy({ mode = 'acceptance', withInventory = false } = {}) {
     mode,
     layout,
     withInventory,
+    values,
     trafficTail: [],
     header: {
       schema: 3,
@@ -472,9 +494,9 @@ function healthy({ mode = 'acceptance', withInventory = false } = {}) {
   return world
 }
 
-/** Replaces one rendered dump's lines and keeps its `.end` and stderr in step. */
+/** Replaces one rendered log dump's lines and keeps its trailer in step. */
 function redump(world, role, lines) {
-  putStep(world.apache, `${role}.dump`, lines.length ? `${lines.join('\n')}\n` : '')
+  putLog(world.apache, role, lines)
 }
 
 const encode = (records) => {
@@ -515,7 +537,7 @@ function writeArtifact(world, dir) {
         : `archived ${file}\n`
     )
   for (const f of ['provenance.json', 'capabilities.json', 'compose.yml']) put(`broker/${f}`, f)
-  for (const [name, text] of Object.entries(world.apache)) put(`apache/${name}`, text)
+  for (const [name, text] of Object.entries(world.apache)) put(`dump/${name}`, text)
   const header = copy(world.header)
   const walk = (rel) =>
     fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).flatMap((e) => {
@@ -537,6 +559,8 @@ function writeArtifact(world, dir) {
 }
 
 module.exports = {
+  TRAILER,
+  putLog,
   renderApache,
   MAIN,
   TXN,
