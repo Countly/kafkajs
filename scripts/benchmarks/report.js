@@ -21,7 +21,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { median } = require('./session')
+const { median, setupFailure } = require('./session')
 const defaultManifest = require('./manifest.json')
 
 const ROOT = path.resolve(__dirname, '..', '..')
@@ -351,6 +351,23 @@ const runEntry = (entry, options) => {
 }
 
 /**
+ * The row of an entry its workflow job could not prepare: written to its evidence directory with
+ * the setup outcomes, and never run.
+ * @param {ManifestEntry} entry
+ * @param {string} reason what `setupFailure` returned
+ * @param {string} setup the job's `BENCH_SETUP`
+ * @param {string} rawDir every entry's evidence directory
+ * @returns {{ rows: Row[], details: Detail[] }}
+ */
+const setupRow = (entry, reason, setup, rawDir) => {
+  const dir = path.join(rawDir, entry.name)
+  fs.mkdirSync(dir, { recursive: true })
+  writeJson(path.join(dir, 'entry.json'), entry)
+  writeJson(path.join(dir, 'setup.json'), { setup, reason })
+  return { rows: [entryRow(entry, 'error', reason)], details: [] }
+}
+
+/**
  * @param {string|number} text
  * @returns {string} `text` on one line with its pipes escaped, safe in a table cell or list item
  */
@@ -463,17 +480,21 @@ const parseArgs = (argv) => {
  * Runs the manifest, or the entries `--only` names, and writes `bench-report.md` and
  * `bench-report.json` into `--out`, with each run entry's raw evidence under `--out/bench-raw/`.
  * An entry `--only` leaves out is a `not selected` row and is neither run nor given evidence.
+ * In a workflow job whose setup steps did not all succeed (`BENCH_SETUP`, space-separated
+ * `<step>=<outcome>` pairs), every selected entry is an `error` row naming those steps and is not
+ * run; its evidence directory keeps the entry and a `setup.json` receipt.
  * @param {string[]} argv `--runs`, `--fork-dir`, `--baseline-dir`, `--out` and `--only`
  * @param {object} [deps]
  * @param {Function} [deps.spawn] `child_process.spawnSync`, replaceable in tests
  * @param {{ entries: ManifestEntry[] }} [deps.manifest] the benchmarks to run
  * @param {(line: string) => void} [deps.log] receives the usage line and one line per entry
+ * @param {Record<string, string|undefined>} [deps.env] the environment, `process.env` by default
  * @returns {number} 0 once the report is written, whatever its rows hold; 2 for a bad argument
  *   or an `--only` name that is no manifest entry
  */
 const main = (
   argv,
-  { spawn = spawnSync, manifest = defaultManifest, log = console.error } = {}
+  { spawn = spawnSync, manifest = defaultManifest, log = console.error, env = process.env } = {}
 ) => {
   let args
   try {
@@ -489,11 +510,13 @@ const main = (
   }
   const rawDir = path.join(args.out, 'bench-raw')
   fs.mkdirSync(rawDir, { recursive: true })
+  const setup = setupFailure(env.BENCH_SETUP)
   const results = manifest.entries.map((entry) => {
     if (args.only && !args.only.includes(entry.name)) {
       return { rows: [entryRow(entry, 'not selected', 'left out by --only')], details: [] }
     }
     log(entry.name)
+    if (setup) return setupRow(entry, setup, env.BENCH_SETUP, rawDir)
     return runEntry(entry, { ...args, spawn, rawDir })
   })
   const rows = results.flatMap((result) => result.rows)

@@ -3,7 +3,8 @@
  *
  * Command: node scripts/benchmarks/adapters/telemetrySession.js --row <name> --raw <file>
  * One row is one owed configuration: a `telemetry.js` job and its worker flags (`ROWS`). The command
- * runs only in the workflow job that owns the row (`BENCH_TELEMETRY_ROW`). It checks the fixture and
+ * runs only in the workflow job that owns the row (`BENCH_TELEMETRY_ROW`); anywhere else it prints
+ * `{ row, omitted }` and the report shows the row as omitted with that reason. It checks the fixture and
  * the free disk and refuses without them, freezes the candidate source (and, for a job with a
  * `previous` arm, the accepted baseline checkout, verified against `ACCEPTED_BASELINE`) into
  * `<raw>.snapshots/`, writes the session manifest beside `--raw`, runs the controller within
@@ -11,18 +12,14 @@
  * The declared session time is the controller's budget plus, for a delivery job, one bounded reporter
  * reset per observation. A session the job allowance cuts off is an `error` row with its elapsed time
  * and completed children: the measurement stays owed, and no partial session is accepted.
- * Exit codes: 0 a report line was printed, 1 the command failed, 2 a usage error, a missing fixture
- * or an unverified baseline.
+ * Exit codes: 0 a report or omitted line was printed, 1 the command failed, 2 a usage error, a
+ * missing fixture or an unverified baseline.
  *
  * Evidence kept beside `--raw` for replay: the manifest, the session directory (`.session`), both
  * snapshot roots and their archives (`.snapshots`), the source and baseline receipts, the decoder
  * receipt (`.decoder.json`) and the reporter sink (`.sink`). Replay: restore the artifact at the same
  * absolute path, check out the same commit at the same path, use the same Node binary, then run
  * `node scripts/benchmarks/telemetry.js --verify-session <raw>.session`.
- *
- * Workflow plan: `--telemetry-rows <names>` prints the telemetry rows to run (a JSON array, one job
- * each) and `--other-rows <names>` the remaining manifest rows (comma separated); empty names select
- * every row.
  *
  * The row shows each arm's median and range of the manifest metrics over the measured observations,
  * and the controls: declared observation count, every observation verified, the independent
@@ -142,29 +139,6 @@ const manifestEntries = () =>
     arms: ['fork'],
   }))
 
-/**
- * Splits a dispatch's row selection between the telemetry jobs and the ordinary report.
- * @param {string} input comma-separated row names; empty selects every row
- * @param {{ name: string }[]} entries the manifest entries
- * @returns {{ telemetry: string[], others: string[] }} telemetry rows to run one per job, and the
- *   other selected names (unknown names included, for the report to reject)
- */
-const plan = (input, entries) => {
-  const wanted = input
-    .split(',')
-    .map((name) => name.trim())
-    .filter(Boolean)
-  const ours = new Set(ROWS.map(({ name }) => name))
-  return {
-    telemetry: ROWS.map(({ name }) => name).filter(
-      (name) => !wanted.length || wanted.includes(name)
-    ),
-    others: (wanted.length ? wanted : entries.map(({ name }) => name)).filter(
-      (name) => !ours.has(name)
-    ),
-  }
-}
-
 /** @param {string} job a `telemetry.js` job @returns {number} free bytes its session needs */
 const diskBytes = (job) => childCount(job) * CHILD_BYTES[JOBS[job].mode] + 1024 * MIB
 
@@ -193,6 +167,10 @@ const exists = (value, kind) =>
 
 /** @param {string} name a row @returns {object|undefined} its `ROWS` entry */
 const rowOf = (name) => ROWS.find((row) => row.name === name)
+
+/** @param {string} name a row @returns {string} why the row prints no session outside its own job */
+const outside = (name) =>
+  `runs in its own telemetry-rows job of the benchmark workflow (BENCH_TELEMETRY_ROW=${name})`
 
 /**
  * The session's time limit: its declared budget plus its reporter resets, cut to the job allowance
@@ -236,7 +214,7 @@ const preparedDecoder = (archive) => {
 }
 
 /**
- * Lists what the row's fixture lacks: its own job, the free disk its ledgers need, a valid job
+ * Lists what the row's fixture lacks: the free disk its ledgers need, a valid job
  * deadline when one is set, the baseline checkout for a `previous` arm, and for a delivery job the
  * telemetry cluster with its reporter, a fresh reporter sink and the decoder prepared by
  * `scripts/e2e/telemetry/prepareDecoder.js`.
@@ -248,12 +226,7 @@ const preparedDecoder = (archive) => {
 const fixtureProblems = (name, env, { raw, statfs = fs.statfsSync, now = Date.now }) => {
   const { job: jobName } = rowOf(name)
   const job = JOBS[jobName]
-  const checks = [
-    [
-      env.BENCH_TELEMETRY_ROW === name,
-      `BENCH_TELEMETRY_ROW: ${name}, set only by the workflow job that runs this row`,
-    ],
-  ]
+  const checks = []
   const directory = path.dirname(raw)
   const { bavail, bsize } = statfs(directory)
   const free = bavail * bsize
@@ -570,13 +543,14 @@ const parseArgs = (argv) => {
 }
 
 /**
- * Runs one session for the report and prints its report line, or prints the workflow plan.
- * @param {string[]} argv see `parseArgs`, or `--telemetry-rows <names>` / `--other-rows <names>`
+ * Runs one session for the report and prints its report line; outside the row's own workflow job
+ * prints an omitted line instead and runs nothing.
+ * @param {string[]} argv see `parseArgs`
  * @param {{ env?: object, spawn?: Function, log?: Function, error?: Function, root?: string,
  *   statfs?: Function, now?: () => number, zstd?: boolean, accepted?: object }} [deps]
  *   `root` is the candidate source, the checkout by default; `accepted` replaces `ACCEPTED_BASELINE`
- * @returns {number} 0 once the line is printed, 1 on a failure, 2 on a usage error, a missing
- *   fixture or an unverified baseline
+ * @returns {number} 0 once the report or omitted line is printed, 1 on a failure, 2 on a usage
+ *   error, a missing fixture or an unverified baseline
  */
 const main = (
   argv,
@@ -592,11 +566,6 @@ const main = (
     accepted = ACCEPTED_BASELINE,
   } = {}
 ) => {
-  if (argv[0] === '--telemetry-rows' || argv[0] === '--other-rows') {
-    const selected = plan(argv[1] ?? '', require('../manifest.json').entries)
-    log(argv[0] === '--other-rows' ? selected.others.join(',') : JSON.stringify(selected.telemetry))
-    return 0
-  }
   let args
   try {
     args = parseArgs(argv)
@@ -605,6 +574,10 @@ const main = (
     return 2
   }
   const { row, raw } = args
+  if (env.BENCH_TELEMETRY_ROW !== row.name) {
+    log(JSON.stringify({ row: row.name, omitted: outside(row.name) }))
+    return 0
+  }
   const missing = fixtureProblems(row.name, env, { raw, statfs, now })
   if (missing.length) {
     log(JSON.stringify({ row: row.name, refused: 'fixture', missing }))
@@ -721,7 +694,7 @@ const main = (
 /**
  * Reads the command's report line.
  * @param {{ status: number|null, signal?: string, error?: Error, stdout?: string, stderr?: string }} result
- * @returns {object} the report line
+ * @returns {object} the report line, or the omitted line of a row run outside its own job
  * @throws {Error} for a refused fixture or baseline, a spawn error, a signal, a non-zero exit or
  *   no report line
  */
@@ -734,6 +707,7 @@ const read = (result) => {
   } catch {
     throw new Error(`exit ${result.status}: ${tail(result.stderr) || 'no session report'}`)
   }
+  if (result.status === 0 && typeof line.omitted === 'string') return line
   if (line.refused === 'fixture')
     throw new Error(`the telemetry fixture is missing: ${line.missing.join('; ')}`)
   if (line.refused === 'baseline')
@@ -758,6 +732,7 @@ const rows = (entry, arm, { outputs, error }) => {
   })
   if (error) return one('error', error)
   const [report] = outputs
+  if (report.omitted && report.row === entry.name) return one('omitted', report.omitted, 0)
   if (report.row !== entry.name)
     return one('error', `the session ran row ${report.row}, expected ${entry.name}`)
   const job = JOBS[report.job]
@@ -943,7 +918,7 @@ module.exports = {
   rows,
   main,
   fixtureProblems,
-  plan,
+  outside,
   diskBytes,
   manifestEntries,
   ROWS,
