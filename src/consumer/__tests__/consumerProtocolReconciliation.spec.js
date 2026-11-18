@@ -495,12 +495,17 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       ])
       const coordinator = runner.rebalanceCoordinator
       const warn = jest.spyOn(coordinator.logger, 'warn')
-      /** Advances fake time in 1 ms steps until `done()` holds, for at most `budget` ms. */
+      /** Advances fake time in 5 ms steps until `done()` holds, for at most `budget` ms. */
       const until = async (done, budget = 1000) => {
-        for (let spent = 0; !done() && spent < budget; spent++) {
-          await jest.advanceTimersByTimeAsync(1)
+        for (let spent = 0; !done() && spent < budget; spent += 5) {
+          await jest.advanceTimersByTimeAsync(5)
         }
       }
+      const INTERVAL = 250
+      const churnTarget = (memberEpoch, byTopic) => ({
+        ...target(memberEpoch, byTopic),
+        heartbeatIntervalMs: INTERVAL,
+      })
       const settle = () => until(() => !coordinator.isRebalancing())
 
       coordinator.runRound(null, 'initial')
@@ -510,8 +515,9 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       await group.heartbeat({ interval: 0 })
       fetching = runner.fetchManager.start()
 
-      // Each round applies the pin it took, and a new matching topic appears before the round
-      // checks whether it converged, so every round owes the next one.
+      // Each round applies the pin it took, and a new matching topic replaces the old one before
+      // the round checks whether it converged: it now owns a partition the subscription dropped,
+      // so every round owes the next one.
       const joinedAt = []
       const recordJoin = coordinator.onJoinComplete
       coordinator.onJoinComplete = () => {
@@ -525,7 +531,7 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       const controlFetches = []
 
       await discover({ [CONTROL]: [0], [churnName(1)]: [0] })
-      answerWith(target(2, { [CONTROL]: [0], [churnName(1)]: [0] }))
+      answerWith(churnTarget(2, { [CONTROL]: [0], [churnName(1)]: [0] }))
       await group.heartbeat({ interval: 0 })
       group.checkSubscriptionChange()
 
@@ -534,7 +540,7 @@ describe('Consumer > the consumer protocol reconciliation', () => {
         if (round % 20 === 0)
           controlFetches.push(fetched.filter((k) => k === `${CONTROL}|0`).length)
         if (round <= 60) {
-          answerWith(target(round + 2, { [CONTROL]: [0], [churnName(round + 1)]: [0] }))
+          answerWith(churnTarget(round + 2, { [CONTROL]: [0], [churnName(round + 1)]: [0] }))
           await group.heartbeat({ interval: 0 })
         }
       }
@@ -558,17 +564,19 @@ describe('Consumer > the consumer protocol reconciliation', () => {
           'Reconciliation is still running',
           GROUP_ID,
           rounds,
-          'subscription-changed',
+          'assignment-changed',
         ])
       )
 
-      // Paced: every follow-up round started at least one 100 ms wait after the one before it,
-      // and the chain itself sent no request beyond the heartbeats this case sent.
+      // Paced: every follow-up round started at least one wait - the membership's interval, never
+      // under 100 ms - after the one before it, and the heartbeats sent while the chain ran are
+      // this case's own plus at most one per wait.
       for (let i = 1; i < joinedAt.length; i++) {
         expect(joinedAt[i] - joinedAt[i - 1]).toBeGreaterThanOrEqual(100)
       }
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(60 * 100)
-      expect(log.filter(({ kind }) => kind === 'heartbeat').length - heartbeatsBefore).toEqual(61)
+      const heartbeats = log.filter(({ kind }) => kind === 'heartbeat').length - heartbeatsBefore
+      expect(heartbeats - 61).toBeLessThanOrEqual(joinedAt.length - 1)
 
       // The retained partition kept being fetched while the chain ran.
       expect(controlFetches[0]).toBeGreaterThan(0)

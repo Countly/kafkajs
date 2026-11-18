@@ -542,6 +542,24 @@ class KafkaJSNoBrokerAvailableError extends KafkaJSError {
 }
 
 /**
+ * A classic-protocol rebalance chain ran its round limit and still owed another round: members
+ * kept revoking partitions from each other. Retriable, so the default `restartOnFailure` policy
+ * restarts the consumer, which rejoins from the committed offsets; records processed since the
+ * last commit can be delivered again. A custom `restartOnFailure` must return true for it to
+ * restart. Consumer-protocol (KIP-848) groups never raise it.
+ */
+class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { retriable: true, cause })
+    this.name = 'KafkaJSRebalanceNotConvergedError'
+  }
+}
+
+/**
  * A transient error the client recovers from by refreshing what it knows — topic metadata, or the
  * coordinator — and retrying. Retriable, like every `KafkaJSError` whose `retriable` is true.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/errors/RefreshRetriableException.java
@@ -933,6 +951,7 @@ module.exports = {
   KafkaJSBootstrapResolutionError,
   KafkaJSNoOffsetError,
   KafkaJSRebalanceListenerError,
+  KafkaJSRebalanceNotConvergedError,
   KafkaJSProducerClosedError,
   KafkaJSTelemetryError,
   KafkaJSError,

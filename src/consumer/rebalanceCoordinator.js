@@ -1,7 +1,7 @@
 const describeThrown = require('../network/describeThrown')
 const handlerContext = require('./handlerContext')
 const RebalanceHooks = require('./rebalanceHooks')
-const { KafkaJSNonRetriableError } = require('../errors')
+const { KafkaJSRebalanceNotConvergedError } = require('../errors')
 const {
   REBALANCE_PATHS,
   rebalanceAction,
@@ -26,11 +26,18 @@ const {
 } = require('./instrumentationEvents')
 
 /**
- * Consecutive rounds one chain may run before it is treated as non-converging. A cooperative
- * round that revokes something runs a follow-up round; a pair of members that keep taking
- * partitions from each other would otherwise chain forever.
+ * Consecutive rounds one classic chain may run before it is treated as non-converging. A
+ * cooperative round that revokes something runs a follow-up round at once; a pair of members that
+ * keep taking partitions from each other would otherwise chain forever. A consumer-protocol chain
+ * has no such count: its rounds are paced, and this is how often it warns instead.
  */
 const MAX_REJOIN_ROUNDS = 20
+
+/**
+ * The shortest wait between two consumer-protocol rounds. The heartbeat interval the wait follows
+ * is supplied by the broker, so a zero or tiny one must not turn a long chain into a spin.
+ */
+const MIN_RECONCILE_YIELD_MS = 100
 
 /**
  * The longest a chain waits between two rounds of one reconciliation. Matches Kafka's default
@@ -154,6 +161,10 @@ module.exports = class RebalanceCoordinator {
    * so a multi-trip reconciliation spends its round budget on real trips instead of spinning the
    * event loop.
    *
+   * The wait is the membership's heartbeat interval, at least `MIN_RECONCILE_YIELD_MS` and at most
+   * `MAX_RECONCILE_YIELD_MS`: with one apply and at most one owed heartbeat per round, it is what
+   * bounds the CPU and request rate of a chain that has no round count.
+   *
    * Raced against the stop signal rather than merely guarded before it: a stop landing one tick
    * after the timer is armed would otherwise hold `stop()` open for the whole delay. Deliberately
    * not `unref()`ed - the chain awaits this timer, so an unreferenced one would strand the round
@@ -162,7 +173,10 @@ module.exports = class RebalanceCoordinator {
    * @returns {Promise<void>}
    */
   yieldBetweenRounds() {
-    const delay = Math.min(this.consumerGroup.heartbeatInterval(), MAX_RECONCILE_YIELD_MS)
+    const delay = Math.max(
+      MIN_RECONCILE_YIELD_MS,
+      Math.min(this.consumerGroup.heartbeatInterval(), MAX_RECONCILE_YIELD_MS)
+    )
 
     return new Promise((resolve) => {
       let timer = null
@@ -235,7 +249,7 @@ module.exports = class RebalanceCoordinator {
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
    * @returns {Promise<void>}
-   * @throws {KafkaJSNonRetriableError} when the chain does not converge
+   * @throws {KafkaJSRebalanceNotConvergedError} when a classic chain does not converge
    */
   async runChain(reason, kind) {
     try {
@@ -271,7 +285,7 @@ module.exports = class RebalanceCoordinator {
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
    * @returns {Promise<void>}
-   * @throws {KafkaJSNonRetriableError} when the chain does not converge
+   * @throws {KafkaJSRebalanceNotConvergedError} when a classic chain does not converge
    */
   async runRounds(reason, kind) {
     do {
@@ -279,7 +293,7 @@ module.exports = class RebalanceCoordinator {
         return
       }
 
-      this.chargeRound()
+      this.chargeRound(reason)
 
       const round = this.consumerGroup.beginRebalanceRound()
       const group = this.consumerGroup
@@ -434,15 +448,33 @@ module.exports = class RebalanceCoordinator {
   }
 
   /**
-   * Charges one round to the running chain, refusing the round past the chain's budget. The only
-   * place a chain is declared exhausted.
+   * Charges one round to the running chain. The only place a chain is declared exhausted.
+   *
+   * A consumer-protocol chain is never exhausted: it runs a round only while work is owed, each
+   * after one paced wait, the way the Java client keeps reconciling. Every `MAX_REJOIN_ROUNDS`
+   * completed rounds it warns, naming the reason for the next one. A classic chain has no wait
+   * between rounds, so it is refused past `MAX_REJOIN_ROUNDS` with a retriable error that the
+   * default crash policy answers with a restart.
    * @private
+   * @param {string|null} reason the reason the round about to run is for
    * @returns {void}
-   * @throws {KafkaJSNonRetriableError} when the chain has already run `MAX_REJOIN_ROUNDS` rounds
+   * @throws {KafkaJSRebalanceNotConvergedError} when a classic chain has already run
+   *   `MAX_REJOIN_ROUNDS` rounds
    */
-  chargeRound() {
-    if (++this.rounds > MAX_REJOIN_ROUNDS) {
-      throw new KafkaJSNonRetriableError(
+  chargeRound(reason) {
+    const completed = this.rounds++
+    if (this.consumerGroup.kind === 'consumer') {
+      if (completed > 0 && completed % MAX_REJOIN_ROUNDS === 0) {
+        this.logger.warn('Reconciliation is still running', {
+          groupId: this.groupId,
+          rounds: completed,
+          reason,
+        })
+      }
+      return
+    }
+    if (completed >= MAX_REJOIN_ROUNDS) {
+      throw new KafkaJSRebalanceNotConvergedError(
         `cooperative rebalance did not converge in ${MAX_REJOIN_ROUNDS} rounds`
       )
     }

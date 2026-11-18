@@ -2111,20 +2111,26 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
     await expect(chain).resolves.toBeUndefined()
     expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(21)
+    // The reason chosen before the wait is the one the round reports.
     expect(payloadsOf(built.emitted, events.REBALANCING).at(-1).reason).toEqual(
-      'subscription-changed'
+      'assignment-changed'
     )
+    expect(built.consumerGroup.subscriptionPending()).toBe(false)
     expect(built.coordinator.isRebalancing()).toBe(false)
   })
 
-  it('runs a twenty-first round, as a lost one, for a LOST queued during the wait, then settles', async () => {
+  it('runs the round a LOST queued during the wait is owed and then a lost round for it, then settles', async () => {
     const built = build()
     const chain = convergeDuringLastWait(built, () => built.coordinator.runRound('fenced', 'lost'))
-    await jest.advanceTimersByTimeAsync(21 * 500)
+    await jest.advanceTimersByTimeAsync(22 * 500)
 
     await expect(chain).resolves.toBeUndefined()
-    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(21)
-    expect(payloadsOf(built.emitted, events.REBALANCING).at(-1).reason).toEqual('fenced')
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(22)
+    expect(
+      payloadsOf(built.emitted, events.REBALANCING)
+        .slice(-2)
+        .map(({ reason }) => reason)
+    ).toEqual(['assignment-changed', 'fenced'])
     expect(built.consumerGroup.forgetOwnedPartitions).toHaveBeenCalledTimes(1)
   })
 
