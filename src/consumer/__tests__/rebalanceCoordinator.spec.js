@@ -2024,6 +2024,102 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
     expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
   })
 
+  /**
+   * Nineteen follow-ups that each find a real mismatch, then a twentieth apply that leaves one,
+   * corrected by the coordinator while the chain waits before round twenty-one.
+   * @param {object} built what `build()` returned
+   * @param {() => void} [atCorrection] what else changes at the moment of the correction
+   * @returns {Promise<void>} the chain
+   */
+  const convergeDuringLastWait = (built, atCorrection = () => {}) => {
+    const { coordinator, consumerGroup } = built
+    let applies = 0
+    let mismatch = false
+    asConsumerProtocol(consumerGroup, { needsReconciliation: () => mismatch })
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      mismatch = true
+      if (++applies === 20) {
+        setTimeout(() => {
+          mismatch = false
+          atCorrection()
+        }, 100)
+      }
+      return { assignment: [], added: [], revoked: [] }
+    })
+    const chain = coordinator.runRound('assignment-changed', 'revoked')
+    chain.catch(() => {})
+    return chain
+  }
+
+  it('ends the chain when the target converges during the wait before another round', async () => {
+    const built = build()
+    const chain = convergeDuringLastWait(built)
+    await jest.advanceTimersByTimeAsync(20 * 500)
+
+    await expect(chain).resolves.toBeUndefined()
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+    expect(built.consumerGroup.joinAndSync).toHaveBeenCalledTimes(20)
+    expect(built.coordinator.isRebalancing()).toBe(false)
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
+  it('still runs the round a subscription revision pending at wake-up is owed', async () => {
+    const built = build()
+    let pending = false
+    built.consumerGroup.subscriptionPending = () => pending
+    const chain = convergeDuringLastWait(built, () => (pending = true))
+    await jest.advanceTimersByTimeAsync(20 * 500)
+
+    await expect(chain).rejects.toThrow('did not converge in 20 rounds')
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+  })
+
+  it('still runs the round a LOST queued during the wait is owed', async () => {
+    const built = build()
+    const chain = convergeDuringLastWait(built, () => built.coordinator.runRound('fenced', 'lost'))
+    await jest.advanceTimersByTimeAsync(20 * 500)
+
+    await expect(chain).rejects.toThrow('did not converge in 20 rounds')
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+  })
+
+  it('still runs the round a current LOST verdict at wake-up is owed', async () => {
+    const built = build()
+    const chain = convergeDuringLastWait(built, () =>
+      built.coordinator.requestRejoin({
+        kind: 'lost',
+        reason: 'fenced',
+        error: new KafkaJSProtocolError(createErrorFromCode(110)),
+      })
+    )
+    await jest.advanceTimersByTimeAsync(20 * 500)
+
+    await expect(chain).rejects.toThrow('did not converge in 20 rounds')
+    expect(built.coordinator.hasVerdict()).toBe(true)
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+  })
+
+  it('keeps every follow-up that a subscription revision during each round asks for, up to the round guard', async () => {
+    const built = build()
+    const { coordinator, consumerGroup } = built
+    let desired = 1
+    let applied = 0
+    asConsumerProtocol(consumerGroup)
+    consumerGroup.subscriptionPending = () => applied !== desired
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      applied = desired++
+      return { assignment: [], added: [], revoked: [] }
+    })
+    const chain = coordinator.runRound('subscription-changed', 'revoked')
+    chain.catch(() => {})
+    await jest.advanceTimersByTimeAsync(25 * 500)
+
+    await expect(chain).rejects.toThrow(
+      new KafkaJSNonRetriableError('cooperative rebalance did not converge in 20 rounds')
+    )
+    expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+  })
+
   // The shipped classic follow-up must survive the round-kind/protocol split.
   it('keeps the classic cooperative follow-up round', async () => {
     const { coordinator, consumerGroup, emitted } = build()
