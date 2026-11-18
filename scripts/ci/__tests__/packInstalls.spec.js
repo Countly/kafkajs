@@ -4,6 +4,7 @@ const yaml = require('js-yaml')
 
 const ROOT = path.join(__dirname, '..', '..', '..')
 const WORKFLOWS = path.join(ROOT, '.github', 'workflows')
+const GATE_MANIFEST = path.join(ROOT, 'scripts', 'ci', 'gate.json')
 
 /** A command that packs or publishes a tarball, directly or through a repository script. */
 const PACKS =
@@ -12,6 +13,8 @@ const PACKS =
 const INSTALLS = /\bnpm (ci|install|i)\b/
 /** The scripts a packing job runs that install packages themselves. */
 const PACK_SCRIPTS = ['packSmoke.sh', 'otelPackSmoke.sh', 'otelTest.sh']
+/** The one install that keeps lifecycle scripts: its install script compiles the optional Kerberos binding, in a prefix of its own. */
+const KERBEROS_BINDING = /^npm install --prefix "\$peer" .*"kerberos@\$version"$/
 
 /**
  * Splits shell text into lines with continued lines joined and comment lines dropped. Quoted
@@ -38,6 +41,13 @@ const workflowJobs = () =>
       }))
     })
 
+/** @returns {{ id: string, command: string }[]} the gate manifest checks that run a shell command */
+const manifestChecks = () =>
+  JSON.parse(fs.readFileSync(GATE_MANIFEST, 'utf8')).checks.filter((check) => check.command)
+
+/** @returns {{ id: string, lines: string[] }[]} the workflow jobs that pack or publish */
+const packingJobs = () => workflowJobs().filter((job) => job.lines.some((line) => PACKS.test(line)))
+
 /**
  * @param {string[]} lines command lines
  * @returns {string[]} the install commands that do not pass --ignore-scripts
@@ -59,13 +69,12 @@ describe('installs before a pack or publish', () => {
   })
 
   test('every workflow job that packs or publishes runs every install with --ignore-scripts', () => {
-    const packing = workflowJobs().filter((job) => job.lines.some((line) => PACKS.test(line)))
-
-    expect(packing.map((job) => job.id)).toEqual(
+    expect(packingJobs().map((job) => job.id)).toEqual(
       expect.arrayContaining([
         'ci.yml:pack',
         'ci.yml:otel',
         'bench.yml:bench',
+        'gate.yml:check',
         'release.yml:pack',
         'release.yml:pack-otel',
         'release.yml:publish',
@@ -73,8 +82,32 @@ describe('installs before a pack or publish', () => {
       ])
     )
     expect(
-      packing.flatMap((job) => scriptedInstalls(job.lines).map((line) => `${job.id}: ${line}`))
+      packingJobs().flatMap((job) =>
+        scriptedInstalls(job.lines)
+          .filter((line) => !KERBEROS_BINDING.test(line))
+          .map((line) => `${job.id}: ${line}`)
+      )
     ).toEqual([])
+  })
+
+  test('the gate manifest packs through its pack and OTel checks', () => {
+    expect(
+      manifestChecks()
+        .filter((check) => PACKS.test(check.command))
+        .map((check) => check.id)
+    ).toEqual(expect.arrayContaining(['pack', 'otel-test', 'e2e-otel']))
+  })
+
+  test('the only install that keeps lifecycle scripts is the Kerberos binding built in its own prefix', () => {
+    expect(
+      packingJobs().flatMap((job) =>
+        scriptedInstalls(job.lines)
+          .filter((line) => KERBEROS_BINDING.test(line))
+          .map((line) => `${job.id}: ${line}`)
+      )
+    ).toEqual([
+      'gate.yml:check: npm install --prefix "$peer" --no-package-lock --no-audit --no-fund "kerberos@$version"',
+    ])
   })
 
   test.each(PACK_SCRIPTS)('every install in scripts/%s passes --ignore-scripts', (file) => {
@@ -82,5 +115,42 @@ describe('installs before a pack or publish', () => {
 
     expect(lines.filter((line) => INSTALLS.test(line)).length).toBeGreaterThan(0)
     expect(scriptedInstalls(lines)).toEqual([])
+  })
+
+  describe('an install that is not the only command on its line', () => {
+    test.each([
+      ['an unprotected install before a protected one', 'npm ci && npm install --ignore-scripts x'],
+      ['an unprotected install after a protected one', 'npm install --ignore-scripts x && npm ci'],
+      ['a semicolon separating the installs', 'npm ci; npm install --ignore-scripts x'],
+      ['an or-list of installs', 'npm install --ignore-scripts x || npm ci'],
+      ['a flag on a command that installs nothing', 'npm ci && echo --ignore-scripts'],
+      ['command substitutions', 'echo "$(npm ci)" "$(npm install --ignore-scripts x)"'],
+    ])('the check flags %s', (_name, line) => {
+      expect(scriptedInstalls(commandLines(line))).toEqual([expect.stringContaining('npm ci')])
+    })
+
+    test('the check flags an unprotected install in a continued compound command', () => {
+      const lines = commandLines('npm ci \\\n  && npm install --ignore-scripts x')
+
+      expect(scriptedInstalls(lines)).toEqual([expect.stringContaining('npm ci')])
+    })
+
+    test('the check flags an unprotected install in a multi-line run block', () => {
+      const lines = commandLines('npm ci\nnpm install --ignore-scripts x\nnpm pack')
+
+      expect(scriptedInstalls(lines)).toEqual(['npm ci'])
+    })
+
+    test('the check accepts installs that each pass the flag', () => {
+      const lines = commandLines(
+        [
+          'npm ci --ignore-scripts && npm install --ignore-scripts x',
+          'npm ci --ignore-scripts; npm install --prefix "$RUNNER_TEMP/a" x --ignore-scripts',
+          'npm pack --pack-destination "$dir" | npm install --ignore-scripts x',
+        ].join('\n')
+      )
+
+      expect(scriptedInstalls(lines)).toEqual([])
+    })
   })
 })
