@@ -676,6 +676,60 @@ describe('Benchmarks > telemetrySession adapter', () => {
     expect(cramped.rows[0].reason).toContain(`the session needs ${need}`)
   })
 
+  test('the telemetry row keeps a cut-off session owed with its elapsed time and completed children when its last raw record is incomplete', () => {
+    const name = 'telemetrySession-requests-control'
+    const budget = minimumBudget('requests-control')
+    const env = { BENCH_TELEMETRY_ROW: name, TELEMETRY_JOB_DEADLINE: String(1_000_000 + 7200) }
+    const FRAGMENT = '{"round":'
+    /** A session that runs 6000 s and rewrites its raw rows with `edit` before it returns. */
+    const session = (script, edit) => {
+      const clock = { t: 1_000_000_000 }
+      const scripted = controller({
+        ...script,
+        during: (manifest) => {
+          clock.t += 6000 * 1000
+          const raw = path.join(manifest.directory, 'raw.jsonl')
+          fs.writeFileSync(raw, edit(fs.readFileSync(raw, 'utf8')))
+        },
+      })
+      return runRow(name, env, scripted.spawn, { now: () => clock.t })
+    }
+
+    const torn = session({ stop: 12 }, (text) => text + FRAGMENT)
+    expect(torn.rows).toEqual([
+      {
+        benchmark: name,
+        arm: '-',
+        metric: '-',
+        unit: '-',
+        runs: 1,
+        status: 'error',
+        reason:
+          `the session was cut off at its 6000 s limit after 6000 s with 12 of 30 children completed ` +
+          `(declared budget ${budget} s, job allowance 6000 s); the measurement stays owed and the partial evidence is kept; ` +
+          `its raw evidence ends in an incomplete record of ${FRAGMENT.length} bytes`,
+      },
+    ])
+    expect(torn.details ?? []).toEqual([])
+    const kept = fs.readFileSync(`${torn.raw}.session/raw.jsonl`, 'utf8')
+    expect(kept.endsWith(`}\n${FRAGMENT}`)).toBe(true)
+    expect(kept.split('\n')).toHaveLength(13)
+
+    const interior = session({ stop: 12 }, (text) => {
+      const lines = text.split('\n')
+      lines[5] = FRAGMENT
+      return lines.join('\n')
+    })
+    expect(interior.rows).toEqual([expect.objectContaining({ runs: 0, status: 'error' })])
+    expect(interior.rows[0].reason).not.toContain('children completed')
+    expect(interior.rows[0]).not.toHaveProperty('median')
+
+    const finished = session({}, (text) => text + FRAGMENT)
+    expect(finished.rows).toEqual([expect.objectContaining({ runs: 0, status: 'error' })])
+    expect(finished.details ?? []).toEqual([])
+    expect(finished.rows[0]).not.toHaveProperty('median')
+  })
+
   test('the long telemetry rows count a session that finishes inside the job and keep one the job cuts off owed with its elapsed time and completed children', () => {
     const allowance = 355 * 60 - 1200
     const start = 1_700_000_000_000
