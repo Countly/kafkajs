@@ -191,6 +191,9 @@ The OAuth bearer token must be an object with properties value and
 (optionally) extensions, that will be sent during the SASL/OAUTHBEARER
 request.
 
+`authorizationIdentity` (optional) is sent as the SASL authorization identity.
+Apache Kafka accepts it only when it equals the token's principal name.
+
 The implementation of the oauthBearerProvider must take care that tokens are
 reused and refreshed when appropriate. An example implementation using
 [`simple-oauth2`](https://github.com/lelylan/simple-oauth2) would look something

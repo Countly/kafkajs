@@ -215,7 +215,11 @@ type SASLMechanismOptionsMap = {
     secretAccessKey: string
     sessionToken?: string
   }
-  oauthbearer: { oauthBearerProvider: () => Promise<OauthbearerProviderResponse> }
+  oauthbearer: {
+    oauthBearerProvider: () => Promise<OauthbearerProviderResponse>
+    /** SASL authorization identity; Apache Kafka requires it to equal the token's principal name. Empty means none. */
+    authorizationIdentity?: string
+  }
 }
 
 export type SASLMechanism = keyof SASLMechanismOptionsMap

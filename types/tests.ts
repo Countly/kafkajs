@@ -1614,6 +1614,7 @@ const legacyCallback: kafkajs.SASLOptions = {
   oauthBearerProvider: async () => ({ value: 'token', extensions: { trace: 'one' } }),
 }
 const helperCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider }
+const authzCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider, authorizationIdentity: 'principal' }
 // @ts-expect-error secret and assertion are exclusive
 oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientSecret: 'secret', clientAssertion: signedAssertion })
 // @ts-expect-error one credential form is required

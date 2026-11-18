@@ -357,7 +357,7 @@ it('registers the builtin mechanism and retains the original invocation guard', 
     return original(value)
   })
   const refusal = await auth.authenticate().catch((error) => error)
-  expect(refusal).toBeInstanceOf(errors.KafkaJSSASLAuthenticationError)
+  expect(refusal).toBe(stale)
   expect(sent).toHaveLength(2)
   expect(auth.sessionLifetime).toBe('15000')
 })

@@ -6,7 +6,8 @@
  *
  * The mechanism consists of a message from the client to the server.
  * The client sends the "n,"" GS header, followed by the authorizationIdentitty
- * prefixed by "a=" (if present), followed by ",", followed by a US-ASCII SOH
+ * prefixed by "a=" (if present; "=" and "," in it are escaped as "=3D" and
+ * "=2C", RFC 5801 saslname), followed by ",", followed by a US-ASCII SOH
  * character, followed by "auth=Bearer ", followed by the token value, followed
  * by US-ASCII SOH character, followed by SASL extensions in OAuth "friendly"
  * format and then closed by two additionals US-ASCII SOH characters.
@@ -45,8 +46,21 @@ function formatExtensions(extensions) {
   return msg
 }
 
+/**
+ * Escapes the two characters RFC 5801 reserves in a saslname.
+ * @param {string} name the authorization identity
+ * @returns {string} the name with "=" as "=3D" and "," as "=2C"
+ */
+const saslName = (name) => `${name}`.replace(/[=,]/g, (c) => (c === '=' ? '=3D' : '=2C'))
+
+/**
+ * Builds the initial client response. An absent or empty authorization identity is omitted.
+ * @param {{ authorizationIdentity?: string|null }} sasl the SASL config
+ * @param {{ value: string, extensions?: Object<string, string> }} oauthBearerToken the token
+ * @returns {Promise<{ encode: () => Promise<Buffer> }>} INT32-prefixed mechanism bytes
+ */
 module.exports = async ({ authorizationIdentity = null }, oauthBearerToken) => {
-  const authzid = authorizationIdentity == null ? '' : `"a=${authorizationIdentity}`
+  const authzid = authorizationIdentity ? `a=${saslName(authorizationIdentity)}` : ''
   let ext = formatExtensions(oauthBearerToken.extensions)
   if (ext.length > 0) {
     ext = `${SEPARATOR}${ext}`
@@ -60,3 +74,11 @@ module.exports = async ({ authorizationIdentity = null }, oauthBearerToken) => {
     },
   }
 }
+
+/**
+ * The client response that answers an error challenge: a single %x01 (RFC 7628 section 3.2.3).
+ * @returns {{ encode: () => Promise<Buffer> }} INT32-prefixed mechanism bytes
+ */
+module.exports.acknowledgeError = () => ({
+  encode: async () => new Encoder().writeBytes(Buffer.from([0x01])).buffer,
+})
