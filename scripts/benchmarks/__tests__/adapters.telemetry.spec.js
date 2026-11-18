@@ -223,12 +223,11 @@ describe('Benchmarks > telemetrySession adapter', () => {
 
   test('the telemetry row refuses to run without its fixture', () => {
     const { spawn, calls } = controller()
-    const bare = runRow(CONTROL, {}, spawn)
+    const bare = runRow(CONTROL, { BENCH_TELEMETRY_ROW: CONTROL }, spawn)
     expect(calls).toEqual([])
     expect(bare.rows).toHaveLength(1)
     expect(bare.rows[0]).toMatchObject({ benchmark: CONTROL, status: 'error' })
     for (const name of [
-      'BENCH_TELEMETRY_ROW',
       'COMPOSE_FILE',
       'COMPOSE_PROJECT_NAME',
       'KAFKA_VERSION',
@@ -612,10 +611,23 @@ describe('Benchmarks > telemetrySession adapter', () => {
 
     const name = 'telemetrySession-requests-control'
     const budget = minimumBudget('requests-control')
-    const elsewhere = controller()
-    const shared = runRow(name, { BENCH_TELEMETRY_ROW: CONTROL }, elsewhere.spawn)
-    expect(elsewhere.calls).toEqual([])
-    expect(shared.rows[0].reason).toContain(`BENCH_TELEMETRY_ROW: ${name}`)
+    for (const env of [{}, { BENCH_TELEMETRY_ROW: CONTROL }]) {
+      const elsewhere = controller()
+      const shared = runRow(name, env, elsewhere.spawn)
+      expect(elsewhere.calls).toEqual([])
+      expect(shared.rows).toEqual([
+        {
+          benchmark: name,
+          arm: '-',
+          metric: '-',
+          unit: '-',
+          runs: 0,
+          status: 'omitted',
+          reason: `runs in its own telemetry-rows job of the benchmark workflow (BENCH_TELEMETRY_ROW=${name})`,
+        },
+      ])
+      expect(fs.existsSync(`${shared.raw}.manifest.json`)).toBe(false)
+    }
 
     const unbounded = controller()
     runRow(name, { BENCH_TELEMETRY_ROW: name }, unbounded.spawn)
@@ -836,29 +848,6 @@ describe('Benchmarks > telemetrySession adapter', () => {
       expect(late.rows[0].reason).toContain('the measurement stays owed')
       expect(late.rows[0]).not.toHaveProperty('median')
     }
-  })
-
-  test('the workflow plan gives each selected telemetry row its own job and keeps them out of the ordinary report', () => {
-    const telemetry = adapter.ROWS.map(({ name }) => name)
-    const entries = [
-      { name: 'producer-send' },
-      ...telemetry.map((name) => ({ name })),
-      { name: 'admin-create' },
-    ]
-    expect(adapter.plan('', entries)).toEqual({
-      telemetry,
-      others: ['producer-send', 'admin-create'],
-    })
-    expect(adapter.plan(` producer-send,${CONTROL} `, entries)).toEqual({
-      telemetry: [CONTROL],
-      others: ['producer-send'],
-    })
-    expect(adapter.plan(CONTROL, entries)).toEqual({ telemetry: [CONTROL], others: [] })
-    expect(adapter.plan('unknown-row', entries)).toEqual({ telemetry: [], others: ['unknown-row'] })
-
-    const out = []
-    expect(adapter.main(['--telemetry-rows', ''], { log: (line) => out.push(line) })).toBe(0)
-    expect(JSON.parse(out[0])).toEqual(telemetry)
   })
 
   test('the delivery row refuses a reporter sink with an earlier session in it and keeps its own sink', () => {
