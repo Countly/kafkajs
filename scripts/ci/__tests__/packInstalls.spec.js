@@ -11,6 +11,12 @@ const PACKS =
   /\bnpm (pack|publish)\b|\b(packSmoke|otelPackSmoke|otelTest)\.sh\b|\bnpm run test:(pack|otel)\b/
 /** A command that installs dependencies. */
 const INSTALLS = /\bnpm (ci|install|i)\b/
+/** Where one shell command ends and the next begins on a line. */
+const COMMAND_BREAK = /&&|\|\||[;|]/
+/** The start of an install, for splitting several installs that share one command. */
+const INSTALL_START = /(?=\bnpm (?:ci|install|i)\b)/
+/** A workflow step that executes the command a gate manifest check names. */
+const RUNS_MANIFEST_COMMAND = /\bcheck\.command\b/
 /** The scripts a packing job runs that install packages themselves. */
 const PACK_SCRIPTS = ['packSmoke.sh', 'otelPackSmoke.sh', 'otelTest.sh']
 /** The one install that keeps lifecycle scripts: its install script compiles the optional Kerberos binding, in a prefix of its own. */
@@ -28,34 +34,52 @@ const commandLines = (text) =>
     .split('\n')
     .filter((line) => !line.trim().startsWith('#'))
 
-/** @returns {{ id: string, lines: string[] }[]} every workflow job with its command lines */
-const workflowJobs = () =>
-  fs
+/** @returns {{ id: string, command: string }[]} the gate manifest checks that run a shell command */
+const manifestChecks = () =>
+  JSON.parse(fs.readFileSync(GATE_MANIFEST, 'utf8')).checks.filter((check) => check.command)
+
+/**
+ * A job that executes the command a gate manifest check names runs every manifest command, so its
+ * lines include them all.
+ * @returns {{ id: string, lines: string[] }[]} every workflow job with its command lines
+ */
+const workflowJobs = () => {
+  const manifestLines = manifestChecks().flatMap((check) => commandLines(check.command))
+  return fs
     .readdirSync(WORKFLOWS)
     .filter((file) => /\.ya?ml$/.test(file))
     .flatMap((file) => {
       const { jobs } = yaml.load(fs.readFileSync(path.join(WORKFLOWS, file), 'utf8'))
-      return Object.entries(jobs).map(([name, job]) => ({
-        id: `${file}:${name}`,
-        lines: (job.steps ?? []).flatMap((step) => (step.run ? commandLines(step.run) : [])),
-      }))
+      return Object.entries(jobs).map(([name, job]) => {
+        const steps = job.steps ?? []
+        return {
+          id: `${file}:${name}`,
+          lines: [
+            ...steps.flatMap((step) => (step.run ? commandLines(step.run) : [])),
+            ...(steps.some((step) => RUNS_MANIFEST_COMMAND.test(step.run ?? ''))
+              ? manifestLines
+              : []),
+          ],
+        }
+      })
     })
-
-/** @returns {{ id: string, command: string }[]} the gate manifest checks that run a shell command */
-const manifestChecks = () =>
-  JSON.parse(fs.readFileSync(GATE_MANIFEST, 'utf8')).checks.filter((check) => check.command)
+}
 
 /** @returns {{ id: string, lines: string[] }[]} the workflow jobs that pack or publish */
 const packingJobs = () => workflowJobs().filter((job) => job.lines.some((line) => PACKS.test(line)))
 
 /**
+ * Judges every install command on its own: a line is split at `&&`, `||`, `;` and `|`, then
+ * where one command holds several installs, so a flag on one command never covers another.
  * @param {string[]} lines command lines
  * @returns {string[]} the install commands that do not pass --ignore-scripts
  */
 const scriptedInstalls = (lines) =>
   lines
-    .filter((line) => INSTALLS.test(line) && !/(^|\s)--ignore-scripts(\s|$)/.test(line))
-    .map((line) => line.trim())
+    .flatMap((line) => line.split(COMMAND_BREAK))
+    .flatMap((command) => command.split(INSTALL_START))
+    .filter((command) => INSTALLS.test(command) && !/(^|\s)--ignore-scripts(\s|$)/.test(command))
+    .map((command) => command.trim())
 
 describe('installs before a pack or publish', () => {
   test('the packing npm scripts are the shell scripts this check reads', () => {
