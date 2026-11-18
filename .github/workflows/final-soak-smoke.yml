@@ -50,12 +50,17 @@ jobs:
       - name: Run the smoke runbook
         timeout-minutes: 50
         run: timeout -k 30s 2940s bash scripts/soak/finalSoakNode.sh "$(git rev-parse HEAD)" smoke
-      - name: Print the driver summary
+      - name: Print the runbook receipt and the driver summary
         if: always()
         timeout-minutes: 2
         run: |
           shopt -s nullglob
-          for summary in "$FINAL_SOAK_ARTIFACTS"/*.summary.json; do cat "$summary"; done
+          receipts=("$FINAL_SOAK_ARTIFACTS"/*.runbook.json)
+          summaries=("$FINAL_SOAK_ARTIFACTS"/*.summary.json)
+          ((${#receipts[@]} > 0)) || echo "no runbook receipt: the runbook stopped before its artifact directory existed"
+          for receipt in "${receipts[@]}"; do cat "$receipt"; done
+          ((${#summaries[@]} > 0)) || echo "no driver summary: the runbook stopped before the driver finished (see the receipt's failedStage)"
+          for summary in "${summaries[@]}"; do cat "$summary"; done
           for log in "$FINAL_SOAK_ARTIFACTS"/*/driver.log; do tail -n 200 "$log"; done
       - name: Stop the cluster
         if: always()

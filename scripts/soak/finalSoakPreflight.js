@@ -14,7 +14,8 @@
  * back; the run's client-metrics subscription created and read back, then one decoded telemetry push
  * with metrics from a probe producer and a probe consumer; per-node
  * broker provenance (image digests from `docker image inspect`, or operator evidence for a supplied
- * cluster); the prepared reporter's file cap and mounted jar digest; a quiet host (no agent or test
+ * cluster); the prepared reporter's file cap, mounted jar digest and the cap each broker's load proof
+ * reports; a quiet host (no agent or test
  * process), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
  * only, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
  * fail the preflight, and the record says so; such a run is never acceptance evidence.
@@ -117,7 +118,9 @@ class Preflight {
       reporter: () =>
         f.reporter.sinkBytes === host.brokerReporterFileBytes.value &&
         SHA.test(f.reporter.jarSha256) &&
-        f.reporter.mounted === f.reporter.jarSha256,
+        f.reporter.mounted === f.reporter.jarSha256 &&
+        f.reporter.loadedCaps.length === NODES.length &&
+        f.reporter.loadedCaps.every((cap) => cap === f.reporter.sinkBytes),
       'quiet-host': () => f.host.census.every((p) => p.class !== 'agent' && p.class !== 'test'),
       memory: () => f.host.memAvailable >= host.minMemAvailableBytes.value,
       disk: () => f.host.freeDisk >= host.minFreeDiskBytes.value,
@@ -339,6 +342,7 @@ async function telemetrySubscription(admin, matrix) {
  * @returns {Promise<object>} the facts `Preflight` judges, plus the header fields it writes
  */
 async function gatherFacts({ out, matrix }) {
+  if (!process.env.KAFKA_BROKERS) throw new Error('KAFKA_BROKERS must list the brokers')
   const { Kafka, logLevel } = require('../../index')
   const kafka = new Kafka({
     clientId: 'preflight-admin',
@@ -369,6 +373,10 @@ async function gatherFacts({ out, matrix }) {
           '/opt/kafka/libs/counting-telemetry-reporter.jar',
         ]).split(/\s+/)[0]
     )
+    const loadedCaps = NODES.map((node) => {
+      const proof = path.join(process.env.TELEMETRY_EVIDENCE_DIR, `reporter-${node}.json`)
+      return JSON.parse(fs.readFileSync(proof, 'utf8')).maxFileBytes
+    })
     const statfs = fs.statfsSync(out)
     return {
       node: process.version,
@@ -393,6 +401,7 @@ async function gatherFacts({ out, matrix }) {
         sinkBytes: receipt.sinkBytes,
         jarSha256: receipt.sha256,
         mounted: mounted.every((m) => m === mounted[0]) ? mounted[0] : 'mixed',
+        loadedCaps,
       },
       host: {
         memAvailable: memAvailable(),
@@ -417,13 +426,29 @@ const tryRun = (command, args) => {
 }
 
 /**
- * Prepares the final run's reporter jar from the retained source with only its file cap changed
- * to the matrix's per-node cap, and the Compose override that mounts it on all three brokers.
+ * The final run's reporter source: the retained source through the repository's own per-line
+ * adaptation (`prepare-reporter-source.sh`, the step every reporter build takes; for Kafka 4.4.0 it
+ * moves the `AppInfoParser` import), then with only its file cap changed.
+ * @param {{ version: string, sinkBytes: number, dir: string }} options the Kafka line, the file cap
+ *   and a fresh scratch directory for the adapted source
+ * @returns {string} the prepared source
+ * @throws {Error} for an unsupported Kafka line or a retained source without exactly one file cap
+ */
+function reporterSource({ version, sinkBytes, dir }) {
+  const { BoundedReporter } = require('./longWindowReporter')
+  const script = path.join(ROOT, 'scripts/e2e/telemetry/prepare-reporter-source.sh')
+  const adapted = execFileSync('bash', [script, version, dir], { encoding: 'utf8' }).trim()
+  return BoundedReporter.source(fs.readFileSync(adapted, 'utf8'), sinkBytes)
+}
+
+/**
+ * Prepares the final run's reporter jar from the retained source, adapted to the Kafka line and with
+ * only its file cap changed to the matrix's per-node cap, and the Compose override that mounts it on
+ * all three brokers.
  * @param {{ out: string, matrix: object }} options
  * @returns {object} the receipt written to `reporter/receipt.json`
  */
 function prepareReporter({ out, matrix }) {
-  const { BoundedReporter } = require('./longWindowReporter')
   const fixture = path.join(ROOT, 'scripts/e2e/telemetry')
   const manifest = JSON.parse(fs.readFileSync(path.join(fixture, 'fixtures/manifest.json'), 'utf8'))
   const line = manifest.lines[process.env.KAFKA_VERSION]
@@ -447,7 +472,11 @@ function prepareReporter({ out, matrix }) {
   const classes = path.join(dir, 'classes')
   fs.mkdirSync(classes, { recursive: true })
   const sinkBytes = matrix.host.brokerReporterFileBytes.value
-  const prepared = BoundedReporter.source(original, sinkBytes)
+  const prepared = reporterSource({
+    version: process.env.KAFKA_VERSION,
+    sinkBytes,
+    dir: path.join(dir, 'adapted'),
+  })
   const source = path.join(dir, 'CountingTelemetryReporter.java')
   fs.writeFileSync(source, prepared, { flag: 'wx' })
   const jar = path.join(dir, 'reporter.jar')
@@ -520,7 +549,14 @@ async function main(argv) {
     diagnostic,
     read: async () => (facts = await gatherFacts({ out, matrix })),
   })
-  const result = await preflight.run()
+  let result
+  try {
+    result = await preflight.run()
+  } catch (e) {
+    const record = { sha, mode, diagnostic, checks: [], failed: ['facts'], error: String(e.stack) }
+    fs.writeFileSync(path.join(out, 'preflight.json'), JSON.stringify(record, null, 2) + '\n')
+    throw e
+  }
   const measuredAt = monotonicMs() - originMs
   fs.writeFileSync(
     path.join(out, 'preflight.json'),
@@ -566,4 +602,11 @@ if (require.main === module) {
   )
 }
 
-module.exports = { Preflight, gatherFacts, prepareReporter, census, telemetrySubscription }
+module.exports = {
+  Preflight,
+  gatherFacts,
+  prepareReporter,
+  reporterSource,
+  census,
+  telemetrySubscription,
+}
