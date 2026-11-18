@@ -19488,6 +19488,7 @@
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > shutdown cleanup order shutdown lane rejects a missing or reordered close-admission record",
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary lane names its spec and cases",
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary control run is reported as a failure",
+        "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary control is credited only for a passed control case the watchdog killed",
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary lane leaves the four-case shutdown inventory unchanged",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls admits the entire short parent at exact remaining bound and refuses one ms less",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls admits the entire full parent at exact remaining bound and refuses one ms less",

@@ -667,6 +667,8 @@ describe('CI natural exit > ordinary clients', () => {
         a.report.testResults[0].assertionResults[7].status = 'failed'
       },
       'absent Jest report': (a) => a.files.set(CONTROL_REPORT, undefined),
+      'a truncated exit artifact': (a) =>
+        a.files.set('.tmp/e2e/natural-exit-ordinary-control-exit.json', '{'),
       'failed Jest suite': (a) => {
         Object.assign(a.report, { success: false, numRuntimeErrorTestSuites: 1 })
         a.report.testResults[0].status = 'failed'

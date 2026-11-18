@@ -141,16 +141,7 @@ jobs:
             echo "::error::The seeded-timer control exited on its own: the lane cannot see a retained handle"
             exit 1
           fi
-          node -e "
-          const fs = require('fs')
-          const exit = require('./.tmp/e2e/natural-exit-ordinary-control-exit.json')
-          const rows = fs.readFileSync('.tmp/e2e/natural-exit-ordinary-control.jsonl', 'utf8')
-            .split('\\n').filter(Boolean).map(JSON.parse)
-          if (exit.control !== true || exit.watchdogTerminated !== true)
-            throw new Error('The control failed for another reason: ' + exit.rejection)
-          if (!rows.some((row) => row.event === 'case-complete' && row.status === 'passed'))
-            throw new Error('The control was stopped before its case completed')
-          "
+          node -e "require('./scripts/ci/naturalExit').verifyControlFailure()"
       - name: Stop ordinary cluster
         if: always() && matrix.group == 'others'
         run: docker compose -f "$COMPOSE_FILE" down --remove-orphans

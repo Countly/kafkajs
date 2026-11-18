@@ -1,4 +1,5 @@
 const fs = require('fs')
+const { isDeepStrictEqual } = require('util')
 const { spawnSync } = require('child_process')
 const {
   TITLE,
@@ -113,30 +114,66 @@ const cleanupTimestamp = (lane, text, { startedAt, exitedAt }, cases = LANES[lan
 }
 
 /**
- * Requires the fixed, actually executed Jest inventory with no skipped or failed cases.
+ * Builds the fixed Jest child argv for a direct lane, without forced exit.
+ * @param {string} spec Repository path of the live spec.
+ * @param {string} [reportStem] Adds a Jest JSON report at `.tmp/e2e/<reportStem>-jest.json`.
+ * @returns {string[]} Child argv.
+ */
+const jestArgs = (spec, reportStem) => [
+  'node_modules/jest/bin/jest.js',
+  '--ci',
+  '--detectOpenHandles',
+  '--runInBand',
+  '--reporters=./testHelpers/quietReporter.js',
+  '--runTestsByPath',
+  spec,
+  ...(reportStem ? ['--json', `--outputFile=.tmp/e2e/${reportStem}-jest.json`] : []),
+]
+
+/**
+ * Requires the fixed, actually executed Jest inventory: one suite of the given spec whose
+ * cases, in file order, are exactly the skipped ones and then the passed ones. `success` is
+ * false on any failed test or suite runtime error. The defaults are the short share soak's.
  * @param {object} report Original Jest JSON report.
+ * @param {object} [expected] Expected inventory.
+ * @param {string} [expected.label] Error prefix.
+ * @param {string} [expected.spec] Repository path of the spec.
+ * @param {string[]} [expected.passed] Titles that must pass.
+ * @param {string[]} [expected.skipped] Titles that must be skipped.
  * @returns {void}
  * @throws {Error} On missing or changed test inventory.
  */
-const validateJestReport = (report) => {
-  const suites = report.testResults
+const validateJestReport = (
+  report,
+  {
+    label = 'soak',
+    spec = 'src/consumer/share/__tests__/shareSoakLive.spec.js',
+    passed = [TITLE],
+    skipped = [],
+  } = {}
+) => {
+  const suites = report?.testResults
   const suite = suites?.[0]
-  const cases = suite?.assertionResults
+  const expected = [
+    ...skipped.map((title) => ({ title, status: 'pending' })),
+    ...passed.map((title) => ({ title, status: 'passed' })),
+  ]
   if (
-    report.success !== true ||
-    report.numTotalTests !== 1 ||
-    report.numPassedTests !== 1 ||
+    report?.success !== true ||
+    report.numTotalTests !== expected.length ||
+    report.numPassedTests !== passed.length ||
     report.numFailedTests !== 0 ||
-    report.numPendingTests !== 0 ||
+    report.numPendingTests !== skipped.length ||
     report.numTodoTests !== 0 ||
     suites?.length !== 1 ||
-    !suite.name?.endsWith('/src/consumer/share/__tests__/shareSoakLive.spec.js') ||
+    !suite.name?.endsWith(`/${spec}`) ||
     suite.status !== 'passed' ||
-    cases?.length !== 1 ||
-    cases[0].title !== TITLE ||
-    cases[0].status !== 'passed'
+    !isDeepStrictEqual(
+      suite.assertionResults?.map(({ title, status }) => ({ title, status })),
+      expected
+    )
   )
-    throw new Error('soak: invalid Jest inventory')
+    throw new Error(`${label}: invalid Jest inventory`)
 }
 
 /**
@@ -182,17 +219,7 @@ const runNaturalExit = (
     throw new Error('Forbidden parent preload or eval override')
   const profile = lane === 'soak' ? 'short' : 'full'
   const childEnv = soak ? childEnvironment(profile, env) : undefined
-  const args = soak
-    ? childArgs(profile)
-    : [
-        'node_modules/jest/bin/jest.js',
-        '--ci',
-        '--detectOpenHandles',
-        '--runInBand',
-        '--reporters=./testHelpers/quietReporter.js',
-        '--runTestsByPath',
-        spec,
-      ]
+  const args = soak ? childArgs(profile) : jestArgs(spec, control ? stem : undefined)
   const startedAt = now()
   let result
   try {
@@ -259,7 +286,67 @@ const runNaturalExit = (
   }
 }
 
-module.exports = { runNaturalExit, cleanupTimestamp, validateJestReport, monotonicMs }
+/**
+ * Credits the seeded-timer control only for its intended failure: the parent's watchdog killed
+ * the fixed control child after Jest reported the control case passed with every ordinary case
+ * skipped, and after that case's single clean cleanup row, stamped within this parent's own
+ * observation. A natural exit, any other exit, a failed or timed-out Jest case (even when its
+ * body later wrote a passed row) and stale, wrong-case, tainted or contradictory evidence all
+ * refuse the credit.
+ * @param {object} [ports] Artifact access, injectable for broker-free controls.
+ * @param {Function} [ports.readFile] Reader of the control's `.tmp/e2e` artifacts.
+ * @returns {void}
+ * @throws {Error} Prefixed `control: ` when the control cannot be credited.
+ */
+const verifyControlFailure = ({ readFile = fs.readFileSync } = {}) => {
+  const { spec, cases: skipped } = LANES.ordinary
+  const { stem, totalMs, cases } = LANES.ordinary.control
+  const read = (file, parse = (text) => text) => {
+    try {
+      return parse(readFile(`.tmp/e2e/${file}`, 'utf8'))
+    } catch {
+      throw new Error(`control: missing or unreadable ${file}`)
+    }
+  }
+  const exit = read(`${stem}-exit.json`, JSON.parse)
+  if (
+    exit?.lane !== 'ordinary' ||
+    exit.control !== true ||
+    !isDeepStrictEqual(exit.argv, jestArgs(spec, stem)) ||
+    exit.totalMs !== totalMs ||
+    exit.watchdogTerminated !== true ||
+    exit.status !== null ||
+    exit.signal !== 'SIGKILL' ||
+    exit.accepted !== false ||
+    exit.rejection !== 'ordinary: unsuccessful child exit'
+  )
+    throw new Error('control: the child was not stopped by the watchdog')
+  if (
+    ![exit.startedAt, exit.exitedAt].every(Number.isSafeInteger) ||
+    exit.startedAt < 0 ||
+    exit.exitedAt < exit.startedAt
+  )
+    throw new Error('control: missing or unordered parent clock observations')
+  validateJestReport(read(`${stem}-jest.json`, JSON.parse), {
+    label: 'control',
+    spec,
+    passed: cases,
+    skipped,
+  })
+  try {
+    cleanupTimestamp('ordinary', read(`${stem}.jsonl`), exit, cases)
+  } catch (error) {
+    throw new Error(`control: ${error.message}`, { cause: error })
+  }
+}
+
+module.exports = {
+  runNaturalExit,
+  cleanupTimestamp,
+  validateJestReport,
+  verifyControlFailure,
+  monotonicMs,
+}
 
 if (require.main === module) {
   try {
