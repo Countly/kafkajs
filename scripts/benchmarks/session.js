@@ -447,7 +447,17 @@ const main = (argv, { log, error } = console) => {
   }
 }
 
-module.exports = { rotate, median, runSession, summarize, format, exitCode, commandArm, main }
+module.exports = {
+  rotate,
+  median,
+  beyond,
+  runSession,
+  summarize,
+  format,
+  exitCode,
+  commandArm,
+  main,
+}
 
 if (require.main === module) {
   process.exitCode = main(process.argv.slice(2))
