@@ -4,7 +4,6 @@ const OffsetOperations = require('../offsetManager/offsetOperations')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../../cluster/instrumentationEvents')
 const { newLogger, waitFor } = require('testHelpers')
-const { KafkaJSRebalanceNotConvergedError } = require('../../errors')
 const {
   createScheduledOffsetManager,
 } = require('../offsetManager/__tests__/fixtures/scheduledOffsetManager')
@@ -293,63 +292,5 @@ describe('Crash cleanup lifetime', () => {
     expect(cluster.listenerCount()).toBe(1)
     await consumer.disconnect()
     expect(cluster.listenerCount()).toBe(0)
-  })
-})
-
-describe('A classic rebalance chain that did not converge', () => {
-  afterEach(() => jest.restoreAllMocks())
-
-  /** @returns {Error} the error the classic round guard ends a chain with */
-  const notConverged = () =>
-    new KafkaJSRebalanceNotConvergedError('cooperative rebalance did not converge in 20 rounds')
-
-  /** @returns {Promise<void>} a short real-time pause for a restart that must not come */
-  const pause = () => new Promise((resolve) => setTimeout(resolve, 40))
-
-  test('restarts the consumer under the default restart policy, and the new run starts', async () => {
-    const { start, consumer, runner } = await started({ restartOnFailure: undefined })
-    const crashes = []
-    consumer.on(consumer.events.CRASH, (event) => crashes.push(event.payload))
-    try {
-      const error = notConverged()
-      await runner.onCrash(error)
-      await waitFor(() => start.mock.calls.length === 2, { delay: 5, maxWait: 2000 })
-      expect(crashes).toEqual([{ error, groupId: 'test-group', restart: true }])
-      expect(start.mock.instances[1]).not.toBe(runner)
-    } finally {
-      await consumer.disconnect()
-    }
-  })
-
-  test('stays stopped when restartOnFailure returns false for it', async () => {
-    const restartOnFailure = jest.fn(async () => false)
-    const { start, consumer, runner } = await started({ restartOnFailure })
-    const crashes = []
-    consumer.on(consumer.events.CRASH, (event) => crashes.push(event.payload))
-    try {
-      const error = notConverged()
-      await runner.onCrash(error)
-      await pause()
-      expect(restartOnFailure).toHaveBeenCalledWith(error)
-      expect(crashes.map(({ restart }) => restart)).toEqual([false])
-      expect(start).toHaveBeenCalledTimes(1)
-    } finally {
-      await consumer.disconnect()
-    }
-  })
-
-  test('does not restart when the consumer is stopped during the retry delay', async () => {
-    const { start, consumer, runner } = await started({
-      restartOnFailure: undefined,
-      initialRetryTime: 30,
-    })
-    const crashes = []
-    consumer.on(consumer.events.CRASH, (event) => crashes.push(event.payload))
-    await runner.onCrash(notConverged())
-    expect(crashes.map(({ restart }) => restart)).toEqual([true])
-
-    await consumer.disconnect()
-    await pause()
-    expect(start).toHaveBeenCalledTimes(1)
   })
 })

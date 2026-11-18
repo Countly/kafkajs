@@ -190,7 +190,9 @@ const build = ({
 const CONTROL = 'rx-control'
 const DELETED = 'rx-0'
 const LATE = 'rx-2'
+const LITERAL = 'literal-a'
 const TOPIC_IDS = {
+  [LITERAL]: 'bElTbElTbElTbElTbElTbA',
   [CONTROL]: 'cTRLcTRLcTRLcTRLcTRLcQ',
   [DELETED]: 'zERozERozERozERozERozQ',
   [LATE]: 'tWOotWOotWOotWOotWOotQ',
@@ -219,15 +221,18 @@ const target = (memberEpoch, byTopic) => ({
  * The same real group, runner and coordinator over a client RegExp subscription and a cluster whose
  * topic metadata the case edits: `known` is what metadata currently names and serves.
  * @param {object[]} script ConsumerGroupHeartbeat responses, the last repeating
+ * @param {object} [options]
+ * @param {boolean} [options.literal=false] also subscribe to the literal topic `LITERAL`
  * @returns {object} the group, runner, records and helpers to discover and to trip
  */
-const buildPattern = (script) => {
+const buildPattern = (script, { literal = false } = {}) => {
   const log = []
   const emitted = []
   const fetched = []
   const known = new Map([
     [CONTROL, [0, 1]],
     [DELETED, [0]],
+    ...(literal ? [[LITERAL, [0, 1]]] : []),
   ])
   const coordinator = scriptedCoordinator(script, log)
   coordinator.offsetFetch = jest.fn(async ({ topics }) => ({
@@ -252,6 +257,7 @@ const buildPattern = (script) => {
   })
   const subscription = new Subscription()
   subscription.add({ topics: [/^rx-/], policy: { kind: 'earliest' } })
+  if (literal) subscription.add({ topics: [LITERAL], policy: { kind: 'earliest' } })
   const desired = subscription.evaluate(metadata())
   subscription.observe(metadata())
 
@@ -379,6 +385,9 @@ const acknowledgements = (log) =>
 
 const owned = (group) =>
   Object.fromEntries(group.assigned().map(({ topic, partitions }) => [topic, partitions]))
+
+const partitionsOfEvery = (emitted, type) =>
+  emitted.filter((event) => event.type === type).map(({ payload }) => payload.partitions)
 
 const partitionsOf = (emitted, type) =>
   emitted
@@ -519,14 +528,21 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       // the round checks whether it converged: it now owns a partition the subscription dropped,
       // so every round owes the next one.
       const joinedAt = []
+      const joinedLogAt = []
       const recordJoin = coordinator.onJoinComplete
       coordinator.onJoinComplete = () => {
         recordJoin()
         joinedAt.push(Date.now())
+        joinedLogAt.push(log.length)
         if (joinedAt.length <= 60)
           discover({ [CONTROL]: [0], [churnName(joinedAt.length + 1)]: [0] })
       }
-      const heartbeatsBefore = log.filter(({ kind }) => kind === 'heartbeat').length
+      // The coordinator's interval is in force before the churn starts.
+      answerWith({ ...target(1, null), heartbeatIntervalMs: INTERVAL })
+      await jest.advanceTimersByTimeAsync(INTERVAL)
+      await group.heartbeat({ interval: 0 })
+      await jest.advanceTimersByTimeAsync(INTERVAL)
+      expect(group.heartbeatInterval()).toEqual(INTERVAL)
       const startedAt = Date.now()
       const controlFetches = []
 
@@ -568,15 +584,21 @@ describe('Consumer > the consumer protocol reconciliation', () => {
         ])
       )
 
-      // Paced: every follow-up round started at least one wait - the membership's interval, never
-      // under 100 ms - after the one before it, and the heartbeats sent while the chain ran are
-      // this case's own plus at most one per wait.
-      for (let i = 1; i < joinedAt.length; i++) {
-        expect(joinedAt[i] - joinedAt[i - 1]).toBeGreaterThanOrEqual(100)
-      }
-      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(60 * 100)
-      const heartbeats = log.filter(({ kind }) => kind === 'heartbeat').length - heartbeatsBefore
-      expect(heartbeats - 61).toBeLessThanOrEqual(joinedAt.length - 1)
+      // Paced: every follow-up round started one wait - the membership's 250 ms interval - after
+      // the one before it. Each wait put exactly one heartbeat carrying ownership on the wire (the
+      // acknowledgement, sent with this case's heartbeat) and at most one other: the fetch loop's
+      // own, which the interval gate admits once per interval. The background timer is disabled.
+      expect(joinedAt.slice(1).map((at, i) => at - joinedAt[i])).toEqual(
+        Array(joinedAt.length - 1).fill(INTERVAL)
+      )
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(60 * INTERVAL)
+      const perWait = joinedLogAt.slice(1).map((end, i) => {
+        const sent = log.slice(joinedLogAt[i], end).filter(({ kind }) => kind === 'heartbeat')
+        const acks = sent.filter(({ request }) => request.topicPartitions).length
+        return { acks, others: sent.length - acks }
+      })
+      expect(perWait).toHaveLength(60)
+      expect(perWait.filter(({ acks, others }) => acks !== 1 || others > 1)).toEqual([])
 
       // The retained partition kept being fetched while the chain ran.
       expect(controlFetches[0]).toBeGreaterThan(0)
@@ -590,6 +612,156 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       await fetching
       jest.useRealTimers()
     }
+  })
+
+  /**
+   * Runs `change` inside the next round's topic resolution: after the round pinned its
+   * subscription, before it checks what it already owns and before anything is acknowledged.
+   * @param {object} group the real consumer group
+   * @param {() => Promise<void>} change
+   * @returns {{ pinned: () => string[]|null }} the names the round had pinned when the change ran
+   */
+  const changeMidRound = (group, change) => {
+    const membership = group.groupMembership
+    const resolve = membership.resolveAssignmentTopicNames
+    let pinned = null
+    jest
+      .spyOn(membership, 'resolveAssignmentTopicNames')
+      .mockImplementationOnce(async (...args) => {
+        pinned = [...group.subscription.round.names]
+        await change()
+        return resolve.apply(membership, args)
+      })
+    return { pinned: () => pinned }
+  }
+
+  /** @returns {object[]} each acknowledgement as `{ topic: partitions }` */
+  const acknowledgedOwnership = (log, from) =>
+    acknowledgements(log)
+      .slice(from)
+      .map((sent) =>
+        Object.fromEntries(
+          sent.map(({ topicId, partitions }) => [
+            Object.keys(TOPIC_IDS).find((topic) => TOPIC_IDS[topic] === topicId),
+            partitions,
+          ])
+        )
+      )
+
+  it('acknowledges only what it owns when a client pattern drops a target topic in the middle of a round, then applies the newer revision in the next round', async () => {
+    const { group, runner, log, emitted, onCrash, discover, opportunity, count, answerWith } =
+      buildPattern([target(1, { [CONTROL]: [0] }), target(1, null)])
+    runner.rebalanceCoordinator.runRound(null, 'initial')
+    await waitFor(() => group.groupMembership.immediatePending, { delay: 1, maxWait: 5000 })
+    await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await opportunity()
+    expect(owned(group)).toEqual({ [CONTROL]: [0] })
+    const joinsBefore = count(events.GROUP_JOIN)
+    const eventsBefore = emitted.length
+    const acksBefore = acknowledgements(log).length
+
+    const round = changeMidRound(group, () => discover({ [CONTROL]: [0, 1] }))
+    answerWith(target(2, { [CONTROL]: [0], [DELETED]: [0] }))
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    for (let i = 0; i < 5; i++) await opportunity()
+
+    expect(round.pinned()).toEqual([DELETED, CONTROL])
+    expect(onCrash).not.toHaveBeenCalled()
+    expect(count(events.GROUP_JOIN) - joinsBefore).toEqual(2)
+    expect(
+      emitted
+        .slice(eventsBefore)
+        .filter(
+          ({ type }) => type === events.PARTITIONS_ASSIGNED || type === events.PARTITIONS_REVOKED
+        )
+    ).toEqual([])
+    expect(acknowledgedOwnership(log, acksBefore)).toEqual([{ [CONTROL]: [0] }])
+    expect(owned(group)).toEqual({ [CONTROL]: [0] })
+    expect(group.subscription.applied.names).toEqual([CONTROL])
+    expect(group.subscriptionPending()).toBe(false)
+    expect(group.needsReconciliation()).toBe(false)
+  })
+
+  it('applies the pinned revision and acknowledges what it applied when a client pattern adds a target topic in the middle of a round, then adopts it in the next round', async () => {
+    const { group, runner, log, emitted, onCrash, discover, opportunity, count, answerWith } =
+      buildPattern([target(1, { [CONTROL]: [0] }), target(1, null)])
+    runner.rebalanceCoordinator.runRound(null, 'initial')
+    await waitFor(() => group.groupMembership.immediatePending, { delay: 1, maxWait: 5000 })
+    await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await opportunity()
+    const joinsBefore = count(events.GROUP_JOIN)
+    const acksBefore = acknowledgements(log).length
+
+    // LATE is not in metadata yet: the round pins a subscription without it, and the change makes
+    // it both resolvable and desired before the round resolves the target.
+    const round = changeMidRound(group, () =>
+      discover({ [CONTROL]: [0, 1], [DELETED]: [0], [LATE]: [0] })
+    )
+    answerWith(target(2, { [CONTROL]: [0, 1], [LATE]: [0] }))
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await opportunity()
+
+    expect(round.pinned()).toEqual([DELETED, CONTROL])
+    expect(onCrash).not.toHaveBeenCalled()
+    expect(count(events.GROUP_JOIN) - joinsBefore).toEqual(2)
+    expect(partitionsOfEvery(emitted, events.PARTITIONS_ASSIGNED).slice(-2)).toEqual([
+      [{ topic: CONTROL, partitions: [1] }],
+      [{ topic: LATE, partitions: [0] }],
+    ])
+    expect(acknowledgedOwnership(log, acksBefore)).toEqual([
+      { [CONTROL]: [0, 1] },
+      { [CONTROL]: [0, 1], [LATE]: [0] },
+    ])
+    expect(owned(group)).toEqual({ [CONTROL]: [0, 1], [LATE]: [0] })
+    expect(group.subscriptionPending()).toBe(false)
+    expect(group.needsReconciliation()).toBe(false)
+  })
+
+  it('applies the pinned revision, literal topic included, when a client pattern drops a target topic in the middle of a round, and releases that topic in the next round', async () => {
+    const { group, runner, log, emitted, onCrash, discover, opportunity, count, answerWith } =
+      buildPattern([target(1, { [LITERAL]: [0], [CONTROL]: [0] }), target(1, null)], {
+        literal: true,
+      })
+    runner.rebalanceCoordinator.runRound(null, 'initial')
+    await waitFor(() => group.groupMembership.immediatePending, { delay: 1, maxWait: 5000 })
+    await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await opportunity()
+    expect(owned(group)).toEqual({ [LITERAL]: [0], [CONTROL]: [0] })
+    const joinsBefore = count(events.GROUP_JOIN)
+    const acksBefore = acknowledgements(log).length
+
+    const round = changeMidRound(group, () =>
+      discover({ [LITERAL]: [0, 1], [CONTROL]: [0, 1], [DELETED]: [0] }).then(() =>
+        discover({ [LITERAL]: [0, 1], [CONTROL]: [0, 1] })
+      )
+    )
+    answerWith(target(2, { [LITERAL]: [0, 1], [CONTROL]: [0], [DELETED]: [0] }))
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await opportunity()
+
+    expect(round.pinned()).toEqual([LITERAL, DELETED, CONTROL])
+    expect(onCrash).not.toHaveBeenCalled()
+    expect(count(events.GROUP_JOIN) - joinsBefore).toEqual(2)
+    expect(acknowledgedOwnership(log, acksBefore)).toEqual([
+      { [LITERAL]: [0, 1], [CONTROL]: [0], [DELETED]: [0] },
+      { [LITERAL]: [0, 1], [CONTROL]: [0] },
+    ])
+    expect(partitionsOfEvery(emitted, events.PARTITIONS_REVOKED).at(-1)).toEqual([
+      { topic: DELETED, partitions: [0] },
+    ])
+    expect(owned(group)).toEqual({ [LITERAL]: [0, 1], [CONTROL]: [0] })
+    expect(group.subscriptionPending()).toBe(false)
+    expect(group.needsReconciliation()).toBe(false)
   })
 
   it('assigns, then revokes, then assigns again across three heartbeat trips', async () => {
