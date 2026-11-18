@@ -167,7 +167,7 @@ describe('scripts/evidence/finalSoakCore', () => {
       const world = fx.healthy()
       world.layout.main[7] = { ...world.layout.main[7], absent: true }
       world.apache = fx.renderApache(world)
-      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /1 send.*unknown.*c08\.7/)
+      expectRow(await check(world), 'K1', 'INCONCLUSIVE', /1 unknown-result sends absent.*c08\.7/)
     })
 
     it('is inconclusive when a transaction has no confirmed outcome', async () => {
@@ -704,10 +704,15 @@ describe('scripts/evidence/finalSoakCore', () => {
       })
       const records = world.records().filter((r) => r.kind === 'identity' || r.kind === 'boundary')
       records.forEach((r) => journal.add(r))
-      const before = journal.stateSize()
+      const size = () => ({
+        ids: journal.names.length,
+        txs: journal.txs.size,
+        owners: journal.owners.size,
+      })
+      const before = size()
       const entry = records.find((r) => r.stage === 'handler-enter' && r.authority)
       for (let i = 0; i < 20000; i++) journal.add({ ...entry, handler: `h${i}` })
-      expect(journal.stateSize()).toEqual(before)
+      expect(size()).toEqual(before)
       expect(before.ids).toBe(12 + 6)
     })
 

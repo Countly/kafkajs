@@ -6,29 +6,22 @@
  *   K1 no lost record      K2 no lost delivery     K3 same-owner duplicates   K4 commits
  *   K5 heap                K6 resources            K7 exit and completeness
  *
- * Each row is PASS, FAIL or INCONCLUSIVE with the numbers behind it. The overall verdict is
+ * Each row is PASS, FAIL or INCONCLUSIVE with the numbers behind it; the overall verdict is
  * ACCEPTED only for an acceptance run on which all seven PASS. Every other contract row is printed
- * as NOT JUDGED with the CI lane that holds its short-run evidence; no code path here can print
- * PASS for them, and the output says that it is a core verdict.
+ * as NOT JUDGED with the CI lane that covers it, and no code path here can print PASS for them.
  *
- * Interface (the artifact directory is the runbook's `$out`):
- * - `config.json`, `header.json`, `supervisor.json`, `stream.ndjson` and the archived matrix as the
- *   driver writes them. The stream is read once, line by line, and never held.
- * - Ground truth taken inside the broker container by Apache's own tools, before finalize, in
- *   `apache/`: `<main|transactions>.dump` from `kafka-console-consumer.sh --partition 0 --offset
- *   earliest --isolation-level read_committed --timeout-ms 60000` with `print.partition`,
- *   `print.offset` and `print.key` set through `--formatter-property` (line
- *   `Partition:<p>\tOffset:<o>\t<key>\t<value>`); `groups/<group>.describe` from
- *   `kafka-consumer-groups.sh --describe --group <group>`. Each has `<file>.stderr` and
- *   `<file>.end` (`exit=<status> lines=<n>`, written after the command returned).
- * - A missing, truncated, unparseable or unbound ground-truth file makes the rows that need it
- *   INCONCLUSIVE, never PASS. The full interface is in the task's interface document.
+ * Inputs (the runbook's artifact directory): `config.json`, `header.json`, `supervisor.json`, the
+ * archived matrix and `stream.ndjson` (read once, line by line, never held), and the ground truth
+ * that Apache's own tools write in the broker container before finalize, under `apache/`:
+ * `<main|transactions>.dump` (`kafka-console-consumer.sh`, read_committed, partition 0, lines
+ * `Partition:<p>\tOffset:<o>\t<key>\t<value>`) and `groups/<group>.describe`
+ * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
+ * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE.
  *
- * Memory: the journal keeps one Map entry plus about 50 bytes of typed arrays per offered id on
- * the two standing topics (at most `matrix.traffic.maxOffers`, about 150 MB at 1.6 million), one
- * entry per owned (client run, partition) key and a fixed sample grid per process. Handler entries
- * only update typed arrays, so state does not grow with traffic; an offer beyond the cap is a
- * reported problem, not a larger table.
+ * Memory: one Map entry and about 50 bytes of typed arrays per offered id on the two standing
+ * topics (at most `matrix.traffic.maxOffers`, about 150 MB at 1.6 million), one entry per owned
+ * (client run, partition) key and a fixed sample grid per process. Handler entries only update
+ * typed arrays, so state does not grow with traffic; an offer beyond the cap is a reported problem.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -39,6 +32,7 @@ const REVIEWED_MATRIX = path.join(__dirname, '../soak/finalSoakMatrix.json')
 const ARCHIVED_MATRIX = 'archive/scripts/soak/finalSoakMatrix.json'
 const ROLES = ['main', 'transactions']
 const EXAMPLES = 3
+const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
 const SHARE_SERIAL = 0xffffffff
 const ACK = { none: 0, acknowledged: 1, unknown: 2, rejected: 3 }
 const ROW_NAMES = {
@@ -64,7 +58,9 @@ const NOT_JUDGED = Object.freeze([
   { name: 'recreate and regex topic contents', lane: 'consumer-churn' },
 ])
 
-/** One row's findings: any failure makes it FAIL, else any gap (missing proof) makes it INCONCLUSIVE. */
+const NOT_JUDGED_ROWS = NOT_JUDGED.map((item) => ({ ...item, verdict: 'NOT JUDGED' }))
+
+/** One row's findings: a failure makes it FAIL, else a gap (missing proof) makes it INCONCLUSIVE. */
 class Row {
   /** @param {string} id `K1`..`K7` */
   constructor(id) {
@@ -76,7 +72,7 @@ class Row {
     this.fails.push(reason)
   }
 
-  /** @param {string} reason missing evidence, or evidence that cannot prove the rule @returns {void} */
+  /** @param {string} reason missing or insufficient evidence @returns {void} */
   gap(reason) {
     this.gaps.push(reason)
   }
@@ -174,11 +170,6 @@ class Journal {
       quiet: new Map(),
       repeats: 0,
     }
-  }
-
-  /** @returns {{ ids: number, transactions: number, ownedKeys: number }} the sizes of the growing tables */
-  stateSize() {
-    return { ids: this.names.length, transactions: this.txs.size, ownedKeys: this.owners.size }
   }
 
   /** @param {object} r one parsed, schema-valid record @returns {void} */
@@ -366,11 +357,12 @@ function readBound({ dir, manifest }, name, problems, missing = 'file is missing
     problems.push(`apache/${name}: ${missing}`)
     return null
   }
-  const got = {
-    bytes: Buffer.byteLength(text),
-    sha256: crypto.createHash('sha256').update(text).digest('hex'),
-  }
-  checkBound(manifest, `apache/${name}`, got, problems)
+  checkBound(
+    manifest,
+    `apache/${name}`,
+    { bytes: Buffer.byteLength(text), sha256: sha(text) },
+    problems
+  )
   return text
 }
 
@@ -464,7 +456,6 @@ function readDescribe(ctx, group) {
   }
   const end = readEnd(ctx, name, out.problems)
   const text = readBound(ctx, name, out.problems)
-  readBound(ctx, `${name}.stderr`, out.problems)
   if (text === null) return out
   const lines = text.split('\n')
   if (end !== null && end !== lines.length - (text.endsWith('\n') ? 1 : 0))
@@ -573,9 +564,7 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
   if (absent.soft.length > 0 && complete) k1.fail(text)
   else if (absent.soft.length > 0) k1.gap(text)
   if (uncertain.length > 0)
-    k1.gap(
-      `${uncertain.length} sends with unknown results are absent from the log${some(uncertain)}`
-    )
+    k1.gap(`${uncertain.length} unknown-result sends absent from the log${some(uncertain)}`)
   const open = [...journal.txs.values()].filter(
     (t) => t.members.length > 0 && !/^(committed|aborted)$/.test(t.outcome)
   )
@@ -622,9 +611,7 @@ function judgeDelivery(k2, journal, dumped) {
 function judgeDuplicates(row, journal) {
   const { sameOwner } = journal
   if (sameOwner.count > 0)
-    row.fail(
-      `${sameOwner.count} same-owner repeats with no assignment change (first ${sameOwner.examples.join('; ')})`
-    )
+    row.fail(`${sameOwner.count} same-owner repeats, first ${sameOwner.examples.join('; ')}`)
   const { repeatsAfterChange, shareRepeats, redundantAcquires } = journal
   Object.assign(row.numbers, {
     sameOwnerRepeats: sameOwner.count,
@@ -720,9 +707,7 @@ function judgeHeap(row, { journal, matrix, config, plan }) {
         series.push([...readings.values()])
     }
     if (series.length < Math.max(plan.hours, 2))
-      row.gap(
-        `${slot} has ${series.length} of ${plan.hours} quiet boundaries with ${plan.readings} readings; the screen needs at least 2`
-      )
+      row.gap(`${slot} has ${series.length} of ${plan.hours} quiet boundaries (at least 2 needed)`)
     if (series.length < 2) continue
     const r = heapScreen(series, limits)
     row.numbers[slot] = { endpoint: r.endpoint, slopePerMinute: Math.round(r.slope) }
@@ -730,7 +715,7 @@ function judgeHeap(row, { journal, matrix, config, plan }) {
       row.fail(`${slot} heap endpoint ${r.endpoint} bytes exceeds ${limits.endpointBytes}`)
     if (r.slope > limits.slopeBytesPerMinute)
       row.fail(
-        `${slot} heap slope ${Math.round(r.slope)} bytes/min exceeds ${limits.slopeBytesPerMinute}`
+        `${slot} heap slope ${Math.round(r.slope)} B/min exceeds ${limits.slopeBytesPerMinute}`
       )
   }
 }
@@ -748,9 +733,7 @@ function judgeResources(row, { journal, config }) {
     for (const [type, count] of final ?? []) {
       if (count <= (baseline?.get(type) ?? 0) || !baseline) continue
       above++
-      row.fail(
-        `${slot} final ${type} count ${count} exceeds its baseline ${baseline.get(type) ?? 0}`
-      )
+      row.fail(`${slot} final ${type} ${count} exceeds its baseline ${baseline.get(type) ?? 0}`)
     }
   }
   row.numbers.typesAboveBaseline = above
@@ -788,9 +771,7 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
         row.fail(`${slot} slot ${k} was admitted early at ${p.periodic[k]}`)
     }
     if (missing.length > 0)
-      row.fail(
-        `${slot} misses periodic slot ${missing[0]} (${missing.length} of ${plan.slots} missing)`
-      )
+      row.fail(`${slot} misses periodic slot ${missing[0]} (${missing.length} missing)`)
   }
   if (supervisor === null) row.gap('supervisor.json is missing or unreadable')
   else {
@@ -799,20 +780,16 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
       row.fail(`the supervisor reports an incomplete run: ${supervisor.incomplete}`)
     if (supervisor.problems?.length > 0)
       row.fail(
-        `the driver reports ${supervisor.problems.length} problems: ${String(supervisor.problems[0]).slice(0, 80)}`
+        `the driver reports ${supervisor.problems.length} problems: ${supervisor.problems[0]}`
       )
     if (supervisor.forced?.length > 0)
-      row.fail(
-        `the supervisor forced ${supervisor.forced.join(', ')} to end after the teardown allowance`
-      )
+      row.fail(`the supervisor forced ${supervisor.forced.join(', ')} to end`)
     if (supervisor.failures?.length > 0)
       row.fail(
-        `the collector recorded ${supervisor.failures.length} failures: ${String(supervisor.failures[0]).slice(0, 80)}`
+        `the collector recorded ${supervisor.failures.length} failures: ${supervisor.failures[0]}`
       )
     if (supervisor.steps?.error > 0 || supervisor.steps?.aborted > 0)
-      row.fail(
-        `${supervisor.steps.error} steps failed and ${supervisor.steps.aborted} were aborted`
-      )
+      row.fail(`${supervisor.steps.error} steps failed, ${supervisor.steps.aborted} aborted`)
     for (const f of ['runId', 'mode', 'treeSha'])
       if (supervisor[f] !== header[f]) row.fail(`supervisor.json ${f} differs from the header`)
     if (mode === 'acceptance' && supervisor.diagnostic) row.fail('the run is marked diagnostic')
@@ -871,7 +848,7 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
     mode,
     treeSha: header.treeSha,
     rows: done,
-    notJudged: NOT_JUDGED.map((item) => ({ ...item, verdict: 'NOT JUDGED' })),
+    notJudged: NOT_JUDGED_ROWS,
     overall: accepted
       ? 'ACCEPTED'
       : done.some((r) => r.verdict === 'FAIL')
@@ -894,7 +871,6 @@ async function checkArtifact(dir) {
       return null
     }
   }
-  const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
   const reviewed = fs.readFileSync(REVIEWED_MATRIX)
   const matrix = JSON.parse(reviewed)
   const [header, config] = [readJson('header.json'), readJson('config.json')]
@@ -919,13 +895,13 @@ async function checkArtifact(dir) {
       else row.gap('the artifact inputs are not valid (see K7)')
       return row.done()
     })
-    const notJudged = NOT_JUDGED.map((item) => ({ ...item, verdict: 'NOT JUDGED' }))
+    const mode = header?.mode ?? 'acceptance'
     return {
       runId: null,
-      mode: header?.mode ?? 'acceptance',
+      mode,
       treeSha: null,
       rows,
-      notJudged,
+      notJudged: NOT_JUDGED_ROWS,
       overall: 'REJECTED',
     }
   }
