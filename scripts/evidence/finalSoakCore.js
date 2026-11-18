@@ -37,6 +37,7 @@ const EXAMPLES = 3
 const LIST_CAP = 20
 const MAX_LINE = 1 << 20
 const MAX_SMALL_FILE = 1 << 20
+/** @param {string|Buffer} data @returns {string} its sha256 in hex */
 const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
 const ACK = { none: 0, acknowledged: 1, unknown: 2, rejected: 3, contradicted: 4 }
 const ROW_NAMES = {
@@ -402,8 +403,8 @@ class Journal {
     p.others.first = Math.min(p.others.first, r.admittedAt)
     p.others.last = Math.max(p.others.last, r.completedAt)
     if (r.role === 'periodic') {
-      if (!(r.slot >= 0 && r.slot < p.periodic.length) || !Number.isNaN(p.periodic[r.slot]))
-        p.repeats++
+      // a slot outside the grid reads undefined, not NaN, so it counts as taken
+      if (!Number.isNaN(p.periodic[r.slot])) p.repeats++
       else p.periodic[r.slot] = r.admittedAt
     } else if (r.role === 'quiet') {
       const h = /^h(\d\d)$/.exec(r.boundary)?.[1]
@@ -505,6 +506,7 @@ async function readDump(ctx, role) {
   const { dir, journal, config, matrix, dumped } = ctx
   const name = `${role}.dump`
   const out = { problems: [], count: 0, maxOffset: -1, findings: {} }
+  /** Counts one finding of a kind on this dump, as `Journal#note` does. */
   const note = Journal.prototype.note.bind(out)
   const end = readEnd(ctx, name, out.problems)
   const stderr = readBound(ctx, `${name}.stderr`, out.problems)
@@ -583,9 +585,11 @@ function readDescribe(ctx, group) {
     out.problems.push(`apache/${name}: no describe header row`)
     return out
   }
+  /** @param {string} v a column @returns {number|null} its number, null for `-` */
   const num = (v) => (v === '-' ? null : Number(v))
   for (const line of body.slice(1)) {
     const c = line.trim().split(/\s+/)
+    /** @param {string} why records one malformed row @returns {void} */
     const bad = (why) => capped(out.problems, `apache/${name}: ${why} "${line.slice(0, 60)}"`)
     if (c.length < 9 || c[0] !== group) bad('unparseable line')
     else if (c.slice(1, 6).every((v) => v === '-')) continue
@@ -684,7 +688,9 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
       )
     return !why
   })
+  /** @param {string[]} ids @returns {string} the count phrase of absent ids */
   const list = (ids) => `${ids.length} acknowledged or committed ids absent from the dump`
+  /** @param {string[]} ids @returns {string} the first few ids */
   const some = (ids) => ` (first ${ids.slice(0, EXAMPLES).join(', ')})`
   if (absent.hard.length > 0) k1.fail(`${list(absent.hard)} inside the log${some(absent.hard)}`)
   const text = `${list(absent.soft)}${some(absent.soft)}`
@@ -1013,6 +1019,7 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
     judgeResources(rows.K6, ctx)
   }
   const done = Object.values(rows).map((r) => r.done())
+  /** @param {string} verdict @returns {boolean} whether any row has it */
   const has = (verdict) => done.some((r) => r.verdict === verdict)
   return {
     runId: header.runId,

@@ -485,6 +485,19 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(fx.healthy(), { edit }), 'K2', 'FAIL', reason)
     })
 
+    it('fails a record every group entered at one offset that is not its log offset', async () => {
+      const edit = mapRecords(
+        (r) => r.stage === 'handler-enter' && r.id === 'c08.6',
+        () => ({ offset: '9' })
+      )
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K2',
+        'FAIL',
+        /c08\.6 entered at 9, in the log at 6/
+      )
+    })
+
     it('fails a read-committed group that entered members of an aborted transaction', async () => {
       const edit = (records) => {
         const e = records.find(isEntry(groupOf('c01'), 'c09.0'))
@@ -614,6 +627,11 @@ describe('scripts/evidence/finalSoakCore', () => {
         /outside an ownership.*c01\.0\.r2/,
       ],
       ['another client', { authority: fx.authority('c01.7') }, /attributed to another client/],
+      [
+        'another client on the same run',
+        { authority: { ...fx.authority('c01.0'), client: 'c01.9' } },
+        /attributed to another client/,
+      ],
       ['no authority in an ordinary group', { authority: null }, /attributed to another client/],
     ])('fails an entry whose authority names %s', async (_, fields, reason) => {
       expectRow(await check(fx.healthy(), { edit: repeat(fields) }), 'K3', 'FAIL', reason)
@@ -1335,6 +1353,12 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('fails K7 when the stream file is missing', async () => {
       const report = await onDisk(smoke(), (dir) => fs.rmSync(path.join(dir, 'stream.ndjson')))
       expectRow(report, 'K7', 'FAIL', /stream file cannot be read/)
+    })
+
+    it('fails K7 for a header the merged schema refuses', async () => {
+      const world = smoke()
+      world.header.platform = 'darwin'
+      expectRow(await onDisk(world), 'K7', 'FAIL', /header\.platform is not one of linux/)
     })
 
     it('rejects an artifact without a header', async () => {
