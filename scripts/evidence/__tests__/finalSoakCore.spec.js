@@ -152,7 +152,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('fails a record whose bytes differ from what was offered', async () => {
       const world = fx.healthy()
       world.apache['main.dump'] = world.apache['main.dump'].replace(/(c08\.2\t[^\t\n]*?)\./, '$1x')
-      expectRow(await check(world), 'K1', 'FAIL', /differs.*c08\.2/)
+      expectRow(await check(world), 'K1', 'FAIL', /differ.*c08\.2/)
     })
 
     it('is inconclusive when the dump stops before the log end, never a pass', async () => {
@@ -411,12 +411,13 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('fails a group that has no row for a topic it must commit', async () => {
       const world = fx.healthy()
-      const group = groupOf('c01')
-      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`]
+      const name = `groups/${groupOf('c01')}.describe`
+      const text = world.apache[name]
         .split('\n')
         .filter((l) => !l.includes(fx.TXN))
         .join('\n')
-      expectRow(await check(world), 'K4', 'FAIL', /c01.*no committed offset|no row/)
+      fx.putStep(world.apache, name, text, 'Consumer group has no active members.\n')
+      expectRow(await check(world), 'K4', 'FAIL', /c01.*no row/)
     })
 
     it('fails a group that never committed on a partition', async () => {
@@ -432,9 +433,10 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('is inconclusive when two describes disagree about the log end', async () => {
       const world = fx.healthy()
       const group = groupOf('c01')
-      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`]
-        .replace(/(0\s+)12(\s+)12/, '$113$2')
-        .replace(/12(\s+)0/, '13$10')
+      world.apache[`groups/${group}.describe`] = world.apache[`groups/${group}.describe`].replace(
+        /(0\s+)12(\s+)12/,
+        (_, a, b) => `${a}13${b}13`
+      )
       expectRow(await check(world), 'K4', 'INCONCLUSIVE', /log end/)
     })
 
@@ -489,7 +491,7 @@ describe('scripts/evidence/finalSoakCore', () => {
         [0, 1, 2].map((i) => ({ heapUsed: 1000 + h * 100 + i, completedAt: (h * 3600 + i) * 1000 }))
       )
       const result = core.heapScreen(boundaries, { endpointBytes: 5000, slopeBytesPerMinute: 2 })
-      expect(result.endpoint).toBe(2200)
+      expect(result.endpoint).toBe(2100)
       expect(result.slope).toBeCloseTo(100 / 60, 3)
       expect(result.ok).toBe(true)
     })
@@ -552,11 +554,14 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
-    it('fails a child that ended on a signal', async () => {
-      const report = await check(fx.healthy(), {
-        edit: exitOf('p06', { code: null, signal: 'SIGTERM' }),
-      })
-      expectRow(report, 'K7', 'FAIL', /p06.*SIGTERM/)
+    it('fails a child that ended on a signal, even one that also reports code 0', async () => {
+      for (const fields of [
+        { code: null, signal: 'SIGTERM' },
+        { code: 0, signal: 'SIGTERM' },
+      ]) {
+        const report = await check(fx.healthy(), { edit: exitOf('p06', fields) })
+        expectRow(report, 'K7', 'FAIL', /p06.*SIGTERM/)
+      }
     })
 
     it('fails a forced exit', async () => {

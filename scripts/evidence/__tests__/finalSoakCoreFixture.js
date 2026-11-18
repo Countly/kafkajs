@@ -313,7 +313,7 @@ function processRecords(config, mode, withInventory) {
   })
   config.processes.forEach((p, i) =>
     records.push({
-      t: end + 1000 + i,
+      t: end + (p.slot === 'p15' ? 2000 : 1000 + i),
       kind: 'process',
       event: 'exit',
       source: p.slot === 'p15' ? 'outer' : 'p15',
