@@ -120,13 +120,24 @@ class SCRAM {
    * @param {Logger} logger
    * @param {Function} saslAuthenticate
    * @param {DigestDefinition} digestDefinition
+   * @param {(error: *) => boolean} [passesThrough] whether an exchange failure is the invocation's
+   *   own guard refusal, rethrown unchanged
    */
-  constructor(sasl, host, port, logger, saslAuthenticate, digestDefinition) {
+  constructor(
+    sasl,
+    host,
+    port,
+    logger,
+    saslAuthenticate,
+    digestDefinition,
+    passesThrough = () => false
+  ) {
     this.sasl = sasl
     this.host = host
     this.port = port
     this.logger = logger
     this.saslAuthenticate = saslAuthenticate
+    this.passesThrough = passesThrough
     this.digestDefinition = digestDefinition
 
     const digestType = digestDefinition.type.toUpperCase()
@@ -139,9 +150,11 @@ class SCRAM {
    * Runs the exchange (RFC 5802): the client-first message, then the client-final message once
    * the server-first message passed its checks, then the server signature, compared in constant
    * time. Every failure is one `KafkaJSSASLAuthenticationError` with this mechanism's prefix and
-   * library-written text only.
+   * library-written text only, except the invocation's own guard refusal during the exchange (the
+   * connection ended, timed out or was cancelled), which is rethrown unchanged.
    * @returns {Promise<void>}
-   * @throws {KafkaJSSASLAuthenticationError}
+   * @throws {KafkaJSSASLAuthenticationError} rejection or validation failure
+   * @throws {Error} the invocation's own guard refusal
    */
   async authenticate() {
     const { PREFIX } = this
@@ -184,6 +197,7 @@ class SCRAM {
 
       this.logger.debug(`${PREFIX} successful`, { broker })
     } catch (e) {
+      if (this.passesThrough(e)) throw e
       const error = new KafkaJSSASLAuthenticationError(`${PREFIX} failed: ${failureDetail(e)}`)
       this.logger.error(error.message, { broker })
       throw error
