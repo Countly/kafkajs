@@ -31,7 +31,11 @@
     "archive": [
       "scripts/soak/finalSoakMatrix.json",
       "scripts/soak/finalSoakSchema.js",
-      "scripts/soak/finalSoak.js"
+      "scripts/soak/finalSoak.js",
+      "scripts/soak/finalSoakScheduler.js",
+      "scripts/soak/finalSoakCollector.js",
+      "scripts/soak/finalSoakObserver.js",
+      "scripts/soak/finalSoakWorkers.js"
     ],
     "companions": ["natural-exit", "consume-retention", "prior-checkpoints"],
     "cli": ["--expect-sha", "--expect-profile", "--matrix", "--companion rs-l14=<run url>"],

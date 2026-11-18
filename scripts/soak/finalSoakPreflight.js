@@ -6,15 +6,18 @@
  *
  * Usage:
  *   KAFKA_BROKERS=... TELEMETRY_EVIDENCE_DIR=... node scripts/soak/finalSoakPreflight.js \
- *     --expect-sha <40-hex> --mode smoke|acceptance --out <artifact dir>
+ *     --expect-sha <40-hex> --mode smoke|acceptance --out <artifact dir> [--diagnostic]
  *   TELEMETRY_JAVA_CACHE=... node scripts/soak/finalSoakPreflight.js --prepare-reporter --out <artifact dir>
  *
  * Checks: Node 22, 24 or 26 on Linux with a boot id; dependencies installed by `npm ci`; a clean
  * checkout at the expected SHA; all three brokers in metadata; `share.version` finalized and read
- * back; one decoded telemetry push with metrics from a probe producer and a probe consumer; per-node
+ * back; the run's client-metrics subscription created and read back, then one decoded telemetry push
+ * with metrics from a probe producer and a probe consumer; per-node
  * broker provenance (image digests from `docker image inspect`, or operator evidence for a supplied
  * cluster); the prepared reporter's file cap and mounted jar digest; a quiet host (no agent or test
- * process), MemAvailable, free disk and load within the matrix floors.
+ * process), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
+ * only, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
+ * fail the preflight, and the record says so; such a run is never acceptance evidence.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -28,6 +31,10 @@ const NODES = [1, 2, 3]
 const PROBES = ['producer', 'consumer']
 const DIGEST = /^sha256:[0-9a-f]{64}$/
 const SHA = /^[0-9a-f]{64}$/
+/** The checks a diagnostic smoke records without requiring them. */
+const HOST_CHECKS = ['quiet-host', 'memory', 'disk', 'load']
+/** The run's client-metrics subscription: every metric, pushed within the matrix's interval. */
+const SUBSCRIPTION = 'final-soak'
 /** Process names whose presence means the host is not paused for the run. */
 const BUSY = /^(node|jest|npm|npx|codex|claude|java|javac|mvn|gradle|cargo|go|python3?|pytest)$/
 
@@ -47,17 +54,23 @@ class Preflight {
    * @param {string} options.mode smoke or acceptance
    * @param {object} options.matrix the reviewed matrix
    * @param {() => Promise<object>} [options.read] gathers the facts; the live gatherer by default
+   * @param {boolean} [options.diagnostic] smoke only: host-capacity misses are recorded, not failed
+   * @throws {Error} for a diagnostic preflight outside smoke mode
    */
-  constructor({ sha, mode, matrix, read }) {
+  constructor({ sha, mode, matrix, read, diagnostic = false }) {
+    if (diagnostic && mode !== 'smoke')
+      throw new Error('--diagnostic is accepted only in smoke mode')
     this.sha = sha
     this.mode = mode
     this.matrix = matrix
     this.read = read
+    this.diagnostic = diagnostic
   }
 
   /**
-   * @returns {Promise<{ checks: { name: string, ok: boolean }[], failed: string[], exitCode: number,
-   *   facts: object }>} every check, the names that failed and the process exit code
+   * @returns {Promise<{ checks: { name: string, ok: boolean, required: boolean }[],
+   *   failed: string[], exitCode: number, facts: object }>} every check, the names that failed and
+   *   the process exit code (only required checks fail it)
    */
   async run() {
     const facts = await this.read()
@@ -68,10 +81,11 @@ class Preflight {
       } catch {
         ok = false
       }
-      return { name, ok }
+      return { name, ok, required: !(this.diagnostic && HOST_CHECKS.includes(name)) }
     })
     const failed = checks.filter((c) => !c.ok).map((c) => c.name)
-    return { checks, failed, exitCode: failed.length === 0 ? 0 : 1, facts }
+    const blocking = checks.filter((c) => !c.ok && c.required)
+    return { checks, failed, exitCode: blocking.length === 0 ? 0 : 1, facts }
   }
 
   /** @param {object} f the gathered facts @returns {Record<string, () => boolean>} named checks */
@@ -86,6 +100,11 @@ class Preflight {
       'expected-sha': () => /^[0-9a-f]{40}$/.test(this.sha) && f.git.head === this.sha,
       'cluster-ready': () => [...f.cluster.brokers].sort().join() === NODES.join(),
       'share-readback': () => share !== undefined && share.maxVersionLevel >= 1,
+      'telemetry-subscription': () =>
+        f.telemetry.subscription?.metrics === '*' &&
+        Number(f.telemetry.subscription?.intervalMs) > 0 &&
+        Number(f.telemetry.subscription?.intervalMs) <=
+          this.matrix.traffic.telemetryPushMaxMs.value,
       'telemetry-proof': () =>
         PROBES.every((probe) =>
           f.telemetry.pushes.some((p) => p.probe === probe && p.decoded === true && p.metrics > 0)
@@ -269,7 +288,7 @@ async function telemetryProof(kafka, sinkDir, waitMs) {
             found.push({
               probe,
               metrics: Number(push.metricsTotal ?? 0),
-              decoded: push.parse === undefined,
+              decoded: push.parse === 'ok' && push.truncated !== true,
             })
         }
       }
@@ -279,6 +298,39 @@ async function telemetryProof(kafka, sinkDir, waitMs) {
     await producer.disconnect()
   }
   return found
+}
+
+/**
+ * Creates (or keeps) the run's client-metrics subscription for every client and reads it back:
+ * all metrics, pushed at half the matrix's push ceiling.
+ * @param {object} admin a connected admin
+ * @param {object} matrix the reviewed matrix
+ * @returns {Promise<{ metrics: string|null, intervalMs: string|null }>} the values read back
+ */
+async function telemetrySubscription(admin, matrix) {
+  const entries = {
+    metrics: '*',
+    'interval.ms': String(matrix.traffic.telemetryPushMaxMs.value / 2),
+  }
+  await admin.incrementalAlterConfigs({
+    resources: [
+      {
+        type: 16,
+        name: SUBSCRIPTION,
+        configEntries: Object.entries(entries).map(([name, value]) => ({
+          name,
+          operation: 0,
+          value,
+        })),
+      },
+    ],
+  })
+  const { resources } = await admin.describeConfigs({
+    resources: [{ type: 16, name: SUBSCRIPTION, configNames: Object.keys(entries) }],
+  })
+  const value = (name) =>
+    resources[0]?.configEntries.find((e) => e.configName === name)?.configValue ?? null
+  return { metrics: value('metrics'), intervalMs: value('interval.ms') }
 }
 
 /**
@@ -299,6 +351,7 @@ async function gatherFacts({ out, matrix }) {
     const { brokers } = await admin.describeCluster()
     const features = await admin.describeFeatures()
     const { provenance, broker } = await captureBroker(kafka, admin, out)
+    const subscription = await telemetrySubscription(admin, matrix)
     const pushes = await telemetryProof(
       kafka,
       process.env.TELEMETRY_EVIDENCE_DIR,
@@ -333,7 +386,7 @@ async function gatherFacts({ out, matrix }) {
       },
       cluster: { brokers: brokers.map((b) => b.nodeId) },
       share: { finalized: features.finalizedFeatures ?? {} },
-      telemetry: { pushes },
+      telemetry: { subscription, pushes },
       provenance,
       broker,
       reporter: {
@@ -458,11 +511,13 @@ async function main(argv) {
   const { originMs } = JSON.parse(fs.readFileSync(clockFile, 'utf8'))
   const sha = flag('--expect-sha')
   const mode = flag('--mode')
+  const diagnostic = argv.includes('--diagnostic')
   let facts = null
   const preflight = new Preflight({
     sha,
     mode,
     matrix,
+    diagnostic,
     read: async () => (facts = await gatherFacts({ out, matrix })),
   })
   const result = await preflight.run()
@@ -473,6 +528,7 @@ async function main(argv) {
       {
         sha,
         mode,
+        diagnostic,
         checks: result.checks,
         failed: result.failed,
         census: facts.host.census,
@@ -488,14 +544,15 @@ async function main(argv) {
             ? run('docker', ['version', '--format', '{{.Server.Version}}'])
             : 'absent',
           measuredAt,
-          pausedWork: !result.failed.includes('quiet-host'),
+          pausedWork: !diagnostic && !result.failed.includes('quiet-host'),
         },
       },
       null,
       2
     ) + '\n'
   )
-  for (const c of result.checks) console.log(`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}`)
+  for (const c of result.checks)
+    console.log(`${c.ok ? 'ok  ' : c.required ? 'FAIL' : 'miss'} ${c.name}`)
   return result.exitCode
 }
 
@@ -509,4 +566,4 @@ if (require.main === module) {
   )
 }
 
-module.exports = { Preflight, gatherFacts, prepareReporter, census }
+module.exports = { Preflight, gatherFacts, prepareReporter, census, telemetrySubscription }

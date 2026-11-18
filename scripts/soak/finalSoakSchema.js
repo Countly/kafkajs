@@ -105,6 +105,10 @@ const ARCHIVE = Object.freeze([
   'scripts/soak/finalSoakMatrix.json',
   'scripts/soak/finalSoakSchema.js',
   'scripts/soak/finalSoak.js',
+  'scripts/soak/finalSoakScheduler.js',
+  'scripts/soak/finalSoakCollector.js',
+  'scripts/soak/finalSoakObserver.js',
+  'scripts/soak/finalSoakWorkers.js',
 ])
 /** The seed's fixed start, clear and sensitivity rule in each mode. */
 const SEED_TIMING = Object.freeze({
@@ -1092,7 +1096,7 @@ const ACCEPTANCE_FIELDS = Object.freeze({
   profile: Id,
   modes: Any,
   archive: type(
-    'a list of relative paths holding the archived matrix, schema and driver',
+    'a list of relative paths holding the archived matrix, schema and driver modules',
     (v) => Array.isArray(v) && v.every(isRelativePath) && ARCHIVE.every((f) => v.includes(f))
   ),
   companions: type('the companion list', (v) => sameList(v, COMPANIONS)),

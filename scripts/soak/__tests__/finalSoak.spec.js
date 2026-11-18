@@ -47,6 +47,29 @@ const IDS = {
 const kindsWhere = (predicate) => CLIENT_KINDS.filter((k) => predicate(matrix.clientKinds[k]))
 const recipients = (role) => matrix.topology.topics.find((t) => t.role === role).recipients
 const sorted = (list) => [...list].sort()
+/** @returns {string[]} the schema problems of a record body once it has an envelope */
+const recordProblems = (kind, body) =>
+  validateRecord({
+    kind,
+    recordId: 'p01.1',
+    source: 'p01',
+    seq: 1,
+    at: 1,
+    t: 1,
+    execution: null,
+    ...body,
+  })
+/** @returns {string[]} the schema problems of one inventory section's entries */
+const sectionProblems = (section, entries, client = 'c03.1') =>
+  recordProblems('inventory', {
+    inventory: 'p01.i1',
+    process: 'p01',
+    client,
+    section,
+    chunk: 0,
+    chunks: 1,
+    entries,
+  })
 
 /** A clock whose sleepers wake in time order when `drive` runs; no wall time passes. */
 class VirtualClock {
@@ -833,6 +856,9 @@ describe('final soak driver', () => {
         { topic: 'txn', topicId: IDS.B },
       ])
       expect(sections['pause-state']).toHaveLength(0)
+      for (const [section, entries] of Object.entries(sections))
+        expect(sectionProblems(section, entries)).toEqual([])
+      expect(recordProblems('ticket', begun)).toEqual([])
 
       group.operations.end(ticket)
       group.operations.end(ticket)
@@ -996,6 +1022,7 @@ describe('final soak driver', () => {
         await group.applyRebalanceResult({ revoked: ['t|0'], added: ['t|1'] }, { round })
       })
       const boundaries = events.filter((e) => e.type === 'boundary').map((e) => e.record)
+      for (const b of boundaries) expect(recordProblems('boundary', b)).toEqual([])
       expect(boundaries.map((b) => [b.event, b.key.partition])).toEqual([
         ['revoke-begin', 0],
         ['revoke-end', 0],
@@ -1017,6 +1044,7 @@ describe('final soak driver', () => {
         revoked: [{ topic: 't', topicId: IDS.A, partition: 0 }],
       })
       expect(boundaries[1].cause).toBe(rounds[0].record.round)
+      expect(recordProblems('round', rounds[0].record)).toEqual([])
 
       events.length = 0
       group.ownership.lose(new Error('stale'), 7)
@@ -1169,6 +1197,7 @@ describe('final soak driver', () => {
         },
         mismatches: [],
       })
+      expect(sectionProblems('share-state', [state().entry], 'c07.1')).toEqual([])
       row.ledger.complete(['10', '11'], 'accept')
       const { ticket } = row.ledger.prepare({ token: row.token })
       expect(state().entry.records.map((r) => r.state)).toEqual(['settling', 'settling'])
