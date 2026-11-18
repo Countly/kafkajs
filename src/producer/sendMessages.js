@@ -2538,7 +2538,8 @@ const createSendMessages = ({
         }
         if (error === null) settle(batch, metadataOf(result))
         else if (result === undefined) {
-          retriable = retriable || fail(batch, error)
+          const outcome = fail(batch, error)
+          retriable = retriable || outcome
         } else {
           decided.add(batch)
           deliveries.get(batch).lastError = error
