@@ -20830,7 +20830,22 @@
         "src/consumer/share/__tests__/shareConsumerConnect.spec.js \u203a public share connection contract does not restart after stop while the callback is pending",
         "src/consumer/share/__tests__/shareConsumerConnect.spec.js \u203a public share connection contract a natural disconnect from the crash listener leaves no restart timer and starts no run",
         "src/consumer/share/__tests__/shareConsumerConnect.spec.js \u203a public share connection contract a zero-timeout disconnect from the crash listener leaves no restart timer and starts no run",
-        "src/consumer/share/__tests__/shareConsumerConnect.spec.js \u203a public share connection contract logs a rejected restart callback and restarts while active"
+        "src/consumer/share/__tests__/shareConsumerConnect.spec.js \u203a public share connection contract logs a rejected restart callback and restarts while active",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema every registry row has workload, observations, bound source and predicate",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema a complete fixture with every record kind and variant is structurally valid",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema the schema rejects an artifact without broker provenance",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema the schema rejects a stream whose digest does not match",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema the schema distinguishes smoke from acceptance mode",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema the matrix is rejected when a mandatory section, version, row or control is missing or replaced",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema identity and settlement records are rejected without each required stage field",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema cross-field rules reject contradictory records",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema malformed values return problems instead of throwing",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema the config binds every client to one process, kind and arm with one isolated seed",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema the stream rejects source gaps, reorder, events after exit and times outside the window",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema inventory cuts are complete per client section and chunk before a sample uses them",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema samples carry their role fields and two new forced collections per reading",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema manifest paths stay inside the artifact and bind every archived input",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema broker capability and provenance files have their fixed types"
       ],
       "capMinutes": 85,
       "allowedSkips": [
