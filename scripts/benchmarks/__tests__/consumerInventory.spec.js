@@ -517,6 +517,46 @@ describe('consumer measurement inventory', () => {
     }
   })
 
+  test('an arm whose recorded tree or configuration is not its own is never valid in the report or the audit', async () => {
+    const fixture = consumerFixture(tmp)
+    const { rawDir, lines, read } = await collect(fixture)
+    const cases = [
+      [
+        'consumer-subscriptionResolve',
+        'alpha.9c',
+        (l) => (l.arms['alpha.9c'] = clone(l.arms.head)),
+      ],
+      ['consumer-subscriptionResolve', 'head', (l) => (l.arms.head.config = 'other-workload')],
+      ['consumer-subscriptionResolve', 'head~AA', (l) => (l.arms['head~AA'].tree = 'alpha.9c')],
+      [
+        'consumer-fetchRound',
+        'alpha.9b/p100~AA',
+        (l) => (l.arms['alpha.9b/p100~AA'].config = 'p1000'),
+      ],
+    ]
+    for (const [i, [name, arm, mutate]] of cases.entries()) {
+      const line = clone(lines[name])
+      mutate(line)
+      expect(line.arms[arm].measured).toBe(7)
+      const adapter = require(`../adapters/${ROWS[name].adapter}`)
+      const { rows } = adapter.rows({ name }, 'fork', { outputs: [line] })
+      expect([i, rows.filter((r) => r.arm === arm && r.status !== 'error')]).toEqual([i, []])
+      expect([i, rows.find((r) => r.arm === arm).reason]).toEqual([
+        i,
+        expect.stringContaining('recorded as'),
+      ])
+      writeEvidence(rawDir, name, line)
+      expect([i, auditedRow(read(), name)]).toEqual([
+        i,
+        expect.objectContaining({
+          status: 'error',
+          reason: expect.stringContaining(`${arm}: recorded as`),
+        }),
+      ])
+      writeEvidence(rawDir, name, lines[name])
+    }
+  })
+
   test('an audit of only the selected rows says which it left out and never completes the inherited contracts', async () => {
     const fixture = consumerFixture(tmp)
     const { read } = await collect(fixture)
