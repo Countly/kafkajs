@@ -28,7 +28,8 @@ const { planSchedule, scheduleTotals, Scheduler, SamplingGate } = require('../fi
 const { Collector, SourceChannel, Sampler, HostMonitor } = require('../finalSoakCollector')
 const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('../finalSoakObserver')
 const { offeredRecord, parseValue, scanPartition, DecoderWorker } = require('../finalSoakWorkers')
-const { Preflight } = require('../finalSoakPreflight')
+const { Preflight, reporterSource } = require('../finalSoakPreflight')
+const { BoundedReporter } = require('../longWindowReporter')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
 const ROOT = path.join(__dirname, '../../..')
@@ -394,6 +395,7 @@ describe('final soak driver', () => {
         sinkBytes: matrix.host.brokerReporterFileBytes.value,
         jarSha256: 'c'.repeat(64),
         mounted: 'c'.repeat(64),
+        loadedCaps: [1, 2, 3].map(() => matrix.host.brokerReporterFileBytes.value),
       },
       host: { memAvailable: 20 * GIB, freeDisk: 300 * GIB, load1m: 1, census: [] },
     })
@@ -439,6 +441,8 @@ describe('final soak driver', () => {
       'broker-provenance',
     ])
     expect(await failing((f) => (f.reporter.mounted = 'd'.repeat(64)))).toEqual(['reporter'])
+    expect(await failing((f) => (f.reporter.loadedCaps[1] = 2 * 1024 * 1024))).toEqual(['reporter'])
+    expect(await failing((f) => f.reporter.loadedCaps.pop())).toEqual(['reporter'])
 
     const hosted = healthy()
     hosted.mode = 'smoke'
@@ -459,48 +463,148 @@ describe('final soak driver', () => {
     ).toThrow('--diagnostic is accepted only in smoke mode')
   })
 
-  test('the runbook forwards SHA and mode to preflight and driver exactly', () => {
+  test('the final reporter source takes the Kafka line adaptation before its file cap', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-reporter-'))
+    const fixture = path.join(ROOT, 'scripts/e2e/telemetry/CountingTelemetryReporter.java')
+    const original = fs.readFileSync(fixture, 'utf8')
+    const cap = matrix.host.brokerReporterFileBytes.value
+    const legacy = 'import org.apache.kafka.common.utils.AppInfoParser;'
+    const internal = 'import org.apache.kafka.common.utils.internals.AppInfoParser;'
+    try {
+      const kafka44 = reporterSource({ version: '4.4.0', sinkBytes: cap, dir: path.join(dir, 'a') })
+      expect(kafka44.split('\n')).toContain(internal)
+      expect(kafka44.split('\n')).not.toContain(legacy)
+      expect(kafka44).toBe(BoundedReporter.source(original.replace(legacy, internal), cap))
+      expect(kafka44).toContain(`MAX_FILE_BYTES = ${cap}L;`)
+
+      const kafka43 = reporterSource({ version: '4.3.1', sinkBytes: cap, dir: path.join(dir, 'b') })
+      expect(kafka43).toBe(BoundedReporter.source(original, cap))
+      expect(fs.readFileSync(fixture, 'utf8')).toBe(original)
+      expect(() =>
+        reporterSource({ version: '3.9.0', sinkBytes: cap, dir: path.join(dir, 'c') })
+      ).toThrow()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('preflight writes its record and fails when the facts cannot be gathered', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-preflight-'))
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [
+          path.join(__dirname, '../finalSoakPreflight.js'),
+          '--expect-sha',
+          TREE,
+          '--mode',
+          'smoke',
+          '--out',
+          out,
+        ],
+        { env: { PATH: process.env.PATH }, encoding: 'utf8' }
+      )
+      expect(result.status).toBe(1)
+      const record = JSON.parse(fs.readFileSync(path.join(out, 'preflight.json'), 'utf8'))
+      expect(record).toMatchObject({ sha: TREE, mode: 'smoke', checks: [], failed: ['facts'] })
+      expect(record.error).toContain('KAFKA_BROKERS must list the brokers')
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * Runs the runbook against PATH stubs that log every call. `FAIL_ON` makes the call containing it
+   * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded.
+   */
+  const runbookHarness = () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-runbook-'))
     const bin = path.join(dir, 'bin')
     const log = path.join(dir, 'calls.log')
+    const artifacts = path.join(dir, 'artifacts')
     fs.mkdirSync(bin)
-    for (const name of ['git', 'npm', 'docker', 'node', 'tar']) {
-      fs.writeFileSync(path.join(bin, name), `#!/bin/sh\necho "${name} $*" >> "$CALLS"\n`, {
-        mode: 0o755,
-      })
+    const bodies = {
+      docker: [
+        'echo "$COMPOSE_PROJECT_NAME $COMPOSE_FILE" >> "$CALLS.env"',
+        'case "$*" in',
+        '  *" describe") level=0; [ -f "$CALLS.upgraded" ] && level=1',
+        '    printf "Feature: share.version\\tSupportedMinVersion: 0\\tSupportedMaxVersion: 2\\tFinalizedVersionLevel: %s\\tEpoch: 5\\n" "$level" ;;',
+        '  *"upgrade --feature share.version=1") touch "$CALLS.upgraded" ;;',
+        'esac',
+      ].join('\n'),
     }
-    const run = (args, extra = {}) =>
-      spawnSync('bash', [RUNBOOK, ...args], {
-        env: {
-          PATH: `${bin}:/usr/bin:/bin`,
-          CALLS: log,
-          FINAL_SOAK_ARTIFACTS: path.join(dir, 'artifacts'),
-          ...extra,
-        },
-        encoding: 'utf8',
-      })
+    for (const name of ['git', 'npm', 'docker', 'node', 'tar', 'sleep']) {
+      const script = [
+        '#!/bin/sh',
+        `echo "${name} $*" >> "$CALLS"`,
+        'if [ -n "$FAIL_ON" ]; then',
+        `  case "${name} $*" in *"$FAIL_ON"*) echo "stub failure: ${name} $*" >&2; exit "\${FAIL_STATUS:-1}" ;; esac`,
+        'fi',
+        bodies[name] ?? '',
+        '',
+      ].join('\n')
+      fs.writeFileSync(path.join(bin, name), script, { mode: 0o755 })
+    }
+    return {
+      run(args, extra = {}) {
+        for (const file of [log, `${log}.env`, `${log}.upgraded`]) fs.rmSync(file, { force: true })
+        fs.rmSync(artifacts, { recursive: true, force: true })
+        return spawnSync('bash', [RUNBOOK, ...args], {
+          env: {
+            PATH: `${bin}:/usr/bin:/bin`,
+            CALLS: log,
+            FINAL_SOAK_ARTIFACTS: artifacts,
+            ...extra,
+          },
+          encoding: 'utf8',
+        })
+      },
+      calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
+      env: () => fs.readFileSync(`${log}.env`, 'utf8').trim().split('\n'),
+      /** @returns {{ out: string, receipt: object, log: string }} the run's sibling files */
+      evidence() {
+        const name = fs.readdirSync(artifacts).find((f) => f.endsWith('.runbook.json'))
+        if (!name) throw new Error('the runbook left no receipt beside its artifact')
+        const out = path.join(artifacts, name.replace(/\.runbook\.json$/, ''))
+        return {
+          out,
+          receipt: JSON.parse(fs.readFileSync(`${out}.runbook.json`, 'utf8')),
+          log: fs.readFileSync(`${out}.runbook.log`, 'utf8'),
+        }
+      },
+      remove: () => fs.rmSync(dir, { recursive: true, force: true }),
+    }
+  }
+
+  test('the runbook forwards SHA and mode to preflight and driver exactly', () => {
+    const harness = runbookHarness()
     try {
-      const result = run([TREE, 'smoke'])
+      const result = harness.run([TREE, 'smoke'])
       expect(result.stderr).toBe('')
       expect(result.status).toBe(0)
-      const calls = fs.readFileSync(log, 'utf8').trim().split('\n')
-      const out = calls.find((c) => c.includes('--prepare-reporter')).match(/--out (\S+)/)[1]
+      const calls = harness.calls()
+      const { out, receipt, log } = harness.evidence()
       const at = (call) => calls.indexOf(call)
-      expect(calls.slice(0, 6)).toEqual([
+      const features =
+        'docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092'
+      expect(calls.slice(0, 9)).toEqual([
         `git checkout --detach ${TREE}`,
         'npm ci --ignore-scripts',
         `node scripts/soak/finalSoakPreflight.js --prepare-reporter --out ${out}`,
         'docker compose up -d --wait',
         'node scripts/waitForKafka.js',
-        'docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092 describe',
+        `${features} describe`,
+        `${features} upgrade --feature share.version=1`,
+        'sleep 2',
+        `${features} describe`,
       ])
-      expect(calls).toContain(
-        'docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092 upgrade --feature share.version=1'
+      expect(new Set(harness.env())).toEqual(
+        new Set([`kafkajs docker-compose.telemetry.yml:${out}/broker/compose.json`])
       )
       const preflight = `node scripts/soak/finalSoakPreflight.js --expect-sha ${TREE} --mode smoke --out ${out}`
       const driver = `node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke --expect-sha ${TREE} --matrix scripts/soak/finalSoakMatrix.json --out ${out}`
       const finalize = `node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`
-      expect(at(preflight)).toBeGreaterThan(at('node scripts/waitForKafka.js'))
+      expect(at(preflight)).toBeGreaterThan(at(`${features} describe`))
       expect(at(driver)).toBeGreaterThan(at(preflight))
       expect(at(finalize)).toBeGreaterThan(at(driver))
       expect(at(`node scripts/soak/finalSoak.js --summary --out ${out}`)).toBeGreaterThan(
@@ -508,22 +612,90 @@ describe('final soak driver', () => {
       )
       expect(at('docker compose down --volumes')).toBeGreaterThan(at(finalize))
       expect(calls.find((c) => c.startsWith('tar '))).toContain(path.basename(out))
+      expect(receipt).toEqual({
+        artifact: path.basename(out),
+        failedStage: null,
+        exitStatus: 0,
+        driverStatus: 0,
+      })
+      expect(log).toContain(`artifact: ${out}.tar.gz`)
 
-      fs.writeFileSync(log, '')
-      expect(run([TREE, 'smoke'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(0)
-      const diagnostic = fs.readFileSync(log, 'utf8').trim().split('\n')
+      expect(harness.run([TREE, 'smoke'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(0)
+      const diagnostic = harness.calls()
       expect(diagnostic.find((c) => c.includes('--expect-sha'))).toMatch(
         /--mode smoke --out \S+ --diagnostic$/
       )
       expect(diagnostic.find((c) => c.includes('--expose-gc'))).toMatch(/--diagnostic$/)
 
-      fs.writeFileSync(log, '')
-      expect(run([TREE, 'acceptance'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(2)
-      expect(run(['main', 'smoke']).status).toBe(2)
-      expect(run([TREE, 'day']).status).toBe(2)
-      expect(fs.readFileSync(log, 'utf8')).toBe('')
+      expect(harness.run([TREE, 'acceptance'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(2)
+      expect(harness.run(['main', 'smoke']).status).toBe(2)
+      expect(harness.run([TREE, 'day']).status).toBe(2)
+      expect(harness.calls()).toEqual([])
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true })
+      harness.remove()
+    }
+  })
+
+  test('a failing runbook stage keeps its log, names the stage, cleans up what it started and archives', () => {
+    const harness = runbookHarness()
+    const failAt = (failOn, status = 1) => {
+      const result = harness.run([TREE, 'smoke'], { FAIL_ON: failOn, FAIL_STATUS: String(status) })
+      const evidence = harness.evidence()
+      expect(result.status).toBe(status)
+      expect(result.stderr).toBe('')
+      expect(harness.calls().find((c) => c.startsWith('tar '))).toContain(
+        path.basename(evidence.out)
+      )
+      return { ...evidence, calls: harness.calls() }
+    }
+    try {
+      const reporter = failAt('--prepare-reporter')
+      expect(reporter.receipt).toEqual({
+        artifact: path.basename(reporter.out),
+        failedStage: 'prepare-reporter',
+        exitStatus: 1,
+        driverStatus: null,
+      })
+      expect(reporter.log).toContain(
+        `stub failure: node scripts/soak/finalSoakPreflight.js --prepare-reporter --out ${reporter.out}`
+      )
+      expect(reporter.log).toContain('runbook failed at stage prepare-reporter (exit status 1)')
+      expect(reporter.calls.some((c) => c.startsWith('docker'))).toBe(false)
+      expect(reporter.calls.some((c) => c.includes('--cleanup'))).toBe(false)
+
+      const share = failAt('upgrade --feature')
+      expect(share.receipt.failedStage).toBe('share-version')
+      expect(share.calls.filter((c) => c.endsWith(' describe'))).toHaveLength(30)
+      expect(share.calls).toContain('docker compose down --volumes')
+
+      const preflight = failAt(`--expect-sha ${TREE} --mode smoke`)
+      expect(preflight.receipt.failedStage).toBe('preflight')
+      expect(preflight.calls.some((c) => c.includes('--expose-gc'))).toBe(false)
+      expect(preflight.calls).toContain(
+        `node scripts/soak/finalSoak.js --cleanup --out ${preflight.out}`
+      )
+      expect(preflight.calls).toContain('docker compose down --volumes')
+
+      const driver = failAt('--expose-gc', 3)
+      expect(driver.receipt).toEqual({
+        artifact: path.basename(driver.out),
+        failedStage: 'driver',
+        exitStatus: 3,
+        driverStatus: 3,
+      })
+      expect(driver.calls).toContain(
+        `node scripts/soak/finalSoak.js --finalize --out ${driver.out} --status 3`
+      )
+      expect(driver.calls).toContain(`node scripts/soak/finalSoak.js --summary --out ${driver.out}`)
+      expect(driver.calls).toContain('docker compose down --volumes')
+
+      const finalize = failAt('--finalize')
+      expect(finalize.receipt).toMatchObject({ failedStage: 'finalize', driverStatus: 0 })
+      expect(finalize.calls).toContain(
+        `node scripts/soak/finalSoak.js --summary --out ${finalize.out}`
+      )
+    } finally {
+      harness.remove()
     }
   })
 
@@ -1527,8 +1699,9 @@ describe('final soak driver', () => {
     expect(runs.some((r) => r.includes('acceptance'))).toBe(false)
     const upload = job.steps.find((s) => s.uses?.startsWith('actions/upload-artifact'))
     expect(upload).toMatchObject({ if: 'always()', with: { 'if-no-files-found': 'error' } })
-    expect(job.steps.find((s) => (s.run ?? '').includes('summary.json'))).toMatchObject({
-      if: 'always()',
-    })
+    const print = job.steps.find((s) => (s.run ?? '').includes('summary.json'))
+    expect(print).toMatchObject({ if: 'always()' })
+    expect(print.run).toContain('*.runbook.json')
+    expect(print.run).toContain('no driver summary')
   })
 })
