@@ -1073,14 +1073,18 @@ const aaControls = (row, session) => {
 }
 
 /**
- * Checks a completed arm's summaries against its own runs, so a session line can never certify
- * numbers its runs do not carry.
+ * Checks a completed arm's identity and summaries against its slot and its own runs, so a session
+ * line can never certify another arm's runs or numbers its runs do not carry.
  * @param {Row} row
+ * @param {{ tree: string, config: string }} arm the arm this slot must hold
  * @param {object} a the arm of the session line
  * @param {number} measured the measured runs the arm must have
  * @returns {string|undefined} why the arm's evidence is incomplete or inconsistent, if it is
  */
-const armEvidence = (row, a, measured) => {
+const armEvidence = (row, arm, a, measured) => {
+  if (a.tree !== arm.tree || a.config !== arm.config) {
+    return `recorded as ${a.tree}/${a.config}, not ${arm.tree}/${arm.config}`
+  }
   const results = Array.isArray(a.results) ? a.results : []
   if (results.length !== measured || a.measured !== measured) {
     return `${results.length} of ${measured} measured runs (${a.measured} reported)`
@@ -1103,11 +1107,12 @@ const armEvidence = (row, a, measured) => {
  * @returns {string|undefined} why this tree's arms give no complete measurement, if they do not
  */
 const headProblem = (row, session) => {
-  for (const { label } of armsOf(row).filter(({ tree }) => tree === HEAD)) {
+  for (const arm of armsOf(row).filter(({ tree }) => tree === HEAD)) {
+    const { label } = arm
     const a = session.arms[label]
     if (a.unsupported) return `${label}: ${a.unsupported}`
     if (a.errors.length) return `${label}: ${a.errors[0]}`
-    const problem = armEvidence(row, a, session.measured)
+    const problem = armEvidence(row, arm, a, session.measured)
     if (problem) return `${label}: ${problem}`
   }
   return undefined
@@ -1260,9 +1265,11 @@ const rowAdapter = ({
         ([l, fns]) => `${l} self time: ${fns.map(({ fn, ms }) => `${fn} ${ms} ms`).join('; ')}`
       ),
     ]
-    const out = arms.flatMap(({ label }) => {
+    const out = arms.flatMap((arm) => {
+      const { label } = arm
       const a = session.arms[label]
-      const problem = !a.unsupported && !a.errors.length && armEvidence(row, a, session.measured)
+      const problem =
+        !a.unsupported && !a.errors.length && armEvidence(row, arm, a, session.measured)
       return row.metrics.map(({ key, unit }) => {
         const base = { benchmark: entry.name, arm: label, metric: key, unit, runs: a.measured }
         if (a.unsupported) return { ...base, status: 'omitted', reason: a.unsupported }
@@ -1359,7 +1366,7 @@ const auditRow = (name, row, line) => {
     if (a.unsupported) {
       if (!arm.copy) found.inconclusive.push(`owed: ${arm.label} ${a.unsupported}`)
     } else {
-      const problem = a.errors[0] ?? armEvidence(row, a, MEASURED)
+      const problem = a.errors[0] ?? armEvidence(row, arm, a, MEASURED)
       if (problem) found.error.push(`${arm.label}: ${problem}`)
     }
   }
