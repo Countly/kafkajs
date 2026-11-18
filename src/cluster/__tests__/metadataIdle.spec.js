@@ -5,7 +5,9 @@ const {
   KafkaJSBrokerNotFound,
   KafkaJSConnectionClosedError,
   KafkaJSConnectionError,
+  KafkaJSNonRetriableError,
   KafkaJSRequestTimeoutError,
+  KafkaJSSASLAuthenticationError,
 } = require('../../errors')
 const { protocol: metadataProtocol } = require('../../protocol/requests/metadata')
 const { Schedule } = require('../../../testHelpers/schedule')
@@ -1335,12 +1337,14 @@ describe('producer metadata idle expiry over the wire', () => {
     /**
      * Starts a producer whose first send to 'a' succeeded and whose next send to it is held in
      * flight; with idempotence a third is queued behind it.
-     * @param {{ idempotent: boolean, key?: string, partitions?: number[] }} options the records'
-     *   key, and the partitions 'a' has
+     * @param {{ idempotent: boolean, key?: string, partitions?: number[], linger?: number }}
+     *   options the records' key, the partitions 'a' has and the producer's linger
      * @returns {Promise<object>} the sender, the held gate and the owned sends
      */
-    const holding = async ({ idempotent, key, partitions }) => {
-      w = start({ producer: idempotent ? {} : { idempotent: false } })
+    const holding = async ({ idempotent, key, partitions, linger }) => {
+      w = start({
+        producer: { ...(!idempotent && { idempotent: false }), ...(linger && { linger }) },
+      })
       if (partitions) w.state.partitions = new Map([['a', partitions]])
       await w.producer.connect()
       const sendTo = (topic, value) => w.producer.send({ topic, messages: [{ key, value }] })
@@ -1547,6 +1551,215 @@ describe('producer metadata idle expiry over the wire', () => {
           expect(Date.now() - released).toBeLessThanOrEqual(500)
           jest.restoreAllMocks()
           await expectRefused(owned, UNAUTHORIZED)
+        } finally {
+          jest.restoreAllMocks()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    /** @returns {KafkaJSConnectionError} a connection the peer reset */
+    const reset = () =>
+      new KafkaJSConnectionError('Connection error: read ECONNRESET', {
+        broker: 'node0:9092',
+        code: 'ECONNRESET',
+      })
+
+    /**
+     * Makes the next metadata refresh necessary and every Metadata request end its socket with a
+     * reset, as when `metadataMaxAge` passes while the cluster cannot be reached.
+     * @returns {void}
+     */
+    const metadataUnreachable = () => {
+      w.cluster.brokerPool.metadataExpireAt = -1
+      w.scripted.answer('Metadata', async () => {
+        throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+      })
+    }
+
+    /** @returns {void} Metadata answered again from the wire state */
+    const metadataReachable = () =>
+      w.scripted.answer('Metadata', ({ topics }) => metadataFor(topics, w.state))
+
+    test.each([
+      [29, UNAUTHORIZED],
+      [3, UNKNOWN],
+    ])(
+      'without idempotence, an owned target refused with code %d fails its own sends with that error when its required metadata refresh cannot reach the cluster',
+      async (code, chain) => {
+        const owned = await holding({ idempotent: false })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          metadataUnreachable()
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          if (code === 29) expect(Date.now() - released).toBeLessThanOrEqual(500)
+          else expect(Date.now() - released).toBeLessThan(20000)
+          metadataReachable()
+          await expectRefused(owned, chain)
+        } finally {
+          metadataReachable()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    test.each([
+      [29, UNAUTHORIZED],
+      [3, UNKNOWN],
+    ])(
+      'without idempotence, a send to an owned target refused with code %d and one to another topic in the same call each end with their own error when the required metadata refresh cannot reach the cluster',
+      async (code, chain) => {
+        const owned = await holding({ idempotent: false, linger: 50 })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          metadataUnreachable()
+          const refreshes = jest.spyOn(w.cluster, 'refreshMetadataIfNecessary')
+          const refused = watch(owned.sendTo('a', 'mixed'))
+          const other = watch(owned.sendTo('b', 'mixed'))
+          await untilSettled([refused, other])
+          expect(refreshes.mock.calls.length).toBeGreaterThan(0)
+          expect(refused.state).toBe('rejected')
+          expect(chainOf(refused.value)).toEqual(chain)
+          expect(other.state).toBe('rejected')
+          expect(chainOf(other.value)).toEqual([
+            'KafkaJSNumberOfRetriesExceeded',
+            'KafkaJSConnectionError',
+          ])
+          jest.restoreAllMocks()
+          metadataReachable()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 0))
+          await untilSettled(owned.sends)
+          expect(owned.sends.map(({ state }) => state)).toEqual(['fulfilled'])
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+        } finally {
+          jest.restoreAllMocks()
+          metadataReachable()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    const AWAITED_STEPS = [
+      [
+        'adding its topic to the producer targets',
+        () => jest.spyOn(w.cluster, 'addMultipleTargetTopics').mockRejectedValue(reset()),
+      ],
+      [
+        'the required metadata refresh',
+        () => jest.spyOn(w.cluster, 'refreshMetadataIfNecessary').mockRejectedValue(reset()),
+      ],
+      [
+        'a metadata refresh',
+        () => jest.spyOn(w.cluster, 'refreshMetadata').mockRejectedValue(reset()),
+      ],
+      ['its broker lookup', () => lookupsFail(reset())],
+      [
+        'its request',
+        () =>
+          producesEnd(async () => {
+            throw reset()
+          }),
+      ],
+    ].flatMap(([step, inject]) =>
+      [true, false].flatMap((idempotent) =>
+        REFUSALS.filter(([mode]) => mode === idempotent).map(([, code, chain]) => [
+          idempotent,
+          code,
+          step,
+          inject,
+          chain,
+        ])
+      )
+    )
+
+    test.each(AWAITED_STEPS)(
+      'with idempotence %s, an owned target refused with code %d fails its own sends with that error when %s fails, and another topic is served after',
+      async (idempotent, code, _, inject, chain) => {
+        const owned = await holding({ idempotent })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+          w.scripted.answer('Produce', (fields) =>
+            produceAnswer(fields, (entry) => (isTopic(entry, 'a') ? code : 0))
+          )
+
+          inject()
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          if (code === 29) expect(Date.now() - released).toBeLessThanOrEqual(500)
+          else expect(Date.now() - released).toBeLessThan(20000)
+          jest.restoreAllMocks()
+          await expectRefused(owned, chain)
+        } finally {
+          jest.restoreAllMocks()
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    const CREDENTIAL_REJECTIONS = [
+      [
+        'a SASL authentication error',
+        () =>
+          new KafkaJSSASLAuthenticationError('SASL authentication failed', {
+            cause: createErrorFromCode(58),
+          }),
+        ['KafkaJSSASLAuthenticationError', 'SASL_AUTHENTICATION_FAILED'],
+      ],
+      [
+        'a wrapped SASL authentication error',
+        () =>
+          new KafkaJSNonRetriableError('Broker lookup failed', {
+            cause: new KafkaJSSASLAuthenticationError('SASL authentication failed'),
+          }),
+        ['KafkaJSNonRetriableError', 'KafkaJSSASLAuthenticationError'],
+      ],
+      [
+        'a SASL_AUTHENTICATION_FAILED answer',
+        () => createErrorFromCode(58),
+        ['SASL_AUTHENTICATION_FAILED'],
+      ],
+    ].flatMap(([rejection, create, chain]) =>
+      REFUSALS.map(([idempotent, code]) => [idempotent, code, rejection, create, chain])
+    )
+
+    test.each(CREDENTIAL_REJECTIONS)(
+      'with idempotence %s, an owned target refused with code %d fails its own sends at once with %s its broker lookup rejects with',
+      async (idempotent, code, _, create, chain) => {
+        const owned = await holding({ idempotent })
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+
+          const lookups = jest.spyOn(w.cluster, 'findBroker').mockImplementation(async () => {
+            throw create()
+          })
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled(owned.sends)
+          expect(Date.now() - released).toBeLessThanOrEqual(500)
+          expect(lookups.mock.calls.length).toBeLessThanOrEqual(owned.sends.length)
+          for (const sent of owned.sends) {
+            expect(sent.state).toBe('rejected')
+            expect(sent.value.retriable).toBe(false)
+            expect(chainOf(sent.value)).toEqual(chain)
+          }
+          jest.restoreAllMocks()
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+          expect(await settle(owned.sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
         } finally {
           jest.restoreAllMocks()
           if (owned.blocked.settle) owned.blocked.release()
