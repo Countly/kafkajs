@@ -394,7 +394,7 @@ The option `retry` can be used to customize the configuration for the producer.
 
 Take a look at [Retry](Configuration.md#retry) for more information.
 
-The retries of a send run until its [delivery deadline](#delivery-timeout) unless you set `retry.retries`: the producer retries a retriable answer, backing off from 100 ms up to 1000 ms with the retrier's jitter, for as long as the deadline lasts, and then rejects with `KafkaJSDeliveryTimeout` whose `cause` is the last error. An explicit `retry.retries`, `retry.maxTotalTime`, `retry.initialRetryTime` or `retry.maxRetryTime` is honoured, each key on its own, and `retry.retries` ends a send with `KafkaJSNumberOfRetriesExceeded` as before. The requests of a transaction (`initTransactions`, `commit`, `abort`, `sendOffsets`) and the producer id and partition registrations keep the retrier's own defaults.
+The retries of a send run until its [delivery deadline](#delivery-timeout) unless you set `retry.retries`: the producer retries a retriable answer, backing off from 100 ms up to 1000 ms with the retrier's jitter, for as long as the deadline lasts, and then rejects with `KafkaJSDeliveryTimeout` whose `cause` is the last error. An explicit `retry.retries`, `retry.maxTotalTime`, `retry.initialRetryTime` or `retry.maxRetryTime` is honoured, each key on its own, and `retry.retries` ends a send with `KafkaJSNumberOfRetriesExceeded` as before. The requests of a transaction (InitProducerId at connect and at a transaction's start, `commit`, `abort`, `sendOffsets`) and the producer id and partition registrations keep the retrier's own defaults.
 
 ## Broker client telemetry
 

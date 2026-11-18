@@ -73,7 +73,7 @@ To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode
 - **Delivery deadlines also settle requests that are already on the wire.** `send()` and `sendBatch()` reject at the deadline instead of waiting for a late broker answer. Later work is fenced, and a late answer cannot resolve that send. There is no configuration escape. If the error says `outcome: 'unknown'`, the broker may already have the records and an application resend may duplicate them; `outcome: 'unsent'` is the positive evidence that no attempt carrying those records could have been written. With `enforceRequestTimeout: false`, an outstanding request can still retain its records until its answer or connection failure after the send has rejected.
-- If you relied on a send failing soon after a broker problem (the five default attempts nominally accumulate about 9 seconds of backoff, request time on top), set `deliveryTimeout` (at least `linger + requestTimeout`) or `retry: { retries: n }`. Code that matched `KafkaJSNumberOfRetriesExceeded` on a send now also sees `KafkaJSDeliveryTimeout`: match `e.type` or `e.cause`. Admin and consumer retries, and the retries of a transaction's own requests (`commit`, `abort`, `initTransactions`), are unchanged
+- If you relied on a send failing soon after a broker problem (the five default attempts nominally accumulate about 9 seconds of backoff, request time on top), set `deliveryTimeout` (at least `linger + requestTimeout`) or `retry: { retries: n }`. Code that matched `KafkaJSNumberOfRetriesExceeded` on a send now also sees `KafkaJSDeliveryTimeout`: match `e.type` or `e.cause`. Admin and consumer retries, and the retries of a transaction's own requests (`commit`, `abort`, and InitProducerId at connect and at a transaction's start), are unchanged
 - A producer that sends faster than the cluster accepts used to grow without bound; it now rejects with a retriable error you can back off on. Raise `bufferMemory` (up to `Number.MAX_SAFE_INTEGER`) or `maxBlockMs` if your bursts are larger. A single `send()` holding more than `bufferMemory` is rejected: split it. Admitted sends are charged at most `bufferMemory`, waiting sends (which keep their records) at most the same again, and each live batch a further 1 024 bytes on top (about 13.6× in the worst case of one empty record per batch, about 3× for records of 1 KiB or more); the bound is a charge, not RSS. **In a transaction, a refused `send()` means the transaction can no longer commit: catch it, `abort()`, and start a new transaction**
 - Do not rely on mutating a record you already passed to `send()`. Mutating the bytes of an uncopied `Buffer` still affects what is sent, as in 2.2.4. A view over a backing store larger than 16 KiB and more than 16 times the view's length is copied at the call. Treat records and Buffer bytes as immutable after passing them; pass a separate Buffer containing the same bytes if you need to change your original Buffer.
 - A `send()` over about 1 MiB used to travel as one request and fail at the broker or close the connection; it is now split. A rejected split send may have written some of its records: resending it whole can duplicate those. Raise `maxRequestSize` to match the broker's `message.max.bytes` if you raised that. **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
@@ -311,6 +311,12 @@ transaction in a way its error decides.
   stays ready and the next `transaction()` tries again. *What to do:* nothing if you already
   handle a rejected `transaction()` — it could reject in 2.2.4 too, for example on its first
   InitProducerId.
+
+- **A transaction coordinator that cannot be found no longer ends the producer.** `commit()`
+  rejects with a retriable error (its `cause` is the discovery error) and can be called again;
+  `abort()` resolves; offset or partition registration makes the transaction abort-only.
+  Transactional-id authorization and producer fencing errors stay fatal; group authorization failures remain
+  abortable.
 
 - **Transactions use the transaction protocol version 2 on Kafka 4.x clusters** (KIP-890). The
   producer reads the cluster's `transaction.version` feature from the transaction coordinator at
@@ -619,6 +625,9 @@ says so, `groupProtocol: 'consumer'`.
   fetched throughout. In practice this is a latency change measured in milliseconds, visible only
   around leader elections and at the first fetch of a new assignment, and never a stall.
 
+- **`maxPollInterval` must be an integer from 1 to 2147483647; other values throw when the consumer
+  is created.**
+
 - **The rebalance timeout default changes from 60 s to 5 minutes.** The rebalance timeout sent to
   the coordinator is now the new `maxPollInterval` option, which defaults to 300000 ms and matches
   the Java client's `max.poll.interval.ms`. If you never set `rebalanceTimeout`, a member that stops
@@ -633,7 +642,7 @@ says so, `groupProtocol: 'consumer'`.
   `t = rebalanceTimeout || sessionTimeout` the allowance is
   `max(requestTimeout, Number.isSafeInteger(t + 5000) ? t + 5000 : t)`. That is 305 s at the
   defaults and 125 s with `rebalanceTimeout: 120000`; kafkajs 2.2.4 used the plain
-  `requestTimeout` (30 s by default). The allowance does not extend the rebalance: the round that
+  `requestTimeout` (30 s by default); the Java client also uses `request.timeout.ms`. The allowance does not extend the rebalance: the round that
   started before the JoinGroup keeps its original deadline (`maxPollInterval`, or the legacy
   `rebalanceTimeout`) and ends a SyncGroup that outlives it, and a peer's larger rebalance budget
   is neither learned nor covered. The cost is that a coordinator which accepts a SyncGroup and
@@ -985,9 +994,9 @@ says so, `groupProtocol: 'consumer'`.
 
 Nothing to do; code that slept after `resume()` to ride out the wait can stop.
 
-- **A broker joining or leaving no longer pauses the other fetchers.** 2.2.4 stopped every fetcher, waited for all in-flight long polls and recreated them. 3.0.0 keeps the fetchers of surviving brokers running, starts a new broker's fetcher at once, and stops only a departed broker's fetcher. Nothing to do; there is at most one fetcher, and one Fetch in flight, per broker.
+- **A broker joining or leaving no longer pauses the other fetchers.** 2.2.4 stopped every fetcher, waited for all in-flight long polls and recreated them. 3.0.0 keeps the fetchers of surviving brokers running, starts a new broker's fetcher at once, and stops only a departed broker's fetcher. Nothing to do; there is at most one fetcher, and one Fetch in flight, per broker. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
 
-- **An unreachable broker no longer stalls the other fetchers.** 2.2.4 stopped and restarted every fetcher each time a fetch lost its connection. 3.0.0 backs off and retries only that broker's fetcher while the others keep fetching. Outage limits, warnings and events are unchanged. Nothing to do.
+- **An unreachable broker no longer stalls the other fetchers.** 2.2.4 stopped and restarted every fetcher each time a fetch lost its connection. 3.0.0 backs off and retries only that broker's fetcher while the others keep fetching. Outage limits, warnings and events are unchanged. Nothing to do. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
 
 If you paused a topic and an operator recreated it, pause it again after you see `consumer.cluster.topic_recreated`. Pausing a topic before it is assigned still works and lasts until the subscription changes.
 
@@ -1326,6 +1335,8 @@ now logged.
 
 - **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
 
+- **`KafkaJSFetcherRebalanceError` is kept for compatibility and is no longer thrown.**
+
 ### Protocol
 
 Wire and connection behavior: negotiated versions, version floors, authentication and rebootstrap.
@@ -1496,6 +1507,11 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   `const leader: string = event.payload.leaderId` is now `TS2322` and `event.payload.leaderId
   .slice(0, 8)` is `TS18047`, for every user — including one who never sets `groupProtocol`. Guard
   the value (`event.payload.leaderId ?? ''`) or narrow it before use.
+- **`ConsumerCrashEvent.payload.groupId` is now `string | null`.** A consumer created without a
+  `groupId` (manual assignment) has no group id. Guard it under `strictNullChecks`.
+- **`ConsumerRebalancingEvent.payload.memberId` is now `string | null`.** A member that has no id,
+  because it has not joined yet or the coordinator rejected its id, reports `null`. Guard it under
+  `strictNullChecks`.
 - **`ConsumerGroupState` gained `'Assigning' | 'Reconciling' | 'NotReady'`**, the states
   `GroupState.java` adds for consumer groups. An exhaustive `switch` over the union without a
   `default` no longer compiles; add the three cases or a `default`.
