@@ -1722,6 +1722,112 @@ describe('final soak driver', () => {
     expect(clock.now()).toBe(900)
   })
 
+  test('every configured client kind constructs a real client from the options the driver passes', () => {
+    const { Kafka } = require('../../../index')
+    const { clientOptions } = require('../finalSoakWorkers')
+    const config = buildConfig(matrix, {
+      mode: 'smoke',
+      runId: RUN,
+      treeSha: TREE,
+      brokers: ['k:1'],
+    })
+    const kafka = new Kafka({ clientId: 'construct', brokers: ['k:1'] })
+    const made = []
+    for (const slot of config.clients.filter((c) => c.purpose !== 'observer')) {
+      const { factory, options } = clientOptions(config, matrix, slot)
+      const client = kafka[factory](options)
+      expect(typeof client.connect).toBe('function')
+      made.push(`${slot.clientKind}:${factory}`)
+    }
+    expect(new Set(made)).toEqual(
+      new Set(
+        CLIENT_KINDS.map((kind) => {
+          const role = matrix.clientKinds[kind].role
+          const factory = { producer: 'producer', share: 'shareConsumer', admin: 'admin' }[role]
+          return `${kind}:${factory ?? 'consumer'}`
+        })
+      )
+    )
+    const options = (kind) =>
+      clientOptions(
+        config,
+        matrix,
+        config.clients.find((c) => c.clientKind === kind && c.purpose === 'subject')
+      ).options
+    expect(options('consumer-static')).not.toHaveProperty('sessionTimeout')
+    expect(options('consumer-static')).not.toHaveProperty('heartbeatInterval')
+    expect(options('consumer-static')).toMatchObject({ groupProtocol: 'consumer' })
+    expect(options('classic-eager-static')).toMatchObject({
+      sessionTimeout: config.timeouts.sessionTimeout,
+      heartbeatInterval: config.timeouts.heartbeatInterval,
+    })
+  })
+
+  test('a command to a process whose channel has closed resolves with an error instead of crashing the supervisor', async () => {
+    const { Supervisor } = require('../finalSoak')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-command-'))
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      const closed = (connected) => {
+        const child = new EventEmitter()
+        child.connected = connected
+        child.send = (message, callback) => {
+          const error = Object.assign(new Error('Channel closed'), {
+            code: 'ERR_IPC_CHANNEL_CLOSED',
+          })
+          if (callback) process.nextTick(callback, error)
+          else process.nextTick(() => child.emit('error', error))
+          return false
+        }
+        return child
+      }
+      supervisor.children.set('p16', closed(false))
+      supervisor.children.set('p04', closed(true))
+      const step = { type: 'periodic', id: 'k60', slot: 60 }
+      await expect(supervisor.command('p16', step)).resolves.toMatchObject({
+        error: expect.stringContaining('p16'),
+        reply: null,
+      })
+      await expect(supervisor.command('p04', step)).resolves.toMatchObject({
+        error: expect.stringContaining('Channel closed'),
+        reply: null,
+      })
+      expect(supervisor.waiting.size).toBe(0)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('the sampling gate reports when every admitted and waiting task has finished', async () => {
+    const clock = new VirtualClock()
+    const gate = new SamplingGate({ limit: 2 })
+    await gate.idle()
+    let finished = 0
+    const task = () => async () => {
+      await clock.sleepUntil(clock.now() + 100)
+      finished++
+    }
+    for (let n = 0; n < 5; n++) gate.run(task())
+    let idleAt = null
+    const idle = gate.idle().then(() => (idleAt = finished))
+    await clock.drive(idle)
+    expect(idleAt).toBe(5)
+    expect(clock.now()).toBe(300)
+  })
+
+  test('a preflight command check is true exactly when the command exits zero', () => {
+    const { tryRun } = require('../finalSoakPreflight')
+    expect(tryRun(process.execPath, ['-e', ''])).toBe(true)
+    expect(tryRun(process.execPath, ['-e', 'process.exit(3)'])).toBe(false)
+    expect(tryRun('final-soak-no-such-command', [])).toBe(false)
+  })
+
   test('the host monitor aborts on low MemAvailable or a short disk reservation, and an abort tears the run down', async () => {
     const host = { mem: 6 * GIB, disk: 300 * GIB }
     const monitor = new HostMonitor({
