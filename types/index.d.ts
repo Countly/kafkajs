@@ -2160,7 +2160,7 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
   memberId: string | null
   /** Which membership protocol this round belongs to. */
   membershipProtocol: 'classic' | 'consumer'
-  /** Why the rebalance started. Absent on the first join of a run, which reports no reason. */
+  /** Why the rebalance started. Absent when no reason was recorded. */
   reason?:
     | 'rebalance-in-progress'
     | 'lost'
@@ -2722,7 +2722,7 @@ export type ShareConsumer = ClientTelemetry & {
   assignment(): TopicPartitions[]
   run(config: ShareConsumerRunConfig): Promise<void>
   stop(): Promise<void>
-  /** The lock duration of the latest fetch, in ms; `null` before the first one. */
+  /** Latest broker lock duration from a fetch or a successful renew, in ms; `null` until one arrives. */
   acquisitionLockTimeoutMs(): number | null
   on(
     eventName: ShareConsumerEvents['HEARTBEAT'],

@@ -1662,7 +1662,7 @@
       "apiKey": 4,
       "forkName": null,
       "apiKeysName": "LeaderAndIsr",
-      "reason": "ZooKeeper-era controller-to-broker API; still defined upstream at 4.3.1 but never sent by a client. Stub in requests/index.js."
+      "reason": "ZooKeeper-era controller-to-broker API, never sent by a client. Stub in requests/index.js."
     },
     {
       "kafkaName": "StopReplica",
