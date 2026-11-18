@@ -1,6 +1,9 @@
 const Broker = require('../../broker')
+const RequestQueue = require('../../network/requestQueue')
+const ConsumerGroup = require('../consumerGroup')
+const handlerContext = require('../handlerContext')
 const { KafkaJSCommitFailedError } = require('../../errors')
-const { TOPIC, CloseRig, batchAt, gate, until } = require('./fixtures/closeRig')
+const { TOPIC, CloseRig, batchAt, gate } = require('./fixtures/closeRig')
 
 const BEFORE = ['value-2', 'value-3', 'value-4']
 
@@ -55,8 +58,10 @@ class SeekScenario {
         .catch((error) => scenario.errors.push(error))
     const handle = async (partition, values, payload) => {
       if (partition !== 0) {
-        if (scenario.otherSeen++ === 0) await guarded(other, payload)
+        const first = scenario.otherSeen++ === 0
+        if (first) await guarded(other, payload)
         for (const { offset } of payload.batch?.messages ?? []) payload.resolveOffset(offset)
+        if (first) scenario.otherDone.resolve()
         return
       }
       scenario.deliveries.push(values)
@@ -113,6 +118,7 @@ class SeekScenario {
     this.gate = gate()
     this.finished = gate()
     this.next = gate()
+    this.otherDone = gate()
     this.hold = gate()
     /** @type {string[][]} */
     this.deliveries = []
@@ -192,6 +198,114 @@ const holdNextCommitCall = () => {
   return { reached: reached.promise, release: opened.resolve, restore: () => spy.mockRestore() }
 }
 
+/**
+ * Holds the next OffsetCommit at the request queue's dispatch, before its final refusal check and
+ * its write, so whatever the request was built from is already fixed.
+ * @returns {{ reached: Promise<void>, release: () => void, restore: () => void }}
+ */
+const holdNextCommitWrite = () => {
+  const reached = gate()
+  const opened = gate()
+  const original = RequestQueue.prototype.sendSocketRequest
+  let held = false
+  const spy = jest
+    .spyOn(RequestQueue.prototype, 'sendSocketRequest')
+    .mockImplementation(function (request) {
+      if (held || request.entry.apiName !== 'OffsetCommit') return original.call(this, request)
+      held = true
+      reached.resolve()
+      opened.promise.then(() => original.call(this, request))
+    })
+  return { reached: reached.promise, release: opened.resolve, restore: () => spy.mockRestore() }
+}
+
+/**
+ * Holds the answers of an API after the broker applied the request, with a gate on the first
+ * arrival.
+ * @param {import('./fixtures/closeRig').CloseRig} rig
+ * @param {string} api
+ * @returns {{ arrived: Promise<void>, release: () => void }}
+ */
+const holdAnswerOnArrival = (rig, api) => {
+  const held = rig.hold(api)
+  const arrived = gate()
+  const answer = rig.cluster.answerers.get(api)
+  rig.cluster.answer(api, (fields, record) => {
+    arrived.resolve()
+    return answer(fields, record)
+  })
+  return { arrived: arrived.promise, release: held.release }
+}
+
+/**
+ * Answers the next OffsetCommit with REQUEST_TIMED_OUT for every cell, recording nothing.
+ * @param {SeekScenario} scenario
+ * @returns {void}
+ */
+const failNextCommit = (scenario) => {
+  const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+  let failed = false
+  scenario.rig.cluster.answer('OffsetCommit', (fields, record) => {
+    if (failed) return answer(fields, record)
+    failed = true
+    return {
+      topics: fields.topics.map((topic) => ({
+        ...topic,
+        partitions: topic.partitions.map(({ partition }) => ({ partition, errorCode: 7 })),
+      })),
+    }
+  })
+}
+
+/**
+ * Captures the consumer group of the scenario when it applies its first assignment.
+ * @returns {{ group: () => ConsumerGroup, restore: () => void }}
+ */
+const captureGroup = () => {
+  const apply = ConsumerGroup.prototype.applyRebalanceResult
+  let captured = null
+  const spy = jest
+    .spyOn(ConsumerGroup.prototype, 'applyRebalanceResult')
+    .mockImplementation(function (...args) {
+      captured = this
+      return apply.apply(this, args)
+    })
+  return { group: () => captured, restore: () => spy.mockRestore() }
+}
+
+/**
+ * Resolves with the request entries of the next fetch built after the call.
+ * @returns {{ next: () => Promise<object[]>, restore: () => void }}
+ */
+const watchFetchBuilds = () => {
+  const build = ConsumerGroup.prototype.buildFetchRequests
+  let waiter = null
+  const spy = jest
+    .spyOn(ConsumerGroup.prototype, 'buildFetchRequests')
+    .mockImplementation(function (...args) {
+      const requests = build.apply(this, args)
+      waiter?.resolve(requests)
+      waiter = null
+      return requests
+    })
+  return {
+    next: () => {
+      waiter = gate()
+      return waiter.promise
+    },
+    restore: () => spy.mockRestore(),
+  }
+}
+
+/**
+ * @param {object[]} requests fetch request entries
+ * @returns {string[]} the fetch offsets asked for partition 0
+ */
+const partitionZeroOffsets = (requests) =>
+  requests.flatMap(({ partitions }) =>
+    partitions.filter(({ partition }) => partition === 0).map(({ fetchOffset }) => fetchOffset)
+  )
+
 const MANUAL = { autoCommit: false, autoCommitThreshold: 1, eachBatchAutoResolve: false }
 const PAYLOAD_5 = { topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }] }
 
@@ -205,6 +319,14 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     await scenario?.dispose()
     scenario = undefined
   })
+  const using = (handle) => {
+    const previous = restore
+    restore = () => {
+      handle.restore()
+      previous()
+    }
+    return handle
+  }
   const open = async (options) => {
     scenario = await SeekScenario.open({ protocol, ...options })
     return scenario
@@ -238,6 +360,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(await scenario.nextDelivery()).toEqual(['value-0'])
     expect(await scenario.position()).toBe('0')
     expect(scenario.commits()).toEqual([])
+    expect(scenario.errors).toEqual([])
   })
 
   test('a seek to the offset the older batch started at still fences that batch', async () => {
@@ -249,6 +372,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(await scenario.nextDelivery()).toEqual(BEFORE)
     expect(await scenario.position()).toBe('2')
     expect(scenario.commits()).toEqual([])
+    expect(scenario.errors).toEqual([])
   })
 
   test('a forward seek refuses the explicit commit callback of an older batch', async () => {
@@ -298,6 +422,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(await scenario.position()).toBe('0')
     expect(scenario.commits()).toEqual(['0'])
     expect(scenario.committed[0]).toBe('0')
+    expect(scenario.errors).toEqual([])
   })
 
   test('eachMessage stops an older batch after a seek and does not resolve or commit it', async () => {
@@ -310,6 +435,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(await scenario.position()).toBe('0')
     expect(scenario.commits()).toEqual(['0'])
     expect(scenario.deliveries.flat()).not.toContain('value-3')
+    expect(scenario.errors).toEqual([])
   })
 
   test('consumer.commitOffsets from work an older batch handler started is refused after a seek', async () => {
@@ -361,18 +487,19 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     await open({
       run: { ...MANUAL, eachBatch: true },
       before: ({ resolveOffset, commitOffsetsIfNecessary }, opened) => {
-        answer.hold = opened.rig.hold('OffsetCommit')
+        answer.hold = holdAnswerOnArrival(opened.rig, 'OffsetCommit')
         resolveOffset('4')
         committing = commitOffsetsIfNecessary()
       },
       old: () => committing,
     })
-    await until(() => answer.hold.hits === 1, 'the written commit')
+    await answer.hold.arrived
     expect(await scenario.seek('0')).toBe('0')
 
     answer.hold.release()
     await scenario.release()
 
+    expect(scenario.errors).toEqual([])
     expect(scenario.commits()).toEqual(['5'])
     expect(scenario.committed[0]).toBe('5')
     expect(await scenario.nextDelivery()).toEqual(['value-0'])
@@ -392,6 +519,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
     expect(scenario.commits()).toEqual([])
     expect(scenario.committed[0]).toBe('2')
+    expect(scenario.errors).toEqual([])
   })
 
   test('a healthy partition commits its progress without the sought partition', async () => {
@@ -415,19 +543,24 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(scenario.commits(1)).toEqual(['1'])
     expect(scenario.commits(0)).toEqual([])
     expect(await scenario.position()).toBe('0')
+    expect(scenario.errors).toEqual([])
   })
 
   test('a seek of another partition leaves an older batch free to resolve and commit', async () => {
-    let stale
+    let stale, identity
     await open({
       partitions: 2,
       run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
+      before: () => {
+        identity = handlerContext.current()
+      },
       old: async (payload) => {
         stale = payload.isStale()
         await resolveAndCommit(payload)
       },
     })
     scenario.consumer.seek({ topic: TOPIC, partition: 1, offset: '0' })
+    expect(handlerContext.isSuperseded(identity)).toBe(false)
 
     await scenario.release()
 
@@ -435,6 +568,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(await scenario.nextDelivery()).toEqual(['value-5'])
     expect(await scenario.position()).toBe('5')
     expect(scenario.commits()).toEqual(['5'])
+    expect(scenario.errors).toEqual([])
   })
 
   test('the batch fetched after a seek resolves and commits as usual', async () => {
@@ -455,6 +589,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(stale).toBe(false)
     expect(await scenario.position()).toBe('7')
     expect(scenario.commits()).toEqual(['7'])
+    expect(scenario.errors).toEqual([])
   })
 
   test('consumer.commitOffsets outside any handler still commits after a seek', async () => {
@@ -465,5 +600,282 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
     expect(scenario.commits()).toEqual(['5'])
     expect(scenario.committed[0]).toBe('5')
+  })
+  test('consumer.commitOffsets from work an older batch handler left running after it returned is refused after a seek', async () => {
+    const later = gate()
+    let detached
+    await open({
+      run: { ...MANUAL, eachBatch: true },
+      handOff: true,
+      before: () => {
+        detached = later.promise.then(() =>
+          scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '5' }])
+        )
+      },
+    })
+    expect(await scenario.nextDelivery()).toEqual(BEFORE)
+    expect(await scenario.seek('0')).toBe('0')
+
+    later.resolve()
+
+    await expect(detached).rejects.toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(await scenario.position()).toBe('0')
+    expect(scenario.commits()).toEqual([])
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a default commit selected before a seek is written without the obsolete offset of the sought partition', async () => {
+    const write = using(holdNextCommitWrite())
+    const allow = gate()
+    await open({
+      partitions: 2,
+      run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+      other: async ({ resolveOffset, commitOffsetsIfNecessary }) => {
+        await allow.promise
+        resolveOffset('0')
+        await commitOffsetsIfNecessary()
+      },
+    })
+    allow.resolve()
+    await write.reached
+    expect(await scenario.seek('0')).toBe('0')
+
+    write.release()
+    await scenario.otherDone.promise
+
+    expect(scenario.commits(0)).toEqual(['0'])
+    expect(scenario.commits(1)).toEqual(['1'])
+    expect(scenario.committed).toEqual({ 0: '0', 1: '1' })
+    expect(await scenario.position()).toBe('0')
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a final commit selected before a pending seek is written without the sought partition', async () => {
+    const write = using(holdNextCommitWrite())
+    await open({
+      partitions: 2,
+      run: {
+        autoCommit: true,
+        autoCommitInterval: 60000,
+        partitionsConsumedConcurrently: 2,
+        eachBatch: true,
+      },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    })
+    await scenario.otherDone.promise
+    const closing = scenario.consumer.disconnect()
+    await scenario.release()
+    await write.reached
+    scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+
+    write.release()
+    await closing
+
+    expect(scenario.commits(0)).toEqual([])
+    expect(scenario.commits(1)).toEqual(['1'])
+    expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a fetch prepared while a seek is still being applied does not read from the old position', async () => {
+    const builds = using(watchFetchBuilds())
+    await open({
+      run: {
+        autoCommit: true,
+        autoCommitThreshold: 1,
+        eachBatchAutoResolve: false,
+        eachBatch: true,
+      },
+    })
+    const answer = holdAnswerOnArrival(scenario.rig, 'OffsetCommit')
+    const seeking = scenario.seek('0')
+    await answer.arrived
+    const built = builds.next()
+    await scenario.release()
+
+    expect(partitionZeroOffsets(await built)).toEqual([])
+
+    answer.release()
+    expect(await seeking).toBe('0')
+    expect(await scenario.nextDelivery()).toEqual(['value-0'])
+    expect(await scenario.position()).toBe('0')
+    expect(scenario.commits()).toEqual(['0'])
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a resolve callback of an older batch stays fenced after its assignment is rebuilt', async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true }, handOff: true })
+    await scenario.nextDelivery()
+    expect(await scenario.seek('0')).toBe('0')
+    scenario.old.resolveOffset('4')
+    expect(await scenario.position()).toBe('0')
+
+    await captured.group().applyRebalanceResult({ assignment: { [TOPIC]: [0] } })
+    expect(await scenario.position()).toBe('2')
+    scenario.old.resolveOffset('4')
+
+    expect(await scenario.position()).toBe('2')
+    await captured.group().commitOffsets({}, { auto: true })
+    expect(scenario.commits()).toEqual([])
+  })
+
+  test('a resolve callback of an older batch stays fenced after its partition is revoked and assigned again', async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true }, handOff: true })
+    await scenario.nextDelivery()
+    expect(await scenario.seek('0')).toBe('0')
+    const group = captured.group()
+
+    await group.applyRebalanceResult({ assignment: {} }, { rebuildOffsets: false })
+    await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: false })
+    expect(await scenario.position()).toBe('2')
+    scenario.old.resolveOffset('4')
+
+    expect(await scenario.position()).toBe('2')
+    await group.commitOffsets({}, { auto: true })
+    expect(scenario.commits()).toEqual([])
+  })
+
+  test('a seek whose commit failed keeps the obsolete progress out of the final commit', async () => {
+    await open({
+      partitions: 2,
+      run: {
+        autoCommit: true,
+        autoCommitInterval: 60000,
+        partitionsConsumedConcurrently: 2,
+        eachBatch: true,
+      },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    })
+    await scenario.otherDone.promise
+    failNextCommit(scenario)
+    await expect(scenario.seek('0')).rejects.toMatchObject({ type: 'REQUEST_TIMED_OUT' })
+
+    const closing = scenario.consumer.disconnect()
+    await scenario.release()
+    await closing
+
+    expect(scenario.commits(0)).toEqual(['0'])
+    expect(scenario.commits(1)).toEqual(['1'])
+    expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a seek whose commit failed is applied by the next resolution', async () => {
+    await open({
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    })
+    failNextCommit(scenario)
+    await expect(scenario.seek('0')).rejects.toMatchObject({ type: 'REQUEST_TIMED_OUT' })
+
+    expect(await scenario.position()).toBe('0')
+    await scenario.release()
+
+    expect(await scenario.nextDelivery()).toEqual(['value-0'])
+    expect(scenario.commits()).toEqual(['0', '0'])
+    expect(scenario.committed[0]).toBe('0')
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a commit with no seek admitted skips the sought-partition checks', async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true }, old: resolveAndCommit })
+    const group = captured.group()
+    const scans = jest.spyOn(group, 'isSoughtAfter')
+    const lookups = jest.spyOn(group.unappliedSeeks, 'has')
+    using({ restore: () => [scans, lookups].forEach((spy) => spy.mockRestore()) })
+
+    await scenario.release()
+
+    expect(scenario.commits()).toEqual(['5'])
+    expect(scans).not.toHaveBeenCalled()
+    expect(lookups).not.toHaveBeenCalled()
+    expect(scenario.errors).toEqual([])
+  })
+
+  test('a handler identity carries its acquisition, which a seek admitted after the fetch supersedes', async () => {
+    let identity, currentIdentity
+    await open({
+      run: { ...MANUAL, eachBatch: true },
+      before: () => {
+        identity = handlerContext.current()
+      },
+      current: async () => {
+        currentIdentity = handlerContext.current()
+      },
+    })
+    expect(identity.acquisition.retired).toBe(false)
+    expect(handlerContext.isSuperseded(identity)).toBe(false)
+
+    scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+    expect(handlerContext.isSuperseded(identity)).toBe(true)
+    expect(await scenario.position()).toBe('0')
+    expect(handlerContext.isSuperseded(identity)).toBe(true)
+
+    await scenario.release()
+    expect(await scenario.nextDelivery()).toEqual(['value-0'])
+    expect(currentIdentity.acquisition).toBe(identity.acquisition)
+    expect(handlerContext.isSuperseded(currentIdentity)).toBe(false)
+  })
+
+  test('rebuilding the assignment retires the acquisition an older identity carries', async () => {
+    const captured = using(captureGroup())
+    let identity
+    await open({
+      run: { ...MANUAL, eachBatch: true },
+      before: () => {
+        identity = handlerContext.current()
+      },
+    })
+    const group = captured.group()
+
+    await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } })
+
+    expect(identity.acquisition.retired).toBe(true)
+    expect(handlerContext.isSuperseded(identity)).toBe(true)
+    const replacement = group.acquired.get(`${TOPIC}|0`)
+    expect(replacement).not.toBe(identity.acquisition)
+    expect(replacement.retired).toBe(false)
+  })
+
+  test('revoking a partition retires its acquisition, and assigning it again does not revive it', async () => {
+    const captured = using(captureGroup())
+    let identity
+    await open({
+      run: { ...MANUAL, eachBatch: true },
+      before: () => {
+        identity = handlerContext.current()
+      },
+    })
+    const group = captured.group()
+
+    await group.applyRebalanceResult({ assignment: {} }, { rebuildOffsets: false })
+    expect(identity.acquisition.retired).toBe(true)
+    await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: false })
+
+    expect(identity.acquisition.retired).toBe(true)
+    expect(handlerContext.isSuperseded(identity)).toBe(true)
+    expect(group.acquired.get(`${TOPIC}|0`).retired).toBe(false)
+  })
+
+  test('stopping the run retires the acquisition a handler identity carries', async () => {
+    let identity
+    await open({
+      run: { ...MANUAL, eachBatch: true },
+      before: () => {
+        identity = handlerContext.current()
+      },
+    })
+    expect(handlerContext.isSuperseded(identity)).toBe(false)
+
+    const closing = scenario.consumer.disconnect()
+    await scenario.release()
+    await closing
+
+    expect(identity.acquisition.retired).toBe(true)
+    expect(handlerContext.isSuperseded(identity)).toBe(true)
   })
 })

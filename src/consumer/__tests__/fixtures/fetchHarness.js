@@ -165,12 +165,20 @@ const encodeAbortedTransactions = (aborted = []) =>
  *   preferredReadReplica?: number, abortedTransactions?: object[],
  *   currentLeader?: { leaderId: number, leaderEpoch: number } }[]} partitions
  * @param {{ topLevel?: number, nodeEndpoints?: object[], apiVersion?: number,
- *   sessionId?: number, includeTopic?: boolean }} [options]
+ *   sessionId?: number, includeTopic?: boolean, topicId?: string }} [options] `topicId` is the
+ *   topic's id from v13, the harness's own by default
  * @returns {Buffer}
  */
 const fetchResponse = (
   partitions,
-  { topLevel = 0, nodeEndpoints, apiVersion = 18, sessionId = 0, includeTopic = true } = {}
+  {
+    topLevel = 0,
+    nodeEndpoints,
+    apiVersion = 18,
+    sessionId = 0,
+    includeTopic = true,
+    topicId = TOPIC_ID,
+  } = {}
 ) =>
   new Encoder()
     .writeInt32(0) // clientSideThrottleTime
@@ -181,7 +189,7 @@ const fetchResponse = (
         ? [
             (apiVersion <= 12
               ? new Encoder().writeUVarIntString(TOPIC)
-              : new Encoder().writeUuid(TOPIC_ID)
+              : new Encoder().writeUuid(topicId)
             )
               .writeUVarIntArray(
                 partitions.map(
