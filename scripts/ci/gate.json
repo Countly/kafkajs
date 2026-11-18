@@ -20969,7 +20969,79 @@
         "scripts/mutants/__tests__/liveEvidence.spec.js \u203a scripts/mutants/liveEvidence.js refuses to write evidence when the brokers disagree or a field is empty",
         "scripts/mutants/__tests__/liveEvidence.spec.js \u203a scripts/mutants/liveEvidence.js a live record without complete guard evidence is invalid and never not-run-as-pass",
         "scripts/mutants/__tests__/liveEvidence.spec.js \u203a scripts/mutants/liveEvidence.js a surviving live record with valid guard evidence is a high-risk survivor and stays OPEN",
-        "scripts/mutants/__tests__/liveEvidence.spec.js \u203a scripts/mutants/liveEvidence.js a live record whose guard evidence names another SHA is invalid"
+        "scripts/mutants/__tests__/liveEvidence.spec.js \u203a scripts/mutants/liveEvidence.js a live record whose guard evidence names another SHA is invalid",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > a passed-through failure belongs to one invocation a refusal a custom provider propagated is judged afresh when a later token getter throws it",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > a passed-through failure belongs to one invocation a refusal before the mechanism runs is judged afresh when a later token getter throws it",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > a passed-through failure belongs to one invocation sequential invocations each rethrow their own refusal",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > a passed-through failure belongs to one invocation two concurrent invocations refused with one shared error each rethrow it unchanged",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors AWS: missing credentials stay an authentication error and send nothing",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors GSSAPI: an invalid service name keeps its configuration error class",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors OAUTHBEARER: a supplier rejection outside the exchange keeps its own error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors OAUTHBEARER: missing credentials stay an authentication error and send nothing",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors PLAIN: missing credentials stay an authentication error and send nothing",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors SCRAM-SHA-256: a server-first message failing validation stays an authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors SCRAM-SHA-256: missing credentials stay an authentication error and send nothing",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors SCRAM-SHA-512: a server-first message failing validation stays an authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > failures that remain authentication errors SCRAM-SHA-512: missing credentials stay an authentication error and send nothing",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > the classification reaches the recovery policies a broker rejection during the exchange decides rebootstrap, consumer restart and share restart",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > the classification reaches the recovery policies a lost connection during the exchange decides rebootstrap, consumer restart and share restart",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > the classification reaches the recovery policies a request timeout during the exchange decides rebootstrap, consumer restart and share restart",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a broker rejection stays a non-retriable authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a cancellation during the exchange keeps its own class and retriability",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a closed connection that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a connection error that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a constructed library connection error from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a native error adopting the connection error prototype from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS a request timeout that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange AWS an error forging a transport name, code and retriable flag stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a broker rejection stays a non-retriable authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a cancellation during the exchange keeps its own class and retriability",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a closed connection that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a connection error that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a constructed library connection error from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a native error adopting the connection error prototype from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI a request timeout that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI an error forging a transport name, code and retriable flag stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI: a library connection error from the native step stage stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI: a library connection error from the native unwrap stage stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI: a library connection error from the native wrap stage stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange GSSAPI: a reset during the final layer exchange is rethrown unchanged",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a broker rejection stays a non-retriable authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a cancellation during the exchange keeps its own class and retriability",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a closed connection that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a connection error that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a constructed library connection error from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a native error adopting the connection error prototype from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER a request timeout that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER an error forging a transport name, code and retriable flag stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange OAUTHBEARER: a library connection error thrown by the supplied token stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a broker rejection stays a non-retriable authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a cancellation during the exchange keeps its own class and retriability",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a closed connection that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a connection error that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a constructed library connection error from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a native error adopting the connection error prototype from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN a request timeout that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange PLAIN an error forging a transport name, code and retriable flag stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a broker rejection stays a non-retriable authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a cancellation during the exchange keeps its own class and retriability",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a closed connection that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a connection error that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a constructed library connection error from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a native error adopting the connection error prototype from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 a request timeout that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-256 an error forging a transport name, code and retriable flag stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a broker rejection stays a non-retriable authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a cancellation during the exchange keeps its own class and retriability",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a closed connection that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a connection error that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a constructed library connection error from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a native error adopting the connection error prototype from a send that leaves the connection open stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 a request timeout that ends the connection during the exchange rethrows the connection's refusal and stays retriable",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures during the exchange SCRAM-SHA-512 an error forging a transport name, code and retriable flag stays an authentication error without its text",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures through the client a connection error a supplied socket throws while writing the login stays a sanitized authentication error",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures through the client a connection reset during re-authentication is retried and the request succeeds",
+        "src/broker/saslAuthenticator/transportFailures.spec.js \u203a Broker > SASLAuthenticator > transport failures through the client a rejected password during re-authentication is not retried"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -21114,6 +21186,7 @@
         "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, expires, reconnects and reauthenticates with the ticket service",
         "src/broker/__tests__/floorGssapiLive.spec.js \u203a GSSAPI with a ticket-granting service reads the SASL capability facts from a GSSAPI-authenticated connection",
         "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service recovers with a fresh context after a reset during the first and the final-layer exchange, and an expired cache stays terminal",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a below-interval batch followed by idle commits only at the next processing opportunity",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a configured interval commits only at processing opportunities inside the quiet window",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a connection loss replays exactly the suffix after the last confirmed commit",
@@ -21460,7 +21533,14 @@
       "evidence": [],
       "titles": [
         "src/broker/__tests__/kafka44ReauthenticationAudit.spec.js \u203a Kafka 4.4 client fix audit KAFKA-20253 failed reauthentication cannot spin consumer retries",
-        "src/broker/__tests__/bootstrapResolutionLive.spec.js \u203a Broker > bootstrap DNS (live) a positive readiness timeout connects with the original bootstrap hostname"
+        "src/broker/__tests__/bootstrapResolutionLive.spec.js \u203a Broker > bootstrap DNS (live) a positive readiness timeout connects with the original bootstrap hostname",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a reset while the SASL PLAIN login is in flight is a retriable connection error and a reconnect completes a request",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a reset while the SASL SCRAM 256 login is in flight is a retriable connection error and a reconnect completes a request",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a reset while the SASL SCRAM 512 login is in flight is a retriable connection error and a reconnect completes a request",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a wrong SASL PLAIN password stays a terminal authentication error without the password",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a wrong SASL SCRAM 256 password stays a terminal authentication error without the password",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a wrong SASL SCRAM 512 password stays a terminal authentication error without the password",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login with an ordinary consumer a consumer whose SASL PLAIN login is reset joins and consumes after reconnecting"
       ],
       "capMinutes": 48,
       "allowedSkips": [
@@ -21499,7 +21579,10 @@
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate only once with multiple parallel requests",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate every request sent when re-authentication threshold is same as session lifetime",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticates only once with multiple requests sent in parallel when re-authentication threshold is same as session lifetime",
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER a reset during re-authentication is a retriable connection error and the next request logs in on a new socket",
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER a token the broker rejects at re-authentication stays a terminal authentication error",
         "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service recovers with a fresh context after a reset during the first and the final-layer exchange, and an expired cache stays terminal",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor deletes offsets and fetches three groups through negotiated versions",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor describes active transactions and refuses an unavailable pattern",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Administration and connection capabilities on the floor aborts a physical transaction and fences the original producer",
@@ -22268,7 +22351,9 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes original key and value to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
-        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000"
+        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000",
+        "src/consumer/share/__tests__/shareSaslLive.spec.js \u203a Share consumer over SASL PLAIN a member whose login is reset while it reconnects resumes delivery",
+        "src/consumer/share/__tests__/shareSaslLive.spec.js \u203a Share consumer over SASL PLAIN a member whose password is revoked stops without restarting even when restartOnFailure asks to"
       ]
     },
     {
@@ -22487,12 +22572,17 @@
       "command": null,
       "needs": {},
       "evidence": [],
-      "titles": [],
+      "titles": [
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login a reset while the SASL OAUTHBEARER login is in flight is a retriable connection error and a reconnect completes a request",
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER a reset during re-authentication is a retriable connection error and the next request logs in on a new socket",
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER a token the broker rejects at re-authentication stays a terminal authentication error"
+      ],
       "capMinutes": 48,
       "allowedSkips": [
         "src/broker/__tests__/connect.spec.js \u203a Broker > connect when PLAIN is configured user provided authenticator overrides built in ones",
         "src/broker/__tests__/connect.spec.js \u203a Broker > connect when SASL SCRAM is configured parallel calls to connect using SCRAM",
-        "src/broker/__tests__/connect.spec.js \u203a Broker > connect #isConnected when SASL SCRAM is configured parallel calls to connect using SCRAM"
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect #isConnected when SASL SCRAM is configured parallel calls to connect using SCRAM",
+        "src/broker/__tests__/connect.spec.js \u203a Broker > connect a connection reset during SASL login with an ordinary consumer a consumer whose SASL PLAIN login is reset joins and consumes after reconnecting"
       ]
     },
     {
@@ -24386,7 +24476,8 @@
         "gssapi"
       ],
       "titles": [
-        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache"
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service recovers with a fresh context after a reset during the first and the final-layer exchange, and an expired cache stays terminal"
       ],
       "capMinutes": 30
     },
@@ -25880,6 +25971,8 @@
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate only once with multiple parallel requests",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate every request sent when re-authentication threshold is same as session lifetime",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticates only once with multiple requests sent in parallel when re-authentication threshold is same as session lifetime",
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER a reset during re-authentication is a retriable connection error and the next request logs in on a new socket",
+        "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER a token the broker rejects at re-authentication stays a terminal authentication error",
         "src/cluster/__tests__/rebootstrapLive.spec.js \u203a Cluster > rebootstrap (live, cluster replaced on new ports) a client whose entire cluster is replaced rebootstraps and resumes producing and consuming",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a configured interval commits only at processing opportunities inside the quiet window",
         "src/consumer/__tests__/autoCommitCadenceLive.spec.js \u203a Consumer > automatic commit cadence (live) a below-interval batch followed by idle commits only at the next processing opportunity",
@@ -26180,6 +26273,7 @@
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) a node that is another broker is refused with REBOOTSTRAP_REQUIRED on 4.4, recovered from once, and not noticed below it",
         "src/broker/__tests__/apiVersionsIdentityLive.spec.js \u203a Broker > ApiVersions identity (live) none names no identity, so a misrouted node is neither refused nor recovered from",
         "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service authenticates, negotiates no layer and rejects an observed expired cache",
+        "src/broker/__tests__/gssapiLive.spec.js \u203a GSSAPI with a ticket-granting service recovers with a fresh context after a reset during the first and the final-layer exchange, and an expired cache stays terminal",
         "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker producer and admin authenticate with every helper form, refresh in the window and read the log",
         "src/oauth/__tests__/oauthHelpersLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
         "src/network/__tests__/tlsNegativeLive.spec.js \u203a TLS negatives against real SSL listeners (live) a client certificate completes a Kafka request on the listener that requires one",
@@ -26211,7 +26305,9 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
         "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000",
-        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
+        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing",
+        "src/consumer/share/__tests__/shareSaslLive.spec.js \u203a Share consumer over SASL PLAIN a member whose login is reset while it reconnects resumes delivery",
+        "src/consumer/share/__tests__/shareSaslLive.spec.js \u203a Share consumer over SASL PLAIN a member whose password is revoked stops without restarting even when restartOnFailure asks to"
       ]
     },
     {
