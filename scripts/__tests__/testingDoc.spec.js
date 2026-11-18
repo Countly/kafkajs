@@ -251,7 +251,16 @@ describe('docs/Testing.md', () => {
       '`scripts/mutants/generate.js`',
       'dispatched by hand',
       'gates nothing',
-      'nominated witness',
+      'Nominated witness specs judge every mutant',
+      'the first valid kill decides',
+      'at least one of its nominated witnesses still passed',
+      'none produced a valid kill',
+      'in their listed order',
+      'appended when the list does not name it',
+      'which replace the default',
+      'otherwise the default spec alone',
+      'starts no new mutant and no further witness of a running one',
+      'a mutant cut between two witnesses is `not-run`',
       '`mutation-report`',
       'does not mean that no test in the suite would fail',
       'gates nothing by itself',
@@ -261,6 +270,10 @@ describe('docs/Testing.md', () => {
     for (const verdict of ['killed', 'survived', 'invalid', 'stale', 'not-run', 'excluded'])
       expect(section).toContain(`\`${verdict}\``)
     expect(section).not.toContain('no merge or release waits')
+    expect(section).not.toContain('A nominated witness spec')
+    expect(section).not.toContain('its nominated witness did not fail')
+    expect(section).not.toContain('means none of its nominated witnesses failed')
+    expect(section).not.toContain('followed by the default spec of its target')
     for (const name of Object.keys(inputs)) expect(section).toContain(`\`${name}\``)
     expect(section).not.toMatch(/\d\s?%/)
   })

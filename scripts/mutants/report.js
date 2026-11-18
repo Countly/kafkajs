@@ -86,14 +86,14 @@ class MutationReport {
   /**
    * @param {string|null} original
    * @param {string|null} mutated
-   * @returns {string} the sentence naming the assertion the selected witness does not make
+   * @returns {string} the sentence naming the assertion the selected witnesses do not make
    */
   static missingAssertion(original, mutated) {
     const was = String(original ?? '').trim()
     const now = String(mutated ?? '').trim()
     return now === ''
-      ? `The selected witness did not fail when \`${was}\` is removed.`
-      : `The selected witness did not fail when \`${was}\` becomes \`${now}\`.`
+      ? `No selected witness produced a valid kill when \`${was}\` is removed.`
+      : `No selected witness produced a valid kill when \`${was}\` becomes \`${now}\`.`
   }
 
   /**
@@ -305,8 +305,8 @@ class MutationReport {
     const lines = [
       '# Mutation report',
       '',
-      '- A mutation run plants one small deliberate bug (a mutant) in the code at a time and runs only its selected witness spec, sometimes one named test in it, not the whole suite.',
-      '- A killed mutant means the witness noticed the bug and failed; a survivor means the witness still passed: its missing assertion is a candidate for review, since another spec may already guard it.',
+      '- A mutation run plants one small deliberate bug (a mutant) in the code at a time and runs only its selected witness specs, sometimes one named test in a spec, not the whole suite.',
+      '- A killed mutant means a witness noticed the bug and failed through its own test body; a survivor means no witness produced a valid kill and at least one still passed (another may have been invalid): its missing assertion is a candidate for review, since another spec may already guard it.',
       '- Score = killed / (killed + survived); stale, invalid, excluded and not-run mutants are listed but never counted as killed.',
       '',
       `Tree ${code(p.sha)} · run ${p.runId} · seed ${p.seed} · ${p.perArea} generated per area · areas: ${p.areas} · unit ledgers found: ${p.ledgers.found} of ${p.ledgers.expected}${
