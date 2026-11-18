@@ -12,13 +12,17 @@ const { createChaosSocketFactory } = require('../../../testHelpers/chaosSocket')
 const { KafkaJSConnectionError, KafkaJSSASLAuthenticationError } = require('../../errors')
 
 /**
- * An unsecured JWT the broker's unsecured validator rejects, since it expired a minute ago.
+ * A valid unsecured JWT for a different principal than the one the connection logged in with.
+ * At re-authentication the broker refuses a principal change with SASL_AUTHENTICATION_FAILED
+ * (SaslServerAuthenticator `ensurePrincipalUnchanged`, Kafka 4.4.0). An invalid or expired token
+ * is not used: the broker answers it with an OAUTHBEARER error challenge in a successful
+ * SaslAuthenticate response, which is not a rejection the client sees as an error code.
  * @returns {string}
  */
-const expiredJwt = () => {
+const otherPrincipalJwt = () => {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url')
   const now = Math.floor(Date.now() / 1000)
-  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode({ sub: 'test', iat: now - 120, exp: now - 60 })}.`
+  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode({ sub: 'someone-else', iat: now, exp: now + 3600 })}.`
 }
 
 /**
@@ -168,7 +172,7 @@ describeIfOauthbearerEnabled('Brokers re-authentication with SASL OAUTHBEARER', 
       ...opts,
       sasl: {
         ...opts.sasl,
-        oauthBearerProvider: async () => (calls++ === 0 ? valid() : { value: expiredJwt() }),
+        oauthBearerProvider: async () => (calls++ === 0 ? valid() : { value: otherPrincipalJwt() }),
       },
       reauthenticationThreshold: 14900,
       socketFactory: chaos,
@@ -182,6 +186,9 @@ describeIfOauthbearerEnabled('Brokers re-authentication with SASL OAUTHBEARER', 
 
       expect(calls).toBe(2)
       expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.message).toBe(
+        'SASL OAUTHBEARER authentication failed: SASL Authentication failed'
+      )
       expect(error.retriable).toBe(false)
       expect(chaos.sockets).toHaveLength(1)
     } finally {
