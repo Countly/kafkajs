@@ -226,6 +226,8 @@ module.exports = class Cluster {
       metadataCache: this.metadataCache,
       captureTopics:
         this.targetTopicState === null ? undefined : (topics) => this.captureTopics(topics),
+      dropTopic:
+        this.targetTopicState === null ? undefined : (topic) => this.dropTargetTopic(topic),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
@@ -909,11 +911,7 @@ module.exports = class Cluster {
               this.targetTopics = previousTopics
             } else {
               for (const topic of this.targetTopics) {
-                if (previousTopics.has(topic)) continue
-                this.targetTopics.delete(topic)
-                this.targetTopicState.delete(topic)
-                this.metadataCache.forget(topic)
-                this.brokerPool.forgetTopic(topic)
+                if (!previousTopics.has(topic)) this.forgetTargetTopic(topic)
               }
             }
           }
@@ -974,11 +972,34 @@ module.exports = class Cluster {
     const now = Date.now()
     for (const [topic, { lastUsed }] of this.targetTopicState) {
       if (this.topicPins.has(topic) || now - lastUsed < this.metadataMaxIdle) continue
-      this.targetTopics.delete(topic)
-      this.targetTopicState.delete(topic)
-      this.metadataCache.forget(topic)
-      this.brokerPool.forgetTopic(topic)
+      this.forgetTargetTopic(topic)
     }
+  }
+
+  /**
+   * Forgets a producer target the broker no longer serves, unless a send still holds it: its
+   * queued and retried batches need its routing and its later refreshes. A later send adds a
+   * forgotten target again as a new incarnation.
+   * @param {string} topic target name
+   * @returns {boolean} whether it was forgotten
+   */
+  dropTargetTopic(topic) {
+    if (this.topicPins.has(topic)) return false
+    this.forgetTargetTopic(topic)
+    return true
+  }
+
+  /**
+   * Forgets one producer target, its incarnation and both cached representations; its pins stay
+   * with their owners. Used for idle expiry, a refused add, and `dropTargetTopic`.
+   * @param {string} topic target name
+   * @returns {void}
+   */
+  forgetTargetTopic(topic) {
+    this.targetTopics.delete(topic)
+    this.targetTopicState.delete(topic)
+    this.metadataCache.forget(topic)
+    this.brokerPool.forgetTopic(topic)
   }
 
   /**
