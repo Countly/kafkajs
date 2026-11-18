@@ -23,7 +23,9 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The runbook needs the 30 min smoke window, the matrix's 15 min teardown allowance, setup and a
+    # cleanup grace after a timeout; the job limit covers every step's own limit.
+    timeout-minutes: 100
     env:
       KAFKA_VERSION: '4.4.0'
       FINAL_SOAK_DIAGNOSTIC: '1'
@@ -48,8 +50,8 @@ jobs:
         timeout-minutes: 4
         run: timeout -k 5s 210s docker pull "apache/kafka:$KAFKA_VERSION"
       - name: Run the smoke runbook
-        timeout-minutes: 50
-        run: timeout -k 30s 2940s bash scripts/soak/finalSoakNode.sh "$(git rev-parse HEAD)" smoke
+        timeout-minutes: 75
+        run: timeout -k 120s 4200s bash scripts/soak/finalSoakNode.sh "$(git rev-parse HEAD)" smoke
       - name: Print the runbook receipt and the driver summary
         if: always()
         timeout-minutes: 2
