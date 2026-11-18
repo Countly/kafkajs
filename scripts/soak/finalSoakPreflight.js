@@ -463,10 +463,13 @@ async function gatherFacts({
   }
 }
 
-/** @returns {boolean} whether the command exits zero */
+/**
+ * @param {string} command @param {string[]} args
+ * @returns {boolean} whether the command exits zero; its output is discarded
+ */
 const tryRun = (command, args) => {
   try {
-    run(command, args, { stdio: 'ignore' })
+    execFileSync(command, args, { cwd: ROOT, stdio: 'ignore' })
     return true
   } catch {
     return false
@@ -672,6 +675,7 @@ module.exports = {
   captureBroker,
   gatherFacts,
   main,
+  tryRun,
   prepareReporter,
   reporterSource,
   census,

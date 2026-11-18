@@ -423,17 +423,31 @@ class ChildRuntime {
   }
 
   /**
-   * Takes a sample: the synchronous inventory cut (every section the config requires for this
+   * Takes a sample after any sample of this process still running, so two readings never overlap
+   * and each one's two forced collections follow the previous reading's.
+   * @param {object} options sample role, slot, boundary and reading
+   * @returns {Promise<void>}
+   */
+  sample(options) {
+    const next = (this.sampling ?? Promise.resolve()).then(() => this.take(options))
+    this.sampling = next.catch(() => {})
+    return next
+  }
+
+  /**
+   * Takes one sample: the synchronous inventory cut (every section the config requires for this
    * process and its live clients), then the sampler's two forced collections and memory reading.
    * @param {object} options sample role, slot, boundary and reading
    * @returns {Promise<void>}
    */
-  async sample(options) {
+  async take(options) {
     const sent = []
     const notes = []
+    let clients = []
     const cut = () => {
       const inventory = `${this.slot}.i${this.cuts++}`
       const at = this.clock.now()
+      clients = this.worker.rigs().map((r) => r.id)
       const parts = []
       for (const [section, entries] of Object.entries(
         this.observer.processSections(this.roles, this.sockets, at)
@@ -484,7 +498,7 @@ class ChildRuntime {
       kind: 'sample',
       recordId: this.nextId(),
       process: this.slot,
-      clients: this.worker.rigs().map((r) => r.id),
+      clients,
       ...reading,
     })
   }
@@ -503,6 +517,8 @@ class ChildRuntime {
         reply = (await this.worker.onTick?.(step)) ?? null
       } else if (step.type === 'quiet')
         await this.sample({ role: 'quiet', boundary: step.boundary, reading: step.reading })
+      else if (step.type === 'closed')
+        await this.sample({ role: 'closed', boundary: step.boundary })
       else if (step.type === 'topic-ids')
         for (const [topic, topicId] of step.topicIds) this.topicIds.set(topic, topicId)
       else if (step.type === 'disconnect') await this.stop()
@@ -520,6 +536,63 @@ class ChildRuntime {
     await this.sample({ role: 'final' })
     this.roles.stop()
     this.observer.restore()
+  }
+}
+
+/**
+ * The client factory and options the driver constructs one config client slot's actual client
+ * with. Classic consumers take the run's session and heartbeat timeouts; a `consumer`-protocol
+ * (KIP-848) member takes neither, since the broker owns them and the client rejects both.
+ * @param {object} config the run config
+ * @param {object} matrix the reviewed matrix
+ * @param {object} slot a non-observer config client slot
+ * @returns {{ factory: 'producer'|'consumer'|'shareConsumer'|'admin', options: object }}
+ */
+function clientOptions(config, matrix, slot) {
+  const kind = matrix.clientKinds[slot.clientKind]
+  const t = config.timeouts
+  const telemetry = slot.telemetryEnabled ? { enableMetricsPush: true } : {}
+  if (kind.role === 'admin') return { factory: 'admin', options: {} }
+  if (kind.role === 'share')
+    return {
+      factory: 'shareConsumer',
+      options: { groupId: slot.group, metadataMaxAge: t.metadataMaxAge },
+    }
+  if (kind.role === 'producer')
+    return {
+      factory: 'producer',
+      options: {
+        idempotent: true,
+        maxInFlightRequests: 1,
+        allowAutoTopicCreation: false,
+        ...(slot.clientKind === 'producer-transactional'
+          ? { transactionalId: `t-${config.runId}-${slot.slot}` }
+          : {}),
+        ...telemetry,
+      },
+    }
+  const { PartitionAssigners } = require('../../index')
+  const assigners = {
+    cooperative: PartitionAssigners.cooperativeSticky,
+    eager: PartitionAssigners.roundRobin,
+  }
+  return {
+    factory: 'consumer',
+    options: {
+      groupId: slot.group,
+      ...(slot.groupInstanceId ? { groupInstanceId: slot.groupInstanceId } : {}),
+      ...(kind.protocol === 'consumer'
+        ? { groupProtocol: 'consumer' }
+        : {
+            partitionAssigners: [assigners[kind.protocol]],
+            sessionTimeout: t.sessionTimeout,
+            heartbeatInterval: t.heartbeatInterval,
+          }),
+      metadataMaxAge: t.metadataMaxAge,
+      allowAutoTopicCreation: false,
+      readUncommitted: false,
+      ...telemetry,
+    },
   }
 }
 
@@ -610,15 +683,8 @@ class ProducerWorker extends Worker {
     const slot = runtime.slots.find((c) => c.purpose === 'subject')
     const rig = this.rig(slot)
     const transactional = slot.clientKind === 'producer-transactional'
-    const producer = await rig.construct((kafka) =>
-      kafka.producer({
-        idempotent: true,
-        maxInFlightRequests: 1,
-        allowAutoTopicCreation: false,
-        ...(transactional ? { transactionalId: `t-${runtime.config.runId}-${slot.slot}` } : {}),
-        ...(slot.telemetryEnabled ? { enableMetricsPush: true } : {}),
-      })
-    )
+    const { options } = clientOptions(runtime.config, runtime.matrix, slot)
+    const producer = await rig.construct((kafka) => kafka.producer(options))
     await rig.call('connect', () => producer.connect())
     this.standing.push(rig)
     this.seq = 0
@@ -815,29 +881,9 @@ class ConsumerWorker extends Worker {
   /** @param {object} slot @returns {Promise<ClientRig>} a connected, running member of the slot */
   async join(slot, execution = null) {
     const { runtime } = this
-    const kind = runtime.matrix.clientKinds[slot.clientKind]
-    const { PartitionAssigners } = require('../../index')
     const rig = this.rig(slot)
-    const t = runtime.config.timeouts
-    const consumer = await rig.construct((kafka) =>
-      kafka.consumer({
-        groupId: slot.group,
-        ...(slot.groupInstanceId ? { groupInstanceId: slot.groupInstanceId } : {}),
-        ...(kind.protocol === 'consumer' ? { groupProtocol: 'consumer' } : {}),
-        ...(kind.protocol === 'cooperative'
-          ? { partitionAssigners: [PartitionAssigners.cooperativeSticky] }
-          : {}),
-        ...(kind.protocol === 'eager'
-          ? { partitionAssigners: [PartitionAssigners.roundRobin] }
-          : {}),
-        metadataMaxAge: t.metadataMaxAge,
-        sessionTimeout: t.sessionTimeout,
-        heartbeatInterval: t.heartbeatInterval,
-        allowAutoTopicCreation: false,
-        readUncommitted: false,
-        ...(slot.telemetryEnabled ? { enableMetricsPush: true } : {}),
-      })
-    )
+    const { options } = clientOptions(runtime.config, runtime.matrix, slot)
+    const consumer = await rig.construct((kafka) => kafka.consumer(options))
     rig.processed = new Map()
     rig.uncommitted = new Map()
     rig.authority = new Map()
@@ -1055,57 +1101,59 @@ class ConsumerWorker extends Worker {
   }
 
   /**
-   * One membership execution: per wave pause the standing member's assigned keys, join the extra,
-   * wait for the extra to take at least one paused key, cut the closed cohort after the extra
-   * leaves, wait for the paused key to return and resume. The first execution of an hour restarts
-   * the static extra with the same static id and a new client id.
-   * @param {object} step the membership execution with its waves
-   * @returns {Promise<{ transfers: number }>} the waves that observed a transfer
+   * One phase of one membership wave, its own pause-resume execution (`step.execution`). `leave`:
+   * pause the standing member's assigned keys, join the extra, wait for the extra to take at least
+   * one paused key, remove the extra and wait for the paused key to return; the supervisor then
+   * takes the closed sample. `resume`: resume the keys paused in `leave`. The first wave of an
+   * execution with a restart restarts the static extra with the same static id and a new client id.
+   * @param {{ execution: string, wave: number, phase: 'leave'|'resume', restart?: string[] }} step
+   * @returns {Promise<{ transfers: number }>} 1 when the wave observed a transfer
    */
   async onMembershipChurn(step) {
     const { runtime } = this
     const [standing] = this.standing
     const extraSlot = runtime.slots.find((c) => c.purpose === 'churn')
-    let transfers = 0
-    if (!standing || !extraSlot) return { transfers }
-    const waveMs = runtime.matrix.schedule.executions.find(
-      (e) => e.shape === 'membership-churn'
-    ).waveMaxMs
-    for (let w = 0; w < step.waves; w++) {
-      const execution = `${step.id}w${w}`
-      const deadline = runtime.clock.now() + waveMs - 5000
-      const assigned = () =>
-        runtime.observer.ordinarySections(standing.id).sections.assignment.map((a) => a.key)
-      const keys = assigned()
-      await this.operation(standing, 'pause', keys, execution, () =>
-        standing.object.pause(byTopic(keys))
-      )
-      const extra = await this.join(extraSlot, execution)
-      this.extras.push(extra)
-      const held = (rig) =>
-        runtime.observer
-          .ordinarySections(rig.id)
-          .sections.assignment.some((a) =>
-            keys.some((k) => k.topicId === a.key.topicId && k.partition === a.key.partition)
-          )
-      if (await this.until(() => held(this.extras.at(-1)), deadline)) transfers++
-      else await runtime.diagnose(`${execution} saw no transfer of a paused partition`)
-      if (w === 0 && step.restart?.includes(extraSlot.clientKind)) {
-        const old = this.extras.pop()
-        await this.operation(old, 'restart', [], execution, () =>
-          old.object.disconnect({ leaveGroup: false })
-        )
-        this.extras.push(await this.join(extraSlot, execution))
-      }
-      for (const rig of this.extras.splice(0))
-        await rig.call('disconnect', () => rig.object.disconnect(), execution)
-      await this.until(() => held(standing), deadline)
-      await runtime.sample({ role: 'closed', boundary: execution })
+    const { execution } = step
+    if (!standing || !extraSlot) return { transfers: 0 }
+    if (step.phase === 'resume') {
+      const keys = this.paused ?? []
+      this.paused = null
       await this.operation(standing, 'resume', keys, execution, () =>
         standing.object.resume(byTopic(keys))
       )
+      return { transfers: 0 }
     }
-    return { transfers }
+    const waveMs = runtime.matrix.schedule.executions.find(
+      (e) => e.shape === 'membership-churn'
+    ).waveMaxMs
+    const deadline = runtime.clock.now() + waveMs - 5000
+    const keys = runtime.observer
+      .ordinarySections(standing.id)
+      .sections.assignment.map((a) => a.key)
+    this.paused = keys
+    await this.operation(standing, 'pause', keys, execution, () =>
+      standing.object.pause(byTopic(keys))
+    )
+    this.extras.push(await this.join(extraSlot, execution))
+    const held = (rig) =>
+      runtime.observer
+        .ordinarySections(rig.id)
+        .sections.assignment.some((a) =>
+          keys.some((k) => k.topicId === a.key.topicId && k.partition === a.key.partition)
+        )
+    const transferred = await this.until(() => held(this.extras.at(-1)), deadline)
+    if (!transferred) await runtime.diagnose(`${execution} saw no transfer of a paused partition`)
+    if (step.wave === 0 && step.restart?.includes(extraSlot.clientKind)) {
+      const old = this.extras.pop()
+      await this.operation(old, 'restart', [], execution, () =>
+        old.object.disconnect({ leaveGroup: false })
+      )
+      this.extras.push(await this.join(extraSlot, execution))
+    }
+    for (const rig of this.extras.splice(0))
+      await rig.call('disconnect', () => rig.object.disconnect(), execution)
+    await this.until(() => held(standing), deadline)
+    return { transfers: transferred ? 1 : 0 }
   }
 
   /**
@@ -1306,14 +1354,8 @@ class ShareWorker extends Worker {
         runtime.observer.exchanged(rig.id, { ...exchange, ...where })
       },
     }
-    const consumer = await rig.construct(
-      (kafka) =>
-        kafka.shareConsumer({
-          groupId: slot.group,
-          metadataMaxAge: runtime.config.timeouts.metadataMaxAge,
-        }),
-      capture
-    )
+    const { options } = clientOptions(runtime.config, runtime.matrix, slot)
+    const consumer = await rig.construct((kafka) => kafka.shareConsumer(options), capture)
     await rig.call('connect', () => consumer.connect(), execution)
     await consumer.subscribe({
       topics: [runtime.config.topics.main, ...runtime.config.topics.recreate],
@@ -1365,18 +1407,18 @@ class ShareWorker extends Worker {
     })
   }
 
-  /** One extra share member joins and leaves per wave. */
+  /**
+   * One extra share member joins and leaves in a wave's `leave` phase; `resume` has nothing to do.
+   * @param {{ execution: string, phase: 'leave'|'resume' }} step
+   * @returns {Promise<void>}
+   */
   async onMembershipChurn(step) {
     const slot = this.runtime.slots.find((c) => c.purpose === 'churn')
-    if (!slot) return
-    for (let w = 0; w < step.waves; w++) {
-      const execution = `${step.id}w${w}`
-      this.extras.push(await this.join(slot, execution))
-      await this.runtime.clock.sleepUntil(this.runtime.clock.now() + 20000)
-      for (const rig of this.extras.splice(0))
-        await rig.call('disconnect', () => rig.object.disconnect(), execution)
-      await this.runtime.sample({ role: 'closed', boundary: execution })
-    }
+    if (!slot || step.phase === 'resume') return
+    this.extras.push(await this.join(slot, step.execution))
+    await this.runtime.clock.sleepUntil(this.runtime.clock.now() + 20000)
+    for (const rig of this.extras.splice(0))
+      await rig.call('disconnect', () => rig.object.disconnect(), step.execution)
   }
 
   /** @returns {Promise<{ ok: boolean }>} whether a record was handled and accepted after recovery */
@@ -1392,8 +1434,10 @@ class ShareWorker extends Worker {
 class AdminWorker extends Worker {
   /** @returns {Promise<void>} */
   async begin() {
-    const rig = this.rig(this.runtime.slots.find((c) => c.purpose === 'subject'))
-    const admin = await rig.construct((kafka) => kafka.admin())
+    const slot = this.runtime.slots.find((c) => c.purpose === 'subject')
+    const rig = this.rig(slot)
+    const { options } = clientOptions(this.runtime.config, this.runtime.matrix, slot)
+    const admin = await rig.construct((kafka) => kafka.admin(options))
     await rig.call('connect', () => admin.connect())
     this.standing.push(rig)
   }
@@ -1819,6 +1863,7 @@ module.exports = {
   WireLog,
   ClientRig,
   ChildRuntime,
+  clientOptions,
   Worker,
   ConsumerWorker,
   ReaderWorker,

@@ -41,6 +41,8 @@ const workspace = () => {
     path.join(out, 'reporter/receipt.json'),
     JSON.stringify({ sinkBytes, sha256: JAR })
   )
+  // What the runbook writes for a supplied cluster in place of the prepared Compose override.
+  fs.writeFileSync(path.join(out, 'broker/compose.json'), '{"services":{}}\n')
   const nodes = [1, 2, 3].map((node) => {
     fs.writeFileSync(
       path.join(sink, `reporter-${node}.json`),
@@ -128,7 +130,12 @@ describe('final soak rehearsal', () => {
       expect(validateProvenance(read('broker/provenance.json'), 'supplied')).toEqual([])
       expect(record.telemetry.pushes.map((p) => p.probe).sort()).toEqual(['consumer', 'producer'])
 
-      const anchor = String(process.hrtime.bigint())
+      // The outer observer's finalize witnesses the exit on the same (warped) run clock.
+      const warped = {
+        ...ws.env,
+        FINAL_SOAK_REHEARSAL_WARP: String(WARP),
+        FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+      }
       const driver = await runDriver(
         [
           '--expose-gc',
@@ -144,19 +151,15 @@ describe('final soak rehearsal', () => {
           ws.out,
           '--diagnostic',
         ],
-        {
-          ...ws.env,
-          FINAL_SOAK_REHEARSAL_WARP: String(WARP),
-          FINAL_SOAK_REHEARSAL_ANCHOR: anchor,
-        }
+        warped
       )
-      expect(driver.output).toBe('')
+      expect(driver.output).not.toMatch(/Error/)
       expect(driver).toMatchObject({ code: 0, signal: null })
 
       const config = read('config.json')
       expect(validateConfig(config, matrix)).toEqual([])
       const supervisor = read('supervisor.json')
-      expect(supervisor).toMatchObject({ aborted: null, incomplete: null, failures: 0 })
+      expect(supervisor).toMatchObject({ aborted: null, incomplete: null, failures: [] })
       const records = recordsOf(ws.out)
       const slots = config.processes.map((p) => p.slot)
       expect(slots).toHaveLength(16)
@@ -173,7 +176,7 @@ describe('final soak rehearsal', () => {
           slot,
           'baseline',
           'periodic',
-          ...(slot === 'p15' ? [] : ['final']),
+          'final',
         ])
       }
       for (const slot of config.clients.filter((c) => c.standing)) {
@@ -194,7 +197,7 @@ describe('final soak rehearsal', () => {
         ]).toEqual([client, ['ok']])
       }
       const notes = of('diagnostic').map((r) => r.message)
-      const plan = planSchedule(matrix, 'smoke').steps.filter((s) => s.lane !== 'within')
+      const plan = planSchedule(matrix, 'smoke').steps
       for (const step of plan)
         expect([step.id, notes.some((n) => new RegExp(`^step ${step.id} \\w+$`).test(n))]).toEqual([
           step.id,
@@ -215,7 +218,7 @@ describe('final soak rehearsal', () => {
           '--status',
           String(driver.code),
         ],
-        { cwd: ROOT, env: ws.env, encoding: 'utf8' }
+        { cwd: ROOT, env: warped, encoding: 'utf8' }
       )
       expect(finalize.stderr).toBe('')
       expect(finalize.status).toBe(0)

@@ -329,6 +329,7 @@ class SamplingGate {
     this.active = 0
     this.peak = 0
     this.waiting = []
+    this.idlers = []
   }
 
   /**
@@ -347,7 +348,14 @@ class SamplingGate {
       const next = this.waiting.shift()
       if (next) next()
       else this.active--
+      if (this.active === 0) for (const resolve of this.idlers.splice(0)) resolve()
     }
+  }
+
+  /** @returns {Promise<void>} resolves once no task is running or waiting */
+  idle() {
+    if (this.active === 0) return Promise.resolve()
+    return new Promise((resolve) => this.idlers.push(resolve))
   }
 }
 

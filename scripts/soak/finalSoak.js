@@ -30,7 +30,7 @@ const os = require('node:os')
 const path = require('node:path')
 const readline = require('node:readline')
 const { spawn, execFile } = require('node:child_process')
-const { validateRecord, validateConfig } = require('./finalSoakSchema')
+const { SHAPES, validateRecord, validateConfig } = require('./finalSoakSchema')
 const {
   valueOf,
   MonotonicClock,
@@ -256,14 +256,23 @@ class Supervisor {
     this.topicRecords = new Map()
     this.routes = new Map()
     this.scanned = new Map()
+    this.ended = new Map()
+    this.waves = new Map()
     this.gate = new SamplingGate({ limit: 2 })
   }
 
   /** @param {object} record @returns {Promise<string>} appends a supervisor record, returns its id */
   async emit(record) {
     const recordId = this.runtime.nextId()
+    this.count(record)
     await this.runtime.emit({ recordId, ...record })
     return recordId
+  }
+
+  /** @param {object} record tallies an ended operation under the execution it carries */
+  count(record) {
+    if (record.kind === 'operation' && record.phase === 'end' && record.execution)
+      this.ended.set(record.execution, (this.ended.get(record.execution) ?? 0) + 1)
   }
 
   /** @returns {Promise<void>} runs the whole lifecycle */
@@ -313,6 +322,8 @@ class Supervisor {
       deadline: shift(st.deadline),
       until: shift(st.until),
     }))
+    for (const st of steps.filter((s) => s.lane === 'within'))
+      this.waves.set(st.parent, [...(this.waves.get(st.parent) ?? []), st])
     this.scheduler = new Scheduler({
       clock: this.clock,
       perform: (step) => this.perform(step),
@@ -589,9 +600,10 @@ class Supervisor {
     const child = this.children.get(slot)
     if (message.type === 'record') {
       const { seq } = message.record
+      this.count(message.record)
       this.collector
         .append(message.record)
-        .then(() => child.connected && child.send({ type: 'ack', seq }))
+        .then(() => child.connected && child.send({ type: 'ack', seq }, () => {}))
     } else if (message.type === 'done') {
       if (message.incomplete) this.incomplete ??= message.incomplete
       const resolve = this.waiting.get(message.id)
@@ -638,15 +650,29 @@ class Supervisor {
       next,
       errorCode,
     })
-    if (slot) this.children.get(slot)?.send({ type: 'reply', request })
+    const child = slot ? this.children.get(slot) : null
+    if (child?.connected) child.send({ type: 'reply', request }, () => {})
   }
 
-  /** @returns {Promise<object>} sends a step to a child and waits for its outcome */
+  /**
+   * Sends a step to a child and waits for its outcome. A child whose IPC channel has closed (it
+   * has disconnected, or does so while the step is being sent) answers with an error outcome, so
+   * a sample admitted after the teardown disconnected a process fails that step, not the run.
+   * @param {string} slot @param {object} step
+   * @returns {Promise<{ error: string|null, reply: unknown }>} the child's outcome
+   */
   command(slot, step) {
     const id = ++this.commands
+    const child = this.children.get(slot)
+    const closed = (reason) => ({ type: 'done', id, error: reason, reply: null })
+    if (!child?.connected) return Promise.resolve(closed(`process ${slot} has disconnected`))
     return new Promise((resolve) => {
       this.waiting.set(id, resolve)
-      this.children.get(slot).send({ type: 'command', id, step })
+      child.send({ type: 'command', id, step }, (e) => {
+        if (!e || !this.waiting.has(id)) return
+        this.waiting.delete(id)
+        resolve(closed(`process ${slot}: ${e.message}`))
+      })
     })
   }
 
@@ -719,6 +745,7 @@ class Supervisor {
     await this.shape(step, 'start')
     const participants = [...new Set(step.participants.map((k) => this.processOf(k)))]
     if (step.shape === 'broker-outage') await this.outage(step, participants)
+    else if (step.shape === 'membership-churn') await this.churnMembers(step, participants)
     else if (step.shape === 'regex-churn' || step.shape === 'topic-recreation')
       await this.churnTopic(step, participants)
     else {
@@ -762,7 +789,45 @@ class Supervisor {
       },
       'end'
     )
+    await this.gate.idle()
     await this.send(all, step)
+  }
+
+  /**
+   * A membership execution, wave by wave. Each wave is its own pause-resume execution: every
+   * participant runs the wave's `leave` phase (pause, join an extra, observe the transfer, remove
+   * the extra), the participants are sampled closed through the gate, every participant resumes,
+   * and the wave ends with its operation count and its outcome note. A failed phase still resumes
+   * and ends the wave; the step then fails with the first error.
+   * @param {object} step the membership execution @param {string[]} participants its processes
+   * @returns {Promise<void>}
+   * @throws {Error} the first failed phase of any wave
+   */
+  async churnMembers(step, participants) {
+    let first = null
+    for (const [index, wave] of (this.waves.get(step.id) ?? []).entries()) {
+      await this.shape(wave, 'start')
+      const base = { ...step, wave: index, execution: wave.id }
+      let failed = null
+      try {
+        await this.send(participants, { ...base, phase: 'leave' })
+        await this.sampleAll(participants, {
+          type: 'closed',
+          id: `${wave.id}.closed`,
+          boundary: wave.id,
+        })
+      } catch (e) {
+        failed = e
+      }
+      await this.send(participants, { ...base, phase: 'resume' }).catch((e) => (failed ??= e))
+      await this.shape(wave, 'end')
+      const late = this.clock.now() > wave.deadline
+      await this.collector.note(`step ${wave.id} ${failed ? 'error' : late ? 'late' : 'ok'}`, {
+        step: wave.id,
+      })
+      first ??= failed
+    }
+    if (first) throw first
   }
 
   /**
@@ -910,15 +975,25 @@ class Supervisor {
     })
   }
 
-  /** @param {object} step @param {'start'|'end'} phase emits the shape boundary record */
-  shape(step, phase) {
+  /**
+   * Emits a shape boundary record for an execution of one of the seven shapes (a drain is a step,
+   * not a shape, and has none). The end carries the operations that ended under the execution;
+   * every one has been appended by then, since each child acknowledges its records before it
+   * answers the step.
+   * @param {object} step @param {'start'|'end'} phase
+   * @returns {Promise<string|null>} the record id, or null for a step that is not a shape
+   */
+  async shape(step, phase) {
+    if (!SHAPES.includes(step.shape)) return null
+    const operationCount = phase === 'end' ? (this.ended.get(step.id) ?? 0) : 0
+    if (phase === 'end') this.ended.delete(step.id)
     return this.emit({
       kind: 'shape',
       execution: step.id,
       phase,
       shape: step.shape,
       participants: step.participants ?? [],
-      operationCount: 0,
+      operationCount,
     })
   }
 }
@@ -967,7 +1042,8 @@ async function cleanup({ out }) {
 /**
  * The outer handover after the supervisor has exited: appends the parent-observed supervisor exit
  * as the `outer` source, copies each supplied companion into the artifact, hashes and fsyncs every
- * file and writes `header.json`.
+ * file and writes `header.json`. The window's observed end is that observation, the last exit of a
+ * persistent process, so every record (the supervisor's closing ones and this receipt) is within it.
  * @param {{ out: string, status: number, companions?: { name: string, file: string,
  *   runUrl: string|null }[] }} options the artifact, the shell's wait status and the companions
  * @returns {object} the header written
@@ -1040,7 +1116,7 @@ function finalize({ out, status, companions = [] }) {
     window: {
       runStartAt: run.runStartAt,
       runEndAt: run.runEndAt,
-      observedEndAt: run.observedEndAt,
+      observedEndAt: observedAt,
       requestedMs: run.requestedMs,
     },
     host: preflight.host,
