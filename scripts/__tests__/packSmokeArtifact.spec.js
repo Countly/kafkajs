@@ -152,6 +152,20 @@ describe('scripts/packSmoke.sh with a supplied tarball', () => {
     expect(fs.existsSync(path.join(workDir, 'pack', 'package.json'))).toBe(true)
   })
 
+  it('installs the tarball and the Node types without lifecycle scripts', () => {
+    const tarball = packClient()
+    const result = run(tarball)
+
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+    const installs = recorded()
+      .filter((line) => line.startsWith('npm '))
+      .map((line) => JSON.parse(line.slice(4)))
+    expect(installs.map((args) => [args[0], args.includes('--ignore-scripts')])).toEqual([
+      ['install', true],
+      ['install', true],
+    ])
+  })
+
   it('rejects a missing tarball', () => {
     const missing = path.join(workDir, 'missing.tgz')
     const result = run(missing)
