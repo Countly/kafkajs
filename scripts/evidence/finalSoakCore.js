@@ -158,7 +158,7 @@ class Journal {
     this.repeatsAfterChange = 0
     this.shareRepeats = 0
     this.redundantAcquires = 0
-    this.diagnostics = { missingSource: 0, first: null }
+    this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
   }
 
@@ -187,9 +187,13 @@ class Journal {
     else if (r.kind === 'boundary') this.boundary(r)
     else if (r.kind === 'sample') this.sample(r)
     else if (r.kind === 'process') this.process(r)
-    else if (r.kind === 'diagnostic' && /^missing-source/.test(r.message)) {
-      this.diagnostics.missingSource++
-      this.diagnostics.first ??= r.message
+    else if (r.kind === 'diagnostic') {
+      const kind = /^(missing-source|partial handler-enter|problem:)/.exec(r.message)?.[1]
+      if (kind)
+        this.incidents.set(kind, {
+          count: (this.incidents.get(kind)?.count ?? 0) + 1,
+          first: this.incidents.get(kind)?.first ?? r.message,
+        })
     }
   }
 
@@ -382,7 +386,7 @@ function readEnd(ctx, name, problems) {
     problems,
     'no end marker: the step was cut off or never ran'
   )
-  const m = text === null ? null : /^exit=(\d+) lines=(\d+)\n$/.exec(text)
+  const m = text === null ? null : /^exit=(-?\d+) lines=(\d+)\n$/.exec(text)
   if (text !== null && !m) problems.push(`apache/${name}.end: unparseable end marker`)
   if (m && m[1] !== '0') problems.push(`apache/${name}: the tool exit status was ${m[1]}`)
   return m ? Number(m[2]) : null
@@ -793,6 +797,14 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
     if (supervisor.aborted) row.fail(`the supervisor aborted the run: ${supervisor.aborted}`)
     if (supervisor.incomplete)
       row.fail(`the supervisor reports an incomplete run: ${supervisor.incomplete}`)
+    if (supervisor.problems?.length > 0)
+      row.fail(
+        `the driver reports ${supervisor.problems.length} problems: ${String(supervisor.problems[0]).slice(0, 80)}`
+      )
+    if (supervisor.forced?.length > 0)
+      row.fail(
+        `the supervisor forced ${supervisor.forced.join(', ')} to end after the teardown allowance`
+      )
     if (supervisor.failures?.length > 0)
       row.fail(
         `the collector recorded ${supervisor.failures.length} failures: ${String(supervisor.failures[0]).slice(0, 80)}`
@@ -806,9 +818,12 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
     if (mode === 'acceptance' && supervisor.diagnostic) row.fail('the run is marked diagnostic')
     row.numbers.lateSteps = supervisor.steps?.late ?? null
   }
-  const { missingSource, first: sample } = journal.diagnostics
-  if (missingSource > 0)
-    row.gap(`the driver journaled ${missingSource} missing-source diagnostics (first: ${sample})`)
+  const { incidents } = journal
+  for (const kind of ['problem:', 'missing-source'])
+    if (incidents.has(kind))
+      row[kind === 'problem:' ? 'fail' : 'gap'](
+        `${incidents.get(kind).count} ${kind} diagnostics (first: ${incidents.get(kind).first})`
+      )
 }
 
 /**
@@ -840,6 +855,12 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
       judgeDelivery(rows.K2, journal, ctx.dumped)
     else rows.K2.gap(`delivery cannot be judged: ${rows.K1.gaps[0]}`)
     judgeDuplicates(rows.K3, journal)
+    const partial = journal.incidents.get('partial handler-enter')
+    if (partial)
+      for (const id of ['K2', 'K3'])
+        rows[id].gap(
+          `${partial.count} handler calls were journaled only in part (first: ${partial.first.slice(0, 120)})`
+        )
     judgeHeap(rows.K5, ctx)
     judgeResources(rows.K6, ctx)
   }
@@ -889,6 +910,8 @@ async function checkArtifact(dir) {
       ...schema.validateHeader(header, matrix)
     )
   else problems.push('header.json or config.json is missing or not JSON')
+  if (fs.existsSync(path.join(dir, 'manifest.partial.json')))
+    problems.push('the artifact is partial: the run left no supervisor receipt')
   if (!header || !config || problems.length > 0) {
     const rows = Object.keys(ROW_NAMES).map((id) => {
       const row = new Row(id)

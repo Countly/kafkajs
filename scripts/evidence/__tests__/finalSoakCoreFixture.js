@@ -456,6 +456,8 @@ function healthy({ mode = 'acceptance', withInventory = false } = {}) {
       mode,
       treeSha: 'b'.repeat(40),
       failures: [],
+      problems: [],
+      forced: [],
       aborted: null,
       incomplete: null,
       diagnostic: false,

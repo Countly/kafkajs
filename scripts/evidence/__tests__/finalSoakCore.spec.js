@@ -217,10 +217,15 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(world), id, 'INCONCLUSIVE', /unparseable|does not parse/)
     })
 
-    it.each(cases)('is inconclusive when %s exited non-zero', async (file, id) => {
-      const world = fx.healthy()
-      world.apache[`${file}.end`] = world.apache[`${file}.end`].replace('exit=0', 'exit=1')
-      expectRow(await check(world), id, 'INCONCLUSIVE', /exit/)
+    it.each(cases)('is inconclusive when %s exited non-zero or was killed', async (file, id) => {
+      for (const status of ['1', '-1']) {
+        const world = fx.healthy()
+        world.apache[`${file}.end`] = world.apache[`${file}.end`].replace(
+          'exit=0',
+          `exit=${status}`
+        )
+        expectRow(await check(world), id, 'INCONCLUSIVE', new RegExp(`exit status was ${status}`))
+      }
     })
 
     it('is inconclusive when the dump holds fewer lines than its end marker counted', async () => {
@@ -583,6 +588,8 @@ describe('scripts/evidence/finalSoakCore', () => {
         ['aborted', 'host monitor', /abort/],
         ['incomplete', 'queue timeout', /incomplete/],
         ['failures', ['stream cap'], /failure/],
+        ['problems', ['handler entry c01.0.h4 lacks batch authority'], /problems/],
+        ['forced', ['p07'], /forced p07/],
       ]) {
         expectRow(
           await check(fx.healthy(), { supervisor: (s) => ({ ...s, [field]: value }) }),
@@ -633,6 +640,34 @@ describe('scripts/evidence/finalSoakCore', () => {
       })
       expectRow(report, 'K7', 'FAIL', /seq is not the next/)
       expectRow(report, 'K1', 'INCONCLUSIVE', /not valid/)
+    })
+
+    it('fails when a process reported a problem diagnostic', async () => {
+      const edit = (records) => [
+        ...records,
+        {
+          t: 9500,
+          kind: 'diagnostic',
+          source: 'p01',
+          message: 'problem: collector refused a record',
+        },
+      ]
+      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /1 problem: diagnostics/)
+    })
+
+    it('is inconclusive for delivery and duplicates when a handler call was journaled only in part', async () => {
+      const edit = (records) => [
+        ...records,
+        {
+          t: 9500,
+          kind: 'diagnostic',
+          source: 'p01',
+          message: 'partial handler-enter {"id":"c08.4"}',
+        },
+      ]
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K2', 'INCONCLUSIVE', /journaled only in part/)
+      expectRow(report, 'K3', 'INCONCLUSIVE', /journaled only in part/)
     })
 
     it('is inconclusive when the driver journaled a missing source', async () => {
@@ -725,6 +760,14 @@ describe('scripts/evidence/finalSoakCore', () => {
       m.bounds['heap-endpoint'].value = 1e12
       fs.writeFileSync(file, JSON.stringify(m))
       expectRow(await checkArtifact(dir), 'K7', 'FAIL', /matrix/)
+    })
+
+    it('rejects a partial artifact that has a partial manifest and no header', async () => {
+      const dir = tmp()
+      fs.writeFileSync(path.join(dir, 'manifest.partial.json'), JSON.stringify({ partial: true }))
+      const report = await checkArtifact(dir)
+      expectRow(report, 'K7', 'FAIL', /partial/)
+      expect(report.overall).toBe('REJECTED')
     })
 
     it('exits 0 only for ACCEPTED and prints the report', async () => {
