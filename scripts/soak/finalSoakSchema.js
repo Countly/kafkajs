@@ -67,8 +67,58 @@ const MATRIX_SECTIONS = Object.freeze([
   'controls',
   'recordSections',
   'observations',
+  'bounds',
+  'predicates',
   'rows',
 ])
+
+/** The shared row predicates the matrix defines once and rows reference by name. */
+const PREDICATES = Object.freeze([
+  'Complete',
+  'Delivery',
+  'AuthorityOK',
+  'ResourcesOK',
+  'HeapOK',
+  'TablesOK',
+])
+const OTHER_TABLES = Object.freeze([
+  'topic-configurations',
+  'preferred-replicas',
+  'grown-topic-names',
+  'queued-seeks',
+  'cluster-targets',
+  'acquired',
+  'halted',
+])
+/** Every backing table TablesOK maps to its source and permitted live owner. */
+const TABLES = Object.freeze([
+  'subscription',
+  'pause-state',
+  'assignment',
+  'membership-state',
+  'operation-cell',
+  'reset-debt',
+  ...OTHER_TABLES,
+  'share-state',
+])
+const ARCHIVE = Object.freeze([
+  'scripts/soak/finalSoakMatrix.json',
+  'scripts/soak/finalSoakSchema.js',
+  'scripts/soak/finalSoak.js',
+])
+/** The seed's fixed start, clear and sensitivity rule in each mode. */
+const SEED_TIMING = Object.freeze({
+  acceptance: {
+    starts: 'after-first-quiet-triplet',
+    clears: 'after-last-quiet-triplet-before-disconnect',
+    sensitivity: 'required',
+  },
+  smoke: {
+    starts: 'after-baseline-before-traffic',
+    clears: 'after-only-quiet-triplet-before-disconnect',
+    sensitivity: 'report-only',
+  },
+})
 
 const COMPANIONS = Object.freeze(['natural-exit', 'consume-retention', 'prior-checkpoints'])
 const CONTROL = 'interning-seeded'
@@ -630,15 +680,7 @@ const SECTIONS = Object.freeze({
   'other-table': {
     entry: {
       client: Id,
-      table: oneOf(
-        'topic-configurations',
-        'preferred-replicas',
-        'grown-topic-names',
-        'queued-seeks',
-        'cluster-targets',
-        'acquired',
-        'halted'
-      ),
+      table: oneOf(...OTHER_TABLES),
       keys: listOf(TableKey),
     },
     key: (e) => `${e.client}\0${e.table}`,
@@ -923,16 +965,36 @@ const subsetOf = (list, allowed) =>
 const sameList = (list, expected) =>
   Array.isArray(list) && list.length === expected.length && list.every((v, i) => v === expected[i])
 
+const Any = type('present', () => true)
+const Positive = type('a positive Count', (v) => Count.test(v) && v > 0)
+/** @param {string} label @param {(v: unknown) => boolean} test @returns {Type} */
+const nonEmptyListOf = (label, test) =>
+  type(label, (v) => Array.isArray(v) && v.length > 0 && v.every(test))
+/** @param {readonly string[]} names @param {Type} t @returns {Record<string, Type>} */
+const each = (names, t) => Object.fromEntries(names.map((n) => [n, t]))
+
 /**
- * @param {unknown} object
- * @param {string[]} names
- * @param {string} path
- * @returns {string[]} problems for each name that is not a valid setting
+ * Checks an object-valued field of `parent` exactly, unless the parent's own check already reports
+ * the field missing.
+ * @param {unknown} parent
+ * @param {string} key
+ * @param {Record<string, Type>} fields
+ * @param {string} path the parent's path
+ * @returns {string[]}
  */
-const settingProblems = (object, names, path) =>
-  names.flatMap((n) =>
-    unless(own(object, n) && Setting.test(object[n]), `${path}.${n} is not a setting`)
-  )
+const nested = (parent, key, fields, path) =>
+  own(parent, key) ? fieldProblems(parent[key], fields, `${path}.${key}`) : []
+
+/**
+ * Resolves a dotted reference from the matrix root through own keys only.
+ * @param {object} matrix
+ * @param {unknown} ref
+ * @returns {unknown} the named value, or undefined
+ */
+const lookup = (matrix, ref) =>
+  isString(ref)
+    ? ref.split('.').reduce((v, k) => (own(v, k) ? v[k] : undefined), matrix)
+    : undefined
 
 const Bound = type('a bound', (v) => {
   if (!isObject(v)) return false
@@ -946,12 +1008,31 @@ const Bound = type('a bound', (v) => {
   }
   return fieldProblems(v, fields, '').length === 0
 })
-const Minimum = shape('a minimum', { name: Text, value: Count })
-
-/** @param {unknown} row @param {number} i @param {object} matrix @returns {string[]} */
+/**
+ * Checks one row. Its bounds reference sourced bounds or settings elsewhere in the matrix, its
+ * minima are products of positive counts and references to counts, so each constant is stored once,
+ * and `uses` lists exactly the shared predicates its predicate text names.
+ * @param {unknown} row
+ * @param {number} i
+ * @param {object} matrix
+ * @returns {string[]}
+ */
 const rowProblems = (row, i, matrix) => {
   const path = `rows[${i}]`
   const kinds = isObject(matrix.clientKinds) ? Object.keys(matrix.clientKinds) : []
+  const sourced = (ref) => {
+    const v = lookup(matrix, ref)
+    return Bound.test(v) || Setting.test(v)
+  }
+  const factor = (f) => {
+    const v = isString(f) ? lookup(matrix, f) : f
+    return Positive.test(Bound.test(v) || Setting.test(v) ? v.value : v)
+  }
+  const distinct = (v) => Array.isArray(v) && new Set(v).size === v.length
+  const Minimum = shape('a minimum', {
+    name: Text,
+    of: nonEmptyListOf('factors', factor),
+  })
   const fields = {
     id: oneOf(ROWS[i]),
     obligation: Text,
@@ -961,15 +1042,16 @@ const rowProblems = (row, i, matrix) => {
       judged: Text,
     }),
     evidence: type('a non-empty list of record kinds', (v) => subsetOf(v, RECORD_KINDS)),
+    uses: type(
+      'a list of distinct predicate names',
+      (v) => distinct(v) && v.every((n) => PREDICATES.includes(n))
+    ),
     predicate: Text,
     bounds: type(
-      'a non-empty list of sourced bounds',
-      (v) => Array.isArray(v) && v.length > 0 && v.every(Bound.test)
+      'a non-empty list of distinct references to sourced bounds or settings',
+      (v) => distinct(v) && v.length > 0 && v.every(sourced)
     ),
-    minima: type(
-      'a non-empty list of minima',
-      (v) => Array.isArray(v) && v.length > 0 && v.every(Minimum.test)
-    ),
+    minima: nonEmptyListOf('a non-empty list of derived minima', Minimum.test),
     fail: Text,
     pass: Text,
     closure: type(
@@ -977,7 +1059,13 @@ const rowProblems = (row, i, matrix) => {
       (v) => Array.isArray(v) && v.every((c) => COMPANIONS.includes(c))
     ),
   }
-  return fieldProblems(row, fields, path)
+  const problems = fieldProblems(row, fields, path)
+  if (problems.length > 0) return problems
+  const named = PREDICATES.filter((n) => new RegExp(`\\b${n}\\b`).test(row.predicate))
+  return unless(
+    named.length === row.uses.length && named.every((n) => row.uses.includes(n)),
+    `${path}.uses differs from the predicates its text names`
+  )
 }
 
 const KIND_FIELDS = Object.freeze({
@@ -990,10 +1078,206 @@ const KIND_FIELDS = Object.freeze({
   inventory: oneOf('ordinary', 'share', 'none'),
 })
 
+const Window = type(
+  'a window',
+  (v) => fieldProblems(v, { from: Ms, to: Ms }, '').length === 0 && v.from < v.to
+)
+const QuietTimes = type(
+  'three quiet times',
+  (v) => Array.isArray(v) && v.length === 3 && v.every(Ms.test)
+)
+const Minutes = nonEmptyListOf('a non-empty list of minutes', (m) => Count.test(m) && m < 60)
+
+const ACCEPTANCE_FIELDS = Object.freeze({
+  profile: Id,
+  modes: Any,
+  archive: type(
+    'a list of relative paths holding the archived matrix, schema and driver',
+    (v) => Array.isArray(v) && v.every(isRelativePath) && ARCHIVE.every((f) => v.includes(f))
+  ),
+  companions: type('the companion list', (v) => sameList(v, COMPANIONS)),
+  cli: type(
+    'a list holding every required verifier argument',
+    (v) =>
+      Array.isArray(v) &&
+      v.every(Text.test) &&
+      ['--expect-sha', '--expect-profile', '--matrix', '--companion rs-l14=<run url>'].every((f) =>
+        v.includes(f)
+      )
+  ),
+  verdicts: shape('the day and closure vocabulary', {
+    day: type('', (v) => sameList(v, ['PASS', 'FAIL', 'INCONCLUSIVE'])),
+    closure: type('', (v) => sameList(v, ['COMPLETE', 'OPEN'])),
+  }),
+  limitations: nonEmptyListOf('a non-empty list of text', Text.test),
+})
+const MODE_FIELDS = each(['requestedMs', 'teardownAllowanceMs'], Setting)
+const HOST_FIELDS = Object.freeze({
+  platform: oneOf('linux'),
+  ...each(
+    [
+      'minMemAvailableBytes',
+      'minFreeDiskBytes',
+      'maxLoadAverage1m',
+      'abortMemAvailableBytes',
+      'maxStreamBytes',
+      'maxEventLineBytes',
+      'maxInventoryLineBytes',
+      'maxTelemetryBytes',
+      'brokerReporterFileBytes',
+    ],
+    Setting
+  ),
+})
+const TRAFFIC_FIELDS = Object.freeze({
+  ...each(
+    [
+      'valueBytes',
+      'maxOffers',
+      'mainRate',
+      'telemetryProducerRate',
+      'transactionRecords',
+      'transactionEveryMs',
+      'abortEvery',
+      'commitEvery',
+      'metadataMaxAgeMs',
+      'telemetryPushMaxMs',
+    ],
+    Setting
+  ),
+  floors: Any,
+})
+const FLOORS = Object.freeze([
+  'confirmedCommits',
+  'confirmedAborts',
+  'visiblePerProducerKind',
+  'mainPerGroup',
+  'transactionsPerGroup',
+  'auxiliaryPerIncarnation',
+  'distinctOffsets',
+])
+const SAMPLING_FIELDS = Object.freeze({
+  ...each(
+    [
+      'periodMs',
+      'jitterMs',
+      'periodicSlots',
+      'warmupMs',
+      'quietReadings',
+      'gcCollections',
+      'gcGapMs',
+    ],
+    Setting
+  ),
+  roles: type('the five sample roles', (v) => sameList(v, SAMPLE_ROLES)),
+  explicitResources: type('TCPSocketWrap and Timeout', (v) => sameList(v, EXPLICIT_RESOURCES)),
+  flags: type('the required node flags', (v) => sameList(v, REQUIRED_FLAGS)),
+})
+const SCHEDULE_FIELDS = Object.freeze({
+  hourMs: Positive,
+  shapes: type('the seven shapes', (v) => sameList(v, SHAPES)),
+  activeMs: Window,
+  idleMs: Window,
+  auxiliaryDrainMs: Window,
+  quietAtMs: QuietTimes,
+  quietDeadlineMs: Positive,
+  executions: type('a list', Array.isArray),
+  totals: Any,
+  smoke: Any,
+})
+const TOTALS = each(
+  [
+    'idleWindows',
+    'regexExecutions',
+    'recreations',
+    'membershipExecutions',
+    'pauseSequencesPerOrdinaryKind',
+    'outages',
+    'staticRestartsPerStaticKind',
+  ],
+  Positive
+)
+const SMOKE_FIELDS = Object.freeze({
+  activeMs: Window,
+  idleMs: Window,
+  quietAtMs: QuietTimes,
+  ...each(['membershipAtMs', 'regexAtMs', 'recreationAtMs', 'outageAtMs', 'recoveredByMs'], Ms),
+  periodicSlots: Positive,
+  floors: Any,
+})
+const SMOKE_FLOORS = each(
+  ['mainPerGroup', 'visiblePerProducerKind', 'confirmedCommits', 'confirmedAborts'],
+  Positive
+)
+/** The fields of each scheduled auxiliary execution, in schedule order. */
+const EXECUTIONS = Object.freeze({
+  'membership-churn': {
+    minutes: Minutes,
+    maxMs: Positive,
+    waves: Positive,
+    waveMaxMs: Positive,
+    pausesPerWave: Positive,
+  },
+  'regex-churn': { minutes: Minutes, maxMs: Positive },
+  'topic-recreation': { minutes: Minutes, maxMs: Positive },
+  'broker-outage': { minutes: Minutes, evenHoursOnly: Bool, recoveredByMinute: Positive },
+})
+
+/** @param {object} schedule @returns {string[]} the exact day schedule, totals and smoke profile */
+const scheduleProblems = (schedule) => {
+  const path = 'matrix.schedule'
+  const problems = [
+    ...fieldProblems(schedule, SCHEDULE_FIELDS, path),
+    ...nested(schedule, 'totals', TOTALS, path),
+    ...nested(schedule, 'smoke', SMOKE_FIELDS, path),
+    ...nested(schedule.smoke, 'floors', SMOKE_FLOORS, `${path}.smoke`),
+  ]
+  const executions = schedule.executions
+  if (!Array.isArray(executions)) return problems
+  const shapes = Object.keys(EXECUTIONS)
+  problems.push(
+    ...unless(
+      sameList(
+        executions.map((e) => (isObject(e) ? e.shape : null)),
+        shapes
+      ),
+      `${path}.executions is not one execution of each auxiliary shape`
+    )
+  )
+  executions.forEach((e, i) => {
+    const known = own(e, 'shape') && own(EXECUTIONS, e.shape)
+    const fields = { shape: oneOf(...shapes), ...(known ? EXECUTIONS[e.shape] : {}) }
+    problems.push(...fieldProblems(e, fields, `${path}.executions[${i}]`, !known))
+  })
+  return problems
+}
+
+const RuleList = nonEmptyListOf('a non-empty list of rules', Text.test)
+const TableRule = shape('a table rule', { source: Source, owner: Text })
+
 /**
- * Checks the matrix: version 3, every mandatory section with its container type, the twelve kinds,
- * the single isolated seed control, sourced settings, exact section and record vocabularies, and
- * the eight ordered rows with scope, evidence, predicate, sourced bounds, minima and closure.
+ * Checks the shared predicate definitions: exactly the six names, each with its rules; Complete
+ * also names every kind's recovery witness and TablesOK every backing table's source and owner.
+ * @param {object} predicates
+ * @returns {string[]}
+ */
+const predicateProblems = (predicates) => {
+  const path = 'matrix.predicates'
+  const extra = { Complete: { recovery: Any }, TablesOK: { tables: Any } }
+  return [
+    ...fieldProblems(predicates, each(PREDICATES, Any), path),
+    ...PREDICATES.flatMap((n) => nested(predicates, n, { rules: RuleList, ...extra[n] }, path)),
+    ...nested(predicates.Complete, 'recovery', each(CLIENT_KINDS, Text), `${path}.Complete`),
+    ...nested(predicates.TablesOK, 'tables', each(TABLES, TableRule), `${path}.TablesOK`),
+  ]
+}
+
+/**
+ * Checks the matrix: version 3, every mandatory section with its container type, the exact nested
+ * acceptance, host, traffic, schedule (day, executions, totals, smoke) and sampling settings, the
+ * twelve kinds, the single isolated seed control with its per-mode timing, exact section and record
+ * vocabularies, the sourced bound catalogue, the six shared predicate definitions, and the eight
+ * ordered rows with scope, evidence, predicate uses, bound references, derived minima and closure.
  * Text anywhere may not name decision ids, uppercase registry labels or local-only paths.
  * @param {unknown} matrix parsed matrix JSON
  * @returns {string[]}
@@ -1012,77 +1296,16 @@ const validateMatrix = (matrix) => {
   if (!Array.isArray(matrix.rows)) problems.push('matrix.rows is not a list')
   if (problems.length > 0) return problems
 
-  const { acceptance, host, traffic, clientKinds, topology, schedule, sampling, controls } = matrix
-  const modes = acceptance.modes
-  for (const mode of MODES) {
-    problems.push(
-      ...settingProblems(
-        own(modes, mode) ? modes[mode] : null,
-        ['requestedMs', 'teardownAllowanceMs'],
-        `matrix.acceptance.modes.${mode}`
-      )
-    )
-  }
-  if (problems.length === 0 && modes.acceptance.requestedMs.value !== 86400000) {
-    problems.push('matrix.acceptance.modes.acceptance.requestedMs is not one day')
-  }
+  const { acceptance, clientKinds, sampling, schedule } = matrix
   problems.push(
-    ...unless(Id.test(acceptance.profile), 'matrix.acceptance.profile is not an Id'),
-    ...unless(
-      Array.isArray(acceptance.archive) &&
-        ['scripts/soak/finalSoakMatrix.json', 'scripts/soak/finalSoakSchema.js'].every((f) =>
-          acceptance.archive.includes(f)
-        ) &&
-        acceptance.archive.every(isRelativePath),
-      'matrix.acceptance.archive does not list the archived matrix and schema as relative paths'
+    ...fieldProblems(acceptance, ACCEPTANCE_FIELDS, 'matrix.acceptance'),
+    ...nested(acceptance, 'modes', each(MODES, Any), 'matrix.acceptance'),
+    ...MODES.flatMap((mode) =>
+      nested(acceptance.modes, mode, MODE_FIELDS, 'matrix.acceptance.modes')
     ),
-    ...unless(
-      sameList(acceptance.companions, COMPANIONS),
-      'matrix.acceptance.companions is not the companion list'
-    ),
-    ...unless(
-      Array.isArray(acceptance.cli) &&
-        ['--expect-sha', '--expect-profile', '--matrix', '--companion rs-l14=<run url>'].every(
-          (f) => acceptance.cli.includes(f)
-        ),
-      'matrix.acceptance.cli omits a required verifier argument'
-    ),
-    ...unless(
-      isObject(acceptance.verdicts) &&
-        sameList(acceptance.verdicts.day, ['PASS', 'FAIL', 'INCONCLUSIVE']) &&
-        sameList(acceptance.verdicts.closure, ['COMPLETE', 'OPEN']),
-      'matrix.acceptance.verdicts is not the day and closure vocabulary'
-    ),
-    ...unless(host.platform === 'linux', 'matrix.host.platform is not linux'),
-    ...settingProblems(
-      host,
-      [
-        'minMemAvailableBytes',
-        'minFreeDiskBytes',
-        'maxLoadAverage1m',
-        'maxEventLineBytes',
-        'maxInventoryLineBytes',
-      ],
-      'matrix.host'
-    ),
-    ...settingProblems(
-      traffic,
-      ['valueBytes', 'maxOffers', 'mainRate', 'commitEvery'],
-      'matrix.traffic'
-    ),
-    ...settingProblems(
-      traffic.floors,
-      [
-        'confirmedCommits',
-        'confirmedAborts',
-        'visiblePerProducerKind',
-        'mainPerGroup',
-        'transactionsPerGroup',
-        'auxiliaryPerIncarnation',
-        'distinctOffsets',
-      ],
-      'matrix.traffic.floors'
-    ),
+    ...fieldProblems(matrix.host, HOST_FIELDS, 'matrix.host'),
+    ...fieldProblems(matrix.traffic, TRAFFIC_FIELDS, 'matrix.traffic'),
+    ...nested(matrix.traffic, 'floors', each(FLOORS, Setting), 'matrix.traffic'),
     ...unless(
       sameList(Object.keys(clientKinds), CLIENT_KINDS),
       'matrix.clientKinds is not the twelve kinds in order'
@@ -1092,43 +1315,10 @@ const validateMatrix = (matrix) => {
         ? fieldProblems(clientKinds[k], KIND_FIELDS, `matrix.clientKinds.${k}`)
         : []
     ),
-    ...topologyProblems(topology, clientKinds),
-    ...unless(sameList(schedule.shapes, SHAPES), 'matrix.schedule.shapes is not the seven shapes'),
-    ...unless(
-      Array.isArray(schedule.executions) &&
-        schedule.executions.every((e) => isObject(e) && SHAPES.includes(e.shape)),
-      'matrix.schedule.executions names an unknown shape'
-    ),
-    ...unless(
-      isObject(schedule.totals) && isObject(schedule.smoke),
-      'matrix.schedule needs totals and a smoke profile'
-    ),
-    ...settingProblems(
-      sampling,
-      [
-        'periodMs',
-        'jitterMs',
-        'periodicSlots',
-        'warmupMs',
-        'quietReadings',
-        'gcCollections',
-        'gcGapMs',
-      ],
-      'matrix.sampling'
-    ),
-    ...unless(
-      sameList(sampling.roles, SAMPLE_ROLES),
-      'matrix.sampling.roles is not the five sample roles'
-    ),
-    ...unless(
-      sameList(sampling.explicitResources, EXPLICIT_RESOURCES),
-      'matrix.sampling.explicitResources is not TCPSocketWrap and Timeout'
-    ),
-    ...unless(
-      sameList(sampling.flags, REQUIRED_FLAGS),
-      'matrix.sampling.flags is not the required node flags'
-    ),
-    ...controlProblems(controls, clientKinds),
+    ...topologyProblems(matrix.topology, clientKinds),
+    ...scheduleProblems(schedule),
+    ...fieldProblems(sampling, SAMPLING_FIELDS, 'matrix.sampling'),
+    ...controlProblems(matrix.controls, clientKinds),
     ...unless(
       sameList(matrix.recordSections.process, SECTION_SETS.process) &&
         sameList(matrix.recordSections.ordinary, SECTION_SETS.ordinary) &&
@@ -1140,13 +1330,22 @@ const validateMatrix = (matrix) => {
       sameList(Object.keys(matrix.observations), RECORD_KINDS) &&
         Object.values(matrix.observations).every(Text.test),
       'matrix.observations does not describe exactly the record kinds'
-    )
+    ),
+    ...Object.keys(matrix.bounds).flatMap((k) =>
+      unless(Bound.test(matrix.bounds[k]), `matrix.bounds.${nameOf(k)} is not a bound`)
+    ),
+    ...predicateProblems(matrix.predicates)
   )
   if (problems.length === 0) {
-    const day = modes.acceptance.requestedMs.value
-    if (sampling.periodicSlots.value !== day / sampling.periodMs.value + 1) {
+    const period = sampling.periodMs.value
+    if (acceptance.modes.acceptance.requestedMs.value !== 86400000)
+      problems.push('matrix.acceptance.modes.acceptance.requestedMs is not one day')
+    if (sampling.periodicSlots.value !== acceptance.modes.acceptance.requestedMs.value / period + 1)
       problems.push('matrix.sampling.periodicSlots does not cover the day at the sample period')
-    }
+    if (schedule.smoke.periodicSlots !== acceptance.modes.smoke.requestedMs.value / period + 1)
+      problems.push(
+        'matrix.schedule.smoke.periodicSlots does not cover the smoke at the sample period'
+      )
     if (sampling.gcCollections.value !== 2) problems.push('matrix.sampling.gcCollections is not 2')
   }
   if (matrix.rows.length !== ROWS.length)
@@ -1204,25 +1403,40 @@ const topologyProblems = (topology, kinds) => {
   return problems
 }
 
-/** @param {object} controls @param {object} kinds @returns {string[]} */
+/**
+ * Checks the single isolated seed control, including its fixed per-mode timing: the day starts the
+ * map after the first quiet triplet and requires sensitivity; the smoke starts it after the
+ * baseline before traffic and only reports growth.
+ * @param {object} controls
+ * @param {object} kinds
+ * @returns {string[]}
+ */
 const controlProblems = (controls, kinds) => {
   if (!sameList(Object.keys(controls), [CONTROL]))
     return [`matrix.controls is not exactly ${CONTROL}`]
+  const path = `matrix.controls.${CONTROL}`
+  const control = controls[CONTROL]
   const fields = {
     arm: oneOf(CONTROL),
     clientKind: type(
       'an ordinary consumer kind',
-      (v) => own(kinds, v) && kinds[v].inventory === 'ordinary'
+      (v) => own(kinds, v) && isObject(kinds[v]) && kinds[v].inventory === 'ordinary'
     ),
     isolated: oneOf(true),
     retains: Text,
     pattern: Source,
-    starts: Text,
-    clears: Text,
+    timing: Any,
     breachBytes: Setting,
     exemption: Text,
   }
-  return fieldProblems(controls[CONTROL], fields, `matrix.controls.${CONTROL}`)
+  const exactly = (rule) => Object.fromEntries(Object.entries(rule).map(([k, v]) => [k, oneOf(v)]))
+  return [
+    ...fieldProblems(control, fields, path),
+    ...nested(control, 'timing', each(MODES, Any), path),
+    ...(own(control, 'timing')
+      ? MODES.flatMap((m) => nested(control.timing, m, exactly(SEED_TIMING[m]), `${path}.timing`))
+      : []),
+  ]
 }
 
 /** @param {unknown} v @returns {boolean} a relative path that cannot escape its root */
@@ -1562,7 +1776,7 @@ const validateProvenance = (json, kind) => {
 /**
  * Validates a record stream line by line with bounded state: per-source counters, live processes
  * and clients, open executions and inventory cuts, and the stream digest. It never holds the
- * stream. Checks: exact record types; `recordId` = `<source>.<seq>` with gap-free per-source
+ * stream. Checks: config and header agree on run id and mode; exact record types; `recordId` = `<source>.<seq>` with gap-free per-source
  * `seq` from 0; `at <= t`, `t` non-decreasing, per-source `at` non-decreasing, `t` within the
  * observed window; processes on the header's boot and Node; no record from an exited process; clients constructed in a started process as
  * their config slot says, never reusing an id; seed records only from the isolated seed's control
@@ -1596,6 +1810,8 @@ class StreamValidator {
     this.lastT = 0
     this.problems = []
     this.omitted = 0
+    if (config.runId !== header.runId || config.mode !== header.mode)
+      this.problems.push('config and header disagree on run id or mode')
   }
 
   /** @param {string} problem */
@@ -1853,28 +2069,6 @@ class StreamValidator {
   }
 }
 
-/**
- * Validates a whole artifact: matrix, config, header (all three must be valid before the stream
- * can be read), their agreement on run id and mode, then the stream line by line.
- * @param {object} artifact
- * @param {unknown} artifact.matrix
- * @param {unknown} artifact.config
- * @param {unknown} artifact.header
- * @param {Iterable<string>} artifact.lines the stream's lines without their newlines
- * @returns {string[]}
- */
-const validateArtifact = ({ matrix, config, header, lines }) => {
-  const matrixProblems = validateMatrix(matrix)
-  if (matrixProblems.length > 0) return matrixProblems
-  const problems = [...validateConfig(config, matrix), ...validateHeader(header, matrix)]
-  if (problems.length > 0) return problems
-  if (config.runId !== header.runId || config.mode !== header.mode)
-    return ['config and header disagree on run id or mode']
-  const stream = new StreamValidator({ matrix, config, header })
-  for (const line of lines) stream.push(line)
-  return stream.finish()
-}
-
 module.exports = {
   SCHEMA_VERSION,
   ROWS,
@@ -1883,7 +2077,6 @@ module.exports = {
   RECORD_KINDS,
   SECTION_SETS,
   StreamValidator,
-  validateArtifact,
   validateCapabilities,
   validateConfig,
   validateHeader,
