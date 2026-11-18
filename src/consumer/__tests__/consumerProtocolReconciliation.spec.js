@@ -7,6 +7,7 @@ const waitFor = require('../../utils/waitFor')
 const { newLogger } = require('testHelpers')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
+const Subscription = require('../subscription')
 
 /** Every runner this file builds, torn down after the case that built it. */
 const built = []
@@ -186,6 +187,199 @@ const build = ({
   return { runner, group, coordinator, log, emitted, trip, joinArmed }
 }
 
+const CONTROL = 'rx-control'
+const DELETED = 'rx-0'
+const LATE = 'rx-2'
+const TOPIC_IDS = {
+  [CONTROL]: 'cTRLcTRLcTRLcTRLcTRLcQ',
+  [DELETED]: 'zERozERozERozERozERozQ',
+  [LATE]: 'tWOotWOotWOotWOotWOotQ',
+}
+
+/** A ConsumerGroupHeartbeat response for a client-pattern member, one entry per topic. */
+const target = (memberEpoch, byTopic) => ({
+  throttleTime: 0,
+  errorCode: 0,
+  errorMessage: null,
+  memberId: 'member-1',
+  memberEpoch,
+  heartbeatIntervalMs: 1,
+  assignment:
+    byTopic === null
+      ? null
+      : {
+          topicPartitions: Object.entries(byTopic).map(([topic, partitions]) => ({
+            topicId: TOPIC_IDS[topic],
+            partitions,
+          })),
+        },
+})
+
+/**
+ * The same real group, runner and coordinator over a client RegExp subscription and a cluster whose
+ * topic metadata the case edits: `known` is what metadata currently names and serves.
+ * @param {object[]} script ConsumerGroupHeartbeat responses, the last repeating
+ * @returns {object} the group, runner, records and helpers to discover and to trip
+ */
+const buildPattern = (script) => {
+  const log = []
+  const emitted = []
+  const fetched = []
+  const known = new Map([
+    [CONTROL, [0, 1]],
+    [DELETED, [0]],
+  ])
+  const coordinator = scriptedCoordinator(script, log)
+  coordinator.offsetFetch = jest.fn(async ({ topics }) => ({
+    responses: topics.map(({ topic, partitions }) => ({
+      topic,
+      partitions: partitions.map(({ partition }) => ({
+        partition,
+        offset: '5',
+        committedLeaderEpoch: -1,
+        metadata: null,
+        errorCode: 0,
+      })),
+    })),
+  }))
+  const metadata = () => ({
+    topicMetadata: [...known.keys()].map((topic) => ({
+      topic,
+      topicId: TOPIC_IDS[topic],
+      topicErrorCode: 0,
+      isInternal: false,
+    })),
+  })
+  const subscription = new Subscription()
+  subscription.add({ topics: [/^rx-/], policy: { kind: 'earliest' } })
+  const desired = subscription.evaluate(metadata())
+  subscription.observe(metadata())
+
+  const cluster = {
+    refreshMetadata: jest.fn(async () => {}),
+    refreshMetadataIfNecessary: jest.fn(async () => {}),
+    refreshMetadataForTopicIds: jest.fn(async () => {}),
+    committedOffsets: () => ({}),
+    topicName: (topicId) =>
+      [...known.keys()].find((topic) => TOPIC_IDS[topic] === topicId) || undefined,
+    topicId: (topic) => (known.has(topic) ? TOPIC_IDS[topic] : undefined),
+    leaderEpoch: () => -1,
+    findTopicPartitionMetadata: (topic) =>
+      (known.get(topic) || []).map((partitionId) => ({ partitionId, leader: 0 })),
+    findBroker: jest.fn(async () => ({
+      fetch: async ({ topics }) => {
+        for (const { topic, partitions } of topics) {
+          for (const { partition } of partitions) fetched.push(`${topic}|${partition}`)
+        }
+        return { responses: [] }
+      },
+      listOffsets: async ({ topics }) =>
+        topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({ partition, offset: '0', errorCode: 0 })),
+        })),
+    })),
+    fetchTopicsOffset: jest.fn(async (requests) =>
+      requests.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({ partition, offset: '0' })),
+      }))
+    ),
+    findGroupCoordinator: jest.fn(async () => coordinator),
+    addMultipleTargetTopics: jest.fn(async () => {}),
+  }
+
+  const instrumentationEmitter = new InstrumentationEventEmitter()
+  for (const name of [
+    events.PARTITIONS_ASSIGNED,
+    events.PARTITIONS_REVOKED,
+    events.PARTITIONS_LOST,
+    events.GROUP_JOIN,
+    events.REBALANCING,
+  ]) {
+    instrumentationEmitter.addListener(name, ({ type, payload }) => emitted.push({ type, payload }))
+  }
+
+  const group = new ConsumerGroup({
+    retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 2 },
+    cluster,
+    groupId: GROUP_ID,
+    groupProtocol: 'consumer',
+    topics: desired.names,
+    topicConfigurations: Subscription.configurationsOf(desired),
+    subscription,
+    logger: newLogger(),
+    instrumentationEmitter,
+    assigners: [],
+    sessionTimeout: 30000,
+    rebalanceTimeout: 60000,
+    heartbeatInterval: 3000,
+    maxBytesPerPartition: 1048576,
+    minBytes: 1,
+    maxBytes: 1048576,
+    maxWaitTimeInMs: 1,
+    autoCommit: false,
+    autoCommitInterval: null,
+    autoCommitThreshold: null,
+    isolationLevel: 0,
+    rackId: '',
+    checkCrcs: true,
+    metadataMaxAge: 300000,
+  })
+  group.coordinator = coordinator
+  group.getNodeIds = () => [0]
+
+  const onCrash = jest.fn()
+  const runner = new Runner({
+    consumerGroup: group,
+    instrumentationEmitter,
+    logger: newLogger(),
+    eachBatch: async () => {},
+    concurrency: 1,
+    heartbeatInterval: 3000,
+    maxPollInterval: 300000,
+    autoCommit: false,
+    onCrash,
+  })
+  runner.running = true
+  runner.heartbeatManager.disable()
+  built.push(runner)
+
+  /**
+   * Accepts one full metadata response naming exactly `topics`, as a refresh would.
+   * @param {Record<string, number[]>} topics name to partitions
+   */
+  const discover = async (topics) => {
+    known.clear()
+    for (const [topic, partitions] of Object.entries(topics)) known.set(topic, partitions)
+    group.observeDiscovery(metadata())
+    const snapshot = group.discovered
+    group.discovered = null
+    await group.updateSubscription(snapshot)
+  }
+
+  /** One heartbeat opportunity, then a timer turn so a pending inter-round wait can elapse. */
+  const opportunity = async () => {
+    await group.heartbeat({ interval: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 3))
+  }
+
+  const count = (type) => emitted.filter((event) => event.type === type).length
+
+  /** Every later heartbeat gets `response`. */
+  const answerWith = (response) => script.splice(0, script.length, response)
+
+  return { group, runner, log, emitted, fetched, onCrash, discover, opportunity, count, answerWith }
+}
+
+const acknowledgements = (log) =>
+  log
+    .filter(({ kind, request }) => kind === 'heartbeat' && request.topicPartitions != null)
+    .map(({ request }) => request.topicPartitions)
+
+const owned = (group) =>
+  Object.fromEntries(group.assigned().map(({ topic, partitions }) => [topic, partitions]))
+
 const partitionsOf = (emitted, type) =>
   emitted
     .filter((event) => event.type === type)
@@ -198,6 +392,203 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       runner.heartbeatManager.stop()
       runner.pollTimer.stop()
       await runner.fetchManager.stop()
+    }
+  })
+
+  it('ends reconciliation once it owns the subscribed part of a target that still names a deleted topic', async () => {
+    const { group, runner, log, emitted, fetched, onCrash, discover, opportunity, count } =
+      buildPattern([target(1, { [CONTROL]: [0], [DELETED]: [0] }), target(1, null)])
+
+    runner.rebalanceCoordinator.runRound(null, 'initial')
+    await waitFor(() => group.groupMembership.immediatePending, { delay: 1, maxWait: 5000 })
+    await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await opportunity()
+    expect(owned(group)).toEqual({ [CONTROL]: [0], [DELETED]: [0] })
+
+    const fetching = runner.fetchManager.start()
+    await discover({ [CONTROL]: [0, 1] })
+    group.checkSubscriptionChange()
+    const joinsBefore = count(events.GROUP_JOIN)
+    const acksBefore = acknowledgements(log).length
+
+    // Every heartbeat answers with the unchanged epoch and no assignment, so the coordinator's
+    // target keeps naming the deleted topic for far longer than one chain's round budget.
+    for (let i = 0; i < 30; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+
+    expect(onCrash).not.toHaveBeenCalled()
+    expect(count(events.PARTITIONS_REVOKED)).toEqual(1)
+    expect(
+      emitted.find(({ type }) => type === events.PARTITIONS_REVOKED).payload.partitions
+    ).toEqual([{ topic: DELETED, partitions: [0] }])
+    expect(count(events.GROUP_JOIN) - joinsBefore).toEqual(1)
+    expect(acknowledgements(log).slice(acksBefore)).toEqual([
+      [{ topicId: TOPIC_IDS[CONTROL], partitions: [0] }],
+    ])
+    expect(owned(group)).toEqual({ [CONTROL]: [0] })
+    expect(runner.rebalanceCoordinator.isRebalancing()).toBe(false)
+    const controlFetches = fetched.filter((key) => key === `${CONTROL}|0`).length
+    await opportunity()
+    expect(fetched.filter((key) => key === `${CONTROL}|0`).length).toBeGreaterThan(controlFetches)
+    expect(fetched).not.toContain(`${DELETED}|0`)
+
+    await runner.fetchManager.stop()
+    await fetching
+  })
+
+  it('still adopts a new subscribed assignment and a newly resolvable topic id while the target names a deleted topic', async () => {
+    const { group, runner, log, onCrash, discover, opportunity, count, answerWith } = buildPattern([
+      target(1, { [CONTROL]: [0], [DELETED]: [0] }),
+      target(1, null),
+    ])
+
+    runner.rebalanceCoordinator.runRound(null, 'initial')
+    await waitFor(() => group.groupMembership.immediatePending, { delay: 1, maxWait: 5000 })
+    await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    await discover({ [CONTROL]: [0, 1] })
+    group.checkSubscriptionChange()
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    expect(owned(group)).toEqual({ [CONTROL]: [0] })
+    const joinsBefore = count(events.GROUP_JOIN)
+
+    answerWith(target(2, { [CONTROL]: [0, 1], [DELETED]: [0] }))
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    expect(owned(group)).toEqual({ [CONTROL]: [0, 1] })
+    expect(acknowledgements(log).at(-1)).toEqual([
+      { topicId: TOPIC_IDS[CONTROL], partitions: [0, 1] },
+    ])
+
+    // The coordinator names a topic this member cannot resolve yet; nothing is owed until it can.
+    answerWith(target(3, { [CONTROL]: [0, 1], [DELETED]: [0], [LATE]: [0] }))
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+    expect(owned(group)).toEqual({ [CONTROL]: [0, 1] })
+
+    await discover({ [CONTROL]: [0, 1], [LATE]: [0] })
+    for (let i = 0; i < 5; i++) await opportunity()
+    await runner.rebalanceCoordinator.idle()
+
+    expect(onCrash).not.toHaveBeenCalled()
+    expect(owned(group)).toEqual({ [CONTROL]: [0, 1], [LATE]: [0] })
+    expect(acknowledgements(log).at(-1)).toEqual([
+      { topicId: TOPIC_IDS[CONTROL], partitions: [0, 1] },
+      { topicId: TOPIC_IDS[LATE], partitions: [0] },
+    ])
+    expect(count(events.GROUP_JOIN) - joinsBefore).toEqual(2)
+  })
+
+  it('keeps reconciling a subscription that changes during every round for sixty rounds, warning every twenty, and settles once the churn stops', async () => {
+    jest.useFakeTimers()
+    let fetching
+    try {
+      const churnName = (k) => `rx-churn-${k}`
+      for (let k = 1; k <= 61; k++) {
+        TOPIC_IDS[churnName(k)] = Buffer.alloc(16, k).toString('base64url')
+      }
+      const { group, runner, log, fetched, onCrash, discover, count, answerWith } = buildPattern([
+        target(1, { [CONTROL]: [0], [DELETED]: [0] }),
+        target(1, null),
+      ])
+      const coordinator = runner.rebalanceCoordinator
+      const warn = jest.spyOn(coordinator.logger, 'warn')
+      /** Advances fake time in 5 ms steps until `done()` holds, for at most `budget` ms. */
+      const until = async (done, budget = 1000) => {
+        for (let spent = 0; !done() && spent < budget; spent += 5) {
+          await jest.advanceTimersByTimeAsync(5)
+        }
+      }
+      const INTERVAL = 250
+      const churnTarget = (memberEpoch, byTopic) => ({
+        ...target(memberEpoch, byTopic),
+        heartbeatIntervalMs: INTERVAL,
+      })
+      const settle = () => until(() => !coordinator.isRebalancing())
+
+      coordinator.runRound(null, 'initial')
+      await until(() => group.groupMembership.immediatePending)
+      await group.heartbeat({ interval: 0 })
+      await settle()
+      await group.heartbeat({ interval: 0 })
+      fetching = runner.fetchManager.start()
+
+      // Each round applies the pin it took, and a new matching topic replaces the old one before
+      // the round checks whether it converged: it now owns a partition the subscription dropped,
+      // so every round owes the next one.
+      const joinedAt = []
+      const recordJoin = coordinator.onJoinComplete
+      coordinator.onJoinComplete = () => {
+        recordJoin()
+        joinedAt.push(Date.now())
+        if (joinedAt.length <= 60)
+          discover({ [CONTROL]: [0], [churnName(joinedAt.length + 1)]: [0] })
+      }
+      const heartbeatsBefore = log.filter(({ kind }) => kind === 'heartbeat').length
+      const startedAt = Date.now()
+      const controlFetches = []
+
+      await discover({ [CONTROL]: [0], [churnName(1)]: [0] })
+      answerWith(churnTarget(2, { [CONTROL]: [0], [churnName(1)]: [0] }))
+      await group.heartbeat({ interval: 0 })
+      group.checkSubscriptionChange()
+
+      for (let round = 1; round <= 61; round++) {
+        await until(() => joinedAt.length >= round || onCrash.mock.calls.length > 0)
+        if (round % 20 === 0)
+          controlFetches.push(fetched.filter((k) => k === `${CONTROL}|0`).length)
+        if (round <= 60) {
+          answerWith(churnTarget(round + 2, { [CONTROL]: [0], [churnName(round + 1)]: [0] }))
+          await group.heartbeat({ interval: 0 })
+        }
+      }
+      await settle()
+
+      expect(onCrash).not.toHaveBeenCalled()
+      expect(joinedAt).toHaveLength(61)
+      expect(count(events.GROUP_JOIN)).toEqual(62)
+      expect(owned(group)).toEqual({ [CONTROL]: [0], [churnName(61)]: [0] })
+      expect(group.subscriptionPending()).toBe(false)
+      expect(group.groupMembership.needsReconciliation()).toBe(false)
+      expect(
+        warn.mock.calls.map(([message, extra]) => [
+          message,
+          extra.groupId,
+          extra.rounds,
+          extra.reason,
+        ])
+      ).toEqual(
+        [20, 40, 60].map((rounds) => [
+          'Reconciliation is still running',
+          GROUP_ID,
+          rounds,
+          'assignment-changed',
+        ])
+      )
+
+      // Paced: every follow-up round started at least one wait - the membership's interval, never
+      // under 100 ms - after the one before it, and the heartbeats sent while the chain ran are
+      // this case's own plus at most one per wait.
+      for (let i = 1; i < joinedAt.length; i++) {
+        expect(joinedAt[i] - joinedAt[i - 1]).toBeGreaterThanOrEqual(100)
+      }
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(60 * 100)
+      const heartbeats = log.filter(({ kind }) => kind === 'heartbeat').length - heartbeatsBefore
+      expect(heartbeats - 61).toBeLessThanOrEqual(joinedAt.length - 1)
+
+      // The retained partition kept being fetched while the chain ran.
+      expect(controlFetches[0]).toBeGreaterThan(0)
+      expect(controlFetches[1]).toBeGreaterThan(controlFetches[0])
+      expect(controlFetches[2]).toBeGreaterThan(controlFetches[1])
+    } finally {
+      // The fetch loop's timers are fake: it has to stop before real time comes back.
+      const stopping = built.at(-1)?.fetchManager.stop()
+      await jest.advanceTimersByTimeAsync(100)
+      await stopping
+      await fetching
+      jest.useRealTimers()
     }
   })
 

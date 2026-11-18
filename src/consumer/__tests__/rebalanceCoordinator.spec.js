@@ -12,7 +12,12 @@ const {
   stampGeneration,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
-const { KafkaJSNonRetriableError, KafkaJSProtocolError } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSNonRetriableError,
+  KafkaJSProtocolError,
+  KafkaJSRebalanceNotConvergedError,
+} = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { MemberMetadata } = require('../assignerProtocol')
 const { newLogger, waitFor } = require('testHelpers')
@@ -369,6 +374,22 @@ describe('Consumer > RebalanceCoordinator > the inter-round yield', () => {
     expect(coordinator.stopWaiters.size).toEqual(0)
   })
 
+  it.each([0, 1])('still waits 100 ms when the membership interval is %i ms', async (interval) => {
+    const { coordinator } = build()
+    coordinator.consumerGroup.heartbeatInterval = () => interval
+
+    let resolved = false
+    const yielding = coordinator.yieldBetweenRounds().then(() => (resolved = true))
+
+    await jest.advanceTimersByTimeAsync(99)
+    expect(resolved).toBe(false)
+
+    await jest.advanceTimersByTimeAsync(1)
+    await yielding
+    expect(resolved).toBe(true)
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
   it('is a no-op to notify when nothing is waiting', () => {
     const { coordinator } = build()
 
@@ -558,16 +579,22 @@ describe('Consumer > RebalanceCoordinator', () => {
       expect(coordinator.rounds).toEqual(0)
     })
 
-    it('refuses a chain that does not converge', async () => {
+    it('refuses a chain that does not converge with a retriable error of its own type', async () => {
       const revoked = [{ topic: 't', partitions: [0] }]
       const { coordinator, consumerGroup } = build({
         mode: COOPERATIVE,
         deltas: Array.from({ length: 25 }, () => ({ revoked })),
       })
 
-      await expect(coordinator.runRound('rebalance-in-progress', 'revoked')).rejects.toThrow(
-        'did not converge in 20 rounds'
-      )
+      const error = await coordinator.runRound('rebalance-in-progress', 'revoked').catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSRebalanceNotConvergedError)
+      expect(error).toBeInstanceOf(KafkaJSError)
+      expect(error).toMatchObject({
+        name: 'KafkaJSRebalanceNotConvergedError',
+        message: 'cooperative rebalance did not converge in 20 rounds',
+        retriable: true,
+      })
       expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(20)
       expect(coordinator.rounds).toEqual(0)
       expect(coordinator.isRebalancing()).toBe(false)
@@ -1968,9 +1995,9 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
   it('runs a follow-up round while the membership still needs reconciliation', async () => {
     const { coordinator, consumerGroup, emitted } = build()
-    let outstanding = 2
+    // A level, read as often as the coordinator likes: it holds until the third apply.
     asConsumerProtocol(consumerGroup, {
-      needsReconciliation: () => outstanding-- > 0,
+      needsReconciliation: () => consumerGroup.applyRebalanceResult.mock.calls.length < 3,
     })
 
     const chain = coordinator.runRound('assignment-changed', 'revoked')
@@ -1988,8 +2015,12 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
   it('yields one membership interval between rounds, capped, and not while stopping', async () => {
     const { coordinator, consumerGroup, runner } = build()
-    let outstanding = 1
-    asConsumerProtocol(consumerGroup, { needsReconciliation: () => outstanding-- > 0 })
+    let outstanding = 2
+    asConsumerProtocol(consumerGroup, { needsReconciliation: () => outstanding > 0 })
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      outstanding--
+      return { assignment: [], added: [], revoked: [] }
+    })
     consumerGroup.heartbeatInterval = jest.fn(() => 30000)
 
     const chain = coordinator.runRound('assignment-changed', 'revoked')
@@ -2002,10 +2033,11 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
     // A stop landing MID-ROUND - the ordinary shape - skips the yield outright, so `stop()` is
     // never held open by it. The round still owes a follow-up: only the guard stops the sleep.
-    outstanding = 1
+    outstanding = 2
     consumerGroup.joinAndSync.mockClear()
     consumerGroup.heartbeatInterval.mockClear()
     consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      outstanding--
       runner.stopRequested = true
       return { assignment: [], added: [], revoked: [] }
     })
@@ -2022,6 +2054,155 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
     consumerGroup.joinAndSync.mockClear()
     await coordinator.runRound('assignment-changed', 'revoked')
     expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Nineteen follow-ups that each find a real mismatch, then a twentieth apply that leaves one,
+   * corrected by the coordinator while the chain waits before round twenty-one. Applies after the
+   * twentieth leave nothing behind.
+   * @param {object} built what `build()` returned
+   * @param {() => void} [atCorrection] what else changes at the moment of the correction
+   * @returns {Promise<void>} the chain
+   */
+  const convergeDuringLastWait = (built, atCorrection = () => {}) => {
+    const { coordinator, consumerGroup } = built
+    let applies = 0
+    let mismatch = false
+    asConsumerProtocol(consumerGroup, { needsReconciliation: () => mismatch })
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      mismatch = ++applies <= 20
+      if (applies === 20) {
+        setTimeout(() => {
+          mismatch = false
+          atCorrection()
+        }, 100)
+      }
+      return { assignment: [], added: [], revoked: [] }
+    })
+    const chain = coordinator.runRound('assignment-changed', 'revoked')
+    chain.catch(() => {})
+    return chain
+  }
+
+  it('ends the chain when the target converges during the wait before another round', async () => {
+    const built = build()
+    const chain = convergeDuringLastWait(built)
+    await jest.advanceTimersByTimeAsync(20 * 500)
+
+    await expect(chain).resolves.toBeUndefined()
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+    expect(built.consumerGroup.joinAndSync).toHaveBeenCalledTimes(20)
+    expect(built.coordinator.isRebalancing()).toBe(false)
+    expect(jest.getTimerCount()).toEqual(0)
+  })
+
+  it('runs a twenty-first round for a subscription revision pending at wake-up, then settles', async () => {
+    const built = build()
+    let pending = false
+    built.consumerGroup.subscriptionPending = () => pending
+    const chain = convergeDuringLastWait(built, () => (pending = true))
+    const apply = built.consumerGroup.applyRebalanceResult.getMockImplementation()
+    built.consumerGroup.applyRebalanceResult.mockImplementation(async (...args) => {
+      const result = await apply(...args)
+      if (pending) pending = false
+      return result
+    })
+    await jest.advanceTimersByTimeAsync(21 * 500)
+
+    await expect(chain).resolves.toBeUndefined()
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(21)
+    // The reason chosen before the wait is the one the round reports.
+    expect(payloadsOf(built.emitted, events.REBALANCING).at(-1).reason).toEqual(
+      'assignment-changed'
+    )
+    expect(built.consumerGroup.subscriptionPending()).toBe(false)
+    expect(built.coordinator.isRebalancing()).toBe(false)
+  })
+
+  it('runs the round a LOST queued during the wait is owed and then a lost round for it, then settles', async () => {
+    const built = build()
+    const chain = convergeDuringLastWait(built, () => built.coordinator.runRound('fenced', 'lost'))
+    await jest.advanceTimersByTimeAsync(22 * 500)
+
+    await expect(chain).resolves.toBeUndefined()
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(22)
+    expect(
+      payloadsOf(built.emitted, events.REBALANCING)
+        .slice(-2)
+        .map(({ reason }) => reason)
+    ).toEqual(['assignment-changed', 'fenced'])
+    expect(built.consumerGroup.forgetOwnedPartitions).toHaveBeenCalledTimes(1)
+  })
+
+  it('runs a twenty-first round for a current LOST verdict at wake-up and leaves the verdict for the runner', async () => {
+    const built = build()
+    const chain = convergeDuringLastWait(built, () =>
+      built.coordinator.requestRejoin({
+        kind: 'lost',
+        reason: 'fenced',
+        error: new KafkaJSProtocolError(createErrorFromCode(110)),
+      })
+    )
+    await jest.advanceTimersByTimeAsync(21 * 500)
+
+    await expect(chain).resolves.toBeUndefined()
+    expect(built.coordinator.hasVerdict()).toBe(true)
+    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(21)
+  })
+
+  it('keeps every follow-up that a subscription revision during each round asks for past twenty rounds, warning once, and settles when the revisions stop', async () => {
+    const built = build()
+    const { coordinator, consumerGroup, runner } = built
+    const warn = jest.spyOn(coordinator.logger, 'warn')
+    let desired = 1
+    let applied = 0
+    asConsumerProtocol(consumerGroup)
+    consumerGroup.subscriptionPending = () => applied !== desired
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      applied = desired
+      if (desired < 25) desired++
+      return { assignment: [], added: [], revoked: [] }
+    })
+    const chain = coordinator.runRound('subscription-changed', 'revoked')
+    await jest.advanceTimersByTimeAsync(30 * 500)
+
+    await expect(chain).resolves.toBeUndefined()
+    expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(25)
+    expect(runner.onCrash).not.toHaveBeenCalled()
+    expect(warn.mock.calls).toEqual([
+      [
+        'Reconciliation is still running',
+        { groupId: 'coordinator-group', rounds: 20, reason: 'subscription-changed' },
+      ],
+    ])
+    expect(coordinator.rounds).toEqual(0)
+  })
+
+  it('paces a long chain: no round starts sooner than one wait after the one before it', async () => {
+    const { coordinator, consumerGroup } = build()
+    let outstanding = 30
+    asConsumerProtocol(consumerGroup, { needsReconciliation: () => outstanding > 0 })
+    consumerGroup.heartbeatInterval = jest.fn(() => 1)
+    const startedAt = []
+    consumerGroup.joinAndSync.mockImplementation(async () => {
+      startedAt.push(Date.now())
+      return { assignment: {} }
+    })
+    consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+      outstanding--
+      return { assignment: [], added: [], revoked: [] }
+    })
+
+    const chain = coordinator.runRound('assignment-changed', 'revoked')
+    for (let waits = 1; waits <= 29; waits++) {
+      await jest.advanceTimersByTimeAsync(100)
+      expect(consumerGroup.joinAndSync.mock.calls.length).toBeLessThanOrEqual(waits + 1)
+    }
+    await chain
+
+    expect(startedAt).toHaveLength(30)
+    expect(startedAt.at(-1) - startedAt[0]).toBeGreaterThanOrEqual(29 * 100)
+    expect(consumerGroup.heartbeatInterval).toHaveBeenCalledTimes(29)
   })
 
   // The shipped classic follow-up must survive the round-kind/protocol split.
