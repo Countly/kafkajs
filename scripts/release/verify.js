@@ -1,9 +1,12 @@
 /**
- * Release verifier: the first job of `release.yml` runs it on a pushed tag and the release goes on only
- * when it exits 0. It reads the tagged checkout and GitHub's run lists; it never writes outside
- * `$GITHUB_OUTPUT` and never prints the token.
+ * Release verifier. Pre-pack (no argument): the first job of `release.yml` runs it on a pushed tag and
+ * the release goes on only when it exits 0; it reads the tagged checkout, GitHub's run lists and, on the
+ * final tag, the npm registry. Post-pack (`--post-pack <main tgz> <otel tgz>`): the OTel pack job checks
+ * both tarballs against their manifests and the main tarball against the pack job's SRI. It never writes
+ * outside `$GITHUB_OUTPUT` and never prints the token.
  */
 const { spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -27,6 +30,15 @@ const path = require('node:path')
 
 /** @typedef {(workflow: string, query: RunQuery) => Promise<WorkflowRun[]>} ListRuns */
 
+/** @typedef {(name: string, version: string) => Promise<boolean>} Lookup true when the registry holds it */
+
+/**
+ * @typedef {object} PackedTarball
+ * @property {{ name?: string, version?: string }} manifest the package's package.json in the checkout
+ * @property {{ name?: string, version?: string }} packed the tarball's package/package.json
+ * @property {string} sri the tarball's `sha512-<base64>` integrity
+ */
+
 const API = 'https://api.github.com'
 const PER_PAGE = 100
 const MAX_PAGES = 10
@@ -34,6 +46,28 @@ const VERSION_PATTERN = /^\d+\.\d+\.\d+(-[0-9a-zA-Z.-]+)?$/
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/
 const REPOSITORY_PATTERN = /^[\w.-]+\/[\w.-]+$/
 const PUSH_WORKFLOWS = ['ci.yml', 'gate.yml']
+const MAIN_NAME = '@countly/kafkajs'
+const OTEL_NAME = '@countly/opentelemetry-instrumentation-kafkajs'
+/** The only tag whose release run publishes the OTel package. */
+const OTEL_PUBLISH_TAG = 'v3.0.0'
+const REGISTRY = 'https://registry.npmjs.org'
+const NUMBER = '0|[1-9]\\d*'
+const IDENTIFIER = `(?:${NUMBER}|\\d*[a-zA-Z-][0-9a-zA-Z-]*)`
+/** Semver 2.0.0 without build metadata: no leading zeroes and no empty pre-release identifiers. */
+const SEMVER = new RegExp(
+  `^(${NUMBER})\\.(${NUMBER})\\.(${NUMBER})(?:-(${IDENTIFIER}(?:\\.${IDENTIFIER})*))?$`
+)
+const PARTIAL = new RegExp(`^(${NUMBER})(?:\\.(${NUMBER}))?$`)
+const MAX_VERSION_LENGTH = 256
+/** Whether a comparison result (negative, zero, positive) meets each range operator. */
+const OPERATORS = {
+  '>=': (order) => order >= 0,
+  '>': (order) => order > 0,
+  '<=': (order) => order <= 0,
+  '<': (order) => order < 0,
+  '=': (order) => order === 0,
+}
+const COMPARATOR = /^(>=|<=|>|<|=)?(.+)$/
 /** Run field that each query key selects, so results are re-checked here whatever the server filtered. */
 const RUN_FIELD = { event: 'event', branch: 'head_branch', head_sha: 'head_sha' }
 
@@ -154,6 +188,166 @@ const verifyRelease = async ({ tag, sha, packageJson, changelog, isOnMaster, lis
 }
 
 /**
+ * Reads a strict semver version, as npm's `semver.valid` accepts it, without build metadata and with
+ * every numeric part a safe integer.
+ * @param {unknown} version `X.Y.Z` or `X.Y.Z-pre`
+ * @returns {{ core: number[], pre: string[] }|null} null when the version is not that
+ */
+const parseVersion = (version) => {
+  const match =
+    typeof version === 'string' && version.length <= MAX_VERSION_LENGTH && SEMVER.exec(version)
+  if (!match) return null
+  const core = match.slice(1, 4).map(Number)
+  const pre = match[4] ? match[4].split('.') : []
+  const numeric = [...core, ...pre.filter((id) => /^\d+$/.test(id)).map(Number)]
+  return numeric.every(Number.isSafeInteger) ? { core, pre } : null
+}
+
+/**
+ * Semver precedence: the numeric core, then a version without a pre-release above one with it, then
+ * pre-release identifiers left to right (numeric ones numerically and below alphanumeric ones).
+ * @param {{ core: number[], pre: string[] }} a
+ * @param {{ core: number[], pre: string[] }} b
+ * @returns {number} negative, zero or positive as `a` is below, equal to or above `b`
+ */
+const compareVersions = (a, b) => {
+  for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i]
+  if (a.pre.length === 0 || b.pre.length === 0) return b.pre.length - a.pre.length
+  for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+    const [x, y] = [a.pre[i], b.pre[i]]
+    if (x === y) continue
+    const [xn, yn] = [/^\d+$/.test(x), /^\d+$/.test(y)]
+    if (xn && yn) return Number(x) - Number(y)
+    if (xn || yn) return xn ? -1 : 1
+    return x < y ? -1 : 1
+  }
+  return a.pre.length - b.pre.length
+}
+
+/**
+ * Whether a version satisfies an npm range, with npm's default pre-release rule: a pre-release only
+ * matches a comparator set that names a pre-release of the same `X.Y.Z`. Only `||` and space-joined
+ * `>=`, `>`, `<=`, `<`, `=` comparators are read; a partial version is accepted after `>=` (missing
+ * parts are 0) and `<` (`<4` is `<4.0.0-0`). Any other syntax is refused rather than guessed.
+ * @param {string} version
+ * @param {string} range
+ * @returns {boolean}
+ * @throws {ReleaseVerificationError} for a version or range this reader does not accept
+ */
+const satisfies = (version, range) => {
+  const target = parseVersion(version)
+  if (!target) fail(7, `version ${JSON.stringify(version)} is not X.Y.Z or X.Y.Z-pre`)
+  const comparator = (text) => {
+    const [, op = '=', bound] = COMPARATOR.exec(text) ?? []
+    const partial = (op === '>=' || op === '<') && PARTIAL.exec(bound)
+    if (partial) {
+      const core = [partial[1], partial[2] ?? 0, 0].map(Number)
+      if (core.every(Number.isSafeInteger))
+        return { op, bound: { core, pre: op === '<' ? ['0'] : [] } }
+    }
+    const version = parseVersion(bound)
+    if (!version) {
+      fail(7, `the peer range ${JSON.stringify(range)} uses syntax this verifier does not read`)
+    }
+    return { op, bound: version }
+  }
+  const holds = ({ op, bound }) => OPERATORS[op](compareVersions(target, bound))
+  return range.split('||').some((set) => {
+    const comparators = set.trim().split(/\s+/).filter(Boolean).map(comparator)
+    if (comparators.length === 0)
+      fail(7, `the peer range ${JSON.stringify(range)} has an empty set`)
+    const preAllowed =
+      target.pre.length === 0 ||
+      comparators.some(
+        ({ bound }) =>
+          bound.pre.length > 0 && bound.core.every((part, i) => part === target.core[i])
+      )
+    return preAllowed && comparators.every(holds)
+  })
+}
+
+/**
+ * Pre-pack checks of the OTel package's manifest: its name and version (6), its `@countly/kafkajs` peer
+ * range includes the main version (7), and on the final tag the registry does not hold that version yet
+ * (8). The registry is read only on the final tag, the one release that publishes the OTel package. Any
+ * existing copy stops the release, whatever its integrity or provenance: there is no automatic recovery,
+ * and the release owner reads the registry copy back by hand.
+ * @param {object} input
+ * @param {string} input.tag
+ * @param {string} input.mainVersion the verified main package version
+ * @param {{ name?: string, version?: string, peerDependencies?: Record<string, string> }} input.otelPackageJson
+ * @param {Lookup} input.lookup
+ * @returns {Promise<{ otelVersion: string }>}
+ * @throws {ReleaseVerificationError} naming the first rule that does not hold
+ */
+const verifyOtelManifest = async ({ tag, mainVersion, otelPackageJson, lookup }) => {
+  const { name, version, peerDependencies = {} } = otelPackageJson
+  if (name !== OTEL_NAME) fail(6, `otel/package.json names ${name}, not ${OTEL_NAME}`)
+  if (!parseVersion(version)) {
+    fail(6, `otel/package.json version ${JSON.stringify(version)} is not X.Y.Z or X.Y.Z-pre`)
+  }
+  const range = peerDependencies[MAIN_NAME]
+  if (typeof range !== 'string' || !satisfies(mainVersion, range)) {
+    fail(7, `the ${MAIN_NAME} peer range ${JSON.stringify(range)} does not include ${mainVersion}`)
+  }
+  if (tag === OTEL_PUBLISH_TAG && (await lookup(OTEL_NAME, version))) {
+    fail(
+      8,
+      `${OTEL_NAME}@${version} is already on the registry; automatic recovery is disabled, so complete the integrity and verified-provenance readback in RELEASING.md and do not publish it again`
+    )
+  }
+  return { otelVersion: version }
+}
+
+/**
+ * Post-pack checks: each tarball holds its package's name and the checkout's version (9), and the main
+ * tarball is byte-identical to the one the pack job recorded (10).
+ * @param {object} input
+ * @param {PackedTarball} input.main
+ * @param {PackedTarball} input.otel
+ * @param {string} input.recordedMainSri the SRI the pack job wrote
+ * @returns {{ otelVersion: string }}
+ * @throws {ReleaseVerificationError} naming the first rule that does not hold
+ */
+const verifyPackedTarballs = ({ main, otel, recordedMainSri }) => {
+  for (const [{ manifest, packed }, expected] of [
+    [main, MAIN_NAME],
+    [otel, OTEL_NAME],
+  ]) {
+    if (
+      packed.name !== expected ||
+      manifest.name !== expected ||
+      packed.version !== manifest.version
+    ) {
+      fail(
+        9,
+        `a tarball holds ${packed.name}@${packed.version}, expected ${expected}@${manifest.version}`
+      )
+    }
+  }
+  if (main.sri !== recordedMainSri) {
+    fail(10, `the main tarball is ${main.sri}, but the pack job recorded ${recordedMainSri}`)
+  }
+  return { otelVersion: otel.packed.version }
+}
+
+/**
+ * Builds a `Lookup` over the public npm registry's version document.
+ * @param {{ fetch?: typeof fetch }} [options] `fetch` is the test seam
+ * @returns {Lookup} resolves false on 404 and true on any 2xx answer
+ * @throws {ReleaseVerificationError} from the returned function on any other answer
+ */
+const createRegistry =
+  ({ fetch: request = globalThis.fetch } = {}) =>
+  async (name, version) => {
+    const url = `${REGISTRY}/${name.replace('/', '%2f')}/${version}`
+    const response = await request(url)
+    if (response.status === 404) return false
+    if (!response.ok) fail(undefined, `the registry answered ${response.status} for ${url}`)
+    return true
+  }
+
+/**
  * Builds a `listRuns` over the GitHub REST API. Each call requests pages 1, 2, … (100 runs per page) and
  * joins them, stopping at the first page with fewer than 100 runs.
  * @param {{ repository: string, token: string, fetch?: typeof fetch }} options `fetch` is the test seam
@@ -227,17 +421,62 @@ const ancestorOfMaster = (cwd) => (sha) => {
 }
 
 /**
- * Command line: verifies the tag that triggered the workflow in the checked-out repository, then appends
- * `version=`, `dist-tag=` and `sha=` (the commit that was judged) to `$GITHUB_OUTPUT`. Nothing is written
- * when verification fails.
+ * @param {string} file a gzip tarball
+ * @returns {object} its package/package.json
+ * @throws {ReleaseVerificationError} when tar cannot read it
+ */
+const readPackedManifest = (file) => {
+  const result = spawnSync('tar', ['-xOzf', file, 'package/package.json'], { encoding: 'utf8' })
+  if (result.status !== 0) fail(9, `cannot read package/package.json from ${file}`)
+  return JSON.parse(result.stdout)
+}
+
+/** @param {string} file @returns {string} its `sha512-<base64>` integrity, as npm computes it */
+const sriOf = (file) =>
+  `sha512-${crypto.createHash('sha512').update(fs.readFileSync(file)).digest('base64')}`
+
+/**
+ * Command line, post-pack mode: checks the two packed tarballs; writes nothing.
+ * @param {(name: string) => string} need reads a required environment variable
+ * @param {string} workspace
+ * @param {string[]} files `[main tgz, otel tgz]`
+ * @throws {ReleaseVerificationError} for a wrong argument count or a failing rule
+ */
+const postPack = (need, workspace, files) => {
+  if (files.length !== 2) fail(undefined, 'usage: verify.js --post-pack <main tgz> <otel tgz>')
+  const [tag, recordedMainSri] = ['GITHUB_REF_NAME', 'MAIN_SRI'].map(need)
+  const readJson = (file) => JSON.parse(fs.readFileSync(path.join(workspace, file), 'utf8'))
+  const tarball = (file, manifest) => ({
+    manifest,
+    packed: readPackedManifest(file),
+    sri: sriOf(file),
+  })
+  const { otelVersion } = verifyPackedTarballs({
+    main: tarball(files[0], readJson('package.json')),
+    otel: tarball(files[1], readJson('otel/package.json')),
+    recordedMainSri,
+  })
+  console.log(`verified the packed tarballs for ${tag}: OTel ${otelVersion}`)
+}
+
+/**
+ * Command line. With no argument, verifies the tag that triggered the workflow in the checked-out
+ * repository and the OTel manifest, then appends `version=`, `dist-tag=`, `sha=` (the commit that was
+ * judged) and `otel-version=` to `$GITHUB_OUTPUT`; nothing is written when verification fails. With
+ * `--post-pack <main tgz> <otel tgz>`, runs the post-pack checks instead (needs GITHUB_REF_NAME and
+ * MAIN_SRI).
  * @param {Record<string, string|undefined>} [env] needs GITHUB_REF_NAME, GITHUB_SHA, GITHUB_REPOSITORY,
  *   GITHUB_TOKEN and GITHUB_OUTPUT; GITHUB_WORKSPACE defaults to the current directory
+ * @param {string[]} [args] command-line arguments
  * @returns {Promise<void>}
  * @throws {ReleaseVerificationError} when a variable is missing, the checkout is not at the tagged
  *   commit, or a rule fails
  */
-const main = async (env = process.env) => {
+const main = async (env = process.env, args = process.argv.slice(2)) => {
   const need = (name) => env[name] || fail(undefined, `${name} is not set`)
+  const workspace = env.GITHUB_WORKSPACE || process.cwd()
+  if (args[0] === '--post-pack') return postPack(need, workspace, args.slice(1))
+
   const [tag, eventSha, repository, token, output] = [
     'GITHUB_REF_NAME',
     'GITHUB_SHA',
@@ -246,23 +485,34 @@ const main = async (env = process.env) => {
     'GITHUB_OUTPUT',
   ].map(need)
   if (!COMMIT_PATTERN.test(eventSha)) fail(undefined, 'GITHUB_SHA is not a 40-hex commit id')
-  const workspace = env.GITHUB_WORKSPACE || process.cwd()
 
   // An annotated tag's object id peels to the commit it points at.
   const sha = gitOutput(workspace, ['rev-parse', '--verify', `${eventSha}^{commit}`])
   const head = gitOutput(workspace, ['rev-parse', 'HEAD'])
   if (head !== sha) fail(undefined, `the checkout is at ${head}, not at the tagged commit ${sha}`)
 
+  const readJson = (file) => JSON.parse(fs.readFileSync(path.join(workspace, file), 'utf8'))
   const { version, distTag } = await verifyRelease({
     tag,
     sha,
-    packageJson: JSON.parse(fs.readFileSync(path.join(workspace, 'package.json'), 'utf8')),
+    packageJson: readJson('package.json'),
     changelog: fs.readFileSync(path.join(workspace, 'CHANGELOG.md'), 'utf8'),
     isOnMaster: ancestorOfMaster(workspace),
     listRuns: createListRuns({ repository, token }),
   })
-  fs.appendFileSync(output, `version=${version}\ndist-tag=${distTag}\nsha=${sha}\n`)
-  console.log(`verified ${tag} at ${sha}: version ${version}, dist-tag ${distTag}`)
+  const { otelVersion } = await verifyOtelManifest({
+    tag,
+    mainVersion: version,
+    otelPackageJson: readJson('otel/package.json'),
+    lookup: createRegistry(),
+  })
+  fs.appendFileSync(
+    output,
+    `version=${version}\ndist-tag=${distTag}\nsha=${sha}\notel-version=${otelVersion}\n`
+  )
+  console.log(
+    `verified ${tag} at ${sha}: version ${version}, dist-tag ${distTag}, OTel ${otelVersion}`
+  )
 }
 
 if (require.main === module) {
@@ -276,4 +526,13 @@ if (require.main === module) {
   })
 }
 
-module.exports = { verifyRelease, distTagOf, createListRuns, ReleaseVerificationError, main }
+module.exports = {
+  verifyRelease,
+  distTagOf,
+  createListRuns,
+  createRegistry,
+  verifyOtelManifest,
+  verifyPackedTarballs,
+  ReleaseVerificationError,
+  main,
+}

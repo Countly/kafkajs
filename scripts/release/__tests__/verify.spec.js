@@ -1,4 +1,5 @@
 const { execFileSync, spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -6,6 +7,8 @@ const {
   verifyRelease,
   distTagOf,
   createListRuns,
+  createRegistry,
+  verifyOtelManifest,
   ReleaseVerificationError,
   main,
 } = require('../verify')
@@ -17,6 +20,30 @@ const TAG = `v${VERSION}`
 const CHANGELOG = `# Changelog\n\n## Unreleased — 3.0.0\n\n## ${VERSION} — 2026-11-20\n`
 const TOKEN = 'ghs_never_print_this_token'
 const REPOSITORY = 'Countly/kafkajs'
+const MAIN_NAME = '@countly/kafkajs'
+const OTEL_NAME = '@countly/opentelemetry-instrumentation-kafkajs'
+const OTEL_VERSION = '0.1.1'
+const PEER_RANGE = '>=3.0.0-0 <4'
+const FINAL = { tag: 'v3.0.0', mainVersion: '3.0.0' }
+
+const otelManifest = (overrides = {}) => ({
+  name: OTEL_NAME,
+  version: OTEL_VERSION,
+  peerDependencies: { [MAIN_NAME]: PEER_RANGE, '@opentelemetry/api': '^1.3.0' },
+  ...overrides,
+})
+const sriOf = (bytes) => `sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`
+
+/** A registry lookup that answers `published` for every version and records its calls. */
+const fakeLookup = (published = false) => {
+  const calls = []
+  const lookup = async (name, version) => {
+    calls.push([name, version])
+    return published
+  }
+  lookup.calls = calls
+  return lookup
+}
 
 let nextId = 1
 const run = (overrides = {}) => ({
@@ -291,6 +318,112 @@ describe('verifyRelease', () => {
   })
 })
 
+describe('the OTel package', () => {
+  const checkOtel = (overrides = {}) =>
+    verifyOtelManifest({
+      tag: TAG,
+      mainVersion: VERSION,
+      otelPackageJson: otelManifest(),
+      lookup: fakeLookup(),
+      ...overrides,
+    })
+
+  test('pre-pack mode checks manifests, versions and the peer range without any tarball', async () => {
+    const rcLookup = fakeLookup()
+    await expect(checkOtel({ lookup: rcLookup })).resolves.toEqual({ otelVersion: OTEL_VERSION })
+    expect(rcLookup.calls).toEqual([])
+
+    const finalLookup = fakeLookup()
+    await expect(checkOtel({ ...FINAL, lookup: finalLookup })).resolves.toEqual({
+      otelVersion: OTEL_VERSION,
+    })
+    expect(finalLookup.calls).toEqual([[OTEL_NAME, OTEL_VERSION]])
+
+    for (const version of ['1.0.0', '0.1.1-rc.0', '0.1.1-alpha.9f', '0.1.1-0a', '0.1.1-x-y']) {
+      await expect(checkOtel({ otelPackageJson: otelManifest({ version }) })).resolves.toEqual({
+        otelVersion: version,
+      })
+    }
+    for (const otelPackageJson of [
+      otelManifest({ version: undefined }),
+      otelManifest({ version: '0.1' }),
+      otelManifest({ version: 'v0.1.1' }),
+      otelManifest({ version: '0.1.1+build' }),
+      otelManifest({ version: '01.1.1' }),
+      otelManifest({ version: '0.01.1' }),
+      otelManifest({ version: '0.1.1-rc..0' }),
+      otelManifest({ version: '0.1.1-01' }),
+      otelManifest({ version: '0.1.1-.' }),
+      otelManifest({ version: '0.1.1-' }),
+      otelManifest({ version: '9007199254740992.0.0' }),
+      otelManifest({ name: 'kafkajs-otel' }),
+    ]) {
+      await expectRule(checkOtel({ otelPackageJson }), 6)
+    }
+  })
+
+  test('rejects a peer range that excludes the main version', async () => {
+    const withPeer = (range) =>
+      otelManifest({ peerDependencies: range === undefined ? {} : { [MAIN_NAME]: range } })
+    for (const [range, mainVersion] of [
+      ['>=3.0.0 <4', '3.0.0-rc.1'],
+      ['>=2.0.0 <4', '3.0.0-rc.1'],
+      ['>=4.0.0-alpha <4', '4.0.0-beta'],
+      ['>=3.0.0-0 <3.0.0-rc.1', '3.0.0-rc.1'],
+      [PEER_RANGE, '4.0.0-rc.1'],
+      [PEER_RANGE, '4.0.0'],
+      [PEER_RANGE, '2.2.4'],
+      ['>=3.1', '3.0.0'],
+      ['^3.0.0', '3.0.0'],
+      ['3.x', '3.0.0'],
+      ['>=03.0.0 <4', '3.0.0'],
+      ['>=3.0.0-rc..0 <4', '3.0.0'],
+      ['>=3.0.0-01 <4', '3.0.0-1'],
+      ['', '3.0.0'],
+      [undefined, '3.0.0'],
+    ]) {
+      await expectRule(checkOtel({ mainVersion, otelPackageJson: withPeer(range) }), 7)
+    }
+    for (const [range, mainVersion] of [
+      [PEER_RANGE, '3.0.0-rc.1'],
+      [PEER_RANGE, '3.0.0-alpha.9f'],
+      [PEER_RANGE, '3.0.0'],
+      [PEER_RANGE, '3.9.1'],
+      ['<2 || >=3.0.0', '3.0.0'],
+      ['=3.0.0-rc.1', '3.0.0-rc.1'],
+    ]) {
+      await expect(checkOtel({ mainVersion, otelPackageJson: withPeer(range) })).resolves.toEqual({
+        otelVersion: OTEL_VERSION,
+      })
+    }
+  })
+
+  test('rejects a v3.0.0 OTel version that is already on the registry, whatever its integrity or provenance', async () => {
+    const requested = []
+    const registry = (status) =>
+      createRegistry({
+        fetch: async (url) => {
+          requested.push(String(url))
+          return Response.json({ dist: { integrity: 'sha512-any' } }, { status })
+        },
+      })
+    await expect(checkOtel({ ...FINAL, lookup: registry(404) })).resolves.toEqual({
+      otelVersion: OTEL_VERSION,
+    })
+    await expectRule(checkOtel({ ...FINAL, lookup: registry(200) }), 8, /already on the registry/)
+    await expect(checkOtel({ ...FINAL, lookup: registry(500) })).rejects.toThrow(/500/)
+    expect(requested).toEqual(
+      Array(3).fill(
+        `https://registry.npmjs.org/@countly%2fopentelemetry-instrumentation-kafkajs/${OTEL_VERSION}`
+      )
+    )
+
+    const rcLookup = fakeLookup(true)
+    await expect(checkOtel({ lookup: rcLookup })).resolves.toEqual({ otelVersion: OTEL_VERSION })
+    expect(rcLookup.calls).toEqual([])
+  })
+})
+
 describe('distTagOf', () => {
   test.each([
     ['3.0.0-rc.1', 'next'],
@@ -462,8 +595,10 @@ describe('main', () => {
   const makeRepo = ({ version = VERSION, changelog = CHANGELOG } = {}) => {
     const dir = sandbox()
     git(dir, 'init', '-q', '-b', 'master')
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version }))
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: MAIN_NAME, version }))
     fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog)
+    fs.mkdirSync(path.join(dir, 'otel'))
+    fs.writeFileSync(path.join(dir, 'otel', 'package.json'), JSON.stringify(otelManifest()))
     git(dir, 'add', '.')
     git(dir, 'commit', '-q', '-m', 'release')
     const sha = git(dir, 'rev-parse', 'HEAD')
@@ -507,8 +642,9 @@ describe('main', () => {
     const env = environment(repo)
     await main(env)
     expect(fs.readFileSync(env.GITHUB_OUTPUT, 'utf8')).toBe(
-      `version=${VERSION}\ndist-tag=next\nsha=${repo.sha}\n`
+      `version=${VERSION}\ndist-tag=next\nsha=${repo.sha}\notel-version=${OTEL_VERSION}\n`
     )
+    expect(fs.readdirSync(repo.dir).filter((file) => file.endsWith('.tgz'))).toEqual([])
     expect(JSON.stringify(writes)).not.toContain(TOKEN)
   })
 
@@ -567,6 +703,60 @@ describe('main', () => {
     const env = environment(repo)
     await expectRule(main(env), 3)
     expect(fs.existsSync(env.GITHUB_OUTPUT)).toBe(false)
+  })
+
+  describe('post-pack mode', () => {
+    /** Writes a gzip tarball whose package/package.json holds `manifest` and returns its path. */
+    const tarball = (file, manifest) => {
+      const content = sandbox()
+      fs.mkdirSync(path.join(content, 'package'))
+      fs.writeFileSync(path.join(content, 'package', 'package.json'), JSON.stringify(manifest))
+      const target = path.join(sandbox(), file)
+      execFileSync('tar', ['-czf', target, '-C', content, 'package'])
+      return target
+    }
+    const postPack = (repo, { mainManifest, otelManifest: otel, mainSri } = {}) => {
+      const mainTgz = tarball('main.tgz', mainManifest ?? { name: MAIN_NAME, version: VERSION })
+      const otelTgz = tarball('otel.tgz', otel ?? otelManifest())
+      const env = {
+        GITHUB_REF_NAME: TAG,
+        GITHUB_WORKSPACE: repo.dir,
+        MAIN_SRI: mainSri ?? sriOf(fs.readFileSync(mainTgz)),
+      }
+      return {
+        run: (args = [mainTgz, otelTgz]) => main(env, ['--post-pack', ...args]),
+        mainTgz,
+        otelTgz,
+      }
+    }
+
+    test('post-pack mode rejects an OTel tarball whose name or version differs from its manifest', async () => {
+      const repo = makeRepo()
+      await expect(postPack(repo).run()).resolves.toBeUndefined()
+      await expectRule(
+        postPack(repo, { otelManifest: otelManifest({ version: '0.1.2' }) }).run(),
+        9
+      )
+      await expectRule(
+        postPack(repo, { otelManifest: otelManifest({ name: 'other-otel' }) }).run(),
+        9
+      )
+      await expectRule(
+        postPack(repo, { mainManifest: { name: MAIN_NAME, version: '3.0.0-rc.2' } }).run(),
+        9
+      )
+      const swapped = postPack(repo)
+      await expectRule(swapped.run([swapped.otelTgz, swapped.mainTgz]), 9)
+    })
+
+    test("post-pack mode rejects a main tarball whose SRI differs from the pack job's record", async () => {
+      const repo = makeRepo()
+      await expectRule(postPack(repo, { mainSri: sriOf('a different main tarball') }).run(), 10)
+      await expect(postPack(repo, { mainSri: '' }).run()).rejects.toThrow(/MAIN_SRI/)
+      const { run, mainTgz, otelTgz } = postPack(repo)
+      await expect(run([mainTgz])).rejects.toThrow(/usage/)
+      await expect(run([mainTgz, otelTgz, otelTgz])).rejects.toThrow(/usage/)
+    })
   })
 
   test('the command line exits non-zero and names the problem without a stack', () => {
