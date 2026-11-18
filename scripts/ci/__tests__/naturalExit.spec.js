@@ -10,6 +10,35 @@ const SHUTDOWN_CASES = [
   'connect during disconnect reconnects only after DISCONNECT',
 ]
 const SHUTDOWN_TOTAL_MS = 335000
+const ORDINARY_SPEC = 'src/__tests__/naturalExitLive.spec.js'
+const ORDINARY_CASES = [
+  'classic dynamic consumer consumes one message and disconnects',
+  'classic static consumer keeps its group slot after disconnect',
+  'consumer-protocol dynamic consumer consumes one message and disconnects',
+  'consumer-protocol static consumer consumes one message and disconnects',
+  'idempotent producer sends one message and disconnects',
+  'transactional producer commits one message and disconnects',
+  'admin creates and describes a topic and disconnects',
+]
+const ORDINARY_TOTAL_MS = 364000
+const CONTROL_CASES = ['leaves one interval alive after its producer disconnects']
+const CONTROL_TOTAL_MS = 42000
+const STEMS = {
+  soak: 'share-soak',
+  'soak-full': 'share-soak-full',
+  shutdown: 'share-shutdown',
+  ordinary: 'natural-exit-ordinary',
+}
+/** @param {string} spec Repository path of the live spec. @returns {string[]} The fixed child argv. */
+const jestChild = (spec) => [
+  'node_modules/jest/bin/jest.js',
+  '--ci',
+  '--detectOpenHandles',
+  '--runInBand',
+  '--reporters=./testHelpers/quietReporter.js',
+  '--runTestsByPath',
+  spec,
+]
 
 /**
  * Adds the independently sealed first-use completion before the original scored cleanup row.
@@ -67,14 +96,31 @@ const withPriming = (rows) => {
 
 /**
  * Supplies only the OS boundary: the production parent still parses and validates the JSONL.
- * @param {'soak'|'shutdown'} lane CI lane.
+ * @param {'soak'|'soak-full'|'shutdown'|'ordinary'} lane CI lane.
+ * @param {{control?: boolean}} [options] Runs the ordinary lane's seeded-timer control.
  * @returns {object} Mutable original timestamps, child result, evidence and captured artifacts.
  */
-const fixture = (lane) => {
+const fixture = (lane, { control = false } = {}) => {
+  const soak = lane === 'soak' || lane === 'soak-full'
   const profile = lane === 'soak' ? PROFILES.short : PROFILES.full
-  const totalMs = lane === 'shutdown' ? SHUTDOWN_TOTAL_MS : profile.totalMs
+  const stem = control ? 'natural-exit-ordinary-control' : STEMS[lane]
+  const totalMs =
+    lane === 'shutdown'
+      ? SHUTDOWN_TOTAL_MS
+      : lane === 'ordinary'
+        ? control
+          ? CONTROL_TOTAL_MS
+          : ORDINARY_TOTAL_MS
+        : profile.totalMs
   const completedAt = 1000 + totalMs - 10000
-  const cases = lane === 'shutdown' ? SHUTDOWN_CASES : [SOAK_CASE]
+  const cases =
+    lane === 'shutdown'
+      ? SHUTDOWN_CASES
+      : lane === 'ordinary'
+        ? control
+          ? CONTROL_CASES
+          : ORDINARY_CASES
+        : [SOAK_CASE]
   const state = {
     startedAt: 1000,
     exitedAt: 1000 + totalMs,
@@ -86,7 +132,7 @@ const fixture = (lane) => {
         case: title,
         status: 'passed',
         tainted: false,
-        ...(lane !== 'shutdown' && {
+        ...(soak && {
           profileMs: profile.profileMs,
           selector: profile.selector,
           soakProfile: profile.profile,
@@ -97,7 +143,7 @@ const fixture = (lane) => {
           groupsAbsent: true,
           topicsAbsent: true,
           completedAt: at,
-          ...(lane !== 'shutdown' && { clock: { origin: 'hrtime', completedAt: at } }),
+          ...(soak && { clock: { origin: 'hrtime', completedAt: at } }),
         },
       }
     }),
@@ -111,7 +157,7 @@ const fixture = (lane) => {
   const run = () =>
     runNaturalExit(lane, {
       spawn,
-      env: {},
+      env: control ? { NATURAL_EXIT_CONTROL: '1' } : {},
       now: () => (childReturned ? state.exitedAt : state.startedAt),
       readFile: (file, encoding) => {
         if (file === '.tmp/e2e/share-soak-jest.json')
@@ -130,11 +176,11 @@ const fixture = (lane) => {
               },
             ],
           })
-        if (file !== `.tmp/e2e/share-${lane}.jsonl` || encoding !== 'utf8')
+        if (file !== `.tmp/e2e/${stem}.jsonl` || encoding !== 'utf8')
           throw new Error('Wrong evidence input')
         return (
           state.text ??
-          (lane !== 'shutdown' ? withPriming(state.rows) : state.rows)
+          (soak ? withPriming(state.rows) : state.rows)
             .map((row) => JSON.stringify(row))
             .join('\n') + '\n'
         )
@@ -433,6 +479,103 @@ describe('CI natural exit > shutdown cleanup order', () => {
     reordered.state.rows[2].case = fourth
     reordered.state.rows[3].case = third
     expect(reordered.run).toThrow('shutdown: incomplete or invalid cleanup evidence')
+  })
+})
+
+describe('CI natural exit > ordinary clients', () => {
+  test('ordinary lane names its spec and cases', () => {
+    const { state, artifacts, spawn, run } = fixture('ordinary')
+    expect(run()).toMatchObject({
+      accepted: true,
+      control: false,
+      totalMs: ORDINARY_TOTAL_MS,
+      cleanupAt: state.rows.at(-1).cleanup.completedAt,
+    })
+    expect(spawn).toHaveBeenCalledWith(process.execPath, jestChild(ORDINARY_SPEC), {
+      stdio: 'inherit',
+      timeout: ORDINARY_TOTAL_MS,
+      killSignal: 'SIGKILL',
+    })
+    expect(artifacts.get('.tmp/e2e/natural-exit-ordinary-exit.json')).toMatchObject({
+      lane: 'ordinary',
+      control: false,
+      accepted: true,
+      argv: jestChild(ORDINARY_SPEC),
+    })
+
+    const missingStatic = fixture('ordinary')
+    missingStatic.state.rows.splice(1, 1)
+    expect(missingStatic.run).toThrow('ordinary: incomplete or invalid cleanup evidence')
+  })
+
+  test('ordinary control run is reported as a failure', () => {
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const { spawnSync } = require('node:child_process')
+    const clean = fixture('ordinary', { control: true })
+    expect(clean.run()).toMatchObject({ accepted: true, control: true, totalMs: CONTROL_TOTAL_MS })
+    expect(clean.spawn.mock.calls[0][2].timeout).toBe(CONTROL_TOTAL_MS)
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-control-'))
+    const artifacts = new Map()
+    const evidence = path.join(root, 'control.jsonl')
+    const child = `
+      const at = Number(process.hrtime.bigint() / 1000000n)
+      const row = { event: 'case-complete', case: ${JSON.stringify(CONTROL_CASES[0])},
+        status: 'passed', tainted: false, cleanup: { completedAt: at } }
+      require('node:fs').writeFileSync(${JSON.stringify(evidence)}, JSON.stringify(row) + '\\n')
+      setInterval(() => {}, 10)
+    `
+    try {
+      const run = () =>
+        runNaturalExit('ordinary', {
+          env: { NATURAL_EXIT_CONTROL: '1' },
+          // Only the watchdog is shortened; the recorded argv stays the fixed control child.
+          spawn: (executable, argv, options) =>
+            spawnSync(executable, ['-e', child], { ...options, stdio: 'ignore', timeout: 500 }),
+          readFile: () => fs.readFileSync(evidence, 'utf8'),
+          writeFile: (name, text) => artifacts.set(name, JSON.parse(text)),
+        })
+      expect(run).toThrow('ordinary: unsuccessful child exit')
+      expect(fs.readFileSync(evidence, 'utf8')).toContain(CONTROL_CASES[0])
+      expect(artifacts.get('.tmp/e2e/natural-exit-ordinary-control-exit.json')).toMatchObject({
+        lane: 'ordinary',
+        control: true,
+        accepted: false,
+        watchdogTerminated: true,
+        totalMs: CONTROL_TOTAL_MS,
+        argv: jestChild(ORDINARY_SPEC),
+        rejection: 'ordinary: unsuccessful child exit',
+      })
+      expect(artifacts.has('.tmp/e2e/natural-exit-ordinary-exit.json')).toBe(false)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('ordinary lane leaves the four-case shutdown inventory unchanged', () => {
+    const shutdown = fixture('shutdown')
+    expect(shutdown.run()).toMatchObject({ accepted: true, totalMs: SHUTDOWN_TOTAL_MS })
+    expect(shutdown.spawn).toHaveBeenCalledWith(
+      process.execPath,
+      jestChild('src/consumer/share/__tests__/shareShutdownLive.spec.js'),
+      { stdio: 'inherit', timeout: SHUTDOWN_TOTAL_MS, killSignal: 'SIGKILL' }
+    )
+    expect(shutdown.artifacts.get('.tmp/e2e/share-shutdown-exit.json')).not.toHaveProperty(
+      'control'
+    )
+
+    const ordinary = fixture('ordinary')
+    ordinary.state.rows = ordinary.state.rows.slice(0, 4).map((row, index) => ({
+      ...row,
+      case: SHUTDOWN_CASES[index],
+    }))
+    expect(ordinary.run).toThrow('ordinary: incomplete or invalid cleanup evidence')
+
+    const extra = fixture('shutdown')
+    extra.state.rows.push({ ...extra.state.rows[3], case: ORDINARY_CASES[0] })
+    expect(extra.run).toThrow('shutdown: incomplete or invalid cleanup evidence')
   })
 })
 
