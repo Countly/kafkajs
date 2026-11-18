@@ -150,7 +150,7 @@ live('Share consumer over SASL PLAIN', () => {
     expect(error.retriable).toBe(false)
     expect(`${error.message}\n${error.stack}`).not.toContain(SECRET)
     expect(restart).toBe(false)
-    expect(asked).toBeLessThanOrEqual(1)
+    expect(asked).toBe(1)
     expect(crashes).toHaveLength(1)
     expect(chaos.sockets).toHaveLength(opened)
   }, 150000)
