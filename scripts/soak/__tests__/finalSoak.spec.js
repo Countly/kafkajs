@@ -1,29 +1,49 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { EventEmitter } = require('node:events')
+const { AsyncLocalStorage } = require('node:async_hooks')
 const { spawnSync } = require('node:child_process')
+const yaml = require('js-yaml')
 const SubscriptionState = require('../../../src/consumer/subscriptionState')
-const { CLIENT_KINDS, SHAPES, validateConfig, validateRecord } = require('../finalSoakSchema')
+const ConsumerGroup = require('../../../src/consumer/consumerGroup')
+const GroupOwnership = require('../../../src/consumer/groupOwnership')
+const OffsetOperations = require('../../../src/consumer/offsetManager/offsetOperations')
+const ResetObligations = require('../../../src/consumer/offsetManager/resetObligations')
+const SeekOffsets = require('../../../src/consumer/seekOffsets')
+const dictionary = require('../../../src/utils/dictionary')
+const handlerContext = require('../../../src/consumer/handlerContext')
+const ISOLATION = require('../../../src/protocol/isolationLevel')
+const { ShareAckLedger } = require('../../../src/consumer/share/shareAckLedger')
+const shareFetchV2 = require('../../../testHelpers/wire/shareFetchV2')
 const {
-  parseArgs,
-  buildConfig,
-  planSchedule,
-  scheduleTotals,
-  Scheduler,
-  Collector,
-  SourceChannel,
-  Sampler,
-  PassiveObserver,
-} = require('../finalSoak')
+  CLIENT_KINDS,
+  SHAPES,
+  validateConfig,
+  validateMatrix,
+  validateRecord,
+} = require('../finalSoakSchema')
+const { parseArgs, buildConfig, recipientGroups } = require('../finalSoak')
+const { planSchedule, scheduleTotals, Scheduler, SamplingGate } = require('../finalSoakScheduler')
+const { Collector, SourceChannel, Sampler, HostMonitor } = require('../finalSoakCollector')
+const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('../finalSoakObserver')
+const { offeredRecord, parseValue, scanPartition, DecoderWorker } = require('../finalSoakWorkers')
 const { Preflight } = require('../finalSoakPreflight')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
+const ROOT = path.join(__dirname, '../../..')
 const RUNBOOK = path.join(__dirname, '../finalSoakNode.sh')
+const WORKFLOW = path.join(ROOT, '.github/workflows/final-soak-smoke.yml')
 const TREE = 'b'.repeat(40)
 const RUN = '0123456789ab'
 const GIB = 1024 ** 3
 const ENV = { KAFKA_BROKERS: 'localhost:19092,localhost:19095,localhost:19098' }
 const ARGS = ['--out', '/var/run/final-soak', '--expect-sha', TREE]
+const IDS = {
+  A: 'AAAAAAAAAAAAAAAAAAAAAA',
+  B: 'BBBBBBBBBBBBBBBBBBBBBB',
+  C: 'CCCCCCCCCCCCCCCCCCCCCC',
+}
 const kindsWhere = (predicate) => CLIENT_KINDS.filter((k) => predicate(matrix.clientKinds[k]))
 const recipients = (role) => matrix.topology.topics.find((t) => t.role === role).recipients
 const sorted = (list) => [...list].sort()
@@ -39,9 +59,16 @@ class VirtualClock {
     return this.t
   }
 
-  sleepUntil(at) {
-    if (at <= this.t) return Promise.resolve()
-    return new Promise((resolve) => this.sleepers.push({ at, resolve }))
+  sleepUntil(at, signal) {
+    if (at <= this.t || signal?.aborted) return Promise.resolve()
+    return new Promise((resolve) => {
+      const sleeper = { at, resolve }
+      this.sleepers.push(sleeper)
+      signal?.addEventListener('abort', () => {
+        this.sleepers = this.sleepers.filter((s) => s !== sleeper)
+        resolve()
+      })
+    })
   }
 
   async drive(done) {
@@ -60,6 +87,33 @@ class VirtualClock {
       next.resolve()
     }
   }
+}
+
+/**
+ * A consumer group made from the real prototype and the real collaborators the observer reads,
+ * without the network: the backing fields carry the product's own names.
+ */
+const realGroup = ({ groupId = 'g-1', kind = 'classic', topicIds }) => {
+  const group = Object.create(ConsumerGroup.prototype)
+  Object.assign(group, {
+    groupId,
+    runIdentity: {},
+    topicsSubscribed: [],
+    topicConfigurations: {},
+    preferredReadReplicasPerTopicPartition: dictionary(),
+    seekOffset: new SeekOffsets(),
+    acquired: new Map(),
+    acquireClock: 0,
+    haltedPartitions: new Map(),
+    ownership: new GroupOwnership(),
+    subscriptionState: new SubscriptionState(),
+    operations: new OffsetOperations(),
+    obligations: new ResetObligations(),
+    assignmentEpoch: 0,
+    groupMembership: { kind, grownTopicNames: new Set(), memberId: 'm1', generationId: 5 },
+    cluster: { topicId: (t) => topicIds[t] ?? null, targetTopics: new Set() },
+  })
+  return group
 }
 
 describe('final soak driver', () => {
@@ -176,6 +230,7 @@ describe('final soak driver', () => {
       requestedMs: 86400000,
       brokers: ENV.KAFKA_BROKERS.split(','),
       expectSha: TREE,
+      diagnostic: false,
     })
     expect(parseArgs(['--mode', 'smoke', '--duration', '1800000', ...ARGS], ENV).requestedMs).toBe(
       1800000
@@ -183,6 +238,10 @@ describe('final soak driver', () => {
     expect(() => parseArgs(['--mode', 'smoke', '--duration', '600000', ...ARGS], ENV)).toThrow(
       'the smoke length is fixed at 1800000 ms'
     )
+    expect(() => parseArgs(['--mode', 'acceptance', '--diagnostic', ...ARGS], ENV)).toThrow(
+      '--diagnostic is accepted only in smoke mode'
+    )
+    expect(parseArgs(['--mode', 'smoke', '--diagnostic', ...ARGS], ENV).diagnostic).toBe(true)
     expect(() => parseArgs(['--mode', 'acceptance', ...ARGS], {})).toThrow('KAFKA_BROKERS')
     expect(() => parseArgs(['--mode', 'day', ...ARGS], ENV)).toThrow('--mode')
   })
@@ -297,6 +356,7 @@ describe('final soak driver', () => {
       cluster: { brokers: [1, 2, 3] },
       share: { finalized: { 'share.version': { minVersionLevel: 1, maxVersionLevel: 1 } } },
       telemetry: {
+        subscription: { metrics: '*', intervalMs: '30000' },
         pushes: [
           { probe: 'producer', metrics: 12, decoded: true },
           { probe: 'consumer', metrics: 9, decoded: true },
@@ -314,8 +374,14 @@ describe('final soak driver', () => {
       },
       host: { memAvailable: 20 * GIB, freeDisk: 300 * GIB, load1m: 1, census: [] },
     })
-    const run = (facts) =>
-      new Preflight({ sha: facts.sha, mode: facts.mode, matrix, read: async () => facts }).run()
+    const run = (facts, diagnostic = false) =>
+      new Preflight({
+        sha: facts.sha,
+        mode: facts.mode,
+        matrix,
+        diagnostic,
+        read: async () => facts,
+      }).run()
     const ok = await run(healthy())
     expect(ok.failed).toEqual([])
     expect(ok.exitCode).toBe(0)
@@ -333,6 +399,12 @@ describe('final soak driver', () => {
     expect(await failing((f) => (f.git.head = 'c'.repeat(40)))).toEqual(['expected-sha'])
     expect(await failing((f) => (f.share.finalized = {}))).toEqual(['share-readback'])
     expect(await failing((f) => (f.telemetry.pushes[1].metrics = 0))).toEqual(['telemetry-proof'])
+    expect(await failing((f) => (f.telemetry.pushes[0].decoded = false))).toEqual([
+      'telemetry-proof',
+    ])
+    expect(await failing((f) => (f.telemetry.subscription.intervalMs = '300000'))).toEqual([
+      'telemetry-subscription',
+    ])
     expect(await failing((f) => (f.node = 'v20.11.0'))).toEqual(['node-version'])
     expect(await failing((f) => (f.cluster.brokers = [1, 2]))).toEqual(['cluster-ready'])
     expect(
@@ -344,6 +416,24 @@ describe('final soak driver', () => {
       'broker-provenance',
     ])
     expect(await failing((f) => (f.reporter.mounted = 'd'.repeat(64)))).toEqual(['reporter'])
+
+    const hosted = healthy()
+    hosted.mode = 'smoke'
+    hosted.host = { memAvailable: 9 * GIB, freeDisk: 20 * GIB, load1m: 4, census: [] }
+    const diagnostic = await run(hosted, true)
+    expect(diagnostic.failed).toEqual(['memory', 'disk', 'load'])
+    expect(diagnostic.exitCode).toBe(0)
+    expect(diagnostic.checks.filter((c) => !c.required).map((c) => c.name)).toEqual([
+      'quiet-host',
+      'memory',
+      'disk',
+      'load',
+    ])
+    hosted.share.finalized = {}
+    expect((await run(hosted, true)).exitCode).toBe(1)
+    expect(
+      () => new Preflight({ sha: TREE, mode: 'acceptance', matrix, diagnostic: true })
+    ).toThrow('--diagnostic is accepted only in smoke mode')
   })
 
   test('the runbook forwards SHA and mode to preflight and driver exactly', () => {
@@ -356,12 +446,13 @@ describe('final soak driver', () => {
         mode: 0o755,
       })
     }
-    const run = (args) =>
+    const run = (args, extra = {}) =>
       spawnSync('bash', [RUNBOOK, ...args], {
         env: {
           PATH: `${bin}:/usr/bin:/bin`,
           CALLS: log,
           FINAL_SOAK_ARTIFACTS: path.join(dir, 'artifacts'),
+          ...extra,
         },
         encoding: 'utf8',
       })
@@ -370,22 +461,41 @@ describe('final soak driver', () => {
       expect(result.stderr).toBe('')
       expect(result.status).toBe(0)
       const calls = fs.readFileSync(log, 'utf8').trim().split('\n')
-      const out = calls.find((c) => c.includes('finalSoakPreflight.js')).match(/--out (\S+)/)[1]
-      expect(calls).toContain(`git checkout --detach ${TREE}`)
-      expect(calls).toContain('npm ci --ignore-scripts')
+      const out = calls.find((c) => c.includes('--prepare-reporter')).match(/--out (\S+)/)[1]
+      const at = (call) => calls.indexOf(call)
+      expect(calls.slice(0, 6)).toEqual([
+        `git checkout --detach ${TREE}`,
+        'npm ci --ignore-scripts',
+        `node scripts/soak/finalSoakPreflight.js --prepare-reporter --out ${out}`,
+        'docker compose up -d --wait',
+        'node scripts/waitForKafka.js',
+        'docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092 describe',
+      ])
       expect(calls).toContain(
-        `node scripts/soak/finalSoakPreflight.js --expect-sha ${TREE} --mode smoke --out ${out}`
+        'docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092 upgrade --feature share.version=1'
       )
-      expect(calls).toContain(
-        `node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke --expect-sha ${TREE} --matrix scripts/soak/finalSoakMatrix.json --out ${out}`
+      const preflight = `node scripts/soak/finalSoakPreflight.js --expect-sha ${TREE} --mode smoke --out ${out}`
+      const driver = `node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke --expect-sha ${TREE} --matrix scripts/soak/finalSoakMatrix.json --out ${out}`
+      const finalize = `node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`
+      expect(at(preflight)).toBeGreaterThan(at('node scripts/waitForKafka.js'))
+      expect(at(driver)).toBeGreaterThan(at(preflight))
+      expect(at(finalize)).toBeGreaterThan(at(driver))
+      expect(at(`node scripts/soak/finalSoak.js --summary --out ${out}`)).toBeGreaterThan(
+        at(finalize)
       )
-      expect(calls).toContain(`node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`)
-      expect(
-        calls.indexOf(calls.find((c) => c.includes('compose') && c.includes(' down')))
-      ).toBeGreaterThan(calls.findIndex((c) => c.includes('--finalize')))
-      expect(calls.find((c) => c.startsWith('tar '))).toContain(out)
+      expect(at('docker compose down --volumes')).toBeGreaterThan(at(finalize))
+      expect(calls.find((c) => c.startsWith('tar '))).toContain(path.basename(out))
 
       fs.writeFileSync(log, '')
+      expect(run([TREE, 'smoke'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(0)
+      const diagnostic = fs.readFileSync(log, 'utf8').trim().split('\n')
+      expect(diagnostic.find((c) => c.includes('--expect-sha'))).toMatch(
+        /--mode smoke --out \S+ --diagnostic$/
+      )
+      expect(diagnostic.find((c) => c.includes('--expose-gc'))).toMatch(/--diagnostic$/)
+
+      fs.writeFileSync(log, '')
+      expect(run([TREE, 'acceptance'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(2)
       expect(run(['main', 'smoke']).status).toBe(2)
       expect(run([TREE, 'day']).status).toBe(2)
       expect(fs.readFileSync(log, 'utf8')).toBe('')
@@ -403,6 +513,7 @@ describe('final soak driver', () => {
     })
     expect(validateConfig(config, matrix)).toEqual([])
     expect(config.processes).toHaveLength(16)
+    expect(config.diagnostic).toBe(false)
     const subjects = config.clients.filter((c) => c.purpose === 'subject')
     expect(sorted(subjects.map((c) => c.clientKind))).toEqual(sorted(CLIENT_KINDS))
     expect(new Set(subjects.map((c) => c.process)).size).toBe(12)
@@ -422,9 +533,10 @@ describe('final soak driver', () => {
     ])
     const extras = config.clients.filter((c) => c.purpose === 'churn')
     expect(sorted(extras.map((c) => c.clientKind))).toEqual(sorted(kindsWhere((k) => k.churn)))
-    expect(
-      config.clients.filter((c) => c.purpose === 'observer').every((c) => c.group === null)
-    ).toBe(true)
+    expect(config.clients.filter((c) => c.purpose === 'observer')).toEqual([
+      expect.objectContaining({ slot: 'c21', process: 'p14', group: null }),
+      expect.objectContaining({ slot: 'c22', process: 'p15', group: null }),
+    ])
   })
 
   test('the scheduler marks late work failed and never shifts an idle window', async () => {
@@ -453,7 +565,7 @@ describe('final soak driver', () => {
       ['c', 'late'],
       ['q', 'ok'],
     ])
-    expect(summary).toEqual({ ok: 2, late: 3, error: 0 })
+    expect(summary).toEqual({ ok: 2, late: 3, error: 0, aborted: 0 })
   })
 
   test('each sample cuts its inventory, then takes two new collections at least 100 ms apart', async () => {
@@ -536,29 +648,32 @@ describe('final soak driver', () => {
     observer.restore()
     expect(Owner.prototype.later).toBe(promised)
 
-    const ids = { A: 'AAAAAAAAAAAAAAAAAAAAAA', B: 'BBBBBBBBBBBBBBBBBBBBBB' }
-    let current = ids.A
+    const topicIds = { whole: IDS.A, some: IDS.A, 'never-paused': IDS.A }
+    const context = new AsyncLocalStorage()
     const pauses = new PassiveObserver({
-      owners: { SubscriptionState },
+      owners: { ConsumerGroup, SubscriptionState },
       watched: {
+        ConsumerGroup: ['retainSubscription'],
         SubscriptionState: ['pause', 'resume', 'retainTopics', 'retireTopic', 'clearPauses'],
       },
-      lifetime: (topic) => ({
-        topicId: current,
-        life: `c01.1.s1/${current}`,
-        client: 'c01.1',
-        run: 'r1',
-      }),
+      context,
     })
+    const lives = new Map()
+    pauses.lives = (client, topic, topicId) => lives.get(`${client}/${topic}/${topicId}`) ?? null
     pauses.install()
     try {
-      const state = new SubscriptionState()
-      state.pause([{ topic: 'whole' }])
-      state.resume([{ topic: 'whole', partitions: [1] }])
-      state.pause([{ topic: 'some', partitions: [0, 1] }])
-      state.resume([{ topic: 'some', partitions: [0, 1] }])
-      state.resume([{ topic: 'never-paused', partitions: [2] }])
-      current = ids.B
+      const group = realGroup({ topicIds })
+      const state = group.subscriptionState
+      context.run('c01.1', () => {
+        group.retainSubscription(['whole', 'some', 'never-paused'])
+        for (const t of Object.keys(topicIds)) lives.set(`c01.1/${t}/${IDS.A}`, `p01.7/${IDS.A}`)
+        state.pause([{ topic: 'whole' }])
+        state.resume([{ topic: 'whole', partitions: [1] }])
+        state.pause([{ topic: 'some', partitions: [0, 1] }])
+        state.resume([{ topic: 'some', partitions: [0, 1] }])
+        state.resume([{ topic: 'never-paused', partitions: [2] }])
+      })
+      topicIds.whole = topicIds.some = IDS.B
       const entries = pauses.pauseStates()
       expect(
         entries.map(({ topic, pauseAll, paused, resumed, originTopicId }) => ({
@@ -569,16 +684,822 @@ describe('final soak driver', () => {
           originTopicId,
         }))
       ).toEqual([
-        { topic: 'whole', pauseAll: true, paused: [], resumed: [1], originTopicId: ids.A },
-        { topic: 'some', pauseAll: false, paused: [], resumed: [], originTopicId: ids.A },
-        { topic: 'never-paused', pauseAll: false, paused: [], resumed: [], originTopicId: ids.A },
+        { topic: 'whole', pauseAll: true, paused: [], resumed: [1], originTopicId: IDS.A },
+        { topic: 'some', pauseAll: false, paused: [], resumed: [], originTopicId: IDS.A },
+        { topic: 'never-paused', pauseAll: false, paused: [], resumed: [], originTopicId: IDS.A },
       ])
       expect(new Set(entries.map((e) => e.stateId)).size).toBe(3)
-      expect(entries.every((e) => e.subscriptionLife === `c01.1.s1/${ids.A}`)).toBe(true)
-      state.retireTopic('some')
+      expect(entries.every((e) => e.subscriptionLife === `p01.7/${IDS.A}`)).toBe(true)
+      expect(entries.every((e) => e.client === 'c01.1' && e.run === pauses.runOf(group))).toBe(true)
+      context.run('c01.1', () => group.retainSubscription(['whole', 'never-paused']))
       expect(pauses.pauseStates().map((e) => e.topic)).toEqual(['whole', 'never-paused'])
     } finally {
       pauses.restore()
     }
+  })
+
+  test('every watched method exists on the real product classes', () => {
+    const observer = new PassiveObserver()
+    observer.install()
+    try {
+      expect(observer.missing()).toEqual([])
+      expect(observer.restores.length).toBe(
+        Object.values(PassiveObserver.WATCHED).reduce((n, methods) => n + methods.length, 0)
+      )
+    } finally {
+      observer.restore()
+    }
+    const removed = new PassiveObserver({
+      owners: { ...PassiveObserver.originals(), Runner: class {} },
+    })
+    removed.install()
+    removed.restore()
+    expect(removed.missing()).toEqual(['Runner#processEachMessage', 'Runner#processEachBatch'])
+  })
+
+  test('the observer reads every ordinary backing table from its real source and reports a missing one', () => {
+    const context = new AsyncLocalStorage()
+    const events = []
+    const observer = new PassiveObserver({
+      owners: {
+        ConsumerGroup,
+        SubscriptionState,
+        GroupOwnership,
+        OffsetOperations,
+        ResetObligations,
+      },
+      watched: {
+        ConsumerGroup: ['retainSubscription'],
+        SubscriptionState: ['pause'],
+        GroupOwnership: ['retain', 'renew'],
+        OffsetOperations: ['begin', 'end'],
+        ResetObligations: ['owe', 'discharge'],
+      },
+      context,
+      onEvent: (e) => events.push(e),
+    })
+    observer.install()
+    try {
+      const topicIds = { main: IDS.A, txn: IDS.B, grown: IDS.C }
+      const group = realGroup({ kind: 'consumer', topicIds })
+      group.cluster.targetTopics = new Set(['main', 'txn', 'grown'])
+      group.groupMembership.grownTopicNames.add('grown')
+      group.topicConfigurations = { main: {}, txn: {}, gone: {} }
+      group.preferredReadReplicasPerTopicPartition.main = { 0: { nodeId: 2, expireAt: 9 } }
+      group.preferredReadReplicasPerTopicPartition.txn = {}
+      group.seekOffset.set('main', 0, '42')
+      group.acquired.set('main|0', { acquiredAt: 3, changedAt: 3, recreatedAt: 0 })
+      group.haltedPartitions.set('txn|0', { offset: '7', reason: 'corrupt', error: new Error() })
+      let ticket
+      context.run('c03.1', () => {
+        group.retainSubscription(['main', 'txn'])
+        group.subscriptionState.pause([{ topic: 'main', partitions: [0] }])
+        group.ownership.retain(0)
+        group.ownership.renew()
+        ticket = group.operations.begin([{ topic: 'main', partition: 0 }], { mutation: true })
+        group.obligations.owe('txn', IDS.B)
+        group.obligations.discharge('txn', 0, IDS.B)
+      })
+      const { sections, missingSources } = observer.ordinarySections('c03.1')
+      expect(missingSources).toEqual([])
+      const tables = Object.fromEntries(
+        sections['other-table'].map((t) => [t.table, t.keys.map((k) => [k.topic, k.partition])])
+      )
+      expect(tables).toEqual({
+        acquired: [['main', 0]],
+        halted: [['txn', 0]],
+        'topic-configurations': [
+          ['main', null],
+          ['txn', null],
+        ],
+        'preferred-replicas': [
+          ['main', 0],
+          ['txn', null],
+        ],
+        'queued-seeks': [['main', 0]],
+        'grown-topic-names': [['grown', null]],
+        'cluster-targets': [
+          ['main', null],
+          ['txn', null],
+          ['grown', null],
+        ],
+      })
+      expect(sections['membership-state']).toEqual([
+        {
+          client: 'c03.1',
+          run: observer.runOf(group),
+          token: 0,
+          current: false,
+          holders: 1,
+          refused: false,
+        },
+        {
+          client: 'c03.1',
+          run: observer.runOf(group),
+          token: 1,
+          current: true,
+          holders: 0,
+          refused: false,
+        },
+      ])
+      const [cell] = sections['operation-cell']
+      const begun = events.find((e) => e.type === 'ticket').record
+      expect(begun).toMatchObject({
+        phase: 'begin',
+        client: 'c03.1',
+        ownerRun: observer.runOf(group),
+        token: 1,
+        keys: [{ topic: 'main', topicId: IDS.A, partition: 0 }],
+      })
+      expect(cell).toEqual({
+        ledger: begun.ledger,
+        topic: 'main',
+        partition: 0,
+        open: 1,
+        tickets: [begun.ticket],
+      })
+      expect(sections['reset-debt']).toEqual([
+        { client: 'c03.1', topic: 'txn', topicId: IDS.B, discharged: [0] },
+      ])
+      expect(sections.assignment).toEqual([
+        {
+          client: 'c03.1',
+          key: { topic: 'main', topicId: IDS.A, partition: 0 },
+          authority: expect.objectContaining({ token: 1, acquiredAt: 3, epoch: 5, member: 'm1' }),
+        },
+      ])
+      expect(sections.subscription[0].accepted).toEqual([
+        { topic: 'main', topicId: IDS.A },
+        { topic: 'txn', topicId: IDS.B },
+      ])
+      expect(sections['pause-state']).toHaveLength(0)
+
+      group.operations.end(ticket)
+      group.operations.end(ticket)
+      expect(events.filter((e) => e.type === 'ticket').map((e) => e.record.phase)).toEqual([
+        'begin',
+        'end',
+      ])
+      expect(observer.ordinarySections('c03.1').sections['operation-cell']).toEqual([])
+
+      delete group.preferredReadReplicasPerTopicPartition
+      const missing = observer.ordinarySections('c03.1')
+      expect(missing.missingSources).toEqual([
+        'ConsumerGroup.preferredReadReplicasPerTopicPartition',
+      ])
+      expect(missing.sections['other-table'].map((t) => t.table)).not.toContain(
+        'preferred-replicas'
+      )
+    } finally {
+      observer.restore()
+    }
+  })
+
+  test('handler and commit authority comes from the original batch, and commits record their write and publish', async () => {
+    const context = new AsyncLocalStorage()
+    const commits = new AsyncLocalStorage()
+    const events = []
+    class Group {
+      async fetch() {
+        await null
+        return [{ topic: 'main', partition: 0, assignmentEpoch: 7, ownershipKey: 'main|0' }]
+      }
+    }
+    const seen = []
+    class Runner {
+      async processEachMessage() {
+        await null
+        seen.push(observer.batchAuthority())
+      }
+    }
+    class Broker {
+      async offsetCommit() {
+        return {}
+      }
+    }
+    class OffsetManager {
+      recordCommitted() {}
+    }
+    const observer = new PassiveObserver({
+      owners: { ConsumerGroup: Group, Runner, Broker, OffsetManager },
+      watched: {
+        ConsumerGroup: ['fetch'],
+        Runner: ['processEachMessage'],
+        Broker: ['offsetCommit'],
+        OffsetManager: ['recordCommitted'],
+      },
+      context,
+      commits,
+      onEvent: (e) => events.push(e),
+    })
+    observer.install()
+    const group = new Group()
+    Object.assign(group, {
+      groupId: 'g-1',
+      memberId: 'm1',
+      generationId: 5,
+      runIdentity: {},
+      ownership: new GroupOwnership(),
+      acquired: new Map([['main|0', { acquiredAt: 3, recreatedAt: 0 }]]),
+    })
+    const [batch] = await context.run('c01.1', () => group.fetch())
+    group.ownership.renew()
+    Object.assign(group, { memberId: 'm2', generationId: 6 })
+    group.acquired.set('main|0', { acquiredAt: 9, recreatedAt: 9 })
+    const identity = { topic: 'main', partition: 0, assignmentEpoch: 7 }
+    await handlerContext.run(identity, () => new Runner().processEachMessage(batch))
+    expect(seen).toEqual([
+      {
+        client: 'c01.1',
+        run: observer.runOf(group),
+        member: 'm1',
+        epoch: 5,
+        token: 0,
+        assignmentEpoch: 7,
+        acquiredAt: 3,
+        recreatedAt: 0,
+      },
+    ])
+    expect(observer.batchAuthority({})).toBeNull()
+
+    const commit = { commit: 'c01.1.m4', key: { topic: 'main', topicId: IDS.A, partition: 0 } }
+    const manager = new OffsetManager()
+    manager.operations = { isSuperseded: (t, topic, partition) => partition === 1 }
+    await new Broker().offsetCommit({})
+    await commits.run(commit, async () => {
+      await new Broker().offsetCommit({})
+      manager.recordCommitted({}, [
+        {
+          topic: 'main',
+          partitions: [
+            { partition: 0, offset: '5' },
+            { partition: 1, offset: '9' },
+          ],
+        },
+      ])
+    })
+    observer.restore()
+    expect(events).toEqual([
+      { type: 'commit-stage', phase: 'write', commit },
+      {
+        type: 'commit-stage',
+        phase: 'publish',
+        commit,
+        written: [{ topic: 'main', partition: 0, offset: '5' }],
+      },
+    ])
+  })
+
+  test('rebalance results become keyed acquire, revoke and loss boundaries with one round', async () => {
+    const context = new AsyncLocalStorage()
+    const events = []
+    class Group {
+      async applyRebalanceResult(result) {
+        await null
+        for (const key of result.revoked) this.acquired.delete(key)
+        for (const key of result.added)
+          this.acquired.set(key, { acquiredAt: ++this.clock, recreatedAt: 0 })
+      }
+
+      async releaseRevoked() {}
+
+      rebalanceProtocol() {
+        return 'cooperative'
+      }
+    }
+    const observer = new PassiveObserver({
+      owners: { ConsumerGroup: Group, GroupOwnership },
+      watched: {
+        ConsumerGroup: ['applyRebalanceResult', 'releaseRevoked'],
+        GroupOwnership: ['lose'],
+      },
+      context,
+      topicIds: () => IDS.A,
+      onEvent: (e) => events.push(e),
+    })
+    observer.install()
+    try {
+      const group = new Group()
+      Object.assign(group, {
+        groupId: 'g-1',
+        kind: 'classic',
+        memberId: 'm1',
+        generationId: 4,
+        runIdentity: {},
+        clock: 1,
+        ownership: new GroupOwnership(),
+        acquired: new Map([['t|0', { acquiredAt: 1, recreatedAt: 0 }]]),
+      })
+      const round = {}
+      await context.run('c03.1', async () => {
+        await group.releaseRevoked([{ topic: 't', partitions: [0] }], round)
+        await group.applyRebalanceResult({ revoked: ['t|0'], added: ['t|1'] }, { round })
+      })
+      const boundaries = events.filter((e) => e.type === 'boundary').map((e) => e.record)
+      expect(boundaries.map((b) => [b.event, b.key.partition])).toEqual([
+        ['revoke-begin', 0],
+        ['revoke-end', 0],
+        ['acquire', 1],
+      ])
+      expect(boundaries[2]).toMatchObject({
+        client: 'c03.1',
+        group: 'g-1',
+        protocol: 'cooperative',
+        member: 'm1',
+        epoch: 4,
+        authority: expect.objectContaining({ acquiredAt: 2, token: 0 }),
+      })
+      const rounds = events.filter((e) => e.type === 'round')
+      expect(rounds).toHaveLength(1)
+      expect(rounds[0].record).toMatchObject({
+        protocol: 'cooperative',
+        assigned: [{ topic: 't', topicId: IDS.A, partition: 1 }],
+        revoked: [{ topic: 't', topicId: IDS.A, partition: 0 }],
+      })
+      expect(boundaries[1].cause).toBe(rounds[0].record.round)
+
+      events.length = 0
+      group.ownership.lose(new Error('stale'), 7)
+      group.ownership.lose(new Error('gone'), 0)
+      group.ownership.lose(new Error('again'), 0)
+      expect(events.map((e) => [e.record.event, e.record.key.partition])).toEqual([['lost', 1]])
+    } finally {
+      observer.restore()
+    }
+  })
+
+  test('share state reads held records and ranges from the real ledger and binds acquisitions to raw frames', () => {
+    const context = new AsyncLocalStorage()
+    const events = []
+    const dashed = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    const id = normalizeTopicId(dashed)
+    class Loop {
+      constructor() {
+        this.cohorts = new Map()
+      }
+
+      adopt(exchange, topicId, partition, lockDuration) {
+        const walk = {
+          deliver: { records: [{ offset: '10' }, { offset: '11' }], deliveryCounts: [1, 2] },
+          gaps: [{ firstOffset: '12', lastOffset: '12' }],
+          release: [],
+          reject: [],
+        }
+        const token = {}
+        const ledger = new ShareAckLedger({
+          topic: 'main',
+          topicId,
+          partition: partition.partitionIndex,
+          token,
+          sentAt: 1,
+          lockDuration,
+          walk,
+        })
+        const row = { topic: 'main', topicId, partition: 0, token, ledger, walk }
+        this.cohorts.set(`${topicId}|0`, [row])
+        return row
+      }
+    }
+    class Run {
+      syncNodes() {}
+    }
+    const observer = new PassiveObserver({
+      owners: { ShareFetchLoop: Loop, ShareRun: Run, ShareAckLedger },
+      watched: {
+        ShareFetchLoop: ['adopt'],
+        ShareRun: ['syncNodes'],
+        ShareAckLedger: ['prepare', 'settle', 'invalidate'],
+      },
+      context,
+      onEvent: (e) => events.push(e),
+    })
+    observer.install()
+    try {
+      const socket = new EventEmitter()
+      socket.write = () => true
+      const registry = new SocketRegistry({ base: () => () => socket })
+      const exchanges = []
+      const make = registry.factory('c07.1', {
+        apiKeys: [78, 79],
+        onExchange: (e) => exchanges.push(e),
+      })
+      expect(make({ host: 'h', port: 1 })).toBe(socket)
+      const request = Buffer.alloc(14)
+      request.writeInt32BE(10, 0)
+      request.writeInt16BE(78, 4)
+      request.writeInt16BE(2, 6)
+      request.writeInt32BE(5, 8)
+      socket.write(request)
+      const body = shareFetchV2.buildResponse({
+        throttleTime: 0,
+        errorCode: 0,
+        errorMessage: null,
+        acquisitionLockTimeoutMs: 15000,
+        responses: [
+          {
+            topicId: dashed,
+            partitions: [
+              {
+                partitionIndex: 0,
+                errorCode: 0,
+                errorMessage: null,
+                acknowledgeErrorCode: 0,
+                acknowledgeErrorMessage: null,
+                currentLeader: { leaderId: 1, leaderEpoch: 0 },
+                records: '',
+                acquiredRecords: [{ firstOffset: '10', lastOffset: '12', deliveryCount: 1 }],
+              },
+            ],
+          },
+        ],
+        nodeEndpoints: [],
+      })
+      const response = Buffer.alloc(9 + body.length)
+      response.writeInt32BE(5 + body.length, 0)
+      response.writeInt32BE(5, 4)
+      body.copy(response, 9)
+      socket.emit('data', response.subarray(0, 6))
+      socket.emit('data', response.subarray(6))
+      expect(exchanges).toHaveLength(1)
+      expect(exchanges[0].response.equals(response)).toBe(true)
+      observer.exchanged('c07.1', {
+        ...exchanges[0],
+        file: 'raw/p07.share.0.ndjson',
+        sha256: 'e'.repeat(64),
+      })
+
+      const loop = new Loop()
+      const run = new Run()
+      run.nodes = new Map([[1, { session: { epoch: 4 } }]])
+      const row = context.run('c07.1', () => {
+        run.syncNodes()
+        return loop.adopt(
+          { sentAt: 1 },
+          dashed,
+          {
+            partitionIndex: 0,
+            acquiredRecords: [{ firstOffset: '10', lastOffset: '12', deliveryCount: 1 }],
+          },
+          15000
+        )
+      })
+      const acquired = events.find((e) => e.type === 'share-acquire')
+      expect(acquired).toMatchObject({
+        client: 'c07.1',
+        key: { topic: 'main', topicId: id, partition: 0 },
+        acquired: [{ from: '10', to: '12', deliveryCount: 1 }],
+        lockMs: 15000,
+        wire: { file: 'raw/p07.share.0.ndjson', sha256: 'e'.repeat(64) },
+      })
+      expect(observer.shareDelivery('c07.1', 'main', 0, '11')).toEqual({
+        acquisition: acquired.acquisition,
+        deliveryCount: 2,
+      })
+      const state = () => observer.shareSections('c07.1')
+      expect(state()).toEqual({
+        entry: {
+          client: 'c07.1',
+          sessions: [{ node: 1, session: 4 }],
+          records: [
+            { acquisition: acquired.acquisition, key: acquired.key, offset: '10', state: 'held' },
+            { acquisition: acquired.acquisition, key: acquired.key, offset: '11', state: 'held' },
+          ],
+          ranges: [{ acquisition: acquired.acquisition, key: acquired.key, from: '12', to: '12' }],
+          cohorts: [acquired.acquisition],
+        },
+        mismatches: [],
+      })
+      row.ledger.complete(['10', '11'], 'accept')
+      const { ticket } = row.ledger.prepare({ token: row.token })
+      expect(state().entry.records.map((r) => r.state)).toEqual(['settling', 'settling'])
+      row.ledger.settle(ticket, { token: row.token, result: 'ok' })
+      expect(row.ledger.counts).toEqual({ records: 0, ranges: 0 })
+      expect(state().entry).toMatchObject({ records: [], ranges: [] })
+      expect(state().mismatches).toEqual([])
+      const settled = events.find((e) => e.type === 'share-settle')
+      expect(settled).toMatchObject({
+        acquisition: acquired.acquisition,
+        offsets: [
+          { offset: '10', type: 'accept' },
+          { offset: '11', type: 'accept' },
+        ],
+        result: 'ok',
+        errorCode: 0,
+        wire: { file: 'raw/p07.share.0.ndjson' },
+      })
+      socket.emit('close')
+      expect(socket.listenerCount('data')).toBe(0)
+    } finally {
+      observer.restore()
+    }
+  })
+
+  test('the raw reader scans from the last scan to the LSO and keeps aborted and control records out', async () => {
+    const record = (offset, producerId, inTransaction, extra = {}) => ({
+      offset: String(offset),
+      key: Buffer.from(`k${offset}`),
+      value: offeredRecord({ runId: RUN, slot: 'c09', seq: offset, valueBytes: 256 }).value,
+      headers: {},
+      batchContext: {
+        producerId,
+        inTransaction,
+        isControlBatch: false,
+        firstOffset: String(offset),
+        lastOffsetDelta: 0,
+      },
+      ...extra,
+    })
+    const control = record(12, '7', true)
+    control.batchContext.isControlBatch = true
+    control.key = Buffer.from([0, 0, 0, 0])
+    const fetches = []
+    const broker = {
+      listOffsets: async ({ isolationLevel }) => ({
+        responses: [
+          { partitions: [{ offset: isolationLevel === ISOLATION.READ_COMMITTED ? '13' : '15' }] },
+        ],
+      }),
+      fetch: async ({ topics }) => {
+        fetches.push(topics[0].partitions[0].fetchOffset)
+        return {
+          responses: [
+            {
+              partitions: [
+                {
+                  messages: [
+                    record(9, '1', false),
+                    record(10, '1', false),
+                    record(11, '7', true),
+                    control,
+                    record(13, '1', false),
+                  ],
+                  abortedTransactions: [{ producerId: '7', firstOffset: '11' }],
+                },
+              ],
+            },
+          ],
+        }
+      },
+    }
+    const result = await scanPartition(broker, { topic: 't', partition: 0, from: 10n })
+    expect(fetches).toEqual(['10'])
+    expect(result.records.map((r) => r.offset)).toEqual(['10'])
+    expect(result).toMatchObject({ to: '13', lso: '13', highWatermark: '15' })
+    expect(parseValue(result.records[0].value, RUN)).toEqual({ id: 'c09.10', transaction: null })
+  })
+
+  test('the decoder binds pushes to the recorded subscription and fails on reporter drops or overflow', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-decoder-'))
+    const sink = path.join(dir, 'sink')
+    fs.mkdirSync(sink)
+    const records = []
+    const notes = []
+    const runtime = {
+      out: dir,
+      slotOf: (client) => (client?.startsWith('c11.') ? { slot: 'c11' } : undefined),
+      nextId: () => `p16.${records.length + notes.length}`,
+      emit: async (r) => records.push(r),
+      diagnose: async (m) => notes.push(m),
+    }
+    const push = (seq, clientId = 'c11.1', extra = {}) =>
+      JSON.stringify({
+        v: 1,
+        node: '1',
+        seq,
+        clientInstanceId: IDS.A,
+        terminating: false,
+        clientId,
+        dataSha256: 'f'.repeat(64),
+        parse: 'ok',
+        metricsTotal: 6,
+        truncated: false,
+        ...extra,
+      }) + '\n'
+    try {
+      const decoder = new DecoderWorker(runtime)
+      decoder.dir = sink
+      fs.writeFileSync(path.join(sink, 'reporter-1.json'), JSON.stringify({ loadedAtMs: 100 }))
+      fs.writeFileSync(path.join(sink, 'exports-1.jsonl'), push(1) + push(2, 'other') + push(3))
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(records).toEqual([])
+      expect(notes).toEqual([
+        'telemetry push 1.1 has no recorded subscription',
+        'telemetry push 1.3 has no recorded subscription',
+      ])
+      await decoder.onTelemetrySubscriptions({
+        entries: [{ client: 'c11.1', instanceId: IDS.A, subscriptionId: 77 }],
+      })
+      fs.appendFileSync(path.join(sink, 'exports-1.jsonl'), push(4))
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(records).toEqual([
+        expect.objectContaining({
+          kind: 'telemetry',
+          client: 'c11.1',
+          instanceId: IDS.A,
+          subscriptionId: '77',
+          broker: 1,
+          metrics: 6,
+          terminating: false,
+        }),
+      ])
+      expect(
+        validateRecord({ ...records[0], source: 'p16', seq: 0, at: 1, t: 1, execution: null })
+      ).toEqual([])
+      fs.writeFileSync(path.join(sink, 'reporter-1.json'), JSON.stringify({ loadedAtMs: 200 }))
+      fs.appendFileSync(path.join(sink, 'exports-1.jsonl'), push(1) + push(2))
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      fs.appendFileSync(path.join(sink, 'exports-1.jsonl'), push(5))
+      expect(await decoder.onTick()).toEqual({ abort: 'reporter 1 sequence 5 follows 2 in boot 2' })
+      fs.writeFileSync(path.join(sink, 'OVERFLOW-2.json'), '{}')
+      expect(await decoder.onTick()).toEqual({ abort: 'reporter overflow marker OVERFLOW-2.json' })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('sampling admits at most two processes at once, in order', async () => {
+    const clock = new VirtualClock()
+    const gate = new SamplingGate({ limit: 2 })
+    const order = []
+    let active = 0
+    let peak = 0
+    const task = (n) => async () => {
+      active++
+      peak = Math.max(peak, active)
+      order.push(n)
+      await clock.sleepUntil(clock.now() + 100)
+      active--
+      return n
+    }
+    const all = Promise.all(Array.from({ length: 16 }, (_, n) => gate.run(task(n))))
+    expect(await clock.drive(all.then(() => gate.run(task(16))))).toBe(16)
+    expect(peak).toBe(2)
+    expect(gate.peak).toBe(2)
+    expect(order).toEqual(Array.from({ length: 17 }, (_, n) => n))
+    expect(clock.now()).toBe(900)
+  })
+
+  test('the host monitor aborts on low MemAvailable or a short disk reservation, and an abort tears the run down', async () => {
+    const host = { mem: 6 * GIB, disk: 300 * GIB }
+    const monitor = new HostMonitor({
+      read: { memAvailable: () => host.mem, freeDisk: () => host.disk },
+      minMemAvailable: matrix.host.abortMemAvailableBytes.value,
+      reserve: () => 92 * GIB,
+    })
+    expect(monitor.check(0)).toEqual({
+      memAvailable: 6 * GIB,
+      freeDisk: 300 * GIB,
+      reserve: 92 * GIB,
+      abort: null,
+    })
+    host.mem = 3 * GIB
+    expect(monitor.check(10000)).toEqual({ abort: null })
+    expect(monitor.check(30000).abort).toBe(`MemAvailable ${3 * GIB} below ${4 * GIB}`)
+    host.mem = 8 * GIB
+    expect(monitor.check(60000).abort).toBe(`MemAvailable ${3 * GIB} below ${4 * GIB}`)
+    const disk = new HostMonitor({
+      read: { memAvailable: () => 8 * GIB, freeDisk: () => host.disk },
+      minMemAvailable: 4 * GIB,
+      reserve: () => 92 * GIB,
+    })
+    host.disk = 90 * GIB
+    expect(disk.check(0).abort).toBe(
+      `free disk ${90 * GIB} below the remaining reservation ${92 * GIB}`
+    )
+
+    const clock = new VirtualClock()
+    const performed = []
+    const outcomes = []
+    const scheduler = new Scheduler({
+      clock,
+      perform: async (step) => {
+        performed.push([step.id, clock.now()])
+        if (step.id === 'work') {
+          await clock.sleepUntil(60)
+          scheduler.abort('MemAvailable low')
+        }
+      },
+      onOutcome: (o) => outcomes.push([o.id, o.outcome]),
+    })
+    const summary = await clock.drive(
+      scheduler.run([
+        { id: 'work', type: 'execution', lane: 'work', at: 0, deadline: 500 },
+        { id: 'k1', type: 'periodic', lane: 'timer', at: 30, deadline: 35 },
+        { id: 'k2', type: 'periodic', lane: 'timer', at: 90, deadline: 95 },
+        { id: 'quiet', type: 'quiet', lane: 'timer', at: 3500, deadline: 3590 },
+        { id: 'next', type: 'execution', lane: 'work', at: 100, deadline: 300 },
+        { id: 'disconnect', type: 'disconnect', lane: 'work', at: 86400 },
+      ])
+    )
+    expect(performed).toEqual([
+      ['work', 0],
+      ['k1', 30],
+      ['disconnect', 60],
+    ])
+    expect(outcomes).toEqual(
+      expect.arrayContaining([
+        ['k2', 'aborted'],
+        ['quiet', 'aborted'],
+        ['next', 'aborted'],
+        ['disconnect', 'ok'],
+      ])
+    )
+    expect(summary).toEqual({ ok: 3, late: 0, error: 0, aborted: 3 })
+    expect(scheduler.aborted).toBe('MemAvailable low')
+    expect(clock.sleepers).toEqual([])
+  })
+
+  test('the archive binds every driver module the driver is split into', () => {
+    const modules = fs
+      .readdirSync(path.join(ROOT, 'scripts/soak'))
+      .filter((f) => /^finalSoak[A-Z]?\w*\.js$/.test(f) && !/Preflight|Schema/.test(f))
+      .map((f) => `scripts/soak/${f}`)
+    expect(sorted(modules)).toEqual([
+      'scripts/soak/finalSoak.js',
+      'scripts/soak/finalSoakCollector.js',
+      'scripts/soak/finalSoakObserver.js',
+      'scripts/soak/finalSoakScheduler.js',
+      'scripts/soak/finalSoakWorkers.js',
+    ])
+    expect(matrix.acceptance.archive).toEqual(expect.arrayContaining(modules))
+    expect(validateMatrix(matrix)).toEqual([])
+    for (const module of modules) {
+      const edited = JSON.parse(JSON.stringify(matrix))
+      edited.acceptance.archive = edited.acceptance.archive.filter((f) => f !== module)
+      expect(validateMatrix(edited).join('\n')).toContain('matrix.acceptance.archive is not')
+    }
+    for (const module of modules.filter((m) => !m.endsWith('finalSoak.js'))) {
+      const source = fs.readFileSync(path.join(ROOT, module), 'utf8')
+      for (const [, required] of source.matchAll(/require\('\.\/(finalSoak\w*)'\)/g))
+        expect(modules).toContain(
+          `scripts/soak/${required}.js`.replace('finalSoakSchema', 'finalSoak')
+        )
+    }
+  })
+
+  test('routes are declared for every recipient group, the seed group on the main topic too', () => {
+    const config = buildConfig(matrix, {
+      mode: 'smoke',
+      runId: RUN,
+      treeSha: TREE,
+      brokers: ['b:1'],
+    })
+    const groupOf = (kind) =>
+      config.clients.find((c) => c.clientKind === kind && c.purpose === 'subject').group
+    const seed = config.clients.find((c) => c.purpose === 'control').group
+    expect(recipientGroups(config, matrix, 'main')).toEqual([
+      ...recipients('main').map(groupOf),
+      seed,
+    ])
+    expect(recipientGroups(config, matrix, 'transactions')).toEqual(
+      recipients('transactions').map(groupOf)
+    )
+    expect(recipientGroups(config, matrix, 'regex')).toEqual(recipients('regex').map(groupOf))
+    expect(recipientGroups(config, matrix, 'recreate')).toEqual(recipients('recreate').map(groupOf))
+    expect(recipientGroups(config, matrix, 'main')).toHaveLength(9)
+    expect(recipientGroups(config, matrix, 'recreate')).toContain(groupOf('share'))
+    expect(recipientGroups(config, matrix, 'transactions')).not.toContain(groupOf('share'))
+  })
+
+  test('topic ids are normalized to their printed form and values carry their id and transaction', () => {
+    expect(normalizeTopicId('01020304-0506-0708-090a-0b0c0d0e0f10')).toBe('AQIDBAUGBwgJCgsMDQ4PEA')
+    expect(normalizeTopicId(IDS.A)).toBe(IDS.A)
+    expect(normalizeTopicId('unknown')).toBeNull()
+    expect(normalizeTopicId(null)).toBeNull()
+    const offered = offeredRecord({
+      runId: RUN,
+      slot: 'c09',
+      seq: 4,
+      valueBytes: 256,
+      transaction: 'c09.1.x2',
+    })
+    expect(offered.value).toHaveLength(256)
+    expect(parseValue(offered.value, RUN)).toEqual({ id: 'c09.4', transaction: 'c09.1.x2' })
+    expect(parseValue(offered.value, 'ffffffffffff')).toBeNull()
+    expect(parseValue(null, RUN)).toBeNull()
+  })
+
+  test('the smoke workflow runs the runbook in diagnostic smoke mode on dispatch or a smoke branch push', () => {
+    const workflow = yaml.load(fs.readFileSync(WORKFLOW, 'utf8'))
+    expect(workflow.on.push).toEqual({ branches: ['p11/soak-smoke*'] })
+    expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch', 'push'])
+    for (const input of Object.values(workflow.on.workflow_dispatch.inputs ?? {}))
+      expect(input.default).toBeDefined()
+    const [job] = Object.values(workflow.jobs)
+    expect(Object.keys(workflow.jobs)).toHaveLength(1)
+    expect(job['timeout-minutes']).toBeLessThanOrEqual(60)
+    expect(job.env).toMatchObject({ KAFKA_VERSION: '4.4.0', FINAL_SOAK_DIAGNOSTIC: '1' })
+    const runs = job.steps.map((s) => s.run ?? '')
+    expect(
+      runs.some((r) =>
+        /bash scripts\/soak\/finalSoakNode\.sh "\$\(git rev-parse HEAD\)" smoke$/.test(r)
+      )
+    ).toBe(true)
+    expect(runs.some((r) => r.includes('acceptance'))).toBe(false)
+    const upload = job.steps.find((s) => s.uses?.startsWith('actions/upload-artifact'))
+    expect(upload).toMatchObject({ if: 'always()', with: { 'if-no-files-found': 'error' } })
+    expect(job.steps.find((s) => (s.run ?? '').includes('summary.json'))).toMatchObject({
+      if: 'always()',
+    })
   })
 })
