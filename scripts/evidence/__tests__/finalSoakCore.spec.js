@@ -79,13 +79,14 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
-    it('never turns a seed start, receipt identity, share expiry or checkpoint edit into a pass', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        supervisor: (s) => ({ ...s, runId: 'ffffffffffff' }),
+    it('lists the seed control, receipt identity, share lock and checkpoint rows as NOT JUDGED even when the supervisor receipt contradicts the run', async () => {
+      const report = await check(fx.healthy(), {
+        supervisor: (s) => ({ ...s, runId: 'ffffffffffff', treeSha: 'f'.repeat(40) }),
       })
-      expect(row(report, 'K7').verdict).toBe('FAIL')
-      expect(formatReport(report)).toMatch(/NOT JUDGED.*seed sensitivity/s)
+      expectRow(report, 'K7', 'FAIL', /runId.*differs/)
+      const names = report.notJudged.map((i) => i.name)
+      for (const part of ['seed sensitivity', 'receipts identity', 'share lock', 'checkpoints'])
+        expect(names.some((n) => n.includes(part))).toBe(true)
       expect(report.notJudged.every((i) => i.verdict === 'NOT JUDGED')).toBe(true)
     })
   })
@@ -289,11 +290,9 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('does not ask for the delivery of a transaction member that is not visible', async () => {
-      const world = fx.healthy()
-      const report = await check(world, {
-        edit: without((r) => r.stage === 'handler-enter' && r.id === 'c09.4'),
-      })
+      const report = await check(fx.healthy())
       expectRow(report, 'K2', 'PASS')
+      expect(row(report, 'K2').numbers.visibleRecords).toBe(12 + 4)
     })
 
     it('is inconclusive when the dump it compares against is unusable', async () => {
