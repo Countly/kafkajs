@@ -254,7 +254,10 @@ test('an external reauthentication protects a socket while its token provider is
   const node = { id: 0, host: 'localhost', port: 9092 }
   const cluster = createScriptedCluster({ nodes: [node], profile: 'sasl' })
   cluster.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
-  cluster.answer('SaslAuthenticate', () => ({ sessionLifetimeMs: '1000' }))
+  cluster.answer('SaslAuthenticate', () => ({
+    authBytes: Buffer.alloc(0),
+    sessionLifetimeMs: '1000',
+  }))
   const hold = gate()
   let calls = 0
   const provider = async () => {

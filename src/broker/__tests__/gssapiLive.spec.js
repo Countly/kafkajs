@@ -4,6 +4,8 @@ const { randomUUID } = require('node:crypto')
 const KdcFixture = require('../../../testHelpers/kerberos')
 const defaultSocketFactory = require('../../network/socketFactory')
 const { writeEvidence, wireVersionsOf } = require('../../../testHelpers/e2eEvidence')
+const { createChaosSocketFactory } = require('../../../testHelpers/chaosSocket')
+const { SaslAuthenticate } = require('../../protocol/requests/apiKeys')
 
 const live = process.env.GSSAPI_E2E === '1' ? describe : describe.skip
 
@@ -156,4 +158,74 @@ live('GSSAPI with a ticket-granting service', () => {
     if (primary) throw primary
     for (const result of cleanupResults) if (result.status === 'rejected') throw result.reason
   }, 300000)
+
+  it('recovers with a fresh context after a reset during the first and the final-layer exchange, and an expired cache stays terminal', async () => {
+    const peer = require('kerberos')
+    const fixture = new KdcFixture()
+    const restore = fixture.observe(peer)
+    fixture.select(fixture.ticket('fresh'))
+    const count = (method) => fixture.events.filter((event) => event.method === method).length
+    const chaos = createChaosSocketFactory(defaultSocketFactory())
+    const resets = []
+    // The first socket loses its first SaslAuthenticate answer; the second loses the answer to the
+    // exchange after `wrap`, the final security-layer reply.
+    const socketFactory = (args) => {
+      const socket = chaos(args)
+      const ordinal = chaos.sockets.length
+      const wrapsBefore = count('wrap')
+      const write = socket.write.bind(socket)
+      let armed = false
+      socket.write = (data, encoding) => {
+        const frame = Buffer.from(data, encoding)
+        if (!armed && frame.length >= 6 && frame.readInt16BE(4) === SaslAuthenticate) {
+          const final = count('wrap') > wrapsBefore
+          if (ordinal === 1 || (ordinal === 2 && final)) {
+            armed = true
+            resets.push(final ? 'final' : 'first')
+            socket.dropResponses(1, { apiKey: SaslAuthenticate, thenClose: true })
+          }
+        }
+        return write(data, encoding)
+      }
+      return socket
+    }
+    const config = {
+      brokers: ['localhost:9192'],
+      logLevel: logLevel.NOTHING,
+      sasl: { mechanism: 'gssapi', principal: 'client@KAFKAJS.TEST' },
+      retry: { retries: 5, initialRetryTime: 100 },
+      connectionTimeout: 10000,
+    }
+    const admin = new Kafka({ ...config, socketFactory }).admin()
+    let expiredAdmin
+    try {
+      await admin.connect()
+      const topics = await admin.listTopics()
+
+      expect(Array.isArray(topics)).toBe(true)
+      expect(resets).toEqual(['first', 'final'])
+      expect(chaos.sockets.length).toBeGreaterThanOrEqual(3)
+      expect(count('initialize')).toBeGreaterThanOrEqual(3)
+
+      const expired = fixture.ticket('expired')
+      fixture.control('gssapi-expired', ['expired'])
+      fixture.select(expired)
+      let expiredSockets = 0
+      expiredAdmin = new Kafka({
+        ...config,
+        socketFactory: (args) => {
+          expiredSockets++
+          return defaultSocketFactory()(args)
+        },
+      }).admin()
+      const error = await expiredAdmin.connect().catch((failure) => failure)
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.retriable).toBe(false)
+      expect(expiredSockets).toBe(1)
+    } finally {
+      await Promise.allSettled([admin.disconnect(), expiredAdmin?.disconnect()])
+      restore()
+    }
+  }, 120000)
 })

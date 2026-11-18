@@ -69,6 +69,12 @@ const unsecuredJwt = (claims) => {
   })}.`
 }
 
+// An unsecured JWT whose expiry lies in the past: the test broker answers it with an OAUTHBEARER error challenge.
+const expiredUnsecuredJwt = (claims) => {
+  const now = Math.floor(Date.now() / 1000)
+  return unsecuredJwt({ iat: now - 7200, exp: now - 3600, ...claims })
+}
+
 const plainTextBrokers = (host = getHost()) => [`${host}:9092`, `${host}:9095`, `${host}:9098`]
 const sslBrokers = (host = getHost()) => [`${host}:9093`, `${host}:9096`, `${host}:9099`]
 const saslBrokers = (host = getHost()) => [`${host}:9094`, `${host}:9097`, `${host}:9100`]
@@ -497,6 +503,7 @@ module.exports = {
   saslSCRAM256ConnectionOpts,
   saslSCRAM512ConnectionOpts,
   saslOAuthBearerConnectionOpts,
+  expiredUnsecuredJwt,
   saslEntries,
   createConnectionPool,
   createConnectionBuilder,
