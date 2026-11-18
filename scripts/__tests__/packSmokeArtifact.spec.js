@@ -145,7 +145,14 @@ describe('scripts/packSmoke.sh with a supplied tarball', () => {
       .filter((line) => line.startsWith('npm '))
       .map((line) => JSON.parse(line.slice(4)))
     expect(npmCalls.some((args) => args.includes('pack'))).toBe(false)
-    expect(npmCalls[0]).toEqual(['install', '--silent', '--no-audit', '--no-fund', tarball])
+    expect(npmCalls[0]).toEqual([
+      'install',
+      '--silent',
+      '--no-audit',
+      '--no-fund',
+      '--ignore-scripts',
+      tarball,
+    ])
     expect(npmCalls).toHaveLength(2)
     expect(npmCalls[1]).toContain('@types/node@^24')
     expect(recorded().filter((line) => line.startsWith('tsc '))).toHaveLength(2)
