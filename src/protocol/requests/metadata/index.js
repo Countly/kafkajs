@@ -161,12 +161,28 @@ const allowingLeaderless = (parse) => async (data) => {
 }
 
 /**
+ * Wraps a version's parse so that a topic answered with its own error code stays in the data for
+ * the caller to judge. The other topics are checked as the wrapped parse decides, and a top-level
+ * error code still throws first.
+ * @param {(data: object) => Promise<object>|object} parse the version's own parse
+ * @returns {(data: object) => Promise<object>} a parse that resolves with `data`, unchanged
+ */
+const retainingTopicErrors = (parse) => async (data) => {
+  await parse({
+    ...data,
+    topicMetadata: data.topicMetadata.filter(({ topicErrorCode }) => !failure(topicErrorCode)),
+  })
+  return data
+}
+
+/**
  * Builds one request at `version`. A request for every topic, an empty `topics` list written as
  * the null array, is parsed by `parseAllTopics`; a request that names topics keeps its version's
  * own parse, which throws the first topic, then partition, error code, unless `allowLeaderless`
- * lets a partition without a leader through.
+ * lets a partition without a leader through and `retainTopicErrors` keeps a topic's own error in
+ * the data.
  * @param {number|string} version
- * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean, lenient?: boolean, allowLeaderless?: boolean }} options
+ * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean, lenient?: boolean, allowLeaderless?: boolean, retainTopicErrors?: boolean }} options
  *   `topics` is absent only when a request is built for its api key and version alone
  * @returns {{ request: object, response: { decode: Function, parse: Function } }}
  */
@@ -175,9 +191,12 @@ const build = (version, options) => {
   if (options.lenient || options.topics?.length === 0) {
     return { ...built, response: { ...built.response, parse: parseAllTopics } }
   }
-  return options.allowLeaderless
-    ? { ...built, response: { ...built.response, parse: allowingLeaderless(built.response.parse) } }
-    : built
+  let { parse } = built.response
+  if (options.allowLeaderless) parse = allowingLeaderless(parse)
+  if (options.retainTopicErrors) parse = retainingTopicErrors(parse)
+  return parse === built.response.parse
+    ? built
+    : { ...built, response: { ...built.response, parse } }
 }
 
 module.exports = {

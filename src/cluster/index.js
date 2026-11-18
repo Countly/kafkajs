@@ -205,6 +205,8 @@ module.exports = class Cluster {
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
     this.topicPins = metadataMaxIdle === undefined ? null : new Map()
     this.nextTopicIncarnation = 0
+    /** @type {Set<string>|null} the targets the `addMultipleTargetTopics` call in progress adds */
+    this.addingTopics = null
     /** @type {WeakMap<object, {topics: object[], byName: Map<string, object>}>} lookup index per accepted metadata object */
     this.topicMetadataIndexes = new WeakMap()
     this.mutatingTargetTopics = new Lock({
@@ -226,6 +228,10 @@ module.exports = class Cluster {
       metadataCache: this.metadataCache,
       captureTopics:
         this.targetTopicState === null ? undefined : (topics) => this.captureTopics(topics),
+      dropTopic:
+        this.targetTopicState === null ? undefined : (topic) => this.dropTargetTopic(topic),
+      isNewTarget:
+        this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
@@ -867,6 +873,9 @@ module.exports = class Cluster {
   }
 
   /**
+   * Adds topics to the targets and refreshes metadata when that changed them. On a producer
+   * cluster, a topic this call adds that the broker refuses fails the call and is rolled back,
+   * while an earlier target it refuses affects only itself (see `BrokerPool#settleTopicErrors`).
    * @public
    * @param {string[]} topics
    * @param {object} [options]
@@ -887,6 +896,7 @@ module.exports = class Cluster {
       checked(null)
       const previousSize = this.targetTopics.size
       const previousTopics = new Set(this.targetTopics)
+      this.addingTopics = new Set(topics.filter((topic) => !previousTopics.has(topic)))
       for (const topic of topics) {
         this.targetTopics.add(topic)
         this.touchTargetTopic(topic)
@@ -909,11 +919,7 @@ module.exports = class Cluster {
               this.targetTopics = previousTopics
             } else {
               for (const topic of this.targetTopics) {
-                if (previousTopics.has(topic)) continue
-                this.targetTopics.delete(topic)
-                this.targetTopicState.delete(topic)
-                this.metadataCache.forget(topic)
-                this.brokerPool.forgetTopic(topic)
+                if (!previousTopics.has(topic)) this.forgetTargetTopic(topic)
               }
             }
           }
@@ -922,6 +928,7 @@ module.exports = class Cluster {
         }
       }
     } finally {
+      this.addingTopics = null
       await this.mutatingTargetTopics.release()
     }
   }
@@ -974,11 +981,34 @@ module.exports = class Cluster {
     const now = Date.now()
     for (const [topic, { lastUsed }] of this.targetTopicState) {
       if (this.topicPins.has(topic) || now - lastUsed < this.metadataMaxIdle) continue
-      this.targetTopics.delete(topic)
-      this.targetTopicState.delete(topic)
-      this.metadataCache.forget(topic)
-      this.brokerPool.forgetTopic(topic)
+      this.forgetTargetTopic(topic)
     }
+  }
+
+  /**
+   * Forgets a producer target the broker no longer serves, unless a send still holds it: its
+   * queued and retried batches need its routing and its later refreshes. A later send adds a
+   * forgotten target again as a new incarnation.
+   * @param {string} topic target name
+   * @returns {boolean} whether it was forgotten
+   */
+  dropTargetTopic(topic) {
+    if (this.topicPins.has(topic)) return false
+    this.forgetTargetTopic(topic)
+    return true
+  }
+
+  /**
+   * Forgets one producer target, its incarnation and both cached representations; its pins stay
+   * with their owners. Used for idle expiry, a refused add, and `dropTargetTopic`.
+   * @param {string} topic target name
+   * @returns {void}
+   */
+  forgetTargetTopic(topic) {
+    this.targetTopics.delete(topic)
+    this.targetTopicState.delete(topic)
+    this.metadataCache.forget(topic)
+    this.brokerPool.forgetTopic(topic)
   }
 
   /**
