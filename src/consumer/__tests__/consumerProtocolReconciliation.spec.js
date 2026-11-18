@@ -279,6 +279,12 @@ const buildPattern = (script) => {
           partitions: partitions.map(({ partition }) => ({ partition, offset: '0', errorCode: 0 })),
         })),
     })),
+    fetchTopicsOffset: jest.fn(async (requests) =>
+      requests.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({ partition, offset: '0' })),
+      }))
+    ),
     findGroupCoordinator: jest.fn(async () => coordinator),
     addMultipleTargetTopics: jest.fn(async () => {}),
   }
@@ -473,6 +479,109 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       { topicId: TOPIC_IDS[LATE], partitions: [0] },
     ])
     expect(count(events.GROUP_JOIN) - joinsBefore).toEqual(2)
+  })
+
+  it('keeps reconciling a subscription that changes during every round for sixty rounds, warning every twenty, and settles once the churn stops', async () => {
+    jest.useFakeTimers()
+    let fetching
+    try {
+      const churnName = (k) => `rx-churn-${k}`
+      for (let k = 1; k <= 61; k++) {
+        TOPIC_IDS[churnName(k)] = Buffer.alloc(16, k).toString('base64url')
+      }
+      const { group, runner, log, fetched, onCrash, discover, count, answerWith } = buildPattern([
+        target(1, { [CONTROL]: [0], [DELETED]: [0] }),
+        target(1, null),
+      ])
+      const coordinator = runner.rebalanceCoordinator
+      const warn = jest.spyOn(coordinator.logger, 'warn')
+      /** Advances fake time in 1 ms steps until `done()` holds, for at most `budget` ms. */
+      const until = async (done, budget = 1000) => {
+        for (let spent = 0; !done() && spent < budget; spent++) {
+          await jest.advanceTimersByTimeAsync(1)
+        }
+      }
+      const settle = () => until(() => !coordinator.isRebalancing())
+
+      coordinator.runRound(null, 'initial')
+      await until(() => group.groupMembership.immediatePending)
+      await group.heartbeat({ interval: 0 })
+      await settle()
+      await group.heartbeat({ interval: 0 })
+      fetching = runner.fetchManager.start()
+
+      // Each round applies the pin it took, and a new matching topic appears before the round
+      // checks whether it converged, so every round owes the next one.
+      const joinedAt = []
+      const recordJoin = coordinator.onJoinComplete
+      coordinator.onJoinComplete = () => {
+        recordJoin()
+        joinedAt.push(Date.now())
+        if (joinedAt.length <= 60)
+          discover({ [CONTROL]: [0], [churnName(joinedAt.length + 1)]: [0] })
+      }
+      const heartbeatsBefore = log.filter(({ kind }) => kind === 'heartbeat').length
+      const startedAt = Date.now()
+      const controlFetches = []
+
+      await discover({ [CONTROL]: [0], [churnName(1)]: [0] })
+      answerWith(target(2, { [CONTROL]: [0], [churnName(1)]: [0] }))
+      await group.heartbeat({ interval: 0 })
+      group.checkSubscriptionChange()
+
+      for (let round = 1; round <= 61; round++) {
+        await until(() => joinedAt.length >= round || onCrash.mock.calls.length > 0)
+        if (round % 20 === 0)
+          controlFetches.push(fetched.filter((k) => k === `${CONTROL}|0`).length)
+        if (round <= 60) {
+          answerWith(target(round + 2, { [CONTROL]: [0], [churnName(round + 1)]: [0] }))
+          await group.heartbeat({ interval: 0 })
+        }
+      }
+      await settle()
+
+      expect(onCrash).not.toHaveBeenCalled()
+      expect(joinedAt).toHaveLength(61)
+      expect(count(events.GROUP_JOIN)).toEqual(62)
+      expect(owned(group)).toEqual({ [CONTROL]: [0], [churnName(61)]: [0] })
+      expect(group.subscriptionPending()).toBe(false)
+      expect(group.groupMembership.needsReconciliation()).toBe(false)
+      expect(
+        warn.mock.calls.map(([message, extra]) => [
+          message,
+          extra.groupId,
+          extra.rounds,
+          extra.reason,
+        ])
+      ).toEqual(
+        [20, 40, 60].map((rounds) => [
+          'Reconciliation is still running',
+          GROUP_ID,
+          rounds,
+          'subscription-changed',
+        ])
+      )
+
+      // Paced: every follow-up round started at least one 100 ms wait after the one before it,
+      // and the chain itself sent no request beyond the heartbeats this case sent.
+      for (let i = 1; i < joinedAt.length; i++) {
+        expect(joinedAt[i] - joinedAt[i - 1]).toBeGreaterThanOrEqual(100)
+      }
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(60 * 100)
+      expect(log.filter(({ kind }) => kind === 'heartbeat').length - heartbeatsBefore).toEqual(61)
+
+      // The retained partition kept being fetched while the chain ran.
+      expect(controlFetches[0]).toBeGreaterThan(0)
+      expect(controlFetches[1]).toBeGreaterThan(controlFetches[0])
+      expect(controlFetches[2]).toBeGreaterThan(controlFetches[1])
+    } finally {
+      // The fetch loop's timers are fake: it has to stop before real time comes back.
+      const stopping = built.at(-1)?.fetchManager.stop()
+      await jest.advanceTimersByTimeAsync(100)
+      await stopping
+      await fetching
+      jest.useRealTimers()
+    }
   })
 
   it('assigns, then revokes, then assigns again across three heartbeat trips', async () => {
