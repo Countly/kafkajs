@@ -303,6 +303,7 @@ module.exports = class ConsumerGroup {
     this.haltedPartitions = new Map()
     this.obligations = obligations
     this.obligations.attachTo(this.operations)
+    this.obligations.claimSubscription(this.topicsSubscribed)
 
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
@@ -1679,12 +1680,14 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Applies a subscription lifecycle, never a rebalance assignment.
+   * Applies a subscription lifecycle, never a rebalance assignment. The names also become the
+   * consumer's subscribed names in its group's ownership record.
    * @param {string[]} topics accepted names with configuration already installed
    * @returns {void}
    */
   retainSubscription(topics) {
     this.topicsSubscribed = [...topics]
+    this.obligations?.claimSubscription(this.topicsSubscribed)
     this.subscriptionState.retainTopics(topics)
     const live = new Set(topics)
     for (const topic of Object.keys(this.topicConfigurations)) {
@@ -1757,6 +1760,7 @@ module.exports = class ConsumerGroup {
     }
 
     this.topicsSubscribed = [...this.topicsSubscribed, ...added]
+    this.obligations.claimSubscription(this.topicsSubscribed)
 
     for (const name of added) {
       this.topicConfigurations[name] = this.topicConfigurations[name] || {

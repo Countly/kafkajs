@@ -83,6 +83,7 @@ const Broker = require('../../src/broker')
 const ConnectionPool = require('../../src/network/connectionPool')
 const defaultSocketFactory = require('../../src/network/socketFactory')
 const ISOLATION_LEVEL = require('../../src/protocol/isolationLevel')
+const CommittedOffsetRevisions = require('../../src/cluster/committedOffsetRevisions')
 const { createLogger } = require('../../src/loggers')
 const LoggerConsole = require('../../src/loggers/console')
 const { Clients } = require('../clients')
@@ -784,7 +785,7 @@ const together = (emitters) => ({
 
 /**
  * @param {object} kafka a `Kafka`
- * @param {string} name `createCluster` or `operations`
+ * @param {string} name `createCluster`, `offsets` or `operations`
  * @returns {{ symbol: symbol, value: * }} the key and the value of the private member of `kafka`
  *   with that name
  * @throws {Error} when this version of the client has no such member
@@ -800,6 +801,27 @@ const privateOf = (kafka, name) => {
   }
 
   return { symbol, value: kafka[symbol] }
+}
+
+/**
+ * The consumer-churn profile's one private read: counts of a group's committed-offset state, taken
+ * from the Kafka instance's stores with `Map.get` and a non-creating revision read, so a read never
+ * creates a store entry, revision source, holder or ticket. Returns primitives only.
+ * @param {object} kafka a `Kafka`
+ * @returns {(groupId: string) => { present: boolean, topics?: number, cells?: number, cache?: number, open?: number }}
+ *   `present: false` when either store has no entry for the group
+ * @throws {Error} when this version of the client has no such stores
+ */
+const offsetStateReader = (kafka) => {
+  const offsets = privateOf(kafka, 'offsets').value
+  const operations = privateOf(kafka, 'operations').value
+  return (groupId) => {
+    const cache = offsets.get(groupId)
+    const ledger = operations.get(groupId)
+    if (!cache || !ledger) return { present: false }
+    const { topics, cells } = CommittedOffsetRevisions.sizeOf(cache)
+    return { present: true, topics, cells, cache: Object.keys(cache).length, open: ledger.size() }
+  }
 }
 
 /**
@@ -3000,8 +3022,9 @@ const buildProducerChurn = ({ brokers, phaseSeconds, phases }) => {
 
 /**
  * Builds the owner of the consumer-churn profile: a public client whose sockets the probe counts,
- * the journal on disk and the four phase workloads. Nothing here imports the client's sources or
- * reads its private members.
+ * the journal on disk and the four phase workloads. Nothing here reads the client's private members
+ * except `offsetStateReader`, whose counts the regex workload records beside, never into, the
+ * delivery journal.
  * @param {object} options
  * @param {string[]} options.brokers
  * @param {number|null} options.phaseSeconds a smoke run's phase length; such a run is never acceptance
@@ -3042,6 +3065,7 @@ const buildConsumerChurn = ({ brokers, phaseSeconds }) => {
     probe,
     tag: `cc${Date.now().toString(36)}`,
     clientLog,
+    offsetState: offsetStateReader(kafka),
   })
   return new ConsumerChurnRun({
     workloads,
@@ -7933,6 +7957,7 @@ module.exports = {
   createTopic,
   parseArgs,
   privateOf,
+  offsetStateReader,
   instrument,
   instrumentShare,
   main,
