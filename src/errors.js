@@ -542,11 +542,13 @@ class KafkaJSNoBrokerAvailableError extends KafkaJSError {
 }
 
 /**
- * A classic-protocol rebalance chain ran its round limit and still owed another round: members
- * kept revoking partitions from each other. Retriable, so the default `restartOnFailure` policy
- * restarts the consumer, which rejoins from the committed offsets; records processed since the
- * last commit can be delivered again. A custom `restartOnFailure` must return true for it to
- * restart. Consumer-protocol (KIP-848) groups never raise it.
+ * A classic-protocol rebalance chain with a cooperative assignor completed its 20-round limit and
+ * another round was still required. Retriable, so the default `restartOnFailure` policy restarts
+ * the consumer, which rejoins and resumes from the committed offsets (the offset reset policy
+ * applies where none is committed); records processed since the last commit can be delivered
+ * again. A custom `restartOnFailure` receives this error itself and restarts only when it returns
+ * true. An eager classic chain still ends with `KafkaJSNonRetriableError`, and consumer-protocol
+ * (KIP-848) groups never raise it.
  */
 class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
   /**

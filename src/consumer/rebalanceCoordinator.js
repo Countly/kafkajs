@@ -1,7 +1,7 @@
 const describeThrown = require('../network/describeThrown')
 const handlerContext = require('./handlerContext')
 const RebalanceHooks = require('./rebalanceHooks')
-const { KafkaJSRebalanceNotConvergedError } = require('../errors')
+const { KafkaJSNonRetriableError, KafkaJSRebalanceNotConvergedError } = require('../errors')
 const {
   REBALANCE_PATHS,
   rebalanceAction,
@@ -26,12 +26,17 @@ const {
 } = require('./instrumentationEvents')
 
 /**
- * Consecutive rounds one classic chain may run before it is treated as non-converging. A
- * cooperative round that revokes something runs a follow-up round at once; a pair of members that
- * keep taking partitions from each other would otherwise chain forever. A consumer-protocol chain
- * has no such count: its rounds are paced, and this is how often it warns instead.
+ * Consecutive rounds one classic chain may run before it is treated as non-converging. A classic
+ * cooperative round that revokes something runs a follow-up round at once, with no wait; a pair of
+ * members that keep taking partitions from each other would otherwise chain forever.
  */
-const MAX_REJOIN_ROUNDS = 20
+const MAX_CLASSIC_ROUNDS = 20
+
+/**
+ * How many rounds a consumer-protocol chain completes between two warnings that it is still
+ * running. Such a chain has no round limit: it waits before each follow-up round instead.
+ */
+const RECONCILE_WARN_EVERY = 20
 
 /**
  * The shortest wait between two consumer-protocol rounds. The heartbeat interval the wait follows
@@ -79,8 +84,9 @@ const POLL_TIMEOUT_WARNING =
  * round loop, the round counter, the mid-chain rejoin request and the pending-verdict slot, and
  * the only owner of the poll-expiry sequence.
  *
- * A **round** is one JoinGroup plus one SyncGroup plus the apply, and rounds run in a
- * single-flight chain: a trigger that arrives while a chain runs is remembered, never raced.
+ * A **round** is one classic JoinGroup and SyncGroup, or one consumer-protocol reconciliation
+ * step, plus the apply. Rounds run in a single-flight chain: a trigger that arrives while a chain
+ * runs is remembered, never raced.
  *
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
  */
@@ -157,13 +163,13 @@ module.exports = class RebalanceCoordinator {
   }
 
   /**
-   * One coordinator trip's worth of spacing between two consumer-protocol reconciliation rounds,
-   * so a multi-trip reconciliation spends its round budget on real trips instead of spinning the
-   * event loop.
+   * The wait after a consumer-protocol round when another one is owed, so a reconciliation that
+   * takes several coordinator trips does not spin the event loop. The first round of a chain does
+   * not wait.
    *
    * The wait is the membership's heartbeat interval, at least `MIN_RECONCILE_YIELD_MS` and at most
-   * `MAX_RECONCILE_YIELD_MS`: with one apply and at most one owed heartbeat per round, it is what
-   * bounds the CPU and request rate of a chain that has no round count.
+   * `MAX_RECONCILE_YIELD_MS`. It bounds how often a chain with no round count applies, not the
+   * member's whole request rate: periodic heartbeats and request retries run on their own timers.
    *
    * Raced against the stop signal rather than merely guarded before it: a stop landing one tick
    * after the timer is armed would otherwise hold `stop()` open for the whole delay. Deliberately
@@ -416,30 +422,14 @@ module.exports = class RebalanceCoordinator {
         // without the accessor is a classic one.
         const protocol = this.consumerGroup.kind || 'classic'
 
-        kind = this.takePendingKind() || 'revoked'
-        let level = false
-        if (kind === 'lost') {
-          reason = this.takeRejoinRequested()
-        } else if (revoked.length && cooperative && protocol === 'classic') {
-          reason = 'partitions-revoked'
-        } else if (protocol === 'consumer' && this.consumerGroup.needsReconciliation()) {
-          reason = 'assignment-changed'
-          level = true
-        } else {
-          reason = this.takeRejoinRequested()
-        }
+        let next = this.nextRound(revoked.length > 0 && cooperative && protocol === 'classic')
 
-        // A level, not an event: a request that arrived while this chain ran was dropped, but the
-        // unapplied revision it stood for is still there.
-        if (!reason && this.consumerGroup.subscriptionPending?.()) {
-          reason = 'subscription-changed'
-          level = true
-        }
-
-        if (reason && protocol === 'consumer' && !this.runner.stopRequested) {
+        if (next.reason && protocol === 'consumer' && !this.runner.stopRequested) {
           await this.yieldBetweenRounds()
-          if (level && !this.owesRound()) reason = null
+          next = this.nextRoundAfterWait(next)
         }
+        kind = next.kind
+        reason = next.reason
       } finally {
         if (hooks) this.finishListenerRound(round, additionHold)
         round.retire()
@@ -451,20 +441,24 @@ module.exports = class RebalanceCoordinator {
    * Charges one round to the running chain. The only place a chain is declared exhausted.
    *
    * A consumer-protocol chain is never exhausted: it runs a round only while work is owed, each
-   * after one paced wait, the way the Java client keeps reconciling. Every `MAX_REJOIN_ROUNDS`
-   * completed rounds it warns, naming the reason for the next one. A classic chain has no wait
-   * between rounds, so it is refused past `MAX_REJOIN_ROUNDS` with a retriable error that the
-   * default crash policy answers with a restart.
+   * follow-up after one paced wait, the way the Java client keeps reconciling. When another round
+   * is about to start after a multiple of `RECONCILE_WARN_EVERY` completed rounds, it warns,
+   * naming that round's reason. A classic chain has no wait between rounds, so the round after
+   * `MAX_CLASSIC_ROUNDS` completed ones is refused: with a cooperative assignor, with the retriable
+   * `KafkaJSRebalanceNotConvergedError` that the default crash policy answers with a restart; with
+   * an eager one, with the non-retriable error it always raised.
    * @private
    * @param {string|null} reason the reason the round about to run is for
    * @returns {void}
-   * @throws {KafkaJSRebalanceNotConvergedError} when a classic chain has already run
-   *   `MAX_REJOIN_ROUNDS` rounds
+   * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain needs another
+   *   round after `MAX_CLASSIC_ROUNDS`
+   * @throws {KafkaJSNonRetriableError} when a classic eager chain needs another round after
+   *   `MAX_CLASSIC_ROUNDS`
    */
   chargeRound(reason) {
     const completed = this.rounds++
     if (this.consumerGroup.kind === 'consumer') {
-      if (completed > 0 && completed % MAX_REJOIN_ROUNDS === 0) {
+      if (completed > 0 && completed % RECONCILE_WARN_EVERY === 0) {
         this.logger.warn('Reconciliation is still running', {
           groupId: this.groupId,
           rounds: completed,
@@ -473,30 +467,61 @@ module.exports = class RebalanceCoordinator {
       }
       return
     }
-    if (completed >= MAX_REJOIN_ROUNDS) {
-      throw new KafkaJSRebalanceNotConvergedError(
-        `cooperative rebalance did not converge in ${MAX_REJOIN_ROUNDS} rounds`
-      )
+    if (completed < MAX_CLASSIC_ROUNDS) return
+    const message = `cooperative rebalance did not converge in ${MAX_CLASSIC_ROUNDS} rounds`
+    if (this.consumerGroup.rebalanceProtocol() !== COOPERATIVE) {
+      throw new KafkaJSNonRetriableError(message)
     }
+    throw new KafkaJSRebalanceNotConvergedError(message)
   }
 
   /**
-   * Whether a consumer-protocol chain still owes another round after its inter-round wait. A
-   * reason taken from a level before the wait is carried only while something is still owed:
-   * the target or the subscription still differs, or an explicit obligation (a queued re-entry or
-   * LOST, or a verdict in the slot) arrived meanwhile. A target that converged during the wait
-   * ends the chain without charging another round.
+   * Picks the round that follows a completed one, taking what it consumes: a queued LOST first,
+   * then a classic cooperative revocation, a target this member does not own yet, a queued
+   * re-entry, and last a desired subscription revision not applied yet. The target and the
+   * subscription are levels, re-read on every call; the queued requests are events, cleared here.
    * @private
-   * @returns {boolean}
+   * @param {boolean} revokedCooperatively whether a classic cooperative apply just revoked something
+   * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} `reason` is null when
+   *   no round is owed; `level` is true when it came from the target or the subscription
    */
-  owesRound() {
-    return (
-      this.pendingKind !== null ||
-      this.rejoinRequested !== null ||
-      this.verdict !== null ||
-      this.consumerGroup.needsReconciliation() ||
-      Boolean(this.consumerGroup.subscriptionPending?.())
-    )
+  nextRound(revokedCooperatively) {
+    const kind = this.takePendingKind() || 'revoked'
+    let reason
+    if (kind === 'lost') {
+      reason = this.takeRejoinRequested()
+    } else if (revokedCooperatively) {
+      reason = 'partitions-revoked'
+    } else if (this.consumerGroup.kind === 'consumer' && this.consumerGroup.needsReconciliation()) {
+      return { kind, reason: 'assignment-changed', level: true }
+    } else {
+      reason = this.takeRejoinRequested()
+    }
+
+    // A level, not an event: a request that arrived while this chain ran was dropped, but the
+    // unapplied revision it stood for is still there.
+    if (!reason && this.consumerGroup.subscriptionPending?.()) {
+      return { kind, reason: 'subscription-changed', level: true }
+    }
+    return { kind, reason, level: false }
+  }
+
+  /**
+   * Picks again once a consumer-protocol chain has waited, because the wait can change what is
+   * owed. A LOST queued during it runs next, ahead of anything chosen before; a LOST queued for a
+   * membership a later join replaced is dropped. A choice taken from a level is replaced by what is
+   * owed now, and ends the chain when nothing is. An explicit re-entry or LOST chosen before the
+   * wait stays. A verdict that reached the slot during the wait keeps the chosen round, which its
+   * refusal then ends.
+   * @private
+   * @param {{ kind: string, reason: string, level: boolean }} chosen the round picked before the wait
+   * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} the round to run, if any
+   */
+  nextRoundAfterWait(chosen) {
+    if (chosen.kind === 'lost' || (!chosen.level && this.pendingKind === null)) return chosen
+    const now = this.nextRound(false)
+    if (now.reason || (chosen.level && this.verdict === null)) return now
+    return chosen
   }
 
   /**
@@ -574,7 +599,7 @@ module.exports = class RebalanceCoordinator {
    * A REVOKED arriving while a chain runs is DROPPED, not queued. The rebalance-in-progress
    * answers a coordinator gives across a round's own sync window are received heartbeats, not
    * verdicts - the Java client ignores `REBALANCE_IN_PROGRESS` unless it is STABLE - and queueing
-   * them would chain a round per sync window until the convergence guard crashed the consumer.
+   * them would chain one round per sync window without end.
    * A LOST is never dropped.
    *
    * @param {Verdict} verdict
