@@ -5,7 +5,11 @@ const { createLogger, LEVELS } = require('../../loggers')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 const { Kafka } = require('../../..')
 const Encoder = require('../../protocol/encoder')
+const Cluster = require('../../cluster')
+const { ShareRunner } = require('../../consumer/share/shareRunner')
+const { newLogger, connectionOpts } = require('testHelpers')
 const {
+  KafkaJSInvalidConfigurationError,
   KafkaJSConnectionError,
   KafkaJSConnectionClosedError,
   KafkaJSNonRetriableError,
@@ -248,6 +252,99 @@ describe('Broker > SASLAuthenticator > transport failures during the exchange', 
     expect(error).toBe(failure)
     expect(error.retriable).toBe(true)
   })
+})
+
+describe('Broker > SASLAuthenticator > failures that remain authentication errors', () => {
+  beforeEach(() => {
+    gssapiClient = gssapiStub()
+  })
+
+  test.each([
+    ['PLAIN', { mechanism: 'plain', username: 'user' }],
+    ['SCRAM-SHA-256', { mechanism: 'scram-sha-256', username: 'user' }],
+    ['SCRAM-SHA-512', { mechanism: 'scram-sha-512', username: 'user' }],
+    ['AWS', { mechanism: 'aws', authorizationIdentity: 'id', accessKeyId: 'key' }],
+    ['OAUTHBEARER', { mechanism: 'oauthbearer', oauthBearerProvider: async () => ({}) }],
+  ])(
+    '%s: missing credentials stay an authentication error and send nothing',
+    async (name, sasl) => {
+      const { error, sent } = await authenticate(name, () => ({}), { sasl })
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.retriable).toBe(false)
+      expect(sent).toBe(0)
+    }
+  )
+
+  test('GSSAPI: an invalid service name keeps its configuration error class', async () => {
+    const { error, sent } = await authenticate('GSSAPI', () => ({}), {
+      sasl: { mechanism: 'gssapi', serviceName: 'kafka/host' },
+    })
+
+    expect(Object.getPrototypeOf(error)).toBe(KafkaJSInvalidConfigurationError.prototype)
+    expect(sent).toBe(0)
+  })
+
+  test.each(['SCRAM-SHA-256', 'SCRAM-SHA-512'])(
+    '%s: a server-first message failing validation stays an authentication error',
+    async (name) => {
+      const serverFirst = Buffer.from(`r=foreign-nonce,s=${SECRET},i=4096`)
+      const { error, entries } = await authenticate(name, () => ({
+        authBytes: new Encoder().writeBytes(serverFirst).buffer,
+      }))
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.retriable).toBe(false)
+      expect(error.message).toContain('Invalid server nonce')
+      expect(textOf([error, entries])).not.toContain(SECRET)
+    }
+  )
+
+  test('OAUTHBEARER: a supplier rejection outside the exchange keeps its own error', async () => {
+    const rejection = new KafkaJSConnectionError('supplier unavailable')
+    const { error, sent } = await authenticate('OAUTHBEARER', () => ({}), {
+      sasl: {
+        mechanism: 'oauthbearer',
+        oauthBearerProvider: async () => {
+          throw rejection
+        },
+      },
+    })
+
+    expect(error).toBe(rejection)
+    expect(sent).toBe(0)
+  })
+})
+
+describe('Broker > SASLAuthenticator > the classification reaches the recovery policies', () => {
+  /** @returns {Promise<Error>} what SCRAM-SHA-512 throws when the exchange send fails so */
+  const produce = (failure) =>
+    authenticate('SCRAM-SHA-512', () => {
+      throw failure
+    }).then(({ error }) => error)
+
+  test.each([
+    ['a lost connection', connectionError, true],
+    ['a request timeout', timeoutError, true],
+    ['a broker rejection', () => createErrorFromCode(58), false],
+  ])(
+    '%s during the exchange decides rebootstrap, consumer restart and share restart',
+    async (_, make, recoverable) => {
+      const error = await produce(make())
+      const cluster = new Cluster({
+        ...connectionOpts(),
+        logger: newLogger(),
+        metadataRecoveryStrategy: 'rebootstrap',
+        metadataRecoveryRebootstrapTriggerMs: 1000,
+      })
+
+      await cluster.brokerPool.onMetadataFailure(error)
+
+      expect(cluster.brokerPool.metadataUnavailableSince !== null).toBe(recoverable)
+      expect(error.retriable === true).toBe(recoverable)
+      expect(ShareRunner.prototype.mustNotRestart.call(null, error)).toBe(!recoverable)
+    }
+  )
 })
 
 describe('Broker > SASLAuthenticator > transport failures through the client', () => {
