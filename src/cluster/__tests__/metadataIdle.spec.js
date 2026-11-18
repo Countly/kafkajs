@@ -1231,11 +1231,13 @@ describe('producer metadata idle expiry over the wire', () => {
 
     /**
      * @param {Error} error
-     * @returns {string[]} the name or protocol type of the error and of each cause under it
+     * @returns {string[]} the protocol type, or else the name, of the error and of each cause
      */
     const chainOf = (error) => {
       const chain = []
-      for (let at = error; at; at = at.cause) chain.push(at.type ?? at.name)
+      for (let at = error; at; at = at.cause) {
+        chain.push(at.name === 'KafkaJSProtocolError' ? at.type : at.name)
+      }
       return chain
     }
 

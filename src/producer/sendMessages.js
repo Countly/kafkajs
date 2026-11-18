@@ -103,6 +103,19 @@ const refreshesMetadata = (e) =>
     describeThrown(e, 'retriable') === 'true')
 
 /**
+ * The error a topic's batches fail with when their leader's broker cannot be found: the topic's
+ * own Metadata refusal while the cluster keeps one (a kept target the broker refused, whose old
+ * routing names a broker that left), so they settle as a Produce answer with that code would.
+ * @param {import("../../types").Cluster} cluster
+ * @param {string} topic
+ * @param {Error} error the lookup failure
+ * @returns {Error}
+ */
+const routingError = (cluster, topic, error) =>
+  (describeThrown(error, 'name') === 'KafkaJSBrokerNotFound' && cluster.topicRefusal?.(topic)) ||
+  error
+
+/**
  * The topic ids of a produce request, when every topic in it has one: the request can then be
  * negotiated at v13, which keys topics by id (KIP-516).
  * @param {import("../../types").Cluster} cluster
@@ -1330,7 +1343,7 @@ class DrainLoop {
         refused.push(batch)
       } else if (error instanceof ProduceAttemptRefused) {
         manager.sequencer.requeue(batch, 0, { counted: false })
-      } else this.#failed(manager, batch, error)
+      } else this.#failed(manager, batch, routingError(this.#cluster, batch.topic, error))
     }
     if (refused.length > 0) this.#repartition(manager, refused, error)
   }
@@ -2491,7 +2504,7 @@ const createSendMessages = ({
                     })
                     generation?.check()
                   } catch (error) {
-                    leave(candidates, error)
+                    leave(candidates, routingError(cluster, topic, error))
                     continue
                   }
                   const live = candidates.filter((batch) => unsettled.has(batch))

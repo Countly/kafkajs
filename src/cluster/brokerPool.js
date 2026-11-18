@@ -147,6 +147,8 @@ module.exports = class BrokerPool {
     drainTimeout,
   }) {
     this.captureTopics = captureTopics
+    /** @type {Map<string, number>} the Metadata error code of each kept refused target */
+    this.topicRefusals = new Map()
     this.dropTopic =
       dropTopic ??
       ((topic) => {
@@ -1019,6 +1021,9 @@ module.exports = class BrokerPool {
             const incoming = this.settleTopicErrors(response.topicMetadata, accept).filter(
               ({ topic }) => accept(topic)
             )
+            if (this.topicRefusals.size > 0) {
+              for (const { topic } of incoming) this.topicRefusals.delete(topic)
+            }
             const replaced = new Set(incoming.map(({ topic }) => topic))
             const retained = (this.metadata?.topicMetadata || []).filter(
               ({ topic }) => !replaced.has(topic)
@@ -1150,7 +1155,8 @@ module.exports = class BrokerPool {
    * invalid or unauthorized (a deleted topic, say) never fails the refresh of the other targets:
    * it is dropped through `dropTopic`, and a later send to it adds it again and fails on its own.
    * One whose sends still own it is kept with the metadata it had, so they keep their routing and
-   * their retries ask about it again; their Produce answers carry the topic's own error. A topic
+   * their retries ask about it again; its error code is remembered in `topicRefusals` until a
+   * refresh answers it healthy or it is forgotten, for sends whose old leader is gone. A topic
    * this refresh no longer captures is skipped. Any other topic error is thrown, as the version's
    * own parse would throw it, after the drops.
    * @param {object[]} topicMetadata the answer's topics, topic errors retained
@@ -1170,6 +1176,7 @@ module.exports = class BrokerPool {
       const error = createErrorFromCode(topicErrorCode)
       if (installed.has(topic) && DROPPED_TOPIC_ERRORS.has(error.type)) {
         const dropped = this.dropTopic(topic)
+        if (!dropped) this.topicRefusals.set(topic, topicErrorCode)
         this.logger.warn(
           dropped
             ? 'Dropping a target topic the broker no longer serves'
@@ -1185,11 +1192,13 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Drops one producer target from the retained decoded response, preserving broker discovery.
+   * Drops one producer target from the retained decoded response and its remembered refusal,
+   * preserving broker discovery.
    * @param {string} topic forgotten name
    * @returns {void}
    */
   forgetTopic(topic) {
+    this.topicRefusals.delete(topic)
     if (this.metadata) {
       this.metadata = {
         ...this.metadata,
