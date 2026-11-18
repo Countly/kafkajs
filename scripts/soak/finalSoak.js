@@ -245,8 +245,11 @@ function recipientGroups(config, matrix, role) {
  * fifteen children, holds the readiness barrier, runs the plan with gated sampling, owns topic and
  * broker churn with their broker-state receipts, relays readbacks, scans and telemetry
  * subscriptions, watches the host, samples itself like every persistent process, records every
- * child exit it observes and leaves after them. It never kills a child, unrefs a handle or calls
- * `process.exit`.
+ * child exit it observes and leaves after them. It never unrefs a handle or calls `process.exit`,
+ * and kills a child only when it is still alive a teardown allowance after its disconnect, naming
+ * it in the receipt. Every failure of the run (a lost or silent child, a refused or unwritten
+ * record, a late or failed step, an unconfirmed outage) is listed in the receipt's `problems`, so
+ * a natural exit is never read as a successful day.
  */
 class Supervisor {
   /** @param {ReturnType<typeof parseArgs>} options */

@@ -13,7 +13,13 @@ const dictionary = require('../../../src/utils/dictionary')
 const { buildConfig, digest, digestFile, finalize, recordOuterExit } = require('../finalSoak')
 const { Collector, SourceChannel } = require('../finalSoakCollector')
 const { PassiveObserver } = require('../finalSoakObserver')
-const { ChildRuntime, ClientRig, ConsumerWorker, ShareWorker } = require('../finalSoakWorkers')
+const {
+  ChildRuntime,
+  ClientRig,
+  ConsumerWorker,
+  DecoderWorker,
+  ShareWorker,
+} = require('../finalSoakWorkers')
 const { ContainerDumper } = require('../finalSoakDump')
 const { validateRecord } = require('../finalSoakSchema')
 
@@ -351,6 +357,52 @@ describe('final soak handler entries', () => {
   })
 })
 
+describe('final soak process lifetime', () => {
+  test('a process whose supervisor is gone marks its source incomplete, disconnects its clients and stops observing', async () => {
+    const calls = []
+    const self = {
+      channel: { incomplete: null },
+      worker: { disconnect: async () => calls.push('disconnect') },
+      roles: { stop: () => calls.push('roles') },
+      observer: { restore: () => calls.push('restore') },
+    }
+    await ChildRuntime.prototype.orphaned.call(self)
+    expect(self.channel.incomplete).toEqual(expect.stringContaining('supervisor'))
+    expect(calls).toEqual(['disconnect', 'roles', 'restore'])
+  })
+
+  test('a telemetry push binds to its subscription whichever form of the instance id each side prints', async () => {
+    const dir = tmp('instance')
+    try {
+      const records = []
+      const runtime = {
+        out: dir,
+        slotOf: () => ({ slot: 'c11' }),
+        nextId: () => `p16.${records.length}`,
+        emit: async (r) => records.push(r),
+        diagnose: async () => {},
+      }
+      const decoder = new DecoderWorker(runtime)
+      decoder.dir = path.join(dir, 'sink')
+      fs.mkdirSync(decoder.dir)
+      await decoder.onTelemetrySubscriptions({
+        entries: [{ client: 'c11.1', instanceId: DASHED, subscriptionId: 5 }],
+      })
+      fs.writeFileSync(path.join(decoder.dir, 'reporter-1.json'), JSON.stringify({ loadedAtMs: 1 }))
+      fs.writeFileSync(
+        path.join(decoder.dir, 'exports-1.jsonl'),
+        `${JSON.stringify({ node: '1', seq: 1, clientId: 'c11.1', clientInstanceId: PRINTED, terminating: false, dataSha256: 'f'.repeat(64), parse: 'ok', metricsTotal: 2, truncated: false })}\n`
+      )
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(records).toEqual([
+        expect.objectContaining({ subscriptionId: '5', instanceId: PRINTED }),
+      ])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('final soak finalization', () => {
   test('a virtual input past the largest single read is hashed and counted with one fixed buffer', () => {
     const size = 2 ** 31 + 5
@@ -503,13 +555,7 @@ describe('final soak finalization', () => {
 
 describe('final soak container dumps', () => {
   const main = config.topics.main
-  const groups = [
-    ...new Set(
-      config.clients
-        .filter((c) => c.group && matrix.clientKinds[c.clientKind].role === 'consumer')
-        .map((c) => c.group)
-    ),
-  ]
+  const groups = [...new Set(config.clients.map((c) => c.group).filter(Boolean))]
 
   /** Scripted Apache tools: argv in, stdout chunks and stderr out. */
   const tools = ({ failGroup = null, shortMain = false } = {}) => {
@@ -521,18 +567,14 @@ describe('final soak container dumps', () => {
       let stdout = ''
       let stderr = ''
       let code = 0
-      if (tool.endsWith('kafka-get-offsets.sh')) {
-        const end = arg('--time') === '-2' ? 0 : arg('--topic') === main ? 5 : 8
-        stdout = `${arg('--topic')}:0:${end}\n`
-      } else if (tool.endsWith('kafka-console-consumer.sh')) {
-        const topic = arg('--topic')
-        const count = topic === main ? (shortMain ? 3 : 5) : 6
-        const offsets = topic === main ? [0, 1, 2, 3, 4] : [0, 1, 2, 4, 5, 6]
-        for (const o of offsets.slice(0, count)) stdout += `Partition:0\tOffset:${o}\tp08.${o}\n`
-        stderr = `[ERROR] Error processing message, terminating consumer process: TimeoutException\nProcessed a total of ${count} messages\n`
+      if (tool.endsWith('kafka-console-consumer.sh')) {
+        const offsets = arg('--topic') === main ? [0, 1, 2, 3, 4] : [0, 1, 2, 4, 5, 6]
+        for (const o of offsets) stdout += `Partition:0\tOffset:${o}\tp08.${o}\t${RUN}|p08.${o}||\n`
+        const counted = shortMain && arg('--topic') === main ? 3 : offsets.length
+        stderr = `[ERROR] Error processing message: TimeoutException\nProcessed a total of ${counted} messages\n`
       } else {
         const group = arg('--group')
-        stdout = `GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG\n${group} ${main} 0 5 5 0\n`
+        stdout = `\nGROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG CONSUMER-ID HOST CLIENT-ID\n${group} ${main} 0 5 5 0 - - -\n`
         if (group === failGroup) {
           code = 1
           stderr = 'Error: group failed\n'
@@ -543,107 +585,79 @@ describe('final soak container dumps', () => {
     }
     return { run, calls }
   }
-  const dump = (out, scripted) =>
-    new ContainerDumper({ out, config, matrix, run: scripted.run, now: () => 7 })
-  const trailer = (file) => {
-    const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n')
-    expect(lines.at(-1)).toMatch(/^#dump-trailer \{/)
-    return { data: lines.slice(0, -1), ...JSON.parse(lines.at(-1).slice('#dump-trailer '.length)) }
-  }
+  const dump = (out, scripted) => new ContainerDumper({ out, config, run: scripted.run })
+  const read = (out, rel) => fs.readFileSync(path.join(out, 'apache', rel), 'utf8')
 
-  test('both standing logs and every ordinary group are dumped by the Apache tools in the broker container', async () => {
+  test('both standing logs and every group are dumped by the Apache tools in the broker container, each with its stderr, command and end line', async () => {
     const out = tmp('dump')
     try {
       const scripted = tools()
-      const index = await dump(out, scripted).run()
-      const log = trailer(path.join(out, 'dump/log-main.txt'))
-      expect(log.data).toEqual([0, 1, 2, 3, 4].map((o) => `Partition:0\tOffset:${o}\tp08.${o}`))
-      expect(log).toMatchObject({
-        lines: 5,
-        exitCode: 0,
-        startOffsets: { 0: '0' },
-        endOffsets: { 0: '5' },
-        lastOffsets: { 0: '4' },
-        processed: 5,
-        complete: true,
-      })
-      const log2 = trailer(path.join(out, 'dump/log-transactions.txt'))
-      expect(log2).toMatchObject({
-        lines: 6,
-        endOffsets: { 0: '8' },
-        lastOffsets: { 0: '6' },
-        complete: true,
-      })
-      expect(groups.length).toBeGreaterThanOrEqual(8)
+      const { files } = await dump(out, scripted).run()
+      expect(files).toEqual([
+        'main.dump',
+        'transactions.dump',
+        ...groups.map((g) => `groups/${g}.describe`),
+      ])
+      expect(read(out, 'main.dump').split('\n').filter(Boolean)).toEqual(
+        [0, 1, 2, 3, 4].map((o) => `Partition:0\tOffset:${o}\tp08.${o}\t${RUN}|p08.${o}||`)
+      )
+      expect(read(out, 'main.dump.end')).toBe('exit=0 lines=5\n')
+      expect(read(out, 'transactions.dump.end')).toBe('exit=0 lines=6\n')
+      expect(read(out, 'main.dump.stderr')).toContain('Processed a total of 5 messages')
       for (const group of groups) {
-        const file = path.join(out, `dump/group-${group}.txt`)
-        expect(trailer(file)).toMatchObject({ exitCode: 0, complete: true })
+        expect(read(out, `groups/${group}.describe`)).toContain(`${group} ${main} 0 5 5 0`)
+        expect(read(out, `groups/${group}.describe.end`)).toBe('exit=0 lines=3\n')
       }
-      expect(
-        fs.existsSync(
-          path.join(
-            out,
-            `dump/group-${config.clients.find((c) => c.clientKind === 'share').group}.txt`
-          )
-        )
-      ).toBe(false)
-      const command = fs.readFileSync(path.join(out, 'dump/log-main.cmd'), 'utf8').trim()
-      expect(command).toBe(
+      expect(read(out, 'main.dump.cmd').trim()).toBe(
         [
           'docker compose exec -T kafka1 /opt/kafka/bin/kafka-console-consumer.sh',
-          '--bootstrap-server kafka1:29092',
+          '--bootstrap-server kafka1:29092,kafka2:29095,kafka3:29098',
           `--topic ${main}`,
           '--partition 0',
           '--offset earliest',
           '--isolation-level read_committed',
-          '--timeout-ms 30000',
+          '--timeout-ms 60000',
           '--formatter-property print.partition=true',
           '--formatter-property print.offset=true',
           '--formatter-property print.key=true',
-          '--formatter-property print.value=false',
         ].join(' ')
       )
-      const groupCall = scripted.calls.find(
-        (c) =>
-          c.includes('kafka-consumer-groups.sh') ||
-          c.some((a) => a.endsWith('kafka-consumer-groups.sh'))
+      const [first] = groups
+      expect(read(out, `groups/${first}.describe.cmd`).trim()).toBe(
+        `docker compose exec -T kafka1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka1:29092,kafka2:29095,kafka3:29098 --describe --group ${first}`
       )
-      expect(groupCall).toEqual(
-        expect.arrayContaining([
-          '--bootstrap-server',
-          'kafka1:29092',
-          '--describe',
-          '--group',
-          groups[0],
-        ])
-      )
-      expect(index.files.map((f) => f.file)).toEqual(
-        expect.arrayContaining(['dump/log-main.txt', 'dump/log-transactions.txt'])
-      )
-      expect(JSON.parse(fs.readFileSync(path.join(out, 'dump/index.json'), 'utf8'))).toEqual(index)
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
   })
 
-  test('a failing tool or a log dump shorter than its log fails the dump loudly after every file is written', async () => {
-    const out = tmp('dump-fail')
+  test('the share group is described for the record but its status never fails the dump', async () => {
+    const out = tmp('dump-share')
     try {
-      await expect(dump(out, tools({ failGroup: groups[1] })).run()).rejects.toThrow(
-        new RegExp(`group-${groups[1]}`)
-      )
-      expect(trailer(path.join(out, `dump/group-${groups[1]}.txt`))).toMatchObject({
-        exitCode: 1,
-        complete: false,
-      })
-      expect(trailer(path.join(out, `dump/group-${groups.at(-1)}.txt`))).toMatchObject({
-        complete: true,
-      })
-      await expect(dump(tmp('dump-short'), tools({ shortMain: true })).run()).rejects.toThrow(
-        /log-main/
-      )
+      const share = config.clients.find((c) => c.clientKind === 'share').group
+      await expect(dump(out, tools({ failGroup: share })).run()).resolves.toMatchObject({})
+      expect(read(out, `groups/${share}.describe.end`)).toBe('exit=1 lines=3\n')
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a failing tool or a log dump whose count differs from its lines fails the dump loudly after every file is written', async () => {
+    const out = tmp('dump-fail')
+    const short = tmp('dump-short')
+    try {
+      await expect(dump(out, tools({ failGroup: groups[1] })).run()).rejects.toThrow(
+        new RegExp(`groups/${groups[1]}.describe \\(exit 1\\)`)
+      )
+      expect(read(out, `groups/${groups[1]}.describe.end`)).toBe('exit=1 lines=3\n')
+      expect(read(out, `groups/${groups.at(-1)}.describe.end`)).toBe('exit=0 lines=3\n')
+      await expect(dump(short, tools({ shortMain: true })).run()).rejects.toThrow(
+        /main\.dump \(the tool counted 3 records, wrote 5 lines\)/
+      )
+      expect(read(short, 'main.dump.end')).toBe('exit=0 lines=5\n')
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+      fs.rmSync(short, { recursive: true, force: true })
     }
   })
 })

@@ -586,6 +586,18 @@ class ChildRuntime {
     process.send({ type: 'done', id, error, reply, incomplete: this.channel.incomplete })
   }
 
+  /**
+   * Winds the process down by itself when the supervisor is gone: its source is marked incomplete,
+   * so nothing more is sent, every client disconnects and the process is left with nothing to run.
+   * @returns {Promise<void>}
+   */
+  async orphaned() {
+    this.channel.incomplete ??= 'the supervisor closed its channel'
+    await this.worker.disconnect()
+    this.roles.stop()
+    this.observer.restore()
+  }
+
   /** @returns {Promise<void>} disconnects every client, takes the final sample and lets the process end */
   async stop() {
     await this.worker.disconnect()
@@ -1845,6 +1857,13 @@ const scanPartition = async (broker, { topic, partition, from }) => {
 }
 
 /**
+ * @param {unknown} id a client instance id, as the client prints it (dashed hex) or the reporter
+ *   does (base64url)
+ * @returns {string} one form for both, so a push binds to the subscription its client received
+ */
+const instanceKey = (id) => normalizeTopicId(String(id)) ?? String(id)
+
+/**
  * Splits each broker reporter's file into boot segments and checks them: within one boot the
  * reporter's sequence numbers must run on without a gap (a gap is a dropped push), a new boot must
  * restart them at 1 after a new load proof, and an overflow marker means the reporter dropped rows.
@@ -1890,7 +1909,7 @@ class DecoderWorker extends Worker {
 
   /** @param {{ entries: object[] }} step subscriptions the clients received */
   async onTelemetrySubscriptions(step) {
-    for (const e of step.entries) this.subscriptions.set(e.instanceId, e)
+    for (const e of step.entries) this.subscriptions.set(instanceKey(e.instanceId), e)
   }
 
   /** @returns {Promise<{ abort: string|null }>} reads what the reporters wrote since the last tick */
@@ -1926,7 +1945,7 @@ class DecoderWorker extends Worker {
         if (push.parse !== 'ok' || push.truncated === true)
           abort ??= `reporter ${node} push ${push.seq} not decoded`
         if (!runtime.slotOf(push.clientId)) continue
-        const subscription = this.subscriptions.get(String(push.clientInstanceId))
+        const subscription = this.subscriptions.get(instanceKey(push.clientInstanceId))
         if (!subscription) {
           await runtime.diagnose(`telemetry push ${node}.${push.seq} has no recorded subscription`)
           continue
@@ -1992,14 +2011,19 @@ function createWorker(runtime) {
 /**
  * Runs a child process: `init` builds the runtime and takes the start handshake and baseline before
  * any command is served; commands then run concurrently, so sampling never waits behind a workload.
- * The process ends by itself once the `disconnect` command has run and the channel is closed.
+ * The process ends by itself once the `disconnect` command has run and the channel is closed, or,
+ * if the supervisor goes away first, once its clients have disconnected.
  * @param {{ child: string, out: string }} options
  * @returns {void}
  */
 function child(options) {
   let ready = null
+  let leaving = false
   const replies = new Map()
   const acks = new Map()
+  process.on('disconnect', () => {
+    if (!leaving && ready) ready.then((runtime) => runtime.orphaned()).catch(() => {})
+  })
   process.on('message', async (message) => {
     if (message.type === 'init') {
       ready = (async () => {
@@ -2013,7 +2037,7 @@ function child(options) {
             acks.set(m.record.seq, done)
             process.send(m)
           },
-          notify: (m) => process.send(m),
+          notify: (m) => process.connected && process.send(m),
         })
         for (const [topic, topicId] of message.topicIds) runtime.topicIds.set(topic, topicId)
         let requests = 0
@@ -2033,6 +2057,7 @@ function child(options) {
       replies.get(message.request)?.()
       replies.delete(message.request)
     } else if (message.type === 'command') {
+      if (message.step.type === 'disconnect') leaving = true
       const runtime = await ready
       await runtime.handle(message)
       if (message.step.type === 'disconnect') {
