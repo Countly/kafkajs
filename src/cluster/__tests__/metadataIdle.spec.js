@@ -1,6 +1,7 @@
 const { inspect } = require('util')
 const Cluster = require('../index')
 const { createErrorFromCode } = require('../../protocol/error')
+const { protocol: metadataProtocol } = require('../../protocol/requests/metadata')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { newLogger, connectionOpts } = require('testHelpers')
@@ -288,7 +289,10 @@ describe('producer metadata idle expiry', () => {
       expect(broker.metadata).toHaveBeenCalledTimes(2)
       await cluster.addTargetTopic('valid')
       expect(cluster.targetTopicState.get('valid').incarnation).toBeGreaterThan(incarnation)
-      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], { guard: expect.any(Function) })
+      expect(broker.metadata).toHaveBeenLastCalledWith(['valid'], {
+        guard: expect.any(Function),
+        retainTopicErrors: true,
+      })
       expect(cluster.topicId('valid')).toBe(ID_A)
     })
 
@@ -318,6 +322,112 @@ describe('producer metadata idle expiry', () => {
       })
       expect([...cluster.targetTopics]).toEqual(['valid'])
       expect(cluster.targetTopicState).toBeNull()
+    })
+  })
+
+  describe('a deleted target topic', () => {
+    /**
+     * @param {object} [options] cluster overrides
+     * @returns {object} a producer cluster whose broker parses each answer as Metadata v13 does:
+     *   a name in `deleted` answers code 3, a name in `creating` once answers code 5 with no
+     *   partitions, as a topic being auto-created does
+     */
+    const deleting = (options) => {
+      const built = build(options)
+      const deleted = new Set()
+      const creating = new Set()
+      built.broker.metadata.mockImplementation(async (topics, requestOptions = {}) => {
+        const data = answer(topics)
+        data.errorCode = 0
+        data.topicMetadata = data.topicMetadata.map((entry) => {
+          if (deleted.has(entry.topic)) {
+            return { topic: entry.topic, topicErrorCode: 3, partitionMetadata: [] }
+          }
+          if (creating.delete(entry.topic)) {
+            return { topic: entry.topic, topicErrorCode: 5, partitionMetadata: [] }
+          }
+          return {
+            ...entry,
+            topicErrorCode: 0,
+            partitionMetadata: entry.partitionMetadata.map((partition) => ({
+              ...partition,
+              partitionErrorCode: 0,
+            })),
+          }
+        })
+        return metadataProtocol({ version: 13 })({ topics, ...requestOptions }).response.parse(data)
+      })
+      return { ...built, deleted, creating }
+    }
+
+    test('adding another topic drops the deleted one and succeeds with one request', async () => {
+      const { cluster, broker, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+
+      await cluster.addTargetTopic('rotating-1')
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect([...cluster.targetTopicState.keys()]).toEqual(['rotating-1'])
+      expect(cluster.topicId('rotating-0')).toBeUndefined()
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toEqual([])
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+      expect(broker.metadata.mock.calls.map(([topics]) => [...topics].sort())).toEqual([
+        ['rotating-0'],
+        ['rotating-0', 'rotating-1'],
+      ])
+    })
+
+    test('adding the deleted topic again fails with its own error and keeps the other target', async () => {
+      const { cluster, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+      await cluster.addTargetTopic('rotating-1')
+
+      await expect(cluster.addTargetTopic('rotating-0')).rejects.toMatchObject({
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+      })
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.topicId('rotating-1')).toBe(ID_A)
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+    })
+
+    test('the dropped topic does not fail a retry of the same refresh', async () => {
+      const { cluster, broker, deleted, creating } = deleting({ retry: RETRY })
+      await cluster.addTargetTopic('rotating-0')
+      deleted.add('rotating-0')
+      creating.add('rotating-1')
+
+      const adding = cluster.addTargetTopic('rotating-1')
+      await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime * 2)
+      await adding
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-1')[0]).toMatchObject({ leader: 0 })
+      expect(broker.metadata).toHaveBeenCalledTimes(3)
+    })
+
+    test('a held target refused while another topic is added keeps its routing until released', async () => {
+      const { cluster, broker, deleted } = deleting()
+      await cluster.addTargetTopic('rotating-0')
+      cluster.holdTopic('rotating-0')
+      deleted.add('rotating-0')
+
+      await cluster.addTargetTopic('rotating-1')
+
+      expect([...cluster.targetTopics]).toEqual(['rotating-0', 'rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toHaveLength(1)
+      expect(cluster.findTopicPartitionMetadata('rotating-1')).toHaveLength(1)
+      cluster.releaseTopic('rotating-0')
+      await cluster.refreshMetadata()
+      expect([...cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(cluster.findTopicPartitionMetadata('rotating-0')).toEqual([])
+      expect(broker.metadata.mock.calls.map(([topics]) => [...topics].sort())).toEqual([
+        ['rotating-0'],
+        ['rotating-0', 'rotating-1'],
+        ['rotating-0', 'rotating-1'],
+      ])
     })
   })
 
@@ -511,31 +621,34 @@ describe('producer metadata idle expiry over the wire', () => {
 
   /**
    * @param {{ name: string }[]|null} requested the topics a Metadata request names
-   * @param {{ ids: Map<string, string>, missing: Set<string>, leaderless: Set<string> }} controls
-   * @returns {object} the answer: unknown topics code 3, leaderless ones code 5
+   * @param {{ ids: Map<string, string>, missing: Set<string>, leaderless: Set<string>,
+   *   refused?: Map<string, number>, node?: number }} controls
+   * @returns {object} the answer: unknown topics code 3, refused ones their own code, leaderless
+   *   ones code 5; `node` (default 0) is the only broker listed and leads every partition
    */
-  const metadataFor = (requested, { ids, missing, leaderless }) => ({
-    brokers: [{ nodeId: 0, host: 'node0', port: 9092, rack: null }],
-    controllerId: 0,
+  const metadataFor = (requested, { ids, missing, leaderless, refused = new Map(), node = 0 }) => ({
+    brokers: [{ nodeId: node, host: `node${node}`, port: 9092, rack: null }],
+    controllerId: node,
     topics: (requested ?? []).map(({ name }) => {
       if (!ids.has(name))
         ids.set(name, `00000000-0000-4000-8000-${String(ids.size + 1).padStart(12, '0')}`)
+      const errorCode = missing.has(name) ? 3 : (refused.get(name) ?? 0)
       return {
-        errorCode: missing.has(name) ? 3 : 0,
+        errorCode,
         name,
         topicId: ids.get(name),
         isInternal: false,
         topicAuthorizedOperations: -2147483648,
-        partitions: missing.has(name)
+        partitions: errorCode
           ? []
           : [
               {
                 errorCode: leaderless.has(name) ? 5 : 0,
                 partitionIndex: 0,
-                leaderId: leaderless.has(name) ? -1 : 0,
+                leaderId: leaderless.has(name) ? -1 : node,
                 leaderEpoch: 5,
-                replicas: [0],
-                isr: [0],
+                replicas: [node],
+                isr: [node],
                 offlineReplicas: [],
               },
             ],
@@ -544,14 +657,26 @@ describe('producer metadata idle expiry over the wire', () => {
   })
 
   /**
-   * @param {{ producer?: object, cluster?: object }} [options] overrides for each
+   * @param {{ producer?: object, cluster?: object, profile?: string }} [options] overrides for
+   *   each, and the scripted cluster's profile
    * @returns {object} a real cluster and producer over the scripted wire, and the wire's controls
    */
-  const start = ({ producer: producerOptions = {}, cluster: clusterOptions = {} } = {}) => {
+  const start = ({
+    producer: producerOptions = {},
+    cluster: clusterOptions = {},
+    profile = 'default',
+  } = {}) => {
     const schedule = new Schedule()
-    const state = { ids: new Map(), missing: new Set(), leaderless: new Set() }
+    const state = { ids: new Map(), missing: new Set(), leaderless: new Set(), refused: new Map() }
     const scripted = producerScript(
-      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], schedule })
+      createScriptedCluster({
+        nodes: [
+          { id: 0, host: 'node0', port: 9092 },
+          { id: 1, host: 'node1', port: 9092 },
+        ],
+        schedule,
+        profile,
+      })
     ).answer('Metadata', ({ topics }) => metadataFor(topics, state))
     const cluster = new Cluster({
       logger: newLogger(),
@@ -621,8 +746,36 @@ describe('producer metadata idle expiry over the wire', () => {
    */
   const produceOf = (topic) => ({
     api: 'Produce',
-    match: ({ fields }) => fields.topics.some(({ topicId }) => topicId === w.state.ids.get(topic)),
+    match: ({ fields }) =>
+      fields.topics.some(
+        (entry) => entry.topic === topic || entry.topicId === w.state.ids.get(topic)
+      ),
   })
+
+  /**
+   * @param {Error} error
+   * @returns {string[]} the protocol type, or else the name, of the error and of each cause
+   */
+  const chainOf = (error) => {
+    const chain = []
+    for (let at = error; at; at = at.cause) {
+      chain.push(at.name === 'KafkaJSProtocolError' ? at.type : at.name)
+    }
+    return chain
+  }
+
+  /**
+   * Advances fake time in 100 ms steps until no send is pending.
+   * @param {{ state: string }[]} sends watched sends
+   * @returns {Promise<void>}
+   */
+  const untilSettled = async (sends) => {
+    for (let i = 0; i < 250 && sends.some(({ state }) => state === 'pending'); i += 1) {
+      await jest.advanceTimersByTimeAsync(100)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(sends.map(({ state }) => state)).not.toContain('pending')
+  }
 
   beforeEach(() => {
     jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
@@ -877,6 +1030,390 @@ describe('producer metadata idle expiry over the wire', () => {
       expect(w.cluster.topicId('gone')).toBe(newId)
       expect(producedAfter(before.requests)).toContain(newId)
       expect(producedAfter(before.requests)).not.toContain(oldId)
+    })
+  })
+
+  test.each([false, true])(
+    'with auto creation %s, a deleted target fails only its own sends and a send to a new topic succeeds at once',
+    async (allowAutoTopicCreation) => {
+      w = start({ cluster: { allowAutoTopicCreation }, producer: { deliveryTimeout: 3000 } })
+      await w.producer.connect()
+      expect(await settle(send('rotating-0'))).toMatchObject({ state: 'fulfilled' })
+      w.state.missing.add('rotating-0')
+      const before = metadataRequests().length
+      const started = Date.now()
+
+      expect(await settle(send('rotating-1'))).toMatchObject({ state: 'fulfilled' })
+      expect(Date.now() - started).toBeLessThan(100)
+      expect(metadataRequests().slice(before)).toEqual([['rotating-0', 'rotating-1']])
+      expect([...w.cluster.targetTopics]).toEqual(['rotating-1'])
+
+      const refused = await settle(send('rotating-0'))
+      expect(refused.state).toBe('rejected')
+      expect(refused.value).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      expect([...w.cluster.targetTopics]).toEqual(['rotating-1'])
+      expect(await settle(send('rotating-1'))).toMatchObject({ state: 'fulfilled' })
+    }
+  )
+
+  test.each(['reconnect', 'rebootstrap'])(
+    'after a %s cleared the metadata, a deleted earlier target fails only its own sends and a send to a new topic succeeds at once',
+    async (event) => {
+      w = start({ producer: { deliveryTimeout: 3000 } })
+      await w.producer.connect()
+      expect(await settle(send('a'))).toMatchObject({ state: 'fulfilled' })
+      expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+      w.state.missing.add('a')
+
+      if (event === 'reconnect') {
+        expect(await settle(w.producer.disconnect())).toMatchObject({ state: 'fulfilled' })
+        expect(await settle(w.producer.connect())).toMatchObject({ state: 'fulfilled' })
+      } else {
+        const restarted = w.cluster.brokerPool.rebootstrap('required')
+        expect(await settle(restarted)).toMatchObject({ state: 'fulfilled' })
+      }
+      expect(w.cluster.brokerPool.metadata).toBeNull()
+      expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+      const started = Date.now()
+      expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+      expect(await settle(send('c'))).toMatchObject({ state: 'fulfilled' })
+      expect(Date.now() - started).toBeLessThan(100)
+      expect([...w.cluster.targetTopics].sort()).toEqual(['b', 'c'])
+
+      const refused = await settle(send('a'))
+      expect(refused.state).toBe('rejected')
+      expect(refused.value).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+      expect([...w.cluster.targetTopics].sort()).toEqual(['b', 'c'])
+    }
+  )
+
+  test('after a reconnect, a fresh send to the deleted earlier target ends with the missing-metadata error while a send to another topic succeeds', async () => {
+    w = start()
+    await w.producer.connect()
+    expect(await settle(send('a'))).toMatchObject({ state: 'fulfilled' })
+    expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+    w.state.missing.add('a')
+    expect(await settle(w.producer.disconnect())).toMatchObject({ state: 'fulfilled' })
+    expect(await settle(w.producer.connect())).toMatchObject({ state: 'fulfilled' })
+    expect(w.cluster.brokerPool.metadata).toBeNull()
+
+    const started = Date.now()
+    const refused = watch(send('a'))
+    expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+    expect(Date.now() - started).toBeLessThan(100)
+
+    await untilSettled([refused])
+    expect(refused.state).toBe('rejected')
+    expect(chainOf(refused.value)).toEqual([
+      'KafkaJSNumberOfRetriesExceeded',
+      'KafkaJSMetadataNotLoaded',
+    ])
+    expect(Date.now() - started).toBeLessThanOrEqual(20000)
+    await until(() => w.cluster.topicPins.size === 0)
+    expect(w.admission.reserved).toBe(0)
+
+    expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+    expect([...w.cluster.targetTopics]).toEqual(['b'])
+  })
+
+  describe('a target refused while sends still own it', () => {
+    /**
+     * @param {{ topic?: string, topicId?: string }} entry a Produce topic entry, by name or by id
+     * @param {string} topic
+     * @returns {boolean} whether the entry is the topic's
+     */
+    const isTopic = (entry, topic) =>
+      entry.topic === topic || entry.topicId === w.state.ids.get(topic)
+
+    /**
+     * @param {{ topics: object[] }} fields a Produce request's fields
+     * @param {(entry: object) => number} codeOf the error code each topic's partitions answer
+     * @returns {object} the Produce answer
+     */
+    const produceAnswer = ({ topics }, codeOf) => ({
+      responses: topics.map(({ partitions, ...key }) => ({
+        ...key,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          errorCode: codeOf(key),
+          baseOffset: codeOf(key) ? '-1' : '0',
+          logAppendTime: '-1',
+          logStartOffset: codeOf(key) ? '-1' : '0',
+          leader: null,
+        })),
+      })),
+      nodeEndpoints: [],
+    })
+
+    /**
+     * Answers the next Metadata request that names `trigger` with `topic` refused with `code`.
+     * @param {string} topic
+     * @param {number} code
+     * @param {string} trigger
+     * @returns {void}
+     */
+    const refuseOnce = (topic, code, trigger) =>
+      w.schedule.once(
+        {
+          api: 'Metadata',
+          match: ({ fields }) => fields.topics?.some(({ name }) => name === trigger),
+        },
+        ({ fields }) =>
+          metadataFor(fields.topics, { ...w.state, refused: new Map([[topic, code]]) })
+      )
+
+    /**
+     * @param {string} topic
+     * @param {number} from requests already written
+     * @returns {number[]} the base sequence of every batch of `topic` a later Produce carried
+     */
+    const sequencesOf = (topic, from) =>
+      w.scripted
+        .requests()
+        .slice(from)
+        .filter(({ api }) => api === 'Produce')
+        .flatMap(({ fields }) => fields.topics.filter((entry) => isTopic(entry, topic)))
+        .flatMap(({ partitions }) => partitions.flatMap(({ batches }) => batches))
+        .map(({ baseSequence }) => baseSequence)
+
+    /**
+     * Starts a producer whose first send to 'a' succeeded and whose next one is held in flight
+     * with a third partitioned and queued behind it.
+     * @param {object} [options] as `start`; a `tv1`/`tv2` profile makes it transactional
+     * @returns {Promise<object>} the sender, the held gate, both sends and the request count
+     *   before them
+     */
+    const owning = async (options = {}) => {
+      const transactional = options.profile === 'tv1' || options.profile === 'tv2'
+      w = start({
+        ...options,
+        producer: transactional ? { transactionalId: 'owned', idempotent: true } : {},
+      })
+      w.scripted.answer('InitProducerId', ({ producerEpoch = -1 }) => ({
+        producerId: '1000',
+        producerEpoch: Math.max(0, producerEpoch + 1),
+      }))
+      await w.producer.connect()
+      const sender = transactional ? await w.producer.transaction() : w.producer
+      const sendTo = (topic, value) => sender.send({ topic, messages: [{ value }] })
+      expect(await settle(sendTo('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const from = w.scripted.requests().length
+      const blocked = w.schedule.hold(produceOf('a'))
+      const inFlight = watch(sendTo('a', 'second'))
+      await until(() => blocked.call !== null)
+      const queued = watch(sendTo('a', 'third'))
+      await until(() => w.cluster.topicPins.get('a') === 2)
+      await flushAll()
+      return { sender, sendTo, blocked, inFlight, queued, from }
+    }
+
+    test.each(['default', 'tv1', 'tv2'])(
+      'under %s, an owned target refused once while another topic is added keeps its routing and its sends succeed in order',
+      async (profile) => {
+        const { sender, sendTo, blocked, inFlight, queued, from } = await owning({ profile })
+        try {
+          refuseOnce('a', 3, 'b')
+          expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+          expect(w.cluster.findTopicPartitionMetadata('a')).toHaveLength(1)
+
+          blocked.release(produceAnswer(blocked.call.fields, () => 6))
+          await until(() => inFlight.state !== 'pending' && queued.state !== 'pending')
+          expect([inFlight.state, queued.state]).toEqual(['fulfilled', 'fulfilled'])
+          expect(sequencesOf('a', from)).toEqual([1, 1, 2])
+          if (profile !== 'default') {
+            expect(await settle(sender.commit())).toMatchObject({ state: 'fulfilled' })
+          }
+          await until(() => w.cluster.topicPins.size === 0)
+          expect(w.admission.reserved).toBe(0)
+        } finally {
+          if (blocked.settle) blocked.release()
+        }
+      }
+    )
+
+    test('a queued retry of an owned target refused once is sent when its backoff ends', async () => {
+      const backoff = { retries: 10, initialRetryTime: 3000, maxRetryTime: 3000, factor: 0 }
+      w = start({ producer: { retry: backoff } })
+      await w.producer.connect()
+      expect(await settle(send('a', 'first'))).toMatchObject({ state: 'fulfilled' })
+      const from = w.scripted.requests().length
+      w.schedule.once(produceOf('a'), ({ fields }) => produceAnswer(fields, () => 7))
+      const queued = watch(send('a', 'second'))
+      await until(() =>
+        w.scripted
+          .requests()
+          .slice(from)
+          .some(({ api, answeredOrder }) => api === 'Produce' && answeredOrder !== undefined)
+      )
+
+      refuseOnce('a', 3, 'b')
+      expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+      expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+      expect(queued.state).toBe('pending')
+
+      await jest.advanceTimersByTimeAsync(3000)
+      await until(() => queued.state !== 'pending')
+      expect(queued.state).toBe('fulfilled')
+      expect(sequencesOf('a', from)).toEqual([1, 1])
+      await until(() => w.cluster.topicPins.size === 0)
+      expect(w.admission.reserved).toBe(0)
+    })
+
+    /**
+     * Refuses 'a' with `code` in every Metadata and Produce answer while its leader still answers,
+     * with one send of 'a' held in flight and another queued behind it. Expects both to end with
+     * `chain` once the held request is let go, every pin and reservation released, 'a' dropped and
+     * 'b' served.
+     * @param {number} code the topic error and Produce error code
+     * @param {string[]} chain the cause chain each send of 'a' ends with
+     * @returns {Promise<void>}
+     */
+    const expectRefusedWhileLeaderAnswers = async (code, chain) => {
+      const { sendTo, blocked, inFlight, queued } = await owning()
+      try {
+        w.state.refused.set('a', code)
+        w.scripted.answer('Produce', (fields) =>
+          produceAnswer(fields, (entry) => (isTopic(entry, 'a') ? code : 0))
+        )
+        expect(await settle(sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+        blocked.release(produceAnswer(blocked.call.fields, () => 6))
+        await untilSettled([inFlight, queued])
+        for (const sent of [inFlight, queued]) {
+          expect(sent.state).toBe('rejected')
+          expect(chainOf(sent.value)).toEqual(chain)
+        }
+        await until(() => w.cluster.topicPins.size === 0)
+        expect(w.admission.reserved).toBe(0)
+
+        expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics]).toEqual(['b'])
+        expect(await settle(sendTo('b', 'again'))).toMatchObject({ state: 'fulfilled' })
+      } finally {
+        if (blocked.settle) blocked.release()
+      }
+    }
+
+    test('an owned target refused as unauthorized fails its own sends with that error while another topic succeeds', async () => {
+      await expectRefusedWhileLeaderAnswers(29, ['TOPIC_AUTHORIZATION_FAILED'])
+    })
+
+    test('an owned target refused as unknown while its leader still answers ends its sends with the retry limit and its own error while another topic succeeds', async () => {
+      await expectRefusedWhileLeaderAnswers(3, [
+        'KafkaJSNumberOfRetriesExceeded',
+        'UNKNOWN_TOPIC_OR_PARTITION',
+      ])
+    })
+
+    /**
+     * Expects the owned sends rejected within the 20 s delivery budget, none with the topic's own
+     * error, then every pin and reservation released and the refused topic dropped, with another
+     * topic still served. A retried send still waiting to find its broker holds the last pin
+     * until that lookup fails, about 17 s after its send ended, so the release is awaited for up
+     * to 40 s of fake time.
+     * @param {object} owned the sender, held gate and sends of `owning`
+     * @param {number} released when the held request was let go
+     * @param {string[][]} chains the cause chain of the in-flight send and of the queued one
+     * @returns {Promise<void>}
+     */
+    const expectEnded = async ({ sendTo, inFlight, queued }, released, chains) => {
+      expect(Date.now() - released).toBeLessThanOrEqual(20000)
+      for (const [i, sent] of [inFlight, queued].entries()) {
+        expect(sent.state).toBe('rejected')
+        expect(chainOf(sent.value)).toEqual(chains[i])
+      }
+      for (let i = 0; i < 40 && w.cluster.topicPins.size > 0; i += 1) {
+        await jest.advanceTimersByTimeAsync(1000)
+      }
+      expect(w.cluster.topicPins.size).toBe(0)
+      expect(w.admission.reserved).toBe(0)
+      expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+      expect(w.cluster.targetTopics.has('a')).toBe(false)
+      const served = watch(sendTo('b', 'again'))
+      await untilSettled([served])
+      expect(served.state).toBe('fulfilled')
+    }
+
+    test.each([
+      ['unknown', 3],
+      ['unauthorized', 29],
+    ])(
+      'an owned target refused as %s whose old leader left the cluster ends its sends with a routing error while another topic succeeds',
+      async (_, code) => {
+        const owned = await owning()
+        try {
+          w.state.refused.set('a', code)
+          w.state.node = 1
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+          expect(w.cluster.brokerPool.getNodeIds()).toEqual(['1'])
+
+          const released = Date.now()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled([owned.inFlight, owned.queued])
+          const routing = ['KafkaJSNumberOfRetriesExceeded', 'KafkaJSBrokerNotFound']
+          await expectEnded(owned, released, [routing, routing])
+        } finally {
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    test.each([
+      ['unknown', 3],
+      ['unauthorized', 29],
+    ])(
+      'an owned target refused as %s while the cluster cannot be reached ends its sends at the delivery timeout while another topic succeeds',
+      async (_, code) => {
+        const owned = await owning()
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+
+          w.scripted.down(0)
+          for (const socket of w.scripted.sockets()) {
+            if (!socket.destroyed)
+              socket.destroy(Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }))
+          }
+          const released = Date.now()
+          owned.blocked.release()
+          await untilSettled([owned.inFlight, owned.queued])
+          w.scripted.up(0)
+          await expectEnded(owned, released, [
+            ['KafkaJSDeliveryTimeout', 'KafkaJSBrokerNotFound'],
+            ['KafkaJSDeliveryTimeout'],
+          ])
+        } finally {
+          w.scripted.up(0)
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
+
+    test('an owned target with no installed metadata after a rebootstrap ends its sends within the delivery budget while another topic succeeds', async () => {
+      const owned = await owning()
+      try {
+        w.state.refused.set('a', 3)
+        const restarted = w.cluster.brokerPool.rebootstrap('required')
+        expect(await settle(restarted)).toMatchObject({ state: 'fulfilled' })
+        expect(w.cluster.brokerPool.metadata).toBeNull()
+
+        expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+        expect([...w.cluster.targetTopics].sort()).toEqual(['a', 'b'])
+        expect(w.cluster.findTopicPartitionMetadata('a')).toEqual([])
+
+        const released = Date.now()
+        owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+        await untilSettled([owned.inFlight, owned.queued])
+        const noMetadata = ['KafkaJSNumberOfRetriesExceeded', 'KafkaJSMetadataNotLoaded']
+        await expectEnded(owned, released, [noMetadata, noMetadata])
+      } finally {
+        if (owned.blocked.settle) owned.blocked.release()
+      }
     })
   })
 
