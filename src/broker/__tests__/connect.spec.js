@@ -46,6 +46,17 @@ const resetFirstLogin = () => {
   return { socketFactory: chaos, armed: () => armed, sockets: chaos.sockets }
 }
 
+/**
+ * Reads the subject claim of the unsecured JWT an OAUTHBEARER connection's provider returns.
+ * @param {{ sasl: { oauthBearerProvider: () => { value: string }|Promise<{ value: string }> } }} opts
+ *   the OAUTHBEARER connection options
+ * @returns {Promise<string>} the token's `sub` claim, the principal name the broker derives from it
+ */
+const tokenSubject = async ({ sasl }) => {
+  const { value } = await sasl.oauthBearerProvider()
+  return JSON.parse(Buffer.from(value.split('.')[1], 'base64url').toString()).sub
+}
+
 describe('Broker > connect', () => {
   let broker, connectionPool
 
@@ -343,6 +354,46 @@ describe('Broker > connect', () => {
       expect(error.message).toBe(
         'SASL OAUTHBEARER authentication failed: SASL Authentication failed'
       )
+      expect(error.retriable).toBe(false)
+      expect(broker.isConnected()).toEqual(false)
+      expect(chaos.sockets).toHaveLength(1)
+    })
+  })
+
+  describeIfOauthbearerEnabled('SASL OAUTHBEARER authorizationIdentity', () => {
+    test('an authorizationIdentity equal to the token subject logs in and the connection serves a request', async () => {
+      const opts = saslOAuthBearerConnectionOpts()
+      broker = new Broker({
+        connectionPool: createConnectionPool({
+          ...opts,
+          sasl: { ...opts.sasl, authorizationIdentity: await tokenSubject(opts) },
+        }),
+        logger: newLogger(),
+      })
+
+      await broker.connect()
+      const { brokers } = await broker.metadata([])
+
+      expect(broker.isConnected()).toEqual(true)
+      expect(brokers.length).toBeGreaterThan(0)
+    })
+
+    test('an authorizationIdentity different from the token subject is a terminal authentication error and is not retried', async () => {
+      const opts = saslOAuthBearerConnectionOpts()
+      const chaos = createChaosSocketFactory(defaultSocketFactory())
+      broker = new Broker({
+        connectionPool: createConnectionPool({
+          ...opts,
+          sasl: { ...opts.sasl, authorizationIdentity: `not-${await tokenSubject(opts)}` },
+          socketFactory: chaos,
+        }),
+        logger: newLogger(),
+      })
+
+      const error = await broker.connect().catch((failure) => failure)
+
+      expect(error).toBeInstanceOf(KafkaJSSASLAuthenticationError)
+      expect(error.message).toMatch(/^SASL OAUTHBEARER authentication failed: /)
       expect(error.retriable).toBe(false)
       expect(broker.isConnected()).toEqual(false)
       expect(chaos.sockets).toHaveLength(1)
