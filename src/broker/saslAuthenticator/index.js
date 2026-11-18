@@ -7,7 +7,6 @@ const awsIAMAuthenticatorProvider = require('./awsIam')
 const oauthBearerAuthenticatorProvider = require('./oauthBearer')
 const gssapiAuthenticatorProvider = require('./gssapi')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
-const { passThrough, isTransportFailure } = require('./failure')
 
 const BUILT_IN_AUTHENTICATION_PROVIDERS = {
   AWS: awsIAMAuthenticatorProvider,
@@ -44,24 +43,29 @@ module.exports = class SASLAuthenticator {
     this.protocolAuthentication = lookupRequest(apiKeys.SaslAuthenticate, requests.SaslAuthenticate)
   }
 
-  /**
-   * Throws before any stale continuation can write or publish. The refusal is a cancellation,
-   * which built-in mechanisms rethrow unchanged.
-   * @returns {void}
-   * @throws {Error} the guard's refusal
-   */
+  /** Throws before any stale continuation can write or publish. @returns {void} @throws {Error} refusal */
   check() {
     const error = this.guard()
-    if (error) throw passThrough(error)
+    if (error) throw error
   }
 
   /**
-   * Negotiates and runs one mechanism under its original connection guard.
+   * Negotiates and runs one mechanism under its original connection guard. A refusal of that guard
+   * during the exchange (the connection ended, timed out or was cancelled) is the one failure a
+   * built-in mechanism rethrows unchanged; it asks through `passesThrough`, which answers only for
+   * this invocation's own refusal. Any other send failure, whatever its class, is the mechanism's
+   * to report as an authentication failure.
    * @returns {Promise<void>} mechanism completed before publication by Connection
    * @throws {Error} original protocol/provider error or invocation refusal
    */
   async authenticate() {
     const mechanism = this.connection.sasl.mechanism.toUpperCase()
+    let refusal = null
+    const check = () => {
+      const error = this.guard()
+      if (error) throw (refusal = error)
+    }
+    const passesThrough = (error) => refusal !== null && error === refusal
     this.check()
     const handshake = await this.connection.send({
       ...this.saslHandshake({ mechanism }),
@@ -76,9 +80,9 @@ module.exports = class SASLAuthenticator {
     }
 
     const saslAuthenticate = async ({ request, response }) => {
-      this.check()
+      check()
       const requestAuthBytes = await request.encode()
-      this.check()
+      check()
 
       let authResponse
       try {
@@ -93,20 +97,19 @@ module.exports = class SASLAuthenticator {
       } catch (e) {
         // Only the raw protocol error still carries the code; mechanisms re-wrap it. The
         // published text is built from stable fields alone, never from the error's message.
-        // A lost connection or timeout passes through the mechanisms with its own class.
-        this.check()
+        check()
         if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
           this.connection.reportAuthenticationFailure(
             mechanism,
             `SASL ${mechanism} authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
           )
         }
-        throw isTransportFailure(e) ? passThrough(e) : e
+        throw e
       }
 
       // `0` is a string because `sessionLifetimeMs` is an int64 encoded as string.
       // This is not present in SaslAuthenticateV0, so we default to `"0"`
-      this.check()
+      check()
       this.sessionLifetime = authResponse.sessionLifetimeMs || UNLIMITED_SESSION_LIFETIME
 
       if (!response) {
@@ -115,9 +118,9 @@ module.exports = class SASLAuthenticator {
 
       const { authBytes: responseAuthBytes } = authResponse
       const payloadDecoded = await response.decode(responseAuthBytes)
-      this.check()
+      check()
       const parsed = await response.parse(payloadDecoded)
-      this.check()
+      check()
       return parsed
     }
 
@@ -135,6 +138,7 @@ module.exports = class SASLAuthenticator {
       port: this.connection.port,
       logger: this.logger.namespace(`SaslAuthenticator-${mechanism}`),
       saslAuthenticate,
+      passesThrough,
     })
     this.check()
     await provider.authenticate()

@@ -6,7 +6,7 @@ const {
   KafkaJSSASLAuthenticationError,
   KafkaJSInvalidConfigurationError,
 } = require('../../errors')
-const { failureCause, isPassedThrough } = require('./failure')
+const { failureCause } = require('./failure')
 
 /**
  * RFC 4752 client reply for no security layer: the layer bit and a zero maximum buffer. The native
@@ -52,13 +52,15 @@ const loadKerberos = () => {
 class GssapiAuthenticator {
   /** Stores connection-local collaborators without loading the native peer.
    * @param {object} options serviceName and optional principal
-   * @param {object} connection host, port and guarded saslAuthenticate
+   * @param {object} connection host, port, guarded saslAuthenticate and passesThrough, which tells
+   *   the invocation's own guard refusal apart from any other failure
    */
-  constructor(options, { host, port, saslAuthenticate }) {
+  constructor(options, { host, port, saslAuthenticate, passesThrough = () => false }) {
     this.options = options
     this.host = host
     this.broker = `${host}:${port}`
     this.saslAuthenticate = saslAuthenticate
+    this.passesThrough = passesThrough
   }
 
   /** Exchanges opaque mechanism bytes through the existing INT32-prefixed boundary.
@@ -92,8 +94,8 @@ class GssapiAuthenticator {
    * @throws {KafkaJSNotImplemented} missing or unsupported optional peer
    * @throws {KafkaJSSASLAuthenticationError} acquisition or exchange failure, named by broker,
    *   stage and the failure's class (with a protocol error's type and code), never its text
-   * @throws {Error} a lost connection, request timeout or cancellation during an exchange stage,
-   *   unchanged; native stages never pass one through
+   * @throws {Error} the invocation's own guard refusal during an exchange stage, unchanged; native
+   *   stages never pass one through
    */
   async authenticate() {
     const { serviceName = 'kafka', principal } = this.options
@@ -142,7 +144,7 @@ class GssapiAuthenticator {
       await this.exchange(token)
     } catch (error) {
       if (stage === 'load' && error instanceof KafkaJSNotImplemented) throw error
-      if (stage.startsWith('exchange') && isPassedThrough(error)) throw error
+      if (stage.startsWith('exchange') && this.passesThrough(error)) throw error
       throw new KafkaJSSASLAuthenticationError(
         `SASL GSSAPI authentication failed: broker=${this.broker} stage=${stage}${failureCause(error)}`
       )

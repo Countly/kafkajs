@@ -2,24 +2,9 @@ const { isNativeError, isProxy } = require('util').types
 const errors = require('../../errors')
 const { createErrorFromCode, errorCodes } = require('../../protocol/error')
 
-const {
-  KafkaJSSASLAuthenticationError,
-  KafkaJSNonRetriableError,
-  KafkaJSProtocolError,
-  KafkaJSConnectionError,
-  KafkaJSConnectionClosedError,
-  KafkaJSRequestTimeoutError,
-} = errors
+const { KafkaJSSASLAuthenticationError, KafkaJSNonRetriableError, KafkaJSProtocolError } = errors
 
 const authoredErrors = new WeakSet()
-const passedErrors = new WeakSet()
-
-/** Classes a lost connection or an unanswered request raises from the library's own transport. */
-const TRANSPORT_CLASSES = [
-  KafkaJSConnectionError,
-  KafkaJSConnectionClosedError,
-  KafkaJSRequestTimeoutError,
-]
 
 /** Classes a failure may be named by: this library's errors and the built-in programming errors. */
 const NAMEABLE_CLASSES = [
@@ -133,40 +118,4 @@ const failureCause = (error) => {
   return ` cause=${Class.name}${protocol}`
 }
 
-/**
- * Records a failure the exchange boundary raised itself, so a mechanism rethrows it unchanged.
- * Only native errors are recorded; anything else stays an authentication failure.
- * @param {*} error a guard refusal (cancellation) or a transport failure of the exchange send
- * @returns {*} the same value
- */
-const passThrough = (error) => {
-  if (isNativeError(error)) passedErrors.add(error)
-  return error
-}
-
-/**
- * Whether a send failure is a lost connection or a request timeout, judged by prototype identity
- * in a closed list, never by `name`, `code` or `retriable`. A broker reply is never one.
- * @param {*} error the send failure
- * @returns {boolean}
- */
-const isTransportFailure = (error) =>
-  isNativeError(error) && TRANSPORT_CLASSES.includes(nameableClass(error))
-
-/**
- * Whether a mechanism must rethrow a failure unchanged instead of reporting an authentication
- * failure: true only for a value `passThrough` recorded, and the record is consumed, so an error
- * object a supplier later rethrows is judged afresh. Supplier and broker failures never are.
- * @param {*} error the exchange failure
- * @returns {boolean}
- */
-const isPassedThrough = (error) => isNativeError(error) && passedErrors.delete(error)
-
-module.exports = {
-  failureDetail,
-  failureCause,
-  trustedError,
-  passThrough,
-  isTransportFailure,
-  isPassedThrough,
-}
+module.exports = { failureDetail, failureCause, trustedError }

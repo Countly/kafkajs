@@ -1,10 +1,10 @@
 const { request, response } = require('../../protocol/sasl/plain')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
-const { failureDetail, isPassedThrough } = require('./failure')
+const { failureDetail } = require('./failure')
 
 const plainAuthenticatorProvider =
   (sasl) =>
-  ({ host, port, logger, saslAuthenticate }) => {
+  ({ host, port, logger, saslAuthenticate, passesThrough = () => false }) => {
     return {
       authenticate: async () => {
         if (sasl.username == null || sasl.password == null) {
@@ -18,7 +18,7 @@ const plainAuthenticatorProvider =
           await saslAuthenticate({ request: request(sasl), response })
           logger.debug('SASL PLAIN authentication successful', { broker })
         } catch (e) {
-          if (isPassedThrough(e)) throw e
+          if (passesThrough(e)) throw e
           const error = new KafkaJSSASLAuthenticationError(
             `SASL PLAIN authentication failed: ${failureDetail(e)}`
           )
