@@ -8,12 +8,69 @@
  * transaction's offsets) is applied to it. A local resolution, a seek with auto-commit off, a
  * sentinel boundary, a failed ListOffsets or a dropped answer leave it owed. Only a user
  * disconnect, through `clear()`, ends the obligations.
+ *
+ * The table is also the consumer's ownership record in the group's ledger: the topics it
+ * subscribes to, the topics its live offset manager is assigned and the topics it owes a reset keep
+ * the group's committed state; every change that gives a topic up asks the ledger to retire it.
+ * The owner sets are snapshots, replaced as a whole.
  */
 class ResetObligations {
   constructor() {
     /** @type {Map<string, {stamp: string, discharged: Set<number>}>} */
     this.entries = new Map()
     this.detach = null
+    /** @type {import('./offsetOperations')|null} the ledger this table is linked to */
+    this.ledger = null
+    /** @type {Set<string>} the consumer's subscribed names */
+    this.subscribed = new Set()
+    /** @type {Set<string>} the topics of the consumer's live assignment */
+    this.assigned = new Set()
+  }
+
+  /**
+   * Whether this consumer owns a topic of its group. Reads only.
+   * @param {string} topic
+   * @returns {boolean}
+   */
+  holds(topic) {
+    return this.entries.has(topic) || this.subscribed.has(topic) || this.assigned.has(topic)
+  }
+
+  /**
+   * Replaces the subscribed names and retires the topics that are owned no longer.
+   * @param {Iterable<string>} topics copied, never retained
+   * @returns {void}
+   */
+  claimSubscription(topics) {
+    this.subscribed = new Set(topics)
+    this.retireUnowned()
+  }
+
+  /**
+   * Replaces the live assignment's topics. The offset manager asks for retirement itself, once it
+   * has applied the assignment.
+   * @param {Iterable<string>} topics copied, never retained
+   * @returns {void}
+   */
+  claimAssignment(topics) {
+    this.assigned = new Set(topics)
+  }
+
+  /**
+   * Ends assignment ownership when the run stopped and no manager is live, then retires.
+   * @returns {void}
+   */
+  releaseAssignment() {
+    this.assigned = new Set()
+    this.retireUnowned()
+  }
+
+  /**
+   * Asks the linked ledger to retire the topics nobody owns; an unlinked table asks nobody.
+   * @returns {void}
+   */
+  retireUnowned() {
+    this.ledger?.retireUnowned()
   }
 
   /**
@@ -42,6 +99,7 @@ class ResetObligations {
 
     if (cachedTopicId !== undefined && cachedTopicId !== entry.stamp) {
       this.entries.delete(topic)
+      this.retireUnowned()
       return undefined
     }
 
@@ -107,6 +165,7 @@ class ResetObligations {
     }
 
     this.entries.delete(topic)
+    this.retireUnowned()
   }
 
   /**
@@ -116,39 +175,52 @@ class ResetObligations {
    * @returns {void}
    */
   retain(topics) {
+    let dropped = false
     for (const topic of this.entries.keys()) {
-      if (!topics.has(topic)) this.entries.delete(topic)
+      if (!topics.has(topic)) dropped = this.entries.delete(topic)
     }
+    if (dropped) this.retireUnowned()
   }
 
   /**
    * Links this table to a group's operation ledger, so a mutation applied by any participant can
-   * discharge it. Linking again replaces the previous link.
+   * discharge it. Linking to the same ledger again changes nothing; linking to another replaces
+   * the link and lets the old ledger retire what this table owned there.
    * @param {import('./offsetOperations')} operations
    * @returns {void}
    */
   attachTo(operations) {
+    if (this.ledger === operations) return
+    const previous = this.ledger
     this.detach?.()
     this.detach = operations.attach(this)
+    this.ledger = operations
+    previous?.retireUnowned()
   }
 
   /**
-   * Unlinks from the ledger and keeps every entry, for a consumer that rebuilds its group after
-   * a crash: the next group it builds links the table again and the debt is still owed.
+   * Unlinks from the ledger and keeps every entry and owner set, for a consumer that rebuilds its
+   * group after a crash: the next group it builds links the table again and the debt is still
+   * owed. The ledger retires what only this table owned.
    * @returns {void}
    */
   unlink() {
+    const previous = this.ledger
     this.detach?.()
     this.detach = null
+    this.ledger = null
+    previous?.retireUnowned()
   }
 
   /**
-   * Drops every entry and unlinks from the ledger. Called when the user disconnects the consumer,
-   * which ends its obligations; a later run starts with none.
+   * Drops every entry and owner set and unlinks from the ledger. Called when the user disconnects
+   * the consumer, which ends its obligations; a later run starts with none.
    * @returns {void}
    */
   clear() {
     this.entries.clear()
+    this.subscribed = new Set()
+    this.assigned = new Set()
     this.unlink()
   }
 
