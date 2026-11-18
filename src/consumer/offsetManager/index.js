@@ -283,6 +283,24 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * The offset `nextOffset` would return, read without seeding the resolved offset.
+   *
+   * For an observer such as position validation: a seeded committed offset would count as
+   * resolved progress, and a seek being applied has just forgotten that progress on purpose.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {Long} the resolved offset, else the committed one, else 0 when neither is valid
+   */
+  peekNextOffset(topic, partition) {
+    let offset = this.resolvedOffsets[topic][partition] || this.heldOffsetAt(topic, partition)
+    if (isInvalidOffset(offset)) {
+      offset = '0'
+    }
+
+    return Long.fromValue(offset)
+  }
+
+  /**
    * The offset this partition has resolved to, exactly as stored.
    *
    * A pure read, on the fetch hot path: no seeding (unlike `nextOffset`, which writes
@@ -311,20 +329,21 @@ module.exports = class OffsetManager {
    * reads the topic's current id.
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
-   * @param {{guard?: Function, fence?: import('../../producer/generation'), since?: number}}
-   *   [options] an immutable caller identity, checked through transmission and settlement, the
-   *   terminal fence that binds the coordinator discovery and the metadata refresh a refused topic
+   * @param {{guard?: Function, fence?: import('../../producer/generation'), since?: number,
+   *   attempt?: {dispatched: boolean}}} [options] an immutable caller identity, checked through
+   *   transmission and settlement, the terminal fence that binds the coordinator discovery and the metadata refresh a refused topic
    *   id starts, and for a default selection the seek clock it was selected at: a seek of a
    *   selected cell admitted after it refuses the request before it is written (`seekRefusal`). A
    *   request that was written is never refused for a seek: it is answered and published cell by
-   *   cell (`recordCommitted`)
+   *   cell (`recordCommitted`). `attempt.dispatched` is set once the request is handed to the
+   *   coordinator, from which point the broker may have applied it
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
    *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
    *   original answer's ownership loss be learned for its own token. A retired run or a forced
    *   close publishes nothing
    */
-  async sendOffsetCommit(payload, { guard = null, fence, since } = {}) {
+  async sendOffsetCommit(payload, { guard = null, fence, since, attempt } = {}) {
     const token = this.ownership?.token()
     const { revision } = this.membership()
     const release = this.ownership?.retain(token)
@@ -342,6 +361,7 @@ module.exports = class OffsetManager {
       refusal = check()
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
+      if (attempt) attempt.dispatched = true
       const result =
         this.ownership || guard || since !== undefined
           ? await coordinator.offsetCommit(request, { guard: check })
@@ -832,9 +852,10 @@ module.exports = class OffsetManager {
    * while the ticket is still current. A concrete offset settles a recreation reset only when the
    * topic is provably the incarnation the commit was sent for; a sentinel never does.
    *
-   * A commit that ends without clearing, whatever the reason (a refused caller, a failure, an
-   * answer the broker may have accepted), forgets the partition's cached committed offset unless a
-   * newer operation owns the cell, so the position is read back from the broker.
+   * A commit that was handed to the coordinator and ends without clearing, whatever the reason (a
+   * refused caller, a failure, an answer the broker may have accepted), forgets the partition's
+   * cached committed offset unless a newer operation owns the cell, so the position is read back
+   * from the broker. A commit refused before that leaves the cache as it was.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
@@ -853,6 +874,7 @@ module.exports = class OffsetManager {
     const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
     const requestedId = this.cluster.topicId(topic)
     const release = this.ownership?.retain(token)
+    const attempt = { dispatched: false }
     let cleared = false
 
     try {
@@ -865,7 +887,7 @@ module.exports = class OffsetManager {
             groupInstanceId,
             topics: [{ topic, partitions: [{ partition, offset }] }],
           },
-          { guard, ...(preparation && { fence: preparation.fence }) }
+          { guard, attempt, ...(preparation && { fence: preparation.fence }) }
         )
       }
 
@@ -885,7 +907,11 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
-      if (!cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
+      if (
+        attempt.dispatched &&
+        !cleared &&
+        !this.operations.isSuperseded(ticket, topic, partition)
+      ) {
         this.forgetCommitted(topic, partition)
       }
       release?.()

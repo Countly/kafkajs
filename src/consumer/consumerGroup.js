@@ -3658,11 +3658,14 @@ module.exports = class ConsumerGroup {
    * is marked validated, and the round proceeds - validation is an optimisation over
    * correctness-on-the-next-round, never a reason to crash a consumer.
    *
+   * Positions are read without seeding (`peekNextOffset`): validation observes a position and
+   * never makes the committed offset count as resolved progress, which a seek being applied has
+   * just forgotten.
+   *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-320%3A+Allow+fetchers+to+detect+and+handle+log+truncation
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment,
    *   which is a superset of what the request keeps: it also contains partitions with no committed
-   *   offset, which are skipped here - there is no position to check, and reading one would create
-   *   a resolved offset holding `undefined`.
+   *   offset, which are skipped here - there is no position to check.
    * @param {FetchPreparation} [preparation] the fetch round's identity. Its refusal is never
    *   swallowed by the fail-open policy above: it is rethrown, and the entries this call put in
    *   flight are returned to unvalidated by identity, also at once when the run's fence closes,
@@ -3693,9 +3696,8 @@ module.exports = class ConsumerGroup {
             continue
           }
 
-          // The same filter the request build applies. `nextOffset()` writes the committed offset
-          // into the resolved ones, so calling it for a partition whose offset was just cleared
-          // would store `undefined` there and break the next commit.
+          // The same filter the request build applies: with no committed offset there is no
+          // position to check.
           if (manager.heldOffsetAt(topic, partition) == null) {
             continue
           }
@@ -3707,7 +3709,7 @@ module.exports = class ConsumerGroup {
           // old leader is not a safe place to keep reading from, whether or not this client is
           // still asking the leader about its position.
           const { action, generation } = this.positionValidator.request(topic, partition, {
-            offset: manager.nextOffset(topic, partition).toString(),
+            offset: manager.peekNextOffset(topic, partition).toString(),
             trackedEpoch,
             currentLeaderEpoch,
           })
@@ -3960,15 +3962,14 @@ module.exports = class ConsumerGroup {
 
         // The partition lost its committed offset while the request was in flight - a concurrent
         // OffsetOutOfRange recovery cleared it. There is no position left to compare the reply
-        // with, and reading one would store `undefined` as its resolved offset. Left to the
-        // caller's awaiting sweep, like a partition the reply never mentioned.
+        // with. Left to the caller's awaiting sweep, like a partition the reply never mentioned.
         if (manager.heldOffsetAt(topic, entry.partition) == null) {
           continue
         }
 
         // Read again now, not the pair captured when the request was made: comparing the captured
         // pair with itself could never detect a position that moved under the request.
-        const offset = manager.nextOffset(topic, entry.partition).toString()
+        const offset = manager.peekNextOffset(topic, entry.partition).toString()
         const outcome = this.positionValidator.complete(
           topic,
           entry.partition,

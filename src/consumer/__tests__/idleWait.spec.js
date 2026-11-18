@@ -1635,7 +1635,7 @@ describe('validation response continuation', () => {
     group.offsetManager.committedOffsets = () => ({ orders: { 0: '0', 1: '0' } })
     group.offsetManager.heldOffsetAt = (topic, partition) =>
       group.offsetManager.committedOffsets()[topic][partition]
-    group.offsetManager.nextOffset = () => ({ toString: () => '0' })
+    group.offsetManager.peekNextOffset = () => ({ toString: () => '0' })
     group.offsetManager.lastConsumedEpoch = () => 1
     group.offsetManager.seek = async () => true
     group.markChanged = () => {}
