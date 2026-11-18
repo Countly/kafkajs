@@ -1168,6 +1168,7 @@ module.exports = class ConsumerGroup {
           return this.coordinatorLookup.find(fence)
         },
         isStopping: () => this.isStopping(),
+        isObsolete: (topic, partition) => this.hasUnappliedSeek(topic, partition),
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
         markPolled: () => this.rebalanceCoordinator?.pollTimer.poll(),
         captureResetContext: (topic, partition, manager, preparation) =>
@@ -1215,7 +1216,13 @@ module.exports = class ConsumerGroup {
         const key = `${topic}|${partition}`
         if (!this.acquired.has(key)) {
           const acquiredAt = ++this.acquireClock
-          this.acquired.set(key, { acquiredAt, changedAt: acquiredAt, recreatedAt: 0 })
+          this.acquired.set(key, {
+            acquiredAt,
+            changedAt: acquiredAt,
+            recreatedAt: 0,
+            soughtAt: 0,
+            settledAt: 0,
+          })
         }
       }
     }
@@ -1787,11 +1794,16 @@ module.exports = class ConsumerGroup {
    * on the next fetch. If this API is invoked for the same topic/partition more
    * than once, the latest offset will be used on the next fetch.
    *
+   * The request also stamps an owned partition as sought (`markSought`), at once rather than when
+   * the seek is applied, so a batch fetched before it can neither resolve nor commit an offset
+   * from this moment on, while the seek is pending and after it is applied.
+   *
    * @param {import("../../types").TopicPartitionOffset} topicPartitionOffset
    * @returns {void} queues intent and wakes idle fetchers; resolution remains next-round work
    */
   seek({ topic, partition, offset }) {
     this.seekOffset.set(topic, partition, offset)
+    this.markSought(topic, partition)
     this.idleWait.wake()
   }
 
@@ -1848,16 +1860,61 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Records that a seek was requested for an owned partition, by stamping `soughtAt` with the next
+   * value of the acquisition clock, so a batch fetched under an earlier clock is known to be
+   * superseded (`Runner#isSuperseded`). Only the latest stamp is kept, and it is dropped with the
+   * partition's acquisition, so the record stays bounded by the assignment. A partition this
+   * member does not own is left alone.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  markSought(topic, partition) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    if (acquired) acquired.soughtAt = ++this.acquireClock
+  }
+
+  /**
+   * The seek fence: whether a seek of the identity's partition was admitted after the identity's
+   * batch was fetched, so work from that batch may neither resolve nor commit an offset for it.
+   * An identity with no acquisition clock, or a partition this member no longer holds, is not
+   * fenced here; ownership checks cover those.
+   * @param {{topic: string, partition: number, acquireClock: number|null, ownershipKey?: string}} identity
+   *   a fetched batch or a handler's batch identity (`handlerContext.current()`)
+   * @returns {boolean}
+   */
+  isSoughtSince(identity) {
+    const acquired = this.acquired.get(
+      identity.ownershipKey || `${identity.topic}|${identity.partition}`
+    )
+    return identity.acquireClock != null && acquired?.soughtAt > identity.acquireClock
+  }
+
+  /**
+   * Whether a seek admitted for an owned partition has not finished applying yet. Until it has,
+   * the partition's resolved progress belongs to the position being replaced.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean}
+   */
+  hasUnappliedSeek(topic, partition) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    return acquired !== undefined && acquired.soughtAt > acquired.settledAt
+  }
+
+  /**
    * Records that the topic of an owned partition was recreated: a change as `markChanged` stamps,
    * plus the same clock value as `recreatedAt`, so a batch fetched under an earlier clock is
-   * known to hold records of the old incarnation (`Runner#isRecreated`).
+   * known to hold records of the old incarnation (`Runner#isSuperseded`).
    * @param {string} topic
    * @param {number} partition
    * @returns {void}
    */
   markRecreated(topic, partition) {
     const acquired = this.acquired.get(`${topic}|${partition}`)
-    if (acquired) acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
+    if (!acquired) return
+    acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
+    acquired.settledAt = acquired.soughtAt
   }
 
   pause(topicPartitions) {
@@ -3421,7 +3478,14 @@ module.exports = class ConsumerGroup {
           seek: seekEntry,
         })
 
-        const applied = await manager.seek(seekEntry, preparation)
+        const acquired = this.acquired.get(`${topic}|${partition}`)
+        const admitted = acquired?.soughtAt
+        let applied
+        try {
+          applied = await manager.seek(seekEntry, preparation)
+        } finally {
+          if (acquired && admitted > acquired.settledAt) acquired.settledAt = admitted
+        }
         preparation?.check()
         if (applied) {
           this.markChanged(topic, partition)

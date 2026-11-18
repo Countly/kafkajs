@@ -147,6 +147,10 @@ module.exports = class OffsetManager {
    *                                its heartbeat, joins and other commits. The originating caller's
    *                                guard must allow publication to membership. Absent in isolated
    *                                managers, which ask the cluster directly.
+   * @param {(topic: string, partition: number) => boolean} [options.isObsolete] whether a
+   *                                partition's resolved progress was superseded by a seek that is
+   *                                not yet applied, so the default commit selection leaves it out.
+   *                                Defaults to never.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch and why an offset fetch is re-sent. Optional and
    *                                silent by default: the consumer group is the only production
@@ -179,6 +183,7 @@ module.exports = class OffsetManager {
     isRebalancePending = null,
     markPolled = null,
     captureResetContext = null,
+    isObsolete = null,
     findCoordinator = (fence) =>
       cluster.findGroupCoordinator(fence ? { groupId, fence } : { groupId }),
     logger = SILENT_LOGGER,
@@ -225,6 +230,7 @@ module.exports = class OffsetManager {
     this.isRebalancePending = isRebalancePending || (() => false)
     this.markPolled = markPolled || (() => {})
     this.captureResetContext = captureResetContext
+    this.isObsolete = isObsolete
     this.logger = logger
 
     this.autoCommit = autoCommit
@@ -930,26 +936,32 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * `uncommittedOffsets().topics`, optionally narrowed to a set of topic-partitions.
+   * `uncommittedOffsets().topics`, optionally narrowed to a set of topic-partitions, without the
+   * partitions whose progress a pending seek made obsolete (`isObsolete`): the seek, once applied,
+   * replaces that progress, so committing it first would move the group's offset away from the
+   * position the application asked for. The other partitions are selected as usual.
    * @private
    * @param {import('../groupProtocol/interface').TopicPartitions[]|null} partitions
    * @returns {import('../../../types').OffsetsByTopicPartition["topics"]}
    */
   selectUncommitted(partitions) {
     const { topics } = this.uncommittedOffsets()
-
-    if (!partitions) {
-      return topics
-    }
-
-    const wanted = new Map(partitions.map(({ topic, partitions: ps }) => [topic, new Set(ps)]))
+    const wanted =
+      partitions && new Map(partitions.map(({ topic, partitions: ps }) => [topic, new Set(ps)]))
+    const isObsolete = this.isObsolete
+    const anyObsolete =
+      isObsolete !== null &&
+      topics.some(({ topic, partitions: entries }) =>
+        entries.some(({ partition }) => isObsolete(topic, Number(partition)))
+      )
+    if (!wanted && !anyObsolete) return topics
 
     return topics
       .map(({ topic, partitions: entries }) => ({
         topic,
         partitions: entries.filter(({ partition }) => {
-          const selected = wanted.get(topic)
-          return selected !== undefined && selected.has(Number(partition))
+          const selected = !wanted || wanted.get(topic)?.has(Number(partition)) === true
+          return selected && !(anyObsolete && isObsolete(topic, Number(partition)))
         }),
       }))
       .filter(({ partitions: entries }) => entries.length > 0)
