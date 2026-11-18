@@ -15,7 +15,11 @@
  *   main.dump, transactions.dump         kafka-console-consumer.sh, read_committed, partition 0
  *                                        from the earliest offset, one line per record:
  *                                        `Partition:P<TAB>Offset:N<TAB>key<TAB>value`
- *   groups/<group>.describe              kafka-consumer-groups.sh --describe --group <group>
+ *   groups/<group>.describe              kafka-consumer-groups.sh --describe --group <group>,
+ *                                        for each ordinary consumer group
+ *   groups/<group>.unavailable           for the share group: one line saying why it has no
+ *                                        describe (the consumer-groups tool does not support
+ *                                        share groups)
  *   <file>.stderr                        the tool's stderr
  *   <file>.end                           one line, `exit=<status> lines=<n>`, written last: a file
  *                                        without it was cut off
@@ -23,9 +27,8 @@
  *
  * Every dump is attempted whatever an earlier one did, so a failed run keeps what could be read.
  * The dumper fails, after writing them all, when a tool failed or a topic dump's own record count
- * does not match its lines; the runbook still finalizes, so the partial dumps are bound. The share
- * group is described too, for the record, but the consumer-groups tool does not support share
- * groups, so its status is written and never fails the dump.
+ * does not match its lines, or an ordinary describe's output is not the tool's offsets table; the
+ * runbook still finalizes, so the partial dumps are bound.
  */
 const fs = require('node:fs')
 const path = require('node:path')
@@ -39,6 +42,31 @@ const IDLE_MS = 60000
 /** How long any one tool may run before it is killed and its dump marked failed. */
 const TOOL_MAX_MS = 30 * 60 * 1000
 const STDERR_CAP = 1024 * 1024
+
+/** Why the share group has no describe in the artifact. */
+const SHARE_UNAVAILABLE =
+  'unavailable: kafka-consumer-groups.sh does not describe share groups (GroupIdNotFoundException)\n'
+
+/**
+ * Checks that one ordinary group's describe output is the tool's offsets table: a header row
+ * starting `GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG`, then one row per partition of
+ * that group with a numeric partition and numeric or `-` offsets and lag.
+ * @param {string} text the tool's stdout @param {string} group the described group
+ * @returns {string|null} what is wrong, or null for a well-formed table
+ */
+const describeProblem = (text, group) => {
+  const [header, ...rows] = text.split('\n').filter((l) => l.trim() !== '')
+  if (
+    !/^GROUP\s+TOPIC\s+PARTITION\s+CURRENT-OFFSET\s+LOG-END-OFFSET\s+LAG(\s|$)/.test(header ?? '')
+  )
+    return 'no offsets header row'
+  if (rows.length === 0) return 'no partition rows'
+  for (const row of rows) {
+    const m = /^(\S+)\s+\S+\s+\d+\s+(\d+|-)\s+(\d+|-)\s+(\d+|-)(\s|$)/.exec(row)
+    if (!m || m[1] !== group) return `unparseable row "${row.slice(0, 40)}"`
+  }
+  return null
+}
 
 /** @param {string} arg @returns {string} the argument as one shell word */
 const quote = (arg) => (/^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`)
@@ -158,30 +186,35 @@ class ContainerDumper {
           `${result.file} (the tool counted ${counted.map((m) => m[1]).join(',') || 'no'} records, wrote ${result.lines} lines)`
         )
     }
+    const share = new Set(
+      this.config.clients.filter((c) => c.clientKind === 'share').map((c) => c.group)
+    )
     for (const group of this.groups()) {
       if (!/^[A-Za-z0-9._-]+$/.test(group)) {
         failures.push(`group ${JSON.stringify(group)} has a name no dump file can carry`)
         continue
       }
-      results.push(
-        await this.tool(`groups/${group}.describe`, [
-          ...EXEC,
-          `${TOOLS}/kafka-consumer-groups.sh`,
-          '--bootstrap-server',
-          BOOTSTRAP,
-          '--describe',
-          '--group',
-          group,
-        ])
-      )
+      if (share.has(group)) {
+        fs.mkdirSync(path.join(this.dir, 'groups'), { recursive: true })
+        fs.writeFileSync(path.join(this.dir, `groups/${group}.unavailable`), SHARE_UNAVAILABLE)
+        continue
+      }
+      const result = await this.tool(`groups/${group}.describe`, [
+        ...EXEC,
+        `${TOOLS}/kafka-consumer-groups.sh`,
+        '--bootstrap-server',
+        BOOTSTRAP,
+        '--describe',
+        '--group',
+        group,
+      ])
+      results.push(result)
+      const problem =
+        result.exit === 0 &&
+        describeProblem(fs.readFileSync(path.join(this.dir, result.file), 'utf8'), group)
+      if (problem) failures.push(`${result.file} (${problem})`)
     }
-    const share = new Set(
-      this.config.clients
-        .filter((c) => c.clientKind === 'share')
-        .map((c) => `groups/${c.group}.describe`)
-    )
-    for (const r of results)
-      if (r.exit !== 0 && !share.has(r.file)) failures.push(`${r.file} (exit ${r.exit})`)
+    for (const r of results) if (r.exit !== 0) failures.push(`${r.file} (exit ${r.exit})`)
     if (failures.length > 0) throw new Error(`dump failed: ${failures.join('; ')}`)
     return { files: results.map((r) => r.file) }
   }
@@ -212,4 +245,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { ContainerDumper, parseArgs, runTool }
+module.exports = { ContainerDumper, describeProblem, parseArgs, runTool }

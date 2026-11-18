@@ -64,6 +64,8 @@ const COMMAND_GRACE_MS = 60000
 const DEFAULT_COMMAND_MS = 300000
 /** How long the final drain waits for every member to resolve the logs' ends. */
 const FINAL_DRAIN_MS = 300000
+/** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
+const TELEMETRY_DRAIN_MS = 15000
 /** Problems kept in the supervisor receipt; later ones are counted, not listed. */
 const MAX_PROBLEMS = 200
 
@@ -80,7 +82,14 @@ const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
  */
 function parseArgs(argv, env) {
   const flags = { companion: [] }
-  const switches = ['--finalize', '--cleanup', '--summary', '--diagnostic', '--outer-exit']
+  const switches = [
+    '--finalize',
+    '--cleanup',
+    '--summary',
+    '--diagnostic',
+    '--outer-exit',
+    '--check-workload',
+  ]
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]
     if (!name.startsWith('--')) throw new Error(`unexpected argument ${name}`)
@@ -106,6 +115,7 @@ function parseArgs(argv, env) {
       exitWallMs: Number(flags['exit-wall-ms'] || NaN),
     }
   if (flags.cleanup) return { command: 'cleanup', out }
+  if (flags['check-workload']) return { command: 'check-workload', out }
   if (flags.summary) return { command: 'summary', out }
   if (flags.child) return { command: 'child', child: flags.child, out }
   if (!['smoke', 'acceptance'].includes(flags.mode))
@@ -412,6 +422,10 @@ class Supervisor {
     this.rig = rig
     for (const p of this.config.processes) if (p.slot !== SUPERVISOR) this.spawn(p.slot)
     await this.createTopics()
+    await this.configureShareGroup().catch((e) => {
+      this.problem(`share group setup failed: ${e.message}`)
+      this.abort(`share group setup failed: ${e.message}`)
+    })
     await this.start()
     this.runStartAt = this.clock.now()
     await this.collector.note('readiness barrier', { runStartAt: this.runStartAt })
@@ -426,12 +440,16 @@ class Supervisor {
     }))
     for (const st of steps.filter((s) => s.lane === 'within'))
       this.waves.set(st.parent, [...(this.waves.get(st.parent) ?? []), st])
+    const outages = new Map(
+      steps.filter((s) => s.shape === 'broker-outage').map((s) => [s.id, null])
+    )
     this.scheduler = new Scheduler({
       clock: this.clock,
       perform: (step) => this.perform(step),
       onOutcome: (o) => {
         this.collector.note(`step ${o.id} ${o.outcome}`, { step: o.id })
         this.stepOutcome(o)
+        if (outages.has(o.id)) outages.set(o.id, o.outcome)
       },
     })
     if (this.aborted) this.scheduler.abort(this.aborted)
@@ -449,6 +467,7 @@ class Supervisor {
     })
     const summary = await this.scheduler.run(steps)
     this.monitor.stop()
+    if (this.options.mode === 'smoke') this.requireOutages(outages)
     await this.collector.note('schedule finished', { ...summary, gatePeak: this.gate.peak })
     await this.untilExited()
     await this.runtime.stop()
@@ -472,6 +491,39 @@ class Supervisor {
       treeSha: this.options.expectSha,
     }
     fs.writeFileSync(path.join(this.out, 'supervisor.json'), JSON.stringify(run) + '\n')
+  }
+
+  /**
+   * Sets `share.auto.offset.reset=earliest` on the run's fresh share group through the public admin
+   * API and waits until the broker reads it back, before any member joins. The broker's default is
+   * `latest`, which would start the group after the records offered before its first fetch.
+   * @returns {Promise<void>}
+   * @throws {Error} when the broker refuses the config or does not read it back in time
+   */
+  async configureShareGroup() {
+    const share = this.config.clients.find(
+      (c) => this.matrix.clientKinds[c.clientKind]?.role === 'share' && c.purpose === 'subject'
+    )
+    if (!share) return
+    // loaded here so child processes never load the test helpers
+    const { setShareGroupConfigs } = require('../../testHelpers/shareFixtures')
+    await setShareGroupConfigs(this.admin, share.group, { 'share.auto.offset.reset': 'earliest' })
+    await this.collector.note(
+      `share group ${share.group} reads back share.auto.offset.reset=earliest`,
+      { group: share.group }
+    )
+  }
+
+  /**
+   * Fails a smoke whose planned broker outages did not all end ok: the smoke exists to show both
+   * outage lengths and their recovery, so an outage cut short or never run leaves it unproven.
+   * @param {Map<string, string|null>} outcomes each planned outage's outcome, null if never settled
+   * @returns {void}
+   */
+  requireOutages(outcomes) {
+    for (const [id, outcome] of outcomes)
+      if (outcome !== 'ok')
+        this.problem(`smoke outage ${id} has no receipt (${outcome ?? 'not run'})`)
   }
 
   /**
@@ -964,9 +1016,10 @@ class Supervisor {
   /**
    * The end of the run. Producers go idle and their in-flight sends and transactions settle; the
    * logs' ends are then read; every consumer waits until it has resolved those ends, filtered
-   * suffix included, and commits what it resolved, and the share member waits until its deliveries
-   * reach the last offset; every live route gets its terminal scan and seal; then every process
-   * disconnects. The cluster and the two standing topics stay up for the runbook's dumps.
+   * suffix included, and commits what it resolved, and the share member waits until every offset
+   * had a handler entry; every live route gets its terminal scan and seal; then every process but
+   * the telemetry decoder disconnects, the decoder reads the telemetry clients' terminating pushes
+   * and disconnects last. The cluster and the two standing topics stay up for the runbook's dumps.
    * @param {object} step the disconnect step
    * @returns {Promise<void>}
    */
@@ -988,7 +1041,38 @@ class Supervisor {
       'end'
     )
     await this.gate.idle()
-    await this.send(all, step)
+    const decoder = this.config.processes.find((p) => p.role === 'decoder')?.slot
+    let failed = null
+    await this.send(
+      all.filter((slot) => slot !== decoder),
+      step
+    ).catch((e) => (failed = e))
+    if (all.includes(decoder)) {
+      await this.drainTelemetry(decoder)
+      await this.send([decoder], step).catch((e) => (failed ??= e))
+    }
+    if (failed) throw failed
+  }
+
+  /**
+   * Has the decoder read the reporters until the disconnected telemetry clients' terminating
+   * pushes are in the stream. A push not read in time is noted; the raw reporter files keep it.
+   * @param {string} decoder the decoder's process
+   * @returns {Promise<void>}
+   */
+  async drainTelemetry(decoder) {
+    const clients = this.config.clients.filter((c) => c.telemetryEnabled).map((c) => c.slot)
+    const step = {
+      type: 'drain-telemetry',
+      id: 'final-telemetry',
+      clients,
+      deadline: this.clock.now() + TELEMETRY_DRAIN_MS,
+    }
+    const [r] = await this.send([decoder], step).catch((e) => [{ error: e.message }])
+    if (r.error) this.problem(`final telemetry: ${r.error}`)
+    if (r.reply?.abort) this.problem(`final telemetry: ${r.reply.abort}`)
+    if (r.reply?.missing?.length > 0)
+      await this.collector.note(`final telemetry: no terminating push read for ${r.reply.missing}`)
   }
 
   /**
@@ -1020,9 +1104,9 @@ class Supervisor {
   /**
    * A membership execution, wave by wave. Each wave is its own pause-resume execution: every
    * participant runs the wave's `leave` phase (pause, join an extra, observe the transfer, remove
-   * the extra), the participants are sampled closed through the gate, every participant resumes,
-   * and the wave ends with its operation count and its outcome note. A failed phase still resumes
-   * and ends the wave; the step then fails with the first error.
+   * the extra, see the paused partitions return), the participants are sampled closed through the
+   * gate, every participant resumes, and the wave ends with its operation count and its outcome
+   * note. A failed phase still resumes and ends the wave; the step then fails with the first error.
    * @param {object} step the membership execution @param {string[]} participants its processes
    * @returns {Promise<void>}
    * @throws {Error} the first failed phase of any wave
@@ -1038,6 +1122,9 @@ class Supervisor {
         const none = participants.filter((_, i) => leave[i].reply?.transfers === 0)
         if (none.length > 0)
           throw new Error(`${wave.id} saw no paused partition transfer in ${none.join(', ')}`)
+        const kept = participants.filter((_, i) => leave[i].reply?.returned === false)
+        if (kept.length > 0)
+          throw new Error(`${wave.id} saw paused partitions not return in ${kept.join(', ')}`)
         await this.sampleAll(participants, {
           type: 'closed',
           id: `${wave.id}.closed`,
@@ -1326,6 +1413,41 @@ async function cleanup({ out }) {
 }
 
 /**
+ * Why a sealed run's workload is not green, from its `supervisor.json`: any failure, problem or
+ * forced exit, an abort or an incomplete source. The parent-observed exit codes stay what they
+ * were; this is the separate verdict the runbook fails on.
+ * @param {object|null} supervisor the parsed receipt, or null when it is missing or unreadable
+ * @returns {string[]} the reasons; empty for a green workload
+ */
+function workloadProblems(supervisor) {
+  if (!supervisor) return ['supervisor.json is missing or unreadable']
+  const shown = (v) => JSON.stringify(v)?.slice(0, 500)
+  return [
+    ...['failures', 'problems', 'forced']
+      .filter((f) => !Array.isArray(supervisor[f]) || supervisor[f].length > 0)
+      .map((f) => `${f}: ${shown(supervisor[f])}`),
+    ...['aborted', 'incomplete']
+      .filter((f) => supervisor[f] !== null)
+      .map((f) => `${f}: ${shown(supervisor[f])}`),
+  ]
+}
+
+/**
+ * Checks a sealed run's workload receipt and fails when it is not green.
+ * @param {{ out: string }} options
+ * @returns {string[]} the reasons, also printed to stderr; empty for a green workload
+ */
+function checkWorkload({ out }) {
+  let supervisor = null
+  try {
+    supervisor = JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))
+  } catch {}
+  const problems = workloadProblems(supervisor)
+  for (const p of problems) console.error(`workload not green: ${p}`)
+  return problems
+}
+
+/**
  * Hashes and counts a byte source with one fixed buffer, so the memory used never grows with the
  * source, however many GiB it holds.
  * @param {{ size: number, read: (buffer: Buffer, position: number) => number }} source `read` fills
@@ -1548,6 +1670,8 @@ async function main(argv) {
   if (options.command === 'finalize') process.exitCode = finalize(options).partial ? 1 : 0
   else if (options.command === 'outer-exit') recordOuterExit(options)
   else if (options.command === 'cleanup') await cleanup(options)
+  else if (options.command === 'check-workload')
+    process.exitCode = checkWorkload(options).length > 0 ? 1 : 0
   else if (options.command === 'summary')
     console.log(JSON.stringify(await summarize(options), null, 2))
   else if (options.command === 'child') child(options)
@@ -1570,5 +1694,7 @@ module.exports = {
   recordOuterExit,
   finalize,
   summarize,
+  workloadProblems,
+  checkWorkload,
   Supervisor,
 }

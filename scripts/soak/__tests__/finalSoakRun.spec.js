@@ -1157,6 +1157,17 @@ describe('final soak smoke schedule', () => {
     expect(every).toBeLessThan(outages[0].at)
   })
 
+  test('the matrix rejects a smoke abort that would not come before the first outage', () => {
+    const { validateMatrix } = require('../finalSoakSchema')
+    const late = JSON.parse(JSON.stringify(matrix))
+    late.schedule.smoke.abortAtTransaction =
+      smoke.outageAtMs / matrix.traffic.transactionEveryMs.value + 1
+    expect(validateMatrix(matrix)).toEqual([])
+    expect(validateMatrix(late)).toEqual([
+      'matrix.schedule.smoke.abortAtTransaction does not abort before the first outage',
+    ])
+  })
+
   test('every work step of the smoke ends before the next starts and before the drain', () => {
     const work = plan.steps.filter((s) => s.lane === 'work' && s.shape && s.shape !== 'traffic')
     for (let i = 1; i < work.length; i++)

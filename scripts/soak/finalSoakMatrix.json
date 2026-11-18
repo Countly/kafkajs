@@ -422,6 +422,7 @@
       "recreationAtMs": 480000,
       "outageAtMs": 600000,
       "recoveredByMs": 960000,
+      "abortAtTransaction": 2,
       "periodicSlots": 61,
       "floors": {
         "mainPerGroup": 100,

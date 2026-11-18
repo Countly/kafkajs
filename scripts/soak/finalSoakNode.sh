@@ -11,7 +11,9 @@
 # consumer group's committed offsets, by the Apache tools inside the first broker's container, while
 # the cluster and the topics are still up), finalize, the driver's summary, cleanup (run topics and
 # groups, then containers) and a tarball of the artifact. A failed or interrupted run is sealed the
-# same way, so its evidence is bound and its dumps kept, never reported as complete.
+# same way, so its evidence is bound and its dumps kept, never reported as complete. A run whose
+# driver exited 0 but whose workload receipt (supervisor.json) holds failures, problems, forced
+# exits, an abort or an incomplete source fails at stage `workload`, after sealing.
 #
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
@@ -206,4 +208,8 @@ if [[ -n "$after" ]]; then
   stage=$after
   exit 1
 fi
+# A workload that aborted or recorded a problem fails the run once its artifact is sealed; the
+# driver's own exit code, observed above, stays in the artifact as it was.
+stage=workload
+node scripts/soak/finalSoak.js --check-workload --out "$out"
 stage=done

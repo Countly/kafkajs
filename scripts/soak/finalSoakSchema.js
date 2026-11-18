@@ -1206,6 +1206,7 @@ const SMOKE_FIELDS = Object.freeze({
   idleMs: Window,
   quietAtMs: QuietTimes,
   ...each(['membershipAtMs', 'regexAtMs', 'recreationAtMs', 'outageAtMs', 'recoveredByMs'], Ms),
+  abortAtTransaction: Positive,
   periodicSlots: Positive,
   floors: Any,
 })
@@ -1351,6 +1352,13 @@ const validateMatrix = (matrix) => {
         'matrix.schedule.smoke.periodicSlots does not cover the smoke at the sample period'
       )
     if (sampling.gcCollections.value !== 2) problems.push('matrix.sampling.gcCollections is not 2')
+    if (
+      (schedule.smoke.abortAtTransaction - 1) * matrix.traffic.transactionEveryMs.value >=
+      schedule.smoke.outageAtMs
+    )
+      problems.push(
+        'matrix.schedule.smoke.abortAtTransaction does not abort before the first outage'
+      )
   }
   if (matrix.rows.length !== ROWS.length)
     problems.push(`matrix.rows does not hold the ${ROWS.length} rows`)

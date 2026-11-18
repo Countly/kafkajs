@@ -239,6 +239,9 @@ function scheduleTotals({ steps }) {
   }
 }
 
+/** The steps that still run after an abort, in plan order. */
+const TEARDOWN = Object.freeze(['seed-clear', 'disconnect'])
+
 /**
  * Runs a plan against a clock. Work steps run one at a time in plan order, and so do the timer
  * steps of each type (so only one timer per type is pending at any moment). A step that cannot
@@ -246,7 +249,8 @@ function scheduleTotals({ steps }) {
  * Either way it is reported `late` and never moved: later steps, and idle windows above all, keep
  * their times. Steps with `lane: 'within'` are performed by their parent work step and reported by
  * it. After `abort()`, every step that has not started is reported `aborted` without being
- * performed, except `disconnect`, which then runs at once so the run is torn down naturally.
+ * performed, except the teardown steps (`seed-clear`, then `disconnect`), which then run at once so
+ * the run is torn down naturally and the seed's clear is still recorded.
  */
 class Scheduler {
   /**
@@ -299,7 +303,7 @@ class Scheduler {
     const deadline = step.deadline ?? Infinity
     let outcome = 'ok'
     let error = null
-    if (this.aborted && step.type !== 'disconnect') outcome = 'aborted'
+    if (this.aborted && !TEARDOWN.includes(step.type)) outcome = 'aborted'
     else if (startedAt >= deadline && !this.aborted) outcome = 'late'
     else {
       try {
