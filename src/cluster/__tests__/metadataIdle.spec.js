@@ -1768,6 +1768,48 @@ describe('producer metadata idle expiry over the wire', () => {
         }
       }
     )
+
+    test.each([
+      [29, 'a before b', UNAUTHORIZED, ['a', 'b']],
+      [29, 'b before a', UNAUTHORIZED, ['b', 'a']],
+      [3, 'a before b', UNKNOWN, ['a', 'b']],
+      [3, 'b before a', UNKNOWN, ['b', 'a']],
+    ])(
+      'without idempotence, an owned target refused with code %d and another topic in one request that answers neither each end with their own error when %s',
+      async (code, _, chain, order) => {
+        const owned = await holding({ idempotent: false, linger: 50 })
+        let answering = false
+        try {
+          w.state.refused.set('a', code)
+          expect(await settle(owned.sendTo('b', 'other'))).toMatchObject({ state: 'fulfilled' })
+          expect(w.cluster.topicRefusal('a')).toMatchObject({ code })
+          w.scripted.answer('Produce', (fields) =>
+            answering ? produceAnswer(fields, () => 0) : { responses: [], nodeEndpoints: [] }
+          )
+
+          const mixed = Object.fromEntries(
+            order.map((topic) => [topic, watch(owned.sendTo(topic, 'mixed'))])
+          )
+          await flushAll()
+          owned.blocked.release(produceAnswer(owned.blocked.call.fields, () => 6))
+          await untilSettled([mixed.a, mixed.b, ...owned.sends])
+          const requested = w.scripted
+            .requests()
+            .filter(({ api }) => api === 'Produce')
+            .map(({ fields }) => ['a', 'b'].filter((t) => fields.topics.some((e) => isTopic(e, t))))
+          expect(requested).toContainEqual(['a', 'b'])
+
+          expect(mixed.b.state).toBe('rejected')
+          expect(chainOf(mixed.b.value)).toEqual(['KafkaJSNumberOfRetriesExceeded', 'KafkaJSError'])
+          expect(mixed.b.value.cause.message).toBe('No result for b partition 0')
+          answering = true
+          await expectRefused({ sendTo: owned.sendTo, sends: [mixed.a, ...owned.sends] }, chain)
+        } finally {
+          answering = true
+          if (owned.blocked.settle) owned.blocked.release()
+        }
+      }
+    )
   })
 
   test('sends to ten thousand distinct topics leave bounded bookkeeping', async () => {
