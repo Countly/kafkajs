@@ -2,7 +2,6 @@ const fs = require('node:fs')
 const path = require('node:path')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- Native resource creation is the contract under test.
 const { createHook } = require('node:async_hooks')
-// eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
 const { load } = require('js-yaml')
 const { childArgs } = require('../shareSoakContract')
 const { runNaturalExit } = require('../naturalExit')

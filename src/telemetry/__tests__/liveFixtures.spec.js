@@ -9,7 +9,6 @@ const os = require('os')
 const path = require('path')
 const { execFileSync } = require('child_process')
 const { performance } = require('perf_hooks')
-// eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
 const yaml = require('js-yaml')
 const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
 const { requestTraceArgs, assertRequestLogConfig } = require('./fixtures/requestTrace')

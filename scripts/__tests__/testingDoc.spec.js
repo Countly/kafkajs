@@ -239,6 +239,32 @@ describe('docs/Testing.md', () => {
       expect(block).toContain(text)
   })
 
+  it('describes the manual mutation report, what it runs and what a survivor means', () => {
+    const start = page.indexOf('### Mutation report')
+    expect(start).toBeGreaterThan(-1)
+    const section = page.slice(start, page.indexOf('\n### ', start + 1))
+    const { inputs } = yaml.load(read('.github', 'workflows', 'mutants.yml')).on.workflow_dispatch
+
+    for (const text of [
+      '`.github/workflows/mutants.yml`',
+      '`scripts/mutants/inventory.json`',
+      '`scripts/mutants/generate.js`',
+      'dispatched by hand',
+      'gates nothing',
+      'nominated witness',
+      '`mutation-report`',
+      'does not mean that no test in the suite would fail',
+      'gates nothing by itself',
+      'the owner reads',
+    ])
+      expect(section).toContain(text)
+    for (const verdict of ['killed', 'survived', 'invalid', 'stale', 'not-run', 'excluded'])
+      expect(section).toContain(`\`${verdict}\``)
+    expect(section).not.toContain('no merge or release waits')
+    for (const name of Object.keys(inputs)) expect(section).toContain(`\`${name}\``)
+    expect(section).not.toMatch(/\d\s?%/)
+  })
+
   it('states the telemetry row counts, Kafka lines and jars the tree has', () => {
     const configured = 'docker-compose.telemetry.yml'
     const development = telemetryRows(false)

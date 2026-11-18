@@ -1767,7 +1767,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('requires the adopted long-window lane on pull requests with three replicates and bounded jobs', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const expr = (text) => '$' + `{{ ${text} }}`
@@ -1836,7 +1835,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('covers all six live census lanes with capture and scalar companions', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const census = workflow.jobs['live-owner-census']
@@ -1893,7 +1891,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const { LIVE_SEED } = require('../../soak/liveSeed')
     const { TELEMETRY } = require('../../soak/soak')

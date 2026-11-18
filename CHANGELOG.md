@@ -43,6 +43,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - CI proves that consumers (both protocols, static and dynamic), producers and admins exit the process on their own after disconnect, with a seeded-timer control.
 - Development dependencies are refreshed to patched releases (`brace-expansion`, the nested `js-yaml` 3.x, `glob` 13 and the nested `picomatch` 2, lockfile only). The CI pack, OTel and benchmark jobs, the gate workflow's install and the pack smoke test install with `--ignore-scripts`, like the release workflow; a unit test checks every install on a line separately, including the packing checks the gate takes from its manifest. The remaining development-only advisories and why they wait are listed in `RELEASING.md`; the published package's dependencies have none.
 - CI, weekly and memory-gates workflows run with a read-only token (`contents: read`); the weekly matrix adds Kafka 4.1.2 on Node 24 (all six groups).
+- `scripts/ci/sweeps.sh` fails when the README, a governance file (`RELEASING.md`, `SECURITY.md`, `QUARANTINE.md`, `CONTRIBUTING.md`, `otel/README.md`) or a guide in `docs/` names a planning id.
 
 #### Docs
 

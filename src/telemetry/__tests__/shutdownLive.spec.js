@@ -5,7 +5,6 @@ const path = require('path')
 const v8 = require('v8')
 const vm = require('vm')
 const { performance } = require('perf_hooks')
-// eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
 const yaml = require('js-yaml')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')

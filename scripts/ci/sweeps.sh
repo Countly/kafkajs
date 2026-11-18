@@ -3,6 +3,7 @@
 # label grep against alpha.9b, test-only exports, focused or failing tests, host paths, TODO text and leftover .orig/.rej files. Each
 # hit is compared as `file:text` (line numbers dropped) with the enumerated exceptions, as a
 # multiset, so an exception that moves still matches and a second copy of one is a new hit.
+# It also fails on planning ids (acceptance, decision or plan ids) in the shipped README, governance files and guides.
 # Usage: sweeps.sh <out directory>     Writes <out>/sweeps.txt, whose last line is the verdict.
 # Every `git grep` is checked by its own exit status (0 hits, 1 none, anything else a failure);
 # a failure stops the sweeps with `sweeps: FAIL`, never with a clean verdict.
@@ -212,6 +213,21 @@ LIST
 )")
 check todo "$(printf '%s\n%s\n' "$TODOS" "$SELF_TODOS")"
 stale_exceptions todo "$TODOS" "$out/todo.hits"
+# Shipped README, governance files and guides never name a planning item. The generated compatibility matrix is
+# machine text and is not read. One pattern per line, joined into a single word-bounded alternation.
+DOC_PATTERNS=(
+  'A[0-9]{2}'     # acceptance id
+  'F[0-9]{2}'     # feature id
+  'P10'           # benchmark phase name
+  '9[A-G]-[0-9]+' # plan task id
+  'D[12][0-9]{2}' # decision id
+  'E[0-9]{2}'     # evidence check id
+  'O[0-9]{2}'     # requirement id
+)
+DOC_IDS="\\b($(IFS='|'; echo "${DOC_PATTERNS[*]}"))\\b"
+hits shipped-doc -n -E "$DOC_IDS" -- README.md RELEASING.md SECURITY.md QUARANTINE.md CONTRIBUTING.md otel/README.md \
+  'docs/*.md' ':!docs/KafkaCompatibility.md'
+check shipped-doc ''
 leftovers leftover '*.orig' '*.rej' '*.swp' '*~'
 check leftover ''
 [ "$failed" = 0 ] && echo "sweeps: clean" >> "$report" || echo "sweeps: FAIL" >> "$report"
