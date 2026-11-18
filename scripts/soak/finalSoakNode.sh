@@ -12,9 +12,11 @@
 #
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
-# the exit status and the driver's status) and <artifact>.tar.gz. Cleanup covers only what was
-# started, and the script exits with the first failure's status. They sit beside the artifact so
-# the header, which hashes every file inside it, never binds a file that is still being written.
+# the exit status and the driver's status) and <artifact>.tar.gz; a failed run with a Compose cluster
+# also leaves the brokers' logs in <artifact>.compose.log. Cleanup covers only what was started (run
+# topics and groups only once the driver wrote its config), and the script exits with the first
+# failure's status. They sit beside the artifact so the header, which hashes every file inside it,
+# never binds a file that is still being written.
 #
 # Environment:
 #   FINAL_SOAK_ARTIFACTS          artifact root ($HOME/final-soak by default)
@@ -65,9 +67,22 @@ started=
 driver=
 driver_status=null
 
+# Removes the run's topics and groups, which exist only once the driver wrote config.json, then on
+# failure keeps the brokers' logs and stops the Compose cluster.
 cleanup() {
-  node scripts/soak/finalSoak.js --cleanup --out "$out" || true
-  if [[ -z "$supplied" ]]; then docker compose down --volumes || true; fi
+  local status=$1
+  if [[ -f "$out/config.json" ]]; then
+    node scripts/soak/finalSoak.js --cleanup --out "$out" || true
+  else
+    echo "no driver config: the driver created no run topics or groups, so none are removed"
+  fi
+  if [[ -z "$supplied" ]]; then
+    if ((status != 0)); then
+      docker compose logs --no-color --timestamps > "$out.compose.log" 2>&1 || true
+      echo "broker logs: $out.compose.log"
+    fi
+    docker compose down --volumes || true
+  fi
 }
 
 # Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped
@@ -82,7 +97,7 @@ finish() {
     wait "$driver"
     driver_status=$?
   fi
-  if [[ -n "$started" ]]; then cleanup; fi
+  if [[ -n "$started" ]]; then cleanup "$status"; fi
   if ! tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
     stage=archive
     status=1
@@ -122,8 +137,9 @@ else
   # The controller can still be settling right after the brokers answer, so this retries.
   stage=share-version
   features=(docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092)
+  # The describe output goes to the log too, so the finalized level is on record.
   share_level() {
-    "${features[@]}" describe | sed -n 's/.*Feature: share\.version.*FinalizedVersionLevel: \([0-9]*\).*/\1/p'
+    "${features[@]}" describe | tee /dev/stderr | sed -n 's/.*Feature: share\.version.*FinalizedVersionLevel: \([0-9]*\).*/\1/p'
   }
   attempt=1
   until level="$(share_level)" && [[ "$level" =~ ^[1-9][0-9]*$ ]]; do

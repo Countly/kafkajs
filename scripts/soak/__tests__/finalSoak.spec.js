@@ -546,9 +546,10 @@ describe('final soak driver', () => {
     const { Kafka } = require('../../../index')
     const { captureBroker } = require('../finalSoakPreflight')
     const { validateCapabilities, validateProvenance } = require('../finalSoakSchema')
+    // The default retry, as live: the admin's first by-node lookup refreshes its metadata and retries.
     const capture = async (ids) => {
       const { wire, out, evidence } = scriptedBrokers(ids)
-      const kafka = new Kafka(wire.kafkaOptions({ retry: { retries: 0 } }))
+      const kafka = new Kafka(wire.kafkaOptions())
       const factory = Object.getOwnPropertySymbols(kafka).find(
         (s) => s.description === 'private:Kafka:createCluster'
       )
@@ -632,7 +633,7 @@ describe('final soak driver', () => {
     try {
       await expect(
         main(['--expect-sha', TREE, '--mode', 'smoke', '--out', out], {
-          kafkaOptions: wire.kafkaOptions({ retry: { retries: 0 } }),
+          kafkaOptions: wire.kafkaOptions(),
         })
       ).rejects.toThrow()
       const record = JSON.parse(fs.readFileSync(path.join(out, 'preflight.json'), 'utf8'))

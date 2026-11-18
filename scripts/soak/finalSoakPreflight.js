@@ -156,43 +156,65 @@ const memAvailable = () =>
   Number(/MemAvailable:\s+(\d+) kB/.exec(fs.readFileSync('/proc/meminfo', 'utf8'))[1]) * 1024
 
 /**
- * Captures per-node broker provenance and capabilities into the artifact.
+ * Builds a private cluster of `kafka` the way `Kafka#admin` builds its own (no auto topic creation)
+ * with telemetry and instrumentation off: the public API exposes no per-node ApiVersions ranges.
+ * @param {object} kafka a `Kafka`
+ * @returns {object} an unconnected cluster
+ * @throws {Error} when the client has no private cluster factory
+ */
+function privateCluster(kafka) {
+  const factory = Object.getOwnPropertySymbols(kafka).find(
+    (s) => s.description === 'private:Kafka:createCluster'
+  )
+  if (typeof kafka[factory] !== 'function')
+    throw new Error('this client has no private cluster factory to read ApiVersions ranges with')
+  return kafka[factory]({
+    telemetryMetrics: null,
+    allowAutoTopicCreation: false,
+    instrumentationEmitter: null,
+  })
+}
+
+/**
+ * Captures per-node broker provenance and capabilities into the artifact. The private cluster is
+ * disconnected whether or not every node answers.
  * @param {object} kafka a connected-capable `Kafka`
  * @param {object} admin a connected admin
  * @param {string} out artifact directory
  * @returns {Promise<{ provenance: object, broker: object }>}
+ * @throws {Error} when a node is missing from metadata or does not answer
  */
 async function captureBroker(kafka, admin, out) {
   fs.mkdirSync(path.join(out, 'broker'), { recursive: true })
-  const symbol = Object.getOwnPropertySymbols(kafka).find(
-    (s) => s.description === 'private:Kafka:createCluster'
-  )
-  const cluster = kafka[symbol]()
-  await cluster.connect()
-  await cluster.refreshMetadata()
+  const cluster = privateCluster(kafka)
   const nodes = []
-  for (const node of NODES) {
-    const broker = await cluster.findBroker({ nodeId: String(node) })
-    const features = await admin.describeFeatures({ brokerId: node })
-    nodes.push({
-      node,
-      apiRanges: Object.entries(broker.versions).map(([apiKey, v]) => ({
-        apiKey: Number(apiKey),
-        minVersion: v.minVersion,
-        maxVersion: v.maxVersion,
-      })),
-      supportedFeatures: Object.entries(features.supportedFeatures ?? {}).map(([name, v]) => ({
-        name,
-        minVersion: v.minVersion,
-        maxVersion: v.maxVersion,
-      })),
-      finalizedFeatures: Object.entries(features.finalizedFeatures ?? {}).map(([name, v]) => ({
-        name,
-        ...v,
-      })),
-    })
+  try {
+    await cluster.connect()
+    await cluster.refreshMetadata()
+    for (const node of NODES) {
+      const broker = await cluster.findBroker({ nodeId: String(node) })
+      const features = await admin.describeFeatures({ brokerId: node })
+      nodes.push({
+        node,
+        apiRanges: Object.entries(broker.versions).map(([apiKey, v]) => ({
+          apiKey: Number(apiKey),
+          minVersion: v.minVersion,
+          maxVersion: v.maxVersion,
+        })),
+        supportedFeatures: Object.entries(features.supportedFeatures ?? {}).map(([name, v]) => ({
+          name,
+          minVersion: v.minVersion,
+          maxVersion: v.maxVersion,
+        })),
+        finalizedFeatures: Object.entries(features.finalizedFeatures ?? {}).map(([name, v]) => ({
+          name,
+          ...v,
+        })),
+      })
+    }
+  } finally {
+    await cluster.disconnect()
   }
-  await cluster.disconnect()
   fs.writeFileSync(path.join(out, 'broker/capabilities.json'), JSON.stringify({ nodes }) + '\n')
   const supplied = process.env.FINAL_SOAK_SUPPLIED_EVIDENCE
   let provenance
@@ -253,24 +275,21 @@ async function captureBroker(kafka, admin, out) {
 /**
  * Pushes from one telemetry-enabled probe producer and one probe consumer and waits for the broker
  * reporter's decoded line of each.
- * @param {object} kafka a `Kafka`
+ * @param {object} kafkaOptions the `Kafka` options every preflight client starts from
  * @param {string} sinkDir the host reporter directory
  * @param {number} waitMs how long to wait for both pushes
  * @returns {Promise<object[]>} the decoded pushes found, by probe
  */
-async function telemetryProof(kafka, sinkDir, waitMs) {
-  const { Kafka, logLevel } = require('../../index')
-  const brokers = process.env.KAFKA_BROKERS.split(',')
+async function telemetryProof(kafkaOptions, sinkDir, waitMs) {
+  const { Kafka } = require('../../index')
   const tag = crypto.randomBytes(4).toString('hex')
   const producer = new Kafka({
+    ...kafkaOptions,
     clientId: `preflight-producer-${tag}`,
-    brokers,
-    logLevel: logLevel.NOTHING,
   }).producer({ enableMetricsPush: true })
   const consumer = new Kafka({
+    ...kafkaOptions,
     clientId: `preflight-consumer-${tag}`,
-    brokers,
-    logLevel: logLevel.NOTHING,
   }).consumer({ groupId: `preflight-${tag}`, enableMetricsPush: true })
   await producer.connect()
   await consumer.connect()
@@ -336,31 +355,59 @@ async function telemetrySubscription(admin, matrix) {
   return { metrics: value('metrics'), intervalMs: value('interval.ms') }
 }
 
-/**
- * Gathers every preflight fact from the live host, checkout and cluster.
- * @param {{ out: string, matrix: object }} options
- * @returns {Promise<object>} the facts `Preflight` judges, plus the header fields it writes
- */
-async function gatherFacts({ out, matrix }) {
+/** @returns {object} the `Kafka` options of the brokers in `KAFKA_BROKERS` @throws {Error} when unset */
+const brokerOptions = () => {
   if (!process.env.KAFKA_BROKERS) throw new Error('KAFKA_BROKERS must list the brokers')
-  const { Kafka, logLevel } = require('../../index')
-  const kafka = new Kafka({
-    clientId: 'preflight-admin',
-    brokers: process.env.KAFKA_BROKERS.split(','),
-    logLevel: logLevel.NOTHING,
-  })
+  const { logLevel } = require('../../index')
+  return { brokers: process.env.KAFKA_BROKERS.split(','), logLevel: logLevel.NOTHING }
+}
+
+/**
+ * Gathers every preflight fact from the live host, checkout and cluster. Each cluster step is
+ * named in `progress.stage` before it starts and its result kept in `progress.completed` once it
+ * ends, so a failure record shows how far gathering got and what it read.
+ * @param {object} options
+ * @param {string} options.out the artifact directory
+ * @param {object} options.matrix the reviewed matrix
+ * @param {object} [options.kafkaOptions] the `Kafka` options every preflight client starts from;
+ *   the brokers in `KAFKA_BROKERS` by default
+ * @param {{ stage: string|null, completed: object }} [options.progress] filled as steps end
+ * @returns {Promise<object>} the facts `Preflight` judges, plus the header fields it writes
+ * @throws {Error} the first failing step's error
+ */
+async function gatherFacts({
+  out,
+  matrix,
+  kafkaOptions = brokerOptions(),
+  progress = { stage: null, completed: {} },
+}) {
+  const { Kafka } = require('../../index')
+  const step = async (name, work) => {
+    progress.stage = name
+    const value = await work()
+    progress.completed[name] = value
+    return value
+  }
+  const kafka = new Kafka({ ...kafkaOptions, clientId: 'preflight-admin' })
   const admin = kafka.admin()
-  await admin.connect()
+  await step('admin-connect', () => admin.connect())
   try {
-    const { brokers } = await admin.describeCluster()
-    const features = await admin.describeFeatures()
-    const { provenance, broker } = await captureBroker(kafka, admin, out)
-    const subscription = await telemetrySubscription(admin, matrix)
-    const pushes = await telemetryProof(
-      kafka,
-      process.env.TELEMETRY_EVIDENCE_DIR,
-      2 * matrix.traffic.telemetryPushMaxMs.value
+    const { brokers } = await step('describe-cluster', () => admin.describeCluster())
+    const features = await step('describe-features', () => admin.describeFeatures())
+    const { provenance, broker } = await step('capture-broker', () =>
+      captureBroker(kafka, admin, out)
     )
+    const subscription = await step('telemetry-subscription', () =>
+      telemetrySubscription(admin, matrix)
+    )
+    const pushes = await step('telemetry-proof', () =>
+      telemetryProof(
+        kafkaOptions,
+        process.env.TELEMETRY_EVIDENCE_DIR,
+        2 * matrix.traffic.telemetryPushMaxMs.value
+      )
+    )
+    progress.stage = 'reporter'
     const receipt = JSON.parse(fs.readFileSync(path.join(out, 'reporter/receipt.json'), 'utf8'))
     const mounted = NODES.map(
       (node) =>
@@ -377,6 +424,7 @@ async function gatherFacts({ out, matrix }) {
       const proof = path.join(process.env.TELEMETRY_EVIDENCE_DIR, `reporter-${node}.json`)
       return JSON.parse(fs.readFileSync(proof, 'utf8')).maxFileBytes
     })
+    progress.stage = 'host'
     const statfs = fs.statfsSync(out)
     return {
       node: process.version,
@@ -523,8 +571,15 @@ function prepareReporter({ out, matrix }) {
   return receipt
 }
 
-/** @param {string[]} argv @returns {Promise<number>} the exit code */
-async function main(argv) {
+/**
+ * The command-line entry.
+ * @param {string[]} argv arguments after the script name
+ * @param {{ kafkaOptions?: object }} [options] the `Kafka` options of the cluster; the brokers in
+ *   `KAFKA_BROKERS` by default
+ * @returns {Promise<number>} the exit code
+ * @throws {Error} when the facts cannot be gathered, after writing the failure record
+ */
+async function main(argv, { kafkaOptions } = {}) {
   const flag = (name) => argv[argv.indexOf(name) + 1]
   const out = path.resolve(flag('--out'))
   const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, 'finalSoakMatrix.json'), 'utf8'))
@@ -542,18 +597,28 @@ async function main(argv) {
   const mode = flag('--mode')
   const diagnostic = argv.includes('--diagnostic')
   let facts = null
+  const progress = { stage: null, completed: {} }
   const preflight = new Preflight({
     sha,
     mode,
     matrix,
     diagnostic,
-    read: async () => (facts = await gatherFacts({ out, matrix })),
+    read: async () => (facts = await gatherFacts({ out, matrix, kafkaOptions, progress })),
   })
   let result
   try {
     result = await preflight.run()
   } catch (e) {
-    const record = { sha, mode, diagnostic, checks: [], failed: ['facts'], error: String(e.stack) }
+    const record = {
+      sha,
+      mode,
+      diagnostic,
+      checks: [],
+      failed: ['facts'],
+      stage: progress.stage,
+      completed: progress.completed,
+      error: String(e.stack),
+    }
     fs.writeFileSync(path.join(out, 'preflight.json'), JSON.stringify(record, null, 2) + '\n')
     throw e
   }
@@ -604,7 +669,9 @@ if (require.main === module) {
 
 module.exports = {
   Preflight,
+  captureBroker,
   gatherFacts,
+  main,
   prepareReporter,
   reporterSource,
   census,
