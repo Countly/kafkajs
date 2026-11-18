@@ -109,10 +109,12 @@ module.exports = class BrokerPool {
    *   a collaborator it can build itself. `Cluster` always injects its own, which is then the
    *   single instance every route reads.
    * @param {(topics: string[]) => ((topic: string) => boolean)} [options.captureTopics] scoped producer publication predicate
-   * @param {(topic: string) => boolean} [options.dropTopic] forgets a producer target the broker
-   *   no longer serves, unless producer work still owns it; returns whether it did
-   * @param {(topic: string) => boolean} [options.isNewTarget] whether a producer target is being
-   *   added by the call in progress, so its refusal fails that call instead of being dropped
+   * @param {(topic: string) => boolean} [options.dropTopic] required when `captureTopics` is
+   *   given: forgets a producer target the broker no longer serves, unless producer work still
+   *   owns it; returns whether it did
+   * @param {(topic: string) => boolean} [options.isNewTarget] required when `captureTopics` is
+   *   given: whether a producer target is being added by the call in progress, so its refusal
+   *   fails that call instead of being dropped
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds

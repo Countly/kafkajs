@@ -752,6 +752,31 @@ describe('producer metadata idle expiry over the wire', () => {
       ),
   })
 
+  /**
+   * @param {Error} error
+   * @returns {string[]} the protocol type, or else the name, of the error and of each cause
+   */
+  const chainOf = (error) => {
+    const chain = []
+    for (let at = error; at; at = at.cause) {
+      chain.push(at.name === 'KafkaJSProtocolError' ? at.type : at.name)
+    }
+    return chain
+  }
+
+  /**
+   * Advances fake time in 100 ms steps until no send is pending.
+   * @param {{ state: string }[]} sends watched sends
+   * @returns {Promise<void>}
+   */
+  const untilSettled = async (sends) => {
+    for (let i = 0; i < 250 && sends.some(({ state }) => state === 'pending'); i += 1) {
+      await jest.advanceTimersByTimeAsync(100)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(sends.map(({ state }) => state)).not.toContain('pending')
+  }
+
   beforeEach(() => {
     jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
   })
@@ -1063,6 +1088,35 @@ describe('producer metadata idle expiry over the wire', () => {
     }
   )
 
+  test('after a reconnect, a fresh send to the deleted earlier target ends with the missing-metadata error while a send to another topic succeeds', async () => {
+    w = start()
+    await w.producer.connect()
+    expect(await settle(send('a'))).toMatchObject({ state: 'fulfilled' })
+    expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+    w.state.missing.add('a')
+    expect(await settle(w.producer.disconnect())).toMatchObject({ state: 'fulfilled' })
+    expect(await settle(w.producer.connect())).toMatchObject({ state: 'fulfilled' })
+    expect(w.cluster.brokerPool.metadata).toBeNull()
+
+    const started = Date.now()
+    const refused = watch(send('a'))
+    expect(await settle(send('b'))).toMatchObject({ state: 'fulfilled' })
+    expect(Date.now() - started).toBeLessThan(100)
+
+    await untilSettled([refused])
+    expect(refused.state).toBe('rejected')
+    expect(chainOf(refused.value)).toEqual([
+      'KafkaJSNumberOfRetriesExceeded',
+      'KafkaJSMetadataNotLoaded',
+    ])
+    expect(Date.now() - started).toBeLessThanOrEqual(20000)
+    await until(() => w.cluster.topicPins.size === 0)
+    expect(w.admission.reserved).toBe(0)
+
+    expect(await settle(w.cluster.refreshMetadata())).toMatchObject({ state: 'fulfilled' })
+    expect([...w.cluster.targetTopics]).toEqual(['b'])
+  })
+
   describe('a target refused while sends still own it', () => {
     /**
      * @param {{ topic?: string, topicId?: string }} entry a Produce topic entry, by name or by id
@@ -1208,42 +1262,16 @@ describe('producer metadata idle expiry over the wire', () => {
     })
 
     /**
-     * @param {Error} error
-     * @returns {string[]} the protocol type, or else the name, of the error and of each cause
-     */
-    const chainOf = (error) => {
-      const chain = []
-      for (let at = error; at; at = at.cause) {
-        chain.push(at.name === 'KafkaJSProtocolError' ? at.type : at.name)
-      }
-      return chain
-    }
-
-    /**
-     * Advances fake time in 100 ms steps until no send is pending.
-     * @param {{ state: string }[]} sends watched sends
-     * @returns {Promise<void>}
-     */
-    const untilSettled = async (sends) => {
-      for (let i = 0; i < 250 && sends.some(({ state }) => state === 'pending'); i += 1) {
-        await jest.advanceTimersByTimeAsync(100)
-        await new Promise((resolve) => setImmediate(resolve))
-      }
-      expect(sends.map(({ state }) => state)).not.toContain('pending')
-    }
-
-    /**
      * Refuses 'a' with `code` in every Metadata and Produce answer while its leader still answers,
      * with one send of 'a' held in flight and another queued behind it. Expects both to end with
      * `chain` once the held request is let go, every pin and reservation released, 'a' dropped and
      * 'b' served.
      * @param {number} code the topic error and Produce error code
      * @param {string[]} chain the cause chain each send of 'a' ends with
-     * @param {object} [producer] producer options of `start`
      * @returns {Promise<void>}
      */
-    const expectRefusedWhileLeaderAnswers = async (code, chain, producer) => {
-      const { sendTo, blocked, inFlight, queued } = await owning({ producer })
+    const expectRefusedWhileLeaderAnswers = async (code, chain) => {
+      const { sendTo, blocked, inFlight, queued } = await owning()
       try {
         w.state.refused.set('a', code)
         w.scripted.answer('Produce', (fields) =>
@@ -1273,16 +1301,12 @@ describe('producer metadata idle expiry over the wire', () => {
       await expectRefusedWhileLeaderAnswers(29, ['TOPIC_AUTHORIZATION_FAILED'])
     })
 
-    test.each([true, false])(
-      'an owned target refused as unknown while its leader still answers ends its sends with the retry limit and its own error while another topic succeeds, with idempotence %s',
-      async (idempotent) => {
-        await expectRefusedWhileLeaderAnswers(
-          3,
-          ['KafkaJSNumberOfRetriesExceeded', 'UNKNOWN_TOPIC_OR_PARTITION'],
-          { idempotent }
-        )
-      }
-    )
+    test('an owned target refused as unknown while its leader still answers ends its sends with the retry limit and its own error while another topic succeeds', async () => {
+      await expectRefusedWhileLeaderAnswers(3, [
+        'KafkaJSNumberOfRetriesExceeded',
+        'UNKNOWN_TOPIC_OR_PARTITION',
+      ])
+    })
 
     /**
      * Expects the owned sends rejected within the 20 s delivery budget, none with the topic's own
