@@ -176,7 +176,7 @@ class FakeLane {
         if (partitions.every(({ records }) => records === false)) {
           await new Promise((resolve) => setTimeout(resolve, maxWaitMs))
         }
-        return { partitions }
+        return { partitions, topicId: this.topicId }
       })
     cleanup.add('scripted cluster is clean', () => this.cluster.assertClean())
     return this
@@ -1073,7 +1073,9 @@ describeReset.each(lanes())('Consumer > offset reset policies (live, %s lane)', 
         expect(unconfirmed[0]).not.toBe('1')
         expect(confirmed[0]).toBe('1')
         expect(rebuilt).toMatchObject({ partition: 0, offset: '1', value: 'new-1' })
-        if (listedBefore !== null) expect(listedAfter).toEqual(listedBefore)
+        // Only partition 0 had a confirmed commit; the others still owe their reset.
+        const listedZero = (listed) => listed.filter(({ partition }) => partition === 0)
+        if (listedBefore !== null) expect(listedZero(listedAfter)).toEqual(listedZero(listedBefore))
       })
     ),
     caseTimeout(CASE_BUDGET_MS)
@@ -1316,6 +1318,100 @@ describeReset.each(lanes())('Consumer > offset reset policies (live, %s lane)', 
           ])
         )
         expect(committed).toEqual({ 0: '-1', 1: '1', 2: '-1' })
+      })
+    ),
+    caseTimeout(CASE_BUDGET_MS)
+  )
+
+  test.each([
+    ['subscribe', undefined],
+    ['assign', [0, 1, 2]],
+  ])(
+    'a seek fences resolution and commits of a batch fetched before it (%s)',
+    liveCase(CASE_BUDGET_MS, (scope, mode, assignment) =>
+      runCase(laneName, `seek-fence-${mode}`, scope, async ({ trace, cleanup }) => {
+        const lane = await trace.open(newLane(laneName, scope), cleanup)
+        const now = Date.now()
+        trace.reach('produce')
+        await lane.append(
+          0,
+          records('p0', 3, (i) => now - (3 - i) * 1000)
+        )
+        const member = trace.join(lane.member(cleanup, {}, { offsetReset: 'earliest' }, assignment))
+        const gates = [0, 1].map(() => {
+          let resolve
+          const promise = new Promise((done) => {
+            resolve = done
+          })
+          return { promise, resolve }
+        })
+        cleanup.add('gates', () => gates.forEach(({ resolve }) => resolve()))
+        const batches = []
+        const refusals = []
+        let oldDone = false
+        member.run = () =>
+          member.consumer.run({
+            autoCommit: false,
+            autoCommitThreshold: 1,
+            eachBatchAutoResolve: false,
+            eachBatch: async ({ batch, resolveOffset, commitOffsetsIfNecessary }) => {
+              if (batch.partition !== 0 || batch.messages.length === 0) return
+              const index = batches.push(batch.messages.map(({ offset }) => offset)) - 1
+              if (index > 1) return resolveOffset(batch.lastOffset())
+              await gates[index].promise
+              resolveOffset(batch.lastOffset())
+              await commitOffsetsIfNecessary()
+              if (index > 0) return
+              const next = String(Number(batch.lastOffset()) + 1)
+              await commitOffsetsIfNecessary({
+                topics: [{ topic: lane.topic, partitions: [{ partition: 0, offset: next }] }],
+              }).catch((error) => refusals.push(error))
+              oldDone = true
+            },
+          })
+        trace.reach('start')
+        await bounded(scope, Infinity, () => member.start())
+        await until(member, scope, () => batches.length > 0, 'The first batch of partition 0')
+        const firstBatch = batches[0]
+
+        trace.reach('seek')
+        member.consumer.seek({ topic: lane.topic, partition: 0, offset: firstBatch[0] })
+        const sought = await bounded(scope, STEP_MS, () =>
+          member.consumer.position({ topic: lane.topic, partition: 0 })
+        )
+        gates[0].resolve()
+        await until(
+          member,
+          scope,
+          () => oldDone && batches.length > 1,
+          'The older batch to finish and the redelivery to start'
+        )
+        const fenced = await lane.committed(lane.groupId)
+        const position = await bounded(scope, STEP_MS, () =>
+          member.consumer.position({ topic: lane.topic, partition: 0 })
+        )
+        const redelivered = batches[1]
+        const expected = String(Number(redelivered[redelivered.length - 1]) + 1)
+
+        trace.reach('commit the current batch')
+        gates[1].resolve()
+        await pollUntil(
+          scope,
+          WAIT_MS,
+          async () => (await lane.committed(lane.groupId))[0] === expected,
+          { delayMs: POLL_MS, label: 'The commit of the current batch' }
+        )
+        const committed = await lane.committed(lane.groupId)
+        trace.keep({ batches, sought, position, committed: { fenced, after: committed } })
+
+        trace.reach('assert')
+        expect(sought).toBe(firstBatch[0])
+        expect(fenced[0]).toBe('-1')
+        expect(position).toBe(firstBatch[0])
+        expect(redelivered[0]).toBe(firstBatch[0])
+        expect(refusals).toHaveLength(1)
+        expect(refusals[0].name).toBe('KafkaJSCommitFailedError')
+        expect(committed[0]).toBe(expected)
       })
     ),
     caseTimeout(CASE_BUDGET_MS)

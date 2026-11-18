@@ -398,4 +398,86 @@ describeConsumerProtocol('Consumer > the consumer group protocol (live)', () => 
     },
     ROW_BUDGET_MS
   )
+
+  it(
+    'a seek fences resolution and commits of a batch fetched before it',
+    async () => {
+      const { consumer } = createMember('seek')
+      const admin = kafka.admin()
+      const gates = [0, 1].map(() => {
+        let resolve
+        const promise = new Promise((done) => {
+          resolve = done
+        })
+        return { promise, resolve }
+      })
+      const committedAt = async () => {
+        const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [topic] })
+        return partitions.find(({ partition }) => partition === 0).offset
+      }
+      const batches = []
+      const refusals = []
+      let oldDone = false
+      try {
+        await admin.connect()
+        await producer.send({
+          topic,
+          messages: [0, 1, 2].map((index) => ({ value: `seek-${index}`, partition: 0 })),
+        })
+        await consumer.connect()
+        await consumer.subscribe({ topic, fromBeginning: true })
+        await consumer.run({
+          autoCommit: false,
+          autoCommitThreshold: 1,
+          eachBatchAutoResolve: false,
+          eachBatch: async ({ batch, resolveOffset, commitOffsetsIfNecessary }) => {
+            if (batch.partition !== 0 || batch.messages.length === 0) return
+            const index = batches.push(batch.messages.map(({ offset }) => offset)) - 1
+            if (index > 1) return resolveOffset(batch.lastOffset())
+            await gates[index].promise
+            resolveOffset(batch.lastOffset())
+            await commitOffsetsIfNecessary()
+            if (index > 0) return
+            const next = String(Number(batch.lastOffset()) + 1)
+            await commitOffsetsIfNecessary({
+              topics: [{ topic, partitions: [{ partition: 0, offset: next }] }],
+            }).catch((error) => refusals.push(error))
+            oldDone = true
+          },
+        })
+        expect(await waitForCondition(() => batches.length > 0, DELIVERY_BUDGET)).toBe(true)
+        const firstBatch = batches[0]
+
+        consumer.seek({ topic, partition: 0, offset: firstBatch[0] })
+        const sought = await consumer.position({ topic, partition: 0 })
+        gates[0].resolve()
+        expect(await waitForCondition(() => oldDone && batches.length > 1, DELIVERY_BUDGET)).toBe(
+          true
+        )
+        const fenced = await committedAt()
+        const position = await consumer.position({ topic, partition: 0 })
+        const redelivered = batches[1]
+        const expected = String(Number(redelivered[redelivered.length - 1]) + 1)
+
+        gates[1].resolve()
+        expect(
+          await waitForCondition(async () => (await committedAt()) === expected, DELIVERY_BUDGET)
+        ).toBe(true)
+
+        expect(sought).toBe(firstBatch[0])
+        expect(fenced).toBe('-1')
+        expect(position).toBe(firstBatch[0])
+        expect(redelivered[0]).toBe(firstBatch[0])
+        expect(refusals).toHaveLength(1)
+        expect(refusals[0].name).toBe('KafkaJSCommitFailedError')
+      } finally {
+        gates.forEach(({ resolve }) => resolve())
+        await withTimeout(
+          admin.disconnect().catch(() => {}),
+          DISCONNECT_BUDGET_MS
+        )
+      }
+    },
+    ROW_BUDGET_MS
+  )
 })
