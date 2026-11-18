@@ -697,11 +697,13 @@ describe('final soak final drain', () => {
   const main = config.topics.main
   const key = `${main}|0`
 
-  /** A consumer worker with one running member and a scripted commit. */
+  /** A consumer worker with one running member that holds main partition 0, and a scripted commit. */
   const consumer = (commitOffsets = jest.fn(async () => {})) => {
+    const group = { acquired: new Map([[key, { acquiredAt: 7 }]]) }
     const runtime = workerRuntime('c01', new MonotonicClock(), {
-      mine: () => [],
-      currentAuthority: () => null,
+      mine: () => [group],
+      currentAuthority: (g, k) => ({ run: 'now', acquiredAt: g.acquired.get(k).acquiredAt }),
+      topicIdOf: () => IDS.A,
     })
     const worker = new ConsumerWorker(runtime)
     const rig = {
@@ -717,8 +719,10 @@ describe('final soak final drain', () => {
       call: async (event, work) => work(),
     }
     worker.standing.push(rig)
-    return { worker, rig, commitOffsets, runtime }
+    return { worker, rig, commitOffsets, runtime, group }
   }
+  const commitsOf = (runtime) =>
+    runtime.records.filter((r) => r.stage === 'commit' && r.phase === 'end')
   const batchEnd = (worker, rig, lastOffset, batchSize = 0) =>
     worker.onBatchEnd(rig, { topic: main, partition: 0, batchSize, lastOffset })
 
@@ -768,7 +772,7 @@ describe('final soak final drain', () => {
     expect(rig.committed.get(key)).toBe('100')
   })
 
-  test('a member that never reaches the end by the deadline reports it and commits only what it resolved', async () => {
+  test('a member that never reaches the end by the deadline reports the drain unreached', async () => {
     const { worker, rig, commitOffsets } = consumer()
     rig.processed.set(key, '90')
     const reply = await worker.onDrain({
@@ -776,7 +780,66 @@ describe('final soak final drain', () => {
       deadline: worker.runtime.clock.now() + 40,
     })
     expect(reply).toEqual({ reached: false })
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '90' }])
+    expect(commitOffsets).not.toHaveBeenCalled()
+  })
+
+  test('the final commit goes through the member that holds the key now, under its current authority, when only filtered batches resolved the key', async () => {
+    const { worker, rig, commitOffsets, runtime } = consumer()
+    rig.authority.clear()
+    batchEnd(worker, rig, '259')
+    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true })
+    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '260' }])
+    expect(commitsOf(runtime)).toEqual([
+      expect.objectContaining({
+        next: '260',
+        outcome: 'ok',
+        key: { topic: main, topicId: IDS.A, partition: 0 },
+        authority: { run: 'now', acquiredAt: 7 },
+      }),
+    ])
+  })
+
+  test('the final commit waits until the member holds the key again', async () => {
+    const held = []
+    const { worker, rig, group } = consumer(jest.fn(async () => held.push(group.acquired.has(key))))
+    rig.processed.set(key, '260')
+    group.acquired.clear()
+    setTimeout(() => group.acquired.set(key, { acquiredAt: 8 }), 80)
+    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true })
+    expect(held).toEqual([true])
+  })
+
+  test('a final commit the client refuses is sent again, and the drain is reached only once a commit succeeded', async () => {
+    const refused = () =>
+      Object.assign(new Error('rebalancing'), { name: 'KafkaJSCommitFailedError' })
+    const once = jest.fn().mockRejectedValueOnce(refused()).mockResolvedValue(undefined)
+    const retried = consumer(once)
+    retried.rig.processed.set(key, '260')
+    const reply = await retried.worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true })
+    expect(once).toHaveBeenCalledTimes(2)
+    const never = consumer(jest.fn(async () => Promise.reject(refused())))
+    never.rig.processed.set(key, '260')
+    const failed = await never.worker.onDrain({
+      ends: { [key]: '260' },
+      deadline: never.worker.runtime.clock.now() + 200,
+    })
+    expect(failed).toEqual({ reached: false })
+  })
+
+  test('a key the group already committed to the log end through another member of the process needs no new commit', async () => {
+    const { worker, rig, commitOffsets } = consumer()
+    const extra = { ...rig, id: 'c01.2', processed: new Map([[key, '260']]) }
+    extra.committed = new Map()
+    extra.uncommitted = new Map()
+    await worker.commit(extra, key)
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
+    rig.processed.set(key, '200')
+    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true })
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
   })
 
   test('a member is not asked to reach a log it does not read', async () => {
@@ -867,6 +930,148 @@ describe('final soak final drain', () => {
       'c07.1 had no share fetch of the main log answered within 60000 ms'
     )
     expect(clock.t).toBeGreaterThanOrEqual(60000)
+  })
+})
+
+describe('final soak final drain ends', () => {
+  test('the final drain reads the ends once the committed and uncommitted ends agree, and drains again when they moved during the drain', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const { main, transactions } = s.config.topics
+      const reads = [
+        { [main]: ['10', '10'], [transactions]: ['40', '41'] },
+        { [main]: ['10', '10'], [transactions]: ['42', '42'] },
+        { [main]: ['10', '10'], [transactions]: ['43', '43'] },
+        { [main]: ['10', '10'], [transactions]: ['43', '43'] },
+      ]
+      let read = -1
+      s.admin = {
+        fetchTopicOffsets: jest.fn(async (topic, { isolationLevel }) => {
+          if (topic === main && isolationLevel === 'read_committed') read++
+          const [committed, uncommitted] = reads[read][topic]
+          const offset = isolationLevel === 'read_committed' ? committed : uncommitted
+          return [{ partition: 0, offset, high: offset, low: '0' }]
+        }),
+      }
+      const drains = []
+      s.command = jest.fn(async (slot, step) => {
+        drains.push(step.ends[`${transactions}|0`])
+        return { reply: { reached: true } }
+      })
+      await s.finalDrain()
+      const slots = new Set(s.command.mock.calls.map(([slot]) => slot)).size
+      expect(drains).toEqual([...Array(slots).fill('42'), ...Array(slots).fill('43')])
+      expect(s.problems).toEqual([])
+    } finally {
+      remove()
+    }
+  })
+})
+
+describe('final soak transaction outcomes', () => {
+  /** A transactional worker whose producer hands out the scripted transactions in turn. */
+  const transactional = (...txns) => {
+    const runtime = workerRuntime('c09', jumpClock(0))
+    const worker = createWorker(runtime)
+    worker.seq = 0
+    const rig = { id: 'c09.1', slot: config.clients.find((c) => c.slot === 'c09') }
+    rig.object = { transaction: jest.fn(async () => txns.shift()) }
+    return { worker, rig, runtime }
+  }
+  /** A transaction whose sends acknowledge, except the `failAt`-th, which rejects. */
+  const scripted = ({ failAt = 0, commit = async () => {}, abort = async () => {} } = {}) => {
+    let n = 0
+    return {
+      send: jest.fn(async () => {
+        if (++n === failAt)
+          throw Object.assign(new Error('timed out'), { name: 'KafkaJSRequestTimeoutError' })
+        return [{ baseOffset: String(n) }]
+      }),
+      commit: jest.fn(commit),
+      abort: jest.fn(abort),
+      isActive: () => false,
+    }
+  }
+  const outcomes = (runtime) =>
+    runtime.records
+      .filter((r) => r.stage === 'transaction')
+      .map(({ decision, outcome, errorType }) => ({ decision, outcome, errorType }))
+
+  test('a send that fails inside a transaction stops its sends and aborts it, journaled as the confirmed abort, and the next transaction commits', async () => {
+    const failing = scripted({ failAt: 3 })
+    const next = scripted()
+    const { worker, rig, runtime } = transactional(failing, next)
+    await worker.transact(rig, 1)
+    await worker.transact(rig, 3)
+    expect(failing.send).toHaveBeenCalledTimes(3)
+    expect(failing.commit).not.toHaveBeenCalled()
+    expect(failing.abort).toHaveBeenCalledTimes(1)
+    expect(next.commit).toHaveBeenCalledTimes(1)
+    expect(outcomes(runtime)).toEqual([
+      { decision: 'abort', outcome: 'aborted', errorType: null },
+      { decision: 'commit', outcome: 'committed', errorType: null },
+    ])
+  })
+
+  test('a commit the client refuses is followed by an abort, journaled as the confirmed abort with the refusal', async () => {
+    const refused = Object.assign(new Error('abortable'), {
+      name: 'KafkaJSTransactionAbortableError',
+      retriable: false,
+    })
+    const txn = scripted({
+      commit: async () => {
+        throw refused
+      },
+    })
+    const { worker, rig, runtime } = transactional(txn)
+    await worker.transact(rig, 1)
+    expect(txn.abort).toHaveBeenCalledTimes(1)
+    expect(outcomes(runtime)).toEqual([
+      { decision: 'abort', outcome: 'aborted', errorType: 'KafkaJSTransactionAbortableError' },
+    ])
+  })
+
+  test('a commit of unknown outcome is sent again until the client confirms it', async () => {
+    let calls = 0
+    const txn = scripted({
+      commit: async () => {
+        if (++calls < 3)
+          throw Object.assign(new Error('unknown'), { name: 'KafkaJSError', retriable: true })
+      },
+    })
+    const { worker, rig, runtime } = transactional(txn)
+    await worker.transact(rig, 1)
+    expect(txn.commit).toHaveBeenCalledTimes(3)
+    expect(txn.abort).not.toHaveBeenCalled()
+    expect(outcomes(runtime)).toEqual([
+      { decision: 'commit', outcome: 'committed', errorType: null },
+    ])
+  })
+
+  test('an abort the client cannot confirm leaves the outcome unknown', async () => {
+    const txn = scripted({
+      failAt: 1,
+      abort: async () => {
+        throw Object.assign(new Error('fenced'), { name: 'KafkaJSApplicationRecoverableError' })
+      },
+    })
+    const { worker, rig, runtime } = transactional(txn)
+    await worker.transact(rig, 1)
+    expect(outcomes(runtime)).toEqual([
+      { decision: 'abort', outcome: 'unknown', errorType: 'KafkaJSApplicationRecoverableError' },
+    ])
+  })
+
+  test('a send the broker confirmed as a duplicate is journaled acknowledged with no offset, never offset -1', async () => {
+    useClient({ connect: async () => {}, send: async () => [{ baseOffset: '-1' }] })
+    const runtime = workerRuntime('c08', boundedClock())
+    const worker = createWorker(runtime)
+    started.push(worker)
+    await worker.begin()
+    expect(await worker.onRecovered({ id: 'h00o' })).toEqual({ ok: true })
+    expect(runtime.records.filter((r) => r.stage === 'ack')).toEqual([
+      expect.objectContaining({ outcome: 'acknowledged', offset: null, errorType: null }),
+    ])
   })
 })
 
