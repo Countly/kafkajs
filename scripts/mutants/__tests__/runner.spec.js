@@ -480,6 +480,63 @@ describe('scripts/mutants/runner.js', () => {
     expect(exec).not.toHaveBeenCalled()
   })
 
+  test('a live record runs only with complete guard evidence for its own tree', () => {
+    const root = tree({ [SPEC]: WITNESS })
+    const sha = 'a'.repeat(40)
+    const guard = {
+      at: '2026-11-17T10:30:00.000Z',
+      lane: 'docker',
+      node: process.version,
+      brokerVersion: '4.4.0',
+      wireVersions: { Produce: [3, 12] },
+      config: {
+        compose: 'docker-compose.yml',
+        env: { NODE_ENV: 'production', BROKER_BOUNCE_E2E: '1' },
+      },
+      composeImages: { kafka1: 'apache/kafka:4.4.0@sha256:1' },
+      runId: '7',
+      sha,
+    }
+    const file = path.join(probeDir(), 'live-guard.json')
+    const run = (evidence) => {
+      if (evidence) fs.writeFileSync(file, JSON.stringify(evidence))
+      else fs.rmSync(file, { force: true })
+      const exec = jest.fn(fakeExec)
+      const runner = new MutantRunner({ exec, liveEvidence: file, treeSha: () => sha })
+      return { entry: runner.runOne(record({ commandClass: 'live' }), root, root), exec }
+    }
+    const complete = run(guard)
+    expect(complete.entry).toMatchObject({ verdict: 'killed', reason: '' })
+    expect(complete.exec).toHaveBeenCalledTimes(2)
+    const partial = run({ ...guard, at: '', composeImages: {} })
+    expect(partial.entry).toMatchObject({
+      verdict: 'invalid',
+      reason: 'guard evidence lacks at, composeImages',
+    })
+    expect(partial.exec).not.toHaveBeenCalled()
+    const foreign = run({ ...guard, sha: 'b'.repeat(40) })
+    expect(foreign.entry).toMatchObject({
+      verdict: 'invalid',
+      reason: `guard evidence names another tree (${'b'.repeat(40)})`,
+    })
+    expect(foreign.exec).not.toHaveBeenCalled()
+    const absent = run(null)
+    expect(absent.entry).toMatchObject({ verdict: 'invalid', reason: 'guard evidence is missing' })
+    expect(absent.exec).not.toHaveBeenCalled()
+  })
+
+  test('an inventory record whose target lies under node_modules is refused', () => {
+    expect(MutantRunner.validate([record()])).toEqual([record()])
+    for (const target of [
+      'node_modules/jest/bin/jest.js',
+      './node_modules/jest/bin/jest.js',
+      'src/x/node_modules/dep/index.js',
+    ])
+      expect(() => MutantRunner.validate([record({ target })])).toThrow(
+        'fixture/M1: a mutation never edits node_modules'
+      )
+  })
+
   /**
    * Runs a script in a child Node process.
    * @param {string} script the script's source
@@ -571,6 +628,18 @@ describe('scripts/mutants/runner.js', () => {
       .sort()
 
   /**
+   * {@link copiedTargets}, read again until no copy is caught between the stray writer's truncate and
+   * write, which reads as an empty file.
+   * @param {string} root a tree
+   * @returns {Promise<string[]>} the targets, each read whole
+   */
+  const wholeTargets = (root) =>
+    until(() => {
+      const targets = copiedTargets(root)
+      return targets.every((text) => text !== '') && targets
+    }, 5000)
+
+  /**
    * Starts the CLI on the records of a tree, with the inventory and the ledger in the probe directory.
    * @param {string} root the tree
    * @param {string} probe the test's probe directory
@@ -614,7 +683,7 @@ describe('scripts/mutants/runner.js', () => {
       expect(alive(orphan(probe))).toBe(true)
       expect(snapshot(root)).toEqual(before)
       await settled(probe)
-      expect(copiedTargets(root)).toEqual(['module.exports = 1\n', 'module.exports = 9\n'])
+      expect(await wholeTargets(root)).toEqual(['module.exports = 1\n', 'module.exports = 9\n'])
       expect(snapshot(root)).toEqual(before)
       fs.writeFileSync(path.join(probe, 'release'), '')
       expect(await exited).toEqual({ code: 0, signal: null })
@@ -652,7 +721,7 @@ describe('scripts/mutants/runner.js', () => {
   const laterRunUnaffected = async (root, probe, before) => {
     expect(alive(orphan(probe))).toBe(true)
     await settled(probe)
-    expect(copiedTargets(root)).toContain('module.exports = 9\n')
+    expect(await wholeTargets(root)).toContain('module.exports = 9\n')
     expect(snapshot(root)).toEqual(before)
     const seen = []
     const exec = (rec, dir, outFile, run) => {
