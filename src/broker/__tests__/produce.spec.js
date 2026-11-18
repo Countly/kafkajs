@@ -9,7 +9,6 @@ const {
   createConnectionPool,
   newLogger,
   createTopic,
-  testIfKafkaAtLeast_0_11,
   retryProtocol,
   waitFor,
 } = require('testHelpers')
@@ -272,7 +271,7 @@ describe('Broker > Produce', () => {
   })
 
   describe('Record batch', () => {
-    testIfKafkaAtLeast_0_11('request', async () => {
+    test('request', async () => {
       const response1 = await waitFor(
         async () => {
           try {
@@ -356,7 +355,7 @@ describe('Broker > Produce', () => {
       })
     })
 
-    testIfKafkaAtLeast_0_11('request with idempotent producer', async () => {
+    test('request with idempotent producer', async () => {
       // Get producer id & epoch
       const {
         coordinator: { host, port },
@@ -465,7 +464,7 @@ describe('Broker > Produce', () => {
       })
     })
 
-    testIfKafkaAtLeast_0_11('request with headers', async () => {
+    test('request with headers', async () => {
       const metadata = await retryProtocol(
         'LEADER_NOT_AVAILABLE',
         async () => await broker.metadata([topicName])
@@ -535,7 +534,7 @@ describe('Broker > Produce', () => {
       })
     })
 
-    testIfKafkaAtLeast_0_11('request with GZIP', async () => {
+    test('request with GZIP', async () => {
       const metadata = await retryProtocol(
         'LEADER_NOT_AVAILABLE',
         async () => await broker.metadata([topicName])
@@ -613,77 +612,74 @@ describe('Broker > Produce', () => {
       })
     })
 
-    testIfKafkaAtLeast_0_11(
-      'request to a topic with max timestamp difference configured',
-      async () => {
-        topicName = `test-max-timestamp-difference-${secureRandom()}`
+    test('request to a topic with max timestamp difference configured', async () => {
+      topicName = `test-max-timestamp-difference-${secureRandom()}`
 
-        // Kafka 4.0 removed message.timestamp.difference.max.ms in favour of the
-        // before/after pair; message.timestamp.before.max.ms is the equivalent knob.
-        await createTopic({
-          topic: topicName,
-          config: [
-            {
-              name: 'message.timestamp.before.max.ms',
-              value: '604800000', // 7 days
-            },
-          ],
-        })
+      // Kafka 4.0 removed message.timestamp.difference.max.ms in favour of the
+      // before/after pair; message.timestamp.before.max.ms is the equivalent knob.
+      await createTopic({
+        topic: topicName,
+        config: [
+          {
+            name: 'message.timestamp.before.max.ms',
+            value: '604800000', // 7 days
+          },
+        ],
+      })
 
-        const metadata = await retryProtocol(
-          'LEADER_NOT_AVAILABLE',
-          async () => await broker.metadata([topicName])
-        )
+      const metadata = await retryProtocol(
+        'LEADER_NOT_AVAILABLE',
+        async () => await broker.metadata([topicName])
+      )
 
-        // Find leader of partition
-        const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
-        const newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
+      // Find leader of partition
+      const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
+      const newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
 
-        // Connect to the correct broker to produce message
-        broker2 = new Broker({
-          connectionPool: createConnectionPool(newBrokerData),
-          logger: newLogger(),
-        })
-        await broker2.connect()
+      // Connect to the correct broker to produce message
+      broker2 = new Broker({
+        connectionPool: createConnectionPool(newBrokerData),
+        logger: newLogger(),
+      })
+      await broker2.connect()
 
-        const partitionData = {
-          topic: topicName,
-          partitions: [
-            {
-              partition: 0,
-              messages: [{ key: `key-${secureRandom()}`, value: `some-value-${secureRandom()}` }],
-            },
-          ],
-        }
-
-        const response1 = await retryProtocol(
-          'LEADER_NOT_AVAILABLE',
-          async () => await broker2.produce({ topicData: [partitionData] })
-        )
-
-        expect(response1).toEqual({
-          topics: [
-            {
-              topicName,
-              partitions: [
-                {
-                  baseOffset: '0',
-                  errorCode: 0,
-                  logAppendTime: '-1',
-                  logStartOffset: '0',
-                  partition: 0,
-                  recordErrors: [],
-                  errorMessage: null,
-                  currentLeader: null,
-                },
-              ],
-            },
-          ],
-          nodeEndpoints: [],
-          clientSideThrottleTime: expect.optional(0),
-          throttleTime: 0,
-        })
+      const partitionData = {
+        topic: topicName,
+        partitions: [
+          {
+            partition: 0,
+            messages: [{ key: `key-${secureRandom()}`, value: `some-value-${secureRandom()}` }],
+          },
+        ],
       }
-    )
+
+      const response1 = await retryProtocol(
+        'LEADER_NOT_AVAILABLE',
+        async () => await broker2.produce({ topicData: [partitionData] })
+      )
+
+      expect(response1).toEqual({
+        topics: [
+          {
+            topicName,
+            partitions: [
+              {
+                baseOffset: '0',
+                errorCode: 0,
+                logAppendTime: '-1',
+                logStartOffset: '0',
+                partition: 0,
+                recordErrors: [],
+                errorMessage: null,
+                currentLeader: null,
+              },
+            ],
+          },
+        ],
+        nodeEndpoints: [],
+        clientSideThrottleTime: expect.optional(0),
+        throttleTime: 0,
+      })
+    })
   })
 })

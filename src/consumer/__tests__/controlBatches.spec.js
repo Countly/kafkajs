@@ -9,7 +9,6 @@ const {
   createTopic,
   createModPartitioner,
   newLogger,
-  testIfKafkaAtLeast_0_11,
   waitForMessages,
   waitFor,
   generateMessages,
@@ -54,7 +53,7 @@ describe('Consumer', () => {
     producer && (await producer.disconnect())
   })
 
-  testIfKafkaAtLeast_0_11('forwards empty control batches to eachBatch', async () => {
+  test('forwards empty control batches to eachBatch', async () => {
     jest.spyOn(cluster, 'refreshMetadataIfNecessary')
 
     await consumer.connect()
@@ -89,7 +88,7 @@ describe('Consumer', () => {
     await waitForMessages(messagesConsumed, { number: 22 })
   })
 
-  testIfKafkaAtLeast_0_11('can process transactions across multiple batches', async () => {
+  test('can process transactions across multiple batches', async () => {
     await consumer.connect()
     await producer.connect()
     await consumer.subscribe({ topic: topicName, fromBeginning: true })

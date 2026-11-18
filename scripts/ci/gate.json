@@ -21502,8 +21502,6 @@
       ],
       "capMinutes": 48,
       "allowedSkips": [
-        "src/broker/__tests__/fetch.spec.js \u203a Broker > Fetch request",
-        "src/broker/__tests__/fetch.spec.js \u203a Broker > Fetch request with GZIP",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor share resource comparison accepts equal evidence projections despite unrelated process and socket history changes",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor share resource comparison rejects a retained ledgerSize and names it before the full compared projections",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor share resource comparison rejects a retained listeners and names it before the full compared projections",
@@ -25923,8 +25921,6 @@
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) an awaited assignment listener holds delivery until it completes",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) a pattern consumer discovers a matching topic created after delivery starts",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Kafka floor core (live) every evidence line of this run carries the stamps a verifier checks",
-        "src/broker/__tests__/fetch.spec.js \u203a Broker > Fetch request",
-        "src/broker/__tests__/fetch.spec.js \u203a Broker > Fetch request with GZIP",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Does not re-authenticate when still within session validity threshold",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate if needed before making a request",
         "src/broker/__tests__/reauthenticate.spec.js \u203a Brokers re-authentication with SASL OAUTHBEARER Re-authenticate only once with multiple parallel requests",

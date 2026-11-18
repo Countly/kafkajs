@@ -4,7 +4,6 @@
 const fs = require('fs')
 const { execSync } = require('child_process')
 const { randomUUID } = require('crypto')
-const semver = require('semver')
 const crypto = require('crypto')
 const Cluster = require('../src/cluster')
 const Broker = require('../src/broker')
@@ -443,25 +442,6 @@ const addPartitions = async ({ topic, partitions }) => {
   })
 }
 
-const testIfKafkaVersion = (version, versionComparator) => {
-  const scopedTest = (description, callback, testFn = test) => {
-    return versionComparator(semver.coerce(process.env.KAFKA_VERSION), semver.coerce(version))
-      ? testFn(description, callback)
-      : test.skip(description, callback)
-  }
-
-  scopedTest.only = (description, callback) => scopedTest(description, callback, test.only)
-
-  return scopedTest
-}
-
-const testIfKafkaVersionLTE = (version) => testIfKafkaVersion(version, semver.lte)
-const testIfKafkaVersionGTE = (version) => testIfKafkaVersion(version, semver.gte)
-
-const testIfKafkaAtMost_0_10 = testIfKafkaVersionLTE('0.10')
-const testIfKafkaAtLeast_0_11 = testIfKafkaVersionGTE('0.11')
-const testIfKafkaAtLeast_1_1_0 = testIfKafkaVersionGTE('1.1')
-
 const flakyTest = (description, callback, testFn = test) =>
   testFn(`[flaky] ${description}`, callback)
 flakyTest.skip = (description, callback) => flakyTest(description, callback, test.skip)
@@ -534,9 +514,6 @@ module.exports = {
   waitForMessages,
   waitForNextEvent,
   waitForConsumerToJoinGroup,
-  testIfKafkaAtMost_0_10,
-  testIfKafkaAtLeast_0_11,
-  testIfKafkaAtLeast_1_1_0,
   flakyTest,
   describeIfOauthbearerEnabled,
   describeIfOauthbearerDisabled,

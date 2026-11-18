@@ -4,7 +4,6 @@ const {
   saslSCRAM256ConnectionOpts,
   sslConnectionOpts,
   newLogger,
-  testIfKafkaAtLeast_1_1_0,
   describeIfOauthbearerDisabled,
   saslEntries,
 } = require('testHelpers')
@@ -178,7 +177,7 @@ describe('Broker > connect', () => {
     })
 
     describeIfOauthbearerDisabled('when SASL SCRAM is configured', () => {
-      testIfKafkaAtLeast_1_1_0('parallel calls to connect using SCRAM', async () => {
+      test('parallel calls to connect using SCRAM', async () => {
         broker = new Broker({
           connectionPool: createConnectionPool(saslSCRAM256ConnectionOpts()),
           logger: newLogger(),

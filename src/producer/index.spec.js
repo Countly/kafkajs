@@ -36,7 +36,6 @@ const {
   sslBrokers,
   saslBrokers,
   newLogger,
-  testIfKafkaAtLeast_0_11,
   createTopic,
   waitForMessages,
 } = require('testHelpers')
@@ -590,7 +589,7 @@ describe('Producer', () => {
       ])
     })
 
-    testIfKafkaAtLeast_0_11('produce messages for Kafka 0.11', async () => {
+    test('produce messages for Kafka 0.11', async () => {
       const cluster = createCluster({
         createPartitioner: createModPartitioner,
       })
@@ -633,33 +632,30 @@ describe('Producer', () => {
       ])
     })
 
-    testIfKafkaAtLeast_0_11(
-      'produce messages for Kafka 0.11 without specifying message key',
-      async () => {
-        const cluster = createCluster({
-          createPartitioner: createModPartitioner,
+    test('produce messages for Kafka 0.11 without specifying message key', async () => {
+      const cluster = createCluster({
+        createPartitioner: createModPartitioner,
+      })
+
+      await createTopic({ topic: topicName })
+
+      producer = createProducer({ cluster, logger: newLogger(), idempotent })
+      await producer.connect()
+
+      await expect(
+        producer.send({
+          acks,
+          topic: topicName,
+          messages: [
+            {
+              value: 'test-value',
+            },
+          ],
         })
+      ).toResolve()
+    })
 
-        await createTopic({ topic: topicName })
-
-        producer = createProducer({ cluster, logger: newLogger(), idempotent })
-        await producer.connect()
-
-        await expect(
-          producer.send({
-            acks,
-            topic: topicName,
-            messages: [
-              {
-                value: 'test-value',
-              },
-            ],
-          })
-        ).toResolve()
-      }
-    )
-
-    testIfKafkaAtLeast_0_11('produce messages for Kafka 0.11 with headers', async () => {
+    test('produce messages for Kafka 0.11 with headers', async () => {
       const cluster = createCluster({
         createPartitioner: createModPartitioner,
       })
@@ -805,7 +801,7 @@ describe('Producer', () => {
 
     const testTransactionEnd = (shouldCommit = true) => {
       const endFn = shouldCommit ? 'commit' : 'abort'
-      testIfKafkaAtLeast_0_11(`transaction flow ${endFn}`, async () => {
+      test(`transaction flow ${endFn}`, async () => {
         const cluster = createCluster({
           createPartitioner: createModPartitioner,
         })
@@ -860,7 +856,7 @@ describe('Producer', () => {
     testTransactionEnd(true)
     testTransactionEnd(false)
 
-    testIfKafkaAtLeast_0_11('allows sending messages outside a transaction', async () => {
+    test('allows sending messages outside a transaction', async () => {
       const cluster = createCluster({
         createPartitioner: createModPartitioner,
       })
@@ -900,7 +896,7 @@ describe('Producer', () => {
       })
     })
 
-    testIfKafkaAtLeast_0_11('supports sending offsets', async () => {
+    test('supports sending offsets', async () => {
       const cluster = createCluster()
 
       const markOffsetAsCommittedSpy = jest.spyOn(cluster, 'markOffsetAsCommitted')
@@ -986,7 +982,7 @@ describe('Producer', () => {
     })
 
     describe('without operations', () => {
-      testIfKafkaAtLeast_0_11('does not throw an error when aborting transaction', async () => {
+      test('does not throw an error when aborting transaction', async () => {
         const cluster = createCluster({
           createPartitioner: createModPartitioner,
         })
@@ -1005,7 +1001,7 @@ describe('Producer', () => {
         await expect(transaction.abort()).toResolve()
       })
 
-      testIfKafkaAtLeast_0_11('does not throw an error when commiting transaction', async () => {
+      test('does not throw an error when commiting transaction', async () => {
         const cluster = createCluster({
           createPartitioner: createModPartitioner,
         })
@@ -1024,107 +1020,98 @@ describe('Producer', () => {
         await expect(transaction.commit()).toResolve()
       })
 
-      testIfKafkaAtLeast_0_11(
-        'allows createing transaction when the previous was aborted without any operations made in it',
-        async () => {
-          const cluster = createCluster({
-            createPartitioner: createModPartitioner,
-          })
+      test('allows createing transaction when the previous was aborted without any operations made in it', async () => {
+        const cluster = createCluster({
+          createPartitioner: createModPartitioner,
+        })
 
-          await createTopic({ topic: topicName })
+        await createTopic({ topic: topicName })
 
-          producer = createProducer({
-            cluster,
-            logger: newLogger(),
-            transactionalId,
-          })
-          await producer.connect()
+        producer = createProducer({
+          cluster,
+          logger: newLogger(),
+          transactionalId,
+        })
+        await producer.connect()
 
-          const transaction = await producer.transaction()
+        const transaction = await producer.transaction()
 
-          await expect(transaction.abort()).toResolve()
-          await expect(producer.transaction()).toResolve()
-        }
-      )
+        await expect(transaction.abort()).toResolve()
+        await expect(producer.transaction()).toResolve()
+      })
 
-      testIfKafkaAtLeast_0_11(
-        'allows createing transaction when the previous was commited without any operations made in it',
-        async () => {
-          const cluster = createCluster({
-            createPartitioner: createModPartitioner,
-          })
+      test('allows createing transaction when the previous was commited without any operations made in it', async () => {
+        const cluster = createCluster({
+          createPartitioner: createModPartitioner,
+        })
 
-          await createTopic({ topic: topicName })
+        await createTopic({ topic: topicName })
 
-          producer = createProducer({
-            cluster,
-            logger: newLogger(),
-            transactionalId,
-          })
-          await producer.connect()
+        producer = createProducer({
+          cluster,
+          logger: newLogger(),
+          transactionalId,
+        })
+        await producer.connect()
 
-          const transaction = await producer.transaction()
+        const transaction = await producer.transaction()
 
-          await expect(transaction.commit()).toResolve()
-          await expect(producer.transaction()).toResolve()
-        }
-      )
+        await expect(transaction.commit()).toResolve()
+        await expect(producer.transaction()).toResolve()
+      })
 
-      testIfKafkaAtLeast_0_11(
-        "transaction that is created after a transaction that hasn't made any operations should work",
-        async () => {
-          const partition = 0
-          const retry = createRetrier({ retries: 5 })
-          const cluster = createCluster({
-            createPartitioner: createModPartitioner,
-          })
+      test("transaction that is created after a transaction that hasn't made any operations should work", async () => {
+        const partition = 0
+        const retry = createRetrier({ retries: 5 })
+        const cluster = createCluster({
+          createPartitioner: createModPartitioner,
+        })
 
-          await createTopic({ topic: topicName })
+        await createTopic({ topic: topicName })
 
-          producer = createProducer({
-            cluster,
-            logger: newLogger(),
-            transactionalId,
-          })
-          await producer.connect()
+        producer = createProducer({
+          cluster,
+          logger: newLogger(),
+          transactionalId,
+        })
+        await producer.connect()
 
-          const invalidTransaction = await producer.transaction()
-          await invalidTransaction.abort()
+        const invalidTransaction = await producer.transaction()
+        await invalidTransaction.abort()
 
-          const transaction = await producer.transaction()
-          await transaction.send({
+        const transaction = await producer.transaction()
+        await transaction.send({
+          topic: topicName,
+          messages: [
+            {
+              value: 'value',
+              partition,
+            },
+            {
+              value: 'value',
+              partition,
+            },
+          ],
+        })
+
+        await transaction.commit()
+
+        await retry(async () => {
+          const [topicOffset] = await cluster.fetchTopicsOffset([
+            { topic: topicName, partitions: [{ partition }] },
+          ])
+
+          expect(topicOffset).toEqual({
             topic: topicName,
-            messages: [
+            partitions: expect.arrayContaining([
               {
-                value: 'value',
                 partition,
+                offset: '3',
               },
-              {
-                value: 'value',
-                partition,
-              },
-            ],
+            ]),
           })
-
-          await transaction.commit()
-
-          await retry(async () => {
-            const [topicOffset] = await cluster.fetchTopicsOffset([
-              { topic: topicName, partitions: [{ partition }] },
-            ])
-
-            expect(topicOffset).toEqual({
-              topic: topicName,
-              partitions: expect.arrayContaining([
-                {
-                  partition,
-                  offset: '3',
-                },
-              ]),
-            })
-          })
-        }
-      )
+        })
+      })
     })
   })
 })

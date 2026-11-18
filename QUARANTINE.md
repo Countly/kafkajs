@@ -37,10 +37,9 @@ to `master`.
 
 ## Not quarantined
 
-`--ci` runs also report skips that are **not** quarantine: the version-conditional helpers in
-`testHelpers/index.js` (`testIfKafkaAtMost_0_10`, `testIfKafkaAtLeast_0_11`,
-`testIfKafkaAtLeast_1_1_0`) and the OAUTHBEARER gates (`describeIfOauthbearerEnabled` /
-`describeIfOauthbearerDisabled`), which select tests by `KAFKA_VERSION` and `OAUTHBEARER_ENABLED`.
+`--ci` runs also report skips that are **not** quarantine: the OAUTHBEARER gates
+(`describeIfOauthbearerEnabled` / `describeIfOauthbearerDisabled`), which select tests by
+`OAUTHBEARER_ENABLED`.
 Those are pre-existing and unrelated to this task.
 
 Counting check: `grep -rn '\.skip(' --include='*.spec.js' src/` returns 0.
