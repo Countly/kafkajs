@@ -330,13 +330,16 @@ class Supervisor {
   }
 
   /**
-   * Records a settled plan step that was not on time or not performed.
+   * Records a settled plan step that was not on time or not performed. A step that failed stops the
+   * admission of later ones, so a run whose workload cannot be trusted does not spend the rest of
+   * its day; a step that only ended after its deadline is recorded and the run goes on.
    * @param {{ id: string, outcome: string, error: string|null }} outcome a scheduler outcome
    * @returns {void}
    */
   stepOutcome({ id, outcome, error }) {
     if (outcome === 'ok' || outcome === 'aborted') return
     this.problem(`step ${id} ${outcome}${error ? `: ${error}` : ''}`)
+    if (outcome === 'error') this.abort(`step ${id} failed: ${error}`)
   }
 
   /**

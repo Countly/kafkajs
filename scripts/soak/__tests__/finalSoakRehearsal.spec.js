@@ -20,12 +20,8 @@ const JAR = 'c'.repeat(64)
 const BROKERS = 'kafka1:9092,kafka2:9092,kafka3:9092'
 /** The clock speed-up: the 30 min smoke schedule runs in about 30 s. */
 const WARP = 60
-/**
- * What a broker-free run cannot avoid and must not be failed for: sixty-fold sampling is late by the
- * real cost of two collections, and clients that deliver nothing cannot show a recovery witness.
- */
-const EXPECTED_PROBLEM =
-  /^step \S+ late$|^step h\d+o\d+ error: (p\d+ has no recovery witness after h\d+o\d+(; )?)+$/
+/** Sixty-fold sampling is late by the real cost of two collections, which no broker-free run avoids. */
+const EXPECTED_PROBLEM = /^step \S+ late$/
 /** The rehearsal's only failing steps: the raw reader has no broker to open a connection to. */
 const UNREACHABLE = /^step scan\.\S+ failed: Connection timeout$/
 
@@ -224,12 +220,7 @@ describe('final soak rehearsal', () => {
           true,
         ])
       expect(
-        notes.filter(
-          (n) =>
-            /^step \S+ (failed|error)/.test(n) &&
-            !UNREACHABLE.test(n) &&
-            !/^step h\d+o\d+ error$/.test(n)
-        )
+        notes.filter((n) => /^step \S+ (failed|error)/.test(n) && !UNREACHABLE.test(n))
       ).toEqual([])
       expect(notes.filter((n) => /^producer loop failed/.test(n))).toEqual([])
 

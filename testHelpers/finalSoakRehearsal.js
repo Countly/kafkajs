@@ -321,7 +321,7 @@ kafkajs.Kafka = RehearsalKafka
 // The in-memory clients never join a group, so no partition is ever assigned: every consumer
 // member reads as holding the main topic's one partition, which is what the readiness check and
 // the membership waves look for.
-const { ConsumerWorker } = require('../scripts/soak/finalSoakWorkers')
+const { ConsumerWorker, ShareWorker } = require('../scripts/soak/finalSoakWorkers')
 ConsumerWorker.prototype.assignedKeys = function () {
   const { main } = this.runtime.config.topics
   return [{ topic: main, topicId: idOf(main), partition: 0 }]
@@ -331,3 +331,6 @@ ConsumerWorker.prototype.assignedKeys = function () {
 ConsumerWorker.prototype.onRegexChurn = async () => ({ accepted: true })
 ConsumerWorker.prototype.onRetired = async () => ({ retired: true })
 ConsumerWorker.prototype.onRecreated = async () => ({ assigned: true })
+// No record is ever delivered here, so no member could show the recovery witness a real one gives.
+ConsumerWorker.prototype.onRecovered = async () => ({ ok: true })
+ShareWorker.prototype.onRecovered = async () => ({ ok: true })

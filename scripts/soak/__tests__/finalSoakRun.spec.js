@@ -376,14 +376,15 @@ describe('final soak supervisor commands', () => {
       s.stepOutcome({ id: 'h00r0', type: 'execution', outcome: 'ok', error: null })
       expect(s.problems).toEqual([])
       s.stepOutcome({ id: 'h00r0', type: 'execution', outcome: 'late', error: null })
+      expect(s.aborted).toBeNull()
       s.stepOutcome({ id: 'h00t0', type: 'execution', outcome: 'error', error: 'boom' })
+      expect(s.aborted).toContain('boom')
       s.receive('p08', { type: 'problem', message: 'producer loop failed: x' })
       expect(s.problems).toEqual([
         expect.stringContaining('h00r0'),
         expect.stringContaining('boom'),
         expect.stringContaining('producer loop failed'),
       ])
-      expect(s.aborted).toContain('producer loop failed')
       s.collector.append = async () => false
       s.receive('p08', { type: 'record', record: { seq: 0, kind: 'diagnostic' } })
       await tick()
