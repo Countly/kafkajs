@@ -117,7 +117,43 @@ jobs:
       - run: npm ci
       - run: docker compose version
       - if: ${{ !startsWith(matrix.group, 'share') }}
+        env:
+          DO_NOT_STOP: ${{ matrix.group == 'others' && '1' || '' }}
         run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"
+      - name: Prove ordinary clients exit naturally
+        if: matrix.group == 'others'
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          NATURAL_EXIT_E2E: '1'
+        run: |
+          mkdir -p .tmp/e2e
+          node scripts/ci/naturalExit.js ordinary
+      - name: Prove a retained timer fails the ordinary natural-exit lane
+        if: matrix.group == 'others'
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          NATURAL_EXIT_E2E: '1'
+          NATURAL_EXIT_CONTROL: '1'
+        run: |
+          if node scripts/ci/naturalExit.js ordinary; then
+            echo "::error::The seeded-timer control exited on its own: the lane cannot see a retained handle"
+            exit 1
+          fi
+          node -e "
+          const fs = require('fs')
+          const exit = require('./.tmp/e2e/natural-exit-ordinary-control-exit.json')
+          const rows = fs.readFileSync('.tmp/e2e/natural-exit-ordinary-control.jsonl', 'utf8')
+            .split('\\n').filter(Boolean).map(JSON.parse)
+          if (exit.control !== true || exit.watchdogTerminated !== true)
+            throw new Error('The control failed for another reason: ' + exit.rejection)
+          if (!rows.some((row) => row.event === 'case-complete' && row.status === 'passed'))
+            throw new Error('The control was stopped before its case completed')
+          "
+      - name: Stop ordinary cluster
+        if: always() && matrix.group == 'others'
+        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
       - name: Prepare share evidence
         if: startsWith(matrix.group, 'share')
         run: |
@@ -154,7 +190,7 @@ jobs:
       - name: Stop share cluster
         if: always() && startsWith(matrix.group, 'share')
         run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
-      - if: always() && startsWith(matrix.group, 'share')
+      - if: always() && (startsWith(matrix.group, 'share') || matrix.group == 'others')
         uses: actions/upload-artifact@v4
         with:
           name: e2e-${{ matrix.group }}-${{ matrix.kafka }}-node${{ matrix.node }}
