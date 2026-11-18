@@ -227,7 +227,7 @@ module.exports = class Cluster {
       captureTopics:
         this.targetTopicState === null ? undefined : (topics) => this.captureTopics(topics),
       dropTopic:
-        this.targetTopicState === null ? undefined : (topic) => this.forgetTargetTopic(topic),
+        this.targetTopicState === null ? undefined : (topic) => this.dropTargetTopic(topic),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
@@ -977,9 +977,21 @@ module.exports = class Cluster {
   }
 
   /**
+   * Forgets a producer target the broker no longer serves, unless a send still holds it: its
+   * queued and retried batches need its routing and its later refreshes. A later send adds a
+   * forgotten target again as a new incarnation.
+   * @param {string} topic target name
+   * @returns {boolean} whether it was forgotten
+   */
+  dropTargetTopic(topic) {
+    if (this.topicPins.has(topic)) return false
+    this.forgetTargetTopic(topic)
+    return true
+  }
+
+  /**
    * Forgets one producer target, its incarnation and both cached representations; its pins stay
-   * with their owners. Used for idle expiry, a refused add, and a target the broker no longer
-   * serves, which a later send adds again as a new incarnation.
+   * with their owners. Used for idle expiry, a refused add, and `dropTargetTopic`.
    * @param {string} topic target name
    * @returns {void}
    */

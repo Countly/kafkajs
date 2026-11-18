@@ -109,8 +109,9 @@ module.exports = class BrokerPool {
    *   a collaborator it can build itself. `Cluster` always injects its own, which is then the
    *   single instance every route reads.
    * @param {(topics: string[]) => ((topic: string) => boolean)} [options.captureTopics] scoped producer publication predicate
-   * @param {(topic: string) => void} [options.dropTopic] forgets a producer target the broker no
-   *   longer serves; defaults to `forgetTopic`
+   * @param {(topic: string) => boolean} [options.dropTopic] forgets a producer target the broker
+   *   no longer serves, unless producer work still owns it; returns whether it did. Defaults to
+   *   `forgetTopic`
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
@@ -146,7 +147,12 @@ module.exports = class BrokerPool {
     drainTimeout,
   }) {
     this.captureTopics = captureTopics
-    this.dropTopic = dropTopic ?? ((topic) => this.forgetTopic(topic))
+    this.dropTopic =
+      dropTopic ??
+      ((topic) => {
+        this.forgetTopic(topic)
+        return true
+      })
     this.telemetryMetrics = telemetryMetrics
     this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
@@ -1141,10 +1147,12 @@ module.exports = class BrokerPool {
   /**
    * Judges the topics a producer refresh got back with their own error code; the Java client keeps
    * such errors per topic too. A target whose metadata is installed and that is now unknown,
-   * invalid or unauthorized (a deleted topic, say) is dropped through `dropTopic`, so it never
-   * fails the refresh of the other targets; a later send to it adds it again and fails on its own.
-   * A topic this refresh no longer captures is skipped. Any other topic error is thrown, as the
-   * version's own parse would throw it, after the drops.
+   * invalid or unauthorized (a deleted topic, say) never fails the refresh of the other targets:
+   * it is dropped through `dropTopic`, and a later send to it adds it again and fails on its own.
+   * One whose sends still own it is kept with the metadata it had, so they keep their routing and
+   * their retries ask about it again; their Produce answers carry the topic's own error. A topic
+   * this refresh no longer captures is skipped. Any other topic error is thrown, as the version's
+   * own parse would throw it, after the drops.
    * @param {object[]} topicMetadata the answer's topics, topic errors retained
    * @param {(topic: string) => boolean} accept this refresh's publication predicate
    * @returns {object[]} the topics answered without an error
@@ -1161,11 +1169,13 @@ module.exports = class BrokerPool {
       if (!accept(topic)) continue
       const error = createErrorFromCode(topicErrorCode)
       if (installed.has(topic) && DROPPED_TOPIC_ERRORS.has(error.type)) {
-        this.logger.warn('Dropping a target topic the broker no longer serves', {
-          topic,
-          error: error.message,
-        })
-        this.dropTopic(topic)
+        const dropped = this.dropTopic(topic)
+        this.logger.warn(
+          dropped
+            ? 'Dropping a target topic the broker no longer serves'
+            : 'Keeping the metadata of a target topic its sends still own',
+          { topic, error: error.message }
+        )
       } else {
         thrown ??= error
       }
