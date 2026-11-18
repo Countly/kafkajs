@@ -12,7 +12,6 @@ const {
 } = require('testHelpers')
 const { CloseRig, TOPIC, gate, pause } = require('./fixtures/closeRig')
 const { pump } = require('./fixtures/lifecycleCase')
-const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 const {
   TOPIC: HARNESS_TOPIC,
   NEW_ID,
@@ -86,8 +85,8 @@ describe.each([true, false])(
       return held
     }
     beforeEach(() => {
-      // API budgets and the imported perf_hooks clock must advance only when the test asks.
-      useSharedFakeClock()
+      // API budgets must advance only when the test asks.
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] })
     })
     /** @param {object} [options] rig options @returns {Promise<void>} a fresh rig, read as `rig` */
     const open = async (options) => {
@@ -241,7 +240,7 @@ describe.each([true, false])(
 describe('describeGroup under one operation spanning its stages', () => {
   const operations = []
   beforeEach(() => {
-    useSharedFakeClock()
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] })
   })
   afterEach(() => {
     operations.splice(0).forEach((operation) => operation.finish())
@@ -344,7 +343,7 @@ describe('position over a real offset manager and ledger', () => {
   const operations = []
 
   beforeEach(() => {
-    useSharedFakeClock()
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] })
   })
   afterEach(() => {
     operations.splice(0).forEach((operation) => operation.finish())

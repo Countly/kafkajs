@@ -1,4 +1,3 @@
-const { performance } = require('node:perf_hooks')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')

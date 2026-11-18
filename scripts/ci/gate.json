@@ -9288,8 +9288,6 @@
         "src/consumer/__tests__/sessionRig.spec.js \u203a the outage clock puts a wall-clock moment on the monotonic clock the frames use",
         "src/consumer/__tests__/sessionRig.spec.js \u203a the recreated topic has the partition count docker-compose.fetch-sessions.yml auto-creates a topic with",
         "src/consumer/__tests__/sessionRig.spec.js \u203a the recreated topic has the partition count docker-compose.racks.yml auto-creates a topic with",
-        "src/consumer/__tests__/sharedFakeClock.spec.js \u203a Shared fake clock for a long-lived worker plain fake timers leave the imported clock at worker age, so a live hook deadline looks expired",
-        "src/consumer/__tests__/sharedFakeClock.spec.js \u203a Shared fake clock for a long-lived worker the helper makes the imported and global clocks one fake clock",
         "src/consumer/__tests__/staleGeneration.spec.js \u203a Consumer > Runner > answer from a replaced membership restarts the fetch loop instead of crashing on an obsolete GROUP_AUTHORIZATION_FAILED, which is not a rebalance code",
         "src/consumer/__tests__/staleGeneration.spec.js \u203a Consumer > Runner > answer from a replaced membership restarts the fetch loop instead of crashing on an obsolete ILLEGAL_GENERATION",
         "src/consumer/__tests__/staleGeneration.spec.js \u203a Consumer > Runner > answer from a replaced membership still crashes on a non-retriable error that is sent under the current membership",
@@ -20845,7 +20843,11 @@
         "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema inventory cuts are complete per client section and chunk before a sample uses them",
         "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema samples carry their role fields and two new forced collections per reading",
         "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema manifest paths stay inside the artifact and bind every archived input",
-        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema broker capability and provenance files have their fixed types"
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema broker capability and provenance files have their fixed types",
+        "src/__tests__/monotonicClock.spec.js \u203a One monotonic clock under fake timers on a long-lived worker a rebalance hook deadline is measured on the faked global clock",
+        "src/__tests__/monotonicClock.spec.js \u203a One monotonic clock under fake timers on a long-lived worker the default telemetry clocks read the faked global clock and arm faked timers",
+        "src/__tests__/monotonicClock.spec.js \u203a Lint forbids the imported clock in client code rejects require('node:perf_hooks') under src/",
+        "src/__tests__/monotonicClock.spec.js \u203a Lint forbids the imported clock in client code rejects require('perf_hooks') under src/"
       ],
       "capMinutes": 85,
       "allowedSkips": [

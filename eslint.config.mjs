@@ -172,6 +172,23 @@ export default [
     },
   },
   {
+    // The client reads the global `performance` only: fake timers replace the global, not the
+    // `perf_hooks` export, so mixing the two compares deadlines across different clocks.
+    files: ['src/**/*.js'],
+    ignores: ['src/**/__tests__/**', 'src/**/*.spec.js'],
+    rules: {
+      'n/no-restricted-require': [
+        'error',
+        [
+          {
+            name: ['perf_hooks', 'node:perf_hooks'],
+            message: 'Use the global `performance` so the client reads one monotonic clock.',
+          },
+        ],
+      ],
+    },
+  },
+  {
     files: ['src/producer/partitioners/legacy/randomBytes.js'],
     rules: {
       // This file feature-detects `global.crypto` (the WebCrypto global) with a fallback to

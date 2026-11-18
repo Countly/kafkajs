@@ -23,6 +23,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - `KafkaJSServerDoesNotSupportApiKey` and `KafkaJSShareGroupsNotSupportedError` carry the broker's error as `cause` when a broker refused the request.
 - `connect()` during `disconnect()` now waits for the close and reconnects; `run()` and `subscribe()` during a close reject instead of starting a membership after the `disconnect` event. A `connect()` still waiting when a later `disconnect()` is called is refused, and one called from a handler of the run being closed, or async work it started, is refused at once instead of deadlocking the close; an event listener is not a handler and waits for the close.
 - A `disconnect()` called from a `CRASH` listener no longer leaves the share consumer's restart timer armed after the close (it could hold the process open for the retry delay).
+- The client and the default telemetry read one monotonic clock (the global `performance`) and look timers up when they arm them, so they follow fake timers and timer functions an application replaces at run time. Nothing changes for an application that replaces neither.
 
 #### Tooling
 

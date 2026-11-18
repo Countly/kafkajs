@@ -1,5 +1,4 @@
 const { EventEmitter } = require('events')
-const { performance } = require('node:perf_hooks')
 const Long = require('../utils/long')
 const createRetry = require('../retry')
 const sleep = require('../utils/sleep')

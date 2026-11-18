@@ -1,10 +1,15 @@
-const { performance } = require('node:perf_hooks')
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
 const TelemetryPayload = require('./payload')
 const MAX_TIMER = 2147483647
 const UUID =
   /^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
-const CLOCK = { now: () => performance.now(), random: Math.random, setTimeout, clearTimeout }
+// Globals are read per call so fake timers installed after load drive the default clock.
+const CLOCK = {
+  now: () => performance.now(),
+  random: Math.random,
+  setTimeout: (...args) => setTimeout(...args),
+  clearTimeout: (timer) => clearTimeout(timer),
+}
 
 /**
  * Validates the public getter options once, reading the timeout property a single time.

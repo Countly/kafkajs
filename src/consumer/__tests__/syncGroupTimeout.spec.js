@@ -9,7 +9,6 @@ const { createScriptedCluster, groupScript } = require('../../../testHelpers/scr
 const ConsumerGroup = require('../consumerGroup')
 const { TOPIC } = require('./fixtures/fetchHarness')
 const { WireTranscript } = require('./fixtures/rackWire')
-const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 
 const versions = {
   [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: 5 },
@@ -128,7 +127,8 @@ describe('Consumer > derived group request timeouts', () => {
 
 /**
  * Puts the imported `node:perf_hooks` clock ten minutes ahead of real time, as in a Jest worker
- * that has already run many suites, so a harness that leaves it unfaked fails on every host.
+ * that has already run many suites, so a client that reads it instead of the faked global clock
+ * fails on every host.
  * Callers restore with `jest.restoreAllMocks()`.
  * @returns {void}
  */
@@ -185,7 +185,7 @@ describe('Consumer > a parked SyncGroup over the wire', () => {
    */
   const withParkedSync = async (options, work) => {
     ageWorker()
-    useSharedFakeClock()
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] })
     const seam = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node', port: 9092 }] }),
       { batches: 0 }
@@ -313,7 +313,7 @@ describe('Consumer > JoinGroup attempts on the wire', () => {
 
   it('a JoinGroup retried inside one round is counted on the wire but adds no GROUP_JOIN (fake time)', async () => {
     ageWorker()
-    useSharedFakeClock()
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] })
     const seam = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node', port: 9092 }] }),
       { batches: 0 }
