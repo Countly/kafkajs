@@ -75,6 +75,27 @@ const parseValue = (value, runId) => {
 }
 
 /**
+ * Keeps a handler entry the observer could not enrich (no batch authority, topic id or share
+ * acquisition) as partial evidence and fails the run: the callback really happened, so it must not
+ * vanish from the record, and nothing is invented to make the entry whole.
+ * @param {object} runtime the hosting process
+ * @param {{ client: string, group: string, handler: string, id: string, topic: string,
+ *   partition: number, offset: string, payloadSha256: string }} entry what the callback gave
+ * @param {string[]} missing the enrichment that could not be read
+ * @returns {void}
+ */
+const partialEntry = (runtime, entry, missing) => {
+  runtime.emit({
+    kind: 'diagnostic',
+    recordId: runtime.nextId(),
+    message: `partial handler-enter ${JSON.stringify({ ...entry, missing })}`,
+  })
+  runtime.problem(
+    `handler entry ${entry.id} at ${entry.topic}/${entry.partition}:${entry.offset} lacks ${missing.join(', ')}`
+  )
+}
+
+/**
  * Appends raw exchanges to rotating segment files in the artifact, one JSON line each, and returns
  * where each line lives and its hash. Each segment is written once and never copied.
  */
@@ -1011,11 +1032,26 @@ class ConsumerWorker extends Worker {
     const [group] = runtime.observer.mine(rig.id, 'ConsumerGroup')
     const topicId = runtime.observer.topicIdOf(topic, group)
     const handler = `${rig.id}.h${runtime.ids}`
+    const parsed = parseValue(message.value, runtime.config.runId)
+    const id = parsed?.id ?? `foreign.${message.offset}`
+    const payload = payloadSha256(message.key, message.value, message.headers)
     if (!topicId || !authority) {
-      runtime.diagnose(`missing-source ${!topicId ? 'topic id' : 'batch authority'} at ${handler}`)
+      partialEntry(
+        runtime,
+        {
+          client: rig.id,
+          group: rig.slot.group,
+          handler,
+          id,
+          topic,
+          partition,
+          offset: message.offset,
+          payloadSha256: payload,
+        },
+        [...(topicId ? [] : ['topic id']), ...(authority ? [] : ['batch authority'])]
+      )
     } else {
       const key = { topic, topicId, partition }
-      const parsed = parseValue(message.value, runtime.config.runId)
       this.replayCheck(rig, key, message.offset, authority)
       runtime.emit({
         kind: 'identity',
@@ -1024,10 +1060,10 @@ class ConsumerWorker extends Worker {
         client: rig.id,
         group: rig.slot.group,
         handler,
-        id: parsed?.id ?? `foreign.${message.offset}`,
+        id,
         key,
         offset: message.offset,
-        payloadSha256: payloadSha256(message.key, message.value, message.headers),
+        payloadSha256: payload,
         authority,
         acquisition: null,
         deliveryCount: null,
@@ -1501,9 +1537,22 @@ class ShareWorker extends Worker {
     const handler = `${rig.id}.h${runtime.ids}`
     const topicId = runtime.observer.topicIdOf(topic, null)
     const delivery = runtime.observer.shareDelivery(rig.id, topic, partition, message.offset)
+    const id = parseValue(message.value, runtime.config.runId)?.id ?? `foreign.${message.offset}`
+    const payload = payloadSha256(message.key, message.value, message.headers)
     if (!topicId || !delivery) {
-      runtime.diagnose(
-        `missing-source ${!topicId ? 'topic id' : 'share acquisition'} at ${handler}`
+      partialEntry(
+        runtime,
+        {
+          client: rig.id,
+          group: rig.slot.group,
+          handler,
+          id,
+          topic,
+          partition,
+          offset: message.offset,
+          payloadSha256: payload,
+        },
+        [...(topicId ? [] : ['topic id']), ...(delivery ? [] : ['share acquisition'])]
       )
     } else {
       runtime.emit({
@@ -1513,10 +1562,10 @@ class ShareWorker extends Worker {
         client: rig.id,
         group: rig.slot.group,
         handler,
-        id: parseValue(message.value, runtime.config.runId)?.id ?? `foreign.${message.offset}`,
+        id,
         key: { topic, topicId, partition },
         offset: message.offset,
-        payloadSha256: payloadSha256(message.key, message.value, message.headers),
+        payloadSha256: payload,
         authority: null,
         acquisition: delivery.acquisition,
         deliveryCount: delivery.deliveryCount,
@@ -1978,7 +2027,7 @@ function child(options) {
         return runtime
       })()
     } else if (message.type === 'ack') {
-      acks.get(message.seq)?.()
+      acks.get(message.seq)?.(message.refused === true)
       acks.delete(message.seq)
     } else if (message.type === 'reply') {
       replies.get(message.request)?.()

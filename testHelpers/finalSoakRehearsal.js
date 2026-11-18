@@ -13,7 +13,8 @@
  *
  * Environment: `KAFKA_BROKERS` (three `host:port`, the scripted nodes 1–3);
  * `TELEMETRY_EVIDENCE_DIR` and `FINAL_SOAK_REHEARSAL_PUSH=1` make a telemetry-enabled client's
- * connect append one decoded push line for node 1, as the broker reporter would.
+ * connect append one decoded push line for node 1, as the broker reporter would. The consumer
+ * worker's assignment read is replaced, since nothing joins a group.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -152,6 +153,15 @@ const adminCalls = () => {
       for (const t of list) topics.delete(t)
     },
     listTopics: async () => [...topics.keys()],
+    fetchTopicOffsets: async (topic) => {
+      check(typeof topic === 'string', 'fetchTopicOffsets')
+      return metadataOf(topic).partitions.map(({ partitionId }) => ({
+        partition: partitionId,
+        offset: '0',
+        high: '0',
+        low: '0',
+      }))
+    },
     fetchTopicMetadata: async ({ topics: list } = {}) => {
       check(Array.isArray(list) && list.every((t) => typeof t === 'string'), 'fetchTopicMetadata')
       return { topics: list.map(metadataOf) }
@@ -307,3 +317,17 @@ class RehearsalKafka extends RealKafka {
 }
 
 kafkajs.Kafka = RehearsalKafka
+
+// The in-memory clients never join a group, so no partition is ever assigned: every consumer
+// member reads as holding the main topic's one partition, which is what the readiness check and
+// the membership waves look for.
+const { ConsumerWorker } = require('../scripts/soak/finalSoakWorkers')
+ConsumerWorker.prototype.assignedKeys = function () {
+  const { main } = this.runtime.config.topics
+  return [{ topic: main, topicId: idOf(main), partition: 0 }]
+}
+// A regex or recreated topic is seen by a real group within its metadata refresh; here no group
+// exists to see it, so these waits are answered at once instead of running to their deadline.
+ConsumerWorker.prototype.onRegexChurn = async () => ({ accepted: true })
+ConsumerWorker.prototype.onRetired = async () => ({ retired: true })
+ConsumerWorker.prototype.onRecreated = async () => ({ assigned: true })

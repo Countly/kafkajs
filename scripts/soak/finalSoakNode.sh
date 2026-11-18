@@ -7,8 +7,11 @@
 # checkout of <sha> (detached), `npm ci --ignore-scripts`, reporter preparation with the run's file
 # cap, the three-broker Kafka 4.4.0 KRaft cluster from docker-compose.telemetry.yml plus the prepared
 # override, share.version finalized, preflight, the driver under nohup with a heartbeat file, the
-# outer exit witness and finalize, the driver's summary, cleanup (run topics and groups, then
-# containers) and a tarball of the artifact.
+# outer exit receipt, the two container dumps (the standing topics' records read_committed and every
+# consumer group's committed offsets, by the Apache tools inside the first broker's container, while
+# the cluster and the topics are still up), finalize, the driver's summary, cleanup (run topics and
+# groups, then containers) and a tarball of the artifact. A failed or interrupted run is sealed the
+# same way, so its evidence is bound and its dumps kept, never reported as complete.
 #
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
@@ -24,8 +27,6 @@
 #                                 CI runner); preflight records those checks without failing on them
 #                                 and the artifact is marked diagnostic. Never acceptance evidence.
 #   FINAL_SOAK_COMPANIONS         space-separated <name>=<file>[@<run url>] companions for finalize
-#   FINAL_SOAK_SUPPLIED_BROKERS   a supplied cluster (comma list); the Compose steps are skipped
-#   FINAL_SOAK_SUPPLIED_EVIDENCE  that cluster's per-node build evidence (JSON naming the files)
 #   TELEMETRY_JAVA_CACHE          the pinned Java inputs of the reporter build
 #
 # This script reads and writes no credentials.
@@ -35,6 +36,10 @@ sha="${1:-}"
 mode="${2:-}"
 if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$mode" != smoke && "$mode" != acceptance ]]; then
   echo "usage: $0 <40-hex sha> <smoke|acceptance>" >&2
+  exit 2
+fi
+if [[ -n "${FINAL_SOAK_SUPPLIED_BROKERS:-}" ]]; then
+  echo "a supplied cluster is not supported: the run stops, restarts and dumps its brokers through the repository Compose services" >&2
   exit 2
 fi
 diagnostic=()
@@ -60,12 +65,15 @@ exec > >(
 export TELEMETRY_EVIDENCE_DIR="$out/telemetry-sink"
 export COMPOSE_PROJECT_NAME=kafkajs
 export COMPOSE_FILE="docker-compose.telemetry.yml:$out/broker/compose.json"
-supplied="${FINAL_SOAK_SUPPLIED_BROKERS:-}"
 
 stage=checkout
 started=
 driver=
 driver_status=null
+exit_ms=
+sealed=
+dump_status=0
+after=
 
 # Removes the run's topics and groups, which exist only once the driver wrote config.json, then on
 # failure keeps the brokers' logs and stops the Compose cluster.
@@ -76,13 +84,27 @@ cleanup() {
   else
     echo "no driver config: the driver created no run topics or groups, so none are removed"
   fi
-  if [[ -z "$supplied" ]]; then
-    if ((status != 0)); then
-      docker compose logs --no-color --timestamps > "$out.compose.log" 2>&1 || true
-      echo "broker logs: $out.compose.log"
-    fi
-    docker compose down --volumes || true
+  if ((status != 0)); then
+    docker compose logs --no-color --timestamps > "$out.compose.log" 2>&1 || true
+    echo "broker logs: $out.compose.log"
   fi
+  docker compose down --volumes || true
+}
+
+# Seals the artifact once, while the cluster and the run's topics are still up: the receipt of the
+# supervisor's exit as the shell saw it, the Apache dumps of the logs and the groups, then
+# finalize, which binds every file (the dumps included) in the header. Only a run whose driver
+# wrote its config has topics to dump. A failed dump is remembered, never hidden, and finalize still
+# runs so the partial dumps are bound.
+seal() {
+  [[ -n "$sealed" ]] && return 0
+  sealed=1
+  [[ -f "$out/config.json" ]] || return 0
+  local companions=() companion
+  node scripts/soak/finalSoak.js --outer-exit --out "$out" --status "$driver_status" --exit-wall-ms "$exit_ms" || after=outer-exit
+  node scripts/soak/finalSoakDump.js --out "$out" || dump_status=$?
+  for companion in ${FINAL_SOAK_COMPANIONS:-}; do companions+=(--companion "$companion"); done
+  node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after="${after:-finalize}"
 }
 
 # Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped
@@ -96,8 +118,12 @@ finish() {
     kill "$driver" 2> /dev/null
     wait "$driver"
     driver_status=$?
+    exit_ms=$((${EPOCHREALTIME/./} / 1000))
   fi
-  if [[ -n "$started" ]]; then cleanup "$status"; fi
+  if [[ -n "$started" ]]; then
+    seal
+    cleanup "$status"
+  fi
   if ! tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
     stage=archive
     status=1
@@ -120,38 +146,32 @@ git checkout --detach "$sha"
 stage=install
 npm ci --ignore-scripts
 
-if [[ -n "$supplied" ]]; then
-  export KAFKA_BROKERS="$supplied"
-  echo '{"services":{}}' > "$out/broker/compose.json"
-  started=1
-else
-  export KAFKA_BROKERS=localhost:19092,localhost:19095,localhost:19098
-  stage=prepare-reporter
-  node scripts/soak/finalSoakPreflight.js --prepare-reporter --out "$out"
-  stage=cluster-start
-  started=1
-  docker compose up -d --wait
-  stage=cluster-wait
-  # waitForKafka hands COMPOSE_FILE to `docker compose -f`, which takes one path, not a list.
-  COMPOSE_FILE=docker-compose.telemetry.yml node scripts/waitForKafka.js
-  # The controller can still be settling right after the brokers answer, so this retries.
-  stage=share-version
-  features=(docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092)
-  # The describe output goes to the log too, so the finalized level is on record.
-  share_level() {
-    "${features[@]}" describe | tee /dev/stderr | sed -n 's/.*Feature: share\.version.*FinalizedVersionLevel: \([0-9]*\).*/\1/p'
-  }
-  attempt=1
-  until level="$(share_level)" && [[ "$level" =~ ^[1-9][0-9]*$ ]]; do
-    if ((attempt >= 30)); then
-      echo "share.version is not finalized after $attempt attempts" >&2
-      exit 1
-    fi
-    if [[ -z "$level" || "$level" == 0 ]]; then "${features[@]}" upgrade --feature share.version=1 || true; fi
-    attempt=$((attempt + 1))
-    sleep 2
-  done
-fi
+export KAFKA_BROKERS=localhost:19092,localhost:19095,localhost:19098
+stage=prepare-reporter
+node scripts/soak/finalSoakPreflight.js --prepare-reporter --out "$out"
+stage=cluster-start
+started=1
+docker compose up -d --wait
+stage=cluster-wait
+# waitForKafka hands COMPOSE_FILE to `docker compose -f`, which takes one path, not a list.
+COMPOSE_FILE=docker-compose.telemetry.yml node scripts/waitForKafka.js
+# The controller can still be settling right after the brokers answer, so this retries.
+stage=share-version
+features=(docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092)
+# The describe output goes to the log too, so the finalized level is on record.
+share_level() {
+  "${features[@]}" describe | tee /dev/stderr | sed -n 's/.*Feature: share\.version.*FinalizedVersionLevel: \([0-9]*\).*/\1/p'
+}
+attempt=1
+until level="$(share_level)" && [[ "$level" =~ ^[1-9][0-9]*$ ]]; do
+  if ((attempt >= 30)); then
+    echo "share.version is not finalized after $attempt attempts" >&2
+    exit 1
+  fi
+  if [[ -z "$level" || "$level" == 0 ]]; then "${features[@]}" upgrade --feature share.version=1 || true; fi
+  attempt=$((attempt + 1))
+  sleep 2
+done
 
 stage=preflight
 node scripts/soak/finalSoakPreflight.js --expect-sha "$sha" --mode "$mode" --out "$out" "${diagnostic[@]}"
@@ -172,14 +192,16 @@ heartbeat=$!
 
 driver_status=0
 wait "$driver" || driver_status=$?
+exit_ms=$((${EPOCHREALTIME/./} / 1000))
 driver=
 wait "$heartbeat" || true
-after=
-companions=()
-for companion in ${FINAL_SOAK_COMPANIONS:-}; do companions+=(--companion "$companion"); done
-node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after=finalize
+seal
 node scripts/soak/finalSoak.js --summary --out "$out" | tee "$out.summary.json" || after="${after:-summary}"
 if ((driver_status != 0)); then exit "$driver_status"; fi
+if ((dump_status != 0)); then
+  stage=dump
+  exit 1
+fi
 if [[ -n "$after" ]]; then
   stage=$after
   exit 1

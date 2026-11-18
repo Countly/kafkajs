@@ -120,6 +120,7 @@ class PassiveObserver {
     Object.assign(this, { owners, watched, context, commits, handlerContext, clock, topicIds })
     this.onEvent = onEvent
     this.errors = 0
+    this.failures = []
     this.absent = []
     this.refs = {}
     this.seen = new WeakSet()
@@ -174,17 +175,21 @@ class PassiveObserver {
     const original = prototype[method]
     const observer = this
     const hooks = this.hooks()[`${name}#${method}`] ?? {}
+    const label = `${name}#${method}`
     const wrapper = function (...args) {
-      observer.guard(() => observer.remember(name, this))
-      const state = hooks.before ? observer.guard(() => hooks.before(this, args)) : undefined
+      observer.guard(() => observer.remember(name, this), `${label} remember`)
+      const state = hooks.before
+        ? observer.guard(() => hooks.before(this, args), `${label} before`)
+        : undefined
       const result = original.apply(this, args)
       if (hooks.after) {
         if (result && typeof result.then === 'function')
           result.then(
-            (value) => observer.guard(() => hooks.after(this, args, value, state)),
-            () => observer.guard(() => hooks.failed?.(this, args, state))
+            (value) =>
+              observer.guard(() => hooks.after(this, args, value, state), `${label} after`),
+            () => observer.guard(() => hooks.failed?.(this, args, state), `${label} failed`)
           )
-        else observer.guard(() => hooks.after(this, args, result, state))
+        else observer.guard(() => hooks.after(this, args, result, state), `${label} after`)
       }
       return result
     }
@@ -194,14 +199,40 @@ class PassiveObserver {
     })
   }
 
-  /** @param {() => unknown} fn a hook @returns {unknown} its value, or undefined after counting its error */
-  guard(fn) {
+  /**
+   * Runs a hook so that a failure never reaches the product, and remembers it: the product call
+   * goes on unchanged, but the evidence the hook was to record is incomplete.
+   * @param {() => unknown} fn a hook @param {string} hook its identity
+   * @returns {unknown} its value, or undefined after counting and naming its error
+   */
+  guard(fn, hook = 'hook') {
     try {
       return fn()
-    } catch {
-      this.errors++
+    } catch (e) {
+      this.fail(`${hook}: ${e.message}`)
       return undefined
     }
+  }
+
+  /** @param {string} failure counts and keeps a failure, at most fifty until drained @returns {void} */
+  fail(failure) {
+    this.errors++
+    if (this.failures.length < 50) this.failures.push(failure)
+  }
+
+  /** @returns {string[]} the hook failures since the last call, by hook identity */
+  drainFailures() {
+    return this.failures.splice(0)
+  }
+
+  /**
+   * Drops everything kept for a client that has disconnected: its ring of share exchanges. What the
+   * observer holds weakly (receivers, ids, origins) is not kept alive by it.
+   * @param {string} client
+   * @returns {void}
+   */
+  forget(client) {
+    this.exchanges.delete(client)
   }
 
   /** @returns {void} puts every original method back */
@@ -255,6 +286,16 @@ class PassiveObserver {
       return value !== undefined
     })
     return out
+  }
+
+  /**
+   * @param {unknown} id a topic id as the product stores it (dashed hex or printed)
+   * @returns {string|null} the printed form; an id that cannot be represented is counted as unknown
+   */
+  printed(id) {
+    const topicId = normalizeTopicId(String(id))
+    if (!topicId) this.unknownTopicIds++
+    return topicId
   }
 
   /** @param {string} client @param {string} name @returns {object[]} the client's live receivers */
@@ -757,8 +798,8 @@ class PassiveObserver {
     let decoded = null
     try {
       decoded = acknowledgementResponse(apiKey, response)
-    } catch {
-      this.errors++
+    } catch (e) {
+      this.fail(`exchanged ${client}: ${e.message}`)
       return
     }
     const ring = this.exchanges.get(client) ?? []
@@ -994,7 +1035,10 @@ class PassiveObserver {
           accepted,
           desired: ids([...desired]),
           observed: observed
-            ? [...observed].map(([topic, topicId]) => ({ topic, topicId: topicId ?? null }))
+            ? [...observed].map(([topic, topicId]) => ({
+                topic,
+                topicId: topicId == null ? null : this.printed(topicId),
+              }))
             : ids([...group.topicsSubscribed]),
         })
       }
@@ -1093,10 +1137,12 @@ class PassiveObserver {
           this.unknownTopicIds++
           continue
         }
+        const topicId = this.printed(entry.stamp)
+        if (!topicId) continue
         debts.push({
           client,
           topic,
-          topicId: String(entry.stamp),
+          topicId,
           discharged: ascending(entry.discharged ?? []),
         })
       }

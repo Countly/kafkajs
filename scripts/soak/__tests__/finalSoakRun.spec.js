@@ -467,6 +467,28 @@ describe('final soak scheduled work', () => {
     await expect(outage(options)).rejects.toThrow(message)
   })
 
+  test('an execution that fails still ends its shape, so the stream never holds an execution that never ends', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const shapes = []
+      s.shape = async (step, phase) => shapes.push(`${step.id} ${phase}`)
+      s.outage = async () => {
+        throw new Error('outage failed')
+      }
+      s.scheduler = { aborted: null }
+      const step = {
+        id: 'h00o0',
+        type: 'execution',
+        shape: 'broker-outage',
+        participants: ['producer-idempotent'],
+      }
+      await expect(s.perform(step)).rejects.toThrow('outage failed')
+      expect(shapes).toEqual(['h00o0 start', 'h00o0 end'])
+    } finally {
+      remove()
+    }
+  })
+
   test('a membership wave in which no process saw a paused partition transfer fails its step', async () => {
     const { s, remove } = supervisor()
     try {

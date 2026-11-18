@@ -20,6 +20,12 @@ const JAR = 'c'.repeat(64)
 const BROKERS = 'kafka1:9092,kafka2:9092,kafka3:9092'
 /** The clock speed-up: the 30 min smoke schedule runs in about 30 s. */
 const WARP = 60
+/**
+ * What a broker-free run cannot avoid and must not be failed for: sixty-fold sampling is late by the
+ * real cost of two collections, and clients that deliver nothing cannot show a recovery witness.
+ */
+const EXPECTED_PROBLEM =
+  /^step \S+ late$|^step h\d+o\d+ error: (p\d+ has no recovery witness after h\d+o\d+(; )?)+$/
 /** The rehearsal's only failing steps: the raw reader has no broker to open a connection to. */
 const UNREACHABLE = /^step scan\.\S+ failed: Connection timeout$/
 
@@ -54,9 +60,17 @@ const workspace = () => {
   })
   const evidence = path.join(dir, 'evidence.json')
   fs.writeFileSync(evidence, JSON.stringify({ nodes }))
+  fs.writeFileSync(path.join(bin, 'running'), '')
   const stubs = {
     docker: [
       `case "$*" in *sha256sum*) echo "${JAR}  /opt/kafka/libs/counting-telemetry-reporter.jar"; exit 0 ;; esac`,
+      'state="$(dirname "$0")/running"',
+      'case "$1 $2" in',
+      '  "compose ps") echo rehearsal-container; exit 0 ;;',
+      '  "compose stop" | "compose kill") rm -f "$state"; exit 0 ;;',
+      '  "compose start") touch "$state"; exit 0 ;;',
+      'esac',
+      'if [ "$1" = inspect ]; then if [ -f "$state" ]; then echo 4242; else echo 0; fi; exit 0; fi',
       'echo "rehearsal: no docker" >&2; exit 1',
     ],
     git: [
@@ -159,7 +173,13 @@ describe('final soak rehearsal', () => {
       const config = read('config.json')
       expect(validateConfig(config, matrix)).toEqual([])
       const supervisor = read('supervisor.json')
-      expect(supervisor).toMatchObject({ aborted: null, incomplete: null, failures: [] })
+      expect(supervisor).toMatchObject({
+        aborted: null,
+        incomplete: null,
+        failures: [],
+        forced: [],
+      })
+      expect(supervisor.problems.filter((p) => !EXPECTED_PROBLEM.test(p))).toEqual([])
       const records = recordsOf(ws.out)
       const slots = config.processes.map((p) => p.slot)
       expect(slots).toHaveLength(16)
@@ -204,7 +224,12 @@ describe('final soak rehearsal', () => {
           true,
         ])
       expect(
-        notes.filter((n) => /^step \S+ (failed|error)/.test(n) && !UNREACHABLE.test(n))
+        notes.filter(
+          (n) =>
+            /^step \S+ (failed|error)/.test(n) &&
+            !UNREACHABLE.test(n) &&
+            !/^step h\d+o\d+ error$/.test(n)
+        )
       ).toEqual([])
       expect(notes.filter((n) => /^producer loop failed/.test(n))).toEqual([])
 

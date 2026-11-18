@@ -773,9 +773,19 @@ describe('final soak driver', () => {
       const preflight = `node scripts/soak/finalSoakPreflight.js --expect-sha ${TREE} --mode smoke --out ${out}`
       const driver = `node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke --expect-sha ${TREE} --matrix scripts/soak/finalSoakMatrix.json --out ${out}`
       const finalize = `node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`
+      const outerExit = calls.find((c) =>
+        new RegExp(
+          `^node scripts/soak/finalSoak.js --outer-exit --out ${out} --status 0 --exit-wall-ms \\d{13}$`
+        ).test(c)
+      )
+      const dump = `node scripts/soak/finalSoakDump.js --out ${out}`
       expect(at(preflight)).toBeGreaterThan(at(`${features} describe`))
       expect(at(driver)).toBeGreaterThan(at(preflight))
-      expect(at(finalize)).toBeGreaterThan(at(driver))
+      expect(at(outerExit)).toBeGreaterThan(at(driver))
+      expect(at(dump)).toBeGreaterThan(at(outerExit))
+      expect(at(finalize)).toBeGreaterThan(at(dump))
+      expect(at(`node scripts/soak/finalSoak.js --cleanup --out ${out}`)).toBeGreaterThan(at(dump))
+      expect(at('docker compose down --volumes')).toBeGreaterThan(at(dump))
       expect(at(`node scripts/soak/finalSoak.js --summary --out ${out}`)).toBeGreaterThan(
         at(finalize)
       )
@@ -805,6 +815,18 @@ describe('final soak driver', () => {
       expect(harness.run([TREE, 'acceptance'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(2)
       expect(harness.run(['main', 'smoke']).status).toBe(2)
       expect(harness.run([TREE, 'day']).status).toBe(2)
+      expect(harness.calls()).toEqual([])
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('a supplied cluster is refused before anything is done', () => {
+    const harness = runbookHarness()
+    try {
+      const result = harness.run([TREE, 'smoke'], { FINAL_SOAK_SUPPLIED_BROKERS: 'b:1' })
+      expect(result.status).toBe(2)
+      expect(result.stderr).toContain('a supplied cluster is not supported')
       expect(harness.calls()).toEqual([])
     } finally {
       harness.remove()
@@ -871,9 +893,22 @@ describe('final soak driver', () => {
       expect(driver.calls).toContain(
         `node scripts/soak/finalSoak.js --finalize --out ${driver.out} --status 3`
       )
+      expect(driver.calls).toContain(`node scripts/soak/finalSoakDump.js --out ${driver.out}`)
+      expect(
+        driver.calls.indexOf(`node scripts/soak/finalSoakDump.js --out ${driver.out}`)
+      ).toBeLessThan(
+        driver.calls.indexOf(`node scripts/soak/finalSoak.js --cleanup --out ${driver.out}`)
+      )
       expect(driver.calls).toContain(`node scripts/soak/finalSoak.js --summary --out ${driver.out}`)
       expect(driver.calls).toContain(`node scripts/soak/finalSoak.js --cleanup --out ${driver.out}`)
       expect(driver.calls).toContain('docker compose down --volumes')
+
+      const dump = failAt('finalSoakDump.js')
+      expect(dump.receipt).toMatchObject({ failedStage: 'dump', exitStatus: 1, driverStatus: 0 })
+      expect(dump.calls).toContain(
+        `node scripts/soak/finalSoak.js --finalize --out ${dump.out} --status 0`
+      )
+      expect(dump.calls).toContain(`node scripts/soak/finalSoak.js --cleanup --out ${dump.out}`)
 
       const finalize = failAt('--finalize')
       expect(finalize.receipt).toMatchObject({ failedStage: 'finalize', driverStatus: 0 })
@@ -1905,7 +1940,7 @@ describe('final soak driver', () => {
   test('the archive binds every driver module the driver is split into', () => {
     const modules = fs
       .readdirSync(path.join(ROOT, 'scripts/soak'))
-      .filter((f) => /^finalSoak[A-Z]?\w*\.js$/.test(f) && !/Preflight|Schema/.test(f))
+      .filter((f) => /^finalSoak[A-Z]?\w*\.js$/.test(f) && !/Preflight|Schema|Dump/.test(f))
       .map((f) => `scripts/soak/${f}`)
     expect(sorted(modules)).toEqual([
       'scripts/soak/finalSoak.js',

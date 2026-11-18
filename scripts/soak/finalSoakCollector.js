@@ -59,6 +59,7 @@ class Collector {
     this.stopped = false
     this.writing = null
     this.waiters = []
+    this.onFailure = null
   }
 
   /**
@@ -101,9 +102,15 @@ class Collector {
     return this.own({ kind: 'diagnostic', message, ...extra })
   }
 
-  /** @param {string} problem */
+  /**
+   * Lists a failure of the collection and tells `onFailure` (the supervisor), which stops
+   * admitting work.
+   * @param {string} problem
+   * @returns {void}
+   */
   fail(problem) {
     if (this.failures.length < 100) this.failures.push(problem)
+    this.onFailure?.(problem)
   }
 
   /** @param {object} record @returns {string} the record's line with the current append time */
@@ -174,13 +181,30 @@ class Collector {
     for (const waiter of this.waiters.splice(0)) waiter.resolve(false)
   }
 
-  /** @returns {Promise<void>} writes queued lines until the queue is empty */
+  /**
+   * Writes queued lines until the queue is empty. Every chunk is written whole: a short write is
+   * continued from where it stopped, and a write that fails or takes no bytes stops collection and
+   * drops what is queued behind it, never truncating or reordering a line already written.
+   * @returns {Promise<void>}
+   */
   async drain() {
-    while (this.queue.length > 0) {
-      const chunk = Buffer.from(this.queue.splice(0, this.queue.length).join(''))
-      await this.sink.write(chunk)
-      this.queuedBytes -= chunk.length
-      this.release()
+    try {
+      while (this.queue.length > 0) {
+        const chunk = Buffer.from(this.queue.splice(0, this.queue.length).join(''))
+        for (let offset = 0; offset < chunk.length;) {
+          const result = await this.sink.write(chunk.subarray(offset))
+          const bytes = result?.bytesWritten ?? chunk.length - offset
+          if (!(bytes > 0)) throw new Error('the sink accepted no bytes')
+          offset += bytes
+        }
+        this.queuedBytes -= chunk.length
+        this.release()
+      }
+    } catch (e) {
+      this.queue.length = 0
+      this.queuedBytes = 0
+      this.fail(`sink write failed: ${e.message}`)
+      this.stop()
     }
     this.writing = null
   }
@@ -206,7 +230,8 @@ class SourceChannel {
    * @param {object} options
    * @param {string} options.source the process slot
    * @param {{ now: () => number, sleepUntil: (at: number) => Promise<void> }} options.clock
-   * @param {(message: object, done: () => void) => void} options.send sends; `done` on acknowledgement
+   * @param {(message: object, done: (refused?: boolean) => void) => void} options.send sends; `done`
+   *   on acknowledgement, with `true` when the collector refused the record
    * @param {number} [options.maxBytes] the pending bound, 8 MiB by default
    */
   constructor({ source, clock, send, maxBytes = 8 * MIB }) {
@@ -263,8 +288,13 @@ class SourceChannel {
       execution: record.execution ?? null,
     }
     this.pendingBytes += bytes
-    this.send({ type: 'record', record: message }, () => {
+    this.send({ type: 'record', record: message }, (refused = false) => {
       this.pendingBytes -= bytes
+      if (refused) {
+        this.incomplete ??= `${this.source} record ${message.seq} was refused by the collector`
+        for (const w of this.waiters.splice(0)) w.resolve(false)
+        return
+      }
       while (this.waiters.length > 0 && this.fits(this.waiters[0])) {
         const next = this.waiters.shift()
         this.dispatch(next)

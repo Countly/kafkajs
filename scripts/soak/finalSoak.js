@@ -10,6 +10,8 @@
  *     node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke|acceptance \
  *       --expect-sha <40-hex> --matrix scripts/soak/finalSoakMatrix.json --out <artifact dir> \
  *       [--diagnostic]
+ *   node scripts/soak/finalSoak.js --outer-exit --out <artifact dir> --status <wait status> \
+ *     --exit-wall-ms <epoch ms the wait returned>
  *   node scripts/soak/finalSoak.js --finalize --out <artifact dir> --status <wait status> \
  *     [--companion <name>=<file>[@<run url>]]...
  *   node scripts/soak/finalSoak.js --summary --out <artifact dir>
@@ -17,8 +19,9 @@
  *
  * The first command is the collector/supervisor process. It spawns the fifteen other persistent
  * processes (`--child <slot>`), is the only stream writer, and exits naturally after every child
- * has. The outer observer (the runbook) witnesses that exit and runs `--finalize`, which appends
- * the parent-observed supervisor exit, hashes every file and writes `header.json`. `--duration` is
+ * has. The outer observer (the runbook) witnesses that exit at once with `--outer-exit`, then runs
+ * `--finalize`, which appends the parent-observed supervisor exit, hashes every file and writes
+ * `header.json`; without a supervisor receipt it writes a partial manifest naming what is absent. `--duration` is
  * accepted only in smoke mode, where the matrix fixes its length. `--diagnostic` (smoke only) marks
  * a run on a host that does not meet the quiet-host floors, such as a hosted CI runner; such a run
  * proves only that the driver works against a live cluster. The modules it is split into
@@ -26,7 +29,6 @@
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const readline = require('node:readline')
 const { spawn, execFile } = require('node:child_process')
@@ -47,10 +49,11 @@ const {
   freeDisk,
 } = require('./finalSoakCollector')
 const { normalizeTopicId } = require('./finalSoakObserver')
-const { sha256, bootId, ChildRuntime, child } = require('./finalSoakWorkers')
+const { bootId, ChildRuntime, child } = require('./finalSoakWorkers')
 
 const ROOT = path.resolve(__dirname, '../..')
 const MATRIX = 'scripts/soak/finalSoakMatrix.json'
+const MIB = 1024 ** 2
 const GIB = 1024 ** 3
 /** Free disk kept back beyond the stream's remaining reservation (the planned 32 GiB safety). */
 const SAFETY_BYTES = 32 * GIB
@@ -77,7 +80,7 @@ const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
  */
 function parseArgs(argv, env) {
   const flags = { companion: [] }
-  const switches = ['--finalize', '--cleanup', '--summary', '--diagnostic']
+  const switches = ['--finalize', '--cleanup', '--summary', '--diagnostic', '--outer-exit']
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]
     if (!name.startsWith('--')) throw new Error(`unexpected argument ${name}`)
@@ -95,6 +98,13 @@ function parseArgs(argv, env) {
     })
     return { command: 'finalize', out, status: Number(flags.status), companions }
   }
+  if (flags['outer-exit'])
+    return {
+      command: 'outer-exit',
+      out,
+      status: Number(flags.status),
+      exitWallMs: Number(flags['exit-wall-ms'] || NaN),
+    }
   if (flags.cleanup) return { command: 'cleanup', out }
   if (flags.summary) return { command: 'summary', out }
   if (flags.child) return { command: 'child', child: flags.child, out }
@@ -906,36 +916,43 @@ class Supervisor {
     }
     if (step.type === 'idle') {
       await this.shape(step, 'start')
-      await this.send(all, step)
-      await this.clock.sleepUntil(step.until, this.scheduler.controller.signal)
-      if (step.until < this.runEndAt && !this.scheduler.aborted)
-        await this.send(all, { ...step, type: 'active' })
-      return this.shape(step, 'end')
+      try {
+        await this.send(all, step)
+        await this.clock.sleepUntil(step.until, this.scheduler.controller.signal)
+        if (step.until < this.runEndAt && !this.scheduler.aborted)
+          await this.send(all, { ...step, type: 'active' })
+      } finally {
+        await this.shape(step, 'end')
+      }
+      return
     }
     await this.shape(step, 'start')
-    const participants = [...new Set(step.participants.map((k) => this.processOf(k)))]
-    if (step.shape === 'broker-outage') await this.outage(step, participants)
-    else if (step.shape === 'membership-churn') await this.churnMembers(step, participants)
-    else if (step.shape === 'regex-churn' || step.shape === 'topic-recreation')
-      await this.churnTopic(step, participants)
-    else {
-      const drain = step.shape === 'drain'
-      await this.send(
-        drain ? [...new Set([...participants, ...this.consumers()])] : participants,
-        step
-      )
-      if (drain) {
-        const t = this.config.topics
-        for (const [topic, partitions] of [
-          [t.main, 1],
-          [t.transactions, 1],
-          ...t.recreate.map((r) => [r, 2]),
-        ])
-          for (let partition = 0; partition < partitions; partition++)
-            await this.scan(topic, partition, step.id)
+    try {
+      const participants = [...new Set(step.participants.map((k) => this.processOf(k)))]
+      if (step.shape === 'broker-outage') await this.outage(step, participants)
+      else if (step.shape === 'membership-churn') await this.churnMembers(step, participants)
+      else if (step.shape === 'regex-churn' || step.shape === 'topic-recreation')
+        await this.churnTopic(step, participants)
+      else {
+        const drain = step.shape === 'drain'
+        await this.send(
+          drain ? [...new Set([...participants, ...this.consumers()])] : participants,
+          step
+        )
+        if (drain) {
+          const t = this.config.topics
+          for (const [topic, partitions] of [
+            [t.main, 1],
+            [t.transactions, 1],
+            ...t.recreate.map((r) => [r, 2]),
+          ])
+            for (let partition = 0; partition < partitions; partition++)
+              await this.scan(topic, partition, step.id)
+        }
       }
+    } finally {
+      await this.shape(step, 'end')
     }
-    await this.shape(step, 'end')
   }
 
   /**
@@ -1303,24 +1320,120 @@ async function cleanup({ out }) {
 }
 
 /**
+ * Hashes and counts a byte source with one fixed buffer, so the memory used never grows with the
+ * source, however many GiB it holds.
+ * @param {{ size: number, read: (buffer: Buffer, position: number) => number }} source `read` fills
+ *   the buffer from `position` and returns the bytes it put there
+ * @param {number} [chunkBytes] the buffer size, 8 MiB by default
+ * @returns {{ bytes: number, sha256: string, lines: number }} size, SHA-256 and newline count
+ * @throws {Error} when a read returns no bytes before the source's end
+ */
+function digest({ size, read }, chunkBytes = 8 * MIB) {
+  const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(chunkBytes, size)))
+  const hash = crypto.createHash('sha256')
+  let lines = 0
+  for (let position = 0; position < size;) {
+    const bytes = read(buffer, position)
+    if (!(bytes > 0)) throw new Error(`a read at byte ${position} of ${size} returned no bytes`)
+    const view = buffer.subarray(0, bytes)
+    hash.update(view)
+    for (let i = view.indexOf(0x0a); i !== -1; i = view.indexOf(0x0a, i + 1)) lines++
+    position += bytes
+  }
+  return { bytes: size, sha256: hash.digest('hex'), lines }
+}
+
+/**
+ * @param {string} file @param {number} [chunkBytes]
+ * @returns {{ bytes: number, sha256: string, lines: number }} the file's digest, read in chunks
+ */
+function digestFile(file, chunkBytes) {
+  const fd = fs.openSync(file, 'r')
+  try {
+    const { size } = fs.fstatSync(fd)
+    const read = (buffer, position) => fs.readSync(fd, buffer, 0, buffer.length, position)
+    return digest({ size, read }, chunkBytes)
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Records, at once, the status the shell's wait returned for the supervisor and the run-clock time
+ * it returned, in `outer-exit.json`. The time is placed from the wall-clock moment of the return,
+ * so a later finalizer cannot move it. The status is kept as the shell saw it: a number above 128
+ * may be a code or a signal and is not guessed.
+ * @param {{ out: string, status: number, exitWallMs: number }} options
+ * @param {{ wallNow?: () => number, clock?: { now: () => number } }} [seams]
+ * @returns {{ status: number, observedAt: number }} the receipt written
+ */
+function recordOuterExit({ out, status, exitWallMs }, seams = {}) {
+  const { wallNow = Date.now, clock = new MonotonicClock(originOf(out)) } = seams
+  const ago = Number.isFinite(exitWallMs) ? Math.max(0, wallNow() - exitWallMs) : 0
+  const receipt = { status, observedAt: Math.max(0, clock.now() - ago) }
+  fs.writeFileSync(path.join(out, 'outer-exit.json'), JSON.stringify(receipt) + '\n')
+  return receipt
+}
+
+/**
+ * Digests every file of the artifact except the files that describe it, streaming each.
+ * @param {string} out @returns {{ file: string, bytes: number, sha256: string, lines: number }[]}
+ */
+function digestArtifact(out) {
+  const files = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(path.join(out, dir), { withFileTypes: true })) {
+      const rel = dir ? `${dir}/${entry.name}` : entry.name
+      if (entry.isDirectory()) walk(rel)
+      else if (entry.isFile() && !['header.json', 'manifest.partial.json'].includes(rel))
+        files.push({ file: rel, ...digestFile(path.join(out, rel)) })
+    }
+  }
+  walk('')
+  return files
+}
+
+/**
  * The outer handover after the supervisor has exited: appends the parent-observed supervisor exit
  * as the `outer` source, copies each supplied companion into the artifact, hashes and fsyncs every
- * file and writes `header.json`. The window's observed end is that observation, the last exit of a
- * persistent process, so every record (the supervisor's closing ones and this receipt) is within it.
+ * file (streamed, never read whole) and writes `header.json`. The exit is what the runbook's
+ * receipt says it observed, at the time it observed it; the window's observed end is that time, so
+ * every record (the supervisor's closing ones and this receipt) is within it. When the supervisor
+ * left no receipt there is no run to describe: only `manifest.partial.json` is written, naming the
+ * files and the absent ones, and the result is `{ partial: true }`.
  * @param {{ out: string, status: number, companions?: { name: string, file: string,
  *   runUrl: string|null }[] }} options the artifact, the shell's wait status and the companions
- * @returns {object} the header written
+ * @returns {object} the header written, or `{ partial: true, manifest }`
  */
 function finalize({ out, status, companions = [] }) {
-  const run = JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))
-  const clock = new MonotonicClock(run.originMs)
-  const observedAt = clock.now()
-  const signal =
-    status > 128
-      ? (Object.keys(os.constants.signals).find((s) => os.constants.signals[s] === status - 128) ??
-        null)
-      : null
-  const code = signal ? null : status
+  const read = (file) => {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(out, file), 'utf8'))
+    } catch {
+      return null
+    }
+  }
+  const run = read('supervisor.json')
+  const receipt = read('outer-exit.json')
+  if (!run) {
+    const manifest = {
+      partial: true,
+      absent: ['supervisor.json', 'header.json'],
+      exit: { status: receipt?.status ?? status, observedAt: receipt?.observedAt ?? null },
+      files: digestArtifact(out).map(({ file, bytes, sha256: hash }) => ({
+        file,
+        bytes,
+        sha256: hash,
+      })),
+    }
+    fs.writeFileSync(
+      path.join(out, 'manifest.partial.json'),
+      JSON.stringify(manifest, null, 2) + '\n'
+    )
+    return { partial: true, manifest }
+  }
+  const observedAt = receipt?.observedAt ?? new MonotonicClock(run.originMs).now()
+  const code = receipt?.status ?? status
   const streamFile = path.join(out, 'stream.ndjson')
   const exit = {
     kind: 'process',
@@ -1333,7 +1446,7 @@ function finalize({ out, status, companions = [] }) {
     event: 'exit',
     process: SUPERVISOR,
     code,
-    signal,
+    signal: null,
     spawnRecord: `${SUPERVISOR}.0`,
   }
   const problems = validateRecord(exit)
@@ -1343,29 +1456,14 @@ function finalize({ out, status, companions = [] }) {
   fs.fsyncSync(fd)
   fs.closeSync(fd)
   const companionEntries = companions.map(({ name, file, runUrl }) => {
-    const bytes = fs.readFileSync(file)
     const rel = `companions/${name}${path.extname(file)}`
     fs.mkdirSync(path.join(out, 'companions'), { recursive: true })
-    fs.writeFileSync(path.join(out, rel), bytes)
-    return { name, treeSha: run.treeSha, file: rel, sha256: sha256(bytes), runUrl }
+    fs.copyFileSync(file, path.join(out, rel))
+    return { name, treeSha: run.treeSha, file: rel, sha256: digestFile(file).sha256, runUrl }
   })
-  const files = []
-  const walk = (dir) => {
-    for (const entry of fs.readdirSync(path.join(out, dir), { withFileTypes: true })) {
-      const rel = dir ? `${dir}/${entry.name}` : entry.name
-      if (entry.isDirectory()) walk(rel)
-      else if (entry.isFile() && rel !== 'header.json') {
-        const bytes = fs.readFileSync(path.join(out, rel))
-        files.push({ file: rel, bytes: bytes.length, sha256: sha256(bytes) })
-      }
-    }
-  }
-  walk('')
+  const files = digestArtifact(out)
   const stream = files.find((f) => f.file === 'stream.ndjson')
-  const preflight = JSON.parse(fs.readFileSync(path.join(out, 'preflight.json'), 'utf8'))
-  let records = 0
-  const bytes = fs.readFileSync(streamFile)
-  for (let i = bytes.indexOf(0x0a); i !== -1; i = bytes.indexOf(0x0a, i + 1)) records++
+  const preflight = read('preflight.json')
   const header = {
     schema: 3,
     mode: run.mode,
@@ -1374,7 +1472,7 @@ function finalize({ out, status, companions = [] }) {
     node: process.version,
     v8: process.versions.v8,
     platform: process.platform,
-    files,
+    files: files.map(({ file, bytes, sha256: hash }) => ({ file, bytes, sha256: hash })),
     clock: { kind: 'linux-monotonic', originMs: run.originMs, bootId: run.bootId },
     window: {
       runStartAt: run.runStartAt,
@@ -1382,10 +1480,15 @@ function finalize({ out, status, companions = [] }) {
       observedEndAt: observedAt,
       requestedMs: run.requestedMs,
     },
-    host: preflight.host,
-    broker: preflight.broker,
-    exit: { supervisorProcess: SUPERVISOR, code, signal, observedAt },
-    stream: { file: 'stream.ndjson', bytes: stream.bytes, records, sha256: stream.sha256 },
+    host: preflight?.host,
+    broker: preflight?.broker,
+    exit: { supervisorProcess: SUPERVISOR, code, signal: null, observedAt },
+    stream: {
+      file: 'stream.ndjson',
+      bytes: stream.bytes,
+      records: stream.lines,
+      sha256: stream.sha256,
+    },
     companions: companionEntries,
   }
   fs.writeFileSync(path.join(out, 'header.json'), JSON.stringify(header, null, 2) + '\n')
@@ -1436,7 +1539,8 @@ async function summarize({ out }) {
 /** @param {string[]} argv @returns {Promise<void>} the command-line entry */
 async function main(argv) {
   const options = parseArgs(argv, process.env)
-  if (options.command === 'finalize') finalize(options)
+  if (options.command === 'finalize') process.exitCode = finalize(options).partial ? 1 : 0
+  else if (options.command === 'outer-exit') recordOuterExit(options)
   else if (options.command === 'cleanup') await cleanup(options)
   else if (options.command === 'summary')
     console.log(JSON.stringify(await summarize(options), null, 2))
@@ -1451,4 +1555,14 @@ if (require.main === module) {
   })
 }
 
-module.exports = { parseArgs, buildConfig, recipientGroups, finalize, summarize, Supervisor }
+module.exports = {
+  parseArgs,
+  buildConfig,
+  recipientGroups,
+  digest,
+  digestFile,
+  recordOuterExit,
+  finalize,
+  summarize,
+  Supervisor,
+}
