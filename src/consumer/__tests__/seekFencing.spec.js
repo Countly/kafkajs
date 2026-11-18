@@ -1,6 +1,7 @@
 const Broker = require('../../broker')
 const RequestQueue = require('../../network/requestQueue')
 const ConsumerGroup = require('../consumerGroup')
+const { FetchPreparation } = require('../fetchPreparation')
 const handlerContext = require('../handlerContext')
 const { KafkaJSCommitFailedError } = require('../../errors')
 const { TOPIC, CloseRig, batchAt, gate } = require('./fixtures/closeRig')
@@ -238,6 +239,17 @@ const holdAnswerOnArrival = (rig, api) => {
 }
 
 /**
+ * @param {{topics: {partitions: {partition: number}[]}[]}} fields an OffsetCommit request
+ * @returns {object} the answer that refuses every cell with REQUEST_TIMED_OUT, recording nothing
+ */
+const timedOut = (fields) => ({
+  topics: fields.topics.map((topic) => ({
+    ...topic,
+    partitions: topic.partitions.map(({ partition }) => ({ partition, errorCode: 7 })),
+  })),
+})
+
+/**
  * Answers the next OffsetCommit with REQUEST_TIMED_OUT for every cell, recording nothing.
  * @param {SeekScenario} scenario
  * @returns {void}
@@ -248,13 +260,50 @@ const failNextCommit = (scenario) => {
   scenario.rig.cluster.answer('OffsetCommit', (fields, record) => {
     if (failed) return answer(fields, record)
     failed = true
-    return {
-      topics: fields.topics.map((topic) => ({
-        ...topic,
-        partitions: topic.partitions.map(({ partition }) => ({ partition, errorCode: 7 })),
-      })),
-    }
+    return timedOut(fields)
   })
+}
+
+/**
+ * Holds the answers of the first OffsetCommits that reach the broker, one hold per kind: an
+ * `applied` request is applied by the broker before its answer is held, a `failed` one is answered
+ * REQUEST_TIMED_OUT and recorded nowhere. Later requests are answered as usual.
+ * @param {SeekScenario} scenario
+ * @param {('applied'|'failed')[]} kinds
+ * @returns {{ holds: {arrived: Promise<void>, release: () => void}[], restore: () => void }}
+ */
+const holdCommitAnswers = (scenario, kinds) => {
+  const holds = kinds.map(() => ({ arrived: gate(), opened: gate() }))
+  const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+  let arrivals = 0
+  scenario.rig.cluster.answer('OffsetCommit', async (fields, record) => {
+    const hold = holds[arrivals++]
+    if (!hold) return answer(fields, record)
+    const result =
+      kinds[arrivals - 1] === 'failed' ? timedOut(fields) : await answer(fields, record)
+    hold.arrived.resolve()
+    await hold.opened.promise
+    return result
+  })
+  return {
+    holds: holds.map(({ arrived, opened }) => ({
+      arrived: arrived.promise,
+      release: opened.resolve,
+    })),
+    restore: () => holds.forEach(({ opened }) => opened.resolve()),
+  }
+}
+
+/** The run options and first handlers of two partitions whose partition 0 progress is resolved. */
+const TWO_PARTITIONS = {
+  partitions: 2,
+  run: {
+    autoCommit: true,
+    autoCommitInterval: 60000,
+    partitionsConsumedConcurrently: 2,
+    eachBatch: true,
+  },
+  before: ({ resolveOffset }) => resolveOffset('4'),
 }
 
 /**
@@ -877,5 +926,242 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
     expect(identity.acquisition.retired).toBe(true)
     expect(handlerContext.isSuperseded(identity)).toBe(true)
+  })
+
+  describe('a default commit the broker already accepted', () => {
+    test('a default commit sends the resolved offset again after a deliberate commit moved the partition ahead, with no seek involved', async () => {
+      const captured = using(captureGroup())
+      await open(TWO_PARTITIONS)
+      await scenario.otherDone.promise
+      const group = captured.group()
+
+      await group.commitOffsets({}, { auto: true })
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 1, offset: '9' }])
+      await group.commitOffsets({}, { auto: true })
+
+      expect(scenario.commits(1)).toEqual(['1', '9', '1'])
+      expect(scenario.commits(0)).toEqual(['5'])
+      expect(scenario.rig.frames('OffsetCommit')).toHaveLength(3)
+    })
+
+    test('is not sent again when a seek reaches its partition before the answer, and a later deliberate commit of another partition stays', async () => {
+      const captured = using(captureGroup())
+      await open(TWO_PARTITIONS)
+      await scenario.otherDone.promise
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const committing = captured.group().commitOffsets({}, { auto: true })
+      await accepted.arrived
+      expect(await scenario.seek('0')).toBe('0')
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 1, offset: '9' }])
+
+      accepted.release()
+      await committing
+
+      expect(scenario.commits(0)).toEqual(['5', '0'])
+      expect(scenario.commits(1)).toEqual(['1', '9'])
+      expect(scenario.rig.frames('OffsetCommit')).toHaveLength(3)
+      expect(scenario.committed).toEqual({ 0: '0', 1: '9' })
+      expect(captured.group().offsetManager.committedOffsets()[TOPIC][1]).toBe('9')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('reaches the caller as the broker error it was, with no commit sent after it, while a seek is pending', async () => {
+      const captured = using(captureGroup())
+      await open(TWO_PARTITIONS)
+      await scenario.otherDone.promise
+      const {
+        holds: [failing],
+      } = using(holdCommitAnswers(scenario, ['failed']))
+      const committing = captured
+        .group()
+        .commitOffsets({}, { auto: true })
+        .then(
+          () => null,
+          (error) => error
+        )
+      await failing.arrived
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+
+      failing.release()
+      const error = await committing
+
+      expect(error).not.toBeNull()
+      expect(error).not.toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(error.type).toBe('REQUEST_TIMED_OUT')
+      expect(scenario.rig.frames('OffsetCommit')).toHaveLength(1)
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('is published to the committed cache cell by cell, leaving out a partition a listener sought', async () => {
+      const captured = using(captureGroup())
+      const allow = gate()
+      await open({
+        ...TWO_PARTITIONS,
+        run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
+        other: async ({ resolveOffset, commitOffsetsIfNecessary }) => {
+          await allow.promise
+          resolveOffset('0')
+          await commitOffsetsIfNecessary()
+        },
+      })
+      let admitted = false
+      scenario.consumer.on(scenario.consumer.events.COMMIT_OFFSETS, () => {
+        if (admitted) return
+        admitted = true
+        scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      })
+      allow.resolve()
+      await scenario.otherDone.promise
+      const group = captured.group()
+
+      expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(true)
+      expect(group.offsetManager.committedOffsets()[TOPIC]).toEqual({ 0: '2', 1: '1' })
+      expect(scenario.commits(0)).toEqual(['5'])
+      expect(await scenario.position()).toBe('0')
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek whose commit the broker accepted', () => {
+    test('drops the progress it replaced when a deliberate commit superseded it, and the final commit sends neither', async () => {
+      const captured = using(captureGroup())
+      await open(TWO_PARTITIONS)
+      await scenario.otherDone.promise
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const seeking = scenario.seek('0')
+      await accepted.arrived
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '8' }])
+      expect(scenario.committed[0]).toBe('8')
+
+      accepted.release()
+
+      expect(await seeking).toBe('8')
+      expect(captured.group().unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
+      const closing = scenario.consumer.disconnect()
+      await scenario.release()
+      await closing
+      expect(scenario.commits(0)).toEqual(['0', '8'])
+      expect(scenario.commits(1)).toEqual(['1'])
+      expect(scenario.committed).toEqual({ 0: '8', 1: '1' })
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek whose commit failed', () => {
+    const FAILING_SEEK = {
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+    const failureOf = (promise) =>
+      promise.then(
+        () => null,
+        (error) => error
+      )
+
+    test('is not applied again after a newer seek of the partition was applied', async () => {
+      await open(FAILING_SEEK)
+      const {
+        holds: [failing],
+      } = using(holdCommitAnswers(scenario, ['failed']))
+      const older = failureOf(scenario.seek('0'))
+      await failing.arrived
+      expect(await scenario.seek('7')).toBe('7')
+
+      failing.release()
+
+      expect((await older).type).toBe('REQUEST_TIMED_OUT')
+      expect(await scenario.position()).toBe('7')
+      expect(scenario.commits()).toEqual(['0', '7'])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('leaves a newer seek of the partition that is still queued to apply alone', async () => {
+      await open(FAILING_SEEK)
+      const {
+        holds: [failing],
+      } = using(holdCommitAnswers(scenario, ['failed']))
+      const older = failureOf(scenario.seek('0'))
+      await failing.arrived
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '7' })
+
+      failing.release()
+
+      expect((await older).type).toBe('REQUEST_TIMED_OUT')
+      expect(await scenario.position()).toBe('7')
+      expect(scenario.commits()).toEqual(['0', '7'])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('is not applied again over a newer seek of the partition that is still being applied', async () => {
+      await open(FAILING_SEEK)
+      const {
+        holds: [failing, applying],
+      } = using(holdCommitAnswers(scenario, ['failed', 'applied']))
+      const older = failureOf(scenario.seek('0'))
+      await failing.arrived
+      const newer = scenario.seek('7')
+      await applying.arrived
+
+      failing.release()
+      expect((await older).type).toBe('REQUEST_TIMED_OUT')
+      applying.release()
+
+      expect(await newer).toBe('7')
+      expect(await scenario.position()).toBe('7')
+      expect(scenario.commits()).toEqual(['0', '7'])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('is not applied again once its assignment was rebuilt', async () => {
+      const captured = using(captureGroup())
+      await open(FAILING_SEEK)
+      const group = captured.group()
+      const {
+        holds: [failing],
+      } = using(holdCommitAnswers(scenario, ['failed']))
+      const parts = [{ topic: TOPIC, partitions: [0] }]
+      const round = new FetchPreparation(
+        group,
+        group.idleWait,
+        parts,
+        Infinity,
+        group.ownership.token()
+      )
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      const older = failureOf(group.seekOffsets(parts, round))
+      await failing.arrived
+      await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } })
+
+      failing.release()
+
+      expect(await older).not.toBeNull()
+      expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
+      expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
+      expect(await scenario.position()).toBe('2')
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('is not applied again once its topic was recreated', async () => {
+      const captured = using(captureGroup())
+      await open(FAILING_SEEK)
+      const {
+        holds: [failing],
+      } = using(holdCommitAnswers(scenario, ['failed']))
+      const older = failureOf(scenario.seek('0'))
+      await failing.arrived
+      captured.group().invalidateTopic(TOPIC)
+
+      failing.release()
+
+      expect((await older).type).toBe('REQUEST_TIMED_OUT')
+      expect(captured.group().hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
+      expect(captured.group().unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
+      expect(scenario.commits()).toEqual(['0'])
+    })
   })
 })
