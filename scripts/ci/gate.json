@@ -19486,6 +19486,9 @@
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > shutdown cleanup order rejects repeated cleanup timestamps despite four distinct completed cases",
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > shutdown cleanup order shutdown lane accepts four ordered cleanup records including the close-admission case",
         "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > shutdown cleanup order shutdown lane rejects a missing or reordered close-admission record",
+        "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary lane names its spec and cases",
+        "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary control run is reported as a failure",
+        "scripts/ci/__tests__/naturalExit.spec.js \u203a CI natural exit > ordinary clients ordinary lane leaves the four-case shutdown inventory unchanged",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls admits the entire short parent at exact remaining bound and refuses one ms less",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls admits the entire full parent at exact remaining bound and refuses one ms less",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls refuses NODE_OPTIONS substitution before any child is selected",
@@ -22463,7 +22466,15 @@
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum",
         "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker authenticates every helper form and observes refresh and file rotation",
         "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker closed providers reject later calls and the issuer keeps no sockets",
-        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker reads the SASL capability facts from an OAUTHBEARER-authenticated connection"
+        "src/oauth/__tests__/floorOAuthLive.spec.js \u203a OAuth helpers against a live OAUTHBEARER broker reads the SASL capability facts from an OAUTHBEARER-authenticated connection",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients classic dynamic consumer consumes one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients classic static consumer keeps its group slot after disconnect",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients consumer-protocol dynamic consumer consumes one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients consumer-protocol static consumer consumes one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients idempotent producer sends one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients transactional producer commits one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients admin creates and describes a topic and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > retained timer control leaves one interval alive after its producer disconnects"
       ]
     },
     {
@@ -26211,7 +26222,15 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
         "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000",
-        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
+        "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients classic dynamic consumer consumes one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients classic static consumer keeps its group slot after disconnect",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients consumer-protocol dynamic consumer consumes one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients consumer-protocol static consumer consumes one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients idempotent producer sends one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients transactional producer commits one message and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > ordinary clients admin creates and describes a topic and disconnects",
+        "src/__tests__/naturalExitLive.spec.js \u203a Natural exit > retained timer control leaves one interval alive after its producer disconnects"
       ]
     },
     {

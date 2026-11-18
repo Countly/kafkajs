@@ -503,6 +503,9 @@ describe('CI natural exit > ordinary clients', () => {
       argv: jestChild(ORDINARY_SPEC),
     })
 
+    const live = require('node:fs').readFileSync(ORDINARY_SPEC, 'utf8')
+    for (const title of [...ORDINARY_CASES, ...CONTROL_CASES]) expect(live).toContain(`'${title}'`)
+
     const missingStatic = fixture('ordinary')
     missingStatic.state.rows.splice(1, 1)
     expect(missingStatic.run).toThrow('ordinary: incomplete or invalid cleanup evidence')
