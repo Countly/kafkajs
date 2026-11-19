@@ -473,16 +473,21 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       const wire = scenario('consumer')
       wire.world.remove(DOOMED)
       wire.world.refused.set(TYPO, code)
+      const answered = []
+      wire.cluster.answer('Metadata', ({ topics }) => {
+        const answer = wire.world.metadata(topics)
+        answer.topics.sort((a, b) => (b.errorCode === 3) - (a.errorCode === 3))
+        answered.push(answer.topics.map(({ errorCode }) => errorCode))
+        return answer
+      })
       await wire.consumer.connect()
 
       await expect(
         wire.consumer.subscribe({ topics: [HEALTHY, DOOMED, TYPO], fromBeginning: true })
       ).rejects.toMatchObject({ type })
-      const asked = wire.cluster
-        .requests()
-        .filter(({ api }) => api === 'Metadata')
-        .map(({ fields }) => (fields.topics || []).map(({ name }) => name))
-      expect(asked).toContainEqual([HEALTHY, DOOMED, TYPO])
+      expect(answered).toHaveLength(1)
+      expect(answered[0][0]).toBe(3)
+      expect([...answered[0]].sort()).toEqual([0, 3, code].sort())
       expect(wire.observed.statuses).toEqual([])
     },
     30000

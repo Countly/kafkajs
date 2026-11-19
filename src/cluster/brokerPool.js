@@ -1240,8 +1240,10 @@ module.exports = class BrokerPool {
    * accepted since it was declared, is isolated: the topic is left out of the installed metadata,
    * so nothing routes to it, while it stays a target that every later refresh asks for again, and
    * its cached id stays, so a recreation is seen as one. Any other topic error, or code 3 for a
-   * topic no answer accepted yet (a subscription whose validation failed, say), is thrown as the
-   * version's own parse would throw it. The healthy topics' partitions are checked only then, so a
+   * topic no answer accepted yet (a subscription whose validation failed, say), is thrown. Any other
+   * code wins over code 3, whatever the wire order, so a missing topic never hides a fatal one (17,
+   * 29); between two such codes the first in wire order wins. The healthy topics' partitions are
+   * checked only then, so a
    * topic error takes precedence over a partition error as in the strict parse, and nothing
    * changes before the whole answer passed. Then the healthy topics are established and installed.
    * The Java consumer and franz-go keep a missing topic per topic too.
@@ -1254,18 +1256,17 @@ module.exports = class BrokerPool {
    * @param {TargetEstablishment} establishment captured when the refresh began
    * @param {{ allowLeaderless?: boolean }} options lets a partition without a leader through
    * @returns {object[]} the topics answered without an error
-   * @throws {import('../errors').KafkaJSProtocolError} the first topic error not isolated, else
-   *   the first partition error
+   * @throws {import('../errors').KafkaJSProtocolError} the first topic error other than code 3,
+   *   else the first code 3 not isolated, else the first partition error
    */
   isolateUnknownTopics(topicMetadata, { isEstablished, establish }, { allowLeaderless }) {
     const failed = topicMetadata.filter(
       ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
     )
-    for (const { topic, topicErrorCode } of failed) {
-      if (topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION || !isEstablished(topic)) {
-        throw createErrorFromCode(topicErrorCode)
-      }
-    }
+    const thrown =
+      failed.find(({ topicErrorCode }) => topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION) ??
+      failed.find(({ topic }) => !isEstablished(topic))
+    if (thrown) throw createErrorFromCode(thrown.topicErrorCode)
     const healthy = failed.length
       ? topicMetadata.filter((entry) => !failed.includes(entry))
       : topicMetadata
