@@ -1715,15 +1715,161 @@ describe('Consumer churn profile > offset state', () => {
     { name: 'b', partitions: 3 },
     { name: 'c', partitions: 3 },
   ]
+  /** A present store whose cache, subscription and claims all hold `names`. */
+  const readState = (names, { claimed = names, subscribed = names } = {}) => ({
+    present: true,
+    topics: names.length,
+    cells: 15,
+    cache: names.length,
+    cacheKeys: [...names].sort(),
+    subscribed: [...subscribed].sort(),
+    claimed: [...claimed].sort(),
+    open: 0,
+  })
+  const liveNames = ['a', 'b', 'c', 'control']
+  const finalOnly = { passes: ['regex-topics'], groupsOf: () => ['g'], deletionsOf: () => 1 }
+  /** A real member that held `old`, then saw its revoke and the join that followed. */
+  const revokedMember = async () => {
+    const handlers = {}
+    const member = new ChurnMember({
+      consumer: {
+        connect: jest.fn(async () => {}),
+        subscribe: jest.fn(async () => {}),
+        run: jest.fn(async (config) => Object.assign(handlers, config.rebalanceListener)),
+        commitOffsets: jest.fn(async () => {}),
+        disconnect: jest.fn(async () => {}),
+      },
+      admin: { fetchOffsets: jest.fn(async () => [{ topic: 'old', partitions: [] }]) },
+      group: 'g',
+      label: 'm',
+      journal: { append: () => {} },
+      gaps: null,
+      phase: 'p',
+      clock: { now: () => 0 },
+      handled: new Map(),
+      incarnationOf: () => 'old.1',
+      acknowledged: async () => true,
+    })
+    await member.start([/^o/])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 'old', partitions: [0] }] })
+    member.noteJoin()
+    await handlers.onPartitionsRevoked({ partitions: [{ topic: 'old', partitions: [0] }] })
+    member.noteJoin()
+    return member
+  }
+
+  test('a revoke and a join that precede the subscription application are not sampled as excess', async () => {
+    const member = await revokedMember()
+    let applied = false
+    const before = [...liveNames, 'old']
+    const { instance, rows } = sampler({
+      read: () => (applied ? readState(liveNames) : readState(before)),
+      onSleep: (n) => {
+        if (n === 3) applied = true
+      },
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        deletions: 1,
+        atMs: 300,
+        quiescent: true,
+        offsetState: expect.objectContaining({ cache: 4, unapplied: [] }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([])
+    await member.stop()
+  })
+
+  test('a cache key left after the subscription was applied and its claims released fails and names the topic', async () => {
+    const member = await revokedMember()
+    const { instance, rows } = sampler({
+      read: () => ({
+        ...readState([...liveNames, 'old'], { claimed: liveNames, subscribed: liveNames }),
+        topics: 4,
+      }),
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([expect.objectContaining({ atMs: 0, quiescent: true })])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([
+      'offset state of g in regex-topics (final): 5 cache topics for 4 live topics: old',
+    ])
+    await member.stop()
+  })
+
+  test('a subscription that still claims a deleted topic at the cutoff fails as not applied, not as excess', async () => {
+    const member = await revokedMember()
+    const { instance, rows } = sampler({
+      read: () => ({ ...readState([...liveNames, 'old']), topics: 4 }),
+      quietMs: 1000,
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        waitedMs: 1000,
+        quiescent: false,
+        offsetState: expect.objectContaining({
+          cacheKeys: ['a', 'b', 'c', 'control', 'old'],
+          subscribed: ['a', 'b', 'c', 'control', 'old'],
+          unapplied: ['old'],
+        }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([
+      'offset state of g in regex-topics (final): subscription not applied within 1.0 s: still claims old',
+    ])
+    await member.stop()
+  })
+
+  test('a store read without claims is never quiescent', async () => {
+    const { claimed, ...withoutClaims } = readState(liveNames)
+    const { instance, rows } = sampler({ read: () => withoutClaims, quietMs: 200 })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [{ group: 'g', settledWithout: () => true }],
+      live,
+      deleted: new Set(),
+    })
+
+    expect(claimed).toEqual(liveNames)
+    expect(rows).toEqual([expect.objectContaining({ waitedMs: 200, quiescent: false })])
+  })
 
   test('consumer-churn samples offset-state cardinalities after quiescence', async () => {
     let applied = false
     const member = { group: 'g-rx', settledWithout: () => applied }
     let open = 2
+    const keys = ['a', 'b', 'c', 'control']
     const state = () =>
       applied
-        ? { present: true, topics: 4, cells: 12, cache: 4, open }
-        : { present: true, topics: 5, cells: 18, cache: 5, open: 0 }
+        ? { ...readState(keys), topics: 4, cells: 12, open }
+        : { ...readState([...keys, 'd']), topics: 5, cells: 18 }
     const { instance, rows } = sampler({
       read: state,
       onSleep: (n) => {
@@ -1737,7 +1883,7 @@ describe('Consumer churn profile > offset state', () => {
       checkpoint: 'periodic',
       members: [member],
       live,
-      deleted: new Set(['a', 'b', 'c', 'd', 'e']),
+      deleted: new Set(['d', 'e', 'f', 'g', 'h']),
     })
 
     expect(rows).toEqual([
@@ -1750,8 +1896,16 @@ describe('Consumer churn profile > offset state', () => {
         atMs: 500,
         waitedMs: 500,
         quiescent: true,
-        live: { topics: 4, partitions: 15 },
-        offsetState: { present: true, topics: 4, cells: 12, cache: 4 },
+        live: { topics: 4, partitions: 15, names: ['a', 'b', 'c', 'control'] },
+        offsetState: {
+          present: true,
+          topics: 4,
+          cells: 12,
+          cache: 4,
+          cacheKeys: ['a', 'b', 'c', 'control'],
+          subscribed: ['a', 'b', 'c', 'control'],
+          unapplied: [],
+        },
       },
     ])
     expect(
@@ -1807,7 +1961,7 @@ describe('Consumer churn profile > offset state', () => {
   test('a sample waits without the fault signal and records a timeout as not quiescent', async () => {
     const member = { group: 'g', settledWithout: () => false }
     const { instance, rows, sleeps } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       quietMs: 1000,
     })
 
@@ -1840,7 +1994,7 @@ describe('Consumer churn profile > offset state', () => {
     const clock = manualClock()
     const member = { group: 'g', settledWithout: () => clock.now() >= 200 }
     const { instance, rows, sleeps } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
       quietMs: 1000,
     })
@@ -1863,7 +2017,7 @@ describe('Consumer churn profile > offset state', () => {
     const clock = manualClock()
     const member = { group: 'g', settledWithout: () => clock.now() >= 1000 }
     const late = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
       quietMs: 1000,
       onSleep: (n) => {
@@ -1888,7 +2042,7 @@ describe('Consumer churn profile > offset state', () => {
     const clock = manualClock()
     clock.advance(500)
     const { instance, rows, sleeps } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
     })
 
@@ -1919,7 +2073,7 @@ describe('Consumer churn profile > offset state', () => {
   test('a later member reached only after the shared cutoff is recorded as not quiescent', async () => {
     const clock = manualClock()
     const { instance, rows } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
       quietMs: 1000,
       onSleep: (n) => {
@@ -2137,14 +2291,61 @@ describe('Consumer churn profile > offset state', () => {
       holder
     )
     entry.offsets.topic = { 0: '1' }
-    expect(read('g')).toEqual({ present: true, topics: 0, cells: 0, cache: 1, open: 0 })
+    const base = { cacheKeys: ['topic'], subscribed: [], claimed: [] }
+    expect(read('g')).toEqual({ present: true, topics: 0, cells: 0, cache: 1, open: 0, ...base })
     expect(CommittedOffsetRevisions.peek(entry.offsets)).toBeUndefined()
     CommittedOffsetRevisions.forCache(entry.offsets).capture('topic', 0)
     const ticket = entry.ledger.begin([{ topic: 'topic', partition: 0 }])
-    expect(read('g')).toEqual({ present: true, topics: 1, cells: 1, cache: 1, open: 1 })
+    expect(read('g')).toEqual({
+      present: true,
+      topics: 1,
+      cells: 1,
+      cache: 1,
+      open: 1,
+      ...base,
+      claimed: ['topic'],
+    })
     entry.ledger.end(ticket)
     expect(entry.holders).toEqual(new Set([holder]))
     expect(entry.ledger.openTickets).toBe(0)
     expect(store('offsets').size).toBe(1)
+  })
+
+  test('the offset-state reader names the subscription and every claim of the attached consumers', () => {
+    const { Kafka, logLevel } = require('../../../index')
+    const GroupRegistry = require('../../../src/cluster/groupRegistry')
+    const ResetObligations = require('../../../src/consumer/offsetManager/resetObligations')
+    const kafka = new Kafka({ brokers: ['localhost:9092'], logLevel: logLevel.NOTHING })
+    const read = offsetStateReader(kafka)
+    const store = (name) =>
+      kafka[
+        Object.getOwnPropertySymbols(kafka).find(
+          ({ description }) => description === `private:Kafka:${name}`
+        )
+      ]
+    const entry = GroupRegistry.forStores(store('offsets'), store('operations')).acquire('g', {})
+    const first = new ResetObligations()
+    const second = new ResetObligations()
+    first.attachTo(entry.ledger)
+    second.attachTo(entry.ledger)
+    first.claimSubscription(['s2', 's1'])
+    first.claimAssignment(['assigned'])
+    second.claimSubscription(['s1', 's3'])
+    second.owe('owed', 'id-1')
+    entry.offsets.s1 = {}
+    entry.offsets.gone = {}
+
+    expect(read('g')).toEqual({
+      present: true,
+      topics: 0,
+      cells: 0,
+      cache: 2,
+      open: 0,
+      cacheKeys: ['gone', 's1'],
+      subscribed: ['s1', 's2', 's3'],
+      claimed: ['assigned', 'owed', 's1', 's2', 's3'],
+    })
+    first.clear()
+    second.clear()
   })
 })

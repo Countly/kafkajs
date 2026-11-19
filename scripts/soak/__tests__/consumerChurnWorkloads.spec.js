@@ -56,7 +56,16 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
         group,
         running: kafka.built.some((client) => client.group === group && client.joined),
       })
-      return { present: true, topics: 0, cells: 0, cache: 0, open: 0 }
+      return {
+        present: true,
+        topics: 0,
+        cells: 0,
+        cache: 0,
+        cacheKeys: [],
+        subscribed: [],
+        claimed: [],
+        open: 0,
+      }
     }
     const workloads = new ChurnWorkloads({ kafka, probe, tag: 'tg', offsetState })
     const journal = new ChurnJournal({ file: path.join(dir, 'run.journal') })
@@ -153,7 +162,14 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
     ])
     for (const row of rows) {
       expect(row.quiescent).toBe(true)
-      if (row.checkpoint === 'periodic') expect(row.live).toEqual({ topics: 4, partitions: 15 })
+      expect(row.offsetState).toEqual(
+        expect.objectContaining({ cacheKeys: [], subscribed: [], unapplied: [] })
+      )
+      expect(row.live.names).toEqual([...row.live.names].sort())
+      expect(row.live.names).toHaveLength(row.live.topics)
+      expect(row.live.names.filter((name) => name.endsWith('-control'))).toHaveLength(1)
+      if (row.checkpoint === 'periodic')
+        expect(row.live).toEqual({ topics: 4, partitions: 15, names: expect.any(Array) })
     }
     expect(reads.length).toBeGreaterThanOrEqual(rows.length)
     expect(reads.filter(({ running }) => !running)).toEqual([])
