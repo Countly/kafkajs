@@ -1,4 +1,5 @@
 const { Kafka, logLevel } = require('../../../index')
+const Cluster = require('../../cluster')
 const { plainTextBrokers, secureRandom, writeEvidence } = require('testHelpers')
 
 // Gated: needs CONSUMER_TOPIC_LIFECYCLE_E2E=1 and the compose cluster (docker-compose.yml). Its
@@ -188,6 +189,105 @@ describeLifecycle('Consumer > a subscribed topic deleted and recreated (live)', 
       'during-2',
     ])
   }
+
+  test(
+    'consumer: a topic assigned and then unknown at its first add is reported while the healthy topic keeps delivering, and is read from its start once it exists',
+    async () => {
+      const healthy = `lifecycle-healthy-${secureRandom()}`
+      const late = `lifecycle-late-${secureRandom()}`
+      const groupId = `lifecycle-first-add-${secureRandom()}`
+      cleanup.push(() => admin.deleteTopics({ topics: [healthy, late] }))
+      await create(healthy)
+      await produce(healthy, 'before', 3)
+
+      // The coordinator assigns `late` by id once it exists. Deleting it right after the consumer
+      // named that id, before its first lookup by name, is the window this case needs: the
+      // lookup by id is awaited by the step that adds the name next.
+      const byId = Cluster.prototype.refreshMetadataForTopicIds
+      let deleted = false
+      Cluster.prototype.refreshMetadataForTopicIds = async function (...args) {
+        const outcome = await byId.apply(this, args)
+        const named = outcome.resolved.some((topicId) => this.topicName(topicId) === late)
+        if (!deleted && named) {
+          deleted = true
+          await admin.deleteTopics({ topics: [late] })
+          await until(async () => !(await admin.listTopics()).includes(late), 'the deletion')
+        }
+        return outcome
+      }
+      cleanup.push(async () => {
+        Cluster.prototype.refreshMetadataForTopicIds = byId
+      })
+
+      const consumer = kafka.consumer({
+        groupId,
+        groupProtocol: 'consumer',
+        allowAutoTopicCreation: false,
+        metadataMaxAge: 1000,
+        maxWaitTimeInMs: 100,
+        retry: { retries: 3, restartOnFailure: async () => false },
+      })
+      cleanup.push(() => consumer.disconnect())
+      const observed = { records: [], statuses: [], crashes: [] }
+      consumer.on(consumer.events.TOPIC_METADATA_STATUS, ({ payload }) =>
+        observed.statuses.push(payload)
+      )
+      consumer.on(consumer.events.CRASH, ({ payload }) => observed.crashes.push(payload))
+      await consumer.connect()
+      await consumer.subscribe({ topics: [healthy, late], fromBeginning: true })
+      await consumer.run({
+        eachMessage: async ({ topic, message }) => {
+          observed.records.push({ topic, offset: message.offset, value: message.value.toString() })
+        },
+      })
+      const values = (topic) =>
+        observed.records.filter((record) => record.topic === topic).map(({ value }) => value)
+      await until(() => values(healthy).length === 3, 'the first healthy records')
+
+      // Created once, not through `create`: its retry would recreate the topic the hook deletes.
+      await admin.createTopics({
+        waitForLeaders: true,
+        topics: [{ topic: late, numPartitions: 1, replicationFactor: 1 }],
+      })
+      await until(() => observed.statuses.length >= 1, 'the unavailable status')
+      expect(deleted).toBe(true)
+      await produce(healthy, 'during', 3)
+      await until(() => values(healthy).length === 6, 'healthy records while the topic is gone')
+
+      await create(late)
+      await produce(late, 'new', 2)
+      await until(() => values(late).length >= 2, 'records from the created topic')
+
+      writeEvidence(EVIDENCE, {
+        mode: 'consumer-first-add',
+        statuses: observed.statuses,
+        crashes: observed.crashes.length,
+        late: observed.records.filter(({ topic }) => topic === late),
+      })
+      expect(observed.crashes).toEqual([])
+      expect(observed.statuses[0]).toEqual({
+        groupId,
+        topic: late,
+        status: 'unavailable',
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+        code: 3,
+      })
+      expect(observed.statuses.every(({ topic }) => topic === late)).toBe(true)
+      expect(observed.records.filter(({ topic }) => topic === late).slice(0, 2)).toEqual([
+        { topic: late, offset: '0', value: 'new-0' },
+        { topic: late, offset: '1', value: 'new-1' },
+      ])
+      expect(values(healthy)).toEqual([
+        'before-0',
+        'before-1',
+        'before-2',
+        'during-0',
+        'during-1',
+        'during-2',
+      ])
+    },
+    CASE_MS
+  )
 
   test(
     'classic: the healthy topic keeps delivering and the recreated one is read from its start',

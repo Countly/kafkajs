@@ -72,6 +72,7 @@ const build = (answer, version = 13) => {
   const cluster = Object.assign(Object.create(Cluster.prototype), {
     logger: log,
     metadataCache: cache,
+    firstAddTopics: new Set(),
     brokerPool: { metadata: old, withBroker: async (fn) => fn({ broker }) },
     refreshMetadata: jest.fn(async () => {}),
     topicName: (id) => cache.topicName(id),

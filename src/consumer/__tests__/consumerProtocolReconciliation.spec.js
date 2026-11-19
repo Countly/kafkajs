@@ -99,6 +99,7 @@ const build = ({
     findBroker: jest.fn(async () => ({ fetch: async () => ({ responses: [] }) })),
     findGroupCoordinator: jest.fn(async () => coordinator),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
   }
 
   const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -297,6 +298,7 @@ const buildPattern = (script, { literal = false } = {}) => {
     ),
     findGroupCoordinator: jest.fn(async () => coordinator),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
   }
 
   const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -1205,6 +1207,7 @@ const buildConsumer = (options = {}) => {
     removeBroker: jest.fn(),
     onTopicRecreated: jest.fn(() => () => {}),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
     refreshMetadata: jest.fn(async () => {
       await delayOnce('metadataDelay')
       state.partial.clear()

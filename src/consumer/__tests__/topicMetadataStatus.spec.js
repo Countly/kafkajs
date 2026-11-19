@@ -169,7 +169,9 @@ class World {
   metadata(requested) {
     const entries =
       requested === null
-        ? [...this.ids.keys()].filter((name) => this.live(name)).map((name) => this.describe(name))
+        ? [...this.ids.keys()]
+            .filter((name) => this.live(name) && !this.idCodes.has(this.ids.get(name)))
+            .map((name) => this.describe(name))
         : requested.map(({ name, topicId }) => {
             if (name != null) return this.describe(name)
             const known = this.nameOf(topicId)
@@ -867,10 +869,11 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
 
     /**
      * A broker-side pattern whose first add of `DOOMED` is held at the broker, with the
-     * coordinator's one withdrawal of it held too.
+     * coordinator's one withdrawal of it held too. Every other lookup by name answers it code 3.
+     * @param {boolean} heldKnows whether the held lookup answers it as a live topic
      * @returns {Promise<object>} the scenario and the releases of both holds
      */
-    const heldWithdrawal = async () => {
+    const heldWithdrawal = async (heldKnows) => {
       const wire = assignedScenario()
       const gates = {}
       const hold = (key) => new Promise((resolve) => (gates[key] = resolve))
@@ -880,6 +883,12 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
         if (!metadataHeld && topics?.some(({ name }) => name === DOOMED)) {
           metadataHeld = hold('metadata')
           await metadataHeld
+          if (heldKnows) {
+            wire.world.namedCodes.delete(DOOMED)
+            const answer = wire.world.metadata(topics)
+            wire.world.namedCodes.set(DOOMED, 3)
+            return answer
+          }
         }
         return wire.world.metadata(topics)
       })
@@ -893,11 +902,13 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
         return answer
       })
       wire.world.ids.delete(NEW)
+      wire.world.ids.delete(DOOMED)
       await wire.consumer.connect()
       await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
       await wire.run()
       await until(() => offsets(wire.observed, HEALTHY).length >= 2, 'healthy records')
 
+      wire.world.namedCodes.set(DOOMED, 3)
       wire.world.ids.set(NEW, NEW_ID)
       wire.world.ids.set(DOOMED, DOOMED_ID)
       await until(() => gates.metadata, 'the held first add')
@@ -922,10 +933,9 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     }
 
     test('a withdrawal held while the first add is answered code 3 and a sibling is applied still sticks', async () => {
-      const { wire, gates } = await heldWithdrawal()
-      wire.world.namedCodes.set(DOOMED, 3)
+      const { wire, gates } = await heldWithdrawal(false)
       gates.metadata()
-      await until(() => offsets(wire.observed, NEW).length >= 1, 'the sibling applied')
+      await until(() => names(wire.assigned, NEW), 'the sibling applied')
       gates.withdrawal()
 
       await expectWithdrawn(wire)
@@ -934,14 +944,14 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       ])
     }, 30000)
 
-    test('a withdrawal released before a late successful first add still sticks and reports nothing', async () => {
-      const { wire, gates } = await heldWithdrawal()
+    test('a withdrawal released before a late successful first add still sticks and reports no recovery', async () => {
+      const { wire, gates } = await heldWithdrawal(true)
       gates.withdrawal()
       await sleep(100)
       gates.metadata()
 
       await expectWithdrawn(wire)
-      expect(wire.observed.statuses).toEqual([])
+      expect(wire.observed.statuses.map(({ status }) => status)).not.toContain('available')
     }, 30000)
 
     test.each([
@@ -1117,6 +1127,51 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       expect(wire.observed.crashes).toEqual([])
     }, 30000)
   })
+
+  test('a classic consumer, a producer and an admin of one client, and a share consumer, still fail on a missing topic and report no status', async () => {
+    const world = new World()
+    world.remove(DOOMED)
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'consumer' })
+    cluster.answer('Metadata', ({ topics }) => world.metadata(topics))
+    const kafka = new Kafka(cluster.kafkaOptions({ retry: RETRY, logLevel: logLevel.NOTHING }))
+    const statuses = []
+    const consumer = kafka.consumer({ groupId: 'strict-classic', allowAutoTopicCreation: false })
+    consumer.on(consumer.events.TOPIC_METADATA_STATUS, ({ payload }) => statuses.push(payload))
+    const producer = kafka.producer({ allowAutoTopicCreation: false })
+    const admin = kafka.admin()
+    const shareCluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    shareCluster.answer('Metadata', ({ topics }) => world.metadata(topics))
+    const share = new Kafka(
+      shareCluster.kafkaOptions({ retry: RETRY, logLevel: logLevel.NOTHING })
+    ).shareConsumer({ groupId: 'strict-share' })
+    consumers.push(consumer, producer, admin, share)
+    const failure = async (promise) =>
+      typed(
+        await promise.then(
+          () => null,
+          (error) => error
+        )
+      )
+
+    await consumer.connect()
+    await producer.connect()
+    await admin.connect()
+    await share.connect()
+
+    expect(
+      await failure(consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true }))
+    ).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    expect(
+      await failure(producer.send({ topic: DOOMED, messages: [{ value: 'x' }] }))
+    ).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    expect(await failure(admin.fetchTopicMetadata({ topics: [DOOMED] }))).toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(await failure(share.subscribe({ topics: [DOOMED] }))).toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(statuses).toEqual([])
+  }, 30000)
 
   describe('with the default metadata age, as the live recreation checks run', () => {
     /**

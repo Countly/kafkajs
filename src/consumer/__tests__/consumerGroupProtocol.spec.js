@@ -672,6 +672,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       // metadata max age, which is the shipped default 300000 here.
       expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith([TOPIC_ID_B], {
         isCurrent: expect.any(Function),
+        surface: true,
       })
       expect(h.sent).toHaveLength(2)
 

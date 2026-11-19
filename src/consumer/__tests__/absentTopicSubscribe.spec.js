@@ -209,9 +209,10 @@ const build = ({ unregisteredTopics, clock }) => {
         : [],
     findBroker: jest.fn(async () => ({ fetch: async () => ({ responses: [] }) })),
     findGroupCoordinator: jest.fn(async () => coordinator),
-    addMultipleTargetTopics: jest.fn(async (names) => {
+    registerAssignedTopics: jest.fn(async (names) => {
       log.push({ kind: 'target', names })
       for (const name of names) targets.add(name)
+      return names
     }),
   }
   const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -294,7 +295,7 @@ describe('Consumer > an assigned topic the member subscribed to before it existe
 
     await h.trip()
     expect(h.group.assigned()).toEqual([])
-    expect(h.cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+    expect(h.cluster.registerAssignedTopics).not.toHaveBeenCalled()
 
     h.create()
     await h.trip()
@@ -322,7 +323,7 @@ describe('Consumer > an assigned topic the member subscribed to before it existe
     await h.trip()
     await h.trip()
 
-    expect(h.cluster.addMultipleTargetTopics).toHaveBeenCalledTimes(1)
+    expect(h.cluster.registerAssignedTopics).toHaveBeenCalledTimes(1)
     expect(unregistered.size).toBe(0)
   })
 
@@ -333,6 +334,6 @@ describe('Consumer > an assigned topic the member subscribed to before it existe
     await h.trip()
     await h.trip()
 
-    expect(h.cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+    expect(h.cluster.registerAssignedTopics).not.toHaveBeenCalled()
   })
 })
