@@ -3,6 +3,7 @@ const Batch = require('../batch')
 const PollTimer = require('../pollTimer')
 const HeartbeatManager = require('../heartbeatManager')
 const ConsumerGroup = require('../consumerGroup')
+const GroupOwnership = require('../groupOwnership')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
@@ -10,6 +11,7 @@ const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const {
   pollIntervalExceededError,
   stampGeneration,
+  stampOwnership,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
 const {
@@ -394,6 +396,180 @@ describe('Consumer > RebalanceCoordinator > the inter-round yield', () => {
     const { coordinator } = build()
 
     expect(() => coordinator.notifyStopRequested()).not.toThrow()
+  })
+})
+
+describe('Consumer > RebalanceCoordinator > the round after the inter-round yield', () => {
+  /** A consumer-protocol coordinator whose current membership is already lost. */
+  const lostMember = () => {
+    const built = build()
+    Object.assign(built.consumerGroup, {
+      kind: 'consumer',
+      joinCount: 1,
+      ownership: new GroupOwnership(),
+      needsReconciliation: () => true,
+    })
+    built.consumerGroup.ownership.lose(new Error('fenced'), 0)
+    return built
+  }
+
+  it('ends the chain when the membership is lost and no LOST round is owed', () => {
+    const { coordinator } = lostMember()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'revoked', reason: null, level: false })
+  })
+
+  it('runs the LOST round chosen before the wait even though the membership is lost', () => {
+    const { coordinator } = lostMember()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'lost', reason: 'fenced', level: false })
+    ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
+  })
+
+  it('keeps the chosen round when the slot holds a LOST of a membership an apply has since renewed', () => {
+    const { coordinator, consumerGroup } = lostMember()
+    coordinator.verdict = {
+      kind: 'lost',
+      reason: 'fenced',
+      error: stampOwnership(new Error('fenced'), 0),
+    }
+    consumerGroup.ownership.renew()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'revoked', reason: 'assignment-changed', level: true })
+  })
+
+  it.each([
+    ['waits in the slot', true],
+    ['was taken by the fetch loop', false],
+  ])(
+    'opens no reconciliation for a REVOKED while a LOST of the current membership %s',
+    async (_, slotted) => {
+      const { coordinator, consumerGroup } = lostMember()
+      consumerGroup.rebalanceProtocol = () => COOPERATIVE
+      const error = stampOwnership(new Error('fenced'), 0)
+      if (slotted) coordinator.verdict = { kind: 'lost', reason: 'fenced', error }
+
+      coordinator.requestRejoin({
+        kind: 'revoked',
+        reason: 'assignment-changed',
+        error: new Error('assignment changed'),
+      })
+      await Promise.resolve()
+
+      expect(coordinator.isRebalancing()).toBe(false)
+      expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+      expect(coordinator.verdict).toEqual(
+        slotted ? { kind: 'lost', reason: 'fenced', error } : null
+      )
+    }
+  )
+
+  it('opens a reconciliation for a REVOKED once an apply has renewed the membership a slotted LOST belonged to', async () => {
+    const { coordinator, consumerGroup } = lostMember()
+    consumerGroup.rebalanceProtocol = () => COOPERATIVE
+    consumerGroup.needsReconciliation = () => false
+    coordinator.verdict = {
+      kind: 'lost',
+      reason: 'fenced',
+      error: stampOwnership(new Error('fenced'), 0),
+    }
+    consumerGroup.ownership.renew()
+
+    coordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'assignment-changed',
+      error: new Error('assignment changed'),
+    })
+    await coordinator.idle()
+
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
+    expect(coordinator.verdict).toBeNull()
+  })
+
+  it('runs a LOST round queued during the wait even though the membership is lost', () => {
+    const { coordinator } = lostMember()
+    Object.assign(coordinator, {
+      pendingKind: 'lost',
+      pendingJoinCount: 1,
+      rejoinRequested: 'fenced',
+    })
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
+  })
+})
+
+describe('Consumer > RebalanceCoordinator > an abandoned consumer-protocol step', () => {
+  /** A consumer-protocol coordinator whose first step comes back abandoned. */
+  const abandoning = () => {
+    const built = build({ mode: COOPERATIVE, heartbeatInterval: 0 })
+    let owed = true
+    Object.assign(built.consumerGroup, {
+      kind: 'consumer',
+      ownership: new GroupOwnership(),
+      needsReconciliation: () => owed,
+    })
+    built.consumerGroup.joinAndSync
+      .mockImplementationOnce(async () => {
+        built.calls.push('joinAndSync')
+        return { assignment: {}, userData: null, abandoned: true }
+      })
+      .mockImplementation(async () => {
+        built.calls.push('joinAndSync')
+        owed = false
+        return { assignment: {}, userData: null }
+      })
+    return built
+  }
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  it('applies and publishes nothing for an abandoned step, and reconciles the live target in the next round after the wait', async () => {
+    const { coordinator, consumerGroup, calls } = abandoning()
+
+    const chain = coordinator.runRound('assignment-changed', 'revoked')
+    await jest.advanceTimersByTimeAsync(100)
+    await chain
+
+    expect(calls.filter((call) => call !== 'ensureStarted')).toEqual([
+      events.REBALANCING,
+      'joinAndSync',
+      events.REBALANCING,
+      'joinAndSync',
+      'applyRebalanceResult',
+      events.GROUP_JOIN,
+    ])
+    expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(1)
+  })
+
+  it('still applies an abandoned step of a LOST round, whose rejoin replaced the membership', async () => {
+    const { coordinator, consumerGroup, calls } = abandoning()
+
+    const chain = coordinator.runRound('fenced', 'lost')
+    await jest.advanceTimersByTimeAsync(100)
+    await chain
+
+    expect(consumerGroup.applyRebalanceResult.mock.calls[0][0]).toEqual({
+      assignment: {},
+      userData: null,
+      abandoned: true,
+    })
+    expect(
+      calls.filter((call) => !['ensureStarted', 'forgetOwnedPartitions'].includes(call)).slice(0, 5)
+    ).toEqual([
+      events.REBALANCING,
+      'joinAndSync',
+      'applyRebalanceResult',
+      events.GROUP_JOIN,
+      events.REBALANCING,
+    ])
   })
 })
 

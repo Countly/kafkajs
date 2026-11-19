@@ -73,6 +73,15 @@ const leaveEpochFor = (isStatic, leaveGroup) =>
  */
 const MAX_UNRESOLVED_ATTEMPTS = 2
 
+/**
+ * The shortest wait before a join the coordinator fenced is sent again, whatever the retry settings
+ * compute: the same floor as the wait between two reconciliation rounds.
+ */
+const MIN_FENCED_JOIN_BACKOFF_MS = 100
+
+/** The longest delay a Node.js timer takes; a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2147483647
+
 const COORDINATOR_LOAD_IN_PROGRESS = 14
 const COORDINATOR_NOT_AVAILABLE = 15
 const NOT_COORDINATOR = 16
@@ -496,6 +505,19 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
+   * The deadline of a join started now: the rebalance timeout counted from the end of the backoff
+   * still armed (after a fenced join, for example), so the wait does not use it up. Only a member
+   * that will join gets the extra time, and the sum is held to the longest timer delay.
+   * @param {number} timeoutMs the rebalance timeout
+   * @returns {number} milliseconds, at most 2147483647
+   */
+  joinBudget(timeoutMs) {
+    const joins = this.memberEpoch <= 0 || isNotInGroup(this.state) || this.state === JOINING
+    const delay = joins ? this.backoff.remaining(Date.now()) : 0
+    return Math.min(MAX_TIMER_MS, timeoutMs + delay)
+  }
+
+  /**
    * Whether the coordinator wants something this member does not have yet - counting only the
    * partitions a round's apply would keep: those whose topic name is known and, under a client
    * pattern, is in the desired subscription. An unresolved topic id deliberately does NOT make
@@ -533,10 +555,14 @@ module.exports = class ConsumerGroupProtocol {
    *
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
    *   growSubscription?: (names: string[]) => Promise<void> }} context
-   * @returns {Promise<{ assignment: Object, userData: null }>} the assignment in the name-keyed
-   *   shape the apply expects
-   * @throws {Error} the stored fatal error when this member may never rejoin; whatever the join
-   *   failed with otherwise
+   * @returns {Promise<{ assignment: Object, userData: null, abandoned?: true }>} the assignment in
+   *   the name-keyed shape the apply expects; `abandoned` with what the member owns when, while the
+   *   step resolved its target, a newer target replaced it or the rollback of a failed
+   *   `subscribe()` (or a mode change) retired the metadata scope it resolved under: the chain's
+   *   follow-up round reconciles the live target under the current scope
+   * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
+   *   when a fencing, a fatal error, a leave or a rejoin retired the membership or the target
+   *   during the step; whatever the join failed with otherwise
    */
   async rebalance(context) {
     if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
@@ -572,10 +598,18 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     const isCurrent = this.targetGuard()
-    const resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
-    await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
+    let resolved
+    try {
+      resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
+      if (!isCurrent()) throw assignmentChangedError()
+      await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
+      if (!isCurrent()) throw assignmentChangedError()
+    } catch (error) {
+      if (error?.type === 'ASSIGNMENT_CHANGED' && isCurrent.member()) {
+        return { assignment: this.ownedAsObject(), userData: null, abandoned: true }
+      }
+      throw error
+    }
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
@@ -622,7 +656,8 @@ module.exports = class ConsumerGroupProtocol {
    *
    * The deadline is not optional. Without it a coordinator that keeps answering
    * `COORDINATOR_LOAD_IN_PROGRESS` - which is swallowed rather than raised - leaves the retrier
-   * with nothing to retry and the round never settles, which holds a `stop()` open forever.
+   * with nothing to retry and the round never settles, which holds a `stop()` open forever. It is
+   * `joinBudget` of the rebalance timeout.
    *
    * @private
    * @returns {{ promise: Promise<void>, resolve: Function, reject: Function }}
@@ -635,7 +670,7 @@ module.exports = class ConsumerGroupProtocol {
         this.rejectFirstMembership(
           joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeoutMs })
         ),
-      this.rebalanceTimeoutMs
+      this.joinBudget(this.rebalanceTimeoutMs)
     )
 
     this.#firstMembership = record
@@ -789,21 +824,26 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Captures a membership and target identity that is never reused, even at equal local epochs,
-   * and, for a client-pattern consumer, the metadata scope: an accepted mode change retires it.
+   * and, for a client-pattern consumer, the metadata scope: an accepted mode change and the
+   * rollback of a failed `subscribe()` retire it.
    * @private
-   * @returns {() => boolean} true only while this member may use the captured target
+   * @returns {(() => boolean) & { member: () => boolean }} true only while this member may use the
+   *   captured target; `member()` true while the captured membership still holds a target, whatever
+   *   became of the target revision and the scope (a fencing, a fatal error and a leave clear the
+   *   target, a leave only after its commit, hence the state check)
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
     const scope = this.subscription?.captureScope()
-    return () =>
-      (!scope || scope()) &&
+    const member = () =>
       membership === this.membershipRevision &&
-      target === this.targetRevision &&
       this.target != null &&
       !isNotInGroup(this.state) &&
       !isLeavingGroup(this.state)
+    return Object.assign(() => (!scope || scope()) && target === this.targetRevision && member(), {
+      member,
+    })
   }
 
   /**
@@ -1117,6 +1157,10 @@ module.exports = class ConsumerGroupProtocol {
 
       const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
       if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
+      // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
+      if (fencing && sentUnderEpoch === 0) {
+        this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
+      }
 
       throw stampOwnership(
         this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
