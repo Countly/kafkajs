@@ -1496,6 +1496,90 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(run.starts).toHaveBeenCalledTimes(1)
   })
 
+  it('runs the LOST round, not a reconciliation, when a commit is fenced while a handler runs and a heartbeat answered before the fence then brings a new target, and rejoins with the latest target', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const handled = []
+    const latest = { 'topic-a': [0, 1], 'topic-b': [0, 1] }
+    const s = { phase: 'steady', fenced: false }
+    let releaseHandler
+    let releaseHeartbeat
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (request.memberEpoch === 0) {
+        return s.fenced ? fullTarget(100, latest) : fullTarget(1, { 'topic-a': [0] })
+      }
+      if (s.phase === 'hold') {
+        s.phase = 'held'
+        return new Promise((resolve) => {
+          releaseHeartbeat = () => resolve(fullTarget(2, { 'topic-a': [0], 'topic-b': [0, 1] }))
+        })
+      }
+      if (s.phase === 'next') {
+        s.phase = 'done'
+        return fullTarget(3, latest)
+      }
+      return fullTarget(request.memberEpoch, null)
+    }
+    const commit = built.coordinator.offsetCommit.getMockImplementation()
+    built.coordinator.offsetCommit.mockImplementation(async (request) => {
+      if (s.fenced && request.groupGenerationId < 100) {
+        throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      }
+      return commit(request)
+    })
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: ['topic-a', 'topic-b'] })
+    consumer.run({
+      autoCommitInterval: 30000,
+      eachMessage: async ({ topic, partition, message }) => {
+        handled.push({ at: Date.now(), tp: `${topic}|${partition}`, offset: message.offset })
+        if (!s.fenced) await new Promise((resolve) => (releaseHandler = resolve))
+      },
+    })
+    await advanceUntil(() => built.fetches.length > 0)
+    built.state.queue['topic-a|0'] = [40]
+    await advanceUntil(() => !!releaseHandler)
+    s.phase = 'hold'
+    await advanceUntil(() => !!releaseHeartbeat)
+    const [runner] = starts.mock.contexts
+
+    s.fenced = true
+    const fencedIndex = built.log.length
+    const fencedAt = Date.now()
+    await expect(
+      consumer.commitOffsets([{ topic: 'topic-a', partition: 0, offset: '41' }])
+    ).rejects.toThrow()
+    built.state.partial.add('topic-b')
+    built.state.metadataDelay = 700
+    s.phase = 'next'
+    releaseHeartbeat()
+    await jest.advanceTimersByTimeAsync(1500)
+    releaseHandler()
+    await advanceUntil(() => built.log.slice(fencedIndex).some(({ epoch }) => epoch === 0))
+    await jest.advanceTimersByTimeAsync(3000)
+    const after = built.log.slice(fencedIndex)
+
+    expect(partitionEventsAndRejoins(after)).toEqual(['PARTITIONS_LOST', 0, 'PARTITIONS_ASSIGNED'])
+    expect(after.find(({ kind }) => kind === 'PARTITIONS_LOST').partitions).toEqual([
+      { topic: 'topic-a', partitions: [0] },
+    ])
+    expect(after.find(({ kind }) => kind === 'PARTITIONS_ASSIGNED').partitions).toEqual([
+      { topic: 'topic-a', partitions: [0, 1] },
+      { topic: 'topic-b', partitions: [0, 1] },
+    ])
+    // Redelivered from the committed offset 40: the progress past it was discarded.
+    expect(
+      handled
+        .filter(({ at, tp }) => at > fencedAt && tp === 'topic-a|0')
+        .map(({ offset }) => offset)
+    ).toEqual(['40'])
+    expect(after.filter(({ kind }) => kind === 'commit')).toEqual([])
+    expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(100)
+    expect(built.crashes).toEqual([])
+    expect(starts).toHaveBeenCalledTimes(1)
+  })
+
   it('backs off between rejoins the coordinator keeps fencing instead of rejoining once per millisecond, and joins once it accepts one', async () => {
     const built = buildConsumer()
     consumer = built.consumer
