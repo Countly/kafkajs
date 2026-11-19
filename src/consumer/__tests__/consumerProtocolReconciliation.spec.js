@@ -1059,8 +1059,8 @@ const fullTarget = (memberEpoch, byTopic) => ({
  * answers every heartbeat; `state.queue['topic|partition']` holds the offsets the broker serves,
  * one record per Fetch; `state.unknown` holds topic names metadata does not know yet (one is
  * learned per topic-id refresh), `state.partial` topics whose metadata names partition 0 only (until
- * the next metadata refresh), and
- * `state.metadataDelay`/`state.idDelay` delay the next metadata/topic-id refresh once. `log` is
+ * the next metadata refresh), `state.metadataDelay` delays the next metadata refresh once and
+ * `state.idDelays` the next topic-id refreshes, one entry each. `log` is
  * one ordered record of heartbeats, commits and partition events.
  * @returns {object} the consumer and the double's records and switches
  */
@@ -1072,7 +1072,7 @@ const buildConsumer = () => {
     unknown: new Set(),
     partial: new Set(),
     metadataDelay: 0,
-    idDelay: 0,
+    idDelays: [],
   }
   const log = []
   const crashes = []
@@ -1188,7 +1188,8 @@ const buildConsumer = () => {
     }),
     refreshMetadataIfNecessary: jest.fn(async () => {}),
     refreshMetadataForTopicIds: jest.fn(async () => {
-      await delayOnce('idDelay')
+      const delay = state.idDelays.shift()
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay))
       const [next] = state.unknown
       state.unknown.delete(next)
     }),
@@ -1394,6 +1395,43 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
       expect.objectContaining({ offset: '42', generationId: 100 }),
     ])
     expect(run.crashes).toEqual([])
+  })
+
+  it('backs off between rejoins the coordinator keeps fencing instead of rejoining once per millisecond, and joins once it accepts one', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    let fenced = false
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (fenced) throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      return request.memberEpoch === 0 ? fullTarget(1, { 'topic-a': [0] }) : fullTarget(1, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: ['topic-a'] })
+    consumer.run({ eachMessage: async () => {} })
+    await advanceUntil(() => built.fetches.length > 0)
+    const [runner] = starts.mock.contexts
+
+    fenced = true
+    const fencedAt = Date.now()
+    runner.heartbeatManager.requestTick()
+    await jest.advanceTimersByTimeAsync(10000)
+    const rejoins = built.log
+      .filter(({ kind, epoch, at }) => kind === 'heartbeat' && epoch === 0 && at > fencedAt)
+      .map(({ at }) => at)
+
+    // Exponential from the 300 ms retry time, capped at 1 s: at most 1 + 10 s / 240 ms.
+    expect(rejoins.length).toBeGreaterThanOrEqual(5)
+    expect(rejoins.length).toBeLessThanOrEqual(15)
+    expect(Math.min(...rejoins.slice(1).map((at, i) => at - rejoins[i]))).toBeGreaterThanOrEqual(
+      240
+    )
+    expect(built.crashes).toEqual([])
+
+    fenced = false
+    await advanceUntil(() => runner.consumerGroup.groupMembership.memberEpoch === 1, 3000)
+    expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(1)
+    expect(starts).toHaveBeenCalledTimes(1)
   })
 
   it("calls the listener's onPartitionsLost once, before any rejoin, when a fence reaches the slot during the wait while a handler keeps the fetch loop busy", async () => {
