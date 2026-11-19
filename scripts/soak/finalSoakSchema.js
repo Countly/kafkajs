@@ -399,6 +399,19 @@ const RECORDS = Object.freeze({
       members: listOf(Count),
       partitions: listOf(shape('a partition state', { key: Key, leader: Int, isr: listOf(Count) })),
       cause: Id,
+      downMs: Ms,
+      processAt: nullable(Ms),
+      processTime: nullable(Id),
+    },
+  },
+  wave: {
+    fields: {
+      client: Id,
+      event: oneOf('transfer', 'return'),
+      member: Id,
+      paused: listOf(Key),
+      keys: listOf(Key),
+      observed: Bool,
     },
   },
   identity: {

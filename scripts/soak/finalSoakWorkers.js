@@ -325,10 +325,7 @@ class ChildRuntime {
       topicIds: (topic) => this.topicIds.get(topic) ?? null,
       onEvent: (event) => this.observed(event),
     })
-    this.observer.lives = (client, topic, topicId) =>
-      this.lifetimes.get(`${client}/${topic}`)?.endsWith(`/${topicId}`)
-        ? this.lifetimes.get(`${client}/${topic}`)
-        : null
+    this.observer.lives = (client, topic, topicId) => this.lifetimeOf(client, topic, topicId)
     this.observer.install()
     this.worker = createWorker(this)
   }
@@ -458,9 +455,20 @@ class ChildRuntime {
   }
 
   /**
+   * @param {string} client @param {string} topic @param {string} topicId
+   * @returns {string|null} the accepted lifetime `<publication>/<topicId>` the name is in for this
+   *   incarnation, or null when no publication accepted it with that id
+   */
+  lifetimeOf(client, topic, topicId) {
+    const life = this.lifetimes.get(`${client}/${topic}`)
+    return life?.endsWith(`/${topicId}`) ? life : null
+  }
+
+  /**
    * Emits an accepted subscription publication and keeps each accepted `(client, topic, id)`
    * lifetime: it starts at its first publication and ends when the name leaves the subscription or
-   * its id changes. Names without a known id are reported, not published.
+   * its id changes. A recreation (`ConsumerGroup#invalidateTopic`) publishes too, so the new id
+   * starts its own lifetime. Names without a known id are reported, not published.
    * @param {object} group the publishing consumer group
    * @param {string[]} topics its accepted names
    * @returns {void}
@@ -940,9 +948,13 @@ class ProducerWorker extends Worker {
     }
   }
 
-  /** @returns {Promise<void>} answers an idle command once the send or transaction in flight settles */
+  /**
+   * @returns {Promise<void>} answers an idle command once the send or transaction in flight, and
+   *   every probe send that outlived its execution deadline, has settled
+   */
   async onIdle() {
     await this.current
+    await Promise.all(this.lateSends ?? [])
   }
 
   /**
@@ -953,6 +965,7 @@ class ProducerWorker extends Worker {
   async disconnect() {
     this.loops?.abort()
     await this.loop
+    await Promise.all(this.lateSends ?? [])
     return super.disconnect()
   }
 
@@ -960,10 +973,22 @@ class ProducerWorker extends Worker {
    * Offers one logical id once: its offered record, the send, then its settled outcome. An id
    * whose topic id is not yet known is not offered. A send the client reports as a success with
    * offset `-1` (the broker deduplicated it and returned no location) is acknowledged with no
-   * offset: the location is unknown, never invented.
+   * offset: the location is unknown, never invented. A send still in flight at `deadline` is
+   * recorded `unknown` (`ExecutionDeadline`) so the caller answers in time; the client cannot cancel
+   * it, so it is kept until it settles (bounded by the producer's delivery timeout) and its late
+   * result is noted, never recorded as a second outcome.
+   * @param {number} [deadline] run-clock ms past which the offer stops waiting for the send
    * @returns {Promise<'acknowledged'|'unknown'|'skipped'>} the send's outcome
    */
-  async offer(rig, topic, partition, transaction, sender = rig.object, execution = null) {
+  async offer(
+    rig,
+    topic,
+    partition,
+    transaction,
+    sender = rig.object,
+    execution = null,
+    deadline = Infinity
+  ) {
     const { runtime } = this
     const topicId = runtime.topicIds.get(topic)
     if (!topicId) {
@@ -990,22 +1015,33 @@ class ProducerWorker extends Worker {
       bytes: record.value.length,
       transaction,
     })
+    const sending = Promise.resolve()
+      .then(() =>
+        sender.send({
+          topic,
+          acks: -1,
+          messages: [{ key: record.key, value: record.value, partition }],
+        })
+      )
+      .then(
+        ([meta] = []) => ({ meta }),
+        (error) => ({ error })
+      )
+    const settled = await this.within(sending, deadline)
     let ack
-    try {
-      const [meta] = await sender.send({
-        topic,
-        acks: -1,
-        messages: [{ key: record.key, value: record.value, partition }],
-      })
-      const offset = meta?.baseOffset ?? null
+    if (!settled) {
+      ack = { outcome: 'unknown', offset: null, errorType: 'ExecutionDeadline' }
+      this.late(sending, record.id, execution)
+    } else if (settled.error) {
+      ack = { outcome: 'unknown', offset: null, errorType: settled.error.name ?? 'Error' }
+      await runtime.failed(`${record.id}.send`, settled.error)
+    } else {
+      const offset = settled.meta?.baseOffset ?? null
       // '-1' is the client's success for a send the broker already had, at no known location
       ack =
         offset === null
           ? { outcome: 'unknown', offset: null, errorType: null }
           : { outcome: 'acknowledged', offset: offset === '-1' ? null : offset, errorType: null }
-    } catch (e) {
-      ack = { outcome: 'unknown', offset: null, errorType: e.name ?? 'Error' }
-      await runtime.failed(`${record.id}.send`, e)
     }
     await runtime.emit({
       kind: 'identity',
@@ -1021,8 +1057,47 @@ class ProducerWorker extends Worker {
   }
 
   /**
+   * @param {Promise<object>} promise a settled-shape send
+   * @param {number} deadline run-clock ms
+   * @returns {Promise<object|null>} its settlement, or null once the deadline passed first; the
+   *   deadline timer is cleared either way
+   */
+  async within(promise, deadline) {
+    if (deadline === Infinity) return promise
+    const timer = new AbortController()
+    try {
+      return await Promise.race([
+        promise,
+        this.runtime.clock.sleepUntil(deadline, timer.signal).then(() => null),
+      ])
+    } finally {
+      timer.abort()
+    }
+  }
+
+  /**
+   * Keeps a send that outlived its execution deadline until it settles, then notes its result (a
+   * failure with its details), so idle and disconnect wait for it and nothing is left in flight.
+   * @param {Promise<{ meta?: object, error?: Error }>} sending @param {string} id the offered id
+   * @param {string|null} execution
+   * @returns {void}
+   */
+  late(sending, id, execution) {
+    this.lateSends ??= new Set()
+    const done = sending.then(async ({ error }) => {
+      const result = error ? (error.name ?? 'Error') : 'ok'
+      await this.runtime.diagnose(
+        `probe send ${id} settled after the ${execution} deadline: ${result}`
+      )
+      if (error) await this.runtime.failed(`${id}.send`, error)
+      this.lateSends.delete(done)
+    })
+    this.lateSends.add(done)
+  }
+
+  /**
    * Offers the probe ids an auxiliary execution asks for, and stops starting sends once the
-   * execution's deadline has passed.
+   * execution's deadline has passed; a send in flight at the deadline stops being awaited there.
    * @param {{ execution: string, topic: string, partitions: number, count: number,
    *   deadline?: number }} step
    * @returns {Promise<{ offered: number, stopped: boolean }>}
@@ -1037,7 +1112,8 @@ class ProducerWorker extends Worker {
         offered % step.partitions,
         null,
         undefined,
-        step.execution
+        step.execution,
+        step.deadline ?? Infinity
       )
     }
     return { offered, stopped: false }
@@ -1344,6 +1420,31 @@ class ConsumerWorker extends Worker {
   }
 
   /**
+   * Journals what one member held of a wave's paused keys when the wave observed the transfer to
+   * the extra or the return to the standing member (or, when not observed, at the wave deadline),
+   * so the transfer can be audited from the journal; the record's `at` is that instant.
+   * @param {string} execution the wave @param {'transfer'|'return'} event
+   * @param {ClientRig} standing @param {ClientRig} member the extra, or the standing member
+   * @param {object[]} paused the keys paused in this wave
+   * @param {(rig: ClientRig) => object[]} heldBy the paused keys a member holds now
+   * @param {boolean} observed whether the event was seen before the deadline
+   * @returns {Promise<void>}
+   */
+  async waveRecord(execution, event, standing, member, paused, heldBy, observed) {
+    await this.runtime.emit({
+      kind: 'wave',
+      recordId: this.runtime.nextId(),
+      execution,
+      event,
+      client: standing.id,
+      member: member.id,
+      paused,
+      keys: heldBy(member),
+      observed,
+    })
+  }
+
+  /**
    * One phase of one membership wave, its own pause-resume execution (`step.execution`). `leave`:
    * pause the standing member's assigned keys, join the extra, wait for the extra to take at least
    * one paused key, remove the extra and wait until the standing member holds every paused key
@@ -1382,11 +1483,13 @@ class ConsumerWorker extends Worker {
       standing.object.pause(byTopic(keys))
     )
     this.extras.push(await this.join(extraSlot, execution))
-    const held = (rig) =>
-      this.assignedKeys(rig).some((a) =>
-        keys.some((k) => k.topicId === a.topicId && k.partition === a.partition)
+    const heldBy = (rig) =>
+      keys.filter((k) =>
+        this.assignedKeys(rig).some((a) => k.topicId === a.topicId && k.partition === a.partition)
       )
-    const transferred = await this.until(() => held(this.extras.at(-1)), deadline)
+    const extra = this.extras.at(-1)
+    const transferred = await this.until(() => heldBy(extra).length > 0, deadline)
+    await this.waveRecord(execution, 'transfer', standing, extra, keys, heldBy, transferred)
     if (!transferred) await runtime.diagnose(`${execution} saw no transfer of a paused partition`)
     if (step.wave === 0 && step.restart?.includes(extraSlot.clientKind)) {
       const old = this.extras.pop()
@@ -1401,11 +1504,8 @@ class ConsumerWorker extends Worker {
       if (leave) await runtime.diagnose(`${execution} retires ${rig.id} with an explicit leave`)
       await rig.retire(execution, leave)
     }
-    const owns = (k) =>
-      this.assignedKeys(standing).some(
-        (a) => a.topicId === k.topicId && a.partition === k.partition
-      )
-    const returned = await this.until(() => keys.every(owns), deadline)
+    const returned = await this.until(() => heldBy(standing).length === keys.length, deadline)
+    await this.waveRecord(execution, 'return', standing, standing, keys, heldBy, returned)
     if (!returned)
       await runtime.diagnose(`${execution} saw the paused partitions not return to ${standing.id}`)
     return { transfers: transferred ? 1 : 0, returned }
@@ -1495,8 +1595,12 @@ class ConsumerWorker extends Worker {
 
   /**
    * Commits every key whose resolved next offset is ahead of the member's last successful commit,
-   * outside any handler, skipping a key whose captured authority is no longer the member's own: the
-   * new owner's progress covers it. A drain with `ends` is the final one (`finalDrain`).
+   * outside any handler. The member still owns a key while it holds the acquisition its last
+   * handler ran under (same client run, `acquiredAt` and `recreatedAt`); a membership round that
+   * retained the key (a cooperative or consumer-protocol rebalance) only advances the token, and
+   * the commit then carries the current authority. Any other key is an expected skip, journaled
+   * with its reason: its current owner's progress covers it. A drain with `ends` is the final one
+   * (`finalDrain`).
    * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps `topic|partition`
    *   to the log end the group must commit
    * @returns {Promise<{ reached: boolean }>} whether every key reached its end in time
@@ -1509,17 +1613,22 @@ class ConsumerWorker extends Worker {
       for (const [k, next] of [...(rig.processed ?? [])]) {
         if (BigInt(next) <= BigInt(rig.committed.get(k) ?? 0)) continue
         const now = group && group.acquired?.has(k) ? observer.currentAuthority(group, k) : null
-        const then = rig.authority.get(k)?.authority
-        const same =
-          now &&
-          then &&
-          now.run === then.run &&
-          now.token === then.token &&
-          now.acquiredAt === then.acquiredAt &&
-          now.recreatedAt === then.recreatedAt
-        if (same) await this.commit(rig, k)
+        const captured = rig.authority.get(k)
+        const then = captured?.authority
+        const reason = !now
+          ? 'the member no longer holds the key'
+          : !then
+            ? 'no handler of the member entered the key'
+            : now.run !== then.run
+              ? 'the client run changed since its last handler'
+              : now.acquiredAt !== then.acquiredAt || now.recreatedAt !== then.recreatedAt
+                ? 'the key was acquired again since its last handler'
+                : null
+        if (reason === null) await this.commit(rig, k, { key: captured.key, authority: now })
         else
-          await this.runtime.diagnose(`drain commit of ${k} by ${rig.id} skipped: authority moved`)
+          await this.runtime.diagnose(
+            `expected skip: drain commit of ${k} by ${rig.id}: ${reason}; its current owner's progress covers it`
+          )
       }
     }
     return { reached: true }

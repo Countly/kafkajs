@@ -253,6 +253,68 @@ describe('final soak observer evidence', () => {
     }
     expect(observer.exchanges.size).toBe(0)
   })
+
+  test('a pause state created after its topic was recreated carries the new incarnation and its subscription lifetime', () => {
+    const NEW = 'CCCCCCCCCCCCCCCCCCCCCC'
+    const recreate = config.topics.recreate[0]
+    const ids = { [config.topics.main]: IDS.A, [recreate]: IDS.B }
+    const context = new AsyncLocalStorage()
+    const runtime = {
+      config,
+      matrix,
+      records: [],
+      lifetimes: new Map(),
+      revisions: new Map(),
+      ids: 0,
+      nextId: () => `p01.${runtime.ids++}`,
+      emit: (record) => runtime.records.push(record),
+      diagnose: (message) => runtime.records.push({ kind: 'diagnostic', message }),
+      slotOf: (client) => ChildRuntime.prototype.slotOf.call(runtime, client),
+    }
+    const observer = new PassiveObserver({
+      owners: { ConsumerGroup, SubscriptionState },
+      watched: {
+        ConsumerGroup: ['retainSubscription', 'invalidateTopic'],
+        SubscriptionState: ['pause', 'resume', 'retireTopic'],
+      },
+      context,
+      onEvent: (event) =>
+        event.type === 'subscription' &&
+        ChildRuntime.prototype.published.call(runtime, event.group, event.names),
+    })
+    runtime.observer = observer
+    observer.lives = (client, topic, topicId) =>
+      ChildRuntime.prototype.lifetimeOf.call(runtime, client, topic, topicId)
+    observer.install()
+    try {
+      const group = realGroup()
+      group.cluster = { topicId: (topic) => ids[topic] ?? null, targetTopics: new Set() }
+      group.preparationChanged = () => {}
+      context.run('c01.1', () => {
+        group.retainSubscription([config.topics.main, recreate])
+        group.subscriptionState.pause([{ topic: recreate, partitions: [0, 1] }])
+      })
+      ids[recreate] = NEW
+      context.run('c01.1', () => {
+        group.invalidateTopic(recreate)
+        group.subscriptionState.pause([{ topic: recreate, partitions: [0] }])
+        group.subscriptionState.resume([{ topic: recreate, partitions: [0] }])
+      })
+      const entries = observer.pauseStates()
+      expect(observer.unknownTopicIds).toBe(0)
+      const fresh = entries.find((e) => e.topic === recreate)
+      expect(fresh.originTopicId).toBe(NEW)
+      expect(fresh.subscriptionLife).toMatch(new RegExp(`^p01\\.\\d+/${NEW}$`))
+      const last = runtime.records.filter((r) => r.kind === 'subscription').at(-1)
+      expect(last.names).toEqual([
+        { topic: config.topics.main, topicId: IDS.A },
+        { topic: recreate, topicId: NEW },
+      ])
+      expect(runtime.lifetimes.get(`c01.1/${config.topics.main}`)).toMatch(/^p01\.0\//)
+    } finally {
+      observer.restore()
+    }
+  })
 })
 
 describe('final soak handler entries', () => {

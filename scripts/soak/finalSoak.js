@@ -1279,8 +1279,12 @@ class Supervisor {
     const service = `kafka${step.node}`
     const failures = []
     const container = await this.docker(['compose', 'ps', '-aq', service]).catch(() => '')
-    const pid = async () =>
-      Number(await this.docker(['inspect', '-f', '{{.State.Pid}}', container]).catch(() => NaN))
+    const inspect = async () => {
+      const format = '{{.State.Pid}} {{.State.StartedAt}} {{.State.FinishedAt}}'
+      const out = await this.docker(['inspect', '-f', format, container]).catch(() => '')
+      const [pid, startedAt = null, finishedAt = null] = out.split(' ')
+      return { pid: out ? Number(pid) : NaN, startedAt, finishedAt }
+    }
     const op = async (name, args) => {
       const operation = `${SUPERVISOR}.b${this.runtime.ids}`
       const base = {
@@ -1310,14 +1314,9 @@ class Supervisor {
       'broker-stop',
       step.stop === 'clean' ? ['stop', service] : ['kill', '-s', 'SIGKILL', service]
     )
-    const down = await pid()
-    await this.brokerState(
-      step,
-      'down',
-      Number.isNaN(down) ? 0 : down,
-      container,
-      stopped.operation
-    )
+    const afterStop = await inspect()
+    const down = afterStop.pid
+    await this.brokerState(step, 'down', afterStop, container, stopped.operation)
     if (stopped.ok && down !== 0)
       failures.push(`${service} still runs (pid ${down}) after its stop`)
     await this.clock.sleepUntil(this.clock.now() + step.downMs)
@@ -1326,8 +1325,9 @@ class Supervisor {
       (await this.admin.describeCluster().catch(() => ({ brokers: [] }))).brokers.length === 3
     while (!(await ready()) && this.clock.now() < step.deadline)
       await this.clock.sleepUntil(this.clock.now() + 500)
-    const up = await pid()
-    await this.brokerState(step, 'ready', Number.isNaN(up) ? 0 : up, container, started.operation)
+    const afterStart = await inspect()
+    const up = afterStart.pid
+    await this.brokerState(step, 'ready', afterStart, container, started.operation)
     if (!(await ready())) failures.push(`the cluster did not regain three brokers by the deadline`)
     else if (started.ok && !(up > 0))
       failures.push(`${service} has no running process after its start`)
@@ -1338,7 +1338,7 @@ class Supervisor {
     }
     while (!(await inSync()) && this.clock.now() < step.deadline)
       await this.clock.sleepUntil(this.clock.now() + 500)
-    await this.brokerState(step, 'isr', Number.isNaN(up) ? 0 : up, container, started.operation)
+    await this.brokerState(step, 'isr', afterStart, container, started.operation)
     if (!(await inSync())) failures.push('the run partitions are not all in sync by the deadline')
     const replies = await Promise.all(
       participants.map((slot) => this.command(slot, { ...step, type: 'recovered' }))
@@ -1368,19 +1368,34 @@ class Supervisor {
     )
   }
 
-  /** Emits one broker-state record. */
-  async brokerState(step, event, pid, container, cause) {
+  /**
+   * Emits one broker-state record: the configured down interval, and the container's own instant
+   * for the event (its process stop for `down`, its process start for `ready` and `isr`), raw as
+   * Docker reports it and on the run clock, so a reader can check the actual down time against the
+   * configured one. An instant Docker does not report (zero or unparseable) is null.
+   * @param {object} step the outage step @param {'down'|'ready'|'isr'} event
+   * @param {{ pid: number, startedAt: string|null, finishedAt: string|null }} state from inspect
+   * @param {string} container @param {string} cause the stop or start operation
+   * @returns {Promise<void>}
+   */
+  async brokerState(step, event, state, container, cause) {
     const { brokers } = await this.admin.describeCluster().catch(() => ({ brokers: [] }))
+    const raw = event === 'down' ? state.finishedAt : state.startedAt
+    const wall = Date.parse(raw)
+    const processAt = wall > 0 ? this.clock.now() - (Date.now() - wall) : null
     await this.emit({
       kind: 'broker-state',
       execution: step.id,
       node: step.node,
-      pid,
+      pid: state.pid > 0 ? state.pid : 0,
       container: container || 'unknown-container',
       event,
       members: brokers.map((b) => b.nodeId).sort((a, b) => a - b),
       partitions: (await this.partitionStates()).filter((p) => p.key.topicId),
       cause,
+      downMs: step.downMs,
+      processAt: processAt !== null && processAt >= 0 ? processAt : null,
+      processTime: processAt !== null && processAt >= 0 ? raw : null,
     })
   }
 
