@@ -515,17 +515,27 @@ module.exports = class RebalanceCoordinator {
 
   /**
    * Picks again once a consumer-protocol chain has waited, because the wait can change what is
-   * owed. A LOST queued during it runs next, ahead of anything chosen before; a LOST queued for a
-   * membership a later join replaced is dropped. A choice taken from a level is replaced by what is
-   * owed now, and ends the chain when nothing is. An explicit re-entry or LOST chosen before the
-   * wait stays. A verdict that reached the slot during the wait keeps the chosen round, which
-   * rejoins with epoch 0 after a fence; whether the coordinator accepts that rejoin or fences it
-   * again, the chain ends without an error and the verdict stays in the slot for the runner.
+   * owed. A LOST verdict that reached the slot during the wait ends the chain: the runner's LOST
+   * round (the lost callback or `PARTITIONS_LOST`, and the discard of uncommitted offsets) must run
+   * before any other round, and the fetch loop takes the verdict once its in-flight handlers
+   * return. Only a verdict of the current membership is slotted, and no round renews the
+   * membership while the chain waits. A loss of the current membership the fetch loop already took
+   * ends the chain too, unless the chain owes a LOST round itself: no round may apply, and renew
+   * the membership, under a membership the runner is about to report lost. A LOST queued during
+   * the wait runs next, ahead of anything chosen before; a LOST queued for a membership a later
+   * join replaced is dropped. A choice taken from a level is replaced by what is owed now, and ends
+   * the chain when nothing is. An explicit re-entry or LOST chosen before the wait stays.
    * @private
    * @param {{ kind: string, reason: string, level: boolean }} chosen the round picked before the wait
    * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} the round to run, if any
    */
   nextRoundAfterWait(chosen) {
+    const ownership = this.consumerGroup.ownership
+    const taken =
+      chosen.kind !== 'lost' && this.pendingKind !== 'lost' && ownership?.refusal(ownership.token())
+    if (this.verdict?.kind === 'lost' || taken) {
+      return { kind: chosen.kind, reason: null, level: false }
+    }
     if (chosen.kind === 'lost' || (!chosen.level && this.pendingKind === null)) return chosen
     const now = this.nextRound(false)
     if (now.reason || (chosen.level && this.verdict === null)) return now
@@ -788,7 +798,9 @@ module.exports = class RebalanceCoordinator {
    * answers for the membership it was sent for, so once a round has joined there is nothing left to
    * reset and no verdict to raise, and resetting would void the new membership. The count, not the
    * generation, because a rejoin can come back at the same generation or epoch. Otherwise the
-   * generation is reset, and a round still in flight owns the rejoin, so no LOST verdict is raised.
+   * generation is reset, and a round still in flight owns the rejoin, so no LOST verdict is raised,
+   * unless the chain is in a consumer-protocol wait between rounds: that chain ends at wake-up, so
+   * the LOST verdict is raised and the runner's LOST round rejoins.
    *
    * @param {{ elapsedMs: number, isStatic: boolean }} details
    * @returns {Promise<void>}
@@ -850,7 +862,10 @@ module.exports = class RebalanceCoordinator {
 
     // A round that started during the leave above already rejoins this member. A second LOST would
     // stay in the slot after that round ends, and an orphan there reads as a rebalance still owed.
-    if (this.isRebalancing()) {
+    // A consumer-protocol chain waiting between rounds (a wait armed in `stopWaiters`) rejoins
+    // nobody: the leave cleared its target, so it ends at wake-up. Its LOST goes to the slot, as a
+    // fence's does, and the runner's LOST round rejoins once the in-flight handlers return.
+    if (this.isRebalancing() && this.stopWaiters.size === 0) {
       return
     }
 

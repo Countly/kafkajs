@@ -1435,7 +1435,8 @@ module.exports = class ConsumerGroup {
     this.leaderUnionWatch?.clear()
     const run = this.idleWait
     const leaderAttempt = Symbol('leader attempt')
-    const roundDeadlineAt = performance.now() + this.rebalanceTimeout
+    const roundDeadlineAt =
+      performance.now() + this.rebalanceTimeout + (this.groupMembership?.joinDelay?.() ?? 0)
     const expired = joinDeadlineError({
       rebalanceTimeoutMs: this.rebalanceTimeout,
     })

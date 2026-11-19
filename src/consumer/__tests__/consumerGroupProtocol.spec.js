@@ -2018,7 +2018,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('A fencing while joining', () => {
-    it('rejects the step with the fencing, and the retried step joins', async () => {
+    it('rejects the step with the fencing, and the retried step joins once the backoff the fenced join armed has elapsed', async () => {
       const h = build({
         answers: [createErrorFromCode(110), heartbeatResponse({ memberEpoch: 3 })],
       })
@@ -2030,7 +2030,14 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await expect(fenced).rejects.toMatchObject({ code: 110 })
       expect(h.protocol.state).toEqual(FENCED)
 
-      const retried = await await startStep(h)
+      const sentAtFence = h.sent.length
+      const retrying = h.protocol.rebalance(context())
+      retrying.catch(() => {})
+      await h.manager.tick()
+      expect(h.sent).toHaveLength(sentAtFence)
+      jest.advanceTimersByTime(1000)
+      await h.manager.tick()
+      const retried = await retrying
 
       expect(retried).toEqual({ assignment: {}, userData: null })
       expect(h.protocol.memberEpoch).toEqual(3)
@@ -2044,6 +2051,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       fenced.catch(() => {})
       await h.manager.tick()
       await expect(fenced).rejects.toMatchObject({ code: 25 })
+      jest.advanceTimersByTime(1000)
       await await startStep(h)
 
       h.protocol.setOwned([])
@@ -2637,6 +2645,31 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
         type: 'ASSIGNMENT_CHANGED',
       })
+    })
+
+    it('throws the assignment change when a leave starts while the names resolve, before the leave clears the target', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      let release
+      jest
+        .spyOn(h.protocol, 'releaseOwnedPartitions')
+        .mockImplementation(() => new Promise((resolve) => (release = resolve)))
+      const resolve = h.protocol.resolveAssignmentTopicNames.bind(h.protocol)
+      let leaving
+      jest.spyOn(h.protocol, 'resolveAssignmentTopicNames').mockImplementation(async (...args) => {
+        const resolved = await resolve(...args)
+        leaving = h.protocol.leave()
+        return resolved
+      })
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+      expect(h.protocol.state).toEqual(PREPARE_LEAVING)
+      expect(h.protocol.target).not.toBeNull()
+      release()
+      await leaving
     })
 
     it('throws the assignment change when the target retires right after the subscription grew', async () => {
