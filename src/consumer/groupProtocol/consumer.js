@@ -73,6 +73,12 @@ const leaveEpochFor = (isStatic, leaveGroup) =>
  */
 const MAX_UNRESOLVED_ATTEMPTS = 2
 
+/**
+ * The shortest wait before a join the coordinator fenced is sent again, whatever the retry settings
+ * compute: the same floor as the wait between two reconciliation rounds.
+ */
+const MIN_FENCED_JOIN_BACKOFF_MS = 100
+
 const COORDINATOR_LOAD_IN_PROGRESS = 14
 const COORDINATOR_NOT_AVAILABLE = 15
 const NOT_COORDINATOR = 16
@@ -496,6 +502,16 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
+   * How long a join started now waits before its heartbeat may go out: the backoff still armed,
+   * after a fenced join for example. A join's deadline starts after it, so the wait does not use up
+   * the rebalance timeout.
+   * @returns {number} milliseconds, 0 when nothing holds the join back
+   */
+  joinDelay() {
+    return this.backoff.remaining(Date.now())
+  }
+
+  /**
    * Whether the coordinator wants something this member does not have yet - counting only the
    * partitions a round's apply would keep: those whose topic name is known and, under a client
    * pattern, is in the desired subscription. An unresolved topic id deliberately does NOT make
@@ -641,7 +657,8 @@ module.exports = class ConsumerGroupProtocol {
    *
    * The deadline is not optional. Without it a coordinator that keeps answering
    * `COORDINATOR_LOAD_IN_PROGRESS` - which is swallowed rather than raised - leaves the retrier
-   * with nothing to retry and the round never settles, which holds a `stop()` open forever.
+   * with nothing to retry and the round never settles, which holds a `stop()` open forever. It is
+   * the rebalance timeout counted from the end of any backoff still armed (`joinDelay`).
    *
    * @private
    * @returns {{ promise: Promise<void>, resolve: Function, reject: Function }}
@@ -654,7 +671,7 @@ module.exports = class ConsumerGroupProtocol {
         this.rejectFirstMembership(
           joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeoutMs })
         ),
-      this.rebalanceTimeoutMs
+      this.rebalanceTimeoutMs + this.joinDelay()
     )
 
     this.#firstMembership = record
@@ -1137,7 +1154,9 @@ module.exports = class ConsumerGroupProtocol {
       const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
       if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
       // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
-      if (fencing && sentUnderEpoch === 0) this.backoff.onFailedAttempt(Date.now())
+      if (fencing && sentUnderEpoch === 0) {
+        this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
+      }
 
       throw stampOwnership(
         this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
