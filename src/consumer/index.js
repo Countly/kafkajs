@@ -525,7 +525,9 @@ module.exports = (params) => {
   /**
    * Returns the lifetime that serves a connect, run or start, beginning a new one when an explicit
    * disconnect has started on the current one, and subscribes it to the cluster's topic-recreation
-   * event, at most once per lifetime. Called at construction and again from connect(), run() and
+   * event, at most once per lifetime. A recreation of any selected topic is owed a reset: a
+   * subscribed name, a client-pattern match, an assigned topic, or a name a broker-side pattern
+   * resolved to. Called at construction and again from connect(), run() and
    * start(), so a consumer reused after disconnect() - including the restart onCrash schedules,
    * which reaches start() alone - re-arms rather than running with the reset silently inert.
    *
@@ -544,10 +546,12 @@ module.exports = (params) => {
       try {
         const { topic, topicId } = payload
 
+        // A broker-side pattern's matched names exist only as the targets it grew.
         if (
           !Object.hasOwn(topics, topic) &&
           !declared.desired.topicConfigurations.has(topic) &&
-          !(manual && Object.hasOwn(manual.configurations, topic))
+          !(manual && Object.hasOwn(manual.configurations, topic)) &&
+          !(subscribedTopicRegex != null && cluster.targetTopics.has(topic))
         ) {
           return
         }
