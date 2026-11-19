@@ -420,7 +420,7 @@
     "check-exports.py": "3b607b9c28b5e855a9f65d9ff82952fe399ca5fac0c1b644a6604faa9c98df67",
     "check-golden-protoc.py": "047fdb999918513e22cba75164197e5a92d29b40324dd3d2daf5c537fbf4540c",
     "check-golden.py": "e7734ff4569b0317505238e380f638095b2e6a0edf8ceec2a8d3910116514b83",
-    "fetch.sh": "4bd8e416d1911026569527a75aa5d487d2ab494353a108ea3672d95a66a5b1b0",
+    "fetch.sh": "6e60de1c7217fdd86fbeb75025110300e08be725bf3c1cdd5a67bbbeaeeb79e9",
     "lib.sh": "e439e1d349bb8e2e9f8c7e97d1175a5671c89ca2596f4a3b0e523c756f6d5cdc",
     "make-golden.sh": "fe81af51242bff3d7c98de7be40911ab1a9a581caaba1fffaba98a6616db12ca",
     "protoc-text-to-semantic.py": "996dbb4b65a6f128a61d22d614c4f61fc1d467d97b5ca0c3cae4b063be12870f",
@@ -435,7 +435,8 @@
     "run-h6a-arm.sh": "edc7de09967a45fb3f149ed27f95bbd360a023c222395c5006f78e99470e9fa2",
     "prepare-reporter-source.sh": "3748442ebfa83bed146058594ef3942acd8dd7808431f1f285e5e46278d73797",
     "legacy/JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
-    "prepare-client-source.sh": "640576304be9ede6093c089c659955cbd67fe12083e6e01d19a8d9b7ce95c5de"
+    "prepare-client-source.sh": "640576304be9ede6093c089c659955cbd67fe12083e6e01d19a8d9b7ce95c5de",
+    "download.sh": "b49018c2dcf031ec721acd69b5a38f73c71d68560be874f7e9607a752a67a457"
   },
   "composeSha256": {
     "docker-compose.telemetry.yml": "cd6640b6553198f0a3b57479f74faffe4df44dbe52e2c990ce9f7136b8974075"
@@ -520,6 +521,16 @@
       "run": "https://github.com/Countly/kafkajs/actions/runs/43166020031",
       "builtFromCommit": "7eda41607a4f2648eca948ae57b7878912c23692",
       "javac": "javac 21.0.13"
+    },
+    {
+      "id": "fetch-retry",
+      "date": "2026-11-19",
+      "change": "fetch.sh and fetch-interop.sh download through the new download.sh: up to four attempts per file with a 2, 4, 6 s backoff under one 150 s deadline, each into a temporary name renamed only after its SHA-256 matches the pinned entry in inputs.sha256 or interop.sha256 (a mismatch is a failed attempt), and the failing file, URL and reason on stderr. A cached file is kept offline only when its digest matches; otherwise it is fetched again. The URL lists, inputs.sha256, interop.sha256 and every retained jar are unchanged; the final whole-set SHA-256 check is unchanged.",
+      "fetchSha256Before": "4bd8e416d1911026569527a75aa5d487d2ab494353a108ea3672d95a66a5b1b0",
+      "fetchSha256After": "6e60de1c7217fdd86fbeb75025110300e08be725bf3c1cdd5a67bbbeaeeb79e9",
+      "addedScripts": [
+        "download.sh"
+      ]
     }
   ]
 }
