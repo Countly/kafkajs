@@ -326,6 +326,29 @@ class PassiveObserver {
     return { topic, topicId, partition: Number(partition) }
   }
 
+  /**
+   * Whether a group's run is still its consumer's current run, by the product's own run identity.
+   * A run ends at a stop, a disconnect or a crash, and a restart starts a new one; the consumer
+   * then drops the old group, but a weak reference still answers until a collection clears it, so
+   * reachability never decides liveness. A group without a run identity counts as current.
+   * @param {object} group @returns {boolean}
+   */
+  isCurrent(group) {
+    return group.runIdentity?.isCurrent?.() !== false
+  }
+
+  /**
+   * The live group that uses `object` as its `field`, preferring the one whose run is current: a
+   * consumer's ledger outlives its runs, so a restarted run and its not yet collected predecessor
+   * share it. Without a current one (a run stopping) the stopping run's group answers.
+   * @param {string} field @param {object} object
+   * @returns {object|undefined}
+   */
+  groupUsing(field, object) {
+    const groups = this.live('ConsumerGroup').filter((g) => g[field] === object)
+    return groups.find((g) => this.isCurrent(g)) ?? groups[0]
+  }
+
   /** @param {object} group @returns {string} the weak id of the group's current run identity */
   runOf(group) {
     const identity = group?.runIdentity
@@ -595,7 +618,7 @@ class PassiveObserver {
         if (method === 'pause' || method === 'resume') origin.lastOperation = op
         continue
       }
-      const group = this.live('ConsumerGroup').find((g) => g.subscriptionState === receiver)
+      const group = this.groupUsing('subscriptionState', receiver)
       const client = this.clientOf(group ?? receiver)
       this.origins.set(state, {
         stateId: this.idOf(state, 'p'),
@@ -624,7 +647,7 @@ class PassiveObserver {
    */
   ticketBegan(ledger, ticket) {
     if (!ticket || typeof ticket !== 'object') return
-    const group = this.live('ConsumerGroup').find((g) => g.operations === ledger)
+    const group = this.groupUsing('operations', ledger)
     const id = this.idOf(ticket, 't')
     const keys = (ticket.cells ?? [])
       .map(({ topic, partition }) => this.keyOf(topic, partition, group))
@@ -653,7 +676,7 @@ class PassiveObserver {
     if (!id || ticket.ended) return
     live.delete(ticket)
     if (live.size === 0) this.liveTickets.delete(ledger)
-    const group = this.live('ConsumerGroup').find((g) => g.operations === ledger)
+    const group = this.groupUsing('operations', ledger)
     this.emit({
       type: 'ticket',
       record: {
@@ -846,14 +869,21 @@ class PassiveObserver {
   }
 
   /**
-   * Every pause-state entry of every live subscription state, including empty, resumed-only and
-   * pause-all ones, with the origin fixed when the state object first appeared.
+   * Every pause-state entry of the subscription state of every current run (see `isCurrent`),
+   * including empty, resumed-only and pause-all ones, with the origin fixed when the state object
+   * first appeared.
    * @returns {object[]} pause-state section entries; entries without an origin id are left out
    *   and counted as unknown topic ids
    */
   pauseStates() {
     const out = []
+    const current = new Set(
+      this.live('ConsumerGroup')
+        .filter((g) => this.isCurrent(g))
+        .map((g) => g.subscriptionState)
+    )
     for (const receiver of this.live('SubscriptionState')) {
+      if (!current.has(receiver)) continue
       const states = receiver.subscriptionStatesByTopic ?? {}
       for (const topic of Object.keys(states)) {
         const state = states[topic]
@@ -1002,6 +1032,8 @@ class PassiveObserver {
    * replicas, queued seeks, consumer-protocol grown names and the cluster's target topics;
    * GroupOwnership states; OffsetOperations cells with their live tickets; ResetObligations
    * entries. A source whose field is missing is listed in `missingSources`, never read as empty.
+   * Only groups whose run is current are read (see `isCurrent`), so a cut holds at most one run
+   * generation of a client: a crashed or stopped run's dropped group is never reported.
    * @param {string} client actual client id
    * @returns {{ sections: Record<string, object[]>, missingSources: string[] }}
    */
@@ -1026,7 +1058,7 @@ class PassiveObserver {
       topicId: this.topicIdOf(topic, group),
       partition: partition === null ? null : Number(partition),
     })
-    for (const group of this.mine(client, 'ConsumerGroup')) {
+    for (const group of this.mine(client, 'ConsumerGroup').filter((g) => this.isCurrent(g))) {
       const run = this.runOf(group)
       const ids = (names) =>
         names.map((topic) => ({ topic, topicId: this.topicIdOf(topic, group) }))

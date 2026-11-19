@@ -2552,7 +2552,7 @@ describe('inventory cuts across a consumer crash restart', () => {
 
   /**
    * One run of a consumer as the consumer factory starts it: a fresh group whose run identity is
-   * current while the factory's run slot holds its token.
+   * current while the factory's run slot holds its token; every run shares the consumer's ledger.
    * @returns {ConsumerGroup}
    */
   const startRun = (consumer, context) => {
@@ -2571,7 +2571,7 @@ describe('inventory cuts across a consumer crash restart', () => {
       haltedPartitions: new Map(),
       ownership: new GroupOwnership(),
       subscriptionState: new SubscriptionState(),
-      operations: new OffsetOperations(),
+      operations: consumer.ledger,
       obligations: new ResetObligations(),
       assignmentEpoch: 1,
       groupMembership: {
@@ -2596,22 +2596,29 @@ describe('inventory cuts across a consumer crash restart', () => {
         x.entries = sections[x.section]
   }
 
-  it('a cut taken after a crash restart, while the dropped run is not yet collected, holds only the restarted run and passes the stream validator', () => {
+  it('a cut taken after a crash restart, while the dropped run is not yet collected, holds only the restarted run and passes the stream validator; a ticket on the shared ledger names the restarted run', () => {
     const context = new AsyncLocalStorage()
+    const tickets = []
     const observer = new PassiveObserver({
-      owners: { ConsumerGroup, SubscriptionState },
-      watched: { ConsumerGroup: ['retainSubscription'], SubscriptionState: ['pause'] },
+      owners: { ConsumerGroup, SubscriptionState, OffsetOperations },
+      watched: {
+        ConsumerGroup: ['retainSubscription'],
+        SubscriptionState: ['pause'],
+        OffsetOperations: ['begin'],
+      },
       context,
+      onEvent: (e) => e.type === 'ticket' && tickets.push(e.record),
     })
     observer.lives = () => `p01.20/${A}`
     observer.install()
     try {
-      const consumer = { slot: null }
+      const consumer = { slot: null, ledger: new OffsetOperations() }
       const crashed = startRun(consumer, context)
       const before = observer.ordinarySections(EAGER).sections
       consumer.slot = null
       const restarted = startRun(consumer, context)
       const after = observer.ordinarySections(EAGER).sections
+      context.run(EAGER, () => consumer.ledger.begin([{ topic: 'main', partition: 0 }]))
       const secondCut = (r) => {
         r.splice(
           at(r, isSample('p01')) + 1,
@@ -2649,6 +2656,7 @@ describe('inventory cuts across a consumer crash restart', () => {
       expect(runs(before)).toEqual([observer.runOf(crashed)])
       expect(runs(after)).toEqual([observer.runOf(restarted)])
       expect(after.assignment.map((e) => e.authority.run)).toEqual([observer.runOf(restarted)])
+      expect(tickets.map((t) => t.ownerRun)).toEqual([observer.runOf(restarted)])
       expect(after['other-table'].map((t) => t.table)).toEqual([
         'acquired',
         'halted',
