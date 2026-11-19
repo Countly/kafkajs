@@ -1583,7 +1583,11 @@ module.exports = class Runner extends EventEmitter {
         acquisition,
         runIdentity: this.consumerGroup.runIdentity,
       }
-      if (this.eachMessage) {
+      // A START_BATCH_PROCESS listener can seek the partition: such a batch is not handed over,
+      // and END_BATCH_PROCESS still pairs with START.
+      if (this.isSuperseded(batch)) {
+        this.logger.debug('Not handing over a batch a seek superseded', { topic, partition })
+      } else if (this.eachMessage) {
         await handlerContext.run(identity, () => this.processEachMessage(batch))
       } else if (this.eachBatch) {
         await handlerContext.run(identity, () => this.processEachBatch(batch))

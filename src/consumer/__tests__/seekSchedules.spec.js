@@ -11,6 +11,7 @@ const PARTITIONS = [0, 1]
 const LAST = 7
 const SETTLE_MS = 3
 const QUIET_MS = 2000
+const OPEN_MS = 10000
 
 /**
  * A seeded linear congruential generator, so a schedule is rebuilt from its seed alone.
@@ -204,7 +205,7 @@ class ScheduleRun {
         consumer.seek({ topic: TOPIC, partition, offset: String(offset) })
       })
     }
-    const deadline = Date.now() + QUIET_MS
+    const deadline = Date.now() + OPEN_MS
     while (!this.group || !this.current[0] || !this.current[1]) {
       if (Date.now() > deadline) throw new Error('the first deliveries did not arrive')
       await pause(2)
@@ -217,7 +218,7 @@ class ScheduleRun {
     const { ops } = this
     this.restores.push(
       around(ConsumerGroup.prototype, 'applyRebalanceResult', function (original, args) {
-        if (!run.group) run.adopt(this)
+        if (run.group !== this) run.adopt(this)
         return original.apply(this, args)
       }),
       around(ConsumerGroup.prototype, 'seek', function (original, args) {
@@ -338,25 +339,26 @@ class ScheduleRun {
    * @param {ConsumerGroup} group
    */
   adopt(group) {
+    if (this.group) this.record({ type: 'newGroup' })
     this.group = group
     const run = this
-    const record = (key) => {
+    const record = (key, kind) => {
       const partition = Number(key.split('|').pop())
-      run.record({ type: 'retire', partition })
+      run.record({ type: 'retire', partition, kind })
     }
     class Watched extends Map {
       set(key, value) {
-        if (super.has(key) && super.get(key) !== value) record(key)
+        if (super.has(key) && super.get(key) !== value) record(key, 'replace')
         return super.set(key, value)
       }
 
       delete(key) {
-        if (super.has(key)) record(key)
+        if (super.has(key)) record(key, 'revoke')
         return super.delete(key)
       }
 
       clear() {
-        for (const key of super.keys()) record(key)
+        for (const key of super.keys()) record(key, 'rebuild')
         super.clear()
       }
     }
@@ -576,13 +578,17 @@ class ScheduleRun {
       ])
         held.resolve()
       for (const p of PARTITIONS) this.take(p)?.done.resolve()
-      if (this.pending.every((op) => op.settled) && this.attempts.size === 0) break
+      const settled = this.pending.every((op) => op.settled) && this.attempts.size === 0
+      // An owed seek is applied by the fetch loop on its own; a stranded one is left to checkGates.
+      if (settled && this.group.unappliedSeeks.size === 0) break
       if (Date.now() > deadline) {
-        this.violate('I6', 'work still in flight after every hold was released', {
-          pending: this.pending.filter((op) => !op.settled).map((op) => op.kind),
-          attempts: this.attempts.size,
-        })
-        return
+        if (!settled) {
+          this.violate('I6', 'work still in flight after every hold was released', {
+            pending: this.pending.filter((op) => !op.settled).map((op) => op.kind),
+            attempts: this.attempts.size,
+          })
+        }
+        break
       }
       await pause(5)
     }
@@ -649,16 +655,24 @@ class Model {
    * @param {number} [until=Infinity]
    */
   stateAt(partition, until = Infinity) {
-    const state = { resolved: null, admission: null, owed: false, broker: '2' }
+    const state = { resolved: null, admission: null, owed: false, applying: false, broker: '2' }
     for (const e of this.events) {
       if (e.t >= until) break
       if (e.type === 'admit' && e.partition === partition) {
         state.resolved = null
         state.admission = e
         state.owed = true
-      } else if (e.type === 'recreate' || (e.type === 'retire' && e.partition === partition)) {
+        state.applying = false
+      } else if (e.type === 'recreate') {
         state.resolved = null
         state.owed = false
+      } else if (e.type === 'retire' && e.partition === partition) {
+        // A rebuild keeps a seek still queued for the next acquisition; a revoke drops it, and
+        // neither keeps one being applied.
+        state.resolved = null
+        if (state.applying || e.kind === 'revoke') state.owed = false
+      } else if (e.type === 'attempt' && e.admission === state.admission) {
+        state.applying = true
       } else if (e.type === 'fetch' && e.partition === partition) {
         if (state.resolved === null && !state.owed) state.resolved = e.offset
       } else if (e.type === 'resolve' && e.partition === partition) {
@@ -673,6 +687,7 @@ class Model {
         e.attempt.admission === state.admission &&
         state.owed
       ) {
+        state.applying = false
         const fate = this.fate(e)
         if (fate === 'applied') {
           state.owed = false

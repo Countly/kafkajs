@@ -1702,6 +1702,9 @@ module.exports = class Broker {
    *   connection was acquired and connected, after the request was authenticated and encoded, and
    *   at the instant of transmission; an error it returns rejects this one request, which is then
    *   written nowhere, takes no in-flight slot and leaves the connection open.
+   * @param {() => void} [options.onWrite] called once, immediately before the request is written
+   *   to the socket, so a caller can tell a request refused before its write from one that may
+   *   have reached the broker
    * @returns {Promise}
    */
   async offsetCommit(
@@ -1716,18 +1719,17 @@ module.exports = class Broker {
       requests.OffsetCommit,
       topicIds === undefined ? OFFSETS_TOPIC_NAMES_MAX_VERSION : undefined
     )
-    return await this[PRIVATE.SEND_REQUEST](
-      offsetCommit({
-        groupId,
-        groupGenerationId,
-        memberId,
-        groupInstanceId,
-        retentionTime,
-        topics,
-        topicIds,
-      }),
-      guard
-    )
+    const protocolRequest = offsetCommit({
+      groupId,
+      groupGenerationId,
+      memberId,
+      groupInstanceId,
+      retentionTime,
+      topics,
+      topicIds,
+    })
+    if (options?.onWrite) protocolRequest.onWrite = options.onWrite
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**

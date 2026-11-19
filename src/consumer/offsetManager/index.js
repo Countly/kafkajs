@@ -7,7 +7,12 @@ const OffsetOperations = require('./offsetOperations')
 const { fencedDelay } = require('../fetchPreparation')
 const ResetObligations = require('./resetObligations')
 const { ResetResolver } = require('../offsetReset')
-const { KafkaJSError, KafkaJSCommitFailedError, isStaleCoordinator } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSCommitFailedError,
+  KafkaJSProtocolError,
+  isStaleCoordinator,
+} = require('../../errors')
 const { isCallDeadline } = require('../groupProtocol/interface')
 const {
   stampGeneration,
@@ -37,9 +42,15 @@ const UNKNOWN_TOPIC_ID = 'UNKNOWN_TOPIC_ID'
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/CommonClientConfigs.java
  */
 const RETRY_INTERVAL = 100
-// How many times in all one default commit selects its offsets while seeks keep reaching them.
-const MAX_SELECTIONS = 3
 const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
+
+/**
+ * What one OffsetCommit did on the wire, recorded before any caller check runs on its answer:
+ * `written` once its bytes were handed to the socket (or an answer proves it), `accepted` once the
+ * broker answered without an error, `rejected` once the broker answered with one, and, for a seek,
+ * `superseded` when a newer operation or barrier owned its cell as the commit ended.
+ * @typedef {{written?: boolean, accepted?: boolean, rejected?: boolean, superseded?: boolean}} CommitAttempt
+ */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
 /** Used when no logger is injected, so a manager built without one still runs and logs nothing. */
@@ -150,12 +161,14 @@ module.exports = class OffsetManager {
    *                                its heartbeat, joins and other commits. The originating caller's
    *                                guard must allow publication to membership. Absent in isolated
    *                                managers, which ask the cluster directly.
-   * @param {{clock: () => number, lastSoughtAt: () => number,
-   *   isSoughtAfter: (topic: string, partition: number|string, since: number) => boolean}}
+   * @param {{clock: () => number, changedSince: (since: number) => boolean,
+   *   isStaleSince: (topic: string, partition: number|string, since: number) => boolean}}
    *   [options.seeks] the consumer group's seek state: the clock a default selection is stamped
-   *                                with, so a seek admitted after it refuses the selection before
-   *                                it is written and keeps its cell out of the cache once it is
-   *                                answered. Absent in isolated managers, which never check.
+   *                                with, whether anything was sought or acquired since a clock
+   *                                (constant time), and the one per-cell authority check
+   *                                (`isStaleSince`): a cell sought or acquired again after it is
+   *                                left out of the request at its write and out of the cache
+   *                                once answered. Absent in isolated managers, which never check.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch and why an offset fetch is re-sent. Optional and
    *                                silent by default: the consumer group is the only production
@@ -330,13 +343,11 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{guard?: Function, fence?: import('../../producer/generation'), since?: number,
-   *   attempt?: {dispatched: boolean}}} [options] an immutable caller identity, checked through
-   *   transmission and settlement, the terminal fence that binds the coordinator discovery and the metadata refresh a refused topic
-   *   id starts, and for a default selection the seek clock it was selected at: a seek of a
-   *   selected cell admitted after it refuses the request before it is written (`seekRefusal`). A
-   *   request that was written is never refused for a seek: it is answered and published cell by
-   *   cell (`recordCommitted`). `attempt.dispatched` is set once the request is handed to the
-   *   coordinator, from which point the broker may have applied it
+   *   attempt?: CommitAttempt}} [options] an immutable caller identity, checked through
+   *   transmission and settlement; the terminal fence that binds the coordinator discovery and
+   *   the metadata refresh a refused topic id starts; for a default selection, the seek clock it
+   *   was selected at, so a cell no longer authorized refuses the request before it is written
+   *   (`seekRefusal`); and the attempt that records what happened on the wire
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
    *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
@@ -344,6 +355,7 @@ module.exports = class OffsetManager {
    *   close publishes nothing
    */
   async sendOffsetCommit(payload, { guard = null, fence, since, attempt } = {}) {
+    let sent = false
     const token = this.ownership?.token()
     const { revision } = this.membership()
     const release = this.ownership?.retain(token)
@@ -361,17 +373,27 @@ module.exports = class OffsetManager {
       refusal = check()
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
-      if (attempt) attempt.dispatched = true
-      const result =
-        this.ownership || guard || since !== undefined
+      sent = true
+      const result = attempt
+        ? await coordinator.offsetCommit(request, {
+            guard: check,
+            onWrite: () => {
+              attempt.written = true
+            },
+          })
+        : this.ownership || guard || since !== undefined
           ? await coordinator.offsetCommit(request, { guard: check })
           : await coordinator.offsetCommit(request)
+      if (attempt) attempt.written = attempt.accepted = true
       checkSeeks = false
       refusal = check()
       if (refusal) throw refusal
       return result
     } catch (error) {
       checkSeeks = false
+      if (attempt && sent && !attempt.accepted && error instanceof KafkaJSProtocolError) {
+        attempt.written = attempt.rejected = true
+      }
       const stampRefusal = (refusal) =>
         stampOwnership(
           stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
@@ -792,6 +814,8 @@ module.exports = class OffsetManager {
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
    *   a fetch round's immutable identity, checked before the commit is written and after it
    *   settles; absent for an unguarded caller, which behaves as before
+   * @param {CommitAttempt} [attempt] records what the seek's own commit did on the wire, for the
+   *   caller that decides whether a failed seek is owed again
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
    *                              currently assigned to this member, when this member lost its
    *                              membership, or when a newer operation or barrier superseded it
@@ -799,7 +823,7 @@ module.exports = class OffsetManager {
    * @throws {Error} whatever the offset conversion or the commit raised, or the preparation's
    *   refusal; the ticket ends either way
    */
-  async seek({ topic, partition, offset }, preparation) {
+  async seek({ topic, partition, offset }, preparation, attempt = {}) {
     this.refuse(preparation)
     if (this.ownership?.refusal(this.ownership.token())) return false
     if (!this.memberAssignment[topic] || !this.memberAssignment[topic].includes(partition)) {
@@ -841,7 +865,7 @@ module.exports = class OffsetManager {
       return true
     }
 
-    const applied = await this.commitAndClear({ topic, partition, offset }, preparation)
+    const applied = await this.commitAndClear({ topic, partition, offset }, preparation, attempt)
     if (applied) this.retireResetRefusals(topic, partition)
     return applied
   }
@@ -852,18 +876,20 @@ module.exports = class OffsetManager {
    * while the ticket is still current. A concrete offset settles a recreation reset only when the
    * topic is provably the incarnation the commit was sent for; a sentinel never does.
    *
-   * A commit that was handed to the coordinator and ends without clearing, whatever the reason (a
-   * refused caller, a failure, an answer the broker may have accepted), forgets the partition's
-   * cached committed offset unless a newer operation owns the cell, so the position is read back
-   * from the broker. A commit refused before that leaves the cache as it was.
+   * A commit that was written and ends without clearing, whatever the reason (a refused caller, a
+   * failure, an answer the broker may have accepted), forgets the partition's cached committed
+   * offset unless a newer operation owns the cell, so the position is read back from the broker.
+   * A commit refused before its write leaves the cache as it was.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
    *   manager's own ownership guard; its refusal is thrown, not reported as `false`
+   * @param {CommitAttempt} [attempt] filled with what the commit did on the wire and whether a
+   *   newer operation owned the cell as it ended
    * @returns {Promise<boolean>} whether the clear was applied
    * @throws {Error} whatever the commit raised
    */
-  async commitAndClear({ topic, partition, offset }, preparation) {
+  async commitAndClear({ topic, partition, offset }, preparation, attempt = {}) {
     const { groupId, generationId, memberId, groupInstanceId } = this
     const token = this.ownership?.token()
     const guard =
@@ -874,7 +900,6 @@ module.exports = class OffsetManager {
     const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
     const requestedId = this.cluster.topicId(topic)
     const release = this.ownership?.retain(token)
-    const attempt = { dispatched: false }
     let cleared = false
 
     try {
@@ -907,13 +932,8 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
-      if (
-        attempt.dispatched &&
-        !cleared &&
-        !this.operations.isSuperseded(ticket, topic, partition)
-      ) {
-        this.forgetCommitted(topic, partition)
-      }
+      attempt.superseded = this.operations.isSuperseded(ticket, topic, partition)
+      if (attempt.written && !cleared && !attempt.superseded) this.forgetCommitted(topic, partition)
       release?.()
       this.operations.end(ticket)
     }
@@ -1037,24 +1057,44 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * The refusal of a default selection that a seek reached after it was selected. The refusal is
-   * marked, so only the commit that raised it selects again (`commitWithOwnership`).
+   * The refusal of a default selection with a cell that is no longer authorized (`isStaleSince`).
+   * The refusal is marked, so the commit that raised it rebuilds its request without those cells
+   * (`sendAndRecordCommit`).
    * @private
-   * @param {{topic: string, partitions: {partition: number|string}[]}[]} topics the selected cells
+   * @param {{topic: string, partitions: {partition: number|string}[]}[]} topics the cells to send
    * @param {number} since the seek clock at selection
    * @returns {Error|null}
    */
   seekRefusal(topics, since) {
-    if (this.seeks.lastSoughtAt() <= since) return null
-    const sought = topics.some(({ topic, partitions }) =>
-      partitions.some(({ partition }) => this.seeks.isSoughtAfter(topic, partition, since))
+    if (!this.seeks.changedSince(since)) return null
+    const stale = topics.some(({ topic, partitions }) =>
+      partitions.some(({ partition }) => this.seeks.isStaleSince(topic, partition, since))
     )
-    if (!sought) return null
+    if (!stale) return null
     const refusal = new KafkaJSCommitFailedError('A seek superseded the selected offsets', {
       reason: 'stale-assignment',
     })
     refusal[SEEK_REFUSAL] = true
     return refusal
+  }
+
+  /**
+   * The cells of a default selection that are still authorized (`isStaleSince`), at their
+   * selected offsets; topics left with no cell are dropped.
+   * @private
+   * @param {{topic: string, partitions: {partition: number|string}[]}[]} topics
+   * @param {number} since the seek clock at selection
+   * @returns {{topic: string, partitions: {partition: number|string}[]}[]}
+   */
+  authorizedCells(topics, since) {
+    return topics
+      .map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.filter(
+          ({ partition }) => !this.seeks.isStaleSince(topic, partition, since)
+        ),
+      }))
+      .filter(({ partitions }) => partitions.length > 0)
   }
 
   /**
@@ -1096,26 +1136,18 @@ module.exports = class OffsetManager {
   /**
    * Completes a commit while its outer operation retains the original membership identity.
    *
-   * A default selection (no `offsets.topics`) is stamped with the seek clock. A seek of one of its
-   * cells admitted after it refuses the request before it is written; the selection is then made
-   * again, which leaves the sought cell out while its seek is pending and takes its new position
-   * once applied, up to `MAX_SELECTIONS` times in all. Only that refusal selects again: nothing is
-   * sent after a request was written, and a broker error reaches the caller unchanged. Explicit
-   * offsets are never reselected.
+   * A default selection (no `offsets.topics`) is made once and stamped with the seek clock; what
+   * is sent is always a subset of it at the selected offsets (`sendAndRecordCommit`). A broker
+   * error reaches the caller unchanged.
    * @private
    * @param {object} offsets the selected offsets
    * @param {{partitions?: object[], auto?: boolean, guard: Function, fence?: object}} options the
    *   immutable guard and the caller's optional terminal fence, retained through recovery so a
    *   replaced caller publishes no coordinator to either the manager or membership
-   * @param {number} [selection=1] which selection of this commit this is
    * @returns {Promise<void>} automatic refusals resolve without publishing
    * @throws {Error} explicit refusals or the original broker error
    */
-  async commitWithOwnership(
-    offsets,
-    { partitions = null, auto = false, guard, fence } = {},
-    selection = 1
-  ) {
+  async commitWithOwnership(offsets, { partitions = null, auto = false, guard, fence } = {}) {
     const refusal = this.ownership?.refusal(this.ownership.token()) || guard?.()
     if (refusal) {
       if (auto) {
@@ -1148,11 +1180,6 @@ module.exports = class OffsetManager {
       if (refusal) throw refusal
       this.lastCommit = Date.now()
     } catch (e) {
-      // A seek reached a selected cell before the write: select again, so the healthy cells still
-      // commit and the sought one leaves with its obsolete offset.
-      if (e?.[SEEK_REFUSAL] === true && selection < MAX_SELECTIONS) {
-        return this.commitWithOwnership(offsets, { partitions, auto, guard, fence }, selection + 1)
-      }
       if (e instanceof KafkaJSCommitFailedError) {
         if (auto) {
           this.logger.debug('Skipping a commit without membership ownership')
@@ -1222,27 +1249,43 @@ module.exports = class OffsetManager {
    * Sends one OffsetCommit and records what the coordinator accepted in the committed cache, cell
    * by cell, under a mutation ticket. A cell that a newer commit or seek, or a barrier, reached
    * while the request was in flight keeps its newer value, whichever answer arrived first. The
-   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` once the request succeeds,
-   * and records after the emit, so a seek a listener admits is seen.
+   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` with the payload sent once
+   * the request succeeds, and records after the emit, so a seek a listener admits is seen.
+   *
+   * A default selection (`since`) is sent once, under this one ticket, with only its cells that
+   * are still authorized at the write: a cell sought or acquired again since the selection is
+   * removed and the request rebuilt from the rest. Every rebuild removes at least one cell, so it
+   * ends by itself; with no cell left nothing is sent and the commit completes.
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
    * @param {{guard?: Function, fence?: object, since?: number}} [options] the guard is checked
    *   again before local publication; the fence binds the coordinator discovery; `since` is the
-   *   seek clock of a default selection (see `recordCommitted`)
+   *   seek clock of a default selection
    * @returns {Promise<void>}
    * @throws {Error} whatever the commit raised; nothing is recorded then
    */
   async sendAndRecordCommit(payload, topics, options) {
     const ticket = this.operations.begin(this.coveredCells(topics), { mutation: true })
     const requestedIds = new Map(topics.map(({ topic }) => [topic, this.cluster.topicId(topic)]))
+    let sent = payload
 
     try {
-      await this.sendOffsetCommit(payload, options)
-      this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
+      for (;;) {
+        try {
+          await this.sendOffsetCommit(sent, options)
+          break
+        } catch (error) {
+          if (error?.[SEEK_REFUSAL] !== true) throw error
+          const cells = this.authorizedCells(sent.topics, options.since)
+          if (cells.length === 0) return
+          sent = { ...payload, topics: cells }
+        }
+      }
+      this.instrumentationEmitter.emit(COMMIT_OFFSETS, sent)
       const refusal = options?.guard?.()
       if (refusal) throw refusal
-      this.recordCommitted(ticket, topics, requestedIds, options?.since)
+      this.recordCommitted(ticket, sent.topics, requestedIds, options?.since)
     } finally {
       this.operations.end(ticket)
     }
@@ -1254,9 +1297,10 @@ module.exports = class OffsetManager {
    * when the topic is provably the incarnation the commit was sent for. Otherwise the cell is
    * only fenced and the debt stays owed.
    *
-   * A cell a seek reached after a default selection was made (`since`) is left out too, whatever
-   * the broker accepted: the offset is no longer the position the application asked for. The
-   * broker keeps it until the seek's own commit or a later one replaces it.
+   * A cell of a default selection (`since`) that is no longer authorized (`isStaleSince`, the
+   * same check as at the write, made after the `COMMIT_OFFSETS` listeners) is left out too,
+   * whatever the broker accepted, and its cached offset is forgotten so the next resolution reads
+   * the broker's.
    * @private
    * @param {object} ticket
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
@@ -1267,7 +1311,7 @@ module.exports = class OffsetManager {
    */
   recordCommitted(ticket, topics, requestedIds = new Map(), since = undefined) {
     const committedOffsets = this.committedOffsets()
-    const checkSeeks = since !== undefined && this.seeks.lastSoughtAt() > since
+    const checkCells = since !== undefined && this.seeks.changedSince(since)
 
     for (const { topic, partitions } of topics) {
       const accepted = {}
@@ -1275,7 +1319,7 @@ module.exports = class OffsetManager {
 
       for (const { partition, offset } of partitions) {
         if (this.operations.isSuperseded(ticket, topic, partition)) continue
-        if (checkSeeks && this.seeks.isSoughtAfter(topic, partition, since)) {
+        if (checkCells && this.seeks.isStaleSince(topic, partition, since)) {
           this.forgetCommitted(topic, partition)
           continue
         }

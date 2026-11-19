@@ -3,8 +3,9 @@ const RequestQueue = require('../../network/requestQueue')
 const ConsumerGroup = require('../consumerGroup')
 const { FetchPreparation } = require('../fetchPreparation')
 const handlerContext = require('../handlerContext')
-const { KafkaJSCommitFailedError } = require('../../errors')
-const { TOPIC, CloseRig, batchAt, gate } = require('./fixtures/closeRig')
+const OffsetManager = require('../offsetManager')
+const { KafkaJSCommitFailedError, KafkaJSNonRetriableError } = require('../../errors')
+const { TOPIC, CloseRig, batchAt, gate, until } = require('./fixtures/closeRig')
 
 const BEFORE = ['value-2', 'value-3', 'value-4']
 
@@ -218,6 +219,36 @@ const holdNextCommitWrite = () => {
       opened.promise.then(() => original.call(this, request))
     })
   return { reached: reached.promise, release: opened.resolve, restore: () => spy.mockRestore() }
+}
+
+/**
+ * Holds each of the next OffsetCommits at its dispatch, as `holdNextCommitWrite` holds one.
+ * @param {number} count
+ * @returns {{ holds: { reached: Promise<void>, release: () => void }[], restore: () => void }}
+ */
+const holdCommitWrites = (count) => {
+  const holds = Array.from({ length: count }, () => ({ reached: gate(), opened: gate() }))
+  const original = RequestQueue.prototype.sendSocketRequest
+  let next = 0
+  const spy = jest
+    .spyOn(RequestQueue.prototype, 'sendSocketRequest')
+    .mockImplementation(function (request) {
+      const hold = request.entry.apiName === 'OffsetCommit' && holds[next]
+      if (!hold) return original.call(this, request)
+      next++
+      hold.reached.resolve()
+      hold.opened.promise.then(() => original.call(this, request))
+    })
+  return {
+    holds: holds.map(({ reached, opened }) => ({
+      reached: reached.promise,
+      release: opened.resolve,
+    })),
+    restore: () => {
+      holds.forEach(({ opened }) => opened.resolve())
+      spy.mockRestore()
+    },
+  }
 }
 
 /**
@@ -703,9 +734,10 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     write.release()
     await scenario.otherDone.promise
 
-    expect(scenario.commits(0)).toEqual(['0'])
+    expect(scenario.rig.frames('OffsetCommit')).toHaveLength(1)
+    expect(scenario.commits(0)).toEqual([])
     expect(scenario.commits(1)).toEqual(['1'])
-    expect(scenario.committed).toEqual({ 0: '0', 1: '1' })
+    expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
     expect(await scenario.position()).toBe('0')
     expect(scenario.errors).toEqual([])
   })
@@ -843,7 +875,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     const captured = using(captureGroup())
     await open({ run: { ...MANUAL, eachBatch: true }, old: resolveAndCommit })
     const group = captured.group()
-    const scans = jest.spyOn(group, 'isSoughtAfter')
+    const scans = jest.spyOn(group, 'isStaleSince')
     const lookups = jest.spyOn(group.unappliedSeeks, 'has')
     const forgetResolved = jest.spyOn(group.offsetManager, 'forgetResolved')
     const forgetCommitted = jest.spyOn(group.offsetManager, 'forgetCommitted')
@@ -1062,37 +1094,6 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     })
   })
 
-  describe('a default commit reached by seeks before the write', () => {
-    test('selects its offsets at most three times while seeks keep reaching them before the write, then an automatic commit skips and a plain one is refused', async () => {
-      const captured = using(captureGroup())
-      await open(TWO_PARTITIONS)
-      await scenario.otherDone.promise
-      const group = captured.group()
-      const selections = jest.spyOn(group.offsetManager, 'selectUncommitted')
-      const sought = jest.spyOn(group, 'isSoughtAfter').mockReturnValue(true)
-      group.lastSoughtAt = Number.MAX_SAFE_INTEGER
-      using({
-        restore: () => {
-          group.lastSoughtAt = 0
-          selections.mockRestore()
-          sought.mockRestore()
-        },
-      })
-
-      await group.commitOffsets({}, { auto: true })
-      expect(selections).toHaveBeenCalledTimes(3)
-
-      selections.mockClear()
-      const refusal = await failureOf(group.commitOffsets({}, {}))
-      expect(refusal).toBeInstanceOf(KafkaJSCommitFailedError)
-      expect(refusal.reason).toBe('stale-assignment')
-      expect(refusal.message).toBe('A seek superseded the selected offsets')
-      expect(selections).toHaveBeenCalledTimes(3)
-      expect(scenario.rig.frames('OffsetCommit')).toHaveLength(0)
-      expect(scenario.errors).toEqual([])
-    })
-  })
-
   describe('a seek whose commit the broker accepted', () => {
     test('drops the progress it replaced when a deliberate commit superseded it, and the final commit sends neither', async () => {
       const captured = using(captureGroup())
@@ -1157,7 +1158,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
       before: ({ resolveOffset }) => resolveOffset('4'),
     }
-    const rebuildIncrementally = async (group) => {
+    const applyIncrementally = async (group) => {
       scenario.consumer.pause([{ topic: TOPIC, partitions: [0] }])
       await scenario.release()
       await group.rebalanceCoordinator.runner.waitForHandlers()
@@ -1169,7 +1170,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       await closing
     }
 
-    test('after the broker accepted it and an incremental rebuild refused the applying call, leaves the replaced progress out and reads the accepted offset', async () => {
+    test('after the broker accepted it and an incremental apply refused the applying call, leaves the replaced progress out and reads the accepted offset', async () => {
       const captured = using(captureGroup())
       await open(SEEKING)
       const group = captured.group()
@@ -1178,7 +1179,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       } = using(holdCommitAnswers(scenario, ['applied']))
       const seeking = failureOf(scenario.seek('0'))
       await accepted.arrived
-      await rebuildIncrementally(group)
+      await applyIncrementally(group)
 
       accepted.release()
 
@@ -1192,23 +1193,37 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('after an incremental rebuild refused its commit before it was written, leaves the replaced progress out of the position and the final commit', async () => {
+    test('after an incremental apply refused its commit before it was written, keeps the cached offset, is owed again and applied once by the next resolution', async () => {
       const captured = using(captureGroup())
       const held = using(holdNextCommitCall())
       await open(SEEKING)
       const group = captured.group()
+      const apply = group.offsetManager.seek
+      let cachedAfterRefusal
+      const seek = jest.spyOn(group.offsetManager, 'seek').mockImplementationOnce(async function (
+        ...args
+      ) {
+        try {
+          return await apply.apply(this, args)
+        } finally {
+          cachedAfterRefusal = group.offsetManager.committedOffsets()[TOPIC][0]
+        }
+      })
+      using({ restore: () => seek.mockRestore() })
       const seeking = failureOf(scenario.seek('0'))
       await held.reached
-      await rebuildIncrementally(group)
+      await applyIncrementally(group)
 
       held.release()
 
       expect((await seeking).type).toBe('CONSUMER_STOPPING')
-      expect(await scenario.position()).toBe('2')
-      expect(group.offsetManager.nextOffset(TOPIC, 0).toString()).toBe('2')
+      expect(cachedAfterRefusal).toBe('2')
+      expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(true)
+      await until(() => !group.unappliedSeeks.has(`${TOPIC}|0`), 'the seek applied')
+      expect(await scenario.position()).toBe('0')
       await disconnect()
-      expect(scenario.commits()).toEqual([])
-      expect(scenario.committed[0]).toBe('2')
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('0')
       expect(scenario.errors).toEqual([])
     })
 
@@ -1292,7 +1307,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('reads the accepted offset after an incremental rebuild refused the applying call, and leaves the committed offset out of the final commit', async () => {
+    test('reads the accepted offset after an incremental apply refused the applying call, and leaves the committed offset out of the final commit', async () => {
       const captured = using(captureGroup())
       await open(SEEKING)
       const group = captured.group()
@@ -1484,6 +1499,401 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.commits()).toEqual(['0'])
       expect(await scenario.position()).toBe('2')
       expect(scenario.committed[0]).toBe('2')
+    })
+  })
+  describe('a seek a fetch round applied', () => {
+    const SEEKING = {
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+    /**
+     * Admits a seek to 0 without applying it, lets the fetch loop apply it, and refuses that
+     * round by an incremental assignment that keeps the partition.
+     * @param {ConsumerGroup} group
+     * @param {Promise<void>} reached resolves once the seek's commit got as far as the test holds it
+     */
+    const applyByFetchThenRetain = async (group, reached) => {
+      const applying = jest.spyOn(group, 'seekOffsets')
+      using({ restore: () => applying.mockRestore() })
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      await scenario.release()
+      await reached
+      expect(applying.mock.calls.some(([, round]) => round instanceof FetchPreparation)).toBe(true)
+      await group.rebalanceCoordinator.runner.waitForHandlers()
+      await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: false })
+    }
+
+    test('is not sent again after the broker accepted its commit and the round was refused', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      await applyByFetchThenRetain(captured.group(), accepted.arrived)
+
+      accepted.release()
+
+      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(await scenario.position()).toBe('0')
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('0')
+      expect(captured.group().unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('keeps a deliberate commit made after the broker accepted its commit and the round was refused', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      await applyByFetchThenRetain(captured.group(), accepted.arrived)
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '8' }])
+
+      accepted.release()
+
+      await until(() => !captured.group().unappliedSeeks.has(`${TOPIC}|0`), 'the seek settled')
+      expect(await scenario.position()).toBe('8')
+      expect(scenario.commits()).toEqual(['0', '8'])
+      expect(scenario.committed[0]).toBe('8')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('clears the halt of its partition when its commit was written, even though the round was refused', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const group = captured.group()
+      const key = `${TOPIC}|0`
+      const refusal = new Error('the round was refused')
+      const seek = jest
+        .spyOn(group.offsetManager, 'seek')
+        .mockImplementationOnce(async (entry, preparation, attempt) => {
+          attempt.written = attempt.accepted = true
+          throw refusal
+        })
+      using({ restore: () => seek.mockRestore() })
+      group.haltedPartitions.set(key, { offset: '2', reason: 'checksum', error: new Error('x') })
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+
+      await expect(group.seekOffsets([{ topic: TOPIC, partitions: [0] }])).rejects.toBe(refusal)
+
+      expect(group.haltedPartitions.has(key)).toBe(false)
+      expect(group.unappliedSeeks.has(key)).toBe(false)
+      expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
+    })
+
+    test('is applied once by the next round when the round was refused before its commit was written', async () => {
+      const captured = using(captureGroup())
+      const held = using(holdNextCommitCall())
+      await open(SEEKING)
+      await applyByFetchThenRetain(captured.group(), held.reached)
+
+      held.release()
+
+      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(await scenario.position()).toBe('0')
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('0')
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek whose commit was written and got no answer', () => {
+    test('is not sent again, and the position is read back from the broker', async () => {
+      await open({
+        run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+        before: ({ resolveOffset }) => resolveOffset('4'),
+      })
+      const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+      let lost = false
+      scenario.rig.cluster.answer('OffsetCommit', async (fields, record) => {
+        const result = await answer(fields, record)
+        if (lost) return result
+        lost = true
+        throw new Error('connection lost after the write')
+      })
+
+      expect(await failureOf(scenario.seek('0'))).not.toBeNull()
+
+      expect(await scenario.position()).toBe('0')
+      await scenario.release()
+      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('0')
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a default commit held at its write after a seek', () => {
+    const SIBLING = {
+      partitions: 2,
+      run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+
+    test('completes without a frame when every selected cell is sought before the write', async () => {
+      const captured = using(captureGroup())
+      await open(SIBLING)
+      await scenario.otherDone.promise
+      const {
+        holds: [first, second],
+      } = using(holdCommitWrites(2))
+      const committing = captured.group().commitOffsets({}, { auto: true })
+      await first.reached
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+
+      first.release()
+      await second.reached
+      scenario.consumer.seek({ topic: TOPIC, partition: 1, offset: '0' })
+      second.release()
+      await committing
+
+      expect(scenario.rig.frames('OffsetCommit')).toHaveLength(0)
+      expect(scenario.committed).toEqual({ 0: '2', 1: '0' })
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek a START_BATCH_PROCESS listener admits', () => {
+    test('keeps the older batch from eachBatch and pairs START with END', async () => {
+      await open({ run: { ...MANUAL, eachBatch: true } })
+      const starts = []
+      const ends = []
+      let sought = false
+      scenario.consumer.on(scenario.consumer.events.START_BATCH_PROCESS, ({ payload }) => {
+        starts.push(payload.firstOffset)
+        if (sought) return
+        sought = true
+        scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      })
+      scenario.consumer.on(scenario.consumer.events.END_BATCH_PROCESS, ({ payload }) =>
+        ends.push(payload.firstOffset)
+      )
+
+      await scenario.release()
+
+      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(scenario.deliveries).toEqual([BEFORE, ['value-0']])
+      expect(starts).toEqual(['2', '0'])
+      expect(ends).toEqual(['2', '2'])
+      expect(scenario.commits()).toEqual([])
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek with a partition that is not a number', () => {
+    test('throws before any state changes, and fetching goes on', async () => {
+      const captured = using(captureGroup())
+      await open({ run: { ...MANUAL, eachBatch: true } })
+      const group = captured.group()
+
+      for (const partition of ['0', null, '', undefined, true]) {
+        expect(() => scenario.consumer.seek({ topic: TOPIC, partition, offset: '0' })).toThrow(
+          new KafkaJSNonRetriableError(`Invalid partition, expected a number received ${partition}`)
+        )
+      }
+
+      expect(scenario.old.isStale()).toBe(false)
+      expect(group.unappliedSeeks.size).toBe(0)
+      expect(group.seekOffset.size).toBe(0)
+      expect(await scenario.position()).toBe('2')
+      await scenario.release()
+      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('throws for a manual assignment before run', async () => {
+      const rig = await CloseRig.open({ protocol })
+      const consumer = rig.consumer()
+      try {
+        await consumer.connect()
+        await consumer.assign([{ topic: TOPIC, partitions: [0] }])
+
+        expect(() => consumer.seek({ topic: TOPIC, partition: '0', offset: '1' })).toThrow(
+          new KafkaJSNonRetriableError('Invalid partition, expected a number received 0')
+        )
+        expect(() => consumer.seek({ topic: TOPIC, partition: 0, offset: '1' })).not.toThrow()
+      } finally {
+        await rig.dispose()
+      }
+    })
+  })
+
+  describe('an answer requested before a seek', () => {
+    test('a truncation answer does not reposition the partition over a newer seek, and no validation is asked while it applies', async () => {
+      const captured = using(captureGroup())
+      await open({
+        run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+        before: ({ resolveOffset }) => resolveOffset('4'),
+      })
+      const group = captured.group()
+      const withEpoch = (node) => {
+        if (Array.isArray(node)) return node.forEach(withEpoch)
+        if (node && typeof node === 'object') {
+          if (node.partition === 0 && 'leaderEpoch' in node && 'offset' in node) {
+            node.leaderEpoch = 5
+          }
+          if (node.partitionIndex === 0 && 'committedLeaderEpoch' in node) {
+            node.committedLeaderEpoch = 5
+          }
+          Object.values(node).forEach(withEpoch)
+        }
+      }
+      const offsetFetch = scenario.rig.cluster.answerers.get('OffsetFetch')
+      let holding = false
+      const fetches = []
+      scenario.rig.cluster.answer('OffsetFetch', async (fields, record) => {
+        const result = await offsetFetch(fields, record)
+        withEpoch(result)
+        if (!holding) return result
+        const opened = gate()
+        fetches.push(opened)
+        await opened.promise
+        return result
+      })
+      const fetchCommitted = OffsetManager.prototype.fetchCommittedOffsets
+      const callers = []
+      const reads = jest
+        .spyOn(OffsetManager.prototype, 'fetchCommittedOffsets')
+        .mockImplementation(function (...args) {
+          if (holding) callers.push(args[1] instanceof FetchPreparation ? 'fetch' : 'call')
+          return fetchCommitted.apply(this, args)
+        })
+      const asked = gate()
+      const reply = gate()
+      scenario.rig.cluster.answer('OffsetForLeaderEpoch', async ({ topics }) => {
+        asked.resolve()
+        await reply.promise
+        return {
+          partitions: topics[0].partitions.map(({ partition }) => ({
+            partition,
+            errorCode: 0,
+            leaderEpoch: 5,
+            endOffset: '1',
+          })),
+        }
+      })
+      const epoch = jest.spyOn(group.cluster, 'leaderEpoch')
+      let validations = 0
+      const validate = group.validatePositions
+      const validating = jest.spyOn(group, 'validatePositions').mockImplementation(async function (
+        ...args
+      ) {
+        try {
+          return await validate.apply(this, args)
+        } finally {
+          validations++
+        }
+      })
+      using({
+        restore: () => {
+          reply.resolve()
+          fetches.forEach((held) => held.resolve())
+          reads.mockRestore()
+          epoch.mockRestore()
+          validating.mockRestore()
+        },
+      })
+      scenario.consumer.pause([{ topic: TOPIC, partitions: [0] }])
+      await scenario.release()
+      holding = true
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '5' })
+      const older = failureOf(scenario.position())
+      await until(() => fetches.length >= 2, 'two resolutions asking')
+      epoch.mockReturnValue(6)
+      fetches[callers.indexOf('fetch')].resolve()
+      await asked.promise
+      const {
+        holds: [accepted],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      const newer = scenario.position()
+      await accepted.arrived
+      holding = false
+      fetches[callers.indexOf('call')].resolve()
+      await older
+
+      reply.resolve()
+      await until(() => !group.positionValidator.isAwaiting(TOPIC, 0), 'the validation answered')
+      const answered = validations
+      await until(() => validations >= answered + 2, 'two more rounds while the seek applies')
+      accepted.release()
+
+      expect(await newer).toBe('0')
+      expect(await scenario.position()).toBe('0')
+      expect(scenario.commits()).toEqual(['5', '0'])
+      expect(scenario.committed[0]).toBe('0')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test.each([true, false])(
+      'an out-of-range answer does not reset the partition over a seek applied after the fetch was built (autoCommit %s)',
+      async (autoCommit) => {
+        await open({
+          run: autoCommit
+            ? { autoCommit: true, autoCommitInterval: 60000, eachBatch: true }
+            : { autoCommit: false, eachBatch: true },
+          before: ({ resolveOffset }) => resolveOffset('4'),
+        })
+        const reached = gate()
+        const released = gate()
+        const fetch = scenario.rig.cluster.answerers.get('Fetch')
+        let held = false
+        scenario.rig.cluster.answer('Fetch', async (fields, record) => {
+          const p0 = fields.topics[0].partitions.find(({ partition }) => partition === 0)
+          if (held || !p0 || String(p0.fetchOffset) !== '5') return fetch(fields, record)
+          held = true
+          reached.resolve()
+          await released.promise
+          return {
+            partitions: fields.topics[0].partitions.map(({ partition }) => ({
+              partition,
+              errorCode: partition === 0 ? 1 : 0,
+              records: false,
+              abortedTransactions: [],
+            })),
+          }
+        })
+        using({ restore: () => released.resolve() })
+        await scenario.release()
+        await reached.promise
+        expect(await scenario.seek('6')).toBe('6')
+
+        released.resolve()
+
+        expect(await scenario.nextDelivery()).toEqual(['value-6'])
+        expect(await scenario.position()).toBe('6')
+        expect(scenario.commits()).toEqual(autoCommit ? ['6'] : [])
+        expect(scenario.errors).toEqual([])
+      }
+    )
+
+    test('an out-of-range answer to a current request still resets the partition', async () => {
+      await open({
+        run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+        before: ({ resolveOffset }) => resolveOffset('4'),
+      })
+      const fetch = scenario.rig.cluster.answerers.get('Fetch')
+      let answered = false
+      scenario.rig.cluster.answer('Fetch', async (fields, record) => {
+        const p0 = fields.topics[0].partitions.find(({ partition }) => partition === 0)
+        if (answered || !p0 || String(p0.fetchOffset) !== '5') return fetch(fields, record)
+        answered = true
+        return {
+          partitions: fields.topics[0].partitions.map(({ partition }) => ({
+            partition,
+            errorCode: partition === 0 ? 1 : 0,
+            records: false,
+            abortedTransactions: [],
+          })),
+        }
+      })
+
+      await scenario.release()
+
+      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(scenario.commits()).toEqual(['-2'])
+      expect(scenario.errors).toEqual([])
     })
   })
 })

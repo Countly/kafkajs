@@ -16,9 +16,12 @@ describe('Consumer > fetch partition error contract', () => {
       })
       // The real reset commits through a coordinator this harness has no broker for; what the
       // contract asserts is that the per-partition recovery is the one that runs.
+      const refusals = []
       const setDefaultOffset = jest
         .spyOn(offsetManager, 'setDefaultOffset')
-        .mockResolvedValue(undefined)
+        .mockImplementation(async (_, { guard }) => {
+          refusals.push(guard())
+        })
 
       setResponse(
         fetchResponse([
@@ -30,8 +33,9 @@ describe('Consumer > fetch partition error contract', () => {
 
       expect(setDefaultOffset).toHaveBeenCalledWith(
         { topic: TOPIC, partition: 0 },
-        { guard: group.idleWait.fence.guard, fence: group.idleWait.fence }
+        { guard: expect.any(Function), fence: group.idleWait.fence }
       )
+      expect(refusals).toEqual([null])
       expect(batches.map(({ partition }) => partition)).toEqual([1])
       // Every delivered batch carries the assignment it was fetched under, so one that outlives
       // that assignment can be recognised before it reaches a handler.
