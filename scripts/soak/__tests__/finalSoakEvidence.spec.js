@@ -383,7 +383,7 @@ describe('final soak handler entries', () => {
     headers: {},
   }
   const authority = { client: 'c01.1', run: 'r', token: 1, acquiredAt: 1, recreatedAt: 0 }
-  const rig = { id: 'c01.1', slot: config.clients[0], processed: new Map(), uncommitted: new Map() }
+  const rig = { id: 'c01.1', slot: config.clients[0], uncommitted: new Map() }
 
   const entered = (rt) =>
     rt.records.filter((r) => r.kind === 'identity' && r.stage === 'handler-enter')
@@ -400,9 +400,7 @@ describe('final soak handler entries', () => {
     async (_, source) => {
       const rt = runtime({ mine: () => [{}], ...source })
       const worker = new ConsumerWorker(rt)
-      worker.progress = new Map()
-      worker.lastBoundary = new Map()
-      const local = { ...rig, processed: new Map(), uncommitted: new Map() }
+      const local = { ...rig, uncommitted: new Map() }
       await worker.handle(local, { topic: config.topics.main, partition: 0, message })
       expect(entered(rt)).toEqual([])
       const [note] = partial(rt)
@@ -416,7 +414,7 @@ describe('final soak handler entries', () => {
       })
       expect(rt.problems).toEqual([expect.stringContaining('c08.3')])
       expect(rt.records.some((r) => r.stage === 'handler-end')).toBe(true)
-      expect(local.processed.get(`${config.topics.main}|0`)).toBe('13')
+      expect(worker.handled).toBe(1)
     }
   )
 
@@ -427,9 +425,7 @@ describe('final soak handler entries', () => {
       topicIdOf: () => IDS.A,
     })
     const worker = new ConsumerWorker(rt)
-    worker.progress = new Map()
-    worker.lastBoundary = new Map()
-    const local = { ...rig, processed: new Map(), uncommitted: new Map(), authority: new Map() }
+    const local = { ...rig, uncommitted: new Map() }
     await worker.handle(local, { topic: config.topics.main, partition: 0, message })
     expect(entered(rt)).toHaveLength(1)
     expect(rt.problems).toEqual([])

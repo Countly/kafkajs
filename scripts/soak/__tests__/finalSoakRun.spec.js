@@ -1084,6 +1084,141 @@ describe('final soak scheduled work', () => {
   })
 })
 
+describe('final soak work admission and quiet samples', () => {
+  test('a work step still running past its grace is reported failed then, and stays in flight until it settles', async () => {
+    const clock = jumpClock(0)
+    let release = null
+    const outcomes = []
+    const scheduler = new Scheduler({
+      clock,
+      graceMs: 500,
+      perform: () => new Promise((resolve) => (release = resolve)),
+      onOutcome: (o) => outcomes.push(o),
+    })
+    await scheduler.run([{ id: 'h00r0', lane: 'work', type: 'execution', at: 0, deadline: 1000 }])
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        id: 'h00r0',
+        outcome: 'error',
+        error: 'h00r0 still runs 500 ms after its deadline',
+      }),
+    ])
+    expect(scheduler.quiescent()).toBe(false)
+    release()
+    await tick()
+    expect(scheduler.quiescent()).toBe(true)
+  })
+
+  /** A supervisor whose sampling is scripted; returns what each quiet step did. */
+  const quiet = async ({ quiesced = 'h00i', inflight = [], aborted = null, during = () => {} }) => {
+    const { s, remove } = supervisor()
+    try {
+      s.scheduler = { inflight: new Set(inflight) }
+      s.quiesced = quiesced
+      s.aborted = aborted
+      const sampled = []
+      s.sampleAll = async (slots, step) => {
+        sampled.push(step.id)
+        during(s)
+      }
+      const step = { id: 'h00q0', type: 'quiet', boundary: 'h00', reading: 0 }
+      const error = await s.perform(step).then(
+        () => null,
+        (e) => e.message
+      )
+      return { error, sampled }
+    } finally {
+      remove()
+    }
+  }
+
+  test('a quiet sample in an idle window with no work running is taken', async () => {
+    expect(await quiet({})).toEqual({ error: null, sampled: ['h00q0'] })
+  })
+
+  test.each([
+    [
+      'an admin or docker operation of an earlier step is still in flight',
+      { inflight: ['h00o0'] },
+      'h00q0 is not a quiet sample: h00o0 is still running',
+    ],
+    [
+      'the processes have not confirmed the idle window',
+      { quiesced: null },
+      'h00q0 is not a quiet sample: the processes have not confirmed idle',
+    ],
+    [
+      'a timed-out command aborted the run',
+      { aborted: 'process p03 did not answer' },
+      'h00q0 is not a quiet sample: the run is aborted',
+    ],
+  ])('a quiet sample is refused when %s', async (_, state, message) => {
+    expect(await quiet(state)).toEqual({ error: message, sampled: [] })
+  })
+
+  test('a quiet sample during which a work step began is refused after it was taken', async () => {
+    const result = await quiet({ during: (s) => s.scheduler.inflight.add('h00d') })
+    expect(result).toEqual({
+      error: 'h00q0 is not a quiet sample: h00d is still running',
+      sampled: ['h00q0'],
+    })
+  })
+
+  test('a docker command that does not end in time is killed and fails', async () => {
+    const { s, remove } = supervisor()
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-docker-'))
+    const PATH = process.env.PATH
+    try {
+      fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 })
+      process.env.PATH = `${bin}:${PATH}`
+      s.dockerMs = 200
+      const started = Date.now()
+      await expect(s.docker(['compose', 'stop', 'kafka1'])).rejects.toMatchObject({
+        killed: true,
+        signal: 'SIGKILL',
+      })
+      expect(Date.now() - started).toBeLessThan(5000)
+    } finally {
+      process.env.PATH = PATH
+      fs.rmSync(bin, { recursive: true, force: true })
+      remove()
+    }
+  })
+
+  test('a membership execution starts no wave after a failed one, and no wave before its planned time', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const clock = jumpClock(0)
+      s.clock = clock
+      const starts = []
+      s.waves = new Map([
+        [
+          'h00m0',
+          [
+            { id: 'h00m0w0', at: 0, deadline: 90000 },
+            { id: 'h00m0w1', at: 90000, deadline: 180000 },
+            { id: 'h00m0w2', at: 180000, deadline: 270000 },
+          ],
+        ],
+      ])
+      s.shape = async (wave, phase) => phase === 'start' && starts.push([wave.id, clock.t])
+      s.sampleAll = async () => {}
+      let leaves = 0
+      s.send = async (slots, step) =>
+        step.phase === 'leave'
+          ? [{ reply: { transfers: ++leaves === 2 ? 0 : 1, returned: true } }]
+          : []
+      await expect(s.churnMembers({ id: 'h00m0' }, ['p01'])).rejects.toThrow(/h00m0w1/)
+      expect(starts).toEqual([
+        ['h00m0w0', 0],
+        ['h00m0w1', 90000],
+      ])
+    } finally {
+      remove()
+    }
+  })
+})
+
 describe('final soak final drain', () => {
   const main = config.topics.main
   const key = `${main}|0`
@@ -1496,6 +1631,28 @@ describe('final soak transaction outcomes', () => {
     expect(txn.abort).toHaveBeenCalledTimes(1)
     expect(outcomes(runtime)).toEqual([
       { decision: 'abort', outcome: 'aborted', errorType: 'KafkaJSTransactionAbortableError' },
+    ])
+  })
+
+  test('a commit still unconfirmed when an idle window begins stops retrying and is aborted, so the idle answers', async () => {
+    let attempts = 0
+    const txn = scripted({
+      commit: async () => {
+        if (++attempts <= 50)
+          throw Object.assign(new Error('unknown'), {
+            name: 'KafkaJSProtocolError',
+            retriable: true,
+          })
+      },
+    })
+    const { worker, rig, runtime } = transactional(txn)
+    const transacting = worker.transact(rig, 1)
+    await worker.onIdle()
+    await transacting
+    expect(attempts).toBe(1)
+    expect(txn.abort).toHaveBeenCalledTimes(1)
+    expect(outcomes(runtime)).toEqual([
+      { decision: 'abort', outcome: 'aborted', errorType: 'KafkaJSProtocolError' },
     ])
   })
 
