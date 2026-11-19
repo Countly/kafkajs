@@ -1359,6 +1359,51 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.overall).not.toBe('ACCEPTED')
     })
 
+    describe('the end of traffic comes from the process that supervised the run', () => {
+      const exitOf = (process, source) =>
+        mapRecords(
+          (r) => r.kind === 'process' && r.event === 'exit' && r.process === process,
+          () => ({ source })
+        )
+      const roleOf = (world, slot, role) => {
+        world.config.processes.find((p) => p.slot === slot).role = role
+        return world
+      }
+
+      it.each([
+        [
+          'the header names the process that emitted the end of traffic',
+          (world) => world,
+          trafficEnd(() => ({ source: 'p14' })),
+          (h) => ({ ...h, exit: { ...h.exit, supervisorProcess: 'p14' } }),
+          /the header names p14 as the supervisor, but the config's collector is p15/,
+        ],
+        [
+          'the outer observer witnessed the exit of another process',
+          (world) => world,
+          (records) => exitOf('p14', 'outer')(exitOf('p15', 'p14')(records)),
+          (h) => h,
+          /the outer observer witnessed the exit of p14, not of the config's collector p15/,
+        ],
+        [
+          'the config names another process as the collector',
+          (world) => roleOf(roleOf(world, 'p15', 'reader'), 'p14', 'collector'),
+          (records) => records,
+          (h) => h,
+          /the header names p15 as the supervisor, but the config's collector is p14/,
+        ],
+      ])(
+        'is inconclusive and fails K7, never ACCEPTED, when %s',
+        async (_, world, edit, header, reason) => {
+          const report = await check(world(fx.healthy()), { edit, header })
+          expectRow(report, 'K6', 'INCONCLUSIVE', /the supervisor is not attributable/)
+          expectRow(report, 'K7', 'FAIL', reason)
+          expect(row(report, 'K6').numbers.trafficEnd).toBeNull()
+          expect(report.overall).not.toBe('ACCEPTED')
+        }
+      )
+    })
+
     it('ignores a later traffic end that the supervisor did not emit', async () => {
       const edit = (records) => {
         const end = records.find((r) => r.kind === 'shape' && r.phase === 'end')
