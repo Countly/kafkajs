@@ -795,7 +795,9 @@ module.exports = class RebalanceCoordinator {
    * answers for the membership it was sent for, so once a round has joined there is nothing left to
    * reset and no verdict to raise, and resetting would void the new membership. The count, not the
    * generation, because a rejoin can come back at the same generation or epoch. Otherwise the
-   * generation is reset, and a round still in flight owns the rejoin, so no LOST verdict is raised.
+   * generation is reset, and a round still in flight owns the rejoin, so no LOST verdict is raised,
+   * unless the chain is in a consumer-protocol wait between rounds: that chain ends at wake-up, so
+   * the LOST verdict is raised and the runner's LOST round rejoins.
    *
    * @param {{ elapsedMs: number, isStatic: boolean }} details
    * @returns {Promise<void>}
@@ -857,7 +859,10 @@ module.exports = class RebalanceCoordinator {
 
     // A round that started during the leave above already rejoins this member. A second LOST would
     // stay in the slot after that round ends, and an orphan there reads as a rebalance still owed.
-    if (this.isRebalancing()) {
+    // A consumer-protocol chain waiting between rounds (a wait armed in `stopWaiters`) rejoins
+    // nobody: the leave cleared its target, so it ends at wake-up. Its LOST goes to the slot, as a
+    // fence's does, and the runner's LOST round rejoins once the in-flight handlers return.
+    if (this.isRebalancing() && this.stopWaiters.size === 0) {
       return
     }
 
