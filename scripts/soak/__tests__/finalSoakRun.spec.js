@@ -1443,20 +1443,38 @@ describe('final soak retained harness state', () => {
     expect(child.topicIds.has('r')).toBe(false)
   })
 
-  test("a share member forgets a retired incarnation's delivered and accepted offsets", () => {
+  test("a share member forgets a retired incarnation's entries, activity, fetch times and unconfirmed accepts, and still counts the accepts left unresolved", () => {
     const share = new ShareWorker(workerRuntime('c07'))
-    for (const topicId of [IDS.A, IDS.B]) {
+    const rig = { id: 'c07.1', slot: { group: 'g' } }
+    for (const [topicId, topic] of [
+      [IDS.A, config.topics.main],
+      [IDS.B, config.topics.transactions],
+    ]) {
+      share.runtime.topicIds.set(topic, topicId)
       share.delivered(`${topicId}|0`, '0')
-      share.onShareSettled({
-        key: { topicId, partition: 0 },
-        offsets: [{ offset: '0', type: 'accept' }],
-        result: 'ok',
-        errorCode: 0,
+      share.onOutcome(rig, {
+        topic,
+        partition: 0,
+        firstOffset: '0',
+        lastOffset: '0',
+        type: 'accept',
+        error: Object.assign(new Error('lost'), { reason: 'session-lost' }),
+      })
+      share.onFetch(rig, {
+        node: 'h:1',
+        sentAt: 0,
+        session: { epoch: 0, partitions: [{ topicId, partition: 0 }], forgotten: [] },
+        decoded: { errorCode: 0, acquisitionLockTimeoutMs: 30000, topics: [] },
       })
     }
     share.forgetTopic(IDS.A)
-    expect([...share.entered.keys()]).toEqual([`${IDS.B}|0`])
-    expect([...share.accepted.keys()]).toEqual([`${IDS.B}|0`])
+    for (const map of [share.entered, share.activity, share.fetched, share.unconfirmed])
+      expect([...map.keys()]).toEqual([`${IDS.B}|0`])
+    expect(share.evidence()).toEqual({
+      unconfirmedAccepts: 2,
+      unresolvedOffsets: '2',
+      untracked: 0,
+    })
   })
 
   test("a day's membership waves and regex topics leave the retained state at the live set", () => {
@@ -1876,13 +1894,23 @@ describe('final soak final drain', () => {
   })
 
   /**
-   * A share worker whose runtime routes settled acknowledgements to it, and `take`, which hands
-   * one record of a topic id to its handler and settles its accept with the given error code.
+   * A share worker on a jumping clock. `take` hands one record of a topic id to a handler now and
+   * settles its accept with `errorCode`; `fetch` is one answered share fetch of the member whose
+   * session holds partition 0 of the given topic ids; `onTick` runs after every sleep, so a member
+   * can keep fetching while a drain waits. The fetches report a lock duration of `lockMs`.
    */
-  const shareDrain = () => {
-    const runtime = { ...workerRuntime('c07'), slotOf: () => ({ group: 'g' }) }
+  const shareDrain = ({ lockMs = 30000 } = {}) => {
+    const ctx = { onTick: () => {} }
+    const clock = jumpClock(0)
+    clock.sleepUntil = async (at) => {
+      clock.t = Math.max(clock.t, at)
+      ctx.onTick(clock.t)
+    }
+    const runtime = { ...workerRuntime('c07', clock), slotOf: () => ({ group: 'g' }) }
     const worker = new ShareWorker(runtime)
     runtime.worker = worker
+    const rig = { id: 'c07.1', slot: { group: 'g' } }
+    worker.standing.push(rig)
     const take = (topicId, offset, errorCode = 0) => {
       worker.delivered(`${topicId}|0`, String(offset))
       ChildRuntime.prototype.observed.call(runtime, {
@@ -1896,108 +1924,80 @@ describe('final soak final drain', () => {
         wire: { file: 'wire', sha256: 'sha' },
       })
     }
-    return { runtime, worker, take }
+    const fetch = (topicIds = [IDS.A], { errorCode = 0, acquired = [], epoch = 0 } = {}) =>
+      worker.onFetch(rig, {
+        node: 'h:1',
+        sentAt: clock.now(),
+        session: {
+          epoch,
+          partitions: topicIds.map((topicId) => ({ topicId, partition: 0 })),
+          forgotten: [],
+        },
+        decoded: {
+          errorCode,
+          acquisitionLockTimeoutMs: lockMs,
+          topics: topicIds.map((topicId) => ({
+            topicId,
+            partitions: [{ partitionIndex: 0, fetchErrorCode: 0, acquired }],
+          })),
+        },
+      })
+    /** Makes the member fetch once a second from now on. */
+    const keepFetching = (topicIds = [IDS.A]) => {
+      let last = -Infinity
+      ctx.onTick = (t) => {
+        if (t - last >= 1000) fetch(topicIds, { epoch: 1 }) && (last = t)
+      }
+    }
+    fetch()
+    return { ctx, clock, runtime, worker, rig, take, fetch, keepFetching }
   }
+  const drainRecord = (runtime) =>
+    runtime.records.filter((r) => r.kind === 'diagnostic' && r.shareDrain).at(-1)?.shareDrain
 
-  test('a share member waits until every offset below the log end had a handler entry and a confirmed accept', async () => {
-    const { runtime, worker, take } = shareDrain()
-    for (let offset = 0; offset < 99; offset++) take(IDS.A, offset)
-    setTimeout(() => take(IDS.A, 99), 60)
-    const reply = await worker.onDrain({
-      ends: { [key]: '100' },
-      deadline: runtime.clock.now() + 5000,
-    })
-    expect(reply).toEqual({ reached: true })
-    const late = await worker.onDrain({
-      ends: { [key]: '120' },
-      deadline: runtime.clock.now() + 40,
-    })
-    expect(late).toEqual({ reached: false })
-  })
-
-  test('a share drain of one topic incarnation is reached while deliveries of another topic never pause', async () => {
-    const { runtime, worker, take } = shareDrain()
+  test('a share drain is reached once every offset below the end had a handler entry and, while the member kept fetching, nothing was delivered for the lock duration reported on the wire and a margin', async () => {
+    const { clock, runtime, worker, take, keepFetching } = shareDrain({ lockMs: 10000 })
     for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
-    let other = 0
-    const traffic = setInterval(() => take(IDS.B, other++), 5)
-    try {
-      const began = runtime.clock.now()
-      const reply = await worker.onDrain({ ends: { [key]: '10' }, deadline: began + 2000 })
-      expect(reply).toEqual({ reached: true })
-      expect(runtime.clock.now() - began).toBeLessThan(2000)
-    } finally {
-      clearInterval(traffic)
-    }
+    keepFetching()
+    const reply = await worker.onDrain({ ends: { [key]: '10' }, deadline: 120000 })
+    expect(reply).toEqual({ reached: true })
+    expect(clock.now()).toBeGreaterThanOrEqual(15000)
+    expect(clock.now()).toBeLessThan(17000)
+    expect(drainRecord(runtime)).toEqual({
+      reached: true,
+      unconfirmedAccepts: 0,
+      unresolvedOffsets: '0',
+      untracked: 0,
+    })
   })
 
-  test('a share drain needs the broker to confirm each accept: a delivered record whose accept was refused stays missing until a later accept is confirmed', async () => {
-    const { runtime, worker, take } = shareDrain()
-    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
-    take(IDS.A, 9, 121)
-    const step = { ends: { [key]: '10' }, deadline: runtime.clock.now() + 40 }
-    expect(await worker.onDrain(step)).toEqual({ reached: false })
-    expect(runtime.records).toContainEqual({
-      kind: 'diagnostic',
-      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9`,
-    })
-    take(IDS.A, 9)
-    expect(await worker.onDrain(step)).toEqual({ reached: true })
-  })
-
-  test('a share drain fails on a missing early offset even when the last offset was delivered', async () => {
-    const { runtime, worker, take } = shareDrain()
-    for (let offset = 60; offset < 100; offset++) take(IDS.A, offset)
-    const step = { ends: { [key]: '100' }, deadline: runtime.clock.now() + 40 }
-    expect(await worker.onDrain(step)).toEqual({ reached: false })
-    expect(runtime.records).toContainEqual({
-      kind: 'diagnostic',
-      message: `share drain: ${key} of topic id ${IDS.A} has no handler entry at offset 0`,
-    })
-    for (let offset = 0; offset < 60; offset++) take(IDS.A, offset)
-    expect(await worker.onDrain(step)).toEqual({ reached: true })
-  })
-
-  /**
-   * A share drain whose standing member reported, for offset 9 of IDS.A, an accept the client
-   * retired after a session loss, and whose broker readback answers with `starts()` in turn.
-   * @param {() => object|undefined} starts the supervisor's reply to each share readback
-   */
-  const lostReply = (starts) => {
-    const clock = jumpClock(0)
-    const { runtime, worker, take } = shareDrain()
-    runtime.clock = clock
-    const asked = []
-    runtime.request = async (body) => {
-      asked.push({ ...body, at: clock.now() })
-      return starts()
-    }
-    const rig = { id: 'c07.1', slot: { group: 'g' } }
-    worker.standing.push(rig)
-    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
-    worker.delivered(`${IDS.A}|0`, '9')
-    const error = Object.assign(new Error('Acknowledgement was not confirmed'), {
-      name: 'KafkaJSShareAcknowledgementError',
-      reason: 'session-lost',
-    })
+  test('an accept whose reply was lost early in a long run does not fail the drain however many settlements follow, and stays in the drain record as an unresolved accept', async () => {
+    const { runtime, worker, rig, keepFetching } = shareDrain()
+    const k = `${IDS.A}|0`
+    worker.delivered(k, '0')
     worker.onOutcome(rig, {
       topic: main,
       partition: 0,
-      firstOffset: '9',
-      lastOffset: '9',
+      firstOffset: '0',
+      lastOffset: '0',
       type: 'accept',
-      error,
+      error: Object.assign(new Error('Acknowledgement was not confirmed'), {
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'session-lost',
+      }),
     })
-    return { clock, runtime, worker, take, asked }
-  }
-
-  test('a share drain passes an accept whose reply was lost to a session loss when the client reported its outcome and the broker start offset is past the end, and journals the outcome', async () => {
-    const { clock, runtime, worker, asked } = lostReply(() => ({
-      topicId: IDS.A,
-      startOffset: '10',
-      lag: '0',
-    }))
-    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
-    expect(await worker.onDrain(step)).toEqual({ reached: true })
+    for (let offset = 1; offset <= 150001; offset++) {
+      worker.delivered(k, String(offset))
+      worker.onShareSettled({
+        key: { topicId: IDS.A, partition: 0 },
+        offsets: [{ offset: String(offset), type: 'accept' }],
+        result: 'ok',
+        errorCode: 0,
+      })
+    }
+    keepFetching()
+    const reply = await worker.onDrain({ ends: { [key]: '150002' }, deadline: 120000 })
+    expect(reply).toEqual({ reached: true })
     expect(runtime.records).toContainEqual({
       kind: 'identity',
       recordId: expect.any(String),
@@ -2005,113 +2005,123 @@ describe('final soak final drain', () => {
       client: 'c07.1',
       group: 'g',
       key: { topic: main, topicId: IDS.A, partition: 0 },
-      from: '9',
-      to: '9',
+      from: '0',
+      to: '0',
       type: 'accept',
       reason: 'session-lost',
       errorType: 'KafkaJSShareAcknowledgementError',
     })
-    expect(asked).toEqual([
-      {
-        type: 'share-readback',
-        client: 'c07.1',
-        group: 'g',
-        key: { topic: main, topicId: IDS.A, partition: 0 },
-        at: 0,
-      },
-    ])
-    expect(runtime.records.some((r) => r.kind === 'diagnostic')).toBe(false)
+    expect(drainRecord(runtime)).toEqual({
+      reached: true,
+      unconfirmedAccepts: 1,
+      unresolvedOffsets: '1',
+      untracked: 0,
+    })
+    expect(runtime.problems).toEqual([])
   })
 
-  test('a share drain fails an accept whose reply was lost when the broker gives no share start offset past the end', async () => {
-    for (const answer of [
-      undefined,
-      { topicId: IDS.A, startOffset: null, lag: null },
-      { topicId: IDS.B, startOffset: '10', lag: '0' },
+  test('an accept reported unconfirmed and later redelivered and accepted on the wire is journaled as resolved and leaves no unresolved offset', async () => {
+    const { runtime, worker, rig, take, keepFetching } = shareDrain()
+    for (let offset = 0; offset < 10; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
+    worker.onOutcome(rig, {
+      topic: main,
+      partition: 0,
+      firstOffset: '0',
+      lastOffset: '9',
+      type: 'accept',
+      error: Object.assign(new Error('lost'), {
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'session-lost',
+      }),
+    })
+    for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
+    keepFetching()
+    expect(await worker.onDrain({ ends: { [key]: '10' }, deadline: 120000 })).toEqual({
+      reached: true,
+    })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      recordId: expect.any(String),
+      message: `share accept without wire confirmation resolved: ${IDS.A}|0 offsets 0 to 9 (session-lost, KafkaJSShareAcknowledgementError) were redelivered and accepted`,
+    })
+    expect(drainRecord(runtime)).toEqual({
+      reached: true,
+      unconfirmedAccepts: 1,
+      unresolvedOffsets: '0',
+      untracked: 0,
+    })
+  })
+
+  test('a share drain fails on a missing handler entry and names the offset, even when every later offset was delivered', async () => {
+    const { runtime, worker, take, keepFetching } = shareDrain()
+    for (let offset = 0; offset < 150001; offset++)
+      if (offset !== 5) worker.delivered(`${IDS.A}|0`, String(offset))
+    take(IDS.A, 150001)
+    keepFetching()
+    const step = { ends: { [key]: '150002' }, deadline: 120000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} of topic id ${IDS.A} has no handler entry at offset 5`,
+    })
+    expect(worker.entered.get(`${IDS.A}|0`).ranges).toHaveLength(1)
+    take(IDS.A, 5)
+    expect(await worker.onDrain({ ...step, deadline: 300000 })).toEqual({ reached: true })
+  })
+
+  test('a record redelivered after its lock expired is a new delivery and extends the quiet period', async () => {
+    const { ctx, clock, worker, take, fetch } = shareDrain()
+    for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
+    let redelivered = false
+    ctx.onTick = (t) => {
+      if (!redelivered && t >= 30000) {
+        redelivered = true
+        fetch([IDS.A], {
+          epoch: 1,
+          acquired: [{ firstOffset: '9', lastOffset: '9', deliveryCount: 2 }],
+        })
+        take(IDS.A, 9)
+        return
+      }
+      fetch([IDS.A], { epoch: 1 })
+    }
+    expect(await worker.onDrain({ ends: { [key]: '10' }, deadline: 120000 })).toEqual({
+      reached: true,
+    })
+    expect(redelivered).toBe(true)
+    expect(clock.now()).toBeGreaterThanOrEqual(30000 + 35000)
+  })
+
+  test('a member that stopped fetching, lost its membership or dropped the partition from its session cannot satisfy the quiet period', async () => {
+    for (const fetching of [
+      () => {},
+      (fetch) => fetch([IDS.A], { epoch: 1, errorCode: 25 }),
+      (fetch) => fetch([IDS.B], { epoch: 0 }),
     ]) {
-      const { clock, runtime, worker } = lostReply(() => answer)
-      const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
-      expect(await worker.onDrain(step)).toEqual({ reached: false })
+      const { ctx, runtime, worker, take, fetch } = shareDrain()
+      for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
+      ctx.onTick = () => fetching(fetch)
+      expect(await worker.onDrain({ ends: { [key]: '10' }, deadline: 120000 })).toEqual({
+        reached: false,
+      })
       expect(runtime.records).toContainEqual({
         kind: 'diagnostic',
-        message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9 (the client reported its outcome; the broker's share start offset is unknown, its lag unknown)`,
+        message: `share drain: ${key} of topic id ${IDS.A} has no share fetch answered without error, by a session holding the partition, sent at or after 35000 (the end of the quiet period)`,
       })
     }
   })
 
-  test('a share drain fails a record the broker still holds once its lock had time to expire, and names the offset', async () => {
-    const { clock, runtime, worker, asked } = lostReply(() => ({
-      topicId: IDS.A,
-      startOffset: '9',
-      lag: '1',
-    }))
-    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
-    expect(await worker.onDrain(step)).toEqual({ reached: false })
-    expect(clock.now()).toBe(60000)
-    expect(asked.at(-1).at).toBeGreaterThan(30000)
-    expect(runtime.records).toContainEqual({
-      kind: 'diagnostic',
-      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9 (the client reported its outcome; the broker's share start offset is 9, its lag 1)`,
-    })
-  })
-
-  test('a share drain passes a lost-reply accept of the last offset when the broker start offset still names it but its lag is 0', async () => {
-    const { clock, worker, asked } = lostReply(() => ({
-      topicId: IDS.A,
-      startOffset: '9',
-      lag: '0',
-    }))
-    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
-    expect(await worker.onDrain(step)).toEqual({ reached: true })
-    expect(asked).toHaveLength(1)
-  })
-
-  test('a share drain without a client outcome fails while the broker start offset is below the end, whatever later answers say', async () => {
-    const { runtime, worker, take } = shareDrain()
-    runtime.clock = jumpClock(0)
-    const asked = []
-    runtime.request = async (body) =>
-      asked.push(body) && { topicId: IDS.A, startOffset: '10', lag: '0' }
-    worker.standing.push({ id: 'c07.1', slot: { group: 'g' } })
-    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
-    worker.delivered(`${IDS.A}|0`, '9')
-    const step = { ends: { [key]: '10' }, deadline: runtime.clock.now() + 40 }
-    expect(await worker.onDrain(step)).toEqual({ reached: false })
-    expect(asked).toEqual([])
-    expect(runtime.records).toContainEqual({
-      kind: 'diagnostic',
-      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9`,
-    })
-  })
-
-  test('a share drain passes a record redelivered and accepted under a later acquisition after its first accept was lost', async () => {
-    let redelivered = false
-    const ctx = lostReply(() => {
-      if (!redelivered && ctx.clock.now() >= 30000) {
-        redelivered = true
-        ctx.take(IDS.A, 9)
-      }
-      return { topicId: IDS.A, startOffset: '9', lag: '1' }
-    })
-    const step = { ends: { [key]: '10' }, deadline: ctx.clock.now() + 60000 }
-    expect(await ctx.worker.onDrain(step)).toEqual({ reached: true })
-    expect(redelivered).toBe(true)
-    expect(ctx.clock.now()).toBeLessThan(60000)
-  })
-
-  test('a share gap that is never filled keeps a bounded memory and still fails the drain', async () => {
-    const runtime = workerRuntime('c07')
-    const worker = new ShareWorker(runtime)
-    for (let offset = 1; offset <= 100001; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
-    const state = worker.entered.get(`${IDS.A}|0`)
-    expect(state.ahead.size).toBeLessThanOrEqual(100000)
-    expect(state.gap).toBe('0')
-    const step = { ends: { [key]: '100002' }, deadline: runtime.clock.now() + 40 }
-    expect(await worker.onDrain(step)).toEqual({ reached: false })
-    expect(runtime.records).toContainEqual({
-      kind: 'diagnostic',
-      message: `share drain: ${key} of topic id ${IDS.A} has no handler entry at offset 0`,
-    })
+  test('a share drain of one topic incarnation is reached while deliveries of another topic never pause', async () => {
+    const { ctx, clock, worker, take, fetch } = shareDrain({ lockMs: 1000 })
+    for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
+    let other = 0
+    ctx.onTick = () => {
+      take(IDS.B, other++)
+      fetch([IDS.A, IDS.B], { epoch: 1 })
+    }
+    const reply = await worker.onDrain({ ends: { [key]: '10' }, deadline: 120000 })
+    expect(reply).toEqual({ reached: true })
+    expect(clock.now()).toBeLessThan(10000)
   })
 
   test('a share member is ready only once a share fetch of main partition 0 was answered without error', async () => {
