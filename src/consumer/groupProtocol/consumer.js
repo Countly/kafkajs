@@ -1435,7 +1435,10 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Decides what the current target means for the state machine, from live state: whether the
-   * member is where the coordinator wants it, and whether a round has to be asked for.
+   * member is where the coordinator wants it, and whether a round has to be asked for. A changed
+   * target whose resolvable part already equals what a settled member owns is acknowledged under
+   * its local epoch with no round, as the Java consumer acknowledges a partially resolved target.
+   * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractMembershipManager.java
    * @private
    * @param {{ targetChanged: boolean }} options
    * @returns {void}
@@ -1447,7 +1450,21 @@ module.exports = class ConsumerGroupProtocol {
     const grew = this.recordResolution(resolved)
     const converged = this.matchesOwned(resolved, this.eligibleTopics())
 
-    if (converged) {
+    if (
+      converged &&
+      targetChanged &&
+      (this.state === STABLE || this.state === ACKNOWLEDGING) &&
+      this.localAssignment.localEpoch !== this.target.localEpoch
+    ) {
+      // The coordinator keeps a dropped partition pending revocation until a heartbeat reports
+      // owned partitions without it, so a new target is acknowledged even when nothing is applied.
+      this.transitionTo(RECONCILING)
+      this.adoptLocalAssignment(
+        this.target.localEpoch,
+        this.appliedSubsetOf(resolved, this.ownedPartitions)
+      )
+      this.acknowledge()
+    } else if (converged) {
       if (wasReconciling || wasJoining) {
         this.transitionTo(STABLE)
       }
