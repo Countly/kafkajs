@@ -1670,3 +1670,95 @@ describe('final soak smoke schedule', () => {
     )
   })
 })
+
+describe('final soak record timestamps and client log', () => {
+  const { SourceChannel } = require('../finalSoakCollector')
+  const { StreamValidator } = require('../finalSoakSchema')
+
+  test("a wave's records keep nondecreasing at within their source when another record of the source is emitted between two wave-key writes", async () => {
+    let t = 0
+    const clock = { now: () => ++t, sleepUntil: async () => {} }
+    const sent = []
+    const channel = new SourceChannel({
+      source: 'p01',
+      clock,
+      send: ({ record }, done) => {
+        sent.push({ ...record, t: clock.now() })
+        done()
+      },
+    })
+    let ids = 0
+    let interleaved = false
+    const runtime = {
+      clock,
+      nextId: () => `p01.${ids++}`,
+      emit: async (record) => {
+        const ok = await channel.emit(record)
+        if (record.kind === 'wave-key' && !interleaved) {
+          interleaved = true
+          await channel.emit({ kind: 'diagnostic', recordId: runtime.nextId(), message: 'between' })
+        }
+        return ok
+      },
+    }
+    const worker = Object.create(ConsumerWorker.prototype)
+    worker.runtime = runtime
+    const keys = [0, 1, 2].map((partition) => ({ topic: 'main', topicId: IDS.A, partition }))
+    await worker.waveRecord(
+      'h00m0w0',
+      'transfer',
+      { id: 'c02.1' },
+      { id: 'c14.1' },
+      keys,
+      () => keys,
+      true
+    )
+    expect(sent.map((r) => r.kind)).toEqual([
+      'wave',
+      'wave-key',
+      'diagnostic',
+      'wave-key',
+      'wave-key',
+    ])
+    const header = { runId: config.runId, mode: config.mode, window: { observedEndAt: Infinity } }
+    const stream = new StreamValidator({ matrix, config, header })
+    for (const record of sent) stream.envelope(record)
+    expect(stream.problems).toEqual([])
+  })
+
+  test("a client's WARN and ERROR log lines reach a bounded file of its process in the artifact and lower levels do not", async () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
+    try {
+      const runtime = {
+        slot: 'p01',
+        out,
+        config,
+        context: new AsyncLocalStorage(),
+        sockets: { factory: () => undefined },
+        nextId: () => 'p01.0',
+        emit: async () => true,
+        clientLogCreator: ChildRuntime.prototype.clientLogCreator,
+      }
+      const slot = config.clients.find((c) => c.process === 'p01')
+      const rig = new ClientRig({ runtime, slot, incarnation: 1 })
+      await rig.construct((kafka) => kafka)
+      const logger = rig.kafka.logger()
+      logger.info('quiet line')
+      logger.warn('Rebalance is still running', { groupId: 'g1' })
+      logger.error('broken line', { groupId: 'g1' })
+      runtime.clientLog?.close()
+      const lines = fs
+        .readFileSync(path.join(out, 'client-log.p01.ndjson'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+      expect(lines.map((l) => [l.message, l.group])).toEqual([
+        ['Rebalance is still running', 'g1'],
+        ['broken line', 'g1'],
+      ])
+      expect(runtime.clientLog.maxLines).toBe(5000)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+})
