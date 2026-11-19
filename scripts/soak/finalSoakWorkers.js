@@ -36,6 +36,12 @@ const splitKey = (k) => {
 }
 /** Bytes after which a raw wire segment file is closed and the next one started. */
 const WIRE_SEGMENT_BYTES = 64 * 1024 * 1024
+/** The byte budget of one process's raw share wire files, all segments together. */
+const WIRE_TOTAL_BYTES = 4 * 1024 ** 3
+/** The byte budget of the reader's raw scan files, all scans together. */
+const RAW_SCAN_BYTES = 8 * 1024 ** 3
+/** The most of a telemetry reporter file the decoder reads in one poll. */
+const TELEMETRY_READ_BYTES = 8 * 1024 * 1024
 
 /** @param {string|Buffer} data @returns {string} lowercase hex SHA-256 */
 const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex')
@@ -147,16 +153,20 @@ const partialEntry = (runtime, entry, missing) => {
  */
 class WireLog {
   /** @param {{ dir: string, prefix: string }} options artifact directory and file prefix */
-  constructor({ dir, prefix }) {
-    Object.assign(this, { dir, prefix })
+  constructor({ dir, prefix, budget = WIRE_TOTAL_BYTES, onFull = () => {} }) {
+    Object.assign(this, { dir, prefix, budget, onFull })
     this.segment = 0
     this.bytes = 0
+    this.total = 0
+    this.dropped = 0
     fs.mkdirSync(path.join(dir, 'raw'), { recursive: true })
   }
 
   /**
+   * Appends one exchange, unless that would pass the byte budget of all segments: the exchange is
+   * then counted as dropped and `onFull` is told once, so the run fails instead of filling the disk.
    * @param {object} exchange `{ apiKey, request: Buffer, response: Buffer }` and any extra fields
-   * @returns {{ file: string, sha256: string }}
+   * @returns {{ file: string, sha256: string }|null} where it was written, null when dropped
    */
   append({ request, response, ...rest }) {
     const line =
@@ -165,6 +175,11 @@ class WireLog {
         request: request.toString('hex'),
         response: response.toString('hex'),
       }) + '\n'
+    if (this.total + line.length > this.budget) {
+      if (this.dropped++ === 0) this.onFull(`raw wire budget of ${this.budget} bytes reached`)
+      return null
+    }
+    this.total += line.length
     if (this.bytes + line.length > WIRE_SEGMENT_BYTES) {
       this.segment++
       this.bytes = 0
@@ -294,7 +309,7 @@ class ClientRig {
     try {
       await this.call('disconnect', () => this.object.disconnect(options), execution)
     } finally {
-      this.runtime.observer.forget(this.id)
+      this.runtime.forget(this.id)
     }
   }
 }
@@ -336,7 +351,11 @@ class ChildRuntime {
     this.ids = 0
     this.cuts = 0
     this.sockets = new SocketRegistry()
-    this.wire = new WireLog({ dir: out, prefix: `${slot}.share` })
+    this.wire = new WireLog({
+      dir: out,
+      prefix: `${slot}.share`,
+      onFull: (message) => this.problem(message),
+    })
     this.observer = new PassiveObserver({
       context: this.context,
       commits: this.commits,
@@ -550,6 +569,33 @@ class ChildRuntime {
     })
   }
 
+  /**
+   * The lifetime boundary of a retired client: everything kept per client (the observer's
+   * exchanges, its subscription lifetimes and revision, the worker's per-client state) is dropped,
+   * so retained harness state follows the live clients, not the run's churn.
+   * @param {string} client @returns {void}
+   */
+  forget(client) {
+    this.observer.forget(client)
+    for (const key of [...this.lifetimes.keys()])
+      if (key.startsWith(`${client}/`)) this.lifetimes.delete(key)
+    this.revisions.delete(client)
+    this.worker.forgetClient?.(client)
+  }
+
+  /**
+   * Sets a name's current topic id, or removes a deleted name (`topicId` null). The incarnation it
+   * replaces is retired: the worker drops what it kept for that topic id.
+   * @param {string} topic @param {string|null} topicId
+   * @returns {void}
+   */
+  setTopicId(topic, topicId) {
+    const old = this.topicIds.get(topic)
+    if (topicId) this.topicIds.set(topic, topicId)
+    else this.topicIds.delete(topic)
+    if (old && old !== topicId) this.worker.forgetTopic?.(old)
+  }
+
   /** @returns {Promise<void>} the start handshake and the preconstruction baseline */
   async start() {
     await this.emit({
@@ -670,9 +716,7 @@ class ChildRuntime {
       else if (step.type === 'closed')
         await this.sample({ role: 'closed', boundary: step.boundary })
       else if (step.type === 'topic-ids')
-        for (const [topic, topicId] of step.topicIds)
-          if (topicId) this.topicIds.set(topic, topicId)
-          else this.topicIds.delete(topic)
+        for (const [topic, topicId] of step.topicIds) this.setTopicId(topic, topicId)
       else if (step.type === 'disconnect') await this.stop()
       else reply = (await this.worker.perform(step)) ?? null
     } catch (e) {
@@ -1572,7 +1616,7 @@ class ConsumerWorker extends Worker {
       await this.operation(old, 'restart', [], execution, () =>
         old.object.disconnect({ leaveGroup: false })
       )
-      runtime.observer.forget(old.id)
+      runtime.forget(old.id)
       this.extras.push(await this.join(extraSlot, execution))
     }
     const leave = extraSlot.groupInstanceId ? { leaveGroup: true } : undefined
@@ -1806,6 +1850,21 @@ class ConsumerWorker extends Worker {
     return { ok: handled && drained.reached && drained.confirmed > 0 }
   }
 
+  /** @param {string} client drops the boundaries remembered for a retired client */
+  forgetClient(client) {
+    for (const key of [...this.lastBoundary.keys()])
+      if (key.startsWith(`${client}/`)) this.lastBoundary.delete(key)
+  }
+
+  /** @param {string} topicId drops what is kept for a retired incarnation */
+  forgetTopic(topicId) {
+    for (const map of [this.progress, this.lastBoundary])
+      for (const key of [...map.keys()]) if (key.split('/')[1] === topicId) map.delete(key)
+    for (const rig of this.rigs())
+      for (const key of [...rig.uncommitted.keys()])
+        if (key.startsWith(`${topicId}|`)) rig.uncommitted.delete(key)
+  }
+
   /** @param {object} step marks an outage in progress, so replays are attributed to it */
   async onBrokerOutage() {
     this.outage = true
@@ -1954,7 +2013,7 @@ class ShareWorker extends Worker {
       apiKeys: [78, 79],
       onExchange: (exchange) => {
         const where = runtime.wire.append({ client: rig.id, ...exchange })
-        runtime.observer.exchanged(rig.id, { ...exchange, ...where })
+        runtime.observer.exchanged(rig.id, { ...exchange, file: null, sha256: null, ...where })
       },
     }
     const { options } = clientOptions(runtime.config, runtime.matrix, slot)
@@ -2022,6 +2081,12 @@ class ShareWorker extends Worker {
       outcome: 'processed',
       errorType: null,
     })
+  }
+
+  /** @param {string} topicId drops the delivered offsets kept for a retired incarnation */
+  forgetTopic(topicId) {
+    for (const key of [...(this.entered?.keys() ?? [])])
+      if (key.startsWith(`${topicId}|`)) this.entered.delete(key)
   }
 
   /**
@@ -2143,10 +2208,20 @@ class ReaderWorker extends Worker {
     this.standing.push(rig)
   }
 
+  /** Raw scan bytes written so far, against `RAW_SCAN_BYTES`. */
+  rawBytes = 0
+  /** Opens the raw broker connection a scan reads through. */
+  openBroker = openRawBroker
+
   /**
+   * Scans one key and journals each committed record as it arrives, one fetch at a time, so the
+   * reader holds no more than one fetch response whatever the interval. Every raw exchange is
+   * appended to the scan's raw file and to its digest as it is written; the file is never read back.
+   * A scan that would pass the raw byte budget of all scans fails.
    * @param {{ id: string, topic: string, topicId: string, partition: number, from: string,
    *   execution?: string|null }} step one key's scan request
    * @returns {Promise<{ scan: string, to: string }>} the scan id and where it ended
+   * @throws {Error} when the scan fails or the raw budget is reached
    */
   async onScan(step) {
     const { runtime } = this
@@ -2154,38 +2229,52 @@ class ReaderWorker extends Worker {
     const scan = `${runtime.slot}.s${runtime.ids}`
     const rawFile = `raw/${scan}.ndjson`
     const raw = path.join(runtime.out, rawFile)
+    const digest = crypto.createHash('sha256')
+    let full = null
     const { leader } = await this.leaderOf(rig, step.topic, step.partition)
-    const broker = await openRawBroker(leader, (exchange) =>
-      fs.appendFileSync(
-        raw,
+    const broker = await this.openBroker(leader, (exchange) => {
+      const line =
         JSON.stringify({
           apiKey: exchange.apiKey,
           request: exchange.request.toString('hex'),
           response: exchange.response.toString('hex'),
         }) + '\n'
-      )
-    )
+      if (this.rawBytes + line.length > RAW_SCAN_BYTES) {
+        full ??= `raw scan budget of ${RAW_SCAN_BYTES} bytes reached at ${scan}`
+        return
+      }
+      this.rawBytes += line.length
+      fs.appendFileSync(raw, line)
+      digest.update(line)
+    })
     try {
-      const result = await scanPartition(broker, { ...step, from: BigInt(step.from) })
       const key = { topic: step.topic, topicId: step.topicId, partition: step.partition }
       let records = 0
-      for (const r of result.records) {
-        const parsed = parseValue(r.value, runtime.config.runId)
-        records++
-        await runtime.emit({
-          kind: 'identity',
-          recordId: runtime.nextId(),
-          execution: step.execution ?? null,
-          stage: 'log',
-          reader: rig.id,
-          scan,
-          id: parsed?.id ?? `foreign.${r.offset}`,
-          key,
-          offset: String(r.offset),
-          payloadSha256: payloadSha256(r.key, r.value, r.headers ?? {}),
-          transaction: parsed?.transaction ?? null,
-        })
-      }
+      const result = await scanPartition(
+        broker,
+        { ...step, from: BigInt(step.from) },
+        async (batch) => {
+          if (full) throw new Error(full)
+          for (const r of batch) {
+            const parsed = parseValue(r.value, runtime.config.runId)
+            records++
+            await runtime.emit({
+              kind: 'identity',
+              recordId: runtime.nextId(),
+              execution: step.execution ?? null,
+              stage: 'log',
+              reader: rig.id,
+              scan,
+              id: parsed?.id ?? `foreign.${r.offset}`,
+              key,
+              offset: String(r.offset),
+              payloadSha256: payloadSha256(r.key, r.value, r.headers ?? {}),
+              transaction: parsed?.transaction ?? null,
+            })
+          }
+        }
+      )
+      if (full) throw new Error(full)
       await runtime.emit({
         kind: 'scan',
         recordId: runtime.nextId(),
@@ -2197,7 +2286,7 @@ class ReaderWorker extends Worker {
         lso: result.lso,
         highWatermark: result.highWatermark,
         rawFile,
-        rawSha256: sha256(fs.readFileSync(raw)),
+        rawSha256: digest.digest('hex'),
         records,
       })
       return { scan, to: result.to }
@@ -2254,13 +2343,15 @@ const openRawBroker = async ({ host, port }, onExchange) => {
  * Reads one partition read_committed from `from` to its last stable offset taken at the start,
  * with the high watermark beside it. Records of aborted transactions and control batches are left
  * out by the same rules a read_committed consumer follows (`committedRecords`), applied per Fetch
- * response, whose aborted-transaction list covers that response's range.
+ * response, whose aborted-transaction list covers that response's range. Each response's committed
+ * records are handed to `onRecords`, awaited before the next fetch, and not kept.
  * @param {object} broker a connected `Broker` to the partition leader
  * @param {{ topic: string, partition: number, from: bigint }} read
- * @returns {Promise<{ records: object[], to: string, lso: string, highWatermark: string }>}
- * @throws {Error} when fifty fetches in a row make no progress
+ * @param {(records: object[]) => Promise<void>} onRecords
+ * @returns {Promise<{ to: string, lso: string, highWatermark: string }>}
+ * @throws {Error} when fifty fetches in a row make no progress, or `onRecords` throws
  */
-const scanPartition = async (broker, { topic, partition, from }) => {
+const scanPartition = async (broker, { topic, partition, from }, onRecords) => {
   const { committedRecords } = require('../../testHelpers/rawLog')
   const ISOLATION = require('../../src/protocol/isolationLevel')
   const end = async (isolationLevel) => {
@@ -2273,7 +2364,6 @@ const scanPartition = async (broker, { topic, partition, from }) => {
   }
   const lso = await end(ISOLATION.READ_COMMITTED)
   const highWatermark = await end(ISOLATION.READ_UNCOMMITTED)
-  const records = []
   let position = from
   let idle = 0
   while (position < lso) {
@@ -2286,8 +2376,8 @@ const scanPartition = async (broker, { topic, partition, from }) => {
     })
     const { messages, abortedTransactions } = responses[0].partitions[0]
     const inRange = messages.filter((m) => BigInt(m.offset) >= position && BigInt(m.offset) < lso)
-    records.push(
-      ...committedRecords({ records: inRange, abortedTransactions: abortedTransactions ?? [] })
+    await onRecords(
+      committedRecords({ records: inRange, abortedTransactions: abortedTransactions ?? [] })
     )
     let next = position
     for (const m of messages) if (BigInt(m.offset) + 1n > next) next = BigInt(m.offset) + 1n
@@ -2296,7 +2386,7 @@ const scanPartition = async (broker, { topic, partition, from }) => {
     if (next > position) idle = 0
     position = next > lso ? lso : next
   }
-  return { records, to: String(lso), lso: String(lso), highWatermark: String(highWatermark) }
+  return { to: String(lso), lso: String(lso), highWatermark: String(highWatermark) }
 }
 
 /**
@@ -2390,11 +2480,15 @@ class DecoderWorker extends Worker {
       const from = this.offsets.get(file) ?? 0
       const fd = fs.openSync(path.join(this.dir, file), 'r')
       const size = fs.fstatSync(fd).size
-      const bytes = Buffer.alloc(size - from)
+      const bytes = Buffer.alloc(Math.min(size - from, TELEMETRY_READ_BYTES))
       fs.readSync(fd, bytes, 0, bytes.length, from)
       fs.closeSync(fd)
       const end = bytes.lastIndexOf(0x0a) + 1
-      if (end === 0) continue
+      if (end === 0) {
+        if (bytes.length === TELEMETRY_READ_BYTES)
+          abort ??= `reporter ${node} line at ${from} exceeds ${TELEMETRY_READ_BYTES} bytes`
+        continue
+      }
       this.offsets.set(file, from + end)
       const raw = bytes.subarray(0, end)
       const rawFile = `telemetry/exports-${node}.${from}.jsonl`

@@ -57,6 +57,8 @@ const MIB = 1024 ** 2
 const GIB = 1024 ** 3
 /** Free disk kept back beyond the stream's remaining reservation (the planned 32 GiB safety). */
 const SAFETY_BYTES = 32 * GIB
+/** The children's explicit auxiliary byte budgets: raw scans 8 GiB, raw share wire 4 GiB, client logs. */
+const AUXILIARY_BYTES = 16 * GIB
 /** The disk a diagnostic run keeps free: enough to finish writing and archive a smoke. */
 const DIAGNOSTIC_RESERVE_BYTES = 2 * GIB
 /** What a command may take beyond its step's deadline, and what one without a deadline may take. */
@@ -464,6 +466,7 @@ class Supervisor {
         this.config.diagnostic
           ? DIAGNOSTIC_RESERVE_BYTES
           : Math.max(0, valueOf(this.matrix.host.maxStreamBytes) - this.collector.streamBytes) +
+            AUXILIARY_BYTES +
             SAFETY_BYTES,
     })
     this.monitor.start(this.clock, (reading) => {
