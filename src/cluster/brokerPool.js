@@ -49,7 +49,8 @@ const { keys, assign, values } = Object
 /**
  * @typedef {object} TargetEstablishment
  * @property {(topic: string) => boolean} isEstablished whether a metadata answer accepted the
- *   topic for its current declaration
+ *   topic for its current declaration, or it is a first-add row
+ * @property {(topic: string) => boolean} isTarget whether the topic is still a target
  * @property {(topics: string[]) => void} establish records the topics an answer accepted, unless a
  *   target was removed since the capture
  */
@@ -1240,32 +1241,35 @@ module.exports = class BrokerPool {
    * accepted since it was declared, is isolated: the topic is left out of the installed metadata,
    * so nothing routes to it, while it stays a target that every later refresh asks for again, and
    * its cached id stays, so a recreation is seen as one. Any other topic error, or code 3 for a
-   * topic no answer accepted yet (a subscription whose validation failed, say), is thrown as the
-   * version's own parse would throw it. The healthy topics' partitions are checked only then, so a
-   * topic error takes precedence over a partition error as in the strict parse, and nothing
-   * changes before the whole answer passed. Then the healthy topics are established and installed.
+   * topic no answer accepted yet (a subscription whose validation failed, say), is thrown. Any other
+   * code wins over code 3, whatever the wire order, so a missing topic never hides a fatal one (17,
+   * 29); between two such codes the first in wire order wins. The healthy topics' partitions are
+   * checked only then, so a topic error takes precedence over a partition error as in the strict
+   * parse, and nothing changes before the whole answer passed. Then the healthy topics are
+   * established and installed. A topic that stopped being a target since the refresh began (a
+   * withdrawn first-add row, say) is left out first: it is neither judged, installed nor reported.
    * The Java consumer and franz-go keep a missing topic per topic too.
    *
    * A status is reported only when it changes: once when a topic becomes unavailable, once when a
    * refresh answers it again. The state is bounded by the targets; `forgetTopic` drops it. An
    * isolated topic is asked for again within a second (see `refreshMetadataIfNecessary`), so a
    * recreation is seen against its kept id and reset as any recreation is.
-   * @param {object[]} topicMetadata the answer's topics, topic and partition errors retained
+   * @param {object[]} answered the answer's topics, topic and partition errors retained
    * @param {TargetEstablishment} establishment captured when the refresh began
    * @param {{ allowLeaderless?: boolean }} options lets a partition without a leader through
    * @returns {object[]} the topics answered without an error
-   * @throws {import('../errors').KafkaJSProtocolError} the first topic error not isolated, else
-   *   the first partition error
+   * @throws {import('../errors').KafkaJSProtocolError} the first topic error other than code 3,
+   *   else the first code 3 not isolated, else the first partition error
    */
-  isolateUnknownTopics(topicMetadata, { isEstablished, establish }, { allowLeaderless }) {
+  isolateUnknownTopics(answered, { isEstablished, isTarget, establish }, { allowLeaderless }) {
+    const topicMetadata = answered.filter(({ topic }) => isTarget(topic))
     const failed = topicMetadata.filter(
       ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
     )
-    for (const { topic, topicErrorCode } of failed) {
-      if (topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION || !isEstablished(topic)) {
-        throw createErrorFromCode(topicErrorCode)
-      }
-    }
+    const thrown =
+      failed.find(({ topicErrorCode }) => topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION) ??
+      failed.find(({ topic }) => !isEstablished(topic))
+    if (thrown) throw createErrorFromCode(thrown.topicErrorCode)
     const healthy = failed.length
       ? topicMetadata.filter((entry) => !failed.includes(entry))
       : topicMetadata

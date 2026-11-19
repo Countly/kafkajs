@@ -95,6 +95,16 @@ class World {
     this.assigned = null
     this.names = null
     this.regex = null
+    /** @type {Map<string, number>} codes for live names on a lookup by name only */
+    this.namedCodes = new Map()
+    /** @type {Map<string, number>} codes for live topic ids on a lookup by id only */
+    this.idCodes = new Map()
+    /** @type {Set<string>} live names the coordinator does not assign */
+    this.withheld = new Set()
+    /** @type {Map<string, string>} the id the coordinator still assigns for a name */
+    this.lagged = new Map()
+    /** Whether the coordinator repeats an unchanged assignment instead of answering null. */
+    this.repeat = false
   }
 
   /** @param {string} name @returns {boolean} whether the topic exists and can be described */
@@ -119,11 +129,15 @@ class World {
     for (const [name, id] of this.ids) if (id === topicId && this.live(name)) return name
   }
 
-  /** @param {string} name @returns {object} one Metadata v13 topic entry */
-  describe(name) {
-    if (!this.live(name)) {
+  /**
+   * @param {string} name
+   * @param {boolean} [byId] whether the lookup was by topic id
+   * @returns {object} one Metadata v13 topic entry
+   */
+  describe(name, byId = false) {
+    if (!this.live(name) || (!byId && this.namedCodes.has(name))) {
       return {
-        errorCode: this.refused.get(name) ?? 3,
+        errorCode: (byId ? undefined : this.namedCodes.get(name)) ?? this.refused.get(name) ?? 3,
         name,
         topicId: NULL_ID,
         isInternal: false,
@@ -155,13 +169,16 @@ class World {
   metadata(requested) {
     const entries =
       requested === null
-        ? [...this.ids.keys()].filter((name) => this.live(name)).map((name) => this.describe(name))
+        ? [...this.ids.keys()]
+            .filter((name) => this.live(name) && !this.idCodes.has(this.ids.get(name)))
+            .map((name) => this.describe(name))
         : requested.map(({ name, topicId }) => {
             if (name != null) return this.describe(name)
             const known = this.nameOf(topicId)
-            return known
-              ? this.describe(known)
-              : { errorCode: 100, name: null, topicId, isInternal: false, partitions: [] }
+            const errorCode = this.idCodes.get(topicId) ?? (known ? 0 : 100)
+            return errorCode === 0
+              ? this.describe(known, true)
+              : { errorCode, name: null, topicId, isInternal: false, partitions: [] }
           })
     return {
       brokers: [{ nodeId: 0, host: 'node0', port: 9092, rack: null }],
@@ -202,14 +219,14 @@ class World {
     if (subscribedTopicNames) this.names = subscribedTopicNames
     if (subscribedTopicRegex) this.regex = new RegExp(subscribedTopicRegex)
     const wanted = [...this.ids.keys()]
-      .filter((name) => this.live(name))
+      .filter((name) => this.live(name) && !this.withheld.has(name))
       .filter((name) => this.names?.includes(name) || this.regex?.test(name))
-      .map((name) => this.ids.get(name))
+      .map((name) => this.lagged.get(name) ?? this.ids.get(name))
       .sort()
     const key = wanted.join()
-    if (memberEpoch === 0 || key !== this.assigned) {
+    if (memberEpoch === 0 || key !== this.assigned || this.repeat) {
+      if (memberEpoch === 0 || key !== this.assigned) this.epoch += 1
       this.assigned = key
-      this.epoch += 1
       return {
         memberId,
         memberEpoch: this.epoch,
@@ -463,6 +480,36 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     30000
   )
 
+  test.each([
+    [17, 'INVALID_TOPIC_EXCEPTION'],
+    [29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    'consumer: a subscription answered code 3 before code %i rejects with %s, not as a topic still to come',
+    async (code, type) => {
+      const TYPO = 'lifecycle-typo'
+      const wire = scenario('consumer')
+      wire.world.remove(DOOMED)
+      wire.world.refused.set(TYPO, code)
+      const answered = []
+      wire.cluster.answer('Metadata', ({ topics }) => {
+        const answer = wire.world.metadata(topics)
+        answer.topics.sort((a, b) => (b.errorCode === 3) - (a.errorCode === 3))
+        answered.push(answer.topics.map(({ errorCode }) => errorCode))
+        return answer
+      })
+      await wire.consumer.connect()
+
+      await expect(
+        wire.consumer.subscribe({ topics: [HEALTHY, DOOMED, TYPO], fromBeginning: true })
+      ).rejects.toMatchObject({ type })
+      expect(answered).toHaveLength(1)
+      expect(answered[0][0]).toBe(3)
+      expect([...answered[0]].sort()).toEqual([0, 3, code].sort())
+      expect(wire.observed.statuses).toEqual([])
+    },
+    30000
+  )
+
   test('unsubscribing drops the state of an unavailable topic and reports nothing for it', async () => {
     const wire = scenario('classic')
     await wire.consumer.connect()
@@ -655,6 +702,552 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     },
     30000
   )
+
+  describe('consumer: a topic the coordinator assigns that a lookup by name does not know yet', () => {
+    const NEW = 'lifecycle-new'
+    const NEW_ID = '0a0a0a0a-0000-4000-8000-000000000004'
+    const TYPO = 'lifecycle-typo'
+    const TYPO_ID = '0a0a0a0a-0000-4000-8000-000000000005'
+
+    /** @param {object} cluster @returns {object[]} the heartbeats sent, oldest first */
+    const heartbeats = (cluster) =>
+      cluster
+        .requests()
+        .filter(({ api }) => api === 'ConsumerGroupHeartbeat')
+        .map(({ fields }) => fields)
+
+    /** @param {object} cluster @returns {string[][]} the topic ids each acknowledgement carried */
+    const acks = (cluster) =>
+      heartbeats(cluster)
+        .filter(({ memberEpoch, topicPartitions }) => memberEpoch > 0 && topicPartitions != null)
+        .map(({ topicPartitions }) => topicPartitions.map(({ topicId }) => topicId).sort())
+
+    /** @param {object} cluster @param {string} name @returns {object[]} lookups by name of it */
+    const namedAsks = (cluster, name) =>
+      cluster
+        .requests()
+        .filter(
+          ({ api, fields }) =>
+            api === 'Metadata' && (fields.topics || []).some((topic) => topic.name === name)
+        )
+
+    /** @param {object} cluster @returns {Set<string>} every topic id a Fetch asked for */
+    const fetched = (cluster) =>
+      new Set(
+        cluster
+          .requests()
+          .filter(({ api }) => api === 'Fetch')
+          .flatMap(({ fields }) => fields.topics.map(({ topicId }) => topicId))
+      )
+
+    /**
+     * A consumer-protocol scenario that also records assignment events.
+     * @param {object} [options] consumer options over the scenario's
+     * @returns {object} the scenario with `assigned` and `revoked` event payloads
+     */
+    const assignedScenario = (options = {}) => {
+      const wire = scenario('consumer', { groupId: `pending-${Math.random()}`, ...options })
+      wire.world.ids.set(NEW, NEW_ID)
+      wire.assigned = []
+      wire.revoked = []
+      wire.joins = 0
+      wire.consumer.on(wire.consumer.events.PARTITIONS_ASSIGNED, ({ payload }) =>
+        wire.assigned.push(payload)
+      )
+      wire.consumer.on(wire.consumer.events.PARTITIONS_REVOKED, ({ payload }) =>
+        wire.revoked.push(payload)
+      )
+      wire.consumer.on(wire.consumer.events.GROUP_JOIN, () => wire.joins++)
+      return wire
+    }
+
+    /** @param {object} payloads @param {string} name @returns {boolean} whether any names it */
+    const names = (payloads, name) => JSON.stringify(payloads).includes(`"${name}"`)
+
+    test('a broker-side pattern keeps the healthy topics, fetches a new healthy sibling at once and holds the unknown name out of the ACK, the Fetch and PARTITIONS_ASSIGNED, reporting it once', async () => {
+      const wire = assignedScenario()
+      wire.world.namedCodes.set(DOOMED, 3)
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.run()
+
+      await until(
+        () =>
+          offsets(wire.observed, HEALTHY).length >= 3 && offsets(wire.observed, NEW).length >= 3,
+        'records from both healthy topics'
+      )
+      await until(() => namedAsks(wire.cluster, DOOMED).length >= 4, 'repeated lookups by name')
+
+      expect(wire.observed.crashes).toEqual([])
+      expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+      expect(acks(wire.cluster).flat()).not.toContain(DOOMED_ID)
+      expect(acks(wire.cluster)).toContainEqual([HEALTHY_ID, NEW_ID].sort())
+      expect(names(wire.assigned, DOOMED)).toBe(false)
+      expect(wire.observed.statuses).toEqual([
+        expect.objectContaining({ topic: DOOMED, status: 'unavailable', code: 3 }),
+      ])
+      expect(wire.observed.warnings).toHaveLength(1)
+    }, 30000)
+
+    test('an awaiting literal refused at its first add keeps its declaration and the healthy delivery, and is read from its start once it is known', async () => {
+      const wire = assignedScenario()
+      wire.world.remove(DOOMED)
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+      wire.world.namedCodes.set(DOOMED, 3)
+      wire.world.recreate(DOOMED, DOOMED_ID)
+      await until(() => namedAsks(wire.cluster, DOOMED).length >= 3, 'lookups by name')
+      const healthy = offsets(wire.observed, HEALTHY).length
+      await until(
+        () => offsets(wire.observed, HEALTHY).length >= healthy + 3,
+        'healthy records while the literal is refused'
+      )
+      expect(wire.observed.crashes).toEqual([])
+      expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+      expect(heartbeats(wire.cluster).at(-1).subscribedTopicNames ?? wire.world.names).toContain(
+        DOOMED
+      )
+
+      wire.world.namedCodes.delete(DOOMED)
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+      expect(offsets(wire.observed, DOOMED)[0]).toBe('0')
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
+
+    test.each([
+      ['answers null', false, [HEALTHY, DOOMED]],
+      ['repeats the assignment', true, [HEALTHY, DOOMED]],
+      ['answers null to an all-pending target', false, [DOOMED]],
+      ['repeats an all-pending target', true, [DOOMED]],
+    ])(
+      'a coordinator that %s sees one acknowledgement, regular heartbeats, no repeated applies and paced lookups while the name stays unknown, then one addition when it is known under the same id',
+      async (_, repeat, topics) => {
+        const wire = assignedScenario()
+        wire.world.repeat = repeat
+        wire.world.namedCodes.set(DOOMED, 3)
+        await wire.consumer.connect()
+        await wire.consumer.subscribe({ topics, fromBeginning: true })
+        await wire.run()
+        await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+        await sleep(200)
+
+        const ackCount = acks(wire.cluster).length
+        const joins = wire.joins
+        const sentAt = heartbeats(wire.cluster).length
+        const askedAt = namedAsks(wire.cluster, DOOMED).length
+        const started = Date.now()
+        await sleep(600)
+        const elapsed = Date.now() - started
+
+        expect(acks(wire.cluster)).toHaveLength(ackCount)
+        expect(ackCount).toBe(1)
+        expect(acks(wire.cluster)[0]).toEqual(topics.includes(HEALTHY) ? [HEALTHY_ID] : [])
+        expect(wire.joins).toBe(joins)
+        expect(heartbeats(wire.cluster).length - sentAt).toBeLessThanOrEqual(elapsed / 50 + 2)
+        expect(namedAsks(wire.cluster, DOOMED).length - askedAt).toBeLessThanOrEqual(
+          elapsed / 100 + 2
+        )
+        expect(wire.observed.crashes).toEqual([])
+
+        wire.world.namedCodes.delete(DOOMED)
+        await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+        await sleep(200)
+        expect(acks(wire.cluster).slice(ackCount)).toEqual([
+          (topics.includes(HEALTHY) ? [HEALTHY_ID, DOOMED_ID] : [DOOMED_ID]).sort(),
+        ])
+        expect(wire.joins).toBe(joins + 1)
+        expect(wire.observed.statuses.map(({ status }) => status)).toEqual([
+          'unavailable',
+          'available',
+        ])
+      },
+      30000
+    )
+
+    /**
+     * A broker-side pattern whose first add of `DOOMED` is held at the broker, with the
+     * coordinator's one withdrawal of it held too. Every other lookup by name answers it code 3.
+     * @param {boolean} heldKnows whether the held lookup answers it as a live topic
+     * @returns {Promise<object>} the scenario and the releases of both holds
+     */
+    const heldWithdrawal = async (heldKnows) => {
+      const wire = assignedScenario()
+      const gates = {}
+      const hold = (key) => new Promise((resolve) => (gates[key] = resolve))
+      let metadataHeld = null
+      let withdrawalHeld = null
+      wire.cluster.answer('Metadata', async ({ topics }) => {
+        if (!metadataHeld && topics?.some(({ name }) => name === DOOMED)) {
+          metadataHeld = hold('metadata')
+          await metadataHeld
+          if (heldKnows) {
+            wire.world.namedCodes.delete(DOOMED)
+            const answer = wire.world.metadata(topics)
+            wire.world.namedCodes.set(DOOMED, 3)
+            return answer
+          }
+        }
+        return wire.world.metadata(topics)
+      })
+      wire.cluster.answer('ConsumerGroupHeartbeat', async (request) => {
+        const answer = wire.world.heartbeat(request)
+        const ids = answer.assignment?.topicPartitions.map(({ topicId }) => topicId)
+        if (!withdrawalHeld && wire.world.withheld.has(DOOMED) && ids && !ids.includes(DOOMED_ID)) {
+          withdrawalHeld = hold('withdrawal')
+          await withdrawalHeld
+        }
+        return answer
+      })
+      wire.world.ids.delete(NEW)
+      wire.world.ids.delete(DOOMED)
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, HEALTHY).length >= 2, 'healthy records')
+
+      wire.world.namedCodes.set(DOOMED, 3)
+      wire.world.ids.set(NEW, NEW_ID)
+      wire.world.ids.set(DOOMED, DOOMED_ID)
+      await until(() => gates.metadata, 'the held first add')
+      wire.world.withheld.add(DOOMED)
+      await until(() => gates.withdrawal, 'the held withdrawal')
+      return { wire, gates }
+    }
+
+    /** The withdrawal stuck: no later lookup, no revocation, healthy delivery goes on. */
+    const expectWithdrawn = async (wire) => {
+      await until(() => offsets(wire.observed, NEW).length >= 2, 'records from the new sibling')
+      await sleep(300)
+      const asked = namedAsks(wire.cluster, DOOMED).length
+      const healthy = offsets(wire.observed, HEALTHY).length
+      await sleep(400)
+      expect(namedAsks(wire.cluster, DOOMED)).toHaveLength(asked)
+      expect(offsets(wire.observed, HEALTHY).length).toBeGreaterThan(healthy)
+      expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+      expect(acks(wire.cluster).at(-1)).toEqual([HEALTHY_ID, NEW_ID].sort())
+      expect(names(wire.revoked, DOOMED)).toBe(false)
+      expect(wire.observed.crashes).toEqual([])
+    }
+
+    test('a withdrawal held while the first add is answered code 3 and a sibling is applied still sticks', async () => {
+      const { wire, gates } = await heldWithdrawal(false)
+      gates.metadata()
+      await until(() => names(wire.assigned, NEW), 'the sibling applied')
+      gates.withdrawal()
+
+      await expectWithdrawn(wire)
+      expect(wire.observed.statuses).toEqual([
+        expect.objectContaining({ topic: DOOMED, status: 'unavailable' }),
+      ])
+    }, 30000)
+
+    test('a withdrawal released before a late successful first add still sticks and reports no recovery', async () => {
+      const { wire, gates } = await heldWithdrawal(true)
+      gates.withdrawal()
+      await sleep(100)
+      gates.metadata()
+
+      await expectWithdrawn(wire)
+      expect(wire.observed.statuses.map(({ status }) => status)).not.toContain('available')
+    }, 30000)
+
+    test.each([
+      [17, 'the first add', 'INVALID_TOPIC_EXCEPTION'],
+      [29, 'the first add', 'TOPIC_AUTHORIZATION_FAILED'],
+      [17, 'a due retry', 'INVALID_TOPIC_EXCEPTION'],
+      [29, 'a due retry', 'TOPIC_AUTHORIZATION_FAILED'],
+    ])(
+      'code 3 answered before code %i on %s stops the run with %s and acknowledges and reports nothing of that answer',
+      async (code, when, type) => {
+        const wire = assignedScenario()
+        wire.cluster.answer('Metadata', ({ topics }) => {
+          const answer = wire.world.metadata(topics)
+          answer.topics.sort((a, b) => (b.errorCode === 3) - (a.errorCode === 3))
+          return answer
+        })
+        wire.world.namedCodes.set(DOOMED, 3)
+        if (when === 'the first add') wire.world.namedCodes.set(NEW, code)
+        else wire.world.ids.delete(NEW)
+        await wire.consumer.connect()
+        await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+        await wire.run()
+        if (when === 'a due retry') {
+          await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+          await until(() => offsets(wire.observed, HEALTHY).length >= 1, 'healthy records')
+          wire.world.namedCodes.set(HEALTHY, code)
+        }
+        await until(() => wire.observed.crashes.length === 1, 'the crash')
+
+        expect(typed(wire.observed.crashes[0].error).type).toBe(type)
+        expect(wire.observed.crashes[0].restart).toBe(false)
+        if (when === 'the first add') {
+          expect(acks(wire.cluster)).toEqual([])
+          expect(wire.observed.statuses).toEqual([])
+        } else {
+          expect(wire.observed.statuses).toHaveLength(1)
+        }
+      },
+      30000
+    )
+
+    test('code 29 for an assigned topic id stops the run with TOPIC_AUTHORIZATION_FAILED', async () => {
+      const wire = assignedScenario()
+      wire.world.ids.set(TYPO, TYPO_ID)
+      wire.world.idCodes.set(TYPO_ID, 29)
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.run().catch(() => {})
+      await until(() => wire.observed.crashes.length === 1, 'the crash')
+
+      expect(typed(wire.observed.crashes[0].error).type).toBe('TOPIC_AUTHORIZATION_FAILED')
+      expect(fetched(wire.cluster).has(TYPO_ID)).toBe(false)
+    }, 30000)
+
+    test.each([false, true])(
+      'a lookup by name that finds a new id while the coordinator still assigns the old one fetches neither until the coordinator assigns the new id, then reads it from the configured reset position (creation %s)',
+      async (allowAutoTopicCreation) => {
+        const wire = assignedScenario({ allowAutoTopicCreation })
+        wire.world.remove(DOOMED)
+        await wire.consumer.connect()
+        await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+        await wire.run()
+        await until(() => offsets(wire.observed, HEALTHY).length >= 2, 'healthy records')
+
+        wire.world.recreate(DOOMED, DOOMED_ID)
+        wire.world.namedCodes.set(DOOMED, 3)
+        await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+        wire.world.lagged.set(DOOMED, DOOMED_ID)
+        wire.world.namedCodes.delete(DOOMED)
+        wire.world.recreate(DOOMED, RECREATED_ID)
+        await until(() => wire.observed.statuses.length === 2, 'the available status')
+        await sleep(300)
+
+        expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+        expect(fetched(wire.cluster).has(RECREATED_ID)).toBe(false)
+        expect(acks(wire.cluster).flat()).not.toContain(DOOMED_ID)
+
+        wire.world.lagged.delete(DOOMED)
+        await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+        const firstAsked = wire.cluster
+          .requests()
+          .filter(({ api }) => api === 'Fetch')
+          .flatMap(({ fields }) => fields.topics)
+          .find(({ topicId }) => topicId === RECREATED_ID)
+        expect(firstAsked.partitions[0].fetchOffset).toBe('0')
+        expect(acks(wire.cluster).flat()).not.toContain(DOOMED_ID)
+        const bits = namedAsks(wire.cluster, DOOMED).map(
+          ({ fields }) => fields.allowAutoTopicCreation
+        )
+        expect(bits.length).toBeGreaterThan(1)
+        expect(new Set(bits)).toEqual(new Set([allowAutoTopicCreation]))
+        expect(wire.observed.crashes).toEqual([])
+      },
+      30000
+    )
+
+    test.each(['stop', 'unsubscribe'])(
+      '%s while a due lookup of an unknown assigned name is held leaves no late report, Fetch, acknowledgement or lookup',
+      async (operation) => {
+        const wire = assignedScenario()
+        wire.world.namedCodes.set(DOOMED, 3)
+        await wire.consumer.connect()
+        await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+        await wire.run()
+        await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+        let release = null
+        wire.cluster.answer('Metadata', async ({ topics }) => {
+          if (!release && topics?.some(({ name }) => name === DOOMED)) {
+            await new Promise((resolve) => (release = resolve))
+          }
+          return wire.world.metadata(topics)
+        })
+        await until(() => release, 'the held lookup')
+
+        await wire.consumer[operation]()
+        wire.world.namedCodes.delete(DOOMED)
+        const requests = wire.cluster.requests().length
+        release()
+        await sleep(300)
+
+        expect(wire.cluster.requests().slice(requests)).toEqual([])
+        expect(wire.observed.statuses).toHaveLength(1)
+        expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+        expect(wire.observed.crashes).toEqual([])
+
+        if (operation === 'stop') {
+          wire.world.withheld.add(DOOMED)
+          const askedAtRestart = namedAsks(wire.cluster, DOOMED).length
+          await wire.run()
+          await until(() => offsets(wire.observed, NEW).length >= 2, 'records after the restart')
+          await sleep(300)
+          expect(namedAsks(wire.cluster, DOOMED)).toHaveLength(askedAtRestart)
+          expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+          expect(wire.observed.statuses).toHaveLength(1)
+        }
+      },
+      30000
+    )
+
+    test('a name known while a sibling apply is held gets one further apply and one acknowledgement with both', async () => {
+      const wire = assignedScenario()
+      wire.world.namedCodes.set(DOOMED, 3)
+      wire.world.ids.delete(NEW)
+      let releaseHook = null
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.consumer.run({
+        rebalanceListener: {
+          onPartitionsAssigned: async ({ partitions }) => {
+            if (JSON.stringify(partitions).includes(NEW)) {
+              await new Promise((resolve) => (releaseHook = resolve))
+            }
+          },
+        },
+        eachMessage: async ({ topic, message }) => {
+          wire.observed.records.push({ topic, offset: message.offset })
+        },
+      })
+      await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+      const joins = wire.joins
+
+      wire.world.ids.set(NEW, NEW_ID)
+      await until(() => releaseHook, 'the held sibling apply')
+      wire.world.namedCodes.delete(DOOMED)
+      await until(() => wire.observed.statuses.length === 2, 'the available status')
+      releaseHook()
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+      await sleep(300)
+
+      expect(wire.joins).toBe(joins + 2)
+      expect(acks(wire.cluster).at(-1)).toEqual([HEALTHY_ID, NEW_ID, DOOMED_ID].sort())
+      expect(acks(wire.cluster).filter((ids) => ids.includes(DOOMED_ID))).toHaveLength(1)
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
+    /**
+     * A coordinator with the revoke-before-assign rule of the Kafka group coordinator: when its
+     * target drops `topicId`, a member that has not reported owned partitions without it keeps its
+     * epoch and is sent the assignment without it, and gets the new target only once a heartbeat
+     * reports owned partitions without it. A heartbeat that reports none still owns it.
+     * @param {object} wire the scenario
+     * @param {string} topicId the id the coordinator drops
+     * @returns {{ freeze: (frozen: boolean) => void }} while frozen, the coordinator answers no change
+     */
+    const revokingCoordinator = (wire, topicId) => {
+      let frozen = false
+      let pending = false
+      const unchanged = ({ memberId }, assignment = null) => ({
+        memberId,
+        memberEpoch: wire.world.epoch,
+        heartbeatIntervalMs: 50,
+        assignment,
+      })
+      wire.cluster.answer('ConsumerGroupHeartbeat', (request) => {
+        if (frozen) return unchanged(request)
+        const reported = request.topicPartitions?.map((topic) => topic.topicId)
+        const owns = !reported || reported.includes(topicId)
+        if (pending) {
+          if (owns) return unchanged(request)
+          pending = false
+        } else if (owns && wire.world.assigned?.split(',').includes(topicId)) {
+          const before = { epoch: wire.world.epoch, assigned: wire.world.assigned }
+          const next = wire.world.heartbeat(request)
+          const ids = next.assignment?.topicPartitions.map((topic) => topic.topicId)
+          if (!ids || ids.includes(topicId)) return next
+          Object.assign(wire.world, before)
+          pending = true
+          const kept = before.assigned.split(',').filter((id) => id !== topicId)
+          return unchanged(request, {
+            topicPartitions: kept.map((id) => ({ topicId: id, partitions: [0] })),
+          })
+        }
+        return wire.world.heartbeat(request)
+      })
+      return { freeze: (value) => (frozen = value) }
+    }
+
+    test('an awaiting literal whose assigned id is deleted at its first add and recreated under a new id acknowledges the revocation of the old id and is read from its start', async () => {
+      const wire = assignedScenario()
+      wire.world.ids.delete(NEW)
+      wire.world.remove(DOOMED)
+      const coordinator = revokingCoordinator(wire, DOOMED_ID)
+      let deleted = false
+      wire.cluster.answer('Metadata', ({ topics }) => {
+        const answer = wire.world.metadata(topics)
+        if (!deleted && topics?.some(({ name, topicId }) => !name && topicId === DOOMED_ID)) {
+          deleted = true
+          wire.world.remove(DOOMED)
+          coordinator.freeze(true)
+        }
+        return answer
+      })
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+      wire.world.recreate(DOOMED, DOOMED_ID)
+      await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+      expect(deleted).toBe(true)
+      wire.world.recreate(DOOMED, RECREATED_ID)
+      await until(() => wire.observed.statuses.length === 2, 'the available status')
+      coordinator.freeze(false)
+
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+      expect(offsets(wire.observed, DOOMED)[0]).toBe('0')
+      expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+      expect(acks(wire.cluster)).toContainEqual([HEALTHY_ID])
+      expect(acks(wire.cluster).at(-1)).toEqual([HEALTHY_ID, RECREATED_ID].sort())
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
+  })
+
+  test('a classic consumer, a producer and an admin of one client, and a share consumer, still fail on a missing topic and report no status', async () => {
+    const world = new World()
+    world.remove(DOOMED)
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'consumer' })
+    cluster.answer('Metadata', ({ topics }) => world.metadata(topics))
+    const kafka = new Kafka(cluster.kafkaOptions({ retry: RETRY, logLevel: logLevel.NOTHING }))
+    const statuses = []
+    const consumer = kafka.consumer({ groupId: 'strict-classic', allowAutoTopicCreation: false })
+    consumer.on(consumer.events.TOPIC_METADATA_STATUS, ({ payload }) => statuses.push(payload))
+    const producer = kafka.producer({ allowAutoTopicCreation: false })
+    const admin = kafka.admin()
+    const shareCluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    shareCluster.answer('Metadata', ({ topics }) => world.metadata(topics))
+    const share = new Kafka(
+      shareCluster.kafkaOptions({ retry: RETRY, logLevel: logLevel.NOTHING })
+    ).shareConsumer({ groupId: 'strict-share' })
+    consumers.push(consumer, producer, admin, share)
+    const failure = async (promise) =>
+      typed(
+        await promise.then(
+          () => null,
+          (error) => error
+        )
+      )
+
+    await consumer.connect()
+    await producer.connect()
+    await admin.connect()
+    await share.connect()
+
+    expect(
+      await failure(consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true }))
+    ).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    expect(
+      await failure(producer.send({ topic: DOOMED, messages: [{ value: 'x' }] }))
+    ).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
+    expect(await failure(admin.fetchTopicMetadata({ topics: [DOOMED] }))).toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(await failure(share.subscribe({ topics: [DOOMED] }))).toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(statuses).toEqual([])
+  }, 30000)
 
   describe('with the default metadata age, as the live recreation checks run', () => {
     /**
