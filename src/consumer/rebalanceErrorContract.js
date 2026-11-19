@@ -475,8 +475,19 @@ const isStaleMembershipVerdict = (verdict, kind, generationId) => {
   return generationId != null && sentUnder != null && sentUnder !== generationId
 }
 
+/** Topic errors a consumer's own target cannot outlive: they stop its run. */
+const FATAL_TOPIC_ERRORS = ['INVALID_TOPIC_EXCEPTION', 'TOPIC_AUTHORIZATION_FAILED']
+
+/**
+ * Whether a metadata error for a topic of the consumer's own target, named or by id, stops its run.
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+const isFatalTopicError = (error) => FATAL_TOPIC_ERRORS.includes(error?.type)
+
 module.exports = {
   isStaleMembershipVerdict,
+  isFatalTopicError,
   REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,

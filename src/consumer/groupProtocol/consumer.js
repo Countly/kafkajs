@@ -27,6 +27,7 @@ const {
   joinDeadlineError,
   unsupportedConsumerProtocolError,
   isConsumerProtocolFatal,
+  isFatalTopicError,
   stampHeartbeatFatal,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
@@ -107,9 +108,6 @@ const INVALID_REGEX_PREFIX = 'Invalid RE2J SubscriptionPattern provided in the c
  * settles before the round awaits from reaching the process as unhandled without swallowing it.
  * @returns {{ promise: Promise<void>, resolve: () => void, reject: (e: Error) => void }}
  */
-/** Topic errors for an id of the member's own target that stop its run, as for a named target. */
-const FATAL_TOPIC_ERRORS = ['INVALID_TOPIC_EXCEPTION', 'TOPIC_AUTHORIZATION_FAILED']
-
 const deferred = () => {
   let resolve
   let reject
@@ -931,7 +929,7 @@ module.exports = class ConsumerGroupProtocol {
           )
         }
       } catch (error) {
-        if (isCurrent() && FATAL_TOPIC_ERRORS.includes(error?.type)) throw error
+        if (isCurrent() && isFatalTopicError(error)) throw error
         if (isCurrent())
           this.logger.debug('Could not refresh metadata for the assigned topic ids', {
             groupId: this.groupId,
@@ -1512,7 +1510,7 @@ module.exports = class ConsumerGroupProtocol {
     this.refreshMetadataForTopicIds(topicIds, { periodic })
       .then(() => this.onTopicIdsRefreshed(topicIds, isCurrent))
       .catch((error) => {
-        if (isCurrent() && FATAL_TOPIC_ERRORS.includes(error?.type)) {
+        if (isCurrent() && isFatalTopicError(error)) {
           this.transitionToFatal(error)
           this.requestRejoinForAssignmentChange()
           return
