@@ -113,6 +113,29 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
     )
   })
 
+  test('an entry with a partition that is not a partition id is refused before the internal consumer starts', async () => {
+    const before = scripted.requests().length
+
+    await expect(
+      admin.setOffsets({
+        groupId: 'set-group',
+        topic: TOPIC,
+        partitions: [
+          { partition: 0, offset: '7' },
+          { partition: 1.5, offset: '-2' },
+        ],
+      })
+    ).rejects.toThrow('Invalid partition')
+
+    expect({
+      consumers: mockMembers.length,
+      requests: scripted
+        .requests()
+        .slice(before)
+        .map(({ api }) => api),
+    }).toEqual({ consumers: 0, requests: [] })
+  })
+
   test('a reset followed by admin.disconnect() leaves no listener', async () => {
     await admin.resetOffsets({ groupId: 'reset-group', topic: TOPIC })
     await admin.disconnect()
