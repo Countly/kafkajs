@@ -2044,8 +2044,12 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
     })
 
     it('adds the backoff a fenced join armed to the deadline of the next join only, held to the longest timer delay', async () => {
-      const h = build({ answers: [heartbeatResponse({ memberEpoch: 3 })] })
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
       await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      expect(h.protocol.state).not.toEqual(JOINING)
       h.protocol.backoff.onFailedAttempt(Date.now(), 100)
 
       // An established member reconciles without joining.

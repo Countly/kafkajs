@@ -79,6 +79,9 @@ const MAX_UNRESOLVED_ATTEMPTS = 2
  */
 const MIN_FENCED_JOIN_BACKOFF_MS = 100
 
+/** The longest delay a Node.js timer takes; a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2147483647
+
 const COORDINATOR_LOAD_IN_PROGRESS = 14
 const COORDINATOR_NOT_AVAILABLE = 15
 const NOT_COORDINATOR = 16
@@ -502,13 +505,16 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * How long a join started now waits before its heartbeat may go out: the backoff still armed,
-   * after a fenced join for example. A join's deadline starts after it, so the wait does not use up
-   * the rebalance timeout.
-   * @returns {number} milliseconds, 0 when nothing holds the join back
+   * The deadline of a join started now: the rebalance timeout counted from the end of the backoff
+   * still armed (after a fenced join, for example), so the wait does not use it up. Only a member
+   * that will join gets the extra time, and the sum is held to the longest timer delay.
+   * @param {number} timeoutMs the rebalance timeout
+   * @returns {number} milliseconds, at most 2147483647
    */
-  joinDelay() {
-    return this.backoff.remaining(Date.now())
+  joinBudget(timeoutMs) {
+    const joins = this.memberEpoch <= 0 || isNotInGroup(this.state) || this.state === JOINING
+    const delay = joins ? this.backoff.remaining(Date.now()) : 0
+    return Math.min(MAX_TIMER_MS, timeoutMs + delay)
   }
 
   /**
@@ -651,7 +657,7 @@ module.exports = class ConsumerGroupProtocol {
    * The deadline is not optional. Without it a coordinator that keeps answering
    * `COORDINATOR_LOAD_IN_PROGRESS` - which is swallowed rather than raised - leaves the retrier
    * with nothing to retry and the round never settles, which holds a `stop()` open forever. It is
-   * the rebalance timeout counted from the end of any backoff still armed (`joinDelay`).
+   * `joinBudget` of the rebalance timeout.
    *
    * @private
    * @returns {{ promise: Promise<void>, resolve: Function, reject: Function }}
@@ -664,7 +670,7 @@ module.exports = class ConsumerGroupProtocol {
         this.rejectFirstMembership(
           joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeoutMs })
         ),
-      this.rebalanceTimeoutMs + this.joinDelay()
+      this.joinBudget(this.rebalanceTimeoutMs)
     )
 
     this.#firstMembership = record
