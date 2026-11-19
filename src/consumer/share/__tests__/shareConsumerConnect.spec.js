@@ -1,6 +1,7 @@
 const Cluster = require('../../../cluster')
 const BrokerPool = require('../../../cluster/brokerPool')
 const { ShareRun } = require('../shareRun')
+const { LEVELS: logLevel } = require('../../../loggers')
 const {
   A,
   acquire,
@@ -12,6 +13,7 @@ const {
   until,
 } = require('../../../../testHelpers/shareHarness')
 const {
+  KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,
@@ -256,8 +258,10 @@ describe('public share connection contract', () => {
     const ordinary = h.client.consumer({ groupId: 'ordinary' })
     const producer = h.client.producer()
     const admin = h.client.admin()
-    expect(Object.keys(ordinary.events)).toHaveLength(25)
+    expect(Object.keys(ordinary.events)).toHaveLength(26)
     expect(Object.keys(h.consumer.events)).toHaveLength(18)
+    expect(ordinary.events.TOPIC_METADATA_STATUS).toBe('consumer.topic_metadata_status')
+    expect(h.consumer.events).not.toHaveProperty('TOPIC_METADATA_STATUS')
     expect(ordinary.events).not.toBe(h.consumer.events)
     expect(typeof ordinary.commitOffsets).toBe('function')
     expect(typeof producer.send).toBe('function')
@@ -378,6 +382,65 @@ describe('public share connection contract', () => {
     expect(second.joins).toHaveLength(1)
   })
 
+  test('does not settle run or publish GROUP_JOIN on an epoch-zero reply', async () => {
+    const clock = new Clock()
+    clock.install()
+    const h = open()
+    const seen = observe(h)
+    await subscribe(h)
+    const unjoined = (fields) => ({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: fields.memberId,
+      memberEpoch: 0,
+      heartbeatIntervalMs: 5,
+      assignment: null,
+    })
+    h.script('ShareGroupHeartbeat', [unjoined])
+    const first = h.hold({ api: 'ShareGroupHeartbeat' })
+    const second = h.hold({ api: 'ShareGroupHeartbeat' })
+    let settled = false
+    const running = run(h).then(() => {
+      settled = true
+    })
+    await first.arrived()
+    first.release()
+    await clock.advanceUntil(
+      () => second.call !== null,
+      'the heartbeat after the epoch-zero reply',
+      {
+        step: 1,
+      }
+    )
+    await flush()
+    expect(settled).toBe(false)
+    expect(seen.joins).toEqual([])
+
+    second.release()
+    await running
+    expect(seen.joins).toEqual([{ groupId: 'group', memberId: expect.any(String), memberEpoch: 1 }])
+  })
+
+  test('run reconnects a retained subscription after disconnect, checking share support again', async () => {
+    const h = open()
+    const seen = observe(h)
+    await subscribe(h)
+    await run(h)
+    await h.consumer.disconnect({ timeout: 0 })
+    expect(h.consumer.subscription()).toEqual(['topic-a'])
+    const heartbeats = h.frames(76).length
+
+    advertise(h, { finalizedFeatures: [], finalizedFeaturesEpoch: 7 })
+    await expect(run(h)).rejects.toMatchObject({ reason: 'feature-disabled' })
+    expect(seen.connects).toHaveLength(1)
+    expect(h.frames(76)).toHaveLength(heartbeats)
+
+    h.cluster.answer('ApiVersions', () => h.cluster.apiVersionsAnswer())
+    await expect(run(h)).resolves.toBeUndefined()
+    expect(seen.connects).toHaveLength(2)
+    expect(seen.joins).toHaveLength(2)
+  })
+
   test.each(RETRIABLE_JOIN_CODES)(
     'keeps a retriable join pending until stop settles it (coordinator code %p)',
     async (code) => {
@@ -437,6 +500,25 @@ describe('public share connection contract', () => {
     expect(seen.crashes[0].error.cause.code).toBe(30)
     expect(seen.crashes[0].restart).toBe(false)
     await flush()
+    expect(seen.crashes).toHaveLength(1)
+  })
+
+  test.each([
+    ['restarts after a retriable cause', new KafkaJSError('transient', { retriable: true }), true],
+    ['does not restart after a non-retriable cause', new KafkaJSNonRetriableError('fatal'), false],
+  ])('without restartOnFailure a crash %s', async (_, error, restart) => {
+    const clock = new Clock()
+    clock.install()
+    const h = open()
+    const seen = observe(h)
+    jest.spyOn(ShareRun.prototype, 'pollNode').mockRejectedValueOnce(error)
+    await subscribe(h)
+    await run(h)
+    await until(() => seen.crashes.length === 1, 'the crash event')
+    expect(seen.crashes).toEqual([{ error, groupId: 'group', restart }])
+    expect(seen.crashes[0].error).toBe(error)
+    await clock.advance(1000)
+    expect(seen.joins).toHaveLength(restart ? 2 : 1)
     expect(seen.crashes).toHaveLength(1)
   })
 
@@ -563,6 +645,41 @@ describe('public share connection contract', () => {
       expect(h.cluster.sockets().filter((socket) => !socket.destroyed)).toHaveLength(0)
     }
   )
+
+  test('logs the restart delay with the group while the delay is pending, before restarting', async () => {
+    const clock = new Clock()
+    clock.install()
+    const lines = []
+    const h = open({
+      kafka: { logLevel: logLevel.ERROR, logCreator: () => (entry) => lines.push(entry) },
+      share: {
+        retry: { retries: 1, initialRetryTime: 50, maxRetryTime: 1000, multiplier: 2, factor: 0 },
+      },
+    })
+    const seen = observe(h)
+    h.table.set('topic-a', { topicId: A, partitions: [{ leader: 5, epoch: 1 }] })
+    await subscribe(h)
+    h.consumer.on(h.consumer.events.CRASH, () => {
+      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 1 }] })
+    })
+    await run(h)
+    await clock.advanceUntil(() => seen.crashes.length === 1, 'the crash event', { step: 10 })
+    const { retryTime } = seen.crashes[0].error
+    expect(retryTime).toBe(100)
+    const restarts = () => lines.filter(({ log }) => log.message.startsWith('Restarting'))
+    const joins = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+    expect(restarts().map(({ level, log }) => [level, log.message, log.groupId])).toEqual([
+      [logLevel.ERROR, 'Restarting the share consumer in 100ms', 'group'],
+    ])
+    expect(joins()).toHaveLength(1)
+
+    await clock.advance(retryTime - 1)
+    expect(joins()).toHaveLength(1)
+    await clock.advance(1)
+    await until(() => seen.joins.length === 2, 'the restarted join')
+    expect(joins()).toHaveLength(2)
+    expect(restarts()).toHaveLength(1)
+  })
 
   test('logs a rejected restart callback and restarts while active', async () => {
     const restartOnFailure = jest.fn(async () => {

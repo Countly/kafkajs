@@ -472,6 +472,156 @@ describe('scripts/mutants/runner.js', () => {
     ])
   })
 
+  describe('a record with several witnesses', () => {
+    const STEADY = 'src/x/steady.js'
+    const MISSING = 'src/z/gone.spec.js'
+
+    /**
+     * @param {string[]} failing the witness specs that fail once the target is mutated
+     * @returns {jest.Mock} a stand-in execution: a witness outside `failing` always passes
+     */
+    const execFailing = (failing) =>
+      jest.fn((rec, dir, outFile, run) =>
+        fakeExec(
+          { ...rec, title: 'w', target: failing.includes(rec.spec) ? rec.target : STEADY },
+          dir,
+          outFile,
+          run
+        )
+      )
+
+    const several = (witnesses, fields = {}) =>
+      record({ spec: witnesses[0], witnesses, title: '', ...fields })
+
+    const files = () => ({
+      [SPEC]: WITNESS,
+      [OTHER_SPEC]: WITNESS,
+      [STEADY]: 'module.exports = 1\n',
+    })
+
+    test('is killed when any one witness fails, names that witness, and runs no witness after a kill', () => {
+      const root = tree(files())
+      const exec = execFailing([OTHER_SPEC])
+      const entry = new MutantRunner({ exec }).runOne(several([SPEC, OTHER_SPEC]), root, root)
+      expect(entry).toMatchObject({ verdict: 'killed', reason: '', witness: `${OTHER_SPEC} › w` })
+      expect(exec.mock.calls.map(([rec]) => rec.spec)).toEqual([SPEC, SPEC, OTHER_SPEC, OTHER_SPEC])
+      expect(read(root, TARGET)).toBe('module.exports = 1\n')
+      expect(leftovers(root)).toEqual([])
+
+      const first = execFailing([SPEC, OTHER_SPEC])
+      const stopped = new MutantRunner({ exec: first }).runOne(
+        several([SPEC, OTHER_SPEC]),
+        root,
+        root
+      )
+      expect(stopped).toMatchObject({ verdict: 'killed', witness: `${SPEC} › w` })
+      expect(first.mock.calls.map(([rec]) => rec.spec)).toEqual([SPEC, SPEC])
+    })
+
+    test('survives only when every witness passes, and reports each of them', () => {
+      const root = tree(files())
+      const exec = execFailing([])
+      const entry = new MutantRunner({ exec }).runOne(several([SPEC, OTHER_SPEC]), root, root)
+      expect(entry.verdict).toBe('survived')
+      expect(entry.witness).toBe(`${SPEC}, ${OTHER_SPEC}`)
+      expect(entry.reason).toBe(
+        `${SPEC}: survived (the witness still passes); ${OTHER_SPEC}: survived (the witness still passes)`
+      )
+      expect(exec).toHaveBeenCalledTimes(4)
+    })
+
+    test('a witness that cannot decide does not hide another that can', () => {
+      const root = tree(files())
+      const killed = new MutantRunner({ exec: execFailing([OTHER_SPEC]) }).runOne(
+        several([MISSING, OTHER_SPEC]),
+        root,
+        root
+      )
+      expect(killed).toMatchObject({ verdict: 'killed', witness: `${OTHER_SPEC} › w` })
+      const survived = new MutantRunner({ exec: execFailing([]) }).runOne(
+        several([MISSING, OTHER_SPEC]),
+        root,
+        root
+      )
+      expect(survived.verdict).toBe('survived')
+      expect(survived.reason).toBe(
+        `${MISSING}: invalid (the witness spec is missing); ${OTHER_SPEC}: survived (the witness still passes)`
+      )
+      const undecided = new MutantRunner({ exec: execFailing([]) }).runOne(
+        several([MISSING, 'src/z/also.spec.js']),
+        root,
+        root
+      )
+      expect(undecided.verdict).toBe('invalid')
+    })
+
+    test('the time cap stops the witnesses still to run, reports the record not-run, and never undoes a kill', () => {
+      const root = tree(files())
+      let now = 0
+      const exec = jest.fn((rec, dir, outFile, run) => {
+        now += 60000
+        return fakeExec({ ...rec, title: 'w', target: STEADY }, dir, outFile, run)
+      })
+      const runner = new MutantRunner({ exec, now: () => now })
+      const records = [
+        several([SPEC, OTHER_SPEC], { id: 'fixture/M0' }),
+        several([SPEC, OTHER_SPEC], { id: 'fixture/M1' }),
+      ]
+      const entries = runner.run(records, { root, patchDir: root, timeCapMs: 2 * 60000 })
+      expect(entries.map((e) => [e.id, e.verdict, e.reason])).toEqual([
+        [
+          'fixture/M0',
+          'not-run',
+          `time cap: 1 of 2 witnesses ran (${SPEC}: survived (the witness still passes))`,
+        ],
+        ['fixture/M1', 'not-run', 'time cap'],
+      ])
+      expect(exec).toHaveBeenCalledTimes(2)
+
+      now = 0
+      const three = runner.run([several([SPEC, OTHER_SPEC, MISSING], { id: 'fixture/M2' })], {
+        root,
+        patchDir: root,
+        timeCapMs: 4 * 60000,
+      })
+      expect(three.map((e) => [e.verdict, e.reason])).toEqual([
+        [
+          'not-run',
+          `time cap: 2 of 3 witnesses ran (${SPEC}: survived (the witness still passes); ${OTHER_SPEC}: survived (the witness still passes))`,
+        ],
+      ])
+
+      now = 0
+      const killing = new MutantRunner({
+        exec: jest.fn((rec, dir, outFile, run) => {
+          now += 60000
+          return fakeExec({ ...rec, title: 'w' }, dir, outFile, run)
+        }),
+        now: () => now,
+      })
+      const killed = killing.run([several([SPEC, OTHER_SPEC])], {
+        root,
+        patchDir: root,
+        timeCapMs: 60000,
+      })
+      expect(killed.map((e) => [e.verdict, e.witness])).toEqual([['killed', `${SPEC} › w`]])
+    })
+
+    test('is validated: at least two distinct specs, starting with spec, none of them the target', () => {
+      const bad = (witnesses, fields) => () => MutantRunner.validate([several(witnesses, fields)])
+      expect(bad([SPEC])).toThrow(/witnesses/)
+      expect(bad([SPEC, SPEC])).toThrow(/witnesses/)
+      expect(bad([OTHER_SPEC, SPEC], { spec: SPEC })).toThrow(/witnesses/)
+      expect(bad([SPEC, 3])).toThrow(/witnesses/)
+      expect(bad([SPEC, TARGET])).toThrow(/never edits its witness spec/)
+      expect(bad([SPEC, '../escape.spec.js'])).toThrow(/escapes the tree/)
+      expect(() => MutantRunner.validate([record({ witnesses: 'src/x/w.spec.js' })])).toThrow(
+        /witnesses/
+      )
+      expect(MutantRunner.validate([several([SPEC, OTHER_SPEC])])).toHaveLength(1)
+    })
+  })
+
   test('a live record is located but reported not-run', () => {
     const root = tree({ [SPEC]: WITNESS })
     const exec = jest.fn(fakeExec)

@@ -242,13 +242,14 @@ describe('scripts/mutants/report.js', () => {
         original: '  this.flush()',
         mutated: '',
         witness: 'src/consumer/offsetManager/__tests__/commitOffsets.spec.js',
-        missingAssertion: 'The selected witness did not fail when `this.flush()` is removed.',
+        missingAssertion:
+          'No selected witness produced a valid kill when `this.flush()` is removed.',
       }),
       expect.objectContaining({
         id: 'b',
         line: 44,
         missingAssertion:
-          'The selected witness did not fail when `if (a < b) {` becomes `if (a <= b) {`.',
+          'No selected witness produced a valid kill when `if (a < b) {` becomes `if (a <= b) {`.',
       }),
     ])
     const md = MutationReport.markdown(json)
@@ -258,9 +259,9 @@ describe('scripts/mutants/report.js', () => {
     expect(md).toContain('mutated: (line removed)')
     expect(md).toContain('witness: `src/consumer/offsetManager/__tests__/commitOffsets.spec.js`')
     expect(md).toContain(
-      'candidate missing assertion: The selected witness did not fail when `if (a < b) {` becomes `if (a <= b) {`.'
+      'candidate missing assertion: No selected witness produced a valid kill when `if (a < b) {` becomes `if (a <= b) {`.'
     )
-    expect(md).toContain('runs only its selected witness spec')
+    expect(md).toContain('runs only its selected witness specs')
     expect(md).toContain('another spec may already guard it')
   })
 
@@ -300,9 +301,9 @@ describe('scripts/mutants/report.js', () => {
       .split('\n')
       .filter((l) => l.startsWith('- '))
     expect(header).toHaveLength(3)
-    expect(header[0]).toMatch(/only its selected witness spec.*not the whole suite/i)
+    expect(header[0]).toMatch(/only its selected witness specs.*not the whole suite/i)
     expect(header[1]).toMatch(
-      /killed.*witness noticed.*survivor.*witness still passed.*another spec may already guard it/i
+      /killed.*a witness noticed.*survivor.*no witness produced a valid kill.*at least one still passed.*another spec may already guard it/i
     )
     expect(header[2]).toMatch(/stale, invalid, excluded and not-run.*never counted as killed/i)
   })

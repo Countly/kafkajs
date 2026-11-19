@@ -50,7 +50,24 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
     })
     const kafka = new FakeKafka({ socketFactory: probe.wrap(() => new FakeSocket()) })
     const { clock, sleep } = fakeTime()
-    const workloads = new ChurnWorkloads({ kafka, probe, tag: 'tg' })
+    const reads = []
+    const offsetState = (group) => {
+      reads.push({
+        group,
+        running: kafka.built.some((client) => client.group === group && client.joined),
+      })
+      return {
+        present: true,
+        topics: 0,
+        cells: 0,
+        cache: 0,
+        cacheKeys: [],
+        subscribed: [],
+        claimed: [],
+        open: 0,
+      }
+    }
+    const workloads = new ChurnWorkloads({ kafka, probe, tag: 'tg', offsetState })
     const journal = new ChurnJournal({ file: path.join(dir, 'run.journal') })
     const appended = []
     const append = journal.append.bind(journal)
@@ -97,6 +114,7 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
       probe,
       appended,
       lines,
+      reads,
       beforeBaseline: () => appended.slice(0, atBaseline ?? 0),
       peak: () => peakRegistrations,
     }
@@ -121,6 +139,40 @@ describe('Consumer churn profile > the real workloads, journal and oracle togeth
     }
     expect(workloads.clients.size).toBe(0)
     expect(probe.registrations.size).toBe(0)
+  }, 60000)
+
+  test('the regex workload samples each group at every fifth deletion and once more before its members stop', async () => {
+    const { run, lines, reads, workloads } = compose()
+    const verdict = await run.run()
+    expect(verdict.violations).toEqual([])
+    const rotations = lines.filter(({ kind }) => kind === 'regex-rotation')
+    expect(rotations).toEqual([
+      { kind: 'regex-rotation', phase: 'regex-topics', deletions: expect.any(Number) },
+    ])
+    const { deletions } = rotations[0]
+    expect(deletions).toBeGreaterThanOrEqual(10)
+    const groups = workloads.groups.forPhase('regex-topics')
+    const due = []
+    for (let at = 5; at <= deletions; at += 5)
+      due.push(...groups.map((group) => [group, 'periodic', at]))
+    const rows = lines.filter(({ kind }) => kind === 'offset-state')
+    expect(rows.map(({ group, checkpoint, deletions: at }) => [group, checkpoint, at])).toEqual([
+      ...due,
+      ...groups.map((group) => [group, 'final', deletions]),
+    ])
+    for (const row of rows) {
+      expect(row.quiescent).toBe(true)
+      expect(row.offsetState).toEqual(
+        expect.objectContaining({ cacheKeys: [], subscribed: [], unapplied: [] })
+      )
+      expect(row.live.names).toEqual([...row.live.names].sort())
+      expect(row.live.names).toHaveLength(row.live.topics)
+      expect(row.live.names.filter((name) => name.endsWith('-control'))).toHaveLength(1)
+      if (row.checkpoint === 'periodic')
+        expect(row.live).toEqual({ topics: 4, partitions: 15, names: expect.any(Array) })
+    }
+    expect(reads.length).toBeGreaterThanOrEqual(rows.length)
+    expect(reads.filter(({ running }) => !running)).toEqual([])
   }, 60000)
 
   test('every acknowledged record of every deleted incarnation was read back before its delete', async () => {

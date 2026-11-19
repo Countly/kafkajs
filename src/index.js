@@ -18,6 +18,7 @@ const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
+const topicMetadataStatusReporter = require('./consumer/topicMetadataStatus')
 const {
   createShareConsumer,
   validateShareConsumerOptions,
@@ -534,6 +535,7 @@ module.exports = class Client {
       maxInFlightRequests = DEFAULT_MAX_IN_FLIGHT_REQUESTS,
       instrumentationEmitter = null,
       isolationLevel,
+      onTopicMetadataStatus,
     }) =>
       new Cluster({
         telemetryMetrics,
@@ -567,6 +569,7 @@ module.exports = class Client {
         metadataClusterCheck: validatedMetadataClusterCheck,
         metadataRecoveryRebootstrapTriggerMs: validatedMetadataRecoveryRebootstrapTriggerMs,
         bootstrapResolveTimeout: validatedBootstrapResolveTimeout,
+        onTopicMetadataStatus,
       })
   }
 
@@ -810,6 +813,11 @@ module.exports = class Client {
       maxInFlightRequests,
       isolationLevel,
       instrumentationEmitter,
+      onTopicMetadataStatus: topicMetadataStatusReporter({
+        groupId,
+        logger: this[PRIVATE.LOGGER].namespace('Consumer'),
+        instrumentationEmitter,
+      }),
     })
 
     telemetry.bind(cluster)

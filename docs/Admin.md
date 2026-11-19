@@ -118,7 +118,7 @@ live script below is a single owner even when it contains several cases or fixtu
 This inventory follows Apache Kafka 4.3.1 Admin, including deprecated aliases, plus the 4.4 unregisterController method. Every method
 also has the inherited AbstractOptions timeout unless the row states an excluded or deferred
 surface. Share administration is implemented; Streams administration
-and quorum/voter administration are excluded from this package. Client telemetry belongs to
+and quorum/voter administration are excluded from this package. A `partial` row names what is missing. Client telemetry belongs to
 the telemetry extension; JVM metric registration has no JavaScript equivalent.
 
 | Java method or configuration | Disposition | JavaScript equivalent or reason | Java options and differences |
@@ -161,7 +161,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | describeReplicaLogDirs | implemented | describeReplicaLogDirs | replicas |
 | describeShareGroups | implemented | describeShareGroups | group ids; includeAuthorizedOperations as a raw signed mask; apiTimeout; rows in caller order |
 | describeStreamsGroups | excluded | Streams-group administration excluded | not implemented |
-| describeTopics | equivalent | fetchTopicMetadata | includeAuthorizedOperations maps to includeTopicAuthorizedOperations; partitionSizeLimitPerResponse uses the internal responsePartitionLimit |
+| describeTopics | partial | fetchTopicMetadata | by topic name only: there is no topicIds option, and a lookup by name cannot find an earlier topic that had the same name; includeAuthorizedOperations maps to includeTopicAuthorizedOperations; partitionSizeLimitPerResponse uses the internal responsePartitionLimit |
 | describeTransactions | implemented | describeTransactions | transactionalIds |
 | describeUserScramCredentials | implemented | describeUserScramCredentials | users optional |
 | electLeaders | implemented | electLeaders | ElectionType; partitions |
@@ -176,7 +176,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | listGroups | implemented | listGroups | states; types |
 | listOffsets | equivalent | fetchTopicOffsets / fetchTopicOffsetsByTimestamp | earliest; latest; timestamp; maxTimestamp; earliestLocal; latestTiered; earliestPendingUpload; isolationLevel |
 | listPartitionReassignments | implemented | listPartitionReassignments | ordinary method fields and apiTimeout; no semantic option is silently dropped |
-| listShareGroupOffsets | implemented | listShareGroupOffsets | group id; optional topic partitions; apiTimeout; offsets and lag as decimal strings, unknown lag null |
+| listShareGroupOffsets | implemented | listShareGroupOffsets | one group id per call; optional topic partitions; apiTimeout; offsets and lag as decimal strings, unknown lag null |
 | listStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | listTopics | implemented | listTopics | listInternal: fetchTopicMetadata returns isInternal for caller filtering |
 | listTransactions | implemented | listTransactions | filterStates maps to states; filterProducerIds maps to producerIds; filterOnDuration maps to durationFilter; filterOnTransactionalIdPattern maps to transactionalIdPattern |
@@ -427,6 +427,12 @@ const { topics } = await admin.fetchTopicMetadata({
 ```
 
 `listTopics()` returns only names as `string[]`. `fetchTopicMetadata()` with no topics returns all those topics with `name`, `topicId`, `isInternal` and partition detail from one fresh Metadata request. Omitted `topicId` support is represented as null. Listing all topics does not add them to the target-topic set.
+
+### Topics are described by name only
+
+`fetchTopicMetadata` takes topic names. It has no `topicIds` option, so you cannot describe a topic by its ID. The Java admin client can. `deleteTopics({ topicIds })` is the only admin call that takes topic IDs.
+
+A lookup by name describes the topic that holds that name now. If a topic was deleted and created again under the same name, the lookup describes the new one and cannot find the earlier one. Every described topic carries its `topicId`. Compare it with the ID you hold to tell whether the name now refers to a different topic.
 
 ## <a name="fetch-topic-offsets"></a> Fetch topic offsets
 

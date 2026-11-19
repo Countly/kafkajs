@@ -125,6 +125,17 @@ describe('Protocol > Decoder', () => {
     })
   })
 
+  describe('readInt64', () => {
+    const read = (bytes) => new Decoder(Buffer.from(bytes)).readInt64()
+
+    it('decodes -1, both extremes and a set top byte from the sign byte up', () => {
+      expect(read([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])).toBe(-1n)
+      expect(read([0x80, 0, 0, 0, 0, 0, 0, 0])).toBe(-(2n ** 63n))
+      expect(read([0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])).toBe(2n ** 63n - 1n)
+      expect(read([0x01, 0, 0, 0, 0, 0, 0, 0])).toBe(2n ** 56n)
+    })
+  })
+
   describe('exact-fit reads do not throw', () => {
     it.each([
       ['readInt8', [0x01], 1],

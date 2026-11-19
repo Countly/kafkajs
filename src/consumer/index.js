@@ -1,4 +1,5 @@
 const { assertPartitionId } = require('../utils/partitionId')
+const describeThrown = require('../network/describeThrown')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
@@ -8,6 +9,7 @@ const ManualGroupProtocol = require('./groupProtocol/manual')
 const CommittedOffsetReader = require('./committedOffsets')
 const handlerContext = require('./handlerContext')
 const OffsetOperations = require('./offsetManager/offsetOperations')
+const CommittedOffsetRevisions = require('../cluster/committedOffsetRevisions')
 const Subscription = require('./subscription')
 const ControlLifetime = require('./controlLifetime')
 const { normalizeResetPolicy } = require('./offsetReset')
@@ -525,7 +527,9 @@ module.exports = (params) => {
   /**
    * Returns the lifetime that serves a connect, run or start, beginning a new one when an explicit
    * disconnect has started on the current one, and subscribes it to the cluster's topic-recreation
-   * event, at most once per lifetime. Called at construction and again from connect(), run() and
+   * event, at most once per lifetime. A recreation of any selected topic is owed a reset: a
+   * subscribed name, a client-pattern match, an assigned topic, or a name a broker-side pattern
+   * resolved to. Called at construction and again from connect(), run() and
    * start(), so a consumer reused after disconnect() - including the restart onCrash schedules,
    * which reaches start() alone - re-arms rather than running with the reset silently inert.
    *
@@ -544,10 +548,12 @@ module.exports = (params) => {
       try {
         const { topic, topicId } = payload
 
+        // A broker-side pattern's matched names exist only as the targets it grew.
         if (
           !Object.hasOwn(topics, topic) &&
           !declared.desired.topicConfigurations.has(topic) &&
-          !(manual && Object.hasOwn(manual.configurations, topic))
+          !(manual && Object.hasOwn(manual.configurations, topic)) &&
+          !(subscribedTopicRegex != null && cluster.targetTopics.has(topic))
         ) {
           return
         }
@@ -842,6 +848,7 @@ module.exports = (params) => {
           runner = null
           consumerGroup = null
           declared.retireRun()
+          life.obligations.releaseAssignment()
         }
         instrumentationEmitter.emit(STOP)
       }
@@ -1339,9 +1346,9 @@ module.exports = (params) => {
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })
@@ -1742,6 +1749,7 @@ module.exports = (params) => {
         }
 
         const published = await cluster.resetTargetTopics(names, {
+          accepted: metadata,
           isCurrent: () => stale() === null,
           publish: () => {
             declared.retireMetadata()
@@ -1773,15 +1781,20 @@ module.exports = (params) => {
 
   /**
    * Drops the recreation debt and the private offsets of every topic outside `keep`, the topic-local
-   * state a consumer holds while stopped. A name that returns owes anew, as after a subscription change.
+   * state a consumer holds while stopped, and makes `keep` the subscribed names its group's shared
+   * offset state is kept for. A name that returns owes anew, as after a subscription change.
    * @param {Set<string>} keep the names that keep their state
    * @returns {void}
    */
   const retainTopics = (keep) => {
     life.obligations.retain(keep)
+    life.obligations.claimSubscription(keep)
     if (privateState) {
+      const revisions = CommittedOffsetRevisions.peek(privateState.offsets)
       for (const topic of keys(privateState.offsets)) {
-        if (!keep.has(topic)) delete privateState.offsets[topic]
+        if (keep.has(topic)) continue
+        delete privateState.offsets[topic]
+        revisions?.clearTopic(topic)
       }
     }
   }

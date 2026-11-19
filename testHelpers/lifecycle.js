@@ -1925,7 +1925,10 @@ class PublicTelemetryRound {
       clientInstanceId: fields.clientInstanceId ?? this.subscription.clientInstanceId,
     }))
     this.wire.answer('PushTelemetry', () => ({}))
-    if (sasl) this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
+    if (sasl) {
+      this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
+      this.wire.answer('SaslAuthenticate', () => ({ authBytes: Buffer.alloc(0) }))
+    }
     if (this.kind !== 'shareConsumer') await this.wait(() => this.createClient(client))
     if (this.kind === 'producer' || this.kind === 'admin') scripted.producerScript(this.wire)
     if (this.kind === 'producer' && client.transactionalId)

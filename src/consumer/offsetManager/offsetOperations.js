@@ -1,5 +1,7 @@
 const CommittedOffsetRevisions = require('../../cluster/committedOffsetRevisions')
 
+const NO_TOPICS = Object.freeze([])
+
 /**
  * Orders the writes to one group's committed-offset cache and resolved positions, and is the one
  * writer of that cache: every publication, read fill, eviction and topic invalidation goes
@@ -23,6 +25,10 @@ const CommittedOffsetRevisions = require('../../cluster/committedOffsetRevisions
  * cells; a hard barrier (topic recreation or reset) ends the incarnation. Both fence older work
  * alike. Each covered cell also keeps its durable winner, the highest-intent mutation published
  * to it: an eviction keeps it, a hard barrier drops it.
+ *
+ * The ledger also answers who owns a topic of the group (an open ticket, or an attached consumer
+ * table that holds it) and tells its registry when a topic's last ticket ends or ownership changed,
+ * so the group's committed state can retire topics nobody owns.
  */
 class OffsetOperations {
   /**
@@ -38,6 +44,10 @@ class OffsetOperations {
     this.intent = 0
     this.openTickets = 0
     this.onIdle = null
+    /** @type {((topic: string) => void)|null} told when the last open ticket of a topic ends */
+    this.onTopicIdle = null
+    /** @type {(() => void)|null} told when an owner gave up topics */
+    this.onRetire = null
     /** @type {Set<{discharge: (topic: string, partition: number) => void}>} */
     this.attached = new Set()
   }
@@ -93,6 +103,8 @@ class OffsetOperations {
 
   /**
    * Closes a ticket and releases the cells and topics no other open ticket covers. Idempotent.
+   * Once the whole ticket is released, each topic it left uncovered is reported to `onTopicIdle`,
+   * then idleness to `onIdle`.
    * @param {object} ticket
    * @returns {void}
    */
@@ -103,6 +115,7 @@ class OffsetOperations {
 
     ticket.ended = true
     this.openTickets -= 1
+    let released = null
     for (const { topic, partition } of ticket.cells) {
       const partitions = this.topics.get(topic)
       const state = partitions.get(partition)
@@ -113,9 +126,12 @@ class OffsetOperations {
         this.cells -= 1
         if (partitions.size === 0) {
           this.topics.delete(topic)
+          released ??= []
+          released.push(topic)
         }
       }
     }
+    for (const topic of released ?? NO_TOPICS) this.onTopicIdle?.(topic)
     this.notifyIdle()
   }
 
@@ -375,6 +391,28 @@ class OffsetOperations {
       this.attached.delete(obligations)
       this.notifyIdle()
     }
+  }
+
+  /**
+   * Whether a topic of this group is owned: an open ticket covers it, or an attached consumer table
+   * holds it (subscription, assignment or owed reset). Reads only.
+   * @param {string} topic
+   * @returns {boolean}
+   */
+  isOwned(topic) {
+    if (this.topics.has(topic)) return true
+    for (const table of this.attached) {
+      if (table.holds?.(topic)) return true
+    }
+    return false
+  }
+
+  /**
+   * Asks the registry to retire the topics nobody owns any longer; a standalone ledger has none.
+   * @returns {void}
+   */
+  retireUnowned() {
+    this.onRetire?.()
   }
 
   /**

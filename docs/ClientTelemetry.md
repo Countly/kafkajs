@@ -305,7 +305,7 @@ An explicit reconnect keeps the accepted client instance ID and uses fresh local
 
 Telemetry is opt-in through `enableMetricsPush`. Benchmark evidence compares disabled observation with the accepted previous snapshot and enabled observation with the same candidate's disabled arm. Serialization uses production-validated descriptors and the configured byte cap. Reports contain actual encoded byte lengths, complete point identities and any omissions; the configured cap is not an expected payload size.
 
-A20/A31 measured acceptance is pending P10 CI measurements. This driver-only delivery still requires F08 configured-outcome evidence, an accepted previous baseline, final public lifecycle delivery and the reviewed broker-guard adapter.
+The public producer, consumer, admin and share-consumer clients deliver telemetry; see the lifecycle checks above. Its CPU, latency and throughput overhead is reported by the benchmark report, not gated; its memory bounds are gated (see [Resource bounds and natural shutdown](#resource-bounds-and-natural-shutdown)): `.github/workflows/bench.yml` runs the telemetry request, payload and delivery rows, and no threshold fails a build or a release on those numbers.
 
 The benchmark suite uses separate request, serialization and delivery workloads. It keeps message counts separate from batch callbacks and actual delivery-gap samples. Noise controls, full identity checks and same-path overhead controls must pass before a measured comparison is valid. The driver spec checks correctness without asserting elapsed-time limits. See the Testing guide for session evidence and CI execution. No measured tuning recommendation follows from a broker-free test pass.
 

@@ -10,16 +10,34 @@
  * Operators read the line with strings and comments masked, so text inside them is never mutated.
  * Every mutant keeps the file's line count.
  *
- * The witness is one spec from the area's list: the area's explicit `witnesses` entry for the target,
- * else `<dir>/<name>.spec.js` or `<dir>/__tests__/<name>.spec.js` when listed, otherwise the listed spec
- * in the closest directory (list order breaks ties).
+ * A mutant's witnesses are the specs that must notice it; the first is the record's `spec`, and the
+ * record lists all of them in `witnesses` when there are several (the runner kills the mutant when any
+ * one fails). A target's default witness is `<dir>/<name>.spec.js` or `<dir>/__tests__/<name>.spec.js`
+ * when listed in the area, otherwise the listed spec in the closest directory (list order breaks ties).
+ * The area's `witnesses` table refines that per target: a spec or a list of specs replaces the default
+ * for the whole file; a map from method name to specs names the guards of those methods, which run in
+ * their listed order with the default appended when not listed, and every other method keeps the default alone. A method is the module-level
+ * function or class method that holds the mutated line, so the table survives line moves. Every spec the
+ * area names must exist, every file a table names must be a generated target and every method it names
+ * must hold a mutated line, or generation fails.
  *
  * Usage: node scripts/mutants/generate.js [--root <dir>] [--out <file>]   prints or writes `{ records }`
  */
 const fs = require('fs')
 const path = require('path')
 
-/** The risk areas, their broker-free witness specs and the targets whose witness is named explicitly. */
+const OFFSET_TESTS = 'src/consumer/offsetManager/__tests__'
+const SHARE_TESTS = 'src/consumer/share/__tests__'
+const PRODUCER_TESTS = 'src/producer/__tests__'
+const PROTOCOL = 'src/protocol'
+const REQUESTS = 'src/protocol/requests'
+const SYNC_GROUP = 'src/protocol/requests/syncGroup'
+const SCHEMA_SPEC = 'scripts/protocol/__tests__/schema.spec.js'
+
+/**
+ * The risk areas, their broker-free default witness specs, and the `witnesses` table that names, per
+ * target, the specs that guard it where the default does not reach (see the file's description).
+ */
 const AREAS = [
   {
     name: 'transactions',
@@ -37,6 +55,24 @@ const AREAS = [
       'src/producer/state/__tests__/transactionState.spec.js',
       'src/producer/state/__tests__/transactionVersion.spec.js',
     ],
+    witnesses: {
+      'src/producer/eosManager/index.js': {
+        hasPartitions: [
+          `${PRODUCER_TESTS}/sendOffsets.spec.js`,
+          `${PRODUCER_TESTS}/sendOffsetsPublication.spec.js`,
+        ],
+      },
+      'src/producer/state/accumulator.js': {
+        halvesOf: ['src/producer/state/__tests__/subdivision.spec.js'],
+      },
+      'src/producer/state/partitionSequencer.js': {
+        restoreUnsent: [`${PRODUCER_TESTS}/splitSend.spec.js`],
+      },
+      'src/producer/state/recordSize.js': {
+        EMPTY_RECORD: [`${REQUESTS}/produce/produceFraming.spec.js`],
+        recordsBytes: [`${REQUESTS}/produce/produceFraming.spec.js`],
+      },
+    },
   },
   {
     name: 'offsets',
@@ -49,6 +85,32 @@ const AREAS = [
       'src/consumer/offsetManager/__tests__/offsetOperations.spec.js',
       'src/consumer/offsetManager/__tests__/resetObligations.spec.js',
     ],
+    witnesses: {
+      'src/cluster/committedOffsetRevisions.js': {
+        forCache: [`${OFFSET_TESTS}/privateResetPositions.spec.js`],
+      },
+      'src/consumer/offsetManager/index.js': {
+        commitWithOwnership: ['src/consumer/__tests__/lostMeansNoCommit.spec.js'],
+        resetByDuration: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
+        commitAndClear: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
+        resolveOffsets: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
+        applyResolution: [
+          `${OFFSET_TESTS}/initializeConsumerOffsets.spec.js`,
+          `${OFFSET_TESTS}/resetSchedules.spec.js`,
+        ],
+        seedConsumedEpochs: [`${OFFSET_TESTS}/resolveOffsetsEpoch.spec.js`],
+      },
+      'src/consumer/offsetManager/offsetOperations.js': {
+        end: ['src/cluster/__tests__/groupRegistry.spec.js'],
+        notifyIdle: ['src/cluster/__tests__/groupRegistry.spec.js'],
+      },
+      'src/consumer/offsetManager/resetObligations.js': {
+        clear: [
+          'src/cluster/__tests__/groupRegistry.spec.js',
+          `${OFFSET_TESTS}/resetSchedules.spec.js`,
+        ],
+      },
+    },
   },
   {
     name: 'group-timing',
@@ -68,20 +130,78 @@ const AREAS = [
       'src/protocol/requests/groupResponses.spec.js',
     ],
     witnesses: {
-      'src/protocol/requests/syncGroup/v4/request.js':
-        'src/protocol/requests/groupRequests.spec.js',
-      'src/protocol/requests/syncGroup/v5/request.js':
-        'src/protocol/requests/groupRequests.spec.js',
-      'src/protocol/requests/syncGroup/v4/response.js':
-        'src/protocol/requests/groupResponses.spec.js',
-      'src/protocol/requests/syncGroup/v5/response.js':
-        'src/protocol/requests/groupResponses.spec.js',
+      'src/consumer/groupTimeouts.js': {
+        resolveGroupTimeouts: ['src/consumer/__tests__/consumerDefaults.spec.js'],
+      },
+      [`${SYNC_GROUP}/v0/request.js`]: [
+        `${REQUESTS}/index.spec.js`,
+        `${SYNC_GROUP}/v0/request.spec.js`,
+      ],
+      [`${SYNC_GROUP}/v1/request.js`]: [
+        `${REQUESTS}/index.spec.js`,
+        `${SYNC_GROUP}/v1/request.spec.js`,
+      ],
+      [`${SYNC_GROUP}/v2/request.js`]: [
+        `${REQUESTS}/index.spec.js`,
+        `${SYNC_GROUP}/v2/request.spec.js`,
+      ],
+      [`${SYNC_GROUP}/v3/request.js`]: [
+        `${REQUESTS}/index.spec.js`,
+        `${SYNC_GROUP}/v3/request.spec.js`,
+      ],
+      [`${SYNC_GROUP}/v4/request.js`]: [
+        `${REQUESTS}/groupRequests.spec.js`,
+        `${REQUESTS}/index.spec.js`,
+        SCHEMA_SPEC,
+      ],
+      [`${SYNC_GROUP}/v5/request.js`]: [
+        `${REQUESTS}/groupRequests.spec.js`,
+        `${REQUESTS}/index.spec.js`,
+        SCHEMA_SPEC,
+      ],
+      [`${SYNC_GROUP}/v4/response.js`]: [`${REQUESTS}/groupResponses.spec.js`, SCHEMA_SPEC],
+      [`${SYNC_GROUP}/v5/response.js`]: [`${REQUESTS}/groupResponses.spec.js`, SCHEMA_SPEC],
     },
   },
   {
     name: 'share',
     targets: ['src/consumer/share/shareRunner.js', 'src/consumer/share/shareRun.js'],
-    specs: ['src/consumer/share/__tests__/shareConsumerClose.spec.js'],
+    specs: [`${SHARE_TESTS}/shareConsumerClose.spec.js`],
+    witnesses: {
+      'src/consumer/share/shareRun.js': {
+        afterFetch: [`${SHARE_TESTS}/shareConsumerSubscription.spec.js`],
+        assignmentChanged: [
+          `${SHARE_TESTS}/shareConsumerEvents.spec.js`,
+          `${SHARE_TESTS}/shareConsumerEventMatrix.spec.js`,
+        ],
+        close: [
+          `${SHARE_TESTS}/shareConsumerShutdown.spec.js`,
+          `${SHARE_TESTS}/shareConsumerCloseRevocation.spec.js`,
+        ],
+        dispatchBatch: [`${SHARE_TESTS}/shareConsumerModes.spec.js`],
+        escalate: [`${SHARE_TESTS}/shareConsumerShutdown.spec.js`],
+        freeze: [
+          `${SHARE_TESTS}/shareConsumerDialRelease.spec.js`,
+          `${SHARE_TESTS}/shareConsumerEvents.spec.js`,
+        ],
+        publishCommitted: [
+          `${SHARE_TESTS}/shareConsumerConnect.spec.js`,
+          `${SHARE_TESTS}/shareConsumerEvents.spec.js`,
+        ],
+        releaseFrom: [`${SHARE_TESTS}/shareConsumerModes.spec.js`],
+        retireLookups: [`${SHARE_TESTS}/shareConsumerCoordinatorClose.spec.js`],
+      },
+      'src/consumer/share/shareRunner.js': {
+        connect: [`${SHARE_TESTS}/shareConsumerConnect.spec.js`],
+        disconnect: ['src/telemetry/__tests__/close.spec.js'],
+        readTelemetryResources: ['src/telemetry/__tests__/factories.spec.js'],
+        run: [`${SHARE_TESTS}/shareConsumerConnect.spec.js`],
+        superviseCrash: [
+          `${SHARE_TESTS}/shareConsumerConnect.spec.js`,
+          `${SHARE_TESTS}/shareConsumerModes.spec.js`,
+        ],
+      },
+    },
   },
   {
     name: 'protocol',
@@ -95,6 +215,29 @@ const AREAS = [
       'src/protocol/encoder.spec.js',
       'src/protocol/requests/index.spec.js',
     ],
+    witnesses: {
+      'src/protocol/decoder.js': {
+        assertCount: [`${PROTOCOL}/decoderCountBounds.spec.js`],
+        readArray: [`${PROTOCOL}/decoderCountBounds.spec.js`],
+        readInt32: [`${PROTOCOL}/decoder.fuzz.spec.js`],
+        readInt64: [`${PROTOCOL}/decoder.spec.js`, 'src/__tests__/equivalentApis.spec.js'],
+        readTaggedFields: [`${PROTOCOL}/taggedFields.spec.js`],
+        readUVarInt: [`${PROTOCOL}/encoder.spec.js`],
+        readUVarIntBytes: [`${PROTOCOL}/compactPrimitives.spec.js`, `${PROTOCOL}/encoder.spec.js`],
+        readUuid: [`${PROTOCOL}/uuid.spec.js`],
+        readVarIntArrayBytesBounded: [`${PROTOCOL}/decoderHeaderArray.spec.js`],
+      },
+      'src/protocol/encoder.js': {
+        writeInt8: [`${PROTOCOL}/compactPrimitives.spec.js`],
+        writeNullableArray: [`${REQUESTS}/metadata/v1/request.spec.js`],
+        writeUuid: [`${PROTOCOL}/uuid.spec.js`],
+        writeUVarIntBytes: [`${PROTOCOL}/compactPrimitives.spec.js`],
+        writeVarIntBytes: [
+          `${PROTOCOL}/recordBatch/record/v0/decoderEquality.spec.js`,
+          `${REQUESTS}/produce/produceFraming.spec.js`,
+        ],
+      },
+    },
   },
   {
     name: 'cluster',
@@ -105,12 +248,20 @@ const AREAS = [
     name: 'admin',
     targets: ['src/admin/deadline.js'],
     specs: ['src/admin/__tests__/apiDeadline.spec.js'],
+    witnesses: {
+      'src/admin/deadline.js': {
+        check: ['src/admin/__tests__/deadlineScopes.spec.js'],
+        expired: ['src/admin/__tests__/deadlineScopes.spec.js'],
+      },
+    },
   },
 ]
 
 const BOUNDARY = { '<': '<=', '<=': '<', '>': '>=', '>=': '>' }
 const KEYWORD_HEAD = /^(?:\}\s*)?(?:if|else|for|while|switch|catch|do|try|finally|return|class)\b/
 const CALL_STATEMENT = /^(?:await\s+)?[\w$#]+(?:\??\.[\w$#]+)*\s*\(.*\)$/
+const CLASS_HEAD = /^(?:module\.exports\s*=\s*)?class\b/
+const SYMBOL_HEAD = /^ {2}(?:(?:async|static|get|set)\s+|\*)*([\w$#]+)\s*[(=]/
 const NOT_A_CALL = /^(?:return|throw|new|typeof|delete|void|if|for|while|switch)\b/
 
 /**
@@ -273,13 +424,38 @@ const expand = (root, target) => {
 }
 
 /**
- * Picks a target's witness from the area's specs.
+ * Names what holds a line: the module-level function, class or constant declaration at column 0, or,
+ * inside a class, the nearest method head two spaces in. Closures inside them belong to them.
+ * @param {string[]} masked the masked lines of a file
+ * @param {number} index the zero-based line
+ * @returns {string} the name, or an empty string for any other module-level statement
+ */
+const enclosingSymbol = (masked, index) => {
+  let method = ''
+  for (let i = index; i >= 0; i--) {
+    const line = masked[i]
+    const opens = /(?:[{(]|=>.*)$/.test(line.trimEnd())
+    if (CLASS_HEAD.test(line)) return method
+    if (/^\S/.test(line)) {
+      const declared = /^(?:async\s+)?(?:function\*?|const|let|var)\s+([\w$#]+)/.exec(line)
+      if (declared) return declared[1]
+      // `_` opens a masked line inside a multi-line template literal; a closer that opens a body continues a head
+      if (!(/^[})\]]/.test(line) && opens) && !line.startsWith('_')) return ''
+    } else {
+      const head = SYMBOL_HEAD.exec(line)
+      if (head && opens && !KEYWORD_HEAD.test(line.trim())) method = method || head[1]
+    }
+  }
+  return method
+}
+
+/**
+ * Picks a target's default witness from the area's specs.
  * @param {string} target
- * @param {{ specs: string[], witnesses?: Record<string, string> }} area
+ * @param {{ specs: string[] }} area
  * @returns {string}
  */
-const witnessFor = (target, { specs, witnesses = {} }) => {
-  if (witnesses[target]) return witnesses[target]
+const witnessFor = (target, { specs }) => {
   const dir = path.posix.dirname(target)
   const name = path.posix.basename(target, '.js')
   const exact = specs.find(
@@ -297,26 +473,81 @@ const witnessFor = (target, { specs, witnesses = {} }) => {
 }
 
 /**
+ * @param {{ witnesses?: object }} area
+ * @param {string} target
+ * @returns {boolean} whether the area names guard specs per method for the target
+ */
+const hasMethodRules = (area, target) => {
+  const entry = area.witnesses?.[target]
+  return typeof entry === 'object' && !Array.isArray(entry)
+}
+
+/**
+ * Picks a mutant's witnesses from the area: a whole-file entry of the `witnesses` table as it stands;
+ * otherwise the guards the table names for the method in their listed order, then the target's default
+ * unless they list it already.
+ * @param {string} target
+ * @param {string} method the method that holds the mutated line ('' when not looked up)
+ * @param {{ specs: string[], witnesses?: Record<string, string|string[]|Record<string, string[]>> }} area
+ * @returns {string[]} one or more specs, the first being the record's `spec`
+ */
+const witnessesFor = (target, method, area) => {
+  const entry = area.witnesses?.[target]
+  if (typeof entry === 'string') return [entry]
+  if (Array.isArray(entry)) return [...entry]
+  const guards = entry && Object.hasOwn(entry, method) ? entry[method] : []
+  return [...new Set([...guards, witnessFor(target, area)])]
+}
+
+/**
+ * @param {{ specs: string[], witnesses?: object }} area
+ * @returns {string[]} every spec the area names, in its default list and in its `witnesses` table
+ */
+const specsNamed = ({ specs, witnesses = {} }) => [
+  ...specs,
+  ...Object.values(witnesses).flatMap((entry) =>
+    typeof entry === 'object' && !Array.isArray(entry) ? Object.values(entry).flat() : entry
+  ),
+]
+
+/**
  * Generates the mutants of every area's targets.
  * @param {string} root the tree
- * @param {{ name: string, targets: string[], specs: string[], witnesses?: Record<string, string> }[]} [areas]
+ * @param {{ name: string, targets: string[], specs: string[], witnesses?: object }[]} [areas]
  * @returns {object[]} runner records, ordered by area, file and line
+ * @throws {Error} when an area names a witness spec that is not in the tree, a rule names a file that
+ *   is not a generated target, or a method rule matches no method of its target
  */
 const generate = (root, areas = AREAS) => {
   const records = []
   for (const area of areas) {
-    for (const target of area.targets.flatMap((t) => expand(root, t))) {
+    for (const spec of specsNamed(area))
+      if (!fs.existsSync(path.join(root, spec)))
+        throw new Error(`mutants: the witness spec ${spec} of area ${area.name} does not exist`)
+    const targets = area.targets.flatMap((t) => expand(root, t))
+    for (const ruled of Object.keys(area.witnesses || {}))
+      if (!targets.includes(ruled))
+        throw new Error(
+          `mutants: the witness rule for ${ruled} of area ${area.name} names no generated target`
+        )
+    for (const target of targets) {
       const text = fs.readFileSync(path.join(root, target), 'utf8')
       const lines = text.split('\n')
       const masked = mask(text).split('\n')
-      const spec = witnessFor(target, area)
+      const byMethod = hasMethodRules(area, target)
+      const symbols = new Set()
       const neighbour = (from, step) => {
         for (let i = from + step; i >= 0 && i < masked.length; i += step)
           if (masked[i].trim() !== '') return masked[i].trim()
         return ''
       }
       lines.forEach((line, i) => {
-        for (const m of lineMutants(line, masked[i], neighbour(i, -1), neighbour(i, 1))) {
+        const mutants = lineMutants(line, masked[i], neighbour(i, -1), neighbour(i, 1))
+        if (mutants.length === 0) return
+        const method = byMethod ? enclosingSymbol(masked, i) : ''
+        symbols.add(method)
+        const witnesses = witnessesFor(target, method, area)
+        for (const m of mutants) {
           records.push({
             id: `${area.name}/${target}:${i + 1}:${m.operator}`,
             area: area.name,
@@ -325,12 +556,17 @@ const generate = (root, areas = AREAS) => {
             operator: m.operator,
             original: line,
             mutated: m.mutated,
-            spec,
+            spec: witnesses[0],
+            ...(witnesses.length > 1 && { witnesses }),
             title: '',
             commandClass: 'unit',
           })
         }
       })
+      if (byMethod)
+        for (const key of Object.keys(area.witnesses[target]))
+          if (!symbols.has(key))
+            throw new Error(`mutants: the witness rule ${key} of ${target} matches no method`)
     }
   }
   return records

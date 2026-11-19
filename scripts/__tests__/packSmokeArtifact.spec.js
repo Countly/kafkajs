@@ -145,11 +145,32 @@ describe('scripts/packSmoke.sh with a supplied tarball', () => {
       .filter((line) => line.startsWith('npm '))
       .map((line) => JSON.parse(line.slice(4)))
     expect(npmCalls.some((args) => args.includes('pack'))).toBe(false)
-    expect(npmCalls[0]).toEqual(['install', '--silent', '--no-audit', '--no-fund', tarball])
+    expect(npmCalls[0]).toEqual([
+      'install',
+      '--silent',
+      '--no-audit',
+      '--no-fund',
+      '--ignore-scripts',
+      tarball,
+    ])
     expect(npmCalls).toHaveLength(2)
     expect(npmCalls[1]).toContain('@types/node@^24')
     expect(recorded().filter((line) => line.startsWith('tsc '))).toHaveLength(2)
     expect(fs.existsSync(path.join(workDir, 'pack', 'package.json'))).toBe(true)
+  })
+
+  it('installs the tarball and the Node types without lifecycle scripts', () => {
+    const tarball = packClient()
+    const result = run(tarball)
+
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+    const installs = recorded()
+      .filter((line) => line.startsWith('npm '))
+      .map((line) => JSON.parse(line.slice(4)))
+    expect(installs.map((args) => [args[0], args.includes('--ignore-scripts')])).toEqual([
+      ['install', true],
+      ['install', true],
+    ])
   })
 
   it('rejects a missing tarball', () => {

@@ -34,6 +34,13 @@
  * judged by the same rule: the control needs every one to pass; the mutant is killed when at least one
  * fails through its own body and none is refused. The killing test is reported as the witness.
  *
+ * A record may list several witness specs in `witnesses` (two or more, the first equal to `spec`). Each
+ * runs on its own copy of the tree with its own control, in order, and the first kill decides: the
+ * mutant is killed by that witness and the rest do not run. Without a kill it survives when any witness
+ * survived, and is otherwise as invalid as its first witness; the reason lists every witness. A time cap
+ * that passes between two witnesses leaves the record `not-run`, so it still bounds a record's length;
+ * the reason lists the verdicts of the witnesses that already ran.
+ *
  * Verdicts: `killed`, `survived`, `invalid` (the evidence cannot decide), `stale` (the mutation no longer
  * applies) and `not-run` (`live` records run without `--live-evidence`, and records past the time cap).
  *
@@ -288,8 +295,23 @@ class MutantRunner {
       const stale = typeof r.stale === 'string' && r.stale !== ''
       if (!inline && !patched && !stale)
         throw new Error(`${id}: neither a patch, an inline mutation nor a stale reason`)
-      if (r.target === r.spec) throw new Error(`${id}: a mutation never edits its witness spec`)
-      for (const p of [r.target, r.spec])
+      if (r.witnesses !== undefined) {
+        const w = r.witnesses
+        if (
+          !Array.isArray(w) ||
+          w.length < 2 ||
+          w.some((p) => typeof p !== 'string' || p === '') ||
+          new Set(w).size !== w.length ||
+          w[0] !== r.spec
+        )
+          throw new Error(
+            `${id}: witnesses lists at least two distinct specs, the first being spec`
+          )
+      }
+      const specs = MutantRunner.specsOf(r)
+      if (specs.includes(r.target))
+        throw new Error(`${id}: a mutation never edits its witness spec`)
+      for (const p of [r.target, ...specs])
         if (path.isAbsolute(p) || p.split(/[\\/]/).includes('..'))
           throw new Error(`${id}: a path escapes the tree`)
       if (path.normalize(r.target).split(/[\\/]/).includes('node_modules'))
@@ -315,12 +337,20 @@ class MutantRunner {
   }
 
   /**
-   * @param {{ spec: string, title?: string }} record
+   * @param {{ spec: string, witnesses?: string[] }} record
+   * @returns {string[]} the record's witness specs, in the order they run
+   */
+  static specsOf(record) {
+    return record.witnesses || [record.spec]
+  }
+
+  /**
+   * @param {{ spec: string, title?: string, witnesses?: string[] }} record
    * @param {string} [name] the test that decided, for a spec-level witness
-   * @returns {string} the witness as `spec › full name`
+   * @returns {string} the witness as `spec › full name`; without one, every witness spec of the record
    */
   static witnessName(record, name = record.title) {
-    return name ? `${record.spec} › ${name}` : record.spec
+    return name ? `${record.spec} › ${name}` : MutantRunner.specsOf(record).join(', ')
   }
 
   /**
@@ -565,23 +595,26 @@ class MutantRunner {
   }
 
   /**
-   * Runs one record in a disposable copy of the tree: location, control, mutation and mutant run.
-   * The tree itself is only read.
+   * Runs one record: location, then each witness in a disposable copy of the tree, in order, until one
+   * kills the mutant. The tree itself is only read.
    * @param {object} record
    * @param {string} root the tree under test, absolute or relative to the working directory
    * @param {string} patchDir directory with `<id>.patch`, absolute or relative to the working directory
+   * @param {number} [stopAt] the clock time after which no further witness of the record starts; a
+   *   record cut there without a kill is `not-run`
    * @returns {object} the report line, with its verdict
    * @throws {Error} when the tree cannot be copied or links outside its copy
    */
-  runOne(record, root, patchDir) {
+  runOne(record, root, patchDir, stopAt) {
     root = fs.realpathSync(root)
     patchDir = path.resolve(patchDir)
     const started = this.now()
     const entry = { ...this.skeleton(record), verdict: 'invalid', reason: '', durationMs: 0 }
     const finish = (verdict, reason) =>
       Object.assign(entry, { verdict, reason, durationMs: this.now() - started })
+    const specs = MutantRunner.specsOf(record)
     if (record.stale) return finish('stale', record.stale)
-    if (record.target === record.spec)
+    if (specs.includes(record.target))
       return finish('invalid', 'a mutation never edits its witness spec')
     const located = this.locate(record, root, patchDir)
     if (located.invalid) return finish('invalid', located.invalid)
@@ -594,21 +627,51 @@ class MutantRunner {
       })
       if (refusal) return finish('invalid', refusal)
     }
+    const outcomes = []
+    const listed = () =>
+      outcomes.map((o) => `${o.spec}: ${o.verdict}${o.reason ? ` (${o.reason})` : ''}`).join('; ')
+    for (const spec of specs) {
+      if (outcomes.length > 0 && stopAt !== undefined && this.now() >= stopAt)
+        return finish(
+          'not-run',
+          `time cap: ${outcomes.length} of ${specs.length} witnesses ran (${listed()})`
+        )
+      const outcome = { spec, ...this.runWitness({ ...record, spec }, root, patchDir) }
+      outcomes.push(outcome)
+      if (outcome.verdict === 'killed' || outcome.verdict === 'stale') break
+    }
+    const last = outcomes.at(-1)
+    if (last.verdict === 'killed' || last.verdict === 'stale') {
+      if (last.witness) entry.witness = last.witness
+      return finish(last.verdict, last.reason)
+    }
+    const decisive = outcomes.find((o) => o.verdict === 'survived') || outcomes[0]
+    if (outcomes.length === 1) return finish(decisive.verdict, decisive.reason)
+    return finish(decisive.verdict, listed())
+  }
+
+  /**
+   * Runs one witness of a record in its own disposable copy of the tree: the control, the mutation
+   * and the mutant run of {@link MutantRunner#decide}.
+   * @param {object} record the record, its `spec` the witness to run
+   * @param {string} root the tree under test
+   * @param {string} patchDir directory with `<id>.patch`
+   * @returns {{ verdict: string, reason: string, witness?: string }} the witness's verdict
+   * @throws {Error} when the tree cannot be copied or links outside its copy
+   */
+  runWitness(record, root, patchDir) {
     if (!fs.existsSync(path.join(root, record.spec)))
-      return finish('invalid', 'the witness spec is missing')
+      return { verdict: 'invalid', reason: 'the witness spec is missing' }
     const scratch = path.join(root, '.tmp', 'mutants')
     fs.mkdirSync(scratch, { recursive: true })
     const dir = fs.mkdtempSync(path.join(scratch, 'record-'))
     try {
       const tree = MutantRunner.copy(root, path.join(dir, 'tree'))
-      let decided
       try {
-        decided = this.decide(record, tree, patchDir, dir)
+        return this.decide(record, tree, patchDir, dir)
       } catch (error) {
-        decided = { verdict: 'invalid', reason: `the run crashed: ${error.message}` }
+        return { verdict: 'invalid', reason: `the run crashed: ${error.message}` }
       }
-      if (decided.witness) entry.witness = decided.witness
-      return finish(decided.verdict, decided.reason)
     } finally {
       try {
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
@@ -721,7 +784,7 @@ class MutantRunner {
       const capped = timeCapMs && this.now() - started >= timeCapMs
       const entry = capped
         ? { ...this.skeleton(record), verdict: 'not-run', reason: 'time cap', durationMs: 0 }
-        : this.runOne(record, root, patchDir)
+        : this.runOne(record, root, patchDir, timeCapMs ? started + timeCapMs : undefined)
       const text = JSON.stringify(entry) + '\n'
       if (out) fs.appendFileSync(out, text)
       else if (print) process.stdout.write(text)

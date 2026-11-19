@@ -793,6 +793,9 @@ module.exports = class Broker {
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
    * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
    *   other errors still throw
+   * @param {boolean} [options.retainTopicErrors=false] keeps every topic and partition error in
+   *   data for the caller to judge, topics first (see the Metadata `checkPartitions`); only a
+   *   top-level error throws
    * @returns {Promise<object>} decoded response; no cache installation
    * @throws {Error} original transport/auth/parse failure or guard refusal
    */
@@ -801,6 +804,7 @@ module.exports = class Broker {
       guard,
       lenient = false,
       allowLeaderless = false,
+      retainTopicErrors = false,
       includeTopicAuthorizedOperations = false,
       includeClusterAuthorizedOperations = false,
       allowAutoTopicCreation = this.allowAutoTopicCreation,
@@ -820,6 +824,7 @@ module.exports = class Broker {
         allowAutoTopicCreation,
         lenient,
         allowLeaderless,
+        retainTopicErrors,
         includeTopicAuthorizedOperations,
         includeClusterAuthorizedOperations,
       }),

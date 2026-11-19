@@ -215,7 +215,11 @@ type SASLMechanismOptionsMap = {
     secretAccessKey: string
     sessionToken?: string
   }
-  oauthbearer: { oauthBearerProvider: () => Promise<OauthbearerProviderResponse> }
+  oauthbearer: {
+    oauthBearerProvider: () => Promise<OauthbearerProviderResponse>
+    /** SASL authorization identity; Apache Kafka requires it to equal the token's principal name. Empty means none. */
+    authorizationIdentity?: string
+  }
 }
 
 export type SASLMechanism = keyof SASLMechanismOptionsMap
@@ -2082,6 +2086,7 @@ export type ConsumerEvents = {
   PARTITIONS_LOST: 'consumer.partitions_lost'
   POLL_INTERVAL_EXCEEDED: 'consumer.poll_interval_exceeded'
   RECEIVED_UNSUBSCRIBED_TOPICS: 'consumer.received_unsubscribed_topics'
+  TOPIC_METADATA_STATUS: 'consumer.topic_metadata_status'
   REQUEST: 'consumer.network.request'
   REQUEST_TIMEOUT: 'consumer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size'
@@ -2235,6 +2240,22 @@ export type ConsumerReceivedUnsubcribedTopicsEvent = InstrumentationEvent<{
   topicsSubscribed: string[]
   topicsNotSubscribed: string[]
 }>
+/**
+ * A subscribed topic's metadata changed between unavailable (a refresh answered
+ * UNKNOWN_TOPIC_OR_PARTITION; the other topics keep consuming and the topic stays subscribed) and
+ * available again. Emitted on change only. `available` means the metadata is back, not that
+ * records or an assignment arrived.
+ */
+export type ConsumerTopicMetadataStatusEvent = InstrumentationEvent<
+  | {
+      groupId: string | null
+      topic: string
+      status: 'unavailable'
+      type: 'UNKNOWN_TOPIC_OR_PARTITION'
+      code: 3
+    }
+  | { groupId: string | null; topic: string; status: 'available'; type: null; code: 0 }
+>
 
 export interface OffsetsByTopicPartition {
   topics: Array<{
@@ -2488,6 +2509,10 @@ export type Consumer = ClientTelemetry & {
   on(
     eventName: ConsumerEvents['RECEIVED_UNSUBSCRIBED_TOPICS'],
     listener: (event: ConsumerReceivedUnsubcribedTopicsEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ConsumerEvents['TOPIC_METADATA_STATUS'],
+    listener: (event: ConsumerTopicMetadataStatusEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
     eventName: ConsumerEvents['REQUEST'],

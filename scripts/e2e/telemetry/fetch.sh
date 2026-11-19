@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Downloads the pinned build inputs into $TF1_CACHE and verifies every SHA-256 against fixtures/inputs.sha256.
+# Downloads the pinned build inputs into $TF1_CACHE through download.sh, which retries and publishes a file only once
+# its SHA-256 matches fixtures/inputs.sha256, then verifies the whole set again.
 # Only Maven Central and the OpenTelemetry proto repo at tag v1.9.0 are contacted; nothing is fetched at broker start.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/download.sh"
 CACHE=${TF1_CACHE:?set TF1_CACHE to the download cache directory}
 M=https://repo1.maven.org/maven2
 O=https://github.com/open-telemetry/opentelemetry-proto/raw/refs/tags/v1.9.0/opentelemetry/proto
 while read -r rel url; do
-  mkdir -p "$CACHE/$(dirname "$rel")"
-  [ -s "$CACHE/$rel" ] || timeout 280 curl -fsSL --max-time 270 -o "$CACHE/$rel" "$url"
+  fetch "$HERE/fixtures/inputs.sha256" "$CACHE" "$rel" "$url"
 done <<LIST
 tools/protoc-3.25.5-linux-x86_64.exe $M/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe
 jars/protobuf-java-3.25.5.jar $M/com/google/protobuf/protobuf-java/3.25.5/protobuf-java-3.25.5.jar

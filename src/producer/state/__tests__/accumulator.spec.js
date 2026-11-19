@@ -3508,6 +3508,31 @@ describe('Producer > the accumulator > the flush inventory', () => {
     expect(accumulator.unsettled()).toEqual([])
   })
 
+  test('close settles when the last send waiting for its partitions expires, and its shell is freed once the assignment returns', async () => {
+    const assigned = deferred()
+    const { accumulator, admission } = inventory({
+      deadline: 1000,
+      partition: () => assigned.promise,
+    })
+    const held = append(accumulator, records(0, 'a'))
+    held.catch(() => {})
+    await jest.advanceTimersByTimeAsync(0)
+    const closed = settledFlag(accumulator.close())
+
+    await jest.advanceTimersByTimeAsync(999)
+    expect(closed()).toBe(false)
+    await jest.advanceTimersByTimeAsync(1)
+    await expect(held).rejects.toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
+    expect(closed()).toBe(true)
+    expect(jest.getTimerCount()).toBe(0)
+    expect(admission.reserved).toBeGreaterThan(0)
+
+    assigned.resolve([{ topic: TOPIC, partition: 0, messages: [] }])
+    await jest.advanceTimersByTimeAsync(0)
+    expect(admission.reserved).toBe(0)
+    expect(accumulator.unsettled()).toEqual([])
+  })
+
   test('a send granted room after a wait goes on, and one granted as the producer closes is refused unsent and gives the room back', async () => {
     const generation = new Generation()
     const { accumulator, admission, batches } = inventory({

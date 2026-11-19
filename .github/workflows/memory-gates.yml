@@ -14,6 +14,8 @@ on:
         options: ['1', '2', '3']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
 concurrency:
   group: memory-gates-${{ github.ref }}-${{ inputs.only || 'all' }}-${{ inputs.replicates || '3' }}
   cancel-in-progress: true

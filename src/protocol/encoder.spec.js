@@ -123,6 +123,13 @@ describe('Protocol > Encoder', () => {
     })
   })
 
+  test('serializes the encoded bytes as Buffer JSON', () => {
+    const encoder = new Encoder().writeInt8(7).writeInt16(258)
+
+    expect(encoder.toJSON()).toEqual({ type: 'Buffer', data: [7, 1, 2] })
+    expect(JSON.stringify(encoder)).toBe('{"type":"Buffer","data":[7,1,2]}')
+  })
+
   describe('writeEncoder', () => {
     it('should throw if the value is not an Encoder', () => {
       const encoder = new Encoder()

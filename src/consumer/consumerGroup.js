@@ -331,6 +331,7 @@ module.exports = class ConsumerGroup {
     this.haltedPartitions = new Map()
     this.obligations = obligations
     this.obligations.attachTo(this.operations)
+    this.obligations.claimSubscription(this.topicsSubscribed)
 
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
@@ -1730,12 +1731,14 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Applies a subscription lifecycle, never a rebalance assignment.
+   * Applies a subscription lifecycle, never a rebalance assignment. The names also become the
+   * consumer's subscribed names in its group's ownership record.
    * @param {string[]} topics accepted names with configuration already installed
    * @returns {void}
    */
   retainSubscription(topics) {
     this.topicsSubscribed = [...topics]
+    this.obligations?.claimSubscription(this.topicsSubscribed)
     this.subscriptionState.retainTopics(topics)
     const live = new Set(topics)
     for (const topic of Object.keys(this.topicConfigurations)) {
@@ -1818,6 +1821,7 @@ module.exports = class ConsumerGroup {
     }
 
     this.topicsSubscribed = [...this.topicsSubscribed, ...added]
+    this.obligations.claimSubscription(this.topicsSubscribed)
 
     for (const name of added) {
       this.topicConfigurations[name] = this.topicConfigurations[name] || {
@@ -3547,13 +3551,17 @@ module.exports = class ConsumerGroup {
    * A leader also reports a topic that only other members subscribe to once its union watch has
    * seen that topic gain partitions.
    *
+   * Classic only: a manual assignment is fixed, and under the consumer protocol the coordinator
+   * sees a topic's partitions change and sends the new assignment itself, so a rejoin would only
+   * repeat the round it already has (a topic that was missing at the last round and is back, say).
+   *
    * @returns {void}
    * @throws {KafkaJSStaleTopicMetadataAssignment} when a subscribed or union-only topic gained
    *   partitions
    */
   checkForStaleAssignment() {
     if (
-      this.kind === 'manual' ||
+      this.kind !== 'classic' ||
       !this.partitionsPerSubscribedTopic ||
       this.staleAssignmentPending
     ) {

@@ -59,14 +59,14 @@ jobs:
           node-version: 24
           package-manager-cache: false
       - id: install
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Install the packed fork and kafkajs 2.2.4 into separate prefixes
         id: prefixes
         run: |
           set -euo pipefail
           tarball=$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename")
-          npm install --prefix "$RUNNER_TEMP/fork" "$RUNNER_TEMP/$tarball"
-          npm install --prefix "$RUNNER_TEMP/base" kafkajs@2.2.4
+          npm install --prefix "$RUNNER_TEMP/fork" --ignore-scripts "$RUNNER_TEMP/$tarball"
+          npm install --prefix "$RUNNER_TEMP/base" kafkajs@2.2.4 --ignore-scripts
       # Without a non-empty NO_LOGS the script ends in `docker compose logs -f` and never returns.
       - name: Start the cluster
         id: start

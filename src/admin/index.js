@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const createDelegationTokens = require('./delegationTokens')
 const createClientQuotas = require('./clientQuotas')
 const createScramCredentials = require('./scramCredentials')
@@ -2770,9 +2771,9 @@ module.exports = ({
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })

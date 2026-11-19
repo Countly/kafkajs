@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('b75a444cd969d490ac896539430a0585ea9155a5a8250592ae837a71b0ecacc5')
+    expect(digest(file)).toBe('1bea7a4b7378cacec239676fb947e51fa675ae2edf2185841e1fa461c8c07c45')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -1114,7 +1114,8 @@ describe('broker telemetry fixture', () => {
       'legacy/JavaTelemetryClient.java',
     ])
       expect(digest(fixture + name)).toBe(manifest.scripts[name])
-    expect(digest(fixture + 'fetch.sh')).toBe(manifest.scripts['fetch.sh'])
+    for (const name of ['fetch.sh', 'download.sh'])
+      expect(digest(fixture + name)).toBe(manifest.scripts[name])
     expect(digest(fixture + 'fixtures/inputs.sha256')).toBe(
       '221be9594f870c453fc4a56126fcadaadcb4d3741750a0d727e6a08e332553b3'
     )
@@ -1767,7 +1768,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('requires the adopted long-window lane on pull requests with three replicates and bounded jobs', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const expr = (text) => '$' + `{{ ${text} }}`
@@ -1836,7 +1836,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('covers all six live census lanes with capture and scalar companions', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const census = workflow.jobs['live-owner-census']
@@ -1893,7 +1892,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const { LIVE_SEED } = require('../../soak/liveSeed')
     const { TELEMETRY } = require('../../soak/soak')
@@ -3804,4 +3802,255 @@ describe('Java node export capture', () => {
     }
     expect(() => assertJavaCaptures([receipt(prefixes)], dir)).toThrow('Invalid capture length')
   })
+})
+
+describe.each([
+  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256'],
+  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256'],
+])('pinned input download by %s', (script, cacheVariable, sums) => {
+  const { createHash } = require('crypto')
+  const { spawn } = require('child_process')
+  const telemetry = path.resolve(__dirname, '../telemetry')
+  const names = fs
+    .readFileSync(path.join(telemetry, sums), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => line.split(/\s+/)[1])
+  const body = (name) => `pinned ${path.basename(name)}\n`
+  const tool = `#!/usr/bin/env node
+const fs = require('fs')
+const path = require('path')
+const tool = path.basename(process.argv[1])
+const args = process.argv.slice(2)
+const state = process.env.FAKE_STATE
+const clock = path.join(state, 'clock')
+const now = () => (fs.existsSync(clock) ? Number(fs.readFileSync(clock, 'utf8')) : 1000000)
+const advance = (seconds) => fs.writeFileSync(clock, String(now() + seconds))
+const block = () => {
+  fs.writeFileSync(path.join(state, 'blocked'), '')
+  setInterval(() => {}, 1000)
+}
+if (tool === 'date') {
+  process.stdout.write(now() + '\\n')
+} else {
+  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ tool, args }) + '\\n')
+  if (tool === 'sleep') {
+    if (process.env.FAKE_BLOCK === 'sleep') block()
+    else advance(Number(args[0]))
+  } else {
+    const url = args.at(-1)
+    const out = args[args.indexOf('-o') + 1]
+    const counter = path.join(state, encodeURIComponent(url))
+    const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0
+    fs.writeFileSync(counter, String(seen + 1))
+    const index = fs.existsSync(path.join(state, 'curls')) ? fs.readFileSync(path.join(state, 'curls'), 'utf8').length : 0
+    fs.appendFileSync(path.join(state, 'curls'), '.')
+    const failure = { partial: [0, 18, 'partial'], wrong: [0, 0, 'wrong'] }[process.env.FAKE_FAILURE]
+    const planned = process.env.FAKE_PLAN ? JSON.parse(process.env.FAKE_PLAN)[index] : undefined
+    const [cost, exit, kind] = planned || (seen < Number(process.env.FAKE_FAILURES) ? failure : [0, 0, 'pinned'])
+    advance(cost)
+    if (kind === 'partial') fs.writeFileSync(out, 'partial')
+    if (kind === 'wrong') fs.writeFileSync(out, '<html>error page</html>\\n')
+    if (kind === 'pinned') fs.writeFileSync(out, 'pinned ' + path.basename(url) + '\\n')
+    if (process.env.FAKE_BLOCK === 'curl') block()
+    else process.exit(exit)
+  }
+}
+`
+  let directory
+  let cache
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pinned-fetch-'))
+    cache = path.join(directory, 'cache')
+    for (const name of ['bin', 'state', 'scripts/fixtures']) {
+      fs.mkdirSync(path.join(directory, name), { recursive: true })
+    }
+    for (const name of fs.readdirSync(telemetry).filter((file) => file.endsWith('.sh'))) {
+      fs.copyFileSync(path.join(telemetry, name), path.join(directory, 'scripts', name))
+    }
+    const digest = (name) => createHash('sha256').update(body(name)).digest('hex')
+    fs.writeFileSync(
+      path.join(directory, 'scripts', sums),
+      names.map((name) => `${digest(name)}  ${name}\n`).join('')
+    )
+    for (const name of ['curl', 'sleep', 'date']) {
+      fs.writeFileSync(path.join(directory, 'bin', name), tool, { mode: 0o755 })
+    }
+  })
+
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  /**
+   * Builds the environment for a copy of the real fetch script run against the curl, sleep and date doubles.
+   * @param {number} failures attempts per URL that fail before one succeeds
+   * @param {object} [extra] further variables: FAKE_FAILURE (`partial` exits 18 after a partial body, `wrong` exits 0
+   *   with the wrong bytes), FAKE_PLAN (JSON `[seconds, exit, body]` per curl call) or FAKE_BLOCK (`curl` or `sleep`)
+   * @returns {object} the environment
+   */
+  const environment = (failures, extra) => ({
+    ...process.env,
+    PATH: `${path.join(directory, 'bin')}${path.delimiter}${process.env.PATH}`,
+    [cacheVariable]: cache,
+    FAKE_LOG: path.join(directory, 'tools.jsonl'),
+    FAKE_STATE: path.join(directory, 'state'),
+    FAKE_FAILURES: String(failures),
+    FAKE_FAILURE: 'partial',
+    ...extra,
+  })
+  const calls = () => {
+    const log = path.join(directory, 'tools.jsonl')
+    return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : []
+  }
+
+  /**
+   * Runs a copy of the real fetch script to completion against the doubles.
+   * @param {number} failures attempts per URL that fail before one succeeds
+   * @param {object} [extra] further double variables, see `environment`
+   * @returns {{status: number|null, signal: string|null, stdout: string, stderr: string, calls: object[]}}
+   */
+  const fetch = (failures, extra = {}) => {
+    fs.rmSync(path.join(directory, 'tools.jsonl'), { force: true })
+    const run = spawnSync('bash', [path.join(directory, 'scripts', script)], {
+      env: environment(failures, extra),
+      encoding: 'utf8',
+      timeout: 60000,
+    })
+    const { status, signal, stdout, stderr } = run
+    return { status, signal, stdout, stderr, calls: calls() }
+  }
+
+  /**
+   * Starts the fetch script in its own process group, waits until a double blocks, then sends SIGTERM to the whole
+   * group as `timeout` does.
+   * @param {object} extra double variables; must set FAKE_BLOCK
+   * @returns {Promise<{code: number|null, signal: string|null}>}
+   */
+  const kill = async (extra) => {
+    const child = spawn('bash', [path.join(directory, 'scripts', script)], {
+      env: environment(Infinity, extra),
+      detached: true,
+      stdio: 'ignore',
+    })
+    const exited = new Promise((resolve) =>
+      child.on('exit', (code, signal) => resolve({ code, signal }))
+    )
+    while (!fs.existsSync(path.join(directory, 'state', 'blocked'))) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    process.kill(-child.pid, 'SIGTERM')
+    return exited
+  }
+  const curls = (list) => list.filter((call) => call.tool === 'curl')
+  const sleeps = (list) => list.filter((call) => call.tool === 'sleep').map(({ args }) => args)
+  const limits = (list) =>
+    curls(list).map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+  const cached = () =>
+    fs
+      .readdirSync(cache, { recursive: true })
+      .map(String)
+      .filter((name) => fs.statSync(path.join(cache, name)).isFile())
+  const fill = () => {
+    for (const name of names) {
+      fs.mkdirSync(path.dirname(path.join(cache, name)), { recursive: true })
+      fs.writeFileSync(path.join(cache, name), body(name))
+    }
+  }
+
+  test('retries a failed download and keeps the file once it arrives', () => {
+    const result = fetch(2)
+    expect(result.status).toBe(0)
+    for (const name of names)
+      expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
+    expect(curls(result.calls)).toHaveLength(names.length * 3)
+    expect(limits(result.calls).every((limit) => limit === 60)).toBe(true)
+    expect(cached().filter((name) => name.includes('.part'))).toEqual([])
+  })
+
+  test('stops after four attempts with a 2, 4 and 6 second backoff and names the file and URL that failed', () => {
+    const result = fetch(Infinity)
+    expect(result.signal).toBeNull()
+    expect(result.status).toBe(1)
+    const attempts = curls(result.calls)
+    expect(attempts).toHaveLength(4)
+    const url = attempts[0].args.at(-1)
+    expect(attempts.every(({ args }) => args.at(-1) === url)).toBe(true)
+    expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['6']])
+    expect(result.stderr).toContain(`${names[0]} from ${url}: curl exit 18`)
+    expect(cached()).toEqual([])
+  })
+
+  test('shares one deadline across files, shortening the last attempt and its backoff', () => {
+    const plan = [
+      [60, 28, 'partial'],
+      [60, 28, 'partial'],
+      [21, 0, 'pinned'],
+      [2, 22, 'none'],
+    ]
+    const result = fetch(0, { FAKE_PLAN: JSON.stringify(plan) })
+    expect(result.signal).toBeNull()
+    expect(result.status).toBe(1)
+    expect(limits(result.calls)).toEqual([60, 60, 24, 3])
+    expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['1']])
+    const url = curls(result.calls)[3].args.at(-1)
+    expect(result.stderr).toContain(`${names[1]} from ${url}: curl exit 22`)
+    expect(cached()).toEqual([names[0]])
+  })
+
+  test('never lets an interrupted download satisfy the cache check', () => {
+    expect(fetch(Infinity).status).toBe(1)
+    const retry = fetch(0)
+    expect(retry.status).toBe(0)
+    expect(curls(retry.calls)).toHaveLength(names.length)
+    expect(fs.readFileSync(path.join(cache, names[0]), 'utf8')).toBe(body(names[0]))
+  })
+
+  test('retries a response with the wrong bytes without publishing it', () => {
+    const result = fetch(1, { FAKE_FAILURE: 'wrong' })
+    expect(result.status).toBe(0)
+    expect(curls(result.calls)).toHaveLength(names.length * 2)
+    for (const name of names)
+      expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
+    expect(cached().filter((name) => name.includes('.part'))).toEqual([])
+  })
+
+  test('fails on wrong bytes naming the file, URL and digest mismatch, and a clean rerun recovers', () => {
+    const result = fetch(Infinity, { FAKE_FAILURE: 'wrong' })
+    expect(result.status).toBe(1)
+    const attempts = curls(result.calls)
+    expect(attempts).toHaveLength(4)
+    expect(result.stderr).toContain(`${names[0]} from ${attempts[0].args.at(-1)}: digest mismatch`)
+    expect(cached()).toEqual([])
+    const retry = fetch(0)
+    expect(retry.status).toBe(0)
+    expect(curls(retry.calls)).toHaveLength(names.length)
+  })
+
+  test('keeps a present file with the pinned digest offline', () => {
+    fill()
+    const result = fetch(0)
+    expect(result.status).toBe(0)
+    expect(result.calls).toEqual([])
+  })
+
+  test('fetches a cached file whose digest is wrong again', () => {
+    fill()
+    fs.writeFileSync(path.join(cache, names[0]), 'wrong\n')
+    const result = fetch(0)
+    expect(result.status).toBe(0)
+    expect(curls(result.calls)).toHaveLength(1)
+    expect(fs.readFileSync(path.join(cache, names[0]), 'utf8')).toBe(body(names[0]))
+  })
+
+  test('leaves no file under the real name when killed after the bytes arrive', async () => {
+    const exit = await kill({ FAKE_FAILURES: '0', FAKE_BLOCK: 'curl' })
+    expect(exit.code === 143 || exit.signal === 'SIGTERM').toBe(true)
+    expect(cached()).toEqual([])
+  }, 30000)
+
+  test('leaves no file under the real name when killed during the backoff', async () => {
+    const exit = await kill({ FAKE_BLOCK: 'sleep' })
+    expect(exit.code === 143 || exit.signal === 'SIGTERM').toBe(true)
+    expect(cached()).toEqual([])
+  }, 30000)
 })

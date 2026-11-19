@@ -45,9 +45,10 @@ echo "tarball: $TARBALL_PATH"
 
 cd "$PACK_DIR"
 [ -f package.json ] || echo '{ "name": "pack-smoke", "private": true, "type": "commonjs" }' > package.json
-npm install --silent --no-audit --no-fund "$TARBALL_PATH"
+# --ignore-scripts: neither install needs a lifecycle script, so none runs.
+npm install --silent --no-audit --no-fund --ignore-scripts "$TARBALL_PATH"
 # Complete dependency installation before creating the alias: reification can prune symlinks.
-npm install --silent --no-audit --no-fund --no-save @types/node@^24
+npm install --silent --no-audit --no-fund --no-save --ignore-scripts @types/node@^24
 # The supported `kafkajs` alias resolves to this one installation, so module identity is shared.
 [ -e node_modules/kafkajs ] || ln -s @countly/kafkajs node_modules/kafkajs
 node -e 'if (require.resolve("kafkajs") !== require.resolve("@countly/kafkajs") || require("kafkajs") !== require("@countly/kafkajs")) throw new Error("Package alias differs")'

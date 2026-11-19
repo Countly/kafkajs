@@ -490,6 +490,23 @@ consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   void isStatic
   void generationId
 })
+consumer.on(consumer.events.TOPIC_METADATA_STATUS, e => {
+  const topic: string = e.payload.topic
+  const groupId: string | null = e.payload.groupId
+  if (e.payload.status === 'unavailable') {
+    const code: 3 = e.payload.code
+    const type: 'UNKNOWN_TOPIC_OR_PARTITION' = e.payload.type
+    void code
+    void type
+  } else {
+    const code: 0 = e.payload.code
+    const type: null = e.payload.type
+    void code
+    void type
+  }
+  void topic
+  void groupId
+})
 // The option and the deprecated alias both compile.
 kafka.consumer({ groupId: 'g', maxPollInterval: 300000 })
 kafka.consumer({ groupId: 'g', rebalanceTimeout: 60000 })
@@ -1614,6 +1631,7 @@ const legacyCallback: kafkajs.SASLOptions = {
   oauthBearerProvider: async () => ({ value: 'token', extensions: { trace: 'one' } }),
 }
 const helperCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider }
+const authzCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider, authorizationIdentity: 'principal' }
 // @ts-expect-error secret and assertion are exclusive
 oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientSecret: 'secret', clientAssertion: signedAssertion })
 // @ts-expect-error one credential form is required
