@@ -66,6 +66,8 @@ const DIAGNOSTIC_RESERVE_BYTES = 2 * GIB
 /** What a command may take beyond its step's deadline, and what one without a deadline may take. */
 const COMMAND_GRACE_MS = 60000
 const DEFAULT_COMMAND_MS = 300000
+/** How long one direct admin call of the supervisor in readiness or the settled ends may take. */
+const ADMIN_CALL_MS = 30000
 /** How long one docker command may run before it is killed. */
 const DOCKER_MS = 60000
 /** How long a child killed at the end of the teardown allowance may take to end. */
@@ -768,9 +770,9 @@ class Supervisor {
    */
   async ready(topic, topicId, partitions, deadline) {
     const suitable = async () => {
-      const { topics } = await this.admin
-        .fetchTopicMetadata({ topics: [topic] })
-        .catch(() => ({ topics: [] }))
+      const { topics } = await this.adminCall(`fetchTopicMetadata of ${topic}`, () =>
+        this.admin.fetchTopicMetadata({ topics: [topic] })
+      ).catch(() => ({ topics: [] }))
       const meta = topics[0]
       return (
         normalizeTopicId(meta?.topicId) === topicId &&
@@ -782,6 +784,30 @@ class Supervisor {
       if (this.clock.now() >= deadline)
         throw new Error(`${topic} has no ready metadata for ${topicId} by the deadline`)
       await this.clock.sleepUntil(Math.min(deadline, this.clock.now() + 250))
+    }
+  }
+
+  /**
+   * Awaits one direct admin call of the supervisor for `ADMIN_CALL_MS` at most, so a call the
+   * cluster never answers cannot hold readiness or the final drain; the call itself is left to
+   * settle on its own.
+   * @template T
+   * @param {string} what names the call @param {() => Promise<T>} call
+   * @returns {Promise<T>} its result
+   * @throws {Error} its failure, or that it did not answer in time
+   */
+  async adminCall(what, call) {
+    const timer = new AbortController()
+    const late = Symbol('late')
+    try {
+      const result = await Promise.race([
+        call(),
+        this.clock.sleepUntil(this.clock.now() + ADMIN_CALL_MS, timer.signal).then(() => late),
+      ])
+      if (result === late) throw new Error(`${what} did not answer within ${ADMIN_CALL_MS} ms`)
+      return result
+    } finally {
+      timer.abort()
     }
   }
 
@@ -1380,19 +1406,20 @@ class Supervisor {
    *   open transaction is a problem of the run
    * @param {string[]} [topics] the logs, by default the two standing ones
    * @returns {Promise<Record<string, string>>} `topic|partition` to log end
-   * @throws {Error} when the log ends cannot be read
+   * @throws {Error} when the log ends cannot be read, or a read does not answer within
+   *   `ADMIN_CALL_MS`
    */
   async settledEnds(deadline, topics = [this.config.topics.main, this.config.topics.transactions]) {
     for (;;) {
       const ends = {}
       let open = false
       for (const topic of topics) {
-        const committed = await this.admin.fetchTopicOffsets(topic, {
-          isolationLevel: 'read_committed',
-        })
-        const high = await this.admin.fetchTopicOffsets(topic, {
-          isolationLevel: 'read_uncommitted',
-        })
+        const offsets = (isolationLevel) =>
+          this.adminCall(`fetchTopicOffsets of ${topic}`, () =>
+            this.admin.fetchTopicOffsets(topic, { isolationLevel })
+          )
+        const committed = await offsets('read_committed')
+        const high = await offsets('read_uncommitted')
         for (const { partition, offset } of high) {
           ends[`${topic}|${partition}`] = offset
           open ||= committed.find((c) => c.partition === partition)?.offset !== offset
