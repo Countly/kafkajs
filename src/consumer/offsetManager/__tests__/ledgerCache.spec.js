@@ -171,4 +171,18 @@ describe('Offset manager cache writes go through the ledger', () => {
     expect(ctx.operations.durable(TOPIC, 0)).toBeNull()
     ctx.operations.end(holder)
   })
+  test('a topic reset is one hard barrier over the cells its open tickets cover', () => {
+    const ctx = createScheduledOffsetManager({ autoCommit: true })
+    const holder = ctx.operations.begin(cell)
+    const stamps = jest.spyOn(ctx.operations, 'touchTopic')
+    const before = ctx.operations.clock
+
+    ctx.manager.resetOffsetsForTopic(TOPIC)
+
+    expect(stamps).toHaveBeenCalledTimes(1)
+    expect(ctx.operations.clock).toBe(before + 1)
+    expect(ctx.operations.isHardBarred(holder, TOPIC, 0)).toBe(true)
+    stamps.mockRestore()
+    ctx.operations.end(holder)
+  })
 })

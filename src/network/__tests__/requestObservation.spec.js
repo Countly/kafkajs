@@ -18,11 +18,11 @@ let nextCorrelation = 0
 /** @returns {{ correlationId: number, resolve: jest.Mock, reject: jest.Mock }} a queue entry */
 const entry = () => ({ correlationId: nextCorrelation++, resolve: jest.fn(), reject: jest.fn() })
 
+const queues = []
 /**
  * @param {object} [extra] RequestQueue options
  * @returns {{ queue: RequestQueue, logger: object }} a queue with one in-flight slot
  */
-const queues = []
 const createQueue = (extra = {}) => {
   const logger = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() }
   const queue = new RequestQueue({

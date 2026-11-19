@@ -52,8 +52,9 @@ const rejectCommitOf = (rig, offset, errorCode) => {
  * @param {object} options
  * @param {'classic'|'consumer'} options.protocol
  * @param {boolean} options.fromBeginning the reset policy, `earliest` when true
- * @param {(rig: CloseRig) => Promise<{ failure: Error|null }>} options.fail arms the failure and
- *   seeks, returning what `position()` raised, or null on the fetch-loop path
+ * @param {(rig: CloseRig, consumer: object, group: ConsumerGroup) => Promise<{ failure: Error|null }>}
+ *   options.fail arms the failure and seeks, returning what `position()` raised, or null on the
+ *   fetch-loop path
  * @returns {Promise<object>} the failure, the position after it, the next delivery, the
  *   OffsetFetch and ListOffsets frames the failure caused, every OffsetCommit offset and the WARN
  *   messages the consumer group logged
@@ -117,7 +118,7 @@ const failedSeek = async ({ protocol, fromBeginning, fail }) => {
     }
     const joinsBefore = joins(rig)
 
-    const { failure } = await fail(rig, consumer)
+    const { failure } = await fail(rig, consumer, captured.group())
     const position = failure ? await consumer.position(CELL) : null
     releaseHandler.resolve()
     const delivery = await next.promise
@@ -187,6 +188,24 @@ const lookupTimedOut = async (rig, consumer) => {
   return { failure }
 }
 
+/**
+ * Makes the group's first `Seek offset` DEBUG run `effect`, then throw `failure`.
+ * @param {ConsumerGroup} group
+ * @param {Error} failure
+ * @param {() => void} [effect]
+ * @returns {void}
+ */
+const throwFromSeekDebug = (group, failure, effect = () => {}) => {
+  const debug = group.logger.debug
+  let thrown = false
+  jest.spyOn(group.logger, 'debug').mockImplementation((message, ...extra) => {
+    if (thrown || message !== 'Seek offset') return debug(message, ...extra)
+    thrown = true
+    effect()
+    throw failure
+  })
+}
+
 describe.each(['classic', 'consumer'])('a failed seek, %s protocol', (protocol) => {
   describe.each([
     ['latest', false],
@@ -235,6 +254,61 @@ describe.each(['classic', 'consumer'])('a failed seek, %s protocol', (protocol) 
       })
     }
   )
+
+  test('whose DEBUG log threw after it was popped, surfaces that error and fetches from the position before the seek', async () => {
+    const failure = new Error('seek log failed')
+    let raised
+    const outcome = await failedSeek({
+      protocol,
+      fromBeginning: false,
+      fail: async (rig, consumer, group) => {
+        throwFromSeekDebug(group, failure)
+        consumer.seek({ ...CELL, offset: '2' })
+        raised = await consumer.position(CELL).then(
+          () => null,
+          (error) => error
+        )
+        return { failure: raised }
+      },
+    })
+    expect(raised).toBe(failure)
+    expect(outcome).toEqual({
+      failure: 'Error',
+      position: '3',
+      delivery: '3',
+      offsetFetches: 0,
+      listOffsets: 0,
+      joins: 0,
+      commits: [],
+      warnings: [WARNING],
+    })
+  })
+
+  test('superseded by a seek admitted from its own DEBUG log, is never written and the newer seek applies', async () => {
+    const outcome = await failedSeek({
+      protocol,
+      fromBeginning: false,
+      fail: async (rig, consumer, group) => {
+        const debug = group.logger.debug
+        let admitted = false
+        jest.spyOn(group.logger, 'debug').mockImplementation((message, ...extra) => {
+          if (!admitted && message === 'Seek offset') {
+            admitted = true
+            consumer.seek({ ...CELL, offset: '4' })
+          }
+          return debug(message, ...extra)
+        })
+        consumer.seek({ ...CELL, offset: '2' })
+        return {
+          failure: await consumer.position(CELL).then(
+            () => null,
+            (error) => error
+          ),
+        }
+      },
+    })
+    expect(outcome).toMatchObject({ failure: null, commits: ['4'], warnings: [] })
+  })
 
   test('rejected with a membership error, ends the acquisition through the normal rejoin', async () => {
     const outcome = await failedSeek({

@@ -905,6 +905,38 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(scenario.errors).toEqual([])
   })
 
+  test('isStale() of an older batch reports no seek when its partition is revoked without one', async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true } })
+    const group = captured.group()
+    expect(scenario.old.isStale()).toBe(false)
+
+    await group.applyRebalanceResult({ assignment: {} }, { rebuildOffsets: false })
+
+    expect(scenario.old.isStale()).toBe(false)
+  })
+
+  test('isStale() of an older batch reports no seek when its topic is recreated without one', async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true } })
+    expect(scenario.old.isStale()).toBe(false)
+
+    captured.group().invalidateTopic(TOPIC)
+
+    expect(scenario.old.isStale()).toBe(false)
+  })
+
+  test('isStale() of an older batch stays true after a seek of its partition, also once its partition is revoked', async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true } })
+    expect(await scenario.seek('0')).toBe('0')
+    expect(scenario.old.isStale()).toBe(true)
+
+    await captured.group().applyRebalanceResult({ assignment: {} }, { rebuildOffsets: false })
+
+    expect(scenario.old.isStale()).toBe(true)
+  })
+
   test('a resolve callback of an older batch stays fenced after its assignment is rebuilt', async () => {
     const captured = using(captureGroup())
     await open({ run: { ...MANUAL, eachBatch: true }, handOff: true })
@@ -1847,6 +1879,75 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       }
     )
   })
+  describe('a seek of a halted partition', () => {
+    const SEEKING = {
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+    const FAILURES = {
+      'refused before its write': (group) => {
+        const refusal = new Error('refused before the write')
+        const seek = jest.spyOn(group.offsetManager, 'seek').mockImplementationOnce(async () => {
+          throw refusal
+        })
+        using({ restore: () => seek.mockRestore() })
+        return { commits: [] }
+      },
+      'rejected by the broker': () => {
+        failNextCommit(scenario)
+        return { commits: ['0'] }
+      },
+      'written and left unanswered': () => {
+        const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+        let lost = false
+        scenario.rig.cluster.answer('OffsetCommit', async (fields, record) => {
+          if (lost) return answer(fields, record)
+          lost = true
+          throw new Error('connection lost after the write')
+        })
+        return { commits: ['0'] }
+      },
+    }
+
+    test.each(Object.keys(FAILURES))(
+      'keeps the halt, the position and the tracked epoch when its commit was %s',
+      async (failure) => {
+        const captured = using(captureGroup())
+        await open(SEEKING)
+        const group = captured.group()
+        const key = `${TOPIC}|0`
+        expect(await scenario.position()).toBe('5')
+        const epoch = group.offsetManager.lastConsumedEpoch(TOPIC, 0)
+        const halt = { offset: '5', reason: 'checksum', error: new Error('crc') }
+        group.haltedPartitions.set(key, halt)
+        const { commits } = FAILURES[failure](group)
+
+        scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+        expect(await failureOf(scenario.position())).toBeInstanceOf(Error)
+
+        expect(group.haltedPartitions.get(key)).toBe(halt)
+        expect(await scenario.position()).toBe('5')
+        expect(group.offsetManager.lastConsumedEpoch(TOPIC, 0)).toBe(epoch)
+        expect(scenario.commits()).toEqual(commits)
+        expect(scenario.committed[0]).toBe('2')
+      }
+    )
+
+    test('clears the halt once the broker accepted its commit', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const group = captured.group()
+      const key = `${TOPIC}|0`
+      group.haltedPartitions.set(key, { offset: '5', reason: 'checksum', error: new Error('crc') })
+
+      expect(await scenario.seek('0')).toBe('0')
+
+      expect(group.haltedPartitions.has(key)).toBe(false)
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('0')
+    })
+  })
+
   describe('a seek a fetch round applied', () => {
     const SEEKING = {
       run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
@@ -1905,7 +2006,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('clears the halt of its partition when its commit was written, even though the round was refused', async () => {
+    test('clears the halt of its partition when the broker accepted its commit, even though the round was refused', async () => {
       const captured = using(captureGroup())
       await open(SEEKING)
       const group = captured.group()
@@ -1914,7 +2015,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       const seek = jest
         .spyOn(group.offsetManager, 'seek')
         .mockImplementationOnce(async (entry, preparation, attempt) => {
-          attempt.written = attempt.accepted = true
+          attempt.accepted = true
           throw refusal
         })
       using({ restore: () => seek.mockRestore() })
