@@ -15,7 +15,7 @@ const {
   isStaleCoordinator,
 } = require('../../errors')
 const { isCallDeadline } = require('../groupProtocol/interface')
-const { ON_WRITE, ON_DECODED, acceptsCell } = require('../../broker/privateOptions')
+const { ON_WRITE, ON_DECODED, acceptedIndex } = require('../../broker/privateOptions')
 const {
   stampGeneration,
   stampOffsetCommit,
@@ -69,21 +69,27 @@ const copyCells = (topics) =>
   topics.map((entry) => ({ ...entry, partitions: entry.partitions.map((cell) => ({ ...cell })) }))
 
 /**
- * The cells of an OffsetCommit that its decoded reply accepted (`acceptsCell`).
+ * The cells of an OffsetCommit that its decoded reply accepted (`acceptedIndex`), in one pass over
+ * the reply and one over the cells.
  * @param {{topic: string, partitions: {partition: number}[]}[]} topics the cells sent
  * @param {object} decoded the decoded reply
  * @returns {{topic: string, partitions: object[]}[]} the accepted cells; topics left with none are
  *   dropped
  */
-const acceptedCells = (topics, decoded) =>
-  topics
-    .map((entry) => ({
-      ...entry,
-      partitions: entry.partitions.filter(({ partition }) =>
-        acceptsCell(decoded, entry.topic, Number(partition))
-      ),
-    }))
+const acceptedCells = (topics, decoded) => {
+  const index = acceptedIndex(decoded)
+  return topics
+    .map((entry) => {
+      const accepted = index.get(entry.topic)
+      return {
+        ...entry,
+        partitions: accepted
+          ? entry.partitions.filter(({ partition }) => accepted.has(Number(partition)))
+          : [],
+      }
+    })
     .filter(({ partitions }) => partitions.length > 0)
+}
 
 /** Used when no logger is injected, so a manager built without one still runs and logs nothing. */
 const SILENT_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }

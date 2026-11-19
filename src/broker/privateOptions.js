@@ -7,20 +7,32 @@
  * isolation; they keep internal options apart from the public ones.
  */
 /**
- * Whether a decoded OffsetCommit reply accepted one cell: the reply names the topic and partition
+ * The cells a decoded OffsetCommit reply accepted, indexed once: the topics and partitions it names
  * with error code 0. A cell the reply does not name is not accepted, including a v10 answer for a
  * topic id the request did not carry (decoded with a null `topic`).
  * @param {{ responses: { topic: string|null, partitions: { partition: number, errorCode: number }[] }[] }} decoded
+ * @returns {Map<string|null, Set<number>>} accepted partitions by topic
+ */
+const acceptedIndex = (decoded) => {
+  const index = new Map()
+  for (const { topic, partitions } of decoded.responses) {
+    let accepted = index.get(topic)
+    if (!accepted) index.set(topic, (accepted = new Set()))
+    for (const cell of partitions) if (cell.errorCode === 0) accepted.add(cell.partition)
+  }
+  return index
+}
+
+/**
+ * Whether a decoded OffsetCommit reply accepted one cell (see `acceptedIndex`). For many cells of
+ * one reply, build the index once instead.
+ * @param {object} decoded the decoded reply
  * @param {string} topic
  * @param {number} partition
  * @returns {boolean}
  */
 const acceptsCell = (decoded, topic, partition) =>
-  decoded.responses.some(
-    (response) =>
-      response.topic === topic &&
-      response.partitions.some((cell) => cell.partition === partition && cell.errorCode === 0)
-  )
+  acceptedIndex(decoded).get(topic)?.has(partition) ?? false
 
 module.exports = {
   /** `offsetCommit`: called once, immediately before the request is written to the socket. */
@@ -28,8 +40,9 @@ module.exports = {
   /**
    * `offsetCommit`: called once with the decoded reply, before a caller refusal, the throttle or
    * parse can end the request, so what the broker accepted is seen even when the caller is not
-   * answered. Read it with `acceptsCell`.
+   * answered. Read it with `acceptedIndex` or `acceptsCell`.
    */
   ON_DECODED: Symbol('onDecoded'),
+  acceptedIndex,
   acceptsCell,
 }
