@@ -978,6 +978,7 @@ class Worker {
     this.extras = []
     this.incarnations = new Map()
     this.active = false
+    this.offersClosed = false
   }
 
   /** @returns {ClientRig[]} the live actual clients of this process */
@@ -1000,6 +1001,7 @@ class Worker {
     if (step.type === 'start') return this.begin()
     if (step.type === 'idle') this.active = false
     if (step.type === 'active') this.active = true
+    if (step.type === 'close-offers') this.offersClosed = true
     const what = step.type === 'execution' ? step.shape : step.type
     const name = `on${what.replace(/(^|-)(\w)/g, (_, __, c) => c.toUpperCase())}`
     return this[name]?.(step)
@@ -1245,6 +1247,12 @@ class ProducerWorker extends Worker {
     deadline = Infinity
   ) {
     const { runtime } = this
+    if (this.offersClosed) {
+      await runtime.diagnose(
+        `offer to ${topic} not made: offers are closed at the core checker's capacity`
+      )
+      return 'skipped'
+    }
     const topicId = runtime.topicIds.get(topic)
     if (!topicId) {
       await runtime.diagnose(`missing-source topic id for offer to ${topic}`)

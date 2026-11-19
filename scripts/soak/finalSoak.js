@@ -76,6 +76,10 @@ const FINAL_DRAIN_MS = 300000
 const FINISH_STEP_MS = 30000
 /** The driver's own work before its readiness barrier, beyond the planned window and the teardown. */
 const DRIVER_START_MS = 1800000
+/** Probe offers per recreation or regex probe. */
+const PROBE_OFFERS = 10
+/** The share of the core checker's offer capacity a plan may expect to use. */
+const OFFER_HEADROOM = 0.8
 /** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
 const TELEMETRY_DRAIN_MS = 15000
 /** Problems kept in the supervisor receipt; later ones are counted, not listed. */
@@ -311,6 +315,8 @@ class Supervisor {
     this.aborted = null
     this.quiesced = null
     this.dockerMs = DOCKER_MS
+    this.offerCapacity = valueOf(this.matrix.traffic.maxOffers)
+    this.offers = 0
   }
 
   /**
@@ -398,14 +404,45 @@ class Supervisor {
     return recordId
   }
 
-  /** @param {object} record tallies an ended operation under the execution it carries */
+  /**
+   * Tallies an ended operation under the execution it carries, and every offer: the offer that
+   * reaches the core checker's capacity closes offers (`closeOffers`).
+   * @param {object} record a record entering the stream
+   * @returns {void}
+   */
   count(record) {
+    if (record.kind === 'identity' && record.stage === 'offered')
+      if (++this.offers === this.offerCapacity) this.closeOffers()
     if (record.kind === 'operation' && record.phase === 'end' && record.execution)
       this.ended.set(record.execution, (this.ended.get(record.execution) ?? 0) + 1)
   }
 
-  /** @returns {Promise<void>} runs the whole lifecycle */
+  /**
+   * Stops every process making offers once their count reached the core checker's capacity
+   * (`traffic.maxOffers`): the run's problem and abort name it and every process is told to make
+   * no further offer. Offers already in flight still reach the stream, so the checker sees them.
+   * @returns {void}
+   */
+  closeOffers() {
+    const reason = `offers reached the core checker's capacity of ${this.offerCapacity} (traffic.maxOffers); no process makes another`
+    this.problem(reason)
+    this.abort(reason)
+    for (const slot of this.children.keys())
+      this.command(slot, { type: 'close-offers', id: 'close-offers' })
+  }
+
+  /**
+   * Runs the whole lifecycle. A plan expected to use more than `OFFER_HEADROOM` of the core
+   * checker's offer capacity does not start.
+   * @returns {Promise<void>}
+   * @throws {Error} when the plan's expected offers exceed the headroom, before anything is written
+   */
   async run() {
+    const { expected, capacity } = offerPlan(this.matrix, this.options.mode)
+    if (expected > capacity * OFFER_HEADROOM)
+      throw new Error(
+        `the plan expects ${expected} offers, more than ${OFFER_HEADROOM * 100}% of the core checker's capacity of ${capacity} (traffic.maxOffers)`
+      )
     fs.mkdirSync(path.join(this.out, 'raw'), { recursive: true })
     for (const file of this.matrix.acceptance.archive) {
       fs.mkdirSync(path.dirname(path.join(this.out, 'archive', file)), { recursive: true })
@@ -1448,7 +1485,7 @@ class Supervisor {
     const producer = this.processOf('producer-idempotent')
     const probe = (topic) =>
       stage('probe', async () => {
-        const count = 10
+        const count = PROBE_OFFERS
         const [{ reply }] = await this.send([producer], {
           type: 'probe',
           id: `${step.id}.probe`,
@@ -2002,6 +2039,33 @@ function driverLimitMs(matrix, mode) {
   )
 }
 
+/**
+ * The offers a plan is expected to make, against the capacity the core checker shares with it
+ * (`traffic.maxOffers`): main and telemetry offers at their rates over the active time (the window
+ * less its idle windows), whole transactions in that time, the probes of every regex (one probe)
+ * and recreation (two) step, one recovery offer per non-transactional producer and outage, and
+ * the closing record.
+ * @param {object} matrix the reviewed matrix @param {'smoke'|'acceptance'} mode
+ * @returns {{ expected: number, capacity: number }}
+ */
+function offerPlan(matrix, mode) {
+  const { requestedMs, steps } = planSchedule(matrix, mode)
+  const t = matrix.traffic
+  const count = (shape) => steps.filter((s) => s.shape === shape).length
+  const idleMs = steps.filter((s) => s.type === 'idle').reduce((ms, s) => ms + s.until - s.at, 0)
+  const activeMs = requestedMs - idleMs
+  const plain = Object.entries(matrix.clientKinds).filter(
+    ([kind, k]) => k.role === 'producer' && kind !== 'producer-transactional'
+  ).length
+  const expected =
+    Math.ceil((activeMs / 1000) * (valueOf(t.mainRate) + valueOf(t.telemetryProducerRate))) +
+    Math.floor(activeMs / valueOf(t.transactionEveryMs)) * valueOf(t.transactionRecords) +
+    PROBE_OFFERS * (count('regex-churn') + 2 * count('topic-recreation')) +
+    plain * count('broker-outage') +
+    1
+  return { expected, capacity: valueOf(t.maxOffers) }
+}
+
 /** @param {string[]} argv @returns {Promise<void>} the command-line entry */
 async function main(argv) {
   const options = parseArgs(argv, process.env)
@@ -2028,6 +2092,7 @@ if (require.main === module) {
 module.exports = {
   parseArgs,
   driverLimitMs,
+  offerPlan,
   buildConfig,
   recipientGroups,
   digest,
