@@ -295,6 +295,37 @@ describe('Consumer > a fatal heartbeat answer while a handler runs', () => {
     await run.consumer.disconnect()
   }, 60000)
 
+  it.each([
+    ['a plain', undefined],
+    ['a longer timed', 10000],
+  ])(
+    '%s disconnect made from the fatal membership log line is bounded by the fatal deadline: it settles one poll interval after the answer with one STOP, DISCONNECT and CRASH',
+    async (_label, timeout) => {
+      const ref = {}
+      let close = null
+      const logger = reentrantLogger((message) => {
+        if (message !== 'The consumer group membership failed fatally' || close || !ref.consumer)
+          return
+        close = settled(ref.consumer.disconnect(timeout === undefined ? undefined : { timeout }))
+      })
+      const run = await startWith((_payload, held) => held.promise, { logger })
+      ref.consumer = run.consumer
+      run.arm()
+      await advanceUntil(() => run.faultAt() !== null)
+      await jest.advanceTimersByTimeAsync(run.faultAt() + 3999 - Date.now())
+
+      expect(close?.done).toBe(false)
+      expect(run.crashes).toEqual([])
+
+      await advanceUntil(() => close.done && run.crashes.length > 0, 100)
+
+      expect(close).toEqual({ done: true, value: undefined })
+      expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
+      expect([count(run, 'STOP'), count(run, 'DISCONNECT')]).toEqual([1, 1])
+    },
+    60000
+  )
+
   it('a disconnect with a deadline shorter than the poll interval ends the held handler wait at its own deadline and still reports one CRASH with restart false', async () => {
     const run = await startWith((_payload, held) => held.promise)
     run.arm()
