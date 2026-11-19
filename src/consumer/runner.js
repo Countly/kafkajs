@@ -253,10 +253,14 @@ module.exports = class Runner extends EventEmitter {
     this.disarmFatal()
     const episode = this.rebalanceHooks ? this.closeEpisode() : null
     this.rebalanceCoordinator.runInternal(() => {
-      const report = Promise.resolve(this.onCrash(fatal.error, { forced: true })).catch((error) =>
+      // Wrapped as the fetch retrier wraps it on the prompt claim, so both claims report one shape.
+      const error = new KafkaJSNonRetriableError(fatal.error, {
+        cause: fatal.error.cause || fatal.error,
+      })
+      const report = Promise.resolve(this.onCrash(error, { forced: true })).catch((failure) =>
         this.logger.error('Crash handler failed', {
           groupId: this.consumerGroup.groupId,
-          error: describeThrown(error),
+          error: describeThrown(failure),
           cause: fatal.error.message,
         })
       )
