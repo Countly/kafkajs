@@ -1074,6 +1074,13 @@ module.exports = class ConsumerGroupProtocol {
    * finishes after the membership was replaced ends the call: nothing is published, built or sent,
    * and a failure of it is stamped with that membership and not counted against the replacement.
    *
+   * Owns one invariant: an answer is valid if and only if the broker membership the request was
+   * sent under (`membershipRevision`, moved by a fencing, a fatal error, a leave or a new join, and
+   * never by an assignment apply) is still the member's. An answer to a replaced membership has no
+   * effect, even when the rejoin reused the member id and epoch. A valid refusal is charged to the
+   * ownership current when it arrives, so an apply between send and answer cannot hide it. A leave
+   * completes by its own state rule.
+   *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null }} options
    *   `guard` is a leave's private pre-write refusal; it never reaches the request
@@ -1122,8 +1129,7 @@ module.exports = class ConsumerGroupProtocol {
         ...(guard && { guard }),
       })
 
-      if (this.ownershipReplaced(ownershipToken) || guard?.()) return
-      if (this.answersEarlierMembership(membershipAtRequest)) return
+      if (membershipAtRequest !== this.membershipRevision || guard?.()) return
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1139,8 +1145,8 @@ module.exports = class ConsumerGroupProtocol {
 
       this.onSuccess(response)
     } catch (error) {
-      stampOwnership(error, ownershipToken)
-      if (obsoleteOwnership(this.ownership, error)) throw error
+      if (membershipAtRequest !== this.membershipRevision) return
+      stampOwnership(error, this.ownership?.token())
       this.sentFields.reset()
 
       if (leaveEpoch != null) {
@@ -1156,36 +1162,17 @@ module.exports = class ConsumerGroupProtocol {
       }
 
       const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
-      if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
       // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
       if (fencing && sentUnderEpoch === 0) {
         this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
       }
 
-      throw stampOwnership(
-        this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
-        ownershipToken
-      )
+      throw this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch))
     } finally {
-      if (!this.ownershipReplaced(ownershipToken)) {
+      if (leaveEpoch != null || membershipAtRequest === this.membershipRevision) {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest })
       }
     }
-  }
-
-  /**
-   * Whether an answer belongs to a request built in an earlier membership while the member is
-   * joining anew (it was fenced out of, or left, that membership and began a new join). A success
-   * would install the old epoch over the join's zero and settle the join with no epoch-0
-   * heartbeat; a fencing error would fence the new join for the old one's loss. Outside a new join
-   * the answer is still processed, so a fencing learned from it reaches the member. The revision
-   * moves only on resets, never on reconciliation progress.
-   * @private
-   * @param {symbol} membershipAtRequest `membershipRevision` when the request was built
-   * @returns {boolean}
-   */
-  answersEarlierMembership(membershipAtRequest) {
-    return this.state === JOINING && membershipAtRequest !== this.membershipRevision
   }
 
   /**
