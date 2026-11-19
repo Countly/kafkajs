@@ -1246,7 +1246,7 @@ module.exports = (params) => {
         eachBatchAutoResolve,
         eachBatch,
         eachMessage,
-        onCrash: (error) => (crashReport ??= onCrash(error, owned, startGeneration)),
+        onCrash: (error, claim) => (crashReport ??= onCrash(error, owned, startGeneration, claim)),
         onJoinComplete: () => recordJoin(group),
         concurrency,
         maxPrefetchBatches,
@@ -1293,11 +1293,16 @@ module.exports = (params) => {
      * @param {Error} e what the run failed with
      * @param {ControlLifetime} owned the lifetime the run belongs to
      * @param {number} startGeneration `stopGeneration` when the run started
+     * @param {{ forced?: boolean }} [claim] `forced` when a fatal deadline retired the run while a
+     *   handler may still run: such a crash joins a close already in progress instead of tearing
+     *   down beside it, and never restarts
      * @returns {Promise<void>}
      */
-    const onCrash = async (e, owned, startGeneration) => {
+    const onCrash = async (e, owned, startGeneration, { forced = false } = {}) => {
+      const admitted = !owned.fence.closed
+      const joining = forced ? closing : null
       // Admitted before the first diagnostic, so a close that diagnostic starts joins the cleanup.
-      const cleaned = owned.fence.closed ? null : deferred()
+      const cleaned = admitted && !joining ? deferred() : null
       if (cleaned) crashCleanup = cleaned.promise
       logger.error(`Crash: ${e.name}: ${e.message}`, {
         groupId,
@@ -1305,7 +1310,7 @@ module.exports = (params) => {
         stack: e.stack,
       })
 
-      if (!cleaned) {
+      if (!admitted) {
         logger.warn('A run of a closed connection crashed late; nothing more is done for it', {
           groupId,
         })
@@ -1333,11 +1338,12 @@ module.exports = (params) => {
         if (e.name === 'KafkaJSConnectionClosedError') {
           cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
         }
-        await shutDown(undefined, { keepResets: true, preserveSetupState: true })
+        if (joining) await joining.promise
+        else await shutDown(undefined, { keepResets: true, preserveSetupState: true })
       } catch {
       } finally {
-        cleaned.resolve()
-        if (crashCleanup === cleaned.promise) crashCleanup = null
+        cleaned?.resolve()
+        if (crashCleanup === cleaned?.promise) crashCleanup = null
       }
 
       const isErrorRetriable =
@@ -1369,6 +1375,8 @@ module.exports = (params) => {
       }
 
       if (!ownsCluster) shouldRestart = false
+      // Two handlers must never process one partition at once.
+      if (forced) shouldRestart = false
 
       if (shouldRestart && (stopGeneration !== crashStopGeneration || owned.fence.closed)) {
         // The user called disconnect()/stop() after the run started - before the crash was

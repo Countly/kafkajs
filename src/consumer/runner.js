@@ -60,7 +60,8 @@ module.exports = class Runner extends EventEmitter {
    * @param {number} options.maxPollInterval the resolved poll deadline, in milliseconds
    * @param {number} [options.sessionTimeout=30000] how long a classic member's fetch loop rides
    *   out lost connections and coordinator moves before they count against `retry.retries`
-   * @param {(reason: Error) => void} options.onCrash
+   * @param {(reason: Error, claim?: { forced: boolean }) => Promise<void>} options.onCrash the
+   *   crash report; `forced` when a deadline retired the run while its handlers may still run
    * @param {() => void} [options.onJoinComplete] forwarded to the rebalance coordinator
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.autoCommit=true]
@@ -143,6 +144,11 @@ module.exports = class Runner extends EventEmitter {
     this.retirement = null
     /** @type {ConsumerOperation|null} the scope of this run's one stop, which `retire` ends */
     this.stopScope = null
+    /**
+     * The fatal heartbeat answer this run accepted and the deadline that claims it, or null.
+     * @type {{ error: Error, timer: ReturnType<typeof setTimeout>, claimed: boolean }|null}
+     */
+    this.fatal = null
     /** Handlers currently inside `eachMessage`/`eachBatch`. */
     this.inFlightHandlers = 0
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
@@ -210,7 +216,67 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    this.acceptVerdict(verdict)
+  }
+
+  /**
+   * Hands a heartbeat verdict to the coordinator. A consumer-protocol fatal answer the coordinator
+   * keeps while the run is running arms the run's one fatal deadline: if the fetch loop has not
+   * claimed the answer one poll interval after its receipt, because a handler is still running,
+   * the run is retired and the crash reported without it.
+   * @private
+   * @param {import('./rebalanceCoordinator').Verdict} verdict
+   * @returns {void}
+   */
+  acceptVerdict(verdict) {
     this.rebalanceCoordinator.requestRejoin(verdict)
+    if (
+      this.fatal ||
+      !this.running ||
+      this.consumerGroup.kind !== 'consumer' ||
+      !isConsumerProtocolFatal(verdict.error) ||
+      this.rebalanceCoordinator.verdict?.error !== verdict.error
+    )
+      return
+    const fatal = { error: verdict.error, timer: null, claimed: false }
+    // Outside any handler or callback store: the crash it reports must not inherit their authority.
+    fatal.timer = this.rebalanceCoordinator.runInternal(() =>
+      setTimeout(() => this.retire(consumerStoppingError()), this.pollTimer.deadline())
+    )
+    this.fatal = fatal
+  }
+
+  /**
+   * Claims the accepted fatal answer for the crash report, once: the forced claim when the run is
+   * retired before the fetch loop took it, so the crash names the original answer.
+   * @private
+   * @returns {void}
+   */
+  claimFatal() {
+    const { fatal } = this
+    if (!fatal || fatal.claimed) return
+    this.disarmFatal()
+    this.rebalanceCoordinator.runInternal(() =>
+      Promise.resolve(this.onCrash(fatal.error, { forced: true })).catch((error) =>
+        this.logger.error('Crash handler failed', {
+          groupId: this.consumerGroup.groupId,
+          error: describeThrown(error),
+          cause: fatal.error.message,
+        })
+      )
+    )
+  }
+
+  /**
+   * Ends the fatal deadline without claiming: the fetch loop's own crash or the run's finished stop
+   * owns the outcome.
+   * @private
+   * @returns {void}
+   */
+  disarmFatal() {
+    if (!this.fatal) return
+    this.fatal.claimed = true
+    clearTimeout(this.fatal.timer)
   }
 
   get consuming() {
@@ -247,6 +313,7 @@ module.exports = class Runner extends EventEmitter {
       await this.runInitialRound()
     } catch (e) {
       this.running = false
+      this.disarmFatal()
       if (this.stopRequested && e?.type === 'CONSUMER_STOPPING') return
 
       try {
@@ -459,6 +526,7 @@ module.exports = class Runner extends EventEmitter {
         // stop the fetch manager and send LeaveGroup, instead of treating the runner as
         // already stopped and skipping both.
         this.consuming = false
+        this.disarmFatal()
 
         try {
           await this.onCrash(e)
@@ -801,6 +869,7 @@ module.exports = class Runner extends EventEmitter {
         })
       }
     } finally {
+      this.disarmFatal()
       if (!operation) scope.finish()
     }
   }
@@ -832,11 +901,13 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Retires this run for good when its close deadline passes: latches the stop, ends the scope of
-   * a stop in progress so it unwinds, and refuses every later commit, heartbeat and hook wait of
-   * the run, so a handler or callback that outlives it changes nothing. Also stops the fetch manager, which never rejects: the close's own stop never
-   * reaches it once its deadline has passed, and with `running` false every fetch returns [] in
-   * microtasks, so a fetcher left running would spin on `setImmediate` for the life of the process.
+   * Retires this run for good when its close deadline or its fatal deadline passes: claims an
+   * accepted fatal answer for the crash report, latches the stop, ends the scope of a stop in
+   * progress so it unwinds, and refuses every later commit, heartbeat and hook wait of the run, so
+   * a handler or callback that outlives it changes nothing. Also stops the fetch manager, which
+   * never rejects: the close's own stop never reaches it once its deadline has passed, and with
+   * `running` false every fetch returns [] in microtasks, so a fetcher left running would spin on
+   * `setImmediate` for the life of the process.
    * Synchronous and idempotent; application promises are left as they are.
    * @param {Error} error the first terminal reason
    * @returns {void}
@@ -844,6 +915,7 @@ module.exports = class Runner extends EventEmitter {
   retire(error) {
     if (this.retirement) return
     this.retirement = error
+    this.claimFatal()
     this.latchStop()
     this.stopScope?.retire(error)
     this.consumerGroup.retireCoordinatorLookup(error)
@@ -991,7 +1063,7 @@ module.exports = class Runner extends EventEmitter {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
       if (verdict) {
-        this.rebalanceCoordinator.requestRejoin(verdict)
+        this.acceptVerdict(verdict)
       }
 
       if (this.consumerGroup.kind === 'consumer' && e.code === 29) return
