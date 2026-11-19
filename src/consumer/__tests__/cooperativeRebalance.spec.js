@@ -451,11 +451,11 @@ describe('Consumer > cooperative rebalance apply', () => {
       const { coordinator, consumerGroup, applies } = createCoordinator()
 
       await coordinator.runRound('initial', 'initial')
-      expect(applies).toEqual([{ rebuildOffsets: false, round: expect.any(Object) }])
+      expect(applies).toEqual([{ rebuildOffsets: false, lost: false, round: expect.any(Object) }])
 
       consumerGroup.rebalanceProtocol = () => EAGER
       await coordinator.runRound('rebalance-in-progress', 'revoked')
-      expect(applies[1]).toEqual({ rebuildOffsets: true, round: expect.any(Object) })
+      expect(applies[1]).toEqual({ rebuildOffsets: true, lost: false, round: expect.any(Object) })
     })
 
     it('touches the fetch layer on neither side of a cooperative round', async () => {
