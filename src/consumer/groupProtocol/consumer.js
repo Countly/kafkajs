@@ -534,9 +534,11 @@ module.exports = class ConsumerGroupProtocol {
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
    *   growSubscription?: (names: string[]) => Promise<void> }} context
    * @returns {Promise<{ assignment: Object, userData: null }>} the assignment in the name-keyed
-   *   shape the apply expects
-   * @throws {Error} the stored fatal error when this member may never rejoin; whatever the join
-   *   failed with otherwise
+   *   shape the apply expects; what the member owns when its target was replaced by a newer one
+   *   while the step resolved it
+   * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
+   *   when a fencing, a fatal error or a leave retired the target during the step; whatever the
+   *   join failed with otherwise
    */
   async rebalance(context) {
     if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
@@ -572,7 +574,6 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     const isCurrent = this.targetGuard()
-    const membership = this.membershipRevision
     let resolved
     try {
       resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
@@ -580,10 +581,16 @@ module.exports = class ConsumerGroupProtocol {
       await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
       if (!isCurrent()) throw assignmentChangedError()
     } catch (error) {
-      // A newer target for the same membership supersedes this step, as Java leaves a target that
-      // arrives mid-reconciliation to the next one: the round applies what is owned and the
-      // chain's follow-up reconciles the newer target.
-      if (error?.type === 'ASSIGNMENT_CHANGED' && this.supersededTarget(membership)) {
+      // A fencing, a fatal error and a leave clear the target (a leave only after its commit,
+      // hence the state check), so a target still here was replaced by a newer one. Java finishes
+      // a reconciliation against its snapshot and leaves a newer target to the next one; this
+      // step's resolution was retired, so it keeps what is owned and the chain's follow-up round
+      // reconciles the newer target.
+      if (
+        error?.type === 'ASSIGNMENT_CHANGED' &&
+        this.target != null &&
+        !isLeavingGroup(this.state)
+      ) {
         return { assignment: this.ownedAsObject(), userData: null }
       }
       throw error
@@ -805,23 +812,6 @@ module.exports = class ConsumerGroupProtocol {
    * @private
    * @returns {() => boolean} true only while this member may use the captured target
    */
-  /**
-   * Whether a step's target was replaced by a newer one while the member stayed in the same
-   * membership, in the group and not leaving: the only reason to abandon a step quietly. A fencing,
-   * a fatal error, a leave or a subscription mode change is not this and still fails the step.
-   * @private
-   * @param {number} membership the `membershipRevision` the step began under
-   * @returns {boolean}
-   */
-  supersededTarget(membership) {
-    return (
-      membership === this.membershipRevision &&
-      this.target != null &&
-      !isNotInGroup(this.state) &&
-      !isLeavingGroup(this.state)
-    )
-  }
-
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
