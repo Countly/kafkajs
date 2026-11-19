@@ -1623,6 +1623,36 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.information.incompleteWaves).toEqual([`${cause} has 1 of 2 wave-key records`])
     })
 
+    /** @returns {object[]} `n` alternating down and ready records of broker 2, one second apart */
+    const outages = (n) =>
+      Array.from({ length: n }, (_, k) => brokerState(k % 2 ? 'ready' : 'down', 4000 + k * 1000))
+
+    it('keeps and prints every down and ready record of the twelve scheduled outages of a day', async () => {
+      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(24)] })
+      expect(report.information.outages.map((o) => `${o.event}@${o.at}`)).toEqual(
+        outages(24).map((o) => `${o.event}@${o.at}`)
+      )
+      expect(report.information.outagesNotShown).toBe(0)
+      const info = formatReport(report).split('NOT JUDGED information')[1]
+      expect(info.match(/^ {2}broker 2 (down|ready) at/gm)).toHaveLength(24)
+      expect(info).toMatch(/broker 2 ready at 27000/)
+      expect(info).not.toMatch(/not shown/)
+    })
+
+    it('prints how many down and ready records beyond the schedule it did not keep', async () => {
+      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(27)] })
+      expect(report.information.outages).toHaveLength(24)
+      expect(report.information.outagesNotShown).toBe(3)
+      expect(formatReport(report)).toMatch(/3 more broker down or ready records not shown/)
+    })
+
+    it('leaves a broker ISR record out of the outage instants', async () => {
+      const edit = (records) => [...records, brokerState('down', 4000), brokerState('isr', 5000)]
+      const report = await check(fx.healthy(), { edit })
+      expect(report.information.outages.map((o) => o.event)).toEqual(['down'])
+      expect(formatReport(report)).not.toMatch(/broker 2 isr/)
+    })
+
     /** The open-wave cap: every client kind running every wave of one membership execution at once, transfer and return. */
     const waveCap =
       fx.matrix.schedule.executions.find((e) => e.shape === 'membership-churn').waves *
