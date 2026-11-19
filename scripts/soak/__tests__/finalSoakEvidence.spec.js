@@ -136,6 +136,69 @@ describe('final soak collector writes', () => {
     expect(collector.failures).toEqual(['sink write failed: io error'])
   })
 
+  describe.each([
+    ['succeeds', async () => {}, true],
+    [
+      'fails',
+      async () => {
+        throw new Error('sync unavailable')
+      },
+      false,
+    ],
+  ])('a short write followed by a stalled remainder, when the sync %s', (_, sync, synced) => {
+    test('counts what was written apart from what was accepted, the stalled remainder as unknown and the line queued behind it as unwritten', async () => {
+      let calls = 0
+      const sink = {
+        write: () => (++calls === 1 ? Promise.resolve({ bytesWritten: 5 }) : new Promise(() => {})),
+        sync,
+      }
+      const collector = new Collector({ sink, clock, matrix, writeTimeoutMs: 50 })
+      const first = collector.append(record(0))
+      const second = collector.append(record(1))
+      const sizes = [0, 1].map((seq) => Buffer.byteLength(collector.line(record(seq))))
+      expect(await within(Promise.all([first, second]), 2000)).toEqual([false, false])
+      await within(
+        collector.close().catch(() => {}),
+        2000
+      )
+      expect(collector.accounting()).toEqual({
+        acceptedRecords: 2,
+        acceptedBytes: sizes[0] + sizes[1],
+        writtenRecords: 0,
+        writtenBytes: 5,
+        unknownBytes: sizes[0] - 5,
+        unwrittenBytes: sizes[1],
+        synced,
+      })
+    })
+  })
+
+  test('a short write followed by a rejected remainder counts the rejected bytes as unwritten, not unknown, and whole lines written before it as written', async () => {
+    let calls = 0
+    const sink = {
+      write: async (buffer) => {
+        if (++calls === 1) return { bytesWritten: buffer.length }
+        if (calls === 2) return { bytesWritten: 2 }
+        throw new Error('io error')
+      },
+      sync: async () => {},
+    }
+    const collector = new Collector({ sink, clock, matrix })
+    const [a, b] = [0, 1].map((seq) => Buffer.byteLength(collector.line(record(seq))))
+    const appends = [collector.append(record(0)), collector.append(record(1))]
+    await Promise.all(appends)
+    await collector.close()
+    expect(collector.accounting()).toEqual({
+      acceptedRecords: 2,
+      acceptedBytes: a + b,
+      writtenRecords: 1,
+      writtenBytes: a + 2,
+      unknownBytes: 0,
+      unwrittenBytes: b - 2,
+      synced: true,
+    })
+  })
+
   test('a sink write that never settles stops the collection in bounded time and the close returns', async () => {
     const sink = { write: () => new Promise(() => {}), sync: async () => {} }
     const collector = new Collector({ sink, clock, matrix, writeTimeoutMs: 50 })

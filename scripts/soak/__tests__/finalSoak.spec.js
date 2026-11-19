@@ -2103,7 +2103,16 @@ describe('final soak driver', () => {
       supervisor.finishStepMs = 50
       supervisor.untilExited = async () => {}
       supervisor.runtime = { stop: async () => {}, channel: { pendingBytes: 0 } }
-      supervisor.collector = { close: async () => {}, streamBytes: 10, queuedBytes: 3, records: 2 }
+      const accounting = {
+        acceptedRecords: 2,
+        acceptedBytes: 10,
+        writtenRecords: 1,
+        writtenBytes: 7,
+        unknownBytes: 0,
+        unwrittenBytes: 3,
+        synced: true,
+      }
+      supervisor.collector = { close: async () => {}, failures: [], accounting: () => accounting }
       const child = { unref: jest.fn(), channel: { unref: jest.fn() } }
       supervisor.children.set('p07', child)
       const missing = await within(supervisor.finish({ close: () => new Promise(() => {}) }), 2000)
@@ -2119,9 +2128,8 @@ describe('final soak driver', () => {
       expect(JSON.parse(fs.readFileSync(path.join(out, 'incomplete.json'), 'utf8'))).toEqual({
         runId: 'r',
         missing,
-        records: 2,
-        streamBytes: 10,
-        unwrittenBytes: 3,
+        collectorFailures: [],
+        ...accounting,
       })
       expect(JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))).toEqual({
         runId: 'r',
@@ -2129,6 +2137,55 @@ describe('final soak driver', () => {
       fs.rmSync(path.join(out, 'incomplete.json'))
       supervisor.writeReceipts({ runId: 'r' }, [])
       expect(fs.existsSync(path.join(out, 'incomplete.json'))).toBe(false)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a collector failure with a finish that completed still writes the incomplete receipt with what was written, and the run ends with an error', async () => {
+    const { Supervisor } = require('../finalSoak')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-collector-failure-'))
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      let calls = 0
+      const sink = {
+        write: async () => {
+          if (++calls === 1) return { bytesWritten: 5 }
+          throw new Error('disk full')
+        },
+        sync: async () => {},
+      }
+      const clock = { now: () => 0, sleepUntil: () => new Promise(() => {}) }
+      const collector = new Collector({ sink, clock, matrix })
+      const record = { kind: 'diagnostic', recordId: 'p01.0', source: 'p01', seq: 0, at: 0 }
+      const size = Buffer.byteLength(collector.line({ ...record, execution: null }))
+      expect(await collector.append({ ...record, execution: null })).toBe(false)
+      supervisor.collector = collector
+      supervisor.untilExited = async () => {}
+      supervisor.runtime = { stop: async () => {}, channel: { pendingBytes: 0 } }
+      const missing = await supervisor.finish({ close: async () => {} })
+      expect(missing).toEqual([])
+      expect(() => supervisor.writeReceipts({ runId: 'r' }, missing)).toThrow(
+        'the run ended incomplete: collector: sink write failed: disk full'
+      )
+      expect(JSON.parse(fs.readFileSync(path.join(out, 'incomplete.json'), 'utf8'))).toEqual({
+        runId: 'r',
+        missing: [],
+        collectorFailures: ['sink write failed: disk full'],
+        acceptedRecords: 1,
+        acceptedBytes: size,
+        writtenRecords: 0,
+        writtenBytes: 5,
+        unknownBytes: 0,
+        unwrittenBytes: size - 5,
+        synced: true,
+      })
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
