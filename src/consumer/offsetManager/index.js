@@ -48,6 +48,13 @@ const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
  */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
+/**
+ * @param {{topic: string, partitions: object[]}[]} topics the cells of an OffsetCommit
+ * @returns {{topic: string, partitions: object[]}[]} a copy down to each cell
+ */
+const copyCells = (topics) =>
+  topics.map((entry) => ({ ...entry, partitions: entry.partitions.map((cell) => ({ ...cell })) }))
+
 /** Used when no logger is injected, so a manager built without one still runs and logs nothing. */
 const SILENT_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }
 
@@ -1249,9 +1256,10 @@ module.exports = class OffsetManager {
    * Sends one OffsetCommit and records what the coordinator accepted in the committed cache, cell
    * by cell, under a mutation ticket. A cell that a newer commit or seek, or a barrier, reached
    * while the request was in flight keeps its newer value, whichever answer arrived first. The
-   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` with a copy of the payload sent
-   * once the request succeeds, and records after the emit, so a seek a listener admits is seen and
-   * a listener that replaces the reported cells changes nothing recorded.
+   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` with a copy of the payload sent,
+   * down to each cell, once the request succeeds, and records after the emit, so a seek a listener
+   * admits is seen and a listener that replaces or edits the reported cells changes nothing
+   * recorded. The copy is made only when something listens: one object per topic and per cell.
    *
    * A default selection (`since`) is sent once, under this one ticket, with only its cells that
    * are still authorized at the write: a cell sought or acquired again since the selection is
@@ -1283,7 +1291,12 @@ module.exports = class OffsetManager {
           sent = { ...payload, topics: cells }
         }
       }
-      this.instrumentationEmitter.emit(COMMIT_OFFSETS, { ...sent })
+      if (this.instrumentationEmitter.hasListeners(COMMIT_OFFSETS)) {
+        this.instrumentationEmitter.emit(COMMIT_OFFSETS, {
+          ...sent,
+          topics: copyCells(sent.topics),
+        })
+      }
       const refusal = options?.guard?.()
       if (refusal) throw refusal
       this.recordCommitted(ticket, sent.topics, requestedIds, options?.since)

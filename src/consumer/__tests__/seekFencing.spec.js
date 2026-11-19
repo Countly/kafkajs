@@ -2393,7 +2393,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
       expect(scenario.commits()).toEqual(['5', '5'])
       expect(scenario.committed[0]).toBe('5')
-      expect(captured.group().offsetManager.committedOffsets()[TOPIC][0]).toBe('5')
+      expect(String(captured.group().offsetManager.committedOffsets()[TOPIC][0])).toBe('5')
       await scenario.release()
       expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.errors).toEqual([])
