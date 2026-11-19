@@ -572,10 +572,22 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     const isCurrent = this.targetGuard()
-    const resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
-    await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
+    const membership = this.membershipRevision
+    let resolved
+    try {
+      resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
+      if (!isCurrent()) throw assignmentChangedError()
+      await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
+      if (!isCurrent()) throw assignmentChangedError()
+    } catch (error) {
+      // A newer target for the same membership supersedes this step, as Java leaves a target that
+      // arrives mid-reconciliation to the next one: the round applies what is owned and the
+      // chain's follow-up reconciles the newer target.
+      if (error?.type === 'ASSIGNMENT_CHANGED' && this.supersededTarget(membership)) {
+        return { assignment: this.ownedAsObject(), userData: null }
+      }
+      throw error
+    }
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
@@ -793,6 +805,23 @@ module.exports = class ConsumerGroupProtocol {
    * @private
    * @returns {() => boolean} true only while this member may use the captured target
    */
+  /**
+   * Whether a step's target was replaced by a newer one while the member stayed in the same
+   * membership, in the group and not leaving: the only reason to abandon a step quietly. A fencing,
+   * a fatal error, a leave or a subscription mode change is not this and still fails the step.
+   * @private
+   * @param {number} membership the `membershipRevision` the step began under
+   * @returns {boolean}
+   */
+  supersededTarget(membership) {
+    return (
+      membership === this.membershipRevision &&
+      this.target != null &&
+      !isNotInGroup(this.state) &&
+      !isLeavingGroup(this.state)
+    )
+  }
+
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
