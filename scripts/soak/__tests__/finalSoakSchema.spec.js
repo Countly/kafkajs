@@ -557,6 +557,25 @@ const baseRecords = () => {
       wireFile: 'wire/share-1.bin',
       wireSha256: SHA,
     })),
+    identity('share-outcome', 'p07', {
+      client: SHARE,
+      group: G7,
+      key: KEY,
+      from: '0',
+      to: '0',
+      type: 'accept',
+      reason: 'session-lost',
+      errorType: 'KafkaJSShareAcknowledgementError',
+    }),
+    identity('broker-share-start', 'p15', {
+      client: SHARE,
+      group: G7,
+      key: KEY,
+      topicId: KEY.topicId,
+      startOffset: '1',
+      lag: '0',
+      errorCode: 0,
+    }),
     {
       kind: 'telemetry',
       source: 'p16',
@@ -1016,6 +1035,8 @@ describe('scripts/soak/finalSoakSchema', () => {
       'handler-end',
       'commit',
       'broker-commit',
+      'share-outcome',
+      'broker-share-start',
     ]) {
       expect(variants.has(`identity/${stage}`)).toBe(true)
     }
