@@ -1901,6 +1901,111 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ).toEqual(new Set(['topic-a|0', 'topic-a|1', 'topic-c|0', 'topic-d|0']))
   })
 
+  it('neither applies nor publishes a step whose metadata scope a failed earlier subscribe() retired, and applies the unchanged target in the next round', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const joins = []
+    consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => joins.push(payload.memberAssignment))
+    const named = { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] }
+    let grow = false
+    let rejectSubscribe
+    built.cluster.refreshMetadata.mockImplementationOnce(async ({ onMetadata }) =>
+      onMetadata({
+        topicMetadata: ['topic-a', 'topic-c', 'topic-d'].map((topic) => ({
+          topic,
+          topicErrorCode: 0,
+        })),
+      })
+    )
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (request.memberEpoch === 0) return fullTarget(1, { 'topic-a': [0] })
+      if (grow) {
+        grow = false
+        return fullTarget(2, named)
+      }
+      return fullTarget(request.memberEpoch, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: [/^topic-/] })
+    built.cluster.refreshMetadata.mockImplementationOnce(
+      () => new Promise((_, reject) => (rejectSubscribe = reject))
+    )
+    const subscribing = consumer.subscribe({ topics: [/^other-/] }).catch((error) => error)
+    consumer.run({ eachMessage: async () => {} })
+    await advanceUntil(() => built.fetches.length > 0)
+    const [runner] = starts.mock.contexts
+    const group = runner.consumerGroup
+    const membership = group.groupMembership
+    const steps = jest.spyOn(membership, 'rebalance')
+    built.state.unknown.add('topic-c').add('topic-d')
+    built.state.idDelays.push(0, 700)
+    grow = true
+    await advanceUntil(() => built.cluster.refreshMetadataForTopicIds.mock.calls.length >= 2)
+    const target = membership.targetRevision
+    const token = group.ownership.token()
+
+    rejectSubscribe(new Error('pattern metadata failure'))
+    expect((await subscribing).message).toEqual('pattern metadata failure')
+    let settled = false
+    steps.mock.results[0].value.then(
+      () => (settled = true),
+      () => (settled = true)
+    )
+    await advanceUntil(() => settled, 1000)
+
+    await expect(steps.mock.results[0].value).resolves.toMatchObject({ abandoned: true })
+    expect(joins).toEqual([{ 'topic-a': [0] }])
+    expect(group.ownership.token()).toEqual(token)
+    await jest.advanceTimersByTimeAsync(2000)
+    expect(joins).toEqual([{ 'topic-a': [0] }, named])
+    expect(membership.targetRevision).toEqual(target)
+    expect(group.ownership.token()).toEqual(token + 1)
+    expect(built.crashes).toEqual([])
+    expect(starts).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails, rather than abandons, a step left behind by a fenced round once the member has rejoined, and reports one PARTITIONS_LOST', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const s = { phase: 'steady' }
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (request.memberEpoch === 0) {
+        return fullTarget(s.phase === 'fenced' ? 100 : 1, { 'topic-a': [0] })
+      }
+      if (s.phase === 'grow') {
+        s.phase = 'fence'
+        return fullTarget(2, { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] })
+      }
+      if (s.phase === 'fence') {
+        s.phase = 'fenced'
+        throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      }
+      return fullTarget(request.memberEpoch, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: ['topic-a', 'topic-c', 'topic-d'] })
+    consumer.run({ eachMessage: async () => {} })
+    await advanceUntil(() => built.fetches.length > 0)
+    const [runner] = starts.mock.contexts
+    const membership = runner.consumerGroup.groupMembership
+    const steps = jest.spyOn(membership, 'rebalance')
+    built.state.unknown.add('topic-c').add('topic-d')
+    built.state.idDelays.push(0, 1200)
+    s.phase = 'grow'
+    await advanceUntil(() => membership.memberEpoch === 100)
+    expect(membership.target).not.toBeNull()
+    const leftBehind = steps.mock.results[0].value
+    leftBehind.catch(() => {})
+    await jest.advanceTimersByTimeAsync(1000)
+
+    await expect(leftBehind).rejects.toMatchObject({ type: 'ASSIGNMENT_CHANGED' })
+    expect(built.log.filter(({ kind }) => kind === 'PARTITIONS_LOST')).toHaveLength(1)
+    expect(built.crashes).toEqual([])
+    expect(starts).toHaveBeenCalledTimes(1)
+  })
+
   it("calls the listener's onPartitionsLost once, before any rejoin, when a fence reaches the slot during the wait while a handler keeps the fetch loop busy", async () => {
     const calls = []
     const record = (name) => async (payload) => calls.push({ name, at: Date.now(), payload })
