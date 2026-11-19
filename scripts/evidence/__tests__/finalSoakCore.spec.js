@@ -278,6 +278,30 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.overall).not.toBe('ACCEPTED')
     })
 
+    it('does not let an aborted member acknowledged beyond the log end explain an offset after the last dumped record', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { ...world.layout.transactions[1], duplicate: true })
+      world.apache = fx.renderApache(world)
+      fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+      const edit = (records) => {
+        const offer = records.find((r) => r.stage === 'offered' && r.id === 'c09.4')
+        const ack = records.find((r) => r.stage === 'ack' && r.id === 'c09.4')
+        return [
+          ...records,
+          { ...offer, id: 'c09.6', t: offer.t + 0.5 },
+          { ...ack, id: 'c09.6', offset: '50', t: ack.t + 0.5 },
+        ]
+      }
+      const report = await check(world, { edit })
+      expectRow(
+        report,
+        'K1',
+        'INCONCLUSIVE',
+        /5 offsets follow the last dumped record.*explains at most 4/
+      )
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
     it.each([
       ['transactions', 'c09.3', 3],
       ['main', 'c08.11', 11],
