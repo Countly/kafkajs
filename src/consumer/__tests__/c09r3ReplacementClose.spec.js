@@ -37,6 +37,7 @@ const scriptedCluster = () => {
     addMultipleTargetTopics: jest.fn(async () => {}),
     useConsumerMetadataScope: jest.fn(),
     releaseConsumerMetadataScope: jest.fn(),
+    useBrokerRegex: jest.fn(),
     onTopicRecreated: jest.fn(() => jest.fn()),
     offsetOperations: () => operations,
     retry: {},

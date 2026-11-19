@@ -983,7 +983,8 @@ module.exports = class Cluster {
    * consumer's refreshes until an answer accepts it, as an established target is. Only this call
    * creates such rows; `retireFirstAddTopics` ends them. The target lock is held for the
    * declaration only, never across the request, so a withdrawal never waits behind it. A name
-   * already accepted needs no request. The creation bit is the cluster's, as for any target.
+   * already accepted needs no request. The creation bit is the cluster's, as for any target, so it
+   * is off under a broker-side regex (see `useBrokerRegex`).
    * @param {string[]} names assigned names
    * @returns {Promise<string[]>} the names an answer has accepted; the others are pending
    * @throws {Error} any other topic error of the answer (17 or 29, say) after this call's own
@@ -1181,6 +1182,17 @@ module.exports = class Cluster {
     this.brokerPool.consumerMetadataScope = scope
     this.brokerPool.consumerMetadataGeneration =
       (this.brokerPool.consumerMetadataGeneration ?? 0) + 1
+  }
+
+  /**
+   * Records whether this consumer cluster's subscription is a broker-side regex. While it is, no
+   * Metadata request by name asks the broker to create a topic: every name came from the pattern,
+   * so a deleted match stays deleted, as under a client-side pattern.
+   * @param {boolean} active whether the regex subscription is in place
+   * @returns {void}
+   */
+  useBrokerRegex(active) {
+    this.brokerPool.consumerBrokerRegex = active
   }
 
   /**

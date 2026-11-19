@@ -1221,6 +1221,7 @@ const buildConsumer = (options = {}) => {
     }),
     useConsumerMetadataScope: jest.fn(),
     releaseConsumerMetadataScope: jest.fn(),
+    useBrokerRegex: jest.fn(),
     resetTargetTopics: jest.fn(async (_names, { publish } = {}) => publish?.()),
     committedOffsets: () => ({}),
     offsetOperations: () => new OffsetOperations(),

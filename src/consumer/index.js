@@ -1013,6 +1013,7 @@ module.exports = (params) => {
       // is nothing this client can usefully validate about the pattern itself.
       subscribedTopicRegex = regex
       regexSubscription = { fromBeginning, resetPolicy }
+      cluster.useBrokerRegex(true)
       return
     }
 
@@ -1834,6 +1835,7 @@ module.exports = (params) => {
           unregisteredTopics.clear()
           subscribedTopicRegex = null
           regexSubscription = null
+          cluster.useBrokerRegex(false)
           retainTopics(new Set())
           lastJoin = null
           selectionRevision++

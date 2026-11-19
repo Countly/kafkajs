@@ -33,6 +33,7 @@ const fakeCluster = (code) => ({
   refreshMetadataIfNecessary: jest.fn(async () => {}),
   useConsumerMetadataScope: jest.fn(),
   releaseConsumerMetadataScope: jest.fn(),
+  useBrokerRegex: jest.fn(),
   resetTargetTopics: jest.fn(async (_names, { publish } = {}) => publish?.()),
   removeBroker: jest.fn(),
   isConnected: () => true,
