@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# Final soak runbook: one smoke or 24-hour acceptance run on this host, on the frozen candidate.
+#
+#   scripts/soak/finalSoakNode.sh <40-hex sha> <smoke|acceptance>
+#
+# Pause every other agent and test on the host first; preflight fails on a busy host. Steps:
+# checkout of <sha> (detached), `npm ci --ignore-scripts`, reporter preparation with the run's file
+# cap, the three-broker Kafka 4.4.0 KRaft cluster from docker-compose.telemetry.yml plus the prepared
+# override, share.version finalized, preflight, the driver under nohup with a heartbeat file, the
+# outer exit receipt, the two container dumps (the standing topics' records read_committed and every
+# consumer group's committed offsets, by the Apache tools inside the first broker's container, while
+# the cluster and the topics are still up), finalize, the driver's summary, cleanup (run topics and
+# groups, then containers) and a tarball of the artifact. A failed or interrupted run is sealed the
+# same way, so its evidence is bound and its dumps kept, never reported as complete. A run whose
+# driver exited 0 but whose workload receipt (supervisor.json) holds failures, problems, forced
+# exits, an abort or an incomplete source fails at stage `workload`, after sealing. The core checker
+# then judges the artifact into <artifact>.core.txt and fails stage `core` on REJECTED, on no verdict,
+# or on an acceptance run that is not ACCEPTED; a smoke is never ACCEPTED, so its NOT ACCEPTED passes.
+#
+# Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
+# (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
+# the exit status and the driver's status) and <artifact>.tar.gz; a failed run with a Compose cluster
+# also leaves the brokers' logs in <artifact>.compose.log. Cleanup covers only what was started (run
+# topics and groups only once the driver wrote its config), and the script exits with the first
+# failure's status. They sit beside the artifact so the header, which hashes every file inside it,
+# never binds a file that is still being written.
+#
+# Environment:
+#   FINAL_SOAK_ARTIFACTS          artifact root ($HOME/final-soak by default)
+#   FINAL_SOAK_DIAGNOSTIC=1       smoke only: a host that cannot meet the quiet-host floors (a hosted
+#                                 CI runner); preflight records those checks without failing on them
+#                                 and the artifact is marked diagnostic. Never acceptance evidence.
+#   FINAL_SOAK_COMPANIONS         space-separated <name>=<file>[@<run url>] companions for finalize
+#   TELEMETRY_JAVA_CACHE          the pinned Java inputs of the reporter build
+#
+# This script reads and writes no credentials.
+set -euo pipefail
+
+sha="${1:-}"
+mode="${2:-}"
+if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$mode" != smoke && "$mode" != acceptance ]]; then
+  echo "usage: $0 <40-hex sha> <smoke|acceptance>" >&2
+  exit 2
+fi
+if [[ -n "${FINAL_SOAK_SUPPLIED_BROKERS:-}" ]]; then
+  echo "a supplied cluster is not supported: the run stops, restarts and dumps its brokers through the repository Compose services" >&2
+  exit 2
+fi
+diagnostic=()
+if [[ "${FINAL_SOAK_DIAGNOSTIC:-}" == 1 ]]; then
+  if [[ "$mode" != smoke ]]; then
+    echo "FINAL_SOAK_DIAGNOSTIC is accepted only in smoke mode" >&2
+    exit 2
+  fi
+  diagnostic=(--diagnostic)
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$root"
+export KAFKA_VERSION=4.4.0
+out="${FINAL_SOAK_ARTIFACTS:-$HOME/final-soak}/${sha:0:12}-${mode}-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$out/telemetry-sink" "$out/broker"
+chmod 0777 "$out/telemetry-sink"
+# tee ignores INT and TERM so it keeps logging while the exit handler cleans up after one.
+exec > >(
+  trap '' INT TERM
+  exec tee -a "$out.runbook.log"
+) 2>&1
+export TELEMETRY_EVIDENCE_DIR="$out/telemetry-sink"
+export COMPOSE_PROJECT_NAME=kafkajs
+export COMPOSE_FILE="docker-compose.telemetry.yml:$out/broker/compose.json"
+
+stage=checkout
+started=
+driver=
+driver_status=null
+exit_ms=
+sealed=
+dump_status=0
+after=
+
+# Removes the run's topics and groups, which exist only once the driver wrote config.json, then on
+# failure keeps the brokers' logs and stops the Compose cluster.
+cleanup() {
+  local status=$1
+  if [[ -f "$out/config.json" ]]; then
+    node scripts/soak/finalSoak.js --cleanup --out "$out" || true
+  else
+    echo "no driver config: the driver created no run topics or groups, so none are removed"
+  fi
+  if ((status != 0)); then
+    docker compose logs --no-color --timestamps > "$out.compose.log" 2>&1 || true
+    echo "broker logs: $out.compose.log"
+  fi
+  docker compose down --volumes || true
+}
+
+# Seals the artifact once, while the cluster and the run's topics are still up: the receipt of the
+# supervisor's exit as the shell saw it, the Apache dumps of the logs and the groups, then
+# finalize, which binds every file (the dumps included) in the header. Only a run whose driver
+# wrote its config has topics to dump. A failed dump is remembered, never hidden, and finalize still
+# runs so the partial dumps are bound.
+seal() {
+  [[ -n "$sealed" ]] && return 0
+  sealed=1
+  [[ -f "$out/config.json" ]] || return 0
+  local companions=() companion
+  node scripts/soak/finalSoak.js --outer-exit --out "$out" --status "$driver_status" --exit-wall-ms "$exit_ms" || after=outer-exit
+  node scripts/soak/finalSoakDump.js --out "$out" || dump_status=$?
+  for companion in ${FINAL_SOAK_COMPANIONS:-}; do companions+=(--companion "$companion"); done
+  node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after="${after:-finalize}"
+}
+
+# Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped
+# (a signal to the process group may already have ended it), cleans up what was started, archives
+# and writes the receipt.
+finish() {
+  local status=$?
+  trap - EXIT
+  set +e
+  if [[ -n "$driver" ]]; then
+    kill "$driver" 2> /dev/null
+    wait "$driver"
+    driver_status=$?
+    exit_ms=$((${EPOCHREALTIME/./} / 1000))
+  fi
+  if [[ -n "$started" ]]; then
+    seal
+    cleanup "$status"
+  fi
+  if ! tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
+    stage=archive
+    status=1
+  fi
+  local failed=null
+  if ((status != 0)); then
+    failed="\"$stage\""
+    echo "runbook failed at stage $stage (exit status $status); log: $out.runbook.log"
+  fi
+  printf '{"artifact":"%s","failedStage":%s,"exitStatus":%d,"driverStatus":%s}\n' \
+    "$(basename "$out")" "$failed" "$status" "$driver_status" > "$out.runbook.json"
+  echo "artifact: $out.tar.gz (receipt $out.runbook.json)"
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+git checkout --detach "$sha"
+stage=install
+npm ci --ignore-scripts
+
+export KAFKA_BROKERS=localhost:19092,localhost:19095,localhost:19098
+stage=prepare-reporter
+node scripts/soak/finalSoakPreflight.js --prepare-reporter --out "$out"
+stage=cluster-start
+started=1
+docker compose up -d --wait
+stage=cluster-wait
+# waitForKafka hands COMPOSE_FILE to `docker compose -f`, which takes one path, not a list.
+COMPOSE_FILE=docker-compose.telemetry.yml node scripts/waitForKafka.js
+# The controller can still be settling right after the brokers answer, so this retries.
+stage=share-version
+features=(docker compose exec -T kafka1 /opt/kafka/bin/kafka-features.sh --bootstrap-server kafka1:29092)
+# The describe output goes to the log too, so the finalized level is on record.
+share_level() {
+  "${features[@]}" describe | tee /dev/stderr | sed -n 's/.*Feature: share\.version.*FinalizedVersionLevel: \([0-9]*\).*/\1/p'
+}
+attempt=1
+until level="$(share_level)" && [[ "$level" =~ ^[1-9][0-9]*$ ]]; do
+  if ((attempt >= 30)); then
+    echo "share.version is not finalized after $attempt attempts" >&2
+    exit 1
+  fi
+  if [[ -z "$level" || "$level" == 0 ]]; then "${features[@]}" upgrade --feature share.version=1 || true; fi
+  attempt=$((attempt + 1))
+  sleep 2
+done
+
+stage=preflight
+node scripts/soak/finalSoakPreflight.js --expect-sha "$sha" --mode "$mode" --out "$out" "${diagnostic[@]}"
+
+stage=driver
+nohup node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode "$mode" --expect-sha "$sha" \
+  --matrix scripts/soak/finalSoakMatrix.json --out "$out" "${diagnostic[@]}" > "$out/driver.log" 2>&1 &
+driver=$!
+(
+  beat=0
+  while kill -0 "$driver" 2> /dev/null; do
+    if ((beat % 60 == 0)); then date -u +%FT%TZ > "$out/heartbeat"; fi
+    beat=$((beat + 1))
+    sleep 1
+  done
+) &
+heartbeat=$!
+
+driver_status=0
+wait "$driver" || driver_status=$?
+exit_ms=$((${EPOCHREALTIME/./} / 1000))
+driver=
+wait "$heartbeat" || true
+seal
+node scripts/soak/finalSoak.js --summary --out "$out" | tee "$out.summary.json" || after="${after:-summary}"
+if ((driver_status != 0)); then exit "$driver_status"; fi
+if ((dump_status != 0)); then
+  stage=dump
+  exit 1
+fi
+if [[ -n "$after" ]]; then
+  stage=$after
+  exit 1
+fi
+# A workload that aborted or recorded a problem fails the run once its artifact is sealed; the
+# driver's own exit code, observed above, stays in the artifact as it was.
+stage=workload
+node scripts/soak/finalSoak.js --check-workload --out "$out"
+# The core checker judges the sealed artifact. Its report goes beside the receipt, outside the
+# directory the header binds. A smoke is never ACCEPTED (its heap row needs two hourly boundaries),
+# so NOT ACCEPTED, which has no FAIL row, is the smoke's expected verdict; REJECTED, no verdict at
+# all, or an acceptance run that is not ACCEPTED fails here.
+stage=core
+core_status=0
+node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt" || core_status=$?
+cat "$out.core.txt"
+verdict="$(sed -n '1s/^CORE VERDICT: \([A-Z ]*[A-Z]\).*/\1/p' "$out.core.txt")"
+note="core checker verdict: ${verdict:-none} (exit status $core_status), report $out.core.txt"
+if [[ "$mode" == smoke ]]; then note="$note. A smoke is never ACCEPTED; NOT ACCEPTED with no FAIL row is its expected verdict."; fi
+echo "$note"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  printf '### Final soak core checker\n\n%s\n\n```\n%s\n```\n' "$note" "$(cat "$out.core.txt")" >> "$GITHUB_STEP_SUMMARY"
+fi
+case "$mode:$verdict:$core_status" in
+  acceptance:ACCEPTED:0 | "smoke:NOT ACCEPTED:1") ;;
+  *) exit 1 ;;
+esac
+stage=done

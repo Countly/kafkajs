@@ -604,6 +604,19 @@ const baseRecords = () => {
       members: [1, 2, 3],
       partitions: [{ key: KEY, leader: 1, isr: [1, 2, 3] }],
       cause: 'o9',
+      downMs: 2000,
+      processAt: 12,
+      processTime: '2026-11-18T16:00:00.012345678Z',
+    },
+    {
+      kind: 'wave',
+      source: 'p01',
+      event: 'transfer',
+      client: EAGER,
+      member: 'c15.0',
+      paused: [KEY],
+      keys: [KEY],
+      observed: true,
     },
     ...['begin', 'end'].map((phase) => ({
       kind: 'ticket',
@@ -1340,6 +1353,15 @@ describe('scripts/soak/finalSoakSchema', () => {
     expectCases(cases)
   })
 
+  it('an acknowledged send whose location the broker did not return has no offset', () => {
+    const lines = encode(baseRecords()).map((line) => JSON.parse(line))
+    const ack = lines.find((r) => r.kind === 'identity' && r.stage === 'ack')
+    expect(validateRecord({ ...ack, offset: null })).toEqual([])
+    expect(validateRecord({ ...ack, offset: '-1' })).toEqual([
+      expect.stringContaining('.offset is not an Offset or null'),
+    ])
+  })
+
   it('cross-field rules reject contradictory records', () => {
     const lines = encode(baseRecords()).map((line) => JSON.parse(line))
     const find = (kind, extra = () => true) => ({
@@ -1347,8 +1369,8 @@ describe('scripts/soak/finalSoakSchema', () => {
     })
     const enter = find('identity', (r) => r.stage === 'handler-enter' && r.authority !== null)
     expectCases({
-      'acknowledged without an offset': [
-        () => validateRecord({ ...find('identity', (r) => r.stage === 'ack'), offset: null }),
+      'an unknown send with an offset': [
+        () => validateRecord({ ...find('identity', (r) => r.stage === 'ack'), outcome: 'unknown' }),
         'only an acknowledged send has an offset',
       ],
       'commit decision seen aborted': [

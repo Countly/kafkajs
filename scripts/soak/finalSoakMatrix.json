@@ -31,7 +31,11 @@
     "archive": [
       "scripts/soak/finalSoakMatrix.json",
       "scripts/soak/finalSoakSchema.js",
-      "scripts/soak/finalSoak.js"
+      "scripts/soak/finalSoak.js",
+      "scripts/soak/finalSoakScheduler.js",
+      "scripts/soak/finalSoakCollector.js",
+      "scripts/soak/finalSoakObserver.js",
+      "scripts/soak/finalSoakWorkers.js"
     ],
     "companions": ["natural-exit", "consume-retention", "prior-checkpoints"],
     "cli": ["--expect-sha", "--expect-profile", "--matrix", "--companion rs-l14=<run url>"],
@@ -413,11 +417,12 @@
       "activeMs": { "from": 0, "to": 1200000 },
       "idleMs": { "from": 1200000, "to": 1800000 },
       "quietAtMs": [1740000, 1750000, 1760000],
-      "membershipAtMs": 120000,
-      "regexAtMs": 480000,
-      "recreationAtMs": 600000,
-      "outageAtMs": 720000,
-      "recoveredByMs": 900000,
+      "membershipAtMs": 60000,
+      "regexAtMs": 360000,
+      "recreationAtMs": 480000,
+      "outageAtMs": 600000,
+      "recoveredByMs": 960000,
+      "abortAtTransaction": 2,
       "periodicSlots": 61,
       "floors": {
         "mainPerGroup": 100,
@@ -519,6 +524,7 @@
     "round": "successful round after awaited hooks",
     "seed": "actual seed map start and clear",
     "broker-state": "supervisor process and container plus raw metadata and ISR",
+    "wave": "paused keys a membership wave's extra and standing member held when the wave observed the transfer and the return",
     "identity": "producer, independent reader, handler, commit and broker readback stages",
     "scan": "independent completed sealed read_committed scan",
     "replay": "observed retry, loss or revoke plus broker boundary",
