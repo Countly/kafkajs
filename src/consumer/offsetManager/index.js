@@ -888,10 +888,9 @@ module.exports = class OffsetManager {
    * A seek's commit (given `attempt`) that fails changes nothing here: the error reaches the
    * caller, including a commit failure, and the cached committed offset and position stay as
    * they were. Only a refusal by the attempt's own check (a newer seek or acquisition owns the
-   * partition) ends it with `false`. One the broker accepted but that did not clear (its caller
-   * was refused afterwards, or a newer operation took the cell) still drops the position it
-   * replaced while it is the partition's current seek, and clears the cached offset unless the
-   * newer operation owns it, so the position is read from the cache or the broker.
+   * partition) ends it with `false`. One the broker accepted whose caller was refused afterwards
+   * still clears the cell while no newer operation owns it, so the position is read back. When a
+   * newer operation does own it, the caller decides whether the position it replaced goes.
    *
    * Any other commit (an inline reset) ends with `false` on a commit failure, and one that was
    * written and did not clear forgets the cached offset, so the position is read back.
@@ -954,9 +953,8 @@ module.exports = class OffsetManager {
       const superseded = this.operations.isSuperseded(ticket, topic, partition)
       if (attempt === undefined) {
         if (wire.written && !cleared && !superseded) this.forgetCommitted(topic, partition)
-      } else if (wire.accepted && !cleared) {
-        if (!superseded) this.clearOffsets({ topic, partition })
-        else if (!wire.refusal?.()) this.forgetResolved(topic, partition)
+      } else if (wire.accepted && !cleared && !superseded) {
+        this.clearOffsets({ topic, partition })
       }
       release?.()
       this.operations.end(ticket)

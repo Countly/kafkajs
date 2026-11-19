@@ -1982,6 +1982,26 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Drops the position a seek replaced when the broker accepted the seek but its application did
+   * not clear the cell (a newer commit owns it, or the caller was refused), as long as the seek is
+   * still the partition's current one: the old cursor is then no longer the partition's position,
+   * and the next resolution reads the cache or the broker. A newer seek owns the position instead.
+   * @private
+   * @param {import('./offsetManager')} manager the manager the seek was applied through
+   * @param {{topic: string, partition: number}} seek the popped seek
+   * @param {import('./handlerContext').Acquisition|undefined} acquired its acquisition when popped
+   * @param {number|undefined} admitted its `soughtAt` when popped
+   * @param {{accepted?: boolean}} attempt what its commit did on the wire
+   * @returns {void}
+   */
+  dropReplacedPosition(manager, { topic, partition }, acquired, admitted, attempt) {
+    const key = `${topic}|${partition}`
+    if (attempt.accepted === true && this.isCurrentSeek(key, acquired, admitted)) {
+      manager.forgetResolved(topic, partition)
+    }
+  }
+
+  /**
    * Logs the one WARN of a popped seek that failed, contained so the log cannot replace the
    * seek's error.
    * @private
@@ -3715,11 +3735,13 @@ module.exports = class ConsumerGroup {
         try {
           applied = await manager.seek(seekEntry, preparation, attempt)
         } catch (error) {
+          this.dropReplacedPosition(manager, seekEntry, acquired, admitted, attempt)
           this.settleSeek(key, acquired, admitted, attempt.accepted === true)
           if (attempt.accepted !== true) this.warnFailedSeek(seekEntry, error)
           throw error
         }
         // Accepted by the broker: the seek took effect there even when a newer commit owns the cell.
+        if (!applied) this.dropReplacedPosition(manager, seekEntry, acquired, admitted, attempt)
         this.settleSeek(key, acquired, admitted, applied || attempt.accepted === true)
         preparation?.check()
       }
