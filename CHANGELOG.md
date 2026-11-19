@@ -53,6 +53,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - A `HEARTBEAT` listener that throws a value that is not an `Error` (for example `null`) no longer turns a successful heartbeat into a failure that can stop a KIP-848 consumer from joining; the throw is logged. A consumer event listener whose promise rejects with `null` or `undefined` is logged as `Failed to execute listener: undefined` instead of raising an unhandled rejection.
 - KIP-848 consumers whose heartbeat timer is stopped while a heartbeat or join is still waiting for its answer (for example on a poll-interval expiry) send the replacement round's join at once instead of waiting for the old answer, which could use up the new join's rebalance timeout.
 - A consumer subscribed by a broker-side `regex` no longer sets the automatic creation bit on any Metadata request by name (the registration of an assigned name, the retry of a name not yet known, the periodic refresh), whatever `allowAutoTopicCreation` says, so a matched topic an operator deleted stays deleted, as under a client-side `RegExp`. Literal subscriptions keep the configured bit.
+- A `groupProtocol: 'consumer'` member now acknowledges a new assignment whose resolvable part it already owns, as the Java consumer does. Before, a coordinator waiting for the revocation of a topic the member never applied (deleted and recreated, say) never assigned the new topic, so its records were not delivered.
 
 #### Tooling
 

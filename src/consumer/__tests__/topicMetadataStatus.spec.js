@@ -1194,6 +1194,82 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       expect(bits(lookupsByName(wire.cluster).slice(before))).toEqual(new Set([true]))
       expect(wire.observed.crashes).toEqual([])
     }, 30000)
+    /**
+     * A coordinator with the revoke-before-assign rule of the Kafka group coordinator: when its
+     * target drops `topicId`, a member that has not reported owned partitions without it keeps its
+     * epoch and is sent the assignment without it, and gets the new target only once a heartbeat
+     * reports owned partitions without it. A heartbeat that reports none still owns it.
+     * @param {object} wire the scenario
+     * @param {string} topicId the id the coordinator drops
+     * @returns {{ freeze: (frozen: boolean) => void }} while frozen, the coordinator answers no change
+     */
+    const revokingCoordinator = (wire, topicId) => {
+      let frozen = false
+      let pending = false
+      const unchanged = ({ memberId }, assignment = null) => ({
+        memberId,
+        memberEpoch: wire.world.epoch,
+        heartbeatIntervalMs: 50,
+        assignment,
+      })
+      wire.cluster.answer('ConsumerGroupHeartbeat', (request) => {
+        if (frozen) return unchanged(request)
+        const reported = request.topicPartitions?.map((topic) => topic.topicId)
+        const owns = !reported || reported.includes(topicId)
+        if (pending) {
+          if (owns) return unchanged(request)
+          pending = false
+        } else if (owns && wire.world.assigned?.split(',').includes(topicId)) {
+          const before = { epoch: wire.world.epoch, assigned: wire.world.assigned }
+          const next = wire.world.heartbeat(request)
+          const ids = next.assignment?.topicPartitions.map((topic) => topic.topicId)
+          if (!ids || ids.includes(topicId)) return next
+          Object.assign(wire.world, before)
+          pending = true
+          const kept = before.assigned.split(',').filter((id) => id !== topicId)
+          return unchanged(request, {
+            topicPartitions: kept.map((id) => ({ topicId: id, partitions: [0] })),
+          })
+        }
+        return wire.world.heartbeat(request)
+      })
+      return { freeze: (value) => (frozen = value) }
+    }
+
+    test('an awaiting literal whose assigned id is deleted at its first add and recreated under a new id acknowledges the revocation of the old id and is read from its start', async () => {
+      const wire = assignedScenario()
+      wire.world.ids.delete(NEW)
+      wire.world.remove(DOOMED)
+      const coordinator = revokingCoordinator(wire, DOOMED_ID)
+      let deleted = false
+      wire.cluster.answer('Metadata', ({ topics }) => {
+        const answer = wire.world.metadata(topics)
+        if (!deleted && topics?.some(({ name, topicId }) => !name && topicId === DOOMED_ID)) {
+          deleted = true
+          wire.world.remove(DOOMED)
+          coordinator.freeze(true)
+        }
+        return answer
+      })
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+      wire.world.recreate(DOOMED, DOOMED_ID)
+      await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+      expect(deleted).toBe(true)
+      wire.world.recreate(DOOMED, RECREATED_ID)
+      await until(() => wire.observed.statuses.length === 2, 'the available status')
+      coordinator.freeze(false)
+
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+      expect(offsets(wire.observed, DOOMED)[0]).toBe('0')
+      expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+      expect(acks(wire.cluster)).toContainEqual([HEALTHY_ID])
+      expect(acks(wire.cluster).at(-1)).toEqual([HEALTHY_ID, RECREATED_ID].sort())
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
   })
 
   test('a classic consumer, a producer and an admin of one client, and a share consumer, still fail on a missing topic and report no status', async () => {
