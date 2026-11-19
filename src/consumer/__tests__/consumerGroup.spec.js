@@ -259,7 +259,10 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
     expect(group.topics).toEqual([])
     expect(group.topicConfigurations['events-a']).toEqual({ fromBeginning: true })
     expect(group.topicConfigurations['events-b']).toEqual({ fromBeginning: true })
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-a', 'events-b'])
+    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(
+      ['events-a', 'events-b'],
+      undefined
+    )
   })
 
   it('is a no-op for an empty list and for a name it already holds', async () => {
@@ -279,7 +282,7 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
     await group.joinAndSync()
 
     expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledTimes(1)
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-b'])
+    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-b'], undefined)
     expect(group.topicConfigurations['events-a']).toEqual({ fromBeginning: false })
     expect(group.topicConfigurations['events-b']).toEqual({ fromBeginning: true })
   })
