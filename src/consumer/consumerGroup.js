@@ -1223,7 +1223,6 @@ module.exports = class ConsumerGroup {
       for (const { topic, partitions } of revoked) {
         for (const partition of partitions) {
           this.consecutiveFetchErrors.delete(`${topic}|${partition}`)
-          this.seekOffset.pop(topic, partition)
         }
       }
 
@@ -1247,6 +1246,7 @@ module.exports = class ConsumerGroup {
         this.acquired.delete(key)
         this.unappliedSeeks.delete(key)
         this.haltedPartitions.delete(key)
+        this.seekOffset.pop(topic, partition)
       }
     }
     for (const { topic, partitions } of currentMemberAssignment) {
@@ -1757,15 +1757,25 @@ module.exports = class ConsumerGroup {
     this.obligations.retain(new Set([...pin.names, ...this.subscription.desired.names]))
   }
 
-  /** Prunes assignment-owned routing and queued seeks after either apply. @returns {void} */
+  /**
+   * Prunes assignment-owned routing after either apply, and the queued seeks of topics that are
+   * neither assigned nor subscribed any more. A seek of a subscribed partition this member does
+   * not hold stays queued until the partition is acquired (`seek`).
+   * @returns {void}
+   */
   pruneAssignmentState() {
     const assigned = this.subscriptionState.assignedPartitionSetsByTopic
     for (const topic of Object.keys(this.preferredReadReplicasPerTopicPartition)) {
       if (!assigned.get(topic)?.size) delete this.preferredReadReplicasPerTopicPartition[topic]
     }
-    for (const [key] of this.seekOffset) {
-      const [topic, partition] = JSON.parse(key)
-      if (!assigned.get(topic)?.has(partition)) this.seekOffset.delete(key)
+    if (this.seekOffset.size !== 0) {
+      const subscribed = new Set(this.topicsSubscribed)
+      for (const [key] of this.seekOffset) {
+        const [topic, partition] = JSON.parse(key)
+        if (!assigned.get(topic)?.has(partition) && !subscribed.has(topic)) {
+          this.seekOffset.delete(key)
+        }
+      }
     }
     if (this.kind === 'consumer' && this.subscribedTopicRegex != null) {
       this.retainSubscription([
@@ -1838,6 +1848,11 @@ module.exports = class ConsumerGroup {
    * The request also stamps an owned partition as sought (`markSought`), at once rather than when
    * the seek is applied, so a batch fetched before it can neither resolve nor commit an offset
    * from this moment on, while the seek is pending and after it is applied.
+   *
+   * A seek of a subscribed partition this member does not hold is kept, the latest per partition,
+   * and is applied before the first delivery once the partition is acquired, as in kafkajs 2.2.4;
+   * it is dropped once its topic is neither assigned nor subscribed. Losing a partition drops the
+   * seek queued while it was held: that seek was the previous owner's work.
    *
    * @param {import("../../types").TopicPartitionOffset} topicPartitionOffset
    * @returns {void} queues intent and wakes idle fetchers; resolution remains next-round work
