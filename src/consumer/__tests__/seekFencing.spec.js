@@ -2356,6 +2356,72 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     })
   })
 
+  describe('a seek made while its partition is not assigned', () => {
+    test('a seek made right after run, before the first assignment, is applied before the first delivery', async () => {
+      const log = {}
+      for (let offset = 0; offset <= 7; offset++) log[`0|${offset}`] = await batchAt(offset)
+      const committed = { 0: '2' }
+      const rig = await CloseRig.open({ protocol, last: -1, log, committed })
+      const commit = rig.cluster.answerers.get('OffsetCommit')
+      rig.cluster.answer('OffsetCommit', (fields, record) => {
+        for (const entry of fields.topics)
+          for (const cell of entry.partitions) committed[cell.partition] = String(cell.offset)
+        return commit(fields, record)
+      })
+      try {
+        const consumer = rig.consumer()
+        const seen = []
+        await consumer.connect()
+        await consumer.subscribe({ topic: TOPIC })
+        const running = consumer.run({
+          eachMessage: async ({ message }) => {
+            seen.push(message.value.toString())
+          },
+        })
+        consumer.seek({ topic: TOPIC, partition: 0, offset: '5' })
+        await running
+        await until(() => seen.length >= 1, 'the first delivery')
+
+        expect(seen[0]).toBe('value-5')
+        expect(fetchOffsetsOf(rig, 0)[0]).toBe('5')
+      } finally {
+        await rig.dispose()
+      }
+    })
+
+    test('a seek made while its partition is revoked is kept across an assignment without it and applied once the partition is assigned again', async () => {
+      const captured = using(captureGroup())
+      await open({ run: { ...MANUAL, eachBatch: true }, handOff: true })
+      await scenario.nextDelivery()
+      const group = captured.group()
+      await group.applyRebalanceResult({ assignment: {} }, { rebuildOffsets: false })
+
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '7' })
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '5' })
+      await group.applyRebalanceResult({ assignment: { [TOPIC]: [] } }, { rebuildOffsets: false })
+      await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: false })
+
+      expect(await scenario.position()).toBe('5')
+      expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('a seek queued before its partition is revoked is dropped with the revocation', async () => {
+      const captured = using(captureGroup())
+      await open({ run: { ...MANUAL, eachBatch: true }, handOff: true })
+      await scenario.nextDelivery()
+      const group = captured.group()
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '5' })
+
+      await group.applyRebalanceResult({ assignment: {} }, { rebuildOffsets: false })
+      await group.applyRebalanceResult({ assignment: { [TOPIC]: [0] } }, { rebuildOffsets: false })
+
+      expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
+      expect(await scenario.position()).toBe('2')
+      expect(scenario.commits()).toEqual([])
+    })
+  })
+
   describe('a seek left open by a later commit', () => {
     const SEEKING = {
       run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
