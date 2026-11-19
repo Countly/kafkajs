@@ -43,8 +43,10 @@ const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
 /**
  * What one OffsetCommit did on the wire, recorded before any caller check runs on its answer:
  * `written` once its bytes were handed to the socket (or an answer proves it), `accepted` once the
- * broker answered without an error.
- * @typedef {{written?: boolean, accepted?: boolean, refusal?: () => Error|null}} CommitAttempt
+ * broker answered without an error. `refusal` is the attempt's own pre-write check, and
+ * `superseded` the refusal it returned, which ends a seek without failing it.
+ * @typedef {{written?: boolean, accepted?: boolean, refusal?: () => Error|null,
+ *   superseded?: Error}} CommitAttempt
  */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
@@ -883,11 +885,16 @@ module.exports = class OffsetManager {
    * while the ticket is still current. A concrete offset settles a recreation reset only when the
    * topic is provably the incarnation the commit was sent for; a sentinel never does.
    *
-   * A seek's commit (given `attempt`) that ends without clearing, whatever the reason (refused
-   * before or after its write, a failure, an answer the broker may have accepted), forgets the
-   * partition's cached committed offset unless a newer operation owns the cell, so the position is
-   * read back from the broker: the cache may miss a commit the broker accepted while the seek was
-   * pending. Any other commit does so only once it was written.
+   * A seek's commit (given `attempt`) that fails changes nothing here: the error reaches the
+   * caller, including a commit failure, and the cached committed offset and position stay as
+   * they were. Only a refusal by the attempt's own check (a newer seek or acquisition owns the
+   * partition) ends it with `false`. One the broker accepted but that did not clear (its caller
+   * was refused afterwards, or a newer operation took the cell) still drops the position it
+   * replaced while it is the partition's current seek, and clears the cached offset unless the
+   * newer operation owns it, so the position is read from the cache or the broker.
+   *
+   * Any other commit (an inline reset) ends with `false` on a commit failure, and one that was
+   * written and did not clear forgets the cached offset, so the position is read back.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
@@ -937,12 +944,19 @@ module.exports = class OffsetManager {
       } else this.operations.fence(ticket, topic, partition)
       return true
     } catch (error) {
-      if (error instanceof KafkaJSCommitFailedError) return false
+      if (
+        error instanceof KafkaJSCommitFailedError &&
+        (attempt === undefined || error === wire.superseded)
+      )
+        return false
       throw error
     } finally {
-      const reread = attempt !== undefined || wire.written
-      if (reread && !cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
-        this.forgetCommitted(topic, partition)
+      const superseded = this.operations.isSuperseded(ticket, topic, partition)
+      if (attempt === undefined) {
+        if (wire.written && !cleared && !superseded) this.forgetCommitted(topic, partition)
+      } else if (wire.accepted && !cleared) {
+        if (!superseded) this.clearOffsets({ topic, partition })
+        else if (!wire.refusal?.()) this.forgetResolved(topic, partition)
       }
       release?.()
       this.operations.end(ticket)

@@ -1210,7 +1210,13 @@ module.exports = class Runner extends EventEmitter {
         },
         uncommittedOffsets: () => this.consumerGroup.uncommittedOffsets(),
         isRunning: () => this.running,
-        isStale: () => this.consumerGroup.hasSeekOffset({ topic, partition }),
+        /**
+         * Whether this batch's records are stale: a seek of the partition is queued, or the batch
+         * was superseded (`isSuperseded`), which lasts for the batch's life.
+         * @returns {boolean}
+         */
+        isStale: () =>
+          this.consumerGroup.hasSeekOffset({ topic, partition }) || this.isSuperseded(batch),
       })
     } catch (e) {
       this.markOwnRequest(e, 'handler')

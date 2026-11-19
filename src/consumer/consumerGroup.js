@@ -1198,7 +1198,10 @@ module.exports = class ConsumerGroup {
         isStopping: () => this.isStopping(),
         seeks: {
           clock: () => this.acquireClock,
-          changedSince: (since) => this.lastSoughtAt > since || this.lastAcquiredAt > since,
+          changedSince: (since) =>
+            this.lastSoughtAt > since ||
+            this.lastAcquiredAt > since ||
+            this.unappliedSeeks.size !== 0,
           isStaleSince: (topic, partition, since) => this.isStaleSince(topic, partition, since),
         },
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
@@ -1918,11 +1921,11 @@ module.exports = class ConsumerGroup {
   /**
    * Records that a seek was requested for an owned partition, by stamping `soughtAt` with the next
    * value of the acquisition clock, so a batch fetched under an earlier clock is known to be
-   * superseded (`Runner#isSuperseded`), and by forgetting the partition's resolved position: it
-   * belongs to the position being replaced, whichever way the seek ends, and what resolves
-   * afterwards is new work. Only the latest stamp is kept, and it is dropped with the partition's
-   * acquisition, so the record stays bounded by the assignment. A partition this member does not
-   * own is left alone.
+   * superseded (`Runner#isSuperseded`) for good, whichever way the seek ends. Admission changes no
+   * position: the cursor, epoch, committed cache and halt stay until the seek is applied, so a
+   * seek that fails leaves the partition where it was. Only the latest stamp is kept, and it is
+   * dropped with the partition's acquisition, so the record stays bounded by the assignment. A
+   * partition this member does not own is left alone.
    * @param {string} topic
    * @param {number} partition
    * @returns {void}
@@ -1933,7 +1936,6 @@ module.exports = class ConsumerGroup {
     if (!acquired) return
     acquired.soughtAt = this.lastSoughtAt = ++this.acquireClock
     this.unappliedSeeks.add(key)
-    this.offsetManager.forgetResolved(topic, partition)
   }
 
   /**
@@ -1958,7 +1960,7 @@ module.exports = class ConsumerGroup {
 
   /**
    * Settles a popped seek that is still current (`isCurrentSeek`), releasing only its own hold on
-   * fetching. One that may have reached the broker also fences answers built before it, clears
+   * fetching. One the broker accepted also fences answers built before it, clears
    * the partition's halt (a seek is how an application resumes a halted partition) and wakes the
    * idle fetcher. A seek that is no longer current changes nothing: a newer seek, acquisition or
    * incarnation owns the partition.
@@ -1967,7 +1969,7 @@ module.exports = class ConsumerGroup {
    * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
    *   was popped under
    * @param {number|undefined} admitted its `soughtAt` when popped
-   * @param {boolean} [reached=false] whether it was applied, or its commit was written
+   * @param {boolean} [reached=false] whether it was applied, or the broker accepted its commit
    * @returns {void}
    */
   settleSeek(key, acquired, admitted, reached = false) {
@@ -1977,6 +1979,26 @@ module.exports = class ConsumerGroup {
     acquired.changedAt = ++this.acquireClock
     this.haltedPartitions.delete(key)
     this.idleWait.wake()
+  }
+
+  /**
+   * Logs the one WARN of a popped seek that failed, contained so the log cannot replace the
+   * seek's error.
+   * @private
+   * @param {{topic: string, partition: number, offset: string}} seek the failed seek
+   * @param {Error} error why it failed
+   * @returns {void}
+   */
+  warnFailedSeek({ topic, partition, offset }, error) {
+    try {
+      this.logger.warn('Seek failed; the partition continues from its position before the seek', {
+        groupId: this.groupId,
+        topic,
+        partition,
+        offset,
+        error: error?.message,
+      })
+    } catch {}
   }
 
   /**
@@ -1994,16 +2016,23 @@ module.exports = class ConsumerGroup {
 
   /**
    * The per-cell authority of a default commit selected at `since`: whether the partition was
-   * sought, or acquired again, after it. Checked when the request is written and again when its
-   * answer is published, only once something was sought or acquired since (`changedSince`).
+   * sought, or acquired again, after it, or still has a seek that is not applied. A seek's
+   * admission keeps the partition's position, so this gate is what keeps a pending seek's cell
+   * out of every default commit, the final one included. Checked when the request is written and
+   * again when its answer is published, only once something was sought or acquired since or a
+   * seek is pending (`changedSince`).
    * @param {string} topic
    * @param {number|string} partition
    * @param {number} since the acquisition clock at selection
    * @returns {boolean}
    */
   isStaleSince(topic, partition, since) {
-    const acquired = this.acquired.get(`${topic}|${partition}`)
-    return acquired !== undefined && (acquired.acquiredAt > since || acquired.soughtAt > since)
+    const key = `${topic}|${partition}`
+    const acquired = this.acquired.get(key)
+    return (
+      acquired !== undefined &&
+      (acquired.acquiredAt > since || acquired.soughtAt > since || this.unappliedSeeks.has(key))
+    )
   }
 
   /**
@@ -3634,15 +3663,15 @@ module.exports = class ConsumerGroup {
    * be discarded. A pass already in flight is not cancelled.
    *
    * A popped seek is attempted once, as in kafkajs 2.2.4: whatever happens to its commit, it is
-   * settled and never sent again, and a failure reaches the caller. One the broker accepted is
-   * settled as applied (clearing its halt), whatever refused the caller afterwards or whichever
-   * newer commit took its cell; one written with no answer (a
-   * timeout, a lost connection) or rejected is settled the same way; one that failed before its
-   * write is settled without clearing a halt. Either way the position is read back from the
-   * broker's committed offset. The application seeks again if it still wants the position. A seek that returns
-   * without applying is settled. A popped seek that is no longer
-   * current (`isCurrentSeek`) is refused before its write and settles nothing; one popped with no
-   * acquisition to compare (a partition assigned without one) is never refused for it.
+   * settled and never sent again. One the broker accepted is settled as applied (clearing its
+   * halt), whatever refused the caller afterwards or whichever newer commit took its cell. One that
+   * failed (refused before its write, rejected, or written with no answer) changes no position:
+   * the partition keeps its cursor, committed cache, pending sentinel and halt, nothing is looked
+   * up because of it, one WARN is logged and the error reaches the caller (`position()`, or the
+   * fetch loop's error policy). The application seeks again if it still wants the position. A
+   * popped seek that is no longer current (`isCurrentSeek`) is refused before its write and
+   * settles nothing; one popped with no acquisition to compare (a partition assigned without one)
+   * is never refused for it.
    *
    * Given a preparation, every step uses its captured offset manager and checks its guard before
    * popping an intent, after every await, before the resolution retry and its yield, and before
@@ -3673,19 +3702,21 @@ module.exports = class ConsumerGroup {
         const acquired = this.acquired.get(key)
         const admitted = acquired?.soughtAt
         const attempt = {
-          refusal: () =>
-            acquired === undefined || this.isCurrentSeek(key, acquired, admitted)
-              ? null
-              : new KafkaJSCommitFailedError('A newer seek superseded this one', {
-                  reason: 'stale-assignment',
-                }),
+          refusal: () => {
+            if (acquired === undefined || this.isCurrentSeek(key, acquired, admitted)) return null
+            const message = 'A newer seek superseded this one'
+            attempt.superseded ??= new KafkaJSCommitFailedError(message, {
+              reason: 'stale-assignment',
+            })
+            return attempt.superseded
+          },
         }
         let applied
         try {
           applied = await manager.seek(seekEntry, preparation, attempt)
         } catch (error) {
-          // Written: the broker may hold the sought offset, whatever refused this caller.
-          this.settleSeek(key, acquired, admitted, attempt.written)
+          this.settleSeek(key, acquired, admitted, attempt.accepted === true)
+          if (attempt.accepted !== true) this.warnFailedSeek(seekEntry, error)
           throw error
         }
         // Accepted by the broker: the seek took effect there even when a newer commit owns the cell.
