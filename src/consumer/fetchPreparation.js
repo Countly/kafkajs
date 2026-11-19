@@ -16,8 +16,11 @@ class PreparationSuperseded extends KafkaJSError {
  * One prepared node snapshot: the node-filtered partitions of one fetch attempt with the stamps
  * they were prepared under. Holds one small record per attempt, never a per-partition cache.
  *
- * `guard()` is the private, immutable identity every descendant of the preparation checks: the run
- * is still open and the assignment, ownership token and offset manager are the captured ones.
+ * `guard()` is the private, immutable identity every descendant of the preparation checks, up to
+ * the transport's final write: the run is still open and the assignment, ownership token and
+ * offset manager are the captured ones. Under the consumer protocol it also requires an installed
+ * offset manager and an ownership that carries no loss, so a Fetch is never admitted for a member
+ * that has learned it was fenced, even before the round that replaces the membership runs.
  * A routing change alone never makes it refuse, so churn cannot prevent the final attempt from
  * finishing; `isCurrent()` answers that separately in constant time.
  */
@@ -62,7 +65,8 @@ class FetchPreparation {
     if (
       group.preparationEpoch !== this.preparationEpoch ||
       group.offsetManager !== this.manager ||
-      group.ownership.token() !== this.ownershipToken
+      group.ownership.token() !== this.ownershipToken ||
+      (group.kind === 'consumer' && (!this.manager || group.ownership.refusal(this.ownershipToken)))
     ) {
       this.superseded = new PreparationSuperseded()
     }

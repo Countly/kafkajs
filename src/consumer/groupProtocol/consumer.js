@@ -6,6 +6,7 @@ const { COOPERATIVE } = require('./interface')
 const { generateMemberId } = require('./memberId')
 const CoordinatorLookup = require('../coordinatorLookup')
 const { SentFields, buildRequest } = require('./heartbeatState')
+const describeThrown = require('../../network/describeThrown')
 const {
   MEMBER_STATES,
   transition,
@@ -72,6 +73,15 @@ const leaveEpochFor = (isStatic, leaveGroup) =>
  * An id may become resolvable later, so the fast budget never ends periodic discovery.
  */
 const MAX_UNRESOLVED_ATTEMPTS = 2
+
+/**
+ * The shortest wait before a join the coordinator fenced is sent again, whatever the retry settings
+ * compute: the same floor as the wait between two reconciliation rounds.
+ */
+const MIN_FENCED_JOIN_BACKOFF_MS = 100
+
+/** The longest delay a Node.js timer takes; a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2147483647
 
 const COORDINATOR_LOAD_IN_PROGRESS = 14
 const COORDINATOR_NOT_AVAILABLE = 15
@@ -323,39 +333,42 @@ module.exports = class ConsumerGroupProtocol {
 
     // The classic protocol wraps its heartbeat the same way: `Runner#heartbeat()` is called per
     // message, per batch and on every empty fetch round, so without the single flight AND the
-    // interval gate below a busy consumer would issue one request per record.
-    this.sharedHeartbeat = sharedPromiseTo(async ({ interval }) => {
-      if (shouldSkipHeartbeat(this.state)) {
-        return
-      }
+    // interval gate below a busy consumer would issue one request per record. The single flight is
+    // scoped by the membership it serves: a heartbeat for a replacement membership never joins one
+    // still awaiting its answer for the replaced membership, whose answer would be dropped.
+    this.sharedHeartbeat = sharedPromiseTo(
+      async ({ interval, guard, onAccepted }) => {
+        if (shouldSkipHeartbeat(this.state)) {
+          return false
+        }
 
-      const now = Date.now()
+        const now = Date.now()
 
-      if (this.backoff.pending(now)) {
-        return
-      }
+        if (this.backoff.pending(now)) {
+          return false
+        }
 
-      if (this.immediatePending && shouldHeartbeatNow(this.state)) {
-        await this.sendHeartbeat({ sendAllFields: this.state === JOINING })
-        return
-      }
+        if (this.immediatePending && shouldHeartbeatNow(this.state)) {
+          return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
+        }
 
-      // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
-      // last request, which is always more recent than the shorter backoff, so leaving the gate in
-      // front of a due retry would swallow it until the ordinary interval came round anyway - and
-      // the backoff would never grow past its first step. It is ONE request, consumed by the send
-      // below: this is the retry the backoff owed, not a mode the gate stays off in.
-      if (this.backoff.isDue(now)) {
-        await this.sendHeartbeat({ sendAllFields: this.state === JOINING })
-        return
-      }
+        // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
+        // last request, which is always more recent than the shorter backoff, so leaving the gate in
+        // front of a due retry would swallow it until the ordinary interval came round anyway - and
+        // the backoff would never grow past its first step. It is ONE request, consumed by the send
+        // below: this is the retry the backoff owed, not a mode the gate stays off in.
+        if (this.backoff.isDue(now)) {
+          return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
+        }
 
-      if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
-        return
-      }
+        if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
+          return false
+        }
 
-      await this.sendHeartbeat({ sendAllFields: false })
-    })
+        return this.sendHeartbeat({ sendAllFields: false, guard, onAccepted })
+      },
+      () => this.membershipRevision
+    )
 
     this.sharedLeave = sharedPromiseTo((options) => this.performLeave(options))
   }
@@ -496,13 +509,43 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
+   * The deadline of a join started now: the rebalance timeout counted from the end of the backoff
+   * still armed (after a fenced join, for example), so the wait does not use it up. Only a member
+   * that will join gets the extra time, and the sum is held to the longest timer delay.
+   * @param {number} timeoutMs the rebalance timeout
+   * @returns {number} milliseconds, at most 2147483647
+   */
+  joinBudget(timeoutMs) {
+    const joins = this.memberEpoch <= 0 || isNotInGroup(this.state) || this.state === JOINING
+    const delay = joins ? this.backoff.remaining(Date.now()) : 0
+    return Math.min(MAX_TIMER_MS, timeoutMs + delay)
+  }
+
+  /**
    * Whether the coordinator wants something this member does not have yet - counting only the
-   * partitions whose topic name is known. An unresolved topic id deliberately does NOT make this
-   * true: an id that can never resolve would otherwise ask for a rebalance round forever.
+   * partitions a round's apply would keep: those whose topic name is known and, under a client
+   * pattern, is in the desired subscription. An unresolved topic id deliberately does NOT make
+   * this true: an id that can never resolve would otherwise ask for a rebalance round forever. Nor
+   * does a target that still names a topic the subscription dropped: the apply filters it, so no
+   * round could ever converge on it. The target itself is kept whole.
    * @returns {boolean}
    */
   needsReconciliation() {
-    return this.target != null && !this.matchesOwned(this.resolveFromCache(this.target))
+    return (
+      this.target != null &&
+      !this.matchesOwned(this.resolveFromCache(this.target), this.eligibleTopics())
+    )
+  }
+
+  /**
+   * The names a round's apply would keep from a target, or null when it keeps every resolvable
+   * one. A client-pattern round pins the desired subscription and drops the rest; every other
+   * subscription is widened with the assigned names before the apply.
+   * @private
+   * @returns {Map<string, object>|null} keyed by topic name
+   */
+  eligibleTopics() {
+    return this.subscription ? this.subscription.desired.topicConfigurations : null
   }
 
   /**
@@ -514,16 +557,24 @@ module.exports = class ConsumerGroupProtocol {
    * apply. It never applies anything itself and never sends the acknowledgement: the apply calls
    * `setOwned`, and that is where the acknowledgement is triggered.
    *
+   * Owns one invariant: a step returns only a result to apply. When a newer target, or the rollback
+   * of a failed `subscribe()` (or a mode change) retiring the metadata scope, replaces what the
+   * step is resolving while its membership still holds a target, the step resolves again against
+   * the live target under the current scope. It stops at the round's own refusal: at the round
+   * deadline the round fails with its join deadline error, as for any step that outlives it.
+   *
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
-   *   growSubscription?: (names: string[]) => Promise<void> }} context
+   *   growSubscription?: (names: string[]) => Promise<void>, round?: { guard: () => Error|null } }}
+   *   context `round` is the round attempt the step runs for
    * @returns {Promise<{ assignment: Object, userData: null }>} the assignment in the name-keyed
    *   shape the apply expects
-   * @throws {Error} the stored fatal error when this member may never rejoin; whatever the join
-   *   failed with otherwise
+   * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
+   *   when a fencing, a fatal error, a leave or a rejoin retired the membership during the step;
+   *   the round's refusal; whatever the join failed with otherwise
    */
   async rebalance(context) {
     if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
-    const { beforeSync, growSubscription } = context
+    const { beforeSync, growSubscription, round } = context
 
     if (this.state === FATAL) {
       throw this.fatalError
@@ -554,17 +605,29 @@ module.exports = class ConsumerGroupProtocol {
       return { assignment: this.ownedAsObject(), userData: null }
     }
 
-    const isCurrent = this.targetGuard()
-    const resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
-    await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
+    let isCurrent, resolved
+    for (;;) {
+      isCurrent = this.targetGuard()
+      try {
+        resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
+        await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
+        if (isCurrent()) break
+      } catch (error) {
+        if (error?.type !== 'ASSIGNMENT_CHANGED') throw error
+      }
+      if (!isCurrent.member()) throw assignmentChangedError()
+      const refusal = round?.guard()
+      if (refusal) throw refusal
+    }
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
     // owned is acknowledged here, under the target's bumped local epoch.
-    if (this.matchesOwned(resolved)) {
-      this.adoptLocalAssignment(this.target.localEpoch, resolved)
+    if (this.matchesOwned(resolved, this.eligibleTopics())) {
+      this.adoptLocalAssignment(
+        this.target.localEpoch,
+        this.appliedSubsetOf(resolved, this.ownedPartitions)
+      )
 
       if (this.state === RECONCILING) {
         this.acknowledge()
@@ -573,6 +636,11 @@ module.exports = class ConsumerGroupProtocol {
       return { assignment: this.ownedAsObject(), userData: null }
     }
 
+    // Owned partitions the subscription dropped while the target still names them: the apply
+    // releases them, and only an acknowledgement tells the coordinator.
+    if (this.state !== RECONCILING && canHandleNewAssignment(this.state)) {
+      this.transitionTo(RECONCILING)
+    }
     this.pendingResolved = resolved
     beforeSync()
 
@@ -597,7 +665,8 @@ module.exports = class ConsumerGroupProtocol {
    *
    * The deadline is not optional. Without it a coordinator that keeps answering
    * `COORDINATOR_LOAD_IN_PROGRESS` - which is swallowed rather than raised - leaves the retrier
-   * with nothing to retry and the round never settles, which holds a `stop()` open forever.
+   * with nothing to retry and the round never settles, which holds a `stop()` open forever. It is
+   * `joinBudget` of the rebalance timeout.
    *
    * @private
    * @returns {{ promise: Promise<void>, resolve: Function, reject: Function }}
@@ -610,7 +679,7 @@ module.exports = class ConsumerGroupProtocol {
         this.rejectFirstMembership(
           joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeoutMs })
         ),
-      this.rebalanceTimeoutMs
+      this.joinBudget(this.rebalanceTimeoutMs)
     )
 
     this.#firstMembership = record
@@ -764,21 +833,26 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Captures a membership and target identity that is never reused, even at equal local epochs,
-   * and, for a client-pattern consumer, the metadata scope: an accepted mode change retires it.
+   * and, for a client-pattern consumer, the metadata scope: an accepted mode change and the
+   * rollback of a failed `subscribe()` retire it.
    * @private
-   * @returns {() => boolean} true only while this member may use the captured target
+   * @returns {(() => boolean) & { member: () => boolean }} true only while this member may use the
+   *   captured target; `member()` true while the captured membership still holds a target, whatever
+   *   became of the target revision and the scope (a fencing, a fatal error and a leave clear the
+   *   target, a leave only after its commit, hence the state check)
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
     const scope = this.subscription?.captureScope()
-    return () =>
-      (!scope || scope()) &&
+    const member = () =>
       membership === this.membershipRevision &&
-      target === this.targetRevision &&
       this.target != null &&
       !isNotInGroup(this.state) &&
       !isLeavingGroup(this.state)
+    return Object.assign(() => (!scope || scope()) && target === this.targetRevision && member(), {
+      member,
+    })
   }
 
   /**
@@ -962,35 +1036,48 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * @private
    * @param {{ assignment: Object }} resolved
-   * @returns {boolean} whether the resolvable subset is exactly what this member owns
+   * @param {Map<string, object>|null} [eligible] when given, only these topics of `resolved` count
+   * @returns {boolean} whether the resolvable (and eligible) subset is exactly what this member owns
    */
-  matchesOwned({ assignment }) {
+  matchesOwned({ assignment }, eligible = null) {
     const owned = indexByTopic(this.ownedPartitions)
-    const topics = Object.keys(assignment)
+    let matched = 0
 
-    if (topics.length !== owned.size) {
-      return false
+    for (const topic of Object.keys(assignment)) {
+      if (eligible && !eligible.has(topic)) continue
+      const partitions = owned.get(topic)
+      if (
+        partitions == null ||
+        partitions.size !== assignment[topic].length ||
+        !assignment[topic].every((partition) => partitions.has(partition))
+      ) {
+        return false
+      }
+      matched++
     }
 
-    return topics.every((topic) => {
-      const partitions = owned.get(topic)
-      return (
-        partitions != null &&
-        partitions.size === assignment[topic].length &&
-        assignment[topic].every((partition) => partitions.has(partition))
-      )
-    })
+    return matched === owned.size
   }
 
   /**
    * One heartbeat, gated exactly as the classic protocol's is: single-flight, and interval-gated
    * unless the state owes an immediate one or a backoff has come due. The gate is load-bearing -
    * the runner calls this per message, per batch and on every empty fetch round.
-   * @param {{ interval: number }} options
-   * @returns {Promise<void>}
+   *
+   * Within one membership the runner's handler heartbeat and its timer share the one exchange,
+   * and the first caller's
+   * `guard` and `onAccepted` govern it. Both callers pass the same live-run guard and the runner's
+   * one clock callback, so a success reaches the clock exactly once, before either caller resumes,
+   * whichever caller started it.
+   * @param {{ interval: number, guard?: () => Error|null, onAccepted?: () => void }} options
+   *   `guard` is the live run's refusal, checked at every effect boundary of the exchange;
+   *   `onAccepted` runs once, inside the exchange, on a success the live run accepted
+   * @returns {Promise<boolean>} true only when a heartbeat was sent and answered with success for
+   *   the membership the member still holds; false when none was sent, the run was retired or its
+   *   answer was dropped
    */
-  async heartbeat({ interval }) {
-    return this.sharedHeartbeat({ interval })
+  async heartbeat({ interval, guard, onAccepted }) {
+    return this.sharedHeartbeat({ interval, guard, onAccepted })
   }
 
   /**
@@ -1002,18 +1089,46 @@ module.exports = class ConsumerGroupProtocol {
    * acknowledgement that failed has still moved the state, and a heartbeat already on the wire when
    * the acknowledgement was decided must not consume it.
    *
-   * The membership the call began under is fixed before the coordinator lookup. A lookup that
-   * finishes after the membership was replaced ends the call: nothing is published, built or sent,
-   * and a failure of it is stamped with that membership and not counted against the replacement.
+   * The membership the call began under (its ownership token and `membershipRevision`) is fixed
+   * before the coordinator lookup. For an ordinary heartbeat one refusal - that revision moved, or
+   * `guard` refuses - reaches the lookup's publication and the transport's final write check, so
+   * a lookup that finishes after the membership was replaced ends the call: nothing is published,
+   * built or sent, and its failure is not counted against the replacement. A leave's write is
+   * governed by its close operation's `guard` alone.
+   *
+   * Owns one invariant: an answer is valid if and only if the broker membership the request was
+   * sent under (`membershipRevision`, moved by a fencing, a fatal error, a leave or a new join, and
+   * never by an assignment apply) is still the member's. An answer to a replaced membership has no
+   * effect, even when the rejoin reused the member id and epoch. A valid refusal is charged to the
+   * ownership current when it arrives, so an apply between send and answer cannot hide it. A leave
+   * completes by its own state rule.
+   *
+   * One effect guard: `guard` is the caller's authority (the live run for an ordinary heartbeat,
+   * the close operation for a leave). Every effect after a suspension - the lookup result, the
+   * write, the answer, the backoff, the error's classification, the clock and the `finally` - runs
+   * only while the sent membership is still the member's and `guard` does not refuse; a retired
+   * ordinary call returns false. Only the wire outcome is classified: a HEARTBEAT listener's throw,
+   * of any value, is logged, and the guard is checked again after it before the success applies.
    *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
-   * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null }} options
-   *   `guard` is a leave's private pre-write refusal; it never reaches the request
-   * @returns {Promise<void>}
+   * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null,
+   *   onAccepted?: () => void }} options `guard` is the caller's pre-write and effect refusal; it
+   *   never reaches the request. `onAccepted` runs once on an accepted success that is not a leave
+   * @returns {Promise<boolean>} true only for a success answered to the membership the member still
+   *   holds (never for a leave); false when nothing was sent or the answer had no effect
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
-  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard }) {
+  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard, onAccepted }) {
     const ownershipToken = this.ownership?.token()
+    const membershipAtRequest = this.membershipRevision
+    const current = () => membershipAtRequest === this.membershipRevision && !guard?.()
+    const refusal =
+      leaveEpoch == null
+        ? () =>
+            membershipAtRequest === this.membershipRevision
+              ? (guard?.() ?? null)
+              : assignmentChangedError()
+        : guard
     if (!this.coordinator) {
       // A leave never LOOKS for a coordinator. `connect()` goes through the cluster's retrier, so
       // waiting for it here would hold `stop()` open for tens of seconds whenever the coordinator
@@ -1024,96 +1139,107 @@ module.exports = class ConsumerGroupProtocol {
           groupId: this.groupId,
         })
         this.onRequestGenerated({ leaveEpoch, stateAtRequest: this.state })
-        return
+        return false
       }
 
       try {
-        await this.connect(ownershipToken)
+        await this.connect(ownershipToken, undefined, refusal)
       } catch (error) {
+        if (!current()) return false
         stampOwnership(error, ownershipToken)
         if (!obsoleteOwnership(this.ownership, error)) this.backoff.onFailedAttempt(Date.now())
         throw error
       }
 
-      if (this.ownershipReplaced(ownershipToken)) return
+      if (this.ownershipReplaced(ownershipToken) || !current()) return false
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
     if (leaveEpoch === -1 || leaveEpoch === -2) this.sentFields.reset()
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
-    const membershipAtRequest = this.membershipRevision
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
     this.backoff.takeDue()
 
     try {
-      const response = await this.coordinator.consumerGroupHeartbeat({
-        ...toBrokerPayload(request),
-        ...(guard && { guard }),
-      })
+      let response
+      try {
+        response = await this.coordinator.consumerGroupHeartbeat({
+          ...toBrokerPayload(request),
+          ...(refusal && { guard: refusal }),
+        })
+      } catch (error) {
+        // A leave's failure is its own to finish whatever its close operation now says.
+        const owned =
+          leaveEpoch == null ? current() : membershipAtRequest === this.membershipRevision
+        if (!owned) return false
+        stampOwnership(error, this.ownership?.token())
+        this.sentFields.reset()
 
-      if (this.ownershipReplaced(ownershipToken) || guard?.()) return
-      if (this.answersEarlierMembership(membershipAtRequest)) return
+        if (leaveEpoch != null) {
+          // A leave's answer is deliberately NOT classified. The classification exists to produce a
+          // verdict and a state move, and a leave raises no verdict: running the table here would
+          // move a leaving member to FATAL or FENCED - states the leave cannot complete out of - and
+          // could ask the stopped heartbeat manager for a tick on the way.
+          this.logger.debug('The leave heartbeat failed; leaving anyway', {
+            groupId: this.groupId,
+            error: error.message,
+          })
+          return false
+        }
+
+        const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
+        // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
+        if (fencing && sentUnderEpoch === 0) {
+          this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
+        }
+
+        throw this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch))
+      }
+
+      if (!current()) return false
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
       }
       this.backoff.reset()
-
-      this.instrumentationEmitter.emit(HEARTBEAT, {
-        groupId: this.groupId,
-        memberId: this.memberId,
-        groupGenerationId: sentUnderEpoch,
-        groupInstanceId: this.groupInstanceId,
-      })
+      this.emitHeartbeat(sentUnderEpoch)
+      if (!current()) return false
 
       this.onSuccess(response)
-    } catch (error) {
-      stampOwnership(error, ownershipToken)
-      if (obsoleteOwnership(this.ownership, error)) throw error
-      this.sentFields.reset()
-
-      if (leaveEpoch != null) {
-        // A leave's answer is deliberately NOT classified. The classification exists to produce a
-        // verdict and a state move, and a leave raises no verdict: running the table here would
-        // move a leaving member to FATAL or FENCED - states the leave cannot complete out of - and
-        // could ask the stopped heartbeat manager for a tick on the way.
-        this.logger.debug('The leave heartbeat failed; leaving anyway', {
-          groupId: this.groupId,
-          error: error.message,
-        })
-        return
-      }
-
-      const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
-      if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
-
-      throw stampOwnership(
-        this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
-        ownershipToken
-      )
+      if (leaveEpoch != null) return false
+      onAccepted?.()
+      return true
     } finally {
-      if (!this.ownershipReplaced(ownershipToken)) {
+      if (leaveEpoch != null || current()) {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest })
       }
     }
   }
 
   /**
-   * Whether an answer belongs to a request built in an earlier membership while the member is
-   * joining anew (it was fenced out of, or left, that membership and began a new join). A success
-   * would install the old epoch over the join's zero and settle the join with no epoch-0
-   * heartbeat; a fencing error would fence the new join for the old one's loss. Outside a new join
-   * the answer is still processed, so a fencing learned from it reaches the member. The revision
-   * moves only on resets, never on reconciliation progress.
+   * Emits HEARTBEAT for an answered heartbeat. A listener's throw, whatever value it throws, is
+   * logged, never classified: it is not the coordinator's answer.
    * @private
-   * @param {symbol} membershipAtRequest `membershipRevision` when the request was built
-   * @returns {boolean}
+   * @param {number} sentUnderEpoch
+   * @returns {void}
    */
-  answersEarlierMembership(membershipAtRequest) {
-    return this.state === JOINING && membershipAtRequest !== this.membershipRevision
+  emitHeartbeat(sentUnderEpoch) {
+    try {
+      this.instrumentationEmitter.emit(HEARTBEAT, {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        groupGenerationId: sentUnderEpoch,
+        groupInstanceId: this.groupInstanceId,
+      })
+    } catch (error) {
+      this.logger.error('A HEARTBEAT listener failed', {
+        groupId: this.groupId,
+        error: describeThrown(error),
+      })
+    }
   }
 
   /**
@@ -1249,7 +1375,7 @@ module.exports = class ConsumerGroupProtocol {
     const wasReconciling = this.state === RECONCILING
     const resolved = this.resolveFromCache(this.target)
     const grew = this.recordResolution(resolved)
-    const converged = this.matchesOwned(resolved)
+    const converged = this.matchesOwned(resolved, this.eligibleTopics())
 
     if (converged) {
       if (wasReconciling || wasJoining) {
