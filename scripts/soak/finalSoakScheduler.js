@@ -254,7 +254,9 @@ const TEARDOWN = Object.freeze(['seed-clear', 'disconnect'])
  *
  * A work step still running `graceMs` after its deadline is reported `error` at that moment, so
  * its lane goes on and the failure aborts the run; its work cannot be cancelled, so it stays in
- * `inflight` until it settles. A sample that must see the run quiet asks `quiescent()`.
+ * `inflight` until it settles. A sample that must see the run quiet asks `quiescent()`. While a
+ * quiet sample runs no work step starts: a work step due then waits until the sample settled (and
+ * is late if that passes its deadline), and an idle window ends only after it (`quietSettled`).
  */
 class Scheduler {
   /**
@@ -273,6 +275,12 @@ class Scheduler {
     this.aborted = null
     this.controller = new AbortController()
     this.inflight = new Set()
+    this.quieting = new Set()
+  }
+
+  /** @returns {Promise<void>} resolves once no quiet sample is running */
+  async quietSettled() {
+    while (this.quieting.size > 0) await Promise.allSettled([...this.quieting])
   }
 
   /** @returns {boolean} whether no work step is running, including one already reported late */
@@ -311,6 +319,7 @@ class Scheduler {
   /** @param {object} step @returns {Promise<void>} */
   async runStep(step) {
     await this.clock.sleepUntil(step.at, this.controller.signal)
+    if (step.lane === 'work') await this.quietSettled()
     const startedAt = this.clock.now()
     const deadline = step.deadline ?? Infinity
     let outcome = 'ok'
@@ -347,6 +356,13 @@ class Scheduler {
    */
   async bounded(step, deadline) {
     const running = Promise.resolve().then(() => this.perform(step))
+    if (step.type === 'quiet') {
+      this.quieting.add(running)
+      running.then(
+        () => this.quieting.delete(running),
+        () => this.quieting.delete(running)
+      )
+    }
     if (step.lane !== 'work') return running
     this.inflight.add(step.id)
     running.then(

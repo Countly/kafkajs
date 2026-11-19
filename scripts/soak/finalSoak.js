@@ -1094,6 +1094,7 @@ class Supervisor {
         await this.send(all, step)
         this.quiesced = step.id
         await this.clock.sleepUntil(step.until, this.scheduler.controller.signal)
+        await this.scheduler.quietSettled()
         this.quiesced = null
         if (step.until < this.runEndAt && !this.scheduler.aborted)
           await this.send(all, { ...step, type: 'active' })
