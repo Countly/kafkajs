@@ -2134,6 +2134,68 @@ describe('final soak driver', () => {
     }
   })
 
+  test("the supervisor's final sample, taken through its bounded finish, counts the same timers as its baseline", async () => {
+    const { Supervisor } = require('../finalSoak')
+    const { MonotonicClock } = require('../finalSoakScheduler')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-final-sample-'))
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      const sampler = new Sampler({ clock: new MonotonicClock(), gc: () => {}, gcGapMs: 1 })
+      const timeouts = (sample) => sample.activeResources.find((r) => r.type === 'Timeout').count
+      const baseline = await sampler.read({ role: 'baseline', cut: () => 'p15.i0' })
+      let final = null
+      supervisor.untilExited = async () => {}
+      supervisor.runtime = {
+        stop: async () => {
+          final = await sampler.read({ role: 'final', cut: () => 'p15.i1' })
+        },
+        channel: { pendingBytes: 0 },
+      }
+      supervisor.collector = { close: async () => {} }
+      expect(await supervisor.finish({ close: async () => {} })).toEqual([])
+      expect(timeouts(final)).toBe(timeouts(baseline))
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a sample counts a timer the code under test armed, but never a wait or bound the harness armed', async () => {
+    const { MonotonicClock } = require('../finalSoakScheduler')
+    const clock = new MonotonicClock()
+    const sampler = new Sampler({ clock, gc: () => {}, gcGapMs: 1 })
+    const timeouts = async () =>
+      (await sampler.read({ role: 'periodic', slot: 1, cut: () => 'p01.i0' })).activeResources.find(
+        (r) => r.type === 'Timeout'
+      ).count
+    const before = await timeouts()
+    const wait = new AbortController()
+    const waiting = clock.sleepUntil(clock.now() + 60000, wait.signal)
+    const collector = new Collector({
+      sink: { write: async () => ({}), sync: async () => {} },
+      clock,
+      matrix,
+      writeTimeoutMs: 60000,
+    })
+    let settle = null
+    const bounded = collector.bounded(new Promise((resolve) => (settle = resolve)))
+    const client = setTimeout(() => {}, 60000)
+    try {
+      expect(await timeouts()).toBe(before + 1)
+    } finally {
+      clearTimeout(client)
+      wait.abort()
+      settle()
+      await Promise.all([waiting, bounded])
+    }
+    expect(await timeouts()).toBe(before)
+  })
+
   test('the sampling gate reports when every admitted and waiting task has finished', async () => {
     const clock = new VirtualClock()
     const gate = new SamplingGate({ limit: 2 })
