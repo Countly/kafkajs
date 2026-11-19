@@ -57,11 +57,17 @@ const MIB = 1024 ** 2
 const GIB = 1024 ** 3
 /** Free disk kept back beyond the stream's remaining reservation (the planned 32 GiB safety). */
 const SAFETY_BYTES = 32 * GIB
+/** The children's explicit auxiliary byte budgets: raw scans 8 GiB, raw share wire 4 GiB, client logs. */
+const AUXILIARY_BYTES = 16 * GIB
 /** The disk a diagnostic run keeps free: enough to finish writing and archive a smoke. */
 const DIAGNOSTIC_RESERVE_BYTES = 2 * GIB
 /** What a command may take beyond its step's deadline, and what one without a deadline may take. */
 const COMMAND_GRACE_MS = 60000
 const DEFAULT_COMMAND_MS = 300000
+/** How long one docker command may run before it is killed. */
+const DOCKER_MS = 60000
+/** How long a child killed at the end of the teardown allowance may take to end. */
+const KILL_WAIT_MS = 10000
 /** How long the final drain waits for every member to resolve the logs' ends. */
 const FINAL_DRAIN_MS = 300000
 /** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
@@ -281,9 +287,9 @@ class Supervisor {
     this.children = new Map()
     this.waiting = new Map()
     this.commands = 0
-    this.exits = 0
+    this.terminal = new Set()
+    this.exitRecords = new Map()
     this.topicIds = []
-    this.topicRecords = new Map()
     this.routes = new Map()
     this.scanned = new Map()
     this.ended = new Map()
@@ -294,6 +300,8 @@ class Supervisor {
     this.leaving = new Set()
     this.lost = new Set()
     this.aborted = null
+    this.quiesced = null
+    this.dockerMs = DOCKER_MS
   }
 
   /**
@@ -445,6 +453,7 @@ class Supervisor {
     )
     this.scheduler = new Scheduler({
       clock: this.clock,
+      graceMs: COMMAND_GRACE_MS,
       perform: (step) => this.perform(step),
       onOutcome: (o) => {
         this.collector.note(`step ${o.id} ${o.outcome}`, { step: o.id })
@@ -460,6 +469,7 @@ class Supervisor {
         this.config.diagnostic
           ? DIAGNOSTIC_RESERVE_BYTES
           : Math.max(0, valueOf(this.matrix.host.maxStreamBytes) - this.collector.streamBytes) +
+            AUXILIARY_BYTES +
             SAFETY_BYTES,
     })
     this.monitor.start(this.clock, (reading) => {
@@ -539,12 +549,16 @@ class Supervisor {
 
   /**
    * Creates one run topic (RF3, min ISR 2, no retention truncation), records the admin result and
-   * declares a route from offset 0 for every recipient group and partition.
+   * declares a route from offset 0 for every recipient group and partition. The creation counts
+   * only when the broker answered without error with a topic id that is not the id the name had
+   * before, so a recreation that left the old incarnation in place fails.
    * @param {string} topic @param {number} partitions @param {string} role its topology role
    * @param {string|null} [execution]
-   * @returns {Promise<string|null>} the topic id
+   * @returns {Promise<string>} the new incarnation's topic id
+   * @throws {Error} when the creation failed or did not produce a new incarnation
    */
   async createTopic(topic, partitions, role, execution = null) {
+    const before = this.topicIds.find(([t]) => t === topic)?.[1] ?? null
     const configEntries = [
       { name: 'min.insync.replicas', value: '2' },
       { name: 'retention.ms', value: '-1' },
@@ -570,11 +584,10 @@ class Supervisor {
       errorCode,
       execution
     )
-    if (!topicId) {
-      await this.collector.note(`missing-source topic id for created ${topic}`)
-      return null
-    }
-    this.topicRecords.set(topicId, recordId)
+    if (errorCode !== 0 || !topicId || topicId === before)
+      throw new Error(
+        `creating ${topic} gave ${topicId === before ? 'its old topic id' : `topic id ${topicId}`} (error code ${errorCode})`
+      )
     await this.publish(topic, topicId)
     for (const group of recipientGroups(this.config, this.matrix, role))
       for (let partition = 0; partition < partitions; partition++) {
@@ -604,6 +617,7 @@ class Supervisor {
    * Deletes a run topic and confirms its absence from metadata.
    * @param {string} topic @param {string|null} [execution]
    * @returns {Promise<void>}
+   * @throws {Error} when the broker refused the deletion or the name is still listed
    */
   async deleteTopic(topic, execution = null) {
     const topicId = this.topicIds.find(([t]) => t === topic)?.[1] ?? null
@@ -613,11 +627,54 @@ class Supervisor {
     } catch (e) {
       errorCode = Number.isInteger(e.code) ? e.code : -1
     }
-    for (let i = 0; i < 40 && (await this.admin.listTopics()).includes(topic); i++)
+    let listed = true
+    for (let i = 0; i < 40 && (listed = (await this.admin.listTopics()).includes(topic)); i++)
       await this.clock.sleepUntil(this.clock.now() + 250)
     await this.topicRecord('delete', topic, topicId, [], errorCode, execution)
     for (const key of [...this.scanned.keys()])
       if (key.startsWith(`${topicId}/`)) this.scanned.delete(key)
+    if (errorCode !== 0 || listed)
+      throw new Error(
+        `deleting ${topic} ${listed ? 'left it listed' : 'failed'} (error code ${errorCode})`
+      )
+  }
+
+  /**
+   * Waits until the broker's metadata shows a new incarnation with its id and a leader and two
+   * in-sync replicas on every partition, before anything is offered to it.
+   * @param {string} topic @param {string} topicId @param {number} partitions
+   * @param {number} deadline on the run clock
+   * @returns {Promise<void>}
+   * @throws {Error} when the metadata is not there by the deadline
+   */
+  async ready(topic, topicId, partitions, deadline) {
+    const suitable = async () => {
+      const { topics } = await this.admin
+        .fetchTopicMetadata({ topics: [topic] })
+        .catch(() => ({ topics: [] }))
+      const meta = topics[0]
+      return (
+        normalizeTopicId(meta?.topicId) === topicId &&
+        meta.partitions.length === partitions &&
+        meta.partitions.every((p) => p.leader >= 0 && p.isr.length >= 2)
+      )
+    }
+    while (!(await suitable())) {
+      if (this.clock.now() >= deadline)
+        throw new Error(`${topic} has no ready metadata for ${topicId} by the deadline`)
+      await this.clock.sleepUntil(Math.min(deadline, this.clock.now() + 250))
+    }
+  }
+
+  /** Tells every process that a deleted name has no current id any more. */
+  async unpublish(topic) {
+    this.topicIds = this.topicIds.filter(([t]) => t !== topic)
+    this.runtime.topicIds.delete(topic)
+    await Promise.all(
+      [...this.children.keys()].map((slot) =>
+        this.command(slot, { type: 'topic-ids', id: 'topic-ids', topicIds: [[topic, null]] })
+      )
+    )
   }
 
   /** Emits one admin topic result record. @returns {Promise<string>} its record id */
@@ -646,12 +703,17 @@ class Supervisor {
     )
   }
 
-  /** Creates the standing run topics. */
+  /** Creates the standing run topics; a failure aborts the run before it starts. */
   async createTopics() {
     const t = this.config.topics
-    await this.createTopic(t.main, 1, 'main')
-    await this.createTopic(t.transactions, 1, 'transactions')
-    for (const topic of t.recreate) await this.createTopic(topic, 2, 'recreate')
+    try {
+      await this.createTopic(t.main, 1, 'main')
+      await this.createTopic(t.transactions, 1, 'transactions')
+      for (const topic of t.recreate) await this.createTopic(topic, 2, 'recreate')
+    } catch (e) {
+      this.problem(`standing topics: ${e.message}`)
+      this.abort(`standing topics: ${e.message}`)
+    }
   }
 
   /**
@@ -733,19 +795,25 @@ class Supervisor {
     this.children.set(slot, child)
     this.exited ??= new Promise((resolve) => (this.allExited = resolve))
     this.watch(slot, child)
-    child.send({
-      type: 'init',
-      config: this.config,
-      matrix: this.matrix,
-      originMs: this.clock.originMs,
-      topicIds: this.topicIds,
-    })
+    if (!child.connected) return
+    child.send(
+      {
+        type: 'init',
+        config: this.config,
+        matrix: this.matrix,
+        originMs: this.clock.originMs,
+        topicIds: this.topicIds,
+      },
+      (e) => e && this.lose(slot, e.message)
+    )
   }
 
   /**
    * Follows one child: its messages, and its loss. A child that exits, closes its channel or fails
    * to spawn settles every command waiting on it; unless it was told to disconnect, that is a
-   * failure of the run.
+   * failure of the run. A process exit is journaled as it happened. Every attempted child reaches
+   * one terminal state at its `close`, which follows both an exit and a spawn that failed (with no
+   * exit, so none is journaled).
    * @param {string} slot @param {import('node:events').EventEmitter} child
    * @returns {void}
    */
@@ -756,17 +824,32 @@ class Supervisor {
     child.on('exit', (code, signal) => {
       this.observedEndAt = this.clock.now()
       this.lose(slot, `exited with ${signal ?? code}`)
-      this.emit({
-        kind: 'process',
-        event: 'exit',
-        process: slot,
-        code,
-        signal,
-        spawnRecord: `${slot}.0`,
-      }).finally(() => {
-        if (++this.exits === this.children.size) this.allExited?.()
-      })
+      this.exitRecords.set(
+        slot,
+        this.emit({
+          kind: 'process',
+          event: 'exit',
+          process: slot,
+          code,
+          signal,
+          spawnRecord: `${slot}.0`,
+        }).catch(() => {})
+      )
     })
+    child.on('close', () => this.settleChild(slot))
+  }
+
+  /**
+   * Records a child's terminal state once, after its exit record (if it exited) is appended; the
+   * last one releases `exited`.
+   * @param {string} slot @returns {Promise<void>}
+   */
+  async settleChild(slot) {
+    if (this.terminal.has(slot)) return
+    this.terminal.add(slot)
+    await this.exitRecords.get(slot)
+    this.exitRecords.delete(slot)
+    if (this.terminal.size === this.children.size) this.allExited?.()
   }
 
   /**
@@ -790,30 +873,43 @@ class Supervisor {
   }
 
   /**
-   * Waits for every child to exit by itself. A child still alive after the teardown allowance is
-   * killed and named in the receipt, so the run ends with its evidence but can never be green.
+   * Waits for every child to reach its terminal state by itself. A child still alive after the
+   * teardown allowance is killed and named in the receipt, so the run ends with its evidence but can
+   * never be green; one that has not ended `KILL_WAIT_MS` after its kill (a kill that failed) is
+   * named too, and the teardown goes on without it. The whole wait is bounded.
    * @returns {Promise<void>}
    */
   async untilExited() {
-    const timer = new AbortController()
     const allowance = this.teardownAllowanceMs()
+    if (await this.exitedWithin(allowance)) return
+    for (const [slot, child] of this.children) {
+      if (this.terminal.has(slot)) continue
+      this.forced.push(slot)
+      this.leaving.add(slot)
+      this.problem(`process ${slot} did not exit within ${allowance} ms of its disconnect; killed`)
+      try {
+        child.kill('SIGKILL')
+      } catch (e) {
+        this.problem(`process ${slot} could not be killed: ${e.message}`)
+      }
+    }
+    if (await this.exitedWithin(KILL_WAIT_MS)) return
+    for (const slot of this.children.keys())
+      if (!this.terminal.has(slot)) {
+        this.problem(`process ${slot} did not end ${KILL_WAIT_MS} ms after its kill`)
+        this.incomplete ??= `process ${slot} did not end`
+      }
+  }
+
+  /** @param {number} ms @returns {Promise<boolean>} whether every child ended within `ms` */
+  async exitedWithin(ms) {
+    const timer = new AbortController()
     const winner = await Promise.race([
-      this.exited.then(() => 'exited'),
-      this.clock.sleepUntil(this.clock.now() + allowance, timer.signal).then(() => 'late'),
+      (this.exited ?? Promise.resolve()).then(() => true),
+      this.clock.sleepUntil(this.clock.now() + ms, timer.signal).then(() => false),
     ])
     timer.abort()
-    if (winner === 'late') {
-      for (const [slot, child] of this.children) {
-        if (child.exitCode !== null || child.signalCode !== null) continue
-        this.forced.push(slot)
-        this.leaving.add(slot)
-        this.problem(
-          `process ${slot} did not exit within ${allowance} ms of its disconnect; killed`
-        )
-        child.kill('SIGKILL')
-      }
-      await this.exited
-    }
+    return winner
   }
 
   /** Routes a child message: records to the collector, outcomes, readbacks and subscriptions. */
@@ -958,6 +1054,22 @@ class Supervisor {
       .map((p) => p.slot)
   }
 
+  /**
+   * Refuses a quiet sample unless the run is quiet: every process confirmed the idle window, no
+   * work step is running (one reported late included) and the run was not aborted.
+   * @param {object} step the quiet step
+   * @returns {void}
+   * @throws {Error} naming what was not quiet
+   */
+  requireQuiet(step) {
+    const busy = [
+      ...(this.quiesced ? [] : ['the processes have not confirmed idle']),
+      ...[...this.scheduler.inflight].map((id) => `${id} is still running`),
+      ...(this.aborted ? [`the run is aborted`] : []),
+    ]
+    if (busy.length > 0) throw new Error(`${step.id} is not a quiet sample: ${busy.join(', ')}`)
+  }
+
   /** Performs one plan step across the processes it involves. */
   async perform(step) {
     const all = [...this.children.keys()]
@@ -965,7 +1077,11 @@ class Supervisor {
       .filter((p) => p.role === 'subject' || p.role === 'seed')
       .map((p) => p.slot)
     if (step.type === 'periodic') return this.sampleAll([...all, SUPERVISOR], step)
-    if (step.type === 'quiet') return this.sampleAll(judged, step)
+    if (step.type === 'quiet') {
+      this.requireQuiet(step)
+      await this.sampleAll(judged, step)
+      return this.requireQuiet(step)
+    }
     if (step.type === 'seed-start' || step.type === 'seed-clear') return this.send(['p13'], step)
     if (step.type === 'disconnect') return this.teardown(step)
     if (step.shape === 'traffic') {
@@ -976,10 +1092,14 @@ class Supervisor {
       await this.shape(step, 'start')
       try {
         await this.send(all, step)
+        this.quiesced = step.id
         await this.clock.sleepUntil(step.until, this.scheduler.controller.signal)
+        await this.scheduler.quietSettled()
+        this.quiesced = null
         if (step.until < this.runEndAt && !this.scheduler.aborted)
           await this.send(all, { ...step, type: 'active' })
       } finally {
+        this.quiesced = null
         await this.shape(step, 'end')
       }
       return
@@ -993,10 +1113,10 @@ class Supervisor {
         await this.churnTopic(step, participants)
       else {
         const drain = step.shape === 'drain'
-        await this.send(
-          drain ? [...new Set([...participants, ...this.consumers()])] : participants,
-          step
-        )
+        const slots = drain ? [...new Set([...participants, ...this.consumers()])] : participants
+        const replies = await this.send(slots, step)
+        const short = slots.filter((_, i) => replies[i].reply?.reached === false)
+        if (short.length > 0) throw new Error(`${step.id}: ${short.join(', ')} did not drain`)
         if (drain) {
           const t = this.config.topics
           for (const [topic, partitions] of [
@@ -1104,19 +1224,19 @@ class Supervisor {
   }
 
   /**
-   * Reads the two standing logs' ends until no transaction is open on them: the read-committed end
-   * equals the high watermark, which Apache's describe prints as the log end.
+   * Reads logs' ends until no transaction is open on them: the read-committed end equals the high
+   * watermark, which Apache's describe prints as the log end.
    * @param {number} deadline on the run clock; past it, the high watermarks are returned and the
    *   open transaction is a problem of the run
+   * @param {string[]} [topics] the logs, by default the two standing ones
    * @returns {Promise<Record<string, string>>} `topic|partition` to log end
    * @throws {Error} when the log ends cannot be read
    */
-  async settledEnds(deadline) {
-    const { main, transactions } = this.config.topics
+  async settledEnds(deadline, topics = [this.config.topics.main, this.config.topics.transactions]) {
     for (;;) {
       const ends = {}
       let open = false
-      for (const topic of [main, transactions]) {
+      for (const topic of topics) {
         const committed = await this.admin.fetchTopicOffsets(topic, {
           isolationLevel: 'read_committed',
         })
@@ -1142,7 +1262,8 @@ class Supervisor {
    * participant runs the wave's `leave` phase (pause, join an extra, observe the transfer, remove
    * the extra, see the paused partitions return), the participants are sampled closed through the
    * gate, every participant resumes, and the wave ends with its operation count and its outcome
-   * note. A failed phase still resumes and ends the wave; the step then fails with the first error.
+   * note. A wave starts no earlier than its planned time. A failed phase still resumes and ends the
+   * wave; no later wave starts, and the step fails with the error. An aborted run starts no wave.
    * @param {object} step the membership execution @param {string[]} participants its processes
    * @returns {Promise<void>}
    * @throws {Error} the first failed phase of any wave
@@ -1150,6 +1271,9 @@ class Supervisor {
   async churnMembers(step, participants) {
     let first = null
     for (const [index, wave] of (this.waves.get(step.id) ?? []).entries()) {
+      if (first || this.aborted) break
+      await this.clock.sleepUntil(wave.at, this.scheduler?.controller.signal)
+      if (this.aborted) break
       await this.shape(wave, 'start')
       const base = { ...step, wave: index, execution: wave.id, waveDeadline: wave.deadline }
       let failed = null
@@ -1181,20 +1305,24 @@ class Supervisor {
   }
 
   /**
-   * A regex execution creates a fresh topic and its routes, lets every applicable client accept
-   * it, offers probe ids, drains, scans and seals it, deletes it and lets the clients retire it. A
-   * recreation drains, scans and seals the old incarnation, deletes it, creates the same name
-   * again with new routes and probes the new one. No stage starts after the execution's deadline
-   * and no wait runs past it: the execution fails and later stages are not attempted, so its work
-   * never reaches into the idle window.
+   * A regex execution creates a fresh topic and its routes, waits for its metadata, lets every
+   * applicable client accept it, offers probe ids, drains the recipients to its ends, scans and
+   * seals it, deletes it, lets the clients retire it and forgets its id. A recreation probes,
+   * drains, scans and seals the old incarnation, deletes it, creates the same name again under a
+   * new id with new routes, waits for its metadata and for every recipient to be assigned it, then
+   * probes the new one. Every stage checks what it did: a creation must give a new id, a deletion
+   * must be confirmed, every probe offer acknowledged, every recipient drained, accepting,
+   * retiring and assigned as asked. No stage starts after the execution's deadline and no wait runs
+   * past it: the execution fails and later stages are not attempted.
    * @param {object} step the execution @param {string[]} participants its processes
    * @returns {Promise<void>}
-   * @throws {Error} when a stage cannot start before the deadline or a probe stopped at it
+   * @throws {Error} when a stage cannot start before the deadline or did not do its work
    */
   async churnTopic(step, participants) {
     const within = (stage) => {
       if (this.clock.now() >= step.deadline)
         throw new Error(`${step.id}: ${stage} is past the execution deadline`)
+      if (this.aborted) throw new Error(`${step.id}: ${stage} not started, the run is aborted`)
     }
     const stage = async (name, work) => {
       within(name)
@@ -1207,60 +1335,82 @@ class Supervisor {
     const producer = this.processOf('producer-idempotent')
     const probe = (topic) =>
       stage('probe', async () => {
-        const [reply] = await this.send([producer], {
+        const count = 10
+        const [{ reply }] = await this.send([producer], {
           type: 'probe',
           id: `${step.id}.probe`,
           execution: step.id,
           topic,
           partitions: 2,
-          count: 10,
+          count,
           deadline: step.deadline,
         })
-        if (reply.reply?.stopped) throw new Error(`${step.id}: probe stopped at the deadline`)
+        if (reply?.acknowledged !== count)
+          throw new Error(
+            `${step.id}: ${reply?.acknowledged ?? 0} of ${count} probe offers to ${topic} were acknowledged${reply?.stopped ? ', stopped at the deadline' : ''}`
+          )
       })
-    const drain = () =>
-      stage('drain', () =>
-        this.send(participants, { type: 'drain', id: `${step.id}.drain`, deadline: step.deadline })
-      )
+    const drain = (topic) =>
+      stage('drain', async () => {
+        const ends = await this.settledEnds(step.deadline, [topic])
+        const replies = await this.send(participants, {
+          type: 'drain',
+          id: `${step.id}.drain`,
+          ends,
+          deadline: step.deadline,
+        })
+        const short = participants.filter((_, i) => replies[i].reply?.reached === false)
+        if (short.length > 0)
+          throw new Error(`${step.id}: ${short.join(', ')} did not drain ${topic} to its end`)
+      })
+    /** Sends a stage to the participants; any of them answering `field: false` fails it. */
+    const each = (name, body, field) =>
+      stage(name, async () => {
+        const replies = await this.send(participants, body)
+        const short = participants.filter((_, i) => replies[i].reply?.[field] === false)
+        if (short.length > 0) throw new Error(`${step.id}: ${name} failed in ${short.join(', ')}`)
+      })
+    const create = (topic, role) =>
+      stage('create', async () => {
+        const topicId = await this.createTopic(topic, 2, role, step.id)
+        await this.ready(topic, topicId, 2, step.deadline)
+      })
     if (step.shape === 'regex-churn') {
       const topic = `${this.config.topics.regex}-${step.id}`
-      await stage('create', () => this.createTopic(topic, 2, 'regex', step.id))
-      await settle()
-      await stage('accept', () => this.send(participants, { ...step, topicName: topic }))
+      await create(topic, 'regex')
+      await each('accept', { ...step, topicName: topic }, 'accepted')
       await probe(topic)
-      await settle()
-      await drain()
+      await drain(topic)
       await stage('seal', () => this.seal(topic, step.id))
       await stage('delete', () => this.deleteTopic(topic, step.id))
-      await stage('retire', () =>
-        this.send(participants, { ...step, type: 'retired', topicName: topic })
-      )
+      await each('retire', { ...step, type: 'retired', topicName: topic }, 'retired')
+      await this.unpublish(topic)
       return
     }
     const topic = this.config.topics.recreate[step.topic]
     await probe(topic)
-    await settle()
-    await drain()
+    await drain(topic)
     await stage('seal', () => this.seal(topic, step.id))
     await stage('pause', () => this.send(participants, { ...step, topicName: topic }))
     await stage('delete', () => this.deleteTopic(topic, step.id))
     await settle()
-    await stage('create', () => this.createTopic(topic, 2, 'recreate', step.id))
-    await settle()
+    await create(topic, 'recreate')
+    await each('recreated', { ...step, type: 'recreated', topicName: topic }, 'assigned')
     await probe(topic)
-    await stage('recreated', () =>
-      this.send(participants, { ...step, type: 'recreated', topicName: topic })
-    )
   }
 
   /**
-   * Runs a docker command.
+   * Runs a docker command, killed if it runs longer than `dockerMs`.
    * @param {string[]} args @returns {Promise<string>} its trimmed stdout
+   * @throws {Error} when it failed or was killed
    */
   docker(args) {
     return new Promise((resolve, reject) =>
-      execFile('docker', args, { env: process.env }, (e, stdout) =>
-        e ? reject(e) : resolve(stdout.trim())
+      execFile(
+        'docker',
+        args,
+        { env: process.env, timeout: this.dockerMs, killSignal: 'SIGKILL' },
+        (e, stdout) => (e ? reject(e) : resolve(stdout.trim()))
       )
     )
   }

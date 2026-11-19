@@ -136,6 +136,12 @@ const MAX_OFFSET = 2n ** 63n - 1n
 const MAX_PROBLEMS = 1000
 /** Records the stream validator holds at once for a client whose construction has not arrived. */
 const MAX_HELD = 100000
+/**
+ * Entries the stream validator keeps of any one kind of live state (constructed clients, open and
+ * closed executions, open inventory cuts, open counting records and their open items); a normal day
+ * keeps far fewer, and a stream that needs more fails.
+ */
+const MAX_OPEN = 100000
 /** Each item record kind and the counting record kind it cites by `cause`. */
 const ITEM_KINDS = Object.freeze({ 'wave-key': 'wave', 'partition-state': 'broker-state' })
 
@@ -1824,6 +1830,10 @@ const validateProvenance = (json, kind) => {
  * process are therefore judged independently of stream position: a process's exit is compared with
  * the event times of its records, and a record naming a client whose construction (by another
  * process) has not arrived yet is held, bounded, and judged when it arrives.
+ *
+ * Every kind of live state is capped at `maxOpen` entries; a stream that needs more fails once per
+ * kind and the excess is not tracked (its later references then fail too), and the problems found
+ * at the end of the stream count against the same problem cap as the others.
  */
 class StreamValidator {
   /**
@@ -1832,8 +1842,9 @@ class StreamValidator {
    * @param {object} options.config a valid config
    * @param {object} options.header a valid header
    * @param {number} [options.maxHeld] records held at once for clients not yet constructed
+   * @param {number} [options.maxOpen] entries kept of any one kind of live state
    */
-  constructor({ matrix, config, header, maxHeld = MAX_HELD }) {
+  constructor({ matrix, config, header, maxHeld = MAX_HELD, maxOpen = MAX_OPEN }) {
     this.matrix = matrix
     this.header = header
     this.slots = new Map(config.clients.map((c) => [c.slot, c]))
@@ -1846,6 +1857,9 @@ class StreamValidator {
     this.held = new Map()
     this.heldCount = 0
     this.maxHeld = maxHeld
+    this.maxOpen = maxOpen
+    this.full = new Set()
+    this.openItems = 0
     this.summaries = new Map()
     this.executions = new Map()
     this.closedExecutions = new Set()
@@ -1859,6 +1873,18 @@ class StreamValidator {
     this.omitted = 0
     if (config.runId !== header.runId || config.mode !== header.mode)
       this.problems.push('config and header disagree on run id or mode')
+  }
+
+  /**
+   * @param {number} size how many entries of one kind of state are kept
+   * @param {string} what the kind, as the problem names it
+   * @returns {boolean} whether one more fits; the first refusal of a kind fails the stream
+   */
+  room(size, what) {
+    if (size < this.maxOpen) return true
+    if (!this.full.has(what)) this.fail(`more than ${this.maxOpen} ${what}`)
+    this.full.add(what)
+    return false
   }
 
   /** @param {string} problem @param {number} [line] the line it is about, the current by default */
@@ -1982,8 +2008,21 @@ class StreamValidator {
     if (r.kind === 'inventory') return this.inventory(r)
     if (own(ITEM_KINDS, r.kind)) return this.item(r)
     const left = r.kind === 'wave' ? r.paused : r.kind === 'broker-state' ? r.partitions : 0
-    if (left > 0)
-      this.summaries.set(r.recordId, { kind: r.kind, source: r.source, left, line: this.lines })
+    if (left > 0 && this.room(this.summaries.size, 'open wave or broker-state records')) {
+      if (this.room(this.openItems + left - 1, 'open wave-key or partition-state items')) {
+        this.openItems += left
+        this.summaries.set(r.recordId, {
+          kind: r.kind,
+          source: r.source,
+          execution: r.execution,
+          left,
+          keys: new Set(),
+          held: r.kind === 'wave' ? r.held : null,
+          line: this.lines,
+        })
+      }
+    }
+    if (r.kind === 'wave') this.client(r.member, r)
     if (r.kind === 'identity' && variant === 'log') this.client(r.reader, r)
     if (r.kind === 'operation' && r.execution !== null) {
       const open = this.executions.get(r.execution)
@@ -1994,13 +2033,27 @@ class StreamValidator {
     if (slot) this.slotChecks({ ...r, variant }, slot)
   }
 
-  /** @param {object} r a `wave-key` or `partition-state` record, one of its cause's counted items */
+  /**
+   * One of a counting record's items: it must cite an open one of its source and execution and
+   * name a key no other item of it named. When the last item arrives, a wave's `held` count must
+   * equal its items held.
+   * @param {object} r a `wave-key` or `partition-state` record
+   */
   item(r) {
     const kind = ITEM_KINDS[r.kind]
     const open = this.summaries.get(r.cause)
     if (!open || open.kind !== kind || open.source !== r.source)
       return this.fail(`cites no open ${kind} of its source`)
-    if (--open.left === 0) this.summaries.delete(r.cause)
+    if (open.execution !== r.execution) return this.fail(`is of another execution than its ${kind}`)
+    const key = JSON.stringify([r.key.topicId, r.key.partition])
+    if (open.keys.has(key)) return this.fail(`repeats a key of its ${kind}`)
+    open.keys.add(key)
+    if (r.kind === 'wave-key' && r.held) open.held--
+    this.openItems--
+    if (--open.left > 0) return
+    this.summaries.delete(r.cause)
+    if (open.held !== null && open.held !== 0)
+      this.fail(`${kind} held count differs from its ${r.kind} records`)
   }
 
   /** @param {object} r */
@@ -2032,6 +2085,7 @@ class StreamValidator {
     if (!new RegExp(`^${r.slot}\\.(0|[1-9][0-9]*)$`).test(r.client))
       this.fail('client id is not <slot>.<incarnation>')
     if (this.clients.has(r.client)) this.fail('client id is reused')
+    else if (!this.room(this.clients.size, 'constructed clients')) return
     if (!this.liveAt(r.process, r.at)) this.fail('client is constructed outside a live process')
     for (const field of [
       'clientKind',
@@ -2061,6 +2115,7 @@ class StreamValidator {
     if (phase === 'start') {
       if (this.executions.has(r.execution) || this.closedExecutions.has(r.execution))
         return this.fail('execution id is reused')
+      if (!this.room(this.executions.size, 'open executions')) return
       return this.executions.set(r.execution, { shape: r.shape, operations: 0 })
     }
     const open = this.executions.get(r.execution)
@@ -2068,7 +2123,8 @@ class StreamValidator {
     if (open.operations !== r.operationCount)
       this.fail('operationCount differs from the ended operations')
     this.executions.delete(r.execution)
-    this.closedExecutions.add(r.execution)
+    if (this.room(this.closedExecutions.size, 'closed executions'))
+      this.closedExecutions.add(r.execution)
   }
 
   /** @param {object} r */
@@ -2085,6 +2141,7 @@ class StreamValidator {
       this.fail('section does not apply to this owner')
     let cut = this.cuts.get(r.inventory)
     if (!cut) {
+      if (!this.room(this.cuts.size, 'open inventory cuts')) return
       cut = { process: r.process, at: r.at, groups: new Map() }
       this.cuts.set(r.inventory, cut)
     }
@@ -2159,18 +2216,13 @@ class StreamValidator {
       const item = Object.keys(ITEM_KINDS).find((k) => ITEM_KINDS[k] === open.kind)
       this.fail(`${nameOf(recordId)} misses ${open.left} of its ${item} records`, open.line)
     }
+    for (const [execution] of this.executions)
+      this.fail(`execution ${nameOf(execution)} never ends`)
+    for (const [inventory, cut] of this.cuts)
+      if ([...cut.groups.values()].some((group) => group.seen.size !== group.chunks))
+        this.fail(`inventory ${nameOf(inventory)} misses a chunk`)
     const problems = [...this.problems]
     if (this.omitted > 0) problems.push(`${this.omitted} more problems omitted`)
-    for (const [execution] of this.executions)
-      problems.push(`execution ${nameOf(execution)} never ends`)
-    for (const [inventory, cut] of this.cuts) {
-      for (const group of cut.groups.values()) {
-        if (group.seen.size !== group.chunks) {
-          problems.push(`inventory ${nameOf(inventory)} misses a chunk`)
-          break
-        }
-      }
-    }
     const stream = this.header.stream
     if (stream.records !== this.lines)
       problems.push('the stream record count differs from the header')
