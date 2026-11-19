@@ -262,7 +262,12 @@ class Rig {
     this.joinsAtStart = 0
 
     const emitter = new InstrumentationEventEmitter()
-    for (const name of [events.REBALANCING, events.GROUP_JOIN, events.POLL_INTERVAL_EXCEEDED]) {
+    for (const name of [
+      events.REBALANCING,
+      events.GROUP_JOIN,
+      events.POLL_INTERVAL_EXCEEDED,
+      events.PARTITIONS_LOST,
+    ]) {
       emitter.addListener(name, ({ type, payload }) => this.emitted.push({ type, payload }))
     }
 
@@ -700,20 +705,24 @@ describe.each(['consumer', 'classic'])(
         await play(rig, ['B'], 'unknownMember')
       }
 
-      it('leaves the membership the round installed in place and raises no verdict', async () => {
-        await playJoinThenLeave()
+      // Under the consumer protocol no round can join first: the answer that would start it belongs
+      // to the membership the guard's leave replaced, so it has no effect.
+      if (protocol === 'classic') {
+        it('leaves the membership the round installed in place and raises no verdict', async () => {
+          await playJoinThenLeave()
 
-        expect(rig.group.generationId).toBe(2)
-        expect(rig.coordinator.verdict).toBeNull()
-      })
+          expect(rig.group.generationId).toBe(2)
+          expect(rig.coordinator.verdict).toBeNull()
+        })
 
-      it('does not clear the assigner state of the membership the round installed', async () => {
-        await playJoinDuringLeave()
-        const cleared = jest.spyOn(rig.group.groupMembership, 'clearAssignerState')
-        await play(rig, ['B'], 'unknownMember')
+        it('does not clear the assigner state of the membership the round installed', async () => {
+          await playJoinDuringLeave()
+          const cleared = jest.spyOn(rig.group.groupMembership, 'clearAssignerState')
+          await play(rig, ['B'], 'unknownMember')
 
-        expect(cleared).not.toHaveBeenCalled()
-      })
+          expect(cleared).not.toHaveBeenCalled()
+        })
+      }
 
       it('keeps the member in the group, heartbeating', async () => {
         await playJoinThenLeave()
@@ -724,6 +733,40 @@ describe.each(['consumer', 'classic'])(
         await expectHeartbeating()
       })
     })
+
+    if (protocol === 'consumer') {
+      describe("a fencing answer to a heartbeat sent before the guard's leave", () => {
+        it('has no effect: the leave replaced that membership, so the guard raises the lost verdict and no round runs', async () => {
+          rig = new Rig({ protocol })
+          await rig.start()
+          await rig.endLoop()
+          const joins = () => rig.wire.requests.filter(({ kind }) => kind === 'join').length
+          const joinsAtStart = joins()
+          await play(rig, ['T', 'A'], 'unknownMember')
+
+          expect(joins()).toBe(joinsAtStart)
+          expect(rig.coordinator.isRebalancing()).toBe(false)
+
+          await play(rig, ['B'], 'unknownMember')
+
+          expect(rig.group.generationId).toBe(0)
+          expect(rig.coordinator.verdict).toMatchObject({
+            kind: 'lost',
+            reason: 'poll-interval-exceeded',
+          })
+
+          await rig.heal()
+
+          expect(await rig.outcome()).toEqual({
+            ...ONE_REJOIN,
+            rebalancings: ['poll-interval-exceeded'],
+          })
+          expect(rig.count(events.PARTITIONS_LOST)).toBe(1)
+          expect(joins()).toBe(joinsAtStart + 1)
+          await expectHeartbeating()
+        })
+      })
+    }
 
     describe('the round joins before the leave of the guard is answered, as the same member', () => {
       /**
@@ -770,21 +813,39 @@ describe.each(['consumer', 'classic'])(
       })
     })
 
-    describe('the leave of the guard is answered before the round has joined', () => {
-      it('resets the dead generation and makes the batches fetched under it stale', async () => {
-        rig = new Rig({ protocol })
-        await rig.start()
-        await rig.endLoop()
-        await play(rig, ['T', 'A'], 'unknownMember')
+    describe(
+      protocol === 'consumer'
+        ? 'the leave of the guard is answered while no round runs'
+        : 'the leave of the guard is answered before the round has joined',
+      () => {
+        it('resets the dead generation and makes the batches fetched under it stale', async () => {
+          rig = new Rig({ protocol })
+          await rig.start()
+          await rig.endLoop()
+          await play(rig, ['T', 'A'], 'unknownMember')
 
-        const epochBefore = rig.group.assignmentEpoch
-        await play(rig, ['B'], 'unknownMember')
+          const epochBefore = rig.group.assignmentEpoch
+          await play(rig, ['B'], 'unknownMember')
 
-        expect(rig.coordinator.isRebalancing()).toBe(true)
-        expect(rig.group.generationId > 0).toBe(false)
-        expect(rig.group.assignmentEpoch).toBe(epochBefore + 1)
-      })
-    })
+          if (protocol === 'consumer') {
+            expect(rig.coordinator.isRebalancing()).toBe(false)
+            expect(rig.coordinator.verdict).toMatchObject({
+              kind: 'lost',
+              reason: 'poll-interval-exceeded',
+            })
+          } else {
+            expect(rig.coordinator.isRebalancing()).toBe(true)
+          }
+          expect(rig.group.generationId > 0).toBe(false)
+          expect(rig.group.assignmentEpoch).toBe(epochBefore + 1)
+
+          await rig.heal()
+
+          expect(await rig.outcome()).toEqual(ONE_REJOIN)
+          expect(rig.count(events.PARTITIONS_LOST)).toBe(1)
+        })
+      }
+    )
   }
 )
 
@@ -821,5 +882,64 @@ describe('Consumer > classic protocol > a stale lost verdict meets a revoked one
       reason: revoked.reason,
       error: revoked.error,
     })
+  })
+})
+
+describe('Consumer > classic protocol > heartbeat outage clock', () => {
+  const NOT_COORDINATOR = 16
+  let rig
+
+  beforeEach(() => jest.useFakeTimers({ now: 0 }))
+
+  afterEach(async () => {
+    await rig.teardown()
+    jest.useRealTimers()
+  })
+
+  /**
+   * A started classic member whose runner's heartbeat outage began at 123.
+   * @returns {Promise<object>} the runner's heartbeat outage
+   */
+  const startWithOutage = async () => {
+    rig = new Rig({ protocol: 'classic' })
+    await rig.start()
+    const outage = rig.runner.outages.heartbeat
+    expect(outage.absorbs({ code: NOT_COORDINATOR }, 123)).toBe(true)
+    expect(outage.since).toBe(123)
+    return outage
+  }
+
+  it('a handler heartbeat the interval gate holds back sends nothing, resolves undefined and ends the outage', async () => {
+    const outage = await startWithOutage()
+    rig.group.groupMembership.lastRequest = Date.now()
+    const beatsBefore = rig.beats()
+
+    await expect(rig.runner.heartbeat()).resolves.toBeUndefined()
+
+    expect(rig.beats()).toBe(beatsBefore)
+    expect(outage.since).toBeNull()
+  })
+
+  it('a handler heartbeat that is sent and answered resolves undefined and ends the outage', async () => {
+    const outage = await startWithOutage()
+    rig.group.groupMembership.lastRequest = -Infinity
+    const beatsBefore = rig.beats()
+
+    await expect(rig.runner.heartbeat()).resolves.toBeUndefined()
+
+    expect(rig.beats()).toBe(beatsBefore + 1)
+    expect(outage.since).toBeNull()
+  })
+
+  it('a timer heartbeat that is sent and answered leaves the runner outage alone', async () => {
+    const outage = await startWithOutage()
+    rig.group.groupMembership.lastRequest = -Infinity
+    const beatsBefore = rig.beats()
+
+    rig.heartbeatManager.requestTick()
+    await rig.settle(0)
+
+    expect(rig.beats()).toBe(beatsBefore + 1)
+    expect(outage.since).toBe(123)
   })
 })

@@ -10,6 +10,7 @@ const {
   KafkaJSCommitFailedError,
   KafkaJSNonRetriableError,
   KafkaJSRebalanceListenerError,
+  KafkaJSRebalanceNotConvergedError,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const handlerContext = require('./handlerContext')
@@ -159,6 +160,8 @@ module.exports = class Runner extends EventEmitter {
         }),
       isRebalancing: () => this.rebalanceCoordinator.isRebalancing(),
       guard: () => this.retirement ?? null,
+      onAccepted: () => this.heartbeatAccepted(),
+      detachOnStop: consumerGroup.kind === 'consumer',
     })
     this.rebalanceCoordinator = new RebalanceCoordinator({
       runner: this,
@@ -345,14 +348,20 @@ module.exports = class Runner extends EventEmitter {
       }
 
       /**
-       * Runs one rebalance for the loop. A failed awaited callback ends the loop through `bail`, so
-       * the retrier hands the typed error on unchanged instead of wrapping it.
+       * Runs one rebalance for the loop. A failed awaited callback, and a classic chain refused at
+       * its round limit, end the loop through `bail`, so the retrier hands the typed error to the
+       * crash policy unchanged instead of retrying it or wrapping it.
        */
       const rebalance = async (verdict) => {
         try {
           await this.handleRebalanceError(verdict)
         } catch (error) {
-          if (error instanceof KafkaJSRebalanceListenerError) return bail(error)
+          if (
+            error instanceof KafkaJSRebalanceListenerError ||
+            error instanceof KafkaJSRebalanceNotConvergedError
+          ) {
+            return bail(error)
+          }
           throw error
         }
       }
@@ -913,9 +922,15 @@ module.exports = class Runner extends EventEmitter {
    * It classifies and routes, and does no offset work: that belongs to `handleRebalanceError`,
    * which is reached once per rebalance. Under cooperative rebalancing a revocation RESOLVES
    * instead of throwing, so the error never reaches the worker, the fetcher or the fetch manager's
-   * own teardown - which is the whole point of not stopping the world. It also ends the heartbeat
-   * outage on a success, marks the error's request class as `heartbeat`, and resolves a cooperative
-   * classic member's `NOT_COORDINATOR` while that outage is absorbed.
+   * own teardown - which is the whole point of not stopping the world. It marks the error's request
+   * class as `heartbeat` and resolves a cooperative classic member's `NOT_COORDINATOR` while the
+   * heartbeat outage is absorbed.
+   *
+   * The runner owns the heartbeat outage clock. A classic or manual call ends it whenever the group
+   * heartbeat resolves, including a call the interval gate holds back; the classic timer's calls
+   * go straight to the group and leave it alone. Under the consumer protocol the handler and the
+   * timer share one exchange, which ends it through {@link Runner#heartbeatAccepted} once, on a
+   * success the live run accepted.
    * @returns {Promise<void>}
    */
   async heartbeat() {
@@ -927,8 +942,9 @@ module.exports = class Runner extends EventEmitter {
       await this.consumerGroup.heartbeat({
         interval: this.consumerGroup.heartbeatInterval(),
         guard: () => this.retirement ?? null,
+        onAccepted: () => this.heartbeatAccepted(),
       })
-      this.outages.heartbeat.end()
+      if (this.consumerGroup.kind !== 'consumer') this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
@@ -948,6 +964,17 @@ module.exports = class Runner extends EventEmitter {
 
       throw this.markOwnRequest(e, 'heartbeat')
     }
+  }
+
+  /**
+   * Ends the heartbeat outage for a consumer-protocol success the live run accepted. The one clock
+   * effect of that protocol: its shared exchange calls this once, before either waiting caller
+   * resumes, whether the handler or the timer started it. Classic ignores it.
+   * @private
+   * @returns {void}
+   */
+  heartbeatAccepted() {
+    this.outages.heartbeat.end()
   }
 
   /**
@@ -1075,6 +1102,7 @@ module.exports = class Runner extends EventEmitter {
 
   async processEachMessage(batch) {
     const { topic, partition } = batch
+    const authority = this.resolutionAuthority(batch)
 
     const pause = () => {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
@@ -1117,7 +1145,8 @@ module.exports = class Runner extends EventEmitter {
       this.resolveBatchOffset(
         batch,
         message.offset,
-        message.batchContext ? message.batchContext.partitionLeaderEpoch : -1
+        message.batchContext ? message.batchContext.partitionLeaderEpoch : -1,
+        authority
       )
 
       // The offset stays resolved - an EAGER quiesce still commits it through
@@ -1138,6 +1167,7 @@ module.exports = class Runner extends EventEmitter {
 
   async processEachBatch(batch) {
     const { topic, partition } = batch
+    const authority = this.resolutionAuthority(batch)
     const lastFilteredMessage = batch.messages[batch.messages.length - 1]
 
     const pause = () => {
@@ -1167,7 +1197,12 @@ module.exports = class Runner extends EventEmitter {
               ? batch.lastOffset()
               : offset
 
-          this.resolveBatchOffset(batch, offsetToResolve, batch.leaderEpochAt(offsetToResolve))
+          this.resolveBatchOffset(
+            batch,
+            offsetToResolve,
+            batch.leaderEpochAt(offsetToResolve),
+            authority
+          )
         },
         heartbeat: () => this.heartbeat(),
         /**
@@ -1232,7 +1267,7 @@ module.exports = class Runner extends EventEmitter {
     // stop their consumers without resolving unprocessed offsets (issues/18)
     if (this.eachBatchAutoResolve) {
       const lastOffset = batch.lastOffset()
-      this.resolveBatchOffset(batch, lastOffset, batch.leaderEpochAt(lastOffset))
+      this.resolveBatchOffset(batch, lastOffset, batch.leaderEpochAt(lastOffset), authority)
     }
   }
 
@@ -1419,21 +1454,60 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * The authority a handler's offset resolution carries, captured when the handler is created: the
+   * offset manager installed then and the batch partition's acquisition cell. The run is this
+   * runner. A saved `resolveOffset` may run long after, outside the handler's async context, so
+   * the resolution never reconstructs its authority from the current group.
+   * @param {import('./batch')} batch
+   * @returns {{ manager: object|null, acquisition: object|undefined, key: string }}
+   */
+  resolutionAuthority(batch) {
+    const key = batch.ownershipKey || `${batch.topic}|${batch.partition}`
+    return {
+      manager: this.consumerGroup.offsetManager,
+      acquisition: this.consumerGroup.acquired?.get(key),
+      key,
+    }
+  }
+
+  /**
    * Resolves the offset of a record a handler finished, unless the batch's topic was recreated
    * since the batch was fetched, in which case the offset is dropped.
+   *
+   * Under the consumer protocol the write needs the authority the handler was created with: this
+   * run not forcibly retired (a natural stop's drain still resolves), that same offset manager still
+   * installed, a current ownership no loss refuses, and the partition still owned under that same
+   * acquisition. It then writes to that manager. An ordinary apply that renews the ownership keeps
+   * all of these; a loss, a rebuilt manager or a revoke and reacquire does not. Classic and manual
+   * resolution write to the current manager, as before.
    * @param {import('./batch')} batch the batch the record came from
    * @param {string} offset the handled record's offset
    * @param {number} leaderEpoch the epoch of the record at `offset`, -1 when none
+   * @param {ReturnType<Runner['resolutionAuthority']>} [authority] the handler's authority;
+   *   captured now when omitted
    * @returns {void}
    */
-  resolveBatchOffset(batch, offset, leaderEpoch) {
+  resolveBatchOffset(batch, offset, leaderEpoch, authority = this.resolutionAuthority(batch)) {
     if (this.isRecreated(batch)) return
-    this.consumerGroup.resolveOffset({
-      topic: batch.topic,
-      partition: batch.partition,
-      offset,
-      leaderEpoch,
-    })
+    const { topic, partition } = batch
+    const group = this.consumerGroup
+    if (group.kind !== 'consumer') {
+      group.resolveOffset({ topic, partition, offset, leaderEpoch })
+      return
+    }
+
+    const { manager, acquisition, key } = authority
+    if (
+      this.retirement ||
+      !manager ||
+      group.offsetManager !== manager ||
+      group.ownership?.refusal(group.ownership.token()) ||
+      group.acquired.get(key) !== acquisition ||
+      !group.isAssigned(topic, partition)
+    ) {
+      return
+    }
+    manager.resolveOffset({ topic, partition, offset, leaderEpoch })
   }
 
   /**

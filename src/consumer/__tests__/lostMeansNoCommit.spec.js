@@ -232,7 +232,7 @@ const GroupOwnership = require('../groupOwnership')
 const handlerContext = require('../handlerContext')
 const Runner = require('../runner')
 const ConsumerGroupProtocol = require('../groupProtocol/consumer')
-const { KafkaJSProtocolError, isLostMember } = require('../../errors')
+const { KafkaJSProtocolError, KafkaJSConnectionError, isLostMember } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   stampOwnership,
@@ -252,7 +252,7 @@ const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
 const { Schedule } = require('../../../testHelpers/schedule')
 const {
-  events: { COMMIT_OFFSETS },
+  events: { COMMIT_OFFSETS, HEARTBEAT },
 } = require('../instrumentationEvents')
 
 /** @param {number} code @returns {Error} a real decoded broker error with literal input code */
@@ -1156,6 +1156,22 @@ describe.each([false, true])('public classic commits with static membership %s',
 })
 
 describe('request identities held across heartbeat answers', () => {
+  /**
+   * Replaces the membership a held heartbeat was sent under the way a broker does: the member is
+   * fenced, then rejoins and is acknowledging epoch 9 with a new target, its ownership renewed by
+   * the apply.
+   * @param {ConsumerGroupProtocol} protocol
+   * @returns {void}
+   */
+  const replaceMembership = (protocol) => {
+    protocol.transitionToFenced(brokerError(UNKNOWN_MEMBER_ID))
+    protocol.transitionTo('JOINING')
+    protocol.ownership.renew()
+    protocol.state = 'ACKNOWLEDGING'
+    protocol.memberEpoch = 9
+    protocol.target = { localEpoch: 9, byTopicId: new Map() }
+  }
+
   it.each([25, 110, 82, 30, 42, 111])(
     'an obsolete consumer heartbeat code %i changes no replacement state',
     async (code) => {
@@ -1176,21 +1192,18 @@ describe('request identities held across heartbeat answers', () => {
       protocol.coordinator = {
         consumerGroupHeartbeat: () => schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({})),
       }
-      const token = ownership.token()
       const request = protocol.sendHeartbeat({}).then(
-        () => null,
-        (error) => error
+        (value) => ({ value }),
+        (error) => ({ error })
       )
       await gate.arrived()
-      ownership.renew()
-      const target = { localEpoch: 9, byTopicId: new Map() }
-      protocol.target = target
-      protocol.memberEpoch = 9
+      replaceMembership(protocol)
+      const target = protocol.target
       const reset = jest.spyOn(protocol.sentFields, 'reset')
       const error = brokerError(code)
       gate.fail(error)
-      expect(await request).toBe(error)
-      expect(sentOwnership(error)).toBe(token)
+      expect(await request).toEqual({ value: false })
+      expect(sentOwnership(error)).toBeUndefined()
       expect(reset).not.toHaveBeenCalled()
       expect(protocol.state).toBe('ACKNOWLEDGING')
       expect(protocol.target).toBe(target)
@@ -1220,17 +1233,409 @@ describe('request identities held across heartbeat answers', () => {
     }
     const request = protocol.sendHeartbeat({})
     await gate.arrived()
-    ownership.renew()
-    const target = { localEpoch: 9, byTopicId: new Map() }
-    protocol.target = target
-    protocol.memberEpoch = 9
+    replaceMembership(protocol)
+    const target = protocol.target
     const remember = jest.spyOn(protocol.sentFields, 'remember')
     gate.release({ memberEpoch: 8, heartbeatIntervalMs: 1, assignment: null })
-    await request
+    expect(await request).toBe(false)
     expect(remember).not.toHaveBeenCalled()
     expect(protocol.state).toBe('ACKNOWLEDGING')
     expect(protocol.memberEpoch).toBe(9)
     expect(protocol.target).toBe(target)
+  })
+})
+
+describe('a consumer heartbeat answered after its membership was replaced', () => {
+  let fixture
+
+  afterEach(async () => {
+    await fixture?.close()
+    fixture = null
+  })
+
+  /**
+   * A real runner whose group heartbeats through a real consumer protocol, with a heartbeat
+   * outage already started by a lost connection.
+   * @returns {{ runner: object, protocol: object, schedule: Schedule, events: string[] }}
+   */
+  const setup = () => {
+    fixture = ownershipFixture({ kind: 'consumer' })
+    const { group, runner } = fixture
+    const emitter = new InstrumentationEventEmitter()
+    const events = []
+    emitter.addListener(HEARTBEAT, () => events.push(HEARTBEAT))
+    const protocol = new ConsumerGroupProtocol({
+      cluster: {},
+      groupId: 'group',
+      topics: ['topic'],
+      ownership: group.ownership,
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: emitter,
+      logger: newLogger(),
+    })
+    protocol.state = 'STABLE'
+    protocol.memberEpoch = 8
+    const schedule = new Schedule()
+    protocol.coordinator = {
+      consumerGroupHeartbeat: () => schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({})),
+    }
+    group.heartbeat = (options) => protocol.heartbeat(options)
+    expect(runner.outages.heartbeat.absorbs(new KafkaJSConnectionError('lost'), 1)).toBe(true)
+    return { runner, protocol, schedule, events }
+  }
+
+  it.each([
+    ['a success with a new epoch and target', null],
+    ['UNKNOWN_MEMBER_ID', 25],
+    ['FENCED_MEMBER_EPOCH', 110],
+    ['a lost connection', 'connection'],
+  ])(
+    'is not a successful heartbeat: %s ends no outage, emits no HEARTBEAT, resets no backoff and installs nothing',
+    async (_name, answer) => {
+      const { runner, protocol, schedule, events } = setup()
+      const gate = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+      const call = runner.heartbeat()
+      await gate.arrived()
+      protocol.transitionToFenced(brokerError(25))
+      const reset = jest.spyOn(protocol.backoff, 'reset')
+      const before = {
+        state: protocol.state,
+        memberEpoch: protocol.memberEpoch,
+        target: protocol.target,
+        interval: protocol.heartbeatIntervalMs,
+      }
+      if (answer === null) {
+        gate.release({
+          memberEpoch: 9,
+          heartbeatIntervalMs: 1,
+          assignment: { topicPartitions: [{ topicId: 'id', partitions: [0] }] },
+        })
+      } else {
+        gate.fail(
+          answer === 'connection' ? new KafkaJSConnectionError('lost') : brokerError(answer)
+        )
+      }
+      await expect(call).resolves.toBeUndefined()
+      expect(runner.outages.heartbeat.since).toBe(1)
+      expect(events).toEqual([])
+      expect(reset).not.toHaveBeenCalled()
+      expect({
+        state: protocol.state,
+        memberEpoch: protocol.memberEpoch,
+        target: protocol.target,
+        interval: protocol.heartbeatIntervalMs,
+      }).toEqual(before)
+    }
+  )
+
+  it('a heartbeat the backoff holds back ends no outage either', async () => {
+    const { runner, protocol, schedule } = setup()
+    protocol.backoff.onFailedAttempt(Date.now())
+    const sent = jest.spyOn(schedule, 'run')
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(sent).not.toHaveBeenCalled()
+    expect(runner.outages.heartbeat.since).toBe(1)
+  })
+
+  it('a current success ends the outage and emits one HEARTBEAT', async () => {
+    const { runner, events } = setup()
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(runner.outages.heartbeat.since).toBeNull()
+    expect(events).toEqual([HEARTBEAT])
+  })
+})
+
+describe('a consumer heartbeat and the runner that sent it', () => {
+  let fixture
+
+  afterEach(async () => {
+    await fixture?.close()
+    fixture = null
+  })
+
+  /**
+   * A real runner whose group heartbeats through a real consumer protocol, with a heartbeat
+   * outage already started by a lost connection and the next heartbeat held on the wire.
+   * @returns {{ runner: object, protocol: object, emitter: object, gate: object, end: object }}
+   */
+  const setup = () => {
+    fixture = ownershipFixture({ kind: 'consumer' })
+    const { group, runner } = fixture
+    const emitter = new InstrumentationEventEmitter()
+    const protocol = new ConsumerGroupProtocol({
+      cluster: { topicName: () => 'topic', topicId: () => 'id' },
+      groupId: 'group',
+      topics: ['topic'],
+      ownership: group.ownership,
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: emitter,
+      logger: newLogger(),
+    })
+    protocol.state = 'STABLE'
+    protocol.memberEpoch = 8
+    const schedule = new Schedule()
+    const gate = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+    protocol.coordinator = {
+      consumerGroupHeartbeat: () => schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({})),
+    }
+    group.heartbeat = (options) => protocol.heartbeat(options)
+    expect(runner.outages.heartbeat.absorbs(new KafkaJSConnectionError('lost'), 1)).toBe(true)
+    const end = jest.spyOn(runner.outages.heartbeat, 'end')
+    return { runner, protocol, emitter, gate, end }
+  }
+
+  it('a success answered after the runner retired has no effect and ends no outage', async () => {
+    const { runner, protocol, emitter, gate, end } = setup()
+    const heartbeats = []
+    emitter.addListener(HEARTBEAT, () => heartbeats.push(HEARTBEAT))
+    const call = runner.heartbeat()
+    await gate.arrived()
+    runner.retirement = new Error('retired')
+    gate.release({
+      memberEpoch: 9,
+      heartbeatIntervalMs: 1,
+      assignment: { topicPartitions: [{ topicId: 'id', partitions: [0] }] },
+    })
+
+    await expect(call).resolves.toBeUndefined()
+    expect(heartbeats).toEqual([])
+    expect(end).not.toHaveBeenCalled()
+    expect(runner.outages.heartbeat.since).toBe(1)
+    expect(protocol.memberEpoch).toBe(8)
+    expect(protocol.target).toBeNull()
+  })
+
+  it('a HEARTBEAT listener that throws on a current success loses nothing: the success applies and ends the outage once', async () => {
+    const { runner, protocol, emitter, gate, end } = setup()
+    emitter.addListener(HEARTBEAT, () => {
+      throw Object.assign(new Error('listener'), { code: 42 })
+    })
+    const call = runner.heartbeat()
+    await gate.arrived()
+    gate.release({
+      memberEpoch: 9,
+      heartbeatIntervalMs: 1,
+      assignment: { topicPartitions: [{ topicId: 'id', partitions: [0, 1] }] },
+    })
+
+    await expect(call).resolves.toBeUndefined()
+    expect(end).toHaveBeenCalledTimes(1)
+    expect(runner.outages.heartbeat.since).toBeNull()
+    expect(['FENCED', 'FATAL']).not.toContain(protocol.state)
+    expect(protocol.memberEpoch).toBe(9)
+    expect(protocol.target).not.toBeNull()
+    expect(runner.rebalanceCoordinator.verdict).toBeNull()
+  })
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+  ])(
+    'a HEARTBEAT listener that throws %s on a current success loses nothing: the success applies and ends the outage once',
+    async (_, thrown) => {
+      const { runner, protocol, emitter, gate, end } = setup()
+      emitter.addListener(HEARTBEAT, () => {
+        throw thrown
+      })
+      const call = runner.heartbeat()
+      await gate.arrived()
+      gate.release({ memberEpoch: 9, heartbeatIntervalMs: 1, assignment: null })
+
+      await expect(call).resolves.toBeUndefined()
+      expect(protocol.memberEpoch).toBe(9)
+      expect(end).toHaveBeenCalledTimes(1)
+      expect(runner.rebalanceCoordinator.verdict).toBeNull()
+    }
+  )
+
+  it('a heartbeat held before its write sends nothing once its membership is reset on the live run', async () => {
+    const { runner, protocol, end } = setup()
+    const written = []
+    let releaseWrite
+    protocol.coordinator.consumerGroupHeartbeat = async (request) => {
+      await new Promise((resolve) => (releaseWrite = resolve))
+      const refusal = request.guard?.()
+      if (refusal) throw refusal
+      written.push(request.memberEpoch)
+      return {}
+    }
+    const call = runner.heartbeat()
+    expect(releaseWrite).toEqual(expect.any(Function))
+    protocol.resetGeneration()
+    expect(runner.retirement).toBeNull()
+    releaseWrite()
+
+    await expect(call).resolves.toBeUndefined()
+    expect(written).toEqual([])
+    expect(end).not.toHaveBeenCalled()
+    expect(protocol.backoff.pending(Date.now())).toBe(false)
+  })
+
+  it('a heartbeat whose coordinator lookup outlives its membership publishes no coordinator and sends nothing', async () => {
+    const { runner, protocol, end } = setup()
+    const coordinator = { consumerGroupHeartbeat: jest.fn(async () => ({})) }
+    protocol.coordinator = null
+    let releaseLookup
+    protocol.coordinatorLookup.find = () => new Promise((resolve) => (releaseLookup = resolve))
+    const call = runner.heartbeat()
+    expect(releaseLookup).toEqual(expect.any(Function))
+    protocol.resetGeneration()
+    releaseLookup(coordinator)
+
+    await expect(call).resolves.toBeUndefined()
+    expect(protocol.coordinator).toBeNull()
+    expect(coordinator.consumerGroupHeartbeat).not.toHaveBeenCalled()
+    expect(end).not.toHaveBeenCalled()
+  })
+})
+
+describe('a consumer heartbeat flight that outlives its membership', () => {
+  const HeartbeatManager = require('../heartbeatManager')
+  let manager
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => {
+    manager?.shutdown()
+    manager = null
+    jest.useRealTimers()
+  })
+
+  /**
+   * A joining consumer protocol whose real heartbeat timer has its epoch 0 join on the wire and
+   * held, then is stopped while the membership is reset and a replacement join is owed, as a poll
+   * expiry does.
+   * @returns {Promise<{ protocol: object, schedule: Schedule, gate: object }>}
+   */
+  const replaceWhileJoinIsHeld = async () => {
+    const protocol = new ConsumerGroupProtocol({
+      cluster: {},
+      groupId: 'group',
+      topics: ['topic'],
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+    })
+    protocol.state = 'JOINING'
+    protocol.memberEpoch = 0
+    protocol.immediatePending = true
+    const schedule = new Schedule()
+    const gate = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+    protocol.coordinator = {
+      consumerGroupHeartbeat: () =>
+        schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({
+          memberEpoch: 0,
+          heartbeatIntervalMs: 60000,
+          assignment: null,
+        })),
+    }
+    manager = new HeartbeatManager({
+      groupMembership: protocol,
+      pollTimer: { expired: () => false },
+      heartbeatInterval: 60000,
+      logger: newLogger(),
+      onError: jest.fn(),
+      onPollExpired: jest.fn(),
+      detachOnStop: true,
+    })
+    protocol.attach({ rebalanceCoordinator: null, heartbeatManager: manager })
+
+    protocol.requestTick()
+    await jest.advanceTimersByTimeAsync(0)
+    await gate.arrived()
+    manager.stop()
+    protocol.clearTarget()
+    protocol.immediatePending = true
+    return { protocol, schedule, gate }
+  }
+
+  it('the replacement tick after the stopped timer sends its join while the old flight is held, and the old flight arms nothing when it settles', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.requestTick()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(schedule.calls).toHaveLength(2)
+
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(0)
+
+    expect(protocol.memberEpoch).toBe(0)
+    expect(manager.isRunning()).toBe(true)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(schedule.calls).toHaveLength(2)
+  })
+
+  it('a replacement round joins before its deadline while the stopped timer still holds the old join reply', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.coordinator.consumerGroupHeartbeat = () =>
+      schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({
+        memberEpoch: 5,
+        heartbeatIntervalMs: 60000,
+        assignment: null,
+      }))
+    const round = protocol.rebalance({}).then(
+      (result) => ({ result }),
+      (error) => ({ error })
+    )
+    try {
+      await jest.advanceTimersByTimeAsync(0)
+      expect(schedule.calls).toHaveLength(2)
+      const outcome = await round
+      expect(outcome.error).toBeUndefined()
+      expect(protocol.memberEpoch).toBe(5)
+    } finally {
+      gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+      await jest.advanceTimersByTimeAsync(0)
+    }
+    expect(protocol.memberEpoch).toBe(5)
+    expect(schedule.calls).toHaveLength(2)
+  })
+
+  it('a shut down timer sends nothing more once the replacement flight has detached the held one', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.requestTick()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(schedule.calls).toHaveLength(2)
+    manager.shutdown()
+    protocol.requestTick()
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(60000)
+
+    expect(schedule.calls).toHaveLength(2)
+    expect(manager.isRunning()).toBe(false)
+  })
+
+  it('a replacement tick asked for before the stop arms nothing once the old flight settles', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    manager.requestTick()
+    manager.stop()
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(schedule.calls).toHaveLength(1)
+    expect(manager.isRunning()).toBe(false)
+    expect(protocol.memberEpoch).toBe(0)
+  })
+
+  it('a shut down timer sends nothing for the replacement round once the old flight settles', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.requestTick()
+    manager.shutdown()
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(schedule.calls).toHaveLength(1)
+    expect(manager.isRunning()).toBe(false)
+  })
+
+  it('a heartbeat for the replacement membership sends its own request while the old one is held', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+
+    const replacement = protocol.heartbeat({ interval: 0 })
+    await jest.advanceTimersByTimeAsync(0)
+
+    expect(schedule.calls).toHaveLength(2)
+    await expect(replacement).resolves.toBe(true)
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(protocol.memberEpoch).toBe(0)
   })
 })
 
@@ -2038,7 +2443,9 @@ describe.each([
       if (code === null) gate.release()
       else gate.answer({ errorCode: code })
       const outcome = await within(old, 5000, 'the obsolete heartbeat completion')
-      if (code !== null) {
+      // The consumer protocol drops an answer to a replaced membership: nothing reaches a caller.
+      if (kind === 'consumer') expect(outcome).toEqual({ value: false })
+      else if (code !== null) {
         expect(outcome.error).toBeInstanceOf(KafkaJSProtocolError)
         expect(outcome.error.code).toBe(code)
         expect(sentOwnership(outcome.error)).toBe(token)
