@@ -884,3 +884,62 @@ describe('Consumer > classic protocol > a stale lost verdict meets a revoked one
     })
   })
 })
+
+describe('Consumer > classic protocol > heartbeat outage clock', () => {
+  const NOT_COORDINATOR = 16
+  let rig
+
+  beforeEach(() => jest.useFakeTimers({ now: 0 }))
+
+  afterEach(async () => {
+    await rig.teardown()
+    jest.useRealTimers()
+  })
+
+  /**
+   * A started classic member whose runner's heartbeat outage began at 123.
+   * @returns {Promise<object>} the runner's heartbeat outage
+   */
+  const startWithOutage = async () => {
+    rig = new Rig({ protocol: 'classic' })
+    await rig.start()
+    const outage = rig.runner.outages.heartbeat
+    expect(outage.absorbs({ code: NOT_COORDINATOR }, 123)).toBe(true)
+    expect(outage.since).toBe(123)
+    return outage
+  }
+
+  it('a handler heartbeat the interval gate holds back sends nothing, resolves undefined and ends the outage', async () => {
+    const outage = await startWithOutage()
+    rig.group.groupMembership.lastRequest = Date.now()
+    const beatsBefore = rig.beats()
+
+    await expect(rig.runner.heartbeat()).resolves.toBeUndefined()
+
+    expect(rig.beats()).toBe(beatsBefore)
+    expect(outage.since).toBeNull()
+  })
+
+  it('a handler heartbeat that is sent and answered resolves undefined and ends the outage', async () => {
+    const outage = await startWithOutage()
+    rig.group.groupMembership.lastRequest = -Infinity
+    const beatsBefore = rig.beats()
+
+    await expect(rig.runner.heartbeat()).resolves.toBeUndefined()
+
+    expect(rig.beats()).toBe(beatsBefore + 1)
+    expect(outage.since).toBeNull()
+  })
+
+  it('a timer heartbeat that is sent and answered leaves the runner outage alone', async () => {
+    const outage = await startWithOutage()
+    rig.group.groupMembership.lastRequest = -Infinity
+    const beatsBefore = rig.beats()
+
+    rig.heartbeatManager.requestTick()
+    await rig.settle(0)
+
+    expect(rig.beats()).toBe(beatsBefore + 1)
+    expect(outage.since).toBe(123)
+  })
+})
