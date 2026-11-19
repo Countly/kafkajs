@@ -233,6 +233,7 @@ async function start({
   hook,
   eachMessage,
   fault = groupAuthorization,
+  initial,
   onZero,
 } = {}) {
   const coordinators = []
@@ -254,6 +255,7 @@ async function start({
   state.answer = (req) => {
     if (req.memberEpoch === 0 && first) {
       first = false
+      if (initial) throw initial()
       return target(1, { 'topic-a': [0] })
     }
     if (req.memberEpoch > 0 && armed) {
@@ -294,6 +296,18 @@ async function start({
     },
     faultAt: () => faultAt,
   }
+}
+
+/** A logger recording every line's message, so a test can look for a diagnostic. */
+const recordingLogger = () => {
+  const lines = []
+  const logger = createLogger({
+    logCreator:
+      () =>
+      ({ log }) =>
+        lines.push(log.message),
+  })
+  return { logger, lines }
 }
 
 const beats = (run, positive) =>
@@ -350,5 +364,83 @@ describe('Consumer > crash supervision', () => {
       expect(failing.delivered).toEqual(['40', '41'])
       expect(failing).toEqual(working)
     }, 120000)
+  })
+  describe('a restartOnFailure policy failing with an unusual value', () => {
+    const unreadable = () => {
+      throw Object.defineProperty({}, 'message', {
+        get() {
+          throw new Error('unreadable')
+        },
+      })
+    }
+    const policies = [
+      [
+        'throws null synchronously',
+        () => {
+          throw null // eslint-disable-line no-throw-literal
+        },
+      ],
+      ['rejects with null', () => Promise.reject(null)], // eslint-disable-line prefer-promise-reject-errors
+      ['throws an object with an unreadable message', unreadable],
+    ]
+
+    it.each(policies)(
+      'an ordinary handler crash whose policy %s: one CRASH with the original error, restart true, one delayed restart',
+      async (_, failing) => {
+        const policy = jest.fn(failing)
+        const { logger, lines } = recordingLogger()
+        const failure = Object.assign(new Error('handler failed'), { retriable: false })
+        let thrown = false
+        const run = await start({
+          logger,
+          retry: { initialRetryTime: 300, restartOnFailure: policy },
+          eachMessage: async () => {
+            if (thrown) return
+            thrown = true
+            throw failure
+          },
+        })
+        await advanceUntil(() => run.crashes.length > 0, 10000)
+        const connects = run.cluster.connect.mock.calls.length
+        const joins = beats(run, false)
+        await jest.advanceTimersByTimeAsync(5000)
+
+        expect(policy).toHaveBeenCalledTimes(1)
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].restart).toBe(true)
+        let cause = run.crashes[0].error
+        while (cause !== failure && cause?.cause) cause = cause.cause
+        expect(cause).toBe(failure)
+        expect(run.cluster.connect.mock.calls.length).toBe(connects + 1)
+        expect(beats(run, false)).toBe(joins + 1)
+        expect(lines).not.toContain('Crash handler failed')
+      },
+      30000
+    )
+
+    it.each(policies)(
+      'a fatal heartbeat at startup whose policy %s: one CRASH with restart false and no restart',
+      async (_, failing) => {
+        const policy = jest.fn(failing)
+        const { logger, lines } = recordingLogger()
+        const run = await start({
+          logger,
+          retry: { initialRetryTime: 300, restartOnFailure: policy },
+          initial: groupAuthorization,
+        })
+        await advanceUntil(() => run.crashes.length > 0, 10000)
+        const connects = run.cluster.connect.mock.calls.length
+        await jest.advanceTimersByTimeAsync(5000)
+
+        expect(policy).toHaveBeenCalledTimes(1)
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0]).toMatchObject({ restart: false })
+        expect(run.crashes[0].error.code).toBe(GROUP_AUTHORIZATION_FAILED)
+        expect(run.cluster.connect.mock.calls.length).toBe(connects)
+        expect(beats(run, false)).toBe(1)
+        expect(lines).not.toContain('Crash handler failed')
+      },
+      30000
+    )
   })
 })
