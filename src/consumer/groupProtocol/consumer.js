@@ -1158,6 +1158,7 @@ module.exports = class ConsumerGroupProtocol {
     if (leaveEpoch === -1 || leaveEpoch === -2) this.sentFields.reset()
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
+    const assignmentAtRequest = this.localAssignment
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
@@ -1214,7 +1215,7 @@ module.exports = class ConsumerGroupProtocol {
       return true
     } finally {
       if (leaveEpoch != null || current()) {
-        this.onRequestGenerated({ leaveEpoch, stateAtRequest })
+        this.onRequestGenerated({ leaveEpoch, stateAtRequest, assignmentAtRequest })
       }
     }
   }
@@ -1243,12 +1244,15 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * The state moves that belong to a request having been GENERATED rather than answered.
+   * The state moves that belong to a request having been GENERATED rather than answered. Only a
+   * request that carried the local assignment still owed ends ACKNOWLEDGING: one built before a
+   * later apply leaves that apply's acknowledgement to the next heartbeat, which goes out at once.
    * @private
-   * @param {{ leaveEpoch: number|null, stateAtRequest: string }} options
+   * @param {{ leaveEpoch: number|null, stateAtRequest: string, assignmentAtRequest?: object }}
+   *   options `assignmentAtRequest` is the local assignment the request was built from
    * @returns {void}
    */
-  onRequestGenerated({ leaveEpoch, stateAtRequest }) {
+  onRequestGenerated({ leaveEpoch, stateAtRequest, assignmentAtRequest }) {
     if (leaveEpoch != null) {
       this.sentFields.reset()
       if (stateAtRequest === LEAVING && this.state === LEAVING) {
@@ -1259,7 +1263,11 @@ module.exports = class ConsumerGroupProtocol {
 
     // Both halves matter: the request must have been the acknowledgement, and nothing since
     // (a fencing, a fatal answer) may have moved the member out of ACKNOWLEDGING.
-    if (stateAtRequest !== ACKNOWLEDGING || this.state !== ACKNOWLEDGING) {
+    if (
+      stateAtRequest !== ACKNOWLEDGING ||
+      this.state !== ACKNOWLEDGING ||
+      assignmentAtRequest !== this.localAssignment
+    ) {
       return
     }
 
