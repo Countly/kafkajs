@@ -1725,6 +1725,100 @@ describe('final soak driver', () => {
     }
   })
 
+  test("share state after a restart holds only the client's current run: a retired run's sessions and its fetch loops' records stay out while still reachable, and the section names the run", () => {
+    const context = new AsyncLocalStorage()
+    const dashed = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    class Loop {
+      constructor(membership) {
+        this.membership = membership
+        this.cohorts = new Map()
+      }
+
+      adopt(exchange, topicId, partition, lockDuration) {
+        const offset = partition.acquiredRecords[0].firstOffset
+        const walk = {
+          deliver: { records: [{ offset }], deliveryCounts: [1] },
+          gaps: [],
+          release: [],
+          reject: [],
+        }
+        const token = {}
+        const ledger = new ShareAckLedger({
+          topic: 'main',
+          topicId,
+          partition: 0,
+          token,
+          sentAt: 1,
+          lockDuration,
+          walk,
+        })
+        this.cohorts.set(`${topicId}|0`, [
+          { topic: 'main', topicId, partition: 0, token, ledger, walk },
+        ])
+      }
+    }
+    class Run {
+      syncNodes() {}
+    }
+    const observer = new PassiveObserver({
+      owners: { ShareFetchLoop: Loop, ShareRun: Run, ShareAckLedger },
+      watched: {
+        ShareFetchLoop: ['adopt'],
+        ShareRun: ['syncNodes'],
+        ShareAckLedger: ['prepare', 'settle', 'invalidate'],
+      },
+      context,
+      onEvent: () => {},
+    })
+    observer.install()
+    try {
+      const runner = { current: null }
+      const run = (retired, node, epoch) =>
+        Object.assign(new Run(), {
+          runner,
+          retired,
+          membership: {},
+          nodes: new Map([[node, { session: { epoch } }]]),
+        })
+      const dropped = run(true, 1, 9)
+      const restarted = run(false, 2, 3)
+      runner.current = restarted
+      const loops = [new Loop(dropped.membership), new Loop(restarted.membership)]
+      context.run('c07.1', () => {
+        dropped.syncNodes()
+        restarted.syncNodes()
+        loops.forEach((loop, n) =>
+          loop.adopt(
+            { sentAt: 1 },
+            dashed,
+            {
+              partitionIndex: 0,
+              acquiredRecords: [{ firstOffset: `${10 * (n + 1)}`, lastOffset: `${10 * (n + 1)}` }],
+            },
+            15000
+          )
+        )
+      })
+      const { entry, mismatches } = observer.shareSections('c07.1')
+      expect(entry.sessions).toEqual([{ node: 2, session: 3 }])
+      expect(entry.records.map((r) => r.offset)).toEqual(['20'])
+      expect(entry.cohorts).toHaveLength(1)
+      expect(entry.run).toBe(`c07.1.${observer.idOf(restarted, 'r')}`)
+      expect(mismatches).toEqual([])
+      expect(sectionProblems('share-state', [entry], 'c07.1')).toEqual([])
+      runner.current = null
+      restarted.retired = true
+      expect(observer.shareSections('c07.1').entry).toMatchObject({
+        run: null,
+        sessions: [],
+        records: [],
+        cohorts: [],
+      })
+    } finally {
+      observer.restore()
+    }
+  })
+
   test('the raw reader scans from the last scan to the LSO and keeps aborted and control records out', async () => {
     const record = (offset, producerId, inTransaction, extra = {}) => ({
       offset: String(offset),
