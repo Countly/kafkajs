@@ -224,9 +224,9 @@ describe('Cluster > a consumer target answered UNKNOWN_TOPIC_OR_PARTITION', () =
 
   test.each([
     ['17 after 3', ['doomed', 'other'], 17, 'INVALID_TOPIC_EXCEPTION'],
-    ['3 after 17', ['other', 'doomed'], 17, 'INVALID_TOPIC_EXCEPTION'],
+    ['3 after 17 (unchanged behaviour)', ['other', 'doomed'], 17, 'INVALID_TOPIC_EXCEPTION'],
     ['29 after 3', ['doomed', 'other'], 29, 'TOPIC_AUTHORIZATION_FAILED'],
-    ['3 after 29', ['other', 'doomed'], 29, 'TOPIC_AUTHORIZATION_FAILED'],
+    ['3 after 29 (unchanged behaviour)', ['other', 'doomed'], 29, 'TOPIC_AUTHORIZATION_FAILED'],
   ])(
     'an added topic answered %s fails the add with the fatal code, not code 3',
     async (_, added, code, type) => {

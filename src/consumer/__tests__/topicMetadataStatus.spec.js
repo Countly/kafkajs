@@ -455,7 +455,7 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     expect(wire.observed.warnings).toEqual([])
   }, 30000)
 
-  test('classic: a client-side pattern never names a topic in Metadata and never sets the creation bit', async () => {
+  test('classic: a client-side pattern still never names a topic in Metadata and never sets the creation bit', async () => {
     const wire = scenario('classic', {
       groupId: 'lifecycle-client-regex-bit',
       allowAutoTopicCreation: true,
@@ -1152,9 +1152,12 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
           ({ api, fields }) => api === 'Metadata' && (fields.topics || []).some(({ name }) => name)
         )
 
-    test.each([false, true])(
+    test.each([
+      ['false, unchanged behaviour', false],
+      ['true', true],
+    ])(
       'a broker-side regex sends no creation bit on any lookup by name: the registration of an assigned name, the retry of a name unknown at its first add and the periodic refresh (creation %s)',
-      async (allowAutoTopicCreation) => {
+      async (_, allowAutoTopicCreation) => {
         const wire = assignedScenario({ allowAutoTopicCreation })
         wire.world.namedCodes.set(DOOMED, 3)
         await wire.consumer.connect()

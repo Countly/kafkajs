@@ -489,7 +489,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.protocol.state).toEqual(STABLE)
     })
 
-    it('a withdrawal answering a heartbeat built before an apply is applied: the next round releases it and acknowledges what is left', async () => {
+    it('a withdrawal answering a heartbeat built before an apply is applied still lets the next round release it and acknowledge what is left', async () => {
       const { h, inFlight, release } = await ackInFlight(
         heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })
       )

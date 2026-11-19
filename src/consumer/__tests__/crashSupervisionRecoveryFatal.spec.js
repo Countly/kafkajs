@@ -18,7 +18,7 @@ afterEach(async () => {
 
 describe('Consumer > crash supervision > a fatal answer to the loss recovery of an independent handler failure', () => {
   it.each([
-    ['GROUP_AUTHORIZATION_FAILED (30)', GROUP_AUTHORIZATION_FAILED],
+    ['GROUP_AUTHORIZATION_FAILED (30), unchanged behaviour', GROUP_AUTHORIZATION_FAILED],
     ['GROUP_ID_NOT_FOUND (69)', 69],
   ])(
     '%s answering the recovery join: CRASH reports that answer with restart false, not the handler failure',
