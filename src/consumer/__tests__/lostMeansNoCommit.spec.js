@@ -232,7 +232,7 @@ const GroupOwnership = require('../groupOwnership')
 const handlerContext = require('../handlerContext')
 const Runner = require('../runner')
 const ConsumerGroupProtocol = require('../groupProtocol/consumer')
-const { KafkaJSProtocolError, isLostMember } = require('../../errors')
+const { KafkaJSProtocolError, KafkaJSConnectionError, isLostMember } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   stampOwnership,
@@ -252,7 +252,7 @@ const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
 const { Schedule } = require('../../../testHelpers/schedule')
 const {
-  events: { COMMIT_OFFSETS },
+  events: { COMMIT_OFFSETS, HEARTBEAT },
 } = require('../instrumentationEvents')
 
 /** @param {number} code @returns {Error} a real decoded broker error with literal input code */
@@ -1231,6 +1231,106 @@ describe('request identities held across heartbeat answers', () => {
     expect(protocol.state).toBe('ACKNOWLEDGING')
     expect(protocol.memberEpoch).toBe(9)
     expect(protocol.target).toBe(target)
+  })
+})
+
+describe('a consumer heartbeat answered after its membership was replaced', () => {
+  let fixture
+
+  afterEach(async () => {
+    await fixture?.close()
+    fixture = null
+  })
+
+  /**
+   * A real runner whose group heartbeats through a real consumer protocol, with a heartbeat
+   * outage already started by a lost connection.
+   * @returns {{ runner: object, protocol: object, schedule: Schedule, events: string[] }}
+   */
+  const setup = () => {
+    fixture = ownershipFixture({ kind: 'consumer' })
+    const { group, runner } = fixture
+    const emitter = new InstrumentationEventEmitter()
+    const events = []
+    emitter.addListener(HEARTBEAT, () => events.push(HEARTBEAT))
+    const protocol = new ConsumerGroupProtocol({
+      cluster: {},
+      groupId: 'group',
+      topics: ['topic'],
+      ownership: group.ownership,
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: emitter,
+      logger: newLogger(),
+    })
+    protocol.state = 'STABLE'
+    protocol.memberEpoch = 8
+    const schedule = new Schedule()
+    protocol.coordinator = {
+      consumerGroupHeartbeat: () => schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({})),
+    }
+    group.heartbeat = (options) => protocol.heartbeat(options)
+    expect(runner.outages.heartbeat.absorbs(new KafkaJSConnectionError('lost'), 1)).toBe(true)
+    return { runner, protocol, schedule, events }
+  }
+
+  it.each([
+    ['a success with a new epoch and target', null],
+    ['UNKNOWN_MEMBER_ID', 25],
+    ['FENCED_MEMBER_EPOCH', 110],
+    ['a lost connection', 'connection'],
+  ])(
+    'is not a successful heartbeat: %s ends no outage, emits no HEARTBEAT, resets no backoff and installs nothing',
+    async (_name, answer) => {
+      const { runner, protocol, schedule, events } = setup()
+      const gate = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+      const call = runner.heartbeat()
+      await gate.arrived()
+      protocol.transitionToFenced(brokerError(25))
+      const reset = jest.spyOn(protocol.backoff, 'reset')
+      const before = {
+        state: protocol.state,
+        memberEpoch: protocol.memberEpoch,
+        target: protocol.target,
+        interval: protocol.heartbeatIntervalMs,
+      }
+      if (answer === null) {
+        gate.release({
+          memberEpoch: 9,
+          heartbeatIntervalMs: 1,
+          assignment: { topicPartitions: [{ topicId: 'id', partitions: [0] }] },
+        })
+      } else {
+        gate.fail(
+          answer === 'connection' ? new KafkaJSConnectionError('lost') : brokerError(answer)
+        )
+      }
+      await expect(call).resolves.toBeUndefined()
+      expect(runner.outages.heartbeat.since).toBe(1)
+      expect(events).toEqual([])
+      expect(reset).not.toHaveBeenCalled()
+      expect({
+        state: protocol.state,
+        memberEpoch: protocol.memberEpoch,
+        target: protocol.target,
+        interval: protocol.heartbeatIntervalMs,
+      }).toEqual(before)
+    }
+  )
+
+  it('a heartbeat the backoff holds back ends no outage either', async () => {
+    const { runner, protocol, schedule } = setup()
+    protocol.backoff.onFailedAttempt(Date.now())
+    const sent = jest.spyOn(schedule, 'run')
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(sent).not.toHaveBeenCalled()
+    expect(runner.outages.heartbeat.since).toBe(1)
+  })
+
+  it('a current success ends the outage and emits one HEARTBEAT', async () => {
+    const { runner, events } = setup()
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(runner.outages.heartbeat.since).toBeNull()
+    expect(events).toEqual([HEARTBEAT])
   })
 })
 
