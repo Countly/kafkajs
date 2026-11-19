@@ -432,6 +432,20 @@ describe('scripts/evidence/finalSoakCore', () => {
         expect(row(report, 'K1').reasons).toHaveLength(1)
       })
 
+      it('is inconclusive when the journal places more invisible records after the last dumped record than offsets follow it', async () => {
+        const world = fx.healthy()
+        const [first, rest] = [tx(world).slice(0, 1), tx(world).slice(1, 7)]
+        world.layout.transactions = [...first, { marker: 'commit' }, ...rest]
+        const report = await check(render(world))
+        expectRow(
+          report,
+          'K1',
+          'INCONCLUSIVE',
+          /3 offsets follow the last dumped record but the journal places 4 invisible records there/
+        )
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+      })
+
       it('is inconclusive when a nontransactional record of the transactions topic was acknowledged after the last dumped record', async () => {
         const world = fx.healthy()
         world.layout.transactions = tx(world).slice(0, 5)

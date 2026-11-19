@@ -24,8 +24,9 @@
  * entry per offered id; one entry per open ownership interval, per transaction, per id an open
  * interval shares with an overlapping one, per record held for its offer and per acknowledged
  * aborted member's offset, each capped at the same capacity; open membership waves and printed
- * outages capped by the matrix schedule; a fixed sample grid per process. Any cap that is reached is a reported problem that leaves K1 to K6
- * INCONCLUSIVE. Side files are read whole only below a size cap.
+ * outages capped by the matrix schedule; a fixed sample grid per process. Any cap that is reached
+ * is a reported problem that leaves K1 to K6 INCONCLUSIVE. Side files are read whole only below a
+ * size cap.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -728,7 +729,8 @@ function readEnd(ctx, name, problems) {
 /**
  * Streams a topic dump and compares every record with what the journal says was offered and, when
  * a group entered it, with the offset the entries name.
- * @param {object} ctx `{ dir, manifest, journal, config, matrix, dumped, claims }` (`claims` from `abortedClaims`)
+ * @param {object} ctx `{ dir, manifest, journal, config, matrix, dumped, claims }`, `claims` from
+ *   `abortedClaims`
  * @param {string} role `main` or `transactions`
  * @returns {Promise<object>} problems (the file cannot be trusted), counts, findings, and the
  *   dumped offsets an acknowledged aborted member claims (`claimedDumped`, capped)
@@ -910,10 +912,10 @@ function unexplainedTail(journal, dump, end, claims) {
  * aborted member at its offset (no two on one offset, none on a dumped offset or at or beyond the
  * end), or a control marker. The main partition holds only visible records, so its dump must hold
  * exactly the end's count. On the transactions partition there is at least one marker per decided
- * transaction with an acknowledged member. The console consumer
- * reads in offset order and can only be cut off, so the dump is complete up to its last record,
- * which must not precede an acknowledged visible record; the offsets after it must be explained
- * one to one (`unexplainedTail`).
+ * transaction with an acknowledged member. The console consumer reads in offset order and can only
+ * be cut off, so the dump is complete up to its last record, which must not precede an
+ * acknowledged visible record; the offsets after it must be explained one to one
+ * (`unexplainedTail`).
  * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end
  * @param {number} n 0 for main, 1 for transactions @param {number} lastVisible the highest
  *   acknowledged offset of a visible transactions record
@@ -1205,8 +1207,8 @@ function judgeHeap(row, { journal, matrix, config, plan, header }) {
 /**
  * Why the process that supervised the run is not attributable, from facts the header cannot assert
  * alone: the supervisor is the config's one collector process (the driver runs its schedule there
- * and emits every `shape` record from it), the header must name it, and the outer observer must have
- * witnessed its exit and no other.
+ * and emits every `shape` record from it), the header must name it, and the outer observer must
+ * have witnessed its exit and no other.
  * @param {Journal} journal @param {object} header
  * @returns {string[]} the disagreements, empty when the supervisor is attributable
  */
@@ -1339,8 +1341,8 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
  * down time, container stop or start instant; two per scheduled outage, with a count of any more), membership wave transfers and returns with the
  * paused and held keys their `wave-key` records name, waves missing some of their `wave-key`
  * records (the stream validator fails those too), probe sends that settled after their step,
- * drain commits skipped as expected, and share acknowledgement outcomes with a reason (only when the
- * stream has `share-outcome` records).
+ * drain commits skipped as expected, and share acknowledgement outcomes with a reason (only when
+ * the stream has `share-outcome` records).
  * @param {Journal} journal @returns {object}
  */
 function informationOf(journal) {
