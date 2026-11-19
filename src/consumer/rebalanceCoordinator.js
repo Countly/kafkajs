@@ -342,6 +342,14 @@ module.exports = class RebalanceCoordinator {
 
         const roundStartedAt = Date.now()
         const result = await this.consumerGroup.joinAndSync(round)
+        // A step whose target was replaced applies and publishes nothing, so it renews no
+        // membership a refusal already on the wire answers for. A LOST round still applies: its
+        // rejoin replaced the membership.
+        if (result.abandoned && kind !== 'lost') {
+          if (!this.runner.stopRequested) this.heartbeatManager.ensureStarted()
+          ;({ kind, reason } = await this.followUp(false))
+          continue
+        }
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
@@ -417,25 +425,31 @@ module.exports = class RebalanceCoordinator {
         const listenerFailure = hooks && group.takeListenerFailure(round)
         if (listenerFailure) throw listenerFailure
 
-        // `kind` here is the ROUND kind, only 'lost' | 'revoked'. The MEMBERSHIP kind is a separate
-        // variable: testing the round kind against 'classic' would be permanently false and would
-        // delete the shipped classic cooperative follow-up below. Defaulted, because a group object
-        // without the accessor is a classic one.
-        const protocol = this.consumerGroup.kind || 'classic'
-
-        let next = this.nextRound(revoked.length > 0 && cooperative && protocol === 'classic')
-
-        if (next.reason && protocol === 'consumer' && !this.runner.stopRequested) {
-          await this.yieldBetweenRounds()
-          next = this.nextRoundAfterWait(next)
-        }
-        kind = next.kind
-        reason = next.reason
+        ;({ kind, reason } = await this.followUp(revoked.length > 0 && cooperative))
       } finally {
         if (hooks) this.finishListenerRound(round, additionHold)
         round.retire()
       }
     } while (reason)
+  }
+
+  /**
+   * Picks the round after this one; a consumer-protocol chain waits before it and picks again.
+   * @private
+   * @param {boolean} revokedCooperatively whether a cooperative apply just revoked something; only
+   *   a classic chain follows that up at once
+   * @returns {Promise<{ kind: 'lost'|'revoked', reason: string|null }>} `reason` null ends the chain
+   */
+  async followUp(revokedCooperatively) {
+    // The MEMBERSHIP kind, not the round kind. Defaulted, because a group object without the
+    // accessor is a classic one.
+    const protocol = this.consumerGroup.kind || 'classic'
+    let next = this.nextRound(revokedCooperatively && protocol === 'classic')
+    if (next.reason && protocol === 'consumer' && !this.runner.stopRequested) {
+      await this.yieldBetweenRounds()
+      next = this.nextRoundAfterWait(next)
+    }
+    return next
   }
 
   /**

@@ -549,9 +549,9 @@ module.exports = class ConsumerGroupProtocol {
    *
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
    *   growSubscription?: (names: string[]) => Promise<void> }} context
-   * @returns {Promise<{ assignment: Object, userData: null }>} the assignment in the name-keyed
-   *   shape the apply expects; what the member owns when its target was replaced by a newer one
-   *   while the step resolved it
+   * @returns {Promise<{ assignment: Object, userData: null, abandoned?: true }>} the assignment in
+   *   the name-keyed shape the apply expects; `abandoned` with what the member owns when its target
+   *   was replaced by a newer one while the step resolved it
    * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
    *   when a fencing, a fatal error or a leave retired the target during the step; whatever the
    *   join failed with otherwise
@@ -598,16 +598,15 @@ module.exports = class ConsumerGroupProtocol {
       if (!isCurrent()) throw assignmentChangedError()
     } catch (error) {
       // A fencing, a fatal error and a leave clear the target (a leave only after its commit,
-      // hence the state check), so a target still here was replaced by a newer one. Java finishes
-      // a reconciliation against its snapshot and leaves a newer target to the next one; this
-      // step's resolution was retired, so it keeps what is owned and the chain's follow-up round
-      // reconciles the newer target.
+      // hence the state check), so a target still here was replaced by a newer one. The step is
+      // abandoned: the member keeps what it owns and the chain's follow-up round reconciles the
+      // newer target.
       if (
         error?.type === 'ASSIGNMENT_CHANGED' &&
         this.target != null &&
         !isLeavingGroup(this.state)
       ) {
-        return { assignment: this.ownedAsObject(), userData: null }
+        return { assignment: this.ownedAsObject(), userData: null, abandoned: true }
       }
       throw error
     }
