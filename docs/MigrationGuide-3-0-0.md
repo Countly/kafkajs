@@ -1035,6 +1035,8 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 - **Follower fetching:** No option change; rack-aware follower fetching avoids a replica known offline.
 - Fetch sessions are opt-in. Set `fetchSessions: true` to enable them. The default remains `false`, so existing consumers keep full Fetch requests.
 
+- **A deleted subscribed topic no longer stops the consumer.** When a metadata refresh answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic the consumer already subscribed to or assigned, the other topics keep consuming and the missing topic stays subscribed; it is asked for again within a second and read again once it is recreated, with the usual [topic recreation](Consuming.md#topic-recreation) reset. kafkajs 2.2.4 crashed and restarted the consumer (`CRASH` with `restart: true`) until the topic came back. If you relied on that crash to notice a missing input, listen for `consumer.events.TOPIC_METADATA_STATUS` instead (or the `kafkajs.consumer.topic_metadata_status` diagnostics channel): `status: 'unavailable'` when the topic goes missing, `status: 'available'` when its metadata is back, once per change, with a warning log for the first. A broker can answer this code for a topic you may not describe, so treat a topic that stays unavailable as missing input.
+
 
 ### Admin
 
@@ -1340,6 +1342,8 @@ now logged.
 - **A rejected OAUTHBEARER token fails the login.** When a broker refuses a SASL OAUTHBEARER token it answers with an error challenge (RFC 7628 section 3.2.3) in a response that carries no error code. kafkajs 2.2.4 ignored it, so `connect()` resolved and the next request failed with a `KafkaJSProtocolError` (`ILLEGAL_SASL_STATE`) or a closed connection; at re-authentication the refresh looked successful and in-flight work then failed. The client now answers the challenge with a single `0x01` byte, as the Java client and franz-go do, so `connect()` and re-authentication reject with a non-retriable `KafkaJSSASLAuthenticationError` and the authentication blackout applies. A valid token is unchanged and sends no extra request. *What to do:* if code detected a bad or expired token by catching the later protocol error, catch `KafkaJSSASLAuthenticationError` from connect instead, and make the `oauthBearerProvider` return a fresh token. Custom `authenticationProvider` mechanisms are not changed.
 
 - **`KafkaJSFetcherRebalanceError` is kept for compatibility and is no longer thrown.**
+
+- **New consumer event `TOPIC_METADATA_STATUS`.** Payload `{ groupId, topic, status, type, code }`; see [Instrumentation events](InstrumentationEvents.md#consumer). There are now 44 ordinary diagnostics channels.
 
 ### Protocol
 

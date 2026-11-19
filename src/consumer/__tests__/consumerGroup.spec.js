@@ -675,6 +675,30 @@ describe('Consumer > ConsumerGroup > guards and fallbacks', () => {
     expect(() => group.checkForStaleAssignment()).not.toThrow()
   })
 
+  test('a consumer-protocol member asks for no rejoin when a topic missing at the last round is back, since its coordinator assigns it', () => {
+    const group = createGroup({ groupProtocol: 'consumer', topics: [TOPIC_A] })
+    let known = 0
+    group.cluster.findTopicPartitionMetadata = () => partitionMetadata(known)
+    group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+    known = 2
+
+    expect(() => group.checkForStaleAssignment()).not.toThrow()
+    expect(group.staleAssignmentPending).toBeFalsy()
+  })
+
+  test('a classic member still asks for a rejoin when a topic missing at the last round is back', () => {
+    const group = createGroup({ topics: [TOPIC_A] })
+    let known = 0
+    group.cluster.findTopicPartitionMetadata = () => partitionMetadata(known)
+    group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+    known = 2
+
+    expect(() => group.checkForStaleAssignment()).toThrow(
+      expect.objectContaining({ name: 'KafkaJSStaleTopicMetadataAssignment' })
+    )
+    expect(group.staleAssignmentPending).toBe(true)
+  })
+
   test('a topic the previous round never saw is not a stale assignment', () => {
     const group = createGroup()
     group.partitionsPerSubscribedTopic = new Map()

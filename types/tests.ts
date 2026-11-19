@@ -490,6 +490,23 @@ consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   void isStatic
   void generationId
 })
+consumer.on(consumer.events.TOPIC_METADATA_STATUS, e => {
+  const topic: string = e.payload.topic
+  const groupId: string | null = e.payload.groupId
+  if (e.payload.status === 'unavailable') {
+    const code: 3 = e.payload.code
+    const type: 'UNKNOWN_TOPIC_OR_PARTITION' = e.payload.type
+    void code
+    void type
+  } else {
+    const code: 0 = e.payload.code
+    const type: null = e.payload.type
+    void code
+    void type
+  }
+  void topic
+  void groupId
+})
 // The option and the deprecated alias both compile.
 kafka.consumer({ groupId: 'g', maxPollInterval: 300000 })
 kafka.consumer({ groupId: 'g', rebalanceTimeout: 60000 })

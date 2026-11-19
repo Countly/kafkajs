@@ -9,10 +9,14 @@ describe('Benchmarks > subscribeChannels', () => {
     const { channels, unsubscribe } = subscribeChannels(kafka)
 
     try {
-      expect(channels).toHaveLength(43)
-      expect(new Set(channels).size).toBe(43)
+      expect(channels).toHaveLength(44)
+      expect(new Set(channels).size).toBe(44)
       expect(channels).toEqual(
-        expect.arrayContaining(['kafkajs.producer.connect', 'kafkajs.consumer.fetch'])
+        expect.arrayContaining([
+          'kafkajs.producer.connect',
+          'kafkajs.consumer.fetch',
+          'kafkajs.consumer.topic_metadata_status',
+        ])
       )
       expect(channels.every((channel) => diagnosticsChannel.hasSubscribers(channel))).toBe(true)
     } finally {

@@ -22,6 +22,12 @@ const {
 } = require('../errors')
 const { isConnectionFailure } = require('../network/connectionFailure')
 const { failure, createErrorFromCode } = require('../protocol/error')
+const { checkPartitions } = require('../protocol/requests/metadata')
+
+/** The code a consumer's named refresh isolates for an established target. */
+const UNKNOWN_TOPIC_OR_PARTITION = 3
+/** How long an isolated target counts as known before it is asked for again, at most. */
+const ISOLATED_RECHECK_MS = 1000
 
 /** Topic errors that drop an earlier producer target the broker no longer serves. */
 const DROPPED_TOPIC_ERRORS = new Set([
@@ -31,6 +37,23 @@ const DROPPED_TOPIC_ERRORS = new Set([
 ])
 
 const { keys, assign, values } = Object
+
+/**
+ * @typedef {object} TopicMetadataStatus
+ * @property {string} topic a consumer target
+ * @property {'unavailable'|'available'} status
+ * @property {string|null} type `UNKNOWN_TOPIC_OR_PARTITION` when unavailable, null when available
+ * @property {number} code 3 when unavailable, 0 when available
+ */
+
+/**
+ * @typedef {object} TargetEstablishment
+ * @property {(topic: string) => boolean} isEstablished whether a metadata answer accepted the
+ *   topic for its current declaration
+ * @property {(topics: string[]) => void} establish records the topics an answer accepted, unless a
+ *   target was removed since the capture
+ */
+
 /**
  * Whether a cached broker now has another address. A rack is not part of a broker's identity: a
  * new rack is written onto the cached connection pool in place, with no new connection.
@@ -115,6 +138,13 @@ module.exports = class BrokerPool {
    * @param {(topic: string) => boolean} [options.isNewTarget] required when `captureTopics` is
    *   given: whether a producer target is being added by the call in progress, so its refusal
    *   fails that call instead of being dropped
+   * @param {(status: TopicMetadataStatus) => void} [options.onTopicMetadataStatus] given only
+   *   for a consumer's cluster: its named refreshes isolate an established target answered
+   *   `UNKNOWN_TOPIC_OR_PARTITION` (see `isolateUnknownTopics`) and report each change of that
+   *   topic's status here
+   * @param {() => TargetEstablishment} [options.captureEstablishment] required with
+   *   `onTopicMetadataStatus`: captures, when a named refresh begins, which targets a metadata
+   *   answer has accepted (see `Cluster#captureEstablishment`)
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
@@ -140,6 +170,8 @@ module.exports = class BrokerPool {
     captureTopics,
     dropTopic,
     isNewTarget,
+    onTopicMetadataStatus,
+    captureEstablishment,
     instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
@@ -153,6 +185,12 @@ module.exports = class BrokerPool {
     this.captureTopics = captureTopics
     this.dropTopic = dropTopic
     this.isNewTarget = isNewTarget
+    this.onTopicMetadataStatus = onTopicMetadataStatus
+    this.captureEstablishment = captureEstablishment
+    /** @type {Set<string>|null} the isolated targets: never more than the current targets */
+    this.unavailableTopics = onTopicMetadataStatus ? new Set() : null
+    /** When an isolated target stops counting as known to `refreshMetadataIfNecessary`. */
+    this.isolatedRecheckAt = 0
     this.telemetryMetrics = telemetryMetrics
     this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
@@ -979,12 +1017,14 @@ module.exports = class BrokerPool {
       allowAutoTopicCreation = false
     }
     const accept = this.captureTopics?.(topics || [])
+    const establishment =
+      this.unavailableTopics !== null && topics?.length > 0 ? this.captureEstablishment() : null
     const requestOptions = {
       ...guardArgs(fence)[0],
       ...(guard && { guard }),
       ...(allowAutoTopicCreation !== undefined && { allowAutoTopicCreation }),
       ...(allowLeaderless && { allowLeaderless }),
-      ...(accept && { retainTopicErrors: true }),
+      ...((accept || establishment) && { retainTopicErrors: true }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
     try {
@@ -1016,14 +1056,21 @@ module.exports = class BrokerPool {
           check()
           if (!applicable()) return
           if (accept) {
-            const incoming = this.settleTopicErrors(response.topicMetadata, accept).filter(
-              ({ topic }) => accept(topic)
-            )
+            const settled = this.settleTopicErrors(response.topicMetadata, accept)
+            checkPartitions(settled, { allowLeaderless })
+            const incoming = settled.filter(({ topic }) => accept(topic))
             const replaced = new Set(incoming.map(({ topic }) => topic))
             const retained = (this.metadata?.topicMetadata || []).filter(
               ({ topic }) => !replaced.has(topic)
             )
             this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
+          } else if (establishment) {
+            this.metadata = {
+              ...response,
+              topicMetadata: this.isolateUnknownTopics(response.topicMetadata, establishment, {
+                allowLeaderless,
+              }),
+            }
           } else {
             this.metadata = response
           }
@@ -1154,8 +1201,10 @@ module.exports = class BrokerPool {
    * they recover once the broker serves it again, or end as any send does: with the broker's
    * answer, a routing error or the delivery timeout. A topic being added is not judged this way:
    * its refusal fails the call. A topic this refresh no longer captures is skipped. Any other
-   * topic error is thrown, as the version's own parse would throw it, after the drops.
-   * @param {object[]} topicMetadata the answer's topics, topic errors retained
+   * topic error is thrown, as the version's own parse would throw it, after the drops. The caller
+   * checks the partitions of the returned topics only afterwards, so a topic error takes
+   * precedence over a partition error, as in the strict parse.
+   * @param {object[]} topicMetadata the answer's topics, topic and partition errors retained
    * @param {(topic: string) => boolean} accept this refresh's publication predicate
    * @returns {object[]} the topics answered without an error
    * @throws {import('../errors').KafkaJSProtocolError} the first other topic error
@@ -1186,11 +1235,70 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Drops one producer target from the retained decoded response, preserving broker discovery.
+   * Judges the topics a consumer's named refresh got back with their own error code. Only
+   * `UNKNOWN_TOPIC_OR_PARTITION` (code 3) for an established target, one a metadata answer
+   * accepted since it was declared, is isolated: the topic is left out of the installed metadata,
+   * so nothing routes to it, while it stays a target that every later refresh asks for again, and
+   * its cached id stays, so a recreation is seen as one. Any other topic error, or code 3 for a
+   * topic no answer accepted yet (a subscription whose validation failed, say), is thrown as the
+   * version's own parse would throw it. The healthy topics' partitions are checked only then, so a
+   * topic error takes precedence over a partition error as in the strict parse, and nothing
+   * changes before the whole answer passed. Then the healthy topics are established and installed.
+   * The Java consumer and franz-go keep a missing topic per topic too.
+   *
+   * A status is reported only when it changes: once when a topic becomes unavailable, once when a
+   * refresh answers it again. The state is bounded by the targets; `forgetTopic` drops it. An
+   * isolated topic is asked for again within a second (see `refreshMetadataIfNecessary`), so a
+   * recreation is seen against its kept id and reset as any recreation is.
+   * @param {object[]} topicMetadata the answer's topics, topic and partition errors retained
+   * @param {TargetEstablishment} establishment captured when the refresh began
+   * @param {{ allowLeaderless?: boolean }} options lets a partition without a leader through
+   * @returns {object[]} the topics answered without an error
+   * @throws {import('../errors').KafkaJSProtocolError} the first topic error not isolated, else
+   *   the first partition error
+   */
+  isolateUnknownTopics(topicMetadata, { isEstablished, establish }, { allowLeaderless }) {
+    const failed = topicMetadata.filter(
+      ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
+    )
+    for (const { topic, topicErrorCode } of failed) {
+      if (topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION || !isEstablished(topic)) {
+        throw createErrorFromCode(topicErrorCode)
+      }
+    }
+    const healthy = failed.length
+      ? topicMetadata.filter((entry) => !failed.includes(entry))
+      : topicMetadata
+    checkPartitions(healthy, { allowLeaderless })
+    establish(healthy.map(({ topic }) => topic))
+    this.isolatedRecheckAt = Date.now() + Math.min(this.metadataMaxAge, ISOLATED_RECHECK_MS)
+
+    for (const { topic } of failed) {
+      if (this.unavailableTopics.has(topic)) continue
+      this.unavailableTopics.add(topic)
+      this.onTopicMetadataStatus({
+        topic,
+        status: 'unavailable',
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+        code: UNKNOWN_TOPIC_OR_PARTITION,
+      })
+    }
+    for (const topic of this.unavailableTopics) {
+      if (!healthy.some((entry) => entry.topic === topic)) continue
+      this.unavailableTopics.delete(topic)
+      this.onTopicMetadataStatus({ topic, status: 'available', type: null, code: 0 })
+    }
+    return healthy
+  }
+
+  /**
+   * Drops one target from the retained decoded response, preserving broker discovery, and from
+   * the isolated targets.
    * @param {string} topic forgotten name
    * @returns {void}
    */
   forgetTopic(topic) {
+    this.unavailableTopics?.delete(topic)
     if (this.metadata) {
       this.metadata = {
         ...this.metadata,
@@ -1315,6 +1423,10 @@ module.exports = class BrokerPool {
 
   /**
    * Only refreshes metadata if the data is stale according to the `metadataMaxAge` param or does not contain information about the provided topics
+   * An isolated consumer target counts as known for at most a second after the refresh that
+   * isolated it (or `metadataMaxAge`, when shorter), so a recreated topic is found again within
+   * that second, as the Java consumer keeps asking for a partition without a leader, while a fetch
+   * loop that calls this on every round does not ask for it on every round.
    *
    * @public
    * @param {Array<String>} topics
@@ -1329,8 +1441,10 @@ module.exports = class BrokerPool {
       this.metadata == null ||
       this.metadataExpireAt == null ||
       Date.now() > this.metadataExpireAt ||
-      !topics.every((topic) =>
-        this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
+      !topics.every(
+        (topic) =>
+          (this.unavailableTopics?.has(topic) && Date.now() <= this.isolatedRecheckAt) ||
+          this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
       )
 
     if (shouldRefresh) {

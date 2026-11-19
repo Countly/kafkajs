@@ -25,6 +25,7 @@ const events = {
   PARTITIONS_LOST: consumerType('partitions_lost'),
   POLL_INTERVAL_EXCEEDED: consumerType('poll_interval_exceeded'),
   RECEIVED_UNSUBSCRIBED_TOPICS: consumerType('received_unsubscribed_topics'),
+  TOPIC_METADATA_STATUS: consumerType('topic_metadata_status'),
   REQUEST: consumerType(networkEvents.NETWORK_REQUEST),
   REQUEST_TIMEOUT: consumerType(networkEvents.NETWORK_REQUEST_TIMEOUT),
   REQUEST_QUEUE_SIZE: consumerType(networkEvents.NETWORK_REQUEST_QUEUE_SIZE),
