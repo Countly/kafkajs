@@ -1,3 +1,8 @@
+/**
+ * Seeded seek schedules checked against an independent model. An exploratory tool, not a gate:
+ * it is not part of the unit selectors, and a failing seed is a lead to reproduce as a named case
+ * in `seekFencing.spec.js`, not a verdict. Run it by name.
+ */
 const { AsyncLocalStorage } = require('node:async_hooks')
 const Broker = require('../../broker')
 const Cluster = require('../../cluster')
@@ -5,7 +10,7 @@ const RequestQueue = require('../../network/requestQueue')
 const ConsumerGroup = require('../consumerGroup')
 const OffsetManager = require('../offsetManager')
 const SeekOffsets = require('../seekOffsets')
-const { KafkaJSNonRetriableError } = require('../../errors')
+const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../../errors')
 const { TOPIC, CloseRig, batchAt, gate } = require('./fixtures/closeRig')
 
 const PARTITIONS = [0, 1]
@@ -379,7 +384,14 @@ class ScheduleRun {
         run.holdWrites = false
         const opened = gate()
         run.heldWrites.push(opened)
-        opened.promise.then(() => original.apply(this, args))
+        // Released after its connection closed, the write throws: the request rejects instead.
+        opened.promise.then(() => {
+          try {
+            original.apply(this, args)
+          } catch (error) {
+            request.rejected(new KafkaJSConnectionError(`Held write not sent: ${error.message}`))
+          }
+        })
       })
     )
 
@@ -853,29 +865,14 @@ class Model {
         state.owed
       ) {
         state.applying = false
-        const fate = this.fate(e)
-        if (fate === 'applied') {
-          state.owed = false
+        state.owed = false
+        if (e.error === undefined && e.applied) {
           state.reset = false
           state.resolved = this.autoCommit ? null : String(e.attempt.admission.target)
-        } else if (fate !== 'retry') state.owed = false
+        }
       }
     }
     return state
-  }
-
-  /**
-   * How one seek application ended, by the rule: applied; settled without applying (refused
-   * after the broker accepted it, written with no answer, or superseded); or owed again (refused
-   * before the write, or rejected by the broker).
-   * @param {object} end an `attemptEnd` event
-   * @returns {'applied'|'settled'|'retry'}
-   */
-  fate(end) {
-    if (end.error === undefined) return end.applied ? 'applied' : 'settled'
-    const arrivals = this.events.filter((e) => e.type === 'arrival' && e.seek === end.attempt)
-    if (arrivals.length === 0) return 'retry'
-    return arrivals.every((a) => a.outcome === 'rejected') ? 'retry' : 'settled'
   }
 
   /** @param {object} state @returns {string} the position the state stands for */
