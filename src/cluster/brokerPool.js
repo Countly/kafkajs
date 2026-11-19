@@ -257,6 +257,8 @@ module.exports = class BrokerPool {
     this.consumerMetadataScope = null
     /** Advances when the default scope is registered or released, fencing earlier unscoped work. */
     this.consumerMetadataGeneration = 0
+    /** Whether the consumer subscribes by a broker-side regex; no lookup by name may create then. */
+    this.consumerBrokerRegex = false
     this.versions = null
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
@@ -1013,10 +1015,9 @@ module.exports = class BrokerPool {
       (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
       isCurrent() &&
       (!ticket || ticket.isCurrent())
-    if (metadataScope?.hasPatterns()) {
-      topics = []
-      allowAutoTopicCreation = false
-    }
+    const clientPattern = metadataScope?.hasPatterns()
+    if (clientPattern) topics = []
+    if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = false
     const accept = this.captureTopics?.(topics || [])
     const establishment =
       this.unavailableTopics !== null && topics?.length > 0 ? this.captureEstablishment() : null

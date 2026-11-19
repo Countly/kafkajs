@@ -455,6 +455,23 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     expect(wire.observed.warnings).toEqual([])
   }, 30000)
 
+  test('classic: a client-side pattern never names a topic in Metadata and never sets the creation bit', async () => {
+    const wire = scenario('classic', {
+      groupId: 'lifecycle-client-regex-bit',
+      allowAutoTopicCreation: true,
+    })
+    await wire.consumer.connect()
+    await wire.consumer.subscribe({ topics: [/^lifecycle-/], fromBeginning: true })
+    await wire.run()
+    await until(() => offsets(wire.observed, DOOMED).length >= 3, 'records of a match')
+
+    const metadata = wire.cluster.requests().filter(({ api }) => api === 'Metadata')
+    expect(metadata.filter(({ fields }) => fields.topics !== null)).toEqual([])
+    expect(new Set(metadata.map(({ fields }) => fields.allowAutoTopicCreation))).toEqual(
+      new Set([false])
+    )
+  }, 30000)
+
   test.each([
     [17, 'INVALID_TOPIC_EXCEPTION'],
     [29, 'TOPIC_AUTHORIZATION_FAILED'],
@@ -1124,6 +1141,57 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       expect(wire.joins).toBe(joins + 2)
       expect(acks(wire.cluster).at(-1)).toEqual([HEALTHY_ID, NEW_ID, DOOMED_ID].sort())
       expect(acks(wire.cluster).filter((ids) => ids.includes(DOOMED_ID))).toHaveLength(1)
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
+
+    /** @param {object} cluster @returns {object[]} every Metadata request that names a topic */
+    const lookupsByName = (cluster) =>
+      cluster
+        .requests()
+        .filter(
+          ({ api, fields }) => api === 'Metadata' && (fields.topics || []).some(({ name }) => name)
+        )
+
+    test.each([false, true])(
+      'a broker-side regex sends no creation bit on any lookup by name: the registration of an assigned name, the retry of a name unknown at its first add and the periodic refresh (creation %s)',
+      async (allowAutoTopicCreation) => {
+        const wire = assignedScenario({ allowAutoTopicCreation })
+        wire.world.namedCodes.set(DOOMED, 3)
+        await wire.consumer.connect()
+        await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+        await wire.run()
+        await until(() => offsets(wire.observed, NEW).length >= 1, 'a record of the new name')
+        await until(() => namedAsks(wire.cluster, DOOMED).length >= 3, 'retried lookups')
+        await until(() => namedAsks(wire.cluster, HEALTHY).length >= 3, 'periodic refreshes')
+
+        expect(namedAsks(wire.cluster, NEW).length).toBeGreaterThan(0)
+        const bits = lookupsByName(wire.cluster).map(({ fields }) => fields.allowAutoTopicCreation)
+        expect(new Set(bits)).toEqual(new Set([false]))
+        expect(wire.observed.crashes).toEqual([])
+      },
+      30000
+    )
+
+    test('after unsubscribing a broker-side regex, a literal subscription sends the configured creation bit again', async () => {
+      const wire = assignedScenario({ allowAutoTopicCreation: true })
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.run()
+      await until(() => namedAsks(wire.cluster, HEALTHY).length >= 2, 'lookups under the regex')
+      await wire.consumer.unsubscribe()
+      const before = lookupsByName(wire.cluster).length
+
+      await wire.consumer.subscribe({ topics: [HEALTHY], fromBeginning: true })
+      await wire.run()
+      await until(
+        () => lookupsByName(wire.cluster).length >= before + 3,
+        'lookups under the literal'
+      )
+
+      const bits = (requests) =>
+        new Set(requests.map(({ fields }) => fields.allowAutoTopicCreation))
+      expect(bits(lookupsByName(wire.cluster).slice(0, before))).toEqual(new Set([false]))
+      expect(bits(lookupsByName(wire.cluster).slice(before))).toEqual(new Set([true]))
       expect(wire.observed.crashes).toEqual([])
     }, 30000)
     /**

@@ -1358,6 +1358,7 @@ function createConsumerHarness({
       return true
     },
     releaseConsumerMetadataScope: () => {},
+    useBrokerRegex: () => {},
     refreshMetadataIfNecessary: async () => {},
     committedOffsets: () => entry().offsets,
     offsetOperations: () => entry().ledger,
