@@ -883,10 +883,10 @@ module.exports = class OffsetManager {
    * while the ticket is still current. A concrete offset settles a recreation reset only when the
    * topic is provably the incarnation the commit was sent for; a sentinel never does.
    *
-   * A commit that was written and ends without clearing, whatever the reason (a refused caller, a
+   * A commit that ends without clearing, whatever the reason (refused before or after its write, a
    * failure, an answer the broker may have accepted), forgets the partition's cached committed
-   * offset unless a newer operation owns the cell, so the position is read back from the broker.
-   * A commit refused before its write leaves the cache as it was.
+   * offset unless a newer operation owns the cell, so the position is read back from the broker:
+   * the cache may miss a commit the broker accepted while this one was pending.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
@@ -938,7 +938,7 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
-      if (attempt.written && !cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
+      if (!cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
         this.forgetCommitted(topic, partition)
       }
       release?.()

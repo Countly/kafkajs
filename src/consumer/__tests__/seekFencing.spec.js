@@ -1303,7 +1303,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('after an incremental apply refused its commit before it was written, keeps the cached offset and is not sent again', async () => {
+    test('after an incremental apply refused its commit before it was written, reads the committed offset back from the broker and is not sent again', async () => {
       const captured = using(captureGroup())
       const held = using(holdNextCommitCall())
       await open(SEEKING)
@@ -1327,13 +1327,41 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       held.release()
 
       expect((await seeking).type).toBe('CONSUMER_STOPPING')
-      expect(cachedAfterRefusal).toBe('2')
+      expect(cachedAfterRefusal).toBeUndefined()
       expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
       expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
       expect(await scenario.position()).toBe('2')
       await disconnect()
       expect(scenario.commits()).toEqual([])
       expect(scenario.committed[0]).toBe('2')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('after an incremental apply refused its commit before it was written, continues from an automatic commit the broker accepted while the seek was admitted', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const group = captured.group()
+      const {
+        holds: [automatic],
+      } = using(holdCommitAnswers(scenario, ['applied']))
+      const committing = group.commitOffsets(undefined, { auto: true })
+      await automatic.arrived
+      expect(scenario.committed[0]).toBe('5')
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      automatic.release()
+      await committing
+      const held = using(holdNextCommitCall())
+      const seeking = failureOf(scenario.position())
+      await held.reached
+      await applyIncrementally(group)
+
+      held.release()
+
+      expect((await seeking).type).toBe('CONSUMER_STOPPING')
+      expect(await scenario.position()).toBe('5')
+      expect(scenario.commits()).toEqual(['5'])
+      scenario.consumer.resume([{ topic: TOPIC, partitions: [0] }])
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.errors).toEqual([])
     })
 

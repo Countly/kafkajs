@@ -3637,9 +3637,9 @@ module.exports = class ConsumerGroup {
    * settled and never sent again, and a failure reaches the caller. One the broker accepted is
    * settled as applied (clearing its halt), whatever refused the caller afterwards or whichever
    * newer commit took its cell; one written with no answer (a
-   * timeout, a lost connection) or rejected is settled the same way and its position is read back
-   * from the broker; one that failed before its write leaves the partition at its committed
-   * offset. The application seeks again if it still wants the position. A seek that returns
+   * timeout, a lost connection) or rejected is settled the same way; one that failed before its
+   * write is settled without clearing a halt. Either way the position is read back from the
+   * broker's committed offset. The application seeks again if it still wants the position. A seek that returns
    * without applying is settled. A popped seek that is no longer
    * current (`isCurrentSeek`) is refused before its write and settles nothing; one popped with no
    * acquisition to compare (a partition assigned without one) is never refused for it.
