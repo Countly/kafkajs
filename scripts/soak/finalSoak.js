@@ -70,6 +70,10 @@ const DOCKER_MS = 60000
 const KILL_WAIT_MS = 10000
 /** How long the final drain waits for every member to resolve the logs' ends. */
 const FINAL_DRAIN_MS = 300000
+/** How long each step of the supervisor's finish after the children's exits may take. */
+const FINISH_STEP_MS = 30000
+/** The driver's own work before its readiness barrier, beyond the planned window and the teardown. */
+const DRIVER_START_MS = 1800000
 /** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
 const TELEMETRY_DRAIN_MS = 15000
 /** Problems kept in the supervisor receipt; later ones are counted, not listed. */
@@ -95,6 +99,7 @@ function parseArgs(argv, env) {
     '--diagnostic',
     '--outer-exit',
     '--check-workload',
+    '--driver-limit',
   ]
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]
@@ -127,6 +132,7 @@ function parseArgs(argv, env) {
   if (!['smoke', 'acceptance'].includes(flags.mode))
     throw new Error('--mode must be smoke or acceptance')
   const matrix = JSON.parse(fs.readFileSync(path.resolve(ROOT, flags.matrix ?? MATRIX), 'utf8'))
+  if (flags['driver-limit']) return { command: 'driver-limit', mode: flags.mode, matrix }
   const fixed = valueOf(matrix.acceptance.modes[flags.mode].requestedMs)
   if (flags.duration !== undefined) {
     if (flags.mode !== 'smoke') throw new Error('--duration is accepted only in smoke mode')
@@ -272,6 +278,7 @@ class Supervisor {
   constructor(options) {
     this.options = options
     this.out = options.out
+    this.finishStepMs = FINISH_STEP_MS
     this.matrix = JSON.parse(fs.readFileSync(path.resolve(ROOT, options.matrix), 'utf8'))
     this.runId = crypto.randomBytes(6).toString('hex')
     this.config = buildConfig(this.matrix, {
@@ -479,12 +486,7 @@ class Supervisor {
     this.monitor.stop()
     if (this.options.mode === 'smoke') this.requireOutages(outages)
     await this.collector.note('schedule finished', { ...summary, gatePeak: this.gate.peak })
-    await this.untilExited()
-    await this.runtime.stop()
-    while (this.runtime.channel.pendingBytes > 0)
-      await new Promise((resolve) => setImmediate(resolve))
-    await this.collector.close()
-    await handle.close()
+    const missing = await this.finish(handle)
     const run = {
       runId: this.runId,
       originMs: this.clock.originMs,
@@ -500,7 +502,84 @@ class Supervisor {
       diagnostic: this.config.diagnostic,
       treeSha: this.options.expectSha,
     }
+    this.writeReceipts(run, missing)
+  }
+
+  /**
+   * Ends the run's evidence in bounded time: the children's exits (`untilExited`, bounded by
+   * itself), then the supervisor's own sources, their last records, the stream's flush and sync,
+   * and the stream file's close, each given at most `finishStepMs`. A step that fails or does not
+   * settle is named and the next one runs. A child still running after its kill has its process,
+   * IPC channel and pipes released, so it cannot keep this process alive; it is named too.
+   * @param {{ close: () => Promise<void> }} handle the stream file
+   * @returns {Promise<string[]>} what did not complete, empty when everything did
+   */
+  async finish(handle) {
+    const missing = []
+    const step = async (name, work) => {
+      let timer = null
+      const late = new Promise((resolve) => {
+        timer = setTimeout(
+          resolve,
+          this.finishStepMs,
+          `did not settle within ${this.finishStepMs} ms`
+        )
+      })
+      const failure = await Promise.race([
+        work().then(
+          () => null,
+          (e) => e.message
+        ),
+        late,
+      ])
+      clearTimeout(timer)
+      if (failure) missing.push(`${name}: ${failure}`)
+    }
+    await this.untilExited()
+    await step('supervisor sources', () => this.runtime.stop())
+    const sent = this.clock.now() + this.finishStepMs
+    await step('supervisor source records', async () => {
+      while (this.runtime.channel.pendingBytes > 0 && this.clock.now() < sent)
+        await new Promise((resolve) => setImmediate(resolve))
+      if (this.runtime.channel.pendingBytes > 0)
+        throw new Error(`${this.runtime.channel.pendingBytes} bytes never acknowledged`)
+    })
+    await step('stream flush and sync', () => this.collector.close())
+    await step('stream file close', () => handle.close())
+    for (const [slot, child] of this.children) {
+      if (this.terminal.has(slot)) continue
+      for (const release of [() => child.channel?.unref(), () => child.unref()])
+        try {
+          release()
+        } catch {}
+      for (const pipe of child.stdio ?? []) pipe?.destroy()
+      missing.push(`process ${slot}: still running after its kill; its handles were released`)
+    }
+    return missing
+  }
+
+  /**
+   * Writes the supervisor receipt and, when the finish left something incomplete, a separate
+   * `incomplete.json` naming what is missing with the stream's record, written and unwritten byte
+   * counts. An incomplete finish then ends the run with an error, never with a clean exit.
+   * @param {object} run the supervisor receipt
+   * @param {string[]} missing what `finish` could not complete
+   * @returns {void}
+   * @throws {Error} when anything is missing
+   */
+  writeReceipts(run, missing) {
     fs.writeFileSync(path.join(this.out, 'supervisor.json'), JSON.stringify(run) + '\n')
+    if (missing.length === 0) return
+    const { records, streamBytes, queuedBytes } = this.collector
+    const incomplete = {
+      runId: run.runId,
+      missing,
+      records,
+      streamBytes,
+      unwrittenBytes: queuedBytes,
+    }
+    fs.writeFileSync(path.join(this.out, 'incomplete.json'), JSON.stringify(incomplete) + '\n')
+    throw new Error(`the run ended incomplete: ${missing.join('; ')}`)
   }
 
   /**
@@ -1900,6 +1979,25 @@ async function summarize({ out }) {
   }
 }
 
+/**
+ * The longest a driver of one mode may run before the runbook stops it: its start before the
+ * readiness barrier (`DRIVER_START_MS`), the planned window, the teardown step and the wait for
+ * the children's exits (each the mode's teardown allowance), the kill wait and the four bounded
+ * finish steps.
+ * @param {object} matrix the reviewed matrix @param {'smoke'|'acceptance'} mode
+ * @returns {number} milliseconds
+ */
+function driverLimitMs(matrix, mode) {
+  const { requestedMs, teardownAllowanceMs } = matrix.acceptance.modes[mode]
+  return (
+    DRIVER_START_MS +
+    valueOf(requestedMs) +
+    2 * valueOf(teardownAllowanceMs) +
+    KILL_WAIT_MS +
+    4 * FINISH_STEP_MS
+  )
+}
+
 /** @param {string[]} argv @returns {Promise<void>} the command-line entry */
 async function main(argv) {
   const options = parseArgs(argv, process.env)
@@ -1911,6 +2009,8 @@ async function main(argv) {
   else if (options.command === 'summary')
     console.log(JSON.stringify(await summarize(options), null, 2))
   else if (options.command === 'child') child(options)
+  else if (options.command === 'driver-limit')
+    console.log(Math.ceil(driverLimitMs(options.matrix, options.mode) / 1000))
   else await new Supervisor(options).run()
 }
 
@@ -1923,6 +2023,7 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs,
+  driverLimitMs,
   buildConfig,
   recipientGroups,
   digest,

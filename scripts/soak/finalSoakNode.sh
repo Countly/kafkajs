@@ -15,6 +15,12 @@
 # driver exited 0 but whose workload receipt (supervisor.json) holds failures, problems, forced
 # exits, an abort or an incomplete source fails at stage `workload`, after sealing.
 #
+# The driver runs under a watchdog: past its limit (`finalSoak.js --driver-limit`: the planned window
+# plus its start, teardown and finish allowances) or after 15 minutes without a stream byte it is
+# sent TERM, then KILL, and <artifact>.watchdog names why. A run never ends with a synthetic clean
+# exit: a supervisor that could not finish its evidence writes <artifact>/incomplete.json and exits
+# non-zero.
+#
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
 # the exit status and the driver's status) and <artifact>.tar.gz; a failed run with a Compose cluster
@@ -190,14 +196,46 @@ stage=preflight
 node scripts/soak/finalSoakPreflight.js --expect-sha "$sha" --mode "$mode" --out "$out" "${diagnostic[@]}"
 
 stage=driver
+limit_s="$(node scripts/soak/finalSoak.js --driver-limit --mode "$mode" --out "$out")"
+[[ "$limit_s" =~ ^[0-9]+$ ]]
 nohup node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode "$mode" --expect-sha "$sha" \
   --matrix scripts/soak/finalSoakMatrix.json --out "$out" "${diagnostic[@]}" > "$out/driver.log" 2>&1 &
 driver=$!
+# Heartbeat and watchdog. Every 60 s the heartbeat file gets the time, the stream's size and how
+# long that size has not changed, so a live but stalled driver shows. A driver that runs past its
+# limit (planned window plus start and teardown allowances) or writes no stream bytes for
+# $stall_s s is sent TERM, then KILL after 60 s; <artifact>.watchdog names the escalation and the
+# run fails at stage driver with the driver's status.
+stall_s=900
 (
-  beat=0
+  start=$EPOCHSECONDS
+  beat=-60
+  size=-1
+  moved=$start
   while kill -0 "$driver" 2> /dev/null; do
-    if ((beat % 60 == 0)); then date -u +%FT%TZ > "$out/heartbeat"; fi
-    beat=$((beat + 1))
+    now=$EPOCHSECONDS
+    current=$(stat -c %s "$out/stream.ndjson" 2> /dev/null || echo 0)
+    if ((current != size)); then
+      size=$current
+      moved=$now
+    fi
+    if ((now - beat >= 60)); then
+      printf '%s stream-bytes=%s unchanged-s=%s\n' "$(date -u +%FT%TZ)" "$size" "$((now - moved))" > "$out/heartbeat"
+      beat=$now
+    fi
+    reason=
+    if ((now - start >= limit_s)); then
+      reason="ran past its limit of $limit_s s"
+    elif ((now - moved >= stall_s)); then
+      reason="wrote no stream bytes for $stall_s s"
+    fi
+    if [[ -n "$reason" ]]; then
+      echo "driver $reason: TERM, then KILL after 60 s" | tee "$out.watchdog"
+      kill -TERM "$driver" 2> /dev/null
+      until ((EPOCHSECONDS - now >= 60)) || ! kill -0 "$driver" 2> /dev/null; do sleep 1; done
+      if kill -KILL "$driver" 2> /dev/null; then echo "driver killed" | tee -a "$out.watchdog"; fi
+      break
+    fi
     sleep 1
   done
 ) &
