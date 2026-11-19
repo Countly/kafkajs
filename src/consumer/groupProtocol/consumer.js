@@ -1117,6 +1117,8 @@ module.exports = class ConsumerGroupProtocol {
 
       const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
       if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
+      // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
+      if (fencing && sentUnderEpoch === 0) this.backoff.onFailedAttempt(Date.now())
 
       throw stampOwnership(
         this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),

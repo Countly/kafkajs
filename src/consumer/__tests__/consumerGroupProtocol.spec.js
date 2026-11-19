@@ -2018,7 +2018,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('A fencing while joining', () => {
-    it('rejects the step with the fencing, and the retried step joins', async () => {
+    it('rejects the step with the fencing, and the retried step joins once the backoff the fenced join armed has elapsed', async () => {
       const h = build({
         answers: [createErrorFromCode(110), heartbeatResponse({ memberEpoch: 3 })],
       })
@@ -2030,7 +2030,14 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await expect(fenced).rejects.toMatchObject({ code: 110 })
       expect(h.protocol.state).toEqual(FENCED)
 
-      const retried = await await startStep(h)
+      const sentAtFence = h.sent.length
+      const retrying = h.protocol.rebalance(context())
+      retrying.catch(() => {})
+      await h.manager.tick()
+      expect(h.sent).toHaveLength(sentAtFence)
+      jest.advanceTimersByTime(1000)
+      await h.manager.tick()
+      const retried = await retrying
 
       expect(retried).toEqual({ assignment: {}, userData: null })
       expect(h.protocol.memberEpoch).toEqual(3)
@@ -2044,6 +2051,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       fenced.catch(() => {})
       await h.manager.tick()
       await expect(fenced).rejects.toMatchObject({ code: 25 })
+      jest.advanceTimersByTime(1000)
       await await startStep(h)
 
       h.protocol.setOwned([])
