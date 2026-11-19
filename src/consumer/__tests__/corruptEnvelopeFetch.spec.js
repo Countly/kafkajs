@@ -678,11 +678,10 @@ describe.each(['magic', 'decompression'])(
       await halt.appendCorrupt(0, 1)
       await halt.append(1, 0, 1)
       await halt.start()
-      halt.listeners.push(
-        halt.consumer.on(halt.consumer.events.PARTITION_HALTED, () => {
-          throw new Error('listener failure')
-        })
-      )
+      const listener = jest.fn(() => {
+        throw new Error('listener failure')
+      })
+      halt.listeners.push(halt.consumer.on(halt.consumer.events.PARTITION_HALTED, listener))
       const error = jest.spyOn(halt.group.logger, 'error').mockImplementation(() => {
         throw new Error('logger failure')
       })
@@ -696,11 +695,10 @@ describe.each(['magic', 'decompression'])(
       expect(halt.offsets(0)).toEqual(['0'])
       expect(halt.halts).toHaveLength(1)
       expect(error).toHaveBeenCalledTimes(1)
-      expect(error.mock.calls[0][1]).toMatchObject({
-        partition: 0,
-        offset: '1',
-        listenerError: 'listener failure',
-      })
+      expect(listener).toHaveBeenCalledTimes(1)
+      // Consumer.on contains and logs its own listener's failure, so the halt never sees it.
+      expect(error.mock.calls[0][1]).toMatchObject({ partition: 0, offset: '1' })
+      expect(error.mock.calls[0][1]).not.toHaveProperty('listenerError')
       expect(later).not.toContain(0)
       expect(halt.group.haltedPartitions.has(`${TOPIC}|0`)).toBe(true)
     })

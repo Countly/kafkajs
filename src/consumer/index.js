@@ -1289,15 +1289,11 @@ module.exports = (params) => {
         try {
           shouldRestart = await retry.restartOnFailure(e)
         } catch (callbackError) {
+          shouldRestart = true
           logger.error(
             'Caught error when invoking user-provided "restartOnFailure" callback. Defaulting to restarting.',
-            {
-              error: callbackError.message || callbackError,
-              cause: e.message || e,
-              groupId,
-            }
+            { error: describeThrown(callbackError), cause: e.message || e, groupId }
           )
-          shouldRestart = true
         }
       }
 
@@ -1353,20 +1349,29 @@ module.exports = (params) => {
     await start(onCrash)
   }
 
-  /** @type {import("../../types").Consumer["on"]} */
+  /**
+   * Subscribes to a consumer event. A listener that throws or rejects is logged and never
+   * reaches the code that emitted the event, and later listeners still run.
+   * @type {import("../../types").Consumer["on"]}
+   */
   const on = (eventName, listener) => {
     if (!eventNames.includes(eventName)) {
       throw new KafkaJSNonRetriableError(`Event name should be one of ${eventKeys}`)
     }
 
+    const report = (e) =>
+      logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
+        eventName,
+        stack: describeThrown(e, 'stack'),
+      })
+    // Called inline so a listener that stops or disconnects keeps its synchronous position.
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
-      Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
-          eventName,
-          stack: describeThrown(e, 'stack'),
-        })
-      })
+      try {
+        Promise.resolve(listener(event)).catch(report)
+      } catch (e) {
+        report(e)
+      }
     })
   }
 

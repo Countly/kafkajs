@@ -68,6 +68,7 @@ const ConsumerGroupProtocol = require('./groupProtocol/consumer')
 const ManualGroupProtocol = require('./groupProtocol/manual')
 const {
   sentGeneration,
+  isHeartbeatFatal,
   isStaleMembershipVerdict,
   stampOwnership,
   obsoleteOwnership,
@@ -1695,7 +1696,7 @@ module.exports = class ConsumerGroup {
         )
       } catch (e) {
         const refusal = attempt.guard()
-        if (refusal) return bail(e)
+        if (refusal || isHeartbeatFatal(e)) return bail(e)
         if (isRebalancing(e)) {
           throw new KafkaJSError(e)
         }

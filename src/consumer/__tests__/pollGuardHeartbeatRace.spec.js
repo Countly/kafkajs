@@ -682,57 +682,84 @@ describe.each(['consumer', 'classic'])(
       }
     )
 
-    describe('the round joins before the leave of the guard is answered', () => {
-      /**
-       * Starts a member whose released handler loses its membership, and plays the order up to the
-       * round's join, its classic SyncGroup held back, with the guard's leave still unanswered.
-       * @returns {Promise<void>}
-       */
-      const playJoinDuringLeave = async () => {
-        rig = new Rig({ protocol })
-        await rig.start()
-        await rig.endLoop()
-        rig.wire.holdSync()
-        await play(rig, ['T', 'A', 'J'], 'unknownMember')
+    /**
+     * Plays `T`, `A` and `J`. Under the consumer protocol it also proves the schedule: the old
+     * heartbeat and the guard's leave exist, and no join is on the wire at `J` while that leave is
+     * unanswered, because the answer at `A` belongs to the membership the leave replaced.
+     * @param {keyof ANSWERS} answer how the old heartbeat is failed at `A`
+     * @param {() => void} [beforeJoin] runs between `A` and `J`
+     * @returns {Promise<void>}
+     */
+    const playUpToJoin = async (answer, beforeJoin) => {
+      const joins = () => rig.wire.requests.filter(({ kind }) => kind === 'join').length
+      const joinsAtStart = joins()
+      await play(rig, ['T'], answer)
+      if (protocol === 'consumer') expect(rig.wire.next('beat')).toMatchObject({ kind: 'beat' })
+      await play(rig, ['A'], answer)
+      beforeJoin?.()
+      await play(rig, ['J'], answer)
+      if (protocol === 'consumer') {
+        expect(rig.wire.next('leave')).toMatchObject({ kind: 'leave' })
+        expect(joins()).toBe(joinsAtStart)
       }
+    }
 
-      /**
-       * Then answers the guard's leave.
-       * @returns {Promise<void>}
-       */
-      const playJoinThenLeave = async () => {
-        await playJoinDuringLeave()
-        await play(rig, ['B'], 'unknownMember')
-      }
+    describe(
+      protocol === 'consumer'
+        ? 'a fencing reply arrives while the guard leave is unanswered'
+        : 'the round joins before the leave of the guard is answered',
+      () => {
+        /**
+         * Starts a member whose released handler loses its membership, and plays the order up to the
+         * round's join, its classic SyncGroup held back, with the guard's leave still unanswered.
+         * @returns {Promise<void>}
+         */
+        const playJoinDuringLeave = async () => {
+          rig = new Rig({ protocol })
+          await rig.start()
+          await rig.endLoop()
+          rig.wire.holdSync()
+          await playUpToJoin('unknownMember')
+        }
 
-      // Under the consumer protocol no round can join first: the answer that would start it belongs
-      // to the membership the guard's leave replaced, so it has no effect.
-      if (protocol === 'classic') {
-        it('leaves the membership the round installed in place and raises no verdict', async () => {
-          await playJoinThenLeave()
-
-          expect(rig.group.generationId).toBe(2)
-          expect(rig.coordinator.verdict).toBeNull()
-        })
-
-        it('does not clear the assigner state of the membership the round installed', async () => {
+        /**
+         * Then answers the guard's leave.
+         * @returns {Promise<void>}
+         */
+        const playJoinThenLeave = async () => {
           await playJoinDuringLeave()
-          const cleared = jest.spyOn(rig.group.groupMembership, 'clearAssignerState')
           await play(rig, ['B'], 'unknownMember')
+        }
 
-          expect(cleared).not.toHaveBeenCalled()
+        // Under the consumer protocol no round can join first: the answer that would start it belongs
+        // to the membership the guard's leave replaced, so it has no effect.
+        if (protocol === 'classic') {
+          it('leaves the membership the round installed in place and raises no verdict', async () => {
+            await playJoinThenLeave()
+
+            expect(rig.group.generationId).toBe(2)
+            expect(rig.coordinator.verdict).toBeNull()
+          })
+
+          it('does not clear the assigner state of the membership the round installed', async () => {
+            await playJoinDuringLeave()
+            const cleared = jest.spyOn(rig.group.groupMembership, 'clearAssignerState')
+            await play(rig, ['B'], 'unknownMember')
+
+            expect(cleared).not.toHaveBeenCalled()
+          })
+        }
+
+        it('keeps the member in the group, heartbeating', async () => {
+          await playJoinThenLeave()
+          rig.wire.releaseSync()
+          await rig.heal()
+
+          expect(await rig.outcome()).toEqual(ONE_REJOIN)
+          await expectHeartbeating()
         })
       }
-
-      it('keeps the member in the group, heartbeating', async () => {
-        await playJoinThenLeave()
-        rig.wire.releaseSync()
-        await rig.heal()
-
-        expect(await rig.outcome()).toEqual(ONE_REJOIN)
-        await expectHeartbeating()
-      })
-    })
+    )
 
     if (protocol === 'consumer') {
       describe("a fencing answer to a heartbeat sent before the guard's leave", () => {
@@ -768,50 +795,54 @@ describe.each(['consumer', 'classic'])(
       })
     }
 
-    describe('the round joins before the leave of the guard is answered, as the same member', () => {
-      /**
-       * Plays the order of the cases above with the coordinator handing the round back what the
-       * guard left: the same member id and, when `sameGeneration` is set, the same generation (the
-       * same member epoch under the consumer protocol), as it may after a coordinator restart.
-       * @param {keyof ANSWERS} answer how the handler's heartbeat is answered; the classic
-       *   `illegalGeneration` is the one answer after which the round keeps its member id
-       * @param {boolean} sameGeneration
-       * @returns {Promise<void>}
-       */
-      const playRejoin = async (answer, sameGeneration) => {
-        rig = new Rig({ protocol })
-        await rig.start()
-        await rig.endLoop()
-        rig.wire.holdSync()
-        await play(rig, ['T', 'A'], answer)
-
-        if (sameGeneration) {
-          rig.wire.generation = 0
+    describe(
+      protocol === 'consumer'
+        ? 'a fencing reply arrives while the guard leave is unanswered'
+        : 'the round joins before the leave of the guard is answered, as the same member',
+      () => {
+        /**
+         * Plays the order of the cases above with the coordinator handing the round back what the
+         * guard left: the same member id and, when `sameGeneration` is set, the same generation (the
+         * same member epoch under the consumer protocol), as it may after a coordinator restart.
+         * @param {keyof ANSWERS} answer how the handler's heartbeat is answered; the classic
+         *   `illegalGeneration` is the one answer after which the round keeps its member id
+         * @param {boolean} sameGeneration
+         * @returns {Promise<void>}
+         */
+        const playRejoin = async (answer, sameGeneration) => {
+          rig = new Rig({ protocol })
+          await rig.start()
+          await rig.endLoop()
+          rig.wire.holdSync()
+          await playUpToJoin(answer, () => {
+            if (sameGeneration) {
+              rig.wire.generation = 0
+            }
+          })
+          await play(rig, ['B'], answer)
+          rig.wire.releaseSync()
+          await rig.heal()
         }
 
-        await play(rig, ['J', 'B'], answer)
-        rig.wire.releaseSync()
-        await rig.heal()
+        it('keeps the assignment and the member heartbeating at the same generation', async () => {
+          await playRejoin('unknownMember', true)
+
+          expect(rig.group.generationId).toBe(1)
+          expect(rig.group.assigned()).toEqual([{ topic: TOPIC, partitions: [0] }])
+          expect(await rig.outcome()).toEqual(ONE_REJOIN)
+          await expectHeartbeating()
+        })
+
+        it('keeps the member in the group when the round keeps its member id', async () => {
+          await playRejoin(LOST_ANSWERS[protocol][1], false)
+
+          expect(rig.group.generationId).toBe(2)
+          expect(rig.group.assigned()).toEqual([{ topic: TOPIC, partitions: [0] }])
+          expect(await rig.outcome()).toEqual(ONE_REJOIN)
+          await expectHeartbeating()
+        })
       }
-
-      it('keeps the assignment and the member heartbeating at the same generation', async () => {
-        await playRejoin('unknownMember', true)
-
-        expect(rig.group.generationId).toBe(1)
-        expect(rig.group.assigned()).toEqual([{ topic: TOPIC, partitions: [0] }])
-        expect(await rig.outcome()).toEqual(ONE_REJOIN)
-        await expectHeartbeating()
-      })
-
-      it('keeps the member in the group when the round keeps its member id', async () => {
-        await playRejoin(LOST_ANSWERS[protocol][1], false)
-
-        expect(rig.group.generationId).toBe(2)
-        expect(rig.group.assigned()).toEqual([{ topic: TOPIC, partitions: [0] }])
-        expect(await rig.outcome()).toEqual(ONE_REJOIN)
-        await expectHeartbeating()
-      })
-    })
+    )
 
     describe(
       protocol === 'consumer'
