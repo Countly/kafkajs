@@ -15,6 +15,7 @@ const {
   DecoderWorker,
   WireLog,
   createWorker,
+  child,
 } = require('../finalSoakWorkers')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
@@ -325,6 +326,7 @@ const fakeChild = () => {
     return true
   }
   child.kill = jest.fn()
+  child.on('exit', () => setImmediate(() => child.emit('close')))
   return child
 }
 
@@ -417,6 +419,114 @@ describe('final soak supervisor commands', () => {
     } finally {
       remove()
     }
+  })
+
+  test('a child whose spawn failed reaches its terminal state at close without an exit record, and the teardown does not wait for it', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const records = []
+      s.emit = async (record) => records.push(record) && 'p15.1'
+      const child = fakeChild()
+      child.connected = false
+      s.children.set('p03', child)
+      s.exited = new Promise((resolve) => (s.allExited = resolve))
+      s.watch('p03', child)
+      child.emit('error', new Error('spawn /usr/bin/node EAGAIN'))
+      child.emit('close', -11, null)
+      expect(await within(s.untilExited(), 2000)).toBeUndefined()
+      expect(records.filter((r) => r.kind === 'process')).toEqual([])
+      expect(s.problems).toEqual(['process p03 spawn /usr/bin/node EAGAIN before its disconnect'])
+      expect(s.forced).toEqual([])
+    } finally {
+      remove()
+    }
+  })
+
+  test('a child that does not end after its kill is named and the teardown still ends', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      const child = fakeChild()
+      child.kill = jest.fn(() => {
+        throw new Error('EPERM')
+      })
+      s.children.set('p03', child)
+      s.watch('p03', child)
+      s.exited = new Promise((resolve) => (s.allExited = resolve))
+      s.teardownAllowanceMs = () => 30
+      expect(await within(s.untilExited(), 2000)).toBeUndefined()
+      expect(s.forced).toEqual(['p03'])
+      expect(s.problems).toEqual([
+        'process p03 did not exit within 30 ms of its disconnect; killed',
+        'process p03 could not be killed: EPERM',
+        'process p03 did not end 10000 ms after its kill',
+      ])
+      expect(s.incomplete).toBe('process p03 did not end')
+    } finally {
+      remove()
+    }
+  })
+
+  /** A child process run against a fake channel and runtime. */
+  const childProcess = ({ start = async () => {} } = {}) => {
+    const proc = new EventEmitter()
+    proc.connected = true
+    proc.sent = []
+    proc.send = (message) => proc.sent.push(message)
+    proc.disconnect = () => {
+      proc.connected = false
+      proc.emit('disconnect')
+    }
+    const runtimes = []
+    class Runtime {
+      constructor(options) {
+        Object.assign(this, options, { topicIds: new Map(), orphans: 0 })
+        this.channel = { pendingBytes: 0 }
+        runtimes.push(this)
+      }
+
+      start() {
+        return start()
+      }
+
+      async orphaned() {
+        this.orphans++
+      }
+
+      async handle({ id }) {
+        this.notify({ type: 'done', id, error: null, reply: null })
+      }
+    }
+    child({ child: 'p03', out: '/nonexistent' }, { proc, Runtime })
+    proc.emit('message', { type: 'init', config, matrix, originMs: 0, topicIds: [] })
+    return { proc, runtimes }
+  }
+
+  test('when the supervisor goes away, a handler waiting on a readback and records awaiting their acknowledgement are settled', async () => {
+    const { proc, runtimes } = childProcess()
+    await tick()
+    const [runtime] = runtimes
+    const readback = runtime.request({ type: 'readback', key: {} })
+    let refused = null
+    runtime.send({ type: 'record', record: { seq: 0 } }, (r) => (refused = r))
+    expect(proc.sent.map((m) => m.type)).toEqual(['readback', 'record'])
+    proc.disconnect()
+    expect(await within(readback, 2000)).toBeUndefined()
+    expect(refused).toBe(true)
+    await tick()
+    expect(runtime.orphans).toBe(1)
+    expect(await within(runtime.request({ type: 'readback' }), 2000)).toBeUndefined()
+    expect(proc.sent).toHaveLength(2)
+  })
+
+  test('a child whose runtime failed to start answers each command with the failure', async () => {
+    const { proc } = childProcess({ start: async () => Promise.reject(new Error('no broker')) })
+    proc.emit('message', { type: 'command', id: 4, step: { type: 'active', id: 'h00a' } })
+    await tick()
+    await tick()
+    expect(proc.sent).toEqual([
+      { type: 'done', id: 4, error: 'start failed: no broker', reply: null },
+    ])
   })
 
   test('the day does not start when any process failed to start, and the failure is recorded', async () => {
