@@ -883,19 +883,21 @@ module.exports = class OffsetManager {
    * while the ticket is still current. A concrete offset settles a recreation reset only when the
    * topic is provably the incarnation the commit was sent for; a sentinel never does.
    *
-   * A commit that ends without clearing, whatever the reason (refused before or after its write, a
-   * failure, an answer the broker may have accepted), forgets the partition's cached committed
-   * offset unless a newer operation owns the cell, so the position is read back from the broker:
-   * the cache may miss a commit the broker accepted while this one was pending.
+   * A seek's commit (given `attempt`) that ends without clearing, whatever the reason (refused
+   * before or after its write, a failure, an answer the broker may have accepted), forgets the
+   * partition's cached committed offset unless a newer operation owns the cell, so the position is
+   * read back from the broker: the cache may miss a commit the broker accepted while the seek was
+   * pending. Any other commit does so only once it was written.
    * @private
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
    *   manager's own ownership guard; its refusal is thrown, not reported as `false`
-   * @param {CommitAttempt} [attempt] filled with what the commit did on the wire
+   * @param {CommitAttempt} [attempt] a seek's attempt, filled with what the commit did on the wire
    * @returns {Promise<boolean>} whether the clear was applied
    * @throws {Error} whatever the commit raised
    */
-  async commitAndClear({ topic, partition, offset }, preparation, attempt = {}) {
+  async commitAndClear({ topic, partition, offset }, preparation, attempt) {
+    const wire = attempt ?? {}
     const { groupId, generationId, memberId, groupInstanceId } = this
     const token = this.ownership?.token()
     const guard =
@@ -918,7 +920,7 @@ module.exports = class OffsetManager {
             groupInstanceId,
             topics: [{ topic, partitions: [{ partition, offset }] }],
           },
-          { guard, attempt, ...(preparation && { fence: preparation.fence }) }
+          { guard, attempt: wire, ...(preparation && { fence: preparation.fence }) }
         )
       }
 
@@ -938,7 +940,8 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
-      if (!cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
+      const reread = attempt !== undefined || wire.written
+      if (reread && !cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
         this.forgetCommitted(topic, partition)
       }
       release?.()
