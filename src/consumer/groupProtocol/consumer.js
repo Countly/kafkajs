@@ -553,20 +553,24 @@ module.exports = class ConsumerGroupProtocol {
    * apply. It never applies anything itself and never sends the acknowledgement: the apply calls
    * `setOwned`, and that is where the acknowledgement is triggered.
    *
+   * Owns one invariant: a step returns only a result to apply. When a newer target, or the rollback
+   * of a failed `subscribe()` (or a mode change) retiring the metadata scope, replaces what the
+   * step is resolving while its membership still holds a target, the step resolves again against
+   * the live target under the current scope. It stops at the round's own refusal: at the round
+   * deadline the round fails with its join deadline error, as for any step that outlives it.
+   *
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
-   *   growSubscription?: (names: string[]) => Promise<void> }} context
-   * @returns {Promise<{ assignment: Object, userData: null, abandoned?: true }>} the assignment in
-   *   the name-keyed shape the apply expects; `abandoned` with what the member owns when, while the
-   *   step resolved its target, a newer target replaced it or the rollback of a failed
-   *   `subscribe()` (or a mode change) retired the metadata scope it resolved under: the chain's
-   *   follow-up round reconciles the live target under the current scope
+   *   growSubscription?: (names: string[]) => Promise<void>, round?: { guard: () => Error|null } }}
+   *   context `round` is the round attempt the step runs for
+   * @returns {Promise<{ assignment: Object, userData: null }>} the assignment in the name-keyed
+   *   shape the apply expects
    * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
-   *   when a fencing, a fatal error, a leave or a rejoin retired the membership or the target
-   *   during the step; whatever the join failed with otherwise
+   *   when a fencing, a fatal error, a leave or a rejoin retired the membership during the step;
+   *   the round's refusal; whatever the join failed with otherwise
    */
   async rebalance(context) {
     if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
-    const { beforeSync, growSubscription } = context
+    const { beforeSync, growSubscription, round } = context
 
     if (this.state === FATAL) {
       throw this.fatalError
@@ -597,18 +601,19 @@ module.exports = class ConsumerGroupProtocol {
       return { assignment: this.ownedAsObject(), userData: null }
     }
 
-    const isCurrent = this.targetGuard()
-    let resolved
-    try {
-      resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
-      if (!isCurrent()) throw assignmentChangedError()
-      await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
-      if (!isCurrent()) throw assignmentChangedError()
-    } catch (error) {
-      if (error?.type === 'ASSIGNMENT_CHANGED' && isCurrent.member()) {
-        return { assignment: this.ownedAsObject(), userData: null, abandoned: true }
+    let isCurrent, resolved
+    for (;;) {
+      isCurrent = this.targetGuard()
+      try {
+        resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
+        await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
+        if (isCurrent()) break
+      } catch (error) {
+        if (error?.type !== 'ASSIGNMENT_CHANGED') throw error
       }
-      throw error
+      if (!isCurrent.member()) throw assignmentChangedError()
+      const refusal = round?.guard()
+      if (refusal) throw refusal
     }
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes

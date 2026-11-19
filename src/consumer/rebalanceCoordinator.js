@@ -342,14 +342,6 @@ module.exports = class RebalanceCoordinator {
 
         const roundStartedAt = Date.now()
         const result = await this.consumerGroup.joinAndSync(round)
-        // A step whose target was replaced applies and publishes nothing, so it renews no
-        // membership a refusal already on the wire answers for. A LOST round still applies: its
-        // rejoin replaced the membership.
-        if (result.abandoned && kind !== 'lost') {
-          if (!this.runner.stopRequested) this.heartbeatManager.ensureStarted()
-          ;({ kind, reason } = await this.followUp(false))
-          continue
-        }
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,

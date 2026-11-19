@@ -1776,7 +1776,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
         [[{ topic: 'topic-a', partitions: [0] }]],
       ],
     ])(
-      'abandons a round whose target is replaced while it resolves topic ids by one that %s, and reconciles the newer target in the next round, without a crash',
+      'resolves again, inside the round, a target replaced while the round resolves its topic ids by one that %s, and applies the newer target once, without a crash',
       async (_, newer, revocations) => {
         const built = buildConsumer()
         consumer = built.consumer
@@ -1817,7 +1817,11 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
         expect(built.crashes).toEqual([])
         expect(starts).toHaveBeenCalledTimes(1)
         expect(runner.running).toBe(true)
-        expect(steps.mock.calls.length).toBeGreaterThanOrEqual(2)
+        expect(steps).toHaveBeenCalledTimes(1)
+        await expect(steps.mock.results[0].value).resolves.toEqual({
+          assignment: newer,
+          userData: null,
+        })
         expect(
           Object.fromEntries(
             runner.consumerGroup.assigned().map(({ topic, partitions }) => [topic, partitions])
@@ -1846,9 +1850,9 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
 
   /**
    * Joins with topic-a:0, then epoch 2 names topic-c and topic-d by id; the round's lookup of
-   * topic-d takes 1,200 ms. Epoch 3 replaces that target 500 ms in, and the heartbeat sent at
-   * epoch 3 after it is held until the superseded step has ended, then refused with `code`.
-   * Rejoins at epoch 0 get epoch 100 with the latest target.
+   * topic-d takes 1,200 ms. Epoch 3 replaces that target 500 ms in, so the step resolves again and
+   * returns the epoch 3 target, and the heartbeat sent at epoch 3 is held until that step has
+   * ended, then refused with `code`. Rejoins at epoch 0 get epoch 100 with the latest target.
    * @param {number} code the error code the held heartbeat is refused with
    * @returns {Promise<object>} the built consumer, its runner and the log index of the refusal
    */
@@ -1895,7 +1899,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     await advanceUntil(() => !!refuse)
     const heldIndex = built.log.length
     const token = group.ownership.token()
-    // The superseded step ends while the epoch 3 heartbeat is held.
+    // The step ends, and its round applies, while the epoch 3 heartbeat is held.
     let settled = false
     steps.mock.results[0].value.then(
       () => (settled = true),
@@ -1912,14 +1916,14 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     return { ...built, runner, group, held, token, tokenBeforeRefusal, refusedIndex }
   }
 
-  it('acts on a fence answering a heartbeat sent while a superseded step resolved its names: the step applies and publishes nothing, then one PARTITIONS_LOST and a rejoin with the latest target', async () => {
+  it('acts on a fence answering a heartbeat sent while a superseded step resolved its names: the step applies the live target, then one PARTITIONS_LOST of it and a rejoin with the latest target', async () => {
     const run = await refuseHeldHeartbeatAcrossSupersededStep(FENCED_MEMBER_EPOCH)
     const after = run.log.slice(run.refusedIndex)
 
     expect(
-      run.held.filter(({ kind }) => kind.startsWith('PARTITIONS_') || kind === 'GROUP_JOIN')
-    ).toEqual([])
-    expect(run.tokenBeforeRefusal).toEqual(run.token)
+      run.held.filter(({ kind }) => kind === 'GROUP_JOIN').map((join) => join.assignment)
+    ).toEqual([{ 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }])
+    expect(run.tokenBeforeRefusal).toEqual(run.token + 1)
     expect(
       after
         .filter(
@@ -1929,7 +1933,9 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
         .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
     ).toEqual(['PARTITIONS_LOST', 0, 'PARTITIONS_ASSIGNED', 'GROUP_JOIN'])
     expect(after.find(({ kind }) => kind === 'PARTITIONS_LOST').partitions).toEqual([
-      { topic: 'topic-a', partitions: [0] },
+      { topic: 'topic-a', partitions: [0, 1] },
+      { topic: 'topic-c', partitions: [0] },
+      { topic: 'topic-d', partitions: [0] },
     ])
     expect(after.find(({ kind }) => kind === 'GROUP_JOIN').assignment).toEqual({
       'topic-a': [0, 1],
@@ -1949,9 +1955,9 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     const after = run.log.slice(run.refusedIndex)
 
     expect(
-      run.held.filter(({ kind }) => kind.startsWith('PARTITIONS_') || kind === 'GROUP_JOIN')
-    ).toEqual([])
-    expect(run.tokenBeforeRefusal).toEqual(run.token)
+      run.held.filter(({ kind }) => kind === 'GROUP_JOIN').map((join) => join.assignment)
+    ).toEqual([{ 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }])
+    expect(run.tokenBeforeRefusal).toEqual(run.token + 1)
     expect(run.crashes.map(({ error }) => error.type)).toEqual(['GROUP_AUTHORIZATION_FAILED'])
     expect(after.filter(({ kind }) => kind === 'GROUP_JOIN')).toEqual([])
     expect(after.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch >= 0)).toEqual([])
@@ -2202,7 +2208,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(run.group.groupMembership.state).toEqual('FATAL')
   })
 
-  it('starts the run when the first step is abandoned for a newer target, and consumes the newer target', async () => {
+  it('starts the run when a newer target replaces the first target while its step resolves names, applying the newer target in that step', async () => {
     const built = buildConsumer()
     consumer = built.consumer
     const newer = { 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }
@@ -2227,10 +2233,10 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     const [runner] = starts.mock.contexts
 
     expect(ran).toBe(true)
+    expect(steps).toHaveBeenCalledTimes(1)
     await expect(steps.mock.results[0].value).resolves.toEqual({
-      assignment: {},
+      assignment: newer,
       userData: null,
-      abandoned: true,
     })
     expect(built.crashes).toEqual([])
     expect(starts).toHaveBeenCalledTimes(1)
@@ -2245,7 +2251,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ).toEqual(new Set(['topic-a|0', 'topic-a|1', 'topic-c|0', 'topic-d|0']))
   })
 
-  it('neither applies nor publishes a step whose metadata scope a failed earlier subscribe() retired, and applies the unchanged target in the next round', async () => {
+  it('resolves again under the current scope a step whose metadata scope a failed earlier subscribe() retired, and applies the unchanged target once', async () => {
     const built = buildConsumer()
     consumer = built.consumer
     const joins = []
@@ -2298,10 +2304,12 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     )
     await advanceUntil(() => settled, 1000)
 
-    await expect(steps.mock.results[0].value).resolves.toMatchObject({ abandoned: true })
-    expect(joins).toEqual([{ 'topic-a': [0] }])
-    expect(group.ownership.token()).toEqual(token)
+    await expect(steps.mock.results[0].value).resolves.toEqual({
+      assignment: named,
+      userData: null,
+    })
     await jest.advanceTimersByTimeAsync(2000)
+    expect(steps).toHaveBeenCalledTimes(1)
     expect(joins).toEqual([{ 'topic-a': [0] }, named])
     expect(membership.targetRevision).toEqual(target)
     expect(group.ownership.token()).toEqual(token + 1)
@@ -2309,7 +2317,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(starts).toHaveBeenCalledTimes(1)
   })
 
-  it('fails, rather than abandons, a step left behind by a fenced round once the member has rejoined, and reports one PARTITIONS_LOST', async () => {
+  it('fails a step left behind by a fenced round once the member has rejoined, without a crash, and reports one PARTITIONS_LOST', async () => {
     const built = buildConsumer()
     consumer = built.consumer
     const s = { phase: 'steady' }
