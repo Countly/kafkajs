@@ -1532,7 +1532,7 @@ describe('a consumer heartbeat flight that outlives its membership', () => {
     await jest.advanceTimersByTimeAsync(0)
 
     expect(schedule.calls).toHaveLength(2)
-    await expect(replacement).resolves.toBe(false)
+    await expect(replacement).resolves.toBe(true)
     gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
     await jest.advanceTimersByTimeAsync(0)
     expect(protocol.memberEpoch).toBe(0)

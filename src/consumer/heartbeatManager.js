@@ -84,7 +84,9 @@ module.exports = class HeartbeatManager {
     this.chainId = 0
     /**
      * Set by `requestTick()` while a tick is in flight, consumed by that tick's `finally`. The
-     * flag exists because arming a second chain under a running one would double it.
+     * flag exists because arming a second chain under a running one would double it. `stop()`
+     * drops it; a request made after the stop is honoured even though the stop cleared the handle,
+     * because that is how the round that replaces a stopped chain asks for its first heartbeat.
      */
     this.tickRequested = false
   }
@@ -110,8 +112,13 @@ module.exports = class HeartbeatManager {
     this.schedule()
   }
 
-  /** Cancels the chain, leaving the manager armable again. @returns {void} */
+  /**
+   * Cancels the chain, leaving the manager armable again. A tick asked for before the stop belonged
+   * to the cancelled chain and is dropped with it; one asked for after it is a new request.
+   * @returns {void}
+   */
   stop() {
+    this.tickRequested = false
     if (this.handle) {
       clearTimeout(this.handle)
       this.handle = null
@@ -296,11 +303,9 @@ module.exports = class HeartbeatManager {
       }
     } finally {
       this.inFlight = false
-      // Guarded on `handle`, which is the one fact `stop()` sets: a tick only ever runs on a
-      // manager that WAS armed, so a null handle here means a stop landed inside this heartbeat
-      // and re-arming would leave a non-unref'd timer holding the event loop open after the member
-      // has left.
-      rearm = this.tickRequested && this.handle !== null
+      // A stop inside this heartbeat already dropped any earlier request, so a request left here was
+      // made after it; only `shutdown()`, which means the member has left, vetoes it.
+      rearm = this.tickRequested && !this.stopped
       this.tickRequested = false
     }
 

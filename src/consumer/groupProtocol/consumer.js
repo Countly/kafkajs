@@ -332,37 +332,42 @@ module.exports = class ConsumerGroupProtocol {
 
     // The classic protocol wraps its heartbeat the same way: `Runner#heartbeat()` is called per
     // message, per batch and on every empty fetch round, so without the single flight AND the
-    // interval gate below a busy consumer would issue one request per record.
-    this.sharedHeartbeat = sharedPromiseTo(async ({ interval, guard, onAccepted }) => {
-      if (shouldSkipHeartbeat(this.state)) {
-        return false
-      }
+    // interval gate below a busy consumer would issue one request per record. The single flight is
+    // scoped by the membership it serves: a heartbeat for a replacement membership never joins one
+    // still awaiting its answer for the replaced membership, whose answer would be dropped.
+    this.sharedHeartbeat = sharedPromiseTo(
+      async ({ interval, guard, onAccepted }) => {
+        if (shouldSkipHeartbeat(this.state)) {
+          return false
+        }
 
-      const now = Date.now()
+        const now = Date.now()
 
-      if (this.backoff.pending(now)) {
-        return false
-      }
+        if (this.backoff.pending(now)) {
+          return false
+        }
 
-      if (this.immediatePending && shouldHeartbeatNow(this.state)) {
-        return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
-      }
+        if (this.immediatePending && shouldHeartbeatNow(this.state)) {
+          return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
+        }
 
-      // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
-      // last request, which is always more recent than the shorter backoff, so leaving the gate in
-      // front of a due retry would swallow it until the ordinary interval came round anyway - and
-      // the backoff would never grow past its first step. It is ONE request, consumed by the send
-      // below: this is the retry the backoff owed, not a mode the gate stays off in.
-      if (this.backoff.isDue(now)) {
-        return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
-      }
+        // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
+        // last request, which is always more recent than the shorter backoff, so leaving the gate in
+        // front of a due retry would swallow it until the ordinary interval came round anyway - and
+        // the backoff would never grow past its first step. It is ONE request, consumed by the send
+        // below: this is the retry the backoff owed, not a mode the gate stays off in.
+        if (this.backoff.isDue(now)) {
+          return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
+        }
 
-      if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
-        return false
-      }
+        if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
+          return false
+        }
 
-      return this.sendHeartbeat({ sendAllFields: false, guard, onAccepted })
-    })
+        return this.sendHeartbeat({ sendAllFields: false, guard, onAccepted })
+      },
+      () => this.membershipRevision
+    )
 
     this.sharedLeave = sharedPromiseTo((options) => this.performLeave(options))
   }
@@ -1058,7 +1063,8 @@ module.exports = class ConsumerGroupProtocol {
    * unless the state owes an immediate one or a backoff has come due. The gate is load-bearing -
    * the runner calls this per message, per batch and on every empty fetch round.
    *
-   * The runner's handler heartbeat and its timer share the one exchange, and the first caller's
+   * Within one membership the runner's handler heartbeat and its timer share the one exchange,
+   * and the first caller's
    * `guard` and `onAccepted` govern it. Both callers pass the same live-run guard and the runner's
    * one clock callback, so a success reaches the clock exactly once, before either caller resumes,
    * whichever caller started it.
