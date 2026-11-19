@@ -435,6 +435,80 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
     })
   })
 
+  describe('An acknowledgement owed after the heartbeat was built', () => {
+    /**
+     * Owns topic-a of a target that also names topic-b before topic-b can be named, then holds the
+     * heartbeat that acknowledges topic-a and names topic-b while it is in flight.
+     * @param {object} heldAnswer what the held heartbeat is answered with
+     * @returns {Promise<object>} the harness, the held heartbeat and its release
+     */
+    const ackInFlight = async (heldAnswer) => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      let release
+      const held = new Promise((resolve) => (release = () => resolve(heldAnswer)))
+      const h = build({
+        names,
+        answers: [
+          heartbeatResponse({
+            assignment: assignmentOf([
+              [TOPIC_ID_A, [0]],
+              [TOPIC_ID_B, [0]],
+            ]),
+          }),
+          () => held,
+          heartbeatResponse(),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      const inFlight = h.manager.tick()
+      await flushRefresh()
+      expect(partitionsSentOn(h.sent[1])).toEqual([[TOPIC_ID_A, [0]]])
+
+      names[TOPIC_ID_B] = 'topic-b'
+      const result = await h.protocol.rebalance(context())
+      h.protocol.setOwned(
+        Object.entries(result.assignment).map(([topic, partitions]) => ({ topic, partitions }))
+      )
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      return { h, inFlight, release }
+    }
+
+    it('a heartbeat built before an apply does not consume the acknowledgement that apply owes: the next one carries the applied set before STABLE', async () => {
+      const { h, inFlight, release } = await ackInFlight(heartbeatResponse())
+
+      release()
+      await inFlight
+
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      await h.manager.tick()
+      expect(partitionsSentOn(h.sent[2])).toEqual([
+        [TOPIC_ID_A, [0]],
+        [TOPIC_ID_B, [0]],
+      ])
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+
+    it('a withdrawal answering a heartbeat built before an apply is applied: the next round releases it and acknowledges what is left', async () => {
+      const { h, inFlight, release } = await ackInFlight(
+        heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })
+      )
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      release()
+      await inFlight
+
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
+      const result = await h.protocol.rebalance(context())
+      expect(result.assignment).toEqual({ 'topic-a': [0] })
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      expect(partitionsSentOn(h.sent[h.sent.length - 1])).toEqual([[TOPIC_ID_A, [0]]])
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+  })
+
   describe('The target changes mid-round', () => {
     it('applies the snapshot the step took, and the next step applies the new target', async () => {
       const h = build({
