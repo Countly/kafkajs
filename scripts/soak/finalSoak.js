@@ -1372,7 +1372,8 @@ class Supervisor {
    * Emits one broker-state record: the configured down interval, and the container's own instant
    * for the event (its process stop for `down`, its process start for `ready` and `isr`), raw as
    * Docker reports it and on the run clock, so a reader can check the actual down time against the
-   * configured one. An instant Docker does not report (zero or unparseable) is null.
+   * configured one. An instant Docker does not report (zero or unparseable) is null. The leader and
+   * ISR of each run partition follow, one `partition-state` record each citing the broker state.
    * @param {object} step the outage step @param {'down'|'ready'|'isr'} event
    * @param {{ pid: number, startedAt: string|null, finishedAt: string|null }} state from inspect
    * @param {string} container @param {string} cause the stop or start operation
@@ -1383,7 +1384,8 @@ class Supervisor {
     const raw = event === 'down' ? state.finishedAt : state.startedAt
     const wall = Date.parse(raw)
     const processAt = wall > 0 ? this.clock.now() - (Date.now() - wall) : null
-    await this.emit({
+    const partitions = (await this.partitionStates()).filter((p) => p.key.topicId)
+    const recordId = await this.emit({
       kind: 'broker-state',
       execution: step.id,
       node: step.node,
@@ -1391,12 +1393,14 @@ class Supervisor {
       container: container || 'unknown-container',
       event,
       members: brokers.map((b) => b.nodeId).sort((a, b) => a - b),
-      partitions: (await this.partitionStates()).filter((p) => p.key.topicId),
+      partitions: partitions.length,
       cause,
       downMs: step.downMs,
       processAt: processAt !== null && processAt >= 0 ? processAt : null,
       processTime: processAt !== null && processAt >= 0 ? raw : null,
     })
+    for (const p of partitions)
+      await this.emit({ kind: 'partition-state', execution: step.id, cause: recordId, ...p })
   }
 
   /**

@@ -339,9 +339,13 @@ describe('final soak driver', () => {
     await strict.close()
     expect(strict.failures).toEqual([
       'p01 sequence 2 follows 0',
-      'p02.0 sample line exceeds 1024 bytes',
+      'p02.0 sample line of 2387 bytes exceeds 1024 bytes',
     ])
-    expect(JSON.parse(strict.lastLine)).toMatchObject({ kind: 'diagnostic', source: 'p15' })
+    expect(JSON.parse(strict.lastLine)).toMatchObject({
+      kind: 'diagnostic',
+      recordId: 'p02.0',
+      message: 'oversize sample record p02.0 of 2387 bytes not written',
+    })
 
     const capped = new Collector({ sink, clock, matrix, maxStreamBytes: 600 })
     await capped.append(sample('p01', 0, 0))

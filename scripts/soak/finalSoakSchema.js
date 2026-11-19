@@ -134,6 +134,10 @@ const EXPLICIT_RESOURCES = Object.freeze(['TCPSocketWrap', 'Timeout'])
 const OUTER = 'outer'
 const MAX_OFFSET = 2n ** 63n - 1n
 const MAX_PROBLEMS = 1000
+/** Records the stream validator holds at once for a client whose construction has not arrived. */
+const MAX_HELD = 100000
+/** Each item record kind and the counting record kind it cites by `cause`. */
+const ITEM_KINDS = Object.freeze({ 'wave-key': 'wave', 'partition-state': 'broker-state' })
 
 /** The arm and control id each process role runs with. */
 const ROLE_ARMS = Object.freeze({
@@ -292,7 +296,9 @@ const SEED = { process: Id, client: Id, controlId: oneOf(CONTROL), mapEntries: C
 
 /**
  * Every record kind: `fields`, or `by` (the discriminator field) and its `variants`. `open` admits
- * fields beyond those listed (the diagnostic note only).
+ * fields beyond those listed (the diagnostic note only). A `wave` or `broker-state` carries the
+ * count of its keys or partitions; each one is its own `wave-key` or `partition-state` record of
+ * the same source citing it by `cause`, so no record grows with the topology past its line cap.
  */
 const RECORDS = Object.freeze({
   process: {
@@ -397,23 +403,25 @@ const RECORDS = Object.freeze({
       container: Id,
       event: oneOf('down', 'ready', 'isr'),
       members: listOf(Count),
-      partitions: listOf(shape('a partition state', { key: Key, leader: Int, isr: listOf(Count) })),
+      partitions: Count,
       cause: Id,
       downMs: Ms,
       processAt: nullable(Ms),
       processTime: nullable(Id),
     },
   },
+  'partition-state': { fields: { cause: Id, key: Key, leader: Int, isr: listOf(Count) } },
   wave: {
     fields: {
       client: Id,
       event: oneOf('transfer', 'return'),
       member: Id,
-      paused: listOf(Key),
-      keys: listOf(Key),
+      paused: Count,
+      held: Count,
       observed: Bool,
     },
   },
+  'wave-key': { fields: { cause: Id, key: Key, held: Bool } },
   identity: {
     by: 'stage',
     variants: {
@@ -847,6 +855,7 @@ const RULES = Object.freeze({
     ...r.entries.flatMap((entry, i) => entryProblems(r.section, entry, `entries[${i}]`)),
   ],
   ticket: (r) => unless(sameNullness(r.ownerRun, r.token), 'ownerRun and token go together'),
+  wave: (r) => unless(r.held <= r.paused, 'a wave holds no more keys than it paused'),
 })
 
 /** @param {object} r a typed sample @returns {string[]} */
@@ -1803,11 +1812,18 @@ const validateProvenance = (json, kind) => {
  * and clients, open executions and inventory cuts, and the stream digest. It never holds the
  * stream. Checks: config and header agree on run id and mode; exact record types; `recordId` = `<source>.<seq>` with gap-free per-source
  * `seq` from 0; `at <= t`, `t` non-decreasing, per-source `at` non-decreasing, `t` within the
- * observed window; processes on the header's boot and Node; no record from an exited process; clients constructed in a started process as
- * their config slot says, never reusing an id; seed records only from the isolated seed's control
- * client; telemetry only from telemetry-enabled clients; executions opened once and closed with
- * their operation count; inventory cuts complete in every chunk and required section before the
- * sample that cites them; gc witnesses with two new forced collections per reading.
+ * observed window; processes on the header's boot and Node; no record of a process later than its
+ * exit; clients constructed in a started process as their config slot says, never reusing an id;
+ * seed records only from the isolated seed's control client; telemetry only from telemetry-enabled
+ * clients; executions opened once and closed with their operation count; every `wave-key` and
+ * `partition-state` record its `wave` or `broker-state` counts; inventory cuts complete in every
+ * chunk and required section before the sample that cites them; gc witnesses with two new forced
+ * collections per reading.
+ *
+ * The merged stream keeps each source's order, not the order between sources. Facts about another
+ * process are therefore judged independently of stream position: a process's exit is compared with
+ * the event times of its records, and a record naming a client whose construction (by another
+ * process) has not arrived yet is held, bounded, and judged when it arrives.
  */
 class StreamValidator {
   /**
@@ -1815,8 +1831,9 @@ class StreamValidator {
    * @param {object} options.matrix a valid matrix
    * @param {object} options.config a valid config
    * @param {object} options.header a valid header
+   * @param {number} [options.maxHeld] records held at once for clients not yet constructed
    */
-  constructor({ matrix, config, header }) {
+  constructor({ matrix, config, header, maxHeld = MAX_HELD }) {
     this.matrix = matrix
     this.header = header
     this.slots = new Map(config.clients.map((c) => [c.slot, c]))
@@ -1825,6 +1842,11 @@ class StreamValidator {
     this.processes = new Map()
     this.sources = new Map()
     this.clients = new Map()
+    this.exits = new Map()
+    this.held = new Map()
+    this.heldCount = 0
+    this.maxHeld = maxHeld
+    this.summaries = new Map()
     this.executions = new Map()
     this.closedExecutions = new Set()
     this.cuts = new Map()
@@ -1839,9 +1861,9 @@ class StreamValidator {
       this.problems.push('config and header disagree on run id or mode')
   }
 
-  /** @param {string} problem */
-  fail(problem) {
-    if (this.problems.length < MAX_PROBLEMS) this.problems.push(`line ${this.lines}: ${problem}`)
+  /** @param {string} problem @param {number} [line] the line it is about, the current by default */
+  fail(problem, line = this.lines) {
+    if (this.problems.length < MAX_PROBLEMS) this.problems.push(`line ${line}: ${problem}`)
     else this.omitted++
   }
 
@@ -1886,16 +1908,67 @@ class StreamValidator {
     if (r.t < this.lastT) this.fail('t decreases')
     if (r.at < last.at) this.fail('at decreases within its source')
     if (r.t > this.header.window.observedEndAt) this.fail('t is after the observed end')
-    if (this.processes.get(r.source) === 'exited') this.fail('its source process has exited')
+    if (r.at > (this.exits.get(r.source) ?? Infinity)) this.fail('its source process has exited')
     this.sources.set(r.source, { seq: r.seq, at: Math.max(r.at, last.at) })
     this.lastT = Math.max(this.lastT, r.t)
   }
 
-  /** @param {string} client @returns {object|undefined} the client's config slot, if constructed */
-  client(client) {
+  /**
+   * The config slot of a constructed client. A record naming one not constructed yet is held,
+   * reduced to what `slotChecks` reads, and judged when the construction arrives; beyond
+   * `maxHeld` held records it is not held and the stream fails once.
+   * @param {string} client @param {object} r the record naming it
+   * @returns {object|undefined} the slot, undefined while the client is not constructed
+   */
+  client(client, r) {
     const slot = this.clients.get(client)
-    if (!slot) this.fail('names a client that was never constructed')
-    return slot
+    if (slot) return slot
+    if (this.heldCount >= this.maxHeld) {
+      if (!this.heldFull)
+        this.fail(`more than ${this.maxHeld} records wait for a client not yet constructed`)
+      this.heldFull = true
+      return undefined
+    }
+    const { kind, source, process, acquisition, group } = r
+    const fact = { line: this.lines, kind, source, process, acquisition, group }
+    fact.variant = RECORDS[kind].by ? r[RECORDS[kind].by] : null
+    this.heldCount++
+    if (this.held.has(client)) this.held.get(client).push(fact)
+    else this.held.set(client, [fact])
+    return undefined
+  }
+
+  /**
+   * The checks of a record that need its client's config slot.
+   * @param {{ kind: string, variant: ?string, process?: string, acquisition?: ?string,
+   *   group?: string }} r the record, or the fact held of it
+   * @param {object} slot @param {number} [line] the record's line
+   */
+  slotChecks(r, slot, line = this.lines) {
+    if (r.kind === 'telemetry' && !slot.telemetryEnabled)
+      this.fail('telemetry from a client without telemetry', line)
+    if (
+      r.kind === 'seed' &&
+      (r.process !== this.seedProcess || slot.purpose !== 'control' || slot.process !== r.process)
+    ) {
+      this.fail('seed record is not from the isolated seed process and its control client', line)
+    }
+    if (r.kind === 'sample' && slot.process !== r.process)
+      this.fail('sample lists a client of another process', line)
+    if (r.kind === 'identity' && r.variant === 'handler-enter') {
+      const share = this.matrix.clientKinds[slot.clientKind].role === 'share'
+      if (share === (r.acquisition === null))
+        this.fail('handler authority does not match the client kind', line)
+      if (r.group !== slot.group) this.fail('handler group is not its client group', line)
+    }
+  }
+
+  /**
+   * @param {string} process @param {number} at an event time
+   * @returns {boolean} whether the process had started and not yet exited at `at`
+   */
+  liveAt(process, at) {
+    return this.processes.has(process) && !(at > (this.exits.get(process) ?? Infinity))
   }
 
   /** @param {object} r a typed, chronologically checked record */
@@ -1907,28 +1980,27 @@ class StreamValidator {
     if (r.kind === 'shape') return this.shape(r, variant)
     if (r.kind === 'sample') return this.sample(r)
     if (r.kind === 'inventory') return this.inventory(r)
-    if (r.kind === 'identity' && variant === 'log') this.client(r.reader)
+    if (own(ITEM_KINDS, r.kind)) return this.item(r)
+    const left = r.kind === 'wave' ? r.paused : r.kind === 'broker-state' ? r.partitions : 0
+    if (left > 0)
+      this.summaries.set(r.recordId, { kind: r.kind, source: r.source, left, line: this.lines })
+    if (r.kind === 'identity' && variant === 'log') this.client(r.reader, r)
     if (r.kind === 'operation' && r.execution !== null) {
       const open = this.executions.get(r.execution)
       if (!open) this.fail('operation names no open execution')
       else if (variant === 'end') open.operations++
     }
-    const slot = isString(r.client) ? this.client(r.client) : undefined
-    if (!slot) return
-    if (r.kind === 'telemetry' && !slot.telemetryEnabled)
-      this.fail('telemetry from a client without telemetry')
-    if (
-      r.kind === 'seed' &&
-      (r.process !== this.seedProcess || slot.purpose !== 'control' || slot.process !== r.process)
-    ) {
-      this.fail('seed record is not from the isolated seed process and its control client')
-    }
-    if (r.kind === 'identity' && variant === 'handler-enter') {
-      const share = this.matrix.clientKinds[slot.clientKind].role === 'share'
-      if (share === (r.acquisition === null))
-        this.fail('handler authority does not match the client kind')
-      if (r.group !== slot.group) this.fail('handler group is not its client group')
-    }
+    const slot = isString(r.client) ? this.client(r.client, r) : undefined
+    if (slot) this.slotChecks({ ...r, variant }, slot)
+  }
+
+  /** @param {object} r a `wave-key` or `partition-state` record, one of its cause's counted items */
+  item(r) {
+    const kind = ITEM_KINDS[r.kind]
+    const open = this.summaries.get(r.cause)
+    if (!open || open.kind !== kind || open.source !== r.source)
+      return this.fail(`cites no open ${kind} of its source`)
+    if (--open.left === 0) this.summaries.delete(r.cause)
   }
 
   /** @param {object} r */
@@ -1947,7 +2019,10 @@ class StreamValidator {
   processExit(r) {
     if (this.processes.get(r.process) !== 'live') this.fail('exit of a process that is not live')
     if (r.source === r.process) this.fail('a process cannot observe its own exit')
+    if ((this.sources.get(r.process)?.at ?? 0) > r.at)
+      this.fail('the process has a record after its exit')
     this.processes.set(r.process, 'exited')
+    this.exits.set(r.process, r.at)
   }
 
   /** @param {object} r */
@@ -1957,8 +2032,7 @@ class StreamValidator {
     if (!new RegExp(`^${r.slot}\\.(0|[1-9][0-9]*)$`).test(r.client))
       this.fail('client id is not <slot>.<incarnation>')
     if (this.clients.has(r.client)) this.fail('client id is reused')
-    if (this.processes.get(r.process) !== 'live')
-      this.fail('client is constructed outside a live process')
+    if (!this.liveAt(r.process, r.at)) this.fail('client is constructed outside a live process')
     for (const field of [
       'clientKind',
       'process',
@@ -1973,6 +2047,13 @@ class StreamValidator {
       if (r[field] !== slot[field]) this.fail(`client ${field} differs from its config slot`)
     }
     this.clients.set(r.client, slot)
+    for (const fact of this.held.get(r.client) ?? []) {
+      if (fact.source === slot.process)
+        this.fail('names a client before its construction', fact.line)
+      else this.slotChecks(fact, slot, fact.line)
+      this.heldCount--
+    }
+    this.held.delete(r.client)
   }
 
   /** @param {object} r @param {string} phase */
@@ -1992,9 +2073,8 @@ class StreamValidator {
 
   /** @param {object} r */
   inventory(r) {
-    if (this.processes.get(r.process) !== 'live')
-      this.fail('inventory of a process that is not live')
-    const slot = r.client === null ? null : this.client(r.client)
+    if (!this.liveAt(r.process, r.at)) this.fail('inventory of a process that is not live')
+    const slot = r.client === null ? null : this.client(r.client, r)
     const sections =
       r.client === null
         ? SECTION_SETS.process
@@ -2028,10 +2108,10 @@ class StreamValidator {
 
   /** @param {object} r */
   sample(r) {
-    if (this.processes.get(r.process) !== 'live') this.fail('sample of a process that is not live')
+    if (!this.liveAt(r.process, r.at)) this.fail('sample of a process that is not live')
     for (const client of r.clients) {
-      const slot = this.client(client)
-      if (slot && slot.process !== r.process) this.fail('sample lists a client of another process')
+      const slot = this.client(client, r)
+      if (slot) this.slotChecks(r, slot)
     }
     const cut = this.cuts.get(r.inventory)
     if (!cut || cut.process !== r.process) this.fail('sample cites no inventory cut of its process')
@@ -2072,6 +2152,13 @@ class StreamValidator {
    * @returns {string[]} every problem found, capped with a count of those omitted
    */
   finish() {
+    for (const facts of this.held.values())
+      for (const fact of facts) this.fail('names a client that was never constructed', fact.line)
+    this.held.clear()
+    for (const [recordId, open] of this.summaries) {
+      const item = Object.keys(ITEM_KINDS).find((k) => ITEM_KINDS[k] === open.kind)
+      this.fail(`${nameOf(recordId)} misses ${open.left} of its ${item} records`, open.line)
+    }
     const problems = [...this.problems]
     if (this.omitted > 0) problems.push(`${this.omitted} more problems omitted`)
     for (const [execution] of this.executions)
@@ -2099,6 +2186,7 @@ module.exports = {
   ROWS,
   CLIENT_KINDS,
   SHAPES,
+  RECORDS,
   RECORD_KINDS,
   SECTION_SETS,
   StreamValidator,

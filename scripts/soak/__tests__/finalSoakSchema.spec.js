@@ -2047,7 +2047,7 @@ describe('scripts/soak/finalSoakSchema', () => {
           r.at(-1).at = r.length - 1.5
         },
       })
-    ).toEqual([expect.stringContaining('its source process has exited')])
+    ).toEqual([expect.stringContaining('the process has a record after its exit')])
   })
 
   it('inventory cuts are complete per client section and chunk before a sample uses them', () => {

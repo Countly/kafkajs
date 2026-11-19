@@ -109,6 +109,16 @@ seal() {
   node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after="${after:-finalize}"
 }
 
+# For diagnosis only, after a run failed its workload check: the core checker of this checkout, when
+# it has one, judges the sealed artifact into <artifact>.core.txt beside the receipt. Its verdict
+# and exit status never change the run's failed status.
+diagnose_core() {
+  [[ -f scripts/evidence/finalSoakCore.js ]] || return 0
+  node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt"
+  cat "$out.core.txt"
+  echo "core checker report for diagnosis only (the run failed at stage workload): $out.core.txt"
+}
+
 # Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped
 # (a signal to the process group may already have ended it), cleans up what was started, archives
 # and writes the receipt.
@@ -126,6 +136,7 @@ finish() {
     seal
     cleanup "$status"
   fi
+  if ((status != 0)) && [[ "$stage" == workload && -n "$sealed" ]]; then diagnose_core; fi
   if ! tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
     stage=archive
     status=1

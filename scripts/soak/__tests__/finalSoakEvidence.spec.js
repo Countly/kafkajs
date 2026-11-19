@@ -1256,7 +1256,7 @@ describe('final soak record line sizes', () => {
     source: 'p06',
     seq: N,
     at: T,
-    execution: null,
+    execution: 'h23m3w2',
     ...record,
     t: T,
   })

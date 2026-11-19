@@ -1384,7 +1384,7 @@ describe('final soak failure evidence', () => {
         type: 'CONSUMER_STOPPING',
         code: 7,
         retriable: false,
-        message: 'x'.repeat(120),
+        message: `${'x'.repeat(98)}… (300 characters)`,
         causes: [
           { name: 'KafkaJSRequestTimeoutError', message: 'Request timed out' },
           { name: 'KafkaJSConnectionError', message: 'socket hang up' },
@@ -1399,7 +1399,7 @@ describe('final soak failure evidence', () => {
     error.cause = error
     await runtime.failed('c18.4.m9385', error)
     const [record] = runtime.records
-    expect(record.error.causes).toHaveLength(3)
+    expect(record.error.causes).toHaveLength(2)
     const line = JSON.stringify({ ...record, source: 'p06', seq: 1e9, at: 1e9, t: 1e9 })
     expect(Buffer.byteLength(line)).toBeLessThanOrEqual(matrix.host.maxEventLineBytes.value)
   })

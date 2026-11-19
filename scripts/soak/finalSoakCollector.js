@@ -12,6 +12,27 @@ const OUTER = 'outer'
 const MIB = 1024 * 1024
 const ENQUEUE_TIMEOUT_MS = 5000
 const EXPLICIT_RESOURCES = ['TCPSocketWrap', 'Timeout']
+/** JSON bytes kept of a diagnostic's message, so the record always fits the event line cap. */
+const DIAGNOSTIC_BYTES = 600
+
+/**
+ * Cuts free text to a JSON size: whole characters are kept while the quoted, escaped text stays
+ * within `maxBytes`, and a cut text ends with how long it was.
+ * @param {string} text @param {number} maxBytes the JSON-encoded size allowed, quotes included
+ * @returns {string}
+ */
+const clip = (text, maxBytes) => {
+  if (Buffer.byteLength(JSON.stringify(text)) <= maxBytes) return text
+  const suffix = `… (${text.length} characters)`
+  let bytes = Buffer.byteLength(JSON.stringify(suffix))
+  let kept = ''
+  for (const char of text) {
+    bytes += Buffer.byteLength(JSON.stringify(char)) - 2
+    if (bytes > maxBytes) break
+    kept += char
+  }
+  return kept + suffix
+}
 
 /**
  * The sole routine stream writer. Records arrive with their envelope from each source; the
@@ -94,12 +115,12 @@ class Collector {
   }
 
   /**
-   * Appends a diagnostic from the collector itself.
+   * Appends a diagnostic from the collector itself; its message is clipped to fit the line cap.
    * @param {string} message @param {object} [extra] open diagnostic fields
    * @returns {Promise<boolean>}
    */
   note(message, extra = {}) {
-    return this.own({ kind: 'diagnostic', message, ...extra })
+    return this.own({ kind: 'diagnostic', message: clip(message, DIAGNOSTIC_BYTES), ...extra })
   }
 
   /**
@@ -119,15 +140,22 @@ class Collector {
     return JSON.stringify({ ...record, t: this.lastT }) + '\n'
   }
 
-  /** @param {object} record @returns {Promise<boolean>} */
+  /**
+   * Queues one record's line. A line over its cap fails the collection with the record's id, kind
+   * and size, and a diagnostic with the record's own envelope takes its place, so its source's
+   * sequence stays gap-free and the source keeps delivering (its final sample included).
+   * @param {object} record @returns {Promise<boolean>} whether its place in the stream was written
+   */
   async enqueue(record) {
     let line = this.line(record)
     const cap = record.kind === 'inventory' ? this.maxInventoryLine : this.maxLine
-    if (Buffer.byteLength(line) - 1 > cap) {
-      this.fail(`${record.recordId} ${record.kind} line exceeds ${cap} bytes`)
-      if (record.source !== this.source)
-        await this.note(`oversize ${record.kind} record ${record.recordId} not written`)
-      return false
+    const size = Buffer.byteLength(line) - 1
+    if (size > cap) {
+      const { recordId, source, seq, at, execution, kind } = record
+      this.fail(`${recordId} ${kind} line of ${size} bytes exceeds ${cap} bytes`)
+      const message = `oversize ${kind} record ${recordId} of ${size} bytes not written`
+      record = { kind: 'diagnostic', recordId, source, seq, at, execution, message }
+      line = this.line(record)
     }
     if (
       this.waiters.length > 0 ||
@@ -491,6 +519,8 @@ module.exports = {
   OUTER,
   MIB,
   EXPLICIT_RESOURCES,
+  DIAGNOSTIC_BYTES,
+  clip,
   Collector,
   SourceChannel,
   Sampler,
