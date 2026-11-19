@@ -1272,9 +1272,11 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
    * @param {object} [options.rebalanceListener]
    * @param {boolean} [options.busy=true] false: the handler of a:0@42 returns at once, so the fetch
    *   loop is free during the wait
+   * @param {'fence'|'poll'} [options.trigger='fence'] 'poll': instead of the fenced heartbeat, the
+   *   poll timer expires as the wait starts, so the member leaves the group
    * @returns {Promise<object>} the built consumer and what the case observed
    */
-  const fenceWhileHandlerRuns = async ({ rebalanceListener, busy = true } = {}) => {
+  const fenceWhileHandlerRuns = async ({ rebalanceListener, busy = true, trigger = 'fence' } = {}) => {
     const built = buildConsumer()
     consumer = built.consumer
     const handled = []
@@ -1308,7 +1310,9 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
         if (++s.waits === 1) {
           s.fenced = true
           s.fencedAt = Date.now()
-          this.heartbeatManager.requestTick()
+          // The heartbeat manager's own call when a tick finds the poll timer expired.
+          if (trigger === 'poll') this.onPollExpired({ elapsedMs: 1, isStatic: false })
+          else this.heartbeatManager.requestTick()
         }
         return wait.call(this)
       })
@@ -1396,6 +1400,40 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ])
     expect(run.crashes).toEqual([])
   })
+
+  it.each([
+    ['keeps the fetch loop busy', true],
+    ['leaves the fetch loop free', false],
+  ])(
+    'leaves, runs one LOST round and rejoins when the poll timer expires during the wait while a handler %s, and redelivers from the committed offset',
+    async (_, busy) => {
+      const run = await fenceWhileHandlerRuns({ busy, trigger: 'poll' })
+      const after = run.log.filter(({ at }) => at >= run.fencedAt)
+      const order = after
+        .filter(({ kind, epoch }) => kind === 'PARTITIONS_LOST' || epoch === -1 || epoch === 0)
+        .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
+
+      expect(order).toEqual([-1, 'PARTITIONS_LOST', 0])
+      expect(after.find(({ kind }) => kind === 'PARTITIONS_LOST').partitions).toEqual([
+        { topic: 'topic-a', partitions: [0] },
+        { topic: 'topic-b', partitions: [0, 1] },
+      ])
+      expect(after.filter(({ kind }) => kind === 'PARTITIONS_REVOKED')).toEqual([])
+      expect(
+        run.handled
+          .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')
+          .map(({ offset }) => offset)
+      ).toEqual(['40', '41'])
+      expect(run.log.filter(({ kind, tp }) => kind === 'commit' && tp === 'topic-a|0')).toEqual([
+        expect.objectContaining({ offset: '42', generationId: 100 }),
+      ])
+      const [runner] = run.starts.mock.contexts
+      expect(runner.consumerGroup.groupMembership.state).toEqual('STABLE')
+      expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(100)
+      expect(run.crashes).toEqual([])
+      expect(run.starts).toHaveBeenCalledTimes(1)
+    }
+  )
 
   it('backs off between rejoins the coordinator keeps fencing instead of rejoining once per millisecond, and joins once it accepts one', async () => {
     const built = buildConsumer()
