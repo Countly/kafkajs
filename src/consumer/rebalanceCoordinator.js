@@ -1,7 +1,7 @@
 const describeThrown = require('../network/describeThrown')
 const handlerContext = require('./handlerContext')
 const RebalanceHooks = require('./rebalanceHooks')
-const { KafkaJSNonRetriableError, KafkaJSRebalanceNotConvergedError } = require('../errors')
+const { KafkaJSRebalanceNotConvergedError } = require('../errors')
 const {
   REBALANCE_PATHS,
   rebalanceAction,
@@ -26,15 +26,16 @@ const {
 } = require('./instrumentationEvents')
 
 /**
- * Consecutive rounds one classic chain may run before it is treated as non-converging. A classic
- * cooperative round that revokes something runs a follow-up round at once, with no wait; a pair of
- * members that keep taking partitions from each other would otherwise chain forever.
+ * Consecutive rounds one classic cooperative chain may run before it is treated as non-converging.
+ * A cooperative round that revokes something runs a follow-up round at once, with no wait; a pair
+ * of members that keep taking partitions from each other would otherwise chain forever.
  */
 const MAX_CLASSIC_ROUNDS = 20
 
 /**
- * How many rounds a consumer-protocol chain completes between two warnings that it is still
- * running. Such a chain has no round limit: it waits before each follow-up round instead.
+ * How many rounds a chain with no round limit completes between two warnings that it is still
+ * running: a consumer-protocol chain, which waits before each follow-up round, and a classic eager
+ * one, which is paced only by its JoinGroup and SyncGroup round trips.
  */
 const RECONCILE_WARN_EVERY = 20
 
@@ -255,7 +256,7 @@ module.exports = class RebalanceCoordinator {
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
    * @returns {Promise<void>}
-   * @throws {KafkaJSRebalanceNotConvergedError} when a classic chain does not converge
+   * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
   async runChain(reason, kind) {
     try {
@@ -291,7 +292,7 @@ module.exports = class RebalanceCoordinator {
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
    * @returns {Promise<void>}
-   * @throws {KafkaJSRebalanceNotConvergedError} when a classic chain does not converge
+   * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
   async runRounds(reason, kind) {
     do {
@@ -440,24 +441,27 @@ module.exports = class RebalanceCoordinator {
   /**
    * Charges one round to the running chain. The only place a chain is declared exhausted.
    *
-   * A consumer-protocol chain is never exhausted: it runs a round only while work is owed, each
-   * follow-up after one paced wait, the way the Java client keeps reconciling. When another round
-   * is about to start after a multiple of `RECONCILE_WARN_EVERY` completed rounds, it warns,
-   * naming that round's reason. A classic chain has no wait between rounds, so the round after
-   * `MAX_CLASSIC_ROUNDS` completed ones is refused: with a cooperative assignor, with the retriable
-   * `KafkaJSRebalanceNotConvergedError` that the default crash policy answers with a restart; with
-   * an eager one, with the non-retriable error it always raised.
+   * Only a classic cooperative chain has a round limit: it has no wait between rounds and its
+   * follow-ups come from revocations two members can keep trading, so the round after
+   * `MAX_CLASSIC_ROUNDS` completed ones is refused with the retriable
+   * `KafkaJSRebalanceNotConvergedError`, which the default crash policy answers with a restart.
+   *
+   * A consumer-protocol chain (paced by a wait between rounds) and a classic eager chain (paced
+   * only by its round trips) keep running while a round is owed, as kafkajs 2.2.4 kept rejoining.
+   * When another of their rounds is about to start after a multiple of `RECONCILE_WARN_EVERY`
+   * completed rounds, it warns, naming that round's reason, so a loop is visible.
    * @private
    * @param {string|null} reason the reason the round about to run is for
    * @returns {void}
    * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain needs another
    *   round after `MAX_CLASSIC_ROUNDS`
-   * @throws {KafkaJSNonRetriableError} when a classic eager chain needs another round after
-   *   `MAX_CLASSIC_ROUNDS`
    */
   chargeRound(reason) {
     const completed = this.rounds++
-    if (this.consumerGroup.kind === 'consumer') {
+    if (
+      this.consumerGroup.kind === 'consumer' ||
+      this.consumerGroup.rebalanceProtocol() !== COOPERATIVE
+    ) {
       if (completed > 0 && completed % RECONCILE_WARN_EVERY === 0) {
         this.logger.warn('Reconciliation is still running', {
           groupId: this.groupId,
@@ -468,11 +472,9 @@ module.exports = class RebalanceCoordinator {
       return
     }
     if (completed < MAX_CLASSIC_ROUNDS) return
-    const message = `cooperative rebalance did not converge in ${MAX_CLASSIC_ROUNDS} rounds`
-    if (this.consumerGroup.rebalanceProtocol() !== COOPERATIVE) {
-      throw new KafkaJSNonRetriableError(message)
-    }
-    throw new KafkaJSRebalanceNotConvergedError(message)
+    throw new KafkaJSRebalanceNotConvergedError(
+      `cooperative rebalance did not converge in ${MAX_CLASSIC_ROUNDS} rounds`
+    )
   }
 
   /**

@@ -547,8 +547,8 @@ class KafkaJSNoBrokerAvailableError extends KafkaJSError {
  * the consumer, which rejoins and resumes from the committed offsets (the offset reset policy
  * applies where none is committed); records processed since the last commit can be delivered
  * again. A custom `restartOnFailure` receives this error itself and restarts only when it returns
- * true. An eager classic chain still ends with `KafkaJSNonRetriableError`, and consumer-protocol
- * (KIP-848) groups never raise it.
+ * true. Classic eager chains and consumer-protocol (KIP-848) groups have no round limit and never
+ * raise it.
  */
 class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
   /**
