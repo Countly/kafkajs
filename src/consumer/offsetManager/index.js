@@ -14,6 +14,7 @@ const {
   isStaleCoordinator,
 } = require('../../errors')
 const { isCallDeadline } = require('../groupProtocol/interface')
+const { ON_WRITE } = require('../../broker/privateOptions')
 const {
   stampGeneration,
   stampOffsetCommit,
@@ -49,7 +50,8 @@ const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
  * `written` once its bytes were handed to the socket (or an answer proves it), `accepted` once the
  * broker answered without an error, `rejected` once the broker answered with one, and, for a seek,
  * `superseded` when a newer operation or barrier owned its cell as the commit ended.
- * @typedef {{written?: boolean, accepted?: boolean, rejected?: boolean, superseded?: boolean}} CommitAttempt
+ * @typedef {{written?: boolean, accepted?: boolean, rejected?: boolean, superseded?: boolean,
+ *   refusal?: () => Error|null}} CommitAttempt
  */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
@@ -347,7 +349,8 @@ module.exports = class OffsetManager {
    *   transmission and settlement; the terminal fence that binds the coordinator discovery and
    *   the metadata refresh a refused topic id starts; for a default selection, the seek clock it
    *   was selected at, so a cell no longer authorized refuses the request before it is written
-   *   (`seekRefusal`); and the attempt that records what happened on the wire
+   *   (`seekRefusal`); and the attempt that records what happened on the wire, whose own
+   *   `refusal`, like `seekRefusal`, is checked only until the write and never replaces an answer
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
    *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
@@ -359,11 +362,13 @@ module.exports = class OffsetManager {
     const token = this.ownership?.token()
     const { revision } = this.membership()
     const release = this.ownership?.retain(token)
-    let checkSeeks = since !== undefined
+    let beforeWrite = true
     const check = () =>
       this.ownership?.refusal(token) ||
       guard?.() ||
-      (checkSeeks && this.seekRefusal(payload.topics, since)) ||
+      (beforeWrite &&
+        ((since !== undefined && this.seekRefusal(payload.topics, since)) ||
+          attempt?.refusal?.())) ||
       null
 
     try {
@@ -377,7 +382,7 @@ module.exports = class OffsetManager {
       const result = attempt
         ? await coordinator.offsetCommit(request, {
             guard: check,
-            onWrite: () => {
+            [ON_WRITE]: () => {
               attempt.written = true
             },
           })
@@ -385,12 +390,12 @@ module.exports = class OffsetManager {
           ? await coordinator.offsetCommit(request, { guard: check })
           : await coordinator.offsetCommit(request)
       if (attempt) attempt.written = attempt.accepted = true
-      checkSeeks = false
+      beforeWrite = false
       refusal = check()
       if (refusal) throw refusal
       return result
     } catch (error) {
-      checkSeeks = false
+      beforeWrite = false
       if (attempt && sent && !attempt.accepted && error instanceof KafkaJSProtocolError) {
         attempt.written = attempt.rejected = true
       }
@@ -709,7 +714,9 @@ module.exports = class OffsetManager {
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
    *   the caller's round identity: refused before the ticket begins, part of every currentness
    *   check, and handed to both lookups and the commit; absent, behaves as without a round
-   * @returns {Promise<boolean>} false when superseded, otherwise actual position installed
+   * @returns {Promise<boolean>} false when superseded, including a commit refused at its write
+   *   because the reset stopped being current (a seek overtook it); otherwise the actual position
+   *   installed
    * @throws {Error} lookup or identity-valid commit failure, or the preparation's refusal
    */
   async resetByDuration({ topic, partition }, preparation) {
@@ -753,10 +760,15 @@ module.exports = class OffsetManager {
           groupInstanceId: this.groupInstanceId,
           topics: [{ topic, partitions: [{ partition, offset: actualOffset }] }],
         }
-        await this.sendOffsetCommit(payload, {
-          guard,
-          ...(preparation && { fence: preparation.fence }),
-        })
+        try {
+          await this.sendOffsetCommit(payload, {
+            guard,
+            ...(preparation && { fence: preparation.fence }),
+          })
+        } catch (error) {
+          if (error instanceof KafkaJSCommitFailedError && !current()) return false
+          throw error
+        }
         if (!current()) return false
         this.instrumentationEmitter.emit(COMMIT_OFFSETS, payload)
       }
@@ -1249,8 +1261,9 @@ module.exports = class OffsetManager {
    * Sends one OffsetCommit and records what the coordinator accepted in the committed cache, cell
    * by cell, under a mutation ticket. A cell that a newer commit or seek, or a barrier, reached
    * while the request was in flight keeps its newer value, whichever answer arrived first. The
-   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` with the payload sent once
-   * the request succeeds, and records after the emit, so a seek a listener admits is seen.
+   * cache write never moves a resolved position. Emits `COMMIT_OFFSETS` with a copy of the payload sent
+   * once the request succeeds, and records after the emit, so a seek a listener admits is seen and
+   * a listener that replaces the reported cells changes nothing recorded.
    *
    * A default selection (`since`) is sent once, under this one ticket, with only its cells that
    * are still authorized at the write: a cell sought or acquired again since the selection is
@@ -1282,7 +1295,7 @@ module.exports = class OffsetManager {
           sent = { ...payload, topics: cells }
         }
       }
-      this.instrumentationEmitter.emit(COMMIT_OFFSETS, sent)
+      this.instrumentationEmitter.emit(COMMIT_OFFSETS, { ...sent })
       const refusal = options?.guard?.()
       if (refusal) throw refusal
       this.recordCommitted(ticket, sent.topics, requestedIds, options?.since)

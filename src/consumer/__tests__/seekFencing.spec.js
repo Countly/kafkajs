@@ -5,7 +5,7 @@ const { FetchPreparation } = require('../fetchPreparation')
 const handlerContext = require('../handlerContext')
 const OffsetManager = require('../offsetManager')
 const { KafkaJSCommitFailedError, KafkaJSNonRetriableError } = require('../../errors')
-const { TOPIC, CloseRig, batchAt, gate, until } = require('./fixtures/closeRig')
+const { TOPIC, GROUP, CloseRig, batchAt, gate, until } = require('./fixtures/closeRig')
 
 const BEFORE = ['value-2', 'value-3', 'value-4']
 
@@ -1947,7 +1947,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
   })
 
   describe('a fetch round prepared before a seek another caller applied', () => {
-    test('delivers the first batch it fetched at the sought offset', async () => {
+    test('delivers at the sought offset, after fetching it once more', async () => {
       const captured = using(captureGroup())
       await open({ run: { ...MANUAL, eachBatch: true } })
       const group = captured.group()
@@ -1978,7 +1978,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       opened.resolve()
 
       expect(await scenario.nextDelivery()).toEqual(['value-0'])
-      expect(fetchOffsetsOf(scenario.rig, 0).filter((offset) => offset === '0')).toEqual(['0'])
+      expect(fetchOffsetsOf(scenario.rig, 0).filter((offset) => offset === '0')).toEqual(['0', '0'])
       expect(scenario.errors).toEqual([])
     })
   })
@@ -2075,6 +2075,37 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
         await rig.dispose()
       }
     })
+  })
+
+  test("a broker's public offsetCommit options cannot reach the commit's write hook", async () => {
+    const captured = using(captureGroup())
+    await open({ run: { ...MANUAL, eachBatch: true } })
+    const broker = await captured.group().cluster.findGroupCoordinator({ groupId: GROUP })
+    const onWrite = jest.fn()
+    const write = jest.spyOn(RequestQueue.prototype, 'sendSocketRequest')
+    using({ restore: () => write.mockRestore() })
+    const { groupId, generationId, memberId } = captured.group()
+
+    await broker.offsetCommit(
+      {
+        groupId,
+        groupGenerationId: generationId,
+        memberId,
+        topics: [
+          {
+            topic: TOPIC,
+            topicId: captured.group().cluster.topicId(TOPIC),
+            partitions: [{ partition: 0, offset: '3' }],
+          },
+        ],
+      },
+      { onWrite }
+    )
+
+    const commits = write.mock.calls.filter(([request]) => request.entry.apiName === 'OffsetCommit')
+    expect(commits.map(([request]) => request.onWrite)).toEqual([null])
+    expect(onWrite).not.toHaveBeenCalled()
+    expect(scenario.committed[0]).toBe('3')
   })
 
   describe('an answer requested before a seek', () => {

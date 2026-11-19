@@ -13,6 +13,7 @@ const {
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
+const { ON_WRITE } = require('./privateOptions')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -1702,9 +1703,10 @@ module.exports = class Broker {
    *   connection was acquired and connected, after the request was authenticated and encoded, and
    *   at the instant of transmission; an error it returns rejects this one request, which is then
    *   written nowhere, takes no in-flight slot and leaves the connection open.
-   * @param {() => void} [options.onWrite] called once, immediately before the request is written
-   *   to the socket, so a caller can tell a request refused before its write from one that may
-   *   have reached the broker
+   * @param {() => void} [options[ON_WRITE]] internal (`./privateOptions`): called once,
+   *   immediately before the request is written to the socket, so a caller can tell a request
+   *   refused before its write from one that may have reached the broker. A synchronous failure
+   *   of the write after it counts as possibly written
    * @returns {Promise}
    */
   async offsetCommit(
@@ -1728,7 +1730,7 @@ module.exports = class Broker {
       topics,
       topicIds,
     })
-    if (options?.onWrite) protocolRequest.onWrite = options.onWrite
+    if (options?.[ON_WRITE]) protocolRequest.onWrite = options[ON_WRITE]
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 

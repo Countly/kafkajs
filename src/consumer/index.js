@@ -58,6 +58,21 @@ const specialOffsets = [
   Long.fromValue(LATEST_OFFSET).toString(),
 ]
 
+/** The highest partition id Kafka can name: partitions are int32 on the wire. */
+const MAX_PARTITION = 2 ** 31 - 1
+
+/**
+ * @param {unknown} value
+ * @returns {string} the value as text, or its type when it cannot be converted
+ */
+const printable = (value) => {
+  try {
+    return String(value)
+  } catch (_) {
+    return typeof value
+  }
+}
+
 /**
  * Keys the classic protocol owns, in the order the Java client lists them, so a rejection naming
  * several reads the same way theirs does.
@@ -1413,9 +1428,10 @@ module.exports = (params) => {
 
   /**
    * Requests a seek of one partition. Every argument is checked before any state changes: a
-   * missing topic, a partition that is not a number (a numeric string such as `'0'` included) and
-   * an offset that is not a non-negative long or a `'-1'`/`'-2'` sentinel throw
-   * `KafkaJSNonRetriableError`.
+   * missing topic, a partition that is not a Kafka partition id (an integer from 0 to 2^31 - 1; a
+   * numeric string such as `'0'`, `NaN`, a fraction or a negative number is not) and an offset
+   * that is not a non-negative long or a `'-1'`/`'-2'` sentinel throw `KafkaJSNonRetriableError`.
+   * `admin.setOffsets` seeks through here and is checked the same way.
    * @type {import("../../types").Consumer["seek"]}
    */
   const seek = ({ topic, partition, offset }) => {
@@ -1423,9 +1439,9 @@ module.exports = (params) => {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
 
-    if (typeof partition !== 'number' || isNaN(partition)) {
+    if (!Number.isInteger(partition) || partition < 0 || partition > MAX_PARTITION) {
       throw new KafkaJSNonRetriableError(
-        `Invalid partition, expected a number received ${partition}`
+        `Invalid partition, expected a number received ${printable(partition)}`
       )
     }
 
