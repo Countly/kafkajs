@@ -870,7 +870,7 @@ says so, `groupProtocol: 'consumer'`.
   exist (`UNSUPPORTED_ASSIGNOR`, 112), the subscription regex is one the broker will not accept
   (`INVALID_REGULAR_EXPRESSION`, 128), the caller is not authorized for the group
   (`GROUP_AUTHORIZATION_FAILED`, 30), the coordinator rejected the request as malformed
-  (`INVALID_REQUEST`, 42), a duplicate `groupInstanceId` fenced this member (`FENCED_INSTANCE_ID`,
+  (`INVALID_REQUEST`, 42), a current heartbeat answered `GROUP_ID_NOT_FOUND` (69) while the member is still in the group or answered with any other error code the heartbeat does not handle (an unrecognized broker error included), a duplicate `groupInstanceId` fenced this member (`FENCED_INSTANCE_ID`,
   82), or the cluster does not implement the consumer protocol at all. Each emits `CRASH` with
   `restart: false` **regardless of `retry.restartOnFailure`** — a callback returning `true` does not
   bring the consumer back. What to do: fix the ACL, the configuration, the assignor name, the
