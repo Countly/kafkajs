@@ -1443,12 +1443,20 @@ describe('final soak retained harness state', () => {
     expect(child.topicIds.has('r')).toBe(false)
   })
 
-  test("a share member forgets a retired incarnation's delivered offsets", () => {
+  test("a share member forgets a retired incarnation's delivered and accepted offsets", () => {
     const share = new ShareWorker(workerRuntime('c07'))
-    share.delivered(`${IDS.A}|0`, '0')
-    share.delivered(`${IDS.B}|0`, '0')
+    for (const topicId of [IDS.A, IDS.B]) {
+      share.delivered(`${topicId}|0`, '0')
+      share.onShareSettled({
+        key: { topicId, partition: 0 },
+        offsets: [{ offset: '0', type: 'accept' }],
+        result: 'ok',
+        errorCode: 0,
+      })
+    }
     share.forgetTopic(IDS.A)
     expect([...share.entered.keys()]).toEqual([`${IDS.B}|0`])
+    expect([...share.accepted.keys()]).toEqual([`${IDS.B}|0`])
   })
 
   test("a day's membership waves and regex topics leave the retained state at the live set", () => {
@@ -1867,37 +1875,85 @@ describe('final soak final drain', () => {
     expect(await worker.onRecovered({})).toEqual({ ok: false })
   })
 
-  test('a share member waits until every offset below the log end had a handler entry and the deliveries go quiet', async () => {
-    const runtime = workerRuntime('c07')
+  /**
+   * A share worker whose runtime routes settled acknowledgements to it, and `take`, which hands
+   * one record of a topic id to its handler and settles its accept with the given error code.
+   */
+  const shareDrain = () => {
+    const runtime = { ...workerRuntime('c07'), slotOf: () => ({ group: 'g' }) }
     const worker = new ShareWorker(runtime)
-    worker.standing.push({ id: 'c07.1', slot: config.clients.find((c) => c.slot === 'c07') })
-    for (let offset = 0; offset < 99; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
-    setTimeout(() => worker.delivered(`${IDS.A}|0`, '99'), 60)
+    runtime.worker = worker
+    const take = (topicId, offset, errorCode = 0) => {
+      worker.delivered(`${topicId}|0`, String(offset))
+      ChildRuntime.prototype.observed.call(runtime, {
+        type: 'share-settle',
+        acquisition: 'c07.1.a1',
+        client: 'c07.1',
+        key: { topic: main, topicId, partition: 0 },
+        offsets: [{ offset: String(offset), automatic: false, type: 'accept' }],
+        result: 'ok',
+        errorCode,
+        wire: { file: 'wire', sha256: 'sha' },
+      })
+    }
+    return { runtime, worker, take }
+  }
+
+  test('a share member waits until every offset below the log end had a handler entry and a confirmed accept', async () => {
+    const { runtime, worker, take } = shareDrain()
+    for (let offset = 0; offset < 99; offset++) take(IDS.A, offset)
+    setTimeout(() => take(IDS.A, 99), 60)
     const reply = await worker.onDrain({
       ends: { [key]: '100' },
       deadline: runtime.clock.now() + 5000,
-      quietMs: 40,
     })
     expect(reply).toEqual({ reached: true })
     const late = await worker.onDrain({
       ends: { [key]: '120' },
       deadline: runtime.clock.now() + 40,
-      quietMs: 10,
     })
     expect(late).toEqual({ reached: false })
   })
 
-  test('a share drain fails on a missing early offset even when the last offset was delivered', async () => {
-    const runtime = workerRuntime('c07')
-    const worker = new ShareWorker(runtime)
-    for (let offset = 60; offset < 100; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
-    const step = { ends: { [key]: '100' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
+  test('a share drain of one topic incarnation is reached while deliveries of another topic never pause', async () => {
+    const { runtime, worker, take } = shareDrain()
+    for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
+    let other = 0
+    const traffic = setInterval(() => take(IDS.B, other++), 5)
+    try {
+      const began = runtime.clock.now()
+      const reply = await worker.onDrain({ ends: { [key]: '10' }, deadline: began + 2000 })
+      expect(reply).toEqual({ reached: true })
+      expect(runtime.clock.now() - began).toBeLessThan(2000)
+    } finally {
+      clearInterval(traffic)
+    }
+  })
+
+  test('a share drain needs the broker to confirm each accept: a delivered record whose accept was refused stays missing until a later accept is confirmed', async () => {
+    const { runtime, worker, take } = shareDrain()
+    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
+    take(IDS.A, 9, 121)
+    const step = { ends: { [key]: '10' }, deadline: runtime.clock.now() + 40 }
     expect(await worker.onDrain(step)).toEqual({ reached: false })
     expect(runtime.records).toContainEqual({
       kind: 'diagnostic',
-      message: `share drain: ${key} has no handler entry at offset 0`,
+      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9`,
     })
-    for (let offset = 0; offset < 60; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
+    take(IDS.A, 9)
+    expect(await worker.onDrain(step)).toEqual({ reached: true })
+  })
+
+  test('a share drain fails on a missing early offset even when the last offset was delivered', async () => {
+    const { runtime, worker, take } = shareDrain()
+    for (let offset = 60; offset < 100; offset++) take(IDS.A, offset)
+    const step = { ends: { [key]: '100' }, deadline: runtime.clock.now() + 40 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} of topic id ${IDS.A} has no handler entry at offset 0`,
+    })
+    for (let offset = 0; offset < 60; offset++) take(IDS.A, offset)
     expect(await worker.onDrain(step)).toEqual({ reached: true })
   })
 
@@ -1908,11 +1964,11 @@ describe('final soak final drain', () => {
     const state = worker.entered.get(`${IDS.A}|0`)
     expect(state.ahead.size).toBeLessThanOrEqual(100000)
     expect(state.gap).toBe('0')
-    const step = { ends: { [key]: '100002' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
+    const step = { ends: { [key]: '100002' }, deadline: runtime.clock.now() + 40 }
     expect(await worker.onDrain(step)).toEqual({ reached: false })
     expect(runtime.records).toContainEqual({
       kind: 'diagnostic',
-      message: `share drain: ${key} has no handler entry at offset 0`,
+      message: `share drain: ${key} of topic id ${IDS.A} has no handler entry at offset 0`,
     })
   })
 
@@ -1969,6 +2025,7 @@ describe('final soak final drain ends', () => {
         }),
       }
       const drains = []
+      s.closeTransactions = async () => {}
       s.command = jest.fn(async (slot, step) => {
         drains.push(step.ends[`${transactions}|0`])
         return { reply: { reached: true } }
@@ -1977,6 +2034,46 @@ describe('final soak final drain ends', () => {
       const slots = new Set(s.command.mock.calls.map(([slot]) => slot)).size
       expect(drains).toEqual([...Array(slots).fill('42'), ...Array(slots).fill('43')])
       expect(s.problems).toEqual([])
+    } finally {
+      remove()
+    }
+  })
+})
+
+describe('final soak closing record', () => {
+  test('the final drain first ends the transactions log with one acknowledged visible record, offered once no transaction is open on it', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const { transactions } = s.config.topics
+      const order = []
+      s.settledEnds = jest.fn(async (deadline, topics = ['both']) => {
+        order.push(`ends ${topics.join(',')}`)
+        return {}
+      })
+      s.command = jest.fn(async (slot, step) => {
+        order.push(`${step.type} ${slot}`)
+        return { reply: step.type === 'probe' ? { acknowledged: 1 } : { reached: true } }
+      })
+      await s.finalDrain()
+      const producer = s.processOf('producer-idempotent')
+      expect(order.slice(0, 2)).toEqual([`ends ${transactions}`, `probe ${producer}`])
+      expect(order[2]).toBe('ends both')
+      expect(s.command.mock.calls[0][1]).toMatchObject({
+        type: 'probe',
+        id: 'final-close',
+        execution: null,
+        topic: transactions,
+        partitions: 1,
+        count: 1,
+      })
+      expect(s.problems).toEqual([])
+      s.command = jest.fn(async (slot, step) => ({
+        reply: step.type === 'probe' ? { acknowledged: 0, offered: 1 } : { reached: true },
+      }))
+      await s.finalDrain()
+      expect(s.problems).toEqual([
+        `final drain: the closing record of ${transactions} was not acknowledged`,
+      ])
     } finally {
       remove()
     }
@@ -2160,6 +2257,48 @@ describe('final soak failure evidence', () => {
     expect(record.error.causes).toHaveLength(2)
     const line = JSON.stringify({ ...record, source: 'p06', seq: 1e9, at: 1e9, t: 1e9 })
     expect(Buffer.byteLength(line)).toBeLessThanOrEqual(matrix.host.maxEventLineBytes.value)
+  })
+
+  test('a commit that outlived the membership it began under is journaled as an expected refusal, and a lost membership still as a failed call', async () => {
+    const { KafkaJSCommitFailedError } = require('../../../src/errors')
+    const runtime = workerRuntime('c18')
+    const worker = new ConsumerWorker(runtime)
+    const refusals = [
+      new KafkaJSCommitFailedError('The commit outlived its assignment', {
+        reason: 'stale-assignment',
+      }),
+      new KafkaJSCommitFailedError('The consumer no longer owns this membership', {
+        reason: 'membership-lost',
+        cause: new Error('member lost'),
+      }),
+    ]
+    const rig = {
+      id: 'c18.4',
+      slot: config.clients.find((c) => c.slot === 'c18'),
+      object: {
+        commitOffsets: async () => {
+          throw refusals.shift()
+        },
+      },
+      uncommitted: new Map(),
+    }
+    const key = { topic: config.topics.main, topicId: IDS.A, partition: 0 }
+    expect(await worker.commit(rig, { key, authority: {} }, '7400')).toBe('refused')
+    const [stale] = runtime.records.filter((r) => r.stage === 'commit' && r.phase === 'end')
+    expect(stale).toMatchObject({ outcome: 'refused', errorType: 'KafkaJSCommitFailedError' })
+    expect(runtime.records.filter((r) => r.kind === 'diagnostic')).toEqual([
+      {
+        kind: 'diagnostic',
+        message: `expected refusal: commit ${stale.commit} outlived the membership it began under`,
+      },
+    ])
+    expect(await worker.commit(rig, { key, authority: {} }, '7400')).toBe('refused')
+    expect(runtime.records.filter((r) => r.failedCall)).toEqual([
+      expect.objectContaining({
+        message: expect.stringMatching(/^public call c18\.4\.m\d+ failed$/),
+        error: expect.objectContaining({ name: 'KafkaJSCommitFailedError' }),
+      }),
+    ])
   })
 
   test('a commit whose public call failed is journaled with what the client returned', async () => {
