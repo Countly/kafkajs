@@ -552,8 +552,8 @@ describe('final soak scheduled work', () => {
         ['ready', 5151, 2000, 505250],
         ['isr', 5151, 2000, 505250],
       ])
-      expect(states[0].processTime).toBe(iso(2600))
-      expect(states[1].processTime).toBe(iso(5250))
+      expect(states[0].processTime).toBe(iso(502600))
+      expect(states[1].processTime).toBe(iso(505250))
       expect(states[1].processAt - states[0].processAt).toBeGreaterThanOrEqual(outageStep.downMs)
     } finally {
       remove()
@@ -933,9 +933,21 @@ describe('final soak final drain', () => {
   })
 
   test.each([
-    ['the key was acquired again', { acquiredAt: 8 }, 'the key was acquired again since its last handler'],
-    ['the topic was recreated', { recreatedAt: 3 }, 'the key was acquired again since its last handler'],
-    ['the client run changed', { run: 'c01.1.r2' }, 'the client run changed since its last handler'],
+    [
+      'the key was acquired again',
+      { acquiredAt: 8 },
+      'the key was acquired again since its last handler',
+    ],
+    [
+      'the topic was recreated',
+      { recreatedAt: 3 },
+      'the key was acquired again since its last handler',
+    ],
+    [
+      'the client run changed',
+      { run: 'c01.1.r2' },
+      'the client run changed since its last handler',
+    ],
   ])(
     'an intermediate drain skips a key when %s and journals the expected skip with its reason',
     async (_, change, reason) => {

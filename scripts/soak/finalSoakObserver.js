@@ -470,6 +470,12 @@ class PassiveObserver {
         after: (group) =>
           self.emit({ type: 'subscription', group, names: [...group.topicsSubscribed] }),
       },
+      // A recreation keeps the names and changes an id: publish so the new incarnation's lifetime
+      // exists before any pause state of it is stamped.
+      'ConsumerGroup#invalidateTopic': {
+        after: (group) =>
+          self.emit({ type: 'subscription', group, names: [...group.topicsSubscribed] }),
+      },
       'SubscriptionState#assign': { after: (state) => self.stamp(state, 'assign') },
       'SubscriptionState#pause': { after: (state) => self.stamp(state, 'pause') },
       'SubscriptionState#resume': { after: (state) => self.stamp(state, 'resume') },

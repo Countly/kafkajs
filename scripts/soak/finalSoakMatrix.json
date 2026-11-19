@@ -524,6 +524,7 @@
     "round": "successful round after awaited hooks",
     "seed": "actual seed map start and clear",
     "broker-state": "supervisor process and container plus raw metadata and ISR",
+    "wave": "paused keys a membership wave's extra and standing member held when the wave observed the transfer and the return",
     "identity": "producer, independent reader, handler, commit and broker readback stages",
     "scan": "independent completed sealed read_committed scan",
     "replay": "observed retry, loss or revoke plus broker boundary",
