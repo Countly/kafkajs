@@ -2701,7 +2701,7 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
   })
 
   // No production line changes for this, so it is pinned rather than implemented.
-  it('rebuilds offsets on a LOST round under both protocols', async () => {
+  it('rebuilds offsets on a LOST round, marked as the LOST round, under both protocols', async () => {
     for (const kind of ['classic', 'consumer']) {
       const { coordinator, consumerGroup } = build()
       consumerGroup.kind = kind
@@ -2712,6 +2712,7 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
       expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledWith(expect.anything(), {
         rebuildOffsets: true,
+        lost: true,
         round: expect.any(Object),
       })
       expect(consumerGroup.forgetOwnedPartitions).toHaveBeenCalled()

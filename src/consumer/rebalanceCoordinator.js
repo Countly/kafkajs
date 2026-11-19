@@ -353,6 +353,7 @@ module.exports = class RebalanceCoordinator {
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
+            lost: kind === 'lost',
             round,
             ...(additionHold && { additionHold }),
           })
@@ -529,25 +530,20 @@ module.exports = class RebalanceCoordinator {
 
   /**
    * Picks again once a consumer-protocol chain has waited, because the wait can change what is
-   * owed. A LOST verdict of the current membership in the slot ends the chain: the runner's LOST
-   * round (the lost callback or `PARTITIONS_LOST`, and the discard of uncommitted offsets) must run
-   * before any other round, and the fetch loop takes the verdict once its in-flight handlers
-   * return. A verdict slotted before an apply renewed the membership is obsolete and does not end
-   * the chain. A loss of the current membership the fetch loop already took ends the chain too,
-   * unless the chain owes a LOST round itself: no round may apply, and renew the membership, under
-   * a membership the runner is about to report lost. A LOST queued during the wait runs next, ahead
-   * of anything chosen before; a LOST queued for a membership a later join replaced is dropped. A
-   * choice taken from a level is replaced by what is owed now, and ends the chain when nothing is.
-   * An explicit re-entry or LOST chosen before the wait stays.
+   * owed. A loss owed by the current membership ends a chain that does not owe the LOST round
+   * itself: the runner's LOST round (the lost callback or `PARTITIONS_LOST`, and the discard of
+   * uncommitted offsets) runs first, and no other apply may renew that membership anyway. A LOST
+   * queued during the wait runs next, ahead of anything chosen before; a LOST queued for a
+   * membership a later join replaced is dropped. A choice taken from a level is replaced by what is
+   * owed now, and ends the chain when nothing is. An explicit re-entry or LOST chosen before the
+   * wait stays.
    * @private
    * @param {{ kind: string, reason: string, level: boolean }} chosen the round picked before the wait
    * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} the round to run, if any
    */
   nextRoundAfterWait(chosen) {
     const owesLost = chosen.kind === 'lost' || this.pendingKind === 'lost'
-    if (this.slottedLoss() || (!owesLost && this.lossTaken())) {
-      return { kind: chosen.kind, reason: null, level: false }
-    }
+    if (!owesLost && this.lossOwed()) return { kind: chosen.kind, reason: null, level: false }
     if (chosen.kind === 'lost' || (!chosen.level && this.pendingKind === null)) return chosen
     const now = this.nextRound(false)
     if (now.reason || (chosen.level && this.verdict === null)) return now
@@ -556,21 +552,10 @@ module.exports = class RebalanceCoordinator {
 
   /**
    * @private
-   * @returns {boolean} whether the slot holds a LOST verdict of the current membership
+   * @returns {boolean} whether the current membership carries a loss its LOST round has not
+   *   handled yet, whether the verdict waits in the slot or the fetch loop has taken it
    */
-  slottedLoss() {
-    return (
-      this.verdict?.kind === 'lost' &&
-      !obsoleteOwnership(this.consumerGroup.ownership, this.verdict.error)
-    )
-  }
-
-  /**
-   * @private
-   * @returns {boolean} whether the current membership is lost: a LOST taken out of the slot by the
-   *   fetch loop, whose LOST round runs once no chain is in flight
-   */
-  lossTaken() {
+  lossOwed() {
     const ownership = this.consumerGroup.ownership
     return !!ownership?.refusal(ownership.token())
   }
@@ -651,7 +636,7 @@ module.exports = class RebalanceCoordinator {
    * answers a coordinator gives across a round's own sync window are received heartbeats, not
    * verdicts - the Java client ignores `REBALANCE_IN_PROGRESS` unless it is STABLE - and queueing
    * them would chain one round per sync window without end. A consumer-protocol REVOKED is also
-   * dropped while a LOST of the current membership is owed, in the slot or taken by the fetch loop.
+   * dropped while the current membership owes a loss.
    * A LOST is never dropped.
    *
    * @param {Verdict} verdict
@@ -710,9 +695,9 @@ module.exports = class RebalanceCoordinator {
     )
       this.verdict = null
 
-    // A LOST of the current membership runs first, from the fetch loop, and its rejoin brings the
-    // latest target: a reconciliation opened now would apply, and renew, a lost membership.
-    if (this.consumerGroup.kind === 'consumer' && (this.slottedLoss() || this.lossTaken())) return
+    // The runner's LOST round runs first and its rejoin brings the latest target; a chain opened
+    // now could only be refused at its apply, and would take a LOST queued behind it with it.
+    if (this.consumerGroup.kind === 'consumer' && this.lossOwed()) return
 
     // Cooperative revocation: nothing stops the fetch manager, so nothing would ever settle
     // `start()` - the round has to be driven from here, in the background.
