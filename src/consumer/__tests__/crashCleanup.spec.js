@@ -453,6 +453,11 @@ describe('A disconnect during crash cleanup', () => {
 
       expect(await Promise.race([awaited[0], pause(500).then(() => 'pending')])).toBe('settled')
       expect(run.crashes).toHaveLength(1)
+      // A CRASH listener's close keeps the automatic restart, so this close ends the restarted run.
+      await run.consumer.disconnect()
+      const starts = run.start.mock.calls.length
+      await pause(30)
+      expect(run.start).toHaveBeenCalledTimes(starts)
     }
   )
 })
