@@ -1241,6 +1241,19 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    it('fails a handler entry for an id never offered when the offered ids fill the capacity exactly', async () => {
+      const offered = fx
+        .healthy()
+        .records()
+        .filter((r) => r.stage === 'offered').length
+      const edit = (records) => {
+        const e = records.find(isEntry(groupOf('c01'), 'c08.4'))
+        return [...records, { ...e, id: 'c08.999', handler: 'c01.0.hz' }]
+      }
+      const report = await check(fx.healthy(), { edit, capacity: offered })
+      expectRow(report, 'K2', 'FAIL', /1 handler entries name an id never offered/)
+    })
+
     it('is inconclusive with a named reason when more records wait for an offer than the capacity', async () => {
       const offered = fx
         .healthy()

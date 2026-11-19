@@ -178,8 +178,12 @@ class Journal {
     this.txOf = []
     this.txs = new Map()
     this.owners = new Map()
+    this.held = new Map()
+    this.heldCount = 0
+    this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
     this.trafficEnd = null
+    this.info = { outages: [], waves: { transfer: 0, return: 0, unobserved: 0 } }
     this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
   }
@@ -216,9 +220,18 @@ class Journal {
     else if (r.kind === 'sample') this.sample(r)
     else if (r.kind === 'process') this.process(r)
     else if (r.kind === 'shape' && r.execution === 'traffic' && r.phase === 'end')
-      this.trafficEnd = r.at
-    else if (r.kind === 'diagnostic') {
-      const kind = /^(missing-source|partial handler-enter|problem:)/.exec(r.message)?.[1]
+      this.trafficEnd = Math.max(this.trafficEnd ?? -Infinity, r.at)
+    else if (r.kind === 'broker-state' && r.event !== 'isr') {
+      const { node, event, at, downMs = null, processAt = null } = r
+      if (this.info.outages.length < LIST_CAP)
+        this.info.outages.push({ node, event, at, downMs, processAt })
+    } else if (r.kind === 'wave') {
+      this.info.waves[r.event]++
+      if (!r.observed) this.info.waves.unobserved++
+    } else if (r.kind === 'diagnostic') {
+      const kind =
+        /^(missing-source|partial handler-enter|problem:|expected skip:)/.exec(r.message)?.[1] ??
+        (/^probe send \S+ settled after/.test(r.message) ? 'late' : null)
       if (kind)
         this.incidents.set(kind, {
           count: (this.incidents.get(kind)?.count ?? 0) + 1,
@@ -230,9 +243,61 @@ class Journal {
   /** @param {object} r an identity record @returns {void} */
   identity(r) {
     if (r.stage === 'offered') this.offered(r)
-    else if (r.stage === 'ack') this.acknowledge(r)
     else if (r.stage === 'transaction') this.decided(r)
-    else if (r.stage === 'handler-enter') this.entry(r)
+    else if (r.stage === 'ack' || r.stage === 'handler-enter') this.byId(r)
+  }
+
+  /**
+   * An `ack` or `handler-enter` of a standing topic, reduced to the fields the rows read. Processes
+   * write the journal concurrently, so a record about an id can precede the id's `offered` record
+   * in the stream: it is held until the offer arrives and judged then; `finish` names those whose
+   * id was never offered. The ownership of an entry is judged on arrival, because only the order
+   * within its own process (the stream keeps it) relates it to that process's boundaries.
+   * @param {object} r @returns {void}
+   */
+  byId(r) {
+    if (!this.topics.has(r.key.topic)) return
+    if (r.stage === 'handler-enter' && !this.groupIndex.has(r.group)) return
+    const fact = {
+      stage: r.stage,
+      id: r.id,
+      offset: r.offset,
+      outcome: r.outcome,
+      group: r.group,
+      key: r.key,
+      digest: r.payloadSha256 && parseInt(r.payloadSha256.slice(0, 8), 16),
+      run: r.authority?.run ?? 'no authority',
+      owned: r.stage === 'handler-enter' ? this.ownership(r) : null,
+    }
+    const i = this.ids.get(r.id)
+    if (i !== undefined) return this.resolve(i, fact)
+    if (this.idsFull) return
+    if (this.heldCount >= this.capacity)
+      return this.problem(`more than ${this.capacity} records wait for an id not yet offered`)
+    this.heldCount++
+    if (this.held.has(r.id)) this.held.get(r.id).push(fact)
+    else this.held.set(r.id, [fact])
+  }
+
+  /** @param {number} i @param {object} fact from `byId` @returns {void} */
+  resolve(i, fact) {
+    if (fact.stage === 'ack') this.acknowledge(i, fact)
+    else this.entry(i, fact)
+  }
+
+  /**
+   * Ends the stream: every record still held refers to an id never offered on a standing topic. A
+   * send result for one is a journal problem; a handler entry for one is a delivery of a record the
+   * journal never offered.
+   * @returns {void}
+   */
+  finish() {
+    for (const facts of this.held.values())
+      for (const f of facts)
+        if (f.stage === 'ack') this.problem(`${f.id} is acknowledged but was never offered`)
+        else this.note('neverOffered', `${f.id} in ${f.group}`)
+    this.held.clear()
+    this.heldCount = 0
   }
 
   /**
@@ -269,7 +334,10 @@ class Journal {
     if (r.key.partition !== 0) this.problem(`${r.id} is on partition ${r.key.partition}`)
     if (this.ids.has(r.id)) return this.problem(`${r.id} is offered twice`)
     const i = this.names.length
-    if (i >= this.capacity) return this.problem(`more than ${this.capacity} offered ids`)
+    if (i >= this.capacity) {
+      this.idsFull = true
+      return this.problem(`more than ${this.capacity} offered ids`)
+    }
     this.names.push(r.id)
     this.ids.set(r.id, i)
     this.topic[i] = topic
@@ -278,21 +346,20 @@ class Journal {
       this.txOf[i] = this.transaction(r.transaction)
       this.txOf[i]?.members.push(i)
     }
+    const waiting = this.held.get(r.id)
+    if (!waiting) return
+    this.held.delete(r.id)
+    this.heldCount -= waiting.length
+    waiting.forEach((fact) => this.resolve(i, fact))
   }
 
   /**
    * An id's send result. A second result for one id contradicts the first: the id becomes
    * `contradicted`, never acknowledged. Offset `-1` (a retried send the broker deduplicated
    * without its position) leaves the offset unknown.
-   * @param {object} r an `ack` record @returns {void}
+   * @param {number} i the id's index @param {object} r an `ack` fact from `byId` @returns {void}
    */
-  acknowledge(r) {
-    const i = this.ids.get(r.id)
-    if (i === undefined) {
-      if (this.topics.has(r.key.topic) && this.names.length < this.capacity)
-        this.problem(`${r.id} is acknowledged but was never offered`)
-      return
-    }
+  acknowledge(i, r) {
     if (this.ack[i] !== ACK.none) {
       this.note('contradiction', `${r.id} has a second send result`)
       this.ack[i] = ACK.contradicted
@@ -346,39 +413,46 @@ class Journal {
   }
 
   /**
-   * A handler entry, matched to its offered record by id, topic, partition and payload digest,
-   * and to one offset across every group. In an ordinary group it must lie in an open ownership
-   * interval of its client run; an entry at or below an offset that interval already entered is a
-   * same-owner repeat. A repeat in another interval or by another run is only counted.
-   * @param {object} r a `handler-enter` record @returns {void}
+   * The ownership of a handler entry, judged when it arrives. In an ordinary group the entry must
+   * lie in an open ownership interval of its client run; one at or below an offset that interval
+   * already entered is a same-owner repeat.
+   * @param {object} r a `handler-enter` record
+   * @returns {'share'|'misattributed'|'unowned'|'sameOwner'|'owned'}
    */
-  entry(r) {
-    const group = this.groupIndex.get(r.group)
-    const i = this.ids.get(r.id)
-    if (group === undefined || i === undefined) return
-    const where = `${r.id} in ${r.group}`
-    if (this.topics.get(r.key.topic) !== this.topic[i] || r.key.partition !== 0)
-      return this.note('wrongRecord', `${where} on ${r.key.topic}|${r.key.partition}`)
-    if (parseInt(r.payloadSha256.slice(0, 8), 16) !== this.digest[i])
-      return this.note('wrongRecord', `${where} with another payload`)
+  ownership(r) {
+    if (this.groupIndex.get(r.group).share) return 'share'
+    if (r.authority === null || !this.attributed(r, r.authority)) return 'misattributed'
+    const owner = this.owners.get(Journal.ownerKey(r.group, r.authority, r.key))
+    if (owner?.acquiredAt !== r.authority.acquiredAt) return 'unowned'
     const offset = Number(r.offset)
+    const owned = offset <= owner.high ? 'sameOwner' : 'owned'
+    owner.high = Math.max(owner.high, offset)
+    return owned
+  }
+
+  /**
+   * A handler entry, matched to its offered record by topic, partition and payload digest, and to
+   * one offset across every group; then its ownership finding is counted. A repeat in another
+   * interval, by another run or in the share group is only counted.
+   * @param {number} i the id's index @param {object} e a `handler-enter` fact from `byId`
+   * @returns {void}
+   */
+  entry(i, e) {
+    const group = this.groupIndex.get(e.group)
+    const where = `${e.id} in ${e.group}`
+    if (this.topics.get(e.key.topic) !== this.topic[i] || e.key.partition !== 0)
+      return this.note('wrongRecord', `${where} on ${e.key.topic}|${e.key.partition}`)
+    if (e.digest !== this.digest[i])
+      return this.note('wrongRecord', `${where} with another payload`)
+    const offset = Number(e.offset)
     if (Number.isNaN(this.enteredAt[i])) this.enteredAt[i] = offset
     else if (this.enteredAt[i] !== offset)
       return this.note('wrongRecord', `${where} at ${offset}, elsewhere at ${this.enteredAt[i]}`)
     const before = this.entered[group.index][i]
     this.entered[group.index][i] = 1
-    if (group.share) {
-      if (before) this.shareRepeats++
-      return
-    }
-    if (r.authority === null || !this.attributed(r, r.authority))
-      return this.note('misattributed', `${where} by ${r.authority?.run ?? 'no authority'}`)
-    const owner = this.owners.get(Journal.ownerKey(r.group, r.authority, r.key))
-    if (owner?.acquiredAt !== r.authority.acquiredAt)
-      return this.note('unowned', `${where} by ${r.authority.run}`)
-    if (offset <= owner.high) this.note('sameOwner', `${where} by ${r.authority.run}`)
-    else if (before) this.repeatsAfterChange++
-    owner.high = Math.max(owner.high, offset)
+    if (e.owned === 'share') this.shareRepeats += before
+    else if (e.owned === 'owned') this.repeatsAfterChange += before
+    else this.note(e.owned, `${where} by ${e.run}`)
   }
 
   /** @param {object} r a `process` record @returns {void} */
@@ -717,7 +791,7 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
 }
 
 /**
- * K2: every handler entry matches its record (topic, partition, payload, one offset that is the
+ * K2: every handler entry names an offered id and matches its record (topic, partition, payload, one offset that is the
  * log's), and when the dump is proved complete every visible record entered a handler in every
  * recipient group while no group entered a record a read-committed reader cannot see.
  * @param {Row} k2 @param {Journal} journal @param {Uint8Array} dumped @param {boolean} complete
@@ -726,6 +800,8 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
 function judgeDelivery(k2, journal, dumped, complete) {
   const wrong = journal.findings.wrongRecord
   if (wrong) k2.fail(`${wrong.count} handler entries do not match their record${first(wrong)}`)
+  const phantom = journal.findings.neverOffered
+  if (phantom) k2.fail(`${phantom.count} handler entries name an id never offered${first(phantom)}`)
   if (!complete) return
   const missing = new Map()
   const invisible = { count: 0, examples: [] }
@@ -981,6 +1057,22 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
 }
 
 /**
+ * What the journal shows but no row judges: broker outages (down and ready instants, configured
+ * down time, container stop or start instant), membership wave transfers and returns, probe sends
+ * that settled after their step, and drain commits skipped as expected.
+ * @param {Journal} journal @returns {object}
+ */
+function informationOf(journal) {
+  const count = (kind) => journal.incidents.get(kind)?.count ?? 0
+  return {
+    outages: journal.info.outages,
+    waves: journal.info.waves,
+    lateProbeSends: count('late'),
+    expectedSkips: count('expected skip:'),
+  }
+}
+
+/**
  * Judges K1 to K7 from the parsed artifact and the ground-truth files below `dir/apache`.
  * @param {object} input
  * @param {string} input.dir the artifact directory
@@ -991,6 +1083,7 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
  * @returns {Promise<object>} the report: rows, NOT JUDGED items and the overall verdict
  */
 async function judge({ dir, matrix, config, mode, header, supervisor, journal, problems = [] }) {
+  journal.finish()
   const plan = planOf(matrix, mode)
   const rows = Object.fromEntries(Object.keys(ROW_NAMES).map((id) => [id, new Row(id)]))
   const manifest = new Map(header.files.map((f) => [f.file, f]))
@@ -1027,6 +1120,7 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
     treeSha: header.treeSha,
     rows: done,
     notJudged: NOT_JUDGED_ROWS,
+    information: informationOf(journal),
     overall: has('FAIL') ? 'REJECTED' : has('INCONCLUSIVE') ? 'NOT ACCEPTED' : 'ACCEPTED',
   }
 }
@@ -1130,6 +1224,18 @@ function formatReport(report) {
   lines.push('', 'NOT JUDGED (outside this checker; each line names the CI job that covers it):')
   for (const item of report.notJudged)
     lines.push(`  NOT JUDGED  ${item.name}  (lane: ${item.lane})`)
+  const info = report.information
+  if (info) {
+    lines.push('', 'NOT JUDGED information (printed for the reader, never a verdict):')
+    for (const o of info.outages)
+      lines.push(
+        `  broker ${o.node} ${o.event} at ${o.at} (configured down ${o.downMs ?? '-'} ms, container at ${o.processAt ?? '-'})`
+      )
+    const w = info.waves
+    lines.push(`  wave transfers ${w.transfer}, returns ${w.return}, not observed ${w.unobserved}`)
+    lines.push(`  probe sends settled after their step: ${info.lateProbeSends}`)
+    lines.push(`  drain commits skipped as expected: ${info.expectedSkips}`)
+  }
   return lines.join('\n')
 }
 
