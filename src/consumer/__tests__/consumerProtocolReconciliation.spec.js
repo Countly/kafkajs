@@ -1062,9 +1062,10 @@ const fullTarget = (memberEpoch, byTopic) => ({
  * the next metadata refresh), `state.metadataDelay` delays the next metadata refresh once and
  * `state.idDelays` the next topic-id refreshes, one entry each. `log` is
  * one ordered record of heartbeats, commits and partition events.
+ * @param {object} [options] consumer options that replace the defaults below
  * @returns {object} the consumer and the double's records and switches
  */
-const buildConsumer = () => {
+const buildConsumer = (options = {}) => {
   const committed = {}
   const state = {
     answer: null,
@@ -1227,6 +1228,7 @@ const buildConsumer = () => {
     fetchSessions: false,
     maxWaitTimeInMs: 50,
     retry: { initialRetryTime: 300 },
+    ...options,
   })
   for (const key of ['PARTITIONS_LOST', 'PARTITIONS_REVOKED', 'PARTITIONS_ASSIGNED']) {
     consumer.on(consumer.events[key], ({ payload }) =>
@@ -1510,6 +1512,52 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(1)
     expect(starts).toHaveBeenCalledTimes(1)
   })
+
+  it.each([
+    ['a rebalance timeout shorter than the backoff', { rebalanceTimeout: 100 }, 300],
+    ['a zero retry time', {}, 0],
+  ])(
+    'waits before sending again a rejoin the coordinator fenced, with %s, and rejoins without a crash',
+    async (_, timeouts, initialRetryTime) => {
+      const built = buildConsumer({
+        ...timeouts,
+        retry: { initialRetryTime, factor: 0, retries: 0 },
+      })
+      consumer = built.consumer
+      const s = { fenced: false, rejoins: 0 }
+      built.state.answer = (request) => {
+        if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+        if (s.fenced && request.memberEpoch === 0 && ++s.rejoins === 1) {
+          throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+        }
+        if (s.fenced && request.memberEpoch === 1) {
+          throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+        }
+        if (request.memberEpoch === 0) return fullTarget(s.fenced ? 2 : 1, { 'topic-a': [0] })
+        return fullTarget(request.memberEpoch, null)
+      }
+      const starts = jest.spyOn(Runner.prototype, 'start')
+      await consumer.subscribe({ topics: ['topic-a'] })
+      consumer.run({ eachMessage: async () => {} })
+      await advanceUntil(() => built.fetches.length > 0)
+      const [runner] = starts.mock.contexts
+
+      s.fenced = true
+      const fencedAt = Date.now()
+      runner.heartbeatManager.requestTick()
+      await advanceUntil(() => runner.consumerGroup.groupMembership.memberEpoch === 2, 3000)
+      const rejoins = built.log
+        .filter(({ kind, epoch, at }) => kind === 'heartbeat' && epoch === 0 && at >= fencedAt)
+        .map(({ at }) => at)
+
+      expect(built.crashes).toEqual([])
+      expect(starts).toHaveBeenCalledTimes(1)
+      expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(2)
+      expect(rejoins).toHaveLength(2)
+      // 100 ms is the floor of the wait before a fenced join is sent again.
+      expect(rejoins[1] - rejoins[0]).toBeGreaterThanOrEqual(Math.max(initialRetryTime, 100))
+    }
+  )
 
   describe.each([
     ['a literal subscription', { topics: ['topic-a', 'topic-c', 'topic-d'] }],
