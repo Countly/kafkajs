@@ -1345,6 +1345,89 @@ describe('a consumer heartbeat answered after its membership was replaced', () =
   })
 })
 
+describe('a consumer heartbeat and the runner that sent it', () => {
+  let fixture
+
+  afterEach(async () => {
+    await fixture?.close()
+    fixture = null
+  })
+
+  /**
+   * A real runner whose group heartbeats through a real consumer protocol, with a heartbeat
+   * outage already started by a lost connection and the next heartbeat held on the wire.
+   * @returns {{ runner: object, protocol: object, emitter: object, gate: object, end: object }}
+   */
+  const setup = () => {
+    fixture = ownershipFixture({ kind: 'consumer' })
+    const { group, runner } = fixture
+    const emitter = new InstrumentationEventEmitter()
+    const protocol = new ConsumerGroupProtocol({
+      cluster: { topicName: () => 'topic', topicId: () => 'id' },
+      groupId: 'group',
+      topics: ['topic'],
+      ownership: group.ownership,
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: emitter,
+      logger: newLogger(),
+    })
+    protocol.state = 'STABLE'
+    protocol.memberEpoch = 8
+    const schedule = new Schedule()
+    const gate = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+    protocol.coordinator = {
+      consumerGroupHeartbeat: () => schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({})),
+    }
+    group.heartbeat = (options) => protocol.heartbeat(options)
+    expect(runner.outages.heartbeat.absorbs(new KafkaJSConnectionError('lost'), 1)).toBe(true)
+    const end = jest.spyOn(runner.outages.heartbeat, 'end')
+    return { runner, protocol, emitter, gate, end }
+  }
+
+  it('a success answered after the runner retired has no effect and ends no outage', async () => {
+    const { runner, protocol, emitter, gate, end } = setup()
+    const heartbeats = []
+    emitter.addListener(HEARTBEAT, () => heartbeats.push(HEARTBEAT))
+    const call = runner.heartbeat()
+    await gate.arrived()
+    runner.retirement = new Error('retired')
+    gate.release({
+      memberEpoch: 9,
+      heartbeatIntervalMs: 1,
+      assignment: { topicPartitions: [{ topicId: 'id', partitions: [0] }] },
+    })
+
+    await expect(call).resolves.toBeUndefined()
+    expect(heartbeats).toEqual([])
+    expect(end).not.toHaveBeenCalled()
+    expect(runner.outages.heartbeat.since).toBe(1)
+    expect(protocol.memberEpoch).toBe(8)
+    expect(protocol.target).toBeNull()
+  })
+
+  it('a HEARTBEAT listener that throws on a current success loses nothing: the success applies and ends the outage once', async () => {
+    const { runner, protocol, emitter, gate, end } = setup()
+    emitter.addListener(HEARTBEAT, () => {
+      throw Object.assign(new Error('listener'), { code: 42 })
+    })
+    const call = runner.heartbeat()
+    await gate.arrived()
+    gate.release({
+      memberEpoch: 9,
+      heartbeatIntervalMs: 1,
+      assignment: { topicPartitions: [{ topicId: 'id', partitions: [0, 1] }] },
+    })
+
+    await expect(call).resolves.toBeUndefined()
+    expect(end).toHaveBeenCalledTimes(1)
+    expect(runner.outages.heartbeat.since).toBeNull()
+    expect(['FENCED', 'FATAL']).not.toContain(protocol.state)
+    expect(protocol.memberEpoch).toBe(9)
+    expect(protocol.target).not.toBeNull()
+    expect(runner.rebalanceCoordinator.verdict).toBeNull()
+  })
+})
+
 describe('completed join ownership', () => {
   it.each([null, 25, 128])('keeps the pre-release apply boundary sound for %s', async (code) => {
     const fixture = ownershipFixture({ kind: 'consumer' })

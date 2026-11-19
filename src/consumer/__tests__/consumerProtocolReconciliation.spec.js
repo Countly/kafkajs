@@ -2624,3 +2624,72 @@ describe('Consumer > a whole consumer-protocol consumer > a refusal held across 
     }
   )
 })
+
+describe('Consumer > a whole consumer-protocol consumer > the heartbeat outage clock', () => {
+  const COORDINATOR_LOAD_IN_PROGRESS = 14
+  let consumer
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(async () => {
+    const stopping = consumer.disconnect().catch(() => {})
+    await jest.advanceTimersByTimeAsync(3000)
+    await stopping
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
+  it('a live timer heartbeat success ends the outage a failed handler heartbeat started', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    const heartbeats = []
+    let releaseHandler
+    let entered = false
+    let failNext = false
+    built.state.answer = ({ memberEpoch }) => {
+      if (memberEpoch === 0) return fullTarget(1, { 'topic-a': [0] })
+      if (failNext) {
+        failNext = false
+        throw new KafkaJSProtocolError(createErrorFromCode(COORDINATOR_LOAD_IN_PROGRESS))
+      }
+      return fullTarget(memberEpoch, null)
+    }
+    consumer.on(consumer.events.HEARTBEAT, ({ payload }) =>
+      heartbeats.push(payload.groupGenerationId)
+    )
+    await consumer.subscribe({ topics: ['topic-a'] })
+    try {
+      consumer.run({
+        eachMessage: async () => {
+          if (entered) return
+          entered = true
+          await new Promise((resolve) => (releaseHandler = resolve))
+        },
+      })
+      await advanceUntil(() => built.fetches.length > 0)
+      const [runner] = starts.mock.contexts
+      runner.heartbeatManager.stop()
+      failNext = true
+      await jest.advanceTimersByTimeAsync(500)
+      const failure = await runner.heartbeat().then(
+        () => null,
+        (error) => error
+      )
+      expect(failure).toMatchObject({ code: COORDINATOR_LOAD_IN_PROGRESS })
+      expect(runner.rideOutage(failure)).toBeDefined()
+      expect(runner.outages.heartbeat.since).not.toBeNull()
+      const count = heartbeats.length
+      built.state.queue['topic-a|0'] = [40]
+      await advanceUntil(() => entered)
+      expect(entered).toBe(true)
+
+      runner.heartbeatManager.ensureStarted()
+      await advanceUntil(() => heartbeats.length > count)
+
+      expect(heartbeats).toHaveLength(count + 1)
+      expect(runner.outages.heartbeat.since).toBeNull()
+    } finally {
+      releaseHandler?.()
+    }
+  })
+})
