@@ -1,4 +1,5 @@
 const { failure, createErrorFromCode } = require('../../error')
+const { checkPartitions: checkPartitionsV0 } = require('./v0/response')
 
 const LEADER_NOT_AVAILABLE = 5
 
@@ -161,26 +162,43 @@ const allowingLeaderless = (parse) => async (data) => {
 }
 
 /**
- * Wraps a version's parse so that a topic answered with its own error code stays in the data for
- * the caller to judge. The other topics are checked as the wrapped parse decides, and a top-level
- * error code still throws first.
+ * Wraps a version's parse so that only a top-level error code throws: every topic and partition
+ * error code stays in the data. The caller judges each topic's own error first and then calls
+ * `checkPartitions` on the topics it keeps, so the strict precedence holds for it too: a
+ * top-level error, then a topic error, then a partition error.
  * @param {(data: object) => Promise<object>|object} parse the version's own parse
  * @returns {(data: object) => Promise<object>} a parse that resolves with `data`, unchanged
  */
 const retainingTopicErrors = (parse) => async (data) => {
-  await parse({
-    ...data,
-    topicMetadata: data.topicMetadata.filter(({ topicErrorCode }) => !failure(topicErrorCode)),
-  })
+  await parse({ ...data, topicMetadata: [] })
   return data
 }
+
+/**
+ * The partition step of the strict parse, for topics a caller kept after judging their own errors.
+ * @param {object[]} topicMetadata decoded topics answered without a topic error
+ * @param {{ allowLeaderless?: boolean }} [options] lets a partition without a leader through
+ * @returns {void}
+ * @throws {import('../../../errors').KafkaJSProtocolError} the first other partition error code
+ */
+const checkPartitions = (topicMetadata, { allowLeaderless = false } = {}) =>
+  checkPartitionsV0(
+    allowLeaderless
+      ? topicMetadata.map((topic) => ({
+          ...topic,
+          partitionMetadata: topic.partitionMetadata.filter(
+            ({ partitionErrorCode }) => partitionErrorCode !== LEADER_NOT_AVAILABLE
+          ),
+        }))
+      : topicMetadata
+  )
 
 /**
  * Builds one request at `version`. A request for every topic, an empty `topics` list written as
  * the null array, is parsed by `parseAllTopics`; a request that names topics keeps its version's
  * own parse, which throws the first topic, then partition, error code, unless `allowLeaderless`
- * lets a partition without a leader through and `retainTopicErrors` keeps a topic's own error in
- * the data.
+ * lets a partition without a leader through and `retainTopicErrors` leaves topic and partition
+ * errors to the caller (see `checkPartitions`).
  * @param {number|string} version
  * @param {{ topics?: Array<string|{ topicId: string }>, allowAutoTopicCreation?: boolean, lenient?: boolean, allowLeaderless?: boolean, retainTopicErrors?: boolean }} options
  *   `topics` is absent only when a request is built for its api key and version alone
@@ -205,4 +223,5 @@ module.exports = {
     ({ version }) =>
     (options) =>
       build(version, options),
+  checkPartitions,
 }

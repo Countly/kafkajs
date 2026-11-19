@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
@@ -1339,9 +1340,9 @@ module.exports = (params) => {
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })
@@ -1739,6 +1740,7 @@ module.exports = (params) => {
         }
 
         const published = await cluster.resetTargetTopics(names, {
+          accepted: metadata,
           isCurrent: () => stale() === null,
           publish: () => {
             declared.retireMetadata()

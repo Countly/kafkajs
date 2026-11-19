@@ -1,5 +1,5 @@
 const Encoder = require('../../encoder')
-const { versions, protocol } = require('./index')
+const { versions, protocol, checkPartitions } = require('./index')
 
 const LEADER_NOT_AVAILABLE = 5
 const TOPIC_AUTHORIZATION_FAILED = 29
@@ -216,16 +216,16 @@ describe('Protocol > Requests > Metadata > a request that retains topic errors',
   })
 
   test.each(versions)(
-    'at v%s, still throws a healthy topic partition error unless leaderless partitions are allowed',
+    'at v%s, leaves a healthy topic partition error to checkPartitions, which lets a leaderless one through only when allowed',
     async (version) => {
-      await expect(
-        retaining(version, ['test-topic', 'deleted'])(withDeleted(version))
-      ).rejects.toMatchObject({ type: 'LEADER_NOT_AVAILABLE' })
-
       const data = withDeleted(version)
-      await expect(
-        retaining(version, ['test-topic', 'deleted'], { allowLeaderless: true })(data)
-      ).resolves.toBe(data)
+      await expect(retaining(version, ['test-topic', 'deleted'])(data)).resolves.toBe(data)
+      const kept = data.topicMetadata.filter(({ topicErrorCode }) => topicErrorCode === 0)
+
+      expect(() => checkPartitions(kept)).toThrow(
+        expect.objectContaining({ type: 'LEADER_NOT_AVAILABLE' })
+      )
+      expect(checkPartitions(kept, { allowLeaderless: true })).toBeUndefined()
       expect(data.topicMetadata).toHaveLength(2)
 
       if (Number(version) >= 13) {
@@ -235,6 +235,22 @@ describe('Protocol > Requests > Metadata > a request that retains topic errors',
           type: 'REBOOTSTRAP_REQUIRED',
         })
       }
+    }
+  )
+
+  test.each(versions)(
+    'at v%s, checkPartitions throws a partition error other than a missing leader even when leaderless partitions are allowed',
+    async (version) => {
+      const data = withDeleted(version)
+      data.topicMetadata[0].partitionMetadata[0] = {
+        ...data.topicMetadata[0].partitionMetadata[0],
+        partitionErrorCode: 6,
+      }
+      await retaining(version, ['test-topic', 'deleted'])(data)
+
+      expect(() => checkPartitions([data.topicMetadata[0]], { allowLeaderless: true })).toThrow(
+        expect.objectContaining({ type: 'NOT_LEADER_FOR_PARTITION' })
+      )
     }
   )
 })

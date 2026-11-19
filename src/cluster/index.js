@@ -213,6 +213,10 @@ module.exports = class Cluster {
     this.nextTopicIncarnation = 0
     /** @type {Set<string>|null} the targets the `addMultipleTargetTopics` call in progress adds */
     this.addingTopics = null
+    /** @type {Set<string>} the targets a metadata answer accepted since they were declared */
+    this.establishedTopics = new Set()
+    /** Counts the removals of targets, so an answer to an earlier declaration establishes nothing. */
+    this.targetRevision = 0
     /** @type {WeakMap<object, {topics: object[], byName: Map<string, object>}>} lookup index per accepted metadata object */
     this.topicMetadataIndexes = new WeakMap()
     this.mutatingTargetTopics = new Lock({
@@ -239,8 +243,7 @@ module.exports = class Cluster {
       isNewTarget:
         this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
       onTopicMetadataStatus,
-      isEstablishedTarget: (topic) =>
-        this.targetTopics.has(topic) && !this.addingTopics?.has(topic),
+      captureEstablishment: () => this.captureEstablishment(),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
@@ -926,6 +929,10 @@ module.exports = class Cluster {
           ) {
             if (this.targetTopicState === null) {
               this.targetTopics = previousTopics
+              this.targetRevision++
+              for (const topic of this.establishedTopics) {
+                if (!previousTopics.has(topic)) this.establishedTopics.delete(topic)
+              }
             } else {
               for (const topic of this.targetTopics) {
                 if (!previousTopics.has(topic)) this.forgetTargetTopic(topic)
@@ -1015,9 +1022,34 @@ module.exports = class Cluster {
    */
   forgetTargetTopic(topic) {
     this.targetTopics.delete(topic)
+    this.establishedTopics.delete(topic)
+    this.targetRevision++
     this.targetTopicState.delete(topic)
     this.metadataCache.forget(topic)
     this.brokerPool.forgetTopic(topic)
+  }
+
+  /**
+   * Captures, when a consumer's named refresh begins, what its answer may judge and establish. A
+   * topic is established once a metadata answer accepted it for its current declaration: the
+   * answer to an add or a refresh that named it, or the answer a manual assignment was validated
+   * with (see `resetTargetTopics`). Only an established target answered
+   * `UNKNOWN_TOPIC_OR_PARTITION` is isolated; any other target keeps the strict error, so a
+   * subscription whose validation failed still fails. An answer establishes nothing once a target
+   * was removed after the capture, since its names may have been declared again since.
+   * @returns {import('./brokerPool').TargetEstablishment}
+   */
+  captureEstablishment() {
+    const revision = this.targetRevision
+    return {
+      isEstablished: (topic) => this.establishedTopics.has(topic),
+      establish: (topics) => {
+        if (revision !== this.targetRevision) return
+        for (const topic of topics) {
+          if (this.targetTopics.has(topic)) this.establishedTopics.add(topic)
+        }
+      },
+    }
   }
 
   /**
@@ -1068,14 +1100,19 @@ module.exports = class Cluster {
    * Replaces consumer targets and prunes removed decoded/id state without issuing a request.
    * Pattern callers pass an empty list. Captured guards are rechecked after the target lock.
    * `publish` runs under that lock right after the replacement with no await between them, so a
-   * caller can make its own state and the targets change together or not at all.
+   * caller can make its own state and the targets change together or not at all. A kept target
+   * stays established; a target named in `accepted`, the answer that validated the call, is
+   * established and its id recorded, so a deletion and recreation before the first refresh is
+   * still seen as a recreation; any other new target is established by the first refresh that
+   * answers it.
    * @param {string[]} names accepted desired target names
-   * @param {{isCurrent?: () => boolean, publish?: () => void}} [options]
+   * @param {{isCurrent?: () => boolean, publish?: () => void, accepted?: object}} [options]
+   *   `accepted` is the decoded Metadata answer that validated `names`
    * @returns {Promise<boolean>} whether the replacement and `publish` ran; false when `isCurrent`
    *   refused before or after the lock, in which case nothing changed
    * @throws {Error} when acquiring the existing target lock fails
    */
-  async resetTargetTopics(names, { isCurrent = () => true, publish } = {}) {
+  async resetTargetTopics(names, { isCurrent = () => true, publish, accepted } = {}) {
     const next = new Set(names)
     if (!isCurrent()) return false
     await this.mutatingTargetTopics.acquire()
@@ -1085,10 +1122,17 @@ module.exports = class Cluster {
         if (next.has(topic)) continue
         this.metadataCache.forget(topic)
         this.brokerPool.forgetTopic(topic)
+        this.establishedTopics.delete(topic)
       }
       this.targetTopics = next
+      this.targetRevision++
       this.topicMetadataIndexes = new WeakMap()
       publish?.()
+      if (accepted) {
+        const topicMetadata = accepted.topicMetadata.filter(({ topic }) => next.has(topic))
+        for (const { topic } of topicMetadata) this.establishedTopics.add(topic)
+        this.metadataCache.updateTopicsById({ ...accepted, topicMetadata })
+      }
       return true
     } finally {
       await this.mutatingTargetTopics.release()
