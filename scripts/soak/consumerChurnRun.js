@@ -327,17 +327,22 @@ class ChurnMember {
 }
 
 /**
- * Samples the counts of each member's group's private offset state while the members still run.
- * A member is sampled once it applied the round that removed the deleted names (see
- * `ChurnMember#settledWithout`) and its group's ledger has no open cell; one that does not settle
- * within the bound, or whose stores cannot be read, is recorded with `quiescent: false`, never
- * dropped. The wait takes no abort signal, so a sample begun at the end of a phase completes.
+ * Samples each member's group's private offset state while the members still run. A member is
+ * sampled once it applied the round that removed the deleted names (see
+ * `ChurnMember#settledWithout`), its group's ledger has no open cell and the group claims no deleted
+ * name any longer: a regex subscription drops a deleted topic only in the revision that observed
+ * the deletion, and until then the client rightly keeps its cache key. The claims are read apart
+ * from the cache, so a stale key cannot prolong the wait. One that does not settle within the
+ * bound, or whose stores cannot be read, is recorded with `quiescent: false`, never dropped, with
+ * the deleted names its group still claims. The wait takes no abort signal, so a sample begun at
+ * the end of a phase completes.
  */
 class OffsetStateSampler {
   /**
    * @param {object} options
-   * @param {((groupId: string) => object)|undefined} options.read the group's counts:
-   *   `{ present, topics, cells, cache, open }`; absent, every sample reads `{ present: false }`
+   * @param {((groupId: string) => object)|undefined} options.read the group's state:
+   *   `{ present, topics, cells, cache, cacheKeys, subscribed, claimed, open }`; absent, every
+   *   sample reads `{ present: false }`
    * @param {{ now: () => number }} options.clock
    * @param {(ms: number) => Promise<void>} options.sleep
    * @param {(row: object) => void} options.record where each row goes
@@ -351,14 +356,17 @@ class OffsetStateSampler {
 
   /**
    * Records one `offset-state` row per member, carrying the deletion count as the checkpoint's
-   * identity. Every wait is cut at the smaller of `quietMs` from the start and `deadlineAt`; a member
-   * is quiescent only when it was observed settled no later than that cutoff, so an overdue wake, an
-   * expired deadline or a later member reached after the cutoff records `quiescent: false`.
+   * identity, the live names, and the cache keys, applied subscription, claims and still-claimed
+   * deleted names (`unapplied`) of the last read, so a failing row names its topics. Every wait is cut
+   * at the smaller of `quietMs` from the start and `deadlineAt`; a member is quiescent only when
+   * it was observed settled no later than that cutoff, so an overdue wake, an expired deadline or
+   * a later member reached after the cutoff records `quiescent: false`.
    * @param {object} options
    * @param {string} options.phase
    * @param {'periodic'|'final'} options.checkpoint
    * @param {Array<{ group: string, settledWithout: (names: Set<string>) => boolean }>} options.members
-   * @param {Array<{ partitions: number }>} options.live the topics the workload keeps, control included
+   * @param {Array<{ name: string, partitions: number }>} options.live the topics the workload keeps,
+   *   control included
    * @param {Set<string>} options.deleted the names the workload deleted
    * @param {number} [options.deadlineAt] the run's inclusive deadline, which also ends the wait
    * @returns {Promise<void>}
@@ -369,19 +377,23 @@ class OffsetStateSampler {
     const denominators = {
       topics: live.length,
       partitions: live.reduce((total, { partitions }) => total + partitions, 0),
+      names: live.map(({ name }) => name).sort(),
     }
     for (const member of members) {
       let state
       let now
       let quiescent
+      let unapplied
       for (;;) {
         state = this.read(member.group)
         now = this.clock.now()
+        unapplied = state.claimed?.filter((topic) => deleted.has(topic))
         quiescent =
           now <= until &&
           member.settledWithout(deleted) &&
           state.present === true &&
-          state.open === 0
+          state.open === 0 &&
+          unapplied?.length === 0
         if (quiescent || now >= until) break
         await this.sleep(Math.min(this.pollMs, until - now))
       }
@@ -397,7 +409,16 @@ class OffsetStateSampler {
         live: denominators,
         offsetState:
           state.present === true
-            ? { present: true, topics: state.topics, cells: state.cells, cache: state.cache }
+            ? {
+                present: true,
+                topics: state.topics,
+                cells: state.cells,
+                cache: state.cache,
+                cacheKeys: state.cacheKeys,
+                subscribed: state.subscribed,
+                claimed: state.claimed,
+                unapplied,
+              }
             : { present: false },
       })
     }

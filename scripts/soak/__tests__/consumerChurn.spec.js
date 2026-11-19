@@ -1105,7 +1105,7 @@ describe('Consumer churn profile > the run', () => {
   test('the run verdict fails on an excessive or a missing offset-state row in a warm-up or a measured regex pass', async () => {
     const excessive = (phase) => [
       { kind: 'regex-rotation', phase, deletions: 0 },
-      offsetRow(phase, 'g', { offsetState: { present: true, topics: 9, cells: 1, cache: 1 } }),
+      offsetRow(phase, 'g', { offsetState: presentState(LIVE_NAMES, { topics: 9, cells: 1 }) }),
     ]
     const periodicMissing = (phase) => [
       { kind: 'regex-rotation', phase, deletions: 5 },
@@ -1674,6 +1674,24 @@ describe('Consumer churn profile > acknowledged records', () => {
   })
 })
 
+const LIVE_NAMES = ['a', 'b', 'c', 'control']
+
+/** A present store whose cache keys, subscription and claims all hold `names`, plus `counts`. */
+function presentState(names = LIVE_NAMES, counts = {}) {
+  const sorted = [...names].sort()
+  return {
+    present: true,
+    topics: names.length,
+    cells: 15,
+    cache: names.length,
+    cacheKeys: sorted,
+    subscribed: sorted,
+    claimed: sorted,
+    unapplied: [],
+    ...counts,
+  }
+}
+
 /** One well-formed offset-state row: four live topics with fifteen partitions, within bounds. */
 function offsetRow(phase, group, overrides = {}) {
   return {
@@ -1685,8 +1703,8 @@ function offsetRow(phase, group, overrides = {}) {
     atMs: 0,
     waitedMs: 0,
     quiescent: true,
-    live: { topics: 4, partitions: 15 },
-    offsetState: { present: true, topics: 4, cells: 15, cache: 4 },
+    live: { topics: 4, partitions: 15, names: LIVE_NAMES },
+    offsetState: presentState(),
     ...overrides,
   }
 }
@@ -1715,15 +1733,248 @@ describe('Consumer churn profile > offset state', () => {
     { name: 'b', partitions: 3 },
     { name: 'c', partitions: 3 },
   ]
+  /** A present store whose cache, subscription and claims all hold `names`. */
+  const readState = (names, { claimed = names, subscribed = names } = {}) => ({
+    present: true,
+    topics: names.length,
+    cells: 15,
+    cache: names.length,
+    cacheKeys: [...names].sort(),
+    subscribed: [...subscribed].sort(),
+    claimed: [...claimed].sort(),
+    open: 0,
+  })
+  const liveNames = ['a', 'b', 'c', 'control']
+  const finalOnly = { passes: ['regex-topics'], groupsOf: () => ['g'], deletionsOf: () => 1 }
+  const stale =
+    'offset state of g in regex-topics (final): cache keys outside the live and claimed topics: '
+  /** A real member that held `old`, then saw its revoke and the join that followed. */
+  const revokedMember = async () => {
+    const handlers = {}
+    const member = new ChurnMember({
+      consumer: {
+        connect: jest.fn(async () => {}),
+        subscribe: jest.fn(async () => {}),
+        run: jest.fn(async (config) => Object.assign(handlers, config.rebalanceListener)),
+        commitOffsets: jest.fn(async () => {}),
+        disconnect: jest.fn(async () => {}),
+      },
+      admin: { fetchOffsets: jest.fn(async () => [{ topic: 'old', partitions: [] }]) },
+      group: 'g',
+      label: 'm',
+      journal: { append: () => {} },
+      gaps: null,
+      phase: 'p',
+      clock: { now: () => 0 },
+      handled: new Map(),
+      incarnationOf: () => 'old.1',
+      acknowledged: async () => true,
+    })
+    await member.start([/^o/])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 'old', partitions: [0] }] })
+    member.noteJoin()
+    await handlers.onPartitionsRevoked({ partitions: [{ topic: 'old', partitions: [0] }] })
+    member.noteJoin()
+    return member
+  }
+
+  test('a revoke and a join that precede the subscription application are not sampled as excess', async () => {
+    const member = await revokedMember()
+    let applied = false
+    const before = [...liveNames, 'old']
+    const { instance, rows } = sampler({
+      read: () => (applied ? readState(liveNames) : readState(before)),
+      onSleep: (n) => {
+        if (n === 3) applied = true
+      },
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        deletions: 1,
+        atMs: 300,
+        quiescent: true,
+        offsetState: expect.objectContaining({ cache: 4, unapplied: [] }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([])
+    await member.stop()
+  })
+
+  test('a cache key left after the subscription was applied and its claims released fails and names the topic', async () => {
+    const member = await revokedMember()
+    const { instance, rows } = sampler({
+      read: () => ({
+        ...readState([...liveNames, 'old'], { claimed: liveNames, subscribed: liveNames }),
+        topics: 4,
+      }),
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([expect.objectContaining({ atMs: 0, quiescent: true })])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([
+      'offset state of g in regex-topics (final): cache keys outside the live and claimed topics: old',
+    ])
+    await member.stop()
+  })
+
+  test('a subscription that still claims a deleted topic at the cutoff fails as not applied, not as excess', async () => {
+    const member = await revokedMember()
+    const { instance, rows } = sampler({
+      read: () => ({ ...readState([...liveNames, 'old']), topics: 4 }),
+      quietMs: 1000,
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        waitedMs: 1000,
+        quiescent: false,
+        offsetState: expect.objectContaining({
+          cacheKeys: ['a', 'b', 'c', 'control', 'old'],
+          subscribed: ['a', 'b', 'c', 'control', 'old'],
+          unapplied: ['old'],
+        }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([
+      'offset state of g in regex-topics (final): subscription not applied within 1.0 s: still subscribes old',
+    ])
+    await member.stop()
+  })
+
+  /** Samples one settled member over `state` at a final checkpoint after `deleted`. */
+  const sampleOnce = async (state, deleted, quietMs = 1000) => {
+    const { instance, rows } = sampler({ read: () => state, quietMs })
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [{ group: 'g', settledWithout: () => true }],
+      live,
+      deleted: new Set(deleted),
+    })
+    return rows
+  }
+
+  test('a stale cache key is named even when a live topic has no key yet', async () => {
+    const keys = ['a', 'b', 'control', 'old']
+    const rows = await sampleOnce(
+      { ...readState(keys, { claimed: liveNames, subscribed: liveNames }), topics: 4 },
+      ['old']
+    )
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        atMs: 0,
+        quiescent: true,
+        offsetState: expect.objectContaining({ cache: 4, cacheKeys: keys, claimed: liveNames }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([`${stale}old`])
+  })
+
+  test('a live topic with no cache key yet is not a failure', async () => {
+    const keys = ['a', 'b', 'control']
+    const rows = await sampleOnce(
+      { ...readState(keys, { claimed: liveNames, subscribed: liveNames }), cells: 12 },
+      ['old']
+    )
+
+    expect(rows).toEqual([expect.objectContaining({ quiescent: true })])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([])
+  })
+
+  test('a deleted topic only a claim holds at the cutoff fails as unreleased, not as an unapplied subscription', async () => {
+    const rows = await sampleOnce(
+      {
+        ...readState([...liveNames, 'old'], { subscribed: liveNames }),
+        topics: 4,
+      },
+      ['old']
+    )
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        quiescent: false,
+        offsetState: expect.objectContaining({ subscribed: liveNames, unapplied: ['old'] }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, finalOnly)).toEqual([
+      'offset state of g in regex-topics (final): claims not released within 1.0 s: still claims old',
+    ])
+  })
+
+  test('a claim timeout still names a separate unclaimed stale cache key', async () => {
+    const rows = await sampleOnce(
+      {
+        ...readState([...liveNames, 'old-a', 'old-b'], {
+          claimed: [...liveNames, 'old-a'],
+          subscribed: liveNames,
+        }),
+        topics: 4,
+      },
+      ['old-a', 'old-b']
+    )
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        quiescent: false,
+        offsetState: expect.objectContaining({ unapplied: ['old-a'] }),
+      }),
+    ])
+    expect(offsetStateViolations(rows, { ...finalOnly, deletionsOf: () => 2 })).toEqual([
+      'offset state of g in regex-topics (final): claims not released within 1.0 s: still claims old-a',
+      `${stale}old-b`,
+    ])
+  })
+
+  test('a store read without claims is never quiescent', async () => {
+    const { claimed, ...withoutClaims } = readState(liveNames)
+    const { instance, rows } = sampler({ read: () => withoutClaims, quietMs: 200 })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [{ group: 'g', settledWithout: () => true }],
+      live,
+      deleted: new Set(),
+    })
+
+    expect(claimed).toEqual(liveNames)
+    expect(rows).toEqual([expect.objectContaining({ waitedMs: 200, quiescent: false })])
+  })
 
   test('consumer-churn samples offset-state cardinalities after quiescence', async () => {
     let applied = false
     const member = { group: 'g-rx', settledWithout: () => applied }
     let open = 2
+    const keys = ['a', 'b', 'c', 'control']
     const state = () =>
       applied
-        ? { present: true, topics: 4, cells: 12, cache: 4, open }
-        : { present: true, topics: 5, cells: 18, cache: 5, open: 0 }
+        ? { ...readState(keys), topics: 4, cells: 12, open }
+        : { ...readState([...keys, 'd']), topics: 5, cells: 18 }
     const { instance, rows } = sampler({
       read: state,
       onSleep: (n) => {
@@ -1737,7 +1988,7 @@ describe('Consumer churn profile > offset state', () => {
       checkpoint: 'periodic',
       members: [member],
       live,
-      deleted: new Set(['a', 'b', 'c', 'd', 'e']),
+      deleted: new Set(['d', 'e', 'f', 'g', 'h']),
     })
 
     expect(rows).toEqual([
@@ -1750,8 +2001,17 @@ describe('Consumer churn profile > offset state', () => {
         atMs: 500,
         waitedMs: 500,
         quiescent: true,
-        live: { topics: 4, partitions: 15 },
-        offsetState: { present: true, topics: 4, cells: 12, cache: 4 },
+        live: { topics: 4, partitions: 15, names: ['a', 'b', 'c', 'control'] },
+        offsetState: {
+          present: true,
+          topics: 4,
+          cells: 12,
+          cache: 4,
+          cacheKeys: ['a', 'b', 'c', 'control'],
+          subscribed: ['a', 'b', 'c', 'control'],
+          claimed: ['a', 'b', 'c', 'control'],
+          unapplied: [],
+        },
       },
     ])
     expect(
@@ -1807,7 +2067,7 @@ describe('Consumer churn profile > offset state', () => {
   test('a sample waits without the fault signal and records a timeout as not quiescent', async () => {
     const member = { group: 'g', settledWithout: () => false }
     const { instance, rows, sleeps } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       quietMs: 1000,
     })
 
@@ -1840,7 +2100,7 @@ describe('Consumer churn profile > offset state', () => {
     const clock = manualClock()
     const member = { group: 'g', settledWithout: () => clock.now() >= 200 }
     const { instance, rows, sleeps } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
       quietMs: 1000,
     })
@@ -1863,7 +2123,7 @@ describe('Consumer churn profile > offset state', () => {
     const clock = manualClock()
     const member = { group: 'g', settledWithout: () => clock.now() >= 1000 }
     const late = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
       quietMs: 1000,
       onSleep: (n) => {
@@ -1888,7 +2148,7 @@ describe('Consumer churn profile > offset state', () => {
     const clock = manualClock()
     clock.advance(500)
     const { instance, rows, sleeps } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
     })
 
@@ -1919,7 +2179,7 @@ describe('Consumer churn profile > offset state', () => {
   test('a later member reached only after the shared cutoff is recorded as not quiescent', async () => {
     const clock = manualClock()
     const { instance, rows } = sampler({
-      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0, claimed: [] }),
       clock,
       quietMs: 1000,
       onSleep: (n) => {
@@ -1949,19 +2209,18 @@ describe('Consumer churn profile > offset state', () => {
     expect(offsetStateViolations([offsetRow('regex-topics', 'g')], expected)).toEqual([])
     for (const [field, value, message] of [
       ['topics', 5, '5 stamp topics for 4 live topics'],
-      ['cache', 5, '5 cache topics for 4 live topics'],
       ['cells', 16, '16 stamp cells for 15 live partitions'],
     ]) {
       const row = offsetRow('regex-topics', 'g', {
-        offsetState: { present: true, topics: 4, cells: 15, cache: 4, [field]: value },
+        offsetState: presentState(LIVE_NAMES, { [field]: value }),
       })
       expect(offsetStateViolations([row], expected)).toEqual([
         `offset state of g in regex-topics (final): ${message}`,
       ])
     }
     const multi = offsetRow('regex-topics', 'g', {
-      live: { topics: 2, partitions: 9 },
-      offsetState: { present: true, topics: 2, cells: 9, cache: 2 },
+      live: { topics: 2, partitions: 9, names: ['a', 'control'] },
+      offsetState: presentState(['a', 'control'], { cells: 9 }),
     })
     expect(offsetStateViolations([multi], expected)).toEqual([])
   })
@@ -2011,6 +2270,22 @@ describe('Consumer churn profile > offset state', () => {
         ])
       ).toEqual(['offset state of g1-regex-topics in regex-topics (final): malformed counts'])
     }
+    for (const state of [
+      presentState(LIVE_NAMES, { cacheKeys: undefined }),
+      presentState(LIVE_NAMES, { cache: 3 }),
+      presentState(LIVE_NAMES, { claimed: undefined }),
+    ]) {
+      expect(bad(['regex-topics', 'g1-regex-topics', { offsetState: state }])).toEqual([
+        'offset state of g1-regex-topics in regex-topics (final): malformed names',
+      ])
+    }
+    expect(
+      bad([
+        'regex-topics',
+        'g1-regex-topics',
+        { live: { topics: 4, partitions: 15, names: ['a'] } },
+      ])
+    ).toEqual(['offset state of g1-regex-topics in regex-topics (final): malformed names'])
     for (const live of [
       { topics: 0, partitions: 0 },
       { topics: 4, partitions: 3 },
@@ -2083,10 +2358,11 @@ describe('Consumer churn profile > offset state', () => {
       [2, 9],
       [3, 12],
     ]) {
+      const names = ['control', ...LIVE_NAMES.slice(0, topics - 1)]
       const final = offsetRow('regex-topics', 'g', {
         deletions: 5,
-        live: { topics, partitions },
-        offsetState: { present: true, topics, cells: partitions, cache: topics },
+        live: { topics, partitions, names },
+        offsetState: presentState(names, { cells: partitions }),
       })
       expect(offsetStateViolations([rows({})[0], final], expected)).toEqual([])
     }
@@ -2137,14 +2413,61 @@ describe('Consumer churn profile > offset state', () => {
       holder
     )
     entry.offsets.topic = { 0: '1' }
-    expect(read('g')).toEqual({ present: true, topics: 0, cells: 0, cache: 1, open: 0 })
+    const base = { cacheKeys: ['topic'], subscribed: [], claimed: [] }
+    expect(read('g')).toEqual({ present: true, topics: 0, cells: 0, cache: 1, open: 0, ...base })
     expect(CommittedOffsetRevisions.peek(entry.offsets)).toBeUndefined()
     CommittedOffsetRevisions.forCache(entry.offsets).capture('topic', 0)
     const ticket = entry.ledger.begin([{ topic: 'topic', partition: 0 }])
-    expect(read('g')).toEqual({ present: true, topics: 1, cells: 1, cache: 1, open: 1 })
+    expect(read('g')).toEqual({
+      present: true,
+      topics: 1,
+      cells: 1,
+      cache: 1,
+      open: 1,
+      ...base,
+      claimed: ['topic'],
+    })
     entry.ledger.end(ticket)
     expect(entry.holders).toEqual(new Set([holder]))
     expect(entry.ledger.openTickets).toBe(0)
     expect(store('offsets').size).toBe(1)
+  })
+
+  test('the offset-state reader names the subscription and every claim of the attached consumers', () => {
+    const { Kafka, logLevel } = require('../../../index')
+    const GroupRegistry = require('../../../src/cluster/groupRegistry')
+    const ResetObligations = require('../../../src/consumer/offsetManager/resetObligations')
+    const kafka = new Kafka({ brokers: ['localhost:9092'], logLevel: logLevel.NOTHING })
+    const read = offsetStateReader(kafka)
+    const store = (name) =>
+      kafka[
+        Object.getOwnPropertySymbols(kafka).find(
+          ({ description }) => description === `private:Kafka:${name}`
+        )
+      ]
+    const entry = GroupRegistry.forStores(store('offsets'), store('operations')).acquire('g', {})
+    const first = new ResetObligations()
+    const second = new ResetObligations()
+    first.attachTo(entry.ledger)
+    second.attachTo(entry.ledger)
+    first.claimSubscription(['s2', 's1'])
+    first.claimAssignment(['assigned'])
+    second.claimSubscription(['s1', 's3'])
+    second.owe('owed', 'id-1')
+    entry.offsets.s1 = {}
+    entry.offsets.gone = {}
+
+    expect(read('g')).toEqual({
+      present: true,
+      topics: 0,
+      cells: 0,
+      cache: 2,
+      open: 0,
+      cacheKeys: ['gone', 's1'],
+      subscribed: ['s1', 's2', 's3'],
+      claimed: ['assigned', 'owed', 's1', 's2', 's3'],
+    })
+    first.clear()
+    second.clear()
   })
 })

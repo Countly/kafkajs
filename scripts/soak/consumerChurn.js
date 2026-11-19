@@ -1007,8 +1007,12 @@ const REGEX_ROTATION = Object.freeze({
 /**
  * Bounds the private offset state each regex pass sampled while its members ran. Every expected
  * group has one final sample at the pass's deletion count and one periodic sample at each multiple
- * of `sampleEvery` up to it; every sample settled, read present stores and stays within the live
- * topics (stamp topics, cache keys) and live partitions (stamp cells). The expected groups come
+ * of `sampleEvery` up to it; every sample settled, read present stores, keeps no cache key that is
+ * neither a live name nor still claimed (named in the failure), and stays within the live topics
+ * (stamp topics) and live partitions (stamp cells). A sample whose group still claimed a deleted
+ * name at the cutoff fails as a subscription not applied for the names still subscribed and as
+ * claims not released for the rest, not on its counts; its unclaimed cache keys still fail by
+ * name. The expected groups come
  * from the plan, the deletion counts from the workload's `regex-rotation` records and the live
  * denominators must fit `shape`, never taken from the rows alone.
  * @param {object[]} rows the run's `offset-state` rows
@@ -1070,8 +1074,21 @@ const offsetStateViolations = (rows, { passes, groupsOf, deletionsOf, shape = RE
       continue
     }
     seen.add(id)
-    if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
     const { offsetState: state, live } = row
+    const outstanding = row.quiescent !== true && state?.unapplied?.length > 0
+    if (outstanding) {
+      const within = (row.waitedMs / 1000).toFixed(1)
+      const subscribed = state.unapplied.filter((topic) => state.subscribed?.includes(topic))
+      const held = state.unapplied.filter((topic) => !subscribed.includes(topic))
+      if (subscribed.length > 0)
+        violations.push(
+          `${where}: subscription not applied within ${within} s: still subscribes ${subscribed.join(', ')}`
+        )
+      if (held.length > 0)
+        violations.push(
+          `${where}: claims not released within ${within} s: still claims ${held.join(', ')}`
+        )
+    } else if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
     if (state?.present !== true) {
       violations.push(`${where}: stores absent`)
       continue
@@ -1084,10 +1101,27 @@ const offsetStateViolations = (rows, { passes, groupsOf, deletionsOf, shape = RE
       violations.push(`${where}: live denominators do not fit the workload`)
       continue
     }
+    const names = (list, size) =>
+      Array.isArray(list) && (size === undefined || list.length === size)
+    if (
+      !names(live.names, live.topics) ||
+      !names(state.cacheKeys, state.cache) ||
+      !names(state.claimed) ||
+      !names(state.subscribed)
+    ) {
+      violations.push(`${where}: malformed names`)
+      continue
+    }
+    const stale = state.cacheKeys.filter(
+      (topic) => !live.names.includes(topic) && !state.claimed.includes(topic)
+    )
+    if (stale.length > 0)
+      violations.push(
+        `${where}: cache keys outside the live and claimed topics: ${stale.join(', ')}`
+      )
+    if (outstanding) continue
     if (state.topics > live.topics)
       violations.push(`${where}: ${state.topics} stamp topics for ${live.topics} live topics`)
-    if (state.cache > live.topics)
-      violations.push(`${where}: ${state.cache} cache topics for ${live.topics} live topics`)
     if (state.cells > live.partitions)
       violations.push(`${where}: ${state.cells} stamp cells for ${live.partitions} live partitions`)
   }
