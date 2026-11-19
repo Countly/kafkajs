@@ -1168,6 +1168,9 @@ module.exports = (params) => {
       retainedMemberId = null
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
+      // A background chain and the fetch loop can both await one failed chain: the run reports
+      // its crash once, so the crash policy and its restart decision run once.
+      let crashReport = null
       runner = new Runner({
         logger: rootLogger,
         consumerGroup,
@@ -1180,7 +1183,7 @@ module.exports = (params) => {
         eachBatchAutoResolve,
         eachBatch,
         eachMessage,
-        onCrash: (error) => onCrash(error, owned),
+        onCrash: (error) => (crashReport ??= onCrash(error, owned)),
         onJoinComplete: () => recordJoin(group),
         concurrency,
         maxPrefetchBatches,

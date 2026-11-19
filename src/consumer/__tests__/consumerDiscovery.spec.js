@@ -167,6 +167,9 @@ describe('Consumer > target discovery', () => {
       const held = gate()
       const h = build(async () => metadata())
       h.p.subscription = new Subscription()
+      // The coordinator assigns only declared names, so the subscription already holds this one.
+      h.p.subscription.add({ topics: ['named'], policy: { kind: 'earliest' } })
+      h.p.subscription.evaluate({ topicMetadata: [] })
       h.p.unresolvedTopicIds.add(ID)
       h.p.unresolvedTopicIds.add(OTHER)
       if (route === 'bulk') {

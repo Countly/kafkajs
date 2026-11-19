@@ -10,6 +10,7 @@ const {
   KafkaJSCommitFailedError,
   KafkaJSNonRetriableError,
   KafkaJSRebalanceListenerError,
+  KafkaJSRebalanceNotConvergedError,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
 const handlerContext = require('./handlerContext')
@@ -345,14 +346,20 @@ module.exports = class Runner extends EventEmitter {
       }
 
       /**
-       * Runs one rebalance for the loop. A failed awaited callback ends the loop through `bail`, so
-       * the retrier hands the typed error on unchanged instead of wrapping it.
+       * Runs one rebalance for the loop. A failed awaited callback, and a classic chain refused at
+       * its round limit, end the loop through `bail`, so the retrier hands the typed error to the
+       * crash policy unchanged instead of retrying it or wrapping it.
        */
       const rebalance = async (verdict) => {
         try {
           await this.handleRebalanceError(verdict)
         } catch (error) {
-          if (error instanceof KafkaJSRebalanceListenerError) return bail(error)
+          if (
+            error instanceof KafkaJSRebalanceListenerError ||
+            error instanceof KafkaJSRebalanceNotConvergedError
+          ) {
+            return bail(error)
+          }
           throw error
         }
       }

@@ -598,6 +598,8 @@ Every consumer logs one INFO line when you create it, naming the rebalance proto
 
 Going straight to deploy 2 splits the group: members still running the old code and members running the new one share no assigner name, and the coordinator rejects the join with `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes. During deploy 2 the group is briefly mixed — some members computing eagerly, some cooperatively — which is safe, because an eager member's JoinGroup advertises no owned partitions at all — it gives everything up before it rejoins — and the cooperative algorithm never hands a partition to a member that still owns it.
 
+One rebalance chain of a classic cooperative consumer may complete 20 rounds. When members keep taking partitions from each other and a 21st round is required, the run ends with `KafkaJSRebalanceNotConvergedError`, which is retriable: the default `restartOnFailure` restarts the consumer, which rejoins and resumes from the committed offsets, so records processed since the last commit can be delivered again. A custom `restartOnFailure` receives the error itself. An eager classic consumer has no round limit. Its rounds are paced only by their JoinGroup and SyncGroup round trips, and the WARN `Rebalance is still running` is logged when another round is about to start after a multiple of 20 completed rounds.
+
 Classic assignment runs on the group leader. For very large assignments, `groupProtocol: 'consumer'` moves assignment to the broker. The retained large sticky-assignment workload and its measured limits are reported with the performance evidence; an unmeasured optimization is not a sizing guarantee.
 
 ## <a name="group-protocols"></a> Consumer group protocols
@@ -678,6 +680,9 @@ A poll-interval overrun is detected on a heartbeat tick and never while a reconc
 - **No client-side assigners.** The broker assigns; `partitionAssigners` is rejected, and a custom assigner has no equivalent under this protocol.
 - **Rack-aware assignment is the broker's.** Your `rackId` is sent to the coordinator, but rack-aware assignment is still work in progress upstream.
 - **Consumer groups only.** `groupProtocol` does not address share groups or streams groups.
+- **Startup waits for a quiet moment.** `consumer.run()` starts fetching only after its first reconciliation chain ends. If a real obligation (an unowned part of the target, or an unapplied subscription change) is still there at every check, the consumer keeps heartbeating and logging `Reconciliation is still running` without delivering records until the changes pause. A consumer already running can keep fetching the partitions it retains during such a chain, unless awaited rebalance callbacks, pauses or a loss of membership hold delivery.
+- **No round limit.** Reconciliation runs another round only while the target or the subscription still differs. The wait between two rounds is the heartbeat interval clamped to 100 ms–5 s, plus the time each round takes. A WARN is logged when another round is about to start after a multiple of 20 completed rounds, so a chain that ends on its 20th round is quiet. It never stops or restarts the consumer on a round count.
+- **Poll-interval detection during long churn.** The `maxPollInterval` check skips a tick while a reconciliation chain runs, and every round restarts the poll timer, so sustained background churn can hold that check off for as long as the churn lasts.
 
 ## <a name="fetch-sessions"></a> Fetch sessions
 

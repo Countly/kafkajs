@@ -3066,6 +3066,16 @@ export class KafkaJSRebalanceListenerError extends KafkaJSNonRetriableError {
   )
 }
 
+/**
+ * A classic-protocol rebalance chain with a cooperative assignor completed 20 rounds and another was
+ * still required. Retriable: the default `restartOnFailure` policy restarts the consumer, and a
+ * custom one receives this error itself. Classic eager chains and consumer-protocol (KIP-848)
+ * groups have no round limit and never raise it.
+ */
+export class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
 /** No buffer memory became available within `maxBlockMs`, or too many sends were already waiting. Retriable. */
 export class KafkaJSBufferExhaustedError extends KafkaJSError {
   readonly reason: 'timeout' | 'queue-full'
