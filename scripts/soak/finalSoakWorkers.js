@@ -670,7 +670,9 @@ class ChildRuntime {
       else if (step.type === 'closed')
         await this.sample({ role: 'closed', boundary: step.boundary })
       else if (step.type === 'topic-ids')
-        for (const [topic, topicId] of step.topicIds) this.topicIds.set(topic, topicId)
+        for (const [topic, topicId] of step.topicIds)
+          if (topicId) this.topicIds.set(topic, topicId)
+          else this.topicIds.delete(topic)
       else if (step.type === 'disconnect') await this.stop()
       else reply = (await this.worker.perform(step)) ?? null
     } catch (e) {
@@ -1138,13 +1140,16 @@ class ProducerWorker extends Worker {
    * execution's deadline has passed; a send in flight at the deadline stops being awaited there.
    * @param {{ execution: string, topic: string, partitions: number, count: number,
    *   deadline?: number }} step
-   * @returns {Promise<{ offered: number, stopped: boolean }>}
+   * @returns {Promise<{ offered: number, acknowledged: number, stopped: boolean }>} how many
+   *   offers were made and how many of them the broker acknowledged
    */
   async onProbe(step) {
     let offered = 0
+    let acknowledged = 0
     for (; offered < step.count; offered++) {
-      if (this.runtime.clock.now() >= (step.deadline ?? Infinity)) return { offered, stopped: true }
-      await this.offer(
+      if (this.runtime.clock.now() >= (step.deadline ?? Infinity))
+        return { offered, acknowledged, stopped: true }
+      const outcome = await this.offer(
         this.standing[0],
         step.topic,
         offered % step.partitions,
@@ -1153,8 +1158,9 @@ class ProducerWorker extends Worker {
         step.execution,
         step.deadline ?? Infinity
       )
+      if (outcome === 'acknowledged') acknowledged++
     }
-    return { offered, stopped: false }
+    return { offered, acknowledged, stopped: false }
   }
 
   /** @returns {Promise<{ ok: boolean }>} a post-recovery send the broker acknowledged */

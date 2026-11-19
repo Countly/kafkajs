@@ -283,7 +283,6 @@ class Supervisor {
     this.commands = 0
     this.exits = 0
     this.topicIds = []
-    this.topicRecords = new Map()
     this.routes = new Map()
     this.scanned = new Map()
     this.ended = new Map()
@@ -539,12 +538,16 @@ class Supervisor {
 
   /**
    * Creates one run topic (RF3, min ISR 2, no retention truncation), records the admin result and
-   * declares a route from offset 0 for every recipient group and partition.
+   * declares a route from offset 0 for every recipient group and partition. The creation counts
+   * only when the broker answered without error with a topic id that is not the id the name had
+   * before, so a recreation that left the old incarnation in place fails.
    * @param {string} topic @param {number} partitions @param {string} role its topology role
    * @param {string|null} [execution]
-   * @returns {Promise<string|null>} the topic id
+   * @returns {Promise<string>} the new incarnation's topic id
+   * @throws {Error} when the creation failed or did not produce a new incarnation
    */
   async createTopic(topic, partitions, role, execution = null) {
+    const before = this.topicIds.find(([t]) => t === topic)?.[1] ?? null
     const configEntries = [
       { name: 'min.insync.replicas', value: '2' },
       { name: 'retention.ms', value: '-1' },
@@ -570,11 +573,10 @@ class Supervisor {
       errorCode,
       execution
     )
-    if (!topicId) {
-      await this.collector.note(`missing-source topic id for created ${topic}`)
-      return null
-    }
-    this.topicRecords.set(topicId, recordId)
+    if (errorCode !== 0 || !topicId || topicId === before)
+      throw new Error(
+        `creating ${topic} gave ${topicId === before ? 'its old topic id' : `topic id ${topicId}`} (error code ${errorCode})`
+      )
     await this.publish(topic, topicId)
     for (const group of recipientGroups(this.config, this.matrix, role))
       for (let partition = 0; partition < partitions; partition++) {
@@ -604,6 +606,7 @@ class Supervisor {
    * Deletes a run topic and confirms its absence from metadata.
    * @param {string} topic @param {string|null} [execution]
    * @returns {Promise<void>}
+   * @throws {Error} when the broker refused the deletion or the name is still listed
    */
   async deleteTopic(topic, execution = null) {
     const topicId = this.topicIds.find(([t]) => t === topic)?.[1] ?? null
@@ -613,11 +616,54 @@ class Supervisor {
     } catch (e) {
       errorCode = Number.isInteger(e.code) ? e.code : -1
     }
-    for (let i = 0; i < 40 && (await this.admin.listTopics()).includes(topic); i++)
+    let listed = true
+    for (let i = 0; i < 40 && (listed = (await this.admin.listTopics()).includes(topic)); i++)
       await this.clock.sleepUntil(this.clock.now() + 250)
     await this.topicRecord('delete', topic, topicId, [], errorCode, execution)
     for (const key of [...this.scanned.keys()])
       if (key.startsWith(`${topicId}/`)) this.scanned.delete(key)
+    if (errorCode !== 0 || listed)
+      throw new Error(
+        `deleting ${topic} ${listed ? 'left it listed' : 'failed'} (error code ${errorCode})`
+      )
+  }
+
+  /**
+   * Waits until the broker's metadata shows a new incarnation with its id and a leader and two
+   * in-sync replicas on every partition, before anything is offered to it.
+   * @param {string} topic @param {string} topicId @param {number} partitions
+   * @param {number} deadline on the run clock
+   * @returns {Promise<void>}
+   * @throws {Error} when the metadata is not there by the deadline
+   */
+  async ready(topic, topicId, partitions, deadline) {
+    const suitable = async () => {
+      const { topics } = await this.admin
+        .fetchTopicMetadata({ topics: [topic] })
+        .catch(() => ({ topics: [] }))
+      const meta = topics[0]
+      return (
+        normalizeTopicId(meta?.topicId) === topicId &&
+        meta.partitions.length === partitions &&
+        meta.partitions.every((p) => p.leader >= 0 && p.isr.length >= 2)
+      )
+    }
+    while (!(await suitable())) {
+      if (this.clock.now() >= deadline)
+        throw new Error(`${topic} has no ready metadata for ${topicId} by the deadline`)
+      await this.clock.sleepUntil(Math.min(deadline, this.clock.now() + 250))
+    }
+  }
+
+  /** Tells every process that a deleted name has no current id any more. */
+  async unpublish(topic) {
+    this.topicIds = this.topicIds.filter(([t]) => t !== topic)
+    this.runtime.topicIds.delete(topic)
+    await Promise.all(
+      [...this.children.keys()].map((slot) =>
+        this.command(slot, { type: 'topic-ids', id: 'topic-ids', topicIds: [[topic, null]] })
+      )
+    )
   }
 
   /** Emits one admin topic result record. @returns {Promise<string>} its record id */
@@ -646,12 +692,17 @@ class Supervisor {
     )
   }
 
-  /** Creates the standing run topics. */
+  /** Creates the standing run topics; a failure aborts the run before it starts. */
   async createTopics() {
     const t = this.config.topics
-    await this.createTopic(t.main, 1, 'main')
-    await this.createTopic(t.transactions, 1, 'transactions')
-    for (const topic of t.recreate) await this.createTopic(topic, 2, 'recreate')
+    try {
+      await this.createTopic(t.main, 1, 'main')
+      await this.createTopic(t.transactions, 1, 'transactions')
+      for (const topic of t.recreate) await this.createTopic(topic, 2, 'recreate')
+    } catch (e) {
+      this.problem(`standing topics: ${e.message}`)
+      this.abort(`standing topics: ${e.message}`)
+    }
   }
 
   /**
@@ -1181,15 +1232,18 @@ class Supervisor {
   }
 
   /**
-   * A regex execution creates a fresh topic and its routes, lets every applicable client accept
-   * it, offers probe ids, drains, scans and seals it, deletes it and lets the clients retire it. A
-   * recreation drains, scans and seals the old incarnation, deletes it, creates the same name
-   * again with new routes and probes the new one. No stage starts after the execution's deadline
-   * and no wait runs past it: the execution fails and later stages are not attempted, so its work
-   * never reaches into the idle window.
+   * A regex execution creates a fresh topic and its routes, waits for its metadata, lets every
+   * applicable client accept it, offers probe ids, drains the recipients to its ends, scans and
+   * seals it, deletes it, lets the clients retire it and forgets its id. A recreation probes,
+   * drains, scans and seals the old incarnation, deletes it, creates the same name again under a
+   * new id with new routes, waits for its metadata and for every recipient to be assigned it, then
+   * probes the new one. Every stage checks what it did: a creation must give a new id, a deletion
+   * must be confirmed, every probe offer acknowledged, every recipient drained, accepting,
+   * retiring and assigned as asked. No stage starts after the execution's deadline and no wait runs
+   * past it: the execution fails and later stages are not attempted.
    * @param {object} step the execution @param {string[]} participants its processes
    * @returns {Promise<void>}
-   * @throws {Error} when a stage cannot start before the deadline or a probe stopped at it
+   * @throws {Error} when a stage cannot start before the deadline or did not do its work
    */
   async churnTopic(step, participants) {
     const within = (stage) => {
@@ -1207,16 +1261,20 @@ class Supervisor {
     const producer = this.processOf('producer-idempotent')
     const probe = (topic) =>
       stage('probe', async () => {
-        const [reply] = await this.send([producer], {
+        const count = 10
+        const [{ reply }] = await this.send([producer], {
           type: 'probe',
           id: `${step.id}.probe`,
           execution: step.id,
           topic,
           partitions: 2,
-          count: 10,
+          count,
           deadline: step.deadline,
         })
-        if (reply.reply?.stopped) throw new Error(`${step.id}: probe stopped at the deadline`)
+        if (reply?.acknowledged !== count)
+          throw new Error(
+            `${step.id}: ${reply?.acknowledged ?? 0} of ${count} probe offers to ${topic} were acknowledged${reply?.stopped ? ', stopped at the deadline' : ''}`
+          )
       })
     const drain = (topic) =>
       stage('drain', async () => {
@@ -1231,35 +1289,40 @@ class Supervisor {
         if (short.length > 0)
           throw new Error(`${step.id}: ${short.join(', ')} did not drain ${topic} to its end`)
       })
+    /** Sends a stage to the participants; any of them answering `field: false` fails it. */
+    const each = (name, body, field) =>
+      stage(name, async () => {
+        const replies = await this.send(participants, body)
+        const short = participants.filter((_, i) => replies[i].reply?.[field] === false)
+        if (short.length > 0) throw new Error(`${step.id}: ${name} failed in ${short.join(', ')}`)
+      })
+    const create = (topic, role) =>
+      stage('create', async () => {
+        const topicId = await this.createTopic(topic, 2, role, step.id)
+        await this.ready(topic, topicId, 2, step.deadline)
+      })
     if (step.shape === 'regex-churn') {
       const topic = `${this.config.topics.regex}-${step.id}`
-      await stage('create', () => this.createTopic(topic, 2, 'regex', step.id))
-      await settle()
-      await stage('accept', () => this.send(participants, { ...step, topicName: topic }))
+      await create(topic, 'regex')
+      await each('accept', { ...step, topicName: topic }, 'accepted')
       await probe(topic)
-      await settle()
       await drain(topic)
       await stage('seal', () => this.seal(topic, step.id))
       await stage('delete', () => this.deleteTopic(topic, step.id))
-      await stage('retire', () =>
-        this.send(participants, { ...step, type: 'retired', topicName: topic })
-      )
+      await each('retire', { ...step, type: 'retired', topicName: topic }, 'retired')
+      await this.unpublish(topic)
       return
     }
     const topic = this.config.topics.recreate[step.topic]
     await probe(topic)
-    await settle()
     await drain(topic)
     await stage('seal', () => this.seal(topic, step.id))
     await stage('pause', () => this.send(participants, { ...step, topicName: topic }))
     await stage('delete', () => this.deleteTopic(topic, step.id))
     await settle()
-    await stage('create', () => this.createTopic(topic, 2, 'recreate', step.id))
-    await settle()
+    await create(topic, 'recreate')
+    await each('recreated', { ...step, type: 'recreated', topicName: topic }, 'assigned')
     await probe(topic)
-    await stage('recreated', () =>
-      this.send(participants, { ...step, type: 'recreated', topicName: topic })
-    )
   }
 
   /**
