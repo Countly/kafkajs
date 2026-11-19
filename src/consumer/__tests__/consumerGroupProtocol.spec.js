@@ -2881,3 +2881,102 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
     })
   })
 })
+
+describe('Consumer > groupProtocol > ConsumerGroupProtocol > an apply in flight when the target converges', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  const TOPIC_ID_X = 'XXXXXXXXXXXXXXXXXXXXXg'
+
+  /**
+   * A coordinator with the Kafka group coordinator's revocation rule: a member asked to revoke
+   * keeps its epoch, and a heartbeat that reports no owned partitions still owns them. It assigns
+   * topic-a/0 and X/0, then adds topic-a/1 at epoch 2, then drops topic-a/1 and X; only a heartbeat
+   * that reports owned partitions without topic-a/1 moves the member to epoch 3.
+   * @returns {{ answer: Function, phase: (next: string) => void }}
+   */
+  const revokingCoordinator = () => {
+    let phase = 'stable'
+    const ownsRevoked = ({ topicPartitions }) =>
+      !topicPartitions ||
+      topicPartitions.some(
+        ({ topicId, partitions }) => topicId === TOPIC_ID_A && partitions.includes(1)
+      )
+    const answer = (request) => {
+      if (request.memberEpoch === 0) {
+        return heartbeatResponse({
+          memberEpoch: 1,
+          assignment: assignmentOf([
+            [TOPIC_ID_A, [0]],
+            [TOPIC_ID_X, [0]],
+          ]),
+        })
+      }
+      if (phase === 'add') {
+        phase = 'added'
+        return heartbeatResponse({
+          memberEpoch: 2,
+          assignment: assignmentOf([
+            [TOPIC_ID_A, [0, 1]],
+            [TOPIC_ID_X, [0]],
+          ]),
+        })
+      }
+      if (phase === 'drop') {
+        phase = 'unrevoked'
+        return heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })
+      }
+      if (phase === 'unrevoked' && !ownsRevoked(request)) phase = 'reconciled'
+      if (phase === 'reconciled') return heartbeatResponse({ memberEpoch: 3 })
+      return heartbeatResponse({ memberEpoch: phase === 'stable' ? 1 : 2 })
+    }
+    return { answer, phase: (next) => (phase = next) }
+  }
+
+  it.each([
+    ['held at its first add', true],
+    ['with no name', false],
+  ])(
+    'a target that drops the added partition and an id %s while the apply is in flight keeps the member reconciling: the apply reports what it applied, and the next round reports the partition released',
+    async (_, held) => {
+      const coordinator = revokingCoordinator()
+      const names = held ? { ...TOPIC_NAMES, [TOPIC_ID_X]: 'topic-x' } : TOPIC_NAMES
+      const h = build({ names, answers: [coordinator.answer] })
+      if (held) h.cluster.isTopicPending = (name) => name === 'topic-x'
+      const tick = async () => {
+        jest.advanceTimersByTime(6000)
+        await h.manager.tick()
+      }
+
+      await await startStep(h, context())
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await tick()
+      expect(h.protocol.state).toEqual(STABLE)
+
+      coordinator.phase('add')
+      await tick()
+      expect(h.protocol.state).toEqual(RECONCILING)
+      const step = await h.protocol.rebalance(context())
+      expect(step.assignment).toEqual({ 'topic-a': [0, 1] })
+
+      coordinator.phase('drop')
+      await tick()
+      expect(h.protocol.state).toEqual(RECONCILING)
+
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0, 1] }])
+      await tick()
+      expect(partitionsSentOn(h.sent.at(-1))).toEqual([[TOPIC_ID_A, [0, 1]]])
+      expect(h.sent.at(-1).memberEpoch).toBe(2)
+      expect(h.protocol.state).toEqual(RECONCILING)
+
+      const next = await h.protocol.rebalance(context())
+      expect(next.assignment).toEqual({ 'topic-a': [0] })
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await tick()
+      expect(partitionsSentOn(h.sent.at(-1))).toEqual([[TOPIC_ID_A, [0]]])
+      await tick()
+      expect(h.sent.at(-1).memberEpoch).toBe(3)
+      expect(h.protocol.state).toEqual(STABLE)
+    }
+  )
+})
