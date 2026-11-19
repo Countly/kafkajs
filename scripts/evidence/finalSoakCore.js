@@ -183,7 +183,13 @@ class Journal {
     this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
     this.trafficEnd = null
-    this.info = { outages: [], waves: { transfer: 0, return: 0, unobserved: 0 } }
+    const keys = () => ({ paused: 0, held: 0 })
+    this.info = {
+      outages: [],
+      waves: { transfer: 0, return: 0, unobserved: 0, keys: { transfer: keys(), return: keys() } },
+      incompleteWaves: [],
+    }
+    this.openWaves = new Map()
     this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
   }
@@ -225,10 +231,9 @@ class Journal {
       const { node, event, at, downMs = null, processAt = null } = r
       if (this.info.outages.length < LIST_CAP)
         this.info.outages.push({ node, event, at, downMs, processAt })
-    } else if (r.kind === 'wave') {
-      this.info.waves[r.event]++
-      if (!r.observed) this.info.waves.unobserved++
-    } else if (r.kind === 'diagnostic') {
+    } else if (r.kind === 'wave') this.wave(r)
+    else if (r.kind === 'wave-key') this.waveKey(r)
+    else if (r.kind === 'diagnostic') {
       const kind =
         /^(missing-source|partial handler-enter|problem:|expected skip:)/.exec(r.message)?.[1] ??
         (/^probe send \S+ settled after/.test(r.message) ? 'late' : null)
@@ -238,6 +243,31 @@ class Journal {
           first: this.incidents.get(kind)?.first ?? r.message,
         })
     }
+  }
+
+  /**
+   * A membership wave's transfer or return. It counts its paused keys; until that many `wave-key`
+   * records cite it, it stays open, and `finish` lists it as incomplete.
+   * @param {object} r a `wave` record @returns {void}
+   */
+  wave(r) {
+    this.info.waves[r.event]++
+    if (!r.observed) this.info.waves.unobserved++
+    if (r.paused > 0) this.openWaves.set(r.recordId, { event: r.event, paused: r.paused, seen: 0 })
+  }
+
+  /**
+   * One paused key of an open wave: counted as paused for the wave's event, and as held when the
+   * wave's member held it. A key citing no open wave is left to the stream validator.
+   * @param {object} r a `wave-key` record @returns {void}
+   */
+  waveKey(r) {
+    const wave = this.openWaves.get(r.cause)
+    if (!wave) return
+    const keys = this.info.waves.keys[wave.event]
+    keys.paused++
+    if (r.held) keys.held++
+    if (++wave.seen === wave.paused) this.openWaves.delete(r.cause)
   }
 
   /** @param {object} r an identity record @returns {void} */
@@ -288,10 +318,13 @@ class Journal {
   /**
    * Ends the stream: every record still held refers to an id never offered on a standing topic. A
    * send result for one is a journal problem; a handler entry for one is a delivery of a record the
-   * journal never offered.
+   * journal never offered. A wave still open is listed as incomplete information.
    * @returns {void}
    */
   finish() {
+    for (const [id, w] of this.openWaves)
+      capped(this.info.incompleteWaves, `${id} has ${w.seen} of ${w.paused} wave-key records`)
+    this.openWaves.clear()
     for (const facts of this.held.values())
       for (const f of facts)
         if (f.stage === 'ack') this.problem(`${f.id} is acknowledged but was never offered`)
@@ -1058,8 +1091,10 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
 
 /**
  * What the journal shows but no row judges: broker outages (down and ready instants, configured
- * down time, container stop or start instant), membership wave transfers and returns, probe sends
- * that settled after their step, and drain commits skipped as expected.
+ * down time, container stop or start instant), membership wave transfers and returns with the
+ * paused and held keys their `wave-key` records name, waves missing some of their `wave-key`
+ * records (the stream validator fails those too), probe sends that settled after their step, and
+ * drain commits skipped as expected.
  * @param {Journal} journal @returns {object}
  */
 function informationOf(journal) {
@@ -1067,6 +1102,7 @@ function informationOf(journal) {
   return {
     outages: journal.info.outages,
     waves: journal.info.waves,
+    incompleteWaves: journal.info.incompleteWaves,
     lateProbeSends: count('late'),
     expectedSkips: count('expected skip:'),
   }
@@ -1232,7 +1268,12 @@ function formatReport(report) {
         `  broker ${o.node} ${o.event} at ${o.at} (configured down ${o.downMs ?? '-'} ms, container at ${o.processAt ?? '-'})`
       )
     const w = info.waves
-    lines.push(`  wave transfers ${w.transfer}, returns ${w.return}, not observed ${w.unobserved}`)
+    const keys = (event) =>
+      `${w.keys[event].paused} paused keys, ${w.keys[event].held} held by the member`
+    lines.push(
+      `  wave transfers ${w.transfer} (${keys('transfer')}), returns ${w.return} (${keys('return')}), not observed ${w.unobserved}`
+    )
+    for (const wave of info.incompleteWaves) lines.push(`  incomplete wave: ${wave}`)
     lines.push(`  probe sends settled after their step: ${info.lateProbeSends}`)
     lines.push(`  drain commits skipped as expected: ${info.expectedSkips}`)
   }
