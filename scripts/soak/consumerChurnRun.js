@@ -356,8 +356,8 @@ class OffsetStateSampler {
 
   /**
    * Records one `offset-state` row per member, carrying the deletion count as the checkpoint's
-   * identity, the live names, and the cache keys, applied subscription and still-claimed deleted
-   * names (`unapplied`) of the last read, so a failing row names its topics. Every wait is cut
+   * identity, the live names, and the cache keys, applied subscription, claims and still-claimed
+   * deleted names (`unapplied`) of the last read, so a failing row names its topics. Every wait is cut
    * at the smaller of `quietMs` from the start and `deadlineAt`; a member is quiescent only when
    * it was observed settled no later than that cutoff, so an overdue wake, an expired deadline or
    * a later member reached after the cutoff records `quiescent: false`.
@@ -416,6 +416,7 @@ class OffsetStateSampler {
                 cache: state.cache,
                 cacheKeys: state.cacheKeys,
                 subscribed: state.subscribed,
+                claimed: state.claimed,
                 unapplied,
               }
             : { present: false },
