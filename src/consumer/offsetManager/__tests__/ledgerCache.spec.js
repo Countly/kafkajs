@@ -121,13 +121,10 @@ describe('Cache and ledger binding', () => {
     const operations = cluster.offsetOperations({ groupId: 'group' })
     const ticket = operations.begin(cell, { mutation: true })
 
-    cluster.markOffsetAsCommitted({
-      groupId: 'group',
-      topic: TOPIC,
-      partition: 0,
-      offset: '9',
-      ticket,
-    })
+    cluster.markOffsetAsCommitted(
+      { groupId: 'group', topic: TOPIC, partition: 0, offset: '9' },
+      ticket
+    )
 
     expect(cluster.committedOffsets({ groupId: 'group' })[TOPIC][0]).toBe('9')
     expect(operations.durable(TOPIC, 0)).toEqual({ intent: ticket.intent, offset: '9' })

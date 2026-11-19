@@ -1778,11 +1778,11 @@ module.exports = class Cluster {
    * @param {string} options.topic
    * @param {string|number} options.partition
    * @param {string} options.offset
-   * @param {object} [options.ticket] the publishing mutation's ledger ticket, which makes the
+   * @param {object|null} [ticket=null] the publishing mutation's ledger ticket, which makes the
    *   offset the cell's durable winner when it outranks it
    * @returns {void} the write goes through the group's ledger, the cache's one writer
    */
-  markOffsetAsCommitted({ groupId, topic, partition, offset, ticket = null }) {
+  markOffsetAsCommitted({ groupId, topic, partition, offset }, ticket = null) {
     this.offsetOperations({ groupId }).publish(ticket, topic, partition, offset)
   }
 }

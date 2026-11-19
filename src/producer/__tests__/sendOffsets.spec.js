@@ -116,7 +116,8 @@ describe('Producer > transaction.sendOffsets', () => {
     expect(cluster.markOffsetAsCommitted).not.toHaveBeenCalled()
     await transaction.commit()
     expect(cluster.markOffsetAsCommitted).toHaveBeenCalledWith(
-      expect.objectContaining({ groupId: GROUP_ID })
+      expect.objectContaining({ groupId: GROUP_ID }),
+      expect.objectContaining({ mutation: true })
     )
   })
 
