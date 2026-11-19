@@ -2538,3 +2538,128 @@ describe('scripts/soak/finalSoakSchema', () => {
     })
   })
 })
+
+describe('inventory cuts across a consumer crash restart', () => {
+  const { AsyncLocalStorage } = require('node:async_hooks')
+  const ConsumerGroup = require('../../../src/consumer/consumerGroup')
+  const GroupOwnership = require('../../../src/consumer/groupOwnership')
+  const OffsetOperations = require('../../../src/consumer/offsetManager/offsetOperations')
+  const ResetObligations = require('../../../src/consumer/offsetManager/resetObligations')
+  const SeekOffsets = require('../../../src/consumer/seekOffsets')
+  const SubscriptionState = require('../../../src/consumer/subscriptionState')
+  const dictionary = require('../../../src/utils/dictionary')
+  const { PassiveObserver } = require('../finalSoakObserver')
+
+  /**
+   * One run of a consumer as the consumer factory starts it: a fresh group whose run identity is
+   * current while the factory's run slot holds its token.
+   * @returns {ConsumerGroup}
+   */
+  const startRun = (consumer, context) => {
+    const token = {}
+    consumer.slot = token
+    const group = Object.create(ConsumerGroup.prototype)
+    Object.assign(group, {
+      groupId: groupOf('c01'),
+      runIdentity: { isCurrent: () => consumer.slot === token },
+      topicsSubscribed: [],
+      topicConfigurations: { main: {} },
+      preferredReadReplicasPerTopicPartition: dictionary(),
+      seekOffset: new SeekOffsets(),
+      acquired: new Map([['main|0', { acquiredAt: 1, changedAt: 1, recreatedAt: 0 }]]),
+      acquireClock: 1,
+      haltedPartitions: new Map(),
+      ownership: new GroupOwnership(),
+      subscriptionState: new SubscriptionState(),
+      operations: new OffsetOperations(),
+      obligations: new ResetObligations(),
+      assignmentEpoch: 1,
+      groupMembership: {
+        kind: 'classic',
+        grownTopicNames: new Set(),
+        memberId: 'm1',
+        generationId: 5,
+      },
+      cluster: { topicId: (t) => (t === 'main' ? A : null), targetTopics: new Set(['main']) },
+    })
+    context.run(EAGER, () => {
+      group.retainSubscription(['main'])
+      group.subscriptionState.pause([{ topic: 'main', partitions: [0] }])
+    })
+    return group
+  }
+
+  /** @returns {(r: object[]) => void} puts the observer's sections into cut `inventory` of p01 */
+  const fill = (inventory, sections) => (r) => {
+    for (const x of r)
+      if (x.kind === 'inventory' && x.inventory === inventory && x.client === EAGER)
+        x.entries = sections[x.section]
+  }
+
+  it('a cut taken after a crash restart, while the dropped run is not yet collected, holds only the restarted run and passes the stream validator', () => {
+    const context = new AsyncLocalStorage()
+    const observer = new PassiveObserver({
+      owners: { ConsumerGroup, SubscriptionState },
+      watched: { ConsumerGroup: ['retainSubscription'], SubscriptionState: ['pause'] },
+      context,
+    })
+    observer.lives = () => `p01.20/${A}`
+    observer.install()
+    try {
+      const consumer = { slot: null }
+      const crashed = startRun(consumer, context)
+      const before = observer.ordinarySections(EAGER).sections
+      consumer.slot = null
+      const restarted = startRun(consumer, context)
+      const after = observer.ordinarySections(EAGER).sections
+      const secondCut = (r) => {
+        r.splice(
+          at(r, isSample('p01')) + 1,
+          0,
+          ...cut('i1b', 'p01', [
+            [null, PROCESS_SECTIONS],
+            [EAGER, ORDINARY_SECTIONS],
+          ]),
+          {
+            ...sample('p01', 'periodic', 'i1b', [EAGER], { slot: 1 }),
+            gc: {
+              ...GC,
+              id: 'gc-2',
+              firstBeginAt: 200,
+              firstEndAt: 201,
+              secondBeginAt: 302,
+              secondEndAt: 303,
+              cumulativeForced: 4,
+            },
+            admittedAt: 199,
+            completedAt: 304,
+          }
+        )
+        fill('i1', before)(r)
+        fill('i1b', after)(r)
+      }
+      expect(run({ edit: secondCut })).toEqual([])
+      const runs = (sections) => [
+        ...new Set(
+          ['subscription', 'pause-state', 'membership-state'].flatMap((s) =>
+            sections[s].map((e) => e.run)
+          )
+        ),
+      ]
+      expect(runs(before)).toEqual([observer.runOf(crashed)])
+      expect(runs(after)).toEqual([observer.runOf(restarted)])
+      expect(after.assignment.map((e) => e.authority.run)).toEqual([observer.runOf(restarted)])
+      expect(after['other-table'].map((t) => t.table)).toEqual([
+        'acquired',
+        'halted',
+        'topic-configurations',
+        'preferred-replicas',
+        'queued-seeks',
+        'grown-topic-names',
+        'cluster-targets',
+      ])
+    } finally {
+      observer.restore()
+    }
+  })
+})
