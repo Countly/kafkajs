@@ -443,4 +443,58 @@ describe('Consumer > crash supervision', () => {
       30000
     )
   })
+  describe('a REBALANCING subscriber failing during a fatal membership loss', () => {
+    /** Runs the fatal code-30 schedule with two REBALANCING subscribers, the first given. */
+    const fatalWith = async (first) => {
+      const policy = jest.fn(async () => true)
+      const { logger, lines } = recordingLogger()
+      const run = await start({
+        logger,
+        retry: { initialRetryTime: 300, restartOnFailure: policy },
+      })
+      const order = []
+      run.consumer.on(run.consumer.events.REBALANCING, () => {
+        order.push('first')
+        return first()
+      })
+      run.consumer.on(run.consumer.events.REBALANCING, () => order.push('second'))
+      run.arm()
+      await advanceUntil(() => run.crashes.length > 0, 20000)
+      await jest.advanceTimersByTimeAsync(5000)
+      return {
+        order,
+        policy: policy.mock.calls.map(([error]) => error.code),
+        crashes: run.crashes.map(({ error, restart }) => [error.code, restart]),
+        diagnostics: lines.filter((line) => line.startsWith('Failed to execute listener')),
+        trace: run.log.map(({ kind, epoch, partitions }) => [kind, epoch, partitions]),
+      }
+    }
+
+    it.each([
+      [
+        'throws synchronously',
+        () => {
+          throw new Error('subscriber threw')
+        },
+      ],
+      ['rejects', async () => Promise.reject(new Error('subscriber threw'))],
+    ])(
+      'a first subscriber that %s: the second runs, one diagnostic, and the run crashes as with a working subscriber',
+      async (_, failing) => {
+        const failed = await fatalWith(failing)
+        await cleanup()
+        cleanup = null
+        jest.restoreAllMocks()
+        const working = await fatalWith(() => {})
+
+        expect(failed.order).toEqual(['first', 'second'])
+        expect(failed.diagnostics).toEqual(['Failed to execute listener: subscriber threw'])
+        expect(failed.policy).toEqual([GROUP_AUTHORIZATION_FAILED])
+        expect(failed.crashes).toEqual([[GROUP_AUTHORIZATION_FAILED, false]])
+        expect(failed.trace).toEqual(working.trace)
+        expect(working.diagnostics).toEqual([])
+      },
+      60000
+    )
+  })
 })

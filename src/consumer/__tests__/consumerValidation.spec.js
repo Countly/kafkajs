@@ -160,6 +160,30 @@ describe('Consumer > what a call is refused for before it reaches a broker', () 
     await disposeConsumer(consumer)
   })
 
+  test('a listener that throws synchronously is logged, runs before the emit returns, and the next listener still runs', async () => {
+    const { consumer, entries } = build()
+    const failure = new Error('listener threw')
+    const order = []
+    consumer.on(consumer.events.CONNECT, () => {
+      order.push('first')
+      throw failure
+    })
+    consumer.on(consumer.events.CONNECT, () => order.push('second'))
+
+    await consumer.connect()
+
+    expect(order).toEqual(['first', 'second'])
+    expect(entries.map(({ level, log }) => ({ level, ...log }))).toEqual([
+      expect.objectContaining({
+        level: LEVELS.ERROR,
+        message: 'Failed to execute listener: listener threw',
+        eventName: consumer.events.CONNECT,
+        stack: failure.stack,
+      }),
+    ])
+    await disposeConsumer(consumer)
+  })
+
   test.each([
     ['null', null],
     ['undefined', undefined],
