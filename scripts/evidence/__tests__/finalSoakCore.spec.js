@@ -263,7 +263,7 @@ describe('scripts/evidence/finalSoakCore', () => {
         report,
         'K1',
         'INCONCLUSIVE',
-        /5 offsets follow the last dumped record.*explains at most 4/
+        /5 offsets follow the last dumped record but the journal places 4 invisible records there/
       )
       expect(report.overall).not.toBe('ACCEPTED')
     })
@@ -297,9 +297,132 @@ describe('scripts/evidence/finalSoakCore', () => {
         report,
         'K1',
         'INCONCLUSIVE',
-        /5 offsets follow the last dumped record.*explains at most 4/
+        /an acknowledged aborted record claims offset 50, at or beyond the log end/
       )
       expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    describe('every offset of the transactions log up to its end is explained by exactly one fact', () => {
+      const tx = (world) => world.layout.transactions
+      const ackAt = (id, offset) =>
+        mapRecords(
+          (r) => r.stage === 'ack' && r.id === id,
+          () => ({ outcome: 'acknowledged', errorType: null, offset })
+        )
+      const render = (world) => {
+        world.apache = fx.renderApache(world)
+        return world
+      }
+
+      it('accepts a log that ends in the nontransactional closing record, leaving nothing after the last dumped record', async () => {
+        const report = await check(fx.closed())
+        expectRow(report, 'K1', 'PASS')
+        expect(row(report, 'K1').numbers).toMatchObject({
+          dumpedTransactions: 5,
+          logEndTransactions: 9,
+        })
+        expect(report.overall).toBe('ACCEPTED')
+      })
+
+      it('accepts a retried marker before the closing record', async () => {
+        const world = fx.closed()
+        tx(world).splice(-1, 0, { marker: 'commit' })
+        const report = await check(render(world))
+        expectRow(report, 'K1', 'PASS')
+        expect(row(report, 'K1').numbers.logEndTransactions).toBe(10)
+      })
+
+      it('is inconclusive, never ACCEPTED, when a dump of a closed log is cut off before the closing record', async () => {
+        const world = fx.closed()
+        fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+        const report = await check(world)
+        expectRow(report, 'K1', 'INCONCLUSIVE', /not proved complete/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      })
+
+      it('is inconclusive, never ACCEPTED, when two acknowledged aborted records claim one offset after a cut-off dump that hides a visible record', async () => {
+        const world = fx.healthy()
+        tx(world).splice(
+          6,
+          1,
+          { id: 'c09.5', transaction: 'c09.0.x2', absent: true },
+          { id: 'c08.99', duplicate: true }
+        )
+        render(world)
+        fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+        const report = await check(world, { edit: ackAt('c09.5', '5') })
+        expectRow(report, 'K1', 'INCONCLUSIVE', /two acknowledged aborted records claim offset 5/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      })
+
+      it('is inconclusive when two acknowledged aborted records claim one offset even though every other offset is explained', async () => {
+        const world = fx.healthy()
+        tx(world).splice(
+          6,
+          1,
+          { id: 'c09.5', transaction: 'c09.0.x2', absent: true },
+          { id: 'c09.6', transaction: 'c09.0.x2', invisible: true }
+        )
+        const report = await check(render(world), { edit: ackAt('c09.5', '5') })
+        expectRow(report, 'K1', 'INCONCLUSIVE', /two acknowledged aborted records claim offset 5/)
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+      })
+
+      it('is inconclusive when an acknowledged aborted record claims the offset of a dumped record', async () => {
+        const report = await check(fx.closed(), { edit: ackAt('c09.4', '2') })
+        expectRow(
+          report,
+          'K1',
+          'INCONCLUSIVE',
+          /an acknowledged aborted record claims offset 2, where the dump holds a visible record/
+        )
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+      })
+
+      it('is inconclusive when an acknowledged aborted record claims an offset at or beyond the log end', async () => {
+        const edit = (records) => {
+          const offer = records.find((r) => r.stage === 'offered' && r.id === 'c09.4')
+          const ack = records.find((r) => r.stage === 'ack' && r.id === 'c09.4')
+          return [
+            ...records,
+            { ...offer, id: 'c09.6', t: offer.t + 0.5 },
+            { ...ack, id: 'c09.6', offset: '50', t: ack.t + 0.5 },
+          ]
+        }
+        const report = await check(fx.closed(), { edit })
+        expectRow(
+          report,
+          'K1',
+          'INCONCLUSIVE',
+          /an acknowledged aborted record claims offset 50, at or beyond the log end/
+        )
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+      })
+
+      it('is inconclusive when a closed log holds fewer invisible offsets than its decided transactions need', async () => {
+        const world = fx.closed()
+        tx(world).splice(4, 1)
+        const report = await check(render(world))
+        expectRow(
+          report,
+          'K1',
+          'INCONCLUSIVE',
+          /5 records dumped but at least 4 offsets are invisible/
+        )
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+      })
+
+      it('is inconclusive, never ACCEPTED, when as many offsets follow a cut-off dump as the journal places there but a marker has no offset after its last record', async () => {
+        const world = fx.healthy()
+        const [x1, aborted] = [tx(world).slice(0, 5), tx(world).slice(5, 7)]
+        world.layout.transactions = [...x1, { id: 'c08.99', duplicate: true }, ...aborted]
+        render(world)
+        fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+        const report = await check(world)
+        expectRow(report, 'K1', 'INCONCLUSIVE', /a control marker .* has no free offset after/)
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+        expect(report.overall).not.toBe('ACCEPTED')
+      })
     })
 
     it.each([
