@@ -682,18 +682,20 @@ module.exports = class Connection {
 
     // `error` stays attached, inert once the attempt is over: a post-close error on the old socket
     // (e.g. ECONNRESET) must not become an uncaught exception.
-    if (socket && !socket.destroyed) {
-      detachSocket(socket)
-      socket.destroy()
-    }
+    try {
+      if (socket && !socket.destroyed) {
+        detachSocket(socket)
+        socket.destroy()
+      }
+    } finally {
+      if (this.socket === socket) {
+        this.socket = null
+      }
 
-    if (this.socket === socket) {
-      this.socket = null
+      this.frames.reset()
+      this.requestQueue.settleAll(error)
+      this.requestQueue.destroy()
     }
-
-    this.frames.reset()
-    this.requestQueue.settleAll(error)
-    this.requestQueue.destroy()
   }
 
   /**
@@ -982,6 +984,10 @@ module.exports = class Connection {
    *                         guard, checked after decode and parse before publishing side effects
    * @param {(() => void)|null} [protocol.onWrite=null] trusted private once-only commit immediately
    *                         before socket.write; never called at encode, enqueue or response
+   * @param {((decoded: object) => void)|null} [protocol.onDecoded=null] trusted private observer of
+   *                         the decoded reply, called once in the continuation of decode, before
+   *                         the response guard, the throttle and parse, so a caller refused after
+   *                         the broker answered cannot hide what the broker accepted
    * @param {boolean} [protocol.establishedOnly=false] refuse any authentication start or refresh
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
@@ -993,6 +999,7 @@ module.exports = class Connection {
     guard = null,
     responseGuard = null,
     onWrite = null,
+    onDecoded = null,
     establishedOnly = false,
   }) {
     if (establishedOnly) {
@@ -1054,6 +1061,7 @@ module.exports = class Connection {
 
     try {
       const payloadDecoded = await response.decode(responseBody(entry, payload))
+      if (onDecoded) onDecoded(payloadDecoded)
       const decodedRefusal = responseGuard && responseGuard()
       if (decodedRefusal) throw decodedRefusal
 
@@ -1067,41 +1075,39 @@ module.exports = class Connection {
       const parsedRefusal = responseGuard && responseGuard()
       if (parsedRefusal) throw parsedRefusal
       const isFetchApi = entry.apiName === 'Fetch'
-      this.logDebug(`Response ${requestInfo(entry)}`, {
-        correlationId,
-        size,
-        data: sensitiveResponse || (isFetchApi && !this.shouldLogFetchBuffer) ? '[filtered]' : data,
-      })
+      try {
+        this.logDebug(`Response ${requestInfo(entry)}`, {
+          correlationId,
+          size,
+          data:
+            sensitiveResponse || (isFetchApi && !this.shouldLogFetchBuffer) ? '[filtered]' : data,
+        })
+      } catch {}
 
       return data
     } catch (e) {
       attachResponseSource(e, request.apiKey)
-      if (logResponseError) {
-        this.logError(`Response ${requestInfo(entry)}`, {
-          error: sensitiveResponse
-            ? 'Sensitive response failed'
-            : this.authenticationOwner
-              ? 'Telemetry response failed'
-              : e.message,
-          correlationId,
-          size,
-        })
-      }
-
-      const isBuffer = Buffer.isBuffer(payload)
-      this.logDebug(`Response ${requestInfo(entry)}`, {
-        error: sensitiveResponse
+      try {
+        const failure = sensitiveResponse
           ? 'Sensitive response failed'
           : this.authenticationOwner
             ? 'Telemetry response failed'
-            : e.message,
-        correlationId,
-        payload: sensitiveResponse
-          ? '[filtered]'
-          : isBuffer && !this.shouldLogBuffers
-            ? { type: 'Buffer', data: '[filtered]' }
-            : payload,
-      })
+            : e.message
+        if (logResponseError) {
+          this.logError(`Response ${requestInfo(entry)}`, { error: failure, correlationId, size })
+        }
+
+        const isBuffer = Buffer.isBuffer(payload)
+        this.logDebug(`Response ${requestInfo(entry)}`, {
+          error: failure,
+          correlationId,
+          payload: sensitiveResponse
+            ? '[filtered]'
+            : isBuffer && !this.shouldLogBuffers
+              ? { type: 'Buffer', data: '[filtered]' }
+              : payload,
+        })
+      } catch {}
 
       throw e
     }

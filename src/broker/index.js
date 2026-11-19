@@ -13,7 +13,7 @@ const {
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
-const { ON_WRITE } = require('./privateOptions')
+const { ON_WRITE, ON_DECODED } = require('./privateOptions')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -1707,6 +1707,9 @@ module.exports = class Broker {
    *   immediately before the request is written to the socket, so a caller can tell a request
    *   refused before its write from one that may have reached the broker. A synchronous failure
    *   of the write after it counts as possibly written
+   * @param {(decoded: object) => void} [options[ON_DECODED]] internal (`./privateOptions`): called
+   *   once with the decoded reply, before a caller refusal, the throttle or parse can end the
+   *   request
    * @returns {Promise}
    */
   async offsetCommit(
@@ -1731,6 +1734,7 @@ module.exports = class Broker {
       topicIds,
     })
     if (options?.[ON_WRITE]) protocolRequest.onWrite = options[ON_WRITE]
+    if (options?.[ON_DECODED]) protocolRequest.onDecoded = options[ON_DECODED]
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 

@@ -137,11 +137,33 @@ module.exports = class RequestQueue extends EventEmitter {
     }
   }
 
+  /**
+   * Records a broker-requested client-side throttle. The diagnostic runs after the throttle is
+   * recorded and is contained, so a throwing logger cannot keep a parsed reply from its caller.
+   * @param {number|null} clientSideThrottleTime ms to hold new requests back
+   * @returns {void}
+   */
   maybeThrottle(clientSideThrottleTime) {
     if (clientSideThrottleTime !== null && clientSideThrottleTime > 0) {
-      this.logger.debug(`Client side throttling in effect for ${clientSideThrottleTime}ms`)
       const minimumThrottledUntil = Date.now() + clientSideThrottleTime
       this.throttledUntil = Math.max(minimumThrottledUntil, this.throttledUntil)
+      this.debugContained(`Client side throttling in effect for ${clientSideThrottleTime}ms`)
+    }
+  }
+
+  /**
+   * Logs a diagnostic of a request the queue already owns. A throw is reported, never propagated:
+   * once a request is enrolled, only its own settlement may reject its promise.
+   * @private
+   * @param {string} message
+   * @param {object} [extra]
+   * @returns {void}
+   */
+  debugContained(message, extra) {
+    try {
+      this.logger.debug(message, extra)
+    } catch (error) {
+      this.reportObserverFailure(error)
     }
   }
 
@@ -256,20 +278,29 @@ module.exports = class RequestQueue extends EventEmitter {
     enrolling = false
     this.scheduleCheckPendingRequests()
 
-    this.logger.debug(`Request enqueued`, {
+    this.debugContained(`Request enqueued`, {
       clientId: this.clientId,
       broker: this.broker,
       correlationId,
     })
 
-    this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+    try {
+      this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+    } catch (error) {
+      this.reportObserverFailure(error)
+    }
   }
 
   /**
    * Commits private transmission after authority checks and before synchronous send. A failed
    * commit settles only this request, including when dispatch runs inside a timer or response.
+   * A send that throws (the socket write, or a correlation collision) withdraws this request's
+   * own in-flight entry and rejects it before the throw propagates, so no entry is left that
+   * neither a reply nor the timeout sweep can settle; bytes already handed to the socket are
+   * indeterminate.
    * @param {SocketRequest} socketRequest captured pending request
-   * @returns {void} foreground send failures keep their existing propagation
+   * @returns {void}
+   * @throws {Error} what the send threw, after this request was rejected with it
    */
   sendSocketRequest(socketRequest) {
     const refusal = socketRequest.refusal()
@@ -288,11 +319,20 @@ module.exports = class RequestQueue extends EventEmitter {
       }
     }
 
-    socketRequest.send()
+    try {
+      socketRequest.send()
+    } catch (error) {
+      if (this.inflight.get(socketRequest.correlationId) === socketRequest) {
+        this.inflight.delete(socketRequest.correlationId)
+      }
+      socketRequest.rejected(error)
+      this.emitQueueState()
+      throw error
+    }
 
     if (!socketRequest.expectResponse) {
       this.lastActivityAt = socketRequest.sentAt
-      this.logger.debug(`Request does not expect a response, resolving immediately`, {
+      this.debugContained(`Request does not expect a response, resolving immediately`, {
         clientId: this.clientId,
         broker: this.broker,
         correlationId: socketRequest.correlationId,
