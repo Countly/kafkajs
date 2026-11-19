@@ -854,6 +854,54 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    /**
+     * Holds every record about c08.4 until its offer arrives: c01's own interval entered it, then
+     * each client run of `clients` enters it in turn (acquiring main first when new), every
+     * interval closes, and only then do the offer and its send result reach the journal.
+     */
+    const heldAfterClose = (clients) => (records) => {
+      const late = (r) => (r.stage === 'offered' || r.stage === 'ack') && r.id === 'c08.4'
+      const [b, e] = [boundaryOf(records), entryOf(records)]
+      const authorities = new Map([['c01.0', fx.authority('c01.0')]])
+      const extra = []
+      clients.forEach((client, n) => {
+        if (!authorities.has(client)) {
+          const authority = fx.authority(client, { acquiredAt: 2 + n })
+          authorities.set(client, authority)
+          extra.push({ ...b, client, run: authority.run, authority, cause: `${client}.a` })
+        }
+        const authority = authorities.get(client)
+        extra.push({ ...e, client, handler: `${client}.h${n}`, authority })
+      })
+      for (const [client, authority] of authorities)
+        extra.push({ ...b, client, run: authority.run, authority, event: 'revoke-end' })
+      return [...records.filter((r) => !late(r)), ...extra, ...records.filter(late)]
+    }
+
+    it('fails an interval that entered a record twice when both its entries wait for the offer until every interval has closed', async () => {
+      const report = await check(fx.healthy(), { edit: heldAfterClose(['c01.1', 'c01.0']) })
+      expectRow(
+        report,
+        'K3',
+        'FAIL',
+        /1 same-owner repeats.*c08\.4 in g-0123456789ab-c01 by c01\.0\.r1/
+      )
+      expect(row(report, 'K3').numbers).toMatchObject({
+        sameOwnerRepeats: 1,
+        repeatsAfterChange: 1,
+      })
+    })
+
+    it('counts, without failing, entries of one record by three intervals once each that wait for the offer until every interval has closed', async () => {
+      const report = await check(fx.healthy(), { edit: heldAfterClose(['c01.1', 'c01.2']) })
+      expectRow(report, 'K3', 'PASS')
+      expect(row(report, 'K3').numbers).toMatchObject({
+        sameOwnerRepeats: 0,
+        repeatsAfterChange: 2,
+      })
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
     it('is inconclusive with a named reason when overlapping intervals re-enter more ids than the capacity', async () => {
       const ids = Array.from({ length: 12 }, (_, n) => `c08.${n}`)
       const edit = (records) => {
