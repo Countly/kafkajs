@@ -1286,15 +1286,11 @@ module.exports = (params) => {
         try {
           shouldRestart = await retry.restartOnFailure(e)
         } catch (callbackError) {
+          shouldRestart = true
           logger.error(
             'Caught error when invoking user-provided "restartOnFailure" callback. Defaulting to restarting.',
-            {
-              error: callbackError.message || callbackError,
-              cause: e.message || e,
-              groupId,
-            }
+            { error: describeThrown(callbackError), cause: e.message || e, groupId }
           )
-          shouldRestart = true
         }
       }
 

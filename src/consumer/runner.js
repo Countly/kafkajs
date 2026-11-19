@@ -254,7 +254,7 @@ module.exports = class Runner extends EventEmitter {
         this.logger.error('Crash handler failed', {
           groupId: this.consumerGroup.groupId,
           memberId: this.consumerGroup.memberId,
-          error: crashHandlerError.message || crashHandlerError,
+          error: describeThrown(crashHandlerError),
           cause: e.message || e,
         })
         return
@@ -457,7 +457,7 @@ module.exports = class Runner extends EventEmitter {
           this.logger.error('Crash handler failed', {
             groupId: this.consumerGroup.groupId,
             memberId: this.consumerGroup.memberId,
-            error: crashHandlerError.message || crashHandlerError,
+            error: describeThrown(crashHandlerError),
             cause: e.message || e,
           })
         } finally {
