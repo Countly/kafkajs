@@ -1240,6 +1240,16 @@ const buildConsumer = (options = {}) => {
 }
 
 /**
+ * The partition events and epoch 0 rejoins of a log, in order.
+ * @param {object[]} log entries of `buildConsumer`'s log
+ * @returns {Array<string|number>} event names, and 0 for each rejoin heartbeat
+ */
+const partitionEventsAndRejoins = (log) =>
+  log
+    .filter(({ kind, epoch }) => kind.startsWith('PARTITIONS_') || epoch === 0)
+    .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
+
+/**
  * Advances fake time in 10 ms steps until `done()` holds, for at most `budget` ms.
  * @param {() => boolean} done
  * @param {number} [budget]
@@ -1280,7 +1290,11 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
    *   old epoch keep succeeding
    * @returns {Promise<object>} the built consumer and what the case observed
    */
-  const fenceWhileHandlerRuns = async ({ rebalanceListener, busy = true, trigger = 'fence' } = {}) => {
+  const fenceWhileHandlerRuns = async ({
+    rebalanceListener,
+    busy = true,
+    trigger = 'fence',
+  } = {}) => {
     const built = buildConsumer()
     consumer = built.consumer
     const handled = []
@@ -1335,9 +1349,20 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
       })
 
     await consumer.subscribe({ topics: ['topic-a', 'topic-b'] })
+    const logged =
+      rebalanceListener &&
+      Object.fromEntries(
+        Object.entries(rebalanceListener).map(([name, call]) => [
+          name,
+          async (payload) => {
+            built.log.push({ kind: name, at: Date.now() })
+            return call(payload)
+          },
+        ])
+      )
     consumer.run({
       autoCommitInterval: 30000,
-      ...(rebalanceListener && { rebalanceListener }),
+      ...(logged && { rebalanceListener: logged }),
       eachMessage: async ({ topic, partition, message }) => {
         handled.push({ at: Date.now(), tp: `${topic}|${partition}`, offset: message.offset })
         if (s.slow && topic === 'topic-a' && message.offset === '42') {
@@ -1357,7 +1382,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     await advanceUntil(() => s.fenced, 10000)
     // Only records the rejoined member is handed again from here on.
     built.state.queue['topic-a|0'] = [40, 41]
-    await advanceUntil(() => built.log.some(({ epoch }) => epoch === 0 && s.fenced), 10000)
+    await advanceUntil(() => built.log.slice(s.fencedIndex).some(({ epoch }) => epoch === 0), 10000)
     await jest.advanceTimersByTimeAsync(3000)
     // A record on topic-b after the auto-commit interval makes the next commit.
     await jest.advanceTimersByTimeAsync(30000)
@@ -1369,10 +1394,10 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
 
   it('runs the LOST round before any rejoin when a fence reaches the slot during the wait while a handler keeps the fetch loop busy: one PARTITIONS_LOST, uncommitted progress discarded and redelivered, nothing resolved under the fenced epoch committed', async () => {
     const run = await fenceWhileHandlerRuns()
-    const after = run.log.filter(({ at }) => at >= run.fencedAt)
+    const after = run.log.slice(run.fencedIndex)
     const lostAt = after.findIndex(({ kind }) => kind === 'PARTITIONS_LOST')
-    const rejoinAt = after.findIndex(({ kind, epoch }) => kind === 'heartbeat' && epoch === 0)
 
+    expect(partitionEventsAndRejoins(after)).toEqual(['PARTITIONS_LOST', 0, 'PARTITIONS_ASSIGNED'])
     expect(after.filter(({ kind }) => kind === 'PARTITIONS_LOST')).toEqual([
       expect.objectContaining({
         partitions: [
@@ -1383,8 +1408,6 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ])
     // The handler of a:0@42 returned after the wait had ended.
     expect(after[lostAt].at).toBeGreaterThan(run.fencedAt + 500)
-    expect(rejoinAt).toBeGreaterThan(lostAt)
-    expect(after.filter(({ kind }) => kind === 'PARTITIONS_REVOKED')).toEqual([])
     // Redelivered from the committed offset 40, not resumed at 43.
     expect(
       run.handled
@@ -1400,13 +1423,12 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
 
   it('runs the LOST round before the rejoin when a fence reaches the slot during the wait while the fetch loop is free, and redelivers from the committed offset', async () => {
     const run = await fenceWhileHandlerRuns({ busy: false })
-    const after = run.log.filter(({ at }) => at >= run.fencedAt)
-    const lostAt = after.findIndex(({ kind }) => kind === 'PARTITIONS_LOST')
 
-    expect(after.filter(({ kind }) => kind === 'PARTITIONS_LOST')).toHaveLength(1)
-    expect(
-      after.findIndex(({ kind, epoch }) => kind === 'heartbeat' && epoch === 0)
-    ).toBeGreaterThan(lostAt)
+    expect(partitionEventsAndRejoins(run.log.slice(run.fencedIndex))).toEqual([
+      'PARTITIONS_LOST',
+      0,
+      'PARTITIONS_ASSIGNED',
+    ])
     expect(
       run.handled
         .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')
@@ -1425,17 +1447,18 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     'leaves, runs one LOST round and rejoins when the poll timer expires during the wait while a handler %s, and redelivers from the committed offset',
     async (_, busy) => {
       const run = await fenceWhileHandlerRuns({ busy, trigger: 'poll' })
-      const after = run.log.filter(({ at }) => at >= run.fencedAt)
-      const order = after
-        .filter(({ kind, epoch }) => kind === 'PARTITIONS_LOST' || epoch === -1 || epoch === 0)
-        .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
+      const after = run.log.slice(run.fencedIndex)
 
-      expect(order).toEqual([-1, 'PARTITIONS_LOST', 0])
+      expect(after.find(({ kind }) => kind === 'heartbeat').epoch).toEqual(-1)
+      expect(partitionEventsAndRejoins(after)).toEqual([
+        'PARTITIONS_LOST',
+        0,
+        'PARTITIONS_ASSIGNED',
+      ])
       expect(after.find(({ kind }) => kind === 'PARTITIONS_LOST').partitions).toEqual([
         { topic: 'topic-a', partitions: [0] },
         { topic: 'topic-b', partitions: [0, 1] },
       ])
-      expect(after.filter(({ kind }) => kind === 'PARTITIONS_REVOKED')).toEqual([])
       expect(
         run.handled
           .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')
@@ -1455,11 +1478,8 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
   it('runs the LOST round before any other round when a commit is fenced during the wait and the fetch loop takes the verdict before the wait ends', async () => {
     const run = await fenceWhileHandlerRuns({ busy: false, trigger: 'commit' })
     const after = run.log.slice(run.fencedIndex)
-    const order = after
-      .filter(({ kind, epoch }) => kind.startsWith('PARTITIONS_') || epoch === 0)
-      .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
 
-    expect(order).toEqual(['PARTITIONS_LOST', 0, 'PARTITIONS_ASSIGNED'])
+    expect(partitionEventsAndRejoins(after)).toEqual(['PARTITIONS_LOST', 0, 'PARTITIONS_ASSIGNED'])
     expect(after[after.findIndex(({ kind }) => kind === 'PARTITIONS_LOST')].partitions).toEqual([
       { topic: 'topic-a', partitions: [0] },
       { topic: 'topic-b', partitions: [0, 1] },
@@ -1563,58 +1583,80 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ['a literal subscription', { topics: ['topic-a', 'topic-c', 'topic-d'] }],
     ['a broker-side regex', { regex: 'topic-.*' }],
   ])('with %s', (_, subscription) => {
-    it('abandons a round whose target is replaced while it resolves topic ids and reconciles the newer target in the next round, without a crash', async () => {
-      const built = buildConsumer()
-      consumer = built.consumer
-      const s = { phase: 'steady' }
-      const named = { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] }
-      const newer = { 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }
-      built.state.answer = (request) => {
-        if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
-        if (s.phase === 'grow') {
-          s.phase = 'grown'
-          return fullTarget(2, named)
+    it.each([
+      ['adds a partition', { 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }, []],
+      [
+        'revokes an owned partition',
+        { 'topic-a': [1], 'topic-c': [0], 'topic-d': [0] },
+        [[{ topic: 'topic-a', partitions: [0] }]],
+      ],
+    ])(
+      'abandons a round whose target is replaced while it resolves topic ids by one that %s, and reconciles the newer target in the next round, without a crash',
+      async (_, newer, revocations) => {
+        const built = buildConsumer()
+        consumer = built.consumer
+        const s = { phase: 'steady' }
+        const named = { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] }
+        built.state.answer = (request) => {
+          if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+          if (s.phase === 'grow') {
+            s.phase = 'grown'
+            return fullTarget(2, named)
+          }
+          if (s.phase === 'grown') {
+            s.phase = 'regrown'
+            return fullTarget(3, newer)
+          }
+          if (s.phase === 'steady') {
+            return request.memberEpoch === 0
+              ? fullTarget(1, { 'topic-a': [0] })
+              : fullTarget(1, null)
+          }
+          return fullTarget(request.memberEpoch, null)
         }
-        if (s.phase === 'grown') {
-          s.phase = 'regrown'
-          return fullTarget(3, newer)
-        }
-        if (s.phase === 'steady') {
-          return request.memberEpoch === 0 ? fullTarget(1, { 'topic-a': [0] }) : fullTarget(1, null)
-        }
-        return fullTarget(request.memberEpoch, null)
-      }
-      const starts = jest.spyOn(Runner.prototype, 'start')
-      built.state.unknown.add('topic-c').add('topic-d')
-      await consumer.subscribe(subscription)
-      consumer.run({ eachMessage: async () => {} })
-      await advanceUntil(() => built.fetches.length > 0)
-      const [runner] = starts.mock.contexts
-      const steps = jest.spyOn(runner.consumerGroup.groupMembership, 'rebalance')
+        const starts = jest.spyOn(Runner.prototype, 'start')
+        built.state.unknown.add('topic-c').add('topic-d')
+        await consumer.subscribe(subscription)
+        consumer.run({ eachMessage: async () => {} })
+        await advanceUntil(() => built.fetches.length > 0)
+        const [runner] = starts.mock.contexts
+        const steps = jest.spyOn(runner.consumerGroup.groupMembership, 'rebalance')
 
-      // The membership's own refresh names topic-c and schedules the round; the round's step
-      // waits 700 ms for topic-d, and the heartbeat sent meanwhile brings epoch 3.
-      built.state.idDelays.push(0, 700)
-      s.phase = 'grow'
-      await advanceUntil(() => s.phase === 'regrown')
-      await jest.advanceTimersByTimeAsync(3000)
+        // The membership's own refresh names topic-c and schedules the round; the round's step
+        // waits 700 ms for topic-d, and the heartbeat sent meanwhile brings epoch 3.
+        built.state.idDelays.push(0, 700)
+        s.phase = 'grow'
+        await advanceUntil(() => s.phase === 'regrown')
+        await jest.advanceTimersByTimeAsync(3000)
 
-      expect(built.crashes).toEqual([])
-      expect(starts).toHaveBeenCalledTimes(1)
-      expect(runner.running).toBe(true)
-      expect(steps.mock.calls.length).toBeGreaterThanOrEqual(2)
-      expect(
-        Object.fromEntries(
-          runner.consumerGroup.assigned().map(({ topic, partitions }) => [topic, partitions])
+        expect(built.crashes).toEqual([])
+        expect(starts).toHaveBeenCalledTimes(1)
+        expect(runner.running).toBe(true)
+        expect(steps.mock.calls.length).toBeGreaterThanOrEqual(2)
+        expect(
+          Object.fromEntries(
+            runner.consumerGroup.assigned().map(({ topic, partitions }) => [topic, partitions])
+          )
+        ).toEqual(newer)
+        expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(3)
+        expect(runner.consumerGroup.groupMembership.state).toEqual('STABLE')
+        expect(
+          built.log
+            .filter(({ kind }) => kind === 'PARTITIONS_REVOKED')
+            .map(({ partitions }) => partitions)
+        ).toEqual(revocations)
+        const fetchedSince = Date.now() - 1000
+        expect(
+          new Set(built.fetches.filter(({ at }) => at > fetchedSince).map(({ tp }) => tp))
+        ).toEqual(
+          new Set(
+            Object.entries(newer).flatMap(([topic, partitions]) =>
+              partitions.map((partition) => `${topic}|${partition}`)
+            )
+          )
         )
-      ).toEqual(newer)
-      expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(3)
-      expect(runner.consumerGroup.groupMembership.state).toEqual('STABLE')
-      const fetchedSince = Date.now() - 1000
-      expect(
-        new Set(built.fetches.filter(({ at }) => at > fetchedSince).map(({ tp }) => tp))
-      ).toEqual(new Set(['topic-a|0', 'topic-a|1', 'topic-c|0', 'topic-d|0']))
-    })
+      }
+    )
   })
 
   it("calls the listener's onPartitionsLost once, before any rejoin, when a fence reaches the slot during the wait while a handler keeps the fetch loop busy", async () => {
@@ -1627,9 +1669,6 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
         onPartitionsLost: record('lost'),
       },
     })
-    const rejoin = run.log.find(
-      ({ kind, epoch, at }) => kind === 'heartbeat' && epoch === 0 && at >= run.fencedAt
-    )
     const later = calls.filter(({ at }) => at > run.fencedAt)
 
     expect(later.map(({ name }) => name)).toEqual(['lost', 'assigned'])
@@ -1637,10 +1676,17 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
       { topic: 'topic-a', partitions: [0] },
       { topic: 'topic-b', partitions: [0, 1] },
     ])
-    expect(later[0].at).toBeLessThanOrEqual(rejoin.at)
-    expect(run.log.indexOf(rejoin)).toBeGreaterThan(
-      run.log.findIndex(({ kind, at }) => kind === 'PARTITIONS_LOST' && at >= run.fencedAt)
-    )
+    expect(
+      run.log
+        .slice(run.fencedIndex)
+        .filter(({ kind, epoch }) => kind.startsWith('onPartitions') || epoch === 0)
+        .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
+    ).toEqual(['onPartitionsLost', 0, 'onPartitionsAssigned'])
+    expect(partitionEventsAndRejoins(run.log.slice(run.fencedIndex))).toEqual([
+      'PARTITIONS_LOST',
+      0,
+      'PARTITIONS_ASSIGNED',
+    ])
     expect(
       run.handled
         .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')

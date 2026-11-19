@@ -315,6 +315,53 @@ describe('Consumer > a classic cooperative chain that the fetch loop starts and 
     expect(built.joins).toHaveLength(joinsAtCrash)
   })
 
+  it('starts no second run when restartOnFailure says true after a stop() and an explicit run(), and restarts that run after its own crash', async () => {
+    let decide
+    const restartOnFailure = jest.fn(() =>
+      restartOnFailure.mock.calls.length === 1
+        ? new Promise((resolve) => (decide = resolve))
+        : Promise.resolve(true)
+    )
+    const built = build({ retries: 3, restartOnFailure })
+    consumer = built.consumer
+    const start = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topic: TOPIC })
+    await consumer.run({ eachMessage: async () => {} })
+    await until(() => built.fetches.length > 0)
+
+    built.state.churn = true
+    built.state.fetchFails = 1
+    await until(() => restartOnFailure.mock.calls.length > 0, 5000)
+    built.state.churn = false
+    const stopping = consumer.stop()
+    await jest.advanceTimersByTimeAsync(100)
+    await stopping
+    await consumer.run({ eachMessage: async () => {} })
+    const restartedAt = Date.now()
+    await until(() => built.fetches.some(({ at }) => at > restartedAt))
+    expect(start).toHaveBeenCalledTimes(2)
+
+    decide(true)
+    await jest.advanceTimersByTimeAsync(RESTART_DELAY * 4)
+    expect(built.crashes.map(({ error, restart }) => [error.constructor, restart])).toEqual([
+      [KafkaJSRebalanceNotConvergedError, false],
+    ])
+    expect(start).toHaveBeenCalledTimes(2)
+
+    built.state.churn = true
+    built.state.fetchFails = 1
+    await until(() => built.crashes.length > 1, 5000)
+    built.state.churn = false
+    const crashedAgainAt = Date.now()
+    await until(() => built.fetches.some(({ at }) => at > crashedAgainAt + RESTART_DELAY))
+
+    expect(built.crashes.map(({ error, restart }) => [error.constructor, restart])).toEqual([
+      [KafkaJSRebalanceNotConvergedError, false],
+      [KafkaJSRebalanceNotConvergedError, true],
+    ])
+    expect(start).toHaveBeenCalledTimes(3)
+  })
+
   it('reports the limit error once when a background chain and the fetch loop both wait on it, and a policy that allows one restart restarts the consumer', async () => {
     let restarts = 1
     const restartOnFailure = jest.fn(async () => restarts-- > 0)
