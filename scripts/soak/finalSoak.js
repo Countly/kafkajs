@@ -35,6 +35,8 @@ const { spawn, execFile } = require('node:child_process')
 const { SHAPES, validateRecord, validateConfig } = require('./finalSoakSchema')
 const {
   valueOf,
+  harnessTimeout,
+  clearHarnessTimeout,
   MonotonicClock,
   planSchedule,
   Scheduler,
@@ -519,7 +521,7 @@ class Supervisor {
     const step = async (name, work) => {
       let timer = null
       const late = new Promise((resolve) => {
-        timer = setTimeout(
+        timer = harnessTimeout(
           resolve,
           this.finishStepMs,
           `did not settle within ${this.finishStepMs} ms`
@@ -532,7 +534,7 @@ class Supervisor {
         ),
         late,
       ])
-      clearTimeout(timer)
+      clearHarnessTimeout(timer)
       if (failure) missing.push(`${name}: ${failure}`)
     }
     await this.untilExited()
@@ -1071,12 +1073,12 @@ class Supervisor {
         slot,
         timer: null,
         settle: (message) => {
-          clearTimeout(entry.timer)
+          clearHarnessTimeout(entry.timer)
           if (this.waiting.delete(id)) resolve(message)
         },
       }
       const ms = this.budget(step)
-      entry.timer = setTimeout(() => {
+      entry.timer = harnessTimeout(() => {
         const reason = `process ${slot} did not answer ${step.type} ${step.id} within ${ms} ms`
         this.problem(reason)
         this.abort(reason)
