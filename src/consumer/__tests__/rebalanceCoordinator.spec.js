@@ -2589,6 +2589,30 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
     expect(consumerGroup.leaveForPollExpiry).toBeUndefined()
   })
 
+  it.each([
+    ['consumer', { kind: 'lost', reason: 'poll-interval-exceeded' }],
+    ['classic', null],
+  ])(
+    'a poll expiry while a %s round is still joining raises the lost verdict only when that round cannot renew the membership',
+    async (protocol, verdict) => {
+      const { coordinator, consumerGroup, fetchManager } = build()
+      if (protocol === 'consumer') asConsumerProtocol(consumerGroup)
+      consumerGroup.ownership = new GroupOwnership()
+      const join = deferred()
+      consumerGroup.joinAndSync.mockImplementation(() => join.promise)
+      const chain = coordinator.runRound('assignment-changed', 'revoked')
+      await jest.advanceTimersByTimeAsync(0)
+
+      await coordinator.onPollExpired({ elapsedMs: 400000, isStatic: false })
+
+      expect(consumerGroup.resetGenerationLocally).toHaveBeenCalledTimes(1)
+      expect(coordinator.takeVerdict()).toEqual(verdict && expect.objectContaining(verdict))
+      expect(fetchManager.stop).toHaveBeenCalledTimes(verdict ? 1 : 0)
+      join.resolve({ assignment: {} })
+      await chain.catch(() => {})
+    }
+  )
+
   // A fencing sent at epoch 7 must not be discarded as stale.
   it('never treats a consumer-protocol fencing as a stale generation', () => {
     const { coordinator, consumerGroup } = build()
