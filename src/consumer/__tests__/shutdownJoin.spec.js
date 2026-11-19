@@ -432,6 +432,27 @@ describe('Consumer > a fatal heartbeat answer while a handler runs', () => {
     expect(run.crashes).toHaveLength(1)
   }, 60000)
 
+  it('a zero-timeout disconnect made from the Crash log line of the crash the fatal deadline forces joins that crash: one stop, one cluster disconnect and one DISCONNECT', async () => {
+    const ref = {}
+    let close = null
+    const logger = reentrantLogger((message) => {
+      if (!message.startsWith('Crash:') || close || !ref.consumer) return
+      close = settled(ref.consumer.disconnect({ timeout: 0 }))
+    })
+    const run = await startWith((_payload, held) => held.promise, { logger })
+    ref.consumer = run.consumer
+    run.arm()
+    await advanceUntil(() => run.faultAt() !== null)
+    await jest.advanceTimersByTimeAsync(run.faultAt() + 4000 - Date.now())
+    await advanceUntil(() => close?.done && run.crashes.length > 0, 500)
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
+    expect([count(run, 'STOP'), count(run, 'DISCONNECT')]).toEqual([1, 1])
+    expect(run.cluster.disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
+  }, 60000)
+
   it('a disconnect with a deadline shorter than the poll interval ends the held handler wait at its own deadline and still reports one CRASH with restart false', async () => {
     const run = await startWith((_payload, held) => held.promise)
     run.arm()
