@@ -51,7 +51,9 @@ const COOPERATIVE = 'cooperative'
  * @property {(deps: { rebalanceCoordinator: Object, heartbeatManager: Object,
  *   commitBeforeRelease?: Function }) => void} attach
  *   Late-bound collaborators, forwarded by `ConsumerGroup#attach`.
- * @property {(options: { interval: number }) => Promise<void>} heartbeat
+ * @property {(options: { interval: number }) => Promise<boolean|void>} heartbeat
+ *   classic and manual resolve void; the consumer protocol resolves true only when a heartbeat was
+ *   sent and answered with success for the membership the member still holds
  * @property {() => number} heartbeatInterval how long until the next heartbeat should go out; the
  *   heartbeat manager reads this and nothing else when it schedules
  * @property {() => boolean} needsReconciliation whether the coordinator wants something this member

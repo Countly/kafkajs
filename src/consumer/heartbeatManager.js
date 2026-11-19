@@ -43,6 +43,8 @@ module.exports = class HeartbeatManager {
    *   the poll deadline is not evaluated while one is
    * @param {() => Error|null} [options.guard] the owner's refusal, handed to every heartbeat so a
    *   request still awaiting its coordinator lookup sends nothing once the owner is retired
+   * @param {() => void} [options.onAccepted] the owner's success effect, handed to every heartbeat;
+   *   a membership that accounts successes inside its exchange runs it once, others ignore it
    */
   constructor({
     groupMembership,
@@ -53,6 +55,7 @@ module.exports = class HeartbeatManager {
     onPollExpired,
     isRebalancing = () => false,
     guard,
+    onAccepted,
   }) {
     this.groupMembership = groupMembership
     this.pollTimer = pollTimer
@@ -62,6 +65,7 @@ module.exports = class HeartbeatManager {
     this.onPollExpired = onPollExpired
     this.isRebalancing = isRebalancing
     this.guard = guard
+    this.onAccepted = onAccepted
 
     this.handle = null
     this.disabled = false
@@ -80,7 +84,9 @@ module.exports = class HeartbeatManager {
     this.chainId = 0
     /**
      * Set by `requestTick()` while a tick is in flight, consumed by that tick's `finally`. The
-     * flag exists because arming a second chain under a running one would double it.
+     * flag exists because arming a second chain under a running one would double it. `stop()`
+     * drops it; a request made after the stop is honoured even though the stop cleared the handle,
+     * because that is how the round that replaces a stopped chain asks for its first heartbeat.
      */
     this.tickRequested = false
   }
@@ -106,8 +112,13 @@ module.exports = class HeartbeatManager {
     this.schedule()
   }
 
-  /** Cancels the chain, leaving the manager armable again. @returns {void} */
+  /**
+   * Cancels the chain, leaving the manager armable again. A tick asked for before the stop belonged
+   * to the cancelled chain and is dropped with it; one asked for after it is a new request.
+   * @returns {void}
+   */
   stop() {
+    this.tickRequested = false
     if (this.handle) {
       clearTimeout(this.handle)
       this.handle = null
@@ -258,7 +269,11 @@ module.exports = class HeartbeatManager {
     let rearm = false
 
     try {
-      await this.groupMembership.heartbeat({ interval: this.nextInterval(), guard: this.guard })
+      await this.groupMembership.heartbeat({
+        interval: this.nextInterval(),
+        guard: this.guard,
+        onAccepted: this.onAccepted,
+      })
     } catch (error) {
       // A result that landed after `stop()`, after the chain was re-armed under a new generation,
       // or inside the JoinGroup window belongs to a generation nobody is in any more: it is
@@ -288,11 +303,9 @@ module.exports = class HeartbeatManager {
       }
     } finally {
       this.inFlight = false
-      // Guarded on `handle`, which is the one fact `stop()` sets: a tick only ever runs on a
-      // manager that WAS armed, so a null handle here means a stop landed inside this heartbeat
-      // and re-arming would leave a non-unref'd timer holding the event loop open after the member
-      // has left.
-      rearm = this.tickRequested && this.handle !== null
+      // A stop inside this heartbeat already dropped any earlier request, so a request left here was
+      // made after it; only `shutdown()`, which means the member has left, vetoes it.
+      rearm = this.tickRequested && !this.stopped
       this.tickRequested = false
     }
 

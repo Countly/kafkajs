@@ -1006,21 +1006,29 @@ module.exports = class ConsumerGroup {
    *
    * Pause state survives either way: `subscriptionState.update()` replaces the assignment only.
    *
+   * Under the consumer protocol only the LOST round renews an ownership that carries a loss,
+   * whatever learned it (a heartbeat, a commit, a poll expiry): any other apply is refused with that
+   * loss before it changes anything, so the runner's LOST round reports and discards it first.
+   *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean, round?: object, additionHold?: object }} [options]
-   *   `rebuildOffsets: false` selects the incremental apply; it still builds the first manager,
-   *   because there is nothing to keep. `additionHold` is the round's token for the partitions this
-   *   apply adds: they are held before they are published and the caller releases the token once
-   *   its assigned callback has returned.
+   * @param {{ rebuildOffsets?: boolean, lost?: boolean, round?: object, additionHold?: object }}
+   *   [options] `rebuildOffsets: false` selects the incremental apply; it still builds the first
+   *   manager, because there is nothing to keep. `lost` marks the LOST round's apply.
+   *   `additionHold` is the round's token for the partitions this apply adds: they are held before
+   *   they are published and the caller releases the token once its assigned callback has returned.
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
+   * @throws {Error} the round's refusal, the fatal error, or the loss the ownership carries
    */
-  async applyRebalanceResult(result, { rebuildOffsets = true, round, additionHold } = {}) {
+  async applyRebalanceResult(
+    result,
+    { rebuildOffsets = true, lost = false, round, additionHold } = {}
+  ) {
     const check = () => {
       const membershipError =
         this.kind === 'consumer' &&
         (this.groupMembership.state === 'FATAL'
           ? this.groupMembership.fatalError
-          : this.groupMembership.state === 'FENCED'
+          : this.groupMembership.state === 'FENCED' || !lost
             ? this.ownership?.refusal(this.ownership.token())?.cause
             : null)
       const error = round?.guard() || membershipError
@@ -1435,7 +1443,9 @@ module.exports = class ConsumerGroup {
     this.leaderUnionWatch?.clear()
     const run = this.idleWait
     const leaderAttempt = Symbol('leader attempt')
-    const roundDeadlineAt = performance.now() + this.rebalanceTimeout
+    const roundDeadlineAt =
+      performance.now() +
+      (this.groupMembership?.joinBudget?.(this.rebalanceTimeout) ?? this.rebalanceTimeout)
     const expired = joinDeadlineError({
       rebalanceTimeoutMs: this.rebalanceTimeout,
     })
@@ -2091,8 +2101,15 @@ module.exports = class ConsumerGroup {
     )
   }
 
-  async heartbeat({ interval, guard }) {
-    return this.groupMembership.heartbeat({ interval, guard })
+  /**
+   * One heartbeat through the membership's own gate.
+   * @param {{ interval: number, guard?: () => Error|null, onAccepted?: () => void }} options
+   *   `onAccepted` is the runner's clock effect; only the consumer protocol runs it
+   * @returns {Promise<boolean|void>} void for classic and manual; under the consumer protocol, true
+   *   only when a heartbeat was sent and answered with success for the membership the member holds
+   */
+  async heartbeat({ interval, guard, onAccepted }) {
+    return this.groupMembership.heartbeat({ interval, guard, onAccepted })
   }
 
   /**

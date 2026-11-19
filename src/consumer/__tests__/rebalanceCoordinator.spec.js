@@ -3,6 +3,7 @@ const Batch = require('../batch')
 const PollTimer = require('../pollTimer')
 const HeartbeatManager = require('../heartbeatManager')
 const ConsumerGroup = require('../consumerGroup')
+const GroupOwnership = require('../groupOwnership')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
@@ -10,6 +11,7 @@ const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const {
   pollIntervalExceededError,
   stampGeneration,
+  stampOwnership,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
 const {
@@ -394,6 +396,112 @@ describe('Consumer > RebalanceCoordinator > the inter-round yield', () => {
     const { coordinator } = build()
 
     expect(() => coordinator.notifyStopRequested()).not.toThrow()
+  })
+})
+
+describe('Consumer > RebalanceCoordinator > the round after the inter-round yield', () => {
+  /** A consumer-protocol coordinator whose current membership is already lost. */
+  const lostMember = () => {
+    const built = build()
+    Object.assign(built.consumerGroup, {
+      kind: 'consumer',
+      joinCount: 1,
+      ownership: new GroupOwnership(),
+      needsReconciliation: () => true,
+    })
+    built.consumerGroup.ownership.lose(new Error('fenced'), 0)
+    return built
+  }
+
+  it('ends the chain when the membership is lost and no LOST round is owed', () => {
+    const { coordinator } = lostMember()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'revoked', reason: null, level: false })
+  })
+
+  it('runs the LOST round chosen before the wait even though the membership is lost', () => {
+    const { coordinator } = lostMember()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'lost', reason: 'fenced', level: false })
+    ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
+  })
+
+  it('keeps the chosen round when the slot holds a LOST of a membership an apply has since renewed', () => {
+    const { coordinator, consumerGroup } = lostMember()
+    coordinator.verdict = {
+      kind: 'lost',
+      reason: 'fenced',
+      error: stampOwnership(new Error('fenced'), 0),
+    }
+    consumerGroup.ownership.renew()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'revoked', reason: 'assignment-changed', level: true })
+  })
+
+  it.each([
+    ['waits in the slot', true],
+    ['was taken by the fetch loop', false],
+  ])(
+    'opens no reconciliation for a REVOKED while a LOST of the current membership %s',
+    async (_, slotted) => {
+      const { coordinator, consumerGroup } = lostMember()
+      consumerGroup.rebalanceProtocol = () => COOPERATIVE
+      const error = stampOwnership(new Error('fenced'), 0)
+      if (slotted) coordinator.verdict = { kind: 'lost', reason: 'fenced', error }
+
+      coordinator.requestRejoin({
+        kind: 'revoked',
+        reason: 'assignment-changed',
+        error: new Error('assignment changed'),
+      })
+      await Promise.resolve()
+
+      expect(coordinator.isRebalancing()).toBe(false)
+      expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+      expect(coordinator.verdict).toEqual(
+        slotted ? { kind: 'lost', reason: 'fenced', error } : null
+      )
+    }
+  )
+
+  it('opens a reconciliation for a REVOKED once an apply has renewed the membership a slotted LOST belonged to', async () => {
+    const { coordinator, consumerGroup } = lostMember()
+    consumerGroup.rebalanceProtocol = () => COOPERATIVE
+    consumerGroup.needsReconciliation = () => false
+    coordinator.verdict = {
+      kind: 'lost',
+      reason: 'fenced',
+      error: stampOwnership(new Error('fenced'), 0),
+    }
+    consumerGroup.ownership.renew()
+
+    coordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'assignment-changed',
+      error: new Error('assignment changed'),
+    })
+    await coordinator.idle()
+
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
+    expect(coordinator.verdict).toBeNull()
+  })
+
+  it('runs a LOST round queued during the wait even though the membership is lost', () => {
+    const { coordinator } = lostMember()
+    Object.assign(coordinator, {
+      pendingKind: 'lost',
+      pendingJoinCount: 1,
+      rejoinRequested: 'fenced',
+    })
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
   })
 })
 
@@ -2481,6 +2589,30 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
     expect(consumerGroup.leaveForPollExpiry).toBeUndefined()
   })
 
+  it.each([
+    ['consumer', { kind: 'lost', reason: 'poll-interval-exceeded' }],
+    ['classic', null],
+  ])(
+    'a poll expiry while a %s round is still joining raises the lost verdict only when that round cannot renew the membership',
+    async (protocol, verdict) => {
+      const { coordinator, consumerGroup, fetchManager } = build()
+      if (protocol === 'consumer') asConsumerProtocol(consumerGroup)
+      consumerGroup.ownership = new GroupOwnership()
+      const join = deferred()
+      consumerGroup.joinAndSync.mockImplementation(() => join.promise)
+      const chain = coordinator.runRound('assignment-changed', 'revoked')
+      await jest.advanceTimersByTimeAsync(0)
+
+      await coordinator.onPollExpired({ elapsedMs: 400000, isStatic: false })
+
+      expect(consumerGroup.resetGenerationLocally).toHaveBeenCalledTimes(1)
+      expect(coordinator.takeVerdict()).toEqual(verdict && expect.objectContaining(verdict))
+      expect(fetchManager.stop).toHaveBeenCalledTimes(verdict ? 1 : 0)
+      join.resolve({ assignment: {} })
+      await chain.catch(() => {})
+    }
+  )
+
   // A fencing sent at epoch 7 must not be discarded as stale.
   it('never treats a consumer-protocol fencing as a stale generation', () => {
     const { coordinator, consumerGroup } = build()
@@ -2525,7 +2657,7 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
   })
 
   // No production line changes for this, so it is pinned rather than implemented.
-  it('rebuilds offsets on a LOST round under both protocols', async () => {
+  it('rebuilds offsets on a LOST round, marked as the LOST round, under both protocols', async () => {
     for (const kind of ['classic', 'consumer']) {
       const { coordinator, consumerGroup } = build()
       consumerGroup.kind = kind
@@ -2536,6 +2668,7 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
 
       expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledWith(expect.anything(), {
         rebuildOffsets: true,
+        lost: true,
         round: expect.any(Object),
       })
       expect(consumerGroup.forgetOwnedPartitions).toHaveBeenCalled()

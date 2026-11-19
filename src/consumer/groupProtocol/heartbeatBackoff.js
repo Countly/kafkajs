@@ -46,15 +46,19 @@ class HeartbeatBackoff {
     this.due = true
   }
 
-  /** @param {number} now @returns {void} */
-  onFailedAttempt(now) {
-    const base = Math.min(
-      this.maxRetryTime,
-      this.initialRetryTime * this.multiplier ** this.attempts
-    )
+  /**
+   * Arms the next step of the backoff.
+   * @param {number} now
+   * @param {number} [floor=0] the shortest delay, kept even when the retry settings compute less
+   * @returns {void}
+   */
+  onFailedAttempt(now, floor = 0) {
+    // `|| 0`: with a zero retry time the power overflows to Infinity, and 0 * Infinity is NaN.
+    const base =
+      Math.min(this.maxRetryTime, this.initialRetryTime * this.multiplier ** this.attempts) || 0
     this.attempts += 1
     const jittered = Math.round(base * (1 + this.factor * (Math.random() * 2 - 1)))
-    this.until = now + Math.min(this.maxRetryTime, jittered)
+    this.until = now + Math.max(floor, Math.min(this.maxRetryTime, jittered))
     this.due = true
   }
 
