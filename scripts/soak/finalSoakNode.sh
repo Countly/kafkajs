@@ -13,7 +13,9 @@
 # groups, then containers) and a tarball of the artifact. A failed or interrupted run is sealed the
 # same way, so its evidence is bound and its dumps kept, never reported as complete. A run whose
 # driver exited 0 but whose workload receipt (supervisor.json) holds failures, problems, forced
-# exits, an abort or an incomplete source fails at stage `workload`, after sealing.
+# exits, an abort or an incomplete source fails at stage `workload`, after sealing. The core checker
+# then judges the artifact into <artifact>.core.txt and fails stage `core` on REJECTED, on no verdict,
+# or on an acceptance run that is not ACCEPTED; a smoke is never ACCEPTED, so its NOT ACCEPTED passes.
 #
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
@@ -212,4 +214,23 @@ fi
 # driver's own exit code, observed above, stays in the artifact as it was.
 stage=workload
 node scripts/soak/finalSoak.js --check-workload --out "$out"
+# The core checker judges the sealed artifact. Its report goes beside the receipt, outside the
+# directory the header binds. A smoke is never ACCEPTED (its heap row needs two hourly boundaries),
+# so NOT ACCEPTED, which has no FAIL row, is the smoke's expected verdict; REJECTED, no verdict at
+# all, or an acceptance run that is not ACCEPTED fails here.
+stage=core
+core_status=0
+node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt" || core_status=$?
+cat "$out.core.txt"
+verdict="$(sed -n '1s/^CORE VERDICT: \([A-Z ]*[A-Z]\).*/\1/p' "$out.core.txt")"
+note="core checker verdict: ${verdict:-none} (exit status $core_status), report $out.core.txt"
+if [[ "$mode" == smoke ]]; then note="$note. A smoke is never ACCEPTED; NOT ACCEPTED with no FAIL row is its expected verdict."; fi
+echo "$note"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  printf '### Final soak core checker\n\n%s\n\n```\n%s\n```\n' "$note" "$(cat "$out.core.txt")" >> "$GITHUB_STEP_SUMMARY"
+fi
+case "$mode:$verdict:$core_status" in
+  acceptance:ACCEPTED:0 | "smoke:NOT ACCEPTED:1") ;;
+  *) exit 1 ;;
+esac
 stage=done
