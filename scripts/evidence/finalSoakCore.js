@@ -18,8 +18,8 @@
  * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
  * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE.
  *
- * Memory: about 87 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
- * 139 MB at 1.6 million; pages are touched only as ids arrive): the full 32-byte payload digest,
+ * Memory: about 86 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
+ * 172 MB at 2 million; pages are touched only as ids arrive): the full 32-byte payload digest,
  * offsets, and one 4-byte ownership-interval serial per judged group. Then one id string and Map
  * entry per offered id; one entry per open ownership interval, per transaction, per id an open
  * interval shares with an overlapping one, per record held for its offer and per acknowledged
