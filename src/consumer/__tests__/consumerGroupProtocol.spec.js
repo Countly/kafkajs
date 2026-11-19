@@ -2647,6 +2647,31 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       })
     })
 
+    it('throws the assignment change when a leave starts while the names resolve, before the leave clears the target', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      let release
+      jest
+        .spyOn(h.protocol, 'releaseOwnedPartitions')
+        .mockImplementation(() => new Promise((resolve) => (release = resolve)))
+      const resolve = h.protocol.resolveAssignmentTopicNames.bind(h.protocol)
+      let leaving
+      jest.spyOn(h.protocol, 'resolveAssignmentTopicNames').mockImplementation(async (...args) => {
+        const resolved = await resolve(...args)
+        leaving = h.protocol.leave()
+        return resolved
+      })
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+      expect(h.protocol.state).toEqual(PREPARE_LEAVING)
+      expect(h.protocol.target).not.toBeNull()
+      release()
+      await leaving
+    })
+
     it('throws the assignment change when the target retires right after the subscription grew', async () => {
       const h = build({
         answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
