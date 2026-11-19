@@ -1307,7 +1307,8 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
    * @param {boolean} [options.busy=true] false: the handler of a:0@42 returns at once, so the fetch
    *   loop is free during the wait
    * @param {'fence'|'poll'|'commit'} [options.trigger='fence'] 'poll': instead of the fenced
-   *   heartbeat, the poll timer expires as the wait starts, so the member leaves the group;
+   *   heartbeat, the coordinator is handed a poll expiry (`onPollExpired`, as the heartbeat manager
+   *   calls it) as the wait starts, so the member leaves the group;
    *   'commit': a `commitOffsets()` call sent as the wait starts is fenced, and heartbeats at the
    *   old epoch keep succeeding
    * @returns {Promise<object>} the built consumer and what the case observed
@@ -1466,7 +1467,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ['keeps the fetch loop busy', true],
     ['leaves the fetch loop free', false],
   ])(
-    'leaves, runs one LOST round and rejoins when the poll timer expires during the wait while a handler %s, and redelivers from the committed offset',
+    'leaves, runs one LOST round and rejoins when a poll expiry is handed to the coordinator as the wait starts while a handler %s, and redelivers from the committed offset',
     async (_, busy) => {
       const run = await fenceWhileHandlerRuns({ busy, trigger: 'poll' })
       const after = run.log.slice(run.fencedIndex)
@@ -1518,7 +1519,7 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(run.starts).toHaveBeenCalledTimes(1)
   })
 
-  it('runs the LOST round, not a reconciliation, when a commit is fenced while a handler runs and a heartbeat answered before the fence then brings a new target, and rejoins with the latest target', async () => {
+  it('runs the LOST round, not a reconciliation, when a commit is fenced while a handler runs and a heartbeat sent before the fence is answered after it with a new target, and rejoins with the latest target', async () => {
     const built = buildConsumer()
     consumer = built.consumer
     const handled = []
@@ -2396,4 +2397,230 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     ])
     expect(run.crashes).toEqual([])
   })
+})
+
+describe('Consumer > a whole consumer-protocol consumer > a refusal held across reconciliation', () => {
+  let consumer
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(async () => {
+    const stopping = consumer.disconnect().catch(() => {})
+    await jest.advanceTimersByTimeAsync(5000)
+    await stopping
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
+  const NAMED = { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] }
+  const HOLD = Symbol('hold')
+  const FENCE = Symbol('fence')
+  const REJOIN_EPOCH = 200
+
+  /**
+   * What each phase answers. `joins` answer epoch 0 heartbeats in order; once the case is armed,
+   * `steps` answer the other heartbeats in order: FENCE refuses one, HOLD keeps one in flight until
+   * the case refuses it. Every phase ends with a target naming topic-c and topic-d by id replaced,
+   * while the round's step looks those ids up, by `newer`, and the heartbeat sent under that
+   * membership held. After the refusal, a rejoin gets epoch 200 with topic-a:0.
+   * @type {Record<string, (newer: object) => { joins: object[], steps: Array<object|symbol>,
+   *   idDelays: number[], armed: boolean }>}
+   */
+  const PHASES = {
+    startup: (newer) => ({
+      joins: [fullTarget(1, NAMED)],
+      steps: [fullTarget(2, newer), HOLD],
+      idDelays: [1200],
+      armed: true,
+    }),
+    ordinary: (newer) => ({
+      joins: [fullTarget(1, { 'topic-a': [0] })],
+      steps: [fullTarget(2, NAMED), fullTarget(3, newer), HOLD],
+      idDelays: [0, 1200],
+      armed: false,
+    }),
+    lost: (newer) => ({
+      joins: [fullTarget(1, { 'topic-a': [0] }), fullTarget(100, NAMED)],
+      steps: [FENCE, fullTarget(101, newer), HOLD],
+      idDelays: [1200],
+      armed: false,
+    }),
+  }
+
+  /**
+   * Runs one row: a whole consumer whose step is superseded by `newer` while a heartbeat sent
+   * under the live membership is held, the held answer released once that step has settled and its
+   * round applied (and, for a busy handler, once a handler of topic-a:0 runs), as a refusal `code`.
+   * A busy handler takes 3,000 ms for every record; with nothing owned no handler can run.
+   * @param {{ phase: string, newer: object, busy: boolean, code: number }} row
+   * @returns {Promise<object>} the log after the refusal and what the case observed
+   */
+  const play = async ({ phase, newer, busy, code }) => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const script = PHASES[phase](newer)
+    const s = { armed: script.armed, refused: false, running: 0 }
+    let refuse
+    consumer.on(consumer.events.GROUP_JOIN, ({ payload }) =>
+      built.log.push({ kind: 'GROUP_JOIN', at: Date.now(), assignment: payload.memberAssignment })
+    )
+    built.state.answer = (request) => {
+      const epoch = request.memberEpoch
+      if (epoch < 0) return fullTarget(epoch, null)
+      if (epoch === 0) {
+        return s.refused || !script.joins.length
+          ? fullTarget(REJOIN_EPOCH, { 'topic-a': [0] })
+          : script.joins.shift()
+      }
+      const step = s.armed && !s.refused ? script.steps.shift() : undefined
+      if (step === FENCE) throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      if (step === HOLD) {
+        return new Promise((_, reject) => {
+          refuse = () => reject(new KafkaJSProtocolError(createErrorFromCode(code)))
+        })
+      }
+      return step || fullTarget(epoch, null)
+    }
+    built.state.queue['topic-a|0'] = [40]
+    const steps = jest.spyOn(ConsumerGroupProtocol.prototype, 'rebalance')
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    const arm = () => {
+      built.state.unknown.add('topic-c').add('topic-d')
+      built.state.idDelays.push(...script.idDelays)
+      s.armed = true
+    }
+    if (s.armed) arm()
+    await consumer.subscribe({ topics: ['topic-a', 'topic-c', 'topic-d'] })
+    let atRun = null
+    consumer
+      .run({
+        eachMessage: async () => {
+          s.running += 1
+          if (busy) await new Promise((resolve) => setTimeout(resolve, 3000))
+          s.running -= 1
+        },
+      })
+      .then(() => {
+        const group = starts.mock.contexts[0].consumerGroup
+        atRun = {
+          joins: built.log.filter(({ kind }) => kind === 'GROUP_JOIN').length,
+          offsetManager: group.offsetManager != null,
+          lossOwed: group.ownership.refusal(group.ownership.token()) != null,
+          stopRequested: starts.mock.contexts[0].stopRequested,
+        }
+      })
+    if (!s.armed) {
+      await advanceUntil(() => (busy ? s.running > 0 : built.fetches.length > 0))
+      arm()
+    }
+    await advanceUntil(() => !!refuse, 10000)
+    let settled = false
+    steps.mock.results.at(-1).value.then(
+      () => (settled = true),
+      () => (settled = true)
+    )
+    await advanceUntil(() => settled, 3000)
+    await jest.advanceTimersByTimeAsync(10)
+    if (busy) await advanceUntil(() => s.running > 0, 1000)
+    const [runner] = starts.mock.contexts
+    const group = runner.consumerGroup
+    const owned = group.assigned()
+    const busyAtRefusal = s.running > 0
+    const refusedIndex = built.log.length
+    const joined = built.log.filter(({ kind }) => kind === 'GROUP_JOIN')
+    s.refused = true
+    refuse()
+    await jest.advanceTimersByTimeAsync(10000)
+    return {
+      ...built,
+      appliedBeforeRefusal: joined[joined.length - 1].assignment,
+      after: built.log.slice(refusedIndex),
+      group,
+      owned,
+      busyAtRefusal,
+      atRun,
+    }
+  }
+
+  const ROWS = []
+  for (const phase of ['startup', 'ordinary', 'lost']) {
+    for (const [target, newer] of [
+      ['empty', {}],
+      ['non-empty', { 'topic-a': [0, 1] }],
+    ]) {
+      for (const busy of [true, false])
+        ROWS.push([phase, target, busy ? 'busy' : 'free', newer, busy])
+    }
+  }
+
+  describe.each(ROWS)(
+    '%s round, %s newer target, handler %s',
+    (phase, _target, _h, newer, busy) => {
+      /**
+       * The row's own preconditions: the superseded step applied the newer target before the
+       * refusal, and a busy handler was running then wherever the member owned, or had owned, a
+       * partition with a record (not with an empty assignment at startup or after a LOST round).
+       * @param {object} run what `play` observed
+       * @returns {void}
+       */
+      const expectRow = (run) => {
+        expect(run.appliedBeforeRefusal).toEqual(newer)
+        expect(run.busyAtRefusal).toBe(
+          busy && (phase === 'ordinary' || Object.keys(newer).length > 0)
+        )
+      }
+
+      it('acts on a fence answering the held heartbeat: no apply or commit of lost progress before one PARTITIONS_LOST of what it owned and the epoch 0 rejoin; run() resolved after one GROUP_JOIN with offsets', async () => {
+        const run = await play({ phase, newer, busy, code: FENCED_MEMBER_EPOCH })
+        expectRow(run)
+        const rejoinAt = run.after.findIndex(({ epoch }) => epoch === 0)
+        const beforeRejoin = run.after.slice(0, rejoinAt)
+
+        expect(rejoinAt).toBeGreaterThanOrEqual(0)
+        expect(
+          beforeRejoin
+            .filter(({ kind }) => kind === 'PARTITIONS_LOST')
+            .map(({ partitions }) => partitions)
+        ).toEqual(run.owned.length ? [run.owned] : [])
+        expect(run.after.filter(({ kind }) => kind === 'PARTITIONS_LOST')).toHaveLength(
+          run.owned.length ? 1 : 0
+        )
+        expect(
+          beforeRejoin.filter(({ kind }) => kind === 'GROUP_JOIN' || kind === 'PARTITIONS_ASSIGNED')
+        ).toEqual([])
+        expect(
+          run.after.filter(
+            ({ kind, generationId }) => kind === 'commit' && generationId < REJOIN_EPOCH
+          )
+        ).toEqual([])
+        expect(run.group.groupMembership.memberEpoch).toEqual(REJOIN_EPOCH)
+        expect(run.atRun).toEqual({
+          joins: 1,
+          offsetManager: true,
+          lossOwed: false,
+          stopRequested: false,
+        })
+        expect(run.crashes).toEqual([])
+      })
+
+      it('reports a fatal error answering the held heartbeat, even when a later heartbeat is authorized, and commits nothing after it', async () => {
+        const run = await play({ phase, newer, busy, code: 30 })
+        expectRow(run)
+
+        expect(run.crashes.map(({ error }) => error.type)).toEqual(['GROUP_AUTHORIZATION_FAILED'])
+        expect(run.after.filter(({ kind }) => kind === 'GROUP_JOIN' || kind === 'commit')).toEqual(
+          []
+        )
+        expect(run.after.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch >= 0)).toEqual(
+          []
+        )
+        expect(run.group.groupMembership.state).toEqual('FATAL')
+        expect(run.atRun).toEqual({
+          joins: 1,
+          offsetManager: true,
+          lossOwed: false,
+          stopRequested: false,
+        })
+      })
+    }
+  )
 })
