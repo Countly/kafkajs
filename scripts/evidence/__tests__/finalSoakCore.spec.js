@@ -379,6 +379,26 @@ describe('scripts/evidence/finalSoakCore', () => {
         expect(row(report, 'K1').reasons).toHaveLength(1)
       })
 
+      it('is inconclusive when an acknowledged aborted record of the main topic claims the offset of a dumped main record', async () => {
+        const edit = (records) => {
+          const offer = records.find((r) => r.stage === 'offered' && r.id === 'c08.6')
+          const ack = records.find((r) => r.stage === 'ack' && r.id === 'c08.6')
+          return [
+            ...records,
+            { ...offer, id: 'c08.20', transaction: 'c09.0.x2', t: 9e7 },
+            { ...ack, id: 'c08.20', t: 9e7 + 1 },
+          ]
+        }
+        const report = await check(fx.closed(), { edit })
+        expectRow(
+          report,
+          'K1',
+          'INCONCLUSIVE',
+          /the main dump .*an acknowledged aborted record claims offset 6, where the dump holds a visible record/
+        )
+        expect(row(report, 'K1').reasons).toHaveLength(1)
+      })
+
       it('is inconclusive when an acknowledged aborted record claims an offset at or beyond the log end', async () => {
         const edit = (records) => {
           const offer = records.find((r) => r.stage === 'offered' && r.id === 'c09.4')
@@ -1401,6 +1421,21 @@ describe('scripts/evidence/finalSoakCore', () => {
           (records) => exitOf('p14', 'outer')(exitOf('p15', 'p14')(records)),
           (h) => h,
           /the outer observer witnessed the exit of p14, not of the config's collector p15/,
+        ],
+        [
+          'the outer observer witnessed the exits of the supervisor and of another process',
+          (world) => world,
+          (records) => [
+            ...records,
+            {
+              ...records.find((r) => r.kind === 'process' && r.event === 'exit'),
+              source: 'outer',
+              process: 'p14',
+              t: 9e9,
+            },
+          ],
+          (h) => h,
+          /the outer observer witnessed the exit of p15, p14, not of the config's collector p15/,
         ],
         [
           'the config names another process as the collector',
