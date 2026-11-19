@@ -40,6 +40,7 @@ const EXAMPLES = 3
 const LIST_CAP = 20
 const MAX_LINE = 1 << 20
 const MAX_SMALL_FILE = 1 << 20
+const MAX_JSON = 16 << 20
 /** @param {string|Buffer} data @returns {string} its sha256 in hex */
 const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
 /** The `entered` value of an id a group entered outside every ownership interval; serials start above it. */
@@ -202,6 +203,9 @@ class Journal {
       incompleteWaves: [],
     }
     this.openWaves = new Map()
+    const churn = matrix.schedule.executions.find((e) => e.shape === 'membership-churn')
+    this.waveCap = churn.waves * 2 * Object.keys(matrix.clientKinds).length
+    this.wavesFull = false
     this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
   }
@@ -269,13 +273,21 @@ class Journal {
 
   /**
    * A membership wave's transfer or return. It counts its paused keys; until that many `wave-key`
-   * records cite it, it stays open, and `finish` lists it as incomplete.
+   * records cite it, it stays open, and `finish` lists it as incomplete. At most `waveCap` waves stay
+   * open: every client kind running every wave of one membership execution at once, transfer and
+   * return each. A wave beyond that is not kept, and the journal reports one problem.
    * @param {object} r a `wave` record @returns {void}
    */
   wave(r) {
     this.info.waves[r.event]++
     if (!r.observed) this.info.waves.unobserved++
-    if (r.paused > 0) this.openWaves.set(r.recordId, { event: r.event, paused: r.paused, seen: 0 })
+    if (!(r.paused > 0)) return
+    if (this.openWaves.size < this.waveCap)
+      this.openWaves.set(r.recordId, { event: r.event, paused: r.paused, seen: 0 })
+    else if (!this.wavesFull) {
+      this.wavesFull = true
+      this.problem(`more than ${this.waveCap} membership waves wait for their wave-key records`)
+    }
   }
 
   /**
@@ -618,6 +630,16 @@ function checkBound(manifest, file, got, problems) {
 }
 
 /**
+ * Reads a file whole, but only when it is at most `cap` bytes.
+ * @param {string} file @param {number} cap @returns {Buffer}
+ * @throws {Error} `larger than <cap> bytes`, or the file system's error
+ */
+function readCapped(file, cap) {
+  if (fs.statSync(file).size > cap) throw new Error(`larger than ${cap} bytes`)
+  return fs.readFileSync(file)
+}
+
+/**
  * Reads one small ground-truth file whole (at most `MAX_SMALL_FILE` bytes) and checks it against
  * the header manifest.
  * @param {object} ctx `{ dir, manifest }` @param {string} name file below `apache/`
@@ -628,13 +650,9 @@ function readBound({ dir, manifest }, name, problems, missing = 'file is missing
   const file = path.join(dir, 'apache', name)
   let text
   try {
-    if (fs.statSync(file).size > MAX_SMALL_FILE) {
-      problems.push(`apache/${name}: larger than ${MAX_SMALL_FILE} bytes`)
-      return null
-    }
-    text = fs.readFileSync(file, 'utf8')
-  } catch {
-    problems.push(`apache/${name}: ${missing}`)
+    text = readCapped(file, MAX_SMALL_FILE).toString('utf8')
+  } catch (e) {
+    problems.push(`apache/${name}: ${/^larger/.test(e.message) ? e.message : missing}`)
     return null
   }
   const got = { bytes: Buffer.byteLength(text), sha256: sha(text) }
@@ -1275,14 +1293,24 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
 }
 
 /**
- * Reads one JSON file of the artifact.
- * @param {string} dir @param {string} file @returns {object|null} the parsed value, or null
+ * Reads one JSON side file of the artifact whole, at most `MAX_JSON` bytes.
+ * @param {string} dir @param {string} file @param {string[]} problems receives a size or read
+ *   problem; a missing file is left to the caller
+ * @returns {{ bytes: Buffer, json: object|null }|null} its bytes and parsed value (null when not
+ *   JSON), or null when it is missing or cannot be read
  */
-function readJson(dir, file) {
+function readSide(dir, file, problems) {
+  let bytes
   try {
-    return JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'))
-  } catch {
+    bytes = readCapped(path.join(dir, file), MAX_JSON)
+  } catch (e) {
+    if (e.code !== 'ENOENT') problems.push(`${file}: ${e.message}`)
     return null
+  }
+  try {
+    return { bytes, json: JSON.parse(bytes) }
+  } catch {
+    return { bytes, json: null }
   }
 }
 
@@ -1295,11 +1323,18 @@ function readJson(dir, file) {
 async function checkArtifact(dir) {
   const reviewed = fs.readFileSync(REVIEWED_MATRIX)
   const matrix = JSON.parse(reviewed)
-  const [header, config] = [readJson(dir, 'header.json'), readJson(dir, 'config.json')]
   const problems = [...schema.validateMatrix(matrix)]
-  const archived = fs.existsSync(path.join(dir, ARCHIVED_MATRIX))
-    ? fs.readFileSync(path.join(dir, ARCHIVED_MATRIX))
-    : null
+  const side = Object.fromEntries(
+    ['header.json', 'config.json', 'supervisor.json', 'outer-exit.json'].map((file) => [
+      file,
+      readSide(dir, file, problems),
+    ])
+  )
+  const [header, config] = [side['header.json']?.json, side['config.json']?.json]
+  let archived = null
+  try {
+    archived = readCapped(path.join(dir, ARCHIVED_MATRIX), MAX_JSON)
+  } catch {}
   if (!archived?.equals(reviewed))
     problems.push(
       `the archived matrix is missing or differs from the matrix of the checkout this checker runs from (${CHECKOUT})`
@@ -1331,11 +1366,10 @@ async function checkArtifact(dir) {
   }
   const manifest = new Map(header.files.map((f) => [f.file, f]))
   for (const file of ['config.json', 'supervisor.json', 'outer-exit.json']) {
-    if (!fs.existsSync(path.join(dir, file))) continue
-    const bytes = fs.readFileSync(path.join(dir, file))
-    checkBound(manifest, file, { bytes: bytes.length, sha256: sha(bytes) }, problems)
+    const bytes = side[file]?.bytes
+    if (bytes) checkBound(manifest, file, { bytes: bytes.length, sha256: sha(bytes) }, problems)
   }
-  const outer = readJson(dir, 'outer-exit.json')
+  const outer = side['outer-exit.json']?.json
   if (outer?.status !== header.exit.code || outer?.observedAt !== header.exit.observedAt)
     problems.push('outer-exit.json is missing or disagrees with the header exit')
   const journal = new Journal({ matrix, config, mode: header.mode })
@@ -1351,7 +1385,7 @@ async function checkArtifact(dir) {
   if (read.error) problems.push(`the stream file cannot be read: ${read.error}`)
   else if (read.unterminated) problems.push('the stream file ends without a newline')
   problems.push(...validator.finish())
-  const supervisor = readJson(dir, 'supervisor.json')
+  const supervisor = side['supervisor.json']?.json ?? null
   return judge({ dir, matrix, config, mode: header.mode, header, supervisor, journal, problems })
 }
 
