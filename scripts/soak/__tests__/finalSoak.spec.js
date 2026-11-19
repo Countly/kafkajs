@@ -339,9 +339,13 @@ describe('final soak driver', () => {
     await strict.close()
     expect(strict.failures).toEqual([
       'p01 sequence 2 follows 0',
-      'p02.0 sample line exceeds 1024 bytes',
+      'p02.0 sample line of 2387 bytes exceeds 1024 bytes',
     ])
-    expect(JSON.parse(strict.lastLine)).toMatchObject({ kind: 'diagnostic', source: 'p15' })
+    expect(JSON.parse(strict.lastLine)).toMatchObject({
+      kind: 'diagnostic',
+      recordId: 'p02.0',
+      message: 'oversize sample record p02.0 of 2387 bytes not written',
+    })
 
     const capped = new Collector({ sink, clock, matrix, maxStreamBytes: 600 })
     await capped.append(sample('p01', 0, 0))
@@ -726,12 +730,12 @@ describe('final soak driver', () => {
       fs.writeFileSync(path.join(bin, name), script, { mode: 0o755 })
     }
     return {
-      run(args, extra = {}) {
+      run(args, extra = {}, runbook = RUNBOOK) {
         for (const suffix of ['', '.env', '.upgraded', '.wait']) {
           fs.rmSync(`${log}${suffix}`, { force: true })
         }
         fs.rmSync(artifacts, { recursive: true, force: true })
-        return spawnSync('bash', [RUNBOOK, ...args], {
+        return spawnSync('bash', [runbook, ...args], {
           env: {
             PATH: `${bin}:/usr/bin:/bin`,
             CALLS: log,
@@ -984,6 +988,46 @@ describe('final soak driver', () => {
       expect(log).not.toContain('A smoke is never ACCEPTED')
     } finally {
       harness.remove()
+    }
+  })
+
+  test('a failed workload still runs the core checker of the checkout for diagnosis beside the receipt, and its verdict never changes the failed status', () => {
+    const harness = runbookHarness()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-checkout-'))
+    try {
+      const runbook = path.join(root, 'scripts/soak/finalSoakNode.sh')
+      const checker = path.join(root, 'scripts/evidence/finalSoakCore.js')
+      fs.mkdirSync(path.dirname(runbook), { recursive: true })
+      fs.mkdirSync(path.dirname(checker), { recursive: true })
+      fs.copyFileSync(RUNBOOK, runbook)
+      fs.writeFileSync(checker, '')
+      const failing = { FAIL_ON: '--check-workload', CORE_STATUS: '0' }
+      expect(harness.run([TREE, 'smoke'], failing, runbook).status).toBe(1)
+      const { out, receipt, log } = harness.evidence()
+      expect(receipt).toEqual({
+        artifact: path.basename(out),
+        failedStage: 'workload',
+        exitStatus: 1,
+        driverStatus: 0,
+      })
+      const calls = harness.calls()
+      const core = `node scripts/evidence/finalSoakCore.js ${out}`
+      expect(calls.indexOf(core)).toBeGreaterThan(
+        calls.indexOf(`node scripts/soak/finalSoak.js --check-workload --out ${out}`)
+      )
+      expect(calls.indexOf(core)).toBeGreaterThan(calls.indexOf('docker compose down --volumes'))
+      expect(fs.existsSync(`${out}.core.txt`)).toBe(true)
+      expect(log).toContain(
+        `core checker report for diagnosis only (the run failed at stage workload): ${out}.core.txt`
+      )
+
+      fs.rmSync(checker)
+      expect(harness.run([TREE, 'smoke'], failing, runbook).status).toBe(1)
+      expect(harness.calls().some((c) => c.includes('finalSoakCore.js'))).toBe(false)
+      expect(harness.evidence().receipt).toMatchObject({ failedStage: 'workload', exitStatus: 1 })
+    } finally {
+      harness.remove()
+      fs.rmSync(root, { recursive: true, force: true })
     }
   })
 

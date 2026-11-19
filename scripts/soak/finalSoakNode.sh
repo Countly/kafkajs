@@ -13,9 +13,11 @@
 # groups, then containers) and a tarball of the artifact. A failed or interrupted run is sealed the
 # same way, so its evidence is bound and its dumps kept, never reported as complete. A run whose
 # driver exited 0 but whose workload receipt (supervisor.json) holds failures, problems, forced
-# exits, an abort or an incomplete source fails at stage `workload`, after sealing. The core checker
-# then judges the artifact into <artifact>.core.txt and fails stage `core` on REJECTED, on no verdict,
-# or on an acceptance run that is not ACCEPTED; a smoke is never ACCEPTED, so its NOT ACCEPTED passes.
+# exits, an abort or an incomplete source fails at stage `workload`, after sealing; the core checker
+# still judges it into <artifact>.core.txt for diagnosis, never changing the failed status. A passed
+# workload check is followed by stage `core`: the same checker run, failing on REJECTED, on no
+# verdict, or on an acceptance run that is not ACCEPTED; a smoke is never ACCEPTED, so its NOT
+# ACCEPTED passes.
 #
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
@@ -111,6 +113,23 @@ seal() {
   node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after="${after:-finalize}"
 }
 
+# Runs the core checker on the sealed artifact, writes its report to <artifact>.core.txt beside the
+# receipt (outside the directory the header binds), prints it and sets core_status to its exit status.
+run_core() {
+  core_status=0
+  node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt" || core_status=$?
+  cat "$out.core.txt"
+}
+
+# For diagnosis only, after a run failed its workload check: the core checker of this checkout, when
+# it has one, judges the sealed artifact through run_core. Its verdict and exit status never change
+# the run's failed status.
+diagnose_core() {
+  [[ -f scripts/evidence/finalSoakCore.js ]] || return 0
+  run_core
+  echo "core checker report for diagnosis only (the run failed at stage workload): $out.core.txt"
+}
+
 # Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped
 # (a signal to the process group may already have ended it), cleans up what was started, archives
 # and writes the receipt.
@@ -128,6 +147,7 @@ finish() {
     seal
     cleanup "$status"
   fi
+  if ((status != 0)) && [[ "$stage" == workload && -n "$sealed" ]]; then diagnose_core; fi
   if ! tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
     stage=archive
     status=1
@@ -219,9 +239,7 @@ node scripts/soak/finalSoak.js --check-workload --out "$out"
 # so NOT ACCEPTED, which has no FAIL row, is the smoke's expected verdict; REJECTED, no verdict at
 # all, or an acceptance run that is not ACCEPTED fails here.
 stage=core
-core_status=0
-node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt" || core_status=$?
-cat "$out.core.txt"
+run_core
 verdict="$(sed -n '1s/^CORE VERDICT: \([A-Z ]*[A-Z]\).*/\1/p' "$out.core.txt")"
 note="core checker verdict: ${verdict:-none} (exit status $core_status), report $out.core.txt"
 if [[ "$mode" == smoke ]]; then note="$note. A smoke is never ACCEPTED; NOT ACCEPTED with no FAIL row is its expected verdict."; fi

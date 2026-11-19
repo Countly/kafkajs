@@ -11,7 +11,15 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const { valueOf, MonotonicClock } = require('./finalSoakScheduler')
-const { SUPERVISOR, OUTER, SourceChannel, Sampler, chunk } = require('./finalSoakCollector')
+const {
+  SUPERVISOR,
+  OUTER,
+  DIAGNOSTIC_BYTES,
+  SourceChannel,
+  Sampler,
+  chunk,
+  clip,
+} = require('./finalSoakCollector')
 const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('./finalSoakObserver')
 
 /** Delivered share offsets kept above a key's first missing one before the gap is given up on. */
@@ -76,29 +84,32 @@ const parseValue = (value, runId) => {
   return run === runId && id ? { id, transaction: transaction || null } : null
 }
 
-/** Characters kept of each error message, so a failure record always fits its line cap. */
-const ERROR_MESSAGE_CHARS = 120
+/** JSON bytes kept of each error message, so a failure record always fits its line cap. */
+const ERROR_MESSAGE_BYTES = 120
+/** JSON bytes kept of an error's name, type or string code. */
+const ERROR_NAME_BYTES = 48
 /** Errors of a `cause` chain kept after the error itself. */
-const ERROR_CAUSES = 3
+const ERROR_CAUSES = 2
 
 /**
  * What a failed public call returned, cut to fit one record line: the error's own fields and the
- * name and message of each error in its `cause` chain.
+ * name and message of each error in its `cause` chain, each string clipped to a fixed JSON size.
  * @param {unknown} error what the call threw
  * @returns {{ name: string|null, type: string|null, code: number|string|null,
  *   retriable: boolean|null, message: string, causes: { name: string|null, message: string }[] }}
  */
 const errorDetail = (error) => {
-  const clip = (e) => String(e?.message ?? e).slice(0, ERROR_MESSAGE_CHARS)
+  const name = (v) => (typeof v === 'string' ? clip(v, ERROR_NAME_BYTES) : (v ?? null))
+  const message = (e) => clip(String(e?.message ?? e), ERROR_MESSAGE_BYTES)
   const causes = []
   for (let c = error?.cause; c && causes.length < ERROR_CAUSES; c = c.cause)
-    causes.push({ name: c.name ?? null, message: clip(c) })
+    causes.push({ name: name(c.name), message: message(c) })
   return {
-    name: error?.name ?? null,
-    type: error?.type ?? null,
-    code: error?.code ?? null,
+    name: name(error?.name),
+    type: name(error?.type),
+    code: name(error?.code),
     retriable: typeof error?.retriable === 'boolean' ? error.retriable : null,
-    message: clip(error),
+    message: message(error),
     causes,
   }
 }
@@ -114,11 +125,7 @@ const errorDetail = (error) => {
  * @returns {void}
  */
 const partialEntry = (runtime, entry, missing) => {
-  runtime.emit({
-    kind: 'diagnostic',
-    recordId: runtime.nextId(),
-    message: `partial handler-enter ${JSON.stringify({ ...entry, missing })}`,
-  })
+  runtime.diagnose(`partial handler-enter ${JSON.stringify({ ...entry, missing })}`)
   runtime.problem(
     `handler entry ${entry.id} at ${entry.topic}/${entry.partition}:${entry.offset} lacks ${missing.join(', ')}`
   )
@@ -340,9 +347,16 @@ class ChildRuntime {
     return this.channel.emit(record)
   }
 
-  /** @param {string} message @returns {Promise<boolean>} a diagnostic note */
+  /**
+   * @param {string} message clipped to fit the line cap
+   * @returns {Promise<boolean>} a diagnostic note
+   */
   diagnose(message) {
-    return this.emit({ kind: 'diagnostic', recordId: this.nextId(), message })
+    return this.emit({
+      kind: 'diagnostic',
+      recordId: this.nextId(),
+      message: clip(message, DIAGNOSTIC_BYTES),
+    })
   }
 
   /**
@@ -1422,7 +1436,9 @@ class ConsumerWorker extends Worker {
   /**
    * Journals what one member held of a wave's paused keys when the wave observed the transfer to
    * the extra or the return to the standing member (or, when not observed, at the wave deadline),
-   * so the transfer can be audited from the journal; the record's `at` is that instant.
+   * so the transfer can be audited from the journal. One `wave` record counts the paused and held
+   * keys, then one `wave-key` record per paused key cites it and says whether the member held it,
+   * so every record stays small however many keys a member holds; all share that instant as `at`.
    * @param {string} execution the wave @param {'transfer'|'return'} event
    * @param {ClientRig} standing @param {ClientRig} member the extra, or the standing member
    * @param {object[]} paused the keys paused in this wave
@@ -1431,17 +1447,32 @@ class ConsumerWorker extends Worker {
    * @returns {Promise<void>}
    */
   async waveRecord(execution, event, standing, member, paused, heldBy, observed) {
-    await this.runtime.emit({
+    const { runtime } = this
+    const held = new Set(heldBy(member))
+    const at = runtime.clock.now()
+    const cause = runtime.nextId()
+    await runtime.emit({
       kind: 'wave',
-      recordId: this.runtime.nextId(),
+      recordId: cause,
+      at,
       execution,
       event,
       client: standing.id,
       member: member.id,
-      paused,
-      keys: heldBy(member),
+      paused: paused.length,
+      held: held.size,
       observed,
     })
+    for (const key of paused)
+      await runtime.emit({
+        kind: 'wave-key',
+        recordId: runtime.nextId(),
+        at,
+        execution,
+        cause,
+        key,
+        held: held.has(key),
+      })
   }
 
   /**

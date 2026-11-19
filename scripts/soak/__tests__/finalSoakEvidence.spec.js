@@ -113,6 +113,41 @@ describe('final soak collector writes', () => {
     expect(sent).toHaveLength(1)
     expect(channel.pendingBytes).toBe(0)
   })
+
+  test('an oversize record is journalled as a diagnostic in its place, naming its kind and size, and its source still delivers its final sample', async () => {
+    const lines = []
+    const sink = { write: async (b) => lines.push(b.toString()), sync: async () => {} }
+    const collector = new Collector({ sink, clock, matrix })
+    const aborts = []
+    collector.onFailure = (problem) => aborts.push(problem)
+    const channel = new SourceChannel({
+      source: 'p01',
+      clock,
+      send: (message, done) => collector.append(message.record).then((ok) => done(!ok)),
+    })
+    const wave = { kind: 'wave', recordId: 'p01.0', execution: 'h00m0w0', pad: 'x'.repeat(2000) }
+    expect(await channel.emit(wave)).toBe(true)
+    await tick()
+    expect(await channel.emit({ kind: 'sample', recordId: 'p01.1', role: 'final' })).toBe(true)
+    await tick()
+    await collector.close()
+    const stream = lines.join('').trim().split('\n').map(JSON.parse)
+    expect(stream.map((r) => [r.recordId, r.source, r.seq, r.kind])).toEqual([
+      ['p01.0', 'p01', 0, 'diagnostic'],
+      ['p01.1', 'p01', 1, 'sample'],
+    ])
+    const bytes = /^p01\.0 wave line of (\d+) bytes exceeds 1024 bytes$/.exec(
+      collector.failures[0]
+    )?.[1]
+    expect(Number(bytes)).toBeGreaterThan(2000)
+    expect(collector.failures).toHaveLength(1)
+    expect(aborts).toEqual(collector.failures)
+    expect(stream[0]).toMatchObject({
+      execution: 'h00m0w0',
+      message: `oversize wave record p01.0 of ${bytes} bytes not written`,
+    })
+    expect(channel.incomplete).toBeNull()
+  })
 })
 
 /** A consumer group made from the real prototype and collaborators, without the network. */
@@ -761,5 +796,483 @@ describe('final soak container dumps', () => {
       fs.rmSync(out, { recursive: true, force: true })
       fs.rmSync(short, { recursive: true, force: true })
     }
+  })
+})
+
+describe('final soak record line sizes', () => {
+  const { RECORDS, CLIENT_KINDS } = require('../finalSoakSchema')
+  const { Supervisor } = require('../finalSoak')
+  const { chunk } = require('../finalSoakCollector')
+  const CAP = matrix.host.maxEventLineBytes.value
+  const INVENTORY_CAP = matrix.host.maxInventoryLineBytes.value
+  /** About 28 hours on the run clock, past the end of a day run with its setup and teardown. */
+  const T = 99999999.12345679
+  const N = 9999999
+  const SHA = 'f'.repeat(64)
+  const OFFSET = '999999999999'
+  const LONG_ERROR = 'KafkaJSNumberOfRetriesExceeded'
+  const topic = (role) => `fs-${RUN}-${role}`
+  /** Every partition one member can hold at once: both standing topics, a regex topic, both recreated topics. */
+  const KEYS = [
+    ['main', 1],
+    ['txn', 1],
+    ['regex-h23r3', 2],
+    ['recreate-0', 2],
+    ['recreate-1', 2],
+  ].flatMap(([role, n]) =>
+    Array.from({ length: n }, (_, partition) => ({ topic: topic(role), topicId: IDS.A, partition }))
+  )
+  const C = 'c18.9999'
+  const RUN_ID = `${C}.r9999`
+  const MEMBER = `s-${RUN}-c18-${DASHED}`
+  const GROUP = `g-${RUN}-c06`
+  const AUTHORITY = {
+    client: C,
+    run: RUN_ID,
+    member: MEMBER,
+    epoch: N,
+    token: N,
+    assignmentEpoch: N,
+    acquiredAt: N,
+    recreatedAt: N,
+  }
+  const KEY = KEYS[2]
+  const call = (event) => ({
+    event,
+    client: C,
+    phase: 'end',
+    call: `${C}.k${N}`,
+    result: 'error',
+    errorType: LONG_ERROR,
+  })
+  const identity = (stage, fields) => ({ kind: 'identity', stage, ...fields })
+
+  /** The largest realistic record of every kind and variant the driver builds by hand. */
+  const handBuilt = () => [
+    {
+      kind: 'process',
+      event: 'start',
+      process: 'p15',
+      pid: 4194304,
+      parent: 'outer',
+      arm: 'observer',
+      controlId: null,
+      execArgv: ['--expose-gc', '--no-flush-bytecode'],
+      nodeOptions: [],
+      node: 'v26.13.1',
+      v8: '14.6.202.34-node.40',
+      bootId: DASHED,
+    },
+    {
+      kind: 'process',
+      event: 'exit',
+      process: 'p06',
+      code: 137,
+      signal: 'SIGKILL',
+      spawnRecord: `p15.${N}`,
+    },
+    {
+      kind: 'client',
+      event: 'construct',
+      client: C,
+      slot: 'c18',
+      clientKind: 'classic-cooperative-static',
+      process: 'p06',
+      arm: 'unseeded',
+      controlId: null,
+      purpose: 'subject',
+      group: GROUP,
+      groupInstanceId: `s-${RUN}-c18`,
+      standing: false,
+      telemetryEnabled: true,
+      configSha256: SHA,
+    },
+    ...['connect', 'run', 'stop', 'disconnect'].map((event) => ({
+      kind: 'client',
+      ...call(event),
+    })),
+    ...['start', 'end'].map((phase) => ({
+      kind: 'shape',
+      phase,
+      shape: 'membership-churn',
+      participants: [...CLIENT_KINDS],
+      operationCount: phase === 'start' ? 0 : N,
+    })),
+    {
+      kind: 'topic',
+      client: `c22.${N}`,
+      call: `c22.${N}.t${N}`,
+      op: 'metadata',
+      topic: KEY.topic,
+      topicId: IDS.A,
+      partitions: [0, 1],
+      errorCode: -1,
+    },
+    ...['start', 'seal'].map((event) => ({
+      kind: 'route',
+      event,
+      group: GROUP,
+      topic: KEY.topic,
+      topicId: IDS.A,
+      partition: 1,
+      from: OFFSET,
+      to: event === 'seal' ? OFFSET : null,
+      topicRecord: `p15.${N}`,
+      scan: event === 'seal' ? `p14.s${N}` : null,
+    })),
+    ...['begin', 'end'].map((phase) => ({
+      kind: 'operation',
+      phase,
+      operation: `${C}.o${N}`,
+      op: 'resume',
+      client: C,
+      keys: KEYS,
+      call: `${C}.o${N}`,
+      result: phase === 'end' ? 'error' : null,
+      errorType: phase === 'end' ? LONG_ERROR : null,
+      causes: [],
+    })),
+    {
+      kind: 'subscription',
+      client: C,
+      revision: N,
+      run: RUN_ID,
+      names: KEYS.filter((k) => k.partition === 0).map(({ topic, topicId }) => ({
+        topic,
+        topicId,
+      })),
+      mode: 'broker-regex',
+      pattern: `^fs-${RUN}-(main|txn|regex-.*|recreate-[01])$`,
+      cause: `p06.${N}`,
+    },
+    {
+      kind: 'boundary',
+      client: C,
+      group: GROUP,
+      run: RUN_ID,
+      member: MEMBER,
+      epoch: N,
+      protocol: 'cooperative',
+      event: 'revoke-begin',
+      key: KEY,
+      authority: AUTHORITY,
+      position: OFFSET,
+      cause: `${C}.n${N}`,
+    },
+    {
+      kind: 'round',
+      client: C,
+      group: GROUP,
+      run: RUN_ID,
+      round: `${C}.n${N}`,
+      protocol: 'cooperative',
+      epoch: N,
+      assigned: KEYS.slice(2),
+      revoked: KEYS.slice(0, 2),
+      causes: [],
+    },
+    ...['start', 'clear'].map((event) => ({
+      kind: 'seed',
+      event,
+      process: 'p13',
+      client: 'c20.9999',
+      controlId: 'interning-seeded',
+      mapEntries: N,
+      cause: `p15.${N}`,
+    })),
+    identity('offered', {
+      client: 'c09.9999',
+      id: `c09.${N}`,
+      key: KEY,
+      payloadSha256: SHA,
+      bytes: N,
+      transaction: `c09.9999.x${N}`,
+    }),
+    identity('ack', {
+      client: 'c09.9999',
+      id: `c09.${N}`,
+      outcome: 'rejected',
+      key: KEY,
+      offset: null,
+      errorType: LONG_ERROR,
+    }),
+    identity('transaction', {
+      client: 'c09.9999',
+      transaction: `c09.9999.x${N}`,
+      decision: 'commit',
+      outcome: 'unknown',
+      call: `c09.9999.x${N}.commit`,
+      errorType: LONG_ERROR,
+    }),
+    identity('log', {
+      reader: 'c21.9999',
+      scan: `p14.s${N}`,
+      id: `c09.${N}`,
+      key: KEY,
+      offset: OFFSET,
+      payloadSha256: SHA,
+      transaction: `c09.9999.x${N}`,
+    }),
+    identity('handler-enter', {
+      client: C,
+      group: GROUP,
+      handler: `${C}.h${N}`,
+      id: `c09.${N}`,
+      key: KEY,
+      offset: OFFSET,
+      payloadSha256: SHA,
+      authority: AUTHORITY,
+      acquisition: null,
+      deliveryCount: null,
+    }),
+    identity('handler-end', { handler: `${C}.h${N}`, outcome: 'processed', errorType: LONG_ERROR }),
+    identity('commit', {
+      client: C,
+      group: GROUP,
+      commit: `${C}.m${N}`,
+      key: KEY,
+      next: OFFSET,
+      authority: AUTHORITY,
+      phase: 'end',
+      outcome: 'unknown',
+      errorType: LONG_ERROR,
+    }),
+    identity('broker-commit', {
+      client: `c22.${N}`,
+      group: GROUP,
+      commit: `${C}.m${N}`,
+      key: KEY,
+      next: OFFSET,
+      errorCode: -1,
+    }),
+    {
+      kind: 'scan',
+      scan: `p14.s${N}`,
+      key: KEY,
+      from: OFFSET,
+      to: OFFSET,
+      lso: OFFSET,
+      highWatermark: OFFSET,
+      rawFile: `raw/p14.s${N}.ndjson`,
+      rawSha256: SHA,
+      records: N,
+    },
+    {
+      kind: 'replay',
+      replay: `${C}.p${N}`,
+      group: GROUP,
+      key: KEY,
+      from: '0',
+      to: OFFSET,
+      reason: 'handler-retry',
+      oldAuthority: AUTHORITY,
+      newAuthority: AUTHORITY,
+      cause: `p06.${N}`,
+    },
+    {
+      kind: 'share-acquire',
+      acquisition: `c07.9999.a${N}`,
+      client: 'c07.9999',
+      group: `g-${RUN}-c07`,
+      key: KEY,
+      from: OFFSET,
+      to: OFFSET,
+      deliveryCount: N,
+      receivedAt: T,
+      lockMs: N,
+      wireFile: `raw/p07.share.${N}.ndjson`,
+      wireSha256: SHA,
+    },
+    {
+      kind: 'share-settle',
+      acquisition: `c07.9999.a${N}`,
+      client: 'c07.9999',
+      group: `g-${RUN}-c07`,
+      key: KEY,
+      offset: OFFSET,
+      type: 'release',
+      phase: 'response',
+      errorCode: -1,
+      wireFile: `raw/p07.share.${N}.ndjson`,
+      wireSha256: SHA,
+    },
+    {
+      kind: 'telemetry',
+      client: 'c11.9999',
+      instanceId: IDS.B,
+      subscriptionId: '-2081645975',
+      broker: 3,
+      metrics: N,
+      terminating: true,
+      rawFile: `telemetry/exports-3.${N}.jsonl`,
+      rawSha256: SHA,
+      decodedFile: `telemetry/decoded-3.${N}.jsonl`,
+      decodedSha256: SHA,
+    },
+    {
+      kind: 'sample',
+      process: 'p06',
+      role: 'quiet',
+      slot: null,
+      boundary: 'h23q2',
+      reading: 2,
+      admittedAt: T - 300,
+      completedAt: T,
+      rss: 99999999999,
+      heapUsed: 99999999999,
+      external: 99999999999,
+      activeResources: [
+        'TCPSocketWrap',
+        'Timeout',
+        'FSReqPromise',
+        'Immediate',
+        'PipeWrap',
+        'ProcessWrap',
+        'SimpleWriteWrap',
+      ].map((type) => ({ type, count: N })),
+      gc: {
+        id: `p06.g${N}`,
+        firstBeginAt: T - 299,
+        firstEndAt: T - 250,
+        secondBeginAt: T - 100,
+        secondEndAt: T - 1,
+        forcedCollections: 2,
+        cumulativeForced: N,
+      },
+      inventory: `p06.i${N}`,
+      clients: ['c06.9999', C],
+    },
+    {
+      kind: 'inventory',
+      inventory: `p06.i${N}`,
+      process: 'p06',
+      client: C,
+      section: 'requests',
+      chunk: N - 1,
+      chunks: N,
+      entries: chunk(
+        Array.from({ length: 2000 }, (_, i) => ({
+          request: `${C}.q${N}.${i}`,
+          queue: `${C}.n${N}`,
+          apiKey: 92,
+          phase: 'inflight',
+          scope: `${C}.w${N}`,
+          beganAt: T,
+          deadlineAt: T,
+        })),
+        INVENTORY_CAP - 1024
+      )[0],
+    },
+    {
+      kind: 'ticket',
+      ticket: `t${N}`,
+      ledger: `o${N}`,
+      client: C,
+      ownerRun: RUN_ID,
+      phase: 'begin',
+      keys: KEYS,
+      token: N,
+    },
+  ]
+
+  /** A stand-in runtime whose ids, clock and journal are at their largest realistic values. */
+  const journal = () => {
+    const records = []
+    return {
+      records,
+      clock: { now: () => T, sleepUntil: async () => {} },
+      nextId: () => `p06.${N}`,
+      emit: async (record) => records.push(record) > 0,
+    }
+  }
+
+  /** The records the driver's own builders make at their largest: waves, outages, failures, notes. */
+  const built = async () => {
+    const runtime = journal()
+    const worker = Object.create(ConsumerWorker.prototype)
+    worker.runtime = runtime
+    const standing = { id: 'c06.9999' }
+    for (const event of ['transfer', 'return'])
+      await worker.waveRecord('h23m3w2', event, standing, { id: C }, KEYS, () => KEYS, false)
+    const cause = (depth) =>
+      Object.assign(new Error('m'.repeat(5000)), {
+        name: `KafkaJS${'X'.repeat(40)}`,
+        cause: depth > 0 ? cause(depth - 1) : undefined,
+      })
+    const error = Object.assign(cause(6), {
+      type: 'TRANSACTIONAL_ID_AUTHORIZATION_FAILED',
+      code: 'ERR_SOCKET_CONNECTION_TIMEOUT',
+      retriable: false,
+    })
+    await ChildRuntime.prototype.failed.call(runtime, `${C}.o${N}`, error)
+    await ChildRuntime.prototype.diagnose.call(runtime, `step h23o0 failed: ${'z'.repeat(5000)}`)
+
+    const out = tmp('sizes')
+    try {
+      const s = new Supervisor({
+        mode: 'acceptance',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      s.runtime = runtime
+      s.clock = runtime.clock
+      const t = s.config.topics
+      s.admin = {
+        describeCluster: async () => ({ brokers: [1, 2, 3].map((nodeId) => ({ nodeId })) }),
+        fetchTopicMetadata: async () => ({
+          topics: [t.main, t.transactions, ...t.recreate].map((name) => ({
+            name: name.replace(s.runId, RUN),
+            topicId: DASHED,
+            partitions: [0, 1].map((partitionId) => ({ partitionId, leader: 3, isr: [3, 2, 1] })),
+          })),
+        }),
+      }
+      const processTime = new Date().toISOString().replace('Z', '123456Z')
+      const state = { pid: 4194304, startedAt: processTime, finishedAt: processTime }
+      for (const event of ['down', 'ready', 'isr'])
+        await s.brokerState({ id: 'h22o0', node: 3, downMs: 12000 }, event, state, SHA, `p15.${N}`)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+
+    const lines = []
+    const collector = new Collector({
+      sink: { write: async (b) => lines.push(b.toString()), sync: async () => {} },
+      clock: runtime.clock,
+      matrix,
+    })
+    collector.ownSeq = N
+    await collector.note(`problem: ${'p'.repeat(5000)}`, { step: 'h23o0' })
+    await collector.close()
+    expect(collector.failures).toEqual([])
+    return [...runtime.records, ...lines.join('').trim().split('\n').map(JSON.parse)]
+  }
+
+  /** @param {object} record @returns {object} the record with its largest realistic envelope */
+  const enveloped = (record) => ({
+    recordId: `p06.${N}`,
+    source: 'p06',
+    seq: N,
+    at: T,
+    execution: 'h23m3w2',
+    ...record,
+    t: T,
+  })
+
+  test('every record kind and variant the driver emits fits its line cap at its largest realistic size', async () => {
+    const records = [...handBuilt(), ...(await built())].map(enveloped)
+    const variantOf = (r) => (RECORDS[r.kind]?.by ? `${r.kind}/${r[RECORDS[r.kind].by]}` : r.kind)
+    const every = Object.entries(RECORDS).flatMap(([kind, spec]) =>
+      spec.by ? Object.keys(spec.variants).map((v) => `${kind}/${v}`) : [kind]
+    )
+    expect([...new Set(records.map(variantOf))].sort()).toEqual(every.sort())
+    const sizes = records.map((r) => ({
+      record: variantOf(r),
+      problems: validateRecord(r),
+      fits: Buffer.byteLength(JSON.stringify(r)) <= (r.kind === 'inventory' ? INVENTORY_CAP : CAP),
+    }))
+    expect(sizes).toEqual(sizes.map(({ record }) => ({ record, problems: [], fits: true })))
   })
 })

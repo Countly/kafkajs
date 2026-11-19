@@ -602,22 +602,24 @@ const baseRecords = () => {
       container: 'kafka-1',
       event: 'ready',
       members: [1, 2, 3],
-      partitions: [{ key: KEY, leader: 1, isr: [1, 2, 3] }],
+      partitions: 1,
       cause: 'o9',
       downMs: 2000,
       processAt: 12,
       processTime: '2026-11-18T16:00:00.012345678Z',
     },
+    { kind: 'partition-state', source: 'p15', key: KEY, leader: 1, isr: [1, 2, 3] },
     {
       kind: 'wave',
       source: 'p01',
       event: 'transfer',
       client: EAGER,
       member: 'c15.0',
-      paused: [KEY],
-      keys: [KEY],
+      paused: 1,
+      held: 1,
       observed: true,
     },
+    { kind: 'wave-key', source: 'p01', key: KEY, held: true },
     ...['begin', 'end'].map((phase) => ({
       kind: 'ticket',
       source: 'p01',
@@ -684,26 +686,35 @@ const baseRecords = () => {
 }
 
 /**
- * Adds envelopes: per-source gap-free seq, `recordId`, `t` one per line and `at` = `t`, except
- * that all chunks of one inventory cut share the first chunk's `at`.
+ * Adds envelopes: per-source gap-free seq, `recordId`, `t` one per line and `at` = `t` unless the
+ * record sets its own, except that all chunks of one inventory cut share the first chunk's `at`. A
+ * `wave-key` or `partition-state` without a `cause` cites its source's latest `wave` or
+ * `broker-state`.
  * @returns {string[]} the stream lines
  */
 const encode = (records) => {
   const seqs = new Map()
   const cutAt = new Map()
+  const summaries = new Map()
   return records.map((record, i) => {
     const seq = seqs.has(record.source) ? seqs.get(record.source) + 1 : 0
     seqs.set(record.source, seq)
     const t = i + 1
-    let at = t
+    let at = record.at ?? t
     if (record.kind === 'inventory') {
       if (!cutAt.has(record.inventory)) cutAt.set(record.inventory, t)
       at = cutAt.get(record.inventory)
     }
+    const recordId = `${record.source}.${seq}`
+    if (['wave', 'broker-state'].includes(record.kind)) summaries.set(record.source, recordId)
+    const cause = ['wave-key', 'partition-state'].includes(record.kind)
+      ? { cause: record.cause ?? summaries.get(record.source) }
+      : {}
     return JSON.stringify({
       execution: null,
       ...record,
-      recordId: `${record.source}.${seq}`,
+      ...cause,
+      recordId,
       seq,
       at,
       t,
@@ -823,6 +834,40 @@ const minimumOf = (minimum) =>
   }, 1)
 
 const at = (records, predicate) => records.findIndex(predicate)
+
+/** A broker-commit the observer process writes about the churn client `c15.0` of process p02. */
+const observed = () => ({
+  kind: 'identity',
+  stage: 'broker-commit',
+  source: 'p10',
+  client: 'c15.0',
+  group: groupOf('c15'),
+  commit: null,
+  key: KEY,
+  next: null,
+  errorCode: 0,
+})
+
+/** A call of `c15.0` from its own process p02. */
+const ownCall = { ...call('connect', 'p02', 'c15.0', 'begin', 'k15') }
+
+/** Moves the construction of `c15.0` to just after the first record matching `predicate`. */
+const moveConstructAfter = (records, predicate) => {
+  const [construction] = records.splice(
+    at(records, (x) => x.event === 'construct' && x.slot === 'c15'),
+    1
+  )
+  records.splice(at(records, predicate) + 1, 0, construction)
+}
+
+/** @returns {string[]} the problems of the records' stream under a validator with `options` */
+const validateWith = (records, options) => {
+  const lines = encode(records)
+  const header = buildHeader(lines)
+  const stream = new StreamValidator({ matrix, config: buildConfig(), header, ...options })
+  lines.forEach((line) => stream.push(line))
+  return stream.finish()
+}
 const isSample = (process) => (r) => r.kind === 'sample' && r.process === process
 
 /**
@@ -1862,6 +1907,68 @@ describe('scripts/soak/finalSoakSchema', () => {
         () => run({ edit: (r) => (r.find((x) => x.kind === 'topic').client = 'c10.7') }),
         'names a client that was never constructed',
       ],
+      "a record of the client's own process before its construction": [
+        () =>
+          run({
+            edit: (r) =>
+              r.splice(
+                at(r, (x) => x.client === 'c15.0'),
+                0,
+                ownCall
+              ),
+          }),
+        'names a client before its construction',
+      ],
+      'a held record whose client turns out to lack what it needs': [
+        () =>
+          run({
+            edit: (r) => {
+              r.find((x) => x.kind === 'telemetry').client = 'c15.0'
+              moveConstructAfter(r, (x) => x.kind === 'telemetry')
+            },
+          }),
+        'telemetry from a client without telemetry',
+      ],
+      'more held records than the bound': [
+        () => {
+          const records = baseRecords()
+          moveConstructAfter(records, (x) => x.kind === 'wave')
+          records.splice(
+            at(records, (x) => x.kind === 'wave'),
+            0,
+            observed(),
+            observed(),
+            observed()
+          )
+          return validateWith(records, { maxHeld: 2 })
+        },
+        'more than 2 records wait for a client not yet constructed',
+      ],
+      'a key record citing no wave of its source': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave-key').cause = 'p01.0') }),
+        'cites no open wave of its source',
+      ],
+      'a wave missing a key record': [
+        () =>
+          run({
+            edit: (r) =>
+              r.splice(
+                at(r, (x) => x.kind === 'wave-key'),
+                1
+              ),
+          }),
+        'misses 1 of its wave-key records',
+      ],
+      'a broker state with a partition record too many': [
+        () =>
+          run({
+            edit: (r) => {
+              const i = at(r, (x) => x.kind === 'partition-state')
+              r.splice(i, 0, { ...r[i] })
+            },
+          }),
+        'cites no open broker-state of its source',
+      ],
       'a blank line': [
         () => {
           const edited = [...lines.slice(0, 5), '', ...lines.slice(5)]
@@ -1908,6 +2015,39 @@ describe('scripts/soak/finalSoakSchema', () => {
         'operation names no open execution',
       ],
     })
+  })
+
+  it('a record from another process naming a client is judged when the construction arrives, in any stream order', () => {
+    expect(
+      run({
+        edit: (r) => {
+          r.splice(
+            at(r, (x) => x.kind === 'wave'),
+            0,
+            observed()
+          )
+          moveConstructAfter(r, (x) => x.kind === 'wave')
+        },
+      })
+    ).toEqual([])
+  })
+
+  it('a record its process wrote before it exited is valid wherever the exit record falls in the stream', () => {
+    expect(
+      run({
+        edit: (r) => {
+          const exitT = r.length
+          r.push({ ...call('connect', 'p01', EAGER, 'begin', 'k9'), at: exitT - 0.5 })
+        },
+      })
+    ).toEqual([])
+    expect(
+      run({
+        edit: (r) => {
+          r.at(-1).at = r.length - 1.5
+        },
+      })
+    ).toEqual([expect.stringContaining('the process has a record after its exit')])
   })
 
   it('inventory cuts are complete per client section and chunk before a sample uses them', () => {
