@@ -515,10 +515,12 @@ module.exports = class RebalanceCoordinator {
 
   /**
    * Picks again once a consumer-protocol chain has waited, because the wait can change what is
-   * owed. A LOST verdict of the current membership that reached the slot during the wait and that
-   * the fetch loop has not taken yet ends the chain: the runner's LOST round (the lost callback or
-   * `PARTITIONS_LOST`, and the discard of uncommitted offsets) must run before any rejoin, and the
-   * fetch loop takes the verdict once its in-flight handlers return. A LOST queued during it runs
+   * owed. A LOST verdict of the current membership that reached the slot during the wait ends the
+   * chain: the runner's LOST round (the lost callback or `PARTITIONS_LOST`, and the discard of
+   * uncommitted offsets) must run before any other round, and the fetch loop takes the verdict
+   * once its in-flight handlers return. So does a loss of the current membership the fetch loop
+   * already took, unless this chain owes a LOST round itself: no round may apply, and renew the
+   * membership, under a membership the runner is about to report lost. A LOST queued during it runs
    * next, ahead of anything chosen before; a LOST queued for a membership a later join replaced is
    * dropped. A choice taken from a level is replaced by what is owed now, and ends the chain when
    * nothing is. An explicit re-entry or LOST chosen before the wait stays.
@@ -527,10 +529,12 @@ module.exports = class RebalanceCoordinator {
    * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} the round to run, if any
    */
   nextRoundAfterWait(chosen) {
-    if (
-      this.verdict?.kind === 'lost' &&
-      !obsoleteOwnership(this.consumerGroup.ownership, this.verdict.error)
-    ) {
+    const ownership = this.consumerGroup.ownership
+    const slotted =
+      this.verdict?.kind === 'lost' && !obsoleteOwnership(ownership, this.verdict.error)
+    const taken =
+      chosen.kind !== 'lost' && this.pendingKind !== 'lost' && ownership?.refusal(ownership.token())
+    if (slotted || taken) {
       return { kind: chosen.kind, reason: null, level: false }
     }
     if (chosen.kind === 'lost' || (!chosen.level && this.pendingKind === null)) return chosen
