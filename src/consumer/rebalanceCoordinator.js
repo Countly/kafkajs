@@ -515,17 +515,24 @@ module.exports = class RebalanceCoordinator {
 
   /**
    * Picks again once a consumer-protocol chain has waited, because the wait can change what is
-   * owed. A LOST queued during it runs next, ahead of anything chosen before; a LOST queued for a
-   * membership a later join replaced is dropped. A choice taken from a level is replaced by what is
-   * owed now, and ends the chain when nothing is. An explicit re-entry or LOST chosen before the
-   * wait stays. A verdict that reached the slot during the wait keeps the chosen round, which
-   * rejoins with epoch 0 after a fence; whether the coordinator accepts that rejoin or fences it
-   * again, the chain ends without an error and the verdict stays in the slot for the runner.
+   * owed. A LOST verdict of the current membership that reached the slot during the wait and that
+   * the fetch loop has not taken yet ends the chain: the runner's LOST round (the lost callback or
+   * `PARTITIONS_LOST`, and the discard of uncommitted offsets) must run before any rejoin, and the
+   * fetch loop takes the verdict once its in-flight handlers return. A LOST queued during it runs
+   * next, ahead of anything chosen before; a LOST queued for a membership a later join replaced is
+   * dropped. A choice taken from a level is replaced by what is owed now, and ends the chain when
+   * nothing is. An explicit re-entry or LOST chosen before the wait stays.
    * @private
    * @param {{ kind: string, reason: string, level: boolean }} chosen the round picked before the wait
    * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} the round to run, if any
    */
   nextRoundAfterWait(chosen) {
+    if (
+      this.verdict?.kind === 'lost' &&
+      !obsoleteOwnership(this.consumerGroup.ownership, this.verdict.error)
+    ) {
+      return { kind: chosen.kind, reason: null, level: false }
+    }
     if (chosen.kind === 'lost' || (!chosen.level && this.pendingKind === null)) return chosen
     const now = this.nextRound(false)
     if (now.reason || (chosen.level && this.verdict === null)) return now
