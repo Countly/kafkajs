@@ -1937,6 +1937,105 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(run.group.groupMembership.state).toEqual('FATAL')
   })
 
+  /**
+   * Joins with topic-a:0, then epoch 2 names topic-c and topic-d by id; the round's lookup of
+   * topic-d takes 1,200 ms. The heartbeat sent at epoch 2 during that lookup is held until the
+   * round has applied the epoch 2 target (an ordinary apply: nothing replaced it), then refused
+   * with `code`. Later heartbeats are authorized; rejoins at epoch 0 get epoch 100 with `latest`.
+   * @param {number} code the error code the held heartbeat is refused with
+   * @returns {Promise<object>} the built consumer, its runner and what the case observed
+   */
+  const refuseHeldHeartbeatAcrossApply = async (code) => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const named = { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] }
+    const latest = { 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }
+    const s = { phase: 'steady' }
+    let refuse
+    consumer.on(consumer.events.GROUP_JOIN, ({ payload }) =>
+      built.log.push({ kind: 'GROUP_JOIN', at: Date.now(), assignment: payload.memberAssignment })
+    )
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (request.memberEpoch === 0) {
+        return s.phase === 'refused' ? fullTarget(100, latest) : fullTarget(1, { 'topic-a': [0] })
+      }
+      if (s.phase === 'grow') {
+        s.phase = 'hold'
+        return fullTarget(2, named)
+      }
+      if (s.phase === 'hold') {
+        s.phase = 'held'
+        return new Promise((_, reject) => {
+          refuse = () => reject(new KafkaJSProtocolError(createErrorFromCode(code)))
+        })
+      }
+      return fullTarget(request.memberEpoch, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: ['topic-a', 'topic-c', 'topic-d'] })
+    consumer.run({ eachMessage: async () => {} })
+    await advanceUntil(() => built.fetches.length > 0)
+    const [runner] = starts.mock.contexts
+    const group = runner.consumerGroup
+    built.state.unknown.add('topic-c').add('topic-d')
+    built.state.idDelays.push(0, 1200)
+    const grownIndex = built.log.length
+    s.phase = 'grow'
+    await advanceUntil(() => !!refuse)
+    const token = group.ownership.token()
+    const joined = () => built.log.slice(grownIndex).filter(({ kind }) => kind === 'GROUP_JOIN')
+    await advanceUntil(() => joined().length > 0, 2000)
+    await jest.advanceTimersByTimeAsync(10)
+    const applied = joined()
+    const tokenBeforeRefusal = group.ownership.token()
+    s.phase = 'refused'
+    const refusedIndex = built.log.length
+    refuse()
+    await jest.advanceTimersByTimeAsync(3000)
+    return { ...built, runner, group, applied, token, tokenBeforeRefusal, refusedIndex }
+  }
+
+  it('acts on a fence answering a heartbeat sent before an ordinary apply completed: one PARTITIONS_LOST of the applied assignment, then a rejoin with the latest target', async () => {
+    const run = await refuseHeldHeartbeatAcrossApply(FENCED_MEMBER_EPOCH)
+    const after = run.log.slice(run.refusedIndex)
+
+    expect(run.applied.map(({ assignment }) => assignment)).toEqual([
+      { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] },
+    ])
+    expect(run.tokenBeforeRefusal).toEqual(run.token + 1)
+    expect(
+      after
+        .filter(
+          ({ kind, epoch }) =>
+            kind.startsWith('PARTITIONS_') || kind === 'GROUP_JOIN' || epoch === 0
+        )
+        .map(({ kind, epoch }) => (kind === 'heartbeat' ? epoch : kind))
+    ).toEqual(['PARTITIONS_LOST', 0, 'PARTITIONS_ASSIGNED', 'GROUP_JOIN'])
+    expect(after.find(({ kind }) => kind === 'PARTITIONS_LOST').partitions).toEqual([
+      { topic: 'topic-a', partitions: [0] },
+      { topic: 'topic-c', partitions: [0] },
+      { topic: 'topic-d', partitions: [0] },
+    ])
+    expect(
+      after.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch > 0 && epoch < 100)
+    ).toEqual([])
+    expect(run.group.groupMembership.memberEpoch).toEqual(100)
+    expect(run.crashes).toEqual([])
+  })
+
+  it('reports a fatal error answering a heartbeat sent before an ordinary apply completed, even when a later heartbeat is authorized', async () => {
+    const run = await refuseHeldHeartbeatAcrossApply(30)
+    const after = run.log.slice(run.refusedIndex)
+
+    expect(run.applied).toHaveLength(1)
+    expect(run.tokenBeforeRefusal).toEqual(run.token + 1)
+    expect(run.crashes.map(({ error }) => error.type)).toEqual(['GROUP_AUTHORIZATION_FAILED'])
+    expect(after.filter(({ kind }) => kind === 'GROUP_JOIN')).toEqual([])
+    expect(after.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch >= 0)).toEqual([])
+    expect(run.group.groupMembership.state).toEqual('FATAL')
+  })
+
   it('starts the run when the first step is abandoned for a newer target, and consumes the newer target', async () => {
     const built = buildConsumer()
     consumer = built.consumer
