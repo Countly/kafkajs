@@ -758,7 +758,7 @@ async function readDump(ctx, role) {
       capped(out.problems, `apache/${name}: offsets are not increasing at line ${n}`)
     out.count++
     out.maxOffset = Math.max(out.maxOffset, offset)
-    if (topic === 1 && ctx.claims.at.has(offset)) capped(out.claimedDumped, offset)
+    if (ctx.claims[topic].at.has(offset)) capped(out.claimedDumped, offset)
     const i = journal.ids.get(id)
     out.lastTx = (i !== undefined && journal.txOf[i]) || null
     if (i === undefined || journal.topic[i] !== topic)
@@ -849,25 +849,25 @@ function readDescribe(ctx, group) {
 }
 
 /**
- * The offsets the acknowledged members of aborted transactions on the transactions topic claim:
- * the broker placed each at its acknowledged offset, invisible to a read-committed reader. Two
- * members acknowledged at one offset cannot both be there.
+ * Per standing topic, the offsets the acknowledged members of aborted transactions claim: the
+ * broker placed each at its acknowledged offset, invisible to a read-committed reader. Two members
+ * acknowledged at one offset cannot both be there.
  * @param {Journal} journal
- * @returns {{ at: Map<number, number>, twice: number[] }} offset to the member's index, and every
- *   offset a second member claimed
+ * @returns {{ at: Map<number, number>, twice: number[] }[]} per topic (`ROLES` order), offset to
+ *   the member's index and every offset a second member claimed
  */
 function abortedClaims(journal) {
-  const [at, twice] = [new Map(), []]
+  const claims = ROLES.map(() => ({ at: new Map(), twice: [] }))
   for (const t of journal.txs.values()) {
     if (t.outcome !== 'aborted') continue
     for (const i of t.members) {
-      const o = journal.offset[i]
-      if (journal.topic[i] !== 1 || journal.ack[i] !== ACK.acknowledged || Number.isNaN(o)) continue
+      const [o, { at, twice }] = [journal.offset[i], claims[journal.topic[i]]]
+      if (journal.ack[i] !== ACK.acknowledged || Number.isNaN(o)) continue
       if (at.has(o)) twice.push(o)
       else at.set(o, i)
     }
   }
-  return { at, twice }
+  return claims
 }
 
 /**
@@ -880,7 +880,7 @@ function abortedClaims(journal) {
  * unknown, or a visible record the dump was cut off before is no such fact, so the dump stays
  * unproved. The driver ends the log in a visible closing record, which leaves no tail.
  * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end the log end
- * @param {Map<number, number>} claims `abortedClaims(journal).at`
+ * @param {Map<number, number>} claims the transactions topic's `abortedClaims` offsets
  * @returns {string|false} why the tail is not explained, or false
  */
 function unexplainedTail(journal, dump, end, claims) {
@@ -906,24 +906,22 @@ function unexplainedTail(journal, dump, end, claims) {
 
 /**
  * Whether a dump holds every visible record of its partition below the log end Apache's describe
- * reports, and why not. Every dumped offset must lie below that end. The main partition holds only
- * visible records, so its dump must hold exactly the end's count. On the transactions partition
- * every offset below the end is one fact: a dumped record, an acknowledged aborted member at its
- * offset (no two on one offset, none on a dumped offset or at or beyond the end), or a control
- * marker, at least one per decided transaction with an acknowledged member. The console consumer
+ * reports, and why not. Every offset below the end is one fact: a dumped record, an acknowledged
+ * aborted member at its offset (no two on one offset, none on a dumped offset or at or beyond the
+ * end), or a control marker. The main partition holds only visible records, so its dump must hold
+ * exactly the end's count. On the transactions partition there is at least one marker per decided
+ * transaction with an acknowledged member. The console consumer
  * reads in offset order and can only be cut off, so the dump is complete up to its last record,
  * which must not precede an acknowledged visible record; the offsets after it must be explained
  * one to one (`unexplainedTail`).
  * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end
  * @param {number} n 0 for main, 1 for transactions @param {number} lastVisible the highest
  *   acknowledged offset of a visible transactions record
- * @param {{ at: Map<number, number>, twice: number[] }} claims `abortedClaims(journal)`
+ * @param {{ at: Map<number, number>, twice: number[] }} claims the topic's `abortedClaims`
  * @returns {string|false} the reason it is not proved complete, or false
  */
 function incomplete(journal, dump, end, n, lastVisible, claims) {
   if (dump.maxOffset >= end) return `offset ${dump.maxOffset} lies at or beyond the log end`
-  if (n === 0) return dump.count !== end && `${dump.count} records dumped`
-  if (dump.maxOffset < lastVisible) return `a visible record was acknowledged at ${lastVisible}`
   if (claims.twice.length > 0)
     return `two acknowledged aborted records claim offset ${claims.twice[0]}`
   if (dump.claimedDumped.length > 0)
@@ -931,6 +929,8 @@ function incomplete(journal, dump, end, n, lastVisible, claims) {
   const beyond = [...claims.at.keys()].find((o) => o >= end)
   if (beyond !== undefined)
     return `an acknowledged aborted record claims offset ${beyond}, at or beyond the log end`
+  if (n === 0) return dump.count !== end && `${dump.count} records dumped`
+  if (dump.maxOffset < lastVisible) return `a visible record was acknowledged at ${lastVisible}`
   let markers = 0
   for (const t of journal.txs.values())
     if (/^(committed|aborted)$/.test(t.outcome))
@@ -989,7 +989,7 @@ function judgeLog(k1, { journal, dumps, ends, dumped, claims }) {
       k1.gap(`no describe row gives the ${ROLES[n]} log end`)
       return false
     }
-    const why = incomplete(journal, d, ends[n], n, lastVisible, claims)
+    const why = incomplete(journal, d, ends[n], n, lastVisible, claims[n])
     if (why)
       k1.gap(
         `the ${ROLES[n]} dump stops at offset ${d.maxOffset} and the log ends at ${ends[n]}: ${why}, so it is not proved complete`
