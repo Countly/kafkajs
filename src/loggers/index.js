@@ -9,9 +9,9 @@ const LEVELS = {
 }
 
 /**
- * Builds one level's log function. The user's sink is invoked synchronously and a synchronous
- * throw from it is swallowed, so a failing sink never decides the outcome of the client code
- * that logged.
+ * Builds one level's log function. The user's sink is invoked synchronously; a synchronous throw
+ * from it is swallowed and a rejection of a promise it returns is discarded, so a failing sink
+ * never decides the outcome of the client code that logged, nor ends the process.
  * @param {string} label
  * @param {number} level
  * @param {() => number} currentLevel
@@ -37,7 +37,8 @@ const createLevel =
       ),
     }
     try {
-      logFunction(entry)
+      const result = logFunction(entry)
+      if (typeof result?.then === 'function') result.then(undefined, () => {})
     } catch {}
   }
 
