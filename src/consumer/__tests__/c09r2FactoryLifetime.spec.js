@@ -40,6 +40,7 @@ const fakeCluster = (overrides = {}) => {
     addMultipleTargetTopics: jest.fn(async () => {}),
     useConsumerMetadataScope: jest.fn(),
     releaseConsumerMetadataScope: jest.fn(),
+    useBrokerRegex: jest.fn(),
     onTopicRecreated: jest.fn((handler) => {
       listeners.add(handler)
       const remove = jest.fn(() => listeners.delete(handler))

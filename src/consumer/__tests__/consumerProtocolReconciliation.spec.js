@@ -99,6 +99,7 @@ const build = ({
     findBroker: jest.fn(async () => ({ fetch: async () => ({ responses: [] }) })),
     findGroupCoordinator: jest.fn(async () => coordinator),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
   }
 
   const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -297,6 +298,7 @@ const buildPattern = (script, { literal = false } = {}) => {
     ),
     findGroupCoordinator: jest.fn(async () => coordinator),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
   }
 
   const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -592,6 +594,8 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       // the one before it. Each wait put exactly one heartbeat carrying ownership on the wire (the
       // acknowledgement, sent with this case's heartbeat) and at most one other: the fetch loop's
       // own, which the interval gate admits once per interval. The background timer is disabled.
+      // The one exception is the first target of the chain: its eligible part equals what the member
+      // owns, so it is acknowledged when it arrives, in the first wait instead of the second.
       expect(joinedAt.slice(1).map((at, i) => at - joinedAt[i])).toEqual(
         Array(joinedAt.length - 1).fill(INTERVAL)
       )
@@ -602,7 +606,11 @@ describe('Consumer > the consumer protocol reconciliation', () => {
         return { acks, others: sent.length - acks }
       })
       expect(perWait).toHaveLength(60)
-      expect(perWait.filter(({ acks, others }) => acks !== 1 || others > 1)).toEqual([])
+      expect(perWait.slice(0, 2)).toEqual([
+        { acks: 2, others: 0 },
+        { acks: 0, others: 1 },
+      ])
+      expect(perWait.slice(2).filter(({ acks, others }) => acks !== 1 || others > 1)).toEqual([])
 
       // The retained partition kept being fetched while the chain ran.
       expect(controlFetches[0]).toBeGreaterThan(0)
@@ -1205,6 +1213,7 @@ const buildConsumer = (options = {}) => {
     removeBroker: jest.fn(),
     onTopicRecreated: jest.fn(() => () => {}),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
     refreshMetadata: jest.fn(async () => {
       await delayOnce('metadataDelay')
       state.partial.clear()
@@ -1218,6 +1227,7 @@ const buildConsumer = (options = {}) => {
     }),
     useConsumerMetadataScope: jest.fn(),
     releaseConsumerMetadataScope: jest.fn(),
+    useBrokerRegex: jest.fn(),
     resetTargetTopics: jest.fn(async (_names, { publish } = {}) => publish?.()),
     committedOffsets: () => ({}),
     offsetOperations: () => new OffsetOperations(),
