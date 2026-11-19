@@ -1873,11 +1873,14 @@ describe('final soak driver', () => {
         }
       },
     }
-    const result = await scanPartition(broker, { topic: 't', partition: 0, from: 10n })
+    const batches = []
+    const result = await scanPartition(broker, { topic: 't', partition: 0, from: 10n }, (b) =>
+      batches.push(b)
+    )
     expect(fetches).toEqual(['10'])
-    expect(result.records.map((r) => r.offset)).toEqual(['10'])
-    expect(result).toMatchObject({ to: '13', lso: '13', highWatermark: '15' })
-    expect(parseValue(result.records[0].value, RUN)).toEqual({ id: 'c09.10', transaction: null })
+    expect(batches.map((b) => b.map((r) => r.offset))).toEqual([['10']])
+    expect(result).toEqual({ to: '13', lso: '13', highWatermark: '15' })
+    expect(parseValue(batches[0][0].value, RUN)).toEqual({ id: 'c09.10', transaction: null })
   })
 
   test('the decoder binds pushes to the recorded subscription and fails on reporter drops or overflow', async () => {

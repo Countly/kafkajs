@@ -11,6 +11,8 @@ const SUPERVISOR = 'p15'
 const OUTER = 'outer'
 const MIB = 1024 * 1024
 const ENQUEUE_TIMEOUT_MS = 5000
+/** How long one sink write may take before the collection stops. */
+const WRITE_TIMEOUT_MS = 60000
 const EXPLICIT_RESOURCES = ['TCPSocketWrap', 'Timeout']
 /** JSON bytes kept of a diagnostic's message, so the record always fits the event line cap. */
 const DIAGNOSTIC_BYTES = 600
@@ -39,9 +41,13 @@ const clip = (text, maxBytes) => {
  * collector checks per-source sequence continuity, stamps the append time `t` (never decreasing),
  * enforces the line and stream caps and streams lines to the sink through a byte-bounded queue.
  * When the queue is full, appends wait in arrival order, so no source is reordered; a wait over five
- * seconds stops collection. Nothing is truncated or silently dropped: a line over its cap is replaced
- * by a diagnostic naming it, and every failure is listed in `failures`. State is fixed in size: one
- * sequence counter per source and the bounded queue.
+ * seconds stops collection. An append is acknowledged only once all of its line's bytes were
+ * written. Nothing is truncated or silently dropped: a line over its cap is replaced, in its place,
+ * by a diagnostic naming it, and every failure is listed in `failures` and told to `onFailure` only
+ * after the record that caused it has taken its place, so a record the failure handler writes comes
+ * after it. A sink write that fails or does not settle in time stops collection and refuses every
+ * record not yet written. State is fixed in size: one sequence counter per source and the bounded
+ * queue; waiting appends are bounded by each source's own unacknowledged-byte cap.
  */
 class Collector {
   /**
@@ -52,6 +58,7 @@ class Collector {
    * @param {number} [options.maxQueueBytes] write queue bound, 32 MiB by default
    * @param {number} [options.maxStreamBytes] stream cap, the matrix's by default
    * @param {string} [options.source] the collector's own source slot, for its own records
+   * @param {number} [options.writeTimeoutMs] how long one sink write may take
    */
   constructor({
     sink,
@@ -60,8 +67,10 @@ class Collector {
     maxQueueBytes = 32 * MIB,
     maxStreamBytes,
     source = SUPERVISOR,
+    writeTimeoutMs = WRITE_TIMEOUT_MS,
   }) {
     this.sink = sink
+    this.writeTimeoutMs = writeTimeoutMs
     this.clock = clock
     this.maxQueueBytes = maxQueueBytes
     this.maxStreamBytes = maxStreamBytes ?? valueOf(matrix.host.maxStreamBytes)
@@ -86,15 +95,17 @@ class Collector {
   /**
    * Appends one source record.
    * @param {object} record a record with its envelope except `t`
-   * @returns {Promise<boolean>} whether the record was written
+   * @returns {Promise<boolean>} whether all of the record's bytes were written
    */
   append(record) {
     if (this.stopped) return Promise.resolve(false)
     const expected = this.nextSeq.get(record.source) ?? 0
-    if (record.seq !== expected)
-      this.fail(`${record.source} sequence ${record.seq} follows ${expected - 1}`)
+    const gap =
+      record.seq === expected
+        ? []
+        : [`${record.source} sequence ${record.seq} follows ${expected - 1}`]
     this.nextSeq.set(record.source, record.seq + 1)
-    return this.enqueue(record)
+    return this.enqueue(record, gap)
   }
 
   /**
@@ -143,50 +154,66 @@ class Collector {
   /**
    * Queues one record's line. A line over its cap fails the collection with the record's id, kind
    * and size, and a diagnostic with the record's own envelope takes its place, so its source's
-   * sequence stays gap-free and the source keeps delivering (its final sample included).
-   * @param {object} record @returns {Promise<boolean>} whether its place in the stream was written
+   * sequence stays gap-free and the source keeps delivering (its final sample included). The
+   * failures are told only once that place is taken.
+   * @param {object} record @param {string[]} [problems] failures the record already caused
+   * @returns {Promise<boolean>} whether all bytes of its place in the stream were written
    */
-  async enqueue(record) {
+  async enqueue(record, problems = []) {
     let line = this.line(record)
     const cap = record.kind === 'inventory' ? this.maxInventoryLine : this.maxLine
     const size = Buffer.byteLength(line) - 1
     if (size > cap) {
       const { recordId, source, seq, at, execution, kind } = record
-      this.fail(`${recordId} ${kind} line of ${size} bytes exceeds ${cap} bytes`)
+      problems = [...problems, `${recordId} ${kind} line of ${size} bytes exceeds ${cap} bytes`]
       const message = `oversize ${kind} record ${recordId} of ${size} bytes not written`
       record = { kind: 'diagnostic', recordId, source, seq, at, execution, message }
       line = this.line(record)
+    }
+    const told = (result) => {
+      for (const problem of problems) this.fail(problem)
+      return result
     }
     if (
       this.waiters.length > 0 ||
       this.queuedBytes + Buffer.byteLength(line) > this.maxQueueBytes
     ) {
-      if (!(await this.turn(Buffer.byteLength(line)))) return false
+      if (!(await this.turn(Buffer.byteLength(line)))) return told(false)
       line = this.line(record)
     }
     const bytes = Buffer.byteLength(line)
-    if (this.stopped) return false
+    if (this.stopped) return told(false)
     if (this.streamBytes + bytes > this.maxStreamBytes) {
       this.fail(`stream exceeds ${this.maxStreamBytes} bytes`)
       this.stop()
-      return false
+      return told(false)
     }
     this.streamBytes += bytes
     this.records++
     this.lastLine = line.slice(0, -1)
-    this.queue.push(line)
+    const entry = { line, resolve: null }
+    const written = new Promise((resolve) => (entry.resolve = resolve))
+    this.queue.push(entry)
     this.queuedBytes += bytes
     this.writing ??= this.drain()
     this.release()
-    return true
+    told(true)
+    return written
   }
 
   /** @param {number} bytes @returns {Promise<boolean>} waits in arrival order for queue space */
   turn(bytes) {
     return new Promise((resolve) => {
-      const waiter = { bytes, resolve }
+      const timer = new AbortController()
+      const waiter = {
+        bytes,
+        resolve: (admitted) => {
+          timer.abort()
+          resolve(admitted)
+        },
+      }
       this.waiters.push(waiter)
-      this.clock.sleepUntil(this.clock.now() + ENQUEUE_TIMEOUT_MS).then(() => {
+      this.clock.sleepUntil(this.clock.now() + ENQUEUE_TIMEOUT_MS, timer.signal).then(() => {
         if (!this.waiters.includes(waiter)) return
         this.fail(`write queue did not drain within ${ENQUEUE_TIMEOUT_MS} ms`)
         this.stop()
@@ -210,26 +237,53 @@ class Collector {
   }
 
   /**
-   * Writes queued lines until the queue is empty. Every chunk is written whole: a short write is
-   * continued from where it stopped, and a write that fails or takes no bytes stops collection and
-   * drops what is queued behind it, never truncating or reordering a line already written.
+   * @param {Promise<unknown>} write one sink write
+   * @returns {Promise<unknown>} its result
+   * @throws {Error} when it does not settle within `writeTimeoutMs`
+   */
+  async bounded(write) {
+    let timer = null
+    try {
+      return await Promise.race([
+        write,
+        new Promise((resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`a write did not settle within ${this.writeTimeoutMs} ms`)),
+            this.writeTimeoutMs
+          )
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Writes queued lines until the queue is empty, and acknowledges each line once all of its bytes
+   * were written. Every chunk is written whole: a short write is continued from where it stopped,
+   * and a write that fails, takes no bytes or does not settle in time stops collection and refuses
+   * every line not wholly written (the chunk in flight and what is queued behind it), never
+   * truncating or reordering a line already written.
    * @returns {Promise<void>}
    */
   async drain() {
+    let batch = []
     try {
       while (this.queue.length > 0) {
-        const chunk = Buffer.from(this.queue.splice(0, this.queue.length).join(''))
+        batch = this.queue.splice(0, this.queue.length)
+        const chunk = Buffer.from(batch.map((entry) => entry.line).join(''))
         for (let offset = 0; offset < chunk.length;) {
-          const result = await this.sink.write(chunk.subarray(offset))
+          const result = await this.bounded(this.sink.write(chunk.subarray(offset)))
           const bytes = result?.bytesWritten ?? chunk.length - offset
           if (!(bytes > 0)) throw new Error('the sink accepted no bytes')
           offset += bytes
         }
         this.queuedBytes -= chunk.length
+        for (const entry of batch.splice(0)) entry.resolve(true)
         this.release()
       }
     } catch (e) {
-      this.queue.length = 0
+      for (const entry of [...batch, ...this.queue.splice(0)]) entry.resolve(false)
       this.queuedBytes = 0
       this.fail(`sink write failed: ${e.message}`)
       this.stop()

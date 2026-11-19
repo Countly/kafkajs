@@ -10,7 +10,14 @@ const ResetObligations = require('../../../src/consumer/offsetManager/resetOblig
 const SeekOffsets = require('../../../src/consumer/seekOffsets')
 const SubscriptionState = require('../../../src/consumer/subscriptionState')
 const dictionary = require('../../../src/utils/dictionary')
-const { buildConfig, digest, digestFile, finalize, recordOuterExit } = require('../finalSoak')
+const {
+  Supervisor,
+  buildConfig,
+  digest,
+  digestFile,
+  finalize,
+  recordOuterExit,
+} = require('../finalSoak')
 const { Collector, SourceChannel } = require('../finalSoakCollector')
 const { PassiveObserver } = require('../finalSoakObserver')
 const {
@@ -33,6 +40,9 @@ const PRINTED = Buffer.from(DASHED.replace(/-/g, ''), 'hex').toString('base64url
 const config = buildConfig(matrix, { mode: 'smoke', runId: RUN, treeSha: TREE, brokers: ['k:1'] })
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `final-soak-${name}-`))
 const tick = () => new Promise(setImmediate)
+/** @returns {Promise<unknown>} the promise's value, or `{ hung: true }` after `ms` */
+const within = (promise, ms) =>
+  Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms, { hung: true }))])
 
 describe('final soak collector writes', () => {
   const clock = { now: () => 0, sleepUntil: () => new Promise(() => {}) }
@@ -80,13 +90,96 @@ describe('final soak collector writes', () => {
     collector.onFailure = (problem) => failed.push(problem)
     expect(await collector.append(record(0))).toBe(true)
     await tick()
-    expect(await collector.append(record(1))).toBe(true)
-    await tick()
-    await tick()
+    expect(await collector.append(record(1))).toBe(false)
     expect(await collector.append(record(2))).toBe(false)
     await collector.close()
     expect(collector.failures).toEqual([expect.stringContaining('disk full')])
     expect(failed).toEqual([expect.stringContaining('disk full')])
+  })
+
+  test('an append is acknowledged only once its bytes are in the sink, not when it is queued', async () => {
+    let open = null
+    const lines = []
+    const sink = {
+      write: async (buffer) => {
+        await new Promise((resolve) => (open = resolve))
+        lines.push(buffer.toString())
+        return { bytesWritten: buffer.length }
+      },
+      sync: async () => {},
+    }
+    const collector = new Collector({ sink, clock, matrix })
+    let acked = null
+    collector.append(record(0)).then((ok) => (acked = ok))
+    await tick()
+    expect(lines).toEqual([])
+    expect(acked).toBeNull()
+    open()
+    await tick()
+    expect(acked).toBe(true)
+    expect(lines.join('')).toContain('"p01.0"')
+  })
+
+  test('a short write followed by an error refuses every record not wholly written, and later appends', async () => {
+    let calls = 0
+    const sink = {
+      write: async (buffer) => {
+        if (++calls === 1) return { bytesWritten: 10 }
+        throw new Error('io error')
+      },
+      sync: async () => {},
+    }
+    const collector = new Collector({ sink, clock, matrix })
+    const results = [collector.append(record(0)), collector.append(record(1))]
+    expect(await Promise.all(results)).toEqual([false, false])
+    expect(await collector.append(record(2))).toBe(false)
+    expect(collector.failures).toEqual(['sink write failed: io error'])
+  })
+
+  test('a sink write that never settles stops the collection in bounded time and the close returns', async () => {
+    const sink = { write: () => new Promise(() => {}), sync: async () => {} }
+    const collector = new Collector({ sink, clock, matrix, writeTimeoutMs: 50 })
+    expect(await within(collector.append(record(0)), 2000)).toBe(false)
+    expect(await within(collector.close(), 2000)).toBeUndefined()
+    expect(collector.failures).toEqual(['sink write failed: a write did not settle within 50 ms'])
+  })
+
+  test("an oversize supervisor record keeps its place before the abort note its failure writes through the supervisor's real abort", async () => {
+    const lines = []
+    const sink = { write: async (b) => lines.push(b.toString()), sync: async () => {} }
+    const collector = new Collector({ sink, clock, matrix })
+    const supervisor = Object.create(Supervisor.prototype)
+    Object.assign(supervisor, { collector, aborted: null, problems: [] })
+    collector.onFailure = (problem) => supervisor.abort(`collector: ${problem}`)
+    const big = { ...record(0), source: 'p15', recordId: 'p15.0', message: 'x'.repeat(4000) }
+    expect(await collector.append(big)).toBe(true)
+    await collector.close()
+    const stream = lines.join('').trim().split('\n').map(JSON.parse)
+    expect(stream.map((r) => r.recordId)).toEqual(['p15.0', 'p15.c0'])
+    expect(stream[1].message).toMatch(/^abort: collector: p15\.0 diagnostic line of \d+ bytes/)
+  })
+
+  test("a source's last records are acknowledged only after they are written, so its pending bytes reach zero only then", async () => {
+    let open = null
+    const sink = {
+      write: async (buffer) => {
+        await new Promise((resolve) => (open = resolve))
+        return { bytesWritten: buffer.length }
+      },
+      sync: async () => {},
+    }
+    const collector = new Collector({ sink, clock, matrix })
+    const channel = new SourceChannel({
+      source: 'p01',
+      clock,
+      send: (message, done) => collector.append(message.record).then((ok) => done(!ok)),
+    })
+    await channel.emit({ kind: 'sample', recordId: 'p01.0', role: 'final' })
+    await tick()
+    expect(channel.pendingBytes).toBeGreaterThan(0)
+    open()
+    await tick()
+    expect(channel.pendingBytes).toBe(0)
   })
 
   test('a write that accepts no bytes is a failure and not an endless loop', async () => {
@@ -272,9 +365,15 @@ describe('final soak observer evidence', () => {
     const observer = new PassiveObserver({ owners: {}, watched: {} })
     const runtime = {
       observer,
+      lifetimes: new Map(),
+      revisions: new Map(),
+      worker: {},
       nextId: () => 'p01.0',
       emit: async () => true,
       context: new AsyncLocalStorage(),
+      forget(client) {
+        ChildRuntime.prototype.forget.call(this, client)
+      },
     }
     const slot = config.clients[0]
     for (let wave = 0; wave < 300; wave++) {
@@ -383,7 +482,7 @@ describe('final soak handler entries', () => {
     headers: {},
   }
   const authority = { client: 'c01.1', run: 'r', token: 1, acquiredAt: 1, recreatedAt: 0 }
-  const rig = { id: 'c01.1', slot: config.clients[0], processed: new Map(), uncommitted: new Map() }
+  const rig = { id: 'c01.1', slot: config.clients[0], uncommitted: new Map() }
 
   const entered = (rt) =>
     rt.records.filter((r) => r.kind === 'identity' && r.stage === 'handler-enter')
@@ -400,9 +499,7 @@ describe('final soak handler entries', () => {
     async (_, source) => {
       const rt = runtime({ mine: () => [{}], ...source })
       const worker = new ConsumerWorker(rt)
-      worker.progress = new Map()
-      worker.lastBoundary = new Map()
-      const local = { ...rig, processed: new Map(), uncommitted: new Map() }
+      const local = { ...rig, uncommitted: new Map() }
       await worker.handle(local, { topic: config.topics.main, partition: 0, message })
       expect(entered(rt)).toEqual([])
       const [note] = partial(rt)
@@ -416,7 +513,7 @@ describe('final soak handler entries', () => {
       })
       expect(rt.problems).toEqual([expect.stringContaining('c08.3')])
       expect(rt.records.some((r) => r.stage === 'handler-end')).toBe(true)
-      expect(local.processed.get(`${config.topics.main}|0`)).toBe('13')
+      expect(worker.handled).toBe(1)
     }
   )
 
@@ -427,9 +524,7 @@ describe('final soak handler entries', () => {
       topicIdOf: () => IDS.A,
     })
     const worker = new ConsumerWorker(rt)
-    worker.progress = new Map()
-    worker.lastBoundary = new Map()
-    const local = { ...rig, processed: new Map(), uncommitted: new Map(), authority: new Map() }
+    const local = { ...rig, uncommitted: new Map() }
     await worker.handle(local, { topic: config.topics.main, partition: 0, message })
     expect(entered(rt)).toHaveLength(1)
     expect(rt.problems).toEqual([])
@@ -801,7 +896,6 @@ describe('final soak container dumps', () => {
 
 describe('final soak record line sizes', () => {
   const { RECORDS, CLIENT_KINDS } = require('../finalSoakSchema')
-  const { Supervisor } = require('../finalSoak')
   const { chunk } = require('../finalSoakCollector')
   const CAP = matrix.host.maxEventLineBytes.value
   const INVENTORY_CAP = matrix.host.maxInventoryLineBytes.value

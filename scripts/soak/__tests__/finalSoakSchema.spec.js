@@ -1959,6 +1959,31 @@ describe('scripts/soak/finalSoakSchema', () => {
           }),
         'misses 1 of its wave-key records',
       ],
+      'a wave whose two key records name the same key, leaving a paused key unnamed': [
+        () =>
+          run({
+            edit: (r) => {
+              const wave = r.find((x) => x.kind === 'wave')
+              wave.paused = 2
+              wave.held = 2
+              const i = at(r, (x) => x.kind === 'wave-key')
+              r.splice(i, 0, { ...r[i] })
+            },
+          }),
+        'repeats a key of its wave',
+      ],
+      'a wave whose held count differs from its key records': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave-key').held = false) }),
+        'wave held count differs from its wave-key records',
+      ],
+      'a key record of another execution than its wave': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave-key').execution = 'x1') }),
+        'is of another execution than its wave',
+      ],
+      'a wave whose member was never constructed': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave').member = 'c15.9') }),
+        'names a client that was never constructed',
+      ],
       'a broker state with a partition record too many': [
         () =>
           run({
@@ -2015,6 +2040,84 @@ describe('scripts/soak/finalSoakSchema', () => {
         'operation names no open execution',
       ],
     })
+  })
+
+  it("a day's membership waves validate with their live state released as each closes", () => {
+    const records = baseRecords()
+    const exit = records.pop()
+    for (let w = 0; w < 288; w++) {
+      const execution = `h${String(Math.floor(w / 12)).padStart(2, '0')}m${w % 12}`
+      const shape = (phase) => ({
+        kind: 'shape',
+        phase,
+        source: 'p15',
+        execution,
+        shape: 'pause-resume',
+        participants: [EAGER],
+        operationCount: 0,
+      })
+      const wave = (event) => ({
+        kind: 'wave',
+        source: 'p01',
+        execution,
+        event,
+        client: EAGER,
+        member: event === 'transfer' ? 'c15.0' : EAGER,
+        paused: 2,
+        held: 1,
+        observed: true,
+      })
+      const key = (partition, held) => ({
+        kind: 'wave-key',
+        source: 'p01',
+        execution,
+        key: { ...KEY, partition },
+        held,
+      })
+      records.push(
+        shape('start'),
+        wave('transfer'),
+        key(0, true),
+        key(1, false),
+        wave('return'),
+        key(0, false),
+        key(1, true),
+        shape('end')
+      )
+    }
+    records.push(exit)
+    const lines = encode(records)
+    const stream = new StreamValidator({
+      matrix,
+      config: buildConfig(),
+      header: buildHeader(lines),
+    })
+    lines.forEach((line) => stream.push(line))
+    expect(stream.finish()).toEqual([])
+    expect([stream.summaries.size, stream.openItems, stream.executions.size]).toEqual([0, 0, 0])
+  })
+
+  it('a stream with many executions that never end fails once at its cap and keeps its problems bounded', () => {
+    const records = baseRecords()
+    const exit = records.pop()
+    for (let n = 0; n < 3000; n++)
+      records.push({
+        kind: 'shape',
+        phase: 'start',
+        source: 'p15',
+        execution: `orphan${n}`,
+        shape: 'pause-resume',
+        participants: [EAGER],
+        operationCount: 0,
+      })
+    records.push(exit)
+    const problems = validateWith(records, { maxOpen: 100 })
+    expect(problems.filter((p) => p.includes('more than 100 open executions'))).toHaveLength(1)
+    expect(problems.filter((p) => p.includes('never ends'))).toHaveLength(100)
+    expect(problems.length).toBeLessThanOrEqual(1001)
+    const unbounded = validateWith(records, {})
+    expect(unbounded.length).toBeLessThanOrEqual(1001)
+    expect(unbounded.at(-1)).toMatch(/^\d+ more problems omitted$/)
   })
 
   it('a record from another process naming a client is judged when the construction arrives, in any stream order', () => {

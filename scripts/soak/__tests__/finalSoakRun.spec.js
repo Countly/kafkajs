@@ -6,17 +6,27 @@ const { AsyncLocalStorage } = require('node:async_hooks')
 const { buildConfig, Supervisor, workloadProblems } = require('../finalSoak')
 const { MonotonicClock, planSchedule, Scheduler } = require('../finalSoakScheduler')
 const {
+  sha256,
   ChildRuntime,
   ClientRig,
   ConsumerWorker,
   ShareWorker,
+  ReaderWorker,
+  DecoderWorker,
+  WireLog,
+  ClientLog,
   createWorker,
+  child,
 } = require('../finalSoakWorkers')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
 const TREE = 'b'.repeat(40)
 const RUN = '0123456789ab'
-const IDS = { A: 'AAAAAAAAAAAAAAAAAAAAAA', B: 'BBBBBBBBBBBBBBBBBBBBBB' }
+const IDS = {
+  A: 'AAAAAAAAAAAAAAAAAAAAAA',
+  B: 'BBBBBBBBBBBBBBBBBBBBBB',
+  C: 'CCCCCCCCCCCCCCCCCCCCCC',
+}
 const config = buildConfig(matrix, { mode: 'smoke', runId: RUN, treeSha: TREE, brokers: ['k:1'] })
 const tick = () => new Promise(setImmediate)
 /** @returns {Promise<unknown>} the promise's value, or `{ hung: true }` after `ms` */
@@ -78,6 +88,7 @@ const workerRuntime = (slotId, clock = new MonotonicClock(), observer = {}) => {
     diagnose: async (message) => runtime.records.push({ kind: 'diagnostic', message }),
     problem: async (message) => runtime.problems.push(message),
     failed: (call, error) => ChildRuntime.prototype.failed.call(runtime, call, error),
+    forget: (client) => observer.forget(client),
     request: async () => {},
   }
   return runtime
@@ -218,7 +229,7 @@ describe('final soak producer shutdown', () => {
       deadline: 1000,
     })
     expect(sent).toHaveLength(3)
-    expect(reply).toEqual({ offered: 3, stopped: true })
+    expect(reply).toEqual({ offered: 3, acknowledged: 3, stopped: true })
     await worker.disconnect()
   })
 
@@ -246,7 +257,7 @@ describe('final soak producer shutdown', () => {
       }),
       2000
     )
-    expect(reply).toEqual({ offered: 1, stopped: true })
+    expect(reply).toEqual({ offered: 1, acknowledged: 0, stopped: true })
     expect(clock.now()).toBeLessThan(deadline + 1000)
     const acks = () => runtime.records.filter((r) => r.stage === 'ack')
     expect(acks()).toEqual([
@@ -316,6 +327,7 @@ const fakeChild = () => {
     return true
   }
   child.kill = jest.fn()
+  child.on('exit', () => setImmediate(() => child.emit('close')))
   return child
 }
 
@@ -408,6 +420,114 @@ describe('final soak supervisor commands', () => {
     } finally {
       remove()
     }
+  })
+
+  test('a child whose spawn failed reaches its terminal state at close without an exit record, and the teardown does not wait for it', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const records = []
+      s.emit = async (record) => records.push(record) && 'p15.1'
+      const child = fakeChild()
+      child.connected = false
+      s.children.set('p03', child)
+      s.exited = new Promise((resolve) => (s.allExited = resolve))
+      s.watch('p03', child)
+      child.emit('error', new Error('spawn /usr/bin/node EAGAIN'))
+      child.emit('close', -11, null)
+      expect(await within(s.untilExited(), 2000)).toBeUndefined()
+      expect(records.filter((r) => r.kind === 'process')).toEqual([])
+      expect(s.problems).toEqual(['process p03 spawn /usr/bin/node EAGAIN before its disconnect'])
+      expect(s.forced).toEqual([])
+    } finally {
+      remove()
+    }
+  })
+
+  test('a child that does not end after its kill is named and the teardown still ends', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      const child = fakeChild()
+      child.kill = jest.fn(() => {
+        throw new Error('EPERM')
+      })
+      s.children.set('p03', child)
+      s.watch('p03', child)
+      s.exited = new Promise((resolve) => (s.allExited = resolve))
+      s.teardownAllowanceMs = () => 30
+      expect(await within(s.untilExited(), 2000)).toBeUndefined()
+      expect(s.forced).toEqual(['p03'])
+      expect(s.problems).toEqual([
+        'process p03 did not exit within 30 ms of its disconnect; killed',
+        'process p03 could not be killed: EPERM',
+        'process p03 did not end 10000 ms after its kill',
+      ])
+      expect(s.incomplete).toBe('process p03 did not end')
+    } finally {
+      remove()
+    }
+  })
+
+  /** A child process run against a fake channel and runtime. */
+  const childProcess = ({ start = async () => {} } = {}) => {
+    const proc = new EventEmitter()
+    proc.connected = true
+    proc.sent = []
+    proc.send = (message) => proc.sent.push(message)
+    proc.disconnect = () => {
+      proc.connected = false
+      proc.emit('disconnect')
+    }
+    const runtimes = []
+    class Runtime {
+      constructor(options) {
+        Object.assign(this, options, { topicIds: new Map(), orphans: 0 })
+        this.channel = { pendingBytes: 0 }
+        runtimes.push(this)
+      }
+
+      start() {
+        return start()
+      }
+
+      async orphaned() {
+        this.orphans++
+      }
+
+      async handle({ id }) {
+        this.notify({ type: 'done', id, error: null, reply: null })
+      }
+    }
+    child({ child: 'p03', out: '/nonexistent' }, { proc, Runtime })
+    proc.emit('message', { type: 'init', config, matrix, originMs: 0, topicIds: [] })
+    return { proc, runtimes }
+  }
+
+  test('when the supervisor goes away, a handler waiting on a readback and records awaiting their acknowledgement are settled', async () => {
+    const { proc, runtimes } = childProcess()
+    await tick()
+    const [runtime] = runtimes
+    const readback = runtime.request({ type: 'readback', key: {} })
+    let refused = null
+    runtime.send({ type: 'record', record: { seq: 0 } }, (r) => (refused = r))
+    expect(proc.sent.map((m) => m.type)).toEqual(['readback', 'record'])
+    proc.disconnect()
+    expect(await within(readback, 2000)).toBeUndefined()
+    expect(refused).toBe(true)
+    await tick()
+    expect(runtime.orphans).toBe(1)
+    expect(await within(runtime.request({ type: 'readback' }), 2000)).toBeUndefined()
+    expect(proc.sent).toHaveLength(2)
+  })
+
+  test('a child whose runtime failed to start answers each command with the failure', async () => {
+    const { proc } = childProcess({ start: async () => Promise.reject(new Error('no broker')) })
+    proc.emit('message', { type: 'command', id: 4, step: { type: 'active', id: 'h00a' } })
+    await tick()
+    await tick()
+    expect(proc.sent).toEqual([
+      { type: 'done', id: 4, error: 'start failed: no broker', reply: null },
+    ])
   })
 
   test('the day does not start when any process failed to start, and the failure is recorded', async () => {
@@ -691,12 +811,13 @@ describe('final soak scheduled work', () => {
       const stages = []
       s.clock = clock
       s.createTopic = async () => stages.push('create') && IDS.A
+      s.ready = async () => {}
       s.deleteTopic = async () => stages.push('delete')
       s.seal = async () => stages.push('seal')
       s.send = async (slots, step) => {
         stages.push(step.type)
         if (step.type === 'probe') clock.t += 200000
-        return [{ reply: { offered: 10 } }]
+        return [{ reply: { offered: 10, acknowledged: 10 } }]
       }
       const step = {
         id: 'h00r0',
@@ -711,6 +832,163 @@ describe('final soak scheduled work', () => {
     } finally {
       remove()
     }
+  })
+
+  test("a topic execution drains its recipients to the topic's settled ends and fails before the delete when one falls short", async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      const stages = []
+      const topic = `${s.config.topics.regex}-h00r0`
+      s.createTopic = async () => stages.push('create') && IDS.A
+      s.ready = async () => {}
+      s.deleteTopic = async () => stages.push('delete')
+      s.seal = async () => stages.push('seal')
+      s.settledEnds = async (deadline, topics) => {
+        stages.push(`ends ${topics}`)
+        return { [`${topic}|0`]: '5', [`${topic}|1`]: '5' }
+      }
+      const drains = []
+      s.send = async (slots, step) => {
+        stages.push(step.type)
+        if (step.type === 'drain') drains.push(step.ends)
+        if (step.type === 'probe') return [{ reply: { offered: 10, acknowledged: 10 } }]
+        return slots.map((slot) => ({
+          reply: step.type === 'drain' ? { reached: slot !== 'p02' } : {},
+        }))
+      }
+      const step = { id: 'h00r0', type: 'execution', shape: 'regex-churn', deadline: 120000 }
+      await expect(s.churnTopic(step, ['p01', 'p02'])).rejects.toThrow(
+        `h00r0: p02 did not drain ${topic} to its end`
+      )
+      expect(drains).toEqual([{ [`${topic}|0`]: '5', [`${topic}|1`]: '5' }])
+      expect(stages).not.toContain('seal')
+      expect(stages).not.toContain('delete')
+    } finally {
+      remove()
+    }
+  })
+
+  /**
+   * A topic execution whose admin, metadata and children are scripted. `probe` is the probe reply,
+   * `replies` maps a stage type to each participant's reply, `admin` overrides admin calls (or is
+   * a function of the recreated topic's name that returns them).
+   */
+  const topicExecution = async ({
+    shape = 'topic-recreation',
+    probe,
+    replies = {},
+    admin = {},
+  }) => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      s.runtime = { ...s.runtime, topicIds: new Map() }
+      const topic = s.config.topics.recreate[0]
+      s.topicIds = [[topic, IDS.A]]
+      const stages = []
+      s.rig = { id: 'p15.1' }
+      s.readback = async () => {}
+      s.publish = async (name, id) => stages.push(`publish ${id}`)
+      s.unpublish = async () => stages.push('unpublish')
+      s.seal = async () => stages.push('seal')
+      s.settledEnds = async () => ({})
+      s.admin = {
+        createTopics: async () => true,
+        deleteTopics: async () => {},
+        listTopics: async () => [],
+        fetchTopicMetadata: async () => ({
+          topics: [
+            {
+              topicId: IDS.B,
+              partitions: [0, 1].map((partitionId) => ({ partitionId, leader: 1, isr: [1, 2] })),
+            },
+          ],
+        }),
+        ...(typeof admin === 'function' ? admin(topic) : admin),
+      }
+      s.send = async (slots, step) => {
+        stages.push(step.type)
+        if (step.type === 'probe') return [{ reply: probe ?? { offered: 10, acknowledged: 10 } }]
+        return slots.map((_, i) => ({ reply: replies[step.type]?.[i] ?? {} }))
+      }
+      const step = { id: 'h00x0', type: 'execution', shape, topic: 0, deadline: 120000 }
+      const error = await s.churnTopic(step, ['p01', 'p02']).then(
+        () => null,
+        (e) => e.message
+      )
+      return { error: error?.replace(s.config.runId, RUN) ?? null, stages }
+    } finally {
+      remove()
+    }
+  }
+
+  test('a recreation creates the new incarnation, waits until every recipient is assigned it, then probes it', async () => {
+    const { error, stages } = await topicExecution({})
+    expect(error).toBeNull()
+    expect(stages).toEqual([
+      'probe',
+      'drain',
+      'seal',
+      'execution',
+      `publish ${IDS.B}`,
+      'recreated',
+      'probe',
+    ])
+  })
+
+  test('a recreation whose creation gives back the old topic id fails before anything is offered to it', async () => {
+    const same = {
+      fetchTopicMetadata: async () => ({ topics: [{ topicId: IDS.A, partitions: [] }] }),
+    }
+    const { error, stages } = await topicExecution({ admin: same })
+    expect(error).toBe(`creating ${config.topics.recreate[0]} gave its old topic id (error code 0)`)
+    expect(stages.filter((st) => st === 'probe')).toHaveLength(1)
+  })
+
+  test('a deletion the broker refuses or never confirms fails the execution before the name is created again', async () => {
+    const refused = await topicExecution({
+      admin: {
+        deleteTopics: async () => Promise.reject(Object.assign(new Error('no'), { code: 41 })),
+      },
+    })
+    expect(refused.error).toBe(`deleting ${config.topics.recreate[0]} failed (error code 41)`)
+    expect(refused.stages).not.toContain(`publish ${IDS.B}`)
+    const listed = await topicExecution({
+      admin: (topic) => ({ listTopics: async () => [topic] }),
+    })
+    expect(listed.error).toBe(`deleting ${config.topics.recreate[0]} left it listed (error code 0)`)
+  })
+
+  test.each([
+    ['ten unacknowledged offers', { offered: 10, acknowledged: 0, stopped: false }, '0 of 10'],
+    ['one fast failed send', { offered: 10, acknowledged: 9, stopped: false }, '9 of 10'],
+  ])('a probe with %s fails its execution', async (_, probe, count) => {
+    const { error, stages } = await topicExecution({ probe })
+    expect(error).toBe(
+      `h00x0: ${count} probe offers to ${config.topics.recreate[0]} were acknowledged`
+    )
+    expect(stages).toEqual(['probe'])
+  })
+
+  test('a recipient that is not assigned the new incarnation fails the recreation before the probe', async () => {
+    const { error, stages } = await topicExecution({
+      replies: { recreated: [{ assigned: true }, { assigned: false }] },
+    })
+    expect(error).toBe('h00x0: recreated failed in p02')
+    expect(stages.at(-1)).toBe('recreated')
+  })
+
+  test('a regex execution whose recipient never accepts the new topic fails before the probe, and a deleted name is forgotten', async () => {
+    const refused = await topicExecution({
+      shape: 'regex-churn',
+      replies: { execution: [{ accepted: false }, { accepted: true }] },
+    })
+    expect(refused.error).toBe('h00x0: accept failed in p01')
+    expect(refused.stages).not.toContain('probe')
+    const done = await topicExecution({ shape: 'regex-churn' })
+    expect(done.error).toBeNull()
+    expect(done.stages.slice(-2)).toEqual(['retired', 'unpublish'])
   })
 
   test('a membership wave works to its scheduled deadline, not to a deadline counted from a late start', async () => {
@@ -926,146 +1204,534 @@ describe('final soak scheduled work', () => {
   })
 })
 
-describe('final soak final drain', () => {
-  const main = config.topics.main
-  const key = `${main}|0`
-
-  /** A consumer worker with one running member that holds main partition 0, and a scripted commit. */
-  const consumer = (commitOffsets = jest.fn(async () => {})) => {
-    const group = { acquired: new Map([[key, { acquiredAt: 7 }]]) }
-    const runtime = workerRuntime('c01', new MonotonicClock(), {
-      mine: () => [group],
-      currentAuthority: (g, k) => ({ run: 'now', acquiredAt: g.acquired.get(k).acquiredAt }),
-      topicIdOf: () => IDS.A,
+describe('final soak work admission and quiet samples', () => {
+  test('a work step still running past its grace is reported failed then, and stays in flight until it settles', async () => {
+    const clock = jumpClock(0)
+    let release = null
+    const outcomes = []
+    const scheduler = new Scheduler({
+      clock,
+      graceMs: 500,
+      perform: () => new Promise((resolve) => (release = resolve)),
+      onOutcome: (o) => outcomes.push(o),
     })
-    const worker = new ConsumerWorker(runtime)
-    const rig = {
-      id: 'c01.1',
-      slot: config.clients[0],
-      object: { commitOffsets },
-      processed: new Map(),
-      uncommitted: new Map(),
-      committed: new Map(),
-      authority: new Map([
-        [key, { key: { topic: main, topicId: IDS.A, partition: 0 }, authority: { run: 'r' } }],
-      ]),
-      call: async (event, work) => work(),
+    await scheduler.run([{ id: 'h00r0', lane: 'work', type: 'execution', at: 0, deadline: 1000 }])
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        id: 'h00r0',
+        outcome: 'error',
+        error: 'h00r0 still runs 500 ms after its deadline',
+      }),
+    ])
+    expect(scheduler.quiescent()).toBe(false)
+    release()
+    await tick()
+    expect(scheduler.quiescent()).toBe(true)
+  })
+
+  test('a work step due while a quiet sample runs starts only once the sample settled', async () => {
+    const clock = jumpClock(0)
+    const order = []
+    let release = null
+    const scheduler = new Scheduler({
+      clock,
+      perform: async (step) => {
+        order.push(`${step.id} start`)
+        if (step.type === 'quiet') await new Promise((resolve) => (release = resolve))
+        order.push(`${step.id} end`)
+      },
+    })
+    const running = scheduler.run([
+      { id: 'h00q2', lane: 'timer', type: 'quiet', at: 0, deadline: 100 },
+      { id: 'disconnect', lane: 'work', type: 'disconnect', at: 10 },
+    ])
+    await tick()
+    await tick()
+    expect(order).toEqual(['h00q2 start'])
+    release()
+    await running
+    expect(order).toEqual(['h00q2 start', 'h00q2 end', 'disconnect start', 'disconnect end'])
+  })
+
+  test('an idle window ends only after the quiet sample running in it settled', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      s.runEndAt = 1000
+      let settle = null
+      const quiet = new Promise((resolve) => (settle = resolve))
+      s.scheduler = new Scheduler({ clock: s.clock, perform: async () => {} })
+      s.scheduler.quieting.add(quiet)
+      quiet.then(() => s.scheduler.quieting.delete(quiet))
+      const sent = []
+      s.send = async (slots, step) => sent.push([step.type, s.quiesced])
+      s.shape = async () => null
+      const idle = s.perform({ id: 'h00i', type: 'idle', shape: 'idle', until: 500 })
+      await tick()
+      await tick()
+      expect(s.quiesced).toBe('h00i')
+      settle()
+      await idle
+      expect(sent).toEqual([
+        ['idle', null],
+        ['active', null],
+      ])
+      expect(s.quiesced).toBeNull()
+    } finally {
+      remove()
     }
-    worker.standing.push(rig)
-    return { worker, rig, commitOffsets, runtime, group }
+  })
+
+  /** A supervisor whose sampling is scripted; returns what each quiet step did. */
+  const quiet = async ({ quiesced = 'h00i', inflight = [], aborted = null, during = () => {} }) => {
+    const { s, remove } = supervisor()
+    try {
+      s.scheduler = { inflight: new Set(inflight) }
+      s.quiesced = quiesced
+      s.aborted = aborted
+      const sampled = []
+      s.sampleAll = async (slots, step) => {
+        sampled.push(step.id)
+        during(s)
+      }
+      const step = { id: 'h00q0', type: 'quiet', boundary: 'h00', reading: 0 }
+      const error = await s.perform(step).then(
+        () => null,
+        (e) => e.message
+      )
+      return { error, sampled }
+    } finally {
+      remove()
+    }
   }
-  const commitsOf = (runtime) =>
-    runtime.records.filter((r) => r.stage === 'commit' && r.phase === 'end')
-  const batchEnd = (worker, rig, lastOffset, batchSize = 0) =>
-    worker.onBatchEnd(rig, { topic: main, partition: 0, batchSize, lastOffset })
 
-  test('the drain waits until the member has resolved the log end, then commits that offset through the member', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    rig.processed.set(key, '248')
-    setTimeout(() => batchEnd(worker, rig, '251'), 80)
-    const reply = await worker.onDrain({ ends: { [key]: '252' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '252' }])
-  })
-
-  test('a trailing aborted suffix and commit marker are resolved by filtered batches and committed', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    rig.processed.set(key, '250')
-    batchEnd(worker, rig, '258')
-    batchEnd(worker, rig, '259')
-    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledTimes(1)
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '260' }])
-  })
-
-  test('an intermediate drain commits a key whose acquisition was retained across a membership round, under the current authority', async () => {
-    const { worker, rig, commitOffsets, runtime } = consumer()
-    const then = { run: 'c01.1.r1', token: 10, acquiredAt: 7, recreatedAt: 0 }
-    rig.authority.get(key).authority = then
-    runtime.observer.currentAuthority = () => ({ ...then, token: 11 })
-    rig.processed.set(key, '62')
-    expect(await worker.onDrain()).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '62' }])
-    expect(commitsOf(runtime)[0].authority).toEqual({ ...then, token: 11 })
+  test('a quiet sample in an idle window with no work running is taken', async () => {
+    expect(await quiet({})).toEqual({ error: null, sampled: ['h00q0'] })
   })
 
   test.each([
     [
-      'the key was acquired again',
-      { acquiredAt: 8 },
-      'the key was acquired again since its last handler',
+      'an admin or docker operation of an earlier step is still in flight',
+      { inflight: ['h00o0'] },
+      'h00q0 is not a quiet sample: h00o0 is still running',
     ],
     [
-      'the topic was recreated',
-      { recreatedAt: 3 },
-      'the key was acquired again since its last handler',
+      'the processes have not confirmed the idle window',
+      { quiesced: null },
+      'h00q0 is not a quiet sample: the processes have not confirmed idle',
     ],
     [
-      'the client run changed',
-      { run: 'c01.1.r2' },
-      'the client run changed since its last handler',
+      'a timed-out command aborted the run',
+      { aborted: 'process p03 did not answer' },
+      'h00q0 is not a quiet sample: the run is aborted',
     ],
-  ])(
-    'an intermediate drain skips a key when %s and journals the expected skip with its reason',
-    async (_, change, reason) => {
-      const { worker, rig, commitOffsets, runtime } = consumer()
-      const then = { run: 'c01.1.r1', token: 10, acquiredAt: 7, recreatedAt: 0 }
-      rig.authority.get(key).authority = then
-      runtime.observer.currentAuthority = () => ({ ...then, ...change })
-      rig.processed.set(key, '62')
-      expect(await worker.onDrain()).toEqual({ reached: true })
-      expect(commitOffsets).not.toHaveBeenCalled()
-      expect(runtime.records).toContainEqual({
-        kind: 'diagnostic',
-        message: `expected skip: drain commit of ${key} by c01.1: ${reason}; its current owner's progress covers it`,
-      })
-    }
-  )
-
-  test('a batch that carried messages does not move the resolved offset beyond what its handler resolved', () => {
-    const { worker, rig } = consumer()
-    rig.processed.set(key, '100')
-    batchEnd(worker, rig, '149', 50)
-    expect(rig.processed.get(key)).toBe('100')
+  ])('a quiet sample is refused when %s', async (_, state, message) => {
+    expect(await quiet(state)).toEqual({ error: message, sampled: [] })
   })
 
-  test('a failed commit at the threshold leaves the offsets owed, and the drain commits them again', async () => {
-    const commitOffsets = jest
-      .fn()
-      .mockRejectedValueOnce(
-        Object.assign(new Error('refused'), { name: 'KafkaJSNumberOfRetriesExceeded' })
-      )
-      .mockResolvedValue(undefined)
-    const { worker, rig } = consumer(commitOffsets)
-    rig.processed.set(key, '100')
-    rig.uncommitted.set(key, 100)
-    await worker.commit(rig, key)
-    expect(rig.uncommitted.get(key)).toBe(100)
-    expect(rig.committed.get(key)).toBeUndefined()
-    const reply = await worker.onDrain({ ends: { [key]: '100' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledTimes(2)
-    expect(rig.committed.get(key)).toBe('100')
-  })
-
-  test('a member that never reaches the end by the deadline reports the drain unreached', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    rig.processed.set(key, '90')
-    const reply = await worker.onDrain({
-      ends: { [key]: '100' },
-      deadline: worker.runtime.clock.now() + 40,
+  test('a quiet sample during which a work step began is refused after it was taken', async () => {
+    const result = await quiet({ during: (s) => s.scheduler.inflight.add('h00d') })
+    expect(result).toEqual({
+      error: 'h00q0 is not a quiet sample: h00d is still running',
+      sampled: ['h00q0'],
     })
-    expect(reply).toEqual({ reached: false })
-    expect(commitOffsets).not.toHaveBeenCalled()
   })
 
-  test('the final commit goes through the member that holds the key now, under its current authority, when only filtered batches resolved the key', async () => {
-    const { worker, rig, commitOffsets, runtime } = consumer()
-    rig.authority.clear()
-    batchEnd(worker, rig, '259')
+  test('a docker command that does not end in time is killed and fails', async () => {
+    const { s, remove } = supervisor()
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-docker-'))
+    const PATH = process.env.PATH
+    try {
+      fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 })
+      process.env.PATH = `${bin}:${PATH}`
+      s.dockerMs = 200
+      const started = Date.now()
+      await expect(s.docker(['compose', 'stop', 'kafka1'])).rejects.toMatchObject({
+        killed: true,
+        signal: 'SIGKILL',
+      })
+      expect(Date.now() - started).toBeLessThan(5000)
+    } finally {
+      process.env.PATH = PATH
+      fs.rmSync(bin, { recursive: true, force: true })
+      remove()
+    }
+  })
+
+  test('a membership execution starts no wave after a failed one, and no wave before its planned time', async () => {
+    const { s, remove } = supervisor()
+    try {
+      const clock = jumpClock(0)
+      s.clock = clock
+      const starts = []
+      s.waves = new Map([
+        [
+          'h00m0',
+          [
+            { id: 'h00m0w0', at: 0, deadline: 90000 },
+            { id: 'h00m0w1', at: 90000, deadline: 180000 },
+            { id: 'h00m0w2', at: 180000, deadline: 270000 },
+          ],
+        ],
+      ])
+      s.shape = async (wave, phase) => phase === 'start' && starts.push([wave.id, clock.t])
+      s.sampleAll = async () => {}
+      let leaves = 0
+      s.send = async (slots, step) =>
+        step.phase === 'leave'
+          ? [{ reply: { transfers: ++leaves === 2 ? 0 : 1, returned: true } }]
+          : []
+      await expect(s.churnMembers({ id: 'h00m0' }, ['p01'])).rejects.toThrow(/h00m0w1/)
+      expect(starts).toEqual([
+        ['h00m0w0', 0],
+        ['h00m0w1', 90000],
+      ])
+    } finally {
+      remove()
+    }
+  })
+})
+
+describe('final soak retained harness state', () => {
+  /** The per-client and per-incarnation state of one consumer process, without its clients. */
+  const retaining = () => {
+    const runtime = workerRuntime('c01')
+    const worker = new ConsumerWorker(runtime)
+    const forgotten = []
+    const child = {
+      observer: { forget: (client) => forgotten.push(client) },
+      lifetimes: new Map(),
+      revisions: new Map(),
+      topicIds: new Map(),
+      worker,
+    }
+    return { runtime, worker, child, forgotten }
+  }
+  const forget = (child, client) => ChildRuntime.prototype.forget.call(child, client)
+  const setTopicId = (child, topic, id) => ChildRuntime.prototype.setTopicId.call(child, topic, id)
+
+  test("a retired client's subscription lifetimes, revision, exchanges and boundaries are dropped", () => {
+    const { worker, child, forgotten } = retaining()
+    child.lifetimes.set('c01.2/main', 'r/A').set('c01.20/main', 'r/A')
+    child.revisions.set('c01.2', 3).set('c01.20', 1)
+    worker.lastBoundary.set(`c01.2/${IDS.A}/0`, 'x').set(`c01.20/${IDS.A}/0`, 'y')
+    forget(child, 'c01.2')
+    expect([...child.lifetimes.keys()]).toEqual(['c01.20/main'])
+    expect([...child.revisions.keys()]).toEqual(['c01.20'])
+    expect([...worker.lastBoundary.keys()]).toEqual([`c01.20/${IDS.A}/0`])
+    expect(forgotten).toEqual(['c01.2'])
+  })
+
+  test('a replaced or deleted incarnation drops its progress, boundaries and owed counts, and keeps the others', () => {
+    const { worker, child } = retaining()
+    const rig = {
+      id: 'c01.1',
+      uncommitted: new Map([
+        [`${IDS.A}|0`, 4],
+        [`${IDS.B}|0`, 2],
+      ]),
+    }
+    worker.standing.push(rig)
+    worker.progress.set(`g/${IDS.A}/0`, {}).set(`g/${IDS.B}/0`, {})
+    worker.lastBoundary.set(`c01.1/${IDS.A}/0`, 'x')
+    setTopicId(child, 'r', IDS.A)
+    setTopicId(child, 'r', IDS.C)
+    expect([...worker.progress.keys()]).toEqual([`g/${IDS.B}/0`])
+    expect(worker.lastBoundary.size).toBe(0)
+    expect([...rig.uncommitted.keys()]).toEqual([`${IDS.B}|0`])
+    setTopicId(child, 'r', null)
+    expect(child.topicIds.has('r')).toBe(false)
+  })
+
+  test("a share member forgets a retired incarnation's delivered offsets", () => {
+    const share = new ShareWorker(workerRuntime('c07'))
+    share.delivered(`${IDS.A}|0`, '0')
+    share.delivered(`${IDS.B}|0`, '0')
+    share.forgetTopic(IDS.A)
+    expect([...share.entered.keys()]).toEqual([`${IDS.B}|0`])
+  })
+
+  test("a day's membership waves and regex topics leave the retained state at the live set", () => {
+    const { worker, child } = retaining()
+    const rig = { id: 'c01.1', uncommitted: new Map() }
+    worker.standing.push(rig)
+    for (let wave = 0; wave < 288; wave++) {
+      const extra = `c01.${wave + 2}`
+      child.lifetimes.set(`${extra}/main`, 'r/A')
+      child.revisions.set(extra, 1)
+      worker.lastBoundary.set(`${extra}/${IDS.A}/0`, 'x')
+      forget(child, extra)
+    }
+    for (let n = 0; n < 96; n++) {
+      const id = `R${String(n).padStart(21, '0')}`
+      setTopicId(child, `regex-${n}`, id)
+      worker.progress.set(`g/${id}/0`, {})
+      worker.lastBoundary.set(`c01.1/${id}/1`, 'x')
+      rig.uncommitted.set(`${id}|0`, 1)
+      setTopicId(child, `regex-${n}`, null)
+    }
+    expect([child.lifetimes.size, child.revisions.size, child.topicIds.size]).toEqual([0, 0, 0])
+    expect([worker.progress.size, worker.lastBoundary.size, rig.uncommitted.size]).toEqual([
+      0, 0, 0,
+    ])
+  })
+
+  /** A reader whose raw broker answers `fetches` fetches of one record each. */
+  const reader = (fetches, dir) => {
+    fs.mkdirSync(path.join(dir, 'raw'))
+    const runtime = { ...workerRuntime('c21'), out: dir }
+    const worker = new ReaderWorker(runtime)
+    worker.standing.push({ id: 'p14.1' })
+    worker.leaderOf = async () => ({ leader: { host: 'h', port: 1 } })
+    let position = 0
+    worker.openBroker = async (address, onExchange) => {
+      const exchange = (apiKey) =>
+        onExchange({
+          apiKey,
+          request: Buffer.from([apiKey]),
+          response: Buffer.from('x'.repeat(64)),
+        })
+      return {
+        disconnect: async () => {},
+        listOffsets: async () => {
+          exchange(2)
+          return { responses: [{ partitions: [{ offset: String(fetches) }] }] }
+        },
+        fetch: async () => {
+          exchange(1)
+          const offset = String(position++)
+          return {
+            responses: [
+              {
+                partitions: [
+                  {
+                    messages: [
+                      {
+                        offset,
+                        key: null,
+                        value: Buffer.from(`${RUN}|c08.${offset}||`),
+                        headers: {},
+                        batchContext: { isControlBatch: false, inTransaction: false },
+                      },
+                    ],
+                    abortedTransactions: [],
+                  },
+                ],
+              },
+            ],
+          }
+        },
+      }
+    }
+    return { runtime, worker }
+  }
+  const scanStep = { id: 's', topic: config.topics.main, topicId: IDS.A, partition: 0, from: '0' }
+
+  test('a scan over a long missed interval journals each fetch as it arrives and digests the raw file without reading it back', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-scan-'))
+    try {
+      const { runtime, worker } = reader(500, dir)
+      const read = jest.spyOn(fs, 'readFileSync')
+      const reply = await worker.onScan(scanStep)
+      expect(read.mock.calls.filter(([f]) => String(f).includes('raw'))).toEqual([])
+      expect(reply.to).toBe('500')
+      expect(runtime.records.filter((r) => r.stage === 'log')).toHaveLength(500)
+      const [scan] = runtime.records.filter((r) => r.kind === 'scan')
+      const bytes = fs.readFileSync(path.join(dir, scan.rawFile))
+      expect(scan).toMatchObject({ records: 500, rawSha256: sha256(bytes) })
+      expect(worker.rawBytes).toBe(bytes.length)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a scan that would pass the raw byte budget of all scans fails', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-scan-'))
+    try {
+      const { runtime, worker } = reader(5, dir)
+      worker.rawBytes = 8 * 1024 ** 3 - 400
+      await expect(worker.onScan(scanStep)).rejects.toThrow(/raw scan budget of 8589934592 bytes/)
+      expect(runtime.records.filter((r) => r.kind === 'scan')).toEqual([])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('raw share wire files stop at their byte budget, count what they dropped and report it once', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-wire-'))
+    try {
+      const full = []
+      const wire = new WireLog({
+        dir,
+        prefix: 'p05.share',
+        budget: 300,
+        onFull: (m) => full.push(m),
+      })
+      const exchange = { apiKey: 78, request: Buffer.alloc(40), response: Buffer.alloc(40) }
+      const written = [1, 2, 3, 4].map(() => wire.append(exchange))
+      expect(written.map((w) => w !== null)).toEqual([true, false, false, false])
+      expect(wire.dropped).toBe(3)
+      expect(full).toEqual(['raw wire budget of 300 bytes reached'])
+      expect(fs.statSync(path.join(dir, 'raw/p05.share.0.ndjson')).size).toBeLessThanOrEqual(300)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a share exchange past the wire budget is journaled as missing its wire, never as a record citing no file', () => {
+    const records = []
+    const runtime = {
+      nextId: () => 'p07.0',
+      emit: (r) => records.push(r),
+      diagnose: (message) => records.push({ kind: 'diagnostic', message }),
+      slotOf: () => ({ group: 'g' }),
+    }
+    const event = {
+      type: 'share-acquire',
+      acquisition: 'c07.1.a1',
+      client: 'c07.1',
+      key: { topic: config.topics.main, topicId: IDS.A, partition: 0 },
+      acquired: [{ from: '0', to: '0', deliveryCount: 1 }],
+      wire: { file: null, sha256: null },
+    }
+    ChildRuntime.prototype.observed.call(runtime, event)
+    expect(records).toEqual([
+      { kind: 'diagnostic', message: 'missing-source share wire for c07.1.a1' },
+    ])
+  })
+
+  test('the telemetry decoder reads a large reporter suffix in bounded polls', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-decoder-'))
+    const sink = path.join(dir, 'sink')
+    fs.mkdirSync(sink)
+    try {
+      const runtime = {
+        out: dir,
+        slotOf: () => undefined,
+        nextId: () => 'p16.0',
+        emit: async () => true,
+        diagnose: async () => true,
+      }
+      const decoder = new DecoderWorker(runtime)
+      decoder.dir = sink
+      fs.writeFileSync(path.join(sink, 'reporter-1.json'), JSON.stringify({ loadedAtMs: 100 }))
+      const line = (seq) =>
+        JSON.stringify({ node: '1', seq, clientId: 'x', parse: 'ok', pad: 'p'.repeat(1000) }) + '\n'
+      const lines = Array.from({ length: 9000 }, (_, i) => line(i + 1)).join('')
+      fs.writeFileSync(path.join(sink, 'exports-1.jsonl'), lines)
+      const alloc = jest.spyOn(Buffer, 'alloc')
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(Math.max(...alloc.mock.calls.map(([n]) => n))).toBeLessThanOrEqual(8 * 1024 * 1024)
+      expect(decoder.offsets.get('exports-1.jsonl')).toBeLessThan(lines.length)
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(decoder.offsets.get('exports-1.jsonl')).toBe(lines.length)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('final soak final drain', () => {
+  const main = config.topics.main
+  const key = `${main}|0`
+
+  /**
+   * A consumer worker with one running member that holds main partition 0 of the run's current
+   * incarnation. Its public `position()` answers `state.position`, `commitOffsets` stores the offset
+   * the group's `committed()` then reads back, and `state.held` says whether it holds the partition.
+   */
+  const consumer = (commitOffsets = null) => {
+    const group = { acquired: new Map([[key, { acquiredAt: 7 }]]) }
+    const state = { position: '0', committed: null, held: true, groupTopicId: IDS.A }
+    const runtime = workerRuntime('c01', new MonotonicClock(), {
+      mine: () => [group],
+      currentAuthority: (g, k) => ({ run: 'now', acquiredAt: g.acquired.get(k)?.acquiredAt }),
+      topicIdOf: () => state.groupTopicId,
+      batchAuthority: () => ({ client: 'c01.1', run: 'r1', token: 1, acquiredAt: 7 }),
+    })
+    const worker = new ConsumerWorker(runtime)
+    const store = jest.fn(async ([{ offset }]) => {
+      state.committed = offset
+    })
+    const rig = {
+      id: 'c01.1',
+      slot: config.clients[0],
+      object: {
+        commitOffsets: commitOffsets
+          ? jest.fn(async (entries) => {
+              await commitOffsets(entries)
+              await store(entries)
+            })
+          : store,
+        assignment: () => (state.held ? [{ topic: main, partitions: [0] }] : []),
+        position: jest.fn(async () => state.position),
+        committed: jest.fn(async ([{ topic, partition }]) => [
+          { topic, partition, offset: state.committed, metadata: null },
+        ]),
+      },
+      uncommitted: new Map(),
+      call: async (event, work) => work(),
+    }
+    worker.standing.push(rig)
+    return { worker, rig, commitOffsets: rig.object.commitOffsets, runtime, group, state }
+  }
+  const commitsOf = (runtime) =>
+    runtime.records.filter((r) => r.stage === 'commit' && r.phase === 'end')
+  const message = (offset) => ({ offset: String(offset), key: null, value: null, headers: {} })
+
+  test("the drain waits until the member's live position reaches the log end, then commits that position through the member and reads it back", async () => {
+    const { worker, rig, commitOffsets, state } = consumer()
+    state.position = '248'
+    setTimeout(() => (state.position = '252'), 80)
+    const reply = await worker.onDrain({ ends: { [key]: '252' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
+    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '252' }])
+    expect(rig.object.committed).toHaveBeenCalledWith([{ topic: main, partition: 0 }])
+  })
+
+  test("a drain commits the current acquisition's live position, never the offset an earlier acquisition's handler resolved", async () => {
+    const { worker, rig, commitOffsets, runtime, group, state } = consumer()
+    await worker.handle(rig, { topic: main, partition: 0, message: message(41) })
+    group.acquired.set(key, { acquiredAt: 8 })
+    state.position = '30'
+    const behind = await worker.onDrain({
+      ends: { [key]: '42' },
+      deadline: runtime.clock.now() + 120,
+    })
+    expect(behind).toEqual({ reached: false, confirmed: 0 })
+    expect(commitOffsets).not.toHaveBeenCalled()
+    state.position = '42'
+    const caught = await worker.onDrain({ ends: { [key]: '42' }, deadline: Infinity })
+    expect(caught).toEqual({ reached: true, confirmed: 1 })
+    expect(commitsOf(runtime)).toEqual([
+      expect.objectContaining({ next: '42', authority: { run: 'now', acquiredAt: 8 } }),
+    ])
+  })
+
+  test('a drain commits nothing while the group still reads an earlier incarnation of the same name', async () => {
+    const { worker, commitOffsets, runtime, state } = consumer()
+    runtime.topicIds.set(main, IDS.B)
+    state.position = '260'
+    state.committed = '260'
+    const stale = await worker.onDrain({
+      ends: { [key]: '260' },
+      deadline: runtime.clock.now() + 120,
+    })
+    expect(stale).toEqual({ reached: false, confirmed: 0 })
+    expect(commitOffsets).not.toHaveBeenCalled()
+    state.groupTopicId = IDS.B
+    state.committed = null
+    const fresh = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(fresh).toEqual({ reached: true, confirmed: 1 })
+    expect(commitsOf(runtime)[0].key).toEqual({ topic: main, topicId: IDS.B, partition: 0 })
+  })
+
+  test('a tail the client resolved with only control or aborted records is committed from the live position without any handler', async () => {
+    const { worker, commitOffsets, runtime, state } = consumer()
+    state.position = '260'
     const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '260' }])
     expect(commitsOf(runtime)).toEqual([
       expect.objectContaining({
@@ -1077,14 +1743,45 @@ describe('final soak final drain', () => {
     ])
   })
 
+  test('a position read while the member lost and regained the partition is not committed, and the drain commits the new acquisition once it is stable', async () => {
+    const { worker, rig, commitOffsets, runtime, group, state } = consumer()
+    state.position = '260'
+    let reads = 0
+    rig.object.position.mockImplementation(async () => {
+      if (++reads === 1) group.acquired.set(key, { acquiredAt: 9 })
+      return state.position
+    })
+    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
+    expect(commitsOf(runtime)[0].authority).toEqual({ run: 'now', acquiredAt: 9 })
+  })
+
+  test('a commit whose readback does not return its offset is not confirmed, and the drain stays unreached', async () => {
+    const { worker, rig, runtime, state } = consumer()
+    state.position = '260'
+    rig.object.committed.mockResolvedValue([
+      { topic: main, partition: 0, offset: '200', metadata: null },
+    ])
+    const reply = await worker.onDrain({
+      ends: { [key]: '260' },
+      deadline: runtime.clock.now() + 120,
+    })
+    expect(reply).toEqual({ reached: false, confirmed: 0 })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `drain: ${key} not committed to 260`,
+    })
+  })
+
   test('the final commit waits until the member holds the key again', async () => {
     const held = []
-    const { worker, rig, group } = consumer(jest.fn(async () => held.push(group.acquired.has(key))))
-    rig.processed.set(key, '260')
-    group.acquired.clear()
-    setTimeout(() => group.acquired.set(key, { acquiredAt: 8 }), 80)
+    const { worker, state } = consumer(async () => held.push(state.held))
+    state.position = '260'
+    state.held = false
+    setTimeout(() => (state.held = true), 80)
     const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(held).toEqual([true])
   })
 
@@ -1093,48 +1790,89 @@ describe('final soak final drain', () => {
       Object.assign(new Error('rebalancing'), { name: 'KafkaJSCommitFailedError' })
     const once = jest.fn().mockRejectedValueOnce(refused()).mockResolvedValue(undefined)
     const retried = consumer(once)
-    retried.rig.processed.set(key, '260')
+    retried.state.position = '260'
     const reply = await retried.worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(once).toHaveBeenCalledTimes(2)
     const never = consumer(jest.fn(async () => Promise.reject(refused())))
-    never.rig.processed.set(key, '260')
+    never.state.position = '260'
     const failed = await never.worker.onDrain({
       ends: { [key]: '260' },
       deadline: never.worker.runtime.clock.now() + 200,
     })
-    expect(failed).toEqual({ reached: false })
+    expect(failed).toEqual({ reached: false, confirmed: 0 })
   })
 
-  test('a key the group already committed to the log end through another member of the process needs no new commit', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    const extra = { ...rig, id: 'c01.2', processed: new Map([[key, '260']]) }
-    extra.committed = new Map()
-    extra.uncommitted = new Map()
-    await worker.commit(extra, key)
-    expect(commitOffsets).toHaveBeenCalledTimes(1)
-    rig.processed.set(key, '200')
+  test('a key whose group readback already shows the log end for the current incarnation needs no new commit', async () => {
+    const { worker, commitOffsets, state } = consumer()
+    state.committed = '260'
+    state.position = '200'
     const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledTimes(1)
+    expect(reply).toEqual({ reached: true, confirmed: 0 })
+    expect(commitOffsets).not.toHaveBeenCalled()
   })
 
   test('a member is not asked to reach a log it does not read', async () => {
-    const { worker, rig, commitOffsets } = consumer()
+    const { worker, commitOffsets, rig } = consumer()
     worker.seeded = true
     const txn = `${config.topics.transactions}|0`
     const reply = await worker.onDrain({ ends: { [txn]: '50' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 0 })
     expect(commitOffsets).not.toHaveBeenCalled()
-    expect(rig.processed.size).toBe(0)
+    expect(rig.object.position).not.toHaveBeenCalled()
+  })
+
+  test('a drain without ends commits and reads back the live position of every held partition, and leaves a partition the member lost to its new owner', async () => {
+    const { worker, rig, commitOffsets, state } = consumer()
+    state.position = '62'
+    expect(await worker.onDrain()).toEqual({ reached: true, confirmed: 1 })
+    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '62' }])
+    rig.object.position.mockImplementation(async () => {
+      state.held = false
+      return '70'
+    })
+    expect(await worker.onDrain()).toEqual({ reached: true, confirmed: 0 })
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
+  })
+
+  test('a failed commit at the threshold leaves the offsets owed, and a successful one settles them', async () => {
+    const commitOffsets = jest
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('refused'), { name: 'KafkaJSNumberOfRetriesExceeded' })
+      )
+      .mockResolvedValue(undefined)
+    const { worker, rig } = consumer(commitOffsets)
+    const captured = {
+      key: { topic: main, topicId: IDS.A, partition: 0 },
+      authority: { run: 'r1' },
+    }
+    rig.uncommitted.set(`${IDS.A}|0`, 100)
+    expect(await worker.commit(rig, captured, '100')).toBe('unknown')
+    expect(rig.uncommitted.get(`${IDS.A}|0`)).toBe(100)
+    expect(await worker.commit(rig, captured, '100')).toBe('ok')
+    expect(rig.uncommitted.has(`${IDS.A}|0`)).toBe(false)
+  })
+
+  test('the recovery witness needs a handler after the recovery and a drain commit that was read back', async () => {
+    const { worker, rig, runtime, state } = consumer()
+    state.position = '5'
+    setTimeout(() => worker.handle(rig, { topic: main, partition: 0, message: message(4) }), 40)
+    expect(await worker.onRecovered({})).toEqual({ ok: true })
+    rig.object.committed.mockResolvedValue([
+      { topic: main, partition: 0, offset: null, metadata: null },
+    ])
+    runtime.clock = jumpClock(0)
+    setTimeout(() => worker.handle(rig, { topic: main, partition: 0, message: message(5) }), 10)
+    expect(await worker.onRecovered({})).toEqual({ ok: false })
   })
 
   test('a share member waits until every offset below the log end had a handler entry and the deliveries go quiet', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
     worker.standing.push({ id: 'c07.1', slot: config.clients.find((c) => c.slot === 'c07') })
-    for (let offset = 0; offset < 99; offset++) worker.delivered(`${main}|0`, String(offset))
-    setTimeout(() => worker.delivered(`${main}|0`, '99'), 60)
+    for (let offset = 0; offset < 99; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
+    setTimeout(() => worker.delivered(`${IDS.A}|0`, '99'), 60)
     const reply = await worker.onDrain({
       ends: { [key]: '100' },
       deadline: runtime.clock.now() + 5000,
@@ -1152,22 +1890,22 @@ describe('final soak final drain', () => {
   test('a share drain fails on a missing early offset even when the last offset was delivered', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
-    for (let offset = 60; offset < 100; offset++) worker.delivered(`${main}|0`, String(offset))
+    for (let offset = 60; offset < 100; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
     const step = { ends: { [key]: '100' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
     expect(await worker.onDrain(step)).toEqual({ reached: false })
     expect(runtime.records).toContainEqual({
       kind: 'diagnostic',
       message: `share drain: ${key} has no handler entry at offset 0`,
     })
-    for (let offset = 0; offset < 60; offset++) worker.delivered(`${main}|0`, String(offset))
+    for (let offset = 0; offset < 60; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
     expect(await worker.onDrain(step)).toEqual({ reached: true })
   })
 
   test('a share gap that is never filled keeps a bounded memory and still fails the drain', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
-    for (let offset = 1; offset <= 100001; offset++) worker.delivered(`${main}|0`, String(offset))
-    const state = worker.entered.get(`${main}|0`)
+    for (let offset = 1; offset <= 100001; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
+    const state = worker.entered.get(`${IDS.A}|0`)
     expect(state.ahead.size).toBeLessThanOrEqual(100000)
     expect(state.gap).toBe('0')
     const step = { ends: { [key]: '100002' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
@@ -1308,6 +2046,28 @@ describe('final soak transaction outcomes', () => {
     ])
   })
 
+  test('a commit still unconfirmed when an idle window begins stops retrying and is aborted, so the idle answers', async () => {
+    let attempts = 0
+    const txn = scripted({
+      commit: async () => {
+        if (++attempts <= 50)
+          throw Object.assign(new Error('unknown'), {
+            name: 'KafkaJSProtocolError',
+            retriable: true,
+          })
+      },
+    })
+    const { worker, rig, runtime } = transactional(txn)
+    const transacting = worker.transact(rig, 1)
+    await worker.onIdle()
+    await transacting
+    expect(attempts).toBe(1)
+    expect(txn.abort).toHaveBeenCalledTimes(1)
+    expect(outcomes(runtime)).toEqual([
+      { decision: 'abort', outcome: 'aborted', errorType: 'KafkaJSProtocolError' },
+    ])
+  })
+
   test('a commit of unknown outcome is sent again until the client confirms it', async () => {
     let calls = 0
     const txn = scripted({
@@ -1410,7 +2170,7 @@ describe('final soak failure evidence', () => {
       type: 'CONSUMER_STOPPING',
       retriable: false,
     })
-    const k = `${config.topics.main}|0`
+    const k = `${IDS.A}|0`
     const rig = {
       id: 'c18.4',
       slot: config.clients.find((c) => c.slot === 'c18'),
@@ -1419,14 +2179,10 @@ describe('final soak failure evidence', () => {
           throw stopping
         },
       },
-      processed: new Map([[k, '4300']]),
       uncommitted: new Map([[k, 100]]),
-      committed: new Map(),
-      authority: new Map([
-        [k, { key: { topic: config.topics.main, topicId: IDS.A, partition: 0 }, authority: {} }],
-      ]),
     }
-    await worker.commit(rig, k)
+    const key = { topic: config.topics.main, topicId: IDS.A, partition: 0 }
+    await worker.commit(rig, { key, authority: {} }, '4300')
     expect(runtime.records.find((r) => r.stage === 'commit' && r.phase === 'end')).toMatchObject({
       outcome: 'unknown',
       errorType: 'KafkaJSError',
@@ -1724,6 +2480,87 @@ describe('final soak record timestamps and client log', () => {
     expect(stream.problems).toEqual([])
   })
 
+  /** @returns {object} a client log entry at `level` with `message` */
+  const entry = (message, level = 2) => ({
+    namespace: 'Consumer',
+    level,
+    log: { message, groupId: 'g1', timestamp: '2026-11-19T00:00:00.000Z' },
+  })
+  const readLog = (file) =>
+    fs
+      .readFileSync(file, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+
+  test('a client log past its byte budget counts every line, keeps the newest dropped ones and writes the counts when it closes', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
+    try {
+      const file = path.join(out, 'log.ndjson')
+      const log = new ClientLog({ file, maxBytes: 64 * 1024 + 2000 })
+      const add = log.creator()(2)
+      for (let n = 1; n <= 5001; n++) add(entry(`warning ${n}`))
+      expect(log.close()).toEqual({
+        total: 5001,
+        written: log.written,
+        dropped: 5001 - log.written,
+        failed: null,
+      })
+      expect(fs.statSync(file).size).toBeLessThanOrEqual(64 * 1024 + 2000)
+      const lines = readLog(file)
+      const summary = lines.at(-1)
+      expect(summary).toMatchObject({ summary: true, total: 5001, failed: null })
+      expect(summary.written).toBe(lines.length - 1)
+      expect(summary.tail.map((l) => l.message).at(-1)).toBe('warning 5001')
+      expect(summary.tail).toHaveLength(20)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a huge client log message is clipped to a fixed size', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
+    try {
+      const file = path.join(out, 'log.ndjson')
+      const log = new ClientLog({ file })
+      log.creator()(1)(entry('x'.repeat(5 * 1024 * 1024), 1))
+      log.close()
+      const [line] = readLog(file)
+      expect(Buffer.byteLength(JSON.stringify(line.message))).toBeLessThanOrEqual(1000)
+      expect(line.message).toMatch(/… \(5242880 characters\)$/)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a client log write that fails is recorded and never reaches the logging client', () => {
+    const files = {
+      openSync: () => 7,
+      writeSync: () => {
+        throw new Error('EIO')
+      },
+      closeSync: () => {},
+    }
+    const log = new ClientLog({ file: 'unused', files })
+    const add = log.creator()(2)
+    expect(() => add(entry('one'))).not.toThrow()
+    add(entry('two'))
+    expect(log.close()).toEqual({ total: 2, written: 0, dropped: 2, failed: 'EIO' })
+  })
+
+  test("a process's client log is closed at its stop and its counts are journaled", async () => {
+    const records = []
+    const runtime = {
+      slot: 'p01',
+      clientLog: { close: () => ({ total: 9, written: 7, dropped: 2, failed: null }) },
+      diagnose: async (message) => records.push(message),
+    }
+    await ChildRuntime.prototype.closeClientLog.call(runtime)
+    expect(records).toEqual([
+      'client log client-log.p01.ndjson: 9 WARN or ERROR lines, 7 written, 2 dropped',
+    ])
+  })
+
   test("a client's WARN and ERROR log lines reach a bounded file of its process in the artifact and lower levels do not", async () => {
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
     try {
@@ -1753,8 +2590,10 @@ describe('final soak record timestamps and client log', () => {
       expect(lines.map((l) => [l.message, l.group])).toEqual([
         ['Rebalance is still running', 'g1'],
         ['broken line', 'g1'],
+        [undefined, undefined],
       ])
-      expect(runtime.clientLog.maxLines).toBe(5000)
+      expect(lines[2]).toMatchObject({ summary: true, total: 2, written: 2, dropped: 0 })
+      expect(runtime.clientLog.maxBytes).toBe(8 * 1024 * 1024)
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
