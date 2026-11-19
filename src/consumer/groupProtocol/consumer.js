@@ -107,6 +107,9 @@ const INVALID_REGEX_PREFIX = 'Invalid RE2J SubscriptionPattern provided in the c
  * settles before the round awaits from reaching the process as unhandled without swallowing it.
  * @returns {{ promise: Promise<void>, resolve: () => void, reject: (e: Error) => void }}
  */
+/** Topic errors for an id of the member's own target that stop its run, as for a named target. */
+const FATAL_TOPIC_ERRORS = ['INVALID_TOPIC_EXCEPTION', 'TOPIC_AUTHORIZATION_FAILED']
+
 const deferred = () => {
   let resolve
   let reject
@@ -310,6 +313,8 @@ module.exports = class ConsumerGroupProtocol {
     this.assignedTopicNames = new Map()
     /** @type {Set<string>} names already handed to the subscription, so it is widened once each */
     this.grownTopicNames = new Set()
+    /** Whether the last recorded projection held a target id out (see `resolveFromCache`). */
+    this.holdsTopics = false
     /** The resolvable subset the current step returned, adopted when the apply acknowledges it. */
     this.pendingResolved = null
 
@@ -620,6 +625,13 @@ module.exports = class ConsumerGroupProtocol {
       const refusal = round?.guard()
       if (refusal) throw refusal
     }
+    // Growth may have left names pending: what is applied and acknowledged is what remains.
+    resolved = this.resolveFromCache(this.target)
+    this.recordResolution(resolved)
+    this.cluster.retireFirstAddTopics?.([
+      ...resolved.names,
+      ...resolved.held.map(([, name]) => name),
+    ])
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
@@ -780,20 +792,37 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * The same resolution against what is already known, without any request. Pure: the caches are
    * written by `recordResolution`, so this can be called from a predicate.
+   *
+   * Projects by id AND name: an id whose name is still pending registration (a lookup by name has
+   * not accepted it), or whose name an accepted answer now gives another id while this member owns
+   * none of it (the topic was recreated and the coordinator still assigns the old id), is held: it
+   * is neither applied, acknowledged nor fetched, and it asks for no round, as the Java consumer
+   * leaves an id it cannot resolve out of the subset it reconciles.
    * @private
    * @param {{ byTopicId: Map<string, number[]> }} target
-   * @returns {{ assignment: Object, byTopicId: Map<string, number[]>, names: string[], unresolved: string[] }}
+   * @returns {{ assignment: Object, byTopicId: Map<string, number[]>, names: string[],
+   *   unresolved: string[], held: Array<[string, string]> }} `held` lists `[topicId, name]` pairs
    */
   resolveFromCache(target) {
     const assignment = dictionary()
     const byTopicId = new Map()
     const names = []
     const unresolved = []
+    const held = []
+    let owned = null
 
     for (const [topicId, partitions] of target.byTopicId) {
       const name = this.cluster.topicName(topicId) || this.assignedTopicNames.get(topicId)
 
-      if (name) {
+      if (name && this.cluster.isTopicPending?.(name)) {
+        held.push([topicId, name])
+      } else if (
+        name &&
+        (this.cluster.topicId?.(name) ?? topicId) !== topicId &&
+        !(owned ??= indexByTopic(this.ownedPartitions)).has(name)
+      ) {
+        held.push([topicId, name])
+      } else if (name) {
         const sorted = [...partitions].sort((a, b) => a - b)
         byTopicId.set(topicId, sorted)
         assignment[name] = sorted
@@ -803,7 +832,7 @@ module.exports = class ConsumerGroupProtocol {
       }
     }
 
-    return { assignment, byTopicId, names, unresolved }
+    return { assignment, byTopicId, names, unresolved, held }
   }
 
   /**
@@ -828,6 +857,13 @@ module.exports = class ConsumerGroupProtocol {
     for (const topicId of resolved.unresolved) {
       this.unresolvedTopicIds.add(topicId)
     }
+
+    for (const [topicId, name] of resolved.held || []) {
+      this.assignedTopicNames.set(topicId, name)
+      this.unresolvedTopicIds.delete(topicId)
+      this.unresolvedAttempts.delete(topicId)
+    }
+    this.holdsTopics = (resolved.held || []).length > 0
 
     return grew
   }
@@ -863,6 +899,7 @@ module.exports = class ConsumerGroupProtocol {
    * @param {string[]} topicIds ids still unnamed
    * @param {{ periodic?: boolean }} [options] permits one slow retry after the fast budget
    * @returns {Promise<void>} best effort; transport failures are logged and swallowed
+   * @throws {Error} code 17 or 29 answered for a current target id
    */
   async refreshMetadataForTopicIds(topicIds, { periodic = false } = {}) {
     const revision = this.targetRevision
@@ -882,7 +919,10 @@ module.exports = class ConsumerGroupProtocol {
     record.promise = Promise.resolve().then(async () => {
       if (!isCurrent()) return
       try {
-        const outcome = await this.cluster.refreshMetadataForTopicIds(askable, { isCurrent })
+        const outcome = await this.cluster.refreshMetadataForTopicIds(askable, {
+          isCurrent,
+          surface: true,
+        })
         if (!isCurrent()) return
         for (const topicId of outcome?.unresolved || []) {
           this.unresolvedAttempts.set(
@@ -891,6 +931,7 @@ module.exports = class ConsumerGroupProtocol {
           )
         }
       } catch (error) {
+        if (isCurrent() && FATAL_TOPIC_ERRORS.includes(error?.type)) throw error
         if (isCurrent())
           this.logger.debug('Could not refresh metadata for the assigned topic ids', {
             groupId: this.groupId,
@@ -912,7 +953,10 @@ module.exports = class ConsumerGroupProtocol {
    * manager's per-topic configuration and into the cluster's target topics - without it the apply
    * would strip the whole assignment as unsubscribed.
    * @private
-   * @param {((names: string[]) => Promise<void>)|undefined} growSubscription
+   * A name the cluster could not register yet stays pending: it is not counted as grown, so the
+   * step after an answer accepts it widens the subscription with it then.
+   * @param {((names: string[]) => Promise<string[]|void>)|undefined} growSubscription resolves
+   *   with the names it registered; nothing means all of them
    * @param {string[]} names
    * @param {() => boolean} [isCurrent] captured target lifetime
    * @throws {Error} assignment changed during subscription growth
@@ -925,9 +969,9 @@ module.exports = class ConsumerGroupProtocol {
     if (!fresh.length) return
 
     if (!isCurrent()) throw assignmentChangedError()
-    await growSubscription(fresh)
+    const registered = (await growSubscription(fresh)) ?? fresh
     if (!isCurrent()) throw assignmentChangedError()
-    for (const name of fresh) {
+    for (const name of registered) {
       this.grownTopicNames.add(name)
     }
   }
@@ -1025,6 +1069,19 @@ module.exports = class ConsumerGroupProtocol {
     // grown" after that reset would never be handed back, and the apply would strip the whole
     // assignment as unsubscribed.
     this.grownTopicNames.clear()
+    this.holdsTopics = false
+    this.cluster.retireFirstAddTopics?.()
+  }
+
+  /**
+   * Asks for a round when a name the current target held out has since been accepted, at a fetch
+   * opportunity: no heartbeat answer reports it, since the coordinator sends nothing new. Only a
+   * STABLE member checks; a member mid-round re-reads the target anyway.
+   * @returns {void}
+   */
+  recheckHeldTopics() {
+    if (this.state !== STABLE || !this.holdsTopics || this.target == null) return
+    if (this.needsReconciliation()) this.evaluateTarget({ targetChanged: false })
   }
 
   /** @private @returns {Object} the owned set in the name-keyed shape the apply expects */
@@ -1159,6 +1216,7 @@ module.exports = class ConsumerGroupProtocol {
     if (leaveEpoch === -1 || leaveEpoch === -2) this.sentFields.reset()
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
+    const assignmentAtRequest = this.localAssignment
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
@@ -1215,7 +1273,7 @@ module.exports = class ConsumerGroupProtocol {
       return true
     } finally {
       if (leaveEpoch != null || current()) {
-        this.onRequestGenerated({ leaveEpoch, stateAtRequest })
+        this.onRequestGenerated({ leaveEpoch, stateAtRequest, assignmentAtRequest })
       }
     }
   }
@@ -1244,12 +1302,15 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * The state moves that belong to a request having been GENERATED rather than answered.
+   * The state moves that belong to a request having been GENERATED rather than answered. Only a
+   * request that carried the local assignment still owed ends ACKNOWLEDGING: one built before a
+   * later apply leaves that apply's acknowledgement to the next heartbeat, which goes out at once.
    * @private
-   * @param {{ leaveEpoch: number|null, stateAtRequest: string }} options
+   * @param {{ leaveEpoch: number|null, stateAtRequest: string, assignmentAtRequest?: object }}
+   *   options `assignmentAtRequest` is the local assignment the request was built from
    * @returns {void}
    */
-  onRequestGenerated({ leaveEpoch, stateAtRequest }) {
+  onRequestGenerated({ leaveEpoch, stateAtRequest, assignmentAtRequest }) {
     if (leaveEpoch != null) {
       this.sentFields.reset()
       if (stateAtRequest === LEAVING && this.state === LEAVING) {
@@ -1260,7 +1321,11 @@ module.exports = class ConsumerGroupProtocol {
 
     // Both halves matter: the request must have been the acknowledgement, and nothing since
     // (a fencing, a fatal answer) may have moved the member out of ACKNOWLEDGING.
-    if (stateAtRequest !== ACKNOWLEDGING || this.state !== ACKNOWLEDGING) {
+    if (
+      stateAtRequest !== ACKNOWLEDGING ||
+      this.state !== ACKNOWLEDGING ||
+      assignmentAtRequest !== this.localAssignment
+    ) {
       return
     }
 
@@ -1354,6 +1419,11 @@ module.exports = class ConsumerGroupProtocol {
     if (changed) {
       this.targetRevision = Symbol('target')
       this.immediateResolutionRevision = null
+      this.cluster.retireFirstAddTopics?.(
+        [...byTopicId.keys()].map(
+          (topicId) => this.cluster.topicName(topicId) || this.assignedTopicNames.get(topicId)
+        )
+      )
       // A new target is the coordinator asserting these ids exist, so the attempt budget starts
       // over: an id given up on under an older target is worth asking about again.
       for (const topicId of byTopicId.keys()) {
@@ -1366,7 +1436,10 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Decides what the current target means for the state machine, from live state: whether the
-   * member is where the coordinator wants it, and whether a round has to be asked for.
+   * member is where the coordinator wants it, and whether a round has to be asked for. A changed
+   * target whose resolvable part already equals what a settled member owns is acknowledged under
+   * its local epoch with no round, as the Java consumer acknowledges a partially resolved target.
+   * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractMembershipManager.java
    * @private
    * @param {{ targetChanged: boolean }} options
    * @returns {void}
@@ -1378,7 +1451,21 @@ module.exports = class ConsumerGroupProtocol {
     const grew = this.recordResolution(resolved)
     const converged = this.matchesOwned(resolved, this.eligibleTopics())
 
-    if (converged) {
+    if (
+      converged &&
+      targetChanged &&
+      (this.state === STABLE || this.state === ACKNOWLEDGING) &&
+      this.localAssignment.localEpoch !== this.target.localEpoch
+    ) {
+      // The coordinator keeps a dropped partition pending revocation until a heartbeat reports
+      // owned partitions without it, so a new target is acknowledged even when nothing is applied.
+      this.transitionTo(RECONCILING)
+      this.adoptLocalAssignment(
+        this.target.localEpoch,
+        this.appliedSubsetOf(resolved, this.ownedPartitions)
+      )
+      this.acknowledge()
+    } else if (converged) {
       if (wasReconciling || wasJoining) {
         this.transitionTo(STABLE)
       }
@@ -1424,6 +1511,11 @@ module.exports = class ConsumerGroupProtocol {
     this.refreshMetadataForTopicIds(topicIds, { periodic })
       .then(() => this.onTopicIdsRefreshed(topicIds, isCurrent))
       .catch((error) => {
+        if (isCurrent() && FATAL_TOPIC_ERRORS.includes(error?.type)) {
+          this.transitionToFatal(error)
+          this.requestRejoinForAssignmentChange()
+          return
+        }
         if (isCurrent())
           this.logger.debug('Could not re-read the target after refreshing its topic ids', {
             groupId: this.groupId,

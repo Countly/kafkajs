@@ -30,6 +30,7 @@ const createGroup = ({ topics = [TOPIC_A], ...options } = {}) => {
     findTopicPartitionMetadata: (topic) => (/^events-/.test(topic) ? partitionMetadata(2) : []),
     findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true })),
     addMultipleTargetTopics: jest.fn(async () => {}),
+    registerAssignedTopics: jest.fn(async (names) => names),
     leaderEpoch: () => -1,
   }
 
@@ -259,7 +260,7 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
     expect(group.topics).toEqual([])
     expect(group.topicConfigurations['events-a']).toEqual({ fromBeginning: true })
     expect(group.topicConfigurations['events-b']).toEqual({ fromBeginning: true })
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-a', 'events-b'])
+    expect(group.cluster.registerAssignedTopics).toHaveBeenCalledWith(['events-a', 'events-b'])
   })
 
   it('is a no-op for an empty list and for a name it already holds', async () => {
@@ -278,8 +279,8 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
 
     await group.joinAndSync()
 
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledTimes(1)
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-b'])
+    expect(group.cluster.registerAssignedTopics).toHaveBeenCalledTimes(1)
+    expect(group.cluster.registerAssignedTopics).toHaveBeenCalledWith(['events-b'])
     expect(group.topicConfigurations['events-a']).toEqual({ fromBeginning: false })
     expect(group.topicConfigurations['events-b']).toEqual({ fromBeginning: true })
   })
@@ -898,7 +899,7 @@ describe('Consumer > ConsumerGroup > more guards', () => {
     const before = group.topicsSubscribed
     await group.growSubscription(['events-z'])
     expect(group.topicsSubscribed).toBe(before)
-    expect(group.cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+    expect(group.cluster.registerAssignedTopics).not.toHaveBeenCalled()
   })
 
   it('a reset refusal without a current identity halts nothing', () => {

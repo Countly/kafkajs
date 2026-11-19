@@ -587,7 +587,7 @@ describe('Cluster > committed offset retirement', () => {
         regexSubscription: { fromBeginning: true },
         unregisteredTopics: new Set(),
         subscriptionState: { retainTopics: () => {} },
-        cluster: { addMultipleTargetTopics: async () => {} },
+        cluster: { registerAssignedTopics: async (names) => names },
       })
       const write = (topic) => {
         const ticket = group.ledger.begin([{ topic, partition: 0 }])
@@ -1352,11 +1352,13 @@ function createConsumerHarness({
         })),
       }),
     addMultipleTargetTopics: async () => {},
+    registerAssignedTopics: async (names) => names,
     resetTargetTopics: async (names, { isCurrent, publish }) => {
       if (isCurrent()) publish?.()
       return true
     },
     releaseConsumerMetadataScope: () => {},
+    useBrokerRegex: () => {},
     refreshMetadataIfNecessary: async () => {},
     committedOffsets: () => entry().offsets,
     offsetOperations: () => entry().ledger,
