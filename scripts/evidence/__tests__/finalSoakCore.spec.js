@@ -1082,6 +1082,42 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(fx.healthy(), { edit }), 'K6', 'INCONCLUSIVE', /no end of traffic/)
     })
 
+    const trafficEnd = (fields) =>
+      mapRecords(
+        (r) => r.kind === 'shape' && r.execution === 'traffic' && r.phase === 'end',
+        fields
+      )
+
+    it.each([
+      ['a shape other than traffic', () => ({ shape: 'idle' })],
+      ['a source other than the supervisor', () => ({ source: 'p01' })],
+    ])(
+      'is inconclusive, never ACCEPTED, when the only end of traffic comes from %s',
+      async (_, fields) => {
+        const report = await check(fx.healthy(), { edit: trafficEnd(fields) })
+        expectRow(report, 'K6', 'INCONCLUSIVE', /no end of traffic/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      }
+    )
+
+    it('is inconclusive, never ACCEPTED, when the end of traffic precedes the end of the run', async () => {
+      const report = await check(fx.healthy(), {
+        edit: trafficEnd((r) => ({ at: fx.START + 1000, t: fx.START + 1000 })),
+      })
+      expectRow(report, 'K6', 'INCONCLUSIVE', /end of traffic at 2000 lies outside the run end/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('ignores a later traffic end that the supervisor did not emit', async () => {
+      const edit = (records) => {
+        const end = records.find((r) => r.kind === 'shape' && r.phase === 'end')
+        return [...records, { ...end, at: 9e9, t: 9e9, source: 'p14' }]
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K6', 'PASS')
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
     it('is inconclusive when the baseline was completed after another sample of its process', async () => {
       const edit = mapRecords(isSample('p04', 'baseline'), () => ({ completedAt: 2e6 }))
       expectRow(
@@ -1408,7 +1444,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('takes the latest end of traffic whatever the order the records arrive in', async () => {
       const edit = (records) => {
         const end = records.find((r) => r.kind === 'shape' && r.phase === 'end')
-        const later = { ...end, at: 9e9, t: 9e9, source: 'p14' }
+        const later = { ...end, at: 9e9, t: 9e9 }
         return [later, ...records]
       }
       expectRow(
