@@ -18,12 +18,14 @@
  * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
  * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE.
  *
- * Memory: about 60 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
- * 96 MB at 1.6 million, the full 32-byte payload digest included) plus one id string and Map entry
- * per offered id; one entry per open
- * ownership interval and per transaction, each capped at the same capacity; a fixed sample grid per
- * process. Handler entries only update typed arrays. Any cap that is reached is a reported problem
- * that leaves K1 to K6 INCONCLUSIVE. Peak RSS has not been measured on a day-size artifact.
+ * Memory: about 87 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
+ * 139 MB at 1.6 million; pages are touched only as ids arrive): the full 32-byte payload digest,
+ * offsets, and one 4-byte ownership-interval serial per judged group. Then one id string and Map
+ * entry per offered id; one entry per open ownership interval, per transaction, per id an open
+ * interval shares with an overlapping one, and per record held for its offer, each capped at the
+ * same capacity; open membership waves and printed outages capped by the matrix schedule; a fixed
+ * sample grid per process. Any cap that is reached is a reported problem that leaves K1 to K6
+ * INCONCLUSIVE. Side files are read whole only below a size cap.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -40,6 +42,8 @@ const MAX_LINE = 1 << 20
 const MAX_SMALL_FILE = 1 << 20
 /** @param {string|Buffer} data @returns {string} its sha256 in hex */
 const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
+/** The `entered` value of an id a group entered outside every ownership interval; serials start above it. */
+const OUTSIDE = 1
 const ACK = { none: 0, acknowledged: 1, unknown: 2, rejected: 3, contradicted: 4 }
 const ROW_NAMES = {
   K1: 'no lost record',
@@ -145,6 +149,10 @@ function recipientsOf(matrix, config, role) {
  * instance applies an assignment that acquires the partition (an `acquire` boundary with a new
  * acquisition) and closes when it revokes or loses it (`revoke-end`, `lost`). A handler entry
  * belongs to the open interval with the batch's acquisition; outside one it is an unowned entry.
+ * Each interval has a serial; per group and offered id the journal keeps the serial of the interval
+ * that last entered the id (`OUTSIDE` for an entry outside every interval), so a same-owner repeat is
+ * the same id entered twice by one interval, whatever the offsets in between. When another interval
+ * re-enters an id an open interval entered, the open one keeps that id in `shadowed` until it closes.
  */
 class Journal {
   /**
@@ -168,7 +176,7 @@ class Journal {
         return { group, share, index: this.groupIndex.get(group).index }
       })
     )
-    this.entered = [...this.groupIndex.keys()].map(() => new Uint8Array(capacity))
+    this.entered = [...this.groupIndex.keys()].map(() => new Uint32Array(capacity))
     this.ids = new Map()
     this.names = []
     this.topic = new Uint8Array(capacity)
@@ -179,6 +187,9 @@ class Journal {
     this.txOf = []
     this.txs = new Map()
     this.owners = new Map()
+    this.serials = OUTSIDE
+    this.shadowed = new Map()
+    this.shadowedCount = 0
     this.held = new Map()
     this.heldCount = 0
     this.idsFull = false
@@ -308,7 +319,7 @@ class Journal {
       key: r.key,
       digest: r.payloadSha256,
       run: r.authority?.run ?? 'no authority',
-      owned: r.stage === 'handler-enter' ? this.ownership(r) : null,
+      ...(r.stage === 'handler-enter' ? this.ownership(r) : {}),
     }
     const i = this.ids.get(r.id)
     if (i !== undefined) return this.resolve(i, fact)
@@ -448,36 +459,60 @@ class Journal {
       return this.note('misattributed', `boundary ${r.recordId ?? r.cause} of ${r.client}`)
     const k = Journal.ownerKey(r.group, r.authority, r.key)
     const owner = this.owners.get(k)
-    if (r.event === 'revoke-end' || r.event === 'lost') this.owners.delete(k)
+    if (r.event === 'revoke-end' || r.event === 'lost') this.close(k)
     if (r.event !== 'acquire') return
     if (owner?.acquiredAt === r.authority.acquiredAt) this.redundantAcquires++
     else if (!owner && this.owners.size >= this.capacity)
       this.problem(`more than ${this.capacity} open ownership intervals`)
-    else this.owners.set(k, { acquiredAt: r.authority.acquiredAt, high: -1 })
+    else {
+      if (owner) this.close(k)
+      this.owners.set(k, { acquiredAt: r.authority.acquiredAt, serial: ++this.serials })
+    }
+  }
+
+  /** @param {string} k an ownership key; closes its interval and drops what it shadowed @returns {void} */
+  close(k) {
+    const serial = this.owners.get(k)?.serial
+    this.shadowedCount -= this.shadowed.get(serial)?.size ?? 0
+    this.shadowed.delete(serial)
+    this.owners.delete(k)
   }
 
   /**
-   * The ownership of a handler entry, judged when it arrives. In an ordinary group the entry must
-   * lie in an open ownership interval of its client run; one at or below an offset that interval
-   * already entered is a same-owner repeat.
+   * The ownership of a handler entry, judged when it arrives: in an ordinary group the entry must
+   * lie in an open ownership interval of its client run, whose serial it takes.
    * @param {object} r a `handler-enter` record
-   * @returns {'share'|'misattributed'|'unowned'|'sameOwner'|'owned'}
+   * @returns {{ owned: 'share'|'misattributed'|'unowned'|'owned', serial: number }}
    */
   ownership(r) {
-    if (this.groupIndex.get(r.group).share) return 'share'
-    if (r.authority === null || !this.attributed(r, r.authority)) return 'misattributed'
+    const outside = (owned) => ({ owned, serial: OUTSIDE })
+    if (this.groupIndex.get(r.group).share) return outside('share')
+    if (r.authority === null || !this.attributed(r, r.authority)) return outside('misattributed')
     const owner = this.owners.get(Journal.ownerKey(r.group, r.authority, r.key))
-    if (owner?.acquiredAt !== r.authority.acquiredAt) return 'unowned'
-    const offset = Number(r.offset)
-    const owned = offset <= owner.high ? 'sameOwner' : 'owned'
-    owner.high = Math.max(owner.high, offset)
-    return owned
+    if (owner?.acquiredAt !== r.authority.acquiredAt) return outside('unowned')
+    return { owned: 'owned', serial: owner.serial }
+  }
+
+  /**
+   * Records that an open interval entered id `i` before another interval of its group re-entered
+   * it, so a later repeat by the open interval is still found; bounded by the capacity.
+   * @param {number} serial @param {number} i @returns {void}
+   */
+  shadow(serial, i) {
+    if (![...this.owners.values()].some((o) => o.serial === serial)) return
+    if (this.shadowedCount >= this.capacity)
+      return this.problem(`more than ${this.capacity} ids re-entered by overlapping intervals`)
+    const set = this.shadowed.get(serial) ?? new Set()
+    this.shadowed.set(serial, set)
+    if (!set.has(i)) this.shadowedCount++
+    set.add(i)
   }
 
   /**
    * A handler entry, matched to its offered record by topic, partition and full payload digest, and to
-   * one offset across every group; then its ownership finding is counted. A repeat in another
-   * interval, by another run or in the share group is only counted.
+   * one offset across every group; then its ownership finding is counted. The same id entered
+   * twice by one interval is a same-owner repeat; a repeat in another interval, by another run or
+   * in the share group is only counted.
    * @param {number} i the id's index @param {object} e a `handler-enter` fact from `byId`
    * @returns {void}
    */
@@ -492,11 +527,19 @@ class Journal {
     if (Number.isNaN(this.enteredAt[i])) this.enteredAt[i] = offset
     else if (this.enteredAt[i] !== offset)
       return this.note('wrongRecord', `${where} at ${offset}, elsewhere at ${this.enteredAt[i]}`)
-    const before = this.entered[group.index][i]
-    this.entered[group.index][i] = 1
-    if (e.owned === 'share') this.shareRepeats += before
-    else if (e.owned === 'owned') this.repeatsAfterChange += before
-    else this.note(e.owned, `${where} by ${e.run}`)
+    const slot = this.entered[group.index]
+    const before = slot[i]
+    if (e.owned !== 'owned') {
+      if (before === 0) slot[i] = OUTSIDE
+      if (e.owned === 'share') this.shareRepeats += before === 0 ? 0 : 1
+      else this.note(e.owned, `${where} by ${e.run}`)
+      return
+    }
+    if (before === e.serial || this.shadowed.get(e.serial)?.has(i))
+      this.note('sameOwner', `${where} by ${e.run}`)
+    else if (before !== 0) this.repeatsAfterChange++
+    if (before > OUTSIDE && before !== e.serial) this.shadow(before, i)
+    slot[i] = e.serial
   }
 
   /** @param {object} r a `process` record @returns {void} */

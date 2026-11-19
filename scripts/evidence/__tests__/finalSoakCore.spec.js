@@ -707,6 +707,29 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    it('is inconclusive with a named reason when overlapping intervals re-enter more ids than the capacity', async () => {
+      const ids = Array.from({ length: 12 }, (_, n) => `c08.${n}`)
+      const edit = (records) => {
+        const b = boundaryOf(records)
+        const runs = ['c01.1', 'c01.2'].flatMap((client, k) => {
+          const authority = fx.authority(client, { acquiredAt: 2 + k })
+          const t = 9e7 + k * 100
+          return [
+            { ...b, t, client, run: authority.run, authority },
+            ...ids.map((id, n) => ({ ...entryOf(records, id), t: t + 1 + n, client, authority })),
+          ]
+        })
+        return [...records, ...runs]
+      }
+      const report = await check(fx.healthy(), { edit, capacity: 18 })
+      expectRow(
+        report,
+        'K3',
+        'INCONCLUSIVE',
+        /more than 18 ids re-entered by overlapping intervals/
+      )
+    })
+
     it('counts a repeat by another client run with its own acquisition, without failing it', async () => {
       const report = await check(fx.healthy(), { edit: otherRun })
       expectRow(report, 'K3', 'PASS')
