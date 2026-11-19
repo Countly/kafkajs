@@ -26,6 +26,11 @@ const NO_TOPICS = Object.freeze([])
  * alike. Each covered cell also keeps its durable winner, the highest-intent mutation published
  * to it: an eviction keeps it, a hard barrier drops it.
  *
+ * A cell also holds at most one seek reservation, from the step that pops a user seek until its
+ * one raw commit request settles, whichever consumer, acquisition or run took it: two seek
+ * commits of one cell are never outstanding at once on this client. The reservation keeps its
+ * cell open, and every release wakes the registered runs.
+ *
  * The ledger also answers who owns a topic of the group (an open ticket, or an attached consumer
  * table that holds it) and tells its registry when a topic's last ticket ends or ownership changed,
  * so the group's committed state can retire topics nobody owns.
@@ -37,7 +42,7 @@ class OffsetOperations {
    */
   constructor(cache = null) {
     this.cache = cache
-    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, hardAt: number, appliedIntent: number, durable: {intent: number, offset: string}|null, ownerBarriers: WeakMap<object, number>|null}>>} */
+    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, hardAt: number, appliedIntent: number, durable: {intent: number, offset: string}|null, ownerBarriers: WeakMap<object, number>|null, reservation: Reservation|null}>>} */
     this.topics = new Map()
     this.cells = 0
     this.clock = 0
@@ -50,6 +55,10 @@ class OffsetOperations {
     this.onRetire = null
     /** @type {Set<{discharge: (topic: string, partition: number) => void}>} */
     this.attached = new Set()
+    /** The reservations held, so an empty ledger answers `reservation` without a lookup. */
+    this.reserved = 0
+    /** @type {Set<() => void>} told after every release; registrations do not count as work */
+    this.releaseWakes = new Set()
   }
 
   /**
@@ -89,6 +98,7 @@ class OffsetOperations {
           appliedIntent: 0,
           durable: null,
           ownerBarriers: null,
+          reservation: null,
         }
         partitions.set(number, state)
         this.cells += 1
@@ -394,6 +404,57 @@ class OffsetOperations {
   }
 
   /**
+   * Takes the cell's seek reservation for `owner` when no one holds it.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {object} owner who took it, read back by `reservation`
+   * @returns {Reservation|null} the reservation, open until `release`; null when the cell is held
+   */
+  reserve(topic, partition, owner) {
+    if (this.reservation(topic, partition) !== null) return null
+    const ticket = this.begin([{ topic, partition }])
+    const reservation = { owner, ticket, released: false }
+    this.state(topic, partition).reservation = reservation
+    this.reserved += 1
+    return reservation
+  }
+
+  /**
+   * Releases a reservation, ends its ticket and wakes the registered runs. Idempotent.
+   * @param {Reservation} reservation
+   * @returns {void}
+   */
+  release(reservation) {
+    if (reservation.released) return
+    reservation.released = true
+    const { topic, partition } = reservation.ticket.cells[0]
+    this.state(topic, partition).reservation = null
+    this.reserved -= 1
+    this.end(reservation.ticket)
+    for (const wake of [...this.releaseWakes]) wake()
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {Reservation|null} the cell's held seek reservation
+   */
+  reservation(topic, partition) {
+    if (this.reserved === 0) return null
+    return this.state(topic, partition)?.reservation ?? null
+  }
+
+  /**
+   * Registers a callback run after every release.
+   * @param {() => void} wake must not throw
+   * @returns {() => void} idempotent unregister
+   */
+  onRelease(wake) {
+    this.releaseWakes.add(wake)
+    return () => this.releaseWakes.delete(wake)
+  }
+
+  /**
    * Whether a topic of this group is owned: an open ticket covers it, or an attached consumer table
    * holds it (subscription, assignment or owed reset). Reads only.
    * @param {string} topic
@@ -449,5 +510,12 @@ class OffsetOperations {
     return partitions && partitions.get(Number(partition))
   }
 }
+
+/**
+ * @typedef {object} Reservation
+ * @property {object} owner who took it
+ * @property {object} ticket the read ticket that keeps its cell open
+ * @property {boolean} released
+ */
 
 module.exports = OffsetOperations

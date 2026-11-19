@@ -44,9 +44,10 @@ const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
  * What one OffsetCommit did on the wire, recorded before any caller check runs on its answer:
  * `written` once its bytes were handed to the socket (or an answer proves it), `accepted` once the
  * broker answered without an error. `refusal` is the attempt's own pre-write check, and
- * `superseded` the refusal it returned, which ends a seek without failing it.
+ * `superseded` the refusal it returned, which ends a seek without failing it. `release` is called
+ * once the commit request has settled on the wire or was never made, before any recovery.
  * @typedef {{written?: boolean, accepted?: boolean, refusal?: () => Error|null,
- *   superseded?: Error}} CommitAttempt
+ *   superseded?: Error, release?: () => void}} CommitAttempt
  */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
@@ -397,12 +398,16 @@ module.exports = class OffsetManager {
         : this.ownership || guard || since !== undefined
           ? await coordinator.offsetCommit(request, { guard: check })
           : await coordinator.offsetCommit(request)
-      if (attempt) attempt.written = attempt.accepted = true
+      if (attempt) {
+        attempt.written = attempt.accepted = true
+        attempt.release?.()
+      }
       beforeWrite = false
       refusal = check()
       if (refusal) throw refusal
       return result
     } catch (error) {
+      attempt?.release?.()
       beforeWrite = false
       const stampRefusal = (refusal) =>
         stampOwnership(

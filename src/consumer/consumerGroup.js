@@ -311,12 +311,6 @@ module.exports = class ConsumerGroup {
     /** @type {Map<string, import('./handlerContext').Acquisition>} one per owned partition */
     this.acquired = new Map()
     this.acquireClock = 0
-    /**
-     * The `topic|partition` keys whose latest admitted seek has not finished applying: they are
-     * not fetched until it has. Bounded by the assignment.
-     * @type {Set<string>}
-     */
-    this.unappliedSeeks = new Set()
     /** The latest `soughtAt` stamped, so a check finds "nothing sought since" in constant time. */
     this.lastSoughtAt = 0
     /** The latest `acquiredAt` stamped, for the same constant-time check of reacquisitions. */
@@ -700,6 +694,7 @@ module.exports = class ConsumerGroup {
       if (!run.fence.closed) this.routingChanged()
     })
     if (unsubscribe) run.fence.register(unsubscribe)
+    run.fence.register(this.operations.onRelease(() => run.wake()))
     return run
   }
 
@@ -1200,9 +1195,7 @@ module.exports = class ConsumerGroup {
         seeks: {
           clock: () => this.acquireClock,
           changedSince: (since) =>
-            this.lastSoughtAt > since ||
-            this.lastAcquiredAt > since ||
-            this.unappliedSeeks.size !== 0,
+            this.lastSoughtAt > since || this.lastAcquiredAt > since || this.hasSeekGates(),
           isStaleSince: (topic, partition, since) => this.isStaleSince(topic, partition, since),
         },
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
@@ -1239,7 +1232,6 @@ module.exports = class ConsumerGroup {
     if (rebuildOffsets) {
       this.retireAcquisitions()
       this.acquired.clear()
-      this.unappliedSeeks.clear()
       this.haltedPartitions.clear()
     }
     for (const { topic, partitions } of revoked) {
@@ -1248,7 +1240,6 @@ module.exports = class ConsumerGroup {
         const acquired = this.acquired.get(key)
         if (acquired) acquired.retired = true
         this.acquired.delete(key)
-        this.unappliedSeeks.delete(key)
         this.haltedPartitions.delete(key)
         this.seekOffset.pop(topic, partition)
       }
@@ -1939,7 +1930,6 @@ module.exports = class ConsumerGroup {
     const acquired = this.acquired.get(key)
     if (!acquired) return
     acquired.soughtAt = this.lastSoughtAt = ++this.acquireClock
-    this.unappliedSeeks.add(key)
   }
 
   /**
@@ -1963,11 +1953,11 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Settles a popped seek that is still current (`isCurrentSeek`), releasing only its own hold on
-   * fetching. One the broker accepted also fences answers built before it, clears
-   * the partition's halt (a seek is how an application resumes a halted partition) and wakes the
-   * idle fetcher. A seek that is no longer current changes nothing: a newer seek, acquisition or
-   * incarnation owns the partition.
+   * Settles a popped seek that is still current (`isCurrentSeek`) and reached the partition (it
+   * was applied, or the broker accepted its commit): fences answers built before it, clears the
+   * partition's halt (a seek is how an application resumes a halted partition) and wakes the idle
+   * fetcher. Anything else changes nothing here: a newer seek, acquisition or incarnation owns
+   * the partition, and the seek's gate ends with its reservation.
    * @private
    * @param {string} key `topic|partition`
    * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
@@ -1977,9 +1967,7 @@ module.exports = class ConsumerGroup {
    * @returns {void}
    */
   settleSeek(key, acquired, admitted, reached = false) {
-    if (!this.isCurrentSeek(key, acquired, admitted)) return
-    this.unappliedSeeks.delete(key)
-    if (!reached) return
+    if (!reached || !this.isCurrentSeek(key, acquired, admitted)) return
     acquired.changedAt = ++this.acquireClock
     this.haltedPartitions.delete(key)
     this.idleWait.wake()
@@ -2055,7 +2043,41 @@ module.exports = class ConsumerGroup {
     const acquired = this.acquired.get(key)
     return (
       acquired !== undefined &&
-      (acquired.acquiredAt > since || acquired.soughtAt > since || this.unappliedSeeks.has(key))
+      (acquired.acquiredAt > since ||
+        acquired.soughtAt > since ||
+        this.isSeekGated(topic, partition))
+    )
+  }
+
+  /**
+   * Whether any seek could gate a partition: a seek is queued or a reservation is held. Constant
+   * time, so a round with no seek pays nothing for the per-partition check.
+   * @returns {boolean}
+   */
+  hasSeekGates() {
+    return this.seekOffset.size !== 0 || this.operations.reserved !== 0
+  }
+
+  /**
+   * Whether a seek holds an owned partition back from Fetch, validation, resolution and default
+   * commits: a seek of it is queued, or the reservation this acquisition took in this run and
+   * incarnation is held. A reservation taken by another acquisition, run, incarnation or consumer
+   * blocks only a new pop
+   * (`seekOffsets`), never this owner's fetch.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {boolean} false for a partition this member does not own
+   */
+  isSeekGated(topic, partition) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    if (acquired === undefined) return false
+    if (this.seekOffset.size !== 0 && this.seekOffset.has(topic, Number(partition))) return true
+    const owner = this.operations.reservation(topic, partition)?.owner
+    return (
+      owner !== undefined &&
+      owner.acquired === acquired &&
+      owner.run === this.idleWait &&
+      !(acquired.recreatedAt > owner.admitted)
     )
   }
 
@@ -2094,7 +2116,6 @@ module.exports = class ConsumerGroup {
     const acquired = this.acquired.get(key)
     if (!acquired) return
     acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
-    this.unappliedSeeks.delete(key)
   }
 
   pause(topicPartitions) {
@@ -2811,7 +2832,7 @@ module.exports = class ConsumerGroup {
             !this.positionValidator.isAwaiting(topic, partition) &&
             (this.haltedPartitions.size === 0 ||
               !this.haltedPartitions.has(`${topic}|${partition}`)) &&
-            (this.unappliedSeeks.size === 0 || !this.unappliedSeeks.has(`${topic}|${partition}`))
+            !(this.hasSeekGates() && this.isSeekGated(topic, partition))
           ) {
             requests.push({
               partition,
@@ -3608,8 +3629,11 @@ module.exports = class ConsumerGroup {
   /**
    * Resolves pending seek/reset work through the ordinary resolver, then reads the latest position.
    * A seek changes position without changing acquisition; revoke/reacquire and rebuild retire it.
-   * A rebalance callback may read while a stop is under way, so a close-time revoked callback sees
-   * the quiescent position. A read from a callback carries that invocation's guard and fence through
+   * A rebalance callback may read while a stop is under way: it then applies and waits for no
+   * seek and returns the established position, and a queued seek dies with the run. Otherwise,
+   * while a seek of the partition is queued or in flight (`isSeekGated`) and its cell's
+   * reservation is held, the read waits for the release with no timer (`awaitSeekRelease`), so
+   * it never returns the position a seek in flight is replacing. A read from a callback carries that invocation's guard and fence through
    * seek, resolution and the answer, so a callback that settled, expired or was retired meanwhile
    * publishes nothing and gets its refusal; a lost caller's read is refused too.
    * With a public-call `operation`, its one deadline and identity guard are carried the same way: its
@@ -3659,18 +3683,55 @@ module.exports = class ConsumerGroup {
       if (error) throw error
     }
     check()
-    for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass++) {
-      await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
+    const quiescent = invocation !== undefined && this.isStopping()
+    for (let pass = 0; pass < MAX_RESOLUTION_PASSES;) {
+      if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
       check()
       const halted = this.haltedPartitions.get(key)
       if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
-      if (this.hasSeekOffset({ topic, partition })) continue
+      if (!quiescent && this.isSeekGated(topic, partition)) {
+        const held = this.operations.reservation(topic, partition)
+        if (held !== null) await this.awaitSeekRelease(entry, held, preparation?.fence, check)
+        else pass++
+        continue
+      }
+      pass++
       const offset = String(
         manager.resolvedOffsetAt(topic, partition) ?? manager.heldOffsetAt(topic, partition)
       )
       if (/^\d+$/.test(offset)) return offset
     }
     throw new KafkaJSNonRetriableError(`Position is not yet resolved for ${topic}[${partition}]`)
+  }
+
+  /**
+   * Waits, with no timer, until the reservation a seek of the partition holds or is blocked on is
+   * released, or the run, the caller or the partition's authority changes.
+   * @private
+   * @param {{topic: string, partition: number}} entry the partition `position()` reads
+   * @param {import('./offsetManager/offsetOperations').Reservation} held the observed reservation
+   * @param {import('../producer/generation')|undefined} fence the caller's lifetime, if any
+   * @param {() => void} check throws the caller's refusal
+   * @returns {Promise<void>} once the wait ended; the caller rechecks before it reads
+   * @throws {Error} the caller's refusal, or the stopping error once the run is disposed
+   */
+  async awaitSeekRelease({ topic, partition }, held, fence, check) {
+    const run = this.idleWait
+    if (run.disposed) throw consumerStoppingError()
+    await run.wait(
+      Infinity,
+      () => {
+        try {
+          check()
+        } catch {
+          return false
+        }
+        return this.operations.reservation(topic, partition) === held
+      },
+      fence
+    )
+    if (run.disposed) throw consumerStoppingError()
+    check()
   }
 
   /**
@@ -3703,6 +3764,12 @@ module.exports = class ConsumerGroup {
    * observer runs, and every later step, its DEBUG log included, ends in its settlement, so a
    * throwing log is a failed seek and a seek admitted from inside the log supersedes it.
    *
+   * A seek is popped only together with its cell's reservation in the group's ledger, taken in
+   * the same synchronous step; while another seek of the cell holds it (any consumer, acquisition
+   * or run of the group) the intent stays queued and this call moves on to the next partition.
+   * The reservation is released when the seek's one commit request settles on the wire, before
+   * any recovery or diagnostic, and at the latest when this attempt ends.
+   *
    * Given a preparation, every step uses its captured offset manager and checks its guard before
    * popping an intent, after every await, before the resolution retry and its yield, and before
    * any local effect, so a late continuation of a retired or replaced preparation changes nothing.
@@ -3717,15 +3784,19 @@ module.exports = class ConsumerGroup {
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
         preparation?.check()
-        const seekEntry = this.seekOffset.pop(topic, partition)
-        if (!seekEntry) {
-          continue
-        }
-
+        if (!this.hasSeekOffset({ topic, partition })) continue
         const key = `${topic}|${partition}`
         const acquired = this.acquired.get(key)
         const admitted = acquired?.soughtAt
+        const reservation = this.operations.reserve(topic, partition, {
+          acquired,
+          admitted,
+          run: this.idleWait,
+        })
+        if (reservation === null) continue
+        const seekEntry = this.seekOffset.pop(topic, partition)
         const attempt = {
+          release: () => this.operations.release(reservation),
           refusal: () => {
             if (acquired === undefined || this.isCurrentSeek(key, acquired, admitted)) return null
             const message = 'A newer seek superseded this one'
@@ -3747,6 +3818,7 @@ module.exports = class ConsumerGroup {
         } catch (error) {
           failure = { error }
         }
+        attempt.release()
         // Accepted by the broker: the seek took effect there even when a newer commit owns the cell.
         if (!applied) this.dropReplacedPosition(manager, seekEntry, acquired, admitted, attempt)
         this.settleSeek(key, acquired, admitted, applied || attempt.accepted === true)
@@ -3829,7 +3901,7 @@ module.exports = class ConsumerGroup {
           // A user seek, queued or still being applied, is newer, more specific intent than
           // anything validation could conclude, and the position it replaces is not worth asking
           // about.
-          if (this.unappliedSeeks.size !== 0 && this.unappliedSeeks.has(`${topic}|${partition}`)) {
+          if (this.hasSeekGates() && this.isSeekGated(topic, partition)) {
             continue
           }
 
