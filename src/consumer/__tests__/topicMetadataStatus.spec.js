@@ -463,6 +463,31 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     30000
   )
 
+  test.each([
+    [17, 'INVALID_TOPIC_EXCEPTION'],
+    [29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    'consumer: a subscription answered code 3 before code %i rejects with %s, not as a topic still to come',
+    async (code, type) => {
+      const TYPO = 'lifecycle-typo'
+      const wire = scenario('consumer')
+      wire.world.remove(DOOMED)
+      wire.world.refused.set(TYPO, code)
+      await wire.consumer.connect()
+
+      await expect(
+        wire.consumer.subscribe({ topics: [HEALTHY, DOOMED, TYPO], fromBeginning: true })
+      ).rejects.toMatchObject({ type })
+      const asked = wire.cluster
+        .requests()
+        .filter(({ api }) => api === 'Metadata')
+        .map(({ fields }) => (fields.topics || []).map(({ name }) => name))
+      expect(asked).toContainEqual([HEALTHY, DOOMED, TYPO])
+      expect(wire.observed.statuses).toEqual([])
+    },
+    30000
+  )
+
   test('unsubscribing drops the state of an unavailable topic and reports nothing for it', async () => {
     const wire = scenario('classic')
     await wire.consumer.connect()
