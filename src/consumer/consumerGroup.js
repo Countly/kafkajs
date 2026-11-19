@@ -2062,8 +2062,7 @@ module.exports = class ConsumerGroup {
    * Whether a seek holds an owned partition back from Fetch, validation, resolution and default
    * commits: a seek of it is queued, or the reservation this acquisition took in this run and
    * incarnation is held. A reservation taken by another acquisition, run, incarnation or consumer
-   * blocks only a new pop
-   * (`seekOffsets`), never this owner's fetch.
+   * blocks only a new pop (`seekOffsets`), never this owner's fetch.
    * @param {string} topic
    * @param {number|string} partition
    * @returns {boolean} false for a partition this member does not own
@@ -3633,9 +3632,11 @@ module.exports = class ConsumerGroup {
    * seek and returns the established position, and a queued seek dies with the run. Otherwise,
    * while a seek of the partition is queued or in flight (`isSeekGated`) and its cell's
    * reservation is held, the read waits for the release with no timer (`awaitSeekRelease`), so
-   * it never returns the position a seek in flight is replacing. A read from a callback carries that invocation's guard and fence through
-   * seek, resolution and the answer, so a callback that settled, expired or was retired meanwhile
-   * publishes nothing and gets its refusal; a lost caller's read is refused too.
+   * it never returns the position a seek in flight is replacing; a halt is reported only once no
+   * seek gates the partition, so a queued seek that repairs it is waited for. A read from a
+   * callback carries that invocation's guard and fence through seek, resolution and the answer,
+   * so a callback that settled, expired or was retired meanwhile publishes nothing and gets its
+   * refusal; a lost caller's read is refused too.
    * With a public-call `operation`, its one deadline and identity guard are carried the same way: its
    * close ends the reads and delays, and an expired call publishes and answers nothing.
    * @param {{topic: string, partition: number}} entry validated public partition
@@ -3687,14 +3688,14 @@ module.exports = class ConsumerGroup {
     for (let pass = 0; pass < MAX_RESOLUTION_PASSES;) {
       if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
       check()
-      const halted = this.haltedPartitions.get(key)
-      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
       if (!quiescent && this.isSeekGated(topic, partition)) {
         const held = this.operations.reservation(topic, partition)
         if (held !== null) await this.awaitSeekRelease(entry, held, preparation?.fence, check)
         else pass++
         continue
       }
+      const halted = this.haltedPartitions.get(key)
+      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
       pass++
       const offset = String(
         manager.resolvedOffsetAt(topic, partition) ?? manager.heldOffsetAt(topic, partition)
@@ -3762,7 +3763,9 @@ module.exports = class ConsumerGroup {
    * settles nothing; one popped with no acquisition to compare (a partition assigned without one)
    * is never refused for it. Its identity is captured in the step that pops it, before any
    * observer runs, and every later step, its DEBUG log included, ends in its settlement, so a
-   * throwing log is a failed seek and a seek admitted from inside the log supersedes it.
+   * throwing log is a failed seek and a seek admitted from inside the log supersedes it: the
+   * attempt's admission is checked once more after the log, before any local or wire effect. The
+   * log gets a copy of the popped seek, so a log creator that edits it changes nothing applied.
    *
    * A seek is popped only together with its cell's reservation in the group's ledger, taken in
    * the same synchronous step; while another seek of the cell holds it (any consumer, acquisition
@@ -3812,9 +3815,11 @@ module.exports = class ConsumerGroup {
           this.logger.debug('Seek offset', {
             groupId: this.groupId,
             memberId: this.memberId,
-            seek: seekEntry,
+            seek: { ...seekEntry },
           })
-          applied = await manager.seek(seekEntry, preparation, attempt)
+          if (attempt.refusal() === null) {
+            applied = await manager.seek(seekEntry, preparation, attempt)
+          }
         } catch (error) {
           failure = { error }
         }
