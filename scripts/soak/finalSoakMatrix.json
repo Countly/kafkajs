@@ -106,7 +106,7 @@
       "source": "design: every offered value is exactly this long"
     },
     "maxOffers": {
-      "value": 1600000,
+      "value": 2000000,
       "unit": "records",
       "source": "design: total offers cap including probes and aborted records"
     },
