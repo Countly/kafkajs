@@ -199,6 +199,7 @@ class Journal {
     const keys = () => ({ paused: 0, held: 0 })
     this.info = {
       outages: [],
+      outagesNotShown: 0,
       waves: { transfer: 0, return: 0, unobserved: 0, keys: { transfer: keys(), return: keys() } },
       incompleteWaves: [],
     }
@@ -206,6 +207,7 @@ class Journal {
     const churn = matrix.schedule.executions.find((e) => e.shape === 'membership-churn')
     this.waveCap = churn.waves * 2 * Object.keys(matrix.clientKinds).length
     this.wavesFull = false
+    this.outageCap = 2 * matrix.schedule.totals.outages
     this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
   }
@@ -242,11 +244,8 @@ class Journal {
     else if (r.kind === 'sample') this.sample(r)
     else if (r.kind === 'process') this.process(r)
     else if (r.kind === 'shape') this.shape(r)
-    else if (r.kind === 'broker-state' && r.event !== 'isr') {
-      const { node, event, at, downMs = null, processAt = null } = r
-      if (this.info.outages.length < LIST_CAP)
-        this.info.outages.push({ node, event, at, downMs, processAt })
-    } else if (r.kind === 'wave') this.wave(r)
+    else if (r.kind === 'broker-state' && r.event !== 'isr') this.outage(r)
+    else if (r.kind === 'wave') this.wave(r)
     else if (r.kind === 'wave-key') this.waveKey(r)
     else if (r.kind === 'diagnostic') {
       const kind =
@@ -258,6 +257,18 @@ class Journal {
           first: this.incidents.get(kind)?.first ?? r.message,
         })
     }
+  }
+
+  /**
+   * Keeps a broker's down or ready instant for the report, up to two per scheduled outage of a day
+   * (`schedule.totals.outages`); beyond that it only counts them.
+   * @param {object} r a `broker-state` record other than `isr` @returns {void}
+   */
+  outage(r) {
+    const { node, event, at, downMs = null, processAt = null } = r
+    if (this.info.outages.length < this.outageCap)
+      this.info.outages.push({ node, event, at, downMs, processAt })
+    else this.info.outagesNotShown++
   }
 
   /**
@@ -1222,7 +1233,7 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
 
 /**
  * What the journal shows but no row judges: broker outages (down and ready instants, configured
- * down time, container stop or start instant), membership wave transfers and returns with the
+ * down time, container stop or start instant; two per scheduled outage, with a count of any more), membership wave transfers and returns with the
  * paused and held keys their `wave-key` records name, waves missing some of their `wave-key`
  * records (the stream validator fails those too), probe sends that settled after their step, and
  * drain commits skipped as expected.
@@ -1232,6 +1243,7 @@ function informationOf(journal) {
   const count = (kind) => journal.incidents.get(kind)?.count ?? 0
   return {
     outages: journal.info.outages,
+    outagesNotShown: journal.info.outagesNotShown,
     waves: journal.info.waves,
     incompleteWaves: journal.info.incompleteWaves,
     lateProbeSends: count('late'),
@@ -1414,6 +1426,8 @@ function formatReport(report) {
       lines.push(
         `  broker ${o.node} ${o.event} at ${o.at} (configured down ${o.downMs ?? '-'} ms, container at ${o.processAt ?? '-'})`
       )
+    if (info.outagesNotShown > 0)
+      lines.push(`  ${info.outagesNotShown} more broker down or ready records not shown`)
     const w = info.waves
     const keys = (event) =>
       `${w.keys[event].paused} paused keys, ${w.keys[event].held} held by the member`
