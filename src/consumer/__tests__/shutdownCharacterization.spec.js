@@ -27,7 +27,7 @@ describe('Consumer > shutdown characterization', () => {
     ['without', false],
     ['with', true],
   ])(
-    'a fatal heartbeat answer while eachMessage is held, %s onPartitionsLost, reports no CRASH, no restartOnFailure call and no disconnect until the handler returns, then one CRASH with restart false',
+    'a fatal heartbeat answer while eachMessage is held, %s onPartitionsLost, waits one maxPollInterval from receipt, then disconnects and reports one CRASH with restart false while the handler is still held',
     async (_, withHook) => {
       const policy = jest.fn(async () => true)
       const lost = jest.fn(async () => {})
@@ -40,26 +40,35 @@ describe('Consumer > shutdown characterization', () => {
           await held.promise
         },
       })
+      run.consumer.on(run.consumer.events.DISCONNECT, () => run.log.push({ kind: 'DISCONNECT' }))
       await advanceUntil(() => entered.mock.calls.length === 1)
       run.arm()
       await advanceUntil(() => run.faultAt() !== null)
       const fetchesAtFault = count(run, 'fetch')
-      await jest.advanceTimersByTimeAsync(12000)
+      await jest.advanceTimersByTimeAsync(run.faultAt() + 3999 - Date.now())
 
       expect(run.crashes).toEqual([])
       expect(policy).not.toHaveBeenCalled()
       expect(run.cluster.disconnect).not.toHaveBeenCalled()
-      expect(lost).not.toHaveBeenCalled()
       expect(count(run, 'fetch')).toBe(fetchesAtFault)
 
-      run.held.resolve()
-      await advanceUntil(() => run.crashes.length > 0, 10000)
+      await advanceUntil(() => run.crashes.length > 0, 100)
 
       expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
       expect(policy).toHaveBeenCalledTimes(1)
       expect(run.cluster.disconnect).toHaveBeenCalledTimes(1)
-      expect(lost).toHaveBeenCalledTimes(withHook ? 1 : 0)
+      expect([count(run, 'STOP'), count(run, 'DISCONNECT')]).toEqual([1, 1])
+      expect(lost).not.toHaveBeenCalled()
+
+      const sent = count(run, 'heartbeat') + count(run, 'commit')
+      run.held.resolve()
+      await jest.advanceTimersByTimeAsync(10000)
+
+      expect(run.crashes).toHaveLength(1)
+      expect(count(run, 'heartbeat') + count(run, 'commit')).toBe(sent)
+      expect(lost).not.toHaveBeenCalled()
       expect(entered).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
     },
     60000
   )

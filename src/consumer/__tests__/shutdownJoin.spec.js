@@ -205,3 +205,110 @@ describe('Consumer > a timed close joining crash cleanup', () => {
     expect(run.crashes).toHaveLength(1)
   }, 60000)
 })
+
+describe('Consumer > a fatal heartbeat answer while a handler runs', () => {
+  /** Starts a run whose eachMessage runs `body(payload, held)` and waits until it has entered. */
+  const startWith = async (body, options = {}) => {
+    const entered = jest.fn()
+    const ready = deferred()
+    const ref = {}
+    const run = await start({
+      ...options,
+      eachMessage: async (payload, held) => {
+        entered()
+        await ready.promise
+        return body(payload, held, ref)
+      },
+    })
+    ref.run = run
+    traceDisconnect(run)
+    ready.resolve()
+    await advanceUntil(() => entered.mock.calls.length === 1)
+    return run
+  }
+
+  it('a handler released before the deadline is claimed by the fetch loop: one CRASH and nothing armed after it (control)', async () => {
+    const run = await startWith((_payload, held) => held.promise)
+    run.arm()
+    await advanceUntil(() => run.faultAt() !== null)
+    await jest.advanceTimersByTimeAsync(2900)
+    run.held.resolve()
+    await advanceUntil(() => run.crashes.length > 0, 1000)
+    await jest.advanceTimersByTimeAsync(5000)
+
+    expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
+    expect(run.cluster.disconnect).toHaveBeenCalledTimes(1)
+    expect(count(run, 'DISCONNECT')).toBe(1)
+    expect(jest.getTimerCount()).toBe(0)
+  }, 60000)
+
+  it("a handler whose own heartbeat gets the fatal answer and then awaits a plain disconnect is not waited for past the deadline: one STOP, DISCONNECT and CRASH, the handler's disconnect settles and a CRASH listener's connect is an outside call", async () => {
+    const outcome = {}
+    const connects = []
+    const run = await startWith(async ({ heartbeat }, _held, ref) => {
+      // Each answer arrives 300 ms after its request, so the handler's heartbeat joins one in flight.
+      const send = ref.run.coordinator.consumerGroupHeartbeat.getMockImplementation()
+      ref.run.coordinator.consumerGroupHeartbeat.mockImplementation(async (request) => {
+        const answer = send(request).then(
+          (value) => () => value,
+          (error) => () => {
+            throw error
+          }
+        )
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        return (await answer)()
+      })
+      ref.run.arm()
+      for (;;) {
+        try {
+          await heartbeat()
+        } catch (error) {
+          outcome.heartbeat = error
+          outcome.at = Date.now()
+          outcome.disconnect = settled(ref.run.consumer.disconnect())
+          await new Promise(() => {})
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+    })
+    run.consumer.on(run.consumer.events.CRASH, () => connects.push(settled(run.consumer.connect())))
+    await advanceUntil(() => outcome.disconnect !== undefined, 2000)
+
+    expect(outcome.heartbeat).toMatchObject({ code: 30 })
+
+    await jest.advanceTimersByTimeAsync(outcome.at + 3999 - Date.now())
+
+    expect(outcome.disconnect.done).toBe(false)
+    expect(run.crashes).toEqual([])
+
+    await advanceUntil(() => outcome.disconnect.done && run.crashes.length > 0, 100)
+
+    expect(outcome.disconnect).toEqual({ done: true, value: undefined })
+    expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
+    expect([count(run, 'STOP'), count(run, 'DISCONNECT')]).toEqual([1, 1])
+    expect(run.cluster.disconnect).toHaveBeenCalledTimes(1)
+
+    await advanceUntil(() => connects[0]?.done, 1000)
+
+    expect(connects).toHaveLength(1)
+    expect(connects[0]).toEqual({ done: true, value: undefined })
+    await run.consumer.disconnect()
+  }, 60000)
+
+  it('a disconnect with a deadline shorter than the poll interval ends the held handler wait at its own deadline and still reports one CRASH with restart false', async () => {
+    const run = await startWith((_payload, held) => held.promise)
+    run.arm()
+    await advanceUntil(() => run.faultAt() !== null)
+    const close = settled(run.consumer.disconnect({ timeout: 100 }))
+    await jest.advanceTimersByTimeAsync(99)
+
+    expect(close.done).toBe(false)
+
+    await advanceUntil(() => close.done && run.crashes.length > 0, 100)
+
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
+    expect([count(run, 'STOP'), count(run, 'DISCONNECT')]).toEqual([1, 1])
+    expect(run.cluster.disconnect).toHaveBeenCalledTimes(1)
+  }, 60000)
+})
