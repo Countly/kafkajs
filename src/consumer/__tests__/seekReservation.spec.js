@@ -683,6 +683,53 @@ describe('a seek without a commit', () => {
       group.idleWait.dispose()
     }
   )
+
+  test('leaves a commit the broker accepted while it applied in the committed cache, and a default commit then sends the position', async () => {
+    const ctx = createScheduledOffsetManager({ committed: '2', autoCommit: false })
+    await ctx.manager.resolveOffsets()
+    const answer = ctx.schedule.hold({ api: 'OffsetCommit' })
+    const committing = ctx.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '6' }] }],
+    })
+    await answer.arrived()
+
+    expect(await ctx.manager.seek({ ...CELL, offset: '3' })).toBe(true)
+    answer.release({})
+    await committing
+
+    expect(ctx.stored[0]).toBe('6')
+    expect(ctx.committedAt(0)).toBe('6')
+    expect(ctx.next(0)).toBe('3')
+    await ctx.manager.commitOffsets()
+    expect(ctx.coordinator.offsetCommit).toHaveBeenCalledTimes(2)
+    expect(ctx.coordinator.offsetCommit.mock.calls[1][0].topics).toEqual([
+      { topic: TOPIC, partitions: [expect.objectContaining({ partition: 0, offset: '3' })] },
+    ])
+    expect(ctx.stored[0]).toBe('3')
+    expect(ctx.committedAt(0)).toBe('3')
+    expect(ctx.operations.size()).toBe(0)
+  })
+
+  test('is not overwritten by its own duration reset that began before it', async () => {
+    const ctx = createScheduledOffsetManager({
+      committed: '-1',
+      listOffset: '12',
+      autoCommit: false,
+    })
+    ctx.manager.topicConfigurations[TOPIC].resetPolicy = { kind: 'by_duration', durationMs: 1000 }
+    const lookup = ctx.schedule.hold({ api: 'ListOffsets' })
+    const resetting = ctx.manager.resetByDuration(CELL)
+    await lookup.arrived()
+
+    expect(await ctx.manager.seek({ ...CELL, offset: '5' })).toBe(true)
+    lookup.release([{ topic: TOPIC, partitions: [{ partition: 0, offset: '12' }] }])
+
+    expect(await resetting).toBe(false)
+    expect(ctx.next(0)).toBe('5')
+    expect(ctx.heldAt(0)).toBe('5')
+    expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
+    expect(ctx.operations.size()).toBe(0)
+  })
 })
 
 describe('an ordinary commit the broker accepted', () => {

@@ -1332,4 +1332,18 @@ describe.each(['classic', 'consumer'])('a seeded seek schedule, %s protocol', (p
   }, 120000)
 })
 
+describe.each(['classic', 'consumer'])('a named seek schedule, %s protocol', (protocol) => {
+  test('a commit the broker accepts while a seek without a commit applies stays in the committed cache', async () => {
+    const steps = [
+      ['seek', 0, 3],
+      ['reply', 'held'],
+      ['outsideCommit', 0, 6],
+      ['position', 0],
+      ['releaseReplies'],
+    ]
+    const violations = await runSchedule(protocol, { seed: 1, autoCommit: false, steps })
+    expect(violations.map(({ check, detail }) => [check, detail])).toEqual([])
+  }, 60000)
+})
+
 module.exports = { generate, runSchedule }
