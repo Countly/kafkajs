@@ -1156,6 +1156,22 @@ describe.each([false, true])('public classic commits with static membership %s',
 })
 
 describe('request identities held across heartbeat answers', () => {
+  /**
+   * Replaces the membership a held heartbeat was sent under the way a broker does: the member is
+   * fenced, then rejoins and is acknowledging epoch 9 with a new target, its ownership renewed by
+   * the apply.
+   * @param {ConsumerGroupProtocol} protocol
+   * @returns {void}
+   */
+  const replaceMembership = (protocol) => {
+    protocol.transitionToFenced(brokerError(UNKNOWN_MEMBER_ID))
+    protocol.transitionTo('JOINING')
+    protocol.ownership.renew()
+    protocol.state = 'ACKNOWLEDGING'
+    protocol.memberEpoch = 9
+    protocol.target = { localEpoch: 9, byTopicId: new Map() }
+  }
+
   it.each([25, 110, 82, 30, 42, 111])(
     'an obsolete consumer heartbeat code %i changes no replacement state',
     async (code) => {
@@ -1176,21 +1192,18 @@ describe('request identities held across heartbeat answers', () => {
       protocol.coordinator = {
         consumerGroupHeartbeat: () => schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({})),
       }
-      const token = ownership.token()
       const request = protocol.sendHeartbeat({}).then(
-        () => null,
-        (error) => error
+        (value) => ({ value }),
+        (error) => ({ error })
       )
       await gate.arrived()
-      ownership.renew()
-      const target = { localEpoch: 9, byTopicId: new Map() }
-      protocol.target = target
-      protocol.memberEpoch = 9
+      replaceMembership(protocol)
+      const target = protocol.target
       const reset = jest.spyOn(protocol.sentFields, 'reset')
       const error = brokerError(code)
       gate.fail(error)
-      expect(await request).toBe(error)
-      expect(sentOwnership(error)).toBe(token)
+      expect(await request).toEqual({ value: false })
+      expect(sentOwnership(error)).toBeUndefined()
       expect(reset).not.toHaveBeenCalled()
       expect(protocol.state).toBe('ACKNOWLEDGING')
       expect(protocol.target).toBe(target)
@@ -1220,13 +1233,11 @@ describe('request identities held across heartbeat answers', () => {
     }
     const request = protocol.sendHeartbeat({})
     await gate.arrived()
-    ownership.renew()
-    const target = { localEpoch: 9, byTopicId: new Map() }
-    protocol.target = target
-    protocol.memberEpoch = 9
+    replaceMembership(protocol)
+    const target = protocol.target
     const remember = jest.spyOn(protocol.sentFields, 'remember')
     gate.release({ memberEpoch: 8, heartbeatIntervalMs: 1, assignment: null })
-    await request
+    expect(await request).toBe(false)
     expect(remember).not.toHaveBeenCalled()
     expect(protocol.state).toBe('ACKNOWLEDGING')
     expect(protocol.memberEpoch).toBe(9)
