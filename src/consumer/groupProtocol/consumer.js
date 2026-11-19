@@ -1466,7 +1466,8 @@ module.exports = class ConsumerGroupProtocol {
       )
       this.acknowledge()
     } else if (converged) {
-      if (wasReconciling || wasJoining) {
+      // An apply still running stays RECONCILING, so its `setOwned` acknowledges what it applied.
+      if ((wasReconciling && this.pendingResolved == null) || wasJoining) {
         this.transitionTo(STABLE)
       }
     } else {
