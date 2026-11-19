@@ -2190,10 +2190,12 @@ class ShareWorker extends Worker {
   entered = new Map()
   /** Per `topicId|partition`, when a record was last handed to a handler or acquired on the wire. */
   activity = new Map()
-  /** Per `client|node`, the `topicId|partition` keys of the share session its requests built. */
+  /**
+   * Per live share session (`client|node`), the `topicId|partition` keys its requests built, each
+   * with the send time of the session's newest fetch answered without error for it (the quiet
+   * witness), or -Infinity before one. A witness lives only as long as its session holds the key.
+   */
   sessions = new Map()
-  /** Per `topicId|partition`, when the newest fetch of a session holding it was sent, if answered without error. */
-  fetched = new Map()
   /** The acquisition lock duration the newest answered share fetch reported, or null. */
   lockMs = null
   /**
@@ -2257,9 +2259,10 @@ class ShareWorker extends Worker {
    * Applies one answered ShareFetch of a member: the session's partitions after the request (a
    * zero epoch opens a new session, -1 closes it, any other epoch adds the request's partitions and
    * drops its forgotten ones), the lock duration the answer reports, activity for every partition
-   * it acquired records of, and, when the answer has no top-level error, the request's send time as
-   * the newest fetch of every partition the session holds that the answer gave no partition error.
-   * A top-level error ends the session, so a member that lost its membership stops counting.
+   * it acquired records of, and the request's send time as the witness of every partition the
+   * session holds that the answer gave no partition error. A partition error clears that
+   * partition's witness; a top-level error ends the session with its witnesses, so a member that
+   * lost its membership stops counting.
    * @param {ClientRig} rig the member
    * @param {{ node: string, sentAt: number, session: { epoch: number,
    *   partitions: { topicId: string, partition: number }[],
@@ -2271,11 +2274,14 @@ class ShareWorker extends Worker {
     const id = `${rig.id}|${node}`
     if (session.epoch <= 0 || decoded.errorCode !== 0) this.sessions.delete(id)
     if (session.epoch === -1 || decoded.errorCode !== 0) return
-    const held = this.sessions.get(id) ?? new Set()
+    const held = this.sessions.get(id) ?? new Map()
     this.sessions.set(id, held)
     for (const { topicId, partition } of session.forgotten)
       held.delete(shareKey(topicId, partition))
-    for (const { topicId, partition } of session.partitions) held.add(shareKey(topicId, partition))
+    for (const { topicId, partition } of session.partitions) {
+      const k = shareKey(topicId, partition)
+      if (!held.has(k)) held.set(k, -Infinity)
+    }
     if (decoded.acquisitionLockTimeoutMs > 0) this.lockMs = decoded.acquisitionLockTimeoutMs
     const failed = new Set()
     for (const t of decoded.topics)
@@ -2284,8 +2290,18 @@ class ShareWorker extends Worker {
         if (p.fetchErrorCode !== 0) failed.add(k)
         if (p.acquired?.length > 0) this.activity.set(k, this.runtime.clock.now())
       }
-    for (const k of held)
-      if (!failed.has(k)) this.fetched.set(k, Math.max(this.fetched.get(k) ?? -Infinity, sentAt))
+    for (const [k, witness] of held)
+      held.set(k, failed.has(k) ? -Infinity : Math.max(witness, sentAt))
+  }
+
+  /**
+   * @param {string} k `topicId|partition`
+   * @returns {number} the newest quiet witness of the key among the live sessions holding it
+   */
+  witnessOf(k) {
+    let newest = -Infinity
+    for (const held of this.sessions.values()) newest = Math.max(newest, held.get(k) ?? -Infinity)
+    return newest
   }
 
   /**
@@ -2494,10 +2510,14 @@ class ShareWorker extends Worker {
       k.startsWith(prefix) ? list : []
     ))
       this.totals.dropped += r.to - r.from + 1n - r.accepted.countFrom(r.from)
-    for (const map of [this.entered, this.activity, this.fetched, this.unconfirmed])
+    for (const map of [this.entered, this.activity, this.unconfirmed, ...this.sessions.values()])
       for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key)
-    for (const held of this.sessions.values())
-      for (const key of [...held]) if (key.startsWith(prefix)) held.delete(key)
+  }
+
+  /** @param {string} client drops the share sessions, with their witnesses, of a retired member */
+  forgetClient(client) {
+    for (const id of [...this.sessions.keys()])
+      if (id.startsWith(`${client}|`)) this.sessions.delete(id)
   }
 
   /**
@@ -2510,11 +2530,7 @@ class ShareWorker extends Worker {
     if (!slot || step.phase === 'resume') return
     this.extras.push(await this.join(slot, step.execution))
     await this.runtime.clock.sleepUntil(this.runtime.clock.now() + 20000)
-    for (const rig of this.extras.splice(0)) {
-      await rig.retire(step.execution)
-      for (const id of [...this.sessions.keys()])
-        if (id.startsWith(`${rig.id}|`)) this.sessions.delete(id)
-    }
+    for (const rig of this.extras.splice(0)) await rig.retire(step.execution)
   }
 
   /**
@@ -2572,7 +2588,7 @@ class ShareWorker extends Worker {
     if (BigInt(end) === 0n) return null
     if (this.lockMs === null) return 'share fetch answer reporting the acquisition lock duration'
     const quietAt = (this.activity.get(k) ?? 0) + this.lockMs + SHARE_QUIET_MARGIN_MS
-    if ((this.fetched.get(k) ?? -Infinity) < quietAt)
+    if (this.witnessOf(k) < quietAt)
       return `share fetch answered without error, by a session holding the partition, sent at or after ${quietAt} (the end of the quiet period)`
     return null
   }

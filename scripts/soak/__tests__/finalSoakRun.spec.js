@@ -1539,7 +1539,12 @@ describe('final soak retained harness state', () => {
       })
     }
     share.forgetTopic(IDS.A)
-    for (const map of [share.entered, share.activity, share.fetched, share.unconfirmed])
+    for (const map of [
+      share.entered,
+      share.activity,
+      share.unconfirmed,
+      ...share.sessions.values(),
+    ])
       expect([...map.keys()]).toEqual([`${IDS.B}|0`])
     expect(share.evidence()).toEqual({
       unconfirmedAccepts: 2,
