@@ -326,6 +326,57 @@ describe('Consumer > a fatal heartbeat answer while a handler runs', () => {
     60000
   )
 
+  it.each([['onPartitionsLost'], ['onPartitionsRevoked']])(
+    'a crash the fatal deadline forces while the handler is held delivers the loss to %s once, before CRASH and without waiting for the handler',
+    async (callback) => {
+      const listener = jest.fn()
+      const run = await startWith((_payload, held) => held.promise, {
+        hook: { [callback]: listener },
+      })
+      const atCrash = []
+      run.consumer.on(run.consumer.events.CRASH, () => atCrash.push(listener.mock.calls.length))
+      run.arm()
+      await advanceUntil(() => run.faultAt() !== null)
+      await jest.advanceTimersByTimeAsync(run.faultAt() + 3999 - Date.now())
+
+      expect(listener).not.toHaveBeenCalled()
+
+      await advanceUntil(() => run.crashes.length > 0, 100)
+
+      expect(atCrash).toEqual([1])
+      expect(run.crashes.map(({ error, restart }) => [error.code, restart])).toEqual([[30, false]])
+
+      run.held.resolve()
+      await jest.advanceTimersByTimeAsync(3000)
+
+      expect(listener.mock.calls.map(([event]) => event.partitions)).toEqual([
+        [{ topic: 'topic-a', partitions: [0] }],
+      ])
+    },
+    60000
+  )
+
+  it('a natural stop made after the fatal answer while the handler is held leaves the forced crash one lost call, made at the deadline', async () => {
+    const lost = jest.fn()
+    const run = await startWith((_payload, held) => held.promise, {
+      hook: { onPartitionsLost: lost },
+    })
+    run.arm()
+    await advanceUntil(() => run.faultAt() !== null)
+    const stop = settled(run.consumer.stop())
+    await jest.advanceTimersByTimeAsync(run.faultAt() + 3999 - Date.now())
+
+    expect([stop.done, lost.mock.calls.length]).toEqual([false, 0])
+
+    await advanceUntil(() => stop.done && run.crashes.length > 0, 100)
+    run.held.resolve()
+    await jest.advanceTimersByTimeAsync(3000)
+
+    expect(stop).toEqual({ done: true, value: undefined })
+    expect(lost).toHaveBeenCalledTimes(1)
+    expect(run.crashes).toHaveLength(1)
+  }, 60000)
+
   it('a disconnect with a deadline shorter than the poll interval ends the held handler wait at its own deadline and still reports one CRASH with restart false', async () => {
     const run = await startWith((_payload, held) => held.promise)
     run.arm()
