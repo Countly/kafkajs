@@ -206,6 +206,7 @@ class Journal {
       outagesNotShown: 0,
       waves: { transfer: 0, return: 0, unobserved: 0, keys: { transfer: keys(), return: keys() } },
       incompleteWaves: [],
+      shareOutcomes: null,
     }
     this.openWaves = new Map()
     const churn = matrix.schedule.executions.find((e) => e.shape === 'membership-churn')
@@ -320,6 +321,22 @@ class Journal {
     if (r.stage === 'offered') this.offered(r)
     else if (r.stage === 'transaction') this.decided(r)
     else if (r.stage === 'ack' || r.stage === 'handler-enter') this.byId(r)
+    else if (r.stage === 'share-outcome') this.shareOutcome(r)
+  }
+
+  /**
+   * Counts, for information only, each share acknowledgement outcome with a reason (a null reason
+   * is a confirmed accept) by reason, and keeps its offset range, at most `capacity` ranges; beyond
+   * them the distinct offsets are not counted.
+   * @param {object} r a `share-outcome` identity record @returns {void}
+   */
+  shareOutcome(r) {
+    const s = (this.info.shareOutcomes ??= { reasons: new Map(), ranges: [], uncounted: 0 })
+    if (r.reason === null) return
+    s.reasons.set(r.reason, (s.reasons.get(r.reason) ?? 0) + 1)
+    if (s.ranges.length < this.capacity)
+      s.ranges.push({ key: `${r.key.topic}|${r.key.partition}`, from: +r.from, to: +r.to })
+    else s.uncounted++
   }
 
   /**
@@ -1321,13 +1338,15 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
  * What the journal shows but no row judges: broker outages (down and ready instants, configured
  * down time, container stop or start instant; two per scheduled outage, with a count of any more), membership wave transfers and returns with the
  * paused and held keys their `wave-key` records name, waves missing some of their `wave-key`
- * records (the stream validator fails those too), probe sends that settled after their step, and
- * drain commits skipped as expected.
+ * records (the stream validator fails those too), probe sends that settled after their step,
+ * drain commits skipped as expected, and share acknowledgement outcomes with a reason (only when the
+ * stream has `share-outcome` records).
  * @param {Journal} journal @returns {object}
  */
 function informationOf(journal) {
   const count = (kind) => journal.incidents.get(kind)?.count ?? 0
   return {
+    shareOutcomes: shareOutcomesOf(journal.info.shareOutcomes),
     outages: journal.info.outages,
     outagesNotShown: journal.info.outagesNotShown,
     waves: journal.info.waves,
@@ -1335,6 +1354,27 @@ function informationOf(journal) {
     lateProbeSends: count('late'),
     expectedSkips: count('expected skip:'),
   }
+}
+
+/**
+ * The unresolved share acknowledgement outcomes: their count by reason and the distinct offsets
+ * their ranges cover (null when more ranges arrived than were kept).
+ * @param {{ reasons: Map<string, number>, ranges: object[], uncounted: number }|null} s the
+ *   journal's tally, null when the stream has no `share-outcome` record
+ * @returns {{ unresolved: number, byReason: [string, number][], distinctOffsets: ?number }|null}
+ */
+function shareOutcomesOf(s) {
+  if (s === null) return null
+  const byReason = [...s.reasons].sort(([a], [b]) => a.localeCompare(b))
+  const unresolved = byReason.reduce((n, [, c]) => n + c, 0)
+  const ranges = s.ranges.sort((a, b) => a.key.localeCompare(b.key) || a.from - b.from)
+  let [distinct, key, reach] = [0, null, -1]
+  for (const r of ranges) {
+    if (r.key !== key) [key, reach] = [r.key, -1]
+    distinct += Math.max(0, r.to - Math.max(r.from, reach + 1) + 1)
+    reach = Math.max(reach, r.to)
+  }
+  return { unresolved, byReason, distinctOffsets: s.uncounted > 0 ? null : distinct }
 }
 
 /**
@@ -1525,6 +1565,14 @@ function formatReport(report) {
     for (const wave of info.incompleteWaves) lines.push(`  incomplete wave: ${wave}`)
     lines.push(`  probe sends settled after their step: ${info.lateProbeSends}`)
     lines.push(`  drain commits skipped as expected: ${info.expectedSkips}`)
+    const share = info.shareOutcomes
+    if (share) {
+      const reasons = share.byReason.map(([reason, n]) => `${reason} ${n}`).join(', ') || 'none'
+      const offsets = share.distinctOffsets ?? 'uncounted (too many ranges)'
+      lines.push(
+        `  unresolved share acknowledgements: ${share.unresolved} (${reasons}) covering ${offsets} distinct offsets`
+      )
+    }
   }
   return lines.join('\n')
 }
