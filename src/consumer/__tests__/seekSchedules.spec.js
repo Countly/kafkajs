@@ -325,11 +325,11 @@ class ScheduleRun {
         return ops.run({ ...ops.getStore(), seek: attempt }, () =>
           original.apply(this, args).then(
             (applied) => {
-              finish({ applied })
+              finish({ applied, accepted: args[2]?.accepted === true })
               return applied
             },
             (error) => {
-              finish({ error })
+              finish({ error, accepted: args[2]?.accepted === true })
               throw error
             }
           )
@@ -802,7 +802,7 @@ class Model {
     for (const e of this.events) {
       if (e.t >= until) break
       if (e.type === 'admit' && e.partition === partition) {
-        state.resolved = null
+        // Admission keeps the position: a seek that fails leaves the partition where it was.
         state.admission = e
         state.owed = true
         state.applying = false
@@ -869,6 +869,9 @@ class Model {
         if (e.error === undefined && e.applied) {
           state.reset = false
           state.resolved = this.autoCommit ? null : String(e.attempt.admission.target)
+        } else if (e.accepted) {
+          // Accepted but not applied here: the replaced position goes and is read back.
+          state.resolved = null
         }
       }
     }
@@ -962,10 +965,20 @@ class Model {
 
   /**
    * @returns {boolean} whether a default commit after `admission` may carry `offset`: the seek's
-   *   own local position, or progress resolved since by a batch fetched after it
+   *   own local position, progress resolved since by a batch fetched after it, or, once the seek
+   *   failed without the broker accepting it, the position the partition kept
    */
   mayCommit(partition, offset, admission, at) {
     if (String(admission.target) === offset) return true
+    const failed = this.events.some(
+      (e) =>
+        e.type === 'attemptEnd' &&
+        e.attempt.admission === admission &&
+        e.t < at &&
+        !e.applied &&
+        !e.accepted
+    )
+    if (failed && this.stateAt(partition, admission.t).resolved === offset) return true
     return this.events.some(
       (e) =>
         e.type === 'resolve' &&

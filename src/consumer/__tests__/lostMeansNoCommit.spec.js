@@ -597,7 +597,8 @@ describe.each([
       await held.arrived()
       const cause = brokerError(69)
       held.fail(cause)
-      await expect(operation).resolves.toBe(method === 'seek' ? false : undefined)
+      if (method === 'seek') expectRefusal(await refusalOf(operation), cause)
+      else await expect(operation).resolves.toBeUndefined()
       expectRefusal(ownership.refusal(ownership.token()), cause)
       const error = await refusalOf(
         manager.commitOffsets({
@@ -2120,11 +2121,14 @@ describe.each([
         ],
       })
       const outcome = await operation
-      expect(outcome.error).toBeUndefined()
-      expect(outcome.value).toBe(method === 'seek' ? false : undefined)
       const loss = member.group.ownership.refusal(member.group.ownership.token())
       expect(loss).toBeInstanceOf(KafkaJSCommitFailedError)
       expect(loss.cause.code).toBe(69)
+      if (method === 'seek') expectRefusal(outcome.error, loss.cause)
+      else {
+        expect(outcome.error).toBeUndefined()
+        expect(outcome.value).toBeUndefined()
+      }
       const count = member.frames('OffsetCommit').length
       expectRefusal((await member.observe(member.commit('8'))).error, loss.cause)
       expect(member.frames('OffsetCommit')).toHaveLength(count)
