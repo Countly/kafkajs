@@ -222,6 +222,54 @@ describe('final soak producer shutdown', () => {
     await worker.disconnect()
   })
 
+  test('a probe send still in flight at the execution deadline is recorded unknown, the probe answers by the deadline, and the late settlement is awaited before idle', async () => {
+    let release = null
+    useClient({
+      connect: async () => {},
+      disconnect: async () => {},
+      send: () => new Promise((resolve) => (release = () => resolve([{ baseOffset: '9' }]))),
+    })
+    const clock = new MonotonicClock()
+    const runtime = workerRuntime('c08', clock)
+    const worker = createWorker(runtime)
+    started.push(worker)
+    await worker.begin()
+    const deadline = clock.now() + 100
+    const reply = await within(
+      worker.onProbe({
+        id: 'p',
+        execution: 'h00t0',
+        topic: config.topics.main,
+        partitions: 1,
+        count: 3,
+        deadline,
+      }),
+      2000
+    )
+    expect(reply).toEqual({ offered: 1, stopped: true })
+    expect(clock.now()).toBeLessThan(deadline + 1000)
+    const acks = () => runtime.records.filter((r) => r.stage === 'ack')
+    expect(acks()).toEqual([
+      expect.objectContaining({
+        outcome: 'unknown',
+        offset: null,
+        errorType: 'ExecutionDeadline',
+        execution: 'h00t0',
+      }),
+    ])
+    let idle = false
+    const settled = worker.onIdle().then(() => (idle = true))
+    await tick()
+    expect(idle).toBe(false)
+    release()
+    await settled
+    expect(acks()).toHaveLength(1)
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: expect.stringMatching(/^probe send c08\.\d+ settled after the h00t0 deadline: ok$/),
+    })
+  })
+
   test('a recovery send counts only when the broker acknowledged it', async () => {
     let outcome = 'offset'
     useClient({
@@ -465,6 +513,78 @@ describe('final soak scheduled work', () => {
     await expect(outage({})).resolves.toEqual([])
   })
 
+  test("an outage records the configured down interval and the container's own stop and start instants on the run clock", async () => {
+    const { s, remove } = supervisor()
+    const WALL = Date.parse('2026-11-18T16:00:00.000Z')
+    try {
+      s.clock = jumpClock(500000)
+      jest.spyOn(Date, 'now').mockImplementation(() => WALL + s.clock.t)
+      const iso = (t) => new Date(WALL + t).toISOString().replace('Z', '123456Z')
+      let pid = 4242
+      let startedAt = iso(1000)
+      let finishedAt = '0001-01-01T00:00:00Z'
+      s.docker = async (args) => {
+        if (['stop', 'kill'].includes(args[1])) {
+          s.clock.t += 3000
+          pid = 0
+          finishedAt = iso(s.clock.t - 400)
+        }
+        if (args[1] === 'start') {
+          pid = 5151
+          startedAt = iso(s.clock.t + 250)
+          s.clock.t += 300
+        }
+        if (args[0] === 'inspect') return `${pid} ${startedAt} ${finishedAt}`
+        return 'container-1'
+      }
+      s.admin = {
+        describeCluster: async () => ({ brokers }),
+        fetchTopicMetadata: async () => ({ topics: partitions([1, 2, 3]) }),
+      }
+      s.send = async () => []
+      s.command = async () => ({ reply: { ok: true }, error: null })
+      const records = []
+      s.emit = async (record) => records.push(record)
+      await s.outage(outageStep, ['p01'])
+      const states = records.filter((r) => r.kind === 'broker-state')
+      expect(states.map((r) => [r.event, r.pid, r.downMs, r.processAt])).toEqual([
+        ['down', 0, 2000, 502600],
+        ['ready', 5151, 2000, 505250],
+        ['isr', 5151, 2000, 505250],
+      ])
+      expect(states[0].processTime).toBe(iso(2600))
+      expect(states[1].processTime).toBe(iso(5250))
+      expect(states[1].processAt - states[0].processAt).toBeGreaterThanOrEqual(outageStep.downMs)
+    } finally {
+      remove()
+    }
+  })
+
+  test('an outage whose container cannot tell its stop and start instants records them as unknown', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      s.docker = async (args) => (args[0] === 'inspect' ? 'garbage' : 'container-1')
+      s.admin = {
+        describeCluster: async () => ({ brokers }),
+        fetchTopicMetadata: async () => ({ topics: partitions([1, 2, 3]) }),
+      }
+      s.send = async () => []
+      s.command = async () => ({ reply: { ok: true }, error: null })
+      const records = []
+      s.emit = async (record) => records.push(record)
+      await expect(s.outage(outageStep, ['p01'])).rejects.toThrow(/no running process/)
+      const states = records.filter((r) => r.kind === 'broker-state')
+      expect(states.map((r) => [r.pid, r.processAt, r.processTime])).toEqual([
+        [0, null, null],
+        [0, null, null],
+        [0, null, null],
+      ])
+    } finally {
+      remove()
+    }
+  })
+
   test.each([
     ['a failed docker stop', { failing: 'stop' }, /broker-stop/],
     ['a failed docker start', { failing: 'start' }, /broker-start/],
@@ -638,6 +758,61 @@ describe('final soak scheduled work', () => {
     })
   })
 
+  test('a wave journals which paused keys moved to which extra and when they returned to the standing member', async () => {
+    const clock = jumpClock(0)
+    const wave = staticWave(clock, ({ joined, retired }) =>
+      joined === 0 || (retired.length === 1 && clock.t >= 1000) ? wave.keys : []
+    )
+    await wave.worker.onMembershipChurn({
+      execution: 'h00m0w1',
+      wave: 1,
+      phase: 'leave',
+      waveDeadline: 90000,
+    })
+    expect(wave.runtime.records.filter((r) => r.kind === 'wave')).toEqual([
+      {
+        kind: 'wave',
+        recordId: expect.any(String),
+        execution: 'h00m0w1',
+        event: 'transfer',
+        client: 'c02.1',
+        member: 'c14.1',
+        paused: wave.keys,
+        keys: wave.keys,
+        observed: true,
+      },
+      {
+        kind: 'wave',
+        recordId: expect.any(String),
+        execution: 'h00m0w1',
+        event: 'return',
+        client: 'c02.1',
+        member: 'c02.1',
+        paused: wave.keys,
+        keys: wave.keys,
+        observed: true,
+      },
+    ])
+  })
+
+  test('a wave whose paused keys never all returned journals what the standing member held at the deadline', async () => {
+    const clock = jumpClock(0)
+    const wave = staticWave(clock, ({ joined }) =>
+      joined === 0 ? wave.keys : wave.keys.slice(0, 1)
+    )
+    await wave.worker.onMembershipChurn({
+      execution: 'h00m0w1',
+      wave: 1,
+      phase: 'leave',
+      waveDeadline: 90000,
+    })
+    const records = wave.runtime.records.filter((r) => r.kind === 'wave')
+    expect(records.map((r) => [r.event, r.member, r.keys, r.observed])).toEqual([
+      ['transfer', 'c14.1', wave.keys, true],
+      ['return', 'c02.1', wave.keys.slice(0, 1), false],
+    ])
+  })
+
   test('a wave whose paused partitions never return to the standing member says so in its reply', async () => {
     const clock = jumpClock(0)
     const wave = staticWave(clock, ({ joined }) =>
@@ -745,6 +920,38 @@ describe('final soak final drain', () => {
     expect(commitOffsets).toHaveBeenCalledTimes(1)
     expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '260' }])
   })
+
+  test('an intermediate drain commits a key whose acquisition was retained across a membership round, under the current authority', async () => {
+    const { worker, rig, commitOffsets, runtime } = consumer()
+    const then = { run: 'c01.1.r1', token: 10, acquiredAt: 7, recreatedAt: 0 }
+    rig.authority.get(key).authority = then
+    runtime.observer.currentAuthority = () => ({ ...then, token: 11 })
+    rig.processed.set(key, '62')
+    expect(await worker.onDrain()).toEqual({ reached: true })
+    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '62' }])
+    expect(commitsOf(runtime)[0].authority).toEqual({ ...then, token: 11 })
+  })
+
+  test.each([
+    ['the key was acquired again', { acquiredAt: 8 }, 'the key was acquired again since its last handler'],
+    ['the topic was recreated', { recreatedAt: 3 }, 'the key was acquired again since its last handler'],
+    ['the client run changed', { run: 'c01.1.r2' }, 'the client run changed since its last handler'],
+  ])(
+    'an intermediate drain skips a key when %s and journals the expected skip with its reason',
+    async (_, change, reason) => {
+      const { worker, rig, commitOffsets, runtime } = consumer()
+      const then = { run: 'c01.1.r1', token: 10, acquiredAt: 7, recreatedAt: 0 }
+      rig.authority.get(key).authority = then
+      runtime.observer.currentAuthority = () => ({ ...then, ...change })
+      rig.processed.set(key, '62')
+      expect(await worker.onDrain()).toEqual({ reached: true })
+      expect(commitOffsets).not.toHaveBeenCalled()
+      expect(runtime.records).toContainEqual({
+        kind: 'diagnostic',
+        message: `expected skip: drain commit of ${key} by c01.1: ${reason}; its current owner's progress covers it`,
+      })
+    }
+  )
 
   test('a batch that carried messages does not move the resolved offset beyond what its handler resolved', () => {
     const { worker, rig } = consumer()
