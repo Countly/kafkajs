@@ -550,11 +550,13 @@ module.exports = class ConsumerGroupProtocol {
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
    *   growSubscription?: (names: string[]) => Promise<void> }} context
    * @returns {Promise<{ assignment: Object, userData: null, abandoned?: true }>} the assignment in
-   *   the name-keyed shape the apply expects; `abandoned` with what the member owns when its target
-   *   was replaced by a newer one while the step resolved it
+   *   the name-keyed shape the apply expects; `abandoned` with what the member owns when, while the
+   *   step resolved its target, a newer target replaced it or the rollback of a failed
+   *   `subscribe()` (or a mode change) retired the metadata scope it resolved under: the chain's
+   *   follow-up round reconciles the live target under the current scope
    * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
-   *   when a fencing, a fatal error or a leave retired the target during the step; whatever the
-   *   join failed with otherwise
+   *   when a fencing, a fatal error, a leave or a rejoin retired the membership or the target
+   *   during the step; whatever the join failed with otherwise
    */
   async rebalance(context) {
     if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
@@ -597,15 +599,7 @@ module.exports = class ConsumerGroupProtocol {
       await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
       if (!isCurrent()) throw assignmentChangedError()
     } catch (error) {
-      // A fencing, a fatal error and a leave clear the target (a leave only after its commit,
-      // hence the state check), so a target still here was replaced by a newer one. The step is
-      // abandoned: the member keeps what it owns and the chain's follow-up round reconciles the
-      // newer target.
-      if (
-        error?.type === 'ASSIGNMENT_CHANGED' &&
-        this.target != null &&
-        !isLeavingGroup(this.state)
-      ) {
+      if (error?.type === 'ASSIGNMENT_CHANGED' && isCurrent.member()) {
         return { assignment: this.ownedAsObject(), userData: null, abandoned: true }
       }
       throw error
@@ -824,21 +818,26 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Captures a membership and target identity that is never reused, even at equal local epochs,
-   * and, for a client-pattern consumer, the metadata scope: an accepted mode change retires it.
+   * and, for a client-pattern consumer, the metadata scope: an accepted mode change and the
+   * rollback of a failed `subscribe()` retire it.
    * @private
-   * @returns {() => boolean} true only while this member may use the captured target
+   * @returns {(() => boolean) & { member: () => boolean }} true only while this member may use the
+   *   captured target; `member()` true while the captured membership still holds a target, whatever
+   *   became of the target revision and the scope (a fencing, a fatal error and a leave clear the
+   *   target, a leave only after its commit, hence the state check)
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
     const scope = this.subscription?.captureScope()
-    return () =>
-      (!scope || scope()) &&
+    const member = () =>
       membership === this.membershipRevision &&
-      target === this.targetRevision &&
       this.target != null &&
       !isNotInGroup(this.state) &&
       !isLeavingGroup(this.state)
+    return Object.assign(() => (!scope || scope()) && target === this.targetRevision && member(), {
+      member,
+    })
   }
 
   /**
