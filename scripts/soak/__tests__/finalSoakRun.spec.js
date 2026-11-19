@@ -1957,6 +1957,148 @@ describe('final soak final drain', () => {
     expect(await worker.onDrain(step)).toEqual({ reached: true })
   })
 
+  /**
+   * A share drain whose standing member reported, for offset 9 of IDS.A, an accept the client
+   * retired after a session loss, and whose broker readback answers with `starts()` in turn.
+   * @param {() => object|undefined} starts the supervisor's reply to each share readback
+   */
+  const lostReply = (starts) => {
+    const clock = jumpClock(0)
+    const { runtime, worker, take } = shareDrain()
+    runtime.clock = clock
+    const asked = []
+    runtime.request = async (body) => {
+      asked.push({ ...body, at: clock.now() })
+      return starts()
+    }
+    const rig = { id: 'c07.1', slot: { group: 'g' } }
+    worker.standing.push(rig)
+    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
+    worker.delivered(`${IDS.A}|0`, '9')
+    const error = Object.assign(new Error('Acknowledgement was not confirmed'), {
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'session-lost',
+    })
+    worker.onOutcome(rig, {
+      topic: main,
+      partition: 0,
+      firstOffset: '9',
+      lastOffset: '9',
+      type: 'accept',
+      error,
+    })
+    return { clock, runtime, worker, take, asked }
+  }
+
+  test('a share drain passes an accept whose reply was lost to a session loss when the client reported its outcome and the broker start offset is past the end, and journals the outcome', async () => {
+    const { clock, runtime, worker, asked } = lostReply(() => ({
+      topicId: IDS.A,
+      startOffset: '10',
+      lag: '0',
+    }))
+    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: true })
+    expect(runtime.records).toContainEqual({
+      kind: 'identity',
+      recordId: expect.any(String),
+      stage: 'share-outcome',
+      client: 'c07.1',
+      group: 'g',
+      key: { topic: main, topicId: IDS.A, partition: 0 },
+      from: '9',
+      to: '9',
+      type: 'accept',
+      reason: 'session-lost',
+      errorType: 'KafkaJSShareAcknowledgementError',
+    })
+    expect(asked).toEqual([
+      {
+        type: 'share-readback',
+        client: 'c07.1',
+        group: 'g',
+        key: { topic: main, topicId: IDS.A, partition: 0 },
+        at: 0,
+      },
+    ])
+    expect(runtime.records.some((r) => r.kind === 'diagnostic')).toBe(false)
+  })
+
+  test('a share drain fails an accept whose reply was lost when the broker gives no share start offset past the end', async () => {
+    for (const answer of [
+      undefined,
+      { topicId: IDS.A, startOffset: null, lag: null },
+      { topicId: IDS.B, startOffset: '10', lag: '0' },
+    ]) {
+      const { clock, runtime, worker } = lostReply(() => answer)
+      const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+      expect(await worker.onDrain(step)).toEqual({ reached: false })
+      expect(runtime.records).toContainEqual({
+        kind: 'diagnostic',
+        message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9 (the client reported its outcome; the broker's share start offset is unknown, its lag unknown)`,
+      })
+    }
+  })
+
+  test('a share drain fails a record the broker still holds once its lock had time to expire, and names the offset', async () => {
+    const { clock, runtime, worker, asked } = lostReply(() => ({
+      topicId: IDS.A,
+      startOffset: '9',
+      lag: '1',
+    }))
+    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(clock.now()).toBe(60000)
+    expect(asked.at(-1).at).toBeGreaterThan(30000)
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9 (the client reported its outcome; the broker's share start offset is 9, its lag 1)`,
+    })
+  })
+
+  test('a share drain passes a lost-reply accept of the last offset when the broker start offset still names it but its lag is 0', async () => {
+    const { clock, worker, asked } = lostReply(() => ({
+      topicId: IDS.A,
+      startOffset: '9',
+      lag: '0',
+    }))
+    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: true })
+    expect(asked).toHaveLength(1)
+  })
+
+  test('a share drain without a client outcome fails while the broker start offset is below the end, whatever later answers say', async () => {
+    const { runtime, worker, take } = shareDrain()
+    runtime.clock = jumpClock(0)
+    const asked = []
+    runtime.request = async (body) =>
+      asked.push(body) && { topicId: IDS.A, startOffset: '10', lag: '0' }
+    worker.standing.push({ id: 'c07.1', slot: { group: 'g' } })
+    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
+    worker.delivered(`${IDS.A}|0`, '9')
+    const step = { ends: { [key]: '10' }, deadline: runtime.clock.now() + 40 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(asked).toEqual([])
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9`,
+    })
+  })
+
+  test('a share drain passes a record redelivered and accepted under a later acquisition after its first accept was lost', async () => {
+    let redelivered = false
+    const ctx = lostReply(() => {
+      if (!redelivered && ctx.clock.now() >= 30000) {
+        redelivered = true
+        ctx.take(IDS.A, 9)
+      }
+      return { topicId: IDS.A, startOffset: '9', lag: '1' }
+    })
+    const step = { ends: { [key]: '10' }, deadline: ctx.clock.now() + 60000 }
+    expect(await ctx.worker.onDrain(step)).toEqual({ reached: true })
+    expect(redelivered).toBe(true)
+    expect(ctx.clock.now()).toBeLessThan(60000)
+  })
+
   test('a share gap that is never filled keeps a bounded memory and still fails the drain', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
