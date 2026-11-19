@@ -582,6 +582,41 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(report, 'K2', 'FAIL', /1 records not visible.*c09\.4 in g-0123456789ab-c01/)
     })
 
+    it('fails, never ACCEPTED, a handler entry whose payload digest shares its first eight digits with the record but differs after them', async () => {
+      const edit = mapRecords(isEntry(groupOf('c03'), 'c08.3'), (r) => ({
+        payloadSha256: `${r.payloadSha256.slice(0, 8)}${r.payloadSha256[8] === '0' ? '1' : '0'}${r.payloadSha256.slice(9)}`,
+      }))
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K2', 'FAIL', /c08\.3 in g-0123456789ab-c03 with another payload/)
+      expect(report.overall).toBe('REJECTED')
+    })
+
+    /** The seed's control client reads only main: an entry of a transactions record is one it must not see. */
+    const controlEntry = (id, offset) => (records) => {
+      const e = records.find(isEntry(groupOf('c13'), 'c08.0'))
+      return [
+        ...records,
+        { ...e, id, offset, key: fx.key(fx.TXN), t: 9e7, payloadSha256: fx.sha256(id) },
+      ]
+    }
+
+    it('fails an ordinary group that does not read the transactions topic yet entered a member of an aborted transaction', async () => {
+      const report = await check(fx.healthy(), { edit: controlEntry('c09.4', '5') })
+      expectRow(report, 'K2', 'FAIL', /1 records not visible.*c09\.4 in g-0123456789ab-c13/)
+      expect(report.overall).toBe('REJECTED')
+    })
+
+    it('fails an ordinary group that entered a visible record of a topic it does not read', async () => {
+      const report = await check(fx.healthy(), { edit: controlEntry('c09.0', '0') })
+      expectRow(
+        report,
+        'K2',
+        'FAIL',
+        /g-0123456789ab-c13 entered 1 records of a topic it does not read \(first c09\.0\)/
+      )
+      expect(report.overall).toBe('REJECTED')
+    })
+
     it('does not ask for the delivery of a transaction member that is not visible', async () => {
       const report = await check(fx.healthy())
       expectRow(report, 'K2', 'PASS')
