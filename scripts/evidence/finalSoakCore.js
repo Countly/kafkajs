@@ -612,7 +612,7 @@ function readEnd(ctx, name, problems) {
 async function readDump(ctx, role) {
   const { dir, journal, config, matrix, dumped } = ctx
   const name = `${role}.dump`
-  const out = { problems: [], count: 0, maxOffset: -1, findings: {} }
+  const out = { problems: [], count: 0, maxOffset: -1, lastTx: null, findings: {} }
   /** Counts one finding of a kind on this dump, as `Journal#note` does. */
   const note = Journal.prototype.note.bind(out)
   const end = readEnd(ctx, name, out.problems)
@@ -628,6 +628,7 @@ async function readDump(ctx, role) {
     out.count++
     out.maxOffset = Math.max(out.maxOffset, offset)
     const i = journal.ids.get(id)
+    out.lastTx = (i !== undefined && journal.txOf[i]) || null
     if (i === undefined || journal.topic[i] !== topic)
       return note('foreign', `${id} at offset ${offset}`)
     if (dumped[i]) return note('duplicate', id)
@@ -733,11 +734,62 @@ function invisibleAtLeast(journal) {
 }
 
 /**
+ * The most offsets after the transactions dump's last record that the journal explains as invisible
+ * to a read-committed reader: the acknowledged members of aborted transactions placed there, one
+ * control marker for each of their transactions, and the marker that closes the transaction of the
+ * last dumped record. A marker follows the records it closes, and the coordinator refuses a
+ * transactional id's next transaction until its markers are written. Anything else there (a retried
+ * marker, an aborted member whose offset is unknown, a visible record the dump was cut off before)
+ * is unexplained, so the dump stays unproved rather than possibly hiding a visible record.
+ * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end the log end
+ * @returns {number}
+ */
+function invisibleAfter(journal, dump, end) {
+  const closing = new Set()
+  if (/^(committed|aborted)$/.test(dump.lastTx?.outcome)) closing.add(dump.lastTx)
+  let members = 0
+  for (const t of journal.txs.values()) {
+    if (t.outcome !== 'aborted') continue
+    for (const i of t.members) {
+      const at = journal.offset[i]
+      if (journal.ack[i] !== ACK.acknowledged || !(at > dump.maxOffset && at < end)) continue
+      members++
+      closing.add(t)
+    }
+  }
+  return members + closing.size
+}
+
+/**
+ * Whether a dump holds every visible record of its partition below the log end Apache's describe
+ * reports, and why not. Every dumped offset must lie below that end. The main partition holds only
+ * visible records, so its dump must hold exactly the end's count. The console consumer reads in
+ * offset order and can only be cut off, so a transactions dump is complete up to its last record;
+ * after it, every offset up to the end must be one the journal explains as invisible
+ * (`invisibleAfter`), and the dump must reach every acknowledged visible record.
+ * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end
+ * @param {number} n 0 for main, 1 for transactions @param {number} lastVisible the highest
+ *   acknowledged offset of a visible transactions record
+ * @returns {string|false} the reason it is not proved complete, or false
+ */
+function incomplete(journal, dump, end, n, lastVisible) {
+  if (dump.maxOffset >= end) return `offset ${dump.maxOffset} lies at or beyond the log end`
+  if (n === 0) return dump.count !== end && `${dump.count} records dumped`
+  if (dump.maxOffset < lastVisible) return `a visible record was acknowledged at ${lastVisible}`
+  const least = invisibleAtLeast(journal)
+  if (end - dump.count < least)
+    return `${dump.count} records dumped but at least ${least} offsets are invisible`
+  const [after, most] = [end - 1 - dump.maxOffset, invisibleAfter(journal, dump, end)]
+  return (
+    after > most &&
+    `${after} offsets follow the last dumped record but the journal explains at most ${most} of them as invisible`
+  )
+}
+
+/**
  * K1: every acknowledged id, and every non-rejected member of a committed transaction, is in the
  * read-committed dump once at its acknowledged offset (anywhere when the offset is unknown),
- * aborted members never. The main dump is complete when it holds every offset below the log end
- * from Apache's describe. The transactions dump is complete when it reached every known offset of a
- * visible record and the remaining offsets are at least the invisible ones the journal explains.
+ * aborted members never, and each dump is proved complete up to Apache's log end (`incomplete`).
  * Unknown results, contradictions and unproved completeness are INCONCLUSIVE, never PASS.
  * @param {Row} k1 @param {object} ctx `{ journal, dumps, ends, dumped }`
  * @returns {boolean} whether the dumps are usable and proved complete
@@ -776,19 +828,12 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
       )
     } else if (!t) uncertain.push(journal.names[i])
   }
-  const least = invisibleAtLeast(journal)
   const complete = dumps.every((d, n) => {
     if (ends[n] === null) {
       k1.gap(`no describe row gives the ${ROLES[n]} log end`)
       return false
     }
-    const why =
-      n === 0
-        ? d.count !== ends[n] && `${d.count} records dumped`
-        : d.maxOffset < lastVisible
-          ? `a visible record was acknowledged at ${lastVisible}`
-          : ends[n] - d.count < least &&
-            `${d.count} records dumped but at least ${least} offsets are invisible`
+    const why = incomplete(journal, d, ends[n], n, lastVisible)
     if (why)
       k1.gap(
         `the ${ROLES[n]} dump stops at offset ${d.maxOffset} and the log ends at ${ends[n]}: ${why}, so it is not proved complete`
