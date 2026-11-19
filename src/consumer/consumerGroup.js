@@ -2097,6 +2097,12 @@ module.exports = class ConsumerGroup {
     )
   }
 
+  /**
+   * One heartbeat through the membership's own gate.
+   * @param {{ interval: number, guard?: () => Error|null }} options
+   * @returns {Promise<boolean>} true only when a heartbeat was sent and answered with success for
+   *   the membership the member still holds
+   */
   async heartbeat({ interval, guard }) {
     return this.groupMembership.heartbeat({ interval, guard })
   }

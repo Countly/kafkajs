@@ -335,18 +335,17 @@ module.exports = class ConsumerGroupProtocol {
     // interval gate below a busy consumer would issue one request per record.
     this.sharedHeartbeat = sharedPromiseTo(async ({ interval }) => {
       if (shouldSkipHeartbeat(this.state)) {
-        return
+        return false
       }
 
       const now = Date.now()
 
       if (this.backoff.pending(now)) {
-        return
+        return false
       }
 
       if (this.immediatePending && shouldHeartbeatNow(this.state)) {
-        await this.sendHeartbeat({ sendAllFields: this.state === JOINING })
-        return
+        return this.sendHeartbeat({ sendAllFields: this.state === JOINING })
       }
 
       // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
@@ -355,15 +354,14 @@ module.exports = class ConsumerGroupProtocol {
       // the backoff would never grow past its first step. It is ONE request, consumed by the send
       // below: this is the retry the backoff owed, not a mode the gate stays off in.
       if (this.backoff.isDue(now)) {
-        await this.sendHeartbeat({ sendAllFields: this.state === JOINING })
-        return
+        return this.sendHeartbeat({ sendAllFields: this.state === JOINING })
       }
 
       if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
-        return
+        return false
       }
 
-      await this.sendHeartbeat({ sendAllFields: false })
+      return this.sendHeartbeat({ sendAllFields: false })
     })
 
     this.sharedLeave = sharedPromiseTo((options) => this.performLeave(options))
@@ -1060,7 +1058,8 @@ module.exports = class ConsumerGroupProtocol {
    * unless the state owes an immediate one or a backoff has come due. The gate is load-bearing -
    * the runner calls this per message, per batch and on every empty fetch round.
    * @param {{ interval: number }} options
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true only when a heartbeat was sent and answered with success for
+   *   the membership the member still holds; false when none was sent or its answer was dropped
    */
   async heartbeat({ interval }) {
     return this.sharedHeartbeat({ interval })
@@ -1089,7 +1088,8 @@ module.exports = class ConsumerGroupProtocol {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null }} options
    *   `guard` is a leave's private pre-write refusal; it never reaches the request
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true only for a success answered to the membership the member still
+   *   holds (never for a leave); false when nothing was sent or the answer had no effect
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
   async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard }) {
@@ -1104,7 +1104,7 @@ module.exports = class ConsumerGroupProtocol {
           groupId: this.groupId,
         })
         this.onRequestGenerated({ leaveEpoch, stateAtRequest: this.state })
-        return
+        return false
       }
 
       try {
@@ -1115,7 +1115,7 @@ module.exports = class ConsumerGroupProtocol {
         throw error
       }
 
-      if (this.ownershipReplaced(ownershipToken)) return
+      if (this.ownershipReplaced(ownershipToken)) return false
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
@@ -1134,7 +1134,7 @@ module.exports = class ConsumerGroupProtocol {
         ...(guard && { guard }),
       })
 
-      if (membershipAtRequest !== this.membershipRevision || guard?.()) return
+      if (membershipAtRequest !== this.membershipRevision || guard?.()) return false
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1149,8 +1149,9 @@ module.exports = class ConsumerGroupProtocol {
       })
 
       this.onSuccess(response)
+      return leaveEpoch == null
     } catch (error) {
-      if (membershipAtRequest !== this.membershipRevision) return
+      if (membershipAtRequest !== this.membershipRevision) return false
       stampOwnership(error, this.ownership?.token())
       this.sentFields.reset()
 
@@ -1163,7 +1164,7 @@ module.exports = class ConsumerGroupProtocol {
           groupId: this.groupId,
           error: error.message,
         })
-        return
+        return false
       }
 
       const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
