@@ -259,7 +259,10 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
     expect(group.topics).toEqual([])
     expect(group.topicConfigurations['events-a']).toEqual({ fromBeginning: true })
     expect(group.topicConfigurations['events-b']).toEqual({ fromBeginning: true })
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-a', 'events-b'])
+    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(
+      ['events-a', 'events-b'],
+      undefined
+    )
   })
 
   it('is a no-op for an empty list and for a name it already holds', async () => {
@@ -279,7 +282,7 @@ describe('Consumer > ConsumerGroup > growSubscription', () => {
     await group.joinAndSync()
 
     expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledTimes(1)
-    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-b'])
+    expect(group.cluster.addMultipleTargetTopics).toHaveBeenCalledWith(['events-b'], undefined)
     expect(group.topicConfigurations['events-a']).toEqual({ fromBeginning: false })
     expect(group.topicConfigurations['events-b']).toEqual({ fromBeginning: true })
   })
@@ -673,6 +676,30 @@ describe('Consumer > ConsumerGroup > guards and fallbacks', () => {
       error: 'stale',
     })
     expect(() => group.checkForStaleAssignment()).not.toThrow()
+  })
+
+  test('a consumer-protocol member asks for no rejoin when a topic missing at the last round is back, since its coordinator assigns it', () => {
+    const group = createGroup({ groupProtocol: 'consumer', topics: [TOPIC_A] })
+    let known = 0
+    group.cluster.findTopicPartitionMetadata = () => partitionMetadata(known)
+    group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+    known = 2
+
+    expect(() => group.checkForStaleAssignment()).not.toThrow()
+    expect(group.staleAssignmentPending).toBeFalsy()
+  })
+
+  test('a classic member still asks for a rejoin when a topic missing at the last round is back', () => {
+    const group = createGroup({ topics: [TOPIC_A] })
+    let known = 0
+    group.cluster.findTopicPartitionMetadata = () => partitionMetadata(known)
+    group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+    known = 2
+
+    expect(() => group.checkForStaleAssignment()).toThrow(
+      expect.objectContaining({ name: 'KafkaJSStaleTopicMetadataAssignment' })
+    )
+    expect(group.staleAssignmentPending).toBe(true)
   })
 
   test('a topic the previous round never saw is not a stale assignment', () => {

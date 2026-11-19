@@ -835,9 +835,12 @@ module.exports = class ConsumerGroupProtocol {
    * Widens the consumer's subscription with names the coordinator assigned, once per name. Under a
    * pattern subscription this is what puts the topic into the subscribed set, into the offset
    * manager's per-topic configuration and into the cluster's target topics - without it the apply
-   * would strip the whole assignment as unsubscribed.
+   * would strip the whole assignment as unsubscribed. A name `growSubscription` leaves pending (the
+   * cluster did not know it yet) is not recorded, so the next assignment that names it grows it
+   * again.
    * @private
-   * @param {((names: string[]) => Promise<void>)|undefined} growSubscription
+   * @param {((names: string[]) => Promise<string[]|void>)|undefined} growSubscription resolves to
+   *   the names it left pending
    * @param {string[]} names
    * @param {() => boolean} [isCurrent] captured target lifetime
    * @throws {Error} assignment changed during subscription growth
@@ -850,10 +853,10 @@ module.exports = class ConsumerGroupProtocol {
     if (!fresh.length) return
 
     if (!isCurrent()) throw assignmentChangedError()
-    await growSubscription(fresh)
+    const pending = new Set((await growSubscription(fresh)) || [])
     if (!isCurrent()) throw assignmentChangedError()
     for (const name of fresh) {
-      this.grownTopicNames.add(name)
+      if (!pending.has(name)) this.grownTopicNames.add(name)
     }
   }
 

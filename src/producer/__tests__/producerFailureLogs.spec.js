@@ -53,6 +53,31 @@ describe('Producer > what a failure inside the producer logs instead of throwing
     await producer.disconnect()
   })
 
+  test('a listener that rejects with null is logged, not left as an unhandled rejection', async () => {
+    const { producer, logged } = loggingProducer()
+    const unhandled = []
+    const onUnhandled = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      producer.on(producer.events.CONNECT, () => Promise.reject(null)) // eslint-disable-line prefer-promise-reject-errors
+      await producer.connect()
+      await turn()
+      await turn()
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+
+    expect(unhandled).toEqual([])
+    expect(logged()).toEqual([
+      expect.objectContaining({
+        level: LEVELS.ERROR,
+        message: 'Failed to execute listener: undefined',
+        eventName: producer.events.CONNECT,
+      }),
+    ])
+    await producer.disconnect()
+  })
+
   test('a failure while delivering what is accumulated is logged as a warning, and the producer still disconnects', async () => {
     const { producer, cluster, logged } = loggingProducer()
     const disconnected = jest.fn()

@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
@@ -524,7 +525,9 @@ module.exports = (params) => {
   /**
    * Returns the lifetime that serves a connect, run or start, beginning a new one when an explicit
    * disconnect has started on the current one, and subscribes it to the cluster's topic-recreation
-   * event, at most once per lifetime. Called at construction and again from connect(), run() and
+   * event, at most once per lifetime. A recreation of any selected topic is owed a reset: a
+   * subscribed name, a client-pattern match, an assigned topic, or a name a broker-side pattern
+   * resolved to. Called at construction and again from connect(), run() and
    * start(), so a consumer reused after disconnect() - including the restart onCrash schedules,
    * which reaches start() alone - re-arms rather than running with the reset silently inert.
    *
@@ -543,10 +546,12 @@ module.exports = (params) => {
       try {
         const { topic, topicId } = payload
 
+        // A broker-side pattern's matched names exist only as the targets it grew.
         if (
           !Object.hasOwn(topics, topic) &&
           !declared.desired.topicConfigurations.has(topic) &&
-          !(manual && Object.hasOwn(manual.configurations, topic))
+          !(manual && Object.hasOwn(manual.configurations, topic)) &&
+          !(subscribedTopicRegex != null && cluster.targetTopics.has(topic))
         ) {
           return
         }
@@ -1036,12 +1041,16 @@ module.exports = (params) => {
         topics[t] = { fromBeginning, resetPolicy }
       }
 
-      try {
+      if (!isConsumerProtocol) {
         await cluster.addMultipleTargetTopics(subscriptions, { fence: owned.fence })
-        for (const name of subscriptions) unregisteredTopics.delete(name)
-      } catch (error) {
-        if (!isConsumerProtocol || error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
-        for (const name of subscriptions) unregisteredTopics.add(name)
+        return
+      }
+      const registered = await ConsumerGroup.registerTargets(cluster, subscriptions, {
+        fence: owned.fence,
+      })
+      for (const name of subscriptions) {
+        if (registered) unregisteredTopics.delete(name)
+        else unregisteredTopics.add(name)
       }
       return
     }
@@ -1339,9 +1348,9 @@ module.exports = (params) => {
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })
@@ -1739,6 +1748,7 @@ module.exports = (params) => {
         }
 
         const published = await cluster.resetTargetTopics(names, {
+          accepted: metadata,
           isCurrent: () => stale() === null,
           publish: () => {
             declared.retireMetadata()
