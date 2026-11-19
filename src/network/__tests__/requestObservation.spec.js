@@ -202,6 +202,120 @@ describe('Network > request observation', () => {
       expect(queue.isIdle()).toBe(true)
     })
 
+    test('a queued write that throws on the throttle timer settles the queue through its owner and escapes nothing', () => {
+      jest.useFakeTimers()
+      try {
+        const onDispatchFailure = jest.fn()
+        const { queue } = createQueue({ maxInFlightRequests: 2, onDispatchFailure })
+        const failure = new Error('write failed')
+        const first = entry()
+        const second = entry()
+        const sendSecond = jest.fn()
+        queue.maybeThrottle(500)
+        queue.push({
+          entry: first,
+          expectResponse: true,
+          sendRequest: () => {
+            throw failure
+          },
+        })
+        queue.push({ entry: second, expectResponse: true, sendRequest: sendSecond })
+        expect(queue.pending).toHaveLength(2)
+
+        expect(() => jest.advanceTimersByTime(1000)).not.toThrow()
+        expect(first.reject).toHaveBeenCalledWith(failure)
+        expect(onDispatchFailure).toHaveBeenCalledTimes(1)
+        expect(onDispatchFailure).toHaveBeenCalledWith(failure)
+        expect(sendSecond).not.toHaveBeenCalled()
+        expect(queue.inflight.size).toBe(0)
+        expect(queue.throttleCheckTimeoutId).toBeNull()
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+
+    test('without an owner, a queued write that throws on the throttle timer rejects every queued request', () => {
+      jest.useFakeTimers()
+      try {
+        const { queue } = createQueue({ maxInFlightRequests: 2 })
+        const failure = new Error('write failed')
+        const first = entry()
+        const second = entry()
+        queue.maybeThrottle(500)
+        queue.push({
+          entry: first,
+          expectResponse: true,
+          sendRequest: () => {
+            throw failure
+          },
+        })
+        queue.push({ entry: second, expectResponse: true, sendRequest: jest.fn() })
+
+        expect(() => jest.advanceTimersByTime(1000)).not.toThrow()
+        expect(first.reject).toHaveBeenCalledWith(failure)
+        expect(second.reject).toHaveBeenCalledWith(failure)
+        expect(queue.isIdle()).toBe(true)
+        expect(queue.throttleCheckTimeoutId).toBeNull()
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+
+    test('a throwing dispatch diagnostic on the throttle timer neither escapes nor stops the next send', () => {
+      jest.useFakeTimers()
+      try {
+        const emitter = new InstrumentationEventEmitter()
+        const { queue, logger } = createQueue({
+          maxInFlightRequests: 2,
+          instrumentationEmitter: emitter,
+        })
+        const first = entry()
+        const second = entry()
+        const sendFirst = jest.fn()
+        const sendSecond = jest.fn()
+        queue.maybeThrottle(500)
+        queue.push({ entry: first, expectResponse: true, sendRequest: sendFirst })
+        queue.push({ entry: second, expectResponse: true, sendRequest: sendSecond })
+        logger.debug.mockImplementation(() => {
+          throw new Error('log failed')
+        })
+        emitter.addListener(events.NETWORK_REQUEST_QUEUE_SIZE, () => {
+          throw new Error('listener failed')
+        })
+
+        expect(() => jest.advanceTimersByTime(1000)).not.toThrow()
+        expect(sendFirst).toHaveBeenCalledTimes(1)
+        expect(sendSecond).toHaveBeenCalledTimes(1)
+        expect([...queue.inflight.keys()]).toEqual([first.correlationId, second.correlationId])
+        expect(first.reject).not.toHaveBeenCalled()
+        expect(second.reject).not.toHaveBeenCalled()
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+
+    test('a connection whose queued write throws on the throttle timer ends its generation and settles every request', async () => {
+      const { connection, state } = await connected()
+      connection.requestQueue.maybeThrottle(30)
+      const answer = { decode: async (payload) => payload, parse: async (payload) => payload }
+      const first = connection.send(protocol(answer))
+      const second = connection.send(protocol(answer))
+      const settled = Promise.allSettled([first, second])
+      await flush()
+      expect(connection.requestQueue.pending).toHaveLength(2)
+      const failure = new Error('write failed')
+      state.socket.write = () => {
+        throw failure
+      }
+
+      const [one, two] = await settled
+      expect(one).toEqual({ status: 'rejected', reason: failure })
+      expect(two).toEqual({ status: 'rejected', reason: failure })
+      expect(connection.isConnected()).toBe(false)
+      expect(connection.requestQueue.isIdle()).toBe(true)
+      expect(connection.requestQueue.throttleCheckTimeoutId).toBeNull()
+    })
+
     test('a correlation collision rejects the new request and keeps the existing one in flight', () => {
       const { queue } = createQueue({ maxInFlightRequests: 2 })
       const first = entry()
