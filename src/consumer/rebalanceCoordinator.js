@@ -553,6 +553,17 @@ module.exports = class RebalanceCoordinator {
   }
 
   /**
+   * Whether only the runner's LOST round may rejoin this member. True for a consumer-protocol
+   * membership that carries a loss: no other apply renews it, and a chain waiting between rounds
+   * ends at wake-up. A classic apply renews any membership, so a classic chain always owns its rejoin.
+   * @private
+   * @returns {boolean}
+   */
+  lostRoundOwed() {
+    return this.consumerGroup.kind === 'consumer' && this.lossOwed()
+  }
+
+  /**
    * The listener-only half of a round before it joins. A lost round dispatches the lost callback
    * (the revoked one when absent) without waiting for any handler and only then quiesces for the
    * rebuild. An eager round stops admission, quiesces under the round's budget, attempts the final
@@ -689,7 +700,7 @@ module.exports = class RebalanceCoordinator {
 
     // The runner's LOST round runs first and its rejoin brings the latest target; a chain opened
     // now could only be refused at its apply, and would take a LOST queued behind it with it.
-    if (this.consumerGroup.kind === 'consumer' && this.lossOwed()) return
+    if (this.lostRoundOwed()) return
 
     // Cooperative revocation: nothing stops the fetch manager, so nothing would ever settle
     // `start()` - the round has to be driven from here, in the background.
@@ -813,9 +824,10 @@ module.exports = class RebalanceCoordinator {
    * answers for the membership it was sent for, so once a round has joined there is nothing left to
    * reset and no verdict to raise, and resetting would void the new membership. The count, not the
    * generation, because a rejoin can come back at the same generation or epoch. Otherwise the
-   * generation is reset, and a round still in flight owns the rejoin, so no LOST verdict is raised,
-   * unless the chain is in a consumer-protocol wait between rounds: that chain ends at wake-up, so
-   * the LOST verdict is raised and the runner's LOST round rejoins.
+   * generation is reset, and a classic round still in flight owns the rejoin, so no LOST verdict is
+   * raised. A consumer-protocol chain, waiting between rounds or joining, owns no rejoin of a
+   * membership that carries a loss (see `lostRoundOwed`), so the LOST verdict is raised and the
+   * runner's LOST round rejoins.
    *
    * @param {{ elapsedMs: number, isStatic: boolean }} details
    * @returns {Promise<void>}
@@ -875,12 +887,9 @@ module.exports = class RebalanceCoordinator {
 
     await this.contain('generation reset', () => this.consumerGroup.resetGenerationLocally())
 
-    // A round that started during the leave above already rejoins this member. A second LOST would
-    // stay in the slot after that round ends, and an orphan there reads as a rebalance still owed.
-    // A consumer-protocol chain waiting between rounds (a wait armed in `stopWaiters`) rejoins
-    // nobody: the leave cleared its target, so it ends at wake-up. Its LOST goes to the slot, as a
-    // fence's does, and the runner's LOST round rejoins once the in-flight handlers return.
-    if (this.isRebalancing() && this.stopWaiters.size === 0) {
+    // A running chain that still renews this membership owns the rejoin, and a second LOST would
+    // be an orphan in the slot after it. One that cannot - waiting or joining - gets the LOST.
+    if (this.isRebalancing() && !this.lostRoundOwed()) {
       return
     }
 
