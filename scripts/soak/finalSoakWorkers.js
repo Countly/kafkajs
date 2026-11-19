@@ -21,7 +21,6 @@ const {
   clip,
 } = require('./finalSoakCollector')
 const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('./finalSoakObserver')
-const { ChurnClientLog } = require('./consumerChurn')
 
 /** Delivered share offsets kept above a key's first missing one before the gap is given up on. */
 const SHARE_AHEAD_MAX = 100000
@@ -188,6 +187,125 @@ class WireLog {
     fs.appendFileSync(path.join(this.dir, file), line)
     this.bytes += line.length
     return { file, sha256: sha256(line) }
+  }
+}
+
+/** The kafkajs WARN level; ERROR is below it. */
+const LOG_WARN = 2
+/** The byte budget of one process's client log file, its closing summary included. */
+const CLIENT_LOG_BYTES = 8 * 1024 * 1024
+/** Bytes of the budget kept for the closing summary. */
+const CLIENT_LOG_SUMMARY_BYTES = 64 * 1024
+/** JSON bytes kept of one client log message. */
+const CLIENT_LOG_MESSAGE_BYTES = 1000
+/** Lines past the budget kept for the closing summary, the newest ones. */
+const CLIENT_LOG_TAIL = 20
+
+/**
+ * One process's client WARN and ERROR lines, as JSON lines in a file of the artifact. The file
+ * never passes its byte budget: each message is clipped, lines that would pass the budget are only
+ * counted, and the newest of them are kept for the summary line written at `close`, with the total,
+ * written and dropped counts, so silence in the file is never mistaken for health. A failed write
+ * is recorded and ends the file; it never reaches the client that logged.
+ */
+class ClientLog {
+  /**
+   * @param {{ file: string, maxBytes?: number, files?: typeof fs }} options the file, created or
+   *   truncated, its byte budget and the file system
+   */
+  constructor({ file, maxBytes = CLIENT_LOG_BYTES, files = fs }) {
+    Object.assign(this, { file, maxBytes, files })
+    this.total = 0
+    this.written = 0
+    this.dropped = 0
+    this.bytes = 0
+    this.tail = []
+    this.failed = null
+    this.fd = null
+    try {
+      this.fd = files.openSync(file, 'w', 0o600)
+    } catch (e) {
+      this.failed = e.message
+    }
+  }
+
+  /** @returns {(level: number) => (entry: object) => void} a `logCreator` writing into this log */
+  creator() {
+    return () => (entry) => {
+      try {
+        this.add(entry)
+      } catch (e) {
+        this.failed ??= e.message
+      }
+    }
+  }
+
+  /** @param {{ namespace: string, level: number, log: object }} entry INFO and DEBUG are ignored */
+  add({ namespace, level, log }) {
+    if (level > LOG_WARN) return
+    this.total++
+    const { message, memberId, groupId, error, errorCode, timestamp } = log
+    const line =
+      JSON.stringify({
+        at: Date.parse(timestamp) || Date.now(),
+        level,
+        namespace,
+        member: memberId,
+        group: groupId,
+        message: clip(String(message ?? ''), CLIENT_LOG_MESSAGE_BYTES),
+        errorType: typeof error === 'object' && error !== null ? error.name : undefined,
+        errorCode: errorCode ?? error?.code ?? error?.type,
+      }) + '\n'
+    const bytes = Buffer.byteLength(line)
+    if (this.fd !== null && this.bytes + bytes <= this.maxBytes - CLIENT_LOG_SUMMARY_BYTES) {
+      if (this.write(line)) {
+        this.written++
+        this.bytes += bytes
+        return
+      }
+    }
+    this.dropped++
+    this.tail.push(line)
+    if (this.tail.length > CLIENT_LOG_TAIL) this.tail.shift()
+  }
+
+  /** @param {string} text @returns {boolean} whether all of it was written; a failure ends the file */
+  write(text) {
+    const buffer = Buffer.from(text)
+    try {
+      for (let offset = 0; offset < buffer.length;)
+        offset += this.files.writeSync(this.fd, buffer, offset)
+      return true
+    } catch (e) {
+      this.failed ??= e.message
+      this.end()
+      return false
+    }
+  }
+
+  /** Closes the file, quietly. */
+  end() {
+    const { fd } = this
+    this.fd = null
+    try {
+      if (fd !== null) this.files.closeSync(fd)
+    } catch (e) {
+      this.failed ??= e.message
+    }
+  }
+
+  /**
+   * Writes the summary line and closes the file, once.
+   * @returns {{ total: number, written: number, dropped: number, failed: string|null }}
+   */
+  close() {
+    const counts = { total: this.total, written: this.written, dropped: this.dropped }
+    if (this.fd !== null) {
+      const tail = this.tail.map((line) => JSON.parse(line))
+      this.write(JSON.stringify({ summary: true, ...counts, failed: this.failed, tail }) + '\n')
+      this.end()
+    }
+    return { ...counts, failed: this.failed }
   }
 }
 
@@ -379,10 +497,23 @@ class ChildRuntime {
    * @returns {(level: number) => (entry: object) => void}
    */
   clientLogCreator() {
-    this.clientLog ??= new ChurnClientLog({
+    this.clientLog ??= new ClientLog({
       file: path.join(this.out, `client-log.${this.slot}.ndjson`),
     })
     return this.clientLog.creator()
+  }
+
+  /**
+   * Closes the process's client log and journals its counts, so a reader can tell a quiet client
+   * from a truncated or failed log.
+   * @returns {Promise<void>}
+   */
+  async closeClientLog() {
+    if (!this.clientLog) return
+    const { total, written, dropped, failed } = this.clientLog.close()
+    await this.diagnose(
+      `client log client-log.${this.slot}.ndjson: ${total} WARN or ERROR lines, ${written} written, ${dropped} dropped${failed ? `, failed: ${failed}` : ''}`
+    )
   }
 
   /** @param {object} record @returns {Promise<boolean>} */
@@ -734,6 +865,7 @@ class ChildRuntime {
   async orphaned() {
     this.channel.incomplete ??= 'the supervisor closed its channel'
     await this.worker.disconnect()
+    this.clientLog?.close()
     this.roles.stop()
     this.observer.restore()
   }
@@ -741,6 +873,7 @@ class ChildRuntime {
   /** @returns {Promise<void>} disconnects every client, takes the final sample and lets the process end */
   async stop() {
     await this.worker.disconnect()
+    await this.closeClientLog()
     await this.sample({ role: 'final' })
     this.roles.stop()
     this.observer.restore()
@@ -2653,6 +2786,7 @@ module.exports = {
   offeredRecord,
   parseValue,
   WireLog,
+  ClientLog,
   ClientRig,
   ChildRuntime,
   clientOptions,
