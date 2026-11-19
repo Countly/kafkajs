@@ -135,6 +135,29 @@ describe('Cluster > a consumer target answered UNKNOWN_TOPIC_OR_PARTITION', () =
     expect(broker.metadata.mock.calls[asked][0]).toEqual(['healthy', 'doomed'])
   })
 
+  test('with the default metadata age, the missing topic is asked for again after a second, not after the whole age', async () => {
+    const { cluster, broker, refused } = build({ metadataMaxAge: 300000 })
+    await cluster.addMultipleTargetTopics(['healthy', 'doomed'])
+    refused.set('doomed', 3)
+    await cluster.refreshMetadata()
+    const asked = broker.metadata.mock.calls.length
+
+    await jest.advanceTimersByTimeAsync(999)
+    await cluster.refreshMetadataIfNecessary()
+    expect(broker.metadata).toHaveBeenCalledTimes(asked)
+
+    await jest.advanceTimersByTimeAsync(2)
+    await cluster.refreshMetadataIfNecessary()
+    expect(broker.metadata).toHaveBeenCalledTimes(asked + 1)
+
+    refused.delete('doomed')
+    await jest.advanceTimersByTimeAsync(1001)
+    await cluster.refreshMetadataIfNecessary()
+    await jest.advanceTimersByTimeAsync(1001)
+    await cluster.refreshMetadataIfNecessary()
+    expect(broker.metadata).toHaveBeenCalledTimes(asked + 2)
+  })
+
   test('a recreated topic is routed under its new id, reported available once and seen as a recreation', async () => {
     const { cluster, refused, ids, reports, recreated } = build()
     await cluster.addMultipleTargetTopics(['healthy', 'doomed'])

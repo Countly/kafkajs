@@ -655,4 +655,89 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     },
     30000
   )
+
+  describe('with the default metadata age, as the live recreation checks run', () => {
+    /**
+     * Subscribes to the doomed topic alone, as the live recreation checks do, deletes it once its
+     * first records were read and recreates it.
+     * @param {object} [script] options of the group script
+     * @param {object} [runOptions] options of `run`
+     * @returns {Promise<object>} the scenario and where the new incarnation's records begin
+     */
+    const recreateAlone = async (script = {}, runOptions = {}) => {
+      const wire = scenario('classic', { metadataMaxAge: undefined }, script)
+      const recreated = []
+      const joins = []
+      wire.consumer.on(wire.consumer.events.TOPIC_RECREATED, ({ payload }) =>
+        recreated.push(payload)
+      )
+      wire.consumer.on(wire.consumer.events.GROUP_JOIN, ({ payload }) => joins.push(payload))
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ topics: [DOOMED], fromBeginning: true })
+      await wire.consumer.run({
+        ...runOptions,
+        eachMessage: async ({ topic, message }) => {
+          wire.observed.records.push({ topic, offset: message.offset })
+        },
+      })
+      await until(() => offsets(wire.observed, DOOMED).length >= 3, 'records from the topic')
+      wire.world.remove(DOOMED)
+      await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+      const after = wire.observed.records.length
+      wire.world.recreate(DOOMED, RECREATED_ID)
+      await until(
+        () => wire.observed.records.slice(after).some(({ topic }) => topic === DOOMED),
+        'a record from the new incarnation',
+        1000
+      )
+      return { wire, after, recreated, joins }
+    }
+
+    test('TOPIC_RECREATED fires and the consumer resumes from fromBeginning', async () => {
+      const { wire, after, recreated } = await recreateAlone()
+
+      expect(recreated).toEqual([
+        expect.objectContaining({
+          topic: DOOMED,
+          previousTopicId: DOOMED_ID,
+          topicId: RECREATED_ID,
+        }),
+      ])
+      expect(observedRecreatedFromStart(wire.observed, after)).toBe(true)
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
+
+    test('a stale committed offset inside the recreated topic range is ignored', async () => {
+      const { wire, after } = await recreateAlone({ committed: { 0: '73' } }, { autoCommit: false })
+
+      expect(offsets(wire.observed, DOOMED)[0]).toBe('73')
+      expect(observedRecreatedFromStart(wire.observed, after)).toBe(true)
+    }, 30000)
+
+    test('a recreation that leaves the partition count unchanged still resets the position, with no rejoin', async () => {
+      const { wire, after, joins } = await recreateAlone({ committed: { 0: '73' } })
+
+      expect(observedRecreatedFromStart(wire.observed, after)).toBe(true)
+      expect(joins).toHaveLength(1)
+    }, 30000)
+
+    test('a recreation before the first confirmed commit resets again after stop and run', async () => {
+      const { wire } = await recreateAlone({ committed: { 0: '73' } }, { autoCommit: false })
+
+      await wire.consumer.stop()
+      const restartedAt = wire.observed.records.length
+      await wire.consumer.run({
+        autoCommit: false,
+        eachMessage: async ({ topic, message }) => {
+          wire.observed.records.push({ topic, offset: message.offset })
+        },
+      })
+      await until(
+        () => wire.observed.records.slice(restartedAt).some(({ topic }) => topic === DOOMED),
+        'a record after the restart'
+      )
+
+      expect(observedRecreatedFromStart(wire.observed, restartedAt)).toBe(true)
+    }, 30000)
+  })
 })
