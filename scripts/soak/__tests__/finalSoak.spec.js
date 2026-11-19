@@ -672,7 +672,9 @@ describe('final soak driver', () => {
    * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded;
    * the driver stub writes `config.json` first, as the driver's first act does, and a
    * `supervisor.json` (`SUPERVISOR_JSON`, a green receipt by default) as its last; the workload
-   * check runs the real driver command.
+   * check runs the real driver command. The core checker prints `CORE_REPORT` (a smoke's NOT
+   * ACCEPTED by default) and exits with `CORE_STATUS` (1 by default), or with `CORE_REAL` set runs
+   * the real checker.
    */
   const runbookHarness = () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-runbook-'))
@@ -705,6 +707,8 @@ describe('final soak driver', () => {
         '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json" && printf "%s" "$receipt" > "$a/supervisor.json"; prev="$a"; done ;;',
         '*--check-workload*) [ -z "$FAIL_ON" ] || case "node $*" in *"$FAIL_ON"*) exit 1 ;; esac',
         '  exec "$REAL_NODE" "$@" ;;',
+        '*finalSoakCore.js*) [ -z "$CORE_REAL" ] || exec "$REAL_NODE" "$@"',
+        '  printf "%s\\n" "$CORE_REPORT"; exit "$CORE_STATUS" ;;',
         'esac',
       ].join('\n'),
     }
@@ -734,6 +738,9 @@ describe('final soak driver', () => {
             FINAL_SOAK_ARTIFACTS: artifacts,
             REAL_NODE: process.execPath,
             GREEN: green,
+            CORE_REPORT:
+              'CORE VERDICT: NOT ACCEPTED (smoke runs are diagnostic and are never ACCEPTED)',
+            CORE_STATUS: '1',
             ...extra,
           },
           encoding: 'utf8',
@@ -881,6 +888,100 @@ describe('final soak driver', () => {
         at('docker compose logs --no-color --timestamps')
       )
       expect(calls.find((c) => c.startsWith('tar '))).toContain(path.basename(out))
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('the runbook runs the core checker after the workload check, keeps its report beside the receipt and passes a smoke that is NOT ACCEPTED', () => {
+    const harness = runbookHarness()
+    try {
+      const summary = path.join(os.tmpdir(), `final-soak-summary-${process.pid}.md`)
+      fs.rmSync(summary, { force: true })
+      const result = harness.run([TREE, 'smoke'], { GITHUB_STEP_SUMMARY: summary })
+      expect(result.status).toBe(0)
+      const { out, receipt, log } = harness.evidence()
+      const calls = harness.calls()
+      const core = `node scripts/evidence/finalSoakCore.js ${out}`
+      expect(calls.indexOf(core)).toBeGreaterThan(
+        calls.indexOf(`node scripts/soak/finalSoak.js --check-workload --out ${out}`)
+      )
+      expect(calls.indexOf(core)).toBeGreaterThan(
+        calls.indexOf(`node scripts/soak/finalSoak.js --finalize --out ${out} --status 0`)
+      )
+      expect(fs.readFileSync(`${out}.core.txt`, 'utf8')).toMatch(/^CORE VERDICT: NOT ACCEPTED/)
+      expect(fs.existsSync(path.join(out, 'core.txt'))).toBe(false)
+      expect(log).toContain('core checker verdict: NOT ACCEPTED (exit status 1)')
+      expect(log).toContain('A smoke is never ACCEPTED')
+      const text = fs.readFileSync(summary, 'utf8')
+      fs.rmSync(summary, { force: true })
+      expect(text).toContain('A smoke is never ACCEPTED')
+      expect(text).toContain('CORE VERDICT: NOT ACCEPTED')
+      expect(receipt).toMatchObject({ failedStage: null, exitStatus: 0 })
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('a REJECTED core verdict from the real checker fails the runbook at stage core after sealing', () => {
+    const harness = runbookHarness()
+    try {
+      const result = harness.run([TREE, 'smoke'], { CORE_REAL: '1' })
+      expect(result.status).toBe(1)
+      const { out, receipt, log } = harness.evidence()
+      expect(receipt).toEqual({
+        artifact: path.basename(out),
+        failedStage: 'core',
+        exitStatus: 1,
+        driverStatus: 0,
+      })
+      expect(fs.readFileSync(`${out}.core.txt`, 'utf8')).toMatch(/^CORE VERDICT: REJECTED/)
+      expect(log).toContain('core checker verdict: REJECTED (exit status 1)')
+      expect(log).toContain('runbook failed at stage core (exit status 1)')
+      expect(harness.calls().find((c) => c.startsWith('tar '))).toContain(path.basename(out))
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test.each([
+    [
+      'a checker that printed no verdict',
+      'smoke',
+      { CORE_REPORT: '', CORE_STATUS: '7' },
+      'none (exit status 7)',
+    ],
+    ['an acceptance run that is NOT ACCEPTED', 'acceptance', {}, 'NOT ACCEPTED (exit status 1)'],
+    [
+      'a smoke whose checker says ACCEPTED with a failing exit status',
+      'smoke',
+      { CORE_REPORT: 'CORE VERDICT: ACCEPTED', CORE_STATUS: '1' },
+      'ACCEPTED (exit status 1)',
+    ],
+  ])('%s fails the runbook at stage core', (_, mode, env, said) => {
+    const harness = runbookHarness()
+    try {
+      expect(harness.run([TREE, mode], env).status).toBe(1)
+      const { receipt, log } = harness.evidence()
+      expect(receipt).toMatchObject({ failedStage: 'core', exitStatus: 1 })
+      expect(log).toContain(`core checker verdict: ${said}`)
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('an acceptance run the core checker ACCEPTS passes the core stage', () => {
+    const harness = runbookHarness()
+    try {
+      const result = harness.run([TREE, 'acceptance'], {
+        CORE_REPORT: 'CORE VERDICT: ACCEPTED',
+        CORE_STATUS: '0',
+      })
+      expect(result.status).toBe(0)
+      const { receipt, log } = harness.evidence()
+      expect(receipt).toMatchObject({ failedStage: null, exitStatus: 0 })
+      expect(log).toContain('core checker verdict: ACCEPTED (exit status 0)')
+      expect(log).not.toContain('A smoke is never ACCEPTED')
     } finally {
       harness.remove()
     }
