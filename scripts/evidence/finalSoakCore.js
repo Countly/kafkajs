@@ -195,7 +195,10 @@ class Journal {
     this.heldCount = 0
     this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
-    this.trafficEnds = new Map()
+    const collectors = config.processes.filter((p) => p.role === 'collector')
+    this.supervisor = collectors.length === 1 ? collectors[0].slot : null
+    this.trafficEnd = null
+    this.outerExits = []
     /** @returns {{ paused: number, held: number }} empty key counts of one wave event */
     const keys = () => ({ paused: 0, held: 0 })
     this.info = {
@@ -272,14 +275,14 @@ class Journal {
   }
 
   /**
-   * Keeps, per process of the config, the latest end of a `traffic` shape executed as `traffic`:
-   * the supervisor writes one after the final drain. Other shapes and sources are no candidates.
+   * Keeps the latest end of a `traffic` shape executed as `traffic` that the supervisor (the
+   * config's one collector process) emitted: it writes one after the final drain. Other shapes and
+   * sources are no candidates.
    * @param {object} r a `shape` record @returns {void}
    */
   shape(r) {
     if (r.execution !== 'traffic' || r.phase !== 'end' || r.shape !== 'traffic') return
-    if (this.procs.has(r.source))
-      this.trafficEnds.set(r.source, Math.max(this.trafficEnds.get(r.source) ?? -Infinity, r.at))
+    if (r.source === this.supervisor) this.trafficEnd = Math.max(this.trafficEnd ?? r.at, r.at)
   }
 
   /**
@@ -580,8 +583,13 @@ class Journal {
     batch?.add(own)
   }
 
-  /** @param {object} r a `process` record @returns {void} */
+  /**
+   * A process start or exit. The exits the outer observer witnessed (source `outer`) are listed:
+   * it witnesses only the supervisor's.
+   * @param {object} r a `process` record @returns {void}
+   */
   process(r) {
+    if (r.event === 'exit' && r.source === 'outer') capped(this.outerExits, r.process)
     const p = this.procs.get(r.process)
     if (!p) return
     if (r.event === 'start') p.started = true
@@ -1178,18 +1186,47 @@ function judgeHeap(row, { journal, matrix, config, plan, header }) {
 }
 
 /**
+ * Why the process that supervised the run is not attributable, from facts the header cannot assert
+ * alone: the supervisor is the config's one collector process (the driver runs its schedule there
+ * and emits every `shape` record from it), the header must name it, and the outer observer must have
+ * witnessed its exit and no other.
+ * @param {Journal} journal @param {object} header
+ * @returns {string[]} the disagreements, empty when the supervisor is attributable
+ */
+function supervisorProblems(journal, header) {
+  const sup = journal.supervisor
+  if (sup === null) return ['the config does not name exactly one collector process']
+  const problems = []
+  const named = header.exit.supervisorProcess
+  if (named !== sup)
+    problems.push(
+      `the header names ${named} as the supervisor, but the config's collector is ${sup}`
+    )
+  const outer = journal.outerExits
+  if (outer.length !== 1 || outer[0] !== sup)
+    problems.push(
+      `the outer observer witnessed the exit of ${outer.join(', ') || 'no process'}, not of the config's collector ${sup}`
+    )
+  return problems
+}
+
+/**
  * K6: every process's final resource counts are at or below its baseline; a type the baseline never
  * had counts against zero, so an unknown type fails. The baseline must precede every other sample
  * of its process and the final follow every other sample and the end of traffic. The end of traffic
- * is the supervisor's (`header.exit.supervisorProcess`) latest `traffic` shape end, written after
- * the final drain, and must lie between the run's end and the supervisor's observed end.
+ * is the supervisor's latest `traffic` shape end, written after the final drain, and must lie
+ * between the run's end and the supervisor's observed end; without an attributable supervisor
+ * (`supervisorProblems`) there is none.
  * @param {Row} row @param {{ journal: Journal, config: object, header: object }} ctx @returns {void}
  */
 function judgeResources(row, { journal, config, header }) {
   let above = 0
-  const end = journal.trafficEnds.get(header.exit.supervisorProcess) ?? null
+  const attributable = supervisorProblems(journal, header).length === 0
+  const end = attributable ? journal.trafficEnd : null
   const { runEndAt, observedEndAt } = header.window
-  if (end === null)
+  if (!attributable)
+    row.gap('the supervisor is not attributable (see K7), so no end of traffic is trusted')
+  else if (end === null)
     row.gap('the journal records no end of traffic (the final drain) from the supervisor')
   else if (end < runEndAt || end > observedEndAt)
     row.gap(
@@ -1217,9 +1254,9 @@ function judgeResources(row, { journal, config, header }) {
 }
 
 /**
- * K7: parent-observed exits (code 0, no signal), a run as long as its mode requires, a complete
- * sample grid admitted inside each slot's window, a clean supervisor receipt and a valid,
- * digest-matching stream.
+ * K7: parent-observed exits (code 0, no signal) and an attributable supervisor
+ * (`supervisorProblems`), a run as long as its mode requires, a complete sample grid admitted
+ * inside each slot's window, a clean supervisor receipt and a valid, digest-matching stream.
  * @param {Row} row @param {object} ctx `{ journal, config, header, supervisor, plan, problems, mode }` @returns {void}
  */
 function judgeCompleteness(row, { journal, config, header, supervisor, plan, problems, mode }) {
@@ -1232,6 +1269,7 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
     row.fail('the run window is not the requested time')
   if (header.exit.code !== 0 || header.exit.signal !== null)
     row.fail(`the supervisor exited with code ${header.exit.code} and signal ${header.exit.signal}`)
+  supervisorProblems(journal, header).forEach((p) => row.fail(p))
   for (const { slot } of config.processes) {
     const p = journal.procs.get(slot)
     if (!p.started) row.fail(`${slot} has no start record`)
