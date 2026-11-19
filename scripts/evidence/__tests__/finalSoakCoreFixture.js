@@ -79,8 +79,9 @@ const valueOf = (id, transaction) =>
 
 /**
  * Whole log layout: twelve main records, then one committed transaction of four members and one
- * aborted transaction of two (`closed` appends the driver's nontransactional closing record). An entry may be a control `marker`, `invisible` to a read-committed
- * reader, `absent` (its send ended unknown and it never reached the log) or a `duplicate` copy.
+ * aborted transaction of two (`closed` appends the driver's nontransactional closing record). An
+ * entry may be a control `marker`, `invisible` to a read-committed reader, `absent` (its send ended
+ * unknown and it never reached the log) or a `duplicate` copy.
  */
 function buildLayout() {
   const main = Array.from({ length: 12 }, (_, i) => ({ id: `c08.${i}` }))
