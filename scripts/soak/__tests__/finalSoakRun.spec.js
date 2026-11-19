@@ -1578,6 +1578,28 @@ describe('final soak retained harness state', () => {
     }
   })
 
+  test('a share exchange past the wire budget is journaled as missing its wire, never as a record citing no file', () => {
+    const records = []
+    const runtime = {
+      nextId: () => 'p07.0',
+      emit: (r) => records.push(r),
+      diagnose: (message) => records.push({ kind: 'diagnostic', message }),
+      slotOf: () => ({ group: 'g' }),
+    }
+    const event = {
+      type: 'share-acquire',
+      acquisition: 'c07.1.a1',
+      client: 'c07.1',
+      key: { topic: config.topics.main, topicId: IDS.A, partition: 0 },
+      acquired: [{ from: '0', to: '0', deliveryCount: 1 }],
+      wire: { file: null, sha256: null },
+    }
+    ChildRuntime.prototype.observed.call(runtime, event)
+    expect(records).toEqual([
+      { kind: 'diagnostic', message: 'missing-source share wire for c07.1.a1' },
+    ])
+  })
+
   test('the telemetry decoder reads a large reporter suffix in bounded polls', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-decoder-'))
     const sink = path.join(dir, 'sink')
