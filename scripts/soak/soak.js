@@ -804,11 +804,15 @@ const privateOf = (kafka, name) => {
 }
 
 /**
- * The consumer-churn profile's one private read: counts of a group's committed-offset state, taken
- * from the Kafka instance's stores with `Map.get` and a non-creating revision read, so a read never
- * creates a store entry, revision source, holder or ticket. Returns primitives only.
+ * The consumer-churn profile's one private read: a group's committed-offset state, taken from the
+ * Kafka instance's stores with `Map.get` and a non-creating revision read, so a read never creates
+ * a store entry, revision source, holder or ticket. Besides the counts it names the cache keys, the
+ * applied subscription of the attached consumers and every topic the group still claims (an open
+ * ticket, or an attached consumer's subscription, assignment or owed reset), which is what keeps a
+ * cache key. Returns primitives and fresh sorted arrays only.
  * @param {object} kafka a `Kafka`
- * @returns {(groupId: string) => { present: boolean, topics?: number, cells?: number, cache?: number, open?: number }}
+ * @returns {(groupId: string) => { present: boolean, topics?: number, cells?: number, cache?: number,
+ *   cacheKeys?: string[], subscribed?: string[], claimed?: string[], open?: number }}
  *   `present: false` when either store has no entry for the group
  * @throws {Error} when this version of the client has no such stores
  */
@@ -820,7 +824,24 @@ const offsetStateReader = (kafka) => {
     const ledger = operations.get(groupId)
     if (!cache || !ledger) return { present: false }
     const { topics, cells } = CommittedOffsetRevisions.sizeOf(cache)
-    return { present: true, topics, cells, cache: Object.keys(cache).length, open: ledger.size() }
+    const cacheKeys = Object.keys(cache).sort()
+    const subscribed = new Set()
+    const claimed = new Set(ledger.topics.keys())
+    for (const table of ledger.attached) {
+      for (const topic of table.subscribed) subscribed.add(topic)
+      for (const topic of [...table.subscribed, ...table.assigned, ...table.entries.keys()])
+        claimed.add(topic)
+    }
+    return {
+      present: true,
+      topics,
+      cells,
+      cache: cacheKeys.length,
+      cacheKeys,
+      subscribed: [...subscribed].sort(),
+      claimed: [...claimed].sort(),
+      open: ledger.size(),
+    }
   }
 }
 

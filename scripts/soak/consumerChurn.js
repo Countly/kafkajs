@@ -1008,7 +1008,9 @@ const REGEX_ROTATION = Object.freeze({
  * Bounds the private offset state each regex pass sampled while its members ran. Every expected
  * group has one final sample at the pass's deletion count and one periodic sample at each multiple
  * of `sampleEvery` up to it; every sample settled, read present stores and stays within the live
- * topics (stamp topics, cache keys) and live partitions (stamp cells). The expected groups come
+ * topics (stamp topics, cache keys) and live partitions (stamp cells). A sample whose group still
+ * claimed a deleted name at the cutoff fails as a subscription not applied, not on its counts; an
+ * excess of cache keys names the keys outside the row's live names. The expected groups come
  * from the plan, the deletion counts from the workload's `regex-rotation` records and the live
  * denominators must fit `shape`, never taken from the rows alone.
  * @param {object[]} rows the run's `offset-state` rows
@@ -1070,8 +1072,16 @@ const offsetStateViolations = (rows, { passes, groupsOf, deletionsOf, shape = RE
       continue
     }
     seen.add(id)
-    if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
     const { offsetState: state, live } = row
+    if (row.quiescent !== true && state?.unapplied?.length > 0) {
+      const within = (row.waitedMs / 1000).toFixed(1)
+      const names = state.unapplied.join(', ')
+      violations.push(
+        `${where}: subscription not applied within ${within} s: still claims ${names}`
+      )
+      continue
+    }
+    if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
     if (state?.present !== true) {
       violations.push(`${where}: stores absent`)
       continue
@@ -1086,8 +1096,13 @@ const offsetStateViolations = (rows, { passes, groupsOf, deletionsOf, shape = RE
     }
     if (state.topics > live.topics)
       violations.push(`${where}: ${state.topics} stamp topics for ${live.topics} live topics`)
-    if (state.cache > live.topics)
-      violations.push(`${where}: ${state.cache} cache topics for ${live.topics} live topics`)
+    if (state.cache > live.topics) {
+      const extra = state.cacheKeys?.filter((topic) => !live.names?.includes(topic)) ?? []
+      const named = extra.length > 0 ? `: ${extra.join(', ')}` : ''
+      violations.push(
+        `${where}: ${state.cache} cache topics for ${live.topics} live topics${named}`
+      )
+    }
     if (state.cells > live.partitions)
       violations.push(`${where}: ${state.cells} stamp cells for ${live.partitions} live partitions`)
   }
