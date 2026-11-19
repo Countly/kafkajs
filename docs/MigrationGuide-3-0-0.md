@@ -490,7 +490,7 @@ says so, `groupProtocol: 'consumer'`.
   never restarts under `groupProtocol: 'consumer'`"). *What to do:* check that a
   `restartOnFailure` you already pass returns what you want for non-retriable errors too.
   When a stop or disconnect cancels the restart this way, the `CRASH` event reports `restart: false`; a later explicit connect/run can reuse the consumer.
-  A `consumer.disconnect()` that a `CRASH` listener makes does not cancel the restart, as in 2.2.4: the event has already reported `restart: true`, and the restart waits for that close to finish before the new run starts. That differs from the disconnect above, which finishes before `CRASH` is emitted, so the event reports `restart: false`. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending automatic restart.
+  A `consumer.disconnect()` that a `CRASH` listener makes does not cancel the restart, as in 2.2.4: the event has already reported `restart: true`, and the restart waits for that close to finish before the new run starts. That differs from the disconnect above, which is asked before `CRASH` is emitted, so the event reports `restart: false`. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending automatic restart.
 
 - **`groupInstanceId` makes a static member that does not leave the group on
   `consumer.disconnect()`.**
@@ -862,6 +862,8 @@ says so, `groupProtocol: 'consumer'`.
   `isStatic: true` reports. To leave for good, call `consumer.disconnect({ leaveGroup: true })`: it
   sends epoch −1 instead, which removes the member (see "`consumer.disconnect({ leaveGroup })`
   overrides how a member leaves its group").
+
+With consumer group protocol, after a fatal heartbeat the consumer waits for in-flight handlers for up to the resolved maxPollInterval from receipt, or a shorter explicit disconnect deadline. Cleanup and crash reporting can proceed while an old handler promise is still pending. After retirement its commit and heartbeat calls fail locally with CONSUMER_STOPPING. The loss is delivered once to onPartitionsLost (or onPartitionsRevoked when lost is absent) at that deadline, without waiting for the handler.
 
 - **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** These conditions
   will be answered the same way by every rejoin, so the consumer stops instead of looping: the group
