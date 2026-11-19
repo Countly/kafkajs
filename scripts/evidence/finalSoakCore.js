@@ -351,10 +351,15 @@ class Journal {
     else this.held.set(r.id, [fact])
   }
 
-  /** @param {number} i @param {object} fact from `byId` @returns {void} */
-  resolve(i, fact) {
+  /**
+   * @param {number} i @param {object} fact from `byId`
+   * @param {Set<string>} [batch] the intervals that entered id `i` among the held records resolved
+   *   with this one (see `entry`)
+   * @returns {void}
+   */
+  resolve(i, fact, batch) {
     if (fact.stage === 'ack') this.acknowledge(i, fact)
-    else this.entry(i, fact)
+    else this.entry(i, fact, batch)
   }
 
   /**
@@ -425,7 +430,8 @@ class Journal {
     if (!waiting) return
     this.held.delete(r.id)
     this.heldCount -= waiting.length
-    waiting.forEach((fact) => this.resolve(i, fact))
+    const batch = new Set()
+    waiting.forEach((fact) => this.resolve(i, fact, batch))
   }
 
   /**
@@ -534,10 +540,19 @@ class Journal {
    * one offset across every group; then its ownership finding is counted. The same id entered
    * twice by one interval is a same-owner repeat; a repeat in another interval, by another run or
    * in the share group is only counted.
+   *
+   * Which intervals entered an id is kept exactly for as long as an entry of that interval for the
+   * id can still arrive. An interval owns an entry only while it is open (`ownership` judges on
+   * arrival), so once the id is offered a closed interval can enter it no more: an open interval's
+   * entries are kept in `entered` and `shadowed` until it closes. Before the offer, entries wait in
+   * `held` and all resolve together when it arrives, possibly after their intervals closed; for
+   * that one resolution `batch` keeps every interval among them, bounded by the held records.
    * @param {number} i the id's index @param {object} e a `handler-enter` fact from `byId`
+   * @param {Set<string>} [batch] `group|serial` of each interval that entered the id earlier in the
+   *   same resolution of held records
    * @returns {void}
    */
-  entry(i, e) {
+  entry(i, e, batch) {
     const group = this.groupIndex.get(e.group)
     const where = `${e.id} in ${e.group}`
     if (this.topics.get(e.key.topic) !== this.topic[i] || e.key.partition !== 0)
@@ -556,11 +571,13 @@ class Journal {
       else this.note(e.owned, `${where} by ${e.run}`)
       return
     }
-    if (before === e.serial || this.shadowed.get(e.serial)?.has(i))
+    const own = `${group.index}|${e.serial}`
+    if (before === e.serial || this.shadowed.get(e.serial)?.has(i) || batch?.has(own))
       this.note('sameOwner', `${where} by ${e.run}`)
     else if (before !== 0) this.repeatsAfterChange++
     if (before > OUTSIDE && before !== e.serial) this.shadow(before, i)
     slot[i] = e.serial
+    batch?.add(own)
   }
 
   /** @param {object} r a `process` record @returns {void} */
