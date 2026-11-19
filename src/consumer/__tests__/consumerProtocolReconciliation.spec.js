@@ -11,6 +11,7 @@ const { newLogger } = require('testHelpers')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const Subscription = require('../subscription')
+const ConsumerGroupProtocol = require('../groupProtocol/consumer')
 
 /** Every runner this file builds, torn down after the case that built it. */
 const built = []
@@ -1855,6 +1856,49 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(after.filter(({ kind }) => kind === 'GROUP_JOIN')).toEqual([])
     expect(after.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch >= 0)).toEqual([])
     expect(run.group.groupMembership.state).toEqual('FATAL')
+  })
+
+  it('starts the run when the first step is abandoned for a newer target, and consumes the newer target', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const newer = { 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }
+    let answered = 0
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      answered += 1
+      if (request.memberEpoch === 0) {
+        return fullTarget(1, { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] })
+      }
+      return answered === 2 ? fullTarget(2, newer) : fullTarget(request.memberEpoch, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    const steps = jest.spyOn(ConsumerGroupProtocol.prototype, 'rebalance')
+    built.state.unknown.add('topic-c').add('topic-d')
+    built.state.idDelays.push(700)
+    await consumer.subscribe({ topics: ['topic-a', 'topic-c', 'topic-d'] })
+    let ran = false
+    consumer.run({ eachMessage: async () => {} }).then(() => (ran = true))
+    await advanceUntil(() => ran)
+    await jest.advanceTimersByTimeAsync(2000)
+    const [runner] = starts.mock.contexts
+
+    expect(ran).toBe(true)
+    await expect(steps.mock.results[0].value).resolves.toEqual({
+      assignment: {},
+      userData: null,
+      abandoned: true,
+    })
+    expect(built.crashes).toEqual([])
+    expect(starts).toHaveBeenCalledTimes(1)
+    expect(
+      Object.fromEntries(
+        runner.consumerGroup.assigned().map(({ topic, partitions }) => [topic, partitions])
+      )
+    ).toEqual(newer)
+    const fetchedSince = Date.now() - 500
+    expect(
+      new Set(built.fetches.filter(({ at }) => at > fetchedSince).map(({ tp }) => tp))
+    ).toEqual(new Set(['topic-a|0', 'topic-a|1', 'topic-c|0', 'topic-d|0']))
   })
 
   it("calls the listener's onPartitionsLost once, before any rejoin, when a fence reaches the slot during the wait while a handler keeps the fetch loop busy", async () => {
