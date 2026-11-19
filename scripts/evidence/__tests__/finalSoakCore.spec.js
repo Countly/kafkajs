@@ -1324,25 +1324,36 @@ describe('scripts/evidence/finalSoakCore', () => {
       container: 'kafka2',
       event,
       members: [1, 3],
-      partitions: [],
+      partitions: 0,
       cause: 'h00o0',
       downMs: 2000,
       processAt: at - 3,
       processTime: '2026-11-18T16:10:00.000Z',
       ...extra,
     })
-    const wave = (event, observed) => ({
-      t: 5000,
-      at: 5000,
+    const wave = (recordId, event, observed, paused, t = 5000) => ({
+      t,
+      at: t,
       kind: 'wave',
       source: 'p01',
+      recordId,
       execution: 'h00w0.0',
       client: 'c01.0',
       event,
       member: 'c01.9',
-      paused: [fx.key(fx.MAIN)],
-      keys: [fx.key(fx.MAIN)],
+      paused,
+      held: 0,
       observed,
+    })
+    const waveKey = (cause, held, t = 5000) => ({
+      t,
+      at: t,
+      kind: 'wave-key',
+      source: 'p01',
+      execution: 'h00w0.0',
+      cause,
+      key: fx.key(fx.MAIN),
+      held,
     })
     const diagnostic = (message) => ({
       t: 5000,
@@ -1355,8 +1366,12 @@ describe('scripts/evidence/finalSoakCore', () => {
       ...records,
       brokerState('down', 4000),
       brokerState('ready', 6500),
-      wave('transfer', true),
-      wave('return', false),
+      wave('p01.w1', 'transfer', true, 2),
+      waveKey('p01.w1', true),
+      waveKey('p01.w1', true),
+      wave('p01.w2', 'return', false, 2),
+      waveKey('p01.w2', true),
+      waveKey('p01.w2', false),
       diagnostic('probe send c08.77 settled after the h00r0 deadline: ok'),
       diagnostic(
         'expected skip: drain commit of fs-x|0 by c05.1: moved; its current owner covers it'
@@ -1369,20 +1384,59 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.information).toMatchObject({ lateProbeSends: 1, expectedSkips: 1 })
     })
 
-    it('prints outage instants and wave transfers as information, never as a verdict', async () => {
+    it('prints outage instants and wave transfers with their paused and held keys as information, never as a verdict', async () => {
       const report = await check(fx.healthy(), { edit: extras })
       expect(report.information.outages).toEqual([
         { node: 2, event: 'down', at: 4000, downMs: 2000, processAt: 3997 },
         { node: 2, event: 'ready', at: 6500, downMs: 2000, processAt: 6497 },
       ])
-      expect(report.information.waves).toEqual({ transfer: 1, return: 1, unobserved: 1 })
+      expect(report.information.waves).toEqual({
+        transfer: 1,
+        return: 1,
+        unobserved: 1,
+        keys: { transfer: { paused: 2, held: 2 }, return: { paused: 2, held: 1 } },
+      })
+      expect(report.information.incompleteWaves).toEqual([])
       const text = formatReport(report)
       const info = text.slice(text.indexOf('NOT JUDGED information'))
       expect(info).toMatch(/broker 2 down at 4000 \(configured down 2000 ms, container at 3997\)/)
-      expect(info).toMatch(/wave transfers 1, returns 1, not observed 1/)
+      expect(info).toMatch(
+        /wave transfers 1 \(2 paused keys, 2 held by the member\), returns 1 \(2 paused keys, 1 held by the member\), not observed 1/
+      )
+      expect(info).not.toMatch(/incomplete wave/)
       expect(info).toMatch(/probe sends settled after their step: 1/)
       expect(info).toMatch(/drain commits skipped as expected: 1/)
       expect(info).not.toMatch(/PASS|FAIL|INCONCLUSIVE/)
+    })
+
+    it('lists a wave whose counted wave-key records do not all arrive as incomplete information without changing a row', async () => {
+      const edit = (records) => [
+        ...extras(records),
+        wave('p01.w3', 'transfer', true, 3),
+        waveKey('p01.w3', true),
+      ]
+      const report = await check(fx.healthy(), { edit })
+      expect(report.overall).toBe('ACCEPTED')
+      expect(report.information.incompleteWaves).toEqual(['p01.w3 has 1 of 3 wave-key records'])
+      expect(report.information.waves.keys.transfer).toEqual({ paused: 3, held: 3 })
+      const text = formatReport(report)
+      expect(text.slice(text.indexOf('NOT JUDGED information'))).toMatch(
+        /incomplete wave: p01\.w3 has 1 of 3 wave-key records/
+      )
+    })
+
+    it('rejects an artifact whose stream misses a wave-key record its wave counts, and still prints the wave as incomplete', async () => {
+      const world = smoke()
+      const base = world.records()
+      const t = Math.max(...base.filter((r) => r.source === 'p01').map((r) => r.t))
+      const cause = `p01.${base.filter((r) => r.source === 'p01').length}`
+      const report = await onDisk({
+        ...world,
+        records: () => [...base, wave(cause, 'transfer', true, 2, t), waveKey(cause, true, t)],
+      })
+      expectRow(report, 'K7', 'FAIL', /misses 1 of its wave-key records/)
+      expect(report.overall).toBe('REJECTED')
+      expect(report.information.incompleteWaves).toEqual([`${cause} has 1 of 2 wave-key records`])
     })
 
     it('fails an acknowledged send whose offset the broker did not return when it is in the dump twice', async () => {
