@@ -764,6 +764,85 @@ describe('Consumer > the consumer protocol reconciliation', () => {
     expect(group.needsReconciliation()).toBe(false)
   })
 
+  /**
+   * Runs a two-round chain over the real group: the first round's apply discovers a new matching
+   * topic, so a second round is owed after the wait. In that wait a heartbeat is fenced
+   * (FENCED_MEMBER_EPOCH) and routed to the runner as a background heartbeat error, so a LOST
+   * verdict reaches the slot. From then on `answer` serves every heartbeat, which the runner's own
+   * heartbeat manager sends, routing its errors to the runner as in production.
+   * @param {(request: object) => object} answer the coordinator's answer after the fence
+   * @returns {Promise<object>} the harness, the chain's outcome and every heartbeat sent from the fence on
+   */
+  const fenceDuringWait = async (answer) => {
+    const built = buildPattern([target(1, { [CONTROL]: [0] }), target(1, null)])
+    const { group, runner, opportunity } = built
+    const coordinator = runner.rebalanceCoordinator
+    coordinator.runRound(null, 'initial')
+    await waitFor(() => group.groupMembership.immediatePending, { delay: 1, maxWait: 5000 })
+    await opportunity()
+    await coordinator.idle()
+    await opportunity()
+    expect(owned(group)).toEqual({ [CONTROL]: [0] })
+
+    const apply = group.applyRebalanceResult.bind(group)
+    jest.spyOn(group, 'applyRebalanceResult').mockImplementationOnce(async (...args) => {
+      await built.discover({ [CONTROL]: [0], [LATE]: [0] })
+      return apply(...args)
+    })
+    const sent = []
+    const fenced = new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+    const wait = coordinator.yieldBetweenRounds.bind(coordinator)
+    jest.spyOn(coordinator, 'yieldBetweenRounds').mockImplementationOnce(() => {
+      const waiting = wait()
+      group.coordinator.consumerGroupHeartbeat.mockImplementation(async (request) => {
+        sent.push(request)
+        if (sent.length === 1) throw fenced
+        return answer(request)
+      })
+      group.heartbeat({ interval: 0 }).catch((error) => runner.onHeartbeatError(error))
+      return waiting
+    })
+
+    let outcome = null
+    coordinator.runRound('subscription-changed', 'revoked').then(
+      () => (outcome = { resolved: true }),
+      (error) => (outcome = { error })
+    )
+    runner.heartbeatManager.enable()
+    runner.heartbeatManager.ensureStarted()
+    await waitFor(() => outcome !== null, { delay: 5, maxWait: 2000 })
+    runner.heartbeatManager.stop()
+    return { ...built, coordinator, outcome, sent }
+  }
+
+  it('rejoins with epoch 0 and resolves the chain when a fence reaches the slot during the wait and the coordinator accepts the rejoin, leaving the LOST verdict for the runner', async () => {
+    const { group, coordinator, onCrash, outcome, sent } = await fenceDuringWait((request) =>
+      request.memberEpoch === 0 ? target(100, { [CONTROL]: [0], [LATE]: [0] }) : target(100, null)
+    )
+
+    expect(outcome).toEqual({ resolved: true })
+    expect(coordinator.yieldBetweenRounds).toHaveBeenCalledTimes(1)
+    expect(sent[0].memberEpoch).toEqual(1)
+    expect(sent[1]).toMatchObject({ memberId: sent[0].memberId, memberEpoch: 0 })
+    expect(group.groupMembership.memberEpoch).toEqual(100)
+    expect(coordinator.hasVerdict()).toBe(true)
+    expect(coordinator.isRebalancing()).toBe(false)
+    expect(onCrash).not.toHaveBeenCalled()
+  })
+
+  it('resolves the chain and leaves the LOST verdict for the runner when a fence reaches the slot during the wait and the coordinator fences the epoch 0 rejoin too', async () => {
+    const { coordinator, onCrash, outcome, sent } = await fenceDuringWait(() => {
+      throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+    })
+
+    expect(outcome).toEqual({ resolved: true })
+    expect(coordinator.yieldBetweenRounds).toHaveBeenCalledTimes(1)
+    expect(sent.map(({ memberEpoch }) => memberEpoch)).toEqual([1, 0])
+    expect(coordinator.hasVerdict()).toBe(true)
+    expect(coordinator.isRebalancing()).toBe(false)
+    expect(onCrash).not.toHaveBeenCalled()
+  })
+
   it('assigns, then revokes, then assigns again across three heartbeat trips', async () => {
     const { emitted, group, trip } = build({
       script: [assignment(1, [0, 1]), assignment(2, [0]), assignment(3, [0, 2]), idle(3)],

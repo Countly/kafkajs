@@ -37,15 +37,21 @@ const assignmentOf = (partitions) =>
 /**
  * A real classic consumer, with its real runner, group and fetch loop, over a coordinator double.
  * While `churn` is on, every SyncGroup moves the member to the other partition, so every
- * cooperative round revokes one and asks for another; otherwise it answers partition 0.
- * `onSync`, when set, is called by every SyncGroup.
+ * cooperative round revokes one and asks for another, and every JoinGroup takes `joinDelay` ms;
+ * otherwise it answers partition 0 at once. `onSync`, when set, is called by every SyncGroup.
+ * `fetchFails` and `heartbeatFails` count the Fetches and Heartbeats answered REBALANCE_IN_PROGRESS.
  * @param {object} retry the consumer's `retry` options
  * @param {Function} [partitionAssigner] the consumer's one assigner
+ * @param {{ heartbeatInterval?: number, joinDelay?: number }} [options]
  * @returns {object} the consumer, the double's records and its switches
  */
-const build = (retry, partitionAssigner = assigner) => {
+const build = (
+  retry,
+  partitionAssigner = assigner,
+  { heartbeatInterval = 3000, joinDelay = 0 } = {}
+) => {
   const hooks = { onSync: null }
-  const state = { churn: false, flip: false, fetchFails: 0 }
+  const state = { churn: false, flip: false, fetchFails: 0, heartbeatFails: 0 }
   const joins = []
   const fetches = []
   const crashes = []
@@ -68,6 +74,7 @@ const build = (retry, partitionAssigner = assigner) => {
     })),
     joinGroup: jest.fn(async () => {
       joins.push(Date.now())
+      if (state.churn && joinDelay) await new Promise((resolve) => setTimeout(resolve, joinDelay))
       return {
         generationId: ++generation,
         leaderId: 'someone-else',
@@ -81,7 +88,12 @@ const build = (retry, partitionAssigner = assigner) => {
       state.flip = state.churn ? !state.flip : false
       return { memberAssignment: assignmentOf([state.flip ? 1 : 0]) }
     }),
-    heartbeat: jest.fn(async () => {}),
+    heartbeat: jest.fn(async () => {
+      if (state.heartbeatFails > 0) {
+        state.heartbeatFails--
+        throw new KafkaJSProtocolError(createErrorFromCode(REBALANCE_IN_PROGRESS))
+      }
+    }),
     leaveGroup: jest.fn(async () => {}),
   }
   const broker = {
@@ -133,7 +145,7 @@ const build = (retry, partitionAssigner = assigner) => {
     instrumentationEmitter: cluster.instrumentationEmitter,
     partitionAssigners: [partitionAssigner],
     sessionTimeout: 30000,
-    heartbeatInterval: 3000,
+    heartbeatInterval,
     retry: { initialRetryTime: RESTART_DELAY, ...retry },
   })
   consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push(payload))
@@ -247,6 +259,49 @@ describe('Consumer > a classic cooperative chain that the fetch loop starts and 
     expect(run.starts).toHaveBeenCalledTimes(1)
     expect(run.crashes).toHaveLength(1)
   })
+
+  it('reports the limit error once when a background chain and the fetch loop both wait on it, and a policy that allows one restart restarts the consumer', async () => {
+    let restarts = 1
+    const restartOnFailure = jest.fn(async () => restarts-- > 0)
+    const built = build({ retries: 3, restartOnFailure }, assigner, {
+      heartbeatInterval: 100,
+      joinDelay: 20,
+    })
+    consumer = built.consumer
+    const start = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topic: TOPIC })
+    await consumer.run({ eachMessage: async () => {} })
+    await until(() => built.fetches.length > 0)
+    const reported = jest.spyOn(start.mock.contexts[0], 'onCrash')
+
+    // A heartbeat starts the chain in the background; during its fourth join a Fetch finds the
+    // group rebalancing, so the fetch loop waits on the same chain.
+    built.state.churn = true
+    built.state.heartbeatFails = 1
+    let fetchFailed = false
+    await until(() => {
+      if (!fetchFailed && built.joins.length >= 4) {
+        fetchFailed = true
+        built.state.fetchFails = 1
+      }
+      return built.crashes.length > 0
+    }, 5000)
+    built.state.churn = false
+    expect(built.state.fetchFails).toBe(0)
+    expect(reported).toHaveBeenCalledTimes(2)
+
+    const crashedAt = Date.now()
+    await until(() => built.fetches.some(({ at }) => at > crashedAt + RESTART_DELAY))
+
+    expect(restartOnFailure).toHaveBeenCalledTimes(1)
+    const [[error]] = restartOnFailure.mock.calls
+    expect(error).toBeInstanceOf(KafkaJSRebalanceNotConvergedError)
+    expect(built.crashes).toEqual([{ error, groupId: GROUP_ID, restart: true }])
+    expect(start).toHaveBeenCalledTimes(2)
+    expect(built.fetches.filter(({ at }) => at > crashedAt)).toContainEqual(
+      expect.objectContaining({ topic: TOPIC, partition: 0, fetchOffset: '5' })
+    )
+  })
 })
 
 describe('Consumer > a classic eager chain that the fetch loop starts and that keeps being asked for another round', () => {
@@ -272,6 +327,7 @@ describe('Consumer > a classic eager chain that the fetch loop starts and that k
     await until(() => built.fetches.length > 0)
     const [runner] = start.mock.contexts
     expect(joined.map(({ rebalanceProtocol }) => rebalanceProtocol)).toEqual(['eager'])
+    const warn = jest.spyOn(runner.rebalanceCoordinator.logger, 'warn')
 
     // Each SyncGroup of the chain asks for one more round, as a fetch that finds the group
     // rebalancing again does, until forty-five rounds have run.
@@ -292,5 +348,13 @@ describe('Consumer > a classic eager chain that the fetch loop starts and that k
     expect(start).toHaveBeenCalledTimes(1)
     expect(runner.rebalanceCoordinator.isRebalancing()).toBe(false)
     expect(built.fetches.length).toBeGreaterThan(fetchesAfterChain)
+    expect(
+      warn.mock.calls
+        .filter(([message]) => message.endsWith('is still running'))
+        .map(([message, { rounds }]) => [message, rounds])
+    ).toEqual([
+      ['Rebalance is still running', 20],
+      ['Rebalance is still running', 40],
+    ])
   })
 })

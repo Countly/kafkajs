@@ -631,7 +631,7 @@ describe('Consumer > RebalanceCoordinator', () => {
         expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(45)
         expect(warn.mock.calls).toEqual(
           [20, 40].map((rounds) => [
-            'Reconciliation is still running',
+            'Rebalance is still running',
             { groupId: 'coordinator-group', rounds, reason },
           ])
         )
@@ -2251,31 +2251,6 @@ describe('Consumer > RebalanceCoordinator > the consumer group protocol', () => 
     expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
     expect(built.consumerGroup.forgetOwnedPartitions).not.toHaveBeenCalled()
     expect(built.coordinator.rejoinRequested).toBeNull()
-  })
-
-  it('refuses the owed round after a LOST verdict reaches the slot during the wait, rejecting the chain with the verdict error and leaving the verdict for the runner', async () => {
-    const built = build()
-    const fenced = new KafkaJSProtocolError(createErrorFromCode(110))
-    // The real group refuses every round once its ownership is lost, before any request: its join
-    // rejects with the error the loss was recorded with.
-    let lost = false
-    built.consumerGroup.roundContext = { retire: jest.fn(() => (lost = true)), guard: () => null }
-    const chain = convergeDuringLastWait(built, () =>
-      built.coordinator.requestRejoin({ kind: 'lost', reason: 'fenced', error: fenced })
-    )
-    const join = built.consumerGroup.joinAndSync.getMockImplementation()
-    built.consumerGroup.joinAndSync.mockImplementation(async (...args) => {
-      if (lost) throw fenced
-      return join(...args)
-    })
-    await jest.advanceTimersByTimeAsync(21 * 500)
-
-    await expect(chain).rejects.toBe(fenced)
-    expect(built.consumerGroup.roundContext.retire).toHaveBeenCalledWith(fenced)
-    expect(built.consumerGroup.joinAndSync).toHaveBeenCalledTimes(21)
-    expect(built.consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
-    expect(built.coordinator.hasVerdict()).toBe(true)
-    expect(built.coordinator.isRebalancing()).toBe(false)
   })
 
   it('keeps every follow-up that a subscription revision during each round asks for past twenty rounds, warning once, and settles when the revisions stop', async () => {
