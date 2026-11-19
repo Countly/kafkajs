@@ -47,15 +47,15 @@ const RETRY_INTERVAL = 100
 const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
 
 /**
- * What one OffsetCommit did on the wire, recorded before any caller check runs on its answer:
- * `written` once its bytes were handed to the socket (or an answer proves it), `accepted` once the
- * broker's answer accepted the seek's cell. `refusal` is the attempt's own pre-write check, and
- * `superseded` the refusal it returned, which ends a seek without failing it. `mayTakeEffect`
+ * What a seek's OffsetCommit did on the wire, recorded before any caller check runs on its
+ * answer: `accepted` once the broker's answer accepted the seek's cell. `refusal` is the attempt's
+ * own pre-write check, and `superseded` the refusal it returned, which ends a seek without failing
+ * it. `mayTakeEffect`
  * tells whether an accepted seek may still change the partition here (its run, acquisition and
  * incarnation are current), and `settle` lets the caller settle it; both run in the same step as
  * the local publication, before `release`, which is called once the commit request has settled on
  * the wire or was never made, before any recovery or diagnostic.
- * @typedef {{written?: boolean, accepted?: boolean, refusal?: () => Error|null,
+ * @typedef {{accepted?: boolean, refusal?: () => Error|null,
  *   superseded?: Error, mayTakeEffect?: () => boolean, settle?: () => void,
  *   release?: () => void}} CommitAttempt
  */
@@ -392,11 +392,14 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{guard?: Function, fence?: import('../../producer/generation'), since?: number,
-   *   attempt?: CommitAttempt}} [options] an immutable caller identity, checked through
+   *   attempt?: CommitAttempt, onAccepted?: Function, onWrite?: () => void}} [options] an
+   *   immutable caller identity, checked through
    *   transmission and settlement; the terminal fence that binds the coordinator discovery and
    *   the metadata refresh a refused topic id starts; for a default selection, the seek clock it
    *   was selected at, so a cell no longer authorized refuses the request before it is written
-   *   (`seekRefusal`); the attempt that records what happened on the wire, whose own `refusal`,
+   *   (`seekRefusal`); `onWrite`, called when the request is handed to the socket and again once
+   *   an answer proves it was; the seek attempt that records what happened on the wire, whose own
+   *   `refusal`,
    *   like `seekRefusal`, is checked only until the write and never replaces an answer; and
    *   `onAccepted`, called once with the cells the broker accepted as soon as the raw request has
    *   an answer: the cells its decoded reply accepted, also when the caller is refused after the
@@ -409,7 +412,10 @@ module.exports = class OffsetManager {
    *   original answer's ownership loss be learned for its own token. A retired run or a forced
    *   close publishes nothing
    */
-  async sendOffsetCommit(payload, { guard = null, fence, since, attempt, onAccepted } = {}) {
+  async sendOffsetCommit(
+    payload,
+    { guard = null, fence, since, attempt, onAccepted, onWrite } = {}
+  ) {
     const token = this.ownership?.token()
     const { revision } = this.membership()
     const release = this.ownership?.retain(token)
@@ -441,22 +447,18 @@ module.exports = class OffsetManager {
       refusal = check()
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
+      const observed = attempt || onWrite || this.ownership || guard || since !== undefined
       const options = { guard: check }
-      if (attempt) {
-        options[ON_WRITE] = () => {
-          attempt.written = true
-        }
-      }
-      if (onAccepted && (attempt || this.ownership || guard || since !== undefined)) {
+      if (onWrite) options[ON_WRITE] = onWrite
+      if (onAccepted && observed) {
         options[ON_DECODED] = (reply) => {
           decoded = reply
         }
       }
-      const result =
-        attempt || this.ownership || guard || since !== undefined
-          ? await coordinator.offsetCommit(request, options)
-          : await coordinator.offsetCommit(request)
-      if (attempt) attempt.written = true
+      const result = observed
+        ? await coordinator.offsetCommit(request, options)
+        : await coordinator.offsetCommit(request)
+      onWrite?.()
       beforeWrite = false
       settle(true)
       refusal = check()
@@ -1077,7 +1079,7 @@ module.exports = class OffsetManager {
     if (this.operations.isOutranked(ticket, topic, partition)) {
       const durable = this.operations.durable(topic, partition)
       this.operations.fence(ticket, topic, partition)
-      if (durable === null || durable.intent < ticket.intent || durable.seek) return false
+      if (durable === null || durable.intent < ticket.intent) return false
       if (cache[topic]?.[partition] == null) {
         this.operations.publish(ticket, topic, partition, durable.offset)
       }
@@ -1087,7 +1089,7 @@ module.exports = class OffsetManager {
       return false
     }
     this.clearPendingSeek(topic, partition)
-    this.operations.publish(ticket, topic, partition, offset, { seek: true })
+    this.operations.publish(ticket, topic, partition, offset)
     if (this.isConfirmedIncarnation(topic, requestedId)) {
       this.operations.apply(ticket, topic, partition)
     } else this.operations.fence(ticket, topic, partition)
@@ -1139,7 +1141,7 @@ module.exports = class OffsetManager {
    * @throws {Error} whatever the commit raised
    */
   async commitAndClear({ topic, partition, offset }, preparation) {
-    const wire = {}
+    let written = false
     const { groupId, generationId, memberId, groupInstanceId } = this
     const token = this.ownership?.token()
     const guard =
@@ -1162,7 +1164,13 @@ module.exports = class OffsetManager {
             groupInstanceId,
             topics: [{ topic, partitions: [{ partition, offset }] }],
           },
-          { guard, attempt: wire, ...(preparation && { fence: preparation.fence }) }
+          {
+            guard,
+            onWrite: () => {
+              written = true
+            },
+            ...(preparation && { fence: preparation.fence }),
+          }
         )
       }
 
@@ -1182,7 +1190,7 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
-      if (wire.written && !cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
+      if (written && !cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
         this.forgetCommitted(topic, partition)
       }
       release?.()

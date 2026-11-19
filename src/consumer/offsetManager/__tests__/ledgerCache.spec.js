@@ -28,7 +28,6 @@ describe('OffsetOperations as the one committed-cache writer', () => {
     expect(operations.durable(TOPIC, 0)).toEqual({
       intent: second.intent,
       offset: '7',
-      seek: false,
     })
     operations.end(first)
     operations.end(second)
@@ -62,7 +61,6 @@ describe('OffsetOperations as the one committed-cache writer', () => {
     expect(operations.durable(TOPIC, 0)).toEqual({
       intent: mutation.intent,
       offset: '5',
-      seek: false,
     })
     operations.end(older)
     operations.end(mutation)
@@ -138,7 +136,6 @@ describe('Cache and ledger binding', () => {
     expect(operations.durable(TOPIC, 0)).toEqual({
       intent: ticket.intent,
       offset: '9',
-      seek: false,
     })
     operations.end(ticket)
   })

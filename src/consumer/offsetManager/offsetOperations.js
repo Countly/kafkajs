@@ -42,7 +42,7 @@ class OffsetOperations {
    */
   constructor(cache = null) {
     this.cache = cache
-    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, hardAt: number, appliedIntent: number, durable: {intent: number, offset: string, seek: boolean}|null, ownerBarriers: WeakMap<object, number>|null, reservation: Reservation|null}>>} */
+    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, hardAt: number, appliedIntent: number, durable: {intent: number, offset: string}|null, ownerBarriers: WeakMap<object, number>|null, reservation: Reservation|null}>>} */
     this.topics = new Map()
     this.cells = 0
     this.clock = 0
@@ -287,15 +287,13 @@ class OffsetOperations {
    * @param {string} topic
    * @param {number|string} partition
    * @param {string} offset
-   * @param {{seek?: boolean}} [options] whether the mutation is a seek, which also set its
-   *   participant's position
    * @returns {void}
    */
-  publish(ticket, topic, partition, offset, { seek = false } = {}) {
+  publish(ticket, topic, partition, offset) {
     this.write(topic, partition, offset)
     const state = this.state(topic, partition)
     if (state && ticket?.mutation && ticket.intent >= (state.durable?.intent ?? 0)) {
-      state.durable = { intent: ticket.intent, offset, seek }
+      state.durable = { intent: ticket.intent, offset }
     }
   }
 
@@ -362,7 +360,7 @@ class OffsetOperations {
   /**
    * @param {string} topic
    * @param {number|string} partition
-   * @returns {{intent: number, offset: string, seek: boolean}|null} the highest-intent mutation
+   * @returns {{intent: number, offset: string}|null} the highest-intent mutation
    *   published to the cell since its last hard barrier, while a ticket covers the cell
    */
   durable(topic, partition) {
