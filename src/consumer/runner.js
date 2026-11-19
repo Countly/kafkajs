@@ -160,6 +160,7 @@ module.exports = class Runner extends EventEmitter {
         }),
       isRebalancing: () => this.rebalanceCoordinator.isRebalancing(),
       guard: () => this.retirement ?? null,
+      onAccepted: () => this.heartbeatAccepted(),
     })
     this.rebalanceCoordinator = new RebalanceCoordinator({
       runner: this,
@@ -926,8 +927,9 @@ module.exports = class Runner extends EventEmitter {
    *
    * The runner owns the heartbeat outage clock. A classic or manual call ends it whenever the group
    * heartbeat resolves, including a call the interval gate holds back; the classic timer's calls
-   * go straight to the group and leave it alone. A consumer-protocol call ends it only on a success
-   * answered to the membership the member still holds.
+   * go straight to the group and leave it alone. Under the consumer protocol the handler and the
+   * timer share one exchange, which ends it through {@link Runner#heartbeatAccepted} once, on a
+   * success the live run accepted.
    * @returns {Promise<void>}
    */
   async heartbeat() {
@@ -936,11 +938,12 @@ module.exports = class Runner extends EventEmitter {
     if (!this.running) return
 
     try {
-      const answered = await this.consumerGroup.heartbeat({
+      await this.consumerGroup.heartbeat({
         interval: this.consumerGroup.heartbeatInterval(),
         guard: () => this.retirement ?? null,
+        onAccepted: () => this.heartbeatAccepted(),
       })
-      if (answered || this.consumerGroup.kind !== 'consumer') this.outages.heartbeat.end()
+      if (this.consumerGroup.kind !== 'consumer') this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
@@ -960,6 +963,17 @@ module.exports = class Runner extends EventEmitter {
 
       throw this.markOwnRequest(e, 'heartbeat')
     }
+  }
+
+  /**
+   * Ends the heartbeat outage for a consumer-protocol success the live run accepted. The one clock
+   * effect of that protocol: its shared exchange calls this once, before either waiting caller
+   * resumes, whether the handler or the timer started it. Classic ignores it.
+   * @private
+   * @returns {void}
+   */
+  heartbeatAccepted() {
+    this.outages.heartbeat.end()
   }
 
   /**

@@ -333,7 +333,7 @@ module.exports = class ConsumerGroupProtocol {
     // The classic protocol wraps its heartbeat the same way: `Runner#heartbeat()` is called per
     // message, per batch and on every empty fetch round, so without the single flight AND the
     // interval gate below a busy consumer would issue one request per record.
-    this.sharedHeartbeat = sharedPromiseTo(async ({ interval }) => {
+    this.sharedHeartbeat = sharedPromiseTo(async ({ interval, guard, onAccepted }) => {
       if (shouldSkipHeartbeat(this.state)) {
         return false
       }
@@ -345,7 +345,7 @@ module.exports = class ConsumerGroupProtocol {
       }
 
       if (this.immediatePending && shouldHeartbeatNow(this.state)) {
-        return this.sendHeartbeat({ sendAllFields: this.state === JOINING })
+        return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
       }
 
       // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
@@ -354,14 +354,14 @@ module.exports = class ConsumerGroupProtocol {
       // the backoff would never grow past its first step. It is ONE request, consumed by the send
       // below: this is the retry the backoff owed, not a mode the gate stays off in.
       if (this.backoff.isDue(now)) {
-        return this.sendHeartbeat({ sendAllFields: this.state === JOINING })
+        return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
       }
 
       if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
         return false
       }
 
-      return this.sendHeartbeat({ sendAllFields: false })
+      return this.sendHeartbeat({ sendAllFields: false, guard, onAccepted })
     })
 
     this.sharedLeave = sharedPromiseTo((options) => this.performLeave(options))
@@ -1057,12 +1057,20 @@ module.exports = class ConsumerGroupProtocol {
    * One heartbeat, gated exactly as the classic protocol's is: single-flight, and interval-gated
    * unless the state owes an immediate one or a backoff has come due. The gate is load-bearing -
    * the runner calls this per message, per batch and on every empty fetch round.
-   * @param {{ interval: number }} options
+   *
+   * The runner's handler heartbeat and its timer share the one exchange, and the first caller's
+   * `guard` and `onAccepted` govern it. Both callers pass the same live-run guard and the runner's
+   * one clock callback, so a success reaches the clock exactly once, before either caller resumes,
+   * whichever caller started it.
+   * @param {{ interval: number, guard?: () => Error|null, onAccepted?: () => void }} options
+   *   `guard` is the live run's refusal, checked at every effect boundary of the exchange;
+   *   `onAccepted` runs once, inside the exchange, on a success the live run accepted
    * @returns {Promise<boolean>} true only when a heartbeat was sent and answered with success for
-   *   the membership the member still holds; false when none was sent or its answer was dropped
+   *   the membership the member still holds; false when none was sent, the run was retired or its
+   *   answer was dropped
    */
-  async heartbeat({ interval }) {
-    return this.sharedHeartbeat({ interval })
+  async heartbeat({ interval, guard, onAccepted }) {
+    return this.sharedHeartbeat({ interval, guard, onAccepted })
   }
 
   /**
@@ -1085,14 +1093,22 @@ module.exports = class ConsumerGroupProtocol {
    * ownership current when it arrives, so an apply between send and answer cannot hide it. A leave
    * completes by its own state rule.
    *
+   * One effect guard: `guard` is the caller's authority (the live run for an ordinary heartbeat,
+   * the close operation for a leave). Every effect after a suspension - the lookup result, the
+   * write, the answer, the backoff, the error's classification, the clock and the `finally` - runs
+   * only while the sent membership is still the member's and `guard` does not refuse; a retired
+   * ordinary call returns false. Only the wire outcome is classified: a HEARTBEAT listener's throw
+   * is logged, and the guard is checked again after it before the success applies.
+   *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
-   * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null }} options
-   *   `guard` is a leave's private pre-write refusal; it never reaches the request
+   * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null,
+   *   onAccepted?: () => void }} options `guard` is the caller's pre-write and effect refusal; it
+   *   never reaches the request. `onAccepted` runs once on an accepted success that is not a leave
    * @returns {Promise<boolean>} true only for a success answered to the membership the member still
    *   holds (never for a leave); false when nothing was sent or the answer had no effect
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
-  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard }) {
+  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard, onAccepted }) {
     const ownershipToken = this.ownership?.token()
     if (!this.coordinator) {
       // A leave never LOOKS for a coordinator. `connect()` goes through the cluster's retrier, so
@@ -1108,14 +1124,15 @@ module.exports = class ConsumerGroupProtocol {
       }
 
       try {
-        await this.connect(ownershipToken)
+        await this.connect(ownershipToken, undefined, guard)
       } catch (error) {
+        if (guard?.()) return false
         stampOwnership(error, ownershipToken)
         if (!obsoleteOwnership(this.ownership, error)) this.backoff.onFailedAttempt(Date.now())
         throw error
       }
 
-      if (this.ownershipReplaced(ownershipToken)) return false
+      if (this.ownershipReplaced(ownershipToken) || guard?.()) return false
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
@@ -1123,61 +1140,88 @@ module.exports = class ConsumerGroupProtocol {
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
     const membershipAtRequest = this.membershipRevision
+    const current = () => membershipAtRequest === this.membershipRevision && !guard?.()
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
     this.backoff.takeDue()
 
     try {
-      const response = await this.coordinator.consumerGroupHeartbeat({
-        ...toBrokerPayload(request),
-        ...(guard && { guard }),
-      })
+      let response
+      try {
+        response = await this.coordinator.consumerGroupHeartbeat({
+          ...toBrokerPayload(request),
+          ...(guard && { guard }),
+        })
+      } catch (error) {
+        // A leave's failure is its own to finish whatever its close operation now says.
+        const owned =
+          leaveEpoch == null ? current() : membershipAtRequest === this.membershipRevision
+        if (!owned) return false
+        stampOwnership(error, this.ownership?.token())
+        this.sentFields.reset()
 
-      if (membershipAtRequest !== this.membershipRevision || guard?.()) return false
+        if (leaveEpoch != null) {
+          // A leave's answer is deliberately NOT classified. The classification exists to produce a
+          // verdict and a state move, and a leave raises no verdict: running the table here would
+          // move a leaving member to FATAL or FENCED - states the leave cannot complete out of - and
+          // could ask the stopped heartbeat manager for a tick on the way.
+          this.logger.debug('The leave heartbeat failed; leaving anyway', {
+            groupId: this.groupId,
+            error: error.message,
+          })
+          return false
+        }
+
+        const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
+        // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
+        if (fencing && sentUnderEpoch === 0) {
+          this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
+        }
+
+        throw this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch))
+      }
+
+      if (!current()) return false
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
       }
       this.backoff.reset()
+      this.emitHeartbeat(sentUnderEpoch)
+      if (!current()) return false
 
+      this.onSuccess(response)
+      if (leaveEpoch != null) return false
+      onAccepted?.()
+      return true
+    } finally {
+      if (leaveEpoch != null || current()) {
+        this.onRequestGenerated({ leaveEpoch, stateAtRequest })
+      }
+    }
+  }
+
+  /**
+   * Emits HEARTBEAT for an answered heartbeat. A listener's throw is logged, never classified: it
+   * is not the coordinator's answer.
+   * @private
+   * @param {number} sentUnderEpoch
+   * @returns {void}
+   */
+  emitHeartbeat(sentUnderEpoch) {
+    try {
       this.instrumentationEmitter.emit(HEARTBEAT, {
         groupId: this.groupId,
         memberId: this.memberId,
         groupGenerationId: sentUnderEpoch,
         groupInstanceId: this.groupInstanceId,
       })
-
-      this.onSuccess(response)
-      return leaveEpoch == null
     } catch (error) {
-      if (membershipAtRequest !== this.membershipRevision) return false
-      stampOwnership(error, this.ownership?.token())
-      this.sentFields.reset()
-
-      if (leaveEpoch != null) {
-        // A leave's answer is deliberately NOT classified. The classification exists to produce a
-        // verdict and a state move, and a leave raises no verdict: running the table here would
-        // move a leaving member to FATAL or FENCED - states the leave cannot complete out of - and
-        // could ask the stopped heartbeat manager for a tick on the way.
-        this.logger.debug('The leave heartbeat failed; leaving anyway', {
-          groupId: this.groupId,
-          error: error.message,
-        })
-        return false
-      }
-
-      const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
-      // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
-      if (fencing && sentUnderEpoch === 0) {
-        this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
-      }
-
-      throw this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch))
-    } finally {
-      if (leaveEpoch != null || membershipAtRequest === this.membershipRevision) {
-        this.onRequestGenerated({ leaveEpoch, stateAtRequest })
-      }
+      this.logger.error('A HEARTBEAT listener failed', {
+        groupId: this.groupId,
+        error: error.message || error,
+      })
     }
   }
 

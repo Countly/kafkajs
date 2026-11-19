@@ -2099,12 +2099,13 @@ module.exports = class ConsumerGroup {
 
   /**
    * One heartbeat through the membership's own gate.
-   * @param {{ interval: number, guard?: () => Error|null }} options
+   * @param {{ interval: number, guard?: () => Error|null, onAccepted?: () => void }} options
+   *   `onAccepted` is the runner's clock effect; only the consumer protocol runs it
    * @returns {Promise<boolean|void>} void for classic and manual; under the consumer protocol, true
    *   only when a heartbeat was sent and answered with success for the membership the member holds
    */
-  async heartbeat({ interval, guard }) {
-    return this.groupMembership.heartbeat({ interval, guard })
+  async heartbeat({ interval, guard, onAccepted }) {
+    return this.groupMembership.heartbeat({ interval, guard, onAccepted })
   }
 
   /**

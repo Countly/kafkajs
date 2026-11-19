@@ -43,6 +43,8 @@ module.exports = class HeartbeatManager {
    *   the poll deadline is not evaluated while one is
    * @param {() => Error|null} [options.guard] the owner's refusal, handed to every heartbeat so a
    *   request still awaiting its coordinator lookup sends nothing once the owner is retired
+   * @param {() => void} [options.onAccepted] the owner's success effect, handed to every heartbeat;
+   *   a membership that accounts successes inside its exchange runs it once, others ignore it
    */
   constructor({
     groupMembership,
@@ -53,6 +55,7 @@ module.exports = class HeartbeatManager {
     onPollExpired,
     isRebalancing = () => false,
     guard,
+    onAccepted,
   }) {
     this.groupMembership = groupMembership
     this.pollTimer = pollTimer
@@ -62,6 +65,7 @@ module.exports = class HeartbeatManager {
     this.onPollExpired = onPollExpired
     this.isRebalancing = isRebalancing
     this.guard = guard
+    this.onAccepted = onAccepted
 
     this.handle = null
     this.disabled = false
@@ -258,7 +262,11 @@ module.exports = class HeartbeatManager {
     let rearm = false
 
     try {
-      await this.groupMembership.heartbeat({ interval: this.nextInterval(), guard: this.guard })
+      await this.groupMembership.heartbeat({
+        interval: this.nextInterval(),
+        guard: this.guard,
+        onAccepted: this.onAccepted,
+      })
     } catch (error) {
       // A result that landed after `stop()`, after the chain was re-armed under a new generation,
       // or inside the JoinGroup window belongs to a generation nobody is in any more: it is
