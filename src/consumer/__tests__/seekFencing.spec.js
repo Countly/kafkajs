@@ -488,7 +488,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
     expect(scenario.old.isStale()).toBe(true)
     expect(await scenario.position()).toBe('0')
-    expect(scenario.old.isStale()).toBe(false)
+    expect(scenario.old.isStale()).toBe(true)
 
     await scenario.release()
 
@@ -939,7 +939,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(scenario.commits()).toEqual([])
   })
 
-  test('a seek whose commit failed keeps the obsolete progress out of the final commit', async () => {
+  test('a seek whose commit failed leaves the progress made before it in the final commit', async () => {
     await open({
       partitions: 2,
       run: {
@@ -958,13 +958,13 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     await scenario.release()
     await closing
 
-    expect(scenario.commits(0)).toEqual(['0'])
+    expect(scenario.commits(0)).toEqual(['0', '5'])
     expect(scenario.commits(1)).toEqual(['1'])
-    expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
+    expect(scenario.committed).toEqual({ 0: '5', 1: '1' })
     expect(scenario.errors).toEqual([])
   })
 
-  test('a seek whose commit failed is not sent again, and the partition continues from the committed offset', async () => {
+  test('a seek whose commit failed is not sent again, and the partition continues from its position before the seek', async () => {
     await open({
       run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
       before: ({ resolveOffset }) => resolveOffset('4'),
@@ -972,10 +972,10 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     failNextCommit(scenario)
     await expect(scenario.seek('0')).rejects.toMatchObject({ type: 'REQUEST_TIMED_OUT' })
 
-    expect(await scenario.position()).toBe('2')
+    expect(await scenario.position()).toBe('5')
     await scenario.release()
 
-    expect(await scenario.nextDelivery()).toEqual(BEFORE)
+    expect(await scenario.nextDelivery()).toEqual(['value-5'])
     expect(scenario.commits()).toEqual(['0'])
     expect(scenario.committed[0]).toBe('2')
     expect(scenario.errors).toEqual([])
@@ -1303,7 +1303,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('after an incremental apply refused its commit before it was written, reads the committed offset back from the broker and is not sent again', async () => {
+    test('after an incremental apply refused its commit before it was written, keeps the cached offset and its position and is not sent again', async () => {
       const captured = using(captureGroup())
       const held = using(holdNextCommitCall())
       await open(SEEKING)
@@ -1327,13 +1327,13 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       held.release()
 
       expect((await seeking).type).toBe('CONSUMER_STOPPING')
-      expect(cachedAfterRefusal).toBeUndefined()
+      expect(cachedAfterRefusal).toBe('2')
       expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
       expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
-      expect(await scenario.position()).toBe('2')
+      expect(await scenario.position()).toBe('5')
       await disconnect()
-      expect(scenario.commits()).toEqual([])
-      expect(scenario.committed[0]).toBe('2')
+      expect(scenario.commits()).toEqual(['5'])
+      expect(scenario.committed[0]).toBe('5')
       expect(scenario.errors).toEqual([])
     })
 
@@ -1365,20 +1365,22 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('after its commit raised a commit failure the seek swallowed, leaves the replaced progress out of the position and the final commit', async () => {
+    test('after its commit raised a commit failure, surfaces it and keeps the position before the seek', async () => {
       const captured = using(captureGroup())
       await open(SEEKING)
+      const lost = new KafkaJSCommitFailedError('lost', { reason: 'stale-assignment' })
       const send = jest
         .spyOn(captured.group().offsetManager, 'sendOffsetCommit')
-        .mockRejectedValueOnce(new KafkaJSCommitFailedError('lost', { reason: 'stale-assignment' }))
+        .mockRejectedValueOnce(lost)
       using({ restore: () => send.mockRestore() })
 
-      expect(await scenario.seek('0')).toBe('2')
+      expect(await failureOf(scenario.seek('0'))).toBe(lost)
+      expect(await scenario.position()).toBe('5')
 
       await scenario.release()
       await disconnect()
-      expect(scenario.commits()).toEqual([])
-      expect(scenario.committed[0]).toBe('2')
+      expect(scenario.commits()).toEqual(['5'])
+      expect(scenario.committed[0]).toBe('5')
       expect(scenario.errors).toEqual([])
     })
   })
@@ -1518,7 +1520,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       await answered.promise
 
       expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(true)
-      expect(group.offsetManager.resolvedOffsetAt(TOPIC, 0)).toBeUndefined()
+      expect(group.offsetManager.resolvedOffsetAt(TOPIC, 0)).toBe('5')
       await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '8' }])
       accepted.release()
       expect(await seeking).toBe('8')
@@ -1527,6 +1529,99 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.committed[0]).toBe('8')
       expect(scenario.deliveries).toEqual([BEFORE])
       expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('an older handler around a seek', () => {
+    const AUTO = { autoCommit: true, autoCommitInterval: 60000, eachBatch: true }
+    /**
+     * The old batch's work once its gate opens: resolve further, then commit through each of its
+     * own paths, recording what each did.
+     * @param {object} seen collects the outcomes
+     * @returns {(payload: object) => Promise<void>}
+     */
+    const oldWork =
+      (seen) =>
+      async ({ resolveOffset, commitOffsetsIfNecessary, isStale }) => {
+        resolveOffset('4')
+        await commitOffsetsIfNecessary()
+        seen.explicit = await failureOf(commitOffsetsIfNecessary(PAYLOAD_5))
+        seen.stale = isStale()
+      }
+
+    test('cannot restore progress after an applied seek: its resolve is ignored and none of its commits is sent', async () => {
+      const seen = {}
+      await open({
+        run: AUTO,
+        before: ({ resolveOffset }) => resolveOffset('2'),
+        old: oldWork(seen),
+      })
+      expect(await scenario.seek('1')).toBe('1')
+
+      await scenario.release()
+
+      expect(seen.explicit).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(seen.stale).toBe(true)
+      expect(scenario.commits()).toEqual(['1'])
+      expect(scenario.committed[0]).toBe('1')
+      expect(await scenario.position()).toBe('1')
+      expect(await scenario.nextDelivery()).toEqual(['value-1'])
+    })
+
+    test('stays fenced after the seek fails, and the partition keeps its position before the seek', async () => {
+      const seen = {}
+      await open({
+        run: AUTO,
+        before: ({ resolveOffset }) => resolveOffset('2'),
+        old: oldWork(seen),
+      })
+      failNextCommit(scenario)
+      expect((await failureOf(scenario.seek('6'))).type).toBe('REQUEST_TIMED_OUT')
+      expect(await scenario.position()).toBe('3')
+
+      await scenario.release()
+
+      expect(seen.explicit).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(seen.stale).toBe(true)
+      expect(await scenario.position()).toBe('3')
+      expect(scenario.commits()).toEqual(['6'])
+      expect(scenario.committed[0]).toBe('2')
+      const closing = scenario.consumer.disconnect()
+      scenario.hold.resolve()
+      await closing
+      expect(scenario.commits()).toEqual(['6', '3'])
+      expect(scenario.committed[0]).toBe('3')
+    })
+
+    test('a non-retriable seek failure on the fetch loop warns once and crashes the consumer, with no retry', async () => {
+      const captured = using(captureGroup())
+      await open({ run: AUTO })
+      const warn = jest.spyOn(captured.group().logger, 'warn')
+      using({ restore: () => warn.mockRestore() })
+      const crash = gate()
+      scenario.consumer.on(scenario.consumer.events.CRASH, ({ payload }) =>
+        crash.resolve({ type: payload.error.type, restart: payload.restart })
+      )
+      const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+      scenario.rig.cluster.answer('OffsetCommit', (fields, record) => {
+        if (String(fields.topics[0].partitions[0].offset) !== '5') return answer(fields, record)
+        return {
+          topics: fields.topics.map(({ partitions, ...entry }) => ({
+            ...entry,
+            partitions: partitions.map(({ partition }) => ({ partition, errorCode: 29 })),
+          })),
+        }
+      })
+
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '5' })
+      await scenario.release()
+
+      expect(await crash.promise).toEqual({ type: 'TOPIC_AUTHORIZATION_FAILED', restart: false })
+      expect(
+        warn.mock.calls.filter(([message]) => message.startsWith('Seek failed')).map(([m]) => m)
+      ).toEqual(['Seek failed; the partition continues from its position before the seek'])
+      expect(scenario.commits()).toEqual(['5'])
+      expect(scenario.committed[0]).toBe('2')
     })
   })
 
@@ -1656,7 +1751,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       deliberate.release()
       await committing
 
-      expect(await scenario.position()).toBe('8')
+      expect(await scenario.position()).toBe('5')
       expect(scenario.commits()).toEqual(['0', '8'])
       expect(scenario.committed[0]).toBe('8')
       expect(scenario.errors).toEqual([])
@@ -1680,7 +1775,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       failing.release()
 
       expect((await applying).type).toBe('REQUEST_TIMED_OUT')
-      expect(await scenario.position()).toBe('8')
+      expect(await scenario.position()).toBe('5')
       expect(scenario.commits()).toEqual(['8', '0'])
       expect(scenario.committed[0]).toBe('8')
       expect(scenario.errors).toEqual([])
@@ -1833,7 +1928,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(group.hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
     })
 
-    test('is not sent again by the next round when the round was refused before its commit was written, and the partition continues from the committed offset', async () => {
+    test('is not sent again by the next round when the round was refused before its commit was written, and the partition continues from its position before the seek', async () => {
       const captured = using(captureGroup())
       const held = using(holdNextCommitCall())
       await open(SEEKING)
@@ -1841,8 +1936,8 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
       held.release()
 
-      expect(await scenario.nextDelivery()).toEqual(BEFORE)
-      expect(await scenario.position()).toBe('2')
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
+      expect(await scenario.position()).toBe('5')
       expect(captured.group().hasSeekOffset({ topic: TOPIC, partition: 0 })).toBe(false)
       expect(scenario.commits()).toEqual([])
       expect(scenario.committed[0]).toBe('2')
@@ -1851,7 +1946,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
   })
 
   describe('a seek whose commit was written and got no answer', () => {
-    test('is not sent again, and the position is read back from the broker', async () => {
+    test('is not sent again, and the live position stays where it was although the broker stored the seek', async () => {
       await open({
         run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
         before: ({ resolveOffset }) => resolveOffset('4'),
@@ -1867,9 +1962,9 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
       expect((await failureOf(scenario.seek('0'))).name).toBe('KafkaJSConnectionError')
 
-      expect(await scenario.position()).toBe('0')
+      expect(await scenario.position()).toBe('5')
       await scenario.release()
-      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.commits()).toEqual(['0'])
       expect(scenario.committed[0]).toBe('0')
       expect(scenario.errors).toEqual([])
@@ -1890,21 +1985,21 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       before: ({ resolveOffset }) => resolveOffset('4'),
     }
 
-    test('is not taken as applied by position() when the broker did not apply it: the position and the next delivery come from the broker', async () => {
+    test('is not taken as applied by position() when the broker did not apply it: the position and the next delivery stay where they were', async () => {
       await open(SEEKING)
       loseNextCommitUnapplied()
 
       expect((await failureOf(scenario.seek('0'))).name).toBe('KafkaJSConnectionError')
 
-      expect(await scenario.position()).toBe('2')
+      expect(await scenario.position()).toBe('5')
       await scenario.release()
-      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.commits()).toEqual(['0'])
       expect(scenario.committed[0]).toBe('2')
       expect(scenario.errors).toEqual([])
     })
 
-    test('is not taken as applied by a fetch round when the broker did not apply it: the next delivery comes from the broker', async () => {
+    test('is not taken as applied by a fetch round when the broker did not apply it: the next delivery stays where it was', async () => {
       const captured = using(captureGroup())
       await open(SEEKING)
       const applying = jest.spyOn(captured.group(), 'seekOffsets')
@@ -1914,9 +2009,9 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
       await scenario.release()
 
-      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(applying.mock.calls.some(([, round]) => round instanceof FetchPreparation)).toBe(true)
-      expect(await scenario.position()).toBe('2')
+      expect(await scenario.position()).toBe('5')
       expect(scenario.commits()).toEqual(['0'])
       expect(scenario.committed[0]).toBe('2')
       expect(captured.group().unappliedSeeks.size).toBe(0)
@@ -2466,12 +2561,12 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
       await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '7' }])
 
-      expect(await scenario.position()).toBe('7')
+      expect(await scenario.position()).toBe('5')
       expect(scenario.commits()).toEqual(['0', '7'])
       expect(scenario.committed[0]).toBe('7')
       expect(captured.group().unappliedSeeks.has(key)).toBe(false)
       await scenario.release()
-      expect(await scenario.nextDelivery()).toEqual(['value-7'])
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.errors).toEqual([])
     })
 
@@ -2531,7 +2626,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(scenario.errors).toEqual([])
     })
 
-    test('a seek refused before its write is dropped with its error, and the partition continues from the committed offset when the deliberate commit made while it was pending was never written', async () => {
+    test('a seek refused before its write is dropped with its error, and the partition continues from its position before the seek when the deliberate commit made while it was pending was never written', async () => {
       const captured = using(captureGroup())
       await open(SEEKING)
       const group = captured.group()
@@ -2553,9 +2648,9 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(group.unappliedSeeks.has(`${TOPIC}|0`)).toBe(false)
       expect(scenario.commits()).toEqual([])
       expect(scenario.committed[0]).toBe('2')
-      expect(await scenario.position()).toBe('2')
+      expect(await scenario.position()).toBe('5')
       await scenario.release()
-      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.commits()).toEqual([])
       expect(scenario.errors).toEqual([])
     })

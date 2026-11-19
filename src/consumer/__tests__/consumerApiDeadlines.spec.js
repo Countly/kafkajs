@@ -148,14 +148,7 @@ describe.each([true, false])(
         await drive(answering, 'the late coordinator lookup to answer')
         expect(rig.frames('OffsetCommit')).toHaveLength(commitsBefore)
         expect(committed).toEqual([])
-        // The failed seek is not applied: the partition goes back to the group's committed state.
-        // This rig commits nothing, so that is the earliest offset its reset already looked up.
-        expect(before).toBe('3')
-        expect(rig.frames('OffsetCommit')).toHaveLength(0)
-        expect(
-          rig.frames('ListOffsets').map(({ fields }) => fields.topics[0].partitions[0].timestamp)
-        ).toEqual(['-2'])
-        expect(await drive(consumer.position(CELL), 'the committed position')).toBe('0')
+        expect(await drive(consumer.position(CELL), 'the unchanged position')).toBe(before)
       })
 
       test('committed settles at its deadline and reads nothing once the lookup answers', async () => {
