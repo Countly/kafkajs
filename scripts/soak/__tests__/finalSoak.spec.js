@@ -1955,6 +1955,66 @@ describe('final soak driver', () => {
     }
   })
 
+  test('a share readback reads the share group state of one key through the admin client, records it and answers the asking process with it', async () => {
+    const { Supervisor } = require('../finalSoak')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-share-readback-'))
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      const records = []
+      supervisor.emit = async (record) => records.push(record)
+      const sent = []
+      supervisor.children.set('p07', { connected: true, send: (m) => sent.push(m) })
+      const asked = []
+      const rows = [
+        { startOffset: '24243', lag: '0', errorCode: 0 },
+        { startOffset: '-1', lag: null, errorCode: 0 },
+      ]
+      supervisor.admin = {
+        listShareGroupOffsets: async (options) => {
+          asked.push(options)
+          const row = rows.shift()
+          if (!row) throw Object.assign(new Error('coordinator moved'), { code: 16 })
+          return [
+            {
+              topic: 'main',
+              topicId: '41414141-4141-4141-4141-414141414141',
+              partitions: [{ partition: 0, leaderEpoch: 2, ...row }],
+            },
+          ]
+        },
+      }
+      const key = { topic: 'main', topicId: 'QUFBQUFBQUFBQUFBQUFBQQ', partition: 0 }
+      for (let request = 1; request <= 3; request++)
+        await supervisor.shareReadback('p07', { request, group: 'g', client: 'c07.1', key })
+      expect(asked[0]).toEqual({ groupId: 'g', topics: [{ topic: 'main', partitions: [0] }] })
+      const values = [
+        { topicId: 'QUFBQUFBQUFBQUFBQUFBQQ', startOffset: '24243', lag: '0' },
+        { topicId: 'QUFBQUFBQUFBQUFBQUFBQQ', startOffset: null, lag: null },
+        { topicId: null, startOffset: null, lag: null },
+      ]
+      expect(sent).toEqual(values.map((value, n) => ({ type: 'reply', request: n + 1, value })))
+      expect(records).toEqual(
+        values.map((value, n) => ({
+          kind: 'identity',
+          stage: 'broker-share-start',
+          client: 'c07.1',
+          group: 'g',
+          key,
+          ...value,
+          errorCode: n === 2 ? 16 : 0,
+        }))
+      )
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
   test('the sampling gate reports when every admitted and waiting task has finished', async () => {
     const clock = new VirtualClock()
     const gate = new SamplingGate({ limit: 2 })
