@@ -1179,6 +1179,212 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
   })
 
+  describe('stream order across processes', () => {
+    const producer = (r) => r.source === 'p08'
+    /** Moves the producer's records after every other record, keeping each source's own order. */
+    const producerLast = (records) => [
+      ...records.filter((r) => !producer(r)),
+      ...records.filter(producer),
+    ]
+    const verdicts = (report) => report.rows.map((r) => `${r.id}:${r.verdict}`)
+    const healthyVerdicts = ['K1', 'K2', 'K3', 'K4', 'K5', 'K6', 'K7'].map((id) => `${id}:PASS`)
+
+    it('judges a handler entry that precedes its offered record in the stream when the offer arrives', async () => {
+      const report = await check(fx.healthy(), { edit: producerLast })
+      expect(verdicts(report)).toEqual(healthyVerdicts)
+      expect(row(report, 'K2').numbers.visibleRecords).toBe(
+        dumpOf(fx.healthy(), 'main').length + dumpOf(fx.healthy(), 'transactions').length
+      )
+    })
+
+    it('judges a send result that precedes its offered record when the offer arrives', async () => {
+      const edit = (records) => {
+        const ack = records.find((r) => r.stage === 'ack' && r.id === 'c08.3')
+        return [ack, ...records.filter((r) => r !== ack)]
+      }
+      const report = await check(fx.healthy(), { edit })
+      expect(verdicts(report)).toEqual(healthyVerdicts)
+    })
+
+    it('judges a held entry against the ownership its own process had when it wrote the entry', async () => {
+      const c01 = groupOf('c01')
+      const edit = (records) => {
+        const out = producerLast(records)
+        const entries = out.filter(
+          (r) => r.stage === 'handler-enter' && r.group === c01 && r.key.topic === fx.MAIN
+        )
+        const acquire = out.find(
+          (r) => r.kind === 'boundary' && r.group === c01 && r.key.topic === fx.MAIN
+        )
+        out.splice(out.indexOf(entries.at(-1)) + 1, 0, {
+          ...acquire,
+          event: 'revoke-end',
+          cause: 'c01.0.r1',
+        })
+        return out
+      }
+      const report = await check(fx.healthy(), { edit })
+      expect(verdicts(report)).toEqual(healthyVerdicts)
+    })
+
+    it('fails a handler entry for an id that was never offered', async () => {
+      const edit = (records) => {
+        const e = records.find(isEntry(groupOf('c01'), 'c08.4'))
+        return [...records, { ...e, id: 'c08.999', handler: 'c01.0.hz' }]
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(
+        report,
+        'K2',
+        'FAIL',
+        /1 handler entries name an id never offered.*c08\.999 in g-0123456789ab-c01/
+      )
+    })
+
+    it('is inconclusive with a named reason when more records wait for an offer than the capacity', async () => {
+      const offered = fx
+        .healthy()
+        .records()
+        .filter((r) => r.stage === 'offered').length
+      const report = await check(fx.healthy(), { edit: producerLast, capacity: offered })
+      for (const id of ['K1', 'K2', 'K3', 'K5', 'K6'])
+        expectRow(
+          report,
+          id,
+          'INCONCLUSIVE',
+          new RegExp(`more than ${offered} records wait for an id not yet offered`)
+        )
+      expect(report.overall).toBe('NOT ACCEPTED')
+    })
+
+    it('gives the healthy verdict for any merge of the sources that keeps each source in its own order', async () => {
+      let seed = 7
+      const random = () => (seed = (seed * 48271) % 2147483647) / 2147483647
+      const edit = (records) => {
+        const queues = new Map()
+        for (const r of records) queues.set(r.source, [...(queues.get(r.source) ?? []), r])
+        const out = []
+        while (queues.size > 0) {
+          const sources = [...queues.keys()]
+          const source = sources[Math.floor(random() * sources.length)]
+          out.push(queues.get(source).shift())
+          if (queues.get(source).length === 0) queues.delete(source)
+        }
+        return out
+      }
+      for (let n = 0; n < 5; n++)
+        expect(verdicts(await check(fx.healthy(), { edit }))).toEqual(healthyVerdicts)
+    })
+
+    it('applies a transaction decision recorded before its members were offered', async () => {
+      const edit = (records) => [
+        ...records.filter((r) => r.stage === 'transaction'),
+        ...records.filter((r) => r.stage !== 'transaction'),
+      ]
+      const report = await check(fx.healthy(), { edit })
+      expect(verdicts(report)).toEqual(healthyVerdicts)
+    })
+
+    it('takes the latest end of traffic whatever the order the records arrive in', async () => {
+      const edit = (records) => {
+        const end = records.find((r) => r.kind === 'shape' && r.phase === 'end')
+        const later = { ...end, at: 9e9, t: 9e9, source: 'p14' }
+        return [later, ...records]
+      }
+      expectRow(
+        await check(fx.healthy(), { edit }),
+        'K6',
+        'INCONCLUSIVE',
+        /final sample was not taken last and after the end of traffic/
+      )
+    })
+  })
+
+  describe('information that is not judged', () => {
+    const brokerState = (event, at, extra = {}) => ({
+      t: at,
+      at,
+      kind: 'broker-state',
+      source: 'p15',
+      node: 2,
+      pid: 77,
+      container: 'kafka2',
+      event,
+      members: [1, 3],
+      partitions: [],
+      cause: 'h00o0',
+      downMs: 2000,
+      processAt: at - 3,
+      processTime: '2026-11-18T16:10:00.000Z',
+      ...extra,
+    })
+    const wave = (event, observed) => ({
+      t: 5000,
+      at: 5000,
+      kind: 'wave',
+      source: 'p01',
+      execution: 'h00w0.0',
+      client: 'c01.0',
+      event,
+      member: 'c01.9',
+      paused: [fx.key(fx.MAIN)],
+      keys: [fx.key(fx.MAIN)],
+      observed,
+    })
+    const diagnostic = (message) => ({
+      t: 5000,
+      at: 5000,
+      kind: 'diagnostic',
+      source: 'p08',
+      message,
+    })
+    const extras = (records) => [
+      ...records,
+      brokerState('down', 4000),
+      brokerState('ready', 6500),
+      wave('transfer', true),
+      wave('return', false),
+      diagnostic('probe send c08.77 settled after the h00r0 deadline: ok'),
+      diagnostic(
+        'expected skip: drain commit of fs-x|0 by c05.1: moved; its current owner covers it'
+      ),
+    ]
+
+    it('keeps the verdict when probe sends settle late and drain commits are skipped as expected, and counts both', async () => {
+      const report = await check(fx.healthy(), { edit: extras })
+      expect(report.overall).toBe('ACCEPTED')
+      expect(report.information).toMatchObject({ lateProbeSends: 1, expectedSkips: 1 })
+    })
+
+    it('prints outage instants and wave transfers as information, never as a verdict', async () => {
+      const report = await check(fx.healthy(), { edit: extras })
+      expect(report.information.outages).toEqual([
+        { node: 2, event: 'down', at: 4000, downMs: 2000, processAt: 3997 },
+        { node: 2, event: 'ready', at: 6500, downMs: 2000, processAt: 6497 },
+      ])
+      expect(report.information.waves).toEqual({ transfer: 1, return: 1, unobserved: 1 })
+      const text = formatReport(report)
+      const info = text.slice(text.indexOf('NOT JUDGED information'))
+      expect(info).toMatch(/broker 2 down at 4000 \(configured down 2000 ms, container at 3997\)/)
+      expect(info).toMatch(/wave transfers 1, returns 1, not observed 1/)
+      expect(info).toMatch(/probe sends settled after their step: 1/)
+      expect(info).toMatch(/drain commits skipped as expected: 1/)
+      expect(info).not.toMatch(/PASS|FAIL|INCONCLUSIVE/)
+    })
+
+    it('fails an acknowledged send whose offset the broker did not return when it is in the dump twice', async () => {
+      const world = fx.healthy()
+      const lines = dumpOf(world, 'main')
+      const twice = lines.find((l) => l.includes('\tc08.3\t')).replace(/Offset:\d+/, 'Offset:900')
+      fx.redump(world, 'main', [...lines, twice])
+      const edit = mapRecords(
+        (r) => r.stage === 'ack' && r.id === 'c08.3',
+        () => ({ offset: null })
+      )
+      expectRow(await check(world, { edit }), 'K1', 'FAIL', /present more than once.*c08\.3/)
+    })
+  })
+
   describe('configuration', () => {
     it('leaves K1 to K6 inconclusive when the config does not name both standing topics', async () => {
       const world = fx.healthy()
