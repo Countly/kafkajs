@@ -334,6 +334,13 @@ module.exports = (params) => {
    * @type {{ timer: ReturnType<typeof setTimeout>|null, crashed: ControlLifetime }|null}
    */
   let restart = null
+  /**
+   * The cleanup of the crash being reported, published before its first diagnostic and settled
+   * once its stop and cluster disconnect are done, before the restart decision. A bounded public
+   * close joins it, so it returns only after that cleanup's transport and registry work.
+   * @type {Promise<void>|null}
+   */
+  let crashCleanup = null
 
   /**
    * Cancels the pending crash restart, both while its timer is armed and while it waits for a close.
@@ -719,33 +726,41 @@ module.exports = (params) => {
    */
   const closeWithin = async (operation, stopOptions, owned) => {
     const captured = runner
-    let disconnecting = null
-    /** Starts the close's one cluster disconnect; later calls share it. */
-    const disconnectCluster = (drainTimeout) =>
-      (disconnecting ??= ownsCluster
-        ? cluster.disconnect(...(drainTimeout === undefined ? [] : [{ drainTimeout }]))
-        : Promise.resolve())
+    /** @type {Promise<void>[]} every cluster disconnect this close made, in order */
+    const transport = []
+    let lastDrain = null
+    /** Starts one cluster disconnect; a shorter one reaches the drains the earlier one started. */
+    const disconnectCluster = (drainTimeout) => {
+      if (!ownsCluster) return
+      lastDrain = drainTimeout
+      const call = cluster.disconnect(...(drainTimeout === undefined ? [] : [{ drainTimeout }]))
+      call.catch(() => {})
+      transport.push(call)
+    }
     let forced = false
     const unregister = operation.register(() => {
       forced = true
       captured?.retire(consumerStoppingError())
       owned.retire(consumerStoppingError())
       if (restart?.crashed === owned) cancelRestart()
-      disconnectCluster(0).catch((error) => {
-        logger.warn('Disconnecting the cluster failed', { error: error.message })
-      })
+      if (transport.length === 0 || lastDrain !== 0) disconnectCluster(0)
     })
-    const unlessForced = (error) => {
-      if (!forced) throw error
-    }
 
     try {
-      await stopShared(stopOptions, operation).catch(unlessForced)
+      await stopShared(stopOptions, operation).catch((error) => {
+        if (!forced) throw error
+      })
       logger.debug('consumer has stopped, disconnecting', { groupId })
       const { deadlineAt } = operation
-      await disconnectCluster(deadlineAt === Infinity ? undefined : operation.remaining()).catch(
-        unlessForced
-      )
+      if (transport.length === 0)
+        disconnectCluster(deadlineAt === Infinity ? undefined : operation.remaining())
+      const results = await Promise.allSettled(transport)
+      // A bounded close also covers the crash cleanup it overlaps; a natural one keeps its own wait.
+      if (deadlineAt !== Infinity) await crashCleanup
+      const failure = results.find(({ status }) => status === 'rejected')
+      if (failure && !forced) throw failure.reason
+      if (failure)
+        logger.warn('Disconnecting the cluster failed', { error: failure.reason.message })
     } finally {
       unregister()
     }
@@ -1281,21 +1296,20 @@ module.exports = (params) => {
      * @returns {Promise<void>}
      */
     const onCrash = async (e, owned, startGeneration) => {
+      // Admitted before the first diagnostic, so a close that diagnostic starts joins the cleanup.
+      const cleaned = owned.fence.closed ? null : deferred()
+      if (cleaned) crashCleanup = cleaned.promise
       logger.error(`Crash: ${e.name}: ${e.message}`, {
         groupId,
         retryCount: e.retryCount,
         stack: e.stack,
       })
 
-      if (owned.fence.closed) {
+      if (!cleaned) {
         logger.warn('A run of a closed connection crashed late; nothing more is done for it', {
           groupId,
         })
         return
-      }
-
-      if (e.name === 'KafkaJSConnectionClosedError') {
-        cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
       }
 
       const getOriginalCause = (error) => {
@@ -1316,8 +1330,15 @@ module.exports = (params) => {
       // further to log here; just make sure it cannot stop the CRASH event from firing.
       const crashStopGeneration = startGeneration + 1
       try {
+        if (e.name === 'KafkaJSConnectionClosedError') {
+          cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
+        }
         await shutDown(undefined, { keepResets: true, preserveSetupState: true })
-      } catch {}
+      } catch {
+      } finally {
+        cleaned.resolve()
+        if (crashCleanup === cleaned.promise) crashCleanup = null
+      }
 
       const isErrorRetriable =
         e.name === 'KafkaJSNumberOfRetriesExceeded' || getOriginalCause(e).retriable === true
