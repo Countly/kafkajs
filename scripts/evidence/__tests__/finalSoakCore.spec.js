@@ -730,6 +730,21 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    it('drops the ids an interval shared with an overlapping one once that interval closes', () => {
+      const world = fx.healthy()
+      const journal = new Journal({ matrix: world.matrix, config: world.config, mode: world.mode })
+      const records = world.records()
+      const extra = otherRun(records)
+      const revoke = { ...boundaryOf(records), t: 9e7 + 5, event: 'revoke-end' }
+      for (const r of [...records, ...extra.slice(records.length)]) journal.add(r)
+      expect(journal.shadowedCount).toBe(1)
+      journal.add(revoke)
+      expect({ shadowed: journal.shadowed.size, count: journal.shadowedCount }).toEqual({
+        shadowed: 0,
+        count: 0,
+      })
+    })
+
     it('counts a repeat by another client run with its own acquisition, without failing it', async () => {
       const report = await check(fx.healthy(), { edit: otherRun })
       expectRow(report, 'K3', 'PASS')
@@ -1861,6 +1876,19 @@ describe('scripts/evidence/finalSoakCore', () => {
         'FAIL',
         /outer-exit\.json is missing or disagrees/
       )
+    })
+
+    it('fails K7 when a manifest-bound outer-exit.json has the header exit status but another observation time', async () => {
+      const world = smoke()
+      world.outerExit = { observedAt: world.header.exit.observedAt + 1 }
+      const report = await onDisk(world)
+      expectRow(
+        report,
+        'K7',
+        'FAIL',
+        /outer-exit\.json is missing or disagrees with the header exit/
+      )
+      expect(row(report, 'K7').reasons.join('\n')).not.toMatch(/outer-exit\.json: differs/)
     })
 
     it('fails K7 when outer-exit.json changed after the header bound it, even with the same values', async () => {

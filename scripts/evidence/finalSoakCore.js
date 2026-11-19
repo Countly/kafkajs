@@ -206,7 +206,6 @@ class Journal {
     this.openWaves = new Map()
     const churn = matrix.schedule.executions.find((e) => e.shape === 'membership-churn')
     this.waveCap = churn.waves * 2 * Object.keys(matrix.clientKinds).length
-    this.wavesFull = false
     this.outageCap = 2 * matrix.schedule.totals.outages
     this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
@@ -286,7 +285,7 @@ class Journal {
    * A membership wave's transfer or return. It counts its paused keys; until that many `wave-key`
    * records cite it, it stays open, and `finish` lists it as incomplete. At most `waveCap` waves stay
    * open: every client kind running every wave of one membership execution at once, transfer and
-   * return each. A wave beyond that is not kept, and the journal reports one problem.
+   * return each. A wave beyond that is not kept, and the journal reports a problem.
    * @param {object} r a `wave` record @returns {void}
    */
   wave(r) {
@@ -295,10 +294,7 @@ class Journal {
     if (!(r.paused > 0)) return
     if (this.openWaves.size < this.waveCap)
       this.openWaves.set(r.recordId, { event: r.event, paused: r.paused, seen: 0 })
-    else if (!this.wavesFull) {
-      this.wavesFull = true
-      this.problem(`more than ${this.waveCap} membership waves wait for their wave-key records`)
-    }
+    else this.problem(`more than ${this.waveCap} membership waves wait for their wave-key records`)
   }
 
   /**

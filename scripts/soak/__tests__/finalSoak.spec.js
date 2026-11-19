@@ -962,6 +962,18 @@ describe('final soak driver', () => {
       { CORE_REPORT: 'CORE VERDICT: ACCEPTED', CORE_STATUS: '1' },
       'ACCEPTED (exit status 1)',
     ],
+    [
+      'a smoke whose checker prints NOT ACCEPTED but exits with a crash status',
+      'smoke',
+      { CORE_REPORT: 'CORE VERDICT: NOT ACCEPTED', CORE_STATUS: '2' },
+      'NOT ACCEPTED (exit status 2)',
+    ],
+    [
+      'an acceptance run whose checker prints ACCEPTED but exits 1',
+      'acceptance',
+      { CORE_REPORT: 'CORE VERDICT: ACCEPTED', CORE_STATUS: '1' },
+      'ACCEPTED (exit status 1)',
+    ],
   ])('%s fails the runbook at stage core', (_, mode, env, said) => {
     const harness = runbookHarness()
     try {
