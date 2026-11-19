@@ -18,8 +18,9 @@
  * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
  * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE.
  *
- * Memory: about 32 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
- * 51 MB at 1.6 million) plus one id string and Map entry per offered id; one entry per open
+ * Memory: about 60 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
+ * 96 MB at 1.6 million, the full 32-byte payload digest included) plus one id string and Map entry
+ * per offered id; one entry per open
  * ownership interval and per transaction, each capped at the same capacity; a fixed sample grid per
  * process. Handler entries only update typed arrays. Any cap that is reached is a reported problem
  * that leaves K1 to K6 INCONCLUSIVE. Peak RSS has not been measured on a day-size artifact.
@@ -173,7 +174,7 @@ class Journal {
     this.topic = new Uint8Array(capacity)
     this.ack = new Uint8Array(capacity)
     this.offset = new Float64Array(capacity).fill(NaN)
-    this.digest = new Uint32Array(capacity)
+    this.digests = Buffer.alloc(capacity * 32)
     this.enteredAt = new Float64Array(capacity).fill(NaN)
     this.txOf = []
     this.txs = new Map()
@@ -295,7 +296,7 @@ class Journal {
       outcome: r.outcome,
       group: r.group,
       key: r.key,
-      digest: r.payloadSha256 && parseInt(r.payloadSha256.slice(0, 8), 16),
+      digest: r.payloadSha256,
       run: r.authority?.run ?? 'no authority',
       owned: r.stage === 'handler-enter' ? this.ownership(r) : null,
     }
@@ -374,7 +375,7 @@ class Journal {
     this.names.push(r.id)
     this.ids.set(r.id, i)
     this.topic[i] = topic
-    this.digest[i] = parseInt(r.payloadSha256.slice(0, 8), 16)
+    this.digests.write(r.payloadSha256, i * 32, 32, 'hex')
     if (r.transaction !== null) {
       this.txOf[i] = this.transaction(r.transaction)
       this.txOf[i]?.members.push(i)
@@ -464,7 +465,7 @@ class Journal {
   }
 
   /**
-   * A handler entry, matched to its offered record by topic, partition and payload digest, and to
+   * A handler entry, matched to its offered record by topic, partition and full payload digest, and to
    * one offset across every group; then its ownership finding is counted. A repeat in another
    * interval, by another run or in the share group is only counted.
    * @param {number} i the id's index @param {object} e a `handler-enter` fact from `byId`
@@ -475,7 +476,7 @@ class Journal {
     const where = `${e.id} in ${e.group}`
     if (this.topics.get(e.key.topic) !== this.topic[i] || e.key.partition !== 0)
       return this.note('wrongRecord', `${where} on ${e.key.topic}|${e.key.partition}`)
-    if (e.digest !== this.digest[i])
+    if (e.digest !== this.digests.toString('hex', i * 32, i * 32 + 32))
       return this.note('wrongRecord', `${where} with another payload`)
     const offset = Number(e.offset)
     if (Number.isNaN(this.enteredAt[i])) this.enteredAt[i] = offset
@@ -869,9 +870,10 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
 }
 
 /**
- * K2: every handler entry names an offered id and matches its record (topic, partition, payload, one offset that is the
- * log's), and when the dump is proved complete every visible record entered a handler in every
- * recipient group while no group entered a record a read-committed reader cannot see.
+ * K2: every handler entry names an offered id and matches its record exactly (topic, partition, full
+ * payload digest, one offset that is the log's). When the dump is proved complete, every visible
+ * record entered a handler in every recipient group of its topic, and no judged group entered a
+ * record a read-committed reader cannot see or a record of a topic the group does not read.
  * @param {Row} k2 @param {Journal} journal @param {Uint8Array} dumped @param {boolean} complete
  * @returns {void}
  */
@@ -881,31 +883,36 @@ function judgeDelivery(k2, journal, dumped, complete) {
   const phantom = journal.findings.neverOffered
   if (phantom) k2.fail(`${phantom.count} handler entries name an id never offered${first(phantom)}`)
   if (!complete) return
-  const missing = new Map()
+  const groups = [...journal.groupIndex.keys()]
+  const reads = journal.recipients.map((rs) => new Set(rs.map((r) => r.index)))
+  const [missing, foreign] = [new Map(), new Map()]
   const invisible = { count: 0, examples: [] }
+  /** @param {Map} map @param {number} g @param {number} i counts record i for group g */
+  const count = (map, g, i) => {
+    const m = map.get(groups[g]) ?? { count: 0, first: journal.names[i] }
+    map.set(groups[g], { ...m, count: m.count + 1 })
+  }
   let visible = 0
   for (let i = 0; i < journal.names.length; i++) {
-    const groups = journal.recipients[journal.topic[i]]
-    if (!dumped[i]) {
-      const by = groups.find(({ index }) => journal.entered[index][i])
-      if (by && invisible.count++ < EXAMPLES)
-        invisible.examples.push(`${journal.names[i]} in ${by.group}`)
-      continue
+    const recipient = reads[journal.topic[i]]
+    if (dumped[i]) visible++
+    for (let g = 0; g < groups.length; g++) {
+      const entered = journal.entered[g][i]
+      if (!dumped[i] && entered && invisible.count++ < EXAMPLES)
+        invisible.examples.push(`${journal.names[i]} in ${groups[g]}`)
+      else if (dumped[i] && !recipient.has(g) && entered) count(foreign, g, i)
+      else if (dumped[i] && recipient.has(g) && !entered) count(missing, g, i)
     }
-    visible++
-    for (const { group, index } of groups)
-      if (!journal.entered[index][i]) {
-        const m = missing.get(group) ?? { count: 0, first: journal.names[i] }
-        missing.set(group, { ...m, count: m.count + 1 })
-      }
   }
   for (const [group, m] of missing)
     k2.fail(`${group} never entered a handler for ${m.count} visible records (first ${m.first})`)
+  for (const [group, m] of foreign)
+    k2.fail(`${group} entered ${m.count} records of a topic it does not read (first ${m.first})`)
   if (invisible.count > 0)
     k2.fail(
       `${invisible.count} records not visible to a read-committed reader entered a handler${first(invisible)}`
     )
-  Object.assign(k2.numbers, { visibleRecords: visible, groupsJudged: journal.groupIndex.size })
+  Object.assign(k2.numbers, { visibleRecords: visible, groupsJudged: groups.length })
 }
 
 /**
