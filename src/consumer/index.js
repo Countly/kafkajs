@@ -336,8 +336,8 @@ module.exports = (params) => {
   let restart = null
   /**
    * The cleanup of the crash being reported, published before its first diagnostic and settled
-   * once its stop and cluster disconnect are done, before the restart decision. A bounded public
-   * close joins it, so it returns only after that cleanup's transport and registry work.
+   * once its stop and cluster disconnect are done, before the restart decision. Every public close
+   * joins it, so it returns only after that cleanup's transport and registry work.
    * @type {Promise<void>|null}
    */
   let crashCleanup = null
@@ -755,8 +755,8 @@ module.exports = (params) => {
       if (transport.length === 0)
         disconnectCluster(deadlineAt === Infinity ? undefined : operation.remaining())
       const results = await Promise.allSettled(transport)
-      // A bounded close also covers the crash cleanup it overlaps; a natural one keeps its own wait.
-      if (deadlineAt !== Infinity) await crashCleanup
+      // Covers the crash cleanup it overlaps, never the crash report, which may await this close.
+      await crashCleanup
       const failure = results.find(({ status }) => status === 'rejected')
       if (failure && !forced) throw failure.reason
       if (failure)
