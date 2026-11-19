@@ -240,14 +240,86 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.overall).not.toBe('ACCEPTED')
     })
 
-    it('accepts a complete transactions dump when a retried commit marker added one more control offset', async () => {
+    it('accepts a complete transactions dump when a retried marker added one more control offset before its last record', async () => {
       const world = fx.healthy()
-      world.layout.transactions.splice(5, 0, { marker: 'commit' })
+      const [committed, aborted] = [
+        world.layout.transactions.slice(0, 5),
+        world.layout.transactions.slice(5),
+      ]
+      world.layout.transactions = [...aborted, { marker: 'abort' }, ...committed]
       world.apache = fx.renderApache(world)
       const report = await check(world)
       expectRow(report, 'K1', 'PASS')
       expect(row(report, 'K1').numbers.logEndTransactions).toBe(9)
       expect(report.overall).toBe('ACCEPTED')
+    })
+
+    it('is inconclusive when a retried marker follows the last dumped record, which a cut-off dump cannot be told apart from', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { marker: 'commit' })
+      world.apache = fx.renderApache(world)
+      const report = await check(world)
+      expectRow(
+        report,
+        'K1',
+        'INCONCLUSIVE',
+        /5 offsets follow the last dumped record.*explains at most 4/
+      )
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('is inconclusive, never ACCEPTED, when a cut-off transactions dump hides a visible record after its last line', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { ...world.layout.transactions[1], duplicate: true })
+      world.apache = fx.renderApache(world)
+      fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+      const report = await check(world)
+      expectRow(report, 'K1', 'INCONCLUSIVE', /not proved complete/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it.each([
+      ['transactions', 'c09.3', 3],
+      ['main', 'c08.11', 11],
+    ])(
+      'is inconclusive, never ACCEPTED, when a %s dump record lies beyond the log end every describe reports',
+      async (role, id, offset) => {
+        const world = fx.healthy()
+        const moved = (r) => r.id === id && (r.stage === 'ack' || r.stage === 'handler-enter')
+        const edit = mapRecords(moved, () => ({ offset: '100' }))
+        const at = `Offset:${offset}\t${id}\t`
+        fx.redump(
+          world,
+          role,
+          dumpOf(world, role).map((l) =>
+            l.includes(at) ? l.replace(at, `Offset:100\t${id}\t`) : l
+          )
+        )
+        const report = await check(world, { edit })
+        expectRow(report, 'K1', 'INCONCLUSIVE', /offset 100 lies at or beyond the log end/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      }
+    )
+
+    it('is inconclusive for a manifest-bound smoke artifact whose dump record lies beyond the described log end', async () => {
+      const world = smoke()
+      const base = world.records
+      world.records = () =>
+        base().map((r) =>
+          r.id === 'c09.3' && (r.stage === 'ack' || r.stage === 'handler-enter')
+            ? { ...r, offset: '100' }
+            : r
+        )
+      fx.redump(
+        world,
+        'transactions',
+        dumpOf(world, 'transactions').map((l) =>
+          l.replace('Offset:3\tc09.3\t', 'Offset:100\tc09.3\t')
+        )
+      )
+      const report = await onDisk(world)
+      expectRow(report, 'K1', 'INCONCLUSIVE', /offset 100 lies at or beyond the log end/)
+      expectRow(report, 'K7', 'PASS')
     })
 
     it('is inconclusive when the transactions dump stops before a visible record the journal acknowledged', async () => {
