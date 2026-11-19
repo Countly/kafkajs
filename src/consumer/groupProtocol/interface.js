@@ -42,12 +42,12 @@ const COOPERATIVE = 'cooperative'
  * @property {() => Promise<import('../../../types').Broker|void>} connect resolves and publishes
  *   the group coordinator; manual membership only checks local readiness
  * @property {(context: { topics: string[], topicsSubscribed: string[],
- *   beforeSync: () => void, growSubscription?: (names: string[]) => Promise<void> }) => Promise<Object>} rebalance
+ *   beforeSync: () => void, growSubscription?: (names: string[]) => Promise<string[]|void> }) => Promise<Object>} rebalance
  *   ONE exchange with the coordinator - a JoinGroup + SyncGroup for the classic protocol, one
  *   reconciliation step for the consumer protocol - returning the result the caller applies.
  *   Plain, not self-guarded and not a loop: the single flight, the round loop and the
  *   instrumentation events belong to the caller. `growSubscription` is supplied only by a caller
- *   whose subscription the coordinator may widen.
+ *   whose subscription the coordinator may widen; it resolves to the names it left pending.
  * @property {(deps: { rebalanceCoordinator: Object, heartbeatManager: Object,
  *   commitBeforeRelease?: Function }) => void} attach
  *   Late-bound collaborators, forwarded by `ConsumerGroup#attach`.

@@ -1041,12 +1041,16 @@ module.exports = (params) => {
         topics[t] = { fromBeginning, resetPolicy }
       }
 
-      try {
+      if (!isConsumerProtocol) {
         await cluster.addMultipleTargetTopics(subscriptions, { fence: owned.fence })
-        for (const name of subscriptions) unregisteredTopics.delete(name)
-      } catch (error) {
-        if (!isConsumerProtocol || error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
-        for (const name of subscriptions) unregisteredTopics.add(name)
+        return
+      }
+      const registered = await ConsumerGroup.registerTargets(cluster, subscriptions, {
+        fence: owned.fence,
+      })
+      for (const name of subscriptions) {
+        if (registered) unregisteredTopics.delete(name)
+        else unregisteredTopics.add(name)
       }
       return
     }

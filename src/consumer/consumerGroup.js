@@ -985,7 +985,8 @@ module.exports = class ConsumerGroup {
   /**
    * Applies one sync result to this member's local state and reports what changed.
    *
-   * Filters out topics the member is not subscribed to, refreshes metadata once when the
+   * Filters out topics the member is not subscribed to, or has not registered as cluster targets
+   * yet (see `growSubscription`), refreshes metadata once when the
    * assignment names a partition the member has never heard of, and replaces the assignment.
    * Emits `RECEIVED_UNSUBSCRIBED_TOPICS` and warns for filtered names under classic only.
    * Under the consumer protocol a target can lag the round subscription, so filtered names are
@@ -1040,7 +1041,9 @@ module.exports = class ConsumerGroup {
     })
 
     const assignedTopics = keys(decodedAssignment)
-    const topicsNotSubscribed = arrayDiff(assignedTopics, topicsSubscribed)
+    const topicsNotSubscribed = assignedTopics.filter(
+      (topic) => !topicsSubscribed.includes(topic) || this.unregisteredTopics.has(topic)
+    )
 
     if (topicsNotSubscribed.length > 0) {
       const payload = {
@@ -1742,21 +1745,29 @@ module.exports = class ConsumerGroup {
    * for it). A literal name subscribed before its topic existed already holds the first two and
    * gets only the target, once.
    *
+   * A name the cluster does not know by the time it is added (deleted since the coordinator
+   * assigned it) is not registered yet, which is not an error (see `registerTargets`): the new
+   * names are taken back out of the name set, a literal one stays in `unregisteredTopics`, and all
+   * are returned as pending so the apply leaves them out and the next assignment that names them
+   * registers them again.
+   *
    * NEVER pushes: `this.topics` and `this.topicsSubscribed` are the same array object at
    * construction, so a mutation would edit both.
    * @param {string[]} names newly resolved topic names
-   * @returns {Promise<void>}
+   * @returns {Promise<string[]>} the names left pending, none when all were registered
+   * @throws {Error} any other failure of the add, `INVALID_TOPIC_EXCEPTION` and
+   *   `TOPIC_AUTHORIZATION_FAILED` included
    */
   async growSubscription(names) {
     // A client-pattern member's names come from its pinned revision: an assigned name that left it
     // is filtered by the apply, never turned into a named target.
-    if (this.subscription) return
+    if (this.subscription) return []
 
     const added = names.filter((name) => !this.topicsSubscribed.includes(name))
     const awaiting = names.filter((name) => this.unregisteredTopics.has(name))
 
     if (!added.length && !awaiting.length) {
-      return
+      return []
     }
 
     this.topicsSubscribed = [...this.topicsSubscribed, ...added]
@@ -1768,8 +1779,42 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    await this.cluster.addMultipleTargetTopics([...added, ...awaiting])
-    for (const name of awaiting) this.unregisteredTopics.delete(name)
+    const pending = [...added, ...awaiting]
+    if (await ConsumerGroup.registerTargets(this.cluster, pending)) {
+      for (const name of awaiting) this.unregisteredTopics.delete(name)
+      return []
+    }
+
+    this.logger.debug('Assigned topics are not known to the cluster yet, leaving them pending', {
+      groupId: this.groupId,
+      topics: pending,
+    })
+    this.topicsSubscribed = this.topicsSubscribed.filter((name) => !added.includes(name))
+    this.obligations.claimSubscription(this.topicsSubscribed)
+    for (const name of added) delete this.topicConfigurations[name]
+    return pending
+  }
+
+  /**
+   * Adds consumer-protocol names to the cluster's targets. The rule both a subscription and an
+   * assignment follow: a name the cluster answers `UNKNOWN_TOPIC_OR_PARTITION` for when it is added
+   * is not registered yet, which is not an error of the consumer, because the coordinator assigns
+   * it once it exists and revokes it once it is deleted. The add has rolled every new name back.
+   * A classic subscription does not use this: its add validates the names the user gave.
+   * @param {import('../cluster')} cluster
+   * @param {string[]} names
+   * @param {{ fence?: object }} [options] passed to `Cluster#addMultipleTargetTopics`
+   * @returns {Promise<boolean>} whether the names are targets now
+   * @throws {Error} any other failure of the add
+   */
+  static async registerTargets(cluster, names, options) {
+    try {
+      await cluster.addMultipleTargetTopics(names, options)
+      return true
+    } catch (error) {
+      if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+      return false
+    }
   }
 
   /**
