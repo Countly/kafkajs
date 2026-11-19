@@ -4,7 +4,12 @@ const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const { buildConfig, Supervisor, workloadProblems } = require('../finalSoak')
-const { MonotonicClock, planSchedule, Scheduler } = require('../finalSoakScheduler')
+const {
+  MonotonicClock,
+  planSchedule,
+  Scheduler,
+  liveHarnessTimers,
+} = require('../finalSoakScheduler')
 const {
   sha256,
   ChildRuntime,
@@ -1390,6 +1395,31 @@ describe('final soak work admission and quiet samples', () => {
         signal: 'SIGKILL',
       })
       expect(Date.now() - started).toBeLessThan(5000)
+    } finally {
+      process.env.PATH = PATH
+      fs.rmSync(bin, { recursive: true, force: true })
+      remove()
+    }
+  })
+
+  test('a docker command arms its time bound as a harness timer, released once the command ends', async () => {
+    const { s, remove } = supervisor()
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-docker-'))
+    const PATH = process.env.PATH
+    const timeouts = () => process.getActiveResourcesInfo().filter((t) => t === 'Timeout').length
+    try {
+      fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nsleep 0.3\necho done\n', {
+        mode: 0o755,
+      })
+      process.env.PATH = `${bin}:${PATH}`
+      s.dockerMs = 10000
+      const harness = liveHarnessTimers()
+      const client = timeouts() - harness
+      const running = s.docker(['compose', 'ps'])
+      expect(liveHarnessTimers()).toBe(harness + 1)
+      expect(timeouts() - liveHarnessTimers()).toBe(client)
+      await expect(running).resolves.toBe('done')
+      expect(liveHarnessTimers()).toBe(harness)
     } finally {
       process.env.PATH = PATH
       fs.rmSync(bin, { recursive: true, force: true })
