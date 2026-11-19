@@ -21,6 +21,7 @@ const {
   clip,
 } = require('./finalSoakCollector')
 const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('./finalSoakObserver')
+const { shareRequestSummary } = require('./shareProtocol')
 
 /** Delivered share offsets kept above a key's first missing one before the gap is given up on. */
 const SHARE_AHEAD_MAX = 100000
@@ -168,12 +169,20 @@ class WireLog {
    * @returns {{ file: string, sha256: string }|null} where it was written, null when dropped
    */
   append({ request, response, ...rest }) {
-    const line =
-      JSON.stringify({
-        ...rest,
-        request: request.toString('hex'),
-        response: response.toString('hex'),
-      }) + '\n'
+    return this.note({
+      ...rest,
+      request: request.toString('hex'),
+      response: response.toString('hex'),
+    })
+  }
+
+  /**
+   * Appends one line of any fields under the same byte budget as `append`.
+   * @param {object} fields JSON-serializable fields
+   * @returns {{ file: string, sha256: string }|null} where it was written, null when dropped
+   */
+  note(fields) {
+    const line = JSON.stringify(fields) + '\n'
     if (this.total + line.length > this.budget) {
       if (this.dropped++ === 0) this.onFull(`raw wire budget of ${this.budget} bytes reached`)
       return null
@@ -2221,6 +2230,20 @@ class ShareWorker extends Worker {
         const where = runtime.wire.append({ client: rig.id, ...exchange })
         runtime.observer.exchanged(rig.id, { ...exchange, file: null, sha256: null, ...where })
       },
+      onSent: ({ request, ...sent }) =>
+        runtime.wire.note({
+          client: rig.id,
+          event: 'sent',
+          ...sent,
+          ...shareRequestSummary(request),
+        }),
+      onUnanswered: ({ request, ...sent }) =>
+        runtime.wire.note({
+          client: rig.id,
+          event: 'unanswered',
+          ...sent,
+          request: request.toString('hex'),
+        }),
     }
     const { options } = clientOptions(runtime.config, runtime.matrix, slot)
     const consumer = await rig.construct((kafka) => kafka.shareConsumer(options), capture)

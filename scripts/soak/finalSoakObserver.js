@@ -1257,7 +1257,9 @@ class PassiveObserver {
  * Supplies each client's public `socketFactory`. It records every socket the default factory makes
  * (weakly, with its client and node) and, for a client that captures, splits the socket's outgoing
  * and incoming bytes into frames and hands each completed request/response pair of the chosen API
- * keys to `onExchange`. A capturing socket's own `data` listener and `write` wrapper are removed at
+ * keys to `onExchange`. Each request of those keys is also handed to `onSent` as it is written, and
+ * each one still unanswered when the socket closes to `onUnanswered`, so a request whose reply was
+ * lost leaves a trace. A capturing socket's own `data` listener and `write` wrapper are removed at
  * close, as the existing share wire trace does.
  */
 class SocketRegistry {
@@ -1279,15 +1281,18 @@ class SocketRegistry {
   /**
    * @param {string} client the actual client id
    * @param {{ apiKeys: number[], onExchange: (e: { apiKey: number, request: Buffer,
-   *   response: Buffer }) => void }|null} [capture]
+   *   response: Buffer }) => void, onSent?: (r: SentRequest) => void,
+   *   onUnanswered?: (r: SentRequest) => void }|null} [capture] `SentRequest` is
+   *   `{ node, apiKey, correlationId, request }`
    * @returns {Function} a `socketFactory` for the client's Kafka config
    */
   factory(client, capture = null) {
     return (options) => {
       const socket = this.make(options)
       this.created++
-      this.refs.push({ ref: new WeakRef(socket), client, node: `${options.host}:${options.port}` })
-      if (capture) this.capture(socket, capture)
+      const node = `${options.host}:${options.port}`
+      this.refs.push({ ref: new WeakRef(socket), client, node })
+      if (capture) this.capture(socket, capture, node)
       return socket
     }
   }
@@ -1303,8 +1308,12 @@ class SocketRegistry {
     return out
   }
 
-  /** Splits a capturing socket's bytes into frames and pairs requests with responses. */
-  capture(socket, { apiKeys, onExchange }) {
+  /**
+   * Splits a capturing socket's bytes into frames and pairs requests with responses.
+   * @param {object} socket @param {object} capture see `factory` @param {string} node host:port
+   * @returns {void}
+   */
+  capture(socket, { apiKeys, onExchange, onSent = () => {}, onUnanswered = () => {} }, node) {
     const pending = new Map()
     const buffers = { out: Buffer.alloc(0), in: Buffer.alloc(0) }
     const take = (direction, chunk) => {
@@ -1315,7 +1324,10 @@ class SocketRegistry {
         bytes = bytes.subarray(length)
         if (direction === 'out') {
           const { apiKey, correlationId } = this.readHeader(frame)
-          if (apiKeys.includes(apiKey)) pending.set(correlationId, { apiKey, request: frame })
+          if (apiKeys.includes(apiKey)) {
+            pending.set(correlationId, { apiKey, request: frame })
+            onSent({ node, apiKey, correlationId, request: frame })
+          }
         } else {
           const correlationId = frame.readInt32BE(4)
           const request = pending.get(correlationId)
@@ -1337,6 +1349,8 @@ class SocketRegistry {
     socket.once('close', () => {
       socket.removeListener('data', receive)
       if (socket.write === write) socket.write = original
+      for (const [correlationId, { apiKey, request }] of pending)
+        onUnanswered({ node, apiKey, correlationId, request })
       pending.clear()
     })
   }
