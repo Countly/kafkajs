@@ -66,6 +66,8 @@ const COMMAND_GRACE_MS = 60000
 const DEFAULT_COMMAND_MS = 300000
 /** How long one docker command may run before it is killed. */
 const DOCKER_MS = 60000
+/** How long a child killed at the end of the teardown allowance may take to end. */
+const KILL_WAIT_MS = 10000
 /** How long the final drain waits for every member to resolve the logs' ends. */
 const FINAL_DRAIN_MS = 300000
 /** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
@@ -285,7 +287,8 @@ class Supervisor {
     this.children = new Map()
     this.waiting = new Map()
     this.commands = 0
-    this.exits = 0
+    this.terminal = new Set()
+    this.exitRecords = new Map()
     this.topicIds = []
     this.routes = new Map()
     this.scanned = new Map()
@@ -792,19 +795,25 @@ class Supervisor {
     this.children.set(slot, child)
     this.exited ??= new Promise((resolve) => (this.allExited = resolve))
     this.watch(slot, child)
-    child.send({
-      type: 'init',
-      config: this.config,
-      matrix: this.matrix,
-      originMs: this.clock.originMs,
-      topicIds: this.topicIds,
-    })
+    if (!child.connected) return
+    child.send(
+      {
+        type: 'init',
+        config: this.config,
+        matrix: this.matrix,
+        originMs: this.clock.originMs,
+        topicIds: this.topicIds,
+      },
+      (e) => e && this.lose(slot, e.message)
+    )
   }
 
   /**
    * Follows one child: its messages, and its loss. A child that exits, closes its channel or fails
    * to spawn settles every command waiting on it; unless it was told to disconnect, that is a
-   * failure of the run.
+   * failure of the run. A process exit is journaled as it happened. Every attempted child reaches
+   * one terminal state at its `close`, which follows both an exit and a spawn that failed (with no
+   * exit, so none is journaled).
    * @param {string} slot @param {import('node:events').EventEmitter} child
    * @returns {void}
    */
@@ -815,17 +824,32 @@ class Supervisor {
     child.on('exit', (code, signal) => {
       this.observedEndAt = this.clock.now()
       this.lose(slot, `exited with ${signal ?? code}`)
-      this.emit({
-        kind: 'process',
-        event: 'exit',
-        process: slot,
-        code,
-        signal,
-        spawnRecord: `${slot}.0`,
-      }).finally(() => {
-        if (++this.exits === this.children.size) this.allExited?.()
-      })
+      this.exitRecords.set(
+        slot,
+        this.emit({
+          kind: 'process',
+          event: 'exit',
+          process: slot,
+          code,
+          signal,
+          spawnRecord: `${slot}.0`,
+        }).catch(() => {})
+      )
     })
+    child.on('close', () => this.settleChild(slot))
+  }
+
+  /**
+   * Records a child's terminal state once, after its exit record (if it exited) is appended; the
+   * last one releases `exited`.
+   * @param {string} slot @returns {Promise<void>}
+   */
+  async settleChild(slot) {
+    if (this.terminal.has(slot)) return
+    this.terminal.add(slot)
+    await this.exitRecords.get(slot)
+    this.exitRecords.delete(slot)
+    if (this.terminal.size === this.children.size) this.allExited?.()
   }
 
   /**
@@ -849,30 +873,43 @@ class Supervisor {
   }
 
   /**
-   * Waits for every child to exit by itself. A child still alive after the teardown allowance is
-   * killed and named in the receipt, so the run ends with its evidence but can never be green.
+   * Waits for every child to reach its terminal state by itself. A child still alive after the
+   * teardown allowance is killed and named in the receipt, so the run ends with its evidence but can
+   * never be green; one that has not ended `KILL_WAIT_MS` after its kill (a kill that failed) is
+   * named too, and the teardown goes on without it. The whole wait is bounded.
    * @returns {Promise<void>}
    */
   async untilExited() {
-    const timer = new AbortController()
     const allowance = this.teardownAllowanceMs()
+    if (await this.exitedWithin(allowance)) return
+    for (const [slot, child] of this.children) {
+      if (this.terminal.has(slot)) continue
+      this.forced.push(slot)
+      this.leaving.add(slot)
+      this.problem(`process ${slot} did not exit within ${allowance} ms of its disconnect; killed`)
+      try {
+        child.kill('SIGKILL')
+      } catch (e) {
+        this.problem(`process ${slot} could not be killed: ${e.message}`)
+      }
+    }
+    if (await this.exitedWithin(KILL_WAIT_MS)) return
+    for (const slot of this.children.keys())
+      if (!this.terminal.has(slot)) {
+        this.problem(`process ${slot} did not end ${KILL_WAIT_MS} ms after its kill`)
+        this.incomplete ??= `process ${slot} did not end`
+      }
+  }
+
+  /** @param {number} ms @returns {Promise<boolean>} whether every child ended within `ms` */
+  async exitedWithin(ms) {
+    const timer = new AbortController()
     const winner = await Promise.race([
-      this.exited.then(() => 'exited'),
-      this.clock.sleepUntil(this.clock.now() + allowance, timer.signal).then(() => 'late'),
+      (this.exited ?? Promise.resolve()).then(() => true),
+      this.clock.sleepUntil(this.clock.now() + ms, timer.signal).then(() => false),
     ])
     timer.abort()
-    if (winner === 'late') {
-      for (const [slot, child] of this.children) {
-        if (child.exitCode !== null || child.signalCode !== null) continue
-        this.forced.push(slot)
-        this.leaving.add(slot)
-        this.problem(
-          `process ${slot} did not exit within ${allowance} ms of its disconnect; killed`
-        )
-        child.kill('SIGKILL')
-      }
-      await this.exited
-    }
+    return winner
   }
 
   /** Routes a child message: records to the collector, outcomes, readbacks and subscriptions. */

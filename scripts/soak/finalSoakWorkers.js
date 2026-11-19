@@ -723,7 +723,7 @@ class ChildRuntime {
       error = e.message
       await this.diagnose(`step ${step.id} failed: ${e.message}`)
     }
-    process.send({ type: 'done', id, error, reply, incomplete: this.channel.incomplete })
+    this.notify({ type: 'done', id, error, reply, incomplete: this.channel.incomplete })
   }
 
   /**
@@ -2572,44 +2572,57 @@ function createWorker(runtime) {
  * Runs a child process: `init` builds the runtime and takes the start handshake and baseline before
  * any command is served; commands then run concurrently, so sampling never waits behind a workload.
  * The process ends by itself once the `disconnect` command has run and the channel is closed, or,
- * if the supervisor goes away first, once its clients have disconnected.
+ * if the supervisor goes away first, once its clients have disconnected. When the channel closes,
+ * every readback and record acknowledgement still awaited is settled (a record as refused), so no
+ * handler or disconnect waits on a supervisor that is gone; nothing is sent on a closed channel. A
+ * runtime that failed to start answers each command with that error.
  * @param {{ child: string, out: string }} options
+ * @param {{ proc?: NodeJS.Process, Runtime?: typeof ChildRuntime }} [seams] the process channel and
+ *   runtime class, replaced only by tests
  * @returns {void}
  */
-function child(options) {
+function child(options, { proc = process, Runtime = ChildRuntime } = {}) {
   let ready = null
   let leaving = false
   const replies = new Map()
   const acks = new Map()
-  process.on('disconnect', () => {
+  const post = (message) => proc.connected && proc.send(message)
+  proc.on('disconnect', () => {
+    for (const resolve of replies.values()) resolve()
+    replies.clear()
+    for (const done of acks.values()) done(true)
+    acks.clear()
     if (!leaving && ready) ready.then((runtime) => runtime.orphaned()).catch(() => {})
   })
-  process.on('message', async (message) => {
+  proc.on('message', async (message) => {
     if (message.type === 'init') {
       ready = (async () => {
-        const runtime = new ChildRuntime({
+        const runtime = new Runtime({
           slot: options.child,
           config: message.config,
           matrix: message.matrix,
           originMs: message.originMs,
           out: options.out,
           send: (m, done) => {
+            if (!proc.connected) return done(true)
             acks.set(m.record.seq, done)
-            process.send(m)
+            proc.send(m)
           },
-          notify: (m) => process.connected && process.send(m),
+          notify: post,
         })
         for (const [topic, topicId] of message.topicIds) runtime.topicIds.set(topic, topicId)
         let requests = 0
         runtime.request = (body) =>
           new Promise((resolve) => {
+            if (!proc.connected) return resolve()
             const request = ++requests
             replies.set(request, resolve)
-            process.send({ ...body, request })
+            proc.send({ ...body, request })
           })
         await runtime.start()
         return runtime
       })()
+      ready.catch(() => {})
     } else if (message.type === 'ack') {
       acks.get(message.seq)?.(message.refused === true)
       acks.delete(message.seq)
@@ -2618,12 +2631,15 @@ function child(options) {
       replies.delete(message.request)
     } else if (message.type === 'command') {
       if (message.step.type === 'disconnect') leaving = true
-      const runtime = await ready
-      await runtime.handle(message)
+      const runtime = await ready.catch((e) => {
+        post({ type: 'done', id: message.id, error: `start failed: ${e.message}`, reply: null })
+        return null
+      })
+      if (runtime) await runtime.handle(message)
       if (message.step.type === 'disconnect') {
-        while (runtime.channel.pendingBytes > 0)
-          await new Promise((resolve) => setTimeout(resolve, 10))
-        process.disconnect()
+        const pending = () => proc.connected && (runtime?.channel.pendingBytes ?? 0) > 0
+        while (pending()) await new Promise((resolve) => setTimeout(resolve, 10))
+        if (proc.connected) proc.disconnect()
       }
     }
   })
