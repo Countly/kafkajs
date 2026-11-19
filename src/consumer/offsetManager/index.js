@@ -22,7 +22,7 @@ const {
   events: { COMMIT_OFFSETS },
 } = require('../instrumentationEvents')
 
-const { keys, assign } = Object
+const { keys } = Object
 const indexTopics = (topics) => dictionary(topics.map((topic) => [topic, {}]))
 const NO_REFUSALS = Object.freeze([])
 
@@ -498,13 +498,13 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   resetOffsetsForTopic(topic) {
+    this.committedOffsets()
     this.operations.touchTopic(topic)
     this.retireResetRefusals(topic)
     for (const partition of this.pendingSeeks.get(topic)?.keys() || []) {
       this.clearPendingSeek(topic, partition)
     }
-    CommittedOffsetRevisions.forCache(this.committedOffsets()).clearTopic(topic)
-    this.committedOffsets()[topic] = {}
+    this.operations.invalidateTopic(topic)
     this.resetPositions[topic] = {}
     this.resolvedOffsets[topic] = {}
     this.resolvedEpochs[topic] = {}
@@ -567,9 +567,9 @@ module.exports = class OffsetManager {
 
     // Keys first, prune second: another consumer of this group on the same client shares the
     // committed-offsets object and may have removed a topic key since the last round.
-    const committedOffsets = this.committedOffsets()
+    this.committedOffsets()
     for (const topic of this.topics) {
-      committedOffsets[topic] = committedOffsets[topic] || {}
+      this.operations.topicCells(topic)
       this.resetPositions[topic] = this.resetPositions[topic] || {}
       this.resolvedOffsets[topic] = this.resolvedOffsets[topic] || {}
       this.resolvedEpochs[topic] = this.resolvedEpochs[topic] || {}
@@ -770,8 +770,8 @@ module.exports = class OffsetManager {
       if (!current()) return false
       this.clearPendingSeek(topic, partition)
       if (this.autoCommit) {
-        CommittedOffsetRevisions.forCache(this.committedOffsets()).advance(topic, partition)
-        this.committedOffsets()[topic][partition] = actualOffset
+        this.committedOffsets()
+        this.operations.publish(ticket, topic, partition, actualOffset)
         delete this.resetPositions[topic]?.[partition]
       } else this.holdResetPosition(topic, partition, actualOffset)
       this.resolveOffset({
@@ -970,10 +970,8 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   forgetCommitted(topic, partition) {
-    const committedOffsets = this.committedOffsets()
-    CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
-    // The cache is shared with the group's other consumers on this client: the topic may be gone.
-    if (committedOffsets[topic]) delete committedOffsets[topic][partition]
+    this.committedOffsets()
+    this.operations.forget(topic, partition)
   }
 
   /**
@@ -1327,11 +1325,10 @@ module.exports = class OffsetManager {
    * @returns {void}
    */
   recordCommitted(ticket, topics, requestedIds = new Map(), since = undefined) {
-    const committedOffsets = this.committedOffsets()
+    this.committedOffsets()
     const checkCells = since !== undefined && this.seeks.changedSince(since)
 
     for (const { topic, partitions } of topics) {
-      const accepted = {}
       const written = []
 
       for (const { partition, offset } of partitions) {
@@ -1340,14 +1337,12 @@ module.exports = class OffsetManager {
           this.forgetCommitted(topic, partition)
           continue
         }
-        accepted[partition] = offset
+        this.operations.publish(ticket, topic, partition, offset)
         written.push(partition)
       }
 
       if (written.length > 0) {
-        committedOffsets[topic] = assign({}, committedOffsets[topic], accepted)
         for (const partition of written) {
-          CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
           delete this.resetPositions[topic]?.[partition]
         }
         const confirmed = this.isConfirmedIncarnation(topic, requestedIds.get(topic))
@@ -1835,11 +1830,11 @@ module.exports = class OffsetManager {
    * @returns {boolean} `false` when a cell was dropped as stale
    */
   applyResolution(ticket, offsets, epochSeeds, requestedIds, derived = new Set()) {
-    const committedOffsets = this.committedOffsets()
+    this.committedOffsets()
     let complete = true
 
     for (const { topic, partitions } of offsets) {
-      const resolved = {}
+      this.operations.topicCells(topic)
       const written = []
 
       for (const { partition, offset } of partitions) {
@@ -1850,15 +1845,10 @@ module.exports = class OffsetManager {
           this.pendingSeekTimestamp(topic, partition) !== undefined
         ) {
           if (derived.has(`${topic}|${partition}`)) this.holdResetPosition(topic, partition, offset)
-          else {
-            CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
-            resolved[partition] = offset
-          }
+          else this.operations.fill(topic, partition, offset)
           written.push(partition)
         }
       }
-
-      committedOffsets[topic] = assign({}, committedOffsets[topic], resolved)
 
       for (const partition of written) {
         if (!isInvalidOffset(this.heldOffsetAt(topic, partition))) {
@@ -2082,22 +2072,12 @@ module.exports = class OffsetManager {
    */
   clearAllOffsets() {
     this.clearPendingSeeks()
-    const committedOffsets = this.committedOffsets()
+    this.committedOffsets()
 
     for (const topic of this.topics) {
-      const partitions = committedOffsets[topic]
-
-      if (!partitions) {
-        committedOffsets[topic] = {}
-      }
-
+      this.operations.topicCells(topic)
       for (const partition of this.memberAssignment[topic]) {
-        CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
-        if (partitions) {
-          delete partitions[partition]
-        }
-
-        this.operations.touch(topic, partition)
+        this.operations.evict(topic, partition)
       }
     }
 
@@ -2122,18 +2102,22 @@ module.exports = class OffsetManager {
   /**
    * The group's committed-offset cache: a topic to partition to offset-string dictionary.
    *
-   * Looked up from the cluster on first use and kept by reference, so every participant of the
-   * group on one `Kafka` instance (other consumers, a producer's transactional publication) reads
-   * and writes the same object, with its writes ordered through the operation ledger. A manager
-   * without a `groupId` uses the private cache it was given, or an empty one.
+   * The cache this manager's ledger is bound to, so every participant of the group on one `Kafka`
+   * instance (other consumers, a producer's transactional publication) reads the same object, and
+   * every write to it goes through that ledger. A ledger not yet bound is bound here to the
+   * cluster's cache for the group or, without a `groupId`, to the private cache this manager was
+   * given, or an empty one.
    * @returns {{[topic: string]: {[partition: number|string]: string}}}
    */
   committedOffsets() {
     if (!this[PRIVATE.COMMITTED_OFFSETS]) {
       this[PRIVATE.COMMITTED_OFFSETS] =
-        this.groupId === undefined
-          ? this.privateOffsets || dictionary()
-          : this.cluster.committedOffsets({ groupId: this.groupId })
+        this.operations.cache ??
+        this.operations.bind(
+          this.groupId === undefined
+            ? this.privateOffsets || dictionary()
+            : this.cluster.committedOffsets({ groupId: this.groupId })
+        )
     }
 
     return this[PRIVATE.COMMITTED_OFFSETS]

@@ -363,9 +363,10 @@ module.exports = (params) => {
    * restarts and never registered on the cluster, so two such consumers cannot see each other.
    * @type {{ offsets: Record<string, object>, operations: OffsetOperations }|null}
    */
+  const privateOffsets = hasGroup ? null : dictionary()
   const privateState = hasGroup
     ? null
-    : { offsets: dictionary(), operations: new OffsetOperations() }
+    : { offsets: privateOffsets, operations: new OffsetOperations(privateOffsets) }
   /** @returns {OffsetOperations} the private ledger, or the group's shared one */
   const offsetOperations = () =>
     privateState ? privateState.operations : cluster.offsetOperations({ groupId })

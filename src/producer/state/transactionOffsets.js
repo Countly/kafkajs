@@ -111,7 +111,7 @@ class TransactionOffsets {
           const { ledger, ticket, groupId } = snapshot
           const { partition, offset } = fields
           if (!ledger.isSuperseded(ticket, topic, partition)) {
-            cluster.markOffsetAsCommitted({ groupId, topic, partition, offset })
+            cluster.markOffsetAsCommitted({ groupId, topic, partition, offset, ticket })
             ledger.apply(ticket, topic, partition)
           }
         } catch (error) {

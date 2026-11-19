@@ -1,5 +1,10 @@
+const CommittedOffsetRevisions = require('../../cluster/committedOffsetRevisions')
+
 /**
- * Orders the writes to one group's committed-offset cache and resolved positions.
+ * Orders the writes to one group's committed-offset cache and resolved positions, and is the one
+ * writer of that cache: every publication, read fill, eviction and topic invalidation goes
+ * through the ledger bound to it, so each write advances the cell's revision and the ledger sees
+ * every published mutation.
  *
  * An operation takes a ticket over the cells (topic and partition) it will write. The ledger
  * remembers a cell only while some open ticket covers it, so its size follows the outstanding
@@ -13,10 +18,20 @@
  *
  * A ticket may name an owner, and an owner barrier fences only the tickets of that owner, so one
  * participant can cancel its own pending work without invalidating anybody else's.
+ *
+ * Barriers come in two kinds. An ordinary eviction (revoke, assignment rebuild) clears cached
+ * cells; a hard barrier (topic recreation or reset) ends the incarnation. Both fence older work
+ * alike. Each covered cell also keeps its durable winner, the highest-intent mutation published
+ * to it: an eviction keeps it, a hard barrier drops it.
  */
 class OffsetOperations {
-  constructor() {
-    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, appliedIntent: number, ownerBarriers: WeakMap<object, number>|null}>>} */
+  /**
+   * @param {object|null} [cache=null] the committed-offset cache this ledger writes, a topic to
+   *   partition to offset dictionary; a ledger built without one is bound by `bind`
+   */
+  constructor(cache = null) {
+    this.cache = cache
+    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, hardAt: number, appliedIntent: number, durable: {intent: number, offset: string}|null, ownerBarriers: WeakMap<object, number>|null}>>} */
     this.topics = new Map()
     this.cells = 0
     this.clock = 0
@@ -56,7 +71,15 @@ class OffsetOperations {
 
       let state = partitions.get(number)
       if (!state) {
-        state = { open: 0, appliedAt: 0, barrierAt: 0, appliedIntent: 0, ownerBarriers: null }
+        state = {
+          open: 0,
+          appliedAt: 0,
+          barrierAt: 0,
+          hardAt: 0,
+          appliedIntent: 0,
+          durable: null,
+          ownerBarriers: null,
+        }
         partitions.set(number, state)
         this.cells += 1
       }
@@ -201,7 +224,8 @@ class OffsetOperations {
   }
 
   /**
-   * A barrier over every covered cell of a topic: a recreation or a topic reset.
+   * A hard barrier over every covered cell of a topic: a recreation or a topic reset. It fences
+   * like `touch` and also drops each cell's durable winner.
    * @param {string} topic
    * @returns {void}
    */
@@ -214,7 +238,130 @@ class OffsetOperations {
     const at = ++this.clock
     for (const state of partitions.values()) {
       state.barrierAt = at
+      state.hardAt = at
+      state.durable = null
     }
+  }
+
+  /**
+   * Binds this ledger to its cache once; a bound ledger keeps its own.
+   * @param {object} cache the cache a participant would otherwise use
+   * @returns {object} the bound cache, which every writer and reader of the pair uses
+   */
+  bind(cache) {
+    this.cache ??= cache
+    return this.cache
+  }
+
+  /**
+   * Publishes a mutation's committed offset: writes the cell, advances its revision and, when the
+   * mutation outranks the cell's durable winner, records it as the new one. Callers check
+   * `isSuperseded` first and record `apply` or `fence` themselves.
+   * @param {object|null} ticket the publishing mutation's ticket; null records no winner
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string} offset
+   * @returns {void}
+   */
+  publish(ticket, topic, partition, offset) {
+    this.write(topic, partition, offset)
+    const state = this.state(topic, partition)
+    if (state && ticket?.mutation && ticket.intent >= (state.durable?.intent ?? 0)) {
+      state.durable = { intent: ticket.intent, offset }
+    }
+  }
+
+  /**
+   * Fills a cell from a read (offset resolution): writes it and advances its revision, never
+   * recording a durable winner.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string} offset
+   * @returns {void}
+   */
+  fill(topic, partition, offset) {
+    this.write(topic, partition, offset)
+  }
+
+  /**
+   * Forgets a cached cell without a barrier and advances its revision, so the next resolution
+   * reads the coordinator.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {void}
+   */
+  forget(topic, partition) {
+    CommittedOffsetRevisions.forCache(this.cache).advance(topic, partition)
+    if (this.cache[topic]) delete this.cache[topic][partition]
+  }
+
+  /**
+   * Ordinary eviction of one cell (revoke, assignment rebuild): forgets it and fences older work
+   * like `touch`, keeping the cell's durable winner.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {void}
+   */
+  evict(topic, partition) {
+    this.topicCells(topic)
+    this.forget(topic, partition)
+    this.touch(topic, partition)
+  }
+
+  /**
+   * Hard invalidation of a topic's cache (topic reset): the barrier of `touchTopic`, a topic
+   * revision stamp and an empty topic entry.
+   * @param {string} topic
+   * @returns {void}
+   */
+  invalidateTopic(topic) {
+    this.touchTopic(topic)
+    CommittedOffsetRevisions.forCache(this.cache).clearTopic(topic)
+    this.cache[topic] = {}
+  }
+
+  /**
+   * The cached cells of a topic, created empty when missing: readers index a topic's cells
+   * without a guard.
+   * @param {string} topic
+   * @returns {object} the topic's partition to offset table
+   */
+  topicCells(topic) {
+    this.cache[topic] ??= {}
+    return this.cache[topic]
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {{intent: number, offset: string}|null} the highest-intent mutation published to the
+   *   cell since its last hard barrier, while a ticket covers the cell
+   */
+  durable(topic, partition) {
+    return this.state(topic, partition)?.durable ?? null
+  }
+
+  /**
+   * @param {object} ticket
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {boolean} whether a hard barrier reached the cell after the ticket began
+   */
+  isHardBarred(ticket, topic, partition) {
+    const state = this.state(topic, partition)
+    return state !== undefined && state.hardAt > ticket.began
+  }
+
+  /**
+   * @private
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string} offset
+   * @returns {void}
+   */
+  write(topic, partition, offset) {
+    CommittedOffsetRevisions.forCache(this.cache).advance(topic, partition)
+    this.topicCells(topic)[partition] = offset
   }
 
   /**
