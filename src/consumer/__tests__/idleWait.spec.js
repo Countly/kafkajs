@@ -1,4 +1,6 @@
 const ConsumerGroup = require('../consumerGroup')
+const IdleWait = require('../idleWait')
+const Generation = require('../../producer/generation')
 const Runner = require('../runner')
 const Cluster = require('../../cluster')
 const createFetcher = require('../fetcher')
@@ -1684,5 +1686,67 @@ describe('validation response continuation', () => {
     expect(disable).not.toHaveBeenCalled()
     expect(markAll).not.toHaveBeenCalled()
     group.onStopRequested()
+  })
+})
+
+describe('IdleWait without a timer', () => {
+  test('an infinite wait arms no timer and ends only with a wake', async () => {
+    jest.useFakeTimers()
+    try {
+      const run = new IdleWait()
+      let ended = false
+      const waiting = run.wait(Infinity).then(() => {
+        ended = true
+      })
+      expect(jest.getTimerCount()).toBe(0)
+      jest.advanceTimersByTime(24 * 60 * 60 * 1000)
+      await Promise.resolve()
+      expect(ended).toBe(false)
+
+      run.wake()
+      await waiting
+
+      expect(ended).toBe(true)
+      expect(run.waiters.size).toBe(0)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  test("a closed caller fence ends the wait and removes the waiter and the fence's registration", async () => {
+    const run = new IdleWait()
+    const fence = new Generation()
+    const register = jest.spyOn(fence, 'register')
+    const waiting = run.wait(Infinity, () => true, fence)
+    expect(run.waiters.size).toBe(1)
+    const unregister = register.mock.results[0].value
+
+    fence.close(new Error('the caller ended'))
+    await waiting
+
+    expect(run.waiters.size).toBe(0)
+    expect(unregister()).toBe(false)
+  })
+
+  test('a wait ended by a wake unregisters from the caller fence', async () => {
+    const run = new IdleWait()
+    const fence = new Generation()
+    const register = jest.spyOn(fence, 'register')
+    const waiting = run.wait(Infinity, () => true, fence)
+
+    run.wake()
+    await waiting
+
+    expect(register.mock.results[0].value()).toBe(false)
+  })
+
+  test('a disposed run, or a closed caller fence, does not wait at all', async () => {
+    const run = new IdleWait()
+    const fence = new Generation()
+    fence.close(new Error('closed'))
+    await run.wait(Infinity, () => true, fence)
+    run.dispose()
+    await run.wait(Infinity)
+    expect(run.waiters.size).toBe(0)
   })
 })

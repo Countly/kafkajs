@@ -692,7 +692,7 @@ class ScheduleRun {
       for (const p of PARTITIONS) this.take(p)?.done.resolve()
       const settled = this.pending.every((op) => op.settled) && this.attempts.size === 0
       // An owed seek is applied by the fetch loop on its own; a stranded one is left to checkGates.
-      if (settled && this.group.unappliedSeeks.size === 0) break
+      if (settled && !this.group.hasSeekGates()) break
       if (spent > QUIET_MS) {
         if (!settled) {
           this.violate('I6', 'work still in flight after every hold was released', {
@@ -1053,15 +1053,14 @@ class Model {
         })
       }
     }
-    for (const key of group.unappliedSeeks) {
-      const partition = Number(key.split('|').pop())
-      if (!group.seekOffset.has(TOPIC, partition)) {
-        this.run.violate('I6', 'a partition waits for a seek no resolution can reach', { key })
-      }
+    if (group.operations.reserved !== 0) {
+      this.run.violate('I6', 'a seek reservation outlived its commit', {
+        reserved: group.operations.reserved,
+      })
     }
     for (const partition of PARTITIONS) {
       const owed = this.stateAt(partition).owed
-      const waiting = group.unappliedSeeks.has(`${TOPIC}|${partition}`)
+      const waiting = group.isSeekGated(TOPIC, partition)
       if (owed !== waiting) {
         this.run.violate('I6', owed ? 'an owed seek was dropped' : 'a settled seek is still owed', {
           partition,
