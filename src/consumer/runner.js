@@ -161,6 +161,7 @@ module.exports = class Runner extends EventEmitter {
       isRebalancing: () => this.rebalanceCoordinator.isRebalancing(),
       guard: () => this.retirement ?? null,
       onAccepted: () => this.heartbeatAccepted(),
+      detachOnStop: consumerGroup.kind === 'consumer',
     })
     this.rebalanceCoordinator = new RebalanceCoordinator({
       runner: this,

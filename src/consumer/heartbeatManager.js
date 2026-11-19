@@ -45,6 +45,10 @@ module.exports = class HeartbeatManager {
    *   request still awaiting its coordinator lookup sends nothing once the owner is retired
    * @param {() => void} [options.onAccepted] the owner's success effect, handed to every heartbeat;
    *   a membership that accounts successes inside its exchange runs it once, others ignore it
+   * @param {boolean} [options.detachOnStop=false] whether `stop()` detaches a heartbeat still in
+   *   flight, so the chain armed after it sends at once. Only a membership that scopes each
+   *   exchange to its own membership (the consumer protocol) may set it: there the stopped
+   *   chain's answer can no longer affect the replacement. Otherwise one flight spans the stop.
    */
   constructor({
     groupMembership,
@@ -56,6 +60,7 @@ module.exports = class HeartbeatManager {
     isRebalancing = () => false,
     guard,
     onAccepted,
+    detachOnStop = false,
   }) {
     this.groupMembership = groupMembership
     this.pollTimer = pollTimer
@@ -66,10 +71,16 @@ module.exports = class HeartbeatManager {
     this.isRebalancing = isRebalancing
     this.guard = guard
     this.onAccepted = onAccepted
+    this.detachOnStop = detachOnStop
 
     this.handle = null
     this.disabled = false
-    this.inFlight = false
+    /**
+     * The heartbeat this manager is waiting on, or null. Only the tick that set it clears it, and
+     * only that tick consumes `tickRequested`; a detached flight's tick touches neither.
+     * @type {object|null}
+     */
+    this.flight = null
     /**
      * Latched by `shutdown()` only. Once set, neither `ensureStarted()` nor `requestTick()` arms
      * anything again: the runner has left the group and any chain armed after that would keep
@@ -89,6 +100,11 @@ module.exports = class HeartbeatManager {
      * because that is how the round that replaces a stopped chain asks for its first heartbeat.
      */
     this.tickRequested = false
+  }
+
+  /** @returns {boolean} whether a heartbeat this manager owns is awaiting its answer */
+  get inFlight() {
+    return this.flight !== null
   }
 
   /** @returns {boolean} whether the chain is armed */
@@ -114,11 +130,14 @@ module.exports = class HeartbeatManager {
 
   /**
    * Cancels the chain, leaving the manager armable again. A tick asked for before the stop belonged
-   * to the cancelled chain and is dropped with it; one asked for after it is a new request.
+   * to the cancelled chain and is dropped with it; one asked for after it is a new request. With
+   * `detachOnStop` the heartbeat in flight is detached too: it finishes on its own, and the next
+   * chain neither waits for it nor is touched by its end.
    * @returns {void}
    */
   stop() {
     this.tickRequested = false
+    if (this.detachOnStop) this.flight = null
     if (this.handle) {
       clearTimeout(this.handle)
       this.handle = null
@@ -260,12 +279,13 @@ module.exports = class HeartbeatManager {
       return
     }
 
-    if (this.inFlight) {
+    if (this.flight) {
       this.schedule()
       return
     }
 
-    this.inFlight = true
+    const flight = {}
+    this.flight = flight
     let rearm = false
 
     try {
@@ -302,11 +322,14 @@ module.exports = class HeartbeatManager {
         )
       }
     } finally {
-      this.inFlight = false
-      // A stop inside this heartbeat already dropped any earlier request, so a request left here was
-      // made after it; only `shutdown()`, which means the member has left, vetoes it.
-      rearm = this.tickRequested && !this.stopped
-      this.tickRequested = false
+      // A detached flight's end belongs to no live chain: it clears and arms nothing.
+      if (this.flight === flight) {
+        this.flight = null
+        // A stop inside this heartbeat already dropped any earlier request, so a request left here
+        // was made after it; only `shutdown()`, which means the member has left, vetoes it.
+        rearm = this.tickRequested && !this.stopped
+        this.tickRequested = false
+      }
     }
 
     if (rearm) {

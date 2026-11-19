@@ -6,6 +6,7 @@ const { COOPERATIVE } = require('./interface')
 const { generateMemberId } = require('./memberId')
 const CoordinatorLookup = require('../coordinatorLookup')
 const { SentFields, buildRequest } = require('./heartbeatState')
+const describeThrown = require('../../network/describeThrown')
 const {
   MEMBER_STATES,
   transition,
@@ -1088,9 +1089,12 @@ module.exports = class ConsumerGroupProtocol {
    * acknowledgement that failed has still moved the state, and a heartbeat already on the wire when
    * the acknowledgement was decided must not consume it.
    *
-   * The membership the call began under is fixed before the coordinator lookup. A lookup that
-   * finishes after the membership was replaced ends the call: nothing is published, built or sent,
-   * and a failure of it is stamped with that membership and not counted against the replacement.
+   * The membership the call began under (its ownership token and `membershipRevision`) is fixed
+   * before the coordinator lookup. For an ordinary heartbeat one refusal - that revision moved, or
+   * `guard` refuses - reaches the lookup's publication and the transport's final write check, so
+   * a lookup that finishes after the membership was replaced ends the call: nothing is published,
+   * built or sent, and its failure is not counted against the replacement. A leave's write is
+   * governed by its close operation's `guard` alone.
    *
    * Owns one invariant: an answer is valid if and only if the broker membership the request was
    * sent under (`membershipRevision`, moved by a fencing, a fatal error, a leave or a new join, and
@@ -1103,8 +1107,8 @@ module.exports = class ConsumerGroupProtocol {
    * the close operation for a leave). Every effect after a suspension - the lookup result, the
    * write, the answer, the backoff, the error's classification, the clock and the `finally` - runs
    * only while the sent membership is still the member's and `guard` does not refuse; a retired
-   * ordinary call returns false. Only the wire outcome is classified: a HEARTBEAT listener's throw
-   * is logged, and the guard is checked again after it before the success applies.
+   * ordinary call returns false. Only the wire outcome is classified: a HEARTBEAT listener's throw,
+   * of any value, is logged, and the guard is checked again after it before the success applies.
    *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null,
@@ -1116,6 +1120,15 @@ module.exports = class ConsumerGroupProtocol {
    */
   async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard, onAccepted }) {
     const ownershipToken = this.ownership?.token()
+    const membershipAtRequest = this.membershipRevision
+    const current = () => membershipAtRequest === this.membershipRevision && !guard?.()
+    const refusal =
+      leaveEpoch == null
+        ? () =>
+            membershipAtRequest === this.membershipRevision
+              ? (guard?.() ?? null)
+              : assignmentChangedError()
+        : guard
     if (!this.coordinator) {
       // A leave never LOOKS for a coordinator. `connect()` goes through the cluster's retrier, so
       // waiting for it here would hold `stop()` open for tens of seconds whenever the coordinator
@@ -1130,23 +1143,21 @@ module.exports = class ConsumerGroupProtocol {
       }
 
       try {
-        await this.connect(ownershipToken, undefined, guard)
+        await this.connect(ownershipToken, undefined, refusal)
       } catch (error) {
-        if (guard?.()) return false
+        if (!current()) return false
         stampOwnership(error, ownershipToken)
         if (!obsoleteOwnership(this.ownership, error)) this.backoff.onFailedAttempt(Date.now())
         throw error
       }
 
-      if (this.ownershipReplaced(ownershipToken) || guard?.()) return false
+      if (this.ownershipReplaced(ownershipToken) || !current()) return false
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
     if (leaveEpoch === -1 || leaveEpoch === -2) this.sentFields.reset()
     const sentUnderEpoch = request.MemberEpoch
     const stateAtRequest = this.state
-    const membershipAtRequest = this.membershipRevision
-    const current = () => membershipAtRequest === this.membershipRevision && !guard?.()
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
@@ -1157,7 +1168,7 @@ module.exports = class ConsumerGroupProtocol {
       try {
         response = await this.coordinator.consumerGroupHeartbeat({
           ...toBrokerPayload(request),
-          ...(guard && { guard }),
+          ...(refusal && { guard: refusal }),
         })
       } catch (error) {
         // A leave's failure is its own to finish whatever its close operation now says.
@@ -1209,8 +1220,8 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Emits HEARTBEAT for an answered heartbeat. A listener's throw is logged, never classified: it
-   * is not the coordinator's answer.
+   * Emits HEARTBEAT for an answered heartbeat. A listener's throw, whatever value it throws, is
+   * logged, never classified: it is not the coordinator's answer.
    * @private
    * @param {number} sentUnderEpoch
    * @returns {void}
@@ -1226,7 +1237,7 @@ module.exports = class ConsumerGroupProtocol {
     } catch (error) {
       this.logger.error('A HEARTBEAT listener failed', {
         groupId: this.groupId,
-        error: error.message || error,
+        error: describeThrown(error),
       })
     }
   }
