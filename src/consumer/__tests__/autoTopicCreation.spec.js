@@ -6,36 +6,39 @@ const { writeEvidence } = require('../../../testHelpers/e2eEvidence')
 const { TOPIC } = require('./fixtures/fetchHarness')
 
 /**
- * Starts the already subscribed consumer and observes the public terminal metadata failure.
+ * Starts the already subscribed consumer and observes the deleted topic reported unavailable,
+ * with the run still alive.
  * @param {import('../../../types').Consumer} consumer the connected, subscribed consumer
- * @returns {Promise<Error>} the original unknown-topic cause reported by CRASH
- * @throws {Error} if no crash arrives within the bounded observation window
+ * @returns {Promise<object>} the payload of the unavailable topic metadata status
+ * @throws {Error} if no status arrives within the bounded observation window
  */
 const startAfterDeletion = async (consumer) => {
   let timer
-  let remove
-  const crashed = new Promise((resolve) => {
-    remove = consumer.on(consumer.events.CRASH, resolve)
-  })
-  const deadline = new Promise((resolve, reject) => {
-    timer = setTimeout(
-      () => reject(new Error('Post-deletion consumer crash did not arrive')),
-      15000
+  const crashes = []
+  const removers = [consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push(payload))]
+  const reported = new Promise((resolve) => {
+    removers.push(
+      consumer.on(consumer.events.TOPIC_METADATA_STATUS, ({ payload }) => resolve(payload))
     )
   })
+  const deadline = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('Post-deletion topic status did not arrive')), 15000)
+  })
   try {
-    const [, { payload }] = await Promise.all([
+    const [, payload] = await Promise.all([
       consumer.run({ eachMessage: async () => {} }),
-      Promise.race([crashed, deadline]),
+      Promise.race([reported, deadline]),
     ])
-    expect(payload.restart).toBe(false)
-    let error = payload.error
-    while (error.cause) error = error.cause
-    expect(error).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION' })
-    return error
+    expect(payload).toMatchObject({
+      status: 'unavailable',
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+      code: 3,
+    })
+    expect(crashes).toEqual([])
+    return payload
   } finally {
     clearTimeout(timer)
-    remove()
+    for (const remove of removers) remove()
   }
 }
 
@@ -89,7 +92,7 @@ describe.each(lanes())('Auto topic creation on %s', (lane) => {
       scripted.answer('Metadata', () => ({
         topics: [{ name: TOPIC, errorCode: 3, partitions: [] }],
       }))
-      await startAfterDeletion(consumer)
+      expect((await startAfterDeletion(consumer)).topic).toBe(TOPIC)
       const later = scripted
         .requests()
         .filter(({ api }) => api === 'Metadata')
@@ -132,7 +135,7 @@ describe.each(lanes())('Auto topic creation on %s', (lane) => {
         await new Promise((resolve) => setTimeout(resolve, 50))
       }
       expect(await admin.listTopics()).not.toContain(name)
-      await startAfterDeletion(consumer)
+      expect((await startAfterDeletion(consumer)).topic).toBe(name)
       for (let attempt = 0; attempt < 20; attempt++) {
         expect(await admin.listTopics()).not.toContain(name)
         await new Promise((resolve) => setTimeout(resolve, 50))
