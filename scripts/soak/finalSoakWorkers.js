@@ -21,6 +21,7 @@ const {
   clip,
 } = require('./finalSoakCollector')
 const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('./finalSoakObserver')
+const { ChurnClientLog } = require('./consumerChurn')
 
 /** Delivered share offsets kept above a key's first missing one before the gap is given up on. */
 const SHARE_AHEAD_MAX = 100000
@@ -188,7 +189,8 @@ class ClientRig {
 
   /**
    * Constructs the actual client inside its own async context, with a socket factory that counts
-   * its sockets (and captures share wire frames for a share client).
+   * its sockets (and captures share wire frames for a share client) and its WARN and ERROR log
+   * lines written to its process's bounded client log.
    * @param {(kafka: object) => object} factory makes the client from its own Kafka instance
    * @param {object|null} [capture] wire capture options for `SocketRegistry#factory`
    * @returns {Promise<object>} the actual client
@@ -202,7 +204,8 @@ class ClientRig {
         new Kafka({
           clientId: this.id,
           brokers: runtime.config.brokers,
-          logLevel: logLevel.NOTHING,
+          logLevel: logLevel.WARN,
+          logCreator: runtime.clientLogCreator(),
           socketFactory: runtime.sockets.factory(this.id, capture),
         })
     )
@@ -340,6 +343,18 @@ class ChildRuntime {
   /** @returns {string} a fresh record id of this source */
   nextId() {
     return `${this.slot}.${this.ids++}`
+  }
+
+  /**
+   * The `logCreator` of this process's clients: their WARN and ERROR lines go to one bounded
+   * JSON-lines file in the artifact, `client-log.<slot>.ndjson`; lines past its cap are only counted.
+   * @returns {(level: number) => (entry: object) => void}
+   */
+  clientLogCreator() {
+    this.clientLog ??= new ChurnClientLog({
+      file: path.join(this.out, `client-log.${this.slot}.ndjson`),
+    })
+    return this.clientLog.creator()
   }
 
   /** @param {object} record @returns {Promise<boolean>} */
@@ -1438,7 +1453,8 @@ class ConsumerWorker extends Worker {
    * the extra or the return to the standing member (or, when not observed, at the wave deadline),
    * so the transfer can be audited from the journal. One `wave` record counts the paused and held
    * keys, then one `wave-key` record per paused key cites it and says whether the member held it,
-   * so every record stays small however many keys a member holds; all share that instant as `at`.
+   * so every record stays small however many keys a member holds. Each record takes its own `at`
+   * when emitted, so another record of this source emitted between them keeps the source's order.
    * @param {string} execution the wave @param {'transfer'|'return'} event
    * @param {ClientRig} standing @param {ClientRig} member the extra, or the standing member
    * @param {object[]} paused the keys paused in this wave
@@ -1449,12 +1465,10 @@ class ConsumerWorker extends Worker {
   async waveRecord(execution, event, standing, member, paused, heldBy, observed) {
     const { runtime } = this
     const held = new Set(heldBy(member))
-    const at = runtime.clock.now()
     const cause = runtime.nextId()
     await runtime.emit({
       kind: 'wave',
       recordId: cause,
-      at,
       execution,
       event,
       client: standing.id,
@@ -1467,7 +1481,6 @@ class ConsumerWorker extends Worker {
       await runtime.emit({
         kind: 'wave-key',
         recordId: runtime.nextId(),
-        at,
         execution,
         cause,
         key,
