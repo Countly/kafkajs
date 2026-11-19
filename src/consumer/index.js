@@ -1070,6 +1070,7 @@ module.exports = (params) => {
       // is nothing this client can usefully validate about the pattern itself.
       subscribedTopicRegex = regex
       regexSubscription = { fromBeginning, resetPolicy }
+      cluster.useBrokerRegex(true)
       return
     }
 
@@ -1909,6 +1910,7 @@ module.exports = (params) => {
           queuedSeeks.clear()
           for (const name of keys(topics)) delete topics[name]
           unregisteredTopics.clear()
+          if (subscribedTopicRegex) cluster.useBrokerRegex(false)
           subscribedTopicRegex = null
           regexSubscription = null
           retainTopics(new Set())

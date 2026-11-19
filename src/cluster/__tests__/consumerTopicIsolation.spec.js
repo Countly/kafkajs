@@ -222,6 +222,37 @@ describe('Cluster > a consumer target answered UNKNOWN_TOPIC_OR_PARTITION', () =
     expect(reports).toEqual([])
   })
 
+  test.each([
+    ['17 after 3', ['doomed', 'other'], 17, 'INVALID_TOPIC_EXCEPTION'],
+    ['3 after 17', ['other', 'doomed'], 17, 'INVALID_TOPIC_EXCEPTION'],
+    ['29 after 3', ['doomed', 'other'], 29, 'TOPIC_AUTHORIZATION_FAILED'],
+    ['3 after 29', ['other', 'doomed'], 29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    'an added topic answered %s fails the add with the fatal code, not code 3',
+    async (_, added, code, type) => {
+      const { cluster, refused, reports } = build()
+      await cluster.addMultipleTargetTopics(['healthy'])
+      refused.set('doomed', 3)
+      refused.set('other', code)
+
+      await expect(cluster.addMultipleTargetTopics(added)).rejects.toMatchObject({ type })
+      expect([...cluster.targetTopics]).toEqual(['healthy'])
+      expect(reports).toEqual([])
+    }
+  )
+
+  test('two fatal codes in one answer fail with the first in wire order', async () => {
+    const { cluster, refused } = build()
+    await cluster.addMultipleTargetTopics(['healthy'])
+    refused.set('doomed', 3)
+    refused.set('other', 29)
+    refused.set('typo', 17)
+
+    await expect(
+      cluster.addMultipleTargetTopics(['doomed', 'other', 'typo'])
+    ).rejects.toMatchObject({ type: 'TOPIC_AUTHORIZATION_FAILED' })
+  })
+
   test('a topic being added that is missing still fails the add and is rolled back', async () => {
     const { cluster, refused, reports } = build()
     await cluster.addMultipleTargetTopics(['healthy'])

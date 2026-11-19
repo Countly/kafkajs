@@ -1751,40 +1751,46 @@ module.exports = class ConsumerGroup {
    * Widens the subscription with names a broker-computed assignment resolved to, before the apply
    * can filter them out as unsubscribed.
    *
-   * Three things in order, each of which something downstream would otherwise trip over: the name
-   * set, a name-keyed `topicConfigurations` entry (the offset manager indexes it positionally and
-   * destructures the result), and a cluster target topic (without which metadata is never fetched
-   * for it). A literal name subscribed before its topic existed already holds the first two and
-   * gets only the target, once.
+   * First each name is registered as a cluster target on its own (without which metadata is never
+   * fetched for it): a name a lookup by name does not know yet stays pending, and nothing else is
+   * published for it. Then, for the registered names only, the name set and a name-keyed
+   * `topicConfigurations` entry (the offset manager indexes it positionally and destructures the
+   * result). A literal name subscribed before its topic existed already holds both and gets only
+   * the target, once.
    *
    * NEVER pushes: `this.topics` and `this.topicsSubscribed` are the same array object at
    * construction, so a mutation would edit both.
    * @param {string[]} names newly resolved topic names
-   * @returns {Promise<void>}
+   * @returns {Promise<string[]>} the names now registered; the others are pending
+   * @throws {Error} a fatal topic error of the registration (17 or 29, say)
    */
   async growSubscription(names) {
     // A client-pattern member's names come from its pinned revision: an assigned name that left it
     // is filtered by the apply, never turned into a named target.
-    if (this.subscription) return
+    if (this.subscription) return names
 
-    const added = names.filter((name) => !this.topicsSubscribed.includes(name))
-    const awaiting = names.filter((name) => this.unregisteredTopics.has(name))
+    const unseen = names.filter(
+      (name) => !this.topicsSubscribed.includes(name) || this.unregisteredTopics.has(name)
+    )
+    if (!unseen.length) return names
 
-    if (!added.length && !awaiting.length) {
-      return
+    const registered = new Set(await this.cluster.registerAssignedTopics(unseen))
+    const added = unseen.filter(
+      (name) => registered.has(name) && !this.topicsSubscribed.includes(name)
+    )
+    for (const name of registered) this.unregisteredTopics.delete(name)
+
+    if (added.length) {
+      this.topicsSubscribed = [...this.topicsSubscribed, ...added]
+      this.obligations.claimSubscription(this.topicsSubscribed)
     }
-
-    this.topicsSubscribed = [...this.topicsSubscribed, ...added]
-    this.obligations.claimSubscription(this.topicsSubscribed)
-
     for (const name of added) {
       this.topicConfigurations[name] = this.topicConfigurations[name] || {
         ...this.regexSubscription,
       }
     }
 
-    await this.cluster.addMultipleTargetTopics([...added, ...awaiting])
-    for (const name of awaiting) this.unregisteredTopics.delete(name)
+    return names.filter((name) => registered.has(name) || !unseen.includes(name))
   }
 
   /**
@@ -2511,6 +2517,7 @@ module.exports = class ConsumerGroup {
     await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary: true }))
     run.fence.check()
     this.checkSubscriptionChange()
+    this.groupMembership.recheckHeldTopics?.()
     if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
     this.checkForStaleAssignment()
 

@@ -56,6 +56,15 @@ const PER_TOPIC_METADATA_ERRORS = [
  */
 const isPerTopicError = (e) => PER_TOPIC_METADATA_ERRORS.includes(e.type)
 
+/** Topic errors a consumer's own target cannot outlive: they stop its run. */
+const FATAL_TOPIC_ERRORS = ['INVALID_TOPIC_EXCEPTION', 'TOPIC_AUTHORIZATION_FAILED']
+/**
+ * @param {Error} e
+ * @param {boolean} surface whether the caller asked for fatal topic errors
+ * @returns {boolean}
+ */
+const surfaced = (e, surface) => surface && FATAL_TOPIC_ERRORS.includes(e?.type)
+
 /** A broker was asked by id and its answer reached the metadata cache. */
 const RESOLVED = 'resolved'
 /** The negotiated Metadata version cannot carry a topic id, so the ids need another route. */
@@ -215,6 +224,8 @@ module.exports = class Cluster {
     this.addingTopics = null
     /** @type {Set<string>} the targets a metadata answer accepted since they were declared */
     this.establishedTopics = new Set()
+    /** @type {Set<string>} assigned targets `registerAssignedTopics` added that no answer accepted */
+    this.firstAddTopics = new Set()
     /** Counts the removals of targets, so an answer to an earlier declaration establishes nothing. */
     this.targetRevision = 0
     /** @type {WeakMap<object, {topics: object[], byName: Map<string, object>}>} lookup index per accepted metadata object */
@@ -583,12 +594,15 @@ module.exports = class Cluster {
    * @see clients/src/main/resources/common/message/MetadataRequest.json
    * @public
    * @param {string[]} topicIds canonical uuid strings
-   * @param {{ isCurrent?: () => boolean }} [options] checked before requests and cache installs;
-   *   guarded old-version discovery reads names without installing global routing metadata
+   * @param {{ isCurrent?: () => boolean, surface?: boolean }} [options] `isCurrent` is checked
+   *   before requests and cache installs; guarded old-version discovery reads names without
+   *   installing global routing metadata. `surface` makes code 17 or 29 for an id throw, for a
+   *   consumer resolving its own current target
    * @returns {Promise<{ resolved: string[], unresolved: string[] }>} the requested ids, split by
    *   whether the cache can name them now. Duplicates and nulls are dropped from both lists.
+   * @throws {Error} only with `surface`: an id answered 17 or 29
    */
-  async refreshMetadataForTopicIds(topicIds, { isCurrent = () => true } = {}) {
+  async refreshMetadataForTopicIds(topicIds, { isCurrent = () => true, surface = false } = {}) {
     const ids = [...new Set(topicIds)].filter((topicId) => topicId != null)
 
     if (!isCurrent() || ids.length === 0) {
@@ -597,6 +611,7 @@ module.exports = class Cluster {
 
     const guarded = arguments[1]?.isCurrent !== undefined
     let outcome = null
+    let fatal = null
 
     try {
       outcome = await this.brokerPool.withBroker(async ({ broker }) => {
@@ -611,7 +626,14 @@ module.exports = class Cluster {
           return RESOLVED
         }
 
-        return await this.fetchMetadataByTopicIds(broker, ids, { isCurrent })
+        try {
+          return await this.fetchMetadataByTopicIds(broker, ids, { isCurrent, surface })
+        } catch (e) {
+          // `withBroker` would try the next broker and drop the error: the answer is the verdict.
+          if (!surfaced(e, surface)) throw e
+          fatal = e
+          return FAILED
+        }
       })
 
       if (outcome === TOO_OLD && isCurrent()) {
@@ -631,6 +653,7 @@ module.exports = class Cluster {
     }
 
     if (!isCurrent()) return { resolved: [], unresolved: [] }
+    if (fatal) throw fatal
 
     const resolution = {
       resolved: ids.filter((topicId) => this.metadataCache.topicName(topicId) != null),
@@ -664,10 +687,12 @@ module.exports = class Cluster {
    * @private
    * @param {import("../broker")} broker
    * @param {string[]} ids
-   * @param {{ isCurrent?: () => boolean }} [options] stale responses have no cache effects
+   * @param {{ isCurrent?: () => boolean, surface?: boolean }} [options] stale responses have no
+   *   cache effects; `surface` throws an id's code 17 or 29
    * @returns {Promise<'resolved'|'failed'>} whether the client managed to ask at all
+   * @throws {Error} only with `surface`: an id answered 17 or 29
    */
-  async fetchMetadataByTopicIds(broker, ids, { isCurrent = () => true } = {}) {
+  async fetchMetadataByTopicIds(broker, ids, { isCurrent = () => true, surface = false } = {}) {
     try {
       if (!isCurrent()) return FAILED
       const response = await broker.metadata(ids.map((topicId) => ({ topicId })))
@@ -676,6 +701,7 @@ module.exports = class Cluster {
       return RESOLVED
     } catch (e) {
       if (!isCurrent()) return FAILED
+      if (ids.length === 1 && surfaced(e, surface)) throw e
       if (ids.length === 1 || !isPerTopicError(e)) {
         this.logger.debug('Metadata by topic id failed; leaving the ids unresolved', {
           topicIds: ids,
@@ -697,6 +723,7 @@ module.exports = class Cluster {
           this.metadataCache.updateTopicsById(response)
         } catch (topicError) {
           if (!isCurrent()) return FAILED
+          if (surfaced(topicError, surface)) throw topicError
           this.logger.debug('Topic id could not be resolved to a name', {
             topicId,
             error: topicError.message,
@@ -928,11 +955,11 @@ module.exports = class Cluster {
             e.type === 'TOPIC_AUTHORIZATION_FAILED'
           ) {
             if (this.targetTopicState === null) {
-              this.targetTopics = previousTopics
-              this.targetRevision++
-              for (const topic of this.establishedTopics) {
-                if (!previousTopics.has(topic)) this.establishedTopics.delete(topic)
+              for (const topic of this.addingTopics) {
+                this.targetTopics.delete(topic)
+                this.establishedTopics.delete(topic)
               }
+              this.targetRevision++
             } else {
               for (const topic of this.targetTopics) {
                 if (!previousTopics.has(topic)) this.forgetTargetTopic(topic)
@@ -947,6 +974,74 @@ module.exports = class Cluster {
       this.addingTopics = null
       await this.mutatingTargetTopics.release()
     }
+  }
+
+  /**
+   * Registers names a consumer-protocol coordinator assigned, each on its own: one answer accepts
+   * some and refuses others with `UNKNOWN_TOPIC_OR_PARTITION`. A refused name stays a target
+   * without routing (a first-add row), reported unavailable once and asked for again by the
+   * consumer's refreshes until an answer accepts it, as an established target is. Only this call
+   * creates such rows; `retireFirstAddTopics` ends them. The target lock is held for the
+   * declaration only, never across the request, so a withdrawal never waits behind it. A name
+   * already accepted needs no request. The creation bit is the cluster's, as for any target, so it
+   * is off under a broker-side regex (see `useBrokerRegex`).
+   * @param {string[]} names assigned names
+   * @returns {Promise<string[]>} the names an answer has accepted; the others are pending
+   * @throws {Error} any other topic error of the answer (17 or 29, say) after this call's own
+   *   rows are retired, or the refresh's failure
+   */
+  async registerAssignedTopics(names) {
+    const fresh = names.filter((name) => !this.establishedTopics.has(name))
+    const added = []
+    if (fresh.length) {
+      await this.mutatingTargetTopics.acquire()
+      try {
+        for (const name of fresh) {
+          if (this.firstAddTopics.has(name)) continue
+          this.targetTopics.add(name)
+          this.firstAddTopics.add(name)
+          added.push(name)
+        }
+      } finally {
+        await this.mutatingTargetTopics.release()
+      }
+    }
+    if (added.length) {
+      try {
+        await this.refreshMetadata()
+      } catch (error) {
+        const own = new Set(added)
+        this.retireFirstAddTopics([...this.firstAddTopics].filter((name) => !own.has(name)))
+        throw error
+      }
+    }
+    return names.filter((name) => this.establishedTopics.has(name))
+  }
+
+  /**
+   * Ends every first-add row not in `keep`, synchronously and without the target lock: the name
+   * stops being a target, its pending status is dropped without a report, and a late answer that
+   * names it installs and reports nothing.
+   * @param {Iterable<string>} [keep] names still assigned
+   * @returns {void}
+   */
+  retireFirstAddTopics(keep = []) {
+    const kept = new Set(keep)
+    for (const topic of this.firstAddTopics) {
+      if (kept.has(topic)) continue
+      this.firstAddTopics.delete(topic)
+      this.targetTopics.delete(topic)
+      this.metadataCache.forget(topic)
+      this.brokerPool.forgetTopic(topic)
+    }
+  }
+
+  /**
+   * @param {string} topic
+   * @returns {boolean} whether the name is a first-add row: registered, not yet accepted
+   */
+  isTopicPending(topic) {
+    return this.firstAddTopics.has(topic)
   }
 
   /**
@@ -1023,6 +1118,7 @@ module.exports = class Cluster {
   forgetTargetTopic(topic) {
     this.targetTopics.delete(topic)
     this.establishedTopics.delete(topic)
+    this.firstAddTopics.delete(topic)
     this.targetRevision++
     this.targetTopicState.delete(topic)
     this.metadataCache.forget(topic)
@@ -1035,18 +1131,23 @@ module.exports = class Cluster {
    * answer to an add or a refresh that named it, or the answer a manual assignment was validated
    * with (see `resetTargetTopics`). Only an established target answered
    * `UNKNOWN_TOPIC_OR_PARTITION` is isolated; any other target keeps the strict error, so a
-   * subscription whose validation failed still fails. An answer establishes nothing once a target
-   * was removed after the capture, since its names may have been declared again since.
+   * subscription whose validation failed still fails. A first-add row is judged as established
+   * and is accepted by any answer naming it while it is still a row. Otherwise an answer
+   * establishes nothing once a target was removed after the capture, since its names may have been
+   * declared again since.
    * @returns {import('./brokerPool').TargetEstablishment}
    */
   captureEstablishment() {
     const revision = this.targetRevision
     return {
-      isEstablished: (topic) => this.establishedTopics.has(topic),
+      isEstablished: (topic) => this.establishedTopics.has(topic) || this.firstAddTopics.has(topic),
+      isTarget: (topic) => this.targetTopics.has(topic),
       establish: (topics) => {
-        if (revision !== this.targetRevision) return
         for (const topic of topics) {
-          if (this.targetTopics.has(topic)) this.establishedTopics.add(topic)
+          if (!this.targetTopics.has(topic)) continue
+          if (this.firstAddTopics.delete(topic) || revision === this.targetRevision) {
+            this.establishedTopics.add(topic)
+          }
         }
       },
     }
@@ -1081,6 +1182,17 @@ module.exports = class Cluster {
     this.brokerPool.consumerMetadataScope = scope
     this.brokerPool.consumerMetadataGeneration =
       (this.brokerPool.consumerMetadataGeneration ?? 0) + 1
+  }
+
+  /**
+   * Records whether this consumer cluster's subscription is a broker-side regex. While it is, no
+   * Metadata request by name asks the broker to create a topic: every name came from the pattern,
+   * so a deleted match stays deleted, as under a client-side pattern.
+   * @param {boolean} active whether the regex subscription is in place
+   * @returns {void}
+   */
+  useBrokerRegex(active) {
+    this.brokerPool.consumerBrokerRegex = active
   }
 
   /**
@@ -1123,6 +1235,7 @@ module.exports = class Cluster {
         this.metadataCache.forget(topic)
         this.brokerPool.forgetTopic(topic)
         this.establishedTopics.delete(topic)
+        this.firstAddTopics.delete(topic)
       }
       this.targetTopics = next
       this.targetRevision++

@@ -29,6 +29,7 @@ const fakeCluster = () => ({
   ),
   useConsumerMetadataScope: jest.fn(),
   releaseConsumerMetadataScope: jest.fn(),
+  useBrokerRegex: jest.fn(),
   resetTargetTopics: jest.fn(async () => {}),
   refreshMetadataIfNecessary: jest.fn(async () => {}),
   removeBroker: jest.fn(),
@@ -256,6 +257,7 @@ describe('Consumer > subscribe > regex', () => {
     // The names are registered by growSubscription once the coordinator resolves the pattern, not
     // here - so a regex-only consumer legitimately starts with an empty target-topic set.
     expect(cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+    expect(cluster.useBrokerRegex.mock.calls).toEqual([[true]])
   })
 
   it('keeps client-side RegExp matching in topics under the consumer protocol', async () => {
