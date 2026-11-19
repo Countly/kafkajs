@@ -79,8 +79,9 @@ const valueOf = (id, transaction) =>
 
 /**
  * Whole log layout: twelve main records, then one committed transaction of four members and one
- * aborted transaction of two. An entry may be a control `marker`, `invisible` to a read-committed
- * reader, `absent` (its send ended unknown and it never reached the log) or a `duplicate` copy.
+ * aborted transaction of two (`closed` appends the driver's nontransactional closing record). An
+ * entry may be a control `marker`, `invisible` to a read-committed reader, `absent` (its send ended
+ * unknown and it never reached the log) or a `duplicate` copy.
  */
 function buildLayout() {
   const main = Array.from({ length: 12 }, (_, i) => ({ id: `c08.${i}` }))
@@ -171,7 +172,7 @@ function trafficRecords(config, layout) {
       .concat(role === 'main' ? [bySlot.get('c13')] : [])
   for (const [topic, role, entries] of [
     [MAIN, 'main', placed(layout.main)],
-    [TXN, 'transactions', placed(layout.transactions).filter((e) => e.transaction === 'c09.0.x1')],
+    [TXN, 'transactions', placed(layout.transactions).filter((e) => !e.marker && !e.invisible)],
   ]) {
     for (const c of recipients(role)) {
       const client = `${c.slot}.0`
@@ -490,6 +491,18 @@ function healthy({ mode = 'acceptance', withInventory = false } = {}) {
   return world
 }
 
+/**
+ * A healthy world whose transactions log ends, as the driver's final drain makes it end, in one
+ * nontransactional closing record after every transaction's markers.
+ * @returns {object}
+ */
+function closed(options) {
+  const world = healthy(options)
+  world.layout.transactions.push({ id: 'c08.12' })
+  world.apache = renderApache(world)
+  return world
+}
+
 /** Replaces one rendered dump's lines and keeps its `.end` and stderr in step. */
 function redump(world, role, lines) {
   putStep(world.apache, `${role}.dump`, lines.length ? `${lines.join('\n')}\n` : '')
@@ -566,6 +579,7 @@ module.exports = {
   copy,
   sha256,
   healthy,
+  closed,
   redump,
   valueOf,
   describeText,

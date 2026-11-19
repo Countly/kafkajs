@@ -22,10 +22,11 @@
  * 139 MB at 1.6 million; pages are touched only as ids arrive): the full 32-byte payload digest,
  * offsets, and one 4-byte ownership-interval serial per judged group. Then one id string and Map
  * entry per offered id; one entry per open ownership interval, per transaction, per id an open
- * interval shares with an overlapping one, and per record held for its offer, each capped at the
- * same capacity; open membership waves and printed outages capped by the matrix schedule; a fixed
- * sample grid per process. Any cap that is reached is a reported problem that leaves K1 to K6
- * INCONCLUSIVE. Side files are read whole only below a size cap.
+ * interval shares with an overlapping one, per record held for its offer and per acknowledged
+ * aborted member's offset, each capped at the same capacity; open membership waves and printed
+ * outages capped by the matrix schedule; a fixed sample grid per process. Any cap that is reached
+ * is a reported problem that leaves K1 to K6 INCONCLUSIVE. Side files are read whole only below a
+ * size cap.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -195,7 +196,10 @@ class Journal {
     this.heldCount = 0
     this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
-    this.trafficEnds = new Map()
+    const collectors = config.processes.filter((p) => p.role === 'collector')
+    this.supervisor = collectors.length === 1 ? collectors[0].slot : null
+    this.trafficEnd = null
+    this.outerExits = []
     /** @returns {{ paused: number, held: number }} empty key counts of one wave event */
     const keys = () => ({ paused: 0, held: 0 })
     this.info = {
@@ -203,6 +207,7 @@ class Journal {
       outagesNotShown: 0,
       waves: { transfer: 0, return: 0, unobserved: 0, keys: { transfer: keys(), return: keys() } },
       incompleteWaves: [],
+      shareOutcomes: null,
     }
     this.openWaves = new Map()
     const churn = matrix.schedule.executions.find((e) => e.shape === 'membership-churn')
@@ -272,14 +277,14 @@ class Journal {
   }
 
   /**
-   * Keeps, per process of the config, the latest end of a `traffic` shape executed as `traffic`:
-   * the supervisor writes one after the final drain. Other shapes and sources are no candidates.
+   * Keeps the latest end of a `traffic` shape executed as `traffic` that the supervisor (the
+   * config's one collector process) emitted: it writes one after the final drain. Other shapes and
+   * sources are no candidates.
    * @param {object} r a `shape` record @returns {void}
    */
   shape(r) {
     if (r.execution !== 'traffic' || r.phase !== 'end' || r.shape !== 'traffic') return
-    if (this.procs.has(r.source))
-      this.trafficEnds.set(r.source, Math.max(this.trafficEnds.get(r.source) ?? -Infinity, r.at))
+    if (r.source === this.supervisor) this.trafficEnd = Math.max(this.trafficEnd ?? r.at, r.at)
   }
 
   /**
@@ -317,6 +322,22 @@ class Journal {
     if (r.stage === 'offered') this.offered(r)
     else if (r.stage === 'transaction') this.decided(r)
     else if (r.stage === 'ack' || r.stage === 'handler-enter') this.byId(r)
+    else if (r.stage === 'share-outcome') this.shareOutcome(r)
+  }
+
+  /**
+   * Counts, for information only, each share acknowledgement outcome with a reason (a null reason
+   * is a confirmed accept) by reason, and keeps its offset range, at most `capacity` ranges; beyond
+   * them the distinct offsets are not counted.
+   * @param {object} r a `share-outcome` identity record @returns {void}
+   */
+  shareOutcome(r) {
+    const s = (this.info.shareOutcomes ??= { reasons: new Map(), ranges: [], uncounted: 0 })
+    if (r.reason === null) return
+    s.reasons.set(r.reason, (s.reasons.get(r.reason) ?? 0) + 1)
+    if (s.ranges.length < this.capacity)
+      s.ranges.push({ key: `${r.key.topic}|${r.key.partition}`, from: +r.from, to: +r.to })
+    else s.uncounted++
   }
 
   /**
@@ -351,10 +372,15 @@ class Journal {
     else this.held.set(r.id, [fact])
   }
 
-  /** @param {number} i @param {object} fact from `byId` @returns {void} */
-  resolve(i, fact) {
+  /**
+   * @param {number} i @param {object} fact from `byId`
+   * @param {Set<string>} [batch] the intervals that entered id `i` among the held records resolved
+   *   with this one (see `entry`)
+   * @returns {void}
+   */
+  resolve(i, fact, batch) {
     if (fact.stage === 'ack') this.acknowledge(i, fact)
-    else this.entry(i, fact)
+    else this.entry(i, fact, batch)
   }
 
   /**
@@ -425,7 +451,8 @@ class Journal {
     if (!waiting) return
     this.held.delete(r.id)
     this.heldCount -= waiting.length
-    waiting.forEach((fact) => this.resolve(i, fact))
+    const batch = new Set()
+    waiting.forEach((fact) => this.resolve(i, fact, batch))
   }
 
   /**
@@ -534,10 +561,19 @@ class Journal {
    * one offset across every group; then its ownership finding is counted. The same id entered
    * twice by one interval is a same-owner repeat; a repeat in another interval, by another run or
    * in the share group is only counted.
+   *
+   * Which intervals entered an id is kept exactly for as long as an entry of that interval for the
+   * id can still arrive. An interval owns an entry only while it is open (`ownership` judges on
+   * arrival), so once the id is offered a closed interval can enter it no more: an open interval's
+   * entries are kept in `entered` and `shadowed` until it closes. Before the offer, entries wait in
+   * `held` and all resolve together when it arrives, possibly after their intervals closed; for
+   * that one resolution `batch` keeps every interval among them, bounded by the held records.
    * @param {number} i the id's index @param {object} e a `handler-enter` fact from `byId`
+   * @param {Set<string>} [batch] `group|serial` of each interval that entered the id earlier in the
+   *   same resolution of held records
    * @returns {void}
    */
-  entry(i, e) {
+  entry(i, e, batch) {
     const group = this.groupIndex.get(e.group)
     const where = `${e.id} in ${e.group}`
     if (this.topics.get(e.key.topic) !== this.topic[i] || e.key.partition !== 0)
@@ -556,15 +592,22 @@ class Journal {
       else this.note(e.owned, `${where} by ${e.run}`)
       return
     }
-    if (before === e.serial || this.shadowed.get(e.serial)?.has(i))
+    const own = `${group.index}|${e.serial}`
+    if (before === e.serial || this.shadowed.get(e.serial)?.has(i) || batch?.has(own))
       this.note('sameOwner', `${where} by ${e.run}`)
     else if (before !== 0) this.repeatsAfterChange++
     if (before > OUTSIDE && before !== e.serial) this.shadow(before, i)
     slot[i] = e.serial
+    batch?.add(own)
   }
 
-  /** @param {object} r a `process` record @returns {void} */
+  /**
+   * A process start or exit. The exits the outer observer witnessed (source `outer`) are listed:
+   * it witnesses only the supervisor's.
+   * @param {object} r a `process` record @returns {void}
+   */
   process(r) {
+    if (r.event === 'exit' && r.source === 'outer') capped(this.outerExits, r.process)
     const p = this.procs.get(r.process)
     if (!p) return
     if (r.event === 'start') p.started = true
@@ -686,14 +729,23 @@ function readEnd(ctx, name, problems) {
 /**
  * Streams a topic dump and compares every record with what the journal says was offered and, when
  * a group entered it, with the offset the entries name.
- * @param {object} ctx `{ dir, manifest, journal, config, matrix, dumped }`
+ * @param {object} ctx `{ dir, manifest, journal, config, matrix, dumped, claims }`, `claims` from
+ *   `abortedClaims`
  * @param {string} role `main` or `transactions`
- * @returns {Promise<object>} problems (the file cannot be trusted), counts and findings
+ * @returns {Promise<object>} problems (the file cannot be trusted), counts, findings, and the
+ *   dumped offsets an acknowledged aborted member claims (`claimedDumped`, capped)
  */
 async function readDump(ctx, role) {
   const { dir, journal, config, matrix, dumped } = ctx
   const name = `${role}.dump`
-  const out = { problems: [], count: 0, maxOffset: -1, lastTx: null, findings: {} }
+  const out = {
+    problems: [],
+    count: 0,
+    maxOffset: -1,
+    lastTx: null,
+    claimedDumped: [],
+    findings: {},
+  }
   /** Counts one finding of a kind on this dump, as `Journal#note` does. */
   const note = Journal.prototype.note.bind(out)
   const end = readEnd(ctx, name, out.problems)
@@ -708,6 +760,7 @@ async function readDump(ctx, role) {
       capped(out.problems, `apache/${name}: offsets are not increasing at line ${n}`)
     out.count++
     out.maxOffset = Math.max(out.maxOffset, offset)
+    if (ctx.claims[topic].at.has(offset)) capped(out.claimedDumped, offset)
     const i = journal.ids.get(id)
     out.lastTx = (i !== undefined && journal.txOf[i]) || null
     if (i === undefined || journal.topic[i] !== topic)
@@ -798,73 +851,96 @@ function readDescribe(ctx, group) {
 }
 
 /**
- * The fewest offsets of the transactions partition that a read-committed reader cannot see, as the
- * journal explains them: one control marker per decided transaction with an acknowledged member
- * and every acknowledged member of an aborted transaction. Kafka may write a retried marker twice,
- * so there is no upper bound.
- * @param {Journal} journal @returns {number}
+ * Per standing topic, the offsets the acknowledged members of aborted transactions claim: the
+ * broker placed each at its acknowledged offset, invisible to a read-committed reader. Two members
+ * acknowledged at one offset cannot both be there.
+ * @param {Journal} journal
+ * @returns {{ at: Map<number, number>, twice: number[] }[]} per topic (`ROLES` order), offset to
+ *   the member's index and every offset a second member claimed
  */
-function invisibleAtLeast(journal) {
-  let least = 0
-  for (const t of journal.txs.values()) {
-    const acked = t.members.filter((i) => journal.ack[i] === ACK.acknowledged).length
-    if (acked > 0 && t.outcome === 'committed') least += 1
-    else if (acked > 0 && t.outcome === 'aborted') least += 1 + acked
-  }
-  return least
-}
-
-/**
- * The most offsets after the transactions dump's last record that the journal explains as invisible
- * to a read-committed reader: the acknowledged members of aborted transactions placed there, one
- * control marker for each of their transactions, and the marker that closes the transaction of the
- * last dumped record. A marker follows the records it closes, and the coordinator refuses a
- * transactional id's next transaction until its markers are written. Anything else there (a retried
- * marker, an aborted member whose offset is unknown, a visible record the dump was cut off before)
- * is unexplained, so the dump stays unproved rather than possibly hiding a visible record.
- * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end the log end
- * @returns {number}
- */
-function invisibleAfter(journal, dump, end) {
-  const closing = new Set()
-  if (/^(committed|aborted)$/.test(dump.lastTx?.outcome)) closing.add(dump.lastTx)
-  let members = 0
+function abortedClaims(journal) {
+  const claims = ROLES.map(() => ({ at: new Map(), twice: [] }))
   for (const t of journal.txs.values()) {
     if (t.outcome !== 'aborted') continue
     for (const i of t.members) {
-      const at = journal.offset[i]
-      if (journal.ack[i] !== ACK.acknowledged || !(at > dump.maxOffset && at < end)) continue
-      members++
-      closing.add(t)
+      const [o, { at, twice }] = [journal.offset[i], claims[journal.topic[i]]]
+      if (journal.ack[i] !== ACK.acknowledged || Number.isNaN(o)) continue
+      if (at.has(o)) twice.push(o)
+      else at.set(o, i)
     }
   }
-  return members + closing.size
+  return claims
+}
+
+/**
+ * Whether the journal explains every offset after the transactions dump's last record, up to the
+ * log end, by exactly one fact the log must hold there: an acknowledged aborted member at its own
+ * offset, and one control marker for each transaction whose marker must follow the last dumped
+ * record (the last dumped record's own transaction, and each transaction with a member placed
+ * there), on a free offset after that transaction's last record. Each marker is matched to its own
+ * offset; the facts must fill the tail exactly. A retried marker, an aborted member whose offset is
+ * unknown, or a visible record the dump was cut off before is no such fact, so the dump stays
+ * unproved. The driver ends the log in a visible closing record, which leaves no tail.
+ * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end the log end
+ * @param {Map<number, number>} claims the transactions topic's `abortedClaims` offsets
+ * @returns {string|false} why the tail is not explained, or false
+ */
+function unexplainedTail(journal, dump, end, claims) {
+  const after = new Map()
+  if (/^(committed|aborted)$/.test(dump.lastTx?.outcome)) after.set(dump.lastTx, dump.maxOffset)
+  let members = 0
+  for (const [o, i] of claims) {
+    if (!(o > dump.maxOffset && o < end)) continue
+    members++
+    after.set(journal.txOf[i], Math.max(after.get(journal.txOf[i]) ?? -1, o))
+  }
+  const count = end - 1 - dump.maxOffset
+  if (count !== members + after.size)
+    return `${count} offsets follow the last dumped record but the journal places ${members + after.size} invisible records there`
+  const free = []
+  for (let o = dump.maxOffset + 1; o < end; o++) if (!claims.has(o)) free.push(o)
+  const last = [...after.values()].sort((a, b) => a - b)
+  return (
+    last.some((o, k) => free[k] <= o) &&
+    'a control marker the journal places after the last dumped record has no free offset after its transaction’s last record'
+  )
 }
 
 /**
  * Whether a dump holds every visible record of its partition below the log end Apache's describe
- * reports, and why not. Every dumped offset must lie below that end. The main partition holds only
- * visible records, so its dump must hold exactly the end's count. The console consumer reads in
- * offset order and can only be cut off, so a transactions dump is complete up to its last record;
- * after it, every offset up to the end must be one the journal explains as invisible
- * (`invisibleAfter`), and the dump must reach every acknowledged visible record.
+ * reports, and why not. Every offset below the end is one fact: a dumped record, an acknowledged
+ * aborted member at its offset (no two on one offset, none on a dumped offset or at or beyond the
+ * end), or a control marker. The main partition holds only visible records, so its dump must hold
+ * exactly the end's count. On the transactions partition there is at least one marker per decided
+ * transaction with an acknowledged member. The console consumer reads in offset order and can only
+ * be cut off, so the dump is complete up to its last record, which must not precede an
+ * acknowledged visible record; the offsets after it must be explained one to one
+ * (`unexplainedTail`).
  * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end
  * @param {number} n 0 for main, 1 for transactions @param {number} lastVisible the highest
  *   acknowledged offset of a visible transactions record
+ * @param {{ at: Map<number, number>, twice: number[] }} claims the topic's `abortedClaims`
  * @returns {string|false} the reason it is not proved complete, or false
  */
-function incomplete(journal, dump, end, n, lastVisible) {
+function incomplete(journal, dump, end, n, lastVisible, claims) {
   if (dump.maxOffset >= end) return `offset ${dump.maxOffset} lies at or beyond the log end`
+  if (claims.twice.length > 0)
+    return `two acknowledged aborted records claim offset ${claims.twice[0]}`
+  if (dump.claimedDumped.length > 0)
+    return `an acknowledged aborted record claims offset ${dump.claimedDumped[0]}, where the dump holds a visible record`
+  const beyond = [...claims.at.keys()].find((o) => o >= end)
+  if (beyond !== undefined)
+    return `an acknowledged aborted record claims offset ${beyond}, at or beyond the log end`
   if (n === 0) return dump.count !== end && `${dump.count} records dumped`
   if (dump.maxOffset < lastVisible) return `a visible record was acknowledged at ${lastVisible}`
-  const least = invisibleAtLeast(journal)
+  let markers = 0
+  for (const t of journal.txs.values())
+    if (/^(committed|aborted)$/.test(t.outcome))
+      markers += t.members.some((i) => journal.ack[i] === ACK.acknowledged) ? 1 : 0
+  const least = claims.at.size + markers
   if (end - dump.count < least)
     return `${dump.count} records dumped but at least ${least} offsets are invisible`
-  const [after, most] = [end - 1 - dump.maxOffset, invisibleAfter(journal, dump, end)]
-  return (
-    after > most &&
-    `${after} offsets follow the last dumped record but the journal explains at most ${most} of them as invisible`
-  )
+  return unexplainedTail(journal, dump, end, claims.at)
 }
 
 /**
@@ -872,10 +948,10 @@ function incomplete(journal, dump, end, n, lastVisible) {
  * read-committed dump once at its acknowledged offset (anywhere when the offset is unknown),
  * aborted members never, and each dump is proved complete up to Apache's log end (`incomplete`).
  * Unknown results, contradictions and unproved completeness are INCONCLUSIVE, never PASS.
- * @param {Row} k1 @param {object} ctx `{ journal, dumps, ends, dumped }`
+ * @param {Row} k1 @param {object} ctx `{ journal, dumps, ends, dumped, claims }`
  * @returns {boolean} whether the dumps are usable and proved complete
  */
-function judgeLog(k1, { journal, dumps, ends, dumped }) {
+function judgeLog(k1, { journal, dumps, ends, dumped, claims }) {
   const problems = dumps.flatMap((d) => d.problems)
   problems.forEach((p) => k1.gap(p))
   if (problems.length > 0) return false
@@ -900,7 +976,8 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
   let lastVisible = -1
   for (let i = 0; i < journal.names.length; i++) {
     const [t, ack, at] = [journal.txOf[i], journal.ack[i], journal.offset[i]]
-    if (t?.outcome === 'committed' && ack !== ACK.rejected && at > lastVisible) lastVisible = at
+    const visible = t ? t.outcome === 'committed' && ack !== ACK.rejected : ack === ACK.acknowledged
+    if (journal.topic[i] === 1 && visible && at > lastVisible) lastVisible = at
     if (dumped[i] || t?.outcome === 'aborted' || ack === ACK.rejected) continue
     if (t ? t.outcome === 'committed' : ack === ACK.acknowledged) {
       const [d, end] = [dumps[journal.topic[i]], ends[journal.topic[i]]]
@@ -914,7 +991,7 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
       k1.gap(`no describe row gives the ${ROLES[n]} log end`)
       return false
     }
-    const why = incomplete(journal, d, ends[n], n, lastVisible)
+    const why = incomplete(journal, d, ends[n], n, lastVisible, claims[n])
     if (why)
       k1.gap(
         `the ${ROLES[n]} dump stops at offset ${d.maxOffset} and the log ends at ${ends[n]}: ${why}, so it is not proved complete`
@@ -1128,18 +1205,47 @@ function judgeHeap(row, { journal, matrix, config, plan, header }) {
 }
 
 /**
+ * Why the process that supervised the run is not attributable, from facts the header cannot assert
+ * alone: the supervisor is the config's one collector process (the driver runs its schedule there
+ * and emits every `shape` record from it), the header must name it, and the outer observer must
+ * have witnessed its exit and no other.
+ * @param {Journal} journal @param {object} header
+ * @returns {string[]} the disagreements, empty when the supervisor is attributable
+ */
+function supervisorProblems(journal, header) {
+  const sup = journal.supervisor
+  if (sup === null) return ['the config does not name exactly one collector process']
+  const problems = []
+  const named = header.exit.supervisorProcess
+  if (named !== sup)
+    problems.push(
+      `the header names ${named} as the supervisor, but the config's collector is ${sup}`
+    )
+  const outer = journal.outerExits
+  if (outer.length !== 1 || outer[0] !== sup)
+    problems.push(
+      `the outer observer witnessed the exit of ${outer.join(', ') || 'no process'}, not of the config's collector ${sup}`
+    )
+  return problems
+}
+
+/**
  * K6: every process's final resource counts are at or below its baseline; a type the baseline never
  * had counts against zero, so an unknown type fails. The baseline must precede every other sample
  * of its process and the final follow every other sample and the end of traffic. The end of traffic
- * is the supervisor's (`header.exit.supervisorProcess`) latest `traffic` shape end, written after
- * the final drain, and must lie between the run's end and the supervisor's observed end.
+ * is the supervisor's latest `traffic` shape end, written after the final drain, and must lie
+ * between the run's end and the supervisor's observed end; without an attributable supervisor
+ * (`supervisorProblems`) there is none.
  * @param {Row} row @param {{ journal: Journal, config: object, header: object }} ctx @returns {void}
  */
 function judgeResources(row, { journal, config, header }) {
   let above = 0
-  const end = journal.trafficEnds.get(header.exit.supervisorProcess) ?? null
+  const attributable = supervisorProblems(journal, header).length === 0
+  const end = attributable ? journal.trafficEnd : null
   const { runEndAt, observedEndAt } = header.window
-  if (end === null)
+  if (!attributable)
+    row.gap('the supervisor is not attributable (see K7), so no end of traffic is trusted')
+  else if (end === null)
     row.gap('the journal records no end of traffic (the final drain) from the supervisor')
   else if (end < runEndAt || end > observedEndAt)
     row.gap(
@@ -1167,9 +1273,9 @@ function judgeResources(row, { journal, config, header }) {
 }
 
 /**
- * K7: parent-observed exits (code 0, no signal), a run as long as its mode requires, a complete
- * sample grid admitted inside each slot's window, a clean supervisor receipt and a valid,
- * digest-matching stream.
+ * K7: parent-observed exits (code 0, no signal) and an attributable supervisor
+ * (`supervisorProblems`), a run as long as its mode requires, a complete sample grid admitted
+ * inside each slot's window, a clean supervisor receipt and a valid, digest-matching stream.
  * @param {Row} row @param {object} ctx `{ journal, config, header, supervisor, plan, problems, mode }` @returns {void}
  */
 function judgeCompleteness(row, { journal, config, header, supervisor, plan, problems, mode }) {
@@ -1182,6 +1288,7 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
     row.fail('the run window is not the requested time')
   if (header.exit.code !== 0 || header.exit.signal !== null)
     row.fail(`the supervisor exited with code ${header.exit.code} and signal ${header.exit.signal}`)
+  supervisorProblems(journal, header).forEach((p) => row.fail(p))
   for (const { slot } of config.processes) {
     const p = journal.procs.get(slot)
     if (!p.started) row.fail(`${slot} has no start record`)
@@ -1233,13 +1340,15 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
  * What the journal shows but no row judges: broker outages (down and ready instants, configured
  * down time, container stop or start instant; two per scheduled outage, with a count of any more), membership wave transfers and returns with the
  * paused and held keys their `wave-key` records name, waves missing some of their `wave-key`
- * records (the stream validator fails those too), probe sends that settled after their step, and
- * drain commits skipped as expected.
+ * records (the stream validator fails those too), probe sends that settled after their step,
+ * drain commits skipped as expected, and share acknowledgement outcomes with a reason (only when
+ * the stream has `share-outcome` records).
  * @param {Journal} journal @returns {object}
  */
 function informationOf(journal) {
   const count = (kind) => journal.incidents.get(kind)?.count ?? 0
   return {
+    shareOutcomes: shareOutcomesOf(journal.info.shareOutcomes),
     outages: journal.info.outages,
     outagesNotShown: journal.info.outagesNotShown,
     waves: journal.info.waves,
@@ -1247,6 +1356,27 @@ function informationOf(journal) {
     lateProbeSends: count('late'),
     expectedSkips: count('expected skip:'),
   }
+}
+
+/**
+ * The unresolved share acknowledgement outcomes: their count by reason and the distinct offsets
+ * their ranges cover (null when more ranges arrived than were kept).
+ * @param {{ reasons: Map<string, number>, ranges: object[], uncounted: number }|null} s the
+ *   journal's tally, null when the stream has no `share-outcome` record
+ * @returns {{ unresolved: number, byReason: [string, number][], distinctOffsets: ?number }|null}
+ */
+function shareOutcomesOf(s) {
+  if (s === null) return null
+  const byReason = [...s.reasons].sort(([a], [b]) => a.localeCompare(b))
+  const unresolved = byReason.reduce((n, [, c]) => n + c, 0)
+  const ranges = s.ranges.sort((a, b) => a.key.localeCompare(b.key) || a.from - b.from)
+  let [distinct, key, reach] = [0, null, -1]
+  for (const r of ranges) {
+    if (r.key !== key) [key, reach] = [r.key, -1]
+    distinct += Math.max(0, r.to - Math.max(r.from, reach + 1) + 1)
+    reach = Math.max(reach, r.to)
+  }
+  return { unresolved, byReason, distinctOffsets: s.uncounted > 0 ? null : distinct }
 }
 
 /**
@@ -1274,8 +1404,9 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
   if (untrusted) for (const id of ['K1', 'K2', 'K3', 'K5', 'K6']) rows[id].gap(untrusted)
   else {
     ctx.dumped = new Uint8Array(journal.capacity)
+    ctx.claims = abortedClaims(journal)
     const dumps = [await readDump(ctx, 'main'), await readDump(ctx, 'transactions')]
-    const complete = judgeLog(rows.K1, { journal, dumps, ends, dumped: ctx.dumped })
+    const complete = judgeLog(rows.K1, { ...ctx, dumps, ends })
     judgeDelivery(rows.K2, journal, ctx.dumped, complete)
     if (!complete) rows.K2.gap(`delivery cannot be judged: ${rows.K1.gaps[0]}`)
     judgeDuplicates(rows.K3, journal)
@@ -1436,6 +1567,14 @@ function formatReport(report) {
     for (const wave of info.incompleteWaves) lines.push(`  incomplete wave: ${wave}`)
     lines.push(`  probe sends settled after their step: ${info.lateProbeSends}`)
     lines.push(`  drain commits skipped as expected: ${info.expectedSkips}`)
+    const share = info.shareOutcomes
+    if (share) {
+      const reasons = share.byReason.map(([reason, n]) => `${reason} ${n}`).join(', ') || 'none'
+      const offsets = share.distinctOffsets ?? 'uncounted (too many ranges)'
+      lines.push(
+        `  unresolved share acknowledgements: ${share.unresolved} (${reasons}) covering ${offsets} distinct offsets`
+      )
+    }
   }
   return lines.join('\n')
 }
