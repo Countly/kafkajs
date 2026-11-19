@@ -21764,6 +21764,8 @@
         "src/consumer/__tests__/seekReservation.spec.js \u203a a seek without a commit applied on an uninitialized partition sets the position with no lookup, no commit and no halt left",
         "src/consumer/__tests__/seekReservation.spec.js \u203a an ordinary commit the broker accepted is recorded in the committed cache when, after the answer, its membership was lost",
         "src/consumer/__tests__/seekReservation.spec.js \u203a an ordinary commit the broker accepted is recorded in the committed cache when, after the answer, only its batch was superseded by a seek",
+        "src/consumer/__tests__/seekReservation.spec.js \u203a a seek without a commit leaves a commit the broker accepted while it applied in the committed cache, and a default commit then sends the position",
+        "src/consumer/__tests__/seekReservation.spec.js \u203a a seek without a commit is not overwritten by its own duration reset that began before it",
         "src/consumer/offsetManager/__tests__/ledgerCache.spec.js \u203a Cache and ledger binding Cluster#markOffsetAsCommitted publishes through the group's ledger with the caller's ticket",
         "src/consumer/offsetManager/__tests__/ledgerCache.spec.js \u203a Cache and ledger binding an offset manager writes the cache its ledger is bound to",
         "src/consumer/offsetManager/__tests__/ledgerCache.spec.js \u203a Cache and ledger binding the group registry pairs each ledger with its cache",
@@ -22934,7 +22936,9 @@
         "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 396950..587006",
         "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 594925..784981",
         "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 792900..982956",
-        "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 990875..1180931"
+        "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 990875..1180931",
+        "src/consumer/__tests__/seekSchedules.spec.js \u203a a named seek schedule, classic protocol a commit the broker accepts while a seek without a commit applies stays in the committed cache",
+        "src/consumer/__tests__/seekSchedules.spec.js \u203a a named seek schedule, consumer protocol a commit the broker accepts while a seek without a commit applies stays in the committed cache"
       ],
       "capMinutes": 68,
       "allowedSkips": [
@@ -22990,6 +22994,7 @@
         "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) joins and acknowledges over ConsumerGroupHeartbeat, and never sends JoinGroup",
         "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) describes its own group correctly through ConsumerGroupDescribe",
         "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) keeps a static member\u2019s partitions across a restart, and releases a dynamic member\u2019s on leave",
+        "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) a seek fences resolution and commits of a batch fetched before it",
         "src/consumer/__tests__/consumerProtocolMigrationLive.spec.js \u203a Consumer > classic to consumer protocol migration (live) delivers every record while the group changes protocol and changes back",
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js \u203a Consumer > consumer-protocol group states (live) captures reconciliation while a live owner withholds revocation",
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js \u203a Consumer > consumer-protocol group states (live) captures assigning in the committed epoch gap while Describe remains serviceable",
@@ -26684,7 +26689,9 @@
         "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 396950..587006",
         "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 594925..784981",
         "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 792900..982956",
-        "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 990875..1180931"
+        "src/consumer/__tests__/seekSchedules.spec.js \u203a seeded seek schedules, consumer protocol keep every seek invariant for seeds 990875..1180931",
+        "src/consumer/__tests__/seekSchedules.spec.js \u203a a named seek schedule, classic protocol a commit the broker accepts while a seek without a commit applies stays in the committed cache",
+        "src/consumer/__tests__/seekSchedules.spec.js \u203a a named seek schedule, consumer protocol a commit the broker accepts while a seek without a commit applies stays in the committed cache"
       ],
       "capMinutes": 93,
       "allowedSkips": [
@@ -26858,6 +26865,7 @@
         "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) joins and acknowledges over ConsumerGroupHeartbeat, and never sends JoinGroup",
         "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) describes its own group correctly through ConsumerGroupDescribe",
         "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) keeps a static member\u2019s partitions across a restart, and releases a dynamic member\u2019s on leave",
+        "src/consumer/__tests__/consumerProtocolLive.spec.js \u203a Consumer > the consumer group protocol (live) a seek fences resolution and commits of a batch fetched before it",
         "src/consumer/__tests__/cooperativeUpgradeLive.spec.js \u203a Consumer > cooperative rolling upgrade (live) keeps delivering on a kept partition across a cooperative round",
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js \u203a Consumer > consumer-protocol group states (live) captures reconciliation while a live owner withholds revocation",
         "src/consumer/__tests__/consumerProtocolStatesLive.spec.js \u203a Consumer > consumer-protocol group states (live) captures assigning in the committed epoch gap while Describe remains serviceable",
