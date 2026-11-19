@@ -1859,18 +1859,21 @@ module.exports = class Runner extends EventEmitter {
    * @param {number} [token] the captured token; automatic calls default to current
    * @param {object} [batch] the captured batch; detached callers have no batch
    * @returns {Error|null} a refusal without writing or changing membership; a forced close's own
-   *   reason once this run is retired
+   *   reason once this run is retired. A refusal of a superseded batch alone is marked
+   *   (`handlerContext.markStaleBatch`), so what the broker accepted for it is still recorded
    */
   commitRefusal(token = this.consumerGroup.ownership?.token(), batch = handlerContext.current()) {
     if (this.retirement) return this.retirement
     const refusal = this.consumerGroup.ownership?.refusal(token)
     if (refusal) return refusal
     if (!batch || !this.isBatchStale(batch)) return null
-    return new KafkaJSCommitFailedError(
-      handlerContext.isSought(batch)
-        ? 'A seek superseded the handler batch'
-        : 'The handler outlived its assignment',
-      { reason: 'stale-assignment' }
+    return handlerContext.markStaleBatch(
+      new KafkaJSCommitFailedError(
+        handlerContext.isSought(batch)
+          ? 'A seek superseded the handler batch'
+          : 'The handler outlived its assignment',
+        { reason: 'stale-assignment' }
+      )
     )
   }
 

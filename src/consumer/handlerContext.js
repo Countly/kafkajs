@@ -53,4 +53,25 @@ const isSuperseded = (identity) => {
   )
 }
 
-module.exports = { run, current, isSought, isSuperseded }
+const STALE_BATCH = Symbol('handlerContext:staleBatch')
+
+/**
+ * Marks a commit refusal that says only that the calling batch lost its authority to commit (a
+ * seek, a recreation or the end of its acquisition superseded it): what the broker already
+ * accepted for such a commit is still recorded, while the caller gets the refusal.
+ * @template {Error} T
+ * @param {T} error the refusal
+ * @returns {T} the same error, marked
+ */
+const markStaleBatch = (error) => {
+  error[STALE_BATCH] = true
+  return error
+}
+
+/**
+ * @param {unknown} error a commit refusal
+ * @returns {boolean} whether it only refuses a superseded batch (`markStaleBatch`)
+ */
+const isStaleBatch = (error) => error?.[STALE_BATCH] === true
+
+module.exports = { run, current, isSought, isSuperseded, markStaleBatch, isStaleBatch }
