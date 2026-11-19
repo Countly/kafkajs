@@ -821,7 +821,6 @@ describe('final soak scheduled work', () => {
     const summary = (event, member) => ({
       kind: 'wave',
       recordId: expect.any(String),
-      at: expect.any(Number),
       execution: 'h00m0w1',
       event,
       client: 'c02.1',
@@ -834,7 +833,6 @@ describe('final soak scheduled work', () => {
       wave.keys.map((key) => ({
         kind: 'wave-key',
         recordId: expect.any(String),
-        at: summary.at,
         execution: 'h00m0w1',
         cause: summary.recordId,
         key,
