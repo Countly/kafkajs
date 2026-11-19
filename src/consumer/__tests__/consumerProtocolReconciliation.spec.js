@@ -1,5 +1,8 @@
+const createConsumer = require('../index')
 const ConsumerGroup = require('../consumerGroup')
 const Runner = require('../runner')
+const RebalanceCoordinator = require('../rebalanceCoordinator')
+const OffsetOperations = require('../offsetManager/offsetOperations')
 const Batch = require('../batch')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
@@ -815,29 +818,15 @@ describe('Consumer > the consumer protocol reconciliation', () => {
     return { ...built, coordinator, outcome, sent }
   }
 
-  it('rejoins with epoch 0 and resolves the chain when a fence reaches the slot during the wait and the coordinator accepts the rejoin, leaving the LOST verdict for the runner', async () => {
+  it('ends the chain without rejoining when a fence reaches the slot during the wait, leaving the LOST verdict for the runner', async () => {
     const { group, coordinator, onCrash, outcome, sent } = await fenceDuringWait((request) =>
       request.memberEpoch === 0 ? target(100, { [CONTROL]: [0], [LATE]: [0] }) : target(100, null)
     )
 
     expect(outcome).toEqual({ resolved: true })
     expect(coordinator.yieldBetweenRounds).toHaveBeenCalledTimes(1)
-    expect(sent[0].memberEpoch).toEqual(1)
-    expect(sent[1]).toMatchObject({ memberId: sent[0].memberId, memberEpoch: 0 })
-    expect(group.groupMembership.memberEpoch).toEqual(100)
-    expect(coordinator.hasVerdict()).toBe(true)
-    expect(coordinator.isRebalancing()).toBe(false)
-    expect(onCrash).not.toHaveBeenCalled()
-  })
-
-  it('resolves the chain and leaves the LOST verdict for the runner when a fence reaches the slot during the wait and the coordinator fences the epoch 0 rejoin too', async () => {
-    const { coordinator, onCrash, outcome, sent } = await fenceDuringWait(() => {
-      throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
-    })
-
-    expect(outcome).toEqual({ resolved: true })
-    expect(coordinator.yieldBetweenRounds).toHaveBeenCalledTimes(1)
-    expect(sent.map(({ memberEpoch }) => memberEpoch)).toEqual([1, 0])
+    expect(sent.map(({ memberEpoch }) => memberEpoch)).toEqual([1])
+    expect(group.groupMembership.state).toEqual('FENCED')
     expect(coordinator.hasVerdict()).toBe(true)
     expect(coordinator.isRebalancing()).toBe(false)
     expect(onCrash).not.toHaveBeenCalled()
@@ -1029,5 +1018,416 @@ describe('Consumer > the consumer protocol reconciliation', () => {
       type: 'JOIN_DEADLINE_EXCEEDED',
       retriable: true,
     })
+  })
+})
+
+const FULL_IDS = {
+  'topic-a': 'aAaAaAaAaAaAaAaAaAaAaA',
+  'topic-b': 'bBbBbBbBbBbBbBbBbBbBbB',
+  'topic-c': 'cCcCcCcCcCcCcCcCcCcCcA',
+  'topic-d': 'dDdDdDdDdDdDdDdDdDdDdA',
+}
+const FULL_NAMES = Object.fromEntries(Object.entries(FULL_IDS).map(([name, id]) => [id, name]))
+
+/**
+ * A ConsumerGroupHeartbeat response naming topics by id, with a 500 ms interval.
+ * @param {number} memberEpoch
+ * @param {Record<string, number[]>|null} byTopic null for "no change"
+ * @returns {object}
+ */
+const fullTarget = (memberEpoch, byTopic) => ({
+  throttleTime: 0,
+  errorCode: 0,
+  errorMessage: null,
+  memberId: 'member-1',
+  memberEpoch,
+  heartbeatIntervalMs: 500,
+  assignment:
+    byTopic === null
+      ? null
+      : {
+          topicPartitions: Object.entries(byTopic).map(([topic, partitions]) => ({
+            topicId: FULL_IDS[topic],
+            partitions,
+          })),
+        },
+})
+
+/**
+ * A whole consumer-protocol consumer - `createConsumer`, its runner, group, heartbeat manager,
+ * fetch loop and auto-commit - over a coordinator and a broker double. `state.answer(request)`
+ * answers every heartbeat; `state.queue['topic|partition']` holds the offsets the broker serves,
+ * one record per Fetch; `state.unknown` holds topic names metadata does not know yet (one is
+ * learned per topic-id refresh), `state.partial` topics whose metadata names partition 0 only (until
+ * the next metadata refresh), and
+ * `state.metadataDelay`/`state.idDelay` delay the next metadata/topic-id refresh once. `log` is
+ * one ordered record of heartbeats, commits and partition events.
+ * @returns {object} the consumer and the double's records and switches
+ */
+const buildConsumer = () => {
+  const committed = {}
+  const state = {
+    answer: null,
+    queue: {},
+    unknown: new Set(),
+    partial: new Set(),
+    metadataDelay: 0,
+    idDelay: 0,
+  }
+  const log = []
+  const crashes = []
+  const delayOnce = async (key) => {
+    const delay = state[key]
+    state[key] = 0
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay))
+  }
+  const coordinator = {
+    isConnected: () => true,
+    nodeId: 0,
+    negotiatedVersion: jest.fn(() => null),
+    consumerGroupHeartbeat: jest.fn(async (request) => {
+      const entry = { kind: 'heartbeat', at: Date.now(), epoch: request.memberEpoch }
+      log.push(entry)
+      try {
+        return state.answer(request)
+      } catch (error) {
+        entry.error = error.type
+        throw error
+      }
+    }),
+    offsetCommit: jest.fn(async ({ topics, groupGenerationId }) => {
+      for (const { topic, partitions } of topics) {
+        for (const { partition, offset } of partitions) {
+          committed[`${topic}|${partition}`] = String(offset)
+          log.push({
+            kind: 'commit',
+            at: Date.now(),
+            tp: `${topic}|${partition}`,
+            offset: String(offset),
+            generationId: groupGenerationId,
+          })
+        }
+      }
+    }),
+    offsetFetch: jest.fn(async ({ topics }) => ({
+      responses: topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          offset: committed[`${topic}|${partition}`] ?? '40',
+          committedLeaderEpoch: -1,
+          metadata: null,
+          errorCode: 0,
+        })),
+      })),
+    })),
+  }
+  const record = (offset) => ({
+    offset: String(offset),
+    key: Buffer.from('k'),
+    value: Buffer.from(`v${offset}`),
+    headers: {},
+    timestamp: '0',
+    attributes: 0,
+    isControlRecord: false,
+    batchContext: {
+      partitionLeaderEpoch: 0,
+      firstOffset: String(offset),
+      firstTimestamp: '0',
+      maxTimestamp: '0',
+      magicByte: 2,
+      producerId: '-1',
+      producerEpoch: -1,
+      firstSequence: -1,
+      isTransactional: false,
+      isControlBatch: false,
+    },
+  })
+  const fetches = []
+  const broker = {
+    fetch: jest.fn(async ({ topics }) => {
+      let served = false
+      const responses = topics.map(({ topic, partitions }) => ({
+        topicName: topic,
+        partitions: partitions.map(({ partition, fetchOffset }) => {
+          const tp = `${topic}|${partition}`
+          fetches.push({ tp, fetchOffset: String(fetchOffset), at: Date.now() })
+          const messages = (state.queue[tp] || [])
+            .filter((offset) => offset >= Number(fetchOffset))
+            .slice(0, 1)
+            .map(record)
+          served = served || messages.length > 0
+          return {
+            partition,
+            errorCode: 0,
+            highWatermark: '100',
+            lastStableOffset: '100',
+            logStartOffset: '0',
+            abortedTransactions: [],
+            preferredReadReplica: -1,
+            messages,
+          }
+        }),
+      }))
+      await new Promise((resolve) => setTimeout(resolve, served ? 5 : 50))
+      return { throttleTime: 0, errorCode: 0, sessionId: 0, responses }
+    }),
+  }
+  const known = (name) => name !== undefined && !state.unknown.has(name)
+  const cluster = {
+    instrumentationEmitter: new InstrumentationEventEmitter(),
+    connect: jest.fn(async () => {}),
+    disconnect: jest.fn(async () => {}),
+    isConnected: () => true,
+    removeBroker: jest.fn(),
+    onTopicRecreated: jest.fn(() => () => {}),
+    addMultipleTargetTopics: jest.fn(async () => {}),
+    refreshMetadata: jest.fn(async () => {
+      await delayOnce('metadataDelay')
+      state.partial.clear()
+    }),
+    refreshMetadataIfNecessary: jest.fn(async () => {}),
+    refreshMetadataForTopicIds: jest.fn(async () => {
+      await delayOnce('idDelay')
+      const [next] = state.unknown
+      state.unknown.delete(next)
+    }),
+    useConsumerMetadataScope: jest.fn(),
+    releaseConsumerMetadataScope: jest.fn(),
+    resetTargetTopics: jest.fn(async (_names, { publish } = {}) => publish?.()),
+    committedOffsets: () => ({}),
+    offsetOperations: () => new OffsetOperations(),
+    defaultOffset: () => -2,
+    topicId: (name) => (known(name) ? FULL_IDS[name] : undefined),
+    topicName: (id) => (known(FULL_NAMES[id]) ? FULL_NAMES[id] : undefined),
+    leaderEpoch: () => -1,
+    getNodeIds: () => [0],
+    findTopicPartitionMetadata: (topic) =>
+      (!known(topic) ? [] : state.partial.has(topic) ? [0] : [0, 1]).map((partitionId) => ({
+        partitionId,
+        leader: 0,
+      })),
+    findBroker: jest.fn(async () => broker),
+    findGroupCoordinator: jest.fn(async () => coordinator),
+    fetchTopicsOffset: jest.fn(async (requests) =>
+      requests.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({ partition, offset: '0' })),
+      }))
+    ),
+    retry: {},
+  }
+  const consumer = createConsumer({
+    cluster,
+    groupId: GROUP_ID,
+    logger: newLogger(),
+    instrumentationEmitter: cluster.instrumentationEmitter,
+    groupProtocol: 'consumer',
+    fetchSessions: false,
+    maxWaitTimeInMs: 50,
+    retry: { initialRetryTime: 300 },
+  })
+  for (const key of ['PARTITIONS_LOST', 'PARTITIONS_REVOKED', 'PARTITIONS_ASSIGNED']) {
+    consumer.on(consumer.events[key], ({ payload }) =>
+      log.push({ kind: key, at: Date.now(), partitions: payload.partitions })
+    )
+  }
+  consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push(payload))
+  return { consumer, coordinator, broker, cluster, state, log, crashes, fetches }
+}
+
+/**
+ * Advances fake time in 10 ms steps until `done()` holds, for at most `budget` ms.
+ * @param {() => boolean} done
+ * @param {number} [budget]
+ * @returns {Promise<void>}
+ */
+const advanceUntil = async (done, budget = 5000) => {
+  for (let spent = 0; !done() && spent < budget; spent += 10) {
+    await jest.advanceTimersByTimeAsync(10)
+  }
+}
+
+describe('Consumer > a whole consumer-protocol consumer during reconciliation', () => {
+  let consumer
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(async () => {
+    const stopping = consumer.disconnect().catch(() => {})
+    await jest.advanceTimersByTimeAsync(3000)
+    await stopping
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
+  /**
+   * Joins with topic-a:0, handles a:0@40 and a:0@41 (41 stays uncommitted: the auto-commit interval
+   * is 30 s), then lets a:0@42 start a handler that runs for two seconds. Then the coordinator moves
+   * the member twice: epoch 2 adds topic-b, whose metadata takes 700 ms, and epoch 3, answered while
+   * that round applies, adds topic-a:1, so a second round is owed after the 500 ms wait. The
+   * heartbeat sent as the wait starts is fenced; from then on an epoch 0 heartbeat gets epoch 100
+   * with `rejoined` and an older epoch is fenced again.
+   * @param {object} [options]
+   * @param {object} [options.rebalanceListener]
+   * @param {boolean} [options.busy=true] false: the handler of a:0@42 returns at once, so the fetch
+   *   loop is free during the wait
+   * @returns {Promise<object>} the built consumer and what the case observed
+   */
+  const fenceWhileHandlerRuns = async ({ rebalanceListener, busy = true } = {}) => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const handled = []
+    const s = { phase: 'steady', fenced: false, waits: 0, slow: busy }
+    const full = { 'topic-a': [0, 1], 'topic-b': [0, 1] }
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (s.fenced) {
+        if (request.memberEpoch === 0) return fullTarget(100, full)
+        if (request.memberEpoch >= 100) return fullTarget(100, null)
+        throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      }
+      if (s.phase === 'grow') {
+        s.phase = 'grown'
+        return fullTarget(2, { 'topic-a': [0], 'topic-b': [0, 1] })
+      }
+      if (s.phase === 'grown') {
+        s.phase = 'regrown'
+        return fullTarget(3, full)
+      }
+      if (s.phase === 'steady') {
+        return request.memberEpoch === 0 ? fullTarget(1, { 'topic-a': [0] }) : fullTarget(1, null)
+      }
+      return fullTarget(request.memberEpoch, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    const wait = RebalanceCoordinator.prototype.yieldBetweenRounds
+    jest
+      .spyOn(RebalanceCoordinator.prototype, 'yieldBetweenRounds')
+      .mockImplementation(function () {
+        if (++s.waits === 1) {
+          s.fenced = true
+          s.fencedAt = Date.now()
+          this.heartbeatManager.requestTick()
+        }
+        return wait.call(this)
+      })
+
+    await consumer.subscribe({ topics: ['topic-a', 'topic-b'] })
+    consumer.run({
+      autoCommitInterval: 30000,
+      ...(rebalanceListener && { rebalanceListener }),
+      eachMessage: async ({ topic, partition, message }) => {
+        handled.push({ at: Date.now(), tp: `${topic}|${partition}`, offset: message.offset })
+        if (s.slow && topic === 'topic-a' && message.offset === '42') {
+          s.slow = false
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
+      },
+    })
+    built.state.queue['topic-a|0'] = [40, 41]
+    await advanceUntil(() => handled.length >= 2)
+    built.state.queue['topic-a|0'] = [40, 41, 42]
+    await advanceUntil(() => handled.length >= 3)
+
+    built.state.partial.add('topic-b')
+    built.state.metadataDelay = 700
+    s.phase = 'grow'
+    await advanceUntil(() => s.fenced, 10000)
+    // Only records the rejoined member is handed again from here on.
+    built.state.queue['topic-a|0'] = [40, 41]
+    await advanceUntil(() => built.log.some(({ epoch }) => epoch === 0 && s.fenced), 10000)
+    await jest.advanceTimersByTimeAsync(3000)
+    // A record on topic-b after the auto-commit interval makes the next commit.
+    await jest.advanceTimersByTimeAsync(30000)
+    built.state.queue['topic-b|0'] = [40]
+    await advanceUntil(() => handled.some(({ tp }) => tp === 'topic-b|0'))
+    await jest.advanceTimersByTimeAsync(1000)
+    return { ...built, handled, starts, fencedAt: s.fencedAt }
+  }
+
+  it('runs the LOST round before any rejoin when a fence reaches the slot during the wait while a handler keeps the fetch loop busy: one PARTITIONS_LOST, uncommitted progress discarded and redelivered, nothing resolved under the fenced epoch committed', async () => {
+    const run = await fenceWhileHandlerRuns()
+    const after = run.log.filter(({ at }) => at >= run.fencedAt)
+    const lostAt = after.findIndex(({ kind }) => kind === 'PARTITIONS_LOST')
+    const rejoinAt = after.findIndex(({ kind, epoch }) => kind === 'heartbeat' && epoch === 0)
+
+    expect(after.filter(({ kind }) => kind === 'PARTITIONS_LOST')).toEqual([
+      expect.objectContaining({
+        partitions: [
+          { topic: 'topic-a', partitions: [0] },
+          { topic: 'topic-b', partitions: [0, 1] },
+        ],
+      }),
+    ])
+    // The handler of a:0@42 returned after the wait had ended.
+    expect(after[lostAt].at).toBeGreaterThan(run.fencedAt + 500)
+    expect(rejoinAt).toBeGreaterThan(lostAt)
+    expect(after.filter(({ kind }) => kind === 'PARTITIONS_REVOKED')).toEqual([])
+    // Redelivered from the committed offset 40, not resumed at 43.
+    expect(
+      run.handled
+        .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')
+        .map(({ offset }) => offset)
+    ).toEqual(['40', '41'])
+    expect(run.log.filter(({ kind, tp }) => kind === 'commit' && tp === 'topic-a|0')).toEqual([
+      expect.objectContaining({ offset: '42', generationId: 100 }),
+    ])
+    expect(run.crashes).toEqual([])
+    expect(run.starts).toHaveBeenCalledTimes(1)
+  })
+
+  it('runs the LOST round before the rejoin when a fence reaches the slot during the wait while the fetch loop is free, and redelivers from the committed offset', async () => {
+    const run = await fenceWhileHandlerRuns({ busy: false })
+    const after = run.log.filter(({ at }) => at >= run.fencedAt)
+    const lostAt = after.findIndex(({ kind }) => kind === 'PARTITIONS_LOST')
+
+    expect(after.filter(({ kind }) => kind === 'PARTITIONS_LOST')).toHaveLength(1)
+    expect(
+      after.findIndex(({ kind, epoch }) => kind === 'heartbeat' && epoch === 0)
+    ).toBeGreaterThan(lostAt)
+    expect(
+      run.handled
+        .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')
+        .map(({ offset }) => offset)
+    ).toEqual(['40', '41'])
+    expect(run.log.filter(({ kind, tp }) => kind === 'commit' && tp === 'topic-a|0')).toEqual([
+      expect.objectContaining({ offset: '42', generationId: 100 }),
+    ])
+    expect(run.crashes).toEqual([])
+  })
+
+  it("calls the listener's onPartitionsLost once, before any rejoin, when a fence reaches the slot during the wait while a handler keeps the fetch loop busy", async () => {
+    const calls = []
+    const record = (name) => async (payload) => calls.push({ name, at: Date.now(), payload })
+    const run = await fenceWhileHandlerRuns({
+      rebalanceListener: {
+        onPartitionsAssigned: record('assigned'),
+        onPartitionsRevoked: record('revoked'),
+        onPartitionsLost: record('lost'),
+      },
+    })
+    const rejoin = run.log.find(
+      ({ kind, epoch, at }) => kind === 'heartbeat' && epoch === 0 && at >= run.fencedAt
+    )
+    const later = calls.filter(({ at }) => at > run.fencedAt)
+
+    expect(later.map(({ name }) => name)).toEqual(['lost', 'assigned'])
+    expect(later[0].payload.partitions).toEqual([
+      { topic: 'topic-a', partitions: [0] },
+      { topic: 'topic-b', partitions: [0, 1] },
+    ])
+    expect(later[0].at).toBeLessThanOrEqual(rejoin.at)
+    expect(run.log.indexOf(rejoin)).toBeGreaterThan(
+      run.log.findIndex(({ kind, at }) => kind === 'PARTITIONS_LOST' && at >= run.fencedAt)
+    )
+    expect(
+      run.handled
+        .filter(({ at, tp }) => at > run.fencedAt && tp === 'topic-a|0')
+        .map(({ offset }) => offset)
+    ).toEqual(['40', '41'])
+    expect(run.log.filter(({ kind, tp }) => kind === 'commit' && tp === 'topic-a|0')).toEqual([
+      expect.objectContaining({ offset: '42', generationId: 100 }),
+    ])
+    expect(run.crashes).toEqual([])
   })
 })
