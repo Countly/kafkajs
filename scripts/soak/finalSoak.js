@@ -928,7 +928,6 @@ class Supervisor {
       this.problem(`${slot}: ${message.message}`)
       this.abort(`${slot}: ${message.message}`)
     } else if (message.type === 'readback') this.readback(slot, message)
-    else if (message.type === 'share-readback') this.shareReadback(slot, message)
     else if (message.type === 'telemetry-subscription')
       this.command('p16', {
         type: 'telemetry-subscriptions',
@@ -971,50 +970,6 @@ class Supervisor {
     })
     const child = slot ? this.children.get(slot) : null
     if (child?.connected) child.send({ type: 'reply', request }, () => {})
-  }
-
-  /**
-   * Reads a share group's state of one key from the share coordinator (`listShareGroupOffsets`:
-   * the persisted start offset and, on brokers that report it, the lag), records it as
-   * `broker-share-start` and answers the asking child with `{ topicId, startOffset, lag }`.
-   * A failed call is recorded with its error code and answered with nulls.
-   * @param {string} slot the child to answer
-   * @param {{ request: number, group: string, client: string, key: object }} body
-   * @returns {Promise<void>}
-   */
-  async shareReadback(slot, { request, group, client, key }) {
-    let row = null
-    let errorCode = 0
-    try {
-      const topics = await this.admin.listShareGroupOffsets({
-        groupId: group,
-        topics: [{ topic: key.topic, partitions: [key.partition] }],
-      })
-      const topic = topics.find((t) => t.topic === key.topic)
-      const partition = topic?.partitions.find((p) => p.partition === key.partition)
-      if (partition) {
-        errorCode = partition.errorCode
-        row = {
-          topicId: normalizeTopicId(topic.topicId),
-          startOffset: partition.startOffset === '-1' ? null : partition.startOffset,
-          lag: partition.lag,
-        }
-      }
-    } catch (e) {
-      errorCode = Number.isInteger(e.code) ? e.code : -1
-    }
-    const value = { topicId: null, startOffset: null, lag: null, ...row }
-    await this.emit({
-      kind: 'identity',
-      stage: 'broker-share-start',
-      client,
-      group,
-      key,
-      ...value,
-      errorCode,
-    })
-    const child = this.children.get(slot)
-    if (child?.connected) child.send({ type: 'reply', request, value }, () => {})
   }
 
   /**
@@ -1182,7 +1137,7 @@ class Supervisor {
    * The end of the run. Producers go idle and their in-flight sends and transactions settle; the
    * logs' ends are then read; every consumer waits until it has resolved those ends, filtered
    * suffix included, and commits what it resolved, and the share member waits until every offset
-   * had a handler entry and a broker-confirmed accept; every live route gets its terminal scan and seal; then every process but
+   * had a handler entry and the group stopped handing records out; every live route gets its terminal scan and seal; then every process but
    * the telemetry decoder disconnects, the decoder reads the telemetry clients' terminating pushes
    * and disconnects last. The cluster and the two standing topics stay up for the runbook's dumps.
    * @param {object} step the disconnect step
@@ -1243,7 +1198,7 @@ class Supervisor {
   /**
    * Ends the transactions log with a visible record (`closeTransactions`), then asks every
    * consuming process to commit its group to the two standing logs' settled ends, and the share
-   * process to prove every record below them delivered and accepted. When the ends moved during the
+   * process to prove every record below them delivered and its group quiet. When the ends moved during the
    * drain (a late marker) the drain runs again with the new ends, until they hold or the deadline
    * passes.
    * @returns {Promise<void>}

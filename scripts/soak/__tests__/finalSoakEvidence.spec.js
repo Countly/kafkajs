@@ -1149,15 +1149,6 @@ describe('final soak record line sizes', () => {
       reason: 'membership-lost',
       errorType: LONG_ERROR,
     }),
-    identity('broker-share-start', {
-      client: C,
-      group: GROUP,
-      key: KEY,
-      topicId: KEY.topicId,
-      startOffset: OFFSET,
-      lag: OFFSET,
-      errorCode: -1,
-    }),
     {
       kind: 'scan',
       scan: `p14.s${N}`,

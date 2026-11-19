@@ -21,10 +21,12 @@ const {
   clip,
 } = require('./finalSoakCollector')
 const { PassiveObserver, SocketRegistry, normalizeTopicId } = require('./finalSoakObserver')
-const { shareRequestSummary } = require('./shareProtocol')
+const { shareRequestSummary, shareFetchSession } = require('./shareProtocol')
 
-/** Delivered share offsets kept above a key's first missing one before the gap is given up on. */
-const SHARE_AHEAD_MAX = 100000
+/** Unconfirmed share accept ranges kept at once as evidence; any more are only counted. */
+const SHARE_UNCONFIRMED_MAX = 1000
+/** Added to the acquisition lock duration before a share key counts as quiet. */
+const SHARE_QUIET_MARGIN_MS = 5000
 
 /** How long a drain without its own deadline, and a recovery witness, may take. */
 const DRAIN_MS = 60000
@@ -477,7 +479,7 @@ class ChildRuntime {
     this.revisions = new Map()
     this.ids = 0
     this.cuts = 0
-    this.sockets = new SocketRegistry()
+    this.sockets = new SocketRegistry({ now: () => this.clock.now() })
     this.wire = new WireLog({
       dir: out,
       prefix: `${slot}.share`,
@@ -2085,28 +2087,50 @@ class ConsumerWorker extends Worker {
   }
 }
 
-/** A key no offset was noted for. */
-const FLOOR_EMPTY = Object.freeze({ next: 0n, gap: null })
-
 /**
- * Notes one offset of a key: per key it keeps the next offset below which every offset was noted,
- * and the noted offsets above it. A gap that would keep more than `SHARE_AHEAD_MAX` offsets ahead
- * is remembered and skipped, so the memory stays bounded and a drain over the gap still fails.
- * @param {Map<string, { next: bigint, ahead: Set<bigint>, gap: string|null }>} floors
- * @param {string} k `topicId|partition` @param {string|number} offset
- * @returns {void}
+ * The offsets of one key that were noted: `next`, below which every offset was noted, and the
+ * sorted, disjoint, non-adjacent `[from, to]` ranges noted above it. Its size grows with the holes
+ * left open, not with the offsets noted, so a hole that never fills costs one range.
  */
-const advanceFloor = (floors, k, offset) => {
-  const state = floors.get(k) ?? { next: 0n, ahead: new Set(), gap: null }
-  floors.set(k, state)
-  const at = BigInt(offset)
-  if (at >= state.next) state.ahead.add(at)
-  if (state.ahead.size > SHARE_AHEAD_MAX) {
-    state.gap ??= String(state.next)
-    state.next = [...state.ahead].reduce((a, b) => (b < a ? b : a))
+class Coverage {
+  /** @param {bigint} [next] the first offset counted */
+  constructor(next = 0n) {
+    this.next = next
+    this.ranges = []
   }
-  while (state.ahead.delete(state.next)) state.next++
+
+  /** @param {bigint} at @returns {void} */
+  add(at) {
+    if (this.has(at)) return
+    if (at === this.next) {
+      this.next++
+      if (this.ranges[0]?.[0] === this.next) this.next = this.ranges.shift()[1] + 1n
+      return
+    }
+    let i = this.ranges.length
+    while (i > 0 && this.ranges[i - 1][0] > at) i--
+    const before = this.ranges[i - 1]
+    const after = this.ranges[i]
+    if (before?.[1] === at - 1n) {
+      before[1] = at
+      if (after?.[0] === at + 1n) before[1] = this.ranges.splice(i, 1)[0][1]
+    } else if (after?.[0] === at + 1n) after[0] = at
+    else this.ranges.splice(i, 0, [at, at])
+  }
+
+  /** @param {bigint} at @returns {boolean} whether the offset was noted */
+  has(at) {
+    return at < this.next || this.ranges.some(([from, to]) => from <= at && at <= to)
+  }
+
+  /** @param {bigint} from @returns {bigint} how many offsets from `from` on were noted */
+  countFrom(from) {
+    return this.ranges.reduce((n, [a, b]) => n + b - a + 1n, this.next - from)
+  }
 }
+
+/** @param {string} topicId any topic id form @param {number|string} partition @returns {string} */
+const shareKey = (topicId, partition) => `${normalizeTopicId(topicId)}|${Number(partition)}`
 
 /** @param {object[]} keys @returns {{ topic: string, partitions: number[] }[]} */
 const byTopic = (keys) => {
@@ -2120,14 +2144,24 @@ const byTopic = (keys) => {
  * capture ShareFetch and ShareAcknowledge exchanges into the artifact's wire segments.
  */
 class ShareWorker extends Worker {
-  /** Per `topicId|partition`, the offsets that had a handler entry (`advanceFloor`). */
+  /** Per `topicId|partition`, the offsets that had a handler entry (a `Coverage`). */
   entered = new Map()
-  /** Per `topicId|partition`, the offsets whose accept the broker confirmed (`advanceFloor`). */
-  accepted = new Map()
-  /** Per `topicId|partition`, the `[first, last]` ranges of accepts the client retired on a session loss. */
-  lost = new Map()
-  /** Per `topicId|partition`, the last broker share-state readback: `{ at, topicId, startOffset, lag }`. */
-  starts = new Map()
+  /** Per `topicId|partition`, when a record was last handed to a handler or acquired on the wire. */
+  activity = new Map()
+  /** Per `client|node`, the `topicId|partition` keys of the share session its requests built. */
+  sessions = new Map()
+  /** Per `topicId|partition`, when the newest fetch of a session holding it was sent, if answered without error. */
+  fetched = new Map()
+  /** The acquisition lock duration the newest answered share fetch reported, or null. */
+  lockMs = null
+  /**
+   * Per `topicId|partition`, accepts the client reported with an error, so with no wire
+   * confirmation: `{ from, to, reason, errorType, redelivered, accepted }`, the last two `Coverage`s
+   * of the range. Evidence only; never a pass or a fail.
+   */
+  unconfirmed = new Map()
+  /** Run totals of the unconfirmed accepts, kept when a range is resolved, untracked or forgotten. */
+  totals = { ranges: 0, untracked: 0, settled: 0n, dropped: 0n }
 
   /**
    * Joins the standing member and waits until its first share fetch for the main log was answered
@@ -2162,35 +2196,91 @@ class ShareWorker extends Worker {
   }
 
   /**
-   * Notes that a record of a key was handed to a handler (`advanceFloor`).
+   * Notes that a record of a key was handed to a handler: its entry, the key's activity and, for an
+   * offset of an unconfirmed accept, that it was delivered again.
    * @param {string} k `topicId|partition`, so a recreated name starts a new key
    * @param {string|number} offset
    * @returns {void}
    */
   delivered(k, offset) {
-    advanceFloor(this.entered, k, offset)
+    const at = BigInt(offset)
+    if (!this.entered.has(k)) this.entered.set(k, new Coverage())
+    this.entered.get(k).add(at)
+    this.activity.set(k, this.runtime.clock.now())
+    for (const range of this.unconfirmed.get(k) ?? [])
+      if (range.from <= at && at <= range.to) range.redelivered.add(at)
   }
 
   /**
-   * Notes the accepts of one settled acknowledgement that the broker confirmed: the settlement
-   * completed and the response's partition error code is 0. A confirmed accept leaves the record
-   * acknowledged, so the group never hands it out again. A refused or failed accept leaves its
-   * offset open: the record is acquirable again and only a later confirmed accept closes it.
+   * Applies one answered ShareFetch of a member: the session's partitions after the request (a
+   * zero epoch opens a new session, -1 closes it, any other epoch adds the request's partitions and
+   * drops its forgotten ones), the lock duration the answer reports, activity for every partition
+   * it acquired records of, and, when the answer has no top-level error, the request's send time as
+   * the newest fetch of every partition the session holds that the answer gave no partition error.
+   * A top-level error ends the session, so a member that lost its membership stops counting.
+   * @param {ClientRig} rig the member
+   * @param {{ node: string, sentAt: number, session: { epoch: number,
+   *   partitions: { topicId: string, partition: number }[],
+   *   forgotten: { topicId: string, partition: number }[] }, decoded: object }} fetch the request's
+   *   session change (`shareFetchSession`) and the independently decoded response
+   * @returns {void}
+   */
+  onFetch(rig, { node, sentAt, session, decoded }) {
+    const id = `${rig.id}|${node}`
+    if (session.epoch <= 0 || decoded.errorCode !== 0) this.sessions.delete(id)
+    if (session.epoch === -1 || decoded.errorCode !== 0) return
+    const held = this.sessions.get(id) ?? new Set()
+    this.sessions.set(id, held)
+    for (const { topicId, partition } of session.forgotten)
+      held.delete(shareKey(topicId, partition))
+    for (const { topicId, partition } of session.partitions) held.add(shareKey(topicId, partition))
+    if (decoded.acquisitionLockTimeoutMs > 0) this.lockMs = decoded.acquisitionLockTimeoutMs
+    const failed = new Set()
+    for (const t of decoded.topics)
+      for (const p of t.partitions) {
+        const k = shareKey(t.topicId, p.partitionIndex)
+        if (p.fetchErrorCode !== 0) failed.add(k)
+        if (p.acquired?.length > 0) this.activity.set(k, this.runtime.clock.now())
+      }
+    for (const k of held)
+      if (!failed.has(k)) this.fetched.set(k, Math.max(this.fetched.get(k) ?? -Infinity, sentAt))
+  }
+
+  /**
+   * Notes the accepts of one settled acknowledgement that the broker confirmed (the settlement
+   * completed with partition error code 0) against the unconfirmed accepts: an offset delivered
+   * again and then accepted this way resolves its part of the range, and a range resolved in full
+   * is journaled and dropped.
    * @param {{ key: { topicId: string, partition: number }, offsets: { offset: string, type: string|null }[], result: string, errorCode: number|null }} event
    *   a `share-settle` observer event
    * @returns {void}
    */
   onShareSettled({ key, offsets, result, errorCode }) {
     if (result !== 'ok' || errorCode !== 0) return
-    for (const { offset, type } of offsets)
-      if (type === 'accept') advanceFloor(this.accepted, `${key.topicId}|${key.partition}`, offset)
+    const k = shareKey(key.topicId, key.partition)
+    const ranges = this.unconfirmed.get(k)
+    if (!ranges) return
+    for (const { offset, type } of offsets) {
+      const at = BigInt(offset)
+      if (type !== 'accept') continue
+      for (const range of ranges)
+        if (range.from <= at && at <= range.to && range.redelivered.has(at)) range.accepted.add(at)
+    }
+    for (const range of ranges.filter((r) => r.accepted.next > r.to)) {
+      ranges.splice(ranges.indexOf(range), 1)
+      this.totals.settled += range.to - range.from + 1n
+      this.runtime.diagnose(
+        `share accept without wire confirmation resolved: ${k} offsets ${range.from} to ${range.to} (${range.reason}, ${range.errorType}) were redelivered and accepted`
+      )
+    }
+    if (ranges.length === 0) this.unconfirmed.delete(k)
   }
 
   /**
    * Journals one acknowledgement outcome the client published (`ACKNOWLEDGE`) as a `share-outcome`
-   * record. An accept whose outcome is unknown because its session was lost (`session-lost`) is
-   * remembered for the drain: the broker may or may not have applied it, so only the broker's own
-   * share state can settle it (`onDrain`).
+   * record. An accept reported with an error had no wire confirmation; its range is kept as
+   * evidence (at most `SHARE_UNCONFIRMED_MAX` ranges at once, any more only counted) until each of
+   * its offsets was delivered again and accepted with a confirmation.
    * @param {ClientRig} rig the share member
    * @param {{ topic: string, partition: number, firstOffset: string, lastOffset: string, type: string, error: Error|null }} payload
    *   the event payload
@@ -2201,6 +2291,7 @@ class ShareWorker extends Worker {
     const topicId = runtime.topicIds.get(topic)
     if (!topicId) return
     const reason = error?.reason ?? null
+    const errorType = error ? (error.name ?? 'Error') : null
     runtime.emit({
       kind: 'identity',
       recordId: runtime.nextId(),
@@ -2212,12 +2303,39 @@ class ShareWorker extends Worker {
       to: lastOffset,
       type,
       reason,
-      errorType: error ? (error.name ?? 'Error') : null,
+      errorType,
     })
-    if (type !== 'accept' || reason !== 'session-lost') return
-    const k = `${topicId}|${partition}`
-    // ponytail: a plain list; session losses are rare, so it stays short
-    this.lost.set(k, [...(this.lost.get(k) ?? []), [BigInt(firstOffset), BigInt(lastOffset)]])
+    if (type !== 'accept' || !error) return
+    const from = BigInt(firstOffset)
+    const to = BigInt(lastOffset)
+    this.totals.ranges++
+    const tracked = [...this.unconfirmed.values()].reduce((n, list) => n + list.length, 0)
+    if (tracked >= SHARE_UNCONFIRMED_MAX) {
+      this.totals.untracked++
+      this.totals.dropped += to - from + 1n
+      return
+    }
+    const k = shareKey(topicId, partition)
+    const range = { from, to, reason, errorType }
+    range.redelivered = new Coverage(from)
+    range.accepted = new Coverage(from)
+    this.unconfirmed.set(k, [...(this.unconfirmed.get(k) ?? []), range])
+  }
+
+  /**
+   * @returns {{ unconfirmedAccepts: number, unresolvedOffsets: string, untracked: number }} the
+   *   run's accepts reported without wire confirmation, and how many of their offsets were not
+   *   delivered again and accepted with a confirmation (untracked and forgotten ranges included)
+   */
+  evidence() {
+    let open = this.totals.dropped
+    for (const ranges of this.unconfirmed.values())
+      for (const r of ranges) open += r.to - r.from + 1n - r.accepted.countFrom(r.from)
+    return {
+      unconfirmedAccepts: this.totals.ranges,
+      unresolvedOffsets: String(open),
+      untracked: this.totals.untracked,
+    }
   }
 
   /** @returns {Promise<ClientRig>} */
@@ -2228,7 +2346,19 @@ class ShareWorker extends Worker {
       apiKeys: [78, 79],
       onExchange: (exchange) => {
         const where = runtime.wire.append({ client: rig.id, ...exchange })
-        runtime.observer.exchanged(rig.id, { ...exchange, file: null, sha256: null, ...where })
+        const decoded = runtime.observer.exchanged(rig.id, {
+          ...exchange,
+          file: null,
+          sha256: null,
+          ...where,
+        })
+        if (exchange.apiKey === 78 && decoded)
+          this.onFetch(rig, {
+            node: exchange.node,
+            sentAt: exchange.sentAt,
+            session: shareFetchSession(exchange.request),
+            decoded,
+          })
       },
       onSent: ({ request, ...sent }) =>
         runtime.wire.note({
@@ -2244,6 +2374,8 @@ class ShareWorker extends Worker {
           ...sent,
           request: request.toString('hex'),
         }),
+      onError: (stage, e) =>
+        runtime.problem(`share wire capture of ${rig.id} lost its ${stage} evidence: ${e.message}`),
     }
     const { options } = clientOptions(runtime.config, runtime.matrix, slot)
     const consumer = await rig.construct((kafka) => kafka.shareConsumer(options), capture)
@@ -2302,7 +2434,7 @@ class ShareWorker extends Worker {
     }
     acknowledge('accept')
     this.handled = (this.handled ?? 0) + 1
-    if (topicId) this.delivered(`${topicId}|${partition}`, message.offset)
+    if (topicId) this.delivered(shareKey(topicId, partition), message.offset)
     await runtime.emit({
       kind: 'identity',
       recordId: runtime.nextId(),
@@ -2313,10 +2445,17 @@ class ShareWorker extends Worker {
     })
   }
 
-  /** @param {string} topicId drops the delivered and accepted offsets of a retired incarnation */
+  /** @param {string} topicId drops what the worker holds of a retired incarnation; its unresolved accepts stay counted */
   forgetTopic(topicId) {
-    for (const floors of [this.entered, this.accepted, this.lost, this.starts])
-      for (const key of [...floors.keys()]) if (key.startsWith(`${topicId}|`)) floors.delete(key)
+    const prefix = `${normalizeTopicId(topicId)}|`
+    for (const r of [...this.unconfirmed].flatMap(([k, list]) =>
+      k.startsWith(prefix) ? list : []
+    ))
+      this.totals.dropped += r.to - r.from + 1n - r.accepted.countFrom(r.from)
+    for (const map of [this.entered, this.activity, this.fetched, this.unconfirmed])
+      for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key)
+    for (const held of this.sessions.values())
+      for (const key of [...held]) if (key.startsWith(prefix)) held.delete(key)
   }
 
   /**
@@ -2329,22 +2468,24 @@ class ShareWorker extends Worker {
     if (!slot || step.phase === 'resume') return
     this.extras.push(await this.join(slot, step.execution))
     await this.runtime.clock.sleepUntil(this.runtime.clock.now() + 20000)
-    for (const rig of this.extras.splice(0)) await rig.retire(step.execution)
+    for (const rig of this.extras.splice(0)) {
+      await rig.retire(step.execution)
+      for (const id of [...this.sessions.keys()])
+        if (id.startsWith(`${rig.id}|`)) this.sessions.delete(id)
+    }
   }
 
   /**
-   * Proves, per topic id and partition, that no record of the run's current incarnation of a topic
-   * below its log end is still available to or held by the share group, and that every record was
-   * handed to a handler in this process at least once. Per offset it needs a handler entry and
-   * either an accept the broker confirmed on the wire (`onShareSettled`; any acquisition counts,
-   * so a record redelivered and accepted later passes) or, when the reply was lost with its session,
-   * the client's own `session-lost` outcome for that accept together with the broker's share state
-   * (`shareState`): a start offset past the offset, or a lag of 0. That state comes from the share
-   * coordinator through the supervisor's admin client, not from this member's sessions. A record
-   * the broker still holds is redelivered once its lock expires, so the drain keeps reading the
-   * state (at most once a second) until the deadline before it fails. Deliveries of other topics
-   * neither delay nor satisfy it. A key still short at the deadline is diagnosed with its topic id,
-   * its first open offset and what that offset lacks.
+   * Proves two things per topic id and partition of the run's current incarnation of a subscribed
+   * topic, and nothing else. Delivery: every offset below the log end had a handler entry in this
+   * process. Quiescence: since the key's last handler entry or wire acquisition, the lock duration
+   * the broker reported plus `SHARE_QUIET_MARGIN_MS` passed, and a share fetch sent after that,
+   * by a live member whose session holds the partition, was answered without error and acquired
+   * nothing of it. A record still held or available below the end would have been acquired by
+   * that fetch, so quiescence shows the group no longer hands any of them out. It does not show
+   * how the broker settled an accept whose reply was lost: those stay evidence (`evidence`), in
+   * the drain record this journals. Deliveries of other keys neither delay nor satisfy a key.
+   * A key still short at the deadline is diagnosed with its topic id and what it lacks.
    * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps
    *   `topic|partition` to the log end; keys of topics the member does not subscribe are ignored
    * @returns {Promise<{ reached: boolean }>}
@@ -2353,80 +2494,45 @@ class ShareWorker extends Worker {
     const { config, topicIds, clock } = this.runtime
     const subscribed = new Set([config.topics.main, ...config.topics.recreate])
     const wanted = Object.entries(ends).filter(([k]) => subscribed.has(splitKey(k)[0]))
-    const shortOf = (w) => this.shortOf(topicIds.get(splitKey(w[0])[0]), splitKey(w[0])[1], w[1])
-    for (;;) {
-      const open = wanted.map((w) => [w, shortOf(w)]).filter(([, short]) => short)
-      if (open.length === 0) return { reached: true }
-      if (clock.now() >= deadline) {
-        for (const [[k], { lacks }] of open)
-          await this.runtime.diagnose(
-            `share drain: ${k} of topic id ${topicIds.get(splitKey(k)[0])} has no ${lacks}`
-          )
-        return { reached: false }
-      }
-      for (const [[k], { ask }] of open) if (ask) await this.shareState(k)
+    if (wanted.length === 0) return { reached: true }
+    const lacking = () =>
+      wanted
+        .map(([k, end]) => [k, this.shortOf(topicIds.get(splitKey(k)[0]), splitKey(k)[1], end)])
+        .filter(([, lacks]) => lacks)
+    let open = lacking()
+    while (open.length > 0 && clock.now() < deadline) {
       await clock.sleepUntil(Math.min(deadline, clock.now() + 250))
+      open = lacking()
     }
+    for (const [k, lacks] of open)
+      await this.runtime.diagnose(
+        `share drain: ${k} of topic id ${topicIds.get(splitKey(k)[0])} has no ${lacks}`
+      )
+    const reached = open.length === 0
+    const evidence = this.evidence()
+    await this.runtime.emit({
+      kind: 'diagnostic',
+      recordId: this.runtime.nextId(),
+      message: `share drain ${reached ? 'reached' : 'unreached'}; evidence, not a verdict: ${evidence.unconfirmedAccepts} accepts reported without wire confirmation, ${evidence.unresolvedOffsets} of their offsets not delivered again and accepted`,
+      shareDrain: { reached, ...evidence },
+    })
+    return { reached }
   }
 
   /**
    * @param {string} topicId @param {number|string} partition @param {string} end the log end
-   * @returns {{ lacks: string, ask: boolean }|null} what the key's first open offset below `end`
-   *   lacks and whether a fresh broker share-state readback could settle it, or null when none is open
+   * @returns {string|null} what the key lacks for the drain (see `onDrain`), or null
    */
   shortOf(topicId, partition, end) {
-    const k = `${topicId}|${partition}`
-    const entered = this.entered.get(k) ?? FLOOR_EMPTY
-    if (entered.gap !== null || entered.next < BigInt(end))
-      return { lacks: `handler entry at offset ${entered.gap ?? entered.next}`, ask: false }
-    const accepted = this.accepted.get(k) ?? FLOOR_EMPTY
-    if (accepted.gap !== null)
-      return { lacks: `confirmed accept at offset ${accepted.gap}`, ask: false }
-    const lost = this.lost.get(k) ?? []
-    const state = this.starts.get(k)
-    const settled = (o) =>
-      state?.topicId === topicId &&
-      ((state.startOffset !== null && BigInt(state.startOffset) > o) || state.lag === '0')
-    for (let o = accepted.next; o < BigInt(end); o++) {
-      if (accepted.ahead?.has(o)) continue
-      if (!lost.some(([first, last]) => first <= o && o <= last))
-        return { lacks: `confirmed accept at offset ${o}`, ask: false }
-      if (settled(o)) continue
-      const known = state?.topicId === topicId
-      const start = (known && state.startOffset) || 'unknown'
-      const lag = (known && state.lag) || 'unknown'
-      return {
-        lacks: `confirmed accept at offset ${o} (the client reported its outcome; the broker's share start offset is ${start}, its lag ${lag})`,
-        ask: !state || this.runtime.clock.now() - state.at >= 1000,
-      }
-    }
+    const k = shareKey(topicId, partition)
+    const next = this.entered.get(k)?.next ?? 0n
+    if (next < BigInt(end)) return `handler entry at offset ${next}`
+    if (BigInt(end) === 0n) return null
+    if (this.lockMs === null) return 'share fetch answer reporting the acquisition lock duration'
+    const quietAt = (this.activity.get(k) ?? 0) + this.lockMs + SHARE_QUIET_MARGIN_MS
+    if ((this.fetched.get(k) ?? -Infinity) < quietAt)
+      return `share fetch answered without error, by a session holding the partition, sent at or after ${quietAt} (the end of the quiet period)`
     return null
-  }
-
-  /**
-   * Asks the supervisor to read the group's share state of one key (`share-readback`, answered by
-   * its admin client's `listShareGroupOffsets` and journaled there) and keeps the answer.
-   * @param {string} k `topic|partition`
-   * @returns {Promise<void>}
-   */
-  async shareState(k) {
-    const { runtime } = this
-    const [rig] = this.standing
-    const [topic, partition] = splitKey(k)
-    const topicId = runtime.topicIds.get(topic)
-    const at = runtime.clock.now()
-    const answer = await runtime.request({
-      type: 'share-readback',
-      client: rig.id,
-      group: rig.slot.group,
-      key: { topic, topicId, partition: Number(partition) },
-    })
-    this.starts.set(`${topicId}|${partition}`, {
-      at,
-      topicId: answer?.topicId ?? null,
-      startOffset: answer?.startOffset ?? null,
-      lag: answer?.lag ?? null,
-    })
   }
 
   /** @returns {Promise<{ ok: boolean }>} whether a record was handled and accepted after recovery */

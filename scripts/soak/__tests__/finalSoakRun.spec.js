@@ -2041,7 +2041,6 @@ describe('final soak final drain', () => {
     })
     expect(runtime.records).toContainEqual({
       kind: 'diagnostic',
-      recordId: expect.any(String),
       message: `share accept without wire confirmation resolved: ${IDS.A}|0 offsets 0 to 9 (session-lost, KafkaJSShareAcknowledgementError) were redelivered and accepted`,
     })
     expect(drainRecord(runtime)).toEqual({
