@@ -232,6 +232,7 @@ async function start({
   logger,
   hook,
   eachMessage,
+  eachBatch,
   fault = groupAuthorization,
   initial,
   onZero,
@@ -266,11 +267,12 @@ async function start({
     if (req.memberEpoch === 0) return onZero?.(req) ?? target(2, { 'topic-a': [0] })
     return target(req.memberEpoch, null)
   }
-  if (eachMessage) state.queue['topic-a|0'] = [40]
+  if (eachMessage || eachBatch) state.queue['topic-a|0'] = [40]
   await consumer.subscribe({ topic: 'topic-a' })
   const started = settled(
     consumer.run({
       eachMessage: eachMessage && ((payload) => eachMessage(payload, held)),
+      eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
       ...(hook && { rebalanceListener: hook }),
     })
   )
@@ -617,5 +619,136 @@ describe('Consumer > crash supervision', () => {
       expect(run.crashes).toEqual([])
       cleanup = null
     })
+  })
+  describe('a fence and an independent non-retriable handler failure in the same fetch attempt', () => {
+    /**
+     * Holds the first delivery, fences the member, then releases the handler into `settle`.
+     * Returns the observed trace after the fence was accepted.
+     */
+    const fenceThenRelease = async ({ api = 'eachMessage', settle, hook, wait = true } = {}) => {
+      const policy = jest.fn(async () => false)
+      const entered = jest.fn()
+      let run = null
+      const handler = async (payload, held) => {
+        entered()
+        if (entered.mock.calls.length > 1) return
+        await held.promise
+        return settle(payload, run)
+      }
+      run = await start({
+        retry: { initialRetryTime: 300, restartOnFailure: policy },
+        fault: fenced,
+        [api]: handler,
+        hook,
+      })
+      await advanceUntil(() => entered.mock.calls.length === 1)
+      run.arm()
+      await advanceUntil(() => run.faultAt() !== null)
+      run.held.resolve()
+      if (!wait) return { run, policy }
+      await advanceUntil(() => run.crashes.length > 0 || beats(run, false) > 1, 20000)
+      await jest.advanceTimersByTimeAsync(5000)
+      return {
+        run,
+        policy,
+        deliveries: entered.mock.calls.length,
+        lost: run.log.filter(({ kind }) => kind === 'PARTITIONS_LOST').map((e) => e.partitions),
+        zeroJoins: beats(run, false),
+        commits: run.log.filter(({ kind }) => kind === 'commit'),
+      }
+    }
+
+    it.each(['eachMessage', 'eachBatch'])(
+      '%s: the loss is handled once, the member rejoins, then one CRASH carries the handler failure',
+      async (api) => {
+        const failure = Object.assign(new Error('handler failed'), { retriable: false })
+        const observed = await fenceThenRelease({
+          api,
+          settle: () => {
+            throw failure
+          },
+        })
+
+        expect(observed.lost).toEqual([[{ topic: 'topic-a', partitions: [0] }]])
+        expect(observed.commits).toEqual([])
+        expect(observed.zeroJoins).toBe(2)
+        expect(observed.policy).toHaveBeenCalledTimes(1)
+        expect(inCauseChain(observed.policy.mock.calls[0][0], failure)).toBe(true)
+        expect(observed.run.crashes).toHaveLength(1)
+        expect(observed.run.crashes[0].restart).toBe(false)
+        expect(inCauseChain(observed.run.crashes[0].error, failure)).toBe(true)
+        expect(observed.deliveries).toBe(1)
+      },
+      60000
+    )
+
+    it('a handler rethrowing the refusal of its own commit recovers without a CRASH', async () => {
+      let refused = null
+      const observed = await fenceThenRelease({
+        settle: async ({ topic, partition }, run) => {
+          try {
+            await run.consumer.commitOffsets([{ topic, partition, offset: '41' }])
+          } catch (error) {
+            refused = error
+            throw error
+          }
+        },
+      })
+
+      expect(refused?.name).toBe('KafkaJSCommitFailedError')
+      expect(observed.lost).toEqual([[{ topic: 'topic-a', partitions: [0] }]])
+      expect(observed.zeroJoins).toBe(2)
+      expect(observed.policy).not.toHaveBeenCalled()
+      expect(observed.run.crashes).toEqual([])
+    }, 60000)
+
+    it('a stop requested while the loss callback is held leaves no late CRASH for the handler failure', async () => {
+      const hookHeld = deferred()
+      const lostEntered = jest.fn()
+      const { run, policy } = await fenceThenRelease({
+        wait: false,
+        settle: () => {
+          throw Object.assign(new Error('handler failed'), { retriable: false })
+        },
+        hook: {
+          onPartitionsLost: async () => {
+            lostEntered()
+            await hookHeld.promise
+          },
+        },
+      })
+      await advanceUntil(() => lostEntered.mock.calls.length > 0, 1000)
+      expect(lostEntered).toHaveBeenCalledTimes(1)
+      const stopping = settled(run.consumer.stop())
+      await jest.advanceTimersByTimeAsync(10)
+      hookHeld.resolve()
+      await advanceUntil(() => stopping.done, 10000)
+      await jest.advanceTimersByTimeAsync(5000)
+
+      expect(stopping).toMatchObject({ done: true, value: undefined })
+      expect(policy).not.toHaveBeenCalled()
+      expect(run.crashes).toEqual([])
+    }, 60000)
+
+    it('a loss callback that throws during the recovery wins over the handler failure', async () => {
+      const hookFailure = new Error('lost hook failed')
+      const handlerFailure = Object.assign(new Error('handler failed'), { retriable: false })
+      const observed = await fenceThenRelease({
+        settle: () => {
+          throw handlerFailure
+        },
+        hook: {
+          onPartitionsLost: async () => {
+            throw hookFailure
+          },
+        },
+      })
+
+      expect(observed.run.crashes).toHaveLength(1)
+      expect(observed.run.crashes[0].error.name).toBe('KafkaJSRebalanceListenerError')
+      expect(inCauseChain(observed.run.crashes[0].error, hookFailure)).toBe(true)
+      expect(inCauseChain(observed.run.crashes[0].error, handlerFailure)).toBe(false)
+      expect(observed.policy).toHaveBeenCalledTimes(1)
+    }, 60000)
   })
 })
