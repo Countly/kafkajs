@@ -412,6 +412,23 @@ describe('scripts/evidence/finalSoakCore', () => {
         expect(row(report, 'K1').reasons).toHaveLength(1)
       })
 
+      it('is inconclusive when a nontransactional record of the transactions topic was acknowledged after the last dumped record', async () => {
+        const world = fx.healthy()
+        world.layout.transactions = tx(world).slice(0, 5)
+        const edit = (records) => {
+          const offer = records.find((r) => r.stage === 'offered' && r.id === 'c09.0')
+          const ack = records.find((r) => r.stage === 'ack' && r.id === 'c09.0')
+          return [
+            ...records,
+            { ...offer, id: 'c08.12', transaction: null, t: 9e7 },
+            { ...ack, id: 'c08.12', offset: '4', t: 9e7 + 1 },
+          ]
+        }
+        const report = await check(render(world), { edit })
+        expectRow(report, 'K1', 'INCONCLUSIVE', /a visible record was acknowledged at 4/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      })
+
       it('is inconclusive, never ACCEPTED, when as many offsets follow a cut-off dump as the journal places there but a marker has no offset after its last record', async () => {
         const world = fx.healthy()
         const [x1, aborted] = [tx(world).slice(0, 5), tx(world).slice(5, 7)]
@@ -1392,6 +1409,13 @@ describe('scripts/evidence/finalSoakCore', () => {
           (h) => h,
           /the header names p15 as the supervisor, but the config's collector is p14/,
         ],
+        [
+          'the config names two collector processes',
+          (world) => roleOf(world, 'p14', 'collector'),
+          (records) => records,
+          (h) => h,
+          /the config does not name exactly one collector process/,
+        ],
       ])(
         'is inconclusive and fails K7, never ACCEPTED, when %s',
         async (_, world, edit, header, reason) => {
@@ -1402,6 +1426,19 @@ describe('scripts/evidence/finalSoakCore', () => {
           expect(report.overall).not.toBe('ACCEPTED')
         }
       )
+    })
+
+    it('is inconclusive, never ACCEPTED, when the end of traffic follows the supervisor’s observed end', async () => {
+      const world = fx.healthy()
+      const late = world.header.window.observedEndAt + 1
+      const report = await check(world, { edit: trafficEnd(() => ({ at: late, t: late })) })
+      expectRow(
+        report,
+        'K6',
+        'INCONCLUSIVE',
+        new RegExp(`end of traffic at ${late} lies outside the run end`)
+      )
+      expect(report.overall).not.toBe('ACCEPTED')
     })
 
     it('ignores a later traffic end that the supervisor did not emit', async () => {
