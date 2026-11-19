@@ -73,7 +73,7 @@ describe('Consumer > shutdown characterization', () => {
     60000
   )
 
-  it('a zero-timeout disconnect joining the transport drain of crash cleanup asks for a zero drain but stays pending until that drain ends, then one CRASH with restart false', async () => {
+  it("a zero-timeout disconnect joining the transport drain of crash cleanup asks for a zero drain and settles only after the crash cleanup's cluster disconnect, then one CRASH with restart false", async () => {
     const transport = deferred()
     const policy = jest.fn(async () => true)
     const run = await start({

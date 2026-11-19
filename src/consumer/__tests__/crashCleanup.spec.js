@@ -151,6 +151,20 @@ describe('Crash cleanup lifetime', () => {
     expect(outcome).toBe('closed')
   })
 
+  test('a crash a deadline forced while the old handler may still run never restarts, even when restartOnFailure says restart', async () => {
+    const policy = jest.fn(async () => true)
+    const { start, consumer, runner } = await started({ restartOnFailure: policy })
+    const crashes = []
+    consumer.on(consumer.events.CRASH, (event) => crashes.push(event.payload))
+    await runner.onCrash(crashError(), { forced: true })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+
+    expect(policy).toHaveBeenCalledTimes(1)
+    expect(crashes.map(({ restart }) => restart)).toEqual([false])
+    expect(start).toHaveBeenCalledTimes(1)
+    await consumer.disconnect()
+  })
+
   test('recreation during the cleanup gap survives and resolves 0 instead of committed 99', async () => {
     const deciding = gate()
     const entered = gate()
