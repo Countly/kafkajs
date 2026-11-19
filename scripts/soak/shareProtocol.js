@@ -94,4 +94,28 @@ const shareRequestSummary = (frame) => {
   }
 }
 
-module.exports = { produceCodecs, shareRequestSummary }
+/**
+ * The share session change one ShareFetch request makes: its epoch, the partitions it lists and the
+ * partitions it forgets.
+ * @param {Buffer} frame Original length-prefixed ShareFetch request.
+ * @returns {{ epoch: number, partitions: { topicId: string, partition: number }[],
+ *   forgotten: { topicId: string, partition: number }[] }}
+ * @throws {Error} A frame that is not a ShareFetch request this reader knows, or is malformed.
+ */
+const shareFetchSession = (frame) => {
+  const header = readRequestHeader(frame)
+  if (header.apiKey !== 78 || header.apiVersion !== SHARE_READERS[78].version)
+    throw new Error(`no ShareFetch reader for api ${header.apiKey} v${header.apiVersion}`)
+  const request = SHARE_READERS[78].readRequest(frame.subarray(header.byteLength))
+  const list = (topics, of) =>
+    topics.flatMap(({ topicId, partitions }) =>
+      partitions.map((p) => ({ topicId, partition: of(p) }))
+    )
+  return {
+    epoch: request.shareSessionEpoch,
+    partitions: list(request.topics, (p) => p.partitionIndex),
+    forgotten: list(request.forgottenTopicsData, (p) => p),
+  }
+}
+
+module.exports = { produceCodecs, shareRequestSummary, shareFetchSession }

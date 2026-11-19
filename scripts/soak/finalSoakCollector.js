@@ -237,18 +237,19 @@ class Collector {
   }
 
   /**
-   * @param {Promise<unknown>} write one sink write
+   * @param {Promise<unknown>} write one sink write or sync
+   * @param {string} [what] what is named when it does not settle
    * @returns {Promise<unknown>} its result
    * @throws {Error} when it does not settle within `writeTimeoutMs`
    */
-  async bounded(write) {
+  async bounded(write, what = 'a write') {
     let timer = null
     try {
       return await Promise.race([
         write,
         new Promise((resolve, reject) => {
           timer = setTimeout(
-            () => reject(new Error(`a write did not settle within ${this.writeTimeoutMs} ms`)),
+            () => reject(new Error(`${what} did not settle within ${this.writeTimeoutMs} ms`)),
             this.writeTimeoutMs
           )
         }),
@@ -291,12 +292,22 @@ class Collector {
     this.writing = null
   }
 
-  /** @returns {Promise<void>} flushes and syncs the stream; later appends are refused */
+  /**
+   * Flushes and syncs the stream; later appends are refused. Every write and the sync are bounded
+   * by `writeTimeoutMs`, so a sink that stops completing I/O cannot hold the close.
+   * @returns {Promise<void>}
+   * @throws {Error} when the sync fails or does not settle in time, recorded as a failure first
+   */
   async close() {
     while (this.writing || this.waiters.length > 0)
       await (this.writing ?? new Promise(setImmediate))
     this.stopped = true
-    await this.sink.sync()
+    try {
+      await this.bounded(this.sink.sync(), 'the stream sync')
+    } catch (e) {
+      this.failures.push(e.message)
+      throw e
+    }
   }
 }
 
