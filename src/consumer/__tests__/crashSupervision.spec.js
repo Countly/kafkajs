@@ -298,6 +298,14 @@ async function start({
   }
 }
 
+const protocolError = (code) => new KafkaJSProtocolError(createErrorFromCode(code))
+
+/** Whether `error` or one of its causes is `target`. */
+const inCauseChain = (error, target) => {
+  for (; error; error = error.cause) if (error === target) return true
+  return false
+}
+
 /** A logger recording every line's message, so a test can look for a diagnostic. */
 const recordingLogger = () => {
   const lines = []
@@ -496,5 +504,118 @@ describe('Consumer > crash supervision', () => {
       },
       60000
     )
+  })
+  describe('a current consumer-group heartbeat answered with a fatal code the error table does not list', () => {
+    /**
+     * Answers an established member's next positive-epoch heartbeat with `make()` and waits for
+     * the crash, then 60 s more. Returns the trace after the fault with times dropped.
+     */
+    const fatalAnswer = async (make, { policy = jest.fn(async () => true) } = {}) => {
+      let answered = null
+      const run = await start({
+        retry: { initialRetryTime: 300, restartOnFailure: policy },
+        fault: () => (answered = make()),
+      })
+      run.arm()
+      await advanceUntil(() => run.crashes.length > 0, 20000)
+      const crashedAt = run.log.length
+      await jest.advanceTimersByTimeAsync(60000)
+      const fault = run.faultAt()
+      return {
+        answered,
+        policy,
+        crashes: run.crashes,
+        after: run.log
+          .filter((entry) => entry.at === undefined || entry.at >= fault)
+          .map(({ kind, epoch }) => [kind, epoch]),
+        sendsAfterCrash: run.log.slice(crashedAt).filter(({ kind }) => kind !== 'STOP'),
+        connects: run.cluster.connect.mock.calls.length,
+      }
+    }
+
+    it.each([
+      ['GROUP_ID_NOT_FOUND (69)', 69],
+      ['an unrecognised wire code (1042)', 1042],
+      ['a code with a generic retriable flag (7)', 7],
+    ])(
+      '%s ends the run like GROUP_AUTHORIZATION_FAILED: one policy call, one CRASH with restart false, nothing sent after it',
+      async (_, code) => {
+        const observed = await fatalAnswer(() => protocolError(code))
+        await cleanup()
+        cleanup = null
+        jest.restoreAllMocks()
+        const control = await fatalAnswer(() => protocolError(GROUP_AUTHORIZATION_FAILED))
+
+        expect(observed.policy).toHaveBeenCalledTimes(1)
+        expect(inCauseChain(observed.policy.mock.calls[0][0], observed.answered)).toBe(true)
+        expect(observed.crashes).toHaveLength(1)
+        expect(observed.crashes[0].restart).toBe(false)
+        expect(inCauseChain(observed.crashes[0].error, observed.answered)).toBe(true)
+        expect(observed.sendsAfterCrash).toEqual([])
+        expect(observed.connects).toBe(1)
+        expect(observed.after).toEqual(control.after)
+      },
+      120000
+    )
+
+    it('a policy clearing the public code and type of the answer still cannot restart the run', async () => {
+      const policy = jest.fn(async (error) => {
+        for (let e = error; e; e = e.cause) {
+          e.code = undefined
+          e.type = undefined
+        }
+        return true
+      })
+      const observed = await fatalAnswer(() => protocolError(69), { policy })
+
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(observed.crashes).toHaveLength(1)
+      expect(observed.crashes[0].restart).toBe(false)
+      expect(observed.connects).toBe(1)
+    }, 120000)
+
+    it.each([
+      ['GROUP_ID_NOT_FOUND (69)', 69],
+      ['an unrecognised wire code (1042)', 1042],
+      ['REBALANCE_IN_PROGRESS (27)', 27],
+      ['a code with a generic retriable flag (7)', 7],
+    ])(
+      '%s answering the first join ends the run after one join request with one CRASH and restart false',
+      async (_, code) => {
+        const policy = jest.fn(async () => true)
+        let answered = null
+        const run = await start({
+          retry: { initialRetryTime: 300, restartOnFailure: policy },
+          initial: () => (answered = protocolError(code)),
+          eachMessage: async () => {},
+        })
+        await advanceUntil(() => run.crashes.length > 0, 20000)
+        await jest.advanceTimersByTimeAsync(60000)
+
+        expect(beats(run, false)).toBe(1)
+        expect(policy).toHaveBeenCalledTimes(1)
+        expect(inCauseChain(policy.mock.calls[0][0], answered)).toBe(true)
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].restart).toBe(false)
+        expect(inCauseChain(run.crashes[0].error, answered)).toBe(true)
+        expect(run.log.filter(({ kind }) => kind === 'fetch')).toEqual([])
+        expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+      },
+      120000
+    )
+
+    it('GROUP_ID_NOT_FOUND answering the leave heartbeat completes the disconnect without a CRASH', async () => {
+      const run = await start({})
+      const answer = run.state.answer
+      run.state.answer = (req) =>
+        req.memberEpoch < 0 ? Promise.reject(protocolError(69)) : answer(req)
+      const closing = settled(run.consumer.disconnect())
+      await advanceUntil(() => closing.done, 10000)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(run.log.some(({ kind, epoch }) => kind === 'heartbeat' && epoch < 0)).toBe(true)
+      expect(run.crashes).toEqual([])
+      cleanup = null
+    })
   })
 })
