@@ -28,6 +28,10 @@ module.exports = class RequestQueue extends EventEmitter {
    *   exceeds its timeout, after that request was rejected with its own timeout error and before
    *   the `NETWORK_REQUEST_TIMEOUT` event. The queue does nothing else about the timeout: the owner
    *   decides what happens to the requests that remain (the connection fails its generation).
+   * @param {(error: Error) => void} [options.onDispatchFailure] Called when writing a queued request
+   *   from the queue's own dispatch timer threw, after that request was rejected with the error; the
+   *   owner ends the transport (the connection fails its generation). Whatever the owner leaves
+   *   unsettled is then rejected with the same error.
    */
   constructor({
     instrumentationEmitter = null,
@@ -39,6 +43,7 @@ module.exports = class RequestQueue extends EventEmitter {
     logger,
     isConnected = () => true,
     onRequestTimeout = () => {},
+    onDispatchFailure = () => {},
   }) {
     super()
     this.instrumentationEmitter = instrumentationEmitter
@@ -50,6 +55,7 @@ module.exports = class RequestQueue extends EventEmitter {
     this.logger = logger
     this.isConnected = isConnected
     this.onRequestTimeout = onRequestTimeout
+    this.onDispatchFailure = onDispatchFailure
     this.afterTimeout = (socketRequest) => {
       this.onRequestTimeout(socketRequest)
       this.emitQueueState()
@@ -346,14 +352,14 @@ module.exports = class RequestQueue extends EventEmitter {
   /**
    * Completes the request the response belongs to, after sending the pending requests the freed
    * slot admits. The request has left the in-flight set by then and no teardown can reach it, so
-   * it is completed even when sending a pending request, or an observer of that, throws: the
-   * valid response is delivered and the exception then propagates to the caller.
+   * it is completed even when sending a pending request throws: the valid response is delivered
+   * and the exception then propagates to the caller.
    * @public
    * @param {object} response
    * @param {number} response.correlationId
    * @param {Buffer} response.payload
    * @param {number} response.size
-   * @throws {Error} what sending a pending request, or an observer of that, threw
+   * @throws {Error} what sending a pending request threw
    */
   fulfillRequest({ correlationId, payload, size }) {
     this.lastActivityAt = Date.now()
@@ -488,17 +494,18 @@ module.exports = class RequestQueue extends EventEmitter {
   }
 
   /**
-   * Check and process pending requests either now or in the future
-   *
-   * This function will send out as many pending requests as possible taking throttling and
-   * in-flight limits into account.
+   * Sends as many pending requests as throttling and the in-flight limit allow, first in first
+   * out, then schedules the next check. Its diagnostics are contained, so only a send failure
+   * propagates.
+   * @returns {void}
+   * @throws {Error} what sending a pending request threw, after that request was rejected with it
    */
   checkPendingRequests() {
     while (this.pending.length > 0 && this.canSendSocketRequestImmediately()) {
-      const pendingRequest = this.pending.shift() // first in first out
+      const pendingRequest = this.pending.shift()
       this.sendSocketRequest(pendingRequest)
 
-      this.logger.debug(`Consumed pending request`, {
+      this.debugContained(`Consumed pending request`, {
         clientId: this.clientId,
         broker: this.broker,
         correlationId: pendingRequest.correlationId,
@@ -506,10 +513,32 @@ module.exports = class RequestQueue extends EventEmitter {
         currentPendingQueueSize: this.pending.length,
       })
 
-      this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+      try {
+        this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+      } catch (error) {
+        this.reportObserverFailure(error)
+      }
     }
 
     this.scheduleCheckPendingRequests()
+  }
+
+  /**
+   * Ends the queue's work after a send from its own dispatch timer threw, where no caller can
+   * receive the error: the owner ends the transport, and anything still queued or in flight is
+   * then rejected with the same error.
+   * @private
+   * @param {Error} error what the send threw
+   * @returns {void}
+   */
+  dispatchFailed(error) {
+    try {
+      this.onDispatchFailure(error)
+    } catch (failure) {
+      this.reportObserverFailure(failure)
+    } finally {
+      if (!this.isIdle()) this.rejectAll(error)
+    }
   }
 
   /**
@@ -544,7 +573,11 @@ module.exports = class RequestQueue extends EventEmitter {
     sharedSetup(() => {
       this.throttleCheckTimeoutId = setTimeout(() => {
         this.throttleCheckTimeoutId = null
-        this.checkPendingRequests()
+        try {
+          this.checkPendingRequests()
+        } catch (error) {
+          this.dispatchFailed(error)
+        }
       }, scheduleAt)
     })
   }

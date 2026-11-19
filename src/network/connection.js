@@ -261,6 +261,7 @@ module.exports = class Connection {
         this.setupAttempt?.fail(error)
         this.closeGeneration(error)
       },
+      onDispatchFailure: (error) => this.failGeneration(error),
     })
 
     this.versions = null
