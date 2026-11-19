@@ -329,6 +329,8 @@ module.exports = class ConsumerGroupProtocol {
     this.heartbeatManager = null
     /** @type {((partitions: import('./interface').TopicPartitions[], options?: object) => Promise<void>)|null} */
     this.commitBeforeRelease = null
+    /** @type {((error: Error) => void)|null} the run's handoff for a current fatal heartbeat answer */
+    this.onHeartbeatFatal = null
     /** @type {Promise<void>|null} the leave on the wire, whichever entry point started it */
     this.inFlightLeave = null
 
@@ -455,13 +457,21 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * Late-bound collaborators.
    * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object,
-   *   commitBeforeRelease?: ((partitions: import('./interface').TopicPartitions[], options?: object) => Promise<void>)|null }} deps
+   *   commitBeforeRelease?: ((partitions: import('./interface').TopicPartitions[], options?: object) => Promise<void>)|null,
+   *   onHeartbeatFatal?: ((error: Error) => void)|null }} deps `onHeartbeatFatal` receives a fatal
+   *   heartbeat answer to the current membership before any diagnostic of it
    * @returns {void}
    */
-  attach({ rebalanceCoordinator, heartbeatManager, commitBeforeRelease = null }) {
+  attach({
+    rebalanceCoordinator,
+    heartbeatManager,
+    commitBeforeRelease = null,
+    onHeartbeatFatal = null,
+  }) {
     this.rebalanceCoordinator = rebalanceCoordinator
     this.heartbeatManager = heartbeatManager
     this.commitBeforeRelease = commitBeforeRelease
+    this.onHeartbeatFatal = onHeartbeatFatal
   }
 
   /**
@@ -1519,14 +1529,14 @@ module.exports = class ConsumerGroupProtocol {
     if (code === UNSUPPORTED_VERSION || this.isUnsupportedApi(error)) {
       const unsupported = unsupportedConsumerProtocolError(error)
       learnOwnershipLoss(this.ownership, unsupported, REBALANCE_PATHS.HEARTBEAT, 'consumer')
-      return this.transitionToFatal(unsupported)
+      return this.transitionToFatal(unsupported, true)
     }
 
     if (code === INVALID_REGULAR_EXPRESSION) {
       if (!error.message.startsWith(INVALID_REGEX_PREFIX)) {
         error.message = `${INVALID_REGEX_PREFIX}${error.message}`
       }
-      return this.transitionToFatal(error)
+      return this.transitionToFatal(error, true)
     }
 
     if (code === TOPIC_AUTHORIZATION_FAILED) {
@@ -1550,7 +1560,7 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     if (isConsumerProtocolFatal(error)) {
-      return this.transitionToFatal(error)
+      return this.transitionToFatal(error, true)
     }
 
     if (error.name === 'KafkaJSInvariantViolation') {
@@ -1581,7 +1591,7 @@ module.exports = class ConsumerGroupProtocol {
   heartbeatFatal(error) {
     stampHeartbeatFatal(error)
     learnOwnershipLoss(this.ownership, error, REBALANCE_PATHS.HEARTBEAT, 'consumer')
-    return this.transitionToFatal(error)
+    return this.transitionToFatal(error, true)
   }
 
   /**
@@ -1631,9 +1641,11 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * @private
    * @param {Error} error
+   * @param {boolean} [heartbeat=false] whether `error` is a current heartbeat answer, which the run
+   *   receives before the diagnostic below, so no observer of it can run first
    * @returns {Error} the same error, so callers can `return this.transitionToFatal(e)`
    */
-  transitionToFatal(error) {
+  transitionToFatal(error, heartbeat = false) {
     this.fatalError = error
 
     // FENCED and STALE included: a fatal error learned on the commit or fetch path while the
@@ -1644,6 +1656,7 @@ module.exports = class ConsumerGroupProtocol {
       this.sentFields.reset()
       this.clearTarget()
     }
+    if (heartbeat) this.onHeartbeatFatal?.(error)
 
     this.logger.error('The consumer group membership failed fatally', {
       groupId: this.groupId,

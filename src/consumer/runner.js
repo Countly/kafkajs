@@ -187,6 +187,7 @@ module.exports = class Runner extends EventEmitter {
     consumerGroup.attach({
       rebalanceCoordinator: this.rebalanceCoordinator,
       heartbeatManager: this.heartbeatManager,
+      onHeartbeatFatal: (error) => this.reserveFatal(error),
     })
   }
 
@@ -216,29 +217,21 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    this.acceptVerdict(verdict)
+    this.rebalanceCoordinator.requestRejoin(verdict)
   }
 
   /**
-   * Hands a heartbeat verdict to the coordinator. A consumer-protocol fatal answer the coordinator
-   * keeps while the run is running arms the run's one fatal deadline: if the fetch loop has not
-   * claimed the answer one poll interval after its receipt, because a handler is still running,
-   * the run is retired and the crash reported without it.
+   * Reserves the run's one fatal deadline for a fatal heartbeat answer to the current membership,
+   * at its receipt and before any diagnostic or observer of it runs: if the fetch loop has not
+   * claimed the answer one poll interval later, because a handler is still running, the run is
+   * retired and the crash reported without it.
    * @private
-   * @param {import('./rebalanceCoordinator').Verdict} verdict
+   * @param {Error} error the answer
    * @returns {void}
    */
-  acceptVerdict(verdict) {
-    this.rebalanceCoordinator.requestRejoin(verdict)
-    if (
-      this.fatal ||
-      !this.running ||
-      this.consumerGroup.kind !== 'consumer' ||
-      !isConsumerProtocolFatal(verdict.error) ||
-      this.rebalanceCoordinator.verdict?.error !== verdict.error
-    )
-      return
-    const fatal = { error: verdict.error, timer: null, claimed: false }
+  reserveFatal(error) {
+    if (this.fatal || !this.running || !isConsumerProtocolFatal(error)) return
+    const fatal = { error, timer: null, claimed: false }
     // Outside any handler or callback store: the crash it reports must not inherit their authority.
     fatal.timer = this.rebalanceCoordinator.runInternal(() =>
       setTimeout(() => this.retire(consumerStoppingError()), this.pollTimer.deadline())
@@ -1063,7 +1056,7 @@ module.exports = class Runner extends EventEmitter {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
       if (verdict) {
-        this.acceptVerdict(verdict)
+        this.rebalanceCoordinator.requestRejoin(verdict)
       }
 
       if (this.consumerGroup.kind === 'consumer' && e.code === 29) return
