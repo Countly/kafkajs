@@ -399,7 +399,9 @@ module.exports = class Runner extends EventEmitter {
           // Read before the recovery can renew ownership.
           const independent = !thrown && this.isIndependentHandlerFailure(e, pending)
           const bailed = await rebalance(merged)
-          if (independent && !bailed && this.running && !this.stopRequested) throw e
+          // A verdict the recovery left in the slot is the outcome: the next attempt acts on it.
+          const settled = !bailed && !this.rebalanceCoordinator.hasVerdict()
+          if (independent && settled && this.running && !this.stopRequested) throw e
           return
         }
 
