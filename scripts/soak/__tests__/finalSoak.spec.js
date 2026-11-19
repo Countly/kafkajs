@@ -2046,6 +2046,33 @@ describe('final soak driver', () => {
     })
   })
 
+  test("a plan whose expected offers exceed 80% of the core checker's capacity refuses to start before it writes anything", async () => {
+    const { Supervisor, offerPlan } = require('../finalSoak')
+    expect(offerPlan(matrix, 'acceptance')).toEqual({ expected: 1470745, capacity: 1600000 })
+    expect(offerPlan(matrix, 'smoke')).toEqual({ expected: 24515, capacity: 1600000 })
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-capacity-'))
+    const options = {
+      matrix: 'scripts/soak/finalSoakMatrix.json',
+      expectSha: TREE,
+      brokers: ['k:1'],
+      out,
+    }
+    try {
+      const day = new Supervisor({ ...options, mode: 'acceptance' })
+      await expect(day.run()).rejects.toThrow(
+        "the plan expects 1470745 offers, more than 80% of the core checker's capacity of 1600000 (traffic.maxOffers)"
+      )
+      const smoke = new Supervisor({ ...options, mode: 'smoke' })
+      smoke.matrix.traffic.maxOffers.value = 30000
+      await expect(smoke.run()).rejects.toThrow(
+        "the plan expects 24515 offers, more than 80% of the core checker's capacity of 30000 (traffic.maxOffers)"
+      )
+      expect(fs.readdirSync(out)).toEqual([])
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
   test('a command to a process whose channel has closed resolves with an error instead of crashing the supervisor', async () => {
     const { Supervisor } = require('../finalSoak')
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-command-'))

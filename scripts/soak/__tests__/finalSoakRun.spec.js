@@ -238,6 +238,31 @@ describe('final soak producer shutdown', () => {
     await worker.disconnect()
   })
 
+  test('a producer whose offers were closed at the core checker capacity makes no offer and journals why', async () => {
+    const sent = []
+    useClient({ connect: async () => {}, send: async () => sent.push(1) && [{ baseOffset: '1' }] })
+    const runtime = workerRuntime('c08', boundedClock())
+    const worker = createWorker(runtime)
+    started.push(worker)
+    await worker.begin()
+    await worker.perform({ type: 'close-offers', id: 'close-offers' })
+    const reply = await worker.onProbe({
+      id: 'p',
+      execution: 'h00t0',
+      topic: config.topics.main,
+      partitions: 1,
+      count: 2,
+    })
+    expect(reply.acknowledged).toBe(0)
+    expect(sent).toEqual([])
+    expect(runtime.records.filter((r) => r.stage === 'offered')).toEqual([])
+    expect(runtime.records.filter((r) => r.kind === 'diagnostic').map((r) => r.message)).toEqual([
+      `offer to ${config.topics.main} not made: offers are closed at the core checker's capacity`,
+      `offer to ${config.topics.main} not made: offers are closed at the core checker's capacity`,
+    ])
+    await worker.disconnect()
+  })
+
   test('a probe whose deadline passes while its offered record is journaled is never sent, is recorded rejected, and the probe stops', async () => {
     const sent = []
     useClient({
@@ -376,6 +401,44 @@ const fakeChild = () => {
 }
 
 describe('final soak supervisor commands', () => {
+  test('offers stop at the core checker capacity: the supervisor journals the error, aborts and closes offers in every process once', () => {
+    const { s, remove } = supervisor()
+    try {
+      const capacity = matrix.traffic.maxOffers.value
+      expect(s.offerCapacity).toBe(capacity)
+      s.offerCapacity = 3
+      const sent = []
+      s.children = new Map([
+        ['p01', fakeChild()],
+        ['p02', fakeChild()],
+      ])
+      s.command = async (slot, step) => {
+        sent.push([slot, step.type])
+        return { reply: null, error: null }
+      }
+      const offered = { kind: 'identity', stage: 'offered' }
+      s.count(offered)
+      s.count({ kind: 'identity', stage: 'ack' })
+      s.count(offered)
+      expect(s.aborted).toBeNull()
+      expect(sent).toEqual([])
+      s.count(offered)
+      const reason =
+        "offers reached the core checker's capacity of 3 (traffic.maxOffers); no process makes another"
+      expect(s.problems).toEqual([reason])
+      expect(s.aborted).toBe(reason)
+      expect(sent).toEqual([
+        ['p01', 'close-offers'],
+        ['p02', 'close-offers'],
+      ])
+      s.count(offered)
+      expect(sent).toHaveLength(2)
+      expect(s.problems).toEqual([reason])
+    } finally {
+      remove()
+    }
+  })
+
   test('a command whose child exits after receiving it settles with an error and fails the run', async () => {
     const { s, remove } = supervisor()
     try {
