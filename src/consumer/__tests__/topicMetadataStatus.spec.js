@@ -612,4 +612,47 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       expect.objectContaining({ message: 'Failed to execute listener: undefined' })
     )
   }, 30000)
+
+  test.each([
+    ['classic', 'a literal subscription', { topics: [HEALTHY, DOOMED] }],
+    ['consumer', 'a literal subscription', { topics: [HEALTHY, DOOMED] }],
+    ['classic', 'a client-side pattern', { topics: [/^lifecycle-/] }],
+    ['consumer', 'a broker-side pattern', { regex: '^lifecycle-.*' }],
+  ])(
+    '%s: %s reads a recreated topic from its start, never from the offset committed for the deleted one',
+    async (protocol, kind, subscription) => {
+      const wire = scenario(
+        protocol,
+        { groupId: `lifecycle-stale-${protocol}-${kind.split(' ')[1]}` },
+        { committed: { 0: '73' } }
+      )
+      await wire.consumer.connect()
+      await wire.consumer.subscribe(subscription)
+      await wire.run()
+      await until(() => offsets(wire.observed, DOOMED).length >= 3, 'records from the topic')
+      expect(offsets(wire.observed, DOOMED)[0]).toBe('73')
+
+      wire.world.remove(DOOMED)
+      await until(
+        () => offsets(wire.observed, HEALTHY).length >= 8,
+        'healthy records after the deletion'
+      )
+      const after = wire.observed.records.length
+      wire.world.recreate(DOOMED, RECREATED_ID)
+      await until(
+        () => wire.observed.records.slice(after).some(({ topic }) => topic === DOOMED),
+        'a record from the new incarnation'
+      )
+
+      expect(observedRecreatedFromStart(wire.observed, after)).toBe(true)
+      const firstAsked = wire.cluster
+        .requests()
+        .filter(({ api }) => api === 'Fetch')
+        .flatMap(({ fields }) => fields.topics)
+        .find(({ topicId }) => topicId === RECREATED_ID)
+      expect(firstAsked.partitions[0].fetchOffset).toBe('0')
+      expect(wire.observed.crashes).toEqual([])
+    },
+    30000
+  )
 })
