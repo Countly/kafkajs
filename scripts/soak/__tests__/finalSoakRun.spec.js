@@ -14,6 +14,7 @@ const {
   ReaderWorker,
   DecoderWorker,
   WireLog,
+  ClientLog,
   createWorker,
   child,
 } = require('../finalSoakWorkers')
@@ -2404,6 +2405,87 @@ describe('final soak record timestamps and client log', () => {
     expect(stream.problems).toEqual([])
   })
 
+  /** @returns {object} a client log entry at `level` with `message` */
+  const entry = (message, level = 2) => ({
+    namespace: 'Consumer',
+    level,
+    log: { message, groupId: 'g1', timestamp: '2026-11-19T00:00:00.000Z' },
+  })
+  const readLog = (file) =>
+    fs
+      .readFileSync(file, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+
+  test('a client log past its byte budget counts every line, keeps the newest dropped ones and writes the counts when it closes', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
+    try {
+      const file = path.join(out, 'log.ndjson')
+      const log = new ClientLog({ file, maxBytes: 64 * 1024 + 2000 })
+      const add = log.creator()(2)
+      for (let n = 1; n <= 5001; n++) add(entry(`warning ${n}`))
+      expect(log.close()).toEqual({
+        total: 5001,
+        written: log.written,
+        dropped: 5001 - log.written,
+        failed: null,
+      })
+      expect(fs.statSync(file).size).toBeLessThanOrEqual(64 * 1024 + 2000)
+      const lines = readLog(file)
+      const summary = lines.at(-1)
+      expect(summary).toMatchObject({ summary: true, total: 5001, failed: null })
+      expect(summary.written).toBe(lines.length - 1)
+      expect(summary.tail.map((l) => l.message).at(-1)).toBe('warning 5001')
+      expect(summary.tail).toHaveLength(20)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a huge client log message is clipped to a fixed size', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
+    try {
+      const file = path.join(out, 'log.ndjson')
+      const log = new ClientLog({ file })
+      log.creator()(1)(entry('x'.repeat(5 * 1024 * 1024), 1))
+      log.close()
+      const [line] = readLog(file)
+      expect(Buffer.byteLength(JSON.stringify(line.message))).toBeLessThanOrEqual(1000)
+      expect(line.message).toMatch(/… \(5242880 characters\)$/)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a client log write that fails is recorded and never reaches the logging client', () => {
+    const files = {
+      openSync: () => 7,
+      writeSync: () => {
+        throw new Error('EIO')
+      },
+      closeSync: () => {},
+    }
+    const log = new ClientLog({ file: 'unused', files })
+    const add = log.creator()(2)
+    expect(() => add(entry('one'))).not.toThrow()
+    add(entry('two'))
+    expect(log.close()).toEqual({ total: 2, written: 0, dropped: 2, failed: 'EIO' })
+  })
+
+  test("a process's client log is closed at its stop and its counts are journaled", async () => {
+    const records = []
+    const runtime = {
+      slot: 'p01',
+      clientLog: { close: () => ({ total: 9, written: 7, dropped: 2, failed: null }) },
+      diagnose: async (message) => records.push(message),
+    }
+    await ChildRuntime.prototype.closeClientLog.call(runtime)
+    expect(records).toEqual([
+      'client log client-log.p01.ndjson: 9 WARN or ERROR lines, 7 written, 2 dropped',
+    ])
+  })
+
   test("a client's WARN and ERROR log lines reach a bounded file of its process in the artifact and lower levels do not", async () => {
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-client-log-'))
     try {
@@ -2433,8 +2515,10 @@ describe('final soak record timestamps and client log', () => {
       expect(lines.map((l) => [l.message, l.group])).toEqual([
         ['Rebalance is still running', 'g1'],
         ['broken line', 'g1'],
+        [undefined, undefined],
       ])
-      expect(runtime.clientLog.maxLines).toBe(5000)
+      expect(lines[2]).toMatchObject({ summary: true, total: 2, written: 2, dropped: 0 })
+      expect(runtime.clientLog.maxBytes).toBe(8 * 1024 * 1024)
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
