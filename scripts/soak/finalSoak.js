@@ -928,6 +928,7 @@ class Supervisor {
       this.problem(`${slot}: ${message.message}`)
       this.abort(`${slot}: ${message.message}`)
     } else if (message.type === 'readback') this.readback(slot, message)
+    else if (message.type === 'share-readback') this.shareReadback(slot, message)
     else if (message.type === 'telemetry-subscription')
       this.command('p16', {
         type: 'telemetry-subscriptions',
@@ -970,6 +971,50 @@ class Supervisor {
     })
     const child = slot ? this.children.get(slot) : null
     if (child?.connected) child.send({ type: 'reply', request }, () => {})
+  }
+
+  /**
+   * Reads a share group's state of one key from the share coordinator (`listShareGroupOffsets`:
+   * the persisted start offset and, on brokers that report it, the lag), records it as
+   * `broker-share-start` and answers the asking child with `{ topicId, startOffset, lag }`.
+   * A failed call is recorded with its error code and answered with nulls.
+   * @param {string} slot the child to answer
+   * @param {{ request: number, group: string, client: string, key: object }} body
+   * @returns {Promise<void>}
+   */
+  async shareReadback(slot, { request, group, client, key }) {
+    let row = null
+    let errorCode = 0
+    try {
+      const topics = await this.admin.listShareGroupOffsets({
+        groupId: group,
+        topics: [{ topic: key.topic, partitions: [key.partition] }],
+      })
+      const topic = topics.find((t) => t.topic === key.topic)
+      const partition = topic?.partitions.find((p) => p.partition === key.partition)
+      if (partition) {
+        errorCode = partition.errorCode
+        row = {
+          topicId: normalizeTopicId(topic.topicId),
+          startOffset: partition.startOffset === '-1' ? null : partition.startOffset,
+          lag: partition.lag,
+        }
+      }
+    } catch (e) {
+      errorCode = Number.isInteger(e.code) ? e.code : -1
+    }
+    const value = { topicId: null, startOffset: null, lag: null, ...row }
+    await this.emit({
+      kind: 'identity',
+      stage: 'broker-share-start',
+      client,
+      group,
+      key,
+      ...value,
+      errorCode,
+    })
+    const child = this.children.get(slot)
+    if (child?.connected) child.send({ type: 'reply', request, value }, () => {})
   }
 
   /**
