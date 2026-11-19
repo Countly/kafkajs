@@ -1300,50 +1300,51 @@ module.exports = (params) => {
      */
     const onCrash = async (e, owned, startGeneration, { forced = false } = {}) => {
       const admitted = !owned.fence.closed
-      const joining = forced ? closing : null
-      // Admitted before the first diagnostic, so a close that diagnostic starts joins the cleanup.
-      const cleaned = admitted && !joining ? deferred() : null
+      // Published before the first diagnostic, so a close that diagnostic starts joins the cleanup.
+      const cleaned = admitted ? deferred() : null
       if (cleaned) crashCleanup = cleaned.promise
-      logger.error(`Crash: ${e.name}: ${e.message}`, {
-        groupId,
-        retryCount: e.retryCount,
-        stack: e.stack,
-      })
-
-      if (!admitted) {
-        logger.warn('A run of a closed connection crashed late; nothing more is done for it', {
-          groupId,
-        })
-        return
+      const settleCleanup = () => {
+        cleaned?.resolve()
+        if (crashCleanup === cleaned?.promise) crashCleanup = null
       }
-
-      const getOriginalCause = (error) => {
-        if (error.cause) {
-          return getOriginalCause(error.cause)
-        }
-
-        return error
-      }
-
-      // The restart rejoins under the id the expired round held, read before the shutdown forgets it.
-      if (isJoinDeadline(getOriginalCause(e)))
-        retainedMemberId = consumerGroup?.retainableMemberId()
+      const getOriginalCause = (error) => (error.cause ? getOriginalCause(error.cause) : error)
+      const crashStopGeneration = startGeneration + 1
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
       // user gets, because consumer.run() has already resolved by the time the runner dies.
       // shutDown() already logs this failure itself (and rethrows), so there is nothing
       // further to log here; just make sure it cannot stop the CRASH event from firing.
-      const crashStopGeneration = startGeneration + 1
       try {
+        logger.error(`Crash: ${e.name}: ${e.message}`, {
+          groupId,
+          retryCount: e.retryCount,
+          stack: e.stack,
+        })
+
+        if (!admitted) {
+          logger.warn('A run of a closed connection crashed late; nothing more is done for it', {
+            groupId,
+          })
+          return
+        }
+
+        // The restart rejoins under the id the expired round held, read before the shutdown forgets it.
+        if (isJoinDeadline(getOriginalCause(e)))
+          retainedMemberId = consumerGroup?.retainableMemberId()
+
         if (e.name === 'KafkaJSConnectionClosedError') {
           cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
         }
-        if (joining) await joining.promise
-        else await shutDown(undefined, { keepResets: true, preserveSetupState: true })
+        // Read after the diagnostic: a forced crash joins a close admitted before or during it, for
+        // one stop and one teardown. Its own cleanup is released first, since that close joins it.
+        const joining = forced ? closing : null
+        if (joining) {
+          settleCleanup()
+          await joining.promise
+        } else await shutDown(undefined, { keepResets: true, preserveSetupState: true })
       } catch {
       } finally {
-        cleaned?.resolve()
-        if (crashCleanup === cleaned?.promise) crashCleanup = null
+        settleCleanup()
       }
 
       const isErrorRetriable =
