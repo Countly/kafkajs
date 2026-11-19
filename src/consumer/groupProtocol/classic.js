@@ -178,7 +178,9 @@ module.exports = class ClassicGroupProtocol {
 
         this.instrumentationEmitter.emit(HEARTBEAT, payload)
         this.lastRequest = Date.now()
+        return true
       }
+      return false
     })
   }
 
@@ -770,7 +772,8 @@ module.exports = class ClassicGroupProtocol {
    * was retired. Concurrent calls share one request, and the first caller's `guard` governs it.
    * @param {{ interval: number, guard?: () => Error|null }} options `guard` is the caller's refusal,
    *   checked again after the coordinator lookup and before the write
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true when a heartbeat was sent and answered with success, false when
+   *   the interval had not passed or no member id is held
    * @throws {Error} the guard's refusal, when it refuses after the lookup
    */
   async heartbeat({ interval, guard }) {

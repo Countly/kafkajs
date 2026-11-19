@@ -73,6 +73,15 @@ const leaveEpochFor = (isStatic, leaveGroup) =>
  */
 const MAX_UNRESOLVED_ATTEMPTS = 2
 
+/**
+ * The shortest wait before a join the coordinator fenced is sent again, whatever the retry settings
+ * compute: the same floor as the wait between two reconciliation rounds.
+ */
+const MIN_FENCED_JOIN_BACKOFF_MS = 100
+
+/** The longest delay a Node.js timer takes; a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2147483647
+
 const COORDINATOR_LOAD_IN_PROGRESS = 14
 const COORDINATOR_NOT_AVAILABLE = 15
 const NOT_COORDINATOR = 16
@@ -326,18 +335,17 @@ module.exports = class ConsumerGroupProtocol {
     // interval gate below a busy consumer would issue one request per record.
     this.sharedHeartbeat = sharedPromiseTo(async ({ interval }) => {
       if (shouldSkipHeartbeat(this.state)) {
-        return
+        return false
       }
 
       const now = Date.now()
 
       if (this.backoff.pending(now)) {
-        return
+        return false
       }
 
       if (this.immediatePending && shouldHeartbeatNow(this.state)) {
-        await this.sendHeartbeat({ sendAllFields: this.state === JOINING })
-        return
+        return this.sendHeartbeat({ sendAllFields: this.state === JOINING })
       }
 
       // A backoff that has ELAPSED is itself the schedule. The interval gate is measured from the
@@ -346,15 +354,14 @@ module.exports = class ConsumerGroupProtocol {
       // the backoff would never grow past its first step. It is ONE request, consumed by the send
       // below: this is the retry the backoff owed, not a mode the gate stays off in.
       if (this.backoff.isDue(now)) {
-        await this.sendHeartbeat({ sendAllFields: this.state === JOINING })
-        return
+        return this.sendHeartbeat({ sendAllFields: this.state === JOINING })
       }
 
       if (now < this.lastRequestAt + Math.max(interval, this.heartbeatIntervalMs)) {
-        return
+        return false
       }
 
-      await this.sendHeartbeat({ sendAllFields: false })
+      return this.sendHeartbeat({ sendAllFields: false })
     })
 
     this.sharedLeave = sharedPromiseTo((options) => this.performLeave(options))
@@ -496,6 +503,19 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
+   * The deadline of a join started now: the rebalance timeout counted from the end of the backoff
+   * still armed (after a fenced join, for example), so the wait does not use it up. Only a member
+   * that will join gets the extra time, and the sum is held to the longest timer delay.
+   * @param {number} timeoutMs the rebalance timeout
+   * @returns {number} milliseconds, at most 2147483647
+   */
+  joinBudget(timeoutMs) {
+    const joins = this.memberEpoch <= 0 || isNotInGroup(this.state) || this.state === JOINING
+    const delay = joins ? this.backoff.remaining(Date.now()) : 0
+    return Math.min(MAX_TIMER_MS, timeoutMs + delay)
+  }
+
+  /**
    * Whether the coordinator wants something this member does not have yet - counting only the
    * partitions a round's apply would keep: those whose topic name is known and, under a client
    * pattern, is in the desired subscription. An unresolved topic id deliberately does NOT make
@@ -531,16 +551,24 @@ module.exports = class ConsumerGroupProtocol {
    * apply. It never applies anything itself and never sends the acknowledgement: the apply calls
    * `setOwned`, and that is where the acknowledgement is triggered.
    *
+   * Owns one invariant: a step returns only a result to apply. When a newer target, or the rollback
+   * of a failed `subscribe()` (or a mode change) retiring the metadata scope, replaces what the
+   * step is resolving while its membership still holds a target, the step resolves again against
+   * the live target under the current scope. It stops at the round's own refusal: at the round
+   * deadline the round fails with its join deadline error, as for any step that outlives it.
+   *
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void,
-   *   growSubscription?: (names: string[]) => Promise<void> }} context
+   *   growSubscription?: (names: string[]) => Promise<void>, round?: { guard: () => Error|null } }}
+   *   context `round` is the round attempt the step runs for
    * @returns {Promise<{ assignment: Object, userData: null }>} the assignment in the name-keyed
    *   shape the apply expects
-   * @throws {Error} the stored fatal error when this member may never rejoin; whatever the join
-   *   failed with otherwise
+   * @throws {Error} the stored fatal error when this member may never rejoin; `ASSIGNMENT_CHANGED`
+   *   when a fencing, a fatal error, a leave or a rejoin retired the membership during the step;
+   *   the round's refusal; whatever the join failed with otherwise
    */
   async rebalance(context) {
     if (isLeavingGroup(this.state) && this.inFlightLeave) await this.inFlightLeave
-    const { beforeSync, growSubscription } = context
+    const { beforeSync, growSubscription, round } = context
 
     if (this.state === FATAL) {
       throw this.fatalError
@@ -571,11 +599,20 @@ module.exports = class ConsumerGroupProtocol {
       return { assignment: this.ownedAsObject(), userData: null }
     }
 
-    const isCurrent = this.targetGuard()
-    const resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
-    await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
-    if (!isCurrent()) throw assignmentChangedError()
+    let isCurrent, resolved
+    for (;;) {
+      isCurrent = this.targetGuard()
+      try {
+        resolved = await this.resolveAssignmentTopicNames(this.target, isCurrent)
+        await this.growSubscriptionWith(growSubscription, resolved.names, isCurrent)
+        if (isCurrent()) break
+      } catch (error) {
+        if (error?.type !== 'ASSIGNMENT_CHANGED') throw error
+      }
+      if (!isCurrent.member()) throw assignmentChangedError()
+      const refusal = round?.guard()
+      if (refusal) throw refusal
+    }
 
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
@@ -622,7 +659,8 @@ module.exports = class ConsumerGroupProtocol {
    *
    * The deadline is not optional. Without it a coordinator that keeps answering
    * `COORDINATOR_LOAD_IN_PROGRESS` - which is swallowed rather than raised - leaves the retrier
-   * with nothing to retry and the round never settles, which holds a `stop()` open forever.
+   * with nothing to retry and the round never settles, which holds a `stop()` open forever. It is
+   * `joinBudget` of the rebalance timeout.
    *
    * @private
    * @returns {{ promise: Promise<void>, resolve: Function, reject: Function }}
@@ -635,7 +673,7 @@ module.exports = class ConsumerGroupProtocol {
         this.rejectFirstMembership(
           joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeoutMs })
         ),
-      this.rebalanceTimeoutMs
+      this.joinBudget(this.rebalanceTimeoutMs)
     )
 
     this.#firstMembership = record
@@ -789,21 +827,26 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Captures a membership and target identity that is never reused, even at equal local epochs,
-   * and, for a client-pattern consumer, the metadata scope: an accepted mode change retires it.
+   * and, for a client-pattern consumer, the metadata scope: an accepted mode change and the
+   * rollback of a failed `subscribe()` retire it.
    * @private
-   * @returns {() => boolean} true only while this member may use the captured target
+   * @returns {(() => boolean) & { member: () => boolean }} true only while this member may use the
+   *   captured target; `member()` true while the captured membership still holds a target, whatever
+   *   became of the target revision and the scope (a fencing, a fatal error and a leave clear the
+   *   target, a leave only after its commit, hence the state check)
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
     const scope = this.subscription?.captureScope()
-    return () =>
-      (!scope || scope()) &&
+    const member = () =>
       membership === this.membershipRevision &&
-      target === this.targetRevision &&
       this.target != null &&
       !isNotInGroup(this.state) &&
       !isLeavingGroup(this.state)
+    return Object.assign(() => (!scope || scope()) && target === this.targetRevision && member(), {
+      member,
+    })
   }
 
   /**
@@ -1015,7 +1058,8 @@ module.exports = class ConsumerGroupProtocol {
    * unless the state owes an immediate one or a backoff has come due. The gate is load-bearing -
    * the runner calls this per message, per batch and on every empty fetch round.
    * @param {{ interval: number }} options
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true only when a heartbeat was sent and answered with success for
+   *   the membership the member still holds; false when none was sent or its answer was dropped
    */
   async heartbeat({ interval }) {
     return this.sharedHeartbeat({ interval })
@@ -1034,10 +1078,18 @@ module.exports = class ConsumerGroupProtocol {
    * finishes after the membership was replaced ends the call: nothing is published, built or sent,
    * and a failure of it is stamped with that membership and not counted against the replacement.
    *
+   * Owns one invariant: an answer is valid if and only if the broker membership the request was
+   * sent under (`membershipRevision`, moved by a fencing, a fatal error, a leave or a new join, and
+   * never by an assignment apply) is still the member's. An answer to a replaced membership has no
+   * effect, even when the rejoin reused the member id and epoch. A valid refusal is charged to the
+   * ownership current when it arrives, so an apply between send and answer cannot hide it. A leave
+   * completes by its own state rule.
+   *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null }} options
    *   `guard` is a leave's private pre-write refusal; it never reaches the request
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true only for a success answered to the membership the member still
+   *   holds (never for a leave); false when nothing was sent or the answer had no effect
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
   async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard }) {
@@ -1052,7 +1104,7 @@ module.exports = class ConsumerGroupProtocol {
           groupId: this.groupId,
         })
         this.onRequestGenerated({ leaveEpoch, stateAtRequest: this.state })
-        return
+        return false
       }
 
       try {
@@ -1063,7 +1115,7 @@ module.exports = class ConsumerGroupProtocol {
         throw error
       }
 
-      if (this.ownershipReplaced(ownershipToken)) return
+      if (this.ownershipReplaced(ownershipToken)) return false
     }
 
     const request = buildRequest(this, { sendAllFields, leaveEpoch })
@@ -1082,8 +1134,7 @@ module.exports = class ConsumerGroupProtocol {
         ...(guard && { guard }),
       })
 
-      if (this.ownershipReplaced(ownershipToken) || guard?.()) return
-      if (this.answersEarlierMembership(membershipAtRequest)) return
+      if (membershipAtRequest !== this.membershipRevision || guard?.()) return false
       this.sentFields.remember(request)
       if (request.SubscribedTopicRegex !== undefined) {
         this.regexUpdated = false
@@ -1098,9 +1149,10 @@ module.exports = class ConsumerGroupProtocol {
       })
 
       this.onSuccess(response)
+      return leaveEpoch == null
     } catch (error) {
-      stampOwnership(error, ownershipToken)
-      if (obsoleteOwnership(this.ownership, error)) throw error
+      if (membershipAtRequest !== this.membershipRevision) return false
+      stampOwnership(error, this.ownership?.token())
       this.sentFields.reset()
 
       if (leaveEpoch != null) {
@@ -1112,36 +1164,21 @@ module.exports = class ConsumerGroupProtocol {
           groupId: this.groupId,
           error: error.message,
         })
-        return
+        return false
       }
 
       const fencing = error.code === UNKNOWN_MEMBER_ID || error.code === FENCED_MEMBER_EPOCH
-      if (fencing && this.answersEarlierMembership(membershipAtRequest)) return
+      // A fenced join is retried by the next LOST round at once; the backoff paces those joins.
+      if (fencing && sentUnderEpoch === 0) {
+        this.backoff.onFailedAttempt(Date.now(), MIN_FENCED_JOIN_BACKOFF_MS)
+      }
 
-      throw stampOwnership(
-        this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch)),
-        ownershipToken
-      )
+      throw this.classifyHeartbeatError(stampGeneration(error, sentUnderEpoch))
     } finally {
-      if (!this.ownershipReplaced(ownershipToken)) {
+      if (leaveEpoch != null || membershipAtRequest === this.membershipRevision) {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest })
       }
     }
-  }
-
-  /**
-   * Whether an answer belongs to a request built in an earlier membership while the member is
-   * joining anew (it was fenced out of, or left, that membership and began a new join). A success
-   * would install the old epoch over the join's zero and settle the join with no epoch-0
-   * heartbeat; a fencing error would fence the new join for the old one's loss. Outside a new join
-   * the answer is still processed, so a fencing learned from it reaches the member. The revision
-   * moves only on resets, never on reconciliation progress.
-   * @private
-   * @param {symbol} membershipAtRequest `membershipRevision` when the request was built
-   * @returns {boolean}
-   */
-  answersEarlierMembership(membershipAtRequest) {
-    return this.state === JOINING && membershipAtRequest !== this.membershipRevision
   }
 
   /**

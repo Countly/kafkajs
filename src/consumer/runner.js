@@ -921,7 +921,7 @@ module.exports = class Runner extends EventEmitter {
    * which is reached once per rebalance. Under cooperative rebalancing a revocation RESOLVES
    * instead of throwing, so the error never reaches the worker, the fetcher or the fetch manager's
    * own teardown - which is the whole point of not stopping the world. It also ends the heartbeat
-   * outage on a success, marks the error's request class as `heartbeat`, and resolves a cooperative
+   * outage on a success the membership answered (not on a gated call or a dropped answer), marks the error's request class as `heartbeat`, and resolves a cooperative
    * classic member's `NOT_COORDINATOR` while that outage is absorbed.
    * @returns {Promise<void>}
    */
@@ -931,11 +931,11 @@ module.exports = class Runner extends EventEmitter {
     if (!this.running) return
 
     try {
-      await this.consumerGroup.heartbeat({
+      const answered = await this.consumerGroup.heartbeat({
         interval: this.consumerGroup.heartbeatInterval(),
         guard: () => this.retirement ?? null,
       })
-      this.outages.heartbeat.end()
+      if (answered) this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
