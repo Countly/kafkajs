@@ -1623,6 +1623,47 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.information.incompleteWaves).toEqual([`${cause} has 1 of 2 wave-key records`])
     })
 
+    /** The open-wave cap: every client kind running every wave of one membership execution at once, transfer and return. */
+    const waveCap =
+      fx.matrix.schedule.executions.find((e) => e.shape === 'membership-churn').waves *
+      2 *
+      Object.keys(fx.matrix.clientKinds).length
+
+    it('keeps the verdict with as many open waves as the schedule allows at once', async () => {
+      const edit = (records) => [
+        ...records,
+        ...Array.from({ length: waveCap }, (_, n) => wave(`p01.o${n}`, 'transfer', true, 1)),
+      ]
+      const report = await check(fx.healthy(), { edit })
+      expect(report.overall).toBe('ACCEPTED')
+      expect(report.information.incompleteWaves).toHaveLength(20)
+    })
+
+    it('is inconclusive with one named reason, and counts no key of a dropped wave, when more waves stay open than the schedule allows', async () => {
+      const edit = (records) => [
+        ...records,
+        ...Array.from({ length: waveCap + 5 }, (_, n) => wave(`p01.o${n}`, 'transfer', true, 1)),
+        waveKey(`p01.o${waveCap + 2}`, true),
+      ]
+      const report = await check(fx.healthy(), { edit })
+      const reason = new RegExp(
+        `more than ${waveCap} membership waves wait for their wave-key records`
+      )
+      for (const id of ['K1', 'K2', 'K3', 'K5', 'K6']) expectRow(report, id, 'INCONCLUSIVE', reason)
+      expect(row(report, 'K1').reasons.filter((r) => reason.test(r))).toHaveLength(1)
+      expect(report.information.waves.keys.transfer).toEqual({ paused: 0, held: 0 })
+      expect(report.overall).toBe('NOT ACCEPTED')
+    })
+
+    it('counts no key and keeps the verdict for a wave-key record citing no open wave', async () => {
+      const report = await check(fx.healthy(), {
+        edit: (records) => [...records, waveKey('p01.none', true)],
+      })
+      expect(report.overall).toBe('ACCEPTED')
+      expect(report.information.waves.keys.transfer).toEqual({ paused: 0, held: 0 })
+      expect(report.information.waves.keys.return).toEqual({ paused: 0, held: 0 })
+    })
+
     it('fails an acknowledged send whose offset the broker did not return when it is in the dump twice', async () => {
       const world = fx.healthy()
       const lines = dumpOf(world, 'main')
@@ -1799,6 +1840,17 @@ describe('scripts/evidence/finalSoakCore', () => {
       })
       expectRow(report, 'K7', 'FAIL', /outer-exit\.json: differs from the header manifest/)
     })
+
+    it.each([['supervisor.json'], ['header.json']])(
+      'fails K7 and does not read %s whole when it is larger than the side-file cap',
+      async (file) => {
+        const report = await onDisk(smoke(), (dir) =>
+          fs.writeFileSync(path.join(dir, file), ' '.repeat((16 << 20) + 1))
+        )
+        expectRow(report, 'K7', 'FAIL', new RegExp(`${file}: larger than 16777216 bytes`))
+        expect(report.overall).toBe('REJECTED')
+      }
+    )
 
     it('fails K7 for a stream line that is not JSON', async () => {
       const report = await onDisk(smoke(), (dir) =>
