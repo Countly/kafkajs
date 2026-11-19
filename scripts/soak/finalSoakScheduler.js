@@ -9,6 +9,33 @@ const { SHAPES } = require('./finalSoakSchema')
 /** @param {object} setting a matrix `{ value, unit, source }` setting @returns {number} */
 const valueOf = (setting) => setting.value
 
+/** The timers the harness armed for its own waits and bounds, until each fires or is cleared. */
+const harnessTimers = new Set()
+
+/**
+ * `setTimeout` for a wait or bound the harness itself arms. A resource sample subtracts these, so
+ * it never counts a timer the harness made for the measurement or the teardown.
+ * @param {(...args: unknown[]) => void} fn @param {number} ms @param {...unknown} args
+ * @returns {NodeJS.Timeout} the timer, cleared with `clearHarnessTimeout`
+ */
+const harnessTimeout = (fn, ms, ...args) => {
+  const timer = setTimeout(() => {
+    harnessTimers.delete(timer)
+    fn(...args)
+  }, ms)
+  harnessTimers.add(timer)
+  return timer
+}
+
+/** @param {NodeJS.Timeout|null} timer a `harnessTimeout` timer @returns {void} */
+const clearHarnessTimeout = (timer) => {
+  harnessTimers.delete(timer)
+  clearTimeout(timer)
+}
+
+/** @returns {number} the harness timers that keep the event loop alive now */
+const liveHarnessTimers = () => [...harnessTimers].filter((t) => t.hasRef()).length
+
 /** The host's monotonic clock, relative to an origin captured once per run. */
 class MonotonicClock {
   /** @param {number} [originMs] the run origin in monotonic ms; now by default */
@@ -36,7 +63,7 @@ class MonotonicClock {
     return new Promise((resolve) => {
       let timer = null
       const done = () => {
-        clearTimeout(timer)
+        clearHarnessTimeout(timer)
         signal?.removeEventListener('abort', done)
         resolve()
       }
@@ -44,7 +71,7 @@ class MonotonicClock {
       const check = () => {
         const wait = at - this.now()
         if (wait <= 0) done()
-        else timer = setTimeout(check, Math.ceil(wait))
+        else timer = harnessTimeout(check, Math.ceil(wait))
       }
       signal?.addEventListener('abort', done, { once: true })
       check()
@@ -428,4 +455,14 @@ class SamplingGate {
   }
 }
 
-module.exports = { valueOf, MonotonicClock, planSchedule, scheduleTotals, Scheduler, SamplingGate }
+module.exports = {
+  valueOf,
+  harnessTimeout,
+  clearHarnessTimeout,
+  liveHarnessTimers,
+  MonotonicClock,
+  planSchedule,
+  scheduleTotals,
+  Scheduler,
+  SamplingGate,
+}
