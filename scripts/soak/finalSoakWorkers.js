@@ -25,6 +25,15 @@ const { ChurnClientLog } = require('./consumerChurn')
 
 /** Delivered share offsets kept above a key's first missing one before the gap is given up on. */
 const SHARE_AHEAD_MAX = 100000
+
+/** How long a drain without its own deadline, and a recovery witness, may take. */
+const DRAIN_MS = 60000
+
+/** @param {string} k `topic|partition` @returns {[string, number]} the topic and partition */
+const splitKey = (k) => {
+  const at = k.lastIndexOf('|')
+  return [k.slice(0, at), Number(k.slice(at + 1))]
+}
 /** Bytes after which a raw wire segment file is closed and the next one started. */
 const WIRE_SEGMENT_BYTES = 64 * 1024 * 1024
 
@@ -1177,16 +1186,19 @@ class ProducerWorker extends Worker {
  * a paused partition, static restarts, and the seed's retained offset map.
  */
 class ConsumerWorker extends Worker {
-  /** The last offset this process committed for each key of its group, by any of its members. */
-  groupCommitted = new Map()
+  /** How many handler calls of this process's members have settled. */
+  handled = 0
+  /** Per `group/topicId/partition`, the highest next offset entered and the authority entering it. */
+  progress = new Map()
+  /** Per `client/topicId/partition`, the cause of the key's last acquisition boundary. */
+  lastBoundary = new Map()
+  /** The seed's retained offset map while the seed runs, else null. */
+  retained = null
 
   /** @returns {Promise<void>} */
   async begin() {
     const slot = this.runtime.slots.find((c) => c.purpose === 'subject' || c.purpose === 'control')
     this.seeded = slot.purpose === 'control'
-    this.retained = null
-    this.progress = new Map()
-    this.lastBoundary = new Map()
     const rig = await this.join(slot)
     this.standing.push(rig)
     if (
@@ -1206,11 +1218,7 @@ class ConsumerWorker extends Worker {
     const rig = this.rig(slot)
     const { options } = clientOptions(runtime.config, runtime.matrix, slot)
     const consumer = await rig.construct((kafka) => kafka.consumer(options))
-    rig.processed = new Map()
     rig.uncommitted = new Map()
-    rig.committed = new Map()
-    rig.authority = new Map()
-    consumer.on(consumer.events.END_BATCH_PROCESS, ({ payload }) => this.onBatchEnd(rig, payload))
     await rig.call('connect', () => consumer.connect(), execution)
     await this.operation(rig, 'subscribe', [], execution, () =>
       consumer.subscribe({ topics: this.topicsFor(slot), fromBeginning: true })
@@ -1290,7 +1298,6 @@ class ConsumerWorker extends Worker {
         acquisition: null,
         deliveryCount: null,
       })
-      rig.authority.set(`${topic}|${partition}`, { key, authority })
     }
     if (this.retained && topic === runtime.config.topics.main)
       this.retained.set(`${partition}:${message.offset}`, String(message.offset))
@@ -1302,11 +1309,16 @@ class ConsumerWorker extends Worker {
       outcome: 'processed',
       errorType: null,
     })
-    const k = `${topic}|${partition}`
-    rig.processed.set(k, (BigInt(message.offset) + 1n).toString())
+    this.handled++
+    if (!topicId || !authority) return
+    const k = `${topicId}|${partition}`
     rig.uncommitted.set(k, (rig.uncommitted.get(k) ?? 0) + 1)
     if (rig.uncommitted.get(k) >= valueOf(runtime.matrix.traffic.commitEvery))
-      await this.commit(rig, k)
+      await this.commit(
+        rig,
+        { key: { topic, topicId, partition }, authority },
+        (BigInt(message.offset) + 1n).toString()
+      )
   }
 
   /**
@@ -1370,22 +1382,20 @@ class ConsumerWorker extends Worker {
   }
 
   /**
-   * Commits a key's processed next offset under the authority its last handler carried, or under
-   * `current` when given, inside the commit store so the write and publish stages are recorded,
-   * then asks for the broker readback. Only a commit that succeeded settles the offsets it covered
-   * and becomes the group's last commit of the key; a failed one leaves them owed.
-   * @param {ClientRig} rig @param {string} k `topic|partition`
-   * @param {{ key: object, authority: object }} [current] the member's current key and authority
-   * @returns {Promise<'ok'|'refused'|'unknown'|null>} the commit's outcome, null when nothing was
-   *   committed
+   * Commits one next offset of a key under the given authority, inside the commit store so the
+   * write and publish stages are recorded, then asks for the broker readback. A commit that
+   * succeeded settles the offsets the member owed on the key; a failed one leaves them owed.
+   * @param {ClientRig} rig
+   * @param {{ key: { topic: string, topicId: string, partition: number }, authority: object }} captured
+   *   the key and the authority the commit is made under
+   * @param {string} next the decimal next offset to commit
+   * @returns {Promise<'ok'|'refused'|'unknown'>} the commit's outcome
    */
-  async commit(rig, k, current = null) {
+  async commit(rig, captured, next) {
     const { runtime } = this
-    const next = rig.processed.get(k)
-    const captured = current ?? rig.authority.get(k)
-    if (!next || !captured) return null
+    const k = `${captured.key.topicId}|${captured.key.partition}`
     const owed = rig.uncommitted.get(k) ?? 0
-    const { topic, partition } = { topic: captured.key.topic, partition: captured.key.partition }
+    const { topic, partition } = captured.key
     const commit = `${rig.id}.m${runtime.ids}`
     const base = {
       kind: 'identity',
@@ -1410,9 +1420,9 @@ class ConsumerWorker extends Worker {
       await runtime.commits.run(base, () =>
         rig.object.commitOffsets([{ topic, partition, offset: next }])
       )
-      rig.committed.set(k, next)
-      this.groupCommitted.set(k, next)
-      rig.uncommitted.set(k, Math.max(0, (rig.uncommitted.get(k) ?? 0) - owed))
+      const left = (rig.uncommitted.get(k) ?? 0) - owed
+      if (left > 0) rig.uncommitted.set(k, left)
+      else rig.uncommitted.delete(k)
     } catch (e) {
       outcome =
         e.name === 'KafkaJSCommitFailedError' || e.name === 'KafkaJSStaleAssignmentError'
@@ -1614,22 +1624,6 @@ class ConsumerWorker extends Worker {
     return this.assignedKeys(rig).filter((k) => k.topic === topic)
   }
 
-  /**
-   * Records that the member resolved a key through a batch that held no application message (only
-   * control records or aborted records): the product itself resolved it, so the member's next
-   * offset moves past it. A batch that carried messages is resolved by its handlers, never by the
-   * batch's last offset, which a pause or stale assignment can leave unprocessed.
-   * @param {ClientRig} rig
-   * @param {{ topic: string, partition: number, batchSize: number, lastOffset: string|null }} batch
-   * @returns {void}
-   */
-  onBatchEnd(rig, { topic, partition, batchSize, lastOffset }) {
-    if (batchSize !== 0 || lastOffset == null) return
-    const k = `${topic}|${partition}`
-    const next = BigInt(lastOffset) + 1n
-    if (next > BigInt(rig.processed.get(k) ?? 0)) rig.processed.set(k, next.toString())
-  }
-
   /** @param {ClientRig} rig @param {string} topic @returns {boolean} whether the member reads it */
   reads(rig, topic) {
     return this.topicsFor(rig.slot).some((t) =>
@@ -1638,105 +1632,156 @@ class ConsumerWorker extends Worker {
   }
 
   /**
-   * Commits every key whose resolved next offset is ahead of the member's last successful commit,
-   * outside any handler. The member still owns a key while it holds the acquisition its last
-   * handler ran under (same client run, `acquiredAt` and `recreatedAt`); a membership round that
-   * retained the key (a cooperative or consumer-protocol rebalance) only advances the token, and
-   * the commit then carries the current authority. Any other key is an expected skip, journaled
-   * with its reason: its current owner's progress covers it. A drain with `ends` is the final one
-   * (`finalDrain`).
-   * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps `topic|partition`
-   *   to the log end the group must commit
-   * @returns {Promise<{ reached: boolean }>} whether every key reached its end in time
+   * The topic id the member's group reads for a topic, when it is the run's current incarnation.
+   * @param {ClientRig} rig @param {string} topic
+   * @returns {string|null} the id, or null when the group has none or still reads another one
    */
-  async onDrain({ ends = {}, deadline = Infinity } = {}) {
-    if (Object.keys(ends).length > 0) return this.finalDrain(ends, deadline)
-    const { observer } = this.runtime
-    for (const rig of this.rigs()) {
-      const [group] = observer.mine(rig.id, 'ConsumerGroup')
-      for (const [k, next] of [...(rig.processed ?? [])]) {
-        if (BigInt(next) <= BigInt(rig.committed.get(k) ?? 0)) continue
-        const now = group && group.acquired?.has(k) ? observer.currentAuthority(group, k) : null
-        const captured = rig.authority.get(k)
-        const then = captured?.authority
-        const reason = !now
-          ? 'the member no longer holds the key'
-          : !then
-            ? 'no handler of the member entered the key'
-            : now.run !== then.run
-              ? 'the client run changed since its last handler'
-              : now.acquiredAt !== then.acquiredAt || now.recreatedAt !== then.recreatedAt
-                ? 'the key was acquired again since its last handler'
-                : null
-        if (reason === null) await this.commit(rig, k, { key: captured.key, authority: now })
-        else
-          await this.runtime.diagnose(
-            `expected skip: drain commit of ${k} by ${rig.id}: ${reason}; its current owner's progress covers it`
-          )
-      }
-    }
-    return { reached: true }
+  incarnation(rig, topic) {
+    const { observer, topicIds } = this.runtime
+    const [group] = observer.mine(rig.id, 'ConsumerGroup')
+    const topicId = group ? observer.topicIdOf(topic, group) : null
+    return topicId && topicId === topicIds.get(topic) ? topicId : null
   }
 
   /**
-   * The final drain: for each key a member reads, the group's committed offset must reach the log
-   * end. The member that holds the key now waits, until the deadline, until its resolved position
-   * (handlers, and batches the client resolved with only control or aborted records) reaches the
-   * end, then commits that position under its current authority; a refused or failed commit is sent
-   * again. A key the group already committed to the end through another member, or an empty log,
-   * needs nothing.
-   * @param {Record<string, string>} ends `topic|partition` to log end
-   * @param {number} deadline on the run clock
-   * @returns {Promise<{ reached: boolean }>} whether every key was committed to its end in time
+   * @param {ClientRig} rig @param {string} topic @param {number} partition
+   * @returns {Promise<string|null>} the group's committed next offset of the partition, read from
+   *   the broker through the member's public `committed()`; null when none or the read failed
    */
-  async finalDrain(ends, deadline) {
-    const { clock, observer } = this.runtime
-    let reached = true
-    for (const [k, end] of Object.entries(ends)) {
-      const topic = k.slice(0, k.lastIndexOf('|'))
-      if (!this.rigs().some((rig) => this.reads(rig, topic))) continue
-      const done = () => end === '0' || BigInt(this.groupCommitted.get(k) ?? -1) >= BigInt(end)
-      const holder = () =>
-        this.rigs().find(
-          (rig) =>
-            observer.mine(rig.id, 'ConsumerGroup')[0]?.acquired?.has(k) &&
-            BigInt(rig.processed?.get(k) ?? -1) >= BigInt(end)
-        )
-      while (
-        !done() &&
-        clock.now() < deadline &&
-        (await this.until(() => done() || holder(), deadline))
-      ) {
-        const rig = holder()
-        if (!rig) continue
-        const [group] = observer.mine(rig.id, 'ConsumerGroup')
-        const partition = Number(k.slice(k.lastIndexOf('|') + 1))
-        const current = {
-          key: { topic, topicId: observer.topicIdOf(topic, group), partition },
-          authority: observer.currentAuthority(group, k),
-        }
-        if ((await this.commit(rig, k, current)) !== 'ok')
-          await clock.sleepUntil(Math.min(deadline, clock.now() + 250))
-      }
-      if (!done()) {
-        reached = false
-        await this.runtime.diagnose(`final drain: ${k} not committed to ${end}`)
-      }
-    }
-    return { reached }
+  async committedOf(rig, topic, partition) {
+    const [entry] = await rig.object.committed([{ topic, partition }]).catch(() => [])
+    return entry?.offset ?? null
   }
 
-  /** @returns {{ ok: boolean }} whether the standing member handled and committed after recovery */
-  async onRecovered(step) {
-    const [rig] = this.standing
-    const before = [...(rig?.processed?.values() ?? [])].join()
-    const ok = await this.until(
-      () => [...(rig?.processed?.values() ?? [])].join() !== before,
-      this.runtime.clock.now() + 60000
-    )
+  /**
+   * Commits the member's live resolved position of one partition it holds and confirms it through
+   * the group. The position is the public `position()` of the acquisition the member holds now: the
+   * records its handlers resolved and the batches the client resolved with only control or aborted
+   * records. It is committed only when the member held the partition, under the same authority and
+   * the run's current topic id, both before and after the position was read; the public
+   * `committed()` readback must then return exactly that offset. A cached offset of an earlier
+   * acquisition or incarnation is never committed.
+   * @param {ClientRig} rig @param {string} topic @param {number} partition
+   * @param {bigint} [min] commit only a position at or past it
+   * @returns {Promise<{ position: string|null, confirmed: boolean }>} the position read, null when
+   *   the member does not hold the partition or its acquisition or incarnation moved meanwhile; and
+   *   whether that position was committed and read back
+   */
+  async settle(rig, topic, partition, min = 0n) {
+    const { observer } = this.runtime
+    const k = `${topic}|${partition}`
+    const view = () => {
+      const held = rig.object
+        .assignment()
+        .some((a) => a.topic === topic && a.partitions.includes(partition))
+      const [group] = observer.mine(rig.id, 'ConsumerGroup')
+      const topicId = this.incarnation(rig, topic)
+      if (!held || !topicId || !group?.acquired?.has(k)) return null
+      return { topicId, authority: observer.currentAuthority(group, k) }
+    }
+    const before = view()
+    const position = before && (await rig.object.position({ topic, partition }).catch(() => null))
+    const after = view()
+    if (!position || !after || JSON.stringify(before) !== JSON.stringify(after))
+      return { position: null, confirmed: false }
+    if (BigInt(position) < min) return { position, confirmed: false }
+    const key = { topic, topicId: after.topicId, partition }
+    if ((await this.commit(rig, { key, authority: after.authority }, position)) !== 'ok')
+      return { position, confirmed: false }
+    return { position, confirmed: (await this.committedOf(rig, topic, partition)) === position }
+  }
+
+  /**
+   * Commits the live position of every partition the members hold, outside any handler, each
+   * confirmed by its readback (`settle`). A partition whose acquisition moved is tried again until
+   * the deadline; one a member no longer holds is left to its current owner. A drain with `ends`
+   * is a drain to those ends (`drainTo`).
+   * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps `topic|partition`
+   *   to the log end the group must commit
+   * @returns {Promise<{ reached: boolean, confirmed: number }>} whether every held partition (or
+   *   every end) was committed and read back in time, and how many commits were confirmed
+   */
+  async onDrain({ ends = {}, deadline = this.runtime.clock.now() + DRAIN_MS } = {}) {
+    if (Object.keys(ends).length > 0) return this.drainTo(ends, deadline)
+    const { clock } = this.runtime
+    const pending = new Map()
+    for (const rig of this.rigs())
+      for (const { topic, partitions } of rig.object.assignment())
+        for (const partition of partitions)
+          pending.set(`${rig.id} ${topic}|${partition}`, { rig, topic, partition })
+    let confirmed = 0
+    while (pending.size > 0 && clock.now() < deadline) {
+      for (const [id, { rig, topic, partition }] of pending) {
+        const held = rig.object
+          .assignment()
+          .some((a) => a.topic === topic && a.partitions.includes(partition))
+        const settled = held ? await this.settle(rig, topic, partition) : null
+        if (settled?.confirmed) confirmed++
+        if (!held || settled.confirmed) pending.delete(id)
+      }
+      if (pending.size > 0) await clock.sleepUntil(Math.min(deadline, clock.now() + 250))
+    }
+    for (const id of pending.keys())
+      await this.runtime.diagnose(`drain: ${id} was not committed and read back in time`)
+    return { reached: pending.size === 0, confirmed }
+  }
+
+  /**
+   * A drain to given ends: for each key a member reads, the group's committed offset must reach the
+   * log end. It is reached when the group's broker readback already shows the end for the run's
+   * current incarnation, or when the member that holds the key commits a live position at or past
+   * the end and reads it back (`settle`). Until the deadline every refused, unconfirmed or early
+   * attempt is made again.
+   * @param {Record<string, string>} ends `topic|partition` to log end
+   * @param {number} deadline on the run clock
+   * @returns {Promise<{ reached: boolean, confirmed: number }>} whether every key was committed to
+   *   its end in time, and how many commits were confirmed
+   */
+  async drainTo(ends, deadline) {
+    const { clock } = this.runtime
+    let reached = true
+    let confirmed = 0
+    for (const [k, end] of Object.entries(ends)) {
+      const [topic, partition] = splitKey(k)
+      const rigs = this.rigs().filter((rig) => this.reads(rig, topic))
+      if (rigs.length === 0) continue
+      const target = BigInt(end)
+      const atEnd = async () =>
+        target === 0n ||
+        (this.incarnation(rigs[0], topic) !== null &&
+          BigInt((await this.committedOf(rigs[0], topic, partition)) ?? -1) >= target)
+      let done = await atEnd()
+      while (!done && clock.now() < deadline) {
+        for (const rig of rigs) {
+          if ((await this.settle(rig, topic, partition, target)).confirmed) {
+            confirmed++
+            done = true
+            break
+          }
+        }
+        if (!done) await clock.sleepUntil(Math.min(deadline, clock.now() + 250))
+        done ||= await atEnd()
+      }
+      if (!done) {
+        reached = false
+        await this.runtime.diagnose(`drain: ${k} not committed to ${end}`)
+      }
+    }
+    return { reached, confirmed }
+  }
+
+  /**
+   * The recovery witness: a handler of this process settled after the recovery, and the drain then
+   * committed and read back every held partition with at least one confirmed commit.
+   * @returns {Promise<{ ok: boolean }>}
+   */
+  async onRecovered() {
+    const before = this.handled
+    const deadline = this.runtime.clock.now() + DRAIN_MS
+    const handled = await this.until(() => this.handled > before, deadline)
     this.outage = false
-    await this.onDrain()
-    return { ok }
+    const drained = await this.onDrain({ deadline })
+    return { ok: handled && drained.reached && drained.confirmed > 0 }
   }
 
   /** @param {object} step marks an outage in progress, so replays are attributed to it */
@@ -1861,7 +1906,8 @@ class ShareWorker extends Worker {
    * below which every offset had a handler entry, and the delivered offsets above it; a gap that
    * would keep more than `SHARE_AHEAD_MAX` offsets ahead is remembered and skipped, so the memory
    * stays bounded and the drain still fails.
-   * @param {string} k `topic|partition` @param {string|number} offset
+   * @param {string} k `topicId|partition`, so a recreated name starts a new key
+   * @param {string|number} offset
    * @returns {void}
    */
   delivered(k, offset) {
@@ -1945,7 +1991,7 @@ class ShareWorker extends Worker {
     }
     acknowledge('accept')
     this.handled = (this.handled ?? 0) + 1
-    this.delivered(`${topic}|${partition}`, message.offset)
+    if (topicId) this.delivered(`${topicId}|${partition}`, message.offset)
     await runtime.emit({
       kind: 'identity',
       recordId: runtime.nextId(),
@@ -1970,16 +2016,21 @@ class ShareWorker extends Worker {
   }
 
   /**
-   * Waits until every offset below each main log end has had a handler entry and deliveries have
-   * been quiet for `quietMs`, so records a lock expiry returned are handed out again first. Every
-   * main offset is an offered id, so this checks each eligible id, not only the last one.
+   * Waits until every offset below each log end of a topic the member subscribes has had a handler
+   * entry for the run's current incarnation of the topic, and deliveries have been quiet for
+   * `quietMs`, so records a lock expiry returned are handed out again first. Every offset is an
+   * offered id, so this checks each eligible id, not only the last one.
    * @param {{ ends?: Record<string, string>, deadline?: number, quietMs?: number }} [step]
    * @returns {Promise<{ reached: boolean }>}
    */
   async onDrain({ ends = {}, deadline = Infinity, quietMs = 5000 } = {}) {
-    const { clock, config } = this.runtime
-    const wanted = Object.entries(ends).filter(([k]) => k.startsWith(`${config.topics.main}|`))
-    const entered = (k) => this.entered?.get(k) ?? { next: 0n, gap: null }
+    const { clock, config, topicIds } = this.runtime
+    const subscribed = new Set([config.topics.main, ...config.topics.recreate])
+    const wanted = Object.entries(ends).filter(([k]) => subscribed.has(splitKey(k)[0]))
+    const entered = (k) => {
+      const [topic, partition] = splitKey(k)
+      return this.entered?.get(`${topicIds.get(topic)}|${partition}`) ?? { next: 0n, gap: null }
+    }
     const done = () =>
       wanted.every(([k, end]) => entered(k).gap === null && entered(k).next >= BigInt(end)) &&
       clock.now() - (this.deliveredAt ?? -Infinity) >= quietMs

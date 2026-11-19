@@ -993,10 +993,10 @@ class Supervisor {
         await this.churnTopic(step, participants)
       else {
         const drain = step.shape === 'drain'
-        await this.send(
-          drain ? [...new Set([...participants, ...this.consumers()])] : participants,
-          step
-        )
+        const slots = drain ? [...new Set([...participants, ...this.consumers()])] : participants
+        const replies = await this.send(slots, step)
+        const short = slots.filter((_, i) => replies[i].reply?.reached === false)
+        if (short.length > 0) throw new Error(`${step.id}: ${short.join(', ')} did not drain`)
         if (drain) {
           const t = this.config.topics
           for (const [topic, partitions] of [
@@ -1104,19 +1104,19 @@ class Supervisor {
   }
 
   /**
-   * Reads the two standing logs' ends until no transaction is open on them: the read-committed end
-   * equals the high watermark, which Apache's describe prints as the log end.
+   * Reads logs' ends until no transaction is open on them: the read-committed end equals the high
+   * watermark, which Apache's describe prints as the log end.
    * @param {number} deadline on the run clock; past it, the high watermarks are returned and the
    *   open transaction is a problem of the run
+   * @param {string[]} [topics] the logs, by default the two standing ones
    * @returns {Promise<Record<string, string>>} `topic|partition` to log end
    * @throws {Error} when the log ends cannot be read
    */
-  async settledEnds(deadline) {
-    const { main, transactions } = this.config.topics
+  async settledEnds(deadline, topics = [this.config.topics.main, this.config.topics.transactions]) {
     for (;;) {
       const ends = {}
       let open = false
-      for (const topic of [main, transactions]) {
+      for (const topic of topics) {
         const committed = await this.admin.fetchTopicOffsets(topic, {
           isolationLevel: 'read_committed',
         })
@@ -1218,10 +1218,19 @@ class Supervisor {
         })
         if (reply.reply?.stopped) throw new Error(`${step.id}: probe stopped at the deadline`)
       })
-    const drain = () =>
-      stage('drain', () =>
-        this.send(participants, { type: 'drain', id: `${step.id}.drain`, deadline: step.deadline })
-      )
+    const drain = (topic) =>
+      stage('drain', async () => {
+        const ends = await this.settledEnds(step.deadline, [topic])
+        const replies = await this.send(participants, {
+          type: 'drain',
+          id: `${step.id}.drain`,
+          ends,
+          deadline: step.deadline,
+        })
+        const short = participants.filter((_, i) => replies[i].reply?.reached === false)
+        if (short.length > 0)
+          throw new Error(`${step.id}: ${short.join(', ')} did not drain ${topic} to its end`)
+      })
     if (step.shape === 'regex-churn') {
       const topic = `${this.config.topics.regex}-${step.id}`
       await stage('create', () => this.createTopic(topic, 2, 'regex', step.id))
@@ -1229,7 +1238,7 @@ class Supervisor {
       await stage('accept', () => this.send(participants, { ...step, topicName: topic }))
       await probe(topic)
       await settle()
-      await drain()
+      await drain(topic)
       await stage('seal', () => this.seal(topic, step.id))
       await stage('delete', () => this.deleteTopic(topic, step.id))
       await stage('retire', () =>
@@ -1240,7 +1249,7 @@ class Supervisor {
     const topic = this.config.topics.recreate[step.topic]
     await probe(topic)
     await settle()
-    await drain()
+    await drain(topic)
     await stage('seal', () => this.seal(topic, step.id))
     await stage('pause', () => this.send(participants, { ...step, topicName: topic }))
     await stage('delete', () => this.deleteTopic(topic, step.id))
