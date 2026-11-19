@@ -233,6 +233,45 @@ describe('final soak producer shutdown', () => {
     await worker.disconnect()
   })
 
+  test('a probe whose deadline passes while its offered record is journaled is never sent, is recorded rejected, and the probe stops', async () => {
+    const sent = []
+    useClient({
+      connect: async () => {},
+      send: async () => sent.push(1) && [{ baseOffset: '1' }],
+    })
+    const clock = boundedClock()
+    let t = 0
+    clock.now = () => t
+    const runtime = workerRuntime('c08', clock)
+    const emit = runtime.emit
+    runtime.emit = async (record) => {
+      if (record.stage === 'offered') t = 1000
+      return emit(record)
+    }
+    const worker = createWorker(runtime)
+    started.push(worker)
+    await worker.begin()
+    const reply = await worker.onProbe({
+      id: 'p',
+      execution: 'h00t0',
+      topic: config.topics.main,
+      partitions: 1,
+      count: 3,
+      deadline: 1000,
+    })
+    expect(sent).toEqual([])
+    expect(reply).toEqual({ offered: 1, acknowledged: 0, stopped: true })
+    expect(runtime.records.filter((r) => r.stage === 'ack')).toEqual([
+      expect.objectContaining({
+        outcome: 'rejected',
+        offset: null,
+        errorType: 'ExecutionDeadline',
+        execution: 'h00t0',
+      }),
+    ])
+    await worker.disconnect()
+  })
+
   test('a probe send still in flight at the execution deadline is recorded unknown, the probe answers by the deadline, and the late settlement is awaited before idle', async () => {
     let release = null
     useClient({
@@ -2922,6 +2961,41 @@ describe('final soak record timestamps and client log', () => {
     expect(log.close()).toEqual({ total: 2, written: 0, dropped: 2, failed: 'EIO' })
   })
 
+  test('a client log write that takes no bytes ends the file instead of spinning, and is recorded', () => {
+    let calls = 0
+    const files = {
+      openSync: () => 7,
+      writeSync: () => {
+        if (++calls > 1000) throw new Error('spinning')
+        return 0
+      },
+      closeSync: () => {},
+    }
+    const log = new ClientLog({ file: 'unused', files })
+    log.creator()(2)(entry('one'))
+    expect(calls).toBe(1)
+    expect(log.close()).toEqual({
+      total: 1,
+      written: 0,
+      dropped: 1,
+      failed: 'the client log file accepted no bytes',
+    })
+  })
+
+  test('the raw wire budget counts the UTF-8 bytes of a line, not its characters', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-wire-bytes-'))
+    try {
+      const full = []
+      const wire = new WireLog({ dir, prefix: 'p07.utf8', budget: 60, onFull: (m) => full.push(m) })
+      expect(wire.note({ pad: 'é'.repeat(30) })).toBeNull()
+      expect(full).toEqual(['raw wire budget of 60 bytes reached'])
+      expect(wire.note({ pad: 'e'.repeat(30) })).not.toBeNull()
+      expect(wire.total).toBe(fs.statSync(path.join(dir, 'raw/p07.utf8.0.ndjson')).size)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("a process's client log is closed at its stop and its counts are journaled", async () => {
     const records = []
     const runtime = {
@@ -3042,6 +3116,77 @@ describe('final soak share request capture', () => {
     expect(seen.unanswered).toHaveLength(1)
     expect(seen.unanswered[0]).toMatchObject({ node: 'h:1', apiKey: 79, correlationId: 8 })
     expect(seen.unanswered[0].request.equals(lost)).toBe(true)
+  })
+
+  test('a capture hook that throws never stops the client write: the socket still writes, the failure is reported, and each request carries its socket generation and send time', async () => {
+    const socket = new EventEmitter()
+    const written = []
+    socket.write = (chunk) => written.push(chunk) > 0
+    let now = 41
+    const registry = new SocketRegistry({ base: () => () => socket, now: () => ++now })
+    const errors = []
+    const sent = []
+    registry.factory('c07.1', {
+      apiKeys: [79],
+      onExchange: () => {
+        throw new Error('exchange sink full')
+      },
+      onSent: (r) => {
+        sent.push(r)
+        throw new Error('sent sink full')
+      },
+      onError: (stage, e) => errors.push([stage, e.message]),
+    })({ host: 'h', port: 1 })
+    const frame = await ackFrame(7, 3, '1', '1')
+    socket.write(frame)
+    expect(written).toEqual([frame])
+    expect(sent).toEqual([
+      expect.objectContaining({ node: 'h:1', socket: 1, sentAt: 42, apiKey: 79, correlationId: 7 }),
+    ])
+    const response = Buffer.alloc(9)
+    response.writeInt32BE(5, 0)
+    response.writeInt32BE(7, 4)
+    socket.emit('data', response)
+    expect(errors).toEqual([
+      ['sent', 'sent sink full'],
+      ['exchange', 'exchange sink full'],
+    ])
+  })
+
+  test('a share member whose wire sink fails at a request reports a problem of the run and its client still writes', async () => {
+    let capture = null
+    jest.spyOn(ClientRig.prototype, 'construct').mockImplementation(async function (make, c) {
+      capture = c
+      this.object = {
+        events: { ACKNOWLEDGE: 'share.acknowledge' },
+        on: () => {},
+        connect: async () => {},
+        subscribe: async () => {},
+        run: async () => {},
+      }
+      return this.object
+    })
+    const runtime = workerRuntime('c07')
+    runtime.wire = {
+      note: () => {
+        throw new Error('ENOSPC')
+      },
+    }
+    const worker = new ShareWorker(runtime)
+    const rig = await worker.join(runtime.slots.find((c) => c.purpose === 'subject'))
+    const socket = new EventEmitter()
+    const written = []
+    socket.write = (chunk) => written.push(chunk) > 0
+    new SocketRegistry({ base: () => () => socket }).factory(
+      rig.id,
+      capture
+    )({ host: 'h', port: 1 })
+    const frame = await ackFrame(8, 4, '15760', '15760')
+    socket.write(frame)
+    expect(written).toEqual([frame])
+    expect(runtime.problems).toEqual([
+      `share wire capture of ${rig.id} lost its sent evidence: ENOSPC`,
+    ])
   })
 
   test('a share request summary names its version, session epoch and acknowledged ranges, and a frame it cannot read yields nulls and the reason', async () => {
