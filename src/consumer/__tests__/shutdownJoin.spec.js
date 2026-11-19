@@ -1,4 +1,5 @@
 const { createLogger, LEVELS } = require('../../loggers')
+const { KafkaJSNonRetriableError } = require('../../errors')
 const {
   advanceUntil,
   deferred,
@@ -203,6 +204,60 @@ describe('Consumer > a timed close joining crash cleanup', () => {
 
     expect(close).toEqual({ done: true, value: undefined })
     expect(run.crashes).toHaveLength(1)
+  }, 60000)
+})
+
+describe('Consumer > a close joining crash cleanup that is past its stop', () => {
+  /**
+   * Crashes a run on a handler failure whose stop is held in the revoked close callback, with the
+   * crash's own cluster disconnect held on `crashTransport`.
+   */
+  const startCrashing = async () => {
+    const hookHeld = deferred()
+    const revoked = jest.fn()
+    const crashTransport = deferred()
+    let fail = false
+    const run = await start({
+      retry: { retries: 0, initialRetryTime: 300, restartOnFailure: async () => false },
+      hook: {
+        onPartitionsRevoked: async () => {
+          revoked()
+          await hookHeld.promise
+        },
+      },
+      eachMessage: async () => {
+        if (fail) throw new KafkaJSNonRetriableError('handler failed')
+      },
+    })
+    traceDisconnect(run)
+    run.cluster.disconnect.mockImplementation(async (options) => {
+      if (options?.preserveSetupState) await crashTransport.promise
+      run.log.push({ kind: 'transport', options })
+    })
+    run.state.queue['topic-a|0'] = [40, 41, 42]
+    fail = true
+    await advanceUntil(() => revoked.mock.calls.length === 1, 3000)
+    return { run, hookHeld, crashTransport }
+  }
+
+  it('a timed disconnect resolves only after the crash cleanup it overlaps has finished its own cluster disconnect', async () => {
+    const { run, hookHeld, crashTransport } = await startCrashing()
+    const close = settled(run.consumer.disconnect({ timeout: 5 }))
+    await jest.advanceTimersByTimeAsync(200)
+
+    expect(close.done).toBe(false)
+    expect(
+      run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
+    ).toEqual([{ drainTimeout: 0 }])
+
+    crashTransport.resolve()
+    await advanceUntil(() => close.done && run.crashes.length > 0, 1000)
+
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(
+      run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
+    ).toEqual([{ drainTimeout: 0 }, { preserveSetupState: true }])
+    hookHeld.resolve()
   }, 60000)
 })
 
