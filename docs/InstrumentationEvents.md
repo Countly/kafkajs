@@ -12,7 +12,7 @@ const removeListener = consumer.on(HEARTBEAT, e => console.log(`heartbeat at ${e
 // Remove the listener by invoking removeListener()
 ```
 
-Listeners run synchronously, in the code that emits the event, so a slow listener slows the client down. A listener may be an `async` function: nobody awaits it, and a rejection is logged as `Failed to execute listener`. An error a listener throws synchronously is not caught by the client (only the cluster's and the lock's events are guarded), so a listener that can throw should catch its own errors.
+Listeners run synchronously, in the code that emits the event, so a slow listener slows the client down. A listener may be an `async` function: nobody awaits it, and a rejection is logged as `Failed to execute listener`. A consumer or share consumer listener's synchronous throw is logged the same way, and the next listener still runs. A producer or admin listener's synchronous throw is not caught by the client (only the cluster's and the lock's events are guarded), so such a listener should catch its own errors.
 
 Instrumentation Event:
 
