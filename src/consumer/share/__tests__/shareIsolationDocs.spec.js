@@ -119,7 +119,7 @@ describe('Share guide API boundaries', () => {
       'ShareConsumer emits instrumentation events and diagnostics channels; this package does not create share-consumer spans.'
     expect(guide).toContain(sentence)
     expect(read('otel/README.md')).toContain(sentence)
-    expect(guide).toContain('43 ordinary channels and 18 share channels')
+    expect(guide).toContain('44 ordinary channels and 18 share channels')
     expect(guide).toContain('no built-in metrics registry')
     expect(guide).toContain('no built-in metrics registry or `metrics()` method')
     const table = guide.slice(

@@ -132,6 +132,11 @@ module.exports = class Cluster {
    *   the instance (`this.instrumentationEmitter`) and shared with the `MetadataCache` and the
    *   `BrokerPool`, so a topic recreation seen by either surfaces on the same emitter the client
    *   already wraps for its public `on()`.
+   * @param {(status: import('./brokerPool').TopicMetadataStatus) => void} [options.onTopicMetadataStatus]
+   *   given by a consumer for the cluster it owns: a refresh of the targets then isolates an
+   *   established target the broker answers `UNKNOWN_TOPIC_OR_PARTITION`, instead of failing for
+   *   every topic, and reports each change of that topic's status here (see
+   *   `BrokerPool#isolateUnknownTopics`). Producer and admin clusters do not pass it.
    */
   constructor({
     logger: rootLogger,
@@ -165,6 +170,7 @@ module.exports = class Cluster {
     metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
     bootstrapResolveTimeout = 0,
+    onTopicMetadataStatus,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -232,6 +238,9 @@ module.exports = class Cluster {
         this.targetTopicState === null ? undefined : (topic) => this.dropTargetTopic(topic),
       isNewTarget:
         this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
+      onTopicMetadataStatus,
+      isEstablishedTarget: (topic) =>
+        this.targetTopics.has(topic) && !this.addingTopics?.has(topic),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
