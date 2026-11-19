@@ -212,7 +212,7 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
    * Crashes a run on a handler failure whose stop is held in the revoked close callback, with the
    * crash's own cluster disconnect held on `crashTransport`.
    */
-  const startCrashing = async () => {
+  const startCrashing = async ({ onRevoked } = {}) => {
     const hookHeld = deferred()
     const revoked = jest.fn()
     const crashTransport = deferred()
@@ -222,6 +222,7 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
       hook: {
         onPartitionsRevoked: async () => {
           revoked()
+          await onRevoked?.(run)
           await hookHeld.promise
         },
       },
@@ -258,6 +259,57 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
       run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
     ).toEqual([{ drainTimeout: 0 }, { preserveSetupState: true }])
     hookHeld.resolve()
+  }, 60000)
+
+  it('a plain disconnect resolves only after the crash cleanup it overlaps has finished its own cluster disconnect and DISCONNECT', async () => {
+    const { run, hookHeld, crashTransport } = await startCrashing()
+    hookHeld.resolve()
+    await advanceUntil(() => run.cluster.disconnect.mock.calls.length > 0, 200)
+    const close = settled(run.consumer.disconnect())
+    await jest.advanceTimersByTimeAsync(200)
+
+    expect([close.done, count(run, 'DISCONNECT')]).toEqual([false, 0])
+
+    crashTransport.resolve()
+    await advanceUntil(() => close.done && run.crashes.length > 0, 1000)
+
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(count(run, 'DISCONNECT')).toBe(2)
+  }, 60000)
+
+  it('a timed disconnect is still bounded by its timeout when the crash cleanup it overlaps is held in a close callback', async () => {
+    const { run, hookHeld, crashTransport } = await startCrashing()
+    crashTransport.resolve()
+    const close = settled(run.consumer.disconnect({ timeout: 50 }))
+    await jest.advanceTimersByTimeAsync(49)
+
+    expect(close.done).toBe(false)
+
+    await advanceUntil(() => close.done, 20)
+
+    expect(close).toEqual({ done: true, value: undefined })
+    hookHeld.resolve()
+    await advanceUntil(() => run.crashes.length > 0, 1000)
+    expect(run.crashes).toHaveLength(1)
+  }, 60000)
+
+  it('a disconnect awaited from the close callback of the crash settles without waiting on itself, and the crash completes', async () => {
+    let awaited = null
+    const { run, hookHeld, crashTransport } = await startCrashing({
+      onRevoked: async ({ consumer }) => {
+        awaited = settled(consumer.disconnect())
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      },
+    })
+    await jest.advanceTimersByTimeAsync(10)
+
+    expect(awaited).toEqual({ done: true, value: undefined })
+
+    hookHeld.resolve()
+    crashTransport.resolve()
+    await advanceUntil(() => run.crashes.length > 0, 1000)
+
+    expect(run.crashes).toHaveLength(1)
   }, 60000)
 })
 
@@ -474,6 +526,29 @@ describe('Consumer > a fatal heartbeat answer while a handler runs', () => {
     },
     60000
   )
+
+  it('a disconnect awaited by the old handler while the forced crash cleanup drains settles without waiting on that cleanup', async () => {
+    const transport = deferred()
+    let outcome = null
+    const run = await startWith(async (_payload, held, ref) => {
+      await held.promise
+      outcome = settled(ref.run.consumer.disconnect())
+      await outcome.promise
+    })
+    run.state.disconnecting = transport.promise
+    run.arm()
+    await advanceUntil(() => run.faultAt() !== null)
+    await jest.advanceTimersByTimeAsync(run.faultAt() + 4000 - Date.now())
+    await advanceUntil(() => run.cluster.disconnect.mock.calls.length > 0, 100)
+    run.held.resolve()
+    await jest.advanceTimersByTimeAsync(10)
+
+    expect(outcome).toMatchObject({ done: true, error: { type: 'CONSUMER_STOPPING' } })
+
+    transport.resolve()
+    await advanceUntil(() => run.crashes.length > 0, 1000)
+    expect(run.crashes).toHaveLength(1)
+  }, 60000)
 
   it('a disconnect with a deadline shorter than the poll interval ends the held handler wait at its own deadline and still reports one CRASH with restart false', async () => {
     const run = await startWith((_payload, held) => held.promise)
