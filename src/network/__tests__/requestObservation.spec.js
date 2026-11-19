@@ -261,34 +261,27 @@ describe('Network > request observation', () => {
       }
     })
 
-    test('a throwing dispatch diagnostic on the throttle timer neither escapes nor stops the next send', () => {
+    test('a throwing dispatch diagnostic on the throttle timer escapes nothing and settles the queue through its owner', () => {
       jest.useFakeTimers()
       try {
-        const emitter = new InstrumentationEventEmitter()
-        const { queue, logger } = createQueue({
-          maxInFlightRequests: 2,
-          instrumentationEmitter: emitter,
-        })
+        const onDispatchFailure = jest.fn()
+        const { queue, logger } = createQueue({ maxInFlightRequests: 2, onDispatchFailure })
         const first = entry()
         const second = entry()
-        const sendFirst = jest.fn()
-        const sendSecond = jest.fn()
         queue.maybeThrottle(500)
-        queue.push({ entry: first, expectResponse: true, sendRequest: sendFirst })
-        queue.push({ entry: second, expectResponse: true, sendRequest: sendSecond })
-        logger.debug.mockImplementation(() => {
-          throw new Error('log failed')
-        })
-        emitter.addListener(events.NETWORK_REQUEST_QUEUE_SIZE, () => {
-          throw new Error('listener failed')
+        queue.push({ entry: first, expectResponse: true, sendRequest: jest.fn() })
+        queue.push({ entry: second, expectResponse: true, sendRequest: jest.fn() })
+        const failure = new Error('log failed')
+        logger.debug.mockImplementation((message) => {
+          if (message === 'Consumed pending request') throw failure
         })
 
         expect(() => jest.advanceTimersByTime(1000)).not.toThrow()
-        expect(sendFirst).toHaveBeenCalledTimes(1)
-        expect(sendSecond).toHaveBeenCalledTimes(1)
-        expect([...queue.inflight.keys()]).toEqual([first.correlationId, second.correlationId])
-        expect(first.reject).not.toHaveBeenCalled()
-        expect(second.reject).not.toHaveBeenCalled()
+        expect(onDispatchFailure).toHaveBeenCalledWith(failure)
+        expect(first.reject).toHaveBeenCalledWith(failure)
+        expect(second.reject).toHaveBeenCalledWith(failure)
+        expect(queue.isIdle()).toBe(true)
+        expect(queue.throttleCheckTimeoutId).toBeNull()
       } finally {
         jest.useRealTimers()
       }
