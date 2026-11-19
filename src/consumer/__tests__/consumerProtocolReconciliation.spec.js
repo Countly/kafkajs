@@ -1664,6 +1664,85 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     }
   )
 
+  it('keeps waiting at least 100 ms between more than 1,024 successive fenced rejoins with a zero retry time and factor, without a join deadline crash, and joins once one is accepted', async () => {
+    const built = buildConsumer({
+      rebalanceTimeout: 100,
+      retry: { initialRetryTime: 0, factor: 0, retries: 0 },
+    })
+    consumer = built.consumer
+    let fenced = false
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (fenced) throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      return request.memberEpoch === 0 ? fullTarget(1, { 'topic-a': [0] }) : fullTarget(1, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: ['topic-a'] })
+    consumer.run({ eachMessage: async () => {} })
+    await advanceUntil(() => built.fetches.length > 0)
+    const [runner] = starts.mock.contexts
+
+    fenced = true
+    const fencedAt = Date.now()
+    runner.heartbeatManager.requestTick()
+    await jest.advanceTimersByTimeAsync(110000)
+    const rejoins = built.log
+      .filter(({ kind, epoch, at }) => kind === 'heartbeat' && epoch === 0 && at > fencedAt)
+      .map(({ at }) => at)
+
+    expect(rejoins.length).toBeGreaterThan(1025)
+    expect(Math.min(...rejoins.slice(1).map((at, i) => at - rejoins[i]))).toBeGreaterThanOrEqual(
+      100
+    )
+    expect(built.crashes).toEqual([])
+
+    fenced = false
+    await advanceUntil(() => runner.consumerGroup.groupMembership.memberEpoch === 1, 3000)
+    expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(1)
+    expect(starts).toHaveBeenCalledTimes(1)
+  })
+
+  it('schedules no timer longer than 2147483647 ms, or NaN, when a fenced rejoin waits out its backoff under the largest maxPollInterval, and rejoins without a crash', async () => {
+    const delays = []
+    const schedule = global.setTimeout
+    jest.spyOn(global, 'setTimeout').mockImplementation((fn, delay, ...args) => {
+      delays.push(delay)
+      return schedule(fn, delay, ...args)
+    })
+    const built = buildConsumer({
+      maxPollInterval: 2147483647,
+      retry: { initialRetryTime: 300, factor: 0, retries: 0 },
+    })
+    consumer = built.consumer
+    const s = { fenced: false, rejoins: 0 }
+    built.state.answer = (request) => {
+      if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+      if (
+        s.fenced &&
+        (request.memberEpoch === 1 || (request.memberEpoch === 0 && ++s.rejoins === 1))
+      ) {
+        throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      }
+      if (request.memberEpoch === 0) return fullTarget(s.fenced ? 2 : 1, { 'topic-a': [0] })
+      return fullTarget(request.memberEpoch, null)
+    }
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    await consumer.subscribe({ topics: ['topic-a'] })
+    consumer.run({ eachMessage: async () => {} })
+    await advanceUntil(() => built.fetches.length > 0)
+    const [runner] = starts.mock.contexts
+
+    s.fenced = true
+    runner.heartbeatManager.requestTick()
+    await advanceUntil(() => runner.consumerGroup.groupMembership.memberEpoch === 2, 3000)
+
+    expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(2)
+    expect(s.rejoins).toEqual(2)
+    expect(delays.filter((delay) => !(delay <= 2147483647))).toEqual([])
+    expect(built.crashes).toEqual([])
+    expect(starts).toHaveBeenCalledTimes(1)
+  })
+
   describe.each([
     ['a literal subscription', { topics: ['topic-a', 'topic-c', 'topic-d'] }],
     ['a broker-side regex', { regex: 'topic-.*' }],
