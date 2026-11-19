@@ -1434,6 +1434,64 @@ describe('Consumer > a whole consumer-protocol consumer during reconciliation', 
     expect(starts).toHaveBeenCalledTimes(1)
   })
 
+  describe.each([
+    ['a literal subscription', { topics: ['topic-a', 'topic-c', 'topic-d'] }],
+    ['a broker-side regex', { regex: 'topic-.*' }],
+  ])('with %s', (_, subscription) => {
+    it('abandons a round whose target is replaced while it resolves topic ids and reconciles the newer target in the next round, without a crash', async () => {
+      const built = buildConsumer()
+      consumer = built.consumer
+      const s = { phase: 'steady' }
+      const named = { 'topic-a': [0], 'topic-c': [0], 'topic-d': [0] }
+      const newer = { 'topic-a': [0, 1], 'topic-c': [0], 'topic-d': [0] }
+      built.state.answer = (request) => {
+        if (request.memberEpoch < 0) return fullTarget(request.memberEpoch, null)
+        if (s.phase === 'grow') {
+          s.phase = 'grown'
+          return fullTarget(2, named)
+        }
+        if (s.phase === 'grown') {
+          s.phase = 'regrown'
+          return fullTarget(3, newer)
+        }
+        if (s.phase === 'steady') {
+          return request.memberEpoch === 0 ? fullTarget(1, { 'topic-a': [0] }) : fullTarget(1, null)
+        }
+        return fullTarget(request.memberEpoch, null)
+      }
+      const starts = jest.spyOn(Runner.prototype, 'start')
+      built.state.unknown.add('topic-c').add('topic-d')
+      await consumer.subscribe(subscription)
+      consumer.run({ eachMessage: async () => {} })
+      await advanceUntil(() => built.fetches.length > 0)
+      const [runner] = starts.mock.contexts
+      const steps = jest.spyOn(runner.consumerGroup.groupMembership, 'rebalance')
+
+      // The membership's own refresh names topic-c and schedules the round; the round's step
+      // waits 700 ms for topic-d, and the heartbeat sent meanwhile brings epoch 3.
+      built.state.idDelays.push(0, 700)
+      s.phase = 'grow'
+      await advanceUntil(() => s.phase === 'regrown')
+      await jest.advanceTimersByTimeAsync(3000)
+
+      expect(built.crashes).toEqual([])
+      expect(starts).toHaveBeenCalledTimes(1)
+      expect(runner.running).toBe(true)
+      expect(steps.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(
+        Object.fromEntries(
+          runner.consumerGroup.assigned().map(({ topic, partitions }) => [topic, partitions])
+        )
+      ).toEqual(newer)
+      expect(runner.consumerGroup.groupMembership.memberEpoch).toEqual(3)
+      expect(runner.consumerGroup.groupMembership.state).toEqual('STABLE')
+      const fetchedSince = Date.now() - 1000
+      expect(
+        new Set(built.fetches.filter(({ at }) => at > fetchedSince).map(({ tp }) => tp))
+      ).toEqual(new Set(['topic-a|0', 'topic-a|1', 'topic-c|0', 'topic-d|0']))
+    })
+  })
+
   it("calls the listener's onPartitionsLost once, before any rejoin, when a fence reaches the slot during the wait while a handler keeps the fetch loop busy", async () => {
     const calls = []
     const record = (name) => async (payload) => calls.push({ name, at: Date.now(), payload })
