@@ -1783,6 +1783,88 @@ describe('final soak final drain', () => {
     expect(commitsOf(runtime)[0].authority).toEqual({ run: 'now', acquiredAt: 9 })
   })
 
+  /**
+   * Holds the journal's acknowledgement of the first commit begin record until `release`, so a test
+   * can move the member's live view between that record and the public commit call.
+   */
+  const holdBegin = (runtime) => {
+    const emit = runtime.emit
+    let release = null
+    const reached = new Promise((resolve) => {
+      runtime.emit = (record) => {
+        if (release || record.stage !== 'commit' || record.phase !== 'begin') return emit(record)
+        emit(record)
+        return new Promise((ack) => {
+          release = () => ack(true)
+          resolve()
+        })
+      }
+    })
+    return { reached, release: () => release() }
+  }
+
+  test('a recreation or a restart between the begin record and the public commit call never sends the earlier offset, and the drain commits the new view', async () => {
+    for (const [move, now] of [
+      [
+        ({ runtime, state }) => {
+          runtime.topicIds.set(main, IDS.C)
+          state.groupTopicId = IDS.C
+        },
+        {
+          key: { topic: main, topicId: IDS.C, partition: 0 },
+          authority: { run: 'now', acquiredAt: 7 },
+        },
+      ],
+      [
+        ({ group }) => group.acquired.set(key, { acquiredAt: 8 }),
+        {
+          key: { topic: main, topicId: IDS.A, partition: 0 },
+          authority: { run: 'now', acquiredAt: 8 },
+        },
+      ],
+    ]) {
+      const ctx = consumer()
+      ctx.state.position = '260'
+      const held = holdBegin(ctx.runtime)
+      const drain = ctx.worker.onDrain({ deadline: ctx.runtime.clock.now() + 5000 })
+      await held.reached
+      move(ctx)
+      ctx.state.position = '5'
+      held.release()
+      expect(await drain).toEqual({ reached: true, confirmed: 1 })
+      expect(ctx.commitOffsets.mock.calls).toEqual([[[{ topic: main, partition: 0, offset: '5' }]]])
+      expect(commitsOf(ctx.runtime)).toEqual([
+        expect.objectContaining({ next: '260', outcome: 'refused', errorType: 'DrainViewMoved' }),
+        expect.objectContaining({ next: '5', outcome: 'ok', ...now }),
+      ])
+    }
+  })
+
+  test('a readback is accepted only while the group reads the topic id the commit was made under, on the already-at-end path too', async () => {
+    const recreateDuringRead = ({ rig, runtime, state }) =>
+      rig.object.committed.mockImplementationOnce(async ([{ topic, partition }]) => {
+        runtime.topicIds.set(main, IDS.C)
+        state.groupTopicId = IDS.C
+        return [{ topic, partition, offset: state.committed, metadata: null }]
+      })
+    const atEnd = consumer()
+    atEnd.state.committed = '260'
+    recreateDuringRead(atEnd)
+    const reply = await atEnd.worker.onDrain({
+      ends: { [key]: '260' },
+      deadline: atEnd.runtime.clock.now() + 120,
+    })
+    expect(reply).toEqual({ reached: false, confirmed: 0 })
+    const settled = consumer()
+    settled.state.position = '260'
+    settled.state.committed = '260'
+    recreateDuringRead(settled)
+    expect(await settled.worker.settle(settled.rig, main, 0)).toEqual({
+      position: '260',
+      confirmed: false,
+    })
+  })
+
   test('a commit whose readback does not return its offset is not confirmed, and the drain stays unreached', async () => {
     const { worker, rig, runtime, state } = consumer()
     state.position = '260'
