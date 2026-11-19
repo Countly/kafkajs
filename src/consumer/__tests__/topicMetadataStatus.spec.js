@@ -1175,6 +1175,30 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       30000
     )
 
+    test('a broker-side regex consumer whose assigned name is unknown at its first add still sends no creation bit on any lookup and reads the topic once it exists', async () => {
+      const wire = assignedScenario({ allowAutoTopicCreation: true })
+      wire.world.namedCodes.set(DOOMED, 3)
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.run()
+      await until(() => namedAsks(wire.cluster, DOOMED).length >= 3, 'retried lookups')
+      expect(fetched(wire.cluster).has(DOOMED_ID)).toBe(false)
+
+      wire.world.namedCodes.delete(DOOMED)
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+
+      expect(offsets(wire.observed, DOOMED)[0]).toBe('0')
+      const bits = namedAsks(wire.cluster, DOOMED).map(
+        ({ fields }) => fields.allowAutoTopicCreation
+      )
+      expect(new Set(bits)).toEqual(new Set([false]))
+      expect(wire.observed.statuses.map(({ status }) => status)).toEqual([
+        'unavailable',
+        'available',
+      ])
+      expect(wire.observed.crashes).toEqual([])
+    }, 30000)
+
     test('after unsubscribing a broker-side regex, a literal subscription sends the configured creation bit again', async () => {
       const wire = assignedScenario({ allowAutoTopicCreation: true })
       await wire.consumer.connect()
