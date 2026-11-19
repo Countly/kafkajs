@@ -656,6 +656,24 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(report, 'K3', 'FAIL', /1 same-owner repeats.*c08\.4 in g-0123456789ab-c01/)
     })
 
+    it('passes two distinct ids that one ownership interval entered in descending offset order, each once', async () => {
+      const edit = (records) => {
+        const [a, b] = ['c08.4', 'c08.5'].map((id) =>
+          records.findIndex(isEntry(groupOf('c01'), id))
+        )
+        const out = [...records]
+        ;[out[a], out[b]] = [records[b], records[a]]
+        return out
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K3', 'PASS')
+      expect(row(report, 'K3').numbers).toMatchObject({
+        sameOwnerRepeats: 0,
+        repeatsAfterChange: 0,
+      })
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
     it('fails a repeat that an acquire record of the identical, still open ownership tries to excuse', async () => {
       const edit = (records) =>
         repeat()([...records, { ...boundaryOf(records), t: 4500, cause: 'c01.0.extra' }])
