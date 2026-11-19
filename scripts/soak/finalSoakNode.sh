@@ -37,6 +37,17 @@
 #   FINAL_SOAK_COMPANIONS         space-separated <name>=<file>[@<run url>] companions for finalize
 #   TELEMETRY_JAVA_CACHE          the pinned Java inputs of the reporter build
 #
+# What a green run does not prove (the core checker's seven rows are the verdict; these are outside it):
+# - The share drain proves delivery (every offset below the end had a handler entry) and quiescence
+#   (a live member kept fetching for the lock duration plus a margin and nothing more was handed
+#   out). It does not prove how the broker settled an accept whose reply was lost; those are counted
+#   as unresolved accepts in the last share drain record, as evidence only.
+# - A recovery step proves a handler ran after the recovery (and, for consumers, that a drain
+#   committed and read back every held partition); it does not pair that handler with that commit.
+# - A recreation or regex step proves the topic change, its probes' acknowledgements and the
+#   recipients' drain to its end; it does not prove each probe reached a handler, that a pause or
+#   resume succeeded, or that the last recreated incarnation was drained before its final seal.
+#
 # This script reads and writes no credentials.
 set -euo pipefail
 

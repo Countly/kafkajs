@@ -706,7 +706,8 @@ describe('final soak driver', () => {
     const first = {
       node: [
         'receipt="$SUPERVISOR_JSON"; [ -n "$receipt" ] || receipt="$GREEN"',
-        'case "$*" in *--driver-limit*) echo "${DRIVER_LIMIT_S:-86400}" ;;',
+        'limit="$DRIVER_LIMIT_S"; [ -n "$limit" ] || limit=86400',
+        'case "$*" in *--driver-limit*) echo "$limit" ;;',
         '*--expose-gc*)',
         '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json" && printf "%s" "$receipt" > "$a/supervisor.json"; prev="$a"; done',
         '  [ -z "$HANG" ] || exec /bin/sleep 60 ;;',
