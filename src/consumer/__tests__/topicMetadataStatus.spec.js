@@ -729,6 +729,34 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     30000
   )
 
+  test('consumer: an assigned name the cluster does not know yet is asked for again while the coordinator still assigns it, and read from the start once it is known', async () => {
+    const wire = scenario('consumer', { groupId: 'lifecycle-pending-lag' })
+    await wire.consumer.connect()
+    await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+    await wire.run()
+    await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+    let unknownAnswers = 2
+    const answer = wire.world.metadata.bind(wire.world)
+    wire.world.metadata = (requested) => {
+      const answered = answer(requested)
+      if (unknownAnswers > 0 && requested?.some(({ name }) => name === FLASH)) {
+        unknownAnswers--
+        answered.topics = answered.topics.map((entry) =>
+          entry.name === FLASH ? { ...wire.world.describe('lifecycle-absent'), name: FLASH } : entry
+        )
+      }
+      return answered
+    }
+    wire.world.recreate(FLASH, FLASH_ID)
+    await until(() => offsets(wire.observed, FLASH).length >= 1, 'a record from the assigned topic')
+
+    expect(unknownAnswers).toBe(0)
+    expect(offsets(wire.observed, FLASH)[0]).toBe('0')
+    expect(wire.observed.crashes).toEqual([])
+    expect(wire.observed.statuses).toEqual([])
+  }, 30000)
+
   test.each([
     [17, 'INVALID_TOPIC_EXCEPTION'],
     [29, 'TOPIC_AUTHORIZATION_FAILED'],
