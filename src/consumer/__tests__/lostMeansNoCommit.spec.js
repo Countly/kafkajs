@@ -1428,6 +1428,117 @@ describe('a consumer heartbeat and the runner that sent it', () => {
   })
 })
 
+describe('a consumer heartbeat flight that outlives its membership', () => {
+  const HeartbeatManager = require('../heartbeatManager')
+  let manager
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => {
+    manager?.shutdown()
+    manager = null
+    jest.useRealTimers()
+  })
+
+  /**
+   * A joining consumer protocol whose real heartbeat timer has its epoch 0 join on the wire and
+   * held, then is stopped while the membership is reset and a replacement join is owed, as a poll
+   * expiry does.
+   * @returns {Promise<{ protocol: object, schedule: Schedule, gate: object }>}
+   */
+  const replaceWhileJoinIsHeld = async () => {
+    const protocol = new ConsumerGroupProtocol({
+      cluster: {},
+      groupId: 'group',
+      topics: ['topic'],
+      rebalanceTimeout: 1000,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+    })
+    protocol.state = 'JOINING'
+    protocol.memberEpoch = 0
+    protocol.immediatePending = true
+    const schedule = new Schedule()
+    const gate = schedule.hold({ api: 'ConsumerGroupHeartbeat' })
+    protocol.coordinator = {
+      consumerGroupHeartbeat: () =>
+        schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({
+          memberEpoch: 0,
+          heartbeatIntervalMs: 60000,
+          assignment: null,
+        })),
+    }
+    manager = new HeartbeatManager({
+      groupMembership: protocol,
+      pollTimer: { expired: () => false },
+      heartbeatInterval: 60000,
+      logger: newLogger(),
+      onError: jest.fn(),
+      onPollExpired: jest.fn(),
+    })
+    protocol.attach({ rebalanceCoordinator: null, heartbeatManager: manager })
+
+    protocol.requestTick()
+    await jest.advanceTimersByTimeAsync(0)
+    await gate.arrived()
+    manager.stop()
+    protocol.clearTarget()
+    protocol.immediatePending = true
+    return { protocol, schedule, gate }
+  }
+
+  it('the replacement round tick after the stopped timer sends one join once the old flight settles', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.requestTick()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(schedule.calls).toHaveLength(1)
+
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(0)
+
+    expect(schedule.calls).toHaveLength(2)
+    expect(protocol.memberEpoch).toBe(0)
+    expect(manager.isRunning()).toBe(true)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(schedule.calls).toHaveLength(2)
+  })
+
+  it('a replacement tick asked for before the stop arms nothing once the old flight settles', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    manager.requestTick()
+    manager.stop()
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(schedule.calls).toHaveLength(1)
+    expect(manager.isRunning()).toBe(false)
+    expect(protocol.memberEpoch).toBe(0)
+  })
+
+  it('a shut down timer sends nothing for the replacement round once the old flight settles', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.requestTick()
+    manager.shutdown()
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(schedule.calls).toHaveLength(1)
+    expect(manager.isRunning()).toBe(false)
+  })
+
+  it('a heartbeat for the replacement membership sends its own request while the old one is held', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+
+    const replacement = protocol.heartbeat({ interval: 0 })
+    await jest.advanceTimersByTimeAsync(0)
+
+    expect(schedule.calls).toHaveLength(2)
+    await expect(replacement).resolves.toBe(false)
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(protocol.memberEpoch).toBe(0)
+  })
+})
+
 describe('completed join ownership', () => {
   it.each([null, 25, 128])('keeps the pre-release apply boundary sound for %s', async (code) => {
     const fixture = ownershipFixture({ kind: 'consumer' })
