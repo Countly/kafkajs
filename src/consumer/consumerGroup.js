@@ -3267,13 +3267,17 @@ module.exports = class ConsumerGroup {
    * A leader also reports a topic that only other members subscribe to once its union watch has
    * seen that topic gain partitions.
    *
+   * Classic only: a manual assignment is fixed, and under the consumer protocol the coordinator
+   * sees a topic's partitions change and sends the new assignment itself, so a rejoin would only
+   * repeat the round it already has (a topic that was missing at the last round and is back, say).
+   *
    * @returns {void}
    * @throws {KafkaJSStaleTopicMetadataAssignment} when a subscribed or union-only topic gained
    *   partitions
    */
   checkForStaleAssignment() {
     if (
-      this.kind === 'manual' ||
+      this.kind !== 'classic' ||
       !this.partitionsPerSubscribedTopic ||
       this.staleAssignmentPending
     ) {

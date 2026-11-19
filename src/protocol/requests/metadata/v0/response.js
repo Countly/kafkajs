@@ -48,6 +48,32 @@ const decode = async (rawData) => {
   }
 }
 
+/**
+ * Throws the first partition error code of the given topics. A partition without a code, which no
+ * decoded answer has, counts as healthy.
+ * @param {object[]} topicMetadata decoded topics
+ * @returns {void}
+ * @throws {import('../../../../errors').KafkaJSProtocolError} on a partition error code
+ */
+const checkPartitions = (topicMetadata) => {
+  const errors = topicMetadata.flatMap((topic) => {
+    return topic.partitionMetadata.filter(
+      ({ partitionErrorCode }) => partitionErrorCode != null && failure(partitionErrorCode)
+    )
+  })
+
+  if (errors.length > 0) {
+    const { partitionErrorCode } = errors[0]
+    throw createErrorFromCode(partitionErrorCode)
+  }
+}
+
+/**
+ * Throws the first topic error code, and only then the first partition error code.
+ * @param {object} data decoded response
+ * @returns {Promise<object>} data, unchanged
+ * @throws {import('../../../../errors').KafkaJSProtocolError} on a topic or partition error code
+ */
 const parse = async (data) => {
   const topicsWithErrors = data.topicMetadata.filter((topic) => failure(topic.topicErrorCode))
   if (topicsWithErrors.length > 0) {
@@ -55,19 +81,12 @@ const parse = async (data) => {
     throw createErrorFromCode(topicErrorCode)
   }
 
-  const errors = data.topicMetadata.flatMap((topic) => {
-    return topic.partitionMetadata.filter((partition) => failure(partition.partitionErrorCode))
-  })
-
-  if (errors.length > 0) {
-    const { partitionErrorCode } = errors[0]
-    throw createErrorFromCode(partitionErrorCode)
-  }
-
+  checkPartitions(data.topicMetadata)
   return data
 }
 
 module.exports = {
   decode,
   parse,
+  checkPartitions,
 }
