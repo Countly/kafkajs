@@ -593,7 +593,7 @@ class ChildRuntime {
       case 'commit-stage':
         return this.worker.onCommitStage?.(event)
       case 'share-acquire':
-        if (!event.wire) {
+        if (!event.wire?.file) {
           this.diagnose(`missing-source share wire for ${event.acquisition}`)
           return
         }
@@ -615,7 +615,7 @@ class ChildRuntime {
           })
         return
       case 'share-settle':
-        if (!event.wire) {
+        if (!event.wire?.file) {
           this.diagnose(`missing-source share ack wire for ${event.acquisition}`)
           return
         }
