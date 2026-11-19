@@ -560,6 +560,54 @@ describe('final soak scheduled work', () => {
     }
   })
 
+  test("an outage journals each run partition's leader and in-sync replicas in its own record citing the broker state", async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      let running = true
+      s.docker = async (args) => {
+        if (['stop', 'kill'].includes(args[1])) running = false
+        if (args[1] === 'start') running = true
+        if (args[0] === 'inspect') return running ? '4242' : '0'
+        return 'container-1'
+      }
+      s.admin = {
+        describeCluster: async () => ({ brokers }),
+        fetchTopicMetadata: async () => ({ topics: partitions([1, 2, 3]) }),
+      }
+      s.send = async () => []
+      s.command = async () => ({ reply: { ok: true }, error: null })
+      const records = []
+      s.emit = async (record) => {
+        const recordId = `p15.${records.length}`
+        records.push({ recordId, ...record })
+        return recordId
+      }
+      await s.outage(outageStep, ['p01'])
+      const expected = partitions([1, 2, 3]).flatMap((t) =>
+        t.partitions.map((p) => ({
+          key: { topic: t.name, topicId: t.topicId, partition: p.partitionId },
+          leader: 1,
+          isr: [1, 2, 3],
+        }))
+      )
+      const states = records.filter((r) => r.kind === 'broker-state')
+      expect(states.map((r) => [r.event, r.partitions])).toEqual([
+        ['down', 6],
+        ['ready', 6],
+        ['isr', 6],
+      ])
+      for (const state of states)
+        expect(
+          records
+            .filter((r) => r.kind === 'partition-state' && r.cause === state.recordId)
+            .map(({ execution, key, leader, isr }) => ({ execution, key, leader, isr }))
+        ).toEqual(expected.map((p) => ({ execution: outageStep.id, ...p })))
+    } finally {
+      remove()
+    }
+  })
+
   test('an outage whose container cannot tell its stop and start instants records them as unknown', async () => {
     const { s, remove } = supervisor()
     try {
@@ -769,29 +817,34 @@ describe('final soak scheduled work', () => {
       phase: 'leave',
       waveDeadline: 90000,
     })
-    expect(wave.runtime.records.filter((r) => r.kind === 'wave')).toEqual([
-      {
-        kind: 'wave',
+    const records = wave.runtime.records.filter((r) => ['wave', 'wave-key'].includes(r.kind))
+    const summary = (event, member) => ({
+      kind: 'wave',
+      recordId: expect.any(String),
+      at: expect.any(Number),
+      execution: 'h00m0w1',
+      event,
+      client: 'c02.1',
+      member,
+      paused: 2,
+      held: 2,
+      observed: true,
+    })
+    const keys = (summary) =>
+      wave.keys.map((key) => ({
+        kind: 'wave-key',
         recordId: expect.any(String),
+        at: summary.at,
         execution: 'h00m0w1',
-        event: 'transfer',
-        client: 'c02.1',
-        member: 'c14.1',
-        paused: wave.keys,
-        keys: wave.keys,
-        observed: true,
-      },
-      {
-        kind: 'wave',
-        recordId: expect.any(String),
-        execution: 'h00m0w1',
-        event: 'return',
-        client: 'c02.1',
-        member: 'c02.1',
-        paused: wave.keys,
-        keys: wave.keys,
-        observed: true,
-      },
+        cause: summary.recordId,
+        key,
+        held: true,
+      }))
+    expect(records).toEqual([
+      summary('transfer', 'c14.1'),
+      ...keys(records[0]),
+      summary('return', 'c02.1'),
+      ...keys(records[3]),
     ])
   })
 
@@ -807,9 +860,16 @@ describe('final soak scheduled work', () => {
       waveDeadline: 90000,
     })
     const records = wave.runtime.records.filter((r) => r.kind === 'wave')
-    expect(records.map((r) => [r.event, r.member, r.keys, r.observed])).toEqual([
-      ['transfer', 'c14.1', wave.keys, true],
-      ['return', 'c02.1', wave.keys.slice(0, 1), false],
+    expect(records.map((r) => [r.event, r.member, r.paused, r.held, r.observed])).toEqual([
+      ['transfer', 'c14.1', 2, 2, true],
+      ['return', 'c02.1', 2, 1, false],
+    ])
+    const returned = wave.runtime.records.filter(
+      (r) => r.kind === 'wave-key' && r.cause === records[1].recordId
+    )
+    expect(returned.map((r) => [r.key, r.held])).toEqual([
+      [wave.keys[0], true],
+      [wave.keys[1], false],
     ])
   })
 
