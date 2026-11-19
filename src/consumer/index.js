@@ -1102,6 +1102,7 @@ module.exports = (params) => {
 
     const start = async (onCrash) => {
       const owned = acquireLife()
+      const startGeneration = stopGeneration
       logger.info('Starting', { groupId })
 
       registerDiscoveryScope()
@@ -1173,6 +1174,9 @@ module.exports = (params) => {
       retainedMemberId = null
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
+      // A background chain and the fetch loop can both await one failed chain: the run reports
+      // its crash once, so the crash policy and its restart decision run once.
+      let crashReport = null
       runner = new Runner({
         logger: rootLogger,
         consumerGroup,
@@ -1185,7 +1189,7 @@ module.exports = (params) => {
         eachBatchAutoResolve,
         eachBatch,
         eachMessage,
-        onCrash: (error) => onCrash(error, owned),
+        onCrash: (error) => (crashReport ??= onCrash(error, owned, startGeneration)),
         onJoinComplete: () => recordJoin(group),
         concurrency,
         maxPrefetchBatches,
@@ -1224,7 +1228,17 @@ module.exports = (params) => {
       if (!consumerGroup) start(onCrash)
     }
 
-    const onCrash = async (e, owned) => {
+    /**
+     * Reports a run's crash: cleans the run up, decides on a restart (the error's retriability,
+     * `restartOnFailure`, and the fatal membership errors that override it), emits `CRASH` and arms
+     * the restart. A stop or disconnect asked at any time after the run started - before this
+     * handler ran included - cancels the restart.
+     * @param {Error} e what the run failed with
+     * @param {ControlLifetime} owned the lifetime the run belongs to
+     * @param {number} startGeneration `stopGeneration` when the run started
+     * @returns {Promise<void>}
+     */
+    const onCrash = async (e, owned, startGeneration) => {
       logger.error(`Crash: ${e.name}: ${e.message}`, {
         groupId,
         retryCount: e.retryCount,
@@ -1258,7 +1272,7 @@ module.exports = (params) => {
       // user gets, because consumer.run() has already resolved by the time the runner dies.
       // shutDown() already logs this failure itself (and rethrows), so there is nothing
       // further to log here; just make sure it cannot stop the CRASH event from firing.
-      const crashStopGeneration = stopGeneration + 1
+      const crashStopGeneration = startGeneration + 1
       try {
         await shutDown(undefined, { keepResets: true, preserveSetupState: true })
       } catch {}
@@ -1298,8 +1312,9 @@ module.exports = (params) => {
       if (!ownsCluster) shouldRestart = false
 
       if (shouldRestart && (stopGeneration !== crashStopGeneration || owned.fence.closed)) {
-        // The user called disconnect()/stop() during the crash cleanup or while restartOnFailure
-        // was deciding: do not resurrect a consumer they believe is gone.
+        // The user called disconnect()/stop() after the run started - before the crash was
+        // reported, during its cleanup or while restartOnFailure was deciding: do not resurrect a
+        // consumer they believe is gone.
         logger.warn(
           'Consumer was stopped while deciding whether to restart after a crash; not restarting',
           { groupId }

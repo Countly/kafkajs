@@ -159,4 +159,36 @@ describe('Consumer > what a call is refused for before it reaches a broker', () 
     ])
     await disposeConsumer(consumer)
   })
+
+  test.each([
+    ['null', null],
+    ['undefined', undefined],
+  ])(
+    'a listener that rejects with %s is logged as an error and leaves no unhandled rejection',
+    async (_, thrown) => {
+      const { consumer, entries } = build()
+      const unhandled = []
+      const record = (reason) => unhandled.push(reason)
+      process.on('unhandledRejection', record)
+      try {
+        consumer.on(consumer.events.CONNECT, () => Promise.reject(thrown))
+
+        await consumer.connect()
+        await new Promise((resolve) => setImmediate(resolve))
+        await new Promise((resolve) => setImmediate(resolve))
+      } finally {
+        process.off('unhandledRejection', record)
+      }
+
+      expect(unhandled).toEqual([])
+      expect(entries.map(({ level, log }) => ({ level, ...log }))).toEqual([
+        expect.objectContaining({
+          level: LEVELS.ERROR,
+          message: 'Failed to execute listener: undefined',
+          eventName: consumer.events.CONNECT,
+        }),
+      ])
+      await disposeConsumer(consumer)
+    }
+  )
 })

@@ -761,6 +761,7 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.heartbeat).toHaveBeenCalledWith({
         interval: 500,
         guard: expect.any(Function),
+        onAccepted: expect.any(Function),
       })
     })
 
