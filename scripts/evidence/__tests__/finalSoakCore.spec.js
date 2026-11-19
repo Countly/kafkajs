@@ -1753,6 +1753,43 @@ describe('scripts/evidence/finalSoakCore', () => {
   })
 
   describe('information that is not judged', () => {
+    const shareOutcome = (from, to, type, reason) => ({
+      t: 4000,
+      kind: 'identity',
+      stage: 'share-outcome',
+      source: 'p07',
+      client: 'c07.0',
+      group: groupOf('c07'),
+      key: fx.key(fx.MAIN),
+      from,
+      to,
+      type,
+      reason,
+      errorType: null,
+    })
+
+    it('prints the unresolved share acknowledgements by reason and the distinct offsets they cover, and changes no row', async () => {
+      const edit = (records) => [
+        ...records,
+        shareOutcome('0', '3', 'accept', null),
+        shareOutcome('4', '5', 'release', 'lock-expired'),
+        shareOutcome('5', '5', 'reject', 'poison'),
+        shareOutcome('7', '7', 'release', 'lock-expired'),
+      ]
+      const [plain, report] = [await check(fx.healthy()), await check(fx.healthy(), { edit })]
+      expect(report.rows).toEqual(plain.rows)
+      expect(report.overall).toBe('ACCEPTED')
+      expect(formatReport(report).split('NOT JUDGED information')[1]).toMatch(
+        /^ {2}unresolved share acknowledgements: 3 \(lock-expired 2, poison 1\) covering 3 distinct offsets$/m
+      )
+    })
+
+    it('prints no share acknowledgement line for a journal without share-outcome records', async () => {
+      const text = formatReport(await check(fx.healthy()))
+      expect(text).toMatch(/NOT JUDGED information/)
+      expect(text).not.toMatch(/share acknowledgements/)
+    })
+
     const brokerState = (event, at, extra = {}) => ({
       t: at,
       at,
