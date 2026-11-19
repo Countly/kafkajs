@@ -11,6 +11,7 @@ const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const {
   pollIntervalExceededError,
   stampGeneration,
+  stampOwnership,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
 const {
@@ -426,6 +427,68 @@ describe('Consumer > RebalanceCoordinator > the round after the inter-round yiel
     expect(
       coordinator.nextRoundAfterWait({ kind: 'lost', reason: 'fenced', level: false })
     ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
+  })
+
+  it('keeps the chosen round when the slot holds a LOST of a membership an apply has since renewed', () => {
+    const { coordinator, consumerGroup } = lostMember()
+    coordinator.verdict = {
+      kind: 'lost',
+      reason: 'fenced',
+      error: stampOwnership(new Error('fenced'), 0),
+    }
+    consumerGroup.ownership.renew()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'revoked', reason: 'assignment-changed', level: true })
+  })
+
+  it.each([
+    ['waits in the slot', true],
+    ['was taken by the fetch loop', false],
+  ])(
+    'opens no reconciliation for a REVOKED while a LOST of the current membership %s',
+    async (_, slotted) => {
+      const { coordinator, consumerGroup } = lostMember()
+      consumerGroup.rebalanceProtocol = () => COOPERATIVE
+      const error = stampOwnership(new Error('fenced'), 0)
+      if (slotted) coordinator.verdict = { kind: 'lost', reason: 'fenced', error }
+
+      coordinator.requestRejoin({
+        kind: 'revoked',
+        reason: 'assignment-changed',
+        error: new Error('assignment changed'),
+      })
+      await Promise.resolve()
+
+      expect(coordinator.isRebalancing()).toBe(false)
+      expect(consumerGroup.joinAndSync).not.toHaveBeenCalled()
+      expect(coordinator.verdict).toEqual(
+        slotted ? { kind: 'lost', reason: 'fenced', error } : null
+      )
+    }
+  )
+
+  it('opens a reconciliation for a REVOKED once an apply has renewed the membership a slotted LOST belonged to', async () => {
+    const { coordinator, consumerGroup } = lostMember()
+    consumerGroup.rebalanceProtocol = () => COOPERATIVE
+    consumerGroup.needsReconciliation = () => false
+    coordinator.verdict = {
+      kind: 'lost',
+      reason: 'fenced',
+      error: stampOwnership(new Error('fenced'), 0),
+    }
+    consumerGroup.ownership.renew()
+
+    coordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'assignment-changed',
+      error: new Error('assignment changed'),
+    })
+    await coordinator.idle()
+
+    expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(1)
+    expect(coordinator.verdict).toBeNull()
   })
 
   it('runs a LOST round queued during the wait even though the membership is lost', () => {
