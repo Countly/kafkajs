@@ -18,11 +18,14 @@
  * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
  * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE.
  *
- * Memory: about 32 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
- * 51 MB at 1.6 million) plus one id string and Map entry per offered id; one entry per open
- * ownership interval and per transaction, each capped at the same capacity; a fixed sample grid per
- * process. Handler entries only update typed arrays. Any cap that is reached is a reported problem
- * that leaves K1 to K6 INCONCLUSIVE. Peak RSS has not been measured on a day-size artifact.
+ * Memory: about 87 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
+ * 139 MB at 1.6 million; pages are touched only as ids arrive): the full 32-byte payload digest,
+ * offsets, and one 4-byte ownership-interval serial per judged group. Then one id string and Map
+ * entry per offered id; one entry per open ownership interval, per transaction, per id an open
+ * interval shares with an overlapping one, and per record held for its offer, each capped at the
+ * same capacity; open membership waves and printed outages capped by the matrix schedule; a fixed
+ * sample grid per process. Any cap that is reached is a reported problem that leaves K1 to K6
+ * INCONCLUSIVE. Side files are read whole only below a size cap.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
@@ -37,8 +40,11 @@ const EXAMPLES = 3
 const LIST_CAP = 20
 const MAX_LINE = 1 << 20
 const MAX_SMALL_FILE = 1 << 20
+const MAX_JSON = 16 << 20
 /** @param {string|Buffer} data @returns {string} its sha256 in hex */
 const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
+/** The `entered` value of an id a group entered outside every ownership interval; serials start above it. */
+const OUTSIDE = 1
 const ACK = { none: 0, acknowledged: 1, unknown: 2, rejected: 3, contradicted: 4 }
 const ROW_NAMES = {
   K1: 'no lost record',
@@ -144,6 +150,10 @@ function recipientsOf(matrix, config, role) {
  * instance applies an assignment that acquires the partition (an `acquire` boundary with a new
  * acquisition) and closes when it revokes or loses it (`revoke-end`, `lost`). A handler entry
  * belongs to the open interval with the batch's acquisition; outside one it is an unowned entry.
+ * Each interval has a serial; per group and offered id the journal keeps the serial of the interval
+ * that last entered the id (`OUTSIDE` for an entry outside every interval), so a same-owner repeat is
+ * the same id entered twice by one interval, whatever the offsets in between. When another interval
+ * re-enters an id an open interval entered, the open one keeps that id in `shadowed` until it closes.
  */
 class Journal {
   /**
@@ -167,29 +177,37 @@ class Journal {
         return { group, share, index: this.groupIndex.get(group).index }
       })
     )
-    this.entered = [...this.groupIndex.keys()].map(() => new Uint8Array(capacity))
+    this.entered = [...this.groupIndex.keys()].map(() => new Uint32Array(capacity))
     this.ids = new Map()
     this.names = []
     this.topic = new Uint8Array(capacity)
     this.ack = new Uint8Array(capacity)
     this.offset = new Float64Array(capacity).fill(NaN)
-    this.digest = new Uint32Array(capacity)
+    this.digests = Buffer.alloc(capacity * 32)
     this.enteredAt = new Float64Array(capacity).fill(NaN)
     this.txOf = []
     this.txs = new Map()
     this.owners = new Map()
+    this.serials = OUTSIDE
+    this.shadowed = new Map()
+    this.shadowedCount = 0
     this.held = new Map()
     this.heldCount = 0
     this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
-    this.trafficEnd = null
+    this.trafficEnds = new Map()
+    /** @returns {{ paused: number, held: number }} empty key counts of one wave event */
     const keys = () => ({ paused: 0, held: 0 })
     this.info = {
       outages: [],
+      outagesNotShown: 0,
       waves: { transfer: 0, return: 0, unobserved: 0, keys: { transfer: keys(), return: keys() } },
       incompleteWaves: [],
     }
     this.openWaves = new Map()
+    const churn = matrix.schedule.executions.find((e) => e.shape === 'membership-churn')
+    this.waveCap = churn.waves * 2 * Object.keys(matrix.clientKinds).length
+    this.outageCap = 2 * matrix.schedule.totals.outages
     this.incidents = new Map()
     this.procs = new Map(config.processes.map(({ slot }) => [slot, this.newProcess()]))
   }
@@ -225,13 +243,9 @@ class Journal {
     else if (r.kind === 'boundary') this.boundary(r)
     else if (r.kind === 'sample') this.sample(r)
     else if (r.kind === 'process') this.process(r)
-    else if (r.kind === 'shape' && r.execution === 'traffic' && r.phase === 'end')
-      this.trafficEnd = Math.max(this.trafficEnd ?? -Infinity, r.at)
-    else if (r.kind === 'broker-state' && r.event !== 'isr') {
-      const { node, event, at, downMs = null, processAt = null } = r
-      if (this.info.outages.length < LIST_CAP)
-        this.info.outages.push({ node, event, at, downMs, processAt })
-    } else if (r.kind === 'wave') this.wave(r)
+    else if (r.kind === 'shape') this.shape(r)
+    else if (r.kind === 'broker-state' && r.event !== 'isr') this.outage(r)
+    else if (r.kind === 'wave') this.wave(r)
     else if (r.kind === 'wave-key') this.waveKey(r)
     else if (r.kind === 'diagnostic') {
       const kind =
@@ -246,14 +260,42 @@ class Journal {
   }
 
   /**
+   * Keeps a broker's down or ready instant for the report, up to two per scheduled outage of a day
+   * (`schedule.totals.outages`); beyond that it only counts them.
+   * @param {object} r a `broker-state` record other than `isr` @returns {void}
+   */
+  outage(r) {
+    const { node, event, at, downMs = null, processAt = null } = r
+    if (this.info.outages.length < this.outageCap)
+      this.info.outages.push({ node, event, at, downMs, processAt })
+    else this.info.outagesNotShown++
+  }
+
+  /**
+   * Keeps, per process of the config, the latest end of a `traffic` shape executed as `traffic`:
+   * the supervisor writes one after the final drain. Other shapes and sources are no candidates.
+   * @param {object} r a `shape` record @returns {void}
+   */
+  shape(r) {
+    if (r.execution !== 'traffic' || r.phase !== 'end' || r.shape !== 'traffic') return
+    if (this.procs.has(r.source))
+      this.trafficEnds.set(r.source, Math.max(this.trafficEnds.get(r.source) ?? -Infinity, r.at))
+  }
+
+  /**
    * A membership wave's transfer or return. It counts its paused keys; until that many `wave-key`
-   * records cite it, it stays open, and `finish` lists it as incomplete.
+   * records cite it, it stays open, and `finish` lists it as incomplete. At most `waveCap` waves stay
+   * open: every client kind running every wave of one membership execution at once, transfer and
+   * return each. A wave beyond that is not kept, and the journal reports a problem.
    * @param {object} r a `wave` record @returns {void}
    */
   wave(r) {
     this.info.waves[r.event]++
     if (!r.observed) this.info.waves.unobserved++
-    if (r.paused > 0) this.openWaves.set(r.recordId, { event: r.event, paused: r.paused, seen: 0 })
+    if (!(r.paused > 0)) return
+    if (this.openWaves.size < this.waveCap)
+      this.openWaves.set(r.recordId, { event: r.event, paused: r.paused, seen: 0 })
+    else this.problem(`more than ${this.waveCap} membership waves wait for their wave-key records`)
   }
 
   /**
@@ -295,9 +337,9 @@ class Journal {
       outcome: r.outcome,
       group: r.group,
       key: r.key,
-      digest: r.payloadSha256 && parseInt(r.payloadSha256.slice(0, 8), 16),
+      digest: r.payloadSha256,
       run: r.authority?.run ?? 'no authority',
-      owned: r.stage === 'handler-enter' ? this.ownership(r) : null,
+      ...(r.stage === 'handler-enter' ? this.ownership(r) : {}),
     }
     const i = this.ids.get(r.id)
     if (i !== undefined) return this.resolve(i, fact)
@@ -374,7 +416,7 @@ class Journal {
     this.names.push(r.id)
     this.ids.set(r.id, i)
     this.topic[i] = topic
-    this.digest[i] = parseInt(r.payloadSha256.slice(0, 8), 16)
+    this.digests.write(r.payloadSha256, i * 32, 32, 'hex')
     if (r.transaction !== null) {
       this.txOf[i] = this.transaction(r.transaction)
       this.txOf[i]?.members.push(i)
@@ -437,36 +479,61 @@ class Journal {
       return this.note('misattributed', `boundary ${r.recordId ?? r.cause} of ${r.client}`)
     const k = Journal.ownerKey(r.group, r.authority, r.key)
     const owner = this.owners.get(k)
-    if (r.event === 'revoke-end' || r.event === 'lost') this.owners.delete(k)
+    if (r.event === 'revoke-end' || r.event === 'lost') this.close(k)
     if (r.event !== 'acquire') return
     if (owner?.acquiredAt === r.authority.acquiredAt) this.redundantAcquires++
     else if (!owner && this.owners.size >= this.capacity)
       this.problem(`more than ${this.capacity} open ownership intervals`)
-    else this.owners.set(k, { acquiredAt: r.authority.acquiredAt, high: -1 })
+    else {
+      if (owner) this.close(k)
+      this.owners.set(k, { acquiredAt: r.authority.acquiredAt, serial: ++this.serials })
+    }
+  }
+
+  /** @param {string} k an ownership key; closes its interval and drops what it shadowed @returns {void} */
+  close(k) {
+    const serial = this.owners.get(k)?.serial
+    this.shadowedCount -= this.shadowed.get(serial)?.size ?? 0
+    this.shadowed.delete(serial)
+    this.owners.delete(k)
   }
 
   /**
-   * The ownership of a handler entry, judged when it arrives. In an ordinary group the entry must
-   * lie in an open ownership interval of its client run; one at or below an offset that interval
-   * already entered is a same-owner repeat.
+   * The ownership of a handler entry, judged when it arrives: in an ordinary group the entry must
+   * lie in an open ownership interval of its client run, whose serial it takes.
    * @param {object} r a `handler-enter` record
-   * @returns {'share'|'misattributed'|'unowned'|'sameOwner'|'owned'}
+   * @returns {{ owned: 'share'|'misattributed'|'unowned'|'owned', serial: number }}
    */
   ownership(r) {
-    if (this.groupIndex.get(r.group).share) return 'share'
-    if (r.authority === null || !this.attributed(r, r.authority)) return 'misattributed'
+    /** @param {string} owned the finding @returns {object} it, outside every interval */
+    const outside = (owned) => ({ owned, serial: OUTSIDE })
+    if (this.groupIndex.get(r.group).share) return outside('share')
+    if (r.authority === null || !this.attributed(r, r.authority)) return outside('misattributed')
     const owner = this.owners.get(Journal.ownerKey(r.group, r.authority, r.key))
-    if (owner?.acquiredAt !== r.authority.acquiredAt) return 'unowned'
-    const offset = Number(r.offset)
-    const owned = offset <= owner.high ? 'sameOwner' : 'owned'
-    owner.high = Math.max(owner.high, offset)
-    return owned
+    if (owner?.acquiredAt !== r.authority.acquiredAt) return outside('unowned')
+    return { owned: 'owned', serial: owner.serial }
   }
 
   /**
-   * A handler entry, matched to its offered record by topic, partition and payload digest, and to
-   * one offset across every group; then its ownership finding is counted. A repeat in another
-   * interval, by another run or in the share group is only counted.
+   * Records that an open interval entered id `i` before another interval of its group re-entered
+   * it, so a later repeat by the open interval is still found; bounded by the capacity.
+   * @param {number} serial @param {number} i @returns {void}
+   */
+  shadow(serial, i) {
+    if (![...this.owners.values()].some((o) => o.serial === serial)) return
+    if (this.shadowedCount >= this.capacity)
+      return this.problem(`more than ${this.capacity} ids re-entered by overlapping intervals`)
+    const set = this.shadowed.get(serial) ?? new Set()
+    this.shadowed.set(serial, set)
+    if (!set.has(i)) this.shadowedCount++
+    set.add(i)
+  }
+
+  /**
+   * A handler entry, matched to its offered record by topic, partition and full payload digest, and to
+   * one offset across every group; then its ownership finding is counted. The same id entered
+   * twice by one interval is a same-owner repeat; a repeat in another interval, by another run or
+   * in the share group is only counted.
    * @param {number} i the id's index @param {object} e a `handler-enter` fact from `byId`
    * @returns {void}
    */
@@ -475,17 +542,25 @@ class Journal {
     const where = `${e.id} in ${e.group}`
     if (this.topics.get(e.key.topic) !== this.topic[i] || e.key.partition !== 0)
       return this.note('wrongRecord', `${where} on ${e.key.topic}|${e.key.partition}`)
-    if (e.digest !== this.digest[i])
+    if (e.digest !== this.digests.toString('hex', i * 32, i * 32 + 32))
       return this.note('wrongRecord', `${where} with another payload`)
     const offset = Number(e.offset)
     if (Number.isNaN(this.enteredAt[i])) this.enteredAt[i] = offset
     else if (this.enteredAt[i] !== offset)
       return this.note('wrongRecord', `${where} at ${offset}, elsewhere at ${this.enteredAt[i]}`)
-    const before = this.entered[group.index][i]
-    this.entered[group.index][i] = 1
-    if (e.owned === 'share') this.shareRepeats += before
-    else if (e.owned === 'owned') this.repeatsAfterChange += before
-    else this.note(e.owned, `${where} by ${e.run}`)
+    const slot = this.entered[group.index]
+    const before = slot[i]
+    if (e.owned !== 'owned') {
+      if (before === 0) slot[i] = OUTSIDE
+      if (e.owned === 'share') this.shareRepeats += before === 0 ? 0 : 1
+      else this.note(e.owned, `${where} by ${e.run}`)
+      return
+    }
+    if (before === e.serial || this.shadowed.get(e.serial)?.has(i))
+      this.note('sameOwner', `${where} by ${e.run}`)
+    else if (before !== 0) this.repeatsAfterChange++
+    if (before > OUTSIDE && before !== e.serial) this.shadow(before, i)
+    slot[i] = e.serial
   }
 
   /** @param {object} r a `process` record @returns {void} */
@@ -564,6 +639,16 @@ function checkBound(manifest, file, got, problems) {
 }
 
 /**
+ * Reads a file whole, but only when it is at most `cap` bytes.
+ * @param {string} file @param {number} cap @returns {Buffer}
+ * @throws {Error} `larger than <cap> bytes`, or the file system's error
+ */
+function readCapped(file, cap) {
+  if (fs.statSync(file).size > cap) throw new Error(`larger than ${cap} bytes`)
+  return fs.readFileSync(file)
+}
+
+/**
  * Reads one small ground-truth file whole (at most `MAX_SMALL_FILE` bytes) and checks it against
  * the header manifest.
  * @param {object} ctx `{ dir, manifest }` @param {string} name file below `apache/`
@@ -574,13 +659,9 @@ function readBound({ dir, manifest }, name, problems, missing = 'file is missing
   const file = path.join(dir, 'apache', name)
   let text
   try {
-    if (fs.statSync(file).size > MAX_SMALL_FILE) {
-      problems.push(`apache/${name}: larger than ${MAX_SMALL_FILE} bytes`)
-      return null
-    }
-    text = fs.readFileSync(file, 'utf8')
-  } catch {
-    problems.push(`apache/${name}: ${missing}`)
+    text = readCapped(file, MAX_SMALL_FILE).toString('utf8')
+  } catch (e) {
+    problems.push(`apache/${name}: ${/^larger/.test(e.message) ? e.message : missing}`)
     return null
   }
   const got = { bytes: Buffer.byteLength(text), sha256: sha(text) }
@@ -612,7 +693,7 @@ function readEnd(ctx, name, problems) {
 async function readDump(ctx, role) {
   const { dir, journal, config, matrix, dumped } = ctx
   const name = `${role}.dump`
-  const out = { problems: [], count: 0, maxOffset: -1, findings: {} }
+  const out = { problems: [], count: 0, maxOffset: -1, lastTx: null, findings: {} }
   /** Counts one finding of a kind on this dump, as `Journal#note` does. */
   const note = Journal.prototype.note.bind(out)
   const end = readEnd(ctx, name, out.problems)
@@ -628,6 +709,7 @@ async function readDump(ctx, role) {
     out.count++
     out.maxOffset = Math.max(out.maxOffset, offset)
     const i = journal.ids.get(id)
+    out.lastTx = (i !== undefined && journal.txOf[i]) || null
     if (i === undefined || journal.topic[i] !== topic)
       return note('foreign', `${id} at offset ${offset}`)
     if (dumped[i]) return note('duplicate', id)
@@ -733,11 +815,62 @@ function invisibleAtLeast(journal) {
 }
 
 /**
+ * The most offsets after the transactions dump's last record that the journal explains as invisible
+ * to a read-committed reader: the acknowledged members of aborted transactions placed there, one
+ * control marker for each of their transactions, and the marker that closes the transaction of the
+ * last dumped record. A marker follows the records it closes, and the coordinator refuses a
+ * transactional id's next transaction until its markers are written. Anything else there (a retried
+ * marker, an aborted member whose offset is unknown, a visible record the dump was cut off before)
+ * is unexplained, so the dump stays unproved rather than possibly hiding a visible record.
+ * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end the log end
+ * @returns {number}
+ */
+function invisibleAfter(journal, dump, end) {
+  const closing = new Set()
+  if (/^(committed|aborted)$/.test(dump.lastTx?.outcome)) closing.add(dump.lastTx)
+  let members = 0
+  for (const t of journal.txs.values()) {
+    if (t.outcome !== 'aborted') continue
+    for (const i of t.members) {
+      const at = journal.offset[i]
+      if (journal.ack[i] !== ACK.acknowledged || !(at > dump.maxOffset && at < end)) continue
+      members++
+      closing.add(t)
+    }
+  }
+  return members + closing.size
+}
+
+/**
+ * Whether a dump holds every visible record of its partition below the log end Apache's describe
+ * reports, and why not. Every dumped offset must lie below that end. The main partition holds only
+ * visible records, so its dump must hold exactly the end's count. The console consumer reads in
+ * offset order and can only be cut off, so a transactions dump is complete up to its last record;
+ * after it, every offset up to the end must be one the journal explains as invisible
+ * (`invisibleAfter`), and the dump must reach every acknowledged visible record.
+ * @param {Journal} journal @param {object} dump `readDump`'s result @param {number} end
+ * @param {number} n 0 for main, 1 for transactions @param {number} lastVisible the highest
+ *   acknowledged offset of a visible transactions record
+ * @returns {string|false} the reason it is not proved complete, or false
+ */
+function incomplete(journal, dump, end, n, lastVisible) {
+  if (dump.maxOffset >= end) return `offset ${dump.maxOffset} lies at or beyond the log end`
+  if (n === 0) return dump.count !== end && `${dump.count} records dumped`
+  if (dump.maxOffset < lastVisible) return `a visible record was acknowledged at ${lastVisible}`
+  const least = invisibleAtLeast(journal)
+  if (end - dump.count < least)
+    return `${dump.count} records dumped but at least ${least} offsets are invisible`
+  const [after, most] = [end - 1 - dump.maxOffset, invisibleAfter(journal, dump, end)]
+  return (
+    after > most &&
+    `${after} offsets follow the last dumped record but the journal explains at most ${most} of them as invisible`
+  )
+}
+
+/**
  * K1: every acknowledged id, and every non-rejected member of a committed transaction, is in the
  * read-committed dump once at its acknowledged offset (anywhere when the offset is unknown),
- * aborted members never. The main dump is complete when it holds every offset below the log end
- * from Apache's describe. The transactions dump is complete when it reached every known offset of a
- * visible record and the remaining offsets are at least the invisible ones the journal explains.
+ * aborted members never, and each dump is proved complete up to Apache's log end (`incomplete`).
  * Unknown results, contradictions and unproved completeness are INCONCLUSIVE, never PASS.
  * @param {Row} k1 @param {object} ctx `{ journal, dumps, ends, dumped }`
  * @returns {boolean} whether the dumps are usable and proved complete
@@ -776,19 +909,12 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
       )
     } else if (!t) uncertain.push(journal.names[i])
   }
-  const least = invisibleAtLeast(journal)
   const complete = dumps.every((d, n) => {
     if (ends[n] === null) {
       k1.gap(`no describe row gives the ${ROLES[n]} log end`)
       return false
     }
-    const why =
-      n === 0
-        ? d.count !== ends[n] && `${d.count} records dumped`
-        : d.maxOffset < lastVisible
-          ? `a visible record was acknowledged at ${lastVisible}`
-          : ends[n] - d.count < least &&
-            `${d.count} records dumped but at least ${least} offsets are invisible`
+    const why = incomplete(journal, d, ends[n], n, lastVisible)
     if (why)
       k1.gap(
         `the ${ROLES[n]} dump stops at offset ${d.maxOffset} and the log ends at ${ends[n]}: ${why}, so it is not proved complete`
@@ -824,9 +950,10 @@ function judgeLog(k1, { journal, dumps, ends, dumped }) {
 }
 
 /**
- * K2: every handler entry names an offered id and matches its record (topic, partition, payload, one offset that is the
- * log's), and when the dump is proved complete every visible record entered a handler in every
- * recipient group while no group entered a record a read-committed reader cannot see.
+ * K2: every handler entry names an offered id and matches its record exactly (topic, partition, full
+ * payload digest, one offset that is the log's). When the dump is proved complete, every visible
+ * record entered a handler in every recipient group of its topic, and no judged group entered a
+ * record a read-committed reader cannot see or a record of a topic the group does not read.
  * @param {Row} k2 @param {Journal} journal @param {Uint8Array} dumped @param {boolean} complete
  * @returns {void}
  */
@@ -836,31 +963,36 @@ function judgeDelivery(k2, journal, dumped, complete) {
   const phantom = journal.findings.neverOffered
   if (phantom) k2.fail(`${phantom.count} handler entries name an id never offered${first(phantom)}`)
   if (!complete) return
-  const missing = new Map()
+  const groups = [...journal.groupIndex.keys()]
+  const reads = journal.recipients.map((rs) => new Set(rs.map((r) => r.index)))
+  const [missing, foreign] = [new Map(), new Map()]
   const invisible = { count: 0, examples: [] }
+  /** @param {Map} map @param {number} g @param {number} i counts record i for group g */
+  const count = (map, g, i) => {
+    const m = map.get(groups[g]) ?? { count: 0, first: journal.names[i] }
+    map.set(groups[g], { ...m, count: m.count + 1 })
+  }
   let visible = 0
   for (let i = 0; i < journal.names.length; i++) {
-    const groups = journal.recipients[journal.topic[i]]
-    if (!dumped[i]) {
-      const by = groups.find(({ index }) => journal.entered[index][i])
-      if (by && invisible.count++ < EXAMPLES)
-        invisible.examples.push(`${journal.names[i]} in ${by.group}`)
-      continue
+    const recipient = reads[journal.topic[i]]
+    if (dumped[i]) visible++
+    for (let g = 0; g < groups.length; g++) {
+      const entered = journal.entered[g][i]
+      if (!dumped[i] && entered && invisible.count++ < EXAMPLES)
+        invisible.examples.push(`${journal.names[i]} in ${groups[g]}`)
+      else if (dumped[i] && !recipient.has(g) && entered) count(foreign, g, i)
+      else if (dumped[i] && recipient.has(g) && !entered) count(missing, g, i)
     }
-    visible++
-    for (const { group, index } of groups)
-      if (!journal.entered[index][i]) {
-        const m = missing.get(group) ?? { count: 0, first: journal.names[i] }
-        missing.set(group, { ...m, count: m.count + 1 })
-      }
   }
   for (const [group, m] of missing)
     k2.fail(`${group} never entered a handler for ${m.count} visible records (first ${m.first})`)
+  for (const [group, m] of foreign)
+    k2.fail(`${group} entered ${m.count} records of a topic it does not read (first ${m.first})`)
   if (invisible.count > 0)
     k2.fail(
       `${invisible.count} records not visible to a read-committed reader entered a handler${first(invisible)}`
     )
-  Object.assign(k2.numbers, { visibleRecords: visible, groupsJudged: journal.groupIndex.size })
+  Object.assign(k2.numbers, { visibleRecords: visible, groupsJudged: groups.length })
 }
 
 /**
@@ -998,13 +1130,21 @@ function judgeHeap(row, { journal, matrix, config, plan, header }) {
 /**
  * K6: every process's final resource counts are at or below its baseline; a type the baseline never
  * had counts against zero, so an unknown type fails. The baseline must precede every other sample
- * of its process and the final follow every other sample and the end of traffic (after the drain).
- * @param {Row} row @param {{ journal: Journal, config: object }} ctx @returns {void}
+ * of its process and the final follow every other sample and the end of traffic. The end of traffic
+ * is the supervisor's (`header.exit.supervisorProcess`) latest `traffic` shape end, written after
+ * the final drain, and must lie between the run's end and the supervisor's observed end.
+ * @param {Row} row @param {{ journal: Journal, config: object, header: object }} ctx @returns {void}
  */
-function judgeResources(row, { journal, config }) {
+function judgeResources(row, { journal, config, header }) {
   let above = 0
-  if (journal.trafficEnd === null)
-    row.gap('the journal records no end of traffic (the final drain)')
+  const end = journal.trafficEnds.get(header.exit.supervisorProcess) ?? null
+  const { runEndAt, observedEndAt } = header.window
+  if (end === null)
+    row.gap('the journal records no end of traffic (the final drain) from the supervisor')
+  else if (end < runEndAt || end > observedEndAt)
+    row.gap(
+      `the end of traffic at ${end} lies outside the run end ${runEndAt} to the observed end ${observedEndAt}`
+    )
   for (const { slot } of config.processes) {
     const { baseline, final, others } = journal.procs.get(slot)
     if (!baseline || !final) {
@@ -1013,7 +1153,7 @@ function judgeResources(row, { journal, config }) {
     }
     if (baseline.completedAt > others.first)
       row.gap(`${slot} baseline was completed after its first other sample`)
-    if (final.admittedAt < Math.max(others.last, journal.trafficEnd ?? Infinity))
+    if (final.admittedAt < Math.max(others.last, end ?? Infinity))
       row.gap(`${slot} final sample was not taken last and after the end of traffic`)
     for (const [type, count] of final.counts) {
       if (count <= (baseline.counts.get(type) ?? 0)) continue
@@ -1023,7 +1163,7 @@ function judgeResources(row, { journal, config }) {
       )
     }
   }
-  row.numbers.typesAboveBaseline = above
+  Object.assign(row.numbers, { trafficEnd: end, typesAboveBaseline: above })
 }
 
 /**
@@ -1091,7 +1231,7 @@ function judgeCompleteness(row, { journal, config, header, supervisor, plan, pro
 
 /**
  * What the journal shows but no row judges: broker outages (down and ready instants, configured
- * down time, container stop or start instant), membership wave transfers and returns with the
+ * down time, container stop or start instant; two per scheduled outage, with a count of any more), membership wave transfers and returns with the
  * paused and held keys their `wave-key` records name, waves missing some of their `wave-key`
  * records (the stream validator fails those too), probe sends that settled after their step, and
  * drain commits skipped as expected.
@@ -1101,6 +1241,7 @@ function informationOf(journal) {
   const count = (kind) => journal.incidents.get(kind)?.count ?? 0
   return {
     outages: journal.info.outages,
+    outagesNotShown: journal.info.outagesNotShown,
     waves: journal.info.waves,
     incompleteWaves: journal.info.incompleteWaves,
     lateProbeSends: count('late'),
@@ -1162,14 +1303,24 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
 }
 
 /**
- * Reads one JSON file of the artifact.
- * @param {string} dir @param {string} file @returns {object|null} the parsed value, or null
+ * Reads one JSON side file of the artifact whole, at most `MAX_JSON` bytes.
+ * @param {string} dir @param {string} file @param {string[]} problems receives a size or read
+ *   problem; a missing file is left to the caller
+ * @returns {{ bytes: Buffer, json: object|null }|null} its bytes and parsed value (null when not
+ *   JSON), or null when it is missing or cannot be read
  */
-function readJson(dir, file) {
+function readSide(dir, file, problems) {
+  let bytes
   try {
-    return JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'))
-  } catch {
+    bytes = readCapped(path.join(dir, file), MAX_JSON)
+  } catch (e) {
+    if (e.code !== 'ENOENT') problems.push(`${file}: ${e.message}`)
     return null
+  }
+  try {
+    return { bytes, json: JSON.parse(bytes) }
+  } catch {
+    return { bytes, json: null }
   }
 }
 
@@ -1182,11 +1333,18 @@ function readJson(dir, file) {
 async function checkArtifact(dir) {
   const reviewed = fs.readFileSync(REVIEWED_MATRIX)
   const matrix = JSON.parse(reviewed)
-  const [header, config] = [readJson(dir, 'header.json'), readJson(dir, 'config.json')]
   const problems = [...schema.validateMatrix(matrix)]
-  const archived = fs.existsSync(path.join(dir, ARCHIVED_MATRIX))
-    ? fs.readFileSync(path.join(dir, ARCHIVED_MATRIX))
-    : null
+  const side = Object.fromEntries(
+    ['header.json', 'config.json', 'supervisor.json', 'outer-exit.json'].map((file) => [
+      file,
+      readSide(dir, file, problems),
+    ])
+  )
+  const [header, config] = [side['header.json']?.json, side['config.json']?.json]
+  let archived = null
+  try {
+    archived = readCapped(path.join(dir, ARCHIVED_MATRIX), MAX_JSON)
+  } catch {}
   if (!archived?.equals(reviewed))
     problems.push(
       `the archived matrix is missing or differs from the matrix of the checkout this checker runs from (${CHECKOUT})`
@@ -1218,11 +1376,10 @@ async function checkArtifact(dir) {
   }
   const manifest = new Map(header.files.map((f) => [f.file, f]))
   for (const file of ['config.json', 'supervisor.json', 'outer-exit.json']) {
-    if (!fs.existsSync(path.join(dir, file))) continue
-    const bytes = fs.readFileSync(path.join(dir, file))
-    checkBound(manifest, file, { bytes: bytes.length, sha256: sha(bytes) }, problems)
+    const bytes = side[file]?.bytes
+    if (bytes) checkBound(manifest, file, { bytes: bytes.length, sha256: sha(bytes) }, problems)
   }
-  const outer = readJson(dir, 'outer-exit.json')
+  const outer = side['outer-exit.json']?.json
   if (outer?.status !== header.exit.code || outer?.observedAt !== header.exit.observedAt)
     problems.push('outer-exit.json is missing or disagrees with the header exit')
   const journal = new Journal({ matrix, config, mode: header.mode })
@@ -1238,7 +1395,7 @@ async function checkArtifact(dir) {
   if (read.error) problems.push(`the stream file cannot be read: ${read.error}`)
   else if (read.unterminated) problems.push('the stream file ends without a newline')
   problems.push(...validator.finish())
-  const supervisor = readJson(dir, 'supervisor.json')
+  const supervisor = side['supervisor.json']?.json ?? null
   return judge({ dir, matrix, config, mode: header.mode, header, supervisor, journal, problems })
 }
 
@@ -1267,7 +1424,10 @@ function formatReport(report) {
       lines.push(
         `  broker ${o.node} ${o.event} at ${o.at} (configured down ${o.downMs ?? '-'} ms, container at ${o.processAt ?? '-'})`
       )
+    if (info.outagesNotShown > 0)
+      lines.push(`  ${info.outagesNotShown} more broker down or ready records not shown`)
     const w = info.waves
+    /** @param {string} event `transfer` or `return` @returns {string} its paused and held key counts */
     const keys = (event) =>
       `${w.keys[event].paused} paused keys, ${w.keys[event].held} held by the member`
     lines.push(

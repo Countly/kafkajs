@@ -240,14 +240,110 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(report.overall).not.toBe('ACCEPTED')
     })
 
-    it('accepts a complete transactions dump when a retried commit marker added one more control offset', async () => {
+    it('accepts a complete transactions dump when a retried marker added one more control offset before its last record', async () => {
       const world = fx.healthy()
-      world.layout.transactions.splice(5, 0, { marker: 'commit' })
+      const [committed, aborted] = [
+        world.layout.transactions.slice(0, 5),
+        world.layout.transactions.slice(5),
+      ]
+      world.layout.transactions = [...aborted, { marker: 'abort' }, ...committed]
       world.apache = fx.renderApache(world)
       const report = await check(world)
       expectRow(report, 'K1', 'PASS')
       expect(row(report, 'K1').numbers.logEndTransactions).toBe(9)
       expect(report.overall).toBe('ACCEPTED')
+    })
+
+    it('is inconclusive when a retried marker follows the last dumped record, which a cut-off dump cannot be told apart from', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { marker: 'commit' })
+      world.apache = fx.renderApache(world)
+      const report = await check(world)
+      expectRow(
+        report,
+        'K1',
+        'INCONCLUSIVE',
+        /5 offsets follow the last dumped record.*explains at most 4/
+      )
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('is inconclusive, never ACCEPTED, when a cut-off transactions dump hides a visible record after its last line', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { ...world.layout.transactions[1], duplicate: true })
+      world.apache = fx.renderApache(world)
+      fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+      const report = await check(world)
+      expectRow(report, 'K1', 'INCONCLUSIVE', /not proved complete/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('does not let an aborted member acknowledged beyond the log end explain an offset after the last dumped record', async () => {
+      const world = fx.healthy()
+      world.layout.transactions.splice(5, 0, { ...world.layout.transactions[1], duplicate: true })
+      world.apache = fx.renderApache(world)
+      fx.redump(world, 'transactions', dumpOf(world, 'transactions').slice(0, 4))
+      const edit = (records) => {
+        const offer = records.find((r) => r.stage === 'offered' && r.id === 'c09.4')
+        const ack = records.find((r) => r.stage === 'ack' && r.id === 'c09.4')
+        return [
+          ...records,
+          { ...offer, id: 'c09.6', t: offer.t + 0.5 },
+          { ...ack, id: 'c09.6', offset: '50', t: ack.t + 0.5 },
+        ]
+      }
+      const report = await check(world, { edit })
+      expectRow(
+        report,
+        'K1',
+        'INCONCLUSIVE',
+        /5 offsets follow the last dumped record.*explains at most 4/
+      )
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it.each([
+      ['transactions', 'c09.3', 3],
+      ['main', 'c08.11', 11],
+    ])(
+      'is inconclusive, never ACCEPTED, when a %s dump record lies beyond the log end every describe reports',
+      async (role, id, offset) => {
+        const world = fx.healthy()
+        const moved = (r) => r.id === id && (r.stage === 'ack' || r.stage === 'handler-enter')
+        const edit = mapRecords(moved, () => ({ offset: '100' }))
+        const at = `Offset:${offset}\t${id}\t`
+        fx.redump(
+          world,
+          role,
+          dumpOf(world, role).map((l) =>
+            l.includes(at) ? l.replace(at, `Offset:100\t${id}\t`) : l
+          )
+        )
+        const report = await check(world, { edit })
+        expectRow(report, 'K1', 'INCONCLUSIVE', /offset 100 lies at or beyond the log end/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      }
+    )
+
+    it('is inconclusive for a manifest-bound smoke artifact whose dump record lies beyond the described log end', async () => {
+      const world = smoke()
+      const base = world.records
+      world.records = () =>
+        base().map((r) =>
+          r.id === 'c09.3' && (r.stage === 'ack' || r.stage === 'handler-enter')
+            ? { ...r, offset: '100' }
+            : r
+        )
+      fx.redump(
+        world,
+        'transactions',
+        dumpOf(world, 'transactions').map((l) =>
+          l.replace('Offset:3\tc09.3\t', 'Offset:100\tc09.3\t')
+        )
+      )
+      const report = await onDisk(world)
+      expectRow(report, 'K1', 'INCONCLUSIVE', /offset 100 lies at or beyond the log end/)
+      expectRow(report, 'K7', 'PASS')
     })
 
     it('is inconclusive when the transactions dump stops before a visible record the journal acknowledged', async () => {
@@ -510,6 +606,41 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(report, 'K2', 'FAIL', /1 records not visible.*c09\.4 in g-0123456789ab-c01/)
     })
 
+    it('fails, never ACCEPTED, a handler entry whose payload digest shares its first eight digits with the record but differs after them', async () => {
+      const edit = mapRecords(isEntry(groupOf('c03'), 'c08.3'), (r) => ({
+        payloadSha256: `${r.payloadSha256.slice(0, 8)}${r.payloadSha256[8] === '0' ? '1' : '0'}${r.payloadSha256.slice(9)}`,
+      }))
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K2', 'FAIL', /c08\.3 in g-0123456789ab-c03 with another payload/)
+      expect(report.overall).toBe('REJECTED')
+    })
+
+    /** The seed's control client reads only main: an entry of a transactions record is one it must not see. */
+    const controlEntry = (id, offset) => (records) => {
+      const e = records.find(isEntry(groupOf('c13'), 'c08.0'))
+      return [
+        ...records,
+        { ...e, id, offset, key: fx.key(fx.TXN), t: 9e7, payloadSha256: fx.sha256(id) },
+      ]
+    }
+
+    it('fails an ordinary group that does not read the transactions topic yet entered a member of an aborted transaction', async () => {
+      const report = await check(fx.healthy(), { edit: controlEntry('c09.4', '5') })
+      expectRow(report, 'K2', 'FAIL', /1 records not visible.*c09\.4 in g-0123456789ab-c13/)
+      expect(report.overall).toBe('REJECTED')
+    })
+
+    it('fails an ordinary group that entered a visible record of a topic it does not read', async () => {
+      const report = await check(fx.healthy(), { edit: controlEntry('c09.0', '0') })
+      expectRow(
+        report,
+        'K2',
+        'FAIL',
+        /g-0123456789ab-c13 entered 1 records of a topic it does not read \(first c09\.0\)/
+      )
+      expect(report.overall).toBe('REJECTED')
+    })
+
     it('does not ask for the delivery of a transaction member that is not visible', async () => {
       const report = await check(fx.healthy())
       expectRow(report, 'K2', 'PASS')
@@ -549,6 +680,24 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(report, 'K3', 'FAIL', /1 same-owner repeats.*c08\.4 in g-0123456789ab-c01/)
     })
 
+    it('passes two distinct ids that one ownership interval entered in descending offset order, each once', async () => {
+      const edit = (records) => {
+        const [a, b] = ['c08.4', 'c08.5'].map((id) =>
+          records.findIndex(isEntry(groupOf('c01'), id))
+        )
+        const out = [...records]
+        ;[out[a], out[b]] = [records[b], records[a]]
+        return out
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K3', 'PASS')
+      expect(row(report, 'K3').numbers).toMatchObject({
+        sameOwnerRepeats: 0,
+        repeatsAfterChange: 0,
+      })
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
     it('fails a repeat that an acquire record of the identical, still open ownership tries to excuse', async () => {
       const edit = (records) =>
         repeat()([...records, { ...boundaryOf(records), t: 4500, cause: 'c01.0.extra' }])
@@ -580,6 +729,44 @@ describe('scripts/evidence/finalSoakCore', () => {
         'FAIL',
         /same-owner repeats.*c08\.4 in g-0123456789ab-c01 by c01\.0\.r1/
       )
+    })
+
+    it('is inconclusive with a named reason when overlapping intervals re-enter more ids than the capacity', async () => {
+      const ids = Array.from({ length: 12 }, (_, n) => `c08.${n}`)
+      const edit = (records) => {
+        const b = boundaryOf(records)
+        const runs = ['c01.1', 'c01.2'].flatMap((client, k) => {
+          const authority = fx.authority(client, { acquiredAt: 2 + k })
+          const t = 9e7 + k * 100
+          return [
+            { ...b, t, client, run: authority.run, authority },
+            ...ids.map((id, n) => ({ ...entryOf(records, id), t: t + 1 + n, client, authority })),
+          ]
+        })
+        return [...records, ...runs]
+      }
+      const report = await check(fx.healthy(), { edit, capacity: 18 })
+      expectRow(
+        report,
+        'K3',
+        'INCONCLUSIVE',
+        /more than 18 ids re-entered by overlapping intervals/
+      )
+    })
+
+    it('drops the ids an interval shared with an overlapping one once that interval closes', () => {
+      const world = fx.healthy()
+      const journal = new Journal({ matrix: world.matrix, config: world.config, mode: world.mode })
+      const records = world.records()
+      const extra = otherRun(records)
+      const revoke = { ...boundaryOf(records), t: 9e7 + 5, event: 'revoke-end' }
+      for (const r of [...records, ...extra.slice(records.length)]) journal.add(r)
+      expect(journal.shadowedCount).toBe(1)
+      journal.add(revoke)
+      expect({ shadowed: journal.shadowed.size, count: journal.shadowedCount }).toEqual({
+        shadowed: 0,
+        count: 0,
+      })
     })
 
     it('counts a repeat by another client run with its own acquisition, without failing it', async () => {
@@ -975,6 +1162,42 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(fx.healthy(), { edit }), 'K6', 'INCONCLUSIVE', /no end of traffic/)
     })
 
+    const trafficEnd = (fields) =>
+      mapRecords(
+        (r) => r.kind === 'shape' && r.execution === 'traffic' && r.phase === 'end',
+        fields
+      )
+
+    it.each([
+      ['a shape other than traffic', () => ({ shape: 'idle' })],
+      ['a source other than the supervisor', () => ({ source: 'p01' })],
+    ])(
+      'is inconclusive, never ACCEPTED, when the only end of traffic comes from %s',
+      async (_, fields) => {
+        const report = await check(fx.healthy(), { edit: trafficEnd(fields) })
+        expectRow(report, 'K6', 'INCONCLUSIVE', /no end of traffic/)
+        expect(report.overall).not.toBe('ACCEPTED')
+      }
+    )
+
+    it('is inconclusive, never ACCEPTED, when the end of traffic precedes the end of the run', async () => {
+      const report = await check(fx.healthy(), {
+        edit: trafficEnd((r) => ({ at: fx.START + 1000, t: fx.START + 1000 })),
+      })
+      expectRow(report, 'K6', 'INCONCLUSIVE', /end of traffic at 2000 lies outside the run end/)
+      expect(report.overall).not.toBe('ACCEPTED')
+    })
+
+    it('ignores a later traffic end that the supervisor did not emit', async () => {
+      const edit = (records) => {
+        const end = records.find((r) => r.kind === 'shape' && r.phase === 'end')
+        return [...records, { ...end, at: 9e9, t: 9e9, source: 'p14' }]
+      }
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K6', 'PASS')
+      expect(report.overall).toBe('ACCEPTED')
+    })
+
     it('is inconclusive when the baseline was completed after another sample of its process', async () => {
       const edit = mapRecords(isSample('p04', 'baseline'), () => ({ completedAt: 2e6 }))
       expectRow(
@@ -1301,7 +1524,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     it('takes the latest end of traffic whatever the order the records arrive in', async () => {
       const edit = (records) => {
         const end = records.find((r) => r.kind === 'shape' && r.phase === 'end')
-        const later = { ...end, at: 9e9, t: 9e9, source: 'p14' }
+        const later = { ...end, at: 9e9, t: 9e9 }
         return [later, ...records]
       }
       expectRow(
@@ -1437,6 +1660,77 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(report, 'K7', 'FAIL', /misses 1 of its wave-key records/)
       expect(report.overall).toBe('REJECTED')
       expect(report.information.incompleteWaves).toEqual([`${cause} has 1 of 2 wave-key records`])
+    })
+
+    /** @returns {object[]} `n` alternating down and ready records of broker 2, one second apart */
+    const outages = (n) =>
+      Array.from({ length: n }, (_, k) => brokerState(k % 2 ? 'ready' : 'down', 4000 + k * 1000))
+
+    it('keeps and prints every down and ready record of the twelve scheduled outages of a day', async () => {
+      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(24)] })
+      expect(report.information.outages.map((o) => `${o.event}@${o.at}`)).toEqual(
+        outages(24).map((o) => `${o.event}@${o.at}`)
+      )
+      expect(report.information.outagesNotShown).toBe(0)
+      const info = formatReport(report).split('NOT JUDGED information')[1]
+      expect(info.match(/^ {2}broker 2 (down|ready) at/gm)).toHaveLength(24)
+      expect(info).toMatch(/broker 2 ready at 27000/)
+      expect(info).not.toMatch(/not shown/)
+    })
+
+    it('prints how many down and ready records beyond the schedule it did not keep', async () => {
+      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(27)] })
+      expect(report.information.outages).toHaveLength(24)
+      expect(report.information.outagesNotShown).toBe(3)
+      expect(formatReport(report)).toMatch(/3 more broker down or ready records not shown/)
+    })
+
+    it('leaves a broker ISR record out of the outage instants', async () => {
+      const edit = (records) => [...records, brokerState('down', 4000), brokerState('isr', 5000)]
+      const report = await check(fx.healthy(), { edit })
+      expect(report.information.outages.map((o) => o.event)).toEqual(['down'])
+      expect(formatReport(report)).not.toMatch(/broker 2 isr/)
+    })
+
+    /** The open-wave cap: every client kind running every wave of one membership execution at once, transfer and return. */
+    const waveCap =
+      fx.matrix.schedule.executions.find((e) => e.shape === 'membership-churn').waves *
+      2 *
+      Object.keys(fx.matrix.clientKinds).length
+
+    it('keeps the verdict with as many open waves as the schedule allows at once', async () => {
+      const edit = (records) => [
+        ...records,
+        ...Array.from({ length: waveCap }, (_, n) => wave(`p01.o${n}`, 'transfer', true, 1)),
+      ]
+      const report = await check(fx.healthy(), { edit })
+      expect(report.overall).toBe('ACCEPTED')
+      expect(report.information.incompleteWaves).toHaveLength(20)
+    })
+
+    it('is inconclusive with one named reason, and counts no key of a dropped wave, when more waves stay open than the schedule allows', async () => {
+      const edit = (records) => [
+        ...records,
+        ...Array.from({ length: waveCap + 5 }, (_, n) => wave(`p01.o${n}`, 'transfer', true, 1)),
+        waveKey(`p01.o${waveCap + 2}`, true),
+      ]
+      const report = await check(fx.healthy(), { edit })
+      const reason = new RegExp(
+        `more than ${waveCap} membership waves wait for their wave-key records`
+      )
+      for (const id of ['K1', 'K2', 'K3', 'K5', 'K6']) expectRow(report, id, 'INCONCLUSIVE', reason)
+      expect(row(report, 'K1').reasons.filter((r) => reason.test(r))).toHaveLength(1)
+      expect(report.information.waves.keys.transfer).toEqual({ paused: 0, held: 0 })
+      expect(report.overall).toBe('NOT ACCEPTED')
+    })
+
+    it('counts no key and keeps the verdict for a wave-key record citing no open wave', async () => {
+      const report = await check(fx.healthy(), {
+        edit: (records) => [...records, waveKey('p01.none', true)],
+      })
+      expect(report.overall).toBe('ACCEPTED')
+      expect(report.information.waves.keys.transfer).toEqual({ paused: 0, held: 0 })
+      expect(report.information.waves.keys.return).toEqual({ paused: 0, held: 0 })
     })
 
     it('fails an acknowledged send whose offset the broker did not return when it is in the dump twice', async () => {
@@ -1608,6 +1902,19 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    it('fails K7 when a manifest-bound outer-exit.json has the header exit status but another observation time', async () => {
+      const world = smoke()
+      world.outerExit = { observedAt: world.header.exit.observedAt + 1 }
+      const report = await onDisk(world)
+      expectRow(
+        report,
+        'K7',
+        'FAIL',
+        /outer-exit\.json is missing or disagrees with the header exit/
+      )
+      expect(row(report, 'K7').reasons.join('\n')).not.toMatch(/outer-exit\.json: differs/)
+    })
+
     it('fails K7 when outer-exit.json changed after the header bound it, even with the same values', async () => {
       const report = await onDisk(smoke(), (dir) => {
         const file = path.join(dir, 'outer-exit.json')
@@ -1615,6 +1922,17 @@ describe('scripts/evidence/finalSoakCore', () => {
       })
       expectRow(report, 'K7', 'FAIL', /outer-exit\.json: differs from the header manifest/)
     })
+
+    it.each([['supervisor.json'], ['header.json']])(
+      'fails K7 and does not read %s whole when it is larger than the side-file cap',
+      async (file) => {
+        const report = await onDisk(smoke(), (dir) =>
+          fs.writeFileSync(path.join(dir, file), ' '.repeat((16 << 20) + 1))
+        )
+        expectRow(report, 'K7', 'FAIL', new RegExp(`${file}: larger than 16777216 bytes`))
+        expect(report.overall).toBe('REJECTED')
+      }
+    )
 
     it('fails K7 for a stream line that is not JSON', async () => {
       const report = await onDisk(smoke(), (dir) =>
