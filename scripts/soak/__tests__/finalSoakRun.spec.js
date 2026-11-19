@@ -2265,6 +2265,64 @@ describe('final soak final drain', () => {
     }
   })
 
+  /** @returns {void} one answered share fetch of the member with an explicit session change and partition answer */
+  const sessionFetch = (h, session, partitions = []) =>
+    h.worker.onFetch(h.rig, {
+      node: 'h:1',
+      sentAt: h.clock.now(),
+      session: { partitions: [], forgotten: [], ...session },
+      decoded: {
+        errorCode: 0,
+        acquisitionLockTimeoutMs: 30000,
+        topics: [{ topicId: IDS.A, partitions }],
+      },
+    })
+
+  test.each([
+    ['a top-level error ends its session', (h) => h.fetch([IDS.A], { epoch: 1, errorCode: 25 })],
+    ['its session closes', (h) => h.fetch([IDS.A], { epoch: -1 })],
+    ['its session is reset without the partition', (h) => h.fetch([IDS.B], { epoch: 0 })],
+    [
+      'its session forgets the partition',
+      (h) => sessionFetch(h, { epoch: 2, forgotten: [{ topicId: IDS.A, partition: 0 }] }),
+    ],
+    [
+      'the partition fails in a later answer of the same session',
+      (h) =>
+        sessionFetch(h, { epoch: 2 }, [{ partitionIndex: 0, fetchErrorCode: 3, acquired: [] }]),
+    ],
+    [
+      'the member retires',
+      (h) =>
+        ChildRuntime.prototype.forget.call(
+          {
+            observer: { forget() {} },
+            lifetimes: new Map(),
+            revisions: new Map(),
+            worker: h.worker,
+          },
+          h.rig.id
+        ),
+    ],
+  ])(
+    'a quiet fetch witness earned and then lost when %s certifies no drain until a new qualifying fetch after recovery',
+    async (_, lose) => {
+      const h = shareDrain()
+      for (let offset = 0; offset < 10; offset++) h.take(IDS.A, offset)
+      const step = () => ({ ends: { [key]: '10' }, deadline: h.clock.now() })
+      h.clock.t = 35000
+      h.fetch([IDS.A], { epoch: 1 })
+      expect(h.worker.shortOf(IDS.A, 0, '10')).toBeNull()
+      h.clock.t = 35001
+      lose(h)
+      expect(await h.worker.onDrain(step())).toEqual({ reached: false })
+      expect(drainRecord(h.runtime).reached).toBe(false)
+      h.clock.t = 36000
+      h.fetch([IDS.A], { epoch: 0 })
+      expect(await h.worker.onDrain(step())).toEqual({ reached: true })
+    }
+  )
+
   test('a share drain of one topic incarnation is reached while deliveries of another topic never pause', async () => {
     const { ctx, clock, worker, take, fetch } = shareDrain({ lockMs: 1000 })
     for (let offset = 0; offset < 10; offset++) take(IDS.A, offset)
