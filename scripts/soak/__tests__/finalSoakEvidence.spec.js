@@ -144,6 +144,15 @@ describe('final soak collector writes', () => {
     expect(collector.failures).toEqual(['sink write failed: a write did not settle within 50 ms'])
   })
 
+  test('a stream sync that never settles fails the close in bounded time, never a clean close', async () => {
+    const sink = { write: async () => {}, sync: () => new Promise(() => {}) }
+    const collector = new Collector({ sink, clock, matrix, writeTimeoutMs: 50 })
+    await expect(within(collector.close(), 2000)).rejects.toThrow(
+      'the stream sync did not settle within 50 ms'
+    )
+    expect(collector.failures).toEqual(['the stream sync did not settle within 50 ms'])
+  })
+
   test("an oversize supervisor record keeps its place before the abort note its failure writes through the supervisor's real abort", async () => {
     const lines = []
     const sink = { write: async (b) => lines.push(b.toString()), sync: async () => {} }

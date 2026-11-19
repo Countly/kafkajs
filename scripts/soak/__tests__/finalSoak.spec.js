@@ -675,8 +675,9 @@ describe('final soak driver', () => {
    * Runs the runbook against PATH stubs that log every call. `FAIL_ON` makes the call containing it
    * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded;
    * the driver stub writes `config.json` first, as the driver's first act does, and a
-   * `supervisor.json` (`SUPERVISOR_JSON`, a green receipt by default) as its last; the workload
-   * check runs the real driver command.
+   * `supervisor.json` (`SUPERVISOR_JSON`, a green receipt by default) as its last, then with `HANG`
+   * never ends by itself; `--driver-limit` prints `DRIVER_LIMIT_S`; the workload check runs the
+   * real driver command.
    */
   const runbookHarness = () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-runbook-'))
@@ -705,8 +706,10 @@ describe('final soak driver', () => {
     const first = {
       node: [
         'receipt="$SUPERVISOR_JSON"; [ -n "$receipt" ] || receipt="$GREEN"',
-        'case "$*" in *--expose-gc*)',
-        '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json" && printf "%s" "$receipt" > "$a/supervisor.json"; prev="$a"; done ;;',
+        'case "$*" in *--driver-limit*) echo "${DRIVER_LIMIT_S:-86400}" ;;',
+        '*--expose-gc*)',
+        '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json" && printf "%s" "$receipt" > "$a/supervisor.json"; prev="$a"; done',
+        '  [ -z "$HANG" ] || exec /bin/sleep 60 ;;',
         '*--check-workload*) [ -z "$FAIL_ON" ] || case "node $*" in *"$FAIL_ON"*) exit 1 ;; esac',
         '  exec "$REAL_NODE" "$@" ;;',
         'esac',
@@ -937,6 +940,39 @@ describe('final soak driver', () => {
       expect(result.status).toBe(2)
       expect(result.stderr).toContain('a supplied cluster is not supported')
       expect(harness.calls()).toEqual([])
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('a driver past its limit is stopped by the runbook watchdog, which names the escalation, while the heartbeat records stream progress; the run fails at the driver stage after sealing', () => {
+    const harness = runbookHarness()
+    try {
+      const began = Date.now()
+      const result = harness.run([TREE, 'smoke'], { HANG: '1', DRIVER_LIMIT_S: '1' })
+      expect(Date.now() - began).toBeLessThan(30000)
+      const { out, receipt } = harness.evidence()
+      expect(result.status).toBe(143)
+      expect(receipt).toEqual({
+        artifact: path.basename(out),
+        failedStage: 'driver',
+        exitStatus: 143,
+        driverStatus: 143,
+      })
+      expect(fs.readFileSync(`${out}.watchdog`, 'utf8')).toContain(
+        'driver ran past its limit of 1 s: TERM'
+      )
+      expect(fs.readFileSync(path.join(out, 'heartbeat'), 'utf8')).toMatch(
+        /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stream-bytes=\d+ unchanged-s=\d+\n$/
+      )
+      const calls = harness.calls()
+      expect(calls).toContain(
+        `node scripts/soak/finalSoak.js --driver-limit --mode smoke --out ${out}`
+      )
+      expect(calls.some((c) => c.startsWith('node scripts/soak/finalSoak.js --finalize'))).toBe(
+        true
+      )
+      expect(calls).toContain('docker compose down --volumes')
     } finally {
       harness.remove()
     }
@@ -2045,6 +2081,53 @@ describe('final soak driver', () => {
         reply: null,
       })
       expect(supervisor.waiting.size).toBe(0)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test("the supervisor ends its evidence in bounded time: a stream close that never settles and a child that outlived its kill are named in a separate incomplete receipt, the child's handles are released, and the run ends with an error", async () => {
+    const { Supervisor } = require('../finalSoak')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-finish-'))
+    const within = (promise, ms) =>
+      Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms, { hung: true }))])
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      supervisor.finishStepMs = 50
+      supervisor.untilExited = async () => {}
+      supervisor.runtime = { stop: async () => {}, channel: { pendingBytes: 0 } }
+      supervisor.collector = { close: async () => {}, streamBytes: 10, queuedBytes: 3, records: 2 }
+      const child = { unref: jest.fn(), channel: { unref: jest.fn() } }
+      supervisor.children.set('p07', child)
+      const missing = await within(supervisor.finish({ close: () => new Promise(() => {}) }), 2000)
+      expect(missing).toEqual([
+        'stream file close: did not settle within 50 ms',
+        'process p07: still running after its kill; its handles were released',
+      ])
+      expect(child.unref).toHaveBeenCalledTimes(1)
+      expect(child.channel.unref).toHaveBeenCalledTimes(1)
+      expect(() => supervisor.writeReceipts({ runId: 'r' }, missing)).toThrow(
+        'the run ended incomplete: stream file close: did not settle within 50 ms; process p07: still running after its kill; its handles were released'
+      )
+      expect(JSON.parse(fs.readFileSync(path.join(out, 'incomplete.json'), 'utf8'))).toEqual({
+        runId: 'r',
+        missing,
+        records: 2,
+        streamBytes: 10,
+        unwrittenBytes: 3,
+      })
+      expect(JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))).toEqual({
+        runId: 'r',
+      })
+      fs.rmSync(path.join(out, 'incomplete.json'))
+      supervisor.writeReceipts({ runId: 'r' }, [])
+      expect(fs.existsSync(path.join(out, 'incomplete.json'))).toBe(false)
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
