@@ -449,7 +449,8 @@ module.exports = class RebalanceCoordinator {
    * A consumer-protocol chain (paced by a wait between rounds) and a classic eager chain (paced
    * only by its round trips) keep running while a round is owed, as kafkajs 2.2.4 kept rejoining.
    * When another of their rounds is about to start after a multiple of `RECONCILE_WARN_EVERY`
-   * completed rounds, it warns, naming that round's reason, so a loop is visible.
+   * completed rounds, it warns, naming that round's reason, so a loop is visible: `Reconciliation
+   * is still running` for a consumer-protocol chain, `Rebalance is still running` for an eager one.
    * @private
    * @param {string|null} reason the reason the round about to run is for
    * @returns {void}
@@ -463,7 +464,11 @@ module.exports = class RebalanceCoordinator {
       this.consumerGroup.rebalanceProtocol() !== COOPERATIVE
     ) {
       if (completed > 0 && completed % RECONCILE_WARN_EVERY === 0) {
-        this.logger.warn('Reconciliation is still running', {
+        const message =
+          this.consumerGroup.kind === 'consumer'
+            ? 'Reconciliation is still running'
+            : 'Rebalance is still running'
+        this.logger.warn(message, {
           groupId: this.groupId,
           rounds: completed,
           reason,
@@ -513,8 +518,9 @@ module.exports = class RebalanceCoordinator {
    * owed. A LOST queued during it runs next, ahead of anything chosen before; a LOST queued for a
    * membership a later join replaced is dropped. A choice taken from a level is replaced by what is
    * owed now, and ends the chain when nothing is. An explicit re-entry or LOST chosen before the
-   * wait stays. A verdict that reached the slot during the wait keeps the chosen round, which its
-   * refusal then ends.
+   * wait stays. A verdict that reached the slot during the wait keeps the chosen round, which
+   * rejoins with epoch 0 after a fence; whether the coordinator accepts that rejoin or fences it
+   * again, the chain ends without an error and the verdict stays in the slot for the runner.
    * @private
    * @param {{ kind: string, reason: string, level: boolean }} chosen the round picked before the wait
    * @returns {{ kind: 'lost'|'revoked', reason: string|null, level: boolean }} the round to run, if any
