@@ -1,0 +1,4 @@
+
+GROUP              TOPIC                PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+g-21b084a0c66e-c01 fs-21b084a0c66e-main 0          6585            6585            0               -               -               -
+g-21b084a0c66e-c01 fs-21b084a0c66e-txn  0          63              63              0               -               -               -
