@@ -2138,7 +2138,9 @@ describe.each([
       if (code === null) gate.release()
       else gate.answer({ errorCode: code })
       const outcome = await within(old, 5000, 'the obsolete heartbeat completion')
-      if (code !== null) {
+      // The consumer protocol drops an answer to a replaced membership: nothing reaches a caller.
+      if (kind === 'consumer') expect(outcome).toEqual({ value: false })
+      else if (code !== null) {
         expect(outcome.error).toBeInstanceOf(KafkaJSProtocolError)
         expect(outcome.error.code).toBe(code)
         expect(sentOwnership(outcome.error)).toBe(token)
