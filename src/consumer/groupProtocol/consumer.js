@@ -497,12 +497,29 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Whether the coordinator wants something this member does not have yet - counting only the
-   * partitions whose topic name is known. An unresolved topic id deliberately does NOT make this
-   * true: an id that can never resolve would otherwise ask for a rebalance round forever.
+   * partitions a round's apply would keep: those whose topic name is known and, under a client
+   * pattern, is in the desired subscription. An unresolved topic id deliberately does NOT make
+   * this true: an id that can never resolve would otherwise ask for a rebalance round forever. Nor
+   * does a target that still names a topic the subscription dropped: the apply filters it, so no
+   * round could ever converge on it. The target itself is kept whole.
    * @returns {boolean}
    */
   needsReconciliation() {
-    return this.target != null && !this.matchesOwned(this.resolveFromCache(this.target))
+    return (
+      this.target != null &&
+      !this.matchesOwned(this.resolveFromCache(this.target), this.eligibleTopics())
+    )
+  }
+
+  /**
+   * The names a round's apply would keep from a target, or null when it keeps every resolvable
+   * one. A client-pattern round pins the desired subscription and drops the rest; every other
+   * subscription is widened with the assigned names before the apply.
+   * @private
+   * @returns {Map<string, object>|null} keyed by topic name
+   */
+  eligibleTopics() {
+    return this.subscription ? this.subscription.desired.topicConfigurations : null
   }
 
   /**
@@ -563,8 +580,11 @@ module.exports = class ConsumerGroupProtocol {
     // The coordinator sees no progress unless something is acknowledged, and an apply that changes
     // nothing never calls `setOwned` with a difference - so a subset that already equals what is
     // owned is acknowledged here, under the target's bumped local epoch.
-    if (this.matchesOwned(resolved)) {
-      this.adoptLocalAssignment(this.target.localEpoch, resolved)
+    if (this.matchesOwned(resolved, this.eligibleTopics())) {
+      this.adoptLocalAssignment(
+        this.target.localEpoch,
+        this.appliedSubsetOf(resolved, this.ownedPartitions)
+      )
 
       if (this.state === RECONCILING) {
         this.acknowledge()
@@ -573,6 +593,11 @@ module.exports = class ConsumerGroupProtocol {
       return { assignment: this.ownedAsObject(), userData: null }
     }
 
+    // Owned partitions the subscription dropped while the target still names them: the apply
+    // releases them, and only an acknowledgement tells the coordinator.
+    if (this.state !== RECONCILING && canHandleNewAssignment(this.state)) {
+      this.transitionTo(RECONCILING)
+    }
     this.pendingResolved = resolved
     beforeSync()
 
@@ -962,24 +987,27 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * @private
    * @param {{ assignment: Object }} resolved
-   * @returns {boolean} whether the resolvable subset is exactly what this member owns
+   * @param {Map<string, object>|null} [eligible] when given, only these topics of `resolved` count
+   * @returns {boolean} whether the resolvable (and eligible) subset is exactly what this member owns
    */
-  matchesOwned({ assignment }) {
+  matchesOwned({ assignment }, eligible = null) {
     const owned = indexByTopic(this.ownedPartitions)
-    const topics = Object.keys(assignment)
+    let matched = 0
 
-    if (topics.length !== owned.size) {
-      return false
+    for (const topic of Object.keys(assignment)) {
+      if (eligible && !eligible.has(topic)) continue
+      const partitions = owned.get(topic)
+      if (
+        partitions == null ||
+        partitions.size !== assignment[topic].length ||
+        !assignment[topic].every((partition) => partitions.has(partition))
+      ) {
+        return false
+      }
+      matched++
     }
 
-    return topics.every((topic) => {
-      const partitions = owned.get(topic)
-      return (
-        partitions != null &&
-        partitions.size === assignment[topic].length &&
-        assignment[topic].every((partition) => partitions.has(partition))
-      )
-    })
+    return matched === owned.size
   }
 
   /**
@@ -1249,7 +1277,7 @@ module.exports = class ConsumerGroupProtocol {
     const wasReconciling = this.state === RECONCILING
     const resolved = this.resolveFromCache(this.target)
     const grew = this.recordResolution(resolved)
-    const converged = this.matchesOwned(resolved)
+    const converged = this.matchesOwned(resolved, this.eligibleTopics())
 
     if (converged) {
       if (wasReconciling || wasJoining) {
