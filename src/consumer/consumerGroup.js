@@ -1887,8 +1887,7 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Records that a seek, a reset, a topic recreation or a deliberate commit made while a seek is
-   * pending was applied to an owned partition, by
+   * Records that a seek, a reset or a topic recreation was applied to an owned partition, by
    * stamping it with the next value of the acquisition clock. A corruption marker fetched by a
    * request built before that stamp is then refused, even when the position came back to the same
    * offset. A partition this member does not own is left alone.
@@ -1925,7 +1924,7 @@ module.exports = class ConsumerGroup {
   /**
    * Whether a popped seek still speaks for its partition: the acquisition it was popped under is
    * the current one, no later seek was admitted and the topic was not recreated since. Only such
-   * a seek may write its commit, settle the partition's gate or be owed again.
+   * a seek may write its commit or settle the partition's gate.
    * @private
    * @param {string} key `topic|partition`
    * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
@@ -2085,22 +2084,13 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Commits through the offset manager. A deliberate commit (given `offsets.topics`) the caller
-   * may still make marks each named partition whose seek is not yet applied as changed
-   * (`markChanged`), so that seek, should its commit fail, is not retried over this commit.
+   * Commits through the offset manager.
    * @param {import("../../types").Offsets} [offsets]
    * @param {{ partitions?: import('./groupProtocol/interface').TopicPartitions[]|null, auto?: boolean, guard?: () => Error|null }} [options]
    *   forwarded verbatim to the offset manager, which owns what each flag means
    * @returns {Promise<void>}
    */
   async commitOffsets(offsets, options) {
-    if (offsets?.topics && this.unappliedSeeks.size !== 0 && !options?.guard?.()) {
-      for (const { topic, partitions } of offsets.topics) {
-        for (const { partition } of partitions) {
-          if (this.unappliedSeeks.has(`${topic}|${partition}`)) this.markChanged(topic, partition)
-        }
-      }
-    }
     await this.offsetManager.commitOffsets(offsets, options)
   }
 
@@ -3628,12 +3618,13 @@ module.exports = class ConsumerGroup {
    * before each pass and after a pass returns, so no further pass starts once the round is about to
    * be discarded. A pass already in flight is not cancelled.
    *
-   * A seek whose application fails is decided by what its own commit did on the wire, whichever
-   * caller applied it: one the broker accepted is settled as applied, whatever refused the caller
-   * afterwards; one written with no answer (a timeout, a lost connection) is settled the same way,
-   * never sent again, and its position is read back from the broker; one that failed before its
-   * write or that the broker rejected is owed again (`requeueSeek`). The error reaches the caller
-   * either way. A seek that returns without applying is settled. A popped seek that is no longer
+   * A popped seek is attempted once, as in kafkajs 2.2.4: whatever happens to its commit, it is
+   * settled and never sent again, and a failure reaches the caller. One the broker accepted is
+   * settled as applied, whatever refused the caller afterwards; one written with no answer (a
+   * timeout, a lost connection) or rejected is settled the same way and its position is read back
+   * from the broker; one that failed before its write leaves the partition at its committed
+   * offset. The application seeks again if it still wants the position. A seek that returns
+   * without applying is settled. A popped seek that is no longer
    * current (`isCurrentSeek`) is refused before its write and settles nothing; one popped with no
    * acquisition to compare (a partition assigned without one) is never refused for it.
    *
@@ -3677,12 +3668,8 @@ module.exports = class ConsumerGroup {
         try {
           applied = await manager.seek(seekEntry, preparation, attempt)
         } catch (error) {
-          if (!attempt.written || attempt.rejected) {
-            this.requeueSeek(seekEntry, acquired, admitted, attempt)
-          } else {
-            // Written: the broker may hold the sought offset, whatever refused this caller.
-            this.settleSeek(key, acquired, admitted, true)
-          }
+          // Written: the broker may hold the sought offset, whatever refused this caller.
+          this.settleSeek(key, acquired, admitted, attempt.written)
           throw error
         }
         this.settleSeek(key, acquired, admitted, applied)
@@ -3714,36 +3701,6 @@ module.exports = class ConsumerGroup {
         })
       }
     }
-  }
-
-  /**
-   * Puts back a seek whose commit failed before its write or was rejected by the broker, so the
-   * next resolution retries it; the partition is not fetched until it applies. It is put back only
-   * while the run is not stopping, the seek is still current (`isCurrentSeek`), nothing changed
-   * the partition since it was admitted (a deliberate commit or a reset stamps `changedAt`) and no
-   * newer operation took its cell while the commit was in flight. Otherwise it is settled: the
-   * newer intent stands, and the position is read from the broker or that intent.
-   * @private
-   * @param {{topic: string, partition: number, offset: string}} seekEntry the popped intent
-   * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
-   *   was popped under
-   * @param {number|undefined} admitted its `soughtAt` when popped
-   * @param {import('./offsetManager').CommitAttempt} attempt what its commit did
-   * @returns {void}
-   */
-  requeueSeek({ topic, partition, offset }, acquired, admitted, attempt) {
-    const key = `${topic}|${partition}`
-    if (
-      this.isStopping() ||
-      !this.isCurrentSeek(key, acquired, admitted) ||
-      acquired.changedAt > admitted ||
-      attempt.superseded
-    ) {
-      this.settleSeek(key, acquired, admitted)
-      return
-    }
-    this.seekOffset.set(topic, partition, offset)
-    this.unappliedSeeks.add(key)
   }
 
   hasSeekOffset({ topic, partition }) {

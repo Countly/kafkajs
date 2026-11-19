@@ -7,12 +7,7 @@ const OffsetOperations = require('./offsetOperations')
 const { fencedDelay } = require('../fetchPreparation')
 const ResetObligations = require('./resetObligations')
 const { ResetResolver } = require('../offsetReset')
-const {
-  KafkaJSError,
-  KafkaJSCommitFailedError,
-  KafkaJSProtocolError,
-  isStaleCoordinator,
-} = require('../../errors')
+const { KafkaJSError, KafkaJSCommitFailedError, isStaleCoordinator } = require('../../errors')
 const { isCallDeadline } = require('../groupProtocol/interface')
 const { ON_WRITE } = require('../../broker/privateOptions')
 const {
@@ -48,10 +43,8 @@ const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
 /**
  * What one OffsetCommit did on the wire, recorded before any caller check runs on its answer:
  * `written` once its bytes were handed to the socket (or an answer proves it), `accepted` once the
- * broker answered without an error, `rejected` once the broker answered with one, and, for a seek,
- * `superseded` when a newer operation or barrier owned its cell as the commit ended.
- * @typedef {{written?: boolean, accepted?: boolean, rejected?: boolean, superseded?: boolean,
- *   refusal?: () => Error|null}} CommitAttempt
+ * broker answered without an error.
+ * @typedef {{written?: boolean, accepted?: boolean, refusal?: () => Error|null}} CommitAttempt
  */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
 
@@ -358,7 +351,6 @@ module.exports = class OffsetManager {
    *   close publishes nothing
    */
   async sendOffsetCommit(payload, { guard = null, fence, since, attempt } = {}) {
-    let sent = false
     const token = this.ownership?.token()
     const { revision } = this.membership()
     const release = this.ownership?.retain(token)
@@ -378,7 +370,6 @@ module.exports = class OffsetManager {
       refusal = check()
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
-      sent = true
       const result = attempt
         ? await coordinator.offsetCommit(request, {
             guard: check,
@@ -396,9 +387,6 @@ module.exports = class OffsetManager {
       return result
     } catch (error) {
       beforeWrite = false
-      if (attempt && sent && !attempt.accepted && error instanceof KafkaJSProtocolError) {
-        attempt.written = attempt.rejected = true
-      }
       const stampRefusal = (refusal) =>
         stampOwnership(
           stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
@@ -827,7 +815,7 @@ module.exports = class OffsetManager {
    *   a fetch round's immutable identity, checked before the commit is written and after it
    *   settles; absent for an unguarded caller, which behaves as before
    * @param {CommitAttempt} [attempt] records what the seek's own commit did on the wire, for the
-   *   caller that decides whether a failed seek is owed again
+   *   caller that settles the seek
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
    *                              currently assigned to this member, when this member lost its
    *                              membership, or when a newer operation or barrier superseded it
@@ -896,8 +884,7 @@ module.exports = class OffsetManager {
    * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
    * @param {{guard: () => Error|null}} [preparation] the caller's identity, conjoined with this
    *   manager's own ownership guard; its refusal is thrown, not reported as `false`
-   * @param {CommitAttempt} [attempt] filled with what the commit did on the wire and whether a
-   *   newer operation owned the cell as it ended
+   * @param {CommitAttempt} [attempt] filled with what the commit did on the wire
    * @returns {Promise<boolean>} whether the clear was applied
    * @throws {Error} whatever the commit raised
    */
@@ -944,8 +931,9 @@ module.exports = class OffsetManager {
       if (error instanceof KafkaJSCommitFailedError) return false
       throw error
     } finally {
-      attempt.superseded = this.operations.isSuperseded(ticket, topic, partition)
-      if (attempt.written && !cleared && !attempt.superseded) this.forgetCommitted(topic, partition)
+      if (attempt.written && !cleared && !this.operations.isSuperseded(ticket, topic, partition)) {
+        this.forgetCommitted(topic, partition)
+      }
       release?.()
       this.operations.end(ticket)
     }
