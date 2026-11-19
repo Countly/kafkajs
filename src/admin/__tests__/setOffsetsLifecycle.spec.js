@@ -100,9 +100,9 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
       admin.setOffsets({
         groupId: 'set-group',
         topic: TOPIC,
-        partitions: [{ partition: 'x', offset: '1' }],
+        partitions: [{ partition: 0, offset: '-5' }],
       })
-    ).rejects.toThrow('Invalid partition')
+    ).rejects.toThrow('Offset must not be a negative number')
 
     expect(listeners()).toBe(0)
     // The disposal asks a start that is still connecting to stop first, so it may never join;

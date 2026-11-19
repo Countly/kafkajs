@@ -21,6 +21,7 @@ const { createOffsets } = require('./offsets')
 const createLogDirs = require('./logDirs')
 const groupBy = require('../utils/groupBy')
 const createConsumer = require('../consumer')
+const { assertPartitionId } = require('../utils/partitionId')
 const { disposeConsumer } = require('../consumer/disposal')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
@@ -1212,7 +1213,8 @@ module.exports = ({
    * @param {Array<SeekEntry>} request.partitions at least one entry
    * @returns {Promise<void>}
    * @throws {KafkaJSNonRetriableError} for a missing `groupId` or `topic`, no `partitions`, an
-   *   entry with an invalid partition or offset, or a group whose state is not `Empty` or `Dead`
+   *   entry whose partition is not a partition id (checked for every entry before any request), an
+   *   invalid offset, or a group whose state is not `Empty` or `Dead`
    * @throws {Error} what subscribing, describing the group, starting the member, committing a
    *   sentinel offset or stopping the member raised; a stop failure can replace a sentinel-commit
    *   failure
@@ -1229,6 +1231,7 @@ module.exports = ({
     if (!partitions || partitions.length === 0) {
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
+    for (const { partition } of partitions) assertPartitionId(partition)
 
     return cluster.withGroup(groupId, async () => {
       const round = currentDeadline()
