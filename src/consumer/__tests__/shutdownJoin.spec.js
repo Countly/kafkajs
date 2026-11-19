@@ -1,5 +1,12 @@
 const { createLogger, LEVELS } = require('../../loggers')
-const { advanceUntil, deferred, settled, start, teardown } = require('./fixtures/scriptedConsumer')
+const {
+  advanceUntil,
+  deferred,
+  fenced,
+  settled,
+  start,
+  teardown,
+} = require('./fixtures/scriptedConsumer')
 
 beforeEach(() => jest.useFakeTimers())
 afterEach(async () => {
@@ -156,5 +163,45 @@ describe('Consumer > a stop joined by a timed close', () => {
 
     expect(outcome.done).toBe(true)
     expect(outcome.error).toMatchObject({ type: 'CONSUMER_STOPPING' })
+  }, 60000)
+})
+
+describe('Consumer > a timed close joining crash cleanup', () => {
+  it('a positive-timeout disconnect joining the transport drain of crash cleanup asks for its remaining drain and, at its deadline, for a zero drain', async () => {
+    const transport = deferred()
+    const run = await start({
+      fault: fenced,
+      hook: {
+        onPartitionsLost: () => {
+          throw new Error('hook failed')
+        },
+      },
+      retry: { initialRetryTime: 300, restartOnFailure: async () => false },
+    })
+    run.state.disconnecting = transport.promise
+    run.arm()
+    await advanceUntil(() => run.cluster.disconnect.mock.calls.length > 0)
+    const close = settled(run.consumer.disconnect({ timeout: 5 }))
+    await jest.advanceTimersByTimeAsync(4)
+
+    expect(run.cluster.disconnect.mock.calls).toEqual([
+      [{ preserveSetupState: true }],
+      [{ drainTimeout: 5 }],
+    ])
+
+    await jest.advanceTimersByTimeAsync(1)
+
+    expect(run.cluster.disconnect.mock.calls).toEqual([
+      [{ preserveSetupState: true }],
+      [{ drainTimeout: 5 }],
+      [{ drainTimeout: 0 }],
+    ])
+    expect(close.done).toBe(false)
+
+    transport.resolve()
+    await advanceUntil(() => close.done && run.crashes.length > 0, 1000)
+
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(run.crashes).toHaveLength(1)
   }, 60000)
 })
