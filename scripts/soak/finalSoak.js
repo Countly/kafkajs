@@ -561,27 +561,28 @@ class Supervisor {
   }
 
   /**
-   * Writes the supervisor receipt and, when the finish left something incomplete, a separate
-   * `incomplete.json` naming what is missing with the stream's record, written and unwritten byte
-   * counts. An incomplete finish then ends the run with an error, never with a clean exit.
+   * Writes the supervisor receipt and, when the finish left something incomplete or the collection
+   * failed, a separate `incomplete.json` naming both with the stream's accounting (accepted,
+   * written, unknown and unwritten lines and bytes, and whether the sync succeeded). The run then
+   * ends with an error, never with a clean exit.
    * @param {object} run the supervisor receipt
    * @param {string[]} missing what `finish` could not complete
    * @returns {void}
-   * @throws {Error} when anything is missing
+   * @throws {Error} when anything is missing or the collection failed
    */
   writeReceipts(run, missing) {
     fs.writeFileSync(path.join(this.out, 'supervisor.json'), JSON.stringify(run) + '\n')
-    if (missing.length === 0) return
-    const { records, streamBytes, queuedBytes } = this.collector
+    const collectorFailures = [...this.collector.failures]
+    if (missing.length === 0 && collectorFailures.length === 0) return
     const incomplete = {
       runId: run.runId,
       missing,
-      records,
-      streamBytes,
-      unwrittenBytes: queuedBytes,
+      collectorFailures,
+      ...this.collector.accounting(),
     }
     fs.writeFileSync(path.join(this.out, 'incomplete.json'), JSON.stringify(incomplete) + '\n')
-    throw new Error(`the run ended incomplete: ${missing.join('; ')}`)
+    const named = [...missing, ...collectorFailures.map((f) => `collector: ${f}`)]
+    throw new Error(`the run ended incomplete: ${named.join('; ')}`)
   }
 
   /**

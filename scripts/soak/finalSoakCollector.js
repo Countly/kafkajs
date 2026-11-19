@@ -86,6 +86,10 @@ class Collector {
     this.queuedBytes = 0
     this.streamBytes = 0
     this.records = 0
+    this.writtenBytes = 0
+    this.writtenRecords = 0
+    this.unknownBytes = 0
+    this.synced = false
     this.lastT = 0
     this.lastLine = null
     this.nextSeq = new Map()
@@ -196,7 +200,7 @@ class Collector {
     this.streamBytes += bytes
     this.records++
     this.lastLine = line.slice(0, -1)
-    const entry = { line, resolve: null }
+    const entry = { line, bytes, resolve: null }
     const written = new Promise((resolve) => (entry.resolve = resolve))
     this.queue.push(entry)
     this.queuedBytes += bytes
@@ -245,7 +249,7 @@ class Collector {
    * @param {Promise<unknown>} write one sink write or sync
    * @param {string} [what] what is named when it does not settle
    * @returns {Promise<unknown>} its result
-   * @throws {Error} when it does not settle within `writeTimeoutMs`
+   * @throws {Error} when it does not settle within `writeTimeoutMs`, marked `unsettled`
    */
   async bounded(write, what = 'a write') {
     let timer = null
@@ -253,10 +257,10 @@ class Collector {
       return await Promise.race([
         write,
         new Promise((resolve, reject) => {
-          timer = harnessTimeout(
-            () => reject(new Error(`${what} did not settle within ${this.writeTimeoutMs} ms`)),
-            this.writeTimeoutMs
-          )
+          timer = harnessTimeout(() => {
+            const late = new Error(`${what} did not settle within ${this.writeTimeoutMs} ms`)
+            reject(Object.assign(late, { unsettled: true }))
+          }, this.writeTimeoutMs)
         }),
       ])
     } finally {
@@ -269,26 +273,37 @@ class Collector {
    * were written. Every chunk is written whole: a short write is continued from where it stopped,
    * and a write that fails, takes no bytes or does not settle in time stops collection and refuses
    * every line not wholly written (the chunk in flight and what is queued behind it), never
-   * truncating or reordering a line already written.
+   * truncating or reordering a line already written. The bytes and whole lines the sink took are
+   * counted as written; a write still outstanding when collection stopped leaves its bytes unknown.
    * @returns {Promise<void>}
    */
   async drain() {
     let batch = []
+    let chunk = null
+    let offset = 0
     try {
       while (this.queue.length > 0) {
         batch = this.queue.splice(0, this.queue.length)
-        const chunk = Buffer.from(batch.map((entry) => entry.line).join(''))
-        for (let offset = 0; offset < chunk.length;) {
+        chunk = Buffer.from(batch.map((entry) => entry.line).join(''))
+        let lines = 0
+        let lineEnd = 0
+        for (offset = 0; offset < chunk.length;) {
           const result = await this.bounded(this.sink.write(chunk.subarray(offset)))
           const bytes = result?.bytesWritten ?? chunk.length - offset
           if (!(bytes > 0)) throw new Error('the sink accepted no bytes')
           offset += bytes
+          this.writtenBytes += bytes
+          while (lines < batch.length && lineEnd + batch[lines].bytes <= offset) {
+            lineEnd += batch[lines++].bytes
+            this.writtenRecords++
+          }
         }
         this.queuedBytes -= chunk.length
         for (const entry of batch.splice(0)) entry.resolve(true)
         this.release()
       }
     } catch (e) {
+      if (e.unsettled) this.unknownBytes = chunk.length - offset
       for (const entry of [...batch, ...this.queue.splice(0)]) entry.resolve(false)
       this.queuedBytes = 0
       this.fail(`sink write failed: ${e.message}`)
@@ -309,9 +324,29 @@ class Collector {
     this.stopped = true
     try {
       await this.bounded(this.sink.sync(), 'the stream sync')
+      this.synced = true
     } catch (e) {
       this.failures.push(e.message)
       throw e
+    }
+  }
+
+  /**
+   * What became of the stream's accepted lines: bytes and whole lines the sink took, bytes of a
+   * write still outstanding when collection stopped (written or not, unknown), the rest unwritten,
+   * and whether the last sync succeeded.
+   * @returns {{ acceptedRecords: number, acceptedBytes: number, writtenRecords: number,
+   *   writtenBytes: number, unknownBytes: number, unwrittenBytes: number, synced: boolean }}
+   */
+  accounting() {
+    return {
+      acceptedRecords: this.records,
+      acceptedBytes: this.streamBytes,
+      writtenRecords: this.writtenRecords,
+      writtenBytes: this.writtenBytes,
+      unknownBytes: this.unknownBytes,
+      unwrittenBytes: this.streamBytes - this.writtenBytes - this.unknownBytes,
+      synced: this.synced,
     }
   }
 }
