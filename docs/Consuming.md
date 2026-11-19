@@ -543,7 +543,7 @@ consumer.run({
 consumer.seek({ topic: 'example', partition: 0, offset: "12384" })
 ```
 
-After a manual assignment, a seek before run is queued once for the first start. A grouped consumer still requires run before seek; an awaited assigned hook is the group equivalent.
+After a manual assignment, a seek before run is queued once for the first start. A grouped consumer still requires run before seek; an awaited assigned hook is the group equivalent. A seek of a subscribed partition that is not assigned to the consumer at that moment (before the first assignment, or after a rebalance moved it away) is kept, the latest per partition, and applied before the first delivery once the partition is assigned; it is dropped once its topic is no longer subscribed. A seek still queued when its partition is revoked is dropped with the revocation.
 
 ## <a name="halted-partitions"></a> Halted partitions
 
