@@ -8,8 +8,8 @@ const { fetchV18: expected } = require('./expected')
 
 /**
  * Fetch v18 (flexible, topics by id), the existing builder and reader of the fetch harness
- * reused as they are. The builder writes the one topic and topic id the harness is built around
- * (`test-topic`); a partition may carry `records` (a record batch, `true` for the harness's own,
+ * reused as they are. The builder writes the one topic the harness is built around
+ * (`test-topic`), under the harness's topic id unless `topicId` names another; a partition may carry `records` (a record batch, `true` for the harness's own,
  * or `false` for none), `preferredReadReplica`, `abortedTransactions` and `currentLeader`.
  *
  * Evidence: Java's own bytes (`fixtures/v18_*_java.json`, bytes only); the harness builder given
@@ -24,12 +24,13 @@ module.exports = {
 
   /**
    * @param {object} [fields] over the vector's: `partitions` (see above), `nodeEndpoints` (`{
-   *   nodeId, host, port, rack }`), `topLevel`, `sessionId` and `includeTopic` (false for
-   *   an empty incremental response)
+   *   nodeId, host, port, rack }`), `topLevel`, `sessionId`, `includeTopic` (false for
+   *   an empty incremental response) and `topicId` (the harness's own when absent, for a
+   *   lane whose topic was recreated under another id)
    * @returns {Buffer} the response body
    */
   buildResponse(fields = {}) {
-    const { partitions, nodeEndpoints, topLevel, sessionId, includeTopic } = {
+    const { partitions, nodeEndpoints, topLevel, sessionId, includeTopic, topicId } = {
       ...expected.response,
       ...fields,
     }
@@ -40,6 +41,7 @@ module.exports = {
       topLevel,
       sessionId,
       includeTopic,
+      topicId,
     })
   },
 

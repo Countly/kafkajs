@@ -159,7 +159,7 @@ describe('scripts > ci > checkIdentities', () => {
         script: 'test:e2e:offset-reset',
         spec: 'src/consumer/__tests__/offsetResetLive.spec.js',
         suite: 'src/consumer/__tests__/offsetResetLive.spec.js › Consumer > offset reset policies',
-        cases: 8,
+        cases: 10,
       },
     ]
 
