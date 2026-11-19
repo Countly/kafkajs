@@ -1827,7 +1827,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       before: ({ resolveOffset }) => resolveOffset('4'),
     }
 
-    test('is not written once the newer seek was applied', async () => {
+    test('is not written once a newer seek was admitted', async () => {
       await open(SEEKING)
       const write = using(holdNextCommitWrite())
       const older = scenario.seek('0')

@@ -252,67 +252,211 @@ describe('a seek reservation', () => {
   })
 
   test('a waiting position caller whose deadline passes leaves its seek queued and no waiter behind', async () => {
-    const h = fixture()
-    const first = h.holdCommit()
-    h.group.seek({ ...CELL, offset: '5' })
-    const older = h.group.position(CELL)
-    await first.arrived
-    h.group.seek({ ...CELL, offset: '7' })
-    const operation = new ConsumerOperation({ deadlineAt: performance.now() + 30 })
-
-    const expired = await failureOf(operation.wait(() => h.group.position(CELL, { operation })))
-
-    expect(expired).toBeInstanceOf(Error)
-    expect(h.group.idleWait.waiters.size).toBe(0)
-    expect(h.group.hasSeekOffset(CELL)).toBe(true)
-    expect(h.wire).toEqual(['0:5'])
-    first.accept()
-    expect(await older).toBe('7')
-    expect(h.wire).toEqual(['0:5', '0:7'])
-  })
-
-  test.each(['times out', 'is closed with its connection'])(
-    'the reservation outlives the caller of its seek and ends only when the commit request %s',
-    async () => {
-      const h = fixture()
-      const first = h.holdCommit()
-      h.group.seek({ ...CELL, offset: '5' })
-      const operation = new ConsumerOperation({ deadlineAt: performance.now() + 30 })
-      const expired = await failureOf(operation.wait(() => h.group.position(CELL, { operation })))
-      expect(expired).toBeInstanceOf(Error)
-      await first.arrived
-      expect(h.operations.reserved).toBe(1)
-      h.group.seek({ ...CELL, offset: '7' })
-      const newer = h.group.position(CELL)
-      await flush()
-      expect(h.wire).toEqual(['0:5'])
-
-      first.fail(new Error('the request ended on the wire'))
-
-      expect(await newer).toBe('7')
-      expect(h.wire).toEqual(['0:5', '0:7'])
-      expect(h.stored[0]).toBe('7')
-    }
-  )
-
-  test('with no request timeout, the reservation survives time and a stop until the request ends', async () => {
-    jest.useFakeTimers()
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
     try {
       const h = fixture()
       const first = h.holdCommit()
       h.group.seek({ ...CELL, offset: '5' })
-      const older = failureOf(h.group.position(CELL))
+      const older = h.group.position(CELL)
       await first.arrived
-      jest.advanceTimersByTime(10 * 60 * 1000)
-      h.group.idleWait.dispose()
+      h.group.seek({ ...CELL, offset: '7' })
+      const operation = new ConsumerOperation({ deadlineAt: performance.now() + 30 })
+      const expired = failureOf(operation.wait(() => h.group.position(CELL, { operation })))
+      await flush()
+      expect(h.group.idleWait.waiters.size).toBe(1)
 
-      expect(h.operations.reserved).toBe(1)
-      first.fail(new Error('the transport closed'))
-      expect((await older).message).toBe('the transport closed')
-      expect(h.operations.reserved).toBe(0)
+      await jest.advanceTimersByTimeAsync(31)
+
+      expect(await expired).toBeInstanceOf(Error)
+      expect(h.group.idleWait.waiters.size).toBe(0)
+      expect(h.group.hasSeekOffset(CELL)).toBe(true)
+      expect(h.wire).toEqual(['0:5'])
+      first.accept()
+      expect(await older).toBe('7')
+      expect(h.wire).toEqual(['0:5', '0:7'])
     } finally {
       jest.useRealTimers()
     }
+  })
+
+  /**
+   * Sends the fixture's next OffsetCommit through a real request queue, which writes it and then
+   * owns its end: an answer, the queue's request timeout or the close of its connection.
+   * @param {object} h the fixture
+   * @param {{ enforceRequestTimeout: boolean }} options
+   * @returns {{ queue: RequestQueue, written: Promise<void> }}
+   */
+  const sendThroughQueue = (h, { enforceRequestTimeout }) => {
+    const RequestQueue = require('../../network/requestQueue')
+    const queue = new RequestQueue({
+      maxInFlightRequests: 1,
+      requestTimeout: 1000,
+      enforceRequestTimeout,
+      clientId: 'test',
+      broker: 'coordinator:9092',
+      logger: h.group.logger,
+    })
+    queue.scheduleRequestTimeoutCheck()
+    const written = deferred()
+    h.coordinator.offsetCommit.mockImplementationOnce(
+      (payload) =>
+        new Promise((resolve, reject) => {
+          queue.push({
+            entry: {
+              correlationId: 1,
+              apiKey: 8,
+              apiName: 'OffsetCommit',
+              apiVersion: 9,
+              resolve,
+              reject,
+            },
+            expectResponse: true,
+            sendRequest: () => {
+              h.wire.push(`0:${payload.topics[0].partitions[0].offset}`)
+              written.resolve()
+            },
+          })
+        })
+    )
+    return { queue, written: written.promise }
+  }
+
+  test.each([
+    ['times out', (queue) => jest.advanceTimersByTimeAsync(1200)],
+    [
+      'is closed with its connection',
+      async (queue) => queue.rejectAll(new Error('Connection closed')),
+    ],
+  ])(
+    'the reservation outlives the caller of its seek and ends only when the commit request %s',
+    async (end, settle) => {
+      jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+      try {
+        const h = fixture()
+        const { queue, written } = sendThroughQueue(h, { enforceRequestTimeout: true })
+        h.group.seek({ ...CELL, offset: '5' })
+        const operation = new ConsumerOperation({ deadlineAt: performance.now() + 30 })
+        const expired = failureOf(operation.wait(() => h.group.position(CELL, { operation })))
+        await written
+        await jest.advanceTimersByTimeAsync(31)
+        expect(await expired).toBeInstanceOf(Error)
+        expect(h.operations.reserved).toBe(1)
+        expect(queue.inflight.size).toBe(1)
+        h.group.seek({ ...CELL, offset: '7' })
+        const newer = h.group.position(CELL)
+        await flush()
+        expect(h.wire).toEqual(['0:5'])
+
+        await settle(queue)
+
+        expect(await newer).toBe('7')
+        expect(h.wire).toEqual(['0:5', '0:7'])
+        expect(h.stored[0]).toBe('7')
+        expect(queue.inflight.size + queue.pending.length).toBe(0)
+        queue.destroy()
+      } finally {
+        jest.useRealTimers()
+      }
+    }
+  )
+
+  test('with no request timeout, the reservation survives time and a stop until its connection closes', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+    try {
+      const h = fixture()
+      const { queue, written } = sendThroughQueue(h, { enforceRequestTimeout: false })
+      h.group.seek({ ...CELL, offset: '5' })
+      const older = failureOf(h.group.position(CELL))
+      await written
+      await jest.advanceTimersByTimeAsync(10 * 60 * 1000)
+      h.group.idleWait.dispose()
+
+      expect(h.operations.reserved).toBe(1)
+      expect(queue.inflight.size).toBe(1)
+      queue.rejectAll(new Error('Connection closed'))
+      expect((await older).message).toBe('Connection closed')
+      expect(h.operations.reserved).toBe(0)
+      expect(queue.inflight.size + queue.pending.length).toBe(0)
+
+      h.group.startIdleWait()
+      h.group.seek({ ...CELL, offset: '7' })
+      expect(await h.group.position(CELL)).toBe('7')
+      expect(h.wire).toEqual(['0:5', '0:7'])
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  test.each([
+    ['accepted', '6'],
+    ['rejected', null],
+  ])(
+    'a position read of a halted partition waits for a queued seek held back by a seek in flight, then reports what the newer seek did when it is %s',
+    async (outcome, position) => {
+      const h = fixture()
+      const halt = new Error('the partition is out of range')
+      h.group.haltedPartitions.set(KEY, { reason: 'offset-out-of-range', error: halt })
+      const first = h.holdCommit()
+      h.group.seek({ ...CELL, offset: '5' })
+      const parts = [{ topic: TOPIC, partitions: [0] }]
+      const round = failureOf(
+        h.group.seekOffsets(
+          parts,
+          new FetchPreparation(
+            h.group,
+            h.group.idleWait,
+            parts,
+            Infinity,
+            h.group.ownership.token()
+          )
+        )
+      )
+      await first.arrived
+      h.group.seek({ ...CELL, offset: '6' })
+      const second = h.holdCommit()
+      const read = h.group.position(CELL).then(
+        (value) => ({ value }),
+        (error) => error
+      )
+      await flush()
+      expect(await Promise.race([read, flush().then(() => 'waiting')])).toBe('waiting')
+      expect(h.wire).toEqual(['0:5'])
+
+      first.accept()
+      await second.arrived
+      expect(h.wire).toEqual(['0:5', '0:6'])
+      const rejected = new Error('the broker rejected the newer seek')
+      if (position) second.accept()
+      else second.fail(rejected)
+
+      const result = await read
+      if (position) expect(result).toEqual({ value: position })
+      else expect(result).toBe(rejected)
+      expect(await round).toBeNull()
+    }
+  )
+
+  test('a log creator that edits the logged seek cannot send it to another partition', async () => {
+    const h = fixture()
+    const { createLogger, LEVELS } = require('../../loggers')
+    h.group.logger = createLogger({
+      level: LEVELS.DEBUG,
+      logCreator:
+        () =>
+        ({ log }) => {
+          if (log.message === 'Seek offset') log.seek.partition = 1
+        },
+    }).namespace('ConsumerGroup')
+    const first = h.holdCommit()
+    h.group.seek({ topic: TOPIC, partition: 1, offset: '5' })
+    const older = h.group.position({ topic: TOPIC, partition: 1 })
+    await first.arrived
+    h.group.seek({ ...CELL, offset: '7' })
+
+    expect(await h.group.position(CELL)).toBe('7')
+    expect(h.wire).toEqual(['1:5', '0:7'])
+    first.accept()
+    expect(await older).toBe('5')
   })
 
   test('a position read from a rebalance callback while the run stops applies and waits for no seek', async () => {

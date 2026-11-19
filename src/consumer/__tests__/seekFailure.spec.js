@@ -310,6 +310,51 @@ describe.each(['classic', 'consumer'])('a failed seek, %s protocol', (protocol) 
     expect(outcome).toMatchObject({ failure: null, commits: ['4'], warnings: [] })
   })
 
+  describe.each([
+    ['latest', '-1'],
+    ['earliest', '-2'],
+  ])('a %s seek superseded by a seek admitted from its own DEBUG log', (boundary, sentinel) => {
+    const admitFromDebug = (consumer, group) => {
+      const debug = group.logger.debug
+      let admitted = false
+      jest.spyOn(group.logger, 'debug').mockImplementation((message, ...extra) => {
+        if (!admitted && message === 'Seek offset') {
+          admitted = true
+          consumer.seek({ ...CELL, offset: '4' })
+        }
+        return debug(message, ...extra)
+      })
+    }
+
+    test('is not applied, and the partition keeps its position when the newer seek is rejected', async () => {
+      const outcome = await failedSeek({
+        protocol,
+        fromBeginning: false,
+        fail: async (rig, consumer, group) => {
+          rejectCommitOf(rig, '4', 7)
+          admitFromDebug(consumer, group)
+          consumer.seek({ ...CELL, offset: sentinel })
+          return {
+            failure: await consumer.position(CELL).then(
+              () => null,
+              (error) => error
+            ),
+          }
+        },
+      })
+      expect(outcome).toEqual({
+        failure: 'REQUEST_TIMED_OUT',
+        position: '3',
+        delivery: '3',
+        offsetFetches: 0,
+        listOffsets: 0,
+        joins: 0,
+        commits: ['4'],
+        warnings: [WARNING],
+      })
+    })
+  })
+
   test('rejected with a membership error, ends the acquisition through the normal rejoin', async () => {
     const outcome = await failedSeek({
       protocol,
