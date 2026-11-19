@@ -133,6 +133,24 @@ describe('Crash cleanup lifetime', () => {
     }
   })
 
+  test('crash cleanup settles when inspecting the crash error throws, so a timed disconnect still returns', async () => {
+    const { consumer, runner } = await started()
+    const error = new Error('odd failure')
+    Object.defineProperty(error, 'cause', {
+      get() {
+        throw new Error('cause getter failed')
+      },
+    })
+    const crashing = runner.onCrash(error).catch(() => {})
+    const outcome = await Promise.race([
+      consumer.disconnect({ timeout: 20 }).then(() => 'closed'),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 500)),
+    ])
+    await crashing
+
+    expect(outcome).toBe('closed')
+  })
+
   test('recreation during the cleanup gap survives and resolves 0 instead of committed 99', async () => {
     const deciding = gate()
     const entered = gate()
