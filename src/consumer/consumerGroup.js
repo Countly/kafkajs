@@ -3699,7 +3699,9 @@ module.exports = class ConsumerGroup {
    * fetch loop's error policy). The application seeks again if it still wants the position. A
    * popped seek that is no longer current (`isCurrentSeek`) is refused before its write and
    * settles nothing; one popped with no acquisition to compare (a partition assigned without one)
-   * is never refused for it.
+   * is never refused for it. Its identity is captured in the step that pops it, before any
+   * observer runs, and every later step, its DEBUG log included, ends in its settlement, so a
+   * throwing log is a failed seek and a seek admitted from inside the log supersedes it.
    *
    * Given a preparation, every step uses its captured offset manager and checks its guard before
    * popping an intent, after every await, before the resolution retry and its yield, and before
@@ -3720,12 +3722,6 @@ module.exports = class ConsumerGroup {
           continue
         }
 
-        this.logger.debug('Seek offset', {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          seek: seekEntry,
-        })
-
         const key = `${topic}|${partition}`
         const acquired = this.acquired.get(key)
         const admitted = acquired?.soughtAt
@@ -3739,18 +3735,25 @@ module.exports = class ConsumerGroup {
             return attempt.superseded
           },
         }
-        let applied
+        let applied = false
+        let failure = null
         try {
+          this.logger.debug('Seek offset', {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            seek: seekEntry,
+          })
           applied = await manager.seek(seekEntry, preparation, attempt)
         } catch (error) {
-          this.dropReplacedPosition(manager, seekEntry, acquired, admitted, attempt)
-          this.settleSeek(key, acquired, admitted, attempt.accepted === true)
-          if (attempt.accepted !== true) this.warnFailedSeek(seekEntry, error)
-          throw error
+          failure = { error }
         }
         // Accepted by the broker: the seek took effect there even when a newer commit owns the cell.
         if (!applied) this.dropReplacedPosition(manager, seekEntry, acquired, admitted, attempt)
         this.settleSeek(key, acquired, admitted, applied || attempt.accepted === true)
+        if (failure) {
+          if (attempt.accepted !== true) this.warnFailedSeek(seekEntry, failure.error)
+          throw failure.error
+        }
         preparation?.check()
       }
     }

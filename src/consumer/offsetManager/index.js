@@ -510,12 +510,11 @@ module.exports = class OffsetManager {
    */
   resetOffsetsForTopic(topic) {
     this.committedOffsets()
-    this.operations.touchTopic(topic)
+    this.operations.invalidateTopic(topic)
     this.retireResetRefusals(topic)
     for (const partition of this.pendingSeeks.get(topic)?.keys() || []) {
       this.clearPendingSeek(topic, partition)
     }
-    this.operations.invalidateTopic(topic)
     this.resetPositions[topic] = {}
     this.resolvedOffsets[topic] = {}
     this.resolvedEpochs[topic] = {}
@@ -844,11 +843,11 @@ module.exports = class OffsetManager {
    * @param {CommitAttempt} [attempt] records what the seek's own commit did on the wire, for the
    *   caller that settles the seek
    * @returns {Promise<boolean>} whether the seek was applied: `false` when the partition is not
-   *                              currently assigned to this member, when this member lost its
-   *                              membership, or when a newer operation or barrier superseded it
-   *                              while its commit was in flight
-   * @throws {Error} whatever the offset conversion or the commit raised, or the preparation's
-   *   refusal; the ticket ends either way
+   *   currently assigned to this member, when this member had lost its membership before the
+   *   seek, when a newer seek refused it before its write, or when a newer operation or barrier
+   *   superseded it while its commit was in flight
+   * @throws {Error} whatever the offset conversion or the commit raised, a membership loss its
+   *   commit learned included, or the preparation's refusal; the ticket ends either way
    */
   async seek({ topic, partition, offset }, preparation, attempt = {}) {
     this.refuse(preparation)

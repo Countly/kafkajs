@@ -1211,12 +1211,13 @@ module.exports = class Runner extends EventEmitter {
         uncommittedOffsets: () => this.consumerGroup.uncommittedOffsets(),
         isRunning: () => this.running,
         /**
-         * Whether this batch's records are stale: a seek of the partition is queued, or the batch
-         * was superseded (`isSuperseded`), which lasts for the batch's life.
+         * Whether a seek made this batch's records stale: one of the partition is queued, or one
+         * was admitted after the batch was fetched (`isSought`), which lasts for the batch's life.
+         * A revoke or a topic recreation without a seek leaves it false.
          * @returns {boolean}
          */
         isStale: () =>
-          this.consumerGroup.hasSeekOffset({ topic, partition }) || this.isSuperseded(batch),
+          this.consumerGroup.hasSeekOffset({ topic, partition }) || this.isSought(batch),
       })
     } catch (e) {
       this.markOwnRequest(e, 'handler')
@@ -1405,6 +1406,21 @@ module.exports = class Runner extends EventEmitter {
     if (batch.acquireClock != null && acquired && acquired.acquiredAt > batch.acquireClock)
       return true
     return !this.consumerGroup.isAssigned(batch.topic, batch.partition)
+  }
+
+  /**
+   * Whether a seek of the batch's partition was admitted after the batch was fetched. Once true it
+   * stays true. A batch identity without an acquisition is checked against the partition's
+   * current one.
+   * @param {import('./batch')|object} batch a fetched batch or a handler's batch identity
+   * @returns {boolean}
+   */
+  isSought(batch) {
+    if (batch.acquisition !== undefined) return handlerContext.isSought(batch)
+    const acquired = this.consumerGroup.acquired?.get(
+      batch.ownershipKey || `${batch.topic}|${batch.partition}`
+    )
+    return batch.acquireClock != null && acquired?.soughtAt > batch.acquireClock
   }
 
   /**
