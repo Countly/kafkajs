@@ -147,4 +147,38 @@ describe('Loggers', () => {
       expect(logger.debugEnabled()).toBe(true)
     })
   })
+  describe('a throwing log sink', () => {
+    const throwing = () =>
+      jest.fn(({ log }) => {
+        if (log.message === 'boom') throw new Error('sink failed')
+      })
+
+    it('does not escape a root or namespaced call, and later lines still reach the sink', () => {
+      const sink = throwing()
+      const root = createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+      const namespaced = root.namespace('Ns')
+
+      expect(root.error('boom')).toBeUndefined()
+      expect(namespaced.info('boom')).toBeUndefined()
+      namespaced.warn('after')
+
+      expect(sink).toHaveBeenCalledTimes(3)
+      expect(sink.mock.calls[2][0]).toMatchObject({ namespace: 'Ns', label: 'WARN' })
+      expect(sink.mock.calls[2][0].log.message).toBe('after')
+    })
+
+    it('is not invoked for a filtered line', () => {
+      const sink = throwing()
+      const root = createLogger({ level: LEVELS.ERROR, logCreator: () => sink })
+      root.namespace('Ns').debug('boom')
+      expect(sink).not.toHaveBeenCalled()
+    })
+
+    it('leaves a throwing log creator failing the logger construction', () => {
+      const creator = () => {
+        throw new Error('creator failed')
+      }
+      expect(() => createLogger({ logCreator: creator })).toThrow('creator failed')
+    })
+  })
 })
