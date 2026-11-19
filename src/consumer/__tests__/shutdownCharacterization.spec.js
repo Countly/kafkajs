@@ -58,7 +58,7 @@ describe('Consumer > shutdown characterization', () => {
       expect(policy).toHaveBeenCalledTimes(1)
       expect(run.cluster.disconnect).toHaveBeenCalledTimes(1)
       expect([count(run, 'STOP'), count(run, 'DISCONNECT')]).toEqual([1, 1])
-      expect(lost).not.toHaveBeenCalled()
+      expect(lost).toHaveBeenCalledTimes(withHook ? 1 : 0)
 
       const sent = count(run, 'heartbeat') + count(run, 'commit')
       run.held.resolve()
@@ -66,7 +66,7 @@ describe('Consumer > shutdown characterization', () => {
 
       expect(run.crashes).toHaveLength(1)
       expect(count(run, 'heartbeat') + count(run, 'commit')).toBe(sent)
-      expect(lost).not.toHaveBeenCalled()
+      expect(lost).toHaveBeenCalledTimes(withHook ? 1 : 0)
       expect(entered).toHaveBeenCalledTimes(1)
       expect(jest.getTimerCount()).toBe(0)
     },
