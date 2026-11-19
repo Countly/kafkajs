@@ -3620,7 +3620,8 @@ module.exports = class ConsumerGroup {
    *
    * A popped seek is attempted once, as in kafkajs 2.2.4: whatever happens to its commit, it is
    * settled and never sent again, and a failure reaches the caller. One the broker accepted is
-   * settled as applied, whatever refused the caller afterwards; one written with no answer (a
+   * settled as applied (clearing its halt), whatever refused the caller afterwards or whichever
+   * newer commit took its cell; one written with no answer (a
    * timeout, a lost connection) or rejected is settled the same way and its position is read back
    * from the broker; one that failed before its write leaves the partition at its committed
    * offset. The application seeks again if it still wants the position. A seek that returns
@@ -3672,7 +3673,8 @@ module.exports = class ConsumerGroup {
           this.settleSeek(key, acquired, admitted, attempt.written)
           throw error
         }
-        this.settleSeek(key, acquired, admitted, applied)
+        // Accepted by the broker: the seek took effect there even when a newer commit owns the cell.
+        this.settleSeek(key, acquired, admitted, applied || attempt.accepted === true)
         preparation?.check()
       }
     }
