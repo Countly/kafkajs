@@ -3,6 +3,7 @@ const Batch = require('../batch')
 const PollTimer = require('../pollTimer')
 const HeartbeatManager = require('../heartbeatManager')
 const ConsumerGroup = require('../consumerGroup')
+const GroupOwnership = require('../groupOwnership')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
@@ -394,6 +395,50 @@ describe('Consumer > RebalanceCoordinator > the inter-round yield', () => {
     const { coordinator } = build()
 
     expect(() => coordinator.notifyStopRequested()).not.toThrow()
+  })
+})
+
+describe('Consumer > RebalanceCoordinator > the round after the inter-round yield', () => {
+  /** A consumer-protocol coordinator whose current membership is already lost. */
+  const lostMember = () => {
+    const built = build()
+    Object.assign(built.consumerGroup, {
+      kind: 'consumer',
+      joinCount: 1,
+      ownership: new GroupOwnership(),
+      needsReconciliation: () => true,
+    })
+    built.consumerGroup.ownership.lose(new Error('fenced'), 0)
+    return built
+  }
+
+  it('ends the chain when the membership is lost and no LOST round is owed', () => {
+    const { coordinator } = lostMember()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'revoked', reason: null, level: false })
+  })
+
+  it('runs the LOST round chosen before the wait even though the membership is lost', () => {
+    const { coordinator } = lostMember()
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'lost', reason: 'fenced', level: false })
+    ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
+  })
+
+  it('runs a LOST round queued during the wait even though the membership is lost', () => {
+    const { coordinator } = lostMember()
+    Object.assign(coordinator, {
+      pendingKind: 'lost',
+      pendingJoinCount: 1,
+      rejoinRequested: 'fenced',
+    })
+
+    expect(
+      coordinator.nextRoundAfterWait({ kind: 'revoked', reason: 'assignment-changed', level: true })
+    ).toEqual({ kind: 'lost', reason: 'fenced', level: false })
   })
 })
 
