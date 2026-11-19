@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Downloads the five pinned Java 4.3.1 interop jars into the flat directory $TELEMETRY_INTEROP_CACHE and verifies each
-# SHA-256 against interop.sha256. Only Maven Central is contacted, never at broker start. run.sh client re-verifies them.
+# SHA-256 against interop.sha256; download.sh retries and publishes a jar only once its digest matches. Only Maven
+# Central is contacted, never at broker start. run.sh client re-verifies them.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/download.sh"
 CACHE=${TELEMETRY_INTEROP_CACHE:?set TELEMETRY_INTEROP_CACHE to the flat interop jar directory}
 case "$CACHE" in /*) ;; *) exit 2 ;; esac
 M=https://repo1.maven.org/maven2
 mkdir -p "$CACHE"
 while read -r name url; do
-  [ -s "$CACHE/$name" ] || timeout 120 curl -fsSL --max-time 110 -o "$CACHE/$name" "$url"
+  fetch "$HERE/interop.sha256" "$CACHE" "$name" "$url"
 done <<LIST
 kafka-clients-4.3.1.jar $M/org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar
 slf4j-api-1.7.36.jar $M/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar
