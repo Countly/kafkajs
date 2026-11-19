@@ -2880,3 +2880,155 @@ describe('final soak record timestamps and client log', () => {
     }
   })
 })
+
+describe('final soak share request capture', () => {
+  const { SocketRegistry } = require('../finalSoakObserver')
+  const { shareRequestSummary } = require('../shareProtocol')
+  const shareAcknowledgeV2 = require('../../../src/protocol/requests/shareAcknowledge/v2/request')
+  const UUID = '41414141-4141-4141-4141-414141414141'
+
+  /** @returns {Promise<Buffer>} a framed ShareAcknowledge v2 request accepting `[from, to]` */
+  const ackFrame = async (correlationId, shareSessionEpoch, from, to) => {
+    const body = (
+      await shareAcknowledgeV2({
+        groupId: 'g',
+        memberId: 'm',
+        shareSessionEpoch,
+        topics: [
+          {
+            topicId: UUID,
+            partitions: [
+              {
+                partitionIndex: 0,
+                acknowledgementBatches: [
+                  { firstOffset: from, lastOffset: to, acknowledgeTypes: [1] },
+                ],
+              },
+            ],
+          },
+        ],
+      }).encode()
+    ).buffer
+    const header = Buffer.alloc(13)
+    header.writeInt16BE(79, 0)
+    header.writeInt16BE(2, 2)
+    header.writeInt32BE(correlationId, 4)
+    header.writeInt16BE(2, 8)
+    header.write('c7', 10)
+    header.writeUInt8(0, 12)
+    const size = Buffer.alloc(4)
+    size.writeInt32BE(header.length + body.length)
+    return Buffer.concat([size, header, body])
+  }
+
+  test('a capturing socket reports each share request when it is written and, at close, each one never answered', async () => {
+    const socket = new EventEmitter()
+    socket.write = () => true
+    const registry = new SocketRegistry({ base: () => () => socket })
+    const seen = { sent: [], unanswered: [], exchanges: [] }
+    registry.factory('c07.1', {
+      apiKeys: [78, 79],
+      onExchange: (e) => seen.exchanges.push(e.request.readInt32BE(8)),
+      onSent: (r) => seen.sent.push([r.node, r.apiKey, r.correlationId]),
+      onUnanswered: (r) => seen.unanswered.push(r),
+    })({ host: 'h', port: 1 })
+    const answered = await ackFrame(7, 3, '1', '1')
+    const lost = await ackFrame(8, 4, '2', '2')
+    socket.write(answered)
+    socket.write(lost)
+    expect(seen.sent).toEqual([
+      ['h:1', 79, 7],
+      ['h:1', 79, 8],
+    ])
+    const response = Buffer.alloc(9)
+    response.writeInt32BE(5, 0)
+    response.writeInt32BE(7, 4)
+    socket.emit('data', response)
+    socket.emit('close')
+    expect(seen.exchanges).toEqual([7])
+    expect(seen.unanswered).toHaveLength(1)
+    expect(seen.unanswered[0]).toMatchObject({ node: 'h:1', apiKey: 79, correlationId: 8 })
+    expect(seen.unanswered[0].request.equals(lost)).toBe(true)
+  })
+
+  test('a share request summary names its version, session epoch and acknowledged ranges, and a frame it cannot read yields nulls and the reason', async () => {
+    expect(shareRequestSummary(await ackFrame(8, 4, '15760', '15760'))).toEqual({
+      apiVersion: 2,
+      sessionEpoch: 4,
+      acknowledged: [{ topicId: UUID, partition: 0, from: '15760', to: '15760', types: [1] }],
+      error: null,
+    })
+    const truncated = (await ackFrame(8, 4, '1', '1')).subarray(0, 20)
+    truncated.writeInt32BE(16, 0)
+    expect(shareRequestSummary(truncated)).toEqual({
+      apiVersion: null,
+      sessionEpoch: null,
+      acknowledged: null,
+      error: expect.any(String),
+    })
+  })
+
+  test('a share member writes a short wire line for each request it sends and one with the full bytes for each request its socket closed without an answer, inside the wire budget', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-sent-'))
+    try {
+      let capture = null
+      jest.spyOn(ClientRig.prototype, 'construct').mockImplementation(async function (make, c) {
+        capture = c
+        this.object = {
+          events: { ACKNOWLEDGE: 'share.acknowledge' },
+          on: () => {},
+          connect: async () => {},
+          subscribe: async () => {},
+          run: async () => {},
+          disconnect: async () => {},
+        }
+        return this.object
+      })
+      const runtime = workerRuntime('c07')
+      const full = []
+      runtime.wire = new WireLog({ dir, prefix: 'p07.share', onFull: (m) => full.push(m) })
+      const worker = new ShareWorker(runtime)
+      const rig = await worker.join(runtime.slots.find((c) => c.purpose === 'subject'))
+      const lost = await ackFrame(8, 4, '15760', '15760')
+      capture.onSent({ node: 'h:1', apiKey: 79, correlationId: 8, request: lost })
+      capture.onUnanswered({ node: 'h:1', apiKey: 79, correlationId: 8, request: lost })
+      const lines = fs
+        .readFileSync(path.join(dir, 'raw/p07.share.0.ndjson'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+      expect(lines).toEqual([
+        {
+          client: rig.id,
+          event: 'sent',
+          node: 'h:1',
+          apiKey: 79,
+          correlationId: 8,
+          apiVersion: 2,
+          sessionEpoch: 4,
+          acknowledged: [{ topicId: UUID, partition: 0, from: '15760', to: '15760', types: [1] }],
+          error: null,
+        },
+        {
+          client: rig.id,
+          event: 'unanswered',
+          node: 'h:1',
+          apiKey: 79,
+          correlationId: 8,
+          request: lost.toString('hex'),
+        },
+      ])
+      const small = new WireLog({
+        dir,
+        prefix: 'p07.small',
+        budget: 50,
+        onFull: (m) => full.push(m),
+      })
+      expect(small.note({ client: rig.id, event: 'sent', pad: 'x'.repeat(60) })).toBeNull()
+      expect(small.dropped).toBe(1)
+      expect(full).toEqual(['raw wire budget of 50 bytes reached'])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
