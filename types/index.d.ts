@@ -3032,13 +3032,6 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
 }
 
 /**
- * An offset commit was refused because the consumer lost its group membership, or a handler or
- * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
- * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
- * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
- * `cause` is the loss.
- */
-/**
  * A record or a send cannot ever fit: its size is above `maxRequestSize` (checked on the encoded
  * frame where compression applies) or `bufferMemory`. Non-retriable. Carries the type and code of
  * the broker's own MESSAGE_TOO_LARGE so a check on either catches both; unlike a real broker
@@ -3117,10 +3110,19 @@ export class KafkaJSBufferExhaustedError extends KafkaJSError {
   )
 }
 
+/**
+ * An offset commit was refused because the consumer lost its group membership, or a handler or
+ * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
+ * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
+ * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
+ * `cause` is the loss; it is absent for a stale handler and for a seek. Reason `stale-assignment`
+ * also covers a handler commit of offsets for a batch fetched before a `consumer.seek()` of its
+ * partition, with no rejoin: it does not by itself mean the group rebalanced.
+ */
 export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'
-  readonly cause: Error
-  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause: Error })
+  readonly cause?: Error
+  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause?: Error })
 }
 
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
