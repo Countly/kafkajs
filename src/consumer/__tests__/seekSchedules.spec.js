@@ -1,7 +1,11 @@
 /**
- * Seeded seek schedules checked against an independent model. An exploratory tool, not a gate:
- * it is not part of the unit selectors, and a failing seed is a lead to reproduce as a named case
- * in `seekFencing.spec.js`, not a verdict. Run it by name.
+ * Seeded seek schedules checked against an independent model. The fixed `SEEDS` and the named
+ * schedules are a gate: each title must pass. Any other seed is exploratory, and a failure there
+ * is a lead to reproduce as a named case, not a verdict. The model does not yet cover three
+ * documented behaviours: a revoke is stamped when its step starts, not when the consumer revokes;
+ * a deliberate commit recorded before a seek's answer while the broker applied the seek last
+ * keeps the commit as the position; a position is served from the shared committed cache with no
+ * OffsetFetch.
  */
 const { AsyncLocalStorage } = require('node:async_hooks')
 const Broker = require('../../broker')
@@ -45,6 +49,15 @@ const drive = async (promise, budget = OPEN_MS) => {
   for (let spent = 0; !state.done && spent < budget; spent += TICK_MS) await advance(TICK_MS)
   if (!state.done) throw new Error(`still pending after ${budget} fake ms`)
   return settled
+}
+
+/**
+ * Lets replies the broker already sent reach the client, without advancing fake time: their I/O
+ * turns are real.
+ * @returns {Promise<void>}
+ */
+const landReplies = async () => {
+  for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
 }
 
 /**
@@ -226,6 +239,17 @@ class ScheduleRun {
     return event
   }
 
+  /**
+   * @param {number} partition
+   * @returns {boolean} whether an OffsetCommit of the partition still waits for its answer at the
+   *   client, so the committed cache may lag the broker until it arrives
+   */
+  awaitsCommitAnswer(partition) {
+    return this.candidates.some(
+      (c) => !c.answered && c.sig.split(',').some((cell) => cell.startsWith(`${partition}:`))
+    )
+  }
+
   /** @param {Promise<unknown>} promise @param {object} [op] @returns {void} */
   track(promise, op = {}) {
     const entry = Object.assign(op, { settled: false, t: this.tick() })
@@ -345,9 +369,16 @@ class ScheduleRun {
           op: outer?.outside ?? outer?.op ?? null,
           selection: null,
           selectedAt: null,
+          began: null,
         }
         if (outer?.outside) outer.outside.commit = commit
         return ops.run({ delivery: outer?.delivery, commit }, () => original.apply(this, args))
+      }),
+      around(OffsetManager.prototype, 'sendAndRecordCommit', function (original, args) {
+        // Each attempt, a retry included, records under a ticket begun here.
+        const commit = ops.getStore()?.commit
+        if (commit) commit.began = run.tick()
+        return original.apply(this, args)
       }),
       around(OffsetManager.prototype, 'selectUncommitted', function (original, args) {
         const selected = original.apply(this, args)
@@ -367,13 +398,23 @@ class ScheduleRun {
       }),
       around(Broker.prototype, 'offsetCommit', function (original, args) {
         const [request] = args
-        const candidate = { sig: signature(request.topics), store: ops.getStore(), live: true }
+        const candidate = {
+          sig: signature(request.topics),
+          store: ops.getStore(),
+          live: true,
+          answered: false,
+        }
         run.candidates.push(candidate)
-        const done = () => {
+        const done = (failed) => {
           candidate.live = false
+          candidate.answered = true
+          candidate.failed = failed
         }
         const result = original.apply(this, args)
-        result.then(done, done)
+        result.then(
+          () => done(false),
+          () => done(true)
+        )
         return result
       }),
       around(RequestQueue.prototype, 'sendSocketRequest', function (original, args) {
@@ -474,6 +515,8 @@ class ScheduleRun {
       type: 'arrival',
       cells,
       outcome,
+      candidate: candidate ?? null,
+      began: store.commit?.began ?? null,
       commit: store.commit ?? null,
       seek: store.seek ?? null,
       reset: store.reset ?? null,
@@ -1110,19 +1153,26 @@ const settledAt = (events, arrival) => {
 
 /**
  * @param {object} arrival
- * @returns {number} when the operation that sent the frame began: its selection, its call or its
- *   seek application
+ * @returns {number} when the operation that sent the frame began: its selection, the ticket of
+ *   the attempt that sent it (a retry has its own), its call or its seek application
  */
 const beganAt = (arrival) =>
-  arrival.commit?.selectedAt ?? arrival.commit?.op?.t ?? arrival.seek?.t ?? arrival.t
+  arrival.commit?.selectedAt ??
+  arrival.began ??
+  arrival.commit?.op?.t ??
+  arrival.seek?.t ??
+  arrival.t
 
 /**
  * Why the committed cache may differ from the broker for a partition, or null when it may not.
  * The client publishes accepted writes in the order their operations began, so the cache may
- * keep another value when the last write the broker took was never answered, began before
- * another accepted write of the partition, or was refused publication: an assignment change
- * refused its caller, or a seek of the partition was admitted, between its start and its answer.
- * A cache the client forgot is read again and is never compared.
+ * keep another value when the last write the broker took was never answered (its call failed,
+ * also when its caller was refused after the broker took it), began before another accepted
+ * write of the partition, or was refused publication: an assignment change refused its caller,
+ * a recreation barred it, or a seek of the partition was admitted, between its start and its
+ * answer. A write still waiting for its answer is exempted by the caller
+ * (`ScheduleRun#awaitsCommitAnswer`). A cache the client forgot is read again and is never
+ * compared.
  * @param {object[]} events
  * @param {number} partition
  * @returns {string|null}
@@ -1138,6 +1188,9 @@ const cacheExemption = (events, partition) => {
   const last = accepted[accepted.length - 1]
   if (!last) return null
   if (last.outcome === 'lost') return 'the last write was never answered'
+  if (last.candidate?.failed) {
+    return 'the call that sent the last write failed: its answer was lost or its caller refused'
+  }
   const began = beganAt(last)
   if (accepted.some((a) => a !== last && beganAt(a) > began)) {
     return 'the last write began before another one of the partition'
@@ -1145,6 +1198,9 @@ const cacheExemption = (events, partition) => {
   const answered = settledAt(events, last)
   if (events.some((e) => e.type === 'reassign' && e.t > last.t && e.t < answered)) {
     return 'an assignment change refused the caller before the answer'
+  }
+  if (events.some((e) => e.type === 'recreate' && e.t > began && e.t < answered)) {
+    return 'a recreation between its start and its answer barred its publication'
   }
   if (
     events.some(
@@ -1216,8 +1272,14 @@ const runSchedule = async (protocol, schedule) => {
           actual,
         })
       }
+      await landReplies()
       const cache = run.group.offsetManager.committedOffsets()[TOPIC]?.[p]
-      if (cache != null && String(cache) !== run.broker[p] && !cacheExemption(run.events, p)) {
+      if (
+        cache != null &&
+        String(cache) !== run.broker[p] &&
+        !run.awaitsCommitAnswer(p) &&
+        !cacheExemption(run.events, p)
+      ) {
         run.violate('I7', 'the committed cache holds a value the broker does not', {
           partition: p,
           cache: String(cache),
