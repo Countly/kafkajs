@@ -185,18 +185,19 @@ class WireLog {
    */
   note(fields) {
     const line = JSON.stringify(fields) + '\n'
-    if (this.total + line.length > this.budget) {
+    const bytes = Buffer.byteLength(line)
+    if (this.total + bytes > this.budget) {
       if (this.dropped++ === 0) this.onFull(`raw wire budget of ${this.budget} bytes reached`)
       return null
     }
-    this.total += line.length
-    if (this.bytes + line.length > WIRE_SEGMENT_BYTES) {
+    this.total += bytes
+    if (this.bytes + bytes > WIRE_SEGMENT_BYTES) {
       this.segment++
       this.bytes = 0
     }
     const file = `raw/${this.prefix}.${this.segment}.ndjson`
     fs.appendFileSync(path.join(this.dir, file), line)
-    this.bytes += line.length
+    this.bytes += bytes
     return { file, sha256: sha256(line) }
   }
 }
@@ -280,12 +281,19 @@ class ClientLog {
     if (this.tail.length > CLIENT_LOG_TAIL) this.tail.shift()
   }
 
-  /** @param {string} text @returns {boolean} whether all of it was written; a failure ends the file */
+  /**
+   * @param {string} text
+   * @returns {boolean} whether all of its UTF-8 bytes were written; a failure, or a write that takes
+   *   no bytes, ends the file
+   */
   write(text) {
     const buffer = Buffer.from(text)
     try {
-      for (let offset = 0; offset < buffer.length;)
-        offset += this.files.writeSync(this.fd, buffer, offset)
+      for (let offset = 0; offset < buffer.length;) {
+        const wrote = this.files.writeSync(this.fd, buffer, offset)
+        if (!(wrote > 0)) throw new Error('the client log file accepted no bytes')
+        offset += wrote
+      }
       return true
     } catch (e) {
       this.failed ??= e.message
@@ -1221,9 +1229,11 @@ class ProducerWorker extends Worker {
    * offset: the location is unknown, never invented. A send still in flight at `deadline` is
    * recorded `unknown` (`ExecutionDeadline`) so the caller answers in time; the client cannot cancel
    * it, so it is kept until it settles (bounded by the producer's delivery timeout) and its late
-   * result is noted, never recorded as a second outcome.
+   * result is noted, never recorded as a second outcome. The deadline is checked again after the
+   * offered record was journaled, right before the send: an offer past it is never sent and is
+   * recorded `rejected` (`ExecutionDeadline`).
    * @param {number} [deadline] run-clock ms past which the offer stops waiting for the send
-   * @returns {Promise<'acknowledged'|'unknown'|'skipped'>} the send's outcome
+   * @returns {Promise<'acknowledged'|'unknown'|'rejected'|'skipped'>} the send's outcome
    */
   async offer(
     rig,
@@ -1260,6 +1270,21 @@ class ProducerWorker extends Worker {
       bytes: record.value.length,
       transaction,
     })
+    if (runtime.clock.now() >= deadline) {
+      await runtime.emit({
+        kind: 'identity',
+        recordId: runtime.nextId(),
+        execution,
+        stage: 'ack',
+        client: rig.id,
+        id: record.id,
+        key,
+        outcome: 'rejected',
+        offset: null,
+        errorType: 'ExecutionDeadline',
+      })
+      return 'rejected'
+    }
     const sending = Promise.resolve()
       .then(() =>
         sender.send({
@@ -1364,6 +1389,7 @@ class ProducerWorker extends Worker {
         step.deadline ?? Infinity
       )
       if (outcome === 'acknowledged') acknowledged++
+      if (outcome === 'rejected') return { offered: offered + 1, acknowledged, stopped: true }
     }
     return { offered, acknowledged, stopped: false }
   }
