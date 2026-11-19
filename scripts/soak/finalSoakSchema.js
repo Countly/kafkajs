@@ -510,15 +510,6 @@ const RECORDS = Object.freeze({
         reason: nullable(Id),
         errorType: nullable(Id),
       },
-      'broker-share-start': {
-        client: Id,
-        group: Id,
-        key: Key,
-        topicId: nullable(Uuid),
-        startOffset: nullable(Offset),
-        lag: nullable(Offset),
-        errorCode: Int,
-      },
     },
   },
   scan: {

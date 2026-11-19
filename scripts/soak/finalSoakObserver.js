@@ -821,7 +821,7 @@ class PassiveObserver {
   /**
    * Stores one completed raw exchange of a client, independently decoded, in a fixed-size ring.
    * @param {string} client @param {{ apiKey: number, response: Buffer, file: string, sha256: string }} exchange
-   * @returns {void}
+   * @returns {object|null} the decoded response, or null when it could not be decoded
    */
   exchanged(client, { apiKey, response, file, sha256 }) {
     let decoded = null
@@ -829,12 +829,13 @@ class PassiveObserver {
       decoded = acknowledgementResponse(apiKey, response)
     } catch (e) {
       this.fail(`exchanged ${client}: ${e.message}`)
-      return
+      return null
     }
     const ring = this.exchanges.get(client) ?? []
     ring.push({ apiKey, decoded, file, sha256 })
     if (ring.length > RECENT_EXCHANGES) ring.shift()
     this.exchanges.set(client, ring)
+    return decoded
   }
 
   /**
@@ -1271,31 +1272,37 @@ class PassiveObserver {
  * and incoming bytes into frames and hands each completed request/response pair of the chosen API
  * keys to `onExchange`. Each request of those keys is also handed to `onSent` as it is written, and
  * each one still unanswered when the socket closes to `onUnanswered`, so a request whose reply was
- * lost leaves a trace. A capturing socket's own `data` listener and `write` wrapper are removed at
- * close, as the existing share wire trace does.
+ * lost leaves a trace. Every request carries its socket's generation (the registry's count of
+ * sockets made, so a correlation id reused on a later socket stays distinct) and its send time
+ * (`now`). A capture failure (a frame it cannot read, a hook that throws) goes to `onError` and
+ * never reaches the client: its write and its reads go on. A capturing socket's own `data`
+ * listener and `write` wrapper are removed at close, as the existing share wire trace does.
  */
 class SocketRegistry {
   /**
    * @param {object} [options]
    * @param {() => Function} [options.base] the default socket factory maker
    * @param {(header: Buffer) => { apiKey: number, correlationId: number }} [options.readHeader]
+   * @param {() => number} [options.now] the monotonic time a request is stamped with
    */
   constructor({
     base = require('../../src/network/socketFactory'),
     readHeader = (frame) => ({ apiKey: frame.readInt16BE(4), correlationId: frame.readInt32BE(8) }),
+    now = () => performance.now(),
   } = {}) {
     this.make = base()
     this.readHeader = readHeader
+    this.now = now
     this.refs = []
     this.created = 0
   }
 
   /**
    * @param {string} client the actual client id
-   * @param {{ apiKeys: number[], onExchange: (e: { apiKey: number, request: Buffer,
-   *   response: Buffer }) => void, onSent?: (r: SentRequest) => void,
-   *   onUnanswered?: (r: SentRequest) => void }|null} [capture] `SentRequest` is
-   *   `{ node, apiKey, correlationId, request }`
+   * @param {{ apiKeys: number[], onExchange: (e: SentRequest & { response: Buffer }) => void,
+   *   onSent?: (r: SentRequest) => void, onUnanswered?: (r: SentRequest) => void,
+   *   onError?: (stage: string, error: Error) => void }|null} [capture] `SentRequest` is
+   *   `{ node, socket, sentAt, apiKey, correlationId, request }`
    * @returns {Function} a `socketFactory` for the client's Kafka config
    */
   factory(client, capture = null) {
@@ -1304,7 +1311,7 @@ class SocketRegistry {
       this.created++
       const node = `${options.host}:${options.port}`
       this.refs.push({ ref: new WeakRef(socket), client, node })
-      if (capture) this.capture(socket, capture, node)
+      if (capture) this.capture(socket, capture, node, this.created)
       return socket
     }
   }
@@ -1323,12 +1330,27 @@ class SocketRegistry {
   /**
    * Splits a capturing socket's bytes into frames and pairs requests with responses.
    * @param {object} socket @param {object} capture see `factory` @param {string} node host:port
+   * @param {number} generation the socket's generation
    * @returns {void}
    */
-  capture(socket, { apiKeys, onExchange, onSent = () => {}, onUnanswered = () => {} }, node) {
+  capture(socket, capture, node, generation) {
+    const { apiKeys, onExchange, onSent = () => {}, onUnanswered = () => {} } = capture
+    const { onError = () => {} } = capture
     const pending = new Map()
     const buffers = { out: Buffer.alloc(0), in: Buffer.alloc(0) }
+    let broken = false
+    const contained = (stage, work) => {
+      try {
+        work()
+      } catch (e) {
+        broken ||= stage === 'frame'
+        try {
+          onError(stage, e)
+        } catch {}
+      }
+    }
     const take = (direction, chunk) => {
+      if (broken) return
       let bytes = Buffer.concat([buffers[direction], Buffer.from(chunk)])
       while (bytes.length >= 4 && bytes.length >= bytes.readInt32BE(0) + 4) {
         const length = bytes.readInt32BE(0) + 4
@@ -1337,32 +1359,32 @@ class SocketRegistry {
         if (direction === 'out') {
           const { apiKey, correlationId } = this.readHeader(frame)
           if (apiKeys.includes(apiKey)) {
-            pending.set(correlationId, { apiKey, request: frame })
-            onSent({ node, apiKey, correlationId, request: frame })
+            const sent = { node, socket: generation, sentAt: this.now(), apiKey, correlationId }
+            pending.set(correlationId, { ...sent, request: frame })
+            contained('sent', () => onSent({ ...sent, request: frame }))
           }
         } else {
           const correlationId = frame.readInt32BE(4)
           const request = pending.get(correlationId)
           if (!request) continue
           pending.delete(correlationId)
-          onExchange({ ...request, response: Buffer.from(frame) })
+          contained('exchange', () => onExchange({ ...request, response: Buffer.from(frame) }))
         }
       }
       buffers[direction] = Buffer.from(bytes)
     }
     const original = socket.write
     const write = function (chunk, ...rest) {
-      take('out', chunk)
+      contained('frame', () => take('out', chunk))
       return Reflect.apply(original, this, [chunk, ...rest])
     }
-    const receive = (chunk) => take('in', chunk)
+    const receive = (chunk) => contained('frame', () => take('in', chunk))
     socket.write = write
     socket.on('data', receive)
     socket.once('close', () => {
       socket.removeListener('data', receive)
       if (socket.write === write) socket.write = original
-      for (const [correlationId, { apiKey, request }] of pending)
-        onUnanswered({ node, apiKey, correlationId, request })
+      for (const request of pending.values()) contained('unanswered', () => onUnanswered(request))
       pending.clear()
     })
   }
