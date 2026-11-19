@@ -4,6 +4,7 @@ const OffsetOperations = require('../offsetManager/offsetOperations')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../../cluster/instrumentationEvents')
 const { newLogger, waitFor } = require('testHelpers')
+const { createLogger, LEVELS } = require('../../loggers')
 const {
   createScheduledOffsetManager,
 } = require('../offsetManager/__tests__/fixtures/scheduledOffsetManager')
@@ -117,9 +118,10 @@ describe('Crash cleanup lifetime', () => {
     try {
       const crashing = runner.onCrash(crashError())
       await entered
-      await consumer.disconnect()
-      expect(runner.consumerGroup.obligations.size()).toBe(0)
+      const closing = consumer.disconnect()
       release()
+      await closing
+      expect(runner.consumerGroup.obligations.size()).toBe(0)
       await crashing
       await new Promise((resolve) => setTimeout(resolve, 40))
       expect({ starts: start.mock.calls.length, restart: crashes[0].restart }).toEqual({
@@ -325,4 +327,132 @@ describe('Crash cleanup lifetime', () => {
     await consumer.disconnect()
     expect(cluster.listenerCount()).toBe(0)
   })
+})
+
+describe('A disconnect during crash cleanup', () => {
+  afterEach(() => jest.restoreAllMocks())
+
+  /**
+   * Starts a run whose crash stop is held on `stop` and whose first cluster disconnect (the
+   * crash's own) is held on `transport`, then crashes it. Records DISCONNECT, CRASH and the
+   * close's resolution in `order`.
+   */
+  const crashing = async ({ buildOptions = {}, retry = {}, holdTransport = false } = {}) => {
+    const stop = gate()
+    const transport = gate()
+    const start = jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
+    jest.spyOn(Runner.prototype, 'stop').mockImplementation(() => stop.promise)
+    const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
+    let calls = 0
+    cluster.disconnect = async () => {
+      if (++calls === 1 && holdTransport) await transport.promise
+    }
+    const consumer = build(cluster, {
+      retry: { retries: 0, initialRetryTime: 5, restartOnFailure: async () => true, ...retry },
+      ...buildOptions,
+    })
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+    await consumer.run({ eachMessage: async () => {}, autoCommit: false })
+    cluster.emitRecreated({ topic: TOPIC, previousTopicId: ID_A, topicId: ID_B })
+    const order = []
+    const crashes = []
+    consumer.on(consumer.events.DISCONNECT, () => order.push('DISCONNECT'))
+    consumer.on(consumer.events.CRASH, (event) => {
+      order.push('CRASH')
+      crashes.push(event.payload)
+    })
+    const runner = start.mock.instances[0]
+    return { stop, transport, start, cluster, consumer, runner, order, crashes }
+  }
+
+  /** @returns {Promise<void>} after `ms` real milliseconds */
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  test.each([
+    ['a cluster with nothing to drain', {}],
+    ['a cluster the consumer does not own', { buildOptions: { ownsCluster: false } }],
+    ['the crash cluster disconnect held', { holdTransport: true }],
+  ])(
+    'a plain disconnect whose stop a crash joins resolves only after the crashed run has dispatched its DISCONNECT and released its registry entries, with %s',
+    async (_label, options) => {
+      const run = await crashing(options)
+      const closing = run.consumer.disconnect().then(() => {
+        run.order.push('closed')
+        return {
+          disconnects: run.order.filter((entry) => entry === 'DISCONNECT').length,
+          obligations: run.runner.consumerGroup.obligations.size(),
+          listeners: run.cluster.listenerCount(),
+        }
+      })
+      const crashed = run.runner.onCrash(crashError())
+      run.stop.release()
+      await pause(30)
+      run.transport.release()
+
+      expect(await closing).toEqual({ disconnects: 2, obligations: 0, listeners: 0 })
+      await crashed
+      expect(run.crashes.map(({ restart }) => restart)).toEqual([false])
+    }
+  )
+
+  test('a plain disconnect made while the crash cluster disconnect is held stays pending until it is released', async () => {
+    const run = await crashing({ holdTransport: true })
+    const crashed = run.runner.onCrash(crashError())
+    run.stop.release()
+    await pause(10)
+    let closed = false
+    const closing = run.consumer.disconnect().then(() => {
+      closed = true
+    })
+    await pause(30)
+
+    expect(closed).toBe(false)
+
+    run.transport.release()
+    await closing
+    await crashed
+    expect(run.order.slice(0, run.order.indexOf('CRASH'))).toEqual(['DISCONNECT'])
+  })
+
+  test.each([
+    ['a CRASH listener', 'listener'],
+    ['restartOnFailure', 'policy'],
+    ['a log creator on the Crash line', 'logger'],
+  ])(
+    'a disconnect awaited from %s during the crash settles without waiting on itself',
+    async (_label, from) => {
+      const ref = {}
+      const awaited = []
+      const disconnectNow = () => awaited.push(ref.consumer.disconnect().then(() => 'settled'))
+      const logger = createLogger({
+        level: LEVELS.ERROR,
+        logCreator:
+          () =>
+          ({ log }) => {
+            if (from === 'logger' && log.message.startsWith('Crash:') && !awaited.length)
+              disconnectNow()
+          },
+      })
+      const run = await crashing({
+        buildOptions: { logger },
+        retry: {
+          restartOnFailure: async () => {
+            if (from === 'policy') {
+              disconnectNow()
+              await awaited[0]
+            }
+            return true
+          },
+        },
+      })
+      ref.consumer = run.consumer
+      if (from === 'listener') run.consumer.on(run.consumer.events.CRASH, disconnectNow)
+      const crashed = run.runner.onCrash(crashError())
+      run.stop.release()
+      await crashed
+
+      expect(await Promise.race([awaited[0], pause(500).then(() => 'pending')])).toBe('settled')
+      expect(run.crashes).toHaveLength(1)
+    }
+  )
 })
