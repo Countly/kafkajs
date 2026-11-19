@@ -101,6 +101,30 @@ const isDeletedGroupCommit = (error) =>
 const isOffsetCommitError = (error) =>
   error !== null && typeof error === 'object' && Boolean(carried(error, OFFSET_COMMIT_ORIGIN))
 
+/**
+ * Marks an error a current consumer-group heartbeat answered with a code that ends the membership
+ * although the code table does not list it as fatal: GROUP_ID_NOT_FOUND to a member still in the
+ * group, or any other numeric code the heartbeat does not handle. The mark, not the public code,
+ * carries the decision, so a policy that rewrites `code` cannot reopen it.
+ */
+const HEARTBEAT_FATAL = Symbol('rebalance:heartbeatFatal')
+
+/**
+ * Records that the heartbeat that answered this error ended the membership.
+ * @param {Error} error the decoded answer
+ * @returns {Error} the same error
+ */
+const stampHeartbeatFatal = (error) => {
+  error[HEARTBEAT_FATAL] = true
+  return error
+}
+
+/**
+ * @param {unknown} error
+ * @returns {boolean} whether a current heartbeat answer marked this error or one it wraps fatal
+ */
+const isHeartbeatFatal = (error) => Boolean(carried(error, HEARTBEAT_FATAL))
+
 /** The message the Java client gives when the cluster cannot speak the new group protocol. */
 const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =
   "The cluster does not support the new CONSUMER group protocol. Set groupProtocol: 'classic' on the consumer until the cluster is upgraded."
@@ -108,7 +132,8 @@ const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =
 /**
  * Every error that ends a consumer-protocol membership for good.
  *
- * Wider than the exported `isFatalMembership` by two codes, on purpose: a fenced instance id, a
+ * Includes a heartbeat answer marked fatal by `stampHeartbeatFatal`. Wider than the exported
+ * `isFatalMembership` by two codes, on purpose: a fenced instance id, a
  * group authorization failure and a malformed request are all fatal to a member of a consumer-type
  * group, but the exported predicate is also honoured on the classic path - where adding them would
  * change behaviour no decision asked to change.
@@ -116,6 +141,7 @@ const CONSUMER_PROTOCOL_UNSUPPORTED_MESSAGE =
  * @returns {boolean}
  */
 const isConsumerProtocolFatal = (error) =>
+  isHeartbeatFatal(error) ||
   isFatalMembership(error) ||
   isFencedInstance(error) ||
   error.code === GROUP_AUTHORIZATION_FAILED ||
@@ -455,6 +481,8 @@ module.exports = {
   rebalanceAction,
   rebalanceReason,
   isConsumerProtocolFatal,
+  stampHeartbeatFatal,
+  isHeartbeatFatal,
   stampOffsetCommit,
   isDeletedGroupCommit,
   isOffsetCommitError,

@@ -30,6 +30,7 @@ const {
   isOffsetCommitError,
   rebalanceReason,
   isConsumerProtocolFatal,
+  isHeartbeatFatal,
   sentOwnership,
   sentMembership,
   obsoleteOwnership,
@@ -254,7 +255,7 @@ module.exports = class Runner extends EventEmitter {
         this.logger.error('Crash handler failed', {
           groupId: this.consumerGroup.groupId,
           memberId: this.consumerGroup.memberId,
-          error: crashHandlerError.message || crashHandlerError,
+          error: describeThrown(crashHandlerError),
           cause: e.message || e,
         })
         return
@@ -348,9 +349,10 @@ module.exports = class Runner extends EventEmitter {
       }
 
       /**
-       * Runs one rebalance for the loop. A failed awaited callback, and a classic chain refused at
-       * its round limit, end the loop through `bail`, so the retrier hands the typed error to the
-       * crash policy unchanged instead of retrying it or wrapping it.
+       * Runs one rebalance for the loop. A failed awaited callback, a classic chain refused at its
+       * round limit and a heartbeat answer marked fatal end the loop through `bail`, so the
+       * retrier hands the typed error to the crash policy unchanged instead of retrying it or
+       * wrapping it.
        */
       const rebalance = async (verdict) => {
         try {
@@ -358,9 +360,11 @@ module.exports = class Runner extends EventEmitter {
         } catch (error) {
           if (
             error instanceof KafkaJSRebalanceListenerError ||
-            error instanceof KafkaJSRebalanceNotConvergedError
+            error instanceof KafkaJSRebalanceNotConvergedError ||
+            isHeartbeatFatal(error)
           ) {
-            return bail(error)
+            bail(error)
+            return true
           }
           throw error
         }
@@ -392,7 +396,12 @@ module.exports = class Runner extends EventEmitter {
           thrown && pending ? this.mergeThrownWithSlot(thrown, pending) : thrown || pending
 
         if (merged) {
-          await rebalance(merged)
+          // Read before the recovery can renew ownership.
+          const independent = !thrown && this.isIndependentHandlerFailure(e, pending)
+          const bailed = await rebalance(merged)
+          // A verdict the recovery left in the slot is the outcome: the next attempt acts on it.
+          const settled = !bailed && !this.rebalanceCoordinator.hasVerdict()
+          if (independent && settled && this.running && !this.stopRequested) throw e
           return
         }
 
@@ -457,7 +466,7 @@ module.exports = class Runner extends EventEmitter {
           this.logger.error('Crash handler failed', {
             groupId: this.consumerGroup.groupId,
             memberId: this.consumerGroup.memberId,
-            error: crashHandlerError.message || crashHandlerError,
+            error: describeThrown(crashHandlerError),
             cause: e.message || e,
           })
         } finally {
@@ -469,6 +478,29 @@ module.exports = class Runner extends EventEmitter {
           this.pollTimer.stop()
         }
       })
+  }
+
+  /**
+   * Whether a handler's own non-retriable failure arrived together with a recoverable
+   * consumer-protocol loss it did not cause. The loss recovery runs first; this failure then
+   * still ends the run, instead of being consumed by the loss. Ownership refusals, OffsetCommit
+   * errors and errors wrapping the loss are the loss itself, not independent of it.
+   * @private
+   * @param {unknown} error what the fetch attempt threw, with no verdict of its own
+   * @param {import('./rebalanceCoordinator').Verdict} pending the slot entry
+   * @returns {boolean}
+   */
+  isIndependentHandlerFailure(error, pending) {
+    if (this.consumerGroup.kind !== 'consumer' || pending.kind !== 'lost') return false
+    if (isConsumerProtocolFatal(pending.error) || this.requestClasses.get(error) !== 'handler') {
+      return false
+    }
+    if (error.retriable !== false || error instanceof KafkaJSCommitFailedError) return false
+    if (isOffsetCommitError(error)) return false
+    for (let cause = error, depth = 0; cause && depth < 8; cause = cause.cause, depth++) {
+      if (cause === pending.error) return false
+    }
+    return true
   }
 
   /**

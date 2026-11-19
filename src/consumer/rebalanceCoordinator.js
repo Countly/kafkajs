@@ -8,6 +8,8 @@ const {
   rebalanceReason,
   pollIntervalExceededError,
   isStaleMembershipVerdict,
+  isHeartbeatFatal,
+  isConsumerProtocolFatal,
   sentOwnership,
   stampOwnership,
   obsoleteOwnership,
@@ -927,7 +929,9 @@ module.exports = class RebalanceCoordinator {
 
   /**
    * LOST beats REVOKED. The two differ on whether uncommitted offsets may be committed, so a
-   * REVOKED must never overwrite a LOST. Two verdicts of the same kind collapse to the first.
+   * REVOKED must never overwrite a LOST. Two verdicts of the same kind collapse to the first,
+   * except that a heartbeat answer marked fatal replaces a pending recoverable LOST: the membership
+   * has already ended, so the round the recoverable one would run must not be attempted.
    *
    * A pending verdict that is already stale is replaced, whatever its kind. It would only be dropped
    * when acted on, and keeping it would drop the fresh verdict with it: a heartbeat failure from
@@ -953,7 +957,8 @@ module.exports = class RebalanceCoordinator {
     }
 
     if (pending.kind === 'lost') {
-      return pending
+      const fatal = isHeartbeatFatal(incoming.error) && !isConsumerProtocolFatal(pending.error)
+      return fatal ? incoming : pending
     }
 
     return incoming.kind === 'lost' ? incoming : pending

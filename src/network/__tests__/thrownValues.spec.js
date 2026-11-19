@@ -205,15 +205,28 @@ describe('Network > arbitrary thrown values', () => {
             enforceRequestTimeout: false,
             retry: { retries: 0 },
             logLevel: logLevel.DEBUG,
-            logCreator:
-              () =>
-              ({ log }) => {
-                if (armed && log.message === 'Connecting') throw thrown
-              },
+            logCreator: () => () => {},
           })
+          // A log sink's throw is contained by createLogger; a logger object that throws still
+          // reaches the connection's own containment.
+          const connect = Connection.prototype.connect
+          const connecting = jest
+            .spyOn(Connection.prototype, 'connect')
+            .mockImplementation(function (...args) {
+              const { logger } = this
+              this.logger = {
+                ...logger,
+                debug: (message, extra) => {
+                  if (armed && message === 'Connecting') throw thrown
+                  return logger.debug(message, extra)
+                },
+              }
+              return connect.apply(this, args)
+            })
           const admin = kafka.admin()
           const close = jest.spyOn(Connection.prototype, 'closeGeneration')
           const { error } = await watch(admin.connect(), 0)
+          connecting.mockRestore()
           const closes = close.mock.calls.length
           close.mockRestore()
           expect(closes).toBe(1)
@@ -282,7 +295,6 @@ describe('Network > arbitrary thrown values', () => {
             () =>
             ({ log }) => {
               if (log.message === 'Failed to drain connection') diagnostics.push(log)
-              if (armed && log.message === 'Waiting for pending requests') throw thrown
             },
         })
         pool = new ConnectionPool(
@@ -290,6 +302,16 @@ describe('Network > arbitrary thrown values', () => {
         )
         const broker = new Broker({ connectionPool: pool, logger: drainLogger })
         const sibling = await pool.getConnection(1)
+        const queueLogger = sibling.requestQueue.logger
+        // A log sink's throw is contained by createLogger; a logger object that throws still
+        // reaches the drain's own containment.
+        sibling.requestQueue.logger = {
+          ...queueLogger,
+          debug: (message, extra) => {
+            if (armed && message === 'Waiting for pending requests') throw thrown
+            return queueLogger.debug(message, extra)
+          },
+        }
         const reply = watch(sibling.send(protocol()), 0)
         await waitFor(() => sibling.requestQueue.inflight.size === 1)
         armed = true
