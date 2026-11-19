@@ -159,10 +159,9 @@ class ManualGroupProtocol {
 
   /** @param {object} dependencies unused group collaborators @returns {void} */
   attach(dependencies) {}
-  /** @returns {Promise<false>} no frame @throws {Error} when obsolete handler work resumes */
+  /** @returns {Promise<void>} no frame @throws {Error} when obsolete handler work resumes */
   async heartbeat() {
     this.assertCurrent()
-    return false
   }
 
   /** @returns {number} no deadline; manual runners never schedule this value */

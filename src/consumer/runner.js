@@ -920,9 +920,14 @@ module.exports = class Runner extends EventEmitter {
    * It classifies and routes, and does no offset work: that belongs to `handleRebalanceError`,
    * which is reached once per rebalance. Under cooperative rebalancing a revocation RESOLVES
    * instead of throwing, so the error never reaches the worker, the fetcher or the fetch manager's
-   * own teardown - which is the whole point of not stopping the world. It also ends the heartbeat
-   * outage on a success the membership answered (not on a gated call or a dropped answer), marks the error's request class as `heartbeat`, and resolves a cooperative
-   * classic member's `NOT_COORDINATOR` while that outage is absorbed.
+   * own teardown - which is the whole point of not stopping the world. It marks the error's request
+   * class as `heartbeat` and resolves a cooperative classic member's `NOT_COORDINATOR` while the
+   * heartbeat outage is absorbed.
+   *
+   * The runner owns the heartbeat outage clock. A classic or manual call ends it whenever the group
+   * heartbeat resolves, including a call the interval gate holds back; the classic timer's calls
+   * go straight to the group and leave it alone. A consumer-protocol call ends it only on a success
+   * answered to the membership the member still holds.
    * @returns {Promise<void>}
    */
   async heartbeat() {
@@ -935,7 +940,7 @@ module.exports = class Runner extends EventEmitter {
         interval: this.consumerGroup.heartbeatInterval(),
         guard: () => this.retirement ?? null,
       })
-      if (answered) this.outages.heartbeat.end()
+      if (answered || this.consumerGroup.kind !== 'consumer') this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
 
