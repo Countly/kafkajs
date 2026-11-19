@@ -1843,9 +1843,11 @@ describe('final soak final drain', () => {
   test('a readback is accepted only while the group reads the topic id the commit was made under, on the already-at-end path too', async () => {
     const recreateDuringRead = ({ rig, runtime, state }) =>
       rig.object.committed.mockImplementationOnce(async ([{ topic, partition }]) => {
+        const offset = state.committed
         runtime.topicIds.set(main, IDS.C)
         state.groupTopicId = IDS.C
-        return [{ topic, partition, offset: state.committed, metadata: null }]
+        state.committed = null
+        return [{ topic, partition, offset, metadata: null }]
       })
     const atEnd = consumer()
     atEnd.state.committed = '260'

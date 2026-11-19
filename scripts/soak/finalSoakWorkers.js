@@ -1596,13 +1596,17 @@ class ConsumerWorker extends Worker {
    * Commits one next offset of a key under the given authority, inside the commit store so the
    * write and publish stages are recorded, then asks for the broker readback. A commit that
    * succeeded settles the offsets the member owed on the key; a failed one leaves them owed.
+   * `current` is asked synchronously at the public call, after the begin record was journaled: when
+   * the view the offset came from moved meanwhile, nothing is sent and the commit ends `refused`
+   * (`DrainViewMoved`), so an offset is never sent under an authority it was not read under.
    * @param {ClientRig} rig
    * @param {{ key: { topic: string, topicId: string, partition: number }, authority: object }} captured
    *   the key and the authority the commit is made under
    * @param {string} next the decimal next offset to commit
+   * @param {() => boolean} [current] whether the view the offset was read under still holds
    * @returns {Promise<'ok'|'refused'|'unknown'>} the commit's outcome
    */
-  async commit(rig, captured, next) {
+  async commit(rig, captured, next, current = () => true) {
     const { runtime } = this
     const k = `${captured.key.topicId}|${captured.key.partition}`
     const owed = rig.uncommitted.get(k) ?? 0
@@ -1628,19 +1632,23 @@ class ConsumerWorker extends Worker {
     let outcome = 'ok'
     let errorType = null
     try {
-      await runtime.commits.run(base, () =>
-        rig.object.commitOffsets([{ topic, partition, offset: next }])
-      )
+      await runtime.commits.run(base, () => {
+        if (!current())
+          throw Object.assign(new Error('the live view moved after the begin record'), {
+            name: 'DrainViewMoved',
+          })
+        return rig.object.commitOffsets([{ topic, partition, offset: next }])
+      })
       const left = (rig.uncommitted.get(k) ?? 0) - owed
       if (left > 0) rig.uncommitted.set(k, left)
       else rig.uncommitted.delete(k)
     } catch (e) {
-      outcome =
-        e.name === 'KafkaJSCommitFailedError' || e.name === 'KafkaJSStaleAssignmentError'
-          ? 'refused'
-          : 'unknown'
+      const refused = ['KafkaJSCommitFailedError', 'KafkaJSStaleAssignmentError', 'DrainViewMoved']
+      outcome = refused.includes(e.name) ? 'refused' : 'unknown'
       errorType = e.name ?? 'Error'
-      if (e.name === 'KafkaJSCommitFailedError' && e.reason === 'stale-assignment')
+      if (e.name === 'DrainViewMoved')
+        await runtime.diagnose(`expected skip: commit ${commit} not sent, ${e.message}`)
+      else if (e.name === 'KafkaJSCommitFailedError' && e.reason === 'stale-assignment')
         await runtime.diagnose(
           `expected refusal: commit ${commit} outlived the membership it began under`
         )
@@ -1860,12 +1868,15 @@ class ConsumerWorker extends Worker {
 
   /**
    * @param {ClientRig} rig @param {string} topic @param {number} partition
+   * @param {string} topicId the incarnation the readback must belong to
    * @returns {Promise<string|null>} the group's committed next offset of the partition, read from
-   *   the broker through the member's public `committed()`; null when none or the read failed
+   *   the broker through the member's public `committed()`; null when none, when the read failed,
+   *   or when the group did not read `topicId` both before and after the read
    */
-  async committedOf(rig, topic, partition) {
+  async committedOf(rig, topic, partition, topicId) {
+    if (this.incarnation(rig, topic) !== topicId) return null
     const [entry] = await rig.object.committed([{ topic, partition }]).catch(() => [])
-    return entry?.offset ?? null
+    return this.incarnation(rig, topic) === topicId ? (entry?.offset ?? null) : null
   }
 
   /**
@@ -1873,9 +1884,10 @@ class ConsumerWorker extends Worker {
    * the group. The position is the public `position()` of the acquisition the member holds now: the
    * records its handlers resolved and the batches the client resolved with only control or aborted
    * records. It is committed only when the member held the partition, under the same authority and
-   * the run's current topic id, both before and after the position was read; the public
-   * `committed()` readback must then return exactly that offset. A cached offset of an earlier
-   * acquisition or incarnation is never committed.
+   * the run's current topic id, both before and after the position was read, and again at the
+   * public commit call (`commit`); the public `committed()` readback of that topic id must then
+   * return exactly that offset. A cached offset of an earlier acquisition or incarnation is never
+   * committed.
    * @param {ClientRig} rig @param {string} topic @param {number} partition
    * @param {bigint} [min] commit only a position at or past it
    * @returns {Promise<{ position: string|null, confirmed: boolean }>} the position read, null when
@@ -1901,9 +1913,11 @@ class ConsumerWorker extends Worker {
       return { position: null, confirmed: false }
     if (BigInt(position) < min) return { position, confirmed: false }
     const key = { topic, topicId: after.topicId, partition }
-    if ((await this.commit(rig, { key, authority: after.authority }, position)) !== 'ok')
+    const current = () => JSON.stringify(view()) === JSON.stringify(after)
+    if ((await this.commit(rig, { key, authority: after.authority }, position, current)) !== 'ok')
       return { position, confirmed: false }
-    return { position, confirmed: (await this.committedOf(rig, topic, partition)) === position }
+    const read = await this.committedOf(rig, topic, partition, after.topicId)
+    return { position, confirmed: read === position }
   }
 
   /**
@@ -1961,10 +1975,12 @@ class ConsumerWorker extends Worker {
       const rigs = this.rigs().filter((rig) => this.reads(rig, topic))
       if (rigs.length === 0) continue
       const target = BigInt(end)
-      const atEnd = async () =>
-        target === 0n ||
-        (this.incarnation(rigs[0], topic) !== null &&
-          BigInt((await this.committedOf(rigs[0], topic, partition)) ?? -1) >= target)
+      const atEnd = async () => {
+        const topicId = this.incarnation(rigs[0], topic)
+        if (target === 0n) return true
+        const read = topicId && (await this.committedOf(rigs[0], topic, partition, topicId))
+        return BigInt(read ?? -1) >= target
+      }
       let done = await atEnd()
       while (!done && clock.now() < deadline) {
         for (const rig of rigs) {
