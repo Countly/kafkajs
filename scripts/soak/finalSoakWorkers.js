@@ -615,6 +615,7 @@ class ChildRuntime {
           })
         return
       case 'share-settle':
+        this.worker.onShareSettled?.(event)
         if (!event.wire?.file) {
           this.diagnose(`missing-source share ack wire for ${event.acquisition}`)
           return
@@ -1628,7 +1629,11 @@ class ConsumerWorker extends Worker {
           ? 'refused'
           : 'unknown'
       errorType = e.name ?? 'Error'
-      await runtime.failed(commit, e)
+      if (e.name === 'KafkaJSCommitFailedError' && e.reason === 'stale-assignment')
+        await runtime.diagnose(
+          `expected refusal: commit ${commit} outlived the membership it began under`
+        )
+      else await runtime.failed(commit, e)
     }
     await runtime.emit({ ...base, recordId: runtime.nextId(), phase: 'end', outcome, errorType })
     await runtime.request({
@@ -2071,6 +2076,29 @@ class ConsumerWorker extends Worker {
   }
 }
 
+/** A key no offset was noted for. */
+const FLOOR_EMPTY = Object.freeze({ next: 0n, gap: null })
+
+/**
+ * Notes one offset of a key: per key it keeps the next offset below which every offset was noted,
+ * and the noted offsets above it. A gap that would keep more than `SHARE_AHEAD_MAX` offsets ahead
+ * is remembered and skipped, so the memory stays bounded and a drain over the gap still fails.
+ * @param {Map<string, { next: bigint, ahead: Set<bigint>, gap: string|null }>} floors
+ * @param {string} k `topicId|partition` @param {string|number} offset
+ * @returns {void}
+ */
+const advanceFloor = (floors, k, offset) => {
+  const state = floors.get(k) ?? { next: 0n, ahead: new Set(), gap: null }
+  floors.set(k, state)
+  const at = BigInt(offset)
+  if (at >= state.next) state.ahead.add(at)
+  if (state.ahead.size > SHARE_AHEAD_MAX) {
+    state.gap ??= String(state.next)
+    state.next = [...state.ahead].reduce((a, b) => (b < a ? b : a))
+  }
+  while (state.ahead.delete(state.next)) state.next++
+}
+
 /** @param {object[]} keys @returns {{ topic: string, partitions: number[] }[]} */
 const byTopic = (keys) => {
   const map = new Map()
@@ -2083,6 +2111,11 @@ const byTopic = (keys) => {
  * capture ShareFetch and ShareAcknowledge exchanges into the artifact's wire segments.
  */
 class ShareWorker extends Worker {
+  /** Per `topicId|partition`, the offsets that had a handler entry (`advanceFloor`). */
+  entered = new Map()
+  /** Per `topicId|partition`, the offsets whose accept the broker confirmed (`advanceFloor`). */
+  accepted = new Map()
+
   /**
    * Joins the standing member and waits until its first share fetch for the main log was answered
    * without error, so the broker has initialized the share partition before any traffic.
@@ -2116,26 +2149,28 @@ class ShareWorker extends Worker {
   }
 
   /**
-   * Notes that a record of a key was handed to a handler and when. Per key it keeps the next offset
-   * below which every offset had a handler entry, and the delivered offsets above it; a gap that
-   * would keep more than `SHARE_AHEAD_MAX` offsets ahead is remembered and skipped, so the memory
-   * stays bounded and the drain still fails.
+   * Notes that a record of a key was handed to a handler (`advanceFloor`).
    * @param {string} k `topicId|partition`, so a recreated name starts a new key
    * @param {string|number} offset
    * @returns {void}
    */
   delivered(k, offset) {
-    this.deliveredAt = this.runtime.clock.now()
-    this.entered ??= new Map()
-    const state = this.entered.get(k) ?? { next: 0n, ahead: new Set(), gap: null }
-    this.entered.set(k, state)
-    const at = BigInt(offset)
-    if (at >= state.next) state.ahead.add(at)
-    if (state.ahead.size > SHARE_AHEAD_MAX) {
-      state.gap ??= String(state.next)
-      state.next = [...state.ahead].reduce((a, b) => (b < a ? b : a))
-    }
-    while (state.ahead.delete(state.next)) state.next++
+    advanceFloor(this.entered, k, offset)
+  }
+
+  /**
+   * Notes the accepts of one settled acknowledgement that the broker confirmed: the settlement
+   * completed and the response's partition error code is 0. A confirmed accept leaves the record
+   * acknowledged, so the group never hands it out again. A refused or failed accept leaves its
+   * offset open: the record is acquirable again and only a later confirmed accept closes it.
+   * @param {{ key: { topicId: string, partition: number }, offsets: { offset: string, type: string|null }[], result: string, errorCode: number|null }} event
+   *   a `share-settle` observer event
+   * @returns {void}
+   */
+  onShareSettled({ key, offsets, result, errorCode }) {
+    if (result !== 'ok' || errorCode !== 0) return
+    for (const { offset, type } of offsets)
+      if (type === 'accept') advanceFloor(this.accepted, `${key.topicId}|${key.partition}`, offset)
   }
 
   /** @returns {Promise<ClientRig>} */
@@ -2216,10 +2251,10 @@ class ShareWorker extends Worker {
     })
   }
 
-  /** @param {string} topicId drops the delivered offsets kept for a retired incarnation */
+  /** @param {string} topicId drops the delivered and accepted offsets of a retired incarnation */
   forgetTopic(topicId) {
-    for (const key of [...(this.entered?.keys() ?? [])])
-      if (key.startsWith(`${topicId}|`)) this.entered.delete(key)
+    for (const floors of [this.entered, this.accepted])
+      for (const key of [...floors.keys()]) if (key.startsWith(`${topicId}|`)) floors.delete(key)
   }
 
   /**
@@ -2236,30 +2271,40 @@ class ShareWorker extends Worker {
   }
 
   /**
-   * Waits until every offset below each log end of a topic the member subscribes has had a handler
-   * entry for the run's current incarnation of the topic, and deliveries have been quiet for
-   * `quietMs`, so records a lock expiry returned are handed out again first. Every offset is an
-   * offered id, so this checks each eligible id, not only the last one.
-   * @param {{ ends?: Record<string, string>, deadline?: number, quietMs?: number }} [step]
+   * Proves, per topic id and partition, that the share group took every record of the run's
+   * current incarnation of a topic below its log end: each offset had a handler entry in this
+   * process and an accept the broker confirmed (`onShareSettled`). Once confirmed, a record is
+   * acknowledged and no member can acquire it again, so nothing acquirable is left below the end.
+   * Deliveries of other topics neither delay nor satisfy it. Every offset is an offered id, so each
+   * eligible id is checked, not only the last one. A key still short at the deadline is diagnosed
+   * with its topic id, its first open offset and what that offset lacks.
+   * @param {{ ends?: Record<string, string>, deadline?: number }} [step] `ends` maps
+   *   `topic|partition` to the log end; keys of topics the member does not subscribe are ignored
    * @returns {Promise<{ reached: boolean }>}
    */
-  async onDrain({ ends = {}, deadline = Infinity, quietMs = 5000 } = {}) {
-    const { clock, config, topicIds } = this.runtime
+  async onDrain({ ends = {}, deadline = Infinity } = {}) {
+    const { config, topicIds } = this.runtime
     const subscribed = new Set([config.topics.main, ...config.topics.recreate])
     const wanted = Object.entries(ends).filter(([k]) => subscribed.has(splitKey(k)[0]))
-    const entered = (k) => {
+    /** @returns {string|null} what the key's first open offset below its end lacks, or null */
+    const lacking = ([k, end]) => {
       const [topic, partition] = splitKey(k)
-      return this.entered?.get(`${topicIds.get(topic)}|${partition}`) ?? { next: 0n, gap: null }
+      for (const [floors, what] of [
+        [this.entered, 'handler entry'],
+        [this.accepted, 'confirmed accept'],
+      ]) {
+        const { next, gap } = floors.get(`${topicIds.get(topic)}|${partition}`) ?? FLOOR_EMPTY
+        if (gap !== null || next < BigInt(end)) return `${what} at offset ${gap ?? next}`
+      }
+      return null
     }
-    const done = () =>
-      wanted.every(([k, end]) => entered(k).gap === null && entered(k).next >= BigInt(end)) &&
-      clock.now() - (this.deliveredAt ?? -Infinity) >= quietMs
-    const reached = wanted.length === 0 || (await this.until(done, deadline))
-    for (const [k, end] of wanted) {
-      const { next, gap } = entered(k)
-      if (gap !== null || next < BigInt(end))
+    const reached =
+      wanted.length === 0 || (await this.until(() => wanted.every((w) => !lacking(w)), deadline))
+    for (const w of wanted) {
+      const lacks = lacking(w)
+      if (lacks)
         await this.runtime.diagnose(
-          `share drain: ${k} has no handler entry at offset ${gap ?? next}`
+          `share drain: ${w[0]} of topic id ${topicIds.get(splitKey(w[0])[0])} has no ${lacks}`
         )
     }
     return { reached }

@@ -1137,7 +1137,7 @@ class Supervisor {
    * The end of the run. Producers go idle and their in-flight sends and transactions settle; the
    * logs' ends are then read; every consumer waits until it has resolved those ends, filtered
    * suffix included, and commits what it resolved, and the share member waits until every offset
-   * had a handler entry; every live route gets its terminal scan and seal; then every process but
+   * had a handler entry and a broker-confirmed accept; every live route gets its terminal scan and seal; then every process but
    * the telemetry decoder disconnects, the decoder reads the telemetry clients' terminating pushes
    * and disconnects last. The cluster and the two standing topics stay up for the runbook's dumps.
    * @param {object} step the disconnect step
@@ -1196,14 +1196,17 @@ class Supervisor {
   }
 
   /**
-   * Asks every consuming process to commit its group to the two standing logs' settled ends, and
-   * the share process to deliver up to them. When the ends moved during the drain (a late marker)
-   * the drain runs again with the new ends, until they hold or the deadline passes.
+   * Ends the transactions log with a visible record (`closeTransactions`), then asks every
+   * consuming process to commit its group to the two standing logs' settled ends, and the share
+   * process to prove every record below them delivered and accepted. When the ends moved during the
+   * drain (a late marker) the drain runs again with the new ends, until they hold or the deadline
+   * passes.
    * @returns {Promise<void>}
    * @throws {Error} when the log ends cannot be read
    */
   async finalDrain() {
     const deadline = this.clock.now() + FINAL_DRAIN_MS
+    await this.closeTransactions(deadline)
     const slots = [...new Set([...this.consumers(), this.processOf('share')])]
     let ends = await this.settledEnds(deadline)
     for (let round = 1; ; round++) {
@@ -1221,6 +1224,34 @@ class Supervisor {
       }
       ends = after
     }
+  }
+
+  /**
+   * Once no transaction is open on the transactions log, the idempotent producer offers it one id,
+   * journaled like every offer, outside any transaction. Every transaction's markers are then below
+   * that record, so the log ends in a record a read-committed dump shows, and nothing after the
+   * last dumped record is left for the dump's completeness to explain. A closing record the broker
+   * did not acknowledge is a problem of the run.
+   * @param {number} deadline on the run clock, for the settled end and the send
+   * @returns {Promise<void>}
+   * @throws {Error} when the log's ends cannot be read
+   */
+  async closeTransactions(deadline) {
+    const topic = this.config.topics.transactions
+    await this.settledEnds(deadline, [topic])
+    const { reply, error } = await this.command(this.processOf('producer-idempotent'), {
+      type: 'probe',
+      id: 'final-close',
+      execution: null,
+      topic,
+      partitions: 1,
+      count: 1,
+      deadline,
+    })
+    if (reply?.acknowledged !== 1)
+      this.problem(
+        `final drain: the closing record of ${topic} was not acknowledged${error ? `: ${error}` : ''}`
+      )
   }
 
   /**
