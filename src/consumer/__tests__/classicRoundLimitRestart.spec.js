@@ -22,6 +22,14 @@ const assigner = () => ({
   assign: async () => [],
 })
 
+/** An eager assigner under the same protocol name, as kafkajs 2.2.4's built-in ones are. */
+const eagerAssigner = () => ({
+  name: 'coop',
+  version: 0,
+  protocol: () => ({ name: 'coop', metadata: Buffer.alloc(0) }),
+  assign: async () => [],
+})
+
 /** @param {number[]} partitions @returns {Buffer} a SyncGroup member assignment of TOPIC */
 const assignmentOf = (partitions) =>
   MemberAssignment.encode({ version: 0, assignment: { [TOPIC]: partitions } })
@@ -30,10 +38,13 @@ const assignmentOf = (partitions) =>
  * A real classic consumer, with its real runner, group and fetch loop, over a coordinator double.
  * While `churn` is on, every SyncGroup moves the member to the other partition, so every
  * cooperative round revokes one and asks for another; otherwise it answers partition 0.
+ * `onSync`, when set, is called by every SyncGroup.
  * @param {object} retry the consumer's `retry` options
+ * @param {Function} [partitionAssigner] the consumer's one assigner
  * @returns {object} the consumer, the double's records and its switches
  */
-const build = (retry) => {
+const build = (retry, partitionAssigner = assigner) => {
+  const hooks = { onSync: null }
   const state = { churn: false, flip: false, fetchFails: 0 }
   const joins = []
   const fetches = []
@@ -66,6 +77,7 @@ const build = (retry) => {
       }
     }),
     syncGroup: jest.fn(async () => {
+      hooks.onSync?.()
       state.flip = state.churn ? !state.flip : false
       return { memberAssignment: assignmentOf([state.flip ? 1 : 0]) }
     }),
@@ -119,13 +131,13 @@ const build = (retry) => {
     groupId: GROUP_ID,
     logger: newLogger(),
     instrumentationEmitter: cluster.instrumentationEmitter,
-    partitionAssigners: [assigner],
+    partitionAssigners: [partitionAssigner],
     sessionTimeout: 30000,
     heartbeatInterval: 3000,
     retry: { initialRetryTime: RESTART_DELAY, ...retry },
   })
   consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push(payload))
-  return { consumer, coordinator, broker, state, joins, fetches, crashes }
+  return { consumer, coordinator, broker, state, joins, fetches, crashes, hooks }
 }
 
 /**
@@ -234,5 +246,51 @@ describe('Consumer > a classic cooperative chain that the fetch loop starts and 
     expect(run.joins).toHaveLength(run.joinsAtCrash)
     expect(run.starts).toHaveBeenCalledTimes(1)
     expect(run.crashes).toHaveLength(1)
+  })
+})
+
+describe('Consumer > a classic eager chain that the fetch loop starts and that keeps being asked for another round', () => {
+  let consumer
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(async () => {
+    const stopping = consumer.disconnect().catch(() => {})
+    await jest.advanceTimersByTimeAsync(1000)
+    await stopping
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
+  it('keeps rejoining for forty-five rounds with one JoinGroup and one SyncGroup each, never crashes, and fetches again once the requests stop', async () => {
+    const built = build({ retries: 3 }, eagerAssigner)
+    consumer = built.consumer
+    const start = jest.spyOn(Runner.prototype, 'start')
+    const joined = []
+    consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => joined.push(payload))
+    await consumer.subscribe({ topic: TOPIC })
+    await consumer.run({ eachMessage: async () => {} })
+    await until(() => built.fetches.length > 0)
+    const [runner] = start.mock.contexts
+    expect(joined.map(({ rebalanceProtocol }) => rebalanceProtocol)).toEqual(['eager'])
+
+    // Each SyncGroup of the chain asks for one more round, as a fetch that finds the group
+    // rebalancing again does, until forty-five rounds have run.
+    built.hooks.onSync = () => {
+      if (built.coordinator.syncGroup.mock.calls.length < 46) {
+        runner.rebalanceCoordinator.runRound('rebalance-in-progress', 'revoked')
+      }
+    }
+    built.state.fetchFails = 1
+    await until(() => joined.length >= 46 || built.crashes.length > 0, 5000)
+    const fetchesAfterChain = built.fetches.length
+    await until(() => built.fetches.length > fetchesAfterChain)
+
+    expect(built.crashes).toEqual([])
+    expect(joined).toHaveLength(46)
+    expect(built.coordinator.joinGroup).toHaveBeenCalledTimes(46)
+    expect(built.coordinator.syncGroup).toHaveBeenCalledTimes(46)
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(runner.rebalanceCoordinator.isRebalancing()).toBe(false)
+    expect(built.fetches.length).toBeGreaterThan(fetchesAfterChain)
   })
 })

@@ -601,33 +601,69 @@ describe('Consumer > RebalanceCoordinator', () => {
     })
 
     it.each([
-      ['a subscription revision pending at every continuation', 'subscription'],
-      ['a re-entry queued during every round', 're-entry'],
+      ['a subscription revision pending at every continuation', 'subscription-changed'],
+      ['a re-entry queued during every round', 'rebalance-in-progress'],
     ])(
-      'refuses an eager chain kept going by %s with the non-retriable error, as before',
-      async (_title, trigger) => {
-        const { coordinator, consumerGroup } = build({ mode: EAGER })
-        if (trigger === 'subscription') consumerGroup.subscriptionPending = () => true
-        else {
-          consumerGroup.applyRebalanceResult.mockImplementation(async () => {
-            coordinator.runRound('rebalance-in-progress', 'revoked')
-            return { assignment: [], added: [], revoked: [] }
-          })
-        }
-
-        const error = await coordinator.runRound('rebalance-in-progress', 'revoked').catch((e) => e)
-
-        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
-        expect(error).not.toBeInstanceOf(KafkaJSRebalanceNotConvergedError)
-        expect(error).toMatchObject({
-          name: 'KafkaJSNonRetriableError',
-          message: 'cooperative rebalance did not converge in 20 rounds',
-          retriable: false,
+      'keeps an eager chain kept going by %s past forty-five rounds, warning every twenty, and settles when the requests stop',
+      async (_title, reason) => {
+        const { coordinator, consumerGroup, runner } = build({ mode: EAGER })
+        const warn = jest.spyOn(coordinator.logger, 'warn')
+        let desired = 1
+        let applied = 0
+        let applies = 0
+        consumerGroup.subscriptionPending = () => applied !== desired
+        consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+          applies++
+          if (reason === 'subscription-changed') {
+            applied = desired
+            if (desired < 45) desired++
+          } else {
+            applied = desired
+            if (applies < 45) coordinator.runRound(reason, 'revoked')
+          }
+          return { assignment: [], added: [], revoked: [] }
         })
-        expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(20)
+
+        await expect(coordinator.runRound(reason, 'revoked')).resolves.toBeUndefined()
+
+        expect(runner.onCrash).not.toHaveBeenCalled()
+        expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(45)
+        expect(consumerGroup.applyRebalanceResult).toHaveBeenCalledTimes(45)
+        expect(warn.mock.calls).toEqual(
+          [20, 40].map((rounds) => [
+            'Reconciliation is still running',
+            { groupId: 'coordinator-group', rounds, reason },
+          ])
+        )
+        expect(coordinator.rounds).toEqual(0)
         expect(coordinator.isRebalancing()).toBe(false)
       }
     )
+
+    it('ends a long eager chain promptly on stop(), leaving no timer behind', async () => {
+      jest.useFakeTimers()
+      try {
+        const { runner, consumerGroup, calls } = createRealRunner({ mode: EAGER })
+        consumerGroup.subscriptionPending = () => true
+        let stopping = null
+        consumerGroup.applyRebalanceResult.mockImplementation(async () => {
+          calls.push('applyRebalanceResult')
+          if (consumerGroup.applyRebalanceResult.mock.calls.length === 30) stopping = runner.stop()
+          return { assignment: [], added: [], revoked: [] }
+        })
+
+        const chain = runner.rebalanceCoordinator.runRound('subscription-changed', 'revoked')
+        await chain
+        await stopping
+
+        expect(consumerGroup.joinAndSync).toHaveBeenCalledTimes(30)
+        expect(calls.filter((call) => call === 'leave')).toHaveLength(1)
+        expect(runner.rebalanceCoordinator.isRebalancing()).toBe(false)
+        expect(jest.getTimerCount()).toEqual(0)
+      } finally {
+        jest.useRealTimers()
+      }
+    })
 
     it('counts rounds, not the attempts a join retries internally', async () => {
       const revoked = [{ topic: 't', partitions: [0] }]
