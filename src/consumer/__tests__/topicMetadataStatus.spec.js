@@ -15,6 +15,9 @@ const DOOMED = 'lifecycle-doomed'
 const HEALTHY_ID = '0a0a0a0a-0000-4000-8000-000000000001'
 const DOOMED_ID = '0a0a0a0a-0000-4000-8000-000000000002'
 const RECREATED_ID = '0a0a0a0a-0000-4000-8000-000000000003'
+const FLASH = 'lifecycle-flash'
+const FLASH_ID = '0a0a0a0a-0000-4000-8000-000000000004'
+const FLASH_RECREATED_ID = '0a0a0a0a-0000-4000-8000-000000000005'
 const NULL_ID = '00000000-0000-0000-0000-000000000000'
 const NODES = [{ id: 0, host: 'node0', port: 9092 }]
 const RETRY = { retries: 2, initialRetryTime: 10, maxRetryTime: 20 }
@@ -652,6 +655,97 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
         .find(({ topicId }) => topicId === RECREATED_ID)
       expect(firstAsked.partitions[0].fetchOffset).toBe('0')
       expect(wire.observed.crashes).toEqual([])
+    },
+    30000
+  )
+
+  /**
+   * Answers the first Metadata request that names `topic` as if the topic changed just before it
+   * arrived: deleted for code 3, refused with `code` otherwise. The coordinator has assigned the
+   * topic by then, so this is the member's own add refresh of an assigned name.
+   * @param {World} world
+   * @param {string} topic
+   * @param {number} [code]
+   * @returns {{ fired: boolean }} whether the change happened
+   */
+  const changeOnAdd = (world, topic, code = 3) => {
+    const state = { fired: false }
+    const answer = world.metadata.bind(world)
+    world.metadata = (requested) => {
+      if (!state.fired && requested?.some(({ name }) => name === topic)) {
+        state.fired = true
+        if (code === 3) world.remove(topic)
+        else world.refused.set(topic, code)
+      }
+      return answer(requested)
+    }
+    return state
+  }
+
+  test.each([
+    ['a broker-side pattern match', 'regex', { regex: '^lifecycle-.*' }],
+    [
+      'a literal name subscribed while its topic was missing',
+      'literal',
+      { topics: [HEALTHY, FLASH] },
+    ],
+  ])(
+    'consumer: %s the coordinator assigned and that was deleted before the member registered it is left pending, and its new incarnation is read from the start',
+    async (kind, label, subscription) => {
+      const wire = scenario('consumer', { groupId: `lifecycle-pending-${label}` })
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ ...subscription, fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+      const change = changeOnAdd(wire.world, FLASH)
+      wire.world.recreate(FLASH, FLASH_ID)
+      await until(() => change.fired, 'the deletion before the add refresh')
+      const healthyAtDeletion = offsets(wire.observed, HEALTHY).length
+      await until(
+        () => offsets(wire.observed, HEALTHY).length >= healthyAtDeletion + 5,
+        'healthy records after the deletion'
+      )
+      expect(wire.observed.crashes).toEqual([])
+
+      wire.world.recreate(FLASH, FLASH_RECREATED_ID)
+      await until(
+        () => offsets(wire.observed, FLASH).length >= 1,
+        'a record from the new incarnation'
+      )
+
+      expect(offsets(wire.observed, FLASH)[0]).toBe('0')
+      const fetched = wire.cluster
+        .requests()
+        .filter(({ api }) => api === 'Fetch')
+        .flatMap(({ fields }) => fields.topics)
+      expect(fetched.filter(({ topicId }) => topicId === FLASH_ID)).toEqual([])
+      expect(
+        fetched.find(({ topicId }) => topicId === FLASH_RECREATED_ID).partitions[0].fetchOffset
+      ).toBe('0')
+      expect(wire.observed.crashes).toEqual([])
+      expect(wire.observed.statuses).toEqual([])
+    },
+    30000
+  )
+
+  test.each([
+    [17, 'INVALID_TOPIC_EXCEPTION'],
+    [29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    "consumer: code %i for a broker-side pattern match on the member's add refresh still stops the run with %s",
+    async (code, type) => {
+      const wire = scenario('consumer', { groupId: `lifecycle-pending-refused-${code}` })
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ regex: '^lifecycle-.*', fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+      changeOnAdd(wire.world, FLASH, code)
+      wire.world.recreate(FLASH, FLASH_ID)
+      await until(() => wire.observed.crashes.length === 1, 'the crash')
+
+      expect(typed(wire.observed.crashes[0].error).type).toBe(type)
     },
     30000
   )
