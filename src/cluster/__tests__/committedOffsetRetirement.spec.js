@@ -1051,7 +1051,7 @@ describe('Cluster > committed offset retirement', () => {
       await expect(manager.seek({ topic: 'topic', partition: 0, offset: '8' })).resolves.toBe(true)
       supersededCommit.release()
       await supersededCommit.pending
-      expect(group.cache.topic[0]).toBeUndefined()
+      expect(group.cache.topic[0]).toBe('8')
 
       const validCommit = await held(() => commit(1, '9'))
       hold.commitError = new Error('seek failed')

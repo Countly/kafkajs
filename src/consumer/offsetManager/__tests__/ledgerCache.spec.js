@@ -25,7 +25,11 @@ describe('OffsetOperations as the one committed-cache writer', () => {
 
     expect(operations.cache[TOPIC][0]).toBe('5')
     expect(revisions.isCurrent(TOPIC, 0, before)).toBe(false)
-    expect(operations.durable(TOPIC, 0)).toEqual({ intent: second.intent, offset: '7' })
+    expect(operations.durable(TOPIC, 0)).toEqual({
+      intent: second.intent,
+      offset: '7',
+      seek: false,
+    })
     operations.end(first)
     operations.end(second)
   })
@@ -55,7 +59,11 @@ describe('OffsetOperations as the one committed-cache writer', () => {
     expect(operations.cache[TOPIC][0]).toBeUndefined()
     expect(operations.isSuperseded(older, TOPIC, 0)).toBe(true)
     expect(operations.isHardBarred(mutation, TOPIC, 0)).toBe(false)
-    expect(operations.durable(TOPIC, 0)).toEqual({ intent: mutation.intent, offset: '5' })
+    expect(operations.durable(TOPIC, 0)).toEqual({
+      intent: mutation.intent,
+      offset: '5',
+      seek: false,
+    })
     operations.end(older)
     operations.end(mutation)
   })
@@ -127,7 +135,11 @@ describe('Cache and ledger binding', () => {
     )
 
     expect(cluster.committedOffsets({ groupId: 'group' })[TOPIC][0]).toBe('9')
-    expect(operations.durable(TOPIC, 0)).toEqual({ intent: ticket.intent, offset: '9' })
+    expect(operations.durable(TOPIC, 0)).toEqual({
+      intent: ticket.intent,
+      offset: '9',
+      seek: false,
+    })
     operations.end(ticket)
   })
 

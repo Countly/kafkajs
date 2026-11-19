@@ -307,7 +307,14 @@ describe.each(['classic', 'consumer'])('a failed seek, %s protocol', (protocol) 
         }
       },
     })
-    expect(outcome).toMatchObject({ failure: null, commits: ['4'], warnings: [] })
+    expect(outcome).toMatchObject({
+      failure: null,
+      delivery: '4',
+      offsetFetches: 0,
+      listOffsets: 0,
+      commits: ['4'],
+      warnings: [],
+    })
   })
 
   describe.each([
@@ -351,6 +358,28 @@ describe.each(['classic', 'consumer'])('a failed seek, %s protocol', (protocol) 
         joins: 0,
         commits: ['4'],
         warnings: [WARNING],
+      })
+    })
+
+    test('looks no boundary up, and the newer seek applies', async () => {
+      let position
+      const outcome = await failedSeek({
+        protocol,
+        fromBeginning: false,
+        fail: async (rig, consumer, group) => {
+          admitFromDebug(consumer, group)
+          consumer.seek({ ...CELL, offset: sentinel })
+          position = await consumer.position(CELL)
+          return { failure: null }
+        },
+      })
+      expect(position).toBe('4')
+      expect(outcome).toMatchObject({
+        delivery: '4',
+        offsetFetches: 0,
+        listOffsets: 0,
+        commits: ['4'],
+        warnings: [],
       })
     })
   })

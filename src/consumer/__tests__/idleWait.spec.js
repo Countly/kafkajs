@@ -1021,7 +1021,7 @@ describe('stop during an unresolved preparation', () => {
         const gates = [gate(), gate()]
         const queue = [...gates]
         h.broker.offsetForLeaderEpoch = jest.fn(() => queue.shift().promise)
-        jest.spyOn(h.offsetManager, 'seek')
+        jest.spyOn(h.offsetManager, 'reposition')
         return {
           late: {
             topics: [
@@ -1032,7 +1032,7 @@ describe('stop during an unresolved preparation', () => {
             ],
           },
           gates,
-          effect: () => h.offsetManager.seek.mock.calls.length,
+          effect: () => h.offsetManager.reposition.mock.calls.length,
           untouched: 0,
         }
       },
@@ -1639,7 +1639,7 @@ describe('validation response continuation', () => {
       group.offsetManager.committedOffsets()[topic][partition]
     group.offsetManager.peekNextOffset = () => ({ toString: () => '0' })
     group.offsetManager.lastConsumedEpoch = () => 1
-    group.offsetManager.seek = async () => true
+    group.offsetManager.reposition = async () => true
     group.markChanged = () => {}
     group.logger.warn = jest.fn()
     jest

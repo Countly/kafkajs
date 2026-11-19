@@ -59,6 +59,13 @@ const open = ({ operations } = {}) => {
   group.acquired.set(`${TOPIC}|1`, acquisition(1))
   ctx.manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '2' })
   ctx.manager.resolveOffset({ topic: TOPIC, partition: 1, offset: '7' })
+  ctx.manager.seeks = {
+    clock: () => group.acquireClock,
+    changedSince: (since) =>
+      group.lastSoughtAt > since || group.lastAcquiredAt > since || group.hasSeekGates(),
+    isStaleSince: (topic, partition, since) => group.isStaleSince(topic, partition, since),
+    isGated: (topic, partition) => group.hasSeekGates() && group.isSeekGated(topic, partition),
+  }
   const wire = []
   const store = ctx.coordinator.offsetCommit.getMockImplementation()
   ctx.coordinator.offsetCommit.mockImplementation((payload, ...rest) => {
@@ -176,6 +183,10 @@ describe('a seek reservation', () => {
       expect(h.stored[0]).toBe('5')
       expect(await h.group.position(CELL)).toBe('5')
       expect(h.wire).toEqual(['0:5', '0:6'])
+      const asked = h.coordinator.offsetFetch.mock.calls.flatMap(([{ topics }]) =>
+        topics.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+      )
+      expect(asked).not.toContain(0)
     }
   )
 
@@ -245,7 +256,7 @@ describe('a seek reservation', () => {
 
     first.accept()
 
-    await older
+    expect(await older).toBe('5')
     expect(await newer).toBe('7')
     expect(other.wire).toEqual(['0:5'])
     expect(h.wire).toEqual(['0:7'])
@@ -478,4 +489,233 @@ describe('a seek reservation', () => {
       fence.mockRestore()
     }
   })
+})
+
+describe('a seek the broker accepted', () => {
+  let fixtures
+  beforeEach(() => {
+    fixtures = []
+  })
+  afterEach(() => audit(...fixtures))
+  const fixture = (options) => {
+    const ctx = open(options)
+    fixtures.push(ctx)
+    return ctx
+  }
+  const fetchRound = (h) => {
+    const parts = [{ topic: TOPIC, partitions: [0] }]
+    return h.group.seekOffsets(
+      parts,
+      new FetchPreparation(h.group, h.group.idleWait, parts, Infinity, h.group.ownership.token())
+    )
+  }
+  /**
+   * @param {object} h the fixture
+   * @returns {number} the OffsetFetch and ListOffsets requests that asked about partition 0
+   */
+  const lookups = (h) =>
+    [...h.coordinator.offsetFetch.mock.calls, ...h.cluster.fetchTopicsOffset.mock.calls].filter(
+      ([request]) =>
+        (request.topics ?? request).some(({ partitions }) =>
+          partitions.some(({ partition }) => partition === 0)
+        )
+    ).length
+
+  test('is the position a waiting reader returns once its commit is answered, with nothing read back', async () => {
+    const h = fixture()
+    const first = h.holdCommit()
+    h.group.seek({ ...CELL, offset: '5' })
+    const round = failureOf(fetchRound(h))
+    await first.arrived
+    const waiting = h.group.position(CELL)
+    await flush()
+
+    first.accept()
+
+    expect(await waiting).toBe('5')
+    expect(await round).toBeNull()
+    expect(lookups(h)).toBe(0)
+    expect(h.committedAt(0)).toBe('5')
+  })
+
+  test('is applied although the caller applying it was refused before the answer arrived', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+    try {
+      const h = fixture()
+      const first = h.holdCommit()
+      h.group.haltedPartitions.set(KEY, {
+        reason: 'offset-out-of-range',
+        error: new Error('out of range'),
+      })
+      h.group.seek({ ...CELL, offset: '5' })
+      const operation = new ConsumerOperation({ deadlineAt: performance.now() + 30 })
+      const expired = failureOf(operation.wait(() => h.group.position(CELL, { operation })))
+      await first.arrived
+      await jest.advanceTimersByTimeAsync(31)
+      expect(await expired).toBeInstanceOf(Error)
+
+      first.accept()
+      await flush()
+
+      expect(h.operations.reserved).toBe(0)
+      expect(h.group.haltedPartitions.has(KEY)).toBe(false)
+      expect(await h.group.position(CELL)).toBe('5')
+      expect(h.committedAt(0)).toBe('5')
+      expect(lookups(h)).toBe(0)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  test('fails, changing nothing, when its reply does not name the sought partition', async () => {
+    const h = fixture()
+    const { ON_DECODED } = require('../../broker/privateOptions')
+    h.coordinator.offsetCommit.mockImplementationOnce(async (payload, options) => {
+      h.wire.push('0:5')
+      options[ON_DECODED]({
+        responses: [{ topic: null, partitions: [{ partition: 0, errorCode: 0 }] }],
+      })
+      return {}
+    })
+    expect(await h.group.position(CELL)).toBe('3')
+    const cached = h.committedAt(0)
+    const asked = lookups(h)
+    const warn = jest.spyOn(h.group.logger, 'warn')
+    h.group.seek({ ...CELL, offset: '5' })
+
+    const failure = await failureOf(h.group.position(CELL))
+
+    expect(failure.name).toBe('KafkaJSNonRetriableError')
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(await h.group.position(CELL)).toBe('3')
+    expect(h.committedAt(0)).toBe(cached)
+    expect(lookups(h)).toBe(asked)
+  })
+
+  test('survives an eviction of its cell before and after its answer, and no default commit sends it again', async () => {
+    const h = fixture()
+    const first = h.holdCommit()
+    h.group.seek({ ...CELL, offset: '5' })
+    const round = failureOf(fetchRound(h))
+    await first.arrived
+    h.operations.evict(TOPIC, 0)
+
+    first.accept()
+    expect(await round).toBeNull()
+    expect(h.committedAt(0)).toBe('5')
+    h.operations.evict(TOPIC, 0)
+
+    expect(await h.group.position(CELL)).toBe('5')
+    expect(h.next(0)).toBe('5')
+    await h.manager.commitOffsets({}, { auto: true })
+    expect(h.wire).toEqual(['0:5', '1:8'])
+    expect(lookups(h)).toBe(0)
+  })
+
+  test('is dropped as a fallback once the consumer committed past it, so an eviction then reads the broker', async () => {
+    const h = fixture()
+    h.group.seek({ ...CELL, offset: '5' })
+    expect(await h.group.position(CELL)).toBe('5')
+    h.manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '7' })
+    await h.manager.commitOffsets({
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '8' }] }],
+    })
+    h.operations.evict(TOPIC, 0)
+
+    expect(h.heldAt(0)).toBeUndefined()
+    h.manager.resetOffset(CELL)
+    expect(h.manager.resolvedOffsetAt(TOPIC, 0)).toBeUndefined()
+  })
+
+  test('has no effect for a run that stopped before its answer, and the next run of the group proceeds', async () => {
+    const old = fixture()
+    const first = old.holdCommit()
+    old.group.seek({ ...CELL, offset: '5' })
+    const older = old.group.position(CELL)
+    await first.arrived
+    old.group.idleWait.dispose()
+    const next = fixture({ operations: old.operations })
+
+    first.accept()
+
+    expect(await older).toBe('3')
+    expect(old.manager.resolvedOffsetAt(TOPIC, 0)).toBe('3')
+    expect(next.manager.resolvedOffsetAt(TOPIC, 0)).toBe('3')
+    next.group.seek({ ...CELL, offset: '7' })
+    expect(await next.group.position(CELL)).toBe('7')
+    expect(old.wire).toEqual(['0:5'])
+    expect(next.wire).toEqual(['0:7'])
+  })
+
+  test('a seek still queued when the run stops keeps its partition out of the final commit', async () => {
+    const h = fixture()
+    h.group.seek({ ...CELL, offset: '-1' })
+    h.group.onStopRequested()
+
+    await h.manager.commitOffsets({}, { auto: true })
+
+    expect(h.wire).toEqual(['1:8'])
+  })
+})
+
+describe('a seek without a commit', () => {
+  test.each(['an uninitialized', 'a halted'])(
+    'applied on %s partition sets the position with no lookup, no commit and no halt left',
+    async (state) => {
+      const ctx = createScheduledOffsetManager({ committed: '-1', autoCommit: false })
+      const group = groupOver(ctx)
+      group.acquired.set(KEY, acquisition(1))
+      if (state === 'a halted') {
+        ctx.manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '2' })
+        group.haltedPartitions.set(KEY, { reason: 'no-offset', error: new Error('none') })
+      }
+      group.seek({ ...CELL, offset: '5' })
+
+      expect(await group.position(CELL)).toBe('5')
+      expect(ctx.next(0)).toBe('5')
+      expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
+      expect(ctx.coordinator.offsetFetch).not.toHaveBeenCalled()
+      expect(ctx.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+      expect(group.haltedPartitions.has(KEY)).toBe(false)
+      expect(ctx.manager.uncommittedOffsets().topics).toEqual([
+        { topic: TOPIC, partitions: [{ partition: '0', offset: '5', leaderEpoch: -1 }] },
+      ])
+      group.idleWait.dispose()
+    }
+  )
+})
+
+describe('an ordinary commit the broker accepted', () => {
+  const { markStaleBatch } = require('../handlerContext')
+  const { KafkaJSCommitFailedError } = require('../../errors')
+  const commitOf = (offset) => ({
+    topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset }] }],
+  })
+
+  test.each([
+    [
+      'only its batch was superseded by a seek',
+      () => markStaleBatch(new KafkaJSCommitFailedError('A seek superseded the handler batch')),
+      '3',
+    ],
+    ['its membership was lost', () => new KafkaJSCommitFailedError('membership lost'), undefined],
+  ])(
+    'is recorded in the committed cache when, after the answer, %s',
+    async (refused, refusal, cached) => {
+      const h = open()
+      const held = h.holdCommit()
+      let refuse = false
+      const committing = failureOf(
+        h.manager.commitOffsets(commitOf('3'), { guard: () => (refuse ? refusal() : null) })
+      )
+      await held.arrived
+      refuse = true
+      held.accept()
+
+      expect(await committing).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(h.stored[0]).toBe('3')
+      expect(h.committedAt(0)).toBe(cached)
+      audit(h)
+    }
+  )
 })

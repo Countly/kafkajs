@@ -362,9 +362,9 @@ test('none halts unknown divergence without a reset request', async () => {
     assignmentEpoch: ctx.group.assignmentEpoch,
   }
   const setDefault = jest.spyOn(ctx.manager, 'setDefaultOffset')
-  const apply = ctx.manager.seek
+  const apply = ctx.manager.reposition
   const refusals = []
-  const seek = jest.spyOn(ctx.manager, 'seek').mockImplementation(function (entry, bound) {
+  const seek = jest.spyOn(ctx.manager, 'reposition').mockImplementation(function (entry, bound) {
     refusals.push(bound.guard())
     return apply.call(this, entry, bound)
   })

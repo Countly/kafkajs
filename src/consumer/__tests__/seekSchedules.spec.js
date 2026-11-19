@@ -866,11 +866,13 @@ class Model {
       ) {
         state.applying = false
         state.owed = false
-        if (e.error === undefined && e.applied) {
+        if (e.applied || (e.accepted && e.error !== undefined)) {
+          // Applied, or accepted with its caller refused afterwards: the target is the position,
+          // published when the answer arrived, and nothing is read back.
           state.reset = false
-          state.resolved = this.autoCommit ? null : String(e.attempt.admission.target)
+          state.resolved = String(e.attempt.admission.target)
         } else if (e.accepted) {
-          // Accepted but not applied here: the replaced position goes and is read back.
+          // Accepted but outranked by a later deliberate commit: that commit's value stands.
           state.resolved = null
         }
       }

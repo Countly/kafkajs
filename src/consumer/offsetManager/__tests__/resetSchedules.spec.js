@@ -207,7 +207,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       await expect(finish()).resolves.toBe(false)
 
       expect(ctx.next()).toEqual('500')
-      expect(ctx.heldAt()).toEqual('0')
+      expect(ctx.heldAt()).toEqual('500')
       expect(ctx.committedAt()).toBeUndefined()
       expect(ctx.owed()).toBe(true)
     })
@@ -938,7 +938,7 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       read.release(offsetFetchAnswer({ 0: '99' }))
 
       await expect(resolving).resolves.toBe(false)
-      expect(ctx.cache[TOPIC]).toEqual({})
+      expect(ctx.cache[TOPIC]).toEqual({ 0: '500' })
 
       await ctx.manager.resolveOffsets()
 
