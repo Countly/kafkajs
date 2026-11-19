@@ -500,6 +500,25 @@ const RECORDS = Object.freeze({
         next: nullable(Offset),
         errorCode: Int,
       },
+      'share-outcome': {
+        client: Id,
+        group: Id,
+        key: Key,
+        from: Offset,
+        to: Offset,
+        type: oneOf('accept', 'release', 'reject', 'renew'),
+        reason: nullable(Id),
+        errorType: nullable(Id),
+      },
+      'broker-share-start': {
+        client: Id,
+        group: Id,
+        key: Key,
+        topicId: nullable(Uuid),
+        startOffset: nullable(Offset),
+        lag: nullable(Offset),
+        errorCode: Int,
+      },
     },
   },
   scan: {
@@ -719,6 +738,7 @@ const SECTIONS = Object.freeze({
   'share-state': {
     entry: {
       client: Id,
+      run: nullable(Id),
       sessions: listOf(shape('a session', { node: Count, session: Int })),
       records: listOf(
         shape('a held record', {

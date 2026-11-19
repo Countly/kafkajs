@@ -326,6 +326,29 @@ class PassiveObserver {
     return { topic, topicId, partition: Number(partition) }
   }
 
+  /**
+   * Whether a group's run is still its consumer's current run, by the product's own run identity.
+   * A run ends at a stop, a disconnect or a crash, and a restart starts a new one; the consumer
+   * then drops the old group, but a weak reference still answers until a collection clears it, so
+   * reachability never decides liveness. A group without a run identity counts as current.
+   * @param {object} group @returns {boolean}
+   */
+  isCurrent(group) {
+    return group.runIdentity?.isCurrent?.() !== false
+  }
+
+  /**
+   * The live group that uses `object` as its `field`, preferring the one whose run is current: a
+   * consumer's ledger outlives its runs, so a restarted run and its not yet collected predecessor
+   * share it. Without a current one (a run stopping) the stopping run's group answers.
+   * @param {string} field @param {object} object
+   * @returns {object|undefined}
+   */
+  groupUsing(field, object) {
+    const groups = this.live('ConsumerGroup').filter((g) => g[field] === object)
+    return groups.find((g) => this.isCurrent(g)) ?? groups[0]
+  }
+
   /** @param {object} group @returns {string} the weak id of the group's current run identity */
   runOf(group) {
     const identity = group?.runIdentity
@@ -595,7 +618,7 @@ class PassiveObserver {
         if (method === 'pause' || method === 'resume') origin.lastOperation = op
         continue
       }
-      const group = this.live('ConsumerGroup').find((g) => g.subscriptionState === receiver)
+      const group = this.groupUsing('subscriptionState', receiver)
       const client = this.clientOf(group ?? receiver)
       this.origins.set(state, {
         stateId: this.idOf(state, 'p'),
@@ -624,7 +647,7 @@ class PassiveObserver {
    */
   ticketBegan(ledger, ticket) {
     if (!ticket || typeof ticket !== 'object') return
-    const group = this.live('ConsumerGroup').find((g) => g.operations === ledger)
+    const group = this.groupUsing('operations', ledger)
     const id = this.idOf(ticket, 't')
     const keys = (ticket.cells ?? [])
       .map(({ topic, partition }) => this.keyOf(topic, partition, group))
@@ -653,7 +676,7 @@ class PassiveObserver {
     if (!id || ticket.ended) return
     live.delete(ticket)
     if (live.size === 0) this.liveTickets.delete(ledger)
-    const group = this.live('ConsumerGroup').find((g) => g.operations === ledger)
+    const group = this.groupUsing('operations', ledger)
     this.emit({
       type: 'ticket',
       record: {
@@ -846,14 +869,21 @@ class PassiveObserver {
   }
 
   /**
-   * Every pause-state entry of every live subscription state, including empty, resumed-only and
-   * pause-all ones, with the origin fixed when the state object first appeared.
+   * Every pause-state entry of the subscription state of every current run (see `isCurrent`),
+   * including empty, resumed-only and pause-all ones, with the origin fixed when the state object
+   * first appeared.
    * @returns {object[]} pause-state section entries; entries without an origin id are left out
    *   and counted as unknown topic ids
    */
   pauseStates() {
     const out = []
+    const current = new Set(
+      this.live('ConsumerGroup')
+        .filter((g) => this.isCurrent(g))
+        .map((g) => g.subscriptionState)
+    )
     for (const receiver of this.live('SubscriptionState')) {
+      if (!current.has(receiver)) continue
       const states = receiver.subscriptionStatesByTopic ?? {}
       for (const topic of Object.keys(states)) {
         const state = states[topic]
@@ -1002,6 +1032,8 @@ class PassiveObserver {
    * replicas, queued seeks, consumer-protocol grown names and the cluster's target topics;
    * GroupOwnership states; OffsetOperations cells with their live tickets; ResetObligations
    * entries. A source whose field is missing is listed in `missingSources`, never read as empty.
+   * Only groups whose run is current are read (see `isCurrent`), so a cut holds at most one run
+   * generation of a client: a crashed or stopped run's dropped group is never reported.
    * @param {string} client actual client id
    * @returns {{ sections: Record<string, object[]>, missingSources: string[] }}
    */
@@ -1026,7 +1058,7 @@ class PassiveObserver {
       topicId: this.topicIdOf(topic, group),
       partition: partition === null ? null : Number(partition),
     })
-    for (const group of this.mine(client, 'ConsumerGroup')) {
+    for (const group of this.mine(client, 'ConsumerGroup').filter((g) => this.isCurrent(g))) {
       const run = this.runOf(group)
       const ids = (names) =>
         names.map((topic) => ({ topic, topicId: this.topicIdOf(topic, group) }))
@@ -1168,15 +1200,23 @@ class PassiveObserver {
   }
 
   /**
-   * The share-state section of one client: live ShareRun node sessions, the held records and decided
-   * ranges of every live acquisition's ledger, and the live cohort rows by acquisition id. The held
-   * set is reconciled with the real ledger's own record and range counts; a disagreement is reported.
+   * The share-state section of one client: the client's current ShareRun (`run`, or null) and its
+   * node sessions, the held records and decided ranges of every acquisition ledger of that run's
+   * fetch loops, and their cohort rows by acquisition id. A run is current by the client's own
+   * check (not retired and still the runner's current run), never by reachability, so a dropped run
+   * that is not yet collected stays out after a restart. A run without a runner, or a loop without
+   * a membership, counts as current. The held set is reconciled with the real ledger's own record
+   * and range counts; a disagreement is reported.
    * @param {string} client actual client id
    * @returns {{ entry: object, mismatches: string[] }}
    */
   shareSections(client) {
+    const runs = this.mine(client, 'ShareRun').filter(
+      (run) => !run.retired && (!run.runner || run.runner.current === run)
+    )
+    const memberships = new Set(runs.map((run) => run.membership))
     const sessions = []
-    for (const run of this.mine(client, 'ShareRun'))
+    for (const run of runs)
       for (const [nodeId, node] of run.nodes ?? [])
         if (node?.session)
           sessions.push({ node: Number(nodeId), session: Number(node.session.epoch) })
@@ -1184,7 +1224,10 @@ class PassiveObserver {
     const ranges = []
     const cohorts = []
     const mismatches = []
-    for (const loop of this.mine(client, 'ShareFetchLoop'))
+    const loops = this.mine(client, 'ShareFetchLoop').filter(
+      (loop) => !loop.membership || memberships.has(loop.membership)
+    )
+    for (const loop of loops)
       for (const rows of loop.cohorts?.values() ?? [])
         for (const row of rows) {
           const mirror = this.ledgers.get(row.ledger)
@@ -1217,7 +1260,8 @@ class PassiveObserver {
               `${mirror.acquisition} holds ${counts.records}/${counts.ranges}, observed ${held}/${decided}`
             )
         }
-    return { entry: { client, sessions, records, ranges, cohorts }, mismatches }
+    const run = runs.length ? `${client}.${this.idOf(runs[0], 'r')}` : null
+    return { entry: { client, run, sessions, records, ranges, cohorts }, mismatches }
   }
 }
 
@@ -1225,7 +1269,9 @@ class PassiveObserver {
  * Supplies each client's public `socketFactory`. It records every socket the default factory makes
  * (weakly, with its client and node) and, for a client that captures, splits the socket's outgoing
  * and incoming bytes into frames and hands each completed request/response pair of the chosen API
- * keys to `onExchange`. A capturing socket's own `data` listener and `write` wrapper are removed at
+ * keys to `onExchange`. Each request of those keys is also handed to `onSent` as it is written, and
+ * each one still unanswered when the socket closes to `onUnanswered`, so a request whose reply was
+ * lost leaves a trace. A capturing socket's own `data` listener and `write` wrapper are removed at
  * close, as the existing share wire trace does.
  */
 class SocketRegistry {
@@ -1247,15 +1293,18 @@ class SocketRegistry {
   /**
    * @param {string} client the actual client id
    * @param {{ apiKeys: number[], onExchange: (e: { apiKey: number, request: Buffer,
-   *   response: Buffer }) => void }|null} [capture]
+   *   response: Buffer }) => void, onSent?: (r: SentRequest) => void,
+   *   onUnanswered?: (r: SentRequest) => void }|null} [capture] `SentRequest` is
+   *   `{ node, apiKey, correlationId, request }`
    * @returns {Function} a `socketFactory` for the client's Kafka config
    */
   factory(client, capture = null) {
     return (options) => {
       const socket = this.make(options)
       this.created++
-      this.refs.push({ ref: new WeakRef(socket), client, node: `${options.host}:${options.port}` })
-      if (capture) this.capture(socket, capture)
+      const node = `${options.host}:${options.port}`
+      this.refs.push({ ref: new WeakRef(socket), client, node })
+      if (capture) this.capture(socket, capture, node)
       return socket
     }
   }
@@ -1271,8 +1320,12 @@ class SocketRegistry {
     return out
   }
 
-  /** Splits a capturing socket's bytes into frames and pairs requests with responses. */
-  capture(socket, { apiKeys, onExchange }) {
+  /**
+   * Splits a capturing socket's bytes into frames and pairs requests with responses.
+   * @param {object} socket @param {object} capture see `factory` @param {string} node host:port
+   * @returns {void}
+   */
+  capture(socket, { apiKeys, onExchange, onSent = () => {}, onUnanswered = () => {} }, node) {
     const pending = new Map()
     const buffers = { out: Buffer.alloc(0), in: Buffer.alloc(0) }
     const take = (direction, chunk) => {
@@ -1283,7 +1336,10 @@ class SocketRegistry {
         bytes = bytes.subarray(length)
         if (direction === 'out') {
           const { apiKey, correlationId } = this.readHeader(frame)
-          if (apiKeys.includes(apiKey)) pending.set(correlationId, { apiKey, request: frame })
+          if (apiKeys.includes(apiKey)) {
+            pending.set(correlationId, { apiKey, request: frame })
+            onSent({ node, apiKey, correlationId, request: frame })
+          }
         } else {
           const correlationId = frame.readInt32BE(4)
           const request = pending.get(correlationId)
@@ -1305,6 +1361,8 @@ class SocketRegistry {
     socket.once('close', () => {
       socket.removeListener('data', receive)
       if (socket.write === write) socket.write = original
+      for (const [correlationId, { apiKey, request }] of pending)
+        onUnanswered({ node, apiKey, correlationId, request })
       pending.clear()
     })
   }

@@ -1957,6 +1957,148 @@ describe('final soak final drain', () => {
     expect(await worker.onDrain(step)).toEqual({ reached: true })
   })
 
+  /**
+   * A share drain whose standing member reported, for offset 9 of IDS.A, an accept the client
+   * retired after a session loss, and whose broker readback answers with `starts()` in turn.
+   * @param {() => object|undefined} starts the supervisor's reply to each share readback
+   */
+  const lostReply = (starts) => {
+    const clock = jumpClock(0)
+    const { runtime, worker, take } = shareDrain()
+    runtime.clock = clock
+    const asked = []
+    runtime.request = async (body) => {
+      asked.push({ ...body, at: clock.now() })
+      return starts()
+    }
+    const rig = { id: 'c07.1', slot: { group: 'g' } }
+    worker.standing.push(rig)
+    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
+    worker.delivered(`${IDS.A}|0`, '9')
+    const error = Object.assign(new Error('Acknowledgement was not confirmed'), {
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'session-lost',
+    })
+    worker.onOutcome(rig, {
+      topic: main,
+      partition: 0,
+      firstOffset: '9',
+      lastOffset: '9',
+      type: 'accept',
+      error,
+    })
+    return { clock, runtime, worker, take, asked }
+  }
+
+  test('a share drain passes an accept whose reply was lost to a session loss when the client reported its outcome and the broker start offset is past the end, and journals the outcome', async () => {
+    const { clock, runtime, worker, asked } = lostReply(() => ({
+      topicId: IDS.A,
+      startOffset: '10',
+      lag: '0',
+    }))
+    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: true })
+    expect(runtime.records).toContainEqual({
+      kind: 'identity',
+      recordId: expect.any(String),
+      stage: 'share-outcome',
+      client: 'c07.1',
+      group: 'g',
+      key: { topic: main, topicId: IDS.A, partition: 0 },
+      from: '9',
+      to: '9',
+      type: 'accept',
+      reason: 'session-lost',
+      errorType: 'KafkaJSShareAcknowledgementError',
+    })
+    expect(asked).toEqual([
+      {
+        type: 'share-readback',
+        client: 'c07.1',
+        group: 'g',
+        key: { topic: main, topicId: IDS.A, partition: 0 },
+        at: 0,
+      },
+    ])
+    expect(runtime.records.some((r) => r.kind === 'diagnostic')).toBe(false)
+  })
+
+  test('a share drain fails an accept whose reply was lost when the broker gives no share start offset past the end', async () => {
+    for (const answer of [
+      undefined,
+      { topicId: IDS.A, startOffset: null, lag: null },
+      { topicId: IDS.B, startOffset: '10', lag: '0' },
+    ]) {
+      const { clock, runtime, worker } = lostReply(() => answer)
+      const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+      expect(await worker.onDrain(step)).toEqual({ reached: false })
+      expect(runtime.records).toContainEqual({
+        kind: 'diagnostic',
+        message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9 (the client reported its outcome; the broker's share start offset is unknown, its lag unknown)`,
+      })
+    }
+  })
+
+  test('a share drain fails a record the broker still holds once its lock had time to expire, and names the offset', async () => {
+    const { clock, runtime, worker, asked } = lostReply(() => ({
+      topicId: IDS.A,
+      startOffset: '9',
+      lag: '1',
+    }))
+    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(clock.now()).toBe(60000)
+    expect(asked.at(-1).at).toBeGreaterThan(30000)
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9 (the client reported its outcome; the broker's share start offset is 9, its lag 1)`,
+    })
+  })
+
+  test('a share drain passes a lost-reply accept of the last offset when the broker start offset still names it but its lag is 0', async () => {
+    const { clock, worker, asked } = lostReply(() => ({
+      topicId: IDS.A,
+      startOffset: '9',
+      lag: '0',
+    }))
+    const step = { ends: { [key]: '10' }, deadline: clock.now() + 60000 }
+    expect(await worker.onDrain(step)).toEqual({ reached: true })
+    expect(asked).toHaveLength(1)
+  })
+
+  test('a share drain without a client outcome fails while the broker start offset is below the end, whatever later answers say', async () => {
+    const { runtime, worker, take } = shareDrain()
+    runtime.clock = jumpClock(0)
+    const asked = []
+    runtime.request = async (body) =>
+      asked.push(body) && { topicId: IDS.A, startOffset: '10', lag: '0' }
+    worker.standing.push({ id: 'c07.1', slot: { group: 'g' } })
+    for (let offset = 0; offset < 9; offset++) take(IDS.A, offset)
+    worker.delivered(`${IDS.A}|0`, '9')
+    const step = { ends: { [key]: '10' }, deadline: runtime.clock.now() + 40 }
+    expect(await worker.onDrain(step)).toEqual({ reached: false })
+    expect(asked).toEqual([])
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `share drain: ${key} of topic id ${IDS.A} has no confirmed accept at offset 9`,
+    })
+  })
+
+  test('a share drain passes a record redelivered and accepted under a later acquisition after its first accept was lost', async () => {
+    let redelivered = false
+    const ctx = lostReply(() => {
+      if (!redelivered && ctx.clock.now() >= 30000) {
+        redelivered = true
+        ctx.take(IDS.A, 9)
+      }
+      return { topicId: IDS.A, startOffset: '9', lag: '1' }
+    })
+    const step = { ends: { [key]: '10' }, deadline: ctx.clock.now() + 60000 }
+    expect(await ctx.worker.onDrain(step)).toEqual({ reached: true })
+    expect(redelivered).toBe(true)
+    expect(ctx.clock.now()).toBeLessThan(60000)
+  })
+
   test('a share gap that is never filled keeps a bounded memory and still fails the drain', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
@@ -2735,6 +2877,158 @@ describe('final soak record timestamps and client log', () => {
       expect(runtime.clientLog.maxBytes).toBe(8 * 1024 * 1024)
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('final soak share request capture', () => {
+  const { SocketRegistry } = require('../finalSoakObserver')
+  const { shareRequestSummary } = require('../shareProtocol')
+  const shareAcknowledgeV2 = require('../../../src/protocol/requests/shareAcknowledge/v2/request')
+  const UUID = '41414141-4141-4141-4141-414141414141'
+
+  /** @returns {Promise<Buffer>} a framed ShareAcknowledge v2 request accepting `[from, to]` */
+  const ackFrame = async (correlationId, shareSessionEpoch, from, to) => {
+    const body = (
+      await shareAcknowledgeV2({
+        groupId: 'g',
+        memberId: 'm',
+        shareSessionEpoch,
+        topics: [
+          {
+            topicId: UUID,
+            partitions: [
+              {
+                partitionIndex: 0,
+                acknowledgementBatches: [
+                  { firstOffset: from, lastOffset: to, acknowledgeTypes: [1] },
+                ],
+              },
+            ],
+          },
+        ],
+      }).encode()
+    ).buffer
+    const header = Buffer.alloc(13)
+    header.writeInt16BE(79, 0)
+    header.writeInt16BE(2, 2)
+    header.writeInt32BE(correlationId, 4)
+    header.writeInt16BE(2, 8)
+    header.write('c7', 10)
+    header.writeUInt8(0, 12)
+    const size = Buffer.alloc(4)
+    size.writeInt32BE(header.length + body.length)
+    return Buffer.concat([size, header, body])
+  }
+
+  test('a capturing socket reports each share request when it is written and, at close, each one never answered', async () => {
+    const socket = new EventEmitter()
+    socket.write = () => true
+    const registry = new SocketRegistry({ base: () => () => socket })
+    const seen = { sent: [], unanswered: [], exchanges: [] }
+    registry.factory('c07.1', {
+      apiKeys: [78, 79],
+      onExchange: (e) => seen.exchanges.push(e.request.readInt32BE(8)),
+      onSent: (r) => seen.sent.push([r.node, r.apiKey, r.correlationId]),
+      onUnanswered: (r) => seen.unanswered.push(r),
+    })({ host: 'h', port: 1 })
+    const answered = await ackFrame(7, 3, '1', '1')
+    const lost = await ackFrame(8, 4, '2', '2')
+    socket.write(answered)
+    socket.write(lost)
+    expect(seen.sent).toEqual([
+      ['h:1', 79, 7],
+      ['h:1', 79, 8],
+    ])
+    const response = Buffer.alloc(9)
+    response.writeInt32BE(5, 0)
+    response.writeInt32BE(7, 4)
+    socket.emit('data', response)
+    socket.emit('close')
+    expect(seen.exchanges).toEqual([7])
+    expect(seen.unanswered).toHaveLength(1)
+    expect(seen.unanswered[0]).toMatchObject({ node: 'h:1', apiKey: 79, correlationId: 8 })
+    expect(seen.unanswered[0].request.equals(lost)).toBe(true)
+  })
+
+  test('a share request summary names its version, session epoch and acknowledged ranges, and a frame it cannot read yields nulls and the reason', async () => {
+    expect(shareRequestSummary(await ackFrame(8, 4, '15760', '15760'))).toEqual({
+      apiVersion: 2,
+      sessionEpoch: 4,
+      acknowledged: [{ topicId: UUID, partition: 0, from: '15760', to: '15760', types: [1] }],
+      error: null,
+    })
+    const truncated = (await ackFrame(8, 4, '1', '1')).subarray(0, 20)
+    truncated.writeInt32BE(16, 0)
+    expect(shareRequestSummary(truncated)).toEqual({
+      apiVersion: null,
+      sessionEpoch: null,
+      acknowledged: null,
+      error: expect.any(String),
+    })
+  })
+
+  test('a share member writes a short wire line for each request it sends and one with the full bytes for each request its socket closed without an answer, inside the wire budget', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-sent-'))
+    try {
+      let capture = null
+      jest.spyOn(ClientRig.prototype, 'construct').mockImplementation(async function (make, c) {
+        capture = c
+        this.object = {
+          events: { ACKNOWLEDGE: 'share.acknowledge' },
+          on: () => {},
+          connect: async () => {},
+          subscribe: async () => {},
+          run: async () => {},
+          disconnect: async () => {},
+        }
+        return this.object
+      })
+      const runtime = workerRuntime('c07')
+      const full = []
+      runtime.wire = new WireLog({ dir, prefix: 'p07.share', onFull: (m) => full.push(m) })
+      const worker = new ShareWorker(runtime)
+      const rig = await worker.join(runtime.slots.find((c) => c.purpose === 'subject'))
+      const lost = await ackFrame(8, 4, '15760', '15760')
+      capture.onSent({ node: 'h:1', apiKey: 79, correlationId: 8, request: lost })
+      capture.onUnanswered({ node: 'h:1', apiKey: 79, correlationId: 8, request: lost })
+      const lines = fs
+        .readFileSync(path.join(dir, 'raw/p07.share.0.ndjson'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+      expect(lines).toEqual([
+        {
+          client: rig.id,
+          event: 'sent',
+          node: 'h:1',
+          apiKey: 79,
+          correlationId: 8,
+          apiVersion: 2,
+          sessionEpoch: 4,
+          acknowledged: [{ topicId: UUID, partition: 0, from: '15760', to: '15760', types: [1] }],
+          error: null,
+        },
+        {
+          client: rig.id,
+          event: 'unanswered',
+          node: 'h:1',
+          apiKey: 79,
+          correlationId: 8,
+          request: lost.toString('hex'),
+        },
+      ])
+      const small = new WireLog({
+        dir,
+        prefix: 'p07.small',
+        budget: 50,
+        onFull: (m) => full.push(m),
+      })
+      expect(small.note({ client: rig.id, event: 'sent', pad: 'x'.repeat(60) })).toBeNull()
+      expect(small.dropped).toBe(1)
+      expect(full).toEqual(['raw wire budget of 50 bytes reached'])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 })

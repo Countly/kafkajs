@@ -1802,6 +1802,7 @@ describe('final soak driver', () => {
       expect(state()).toEqual({
         entry: {
           client: 'c07.1',
+          run: `c07.1.${observer.idOf(run, 'r')}`,
           sessions: [{ node: 1, session: 4 }],
           records: [
             { acquisition: acquired.acquisition, key: acquired.key, offset: '10', state: 'held' },
@@ -1833,6 +1834,100 @@ describe('final soak driver', () => {
       })
       socket.emit('close')
       expect(socket.listenerCount('data')).toBe(0)
+    } finally {
+      observer.restore()
+    }
+  })
+
+  test("share state after a restart holds only the client's current run: a retired run's sessions and its fetch loops' records stay out while still reachable, and the section names the run", () => {
+    const context = new AsyncLocalStorage()
+    const dashed = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    class Loop {
+      constructor(membership) {
+        this.membership = membership
+        this.cohorts = new Map()
+      }
+
+      adopt(exchange, topicId, partition, lockDuration) {
+        const offset = partition.acquiredRecords[0].firstOffset
+        const walk = {
+          deliver: { records: [{ offset }], deliveryCounts: [1] },
+          gaps: [],
+          release: [],
+          reject: [],
+        }
+        const token = {}
+        const ledger = new ShareAckLedger({
+          topic: 'main',
+          topicId,
+          partition: 0,
+          token,
+          sentAt: 1,
+          lockDuration,
+          walk,
+        })
+        const row = { topic: 'main', topicId, partition: 0, token, ledger, walk }
+        this.cohorts.set(`${topicId}|0`, [row])
+        return row
+      }
+    }
+    class Run {
+      syncNodes() {}
+    }
+    const observer = new PassiveObserver({
+      owners: { ShareFetchLoop: Loop, ShareRun: Run, ShareAckLedger },
+      watched: {
+        ShareFetchLoop: ['adopt'],
+        ShareRun: ['syncNodes'],
+        ShareAckLedger: ['prepare', 'settle', 'invalidate'],
+      },
+      context,
+      onEvent: () => {},
+    })
+    observer.install()
+    try {
+      const runner = { current: null }
+      const run = (retired, node, epoch) =>
+        Object.assign(new Run(), {
+          runner,
+          retired,
+          membership: {},
+          nodes: new Map([[node, { session: { epoch } }]]),
+        })
+      const dropped = run(true, 1, 9)
+      const restarted = run(false, 2, 3)
+      runner.current = restarted
+      const loops = [new Loop(dropped.membership), new Loop(restarted.membership)]
+      context.run('c07.1', () => {
+        dropped.syncNodes()
+        restarted.syncNodes()
+        loops.forEach((loop, n) =>
+          loop.adopt(
+            { sentAt: 1 },
+            dashed,
+            {
+              partitionIndex: 0,
+              acquiredRecords: [{ firstOffset: `${10 * (n + 1)}`, lastOffset: `${10 * (n + 1)}` }],
+            },
+            15000
+          )
+        )
+      })
+      const { entry, mismatches } = observer.shareSections('c07.1')
+      expect(entry.sessions).toEqual([{ node: 2, session: 3 }])
+      expect(entry.records.map((r) => r.offset)).toEqual(['20'])
+      expect(entry.cohorts).toHaveLength(1)
+      expect(entry.run).toBe(`c07.1.${observer.idOf(restarted, 'r')}`)
+      expect(mismatches).toEqual([])
+      expect(sectionProblems('share-state', [entry], 'c07.1')).toEqual([])
+      runner.current = null
+      restarted.retired = true
+      expect(observer.shareSections('c07.1').entry).toMatchObject({
+        run: null,
+        sessions: [],
+        records: [],
+        cohorts: [],
+      })
     } finally {
       observer.restore()
     }
@@ -2063,6 +2158,66 @@ describe('final soak driver', () => {
         reply: null,
       })
       expect(supervisor.waiting.size).toBe(0)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a share readback reads the share group state of one key through the admin client, records it and answers the asking process with it', async () => {
+    const { Supervisor } = require('../finalSoak')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-share-readback-'))
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      const records = []
+      supervisor.emit = async (record) => records.push(record)
+      const sent = []
+      supervisor.children.set('p07', { connected: true, send: (m) => sent.push(m) })
+      const asked = []
+      const rows = [
+        { startOffset: '24243', lag: '0', errorCode: 0 },
+        { startOffset: '-1', lag: null, errorCode: 0 },
+      ]
+      supervisor.admin = {
+        listShareGroupOffsets: async (options) => {
+          asked.push(options)
+          const row = rows.shift()
+          if (!row) throw Object.assign(new Error('coordinator moved'), { code: 16 })
+          return [
+            {
+              topic: 'main',
+              topicId: '41414141-4141-4141-4141-414141414141',
+              partitions: [{ partition: 0, leaderEpoch: 2, ...row }],
+            },
+          ]
+        },
+      }
+      const key = { topic: 'main', topicId: 'QUFBQUFBQUFBQUFBQUFBQQ', partition: 0 }
+      for (let request = 1; request <= 3; request++)
+        await supervisor.shareReadback('p07', { request, group: 'g', client: 'c07.1', key })
+      expect(asked[0]).toEqual({ groupId: 'g', topics: [{ topic: 'main', partitions: [0] }] })
+      const values = [
+        { topicId: 'QUFBQUFBQUFBQUFBQUFBQQ', startOffset: '24243', lag: '0' },
+        { topicId: 'QUFBQUFBQUFBQUFBQUFBQQ', startOffset: null, lag: null },
+        { topicId: null, startOffset: null, lag: null },
+      ]
+      expect(sent).toEqual(values.map((value, n) => ({ type: 'reply', request: n + 1, value })))
+      expect(records).toEqual(
+        values.map((value, n) => ({
+          kind: 'identity',
+          stage: 'broker-share-start',
+          client: 'c07.1',
+          group: 'g',
+          key,
+          ...value,
+          errorCode: n === 2 ? 16 : 0,
+        }))
+      )
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
