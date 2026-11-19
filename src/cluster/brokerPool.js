@@ -23,6 +23,9 @@ const {
 const { isConnectionFailure } = require('../network/connectionFailure')
 const { failure, createErrorFromCode } = require('../protocol/error')
 
+/** The code a consumer's named refresh isolates for an established target. */
+const UNKNOWN_TOPIC_OR_PARTITION = 3
+
 /** Topic errors that drop an earlier producer target the broker no longer serves. */
 const DROPPED_TOPIC_ERRORS = new Set([
   'UNKNOWN_TOPIC_OR_PARTITION',
@@ -31,6 +34,15 @@ const DROPPED_TOPIC_ERRORS = new Set([
 ])
 
 const { keys, assign, values } = Object
+
+/**
+ * @typedef {object} TopicMetadataStatus
+ * @property {string} topic a consumer target
+ * @property {'unavailable'|'available'} status
+ * @property {string|null} type `UNKNOWN_TOPIC_OR_PARTITION` when unavailable, null when available
+ * @property {number} code 3 when unavailable, 0 when available
+ */
+
 /**
  * Whether a cached broker now has another address. A rack is not part of a broker's identity: a
  * new rack is written onto the cached connection pool in place, with no new connection.
@@ -115,6 +127,12 @@ module.exports = class BrokerPool {
    * @param {(topic: string) => boolean} [options.isNewTarget] required when `captureTopics` is
    *   given: whether a producer target is being added by the call in progress, so its refusal
    *   fails that call instead of being dropped
+   * @param {(status: TopicMetadataStatus) => void} [options.onTopicMetadataStatus] given only
+   *   for a consumer's cluster: its named refreshes isolate an established target answered
+   *   `UNKNOWN_TOPIC_OR_PARTITION` (see `isolateUnknownTopics`) and report each change of that
+   *   topic's status here
+   * @param {(topic: string) => boolean} [options.isEstablishedTarget] required with
+   *   `onTopicMetadataStatus`: whether a topic is a target that no call in progress is adding
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
@@ -140,6 +158,8 @@ module.exports = class BrokerPool {
     captureTopics,
     dropTopic,
     isNewTarget,
+    onTopicMetadataStatus,
+    isEstablishedTarget,
     instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
@@ -153,6 +173,10 @@ module.exports = class BrokerPool {
     this.captureTopics = captureTopics
     this.dropTopic = dropTopic
     this.isNewTarget = isNewTarget
+    this.onTopicMetadataStatus = onTopicMetadataStatus
+    this.isEstablishedTarget = isEstablishedTarget
+    /** @type {Set<string>|null} the isolated targets: never more than the current targets */
+    this.unavailableTopics = onTopicMetadataStatus ? new Set() : null
     this.telemetryMetrics = telemetryMetrics
     this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
@@ -979,12 +1003,13 @@ module.exports = class BrokerPool {
       allowAutoTopicCreation = false
     }
     const accept = this.captureTopics?.(topics || [])
+    const isolate = this.unavailableTopics !== null && topics?.length > 0
     const requestOptions = {
       ...guardArgs(fence)[0],
       ...(guard && { guard }),
       ...(allowAutoTopicCreation !== undefined && { allowAutoTopicCreation }),
       ...(allowLeaderless && { allowLeaderless }),
-      ...(accept && { retainTopicErrors: true }),
+      ...((accept || isolate) && { retainTopicErrors: true }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
     try {
@@ -1024,6 +1049,11 @@ module.exports = class BrokerPool {
               ({ topic }) => !replaced.has(topic)
             )
             this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
+          } else if (isolate) {
+            this.metadata = {
+              ...response,
+              topicMetadata: this.isolateUnknownTopics(response.topicMetadata),
+            }
           } else {
             this.metadata = response
           }
@@ -1186,11 +1216,58 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Drops one producer target from the retained decoded response, preserving broker discovery.
+   * Judges the topics a consumer's named refresh got back with their own error code. Only
+   * `UNKNOWN_TOPIC_OR_PARTITION` (code 3) for an established target is isolated: the topic is left
+   * out of the installed metadata, so nothing routes to it, while it stays a target that every
+   * later refresh asks for again, and its cached id stays, so a recreation is seen as one. The
+   * healthy topics are installed as usual. Any other topic error, or code 3 for a topic a call is
+   * adding or that is not a target, is thrown as the version's own parse would throw it, before
+   * any status changes. The Java consumer and franz-go keep a missing topic per topic too.
+   *
+   * A status is reported only when it changes: once when a topic becomes unavailable, once when a
+   * refresh answers it again. The state is bounded by the targets; `forgetTopic` drops it.
+   * @param {object[]} topicMetadata the answer's topics, topic errors retained
+   * @returns {object[]} the topics answered without an error
+   * @throws {import('../errors').KafkaJSProtocolError} the first topic error not isolated
+   */
+  isolateUnknownTopics(topicMetadata) {
+    const failed = topicMetadata.filter(
+      ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
+    )
+    for (const { topic, topicErrorCode } of failed) {
+      if (topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION || !this.isEstablishedTarget(topic)) {
+        throw createErrorFromCode(topicErrorCode)
+      }
+    }
+    for (const { topic } of failed) {
+      if (this.unavailableTopics.has(topic)) continue
+      this.unavailableTopics.add(topic)
+      this.onTopicMetadataStatus({
+        topic,
+        status: 'unavailable',
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+        code: UNKNOWN_TOPIC_OR_PARTITION,
+      })
+    }
+    const healthy = failed.length
+      ? topicMetadata.filter((entry) => !failed.includes(entry))
+      : topicMetadata
+    for (const topic of this.unavailableTopics) {
+      if (!healthy.some((entry) => entry.topic === topic)) continue
+      this.unavailableTopics.delete(topic)
+      this.onTopicMetadataStatus({ topic, status: 'available', type: null, code: 0 })
+    }
+    return healthy
+  }
+
+  /**
+   * Drops one target from the retained decoded response, preserving broker discovery, and from
+   * the isolated targets.
    * @param {string} topic forgotten name
    * @returns {void}
    */
   forgetTopic(topic) {
+    this.unavailableTopics?.delete(topic)
     if (this.metadata) {
       this.metadata = {
         ...this.metadata,
@@ -1315,6 +1392,8 @@ module.exports = class BrokerPool {
 
   /**
    * Only refreshes metadata if the data is stale according to the `metadataMaxAge` param or does not contain information about the provided topics
+   * An isolated consumer target counts as known, so it is asked for again when the metadata
+   * expires, not on every call.
    *
    * @public
    * @param {Array<String>} topics
@@ -1329,8 +1408,10 @@ module.exports = class BrokerPool {
       this.metadata == null ||
       this.metadataExpireAt == null ||
       Date.now() > this.metadataExpireAt ||
-      !topics.every((topic) =>
-        this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
+      !topics.every(
+        (topic) =>
+          this.unavailableTopics?.has(topic) ||
+          this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
       )
 
     if (shouldRefresh) {

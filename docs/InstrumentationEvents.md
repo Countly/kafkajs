@@ -52,6 +52,7 @@ Instrumentation Event:
 | REQUEST_TIMEOUT     | {`broker`, `clientId`, `correlationId`, `createdAt`, `sentAt`, `pendingDuration`, `apiName`, `apiKey`, `apiVersion`}                                 | Request to a broker has timed out. |
 | REQUEST_QUEUE_SIZE  | {`broker`, `clientId`, `queueSize`}                                                                                                                                                      | All requests go through a request queue where concurrency is managed (`maxInflightRequests`). Whenever the size of the queue changes, this event is emitted. |
 | RECEIVED_UNSUBSCRIBED_TOPICS | {`groupId`, `generationId`, `memberId`, `assignedTopics`, `topicsSubscribed`, `topicsNotSubscribed`} | Event emitted when some members of your consumer group are subscribed to some topics, and some other members of the group are subscribed to a different set of topics. Emitted under the classic group protocol only. Under the consumer protocol, assigned names outside the round subscription are filtered with a debug message and no event or warning. |
+| TOPIC_METADATA_STATUS | {`groupId`, `topic`, `status`, `type`, `code`} | A subscribed or assigned topic's metadata changed. `status: 'unavailable'` (`type: 'UNKNOWN_TOPIC_OR_PARTITION'`, `code: 3`): a refresh no longer finds the topic; the other topics keep consuming and the topic stays subscribed. `status: 'available'` (`type: null`, `code: 0`): a later refresh finds it again; that means the metadata is back, not that records or an assignment arrived. Emitted on change only, with a warning for `unavailable` and an info log for `available`; never for a topic the consumer no longer subscribes to. `groupId` is null in a consumer without a group. See [Deleted subscribed topics](Consuming.md#deleted-topics). |
 | AUTHENTICATION_FAILURE | {`broker`, `mechanism`, `errorMessage`} | A broker rejected SASL authentication (`SASL_AUTHENTICATION_FAILED`), carrying its own error message. The broker is then blacked out for `max(authenticationTimeout, 1000ms)` — 10s out of the box, since `authenticationTimeout` defaults to 10000ms — so a (re)authentication attempt against it fails fast with `KafkaJSSASLAuthenticationError` instead of retrying immediately; an already-authenticated connection is unaffected. |
 | TOPIC_RECREATED     | {`topic`, `previousTopicId`, `topicId`}                                                    | A subscribed topic came back from a metadata refresh with a different topic id — it was deleted and recreated. The consumer resets that topic's offsets once, per its subscription's `fromBeginning`. |
 | REBOOTSTRAP         | {`reason`}                                                                                 | The client rebuilt its connections and metadata from the configured broker list (KIP-899/1102). `reason` is `'timeout'` (metadata failed continuously for `metadataRecoveryRebootstrapTriggerMs`), `'required'` (a broker returned `REBOOTSTRAP_REQUIRED`), or `'all-brokers-unavailable'` (every known broker became unreachable). Only fires when `metadataRecoveryStrategy` is `'rebootstrap'` (the default). |
@@ -119,7 +120,7 @@ Acknowledgement endpoints are inclusive decimal strings. Terminal homogeneous su
 
 ## <a name="channels"></a> Channels (`node:diagnostics_channel`)
 
-Every event above is also published on [`node:diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html), on the channel named `kafkajs.` plus the event's name: the consumer's `REQUEST` is on `kafkajs.consumer.network.request`. A library can then observe every client in the process (a metrics layer, a tracer) without holding a reference to any of them. The 43 ordinary channels and 18 share channels exist from the moment the package is loaded, and while a channel has no subscriber and the event has no `on()` listener nothing is allocated and nothing is published.
+Every event above is also published on [`node:diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html), on the channel named `kafkajs.` plus the event's name: the consumer's `REQUEST` is on `kafkajs.consumer.network.request`. A library can then observe every client in the process (a metrics layer, a tracer) without holding a reference to any of them. The 44 ordinary channels and 18 share channels exist from the moment the package is loaded, and while a channel has no subscriber and the event has no `on()` listener nothing is allocated and nothing is published.
 
 ```javascript
 const diagnosticsChannel = require('node:diagnostics_channel')
@@ -139,7 +140,7 @@ A subscriber:
 - must treat the message as read-only: the payload is the object the client built, and some payloads (the offset commit's, the group join's) are objects the client goes on using;
 - must not retain the message or its payload after it returns: copy what it needs.
 
-A subscriber is process-wide and receives the events of every client in the process. The request events (`network.request`, `network.request_timeout` and `network.request_queue_size`) carry `clientId` and `broker`, and the consumer's group events (`group_join`, `heartbeat`, `commit_offsets`, `rebalancing`, `crash`, the partition events and `poll_interval_exceeded`) carry `groupId`; an event such as `consumer.fetch` or `consumer.start_batch_process` carries neither, so two clients in one process cannot be told apart by it.
+A subscriber is process-wide and receives the events of every client in the process. The request events (`network.request`, `network.request_timeout` and `network.request_queue_size`) carry `clientId` and `broker`, and the consumer's group events (`group_join`, `heartbeat`, `commit_offsets`, `rebalancing`, `crash`, the partition events, `poll_interval_exceeded` and `topic_metadata_status`) carry `groupId`; an event such as `consumer.fetch` or `consumer.start_batch_process` carries neither, so two clients in one process cannot be told apart by it.
 
 The payloads are those in the tables above.
 
@@ -166,6 +167,7 @@ The payloads are those in the tables above.
 | `kafkajs.consumer.partition_halted` | `consumer.events.PARTITION_HALTED` |
 | `kafkajs.consumer.poll_interval_exceeded` | `consumer.events.POLL_INTERVAL_EXCEEDED` |
 | `kafkajs.consumer.received_unsubscribed_topics` | `consumer.events.RECEIVED_UNSUBSCRIBED_TOPICS` |
+| `kafkajs.consumer.topic_metadata_status` | `consumer.events.TOPIC_METADATA_STATUS` |
 | `kafkajs.consumer.network.request` | `consumer.events.REQUEST` |
 | `kafkajs.consumer.network.request_timeout` | `consumer.events.REQUEST_TIMEOUT` |
 | `kafkajs.consumer.network.request_queue_size` | `consumer.events.REQUEST_QUEUE_SIZE` |

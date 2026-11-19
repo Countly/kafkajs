@@ -90,6 +90,8 @@ describe.each(lanes())('Auto topic creation on %s', (lane) => {
       await consumer.subscribe({ topic: TOPIC })
       const before = scripted.requests().filter(({ api }) => api === 'Metadata').length
       scripted.answer('Metadata', () => ({
+        brokers: [{ nodeId: 0, host: 'node', port: 9092, rack: null }],
+        controllerId: 0,
         topics: [{ name: TOPIC, errorCode: 3, partitions: [] }],
       }))
       expect((await startAfterDeletion(consumer)).topic).toBe(TOPIC)
