@@ -8,6 +8,7 @@ const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const channels = require('../../instrumentation/channels')
 const { events } = require('../instrumentationEvents')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
+const { stampHeartbeatFatal } = require('../rebalanceErrorContract')
 const {
   pollIntervalExceededError,
   stampGeneration,
@@ -566,6 +567,18 @@ describe('Consumer > RebalanceCoordinator', () => {
         revoked
       )
       expect(coordinator.mergeVerdict(lost, verdict('lost', 'poll-interval-exceeded'))).toBe(lost)
+    })
+
+    it('lets a heartbeat answer marked fatal replace a pending recoverable LOST, in either order', () => {
+      const { coordinator } = build()
+      const fenced = verdict('lost', 'fenced')
+      const fatal = { kind: 'lost', reason: 'lost', error: stampHeartbeatFatal(new Error('69')) }
+      const authorization = Object.assign(new Error('30'), { code: 30 })
+      const otherFatal = { kind: 'lost', reason: 'lost', error: authorization }
+
+      expect(coordinator.mergeVerdict(fenced, fatal)).toBe(fatal)
+      expect(coordinator.mergeVerdict(fatal, fenced)).toBe(fatal)
+      expect(coordinator.mergeVerdict(otherFatal, fatal)).toBe(otherFatal)
     })
 
     it('hands the merged verdict out once and leaves the slot null', () => {

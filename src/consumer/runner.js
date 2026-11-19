@@ -30,6 +30,7 @@ const {
   isOffsetCommitError,
   rebalanceReason,
   isConsumerProtocolFatal,
+  isHeartbeatFatal,
   sentOwnership,
   sentMembership,
   obsoleteOwnership,
@@ -348,9 +349,10 @@ module.exports = class Runner extends EventEmitter {
       }
 
       /**
-       * Runs one rebalance for the loop. A failed awaited callback, and a classic chain refused at
-       * its round limit, end the loop through `bail`, so the retrier hands the typed error to the
-       * crash policy unchanged instead of retrying it or wrapping it.
+       * Runs one rebalance for the loop. A failed awaited callback, a classic chain refused at its
+       * round limit and a heartbeat answer marked fatal end the loop through `bail`, so the
+       * retrier hands the typed error to the crash policy unchanged instead of retrying it or
+       * wrapping it.
        */
       const rebalance = async (verdict) => {
         try {
@@ -358,7 +360,8 @@ module.exports = class Runner extends EventEmitter {
         } catch (error) {
           if (
             error instanceof KafkaJSRebalanceListenerError ||
-            error instanceof KafkaJSRebalanceNotConvergedError
+            error instanceof KafkaJSRebalanceNotConvergedError ||
+            isHeartbeatFatal(error)
           ) {
             return bail(error)
           }

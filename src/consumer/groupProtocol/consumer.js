@@ -27,6 +27,7 @@ const {
   joinDeadlineError,
   unsupportedConsumerProtocolError,
   isConsumerProtocolFatal,
+  stampHeartbeatFatal,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
 const {
@@ -1545,7 +1546,7 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     if (code === GROUP_ID_NOT_FOUND) {
-      return this.state === UNSUBSCRIBED ? error : this.transitionToFatal(error)
+      return this.state === UNSUBSCRIBED ? error : this.heartbeatFatal(error)
     }
 
     if (isConsumerProtocolFatal(error)) {
@@ -1566,6 +1567,20 @@ module.exports = class ConsumerGroupProtocol {
       return error
     }
 
+    return this.heartbeatFatal(error)
+  }
+
+  /**
+   * Ends the membership for a current answer the code table does not call fatal. The mark lets
+   * the verdict, the runner and the restart policy agree with this decision, and the loss is
+   * learned before any of them can await.
+   * @private
+   * @param {Error} error the decoded answer
+   * @returns {Error} the same error, marked
+   */
+  heartbeatFatal(error) {
+    stampHeartbeatFatal(error)
+    learnOwnershipLoss(this.ownership, error, REBALANCE_PATHS.HEARTBEAT, 'consumer')
     return this.transitionToFatal(error)
   }
 
