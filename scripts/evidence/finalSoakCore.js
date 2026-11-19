@@ -196,6 +196,7 @@ class Journal {
     this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
     this.trafficEnds = new Map()
+    /** @returns {{ paused: number, held: number }} empty key counts of one wave event */
     const keys = () => ({ paused: 0, held: 0 })
     this.info = {
       outages: [],
@@ -504,6 +505,7 @@ class Journal {
    * @returns {{ owned: 'share'|'misattributed'|'unowned'|'owned', serial: number }}
    */
   ownership(r) {
+    /** @param {string} owned the finding @returns {object} it, outside every interval */
     const outside = (owned) => ({ owned, serial: OUTSIDE })
     if (this.groupIndex.get(r.group).share) return outside('share')
     if (r.authority === null || !this.attributed(r, r.authority)) return outside('misattributed')
@@ -1425,6 +1427,7 @@ function formatReport(report) {
     if (info.outagesNotShown > 0)
       lines.push(`  ${info.outagesNotShown} more broker down or ready records not shown`)
     const w = info.waves
+    /** @param {string} event `transfer` or `return` @returns {string} its paused and held key counts */
     const keys = (event) =>
       `${w.keys[event].paused} paused keys, ${w.keys[event].held} held by the member`
     lines.push(
