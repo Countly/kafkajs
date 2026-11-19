@@ -341,6 +341,7 @@ describe('Consumer > crash supervision', () => {
       const failing = await fenceWith(throwing)
       await cleanup()
       cleanup = null
+      jest.restoreAllMocks()
       const working = await fenceWith(createLogger({ logCreator: () => () => {} }))
 
       expect(invoked).toHaveBeenCalledTimes(1)

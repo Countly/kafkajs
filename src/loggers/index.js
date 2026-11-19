@@ -8,11 +8,22 @@ const LEVELS = {
   DEBUG: 5,
 }
 
+/**
+ * Builds one level's log function. The user's sink is invoked synchronously and a synchronous
+ * throw from it is swallowed, so a failing sink never decides the outcome of the client code
+ * that logged.
+ * @param {string} label
+ * @param {number} level
+ * @param {() => number} currentLevel
+ * @param {string} [namespace]
+ * @param {(entry: object) => void} logFunction the user's sink
+ * @returns {(message: string, extra?: object) => void}
+ */
 const createLevel =
   (label, level, currentLevel, namespace, logFunction) =>
   (message, extra = {}) => {
     if (level > currentLevel()) return
-    logFunction({
+    const entry = {
       namespace,
       level,
       label,
@@ -24,7 +35,10 @@ const createLevel =
         },
         extra
       ),
-    })
+    }
+    try {
+      logFunction(entry)
+    } catch {}
   }
 
 const evaluateLogLevel = (logLevel) => {
