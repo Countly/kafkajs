@@ -59,7 +59,14 @@ describe('a close that is still running when a replacement connects', () => {
     jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
     jest
       .spyOn(Runner.prototype, 'stop')
-      .mockImplementationOnce(() => stopped.promise)
+      // Like the real stop, it unwinds once a forced close retires its scope.
+      .mockImplementationOnce((_options, operation) =>
+        operation
+          .wait(() => stopped.promise)
+          .catch((error) => {
+            if (!operation.guard()) throw error
+          })
+      )
       .mockResolvedValue()
     const { cluster, log, state } = scriptedCluster()
     const consumer = build(cluster)

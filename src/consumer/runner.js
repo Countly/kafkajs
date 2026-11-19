@@ -141,6 +141,8 @@ module.exports = class Runner extends EventEmitter {
     this.stopLatched = false
     /** @type {Error|null} the first terminal reason of a forced close; the run refuses all later work */
     this.retirement = null
+    /** @type {ConsumerOperation|null} the scope of this run's one stop, which `retire` ends */
+    this.stopScope = null
     /** Handlers currently inside `eachMessage`/`eachBatch`. */
     this.inFlightHandlers = 0
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
@@ -735,6 +737,8 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    // Published before the first diagnostic, so a close a log sink starts can retire it.
+    const scope = (this.stopScope = operation ?? new ConsumerOperation())
     this.logger.debug('stop consumer group', {
       groupId: this.consumerGroup.groupId,
       memberId: this.consumerGroup.memberId,
@@ -742,7 +746,6 @@ module.exports = class Runner extends EventEmitter {
 
     const closing = this.rebalanceHooks ? this.closeEpisode() : null
     this.latchStop()
-    const scope = operation ?? new ConsumerOperation()
 
     try {
       // The fetch layer goes first: with `running` already false every fetch returns [] without
@@ -827,9 +830,9 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Retires this run for good when its close deadline passes: latches the stop and refuses every
-   * later commit, heartbeat and hook wait of the run, so a handler or callback that outlives it
-   * changes nothing. Also stops the fetch manager, which never rejects: the close's own stop never
+   * Retires this run for good when its close deadline passes: latches the stop, ends the scope of
+   * a stop in progress so it unwinds, and refuses every later commit, heartbeat and hook wait of
+   * the run, so a handler or callback that outlives it changes nothing. Also stops the fetch manager, which never rejects: the close's own stop never
    * reaches it once its deadline has passed, and with `running` false every fetch returns [] in
    * microtasks, so a fetcher left running would spin on `setImmediate` for the life of the process.
    * Synchronous and idempotent; application promises are left as they are.
@@ -840,6 +843,7 @@ module.exports = class Runner extends EventEmitter {
     if (this.retirement) return
     this.retirement = error
     this.latchStop()
+    this.stopScope?.retire(error)
     this.consumerGroup.retireCoordinatorLookup(error)
     this.consumerGroup.retireFetchSessions()
     this.fetchManager.stop()
@@ -891,6 +895,11 @@ module.exports = class Runner extends EventEmitter {
       },
       wait: (work) => work(),
     }
+    const unregister =
+      operation?.register((error) => {
+        round.retire(error)
+        group.rebalanceHooks.retire({ run: round.run }, error)
+      }) ?? (() => {})
     try {
       // Whoever requested the stop, a handler or another callback, the close callback runs on its
       // own authority: it must neither inherit nor be refused by the requester's identity.
@@ -913,6 +922,7 @@ module.exports = class Runner extends EventEmitter {
         error: describeThrown(error),
       })
     } finally {
+      unregister()
       round.retire(consumerStoppingError())
       group.rebalanceHooks.retire({ run: round.run }, consumerStoppingError())
     }
