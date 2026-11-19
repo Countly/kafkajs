@@ -26,6 +26,8 @@ const { checkPartitions } = require('../protocol/requests/metadata')
 
 /** The code a consumer's named refresh isolates for an established target. */
 const UNKNOWN_TOPIC_OR_PARTITION = 3
+/** How long an isolated target counts as known before it is asked for again, at most. */
+const ISOLATED_RECHECK_MS = 1000
 
 /** Topic errors that drop an earlier producer target the broker no longer serves. */
 const DROPPED_TOPIC_ERRORS = new Set([
@@ -187,6 +189,8 @@ module.exports = class BrokerPool {
     this.captureEstablishment = captureEstablishment
     /** @type {Set<string>|null} the isolated targets: never more than the current targets */
     this.unavailableTopics = onTopicMetadataStatus ? new Set() : null
+    /** When an isolated target stops counting as known to `refreshMetadataIfNecessary`. */
+    this.isolatedRecheckAt = 0
     this.telemetryMetrics = telemetryMetrics
     this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
@@ -1243,7 +1247,9 @@ module.exports = class BrokerPool {
    * The Java consumer and franz-go keep a missing topic per topic too.
    *
    * A status is reported only when it changes: once when a topic becomes unavailable, once when a
-   * refresh answers it again. The state is bounded by the targets; `forgetTopic` drops it.
+   * refresh answers it again. The state is bounded by the targets; `forgetTopic` drops it. An
+   * isolated topic is asked for again within a second (see `refreshMetadataIfNecessary`), so a
+   * recreation is seen against its kept id and reset as any recreation is.
    * @param {object[]} topicMetadata the answer's topics, topic and partition errors retained
    * @param {TargetEstablishment} establishment captured when the refresh began
    * @param {{ allowLeaderless?: boolean }} options lets a partition without a leader through
@@ -1265,6 +1271,7 @@ module.exports = class BrokerPool {
       : topicMetadata
     checkPartitions(healthy, { allowLeaderless })
     establish(healthy.map(({ topic }) => topic))
+    this.isolatedRecheckAt = Date.now() + Math.min(this.metadataMaxAge, ISOLATED_RECHECK_MS)
 
     for (const { topic } of failed) {
       if (this.unavailableTopics.has(topic)) continue
@@ -1416,8 +1423,10 @@ module.exports = class BrokerPool {
 
   /**
    * Only refreshes metadata if the data is stale according to the `metadataMaxAge` param or does not contain information about the provided topics
-   * An isolated consumer target counts as known, so it is asked for again when the metadata
-   * expires, not on every call.
+   * An isolated consumer target counts as known for at most a second after the refresh that
+   * isolated it (or `metadataMaxAge`, when shorter), so a recreated topic is found again within
+   * that second, as the Java consumer keeps asking for a partition without a leader, while a fetch
+   * loop that calls this on every round does not ask for it on every round.
    *
    * @public
    * @param {Array<String>} topics
@@ -1434,7 +1443,7 @@ module.exports = class BrokerPool {
       Date.now() > this.metadataExpireAt ||
       !topics.every(
         (topic) =>
-          this.unavailableTopics?.has(topic) ||
+          (this.unavailableTopics?.has(topic) && Date.now() <= this.isolatedRecheckAt) ||
           this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
       )
 
