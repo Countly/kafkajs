@@ -2848,3 +2848,148 @@ describe('Consumer > a whole consumer-protocol consumer > a saved eachBatch reso
     expect(commitsOf(run.log, 'topic-a|0')).toEqual(['41'])
   })
 })
+
+describe('Consumer > a whole consumer-protocol consumer > observers and fetch admission', () => {
+  let consumer
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(async () => {
+    const stopping = consumer.disconnect().catch(() => {})
+    await jest.advanceTimersByTimeAsync(3000)
+    await stopping
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['an Error', new Error('observer')],
+  ])(
+    'a HEARTBEAT listener that throws %s does not stop startup: the member joins and the first record is delivered',
+    async (_, thrown) => {
+      const built = buildConsumer({
+        maxPollInterval: 1500,
+        retry: { retries: 0, initialRetryTime: 100, restartOnFailure: async () => false },
+      })
+      consumer = built.consumer
+      const received = []
+      const joins = []
+      built.state.queue['topic-a|0'] = [40]
+      built.state.answer = ({ memberEpoch }) =>
+        memberEpoch === 0 ? fullTarget(1, { 'topic-a': [0] }) : fullTarget(memberEpoch, null)
+      consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => joins.push(payload.memberAssignment))
+      consumer.on(consumer.events.HEARTBEAT, () => {
+        throw thrown
+      })
+      await consumer.subscribe({ topics: ['topic-a'] })
+      const run = consumer.run({
+        eachMessage: async ({ message }) => received.push(message.offset),
+      })
+      await advanceUntil(() => received.length || built.crashes.length)
+      await run
+
+      expect(built.crashes).toEqual([])
+      expect(joins).toEqual([{ 'topic-a': [0] }])
+      expect(received).toEqual(['40'])
+    },
+    5000
+  )
+
+  it('an ordinary Fetch waiting for its broker when a heartbeat learns the member was fenced is not sent', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    let releaseBroker
+    let fenced = false
+    built.state.queue['topic-a|0'] = [40]
+    built.state.answer = ({ memberEpoch }) => {
+      if (memberEpoch === 0) return fullTarget(fenced ? 2 : 1, { 'topic-a': [0] })
+      if (memberEpoch === 1 && fenced) {
+        throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      }
+      return fullTarget(memberEpoch, null)
+    }
+    await consumer.subscribe({ topics: ['topic-a'] })
+    const startup = consumer.run({
+      eachMessage: async () => {
+        if (releaseBroker) return
+        built.cluster.findBroker.mockImplementationOnce(
+          () => new Promise((resolve) => (releaseBroker = () => resolve(built.broker)))
+        )
+      },
+    })
+    await advanceUntil(() => releaseBroker || built.crashes.length)
+    await startup
+    expect(releaseBroker).toEqual(expect.any(Function))
+    const [runner] = starts.mock.contexts
+    const group = runner.consumerGroup
+    const membership = group.groupMembership
+    const fencedToken = group.ownership.token()
+    const sent = []
+    const fetch = built.broker.fetch.getMockImplementation()
+    built.broker.fetch.mockImplementation(async (request) => {
+      const refusal = request.guard?.()
+      if (refusal) throw refusal
+      sent.push(group.ownership.token())
+      return fetch(request)
+    })
+    try {
+      fenced = true
+      membership.lastRequestAt = Date.now() - membership.heartbeatIntervalMs - 1
+      await expect(runner.heartbeat()).rejects.toMatchObject({ type: 'FENCED_MEMBER_EPOCH' })
+      expect(group.ownership.refusal(fencedToken)?.cause.type).toBe('FENCED_MEMBER_EPOCH')
+    } finally {
+      releaseBroker()
+    }
+    await jest.advanceTimersByTimeAsync(10)
+
+    expect(sent.filter((token) => token === fencedToken)).toEqual([])
+    expect(built.crashes).toEqual([])
+  })
+
+  it('an empty first assignment whose assigned hook is held delivers the only grant that arrives during the hook', async () => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const starts = jest.spyOn(Runner.prototype, 'start')
+    let grant = false
+    let granted = false
+    let releaseFirst
+    let firstManager
+    const deliveries = []
+    built.state.queue['topic-a|0'] = [40]
+    built.state.answer = ({ memberEpoch }) => {
+      if (memberEpoch === 0) return fullTarget(1, {})
+      if (grant && !granted) {
+        granted = true
+        return fullTarget(2, { 'topic-a': [0] })
+      }
+      return fullTarget(memberEpoch, null)
+    }
+    await consumer.subscribe({ topics: ['topic-a'] })
+    const run = consumer.run({
+      eachMessage: async ({ message }) => deliveries.push(message.offset),
+      rebalanceListener: {
+        onPartitionsAssigned: ({ partitions }) => {
+          if (partitions.length) return
+          firstManager = starts.mock.contexts[0].consumerGroup.offsetManager
+          return new Promise((resolve) => (releaseFirst = resolve))
+        },
+      },
+    })
+    try {
+      await advanceUntil(() => releaseFirst)
+      expect(firstManager).toBeTruthy()
+      grant = true
+      await advanceUntil(() => granted)
+      expect(deliveries).toEqual([])
+    } finally {
+      releaseFirst?.()
+    }
+    await advanceUntil(() => deliveries.length || built.crashes.length)
+    await run
+
+    expect(deliveries).toEqual(['40'])
+    expect(built.crashes).toEqual([])
+  })
+})

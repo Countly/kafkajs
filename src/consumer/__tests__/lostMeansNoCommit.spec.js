@@ -1426,6 +1426,66 @@ describe('a consumer heartbeat and the runner that sent it', () => {
     expect(protocol.target).not.toBeNull()
     expect(runner.rebalanceCoordinator.verdict).toBeNull()
   })
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+  ])(
+    'a HEARTBEAT listener that throws %s on a current success loses nothing: the success applies and ends the outage once',
+    async (_, thrown) => {
+      const { runner, protocol, emitter, gate, end } = setup()
+      emitter.addListener(HEARTBEAT, () => {
+        throw thrown
+      })
+      const call = runner.heartbeat()
+      await gate.arrived()
+      gate.release({ memberEpoch: 9, heartbeatIntervalMs: 1, assignment: null })
+
+      await expect(call).resolves.toBeUndefined()
+      expect(protocol.memberEpoch).toBe(9)
+      expect(end).toHaveBeenCalledTimes(1)
+      expect(runner.rebalanceCoordinator.verdict).toBeNull()
+    }
+  )
+
+  it('a heartbeat held before its write sends nothing once its membership is reset on the live run', async () => {
+    const { runner, protocol, end } = setup()
+    const written = []
+    let releaseWrite
+    protocol.coordinator.consumerGroupHeartbeat = async (request) => {
+      await new Promise((resolve) => (releaseWrite = resolve))
+      const refusal = request.guard?.()
+      if (refusal) throw refusal
+      written.push(request.memberEpoch)
+      return {}
+    }
+    const call = runner.heartbeat()
+    expect(releaseWrite).toEqual(expect.any(Function))
+    protocol.resetGeneration()
+    expect(runner.retirement).toBeNull()
+    releaseWrite()
+
+    await expect(call).resolves.toBeUndefined()
+    expect(written).toEqual([])
+    expect(end).not.toHaveBeenCalled()
+    expect(protocol.backoff.pending(Date.now())).toBe(false)
+  })
+
+  it('a heartbeat whose coordinator lookup outlives its membership publishes no coordinator and sends nothing', async () => {
+    const { runner, protocol, end } = setup()
+    const coordinator = { consumerGroupHeartbeat: jest.fn(async () => ({})) }
+    protocol.coordinator = null
+    let releaseLookup
+    protocol.coordinatorLookup.find = () => new Promise((resolve) => (releaseLookup = resolve))
+    const call = runner.heartbeat()
+    expect(releaseLookup).toEqual(expect.any(Function))
+    protocol.resetGeneration()
+    releaseLookup(coordinator)
+
+    await expect(call).resolves.toBeUndefined()
+    expect(protocol.coordinator).toBeNull()
+    expect(coordinator.consumerGroupHeartbeat).not.toHaveBeenCalled()
+    expect(end).not.toHaveBeenCalled()
+  })
 })
 
 describe('a consumer heartbeat flight that outlives its membership', () => {
@@ -1474,6 +1534,7 @@ describe('a consumer heartbeat flight that outlives its membership', () => {
       logger: newLogger(),
       onError: jest.fn(),
       onPollExpired: jest.fn(),
+      detachOnStop: true,
     })
     protocol.attach({ rebalanceCoordinator: null, heartbeatManager: manager })
 
@@ -1486,20 +1547,59 @@ describe('a consumer heartbeat flight that outlives its membership', () => {
     return { protocol, schedule, gate }
   }
 
-  it('the replacement round tick after the stopped timer sends one join once the old flight settles', async () => {
+  it('the replacement tick after the stopped timer sends its join while the old flight is held, and the old flight arms nothing when it settles', async () => {
     const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
     protocol.requestTick()
     await jest.advanceTimersByTimeAsync(0)
-    expect(schedule.calls).toHaveLength(1)
+    expect(schedule.calls).toHaveLength(2)
 
     gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
     await jest.advanceTimersByTimeAsync(0)
 
-    expect(schedule.calls).toHaveLength(2)
     expect(protocol.memberEpoch).toBe(0)
     expect(manager.isRunning()).toBe(true)
     await jest.advanceTimersByTimeAsync(1000)
     expect(schedule.calls).toHaveLength(2)
+  })
+
+  it('a replacement round joins before its deadline while the stopped timer still holds the old join reply', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.coordinator.consumerGroupHeartbeat = () =>
+      schedule.run({ api: 'ConsumerGroupHeartbeat' }, () => ({
+        memberEpoch: 5,
+        heartbeatIntervalMs: 60000,
+        assignment: null,
+      }))
+    const round = protocol.rebalance({}).then(
+      (result) => ({ result }),
+      (error) => ({ error })
+    )
+    try {
+      await jest.advanceTimersByTimeAsync(0)
+      expect(schedule.calls).toHaveLength(2)
+      const outcome = await round
+      expect(outcome.error).toBeUndefined()
+      expect(protocol.memberEpoch).toBe(5)
+    } finally {
+      gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+      await jest.advanceTimersByTimeAsync(0)
+    }
+    expect(protocol.memberEpoch).toBe(5)
+    expect(schedule.calls).toHaveLength(2)
+  })
+
+  it('a shut down timer sends nothing more once the replacement flight has detached the held one', async () => {
+    const { protocol, schedule, gate } = await replaceWhileJoinIsHeld()
+    protocol.requestTick()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(schedule.calls).toHaveLength(2)
+    manager.shutdown()
+    protocol.requestTick()
+    gate.release({ memberEpoch: 7, heartbeatIntervalMs: 60000, assignment: null })
+    await jest.advanceTimersByTimeAsync(60000)
+
+    expect(schedule.calls).toHaveLength(2)
+    expect(manager.isRunning()).toBe(false)
   })
 
   it('a replacement tick asked for before the stop arms nothing once the old flight settles', async () => {
