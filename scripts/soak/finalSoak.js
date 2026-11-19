@@ -62,6 +62,8 @@ const DIAGNOSTIC_RESERVE_BYTES = 2 * GIB
 /** What a command may take beyond its step's deadline, and what one without a deadline may take. */
 const COMMAND_GRACE_MS = 60000
 const DEFAULT_COMMAND_MS = 300000
+/** How long one docker command may run before it is killed. */
+const DOCKER_MS = 60000
 /** How long the final drain waits for every member to resolve the logs' ends. */
 const FINAL_DRAIN_MS = 300000
 /** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
@@ -293,6 +295,8 @@ class Supervisor {
     this.leaving = new Set()
     this.lost = new Set()
     this.aborted = null
+    this.quiesced = null
+    this.dockerMs = DOCKER_MS
   }
 
   /**
@@ -444,6 +448,7 @@ class Supervisor {
     )
     this.scheduler = new Scheduler({
       clock: this.clock,
+      graceMs: COMMAND_GRACE_MS,
       perform: (step) => this.perform(step),
       onOutcome: (o) => {
         this.collector.note(`step ${o.id} ${o.outcome}`, { step: o.id })
@@ -1009,6 +1014,22 @@ class Supervisor {
       .map((p) => p.slot)
   }
 
+  /**
+   * Refuses a quiet sample unless the run is quiet: every process confirmed the idle window, no
+   * work step is running (one reported late included) and the run was not aborted.
+   * @param {object} step the quiet step
+   * @returns {void}
+   * @throws {Error} naming what was not quiet
+   */
+  requireQuiet(step) {
+    const busy = [
+      ...(this.quiesced ? [] : ['the processes have not confirmed idle']),
+      ...[...this.scheduler.inflight].map((id) => `${id} is still running`),
+      ...(this.aborted ? [`the run is aborted`] : []),
+    ]
+    if (busy.length > 0) throw new Error(`${step.id} is not a quiet sample: ${busy.join(', ')}`)
+  }
+
   /** Performs one plan step across the processes it involves. */
   async perform(step) {
     const all = [...this.children.keys()]
@@ -1016,7 +1037,11 @@ class Supervisor {
       .filter((p) => p.role === 'subject' || p.role === 'seed')
       .map((p) => p.slot)
     if (step.type === 'periodic') return this.sampleAll([...all, SUPERVISOR], step)
-    if (step.type === 'quiet') return this.sampleAll(judged, step)
+    if (step.type === 'quiet') {
+      this.requireQuiet(step)
+      await this.sampleAll(judged, step)
+      return this.requireQuiet(step)
+    }
     if (step.type === 'seed-start' || step.type === 'seed-clear') return this.send(['p13'], step)
     if (step.type === 'disconnect') return this.teardown(step)
     if (step.shape === 'traffic') {
@@ -1027,10 +1052,13 @@ class Supervisor {
       await this.shape(step, 'start')
       try {
         await this.send(all, step)
+        this.quiesced = step.id
         await this.clock.sleepUntil(step.until, this.scheduler.controller.signal)
+        this.quiesced = null
         if (step.until < this.runEndAt && !this.scheduler.aborted)
           await this.send(all, { ...step, type: 'active' })
       } finally {
+        this.quiesced = null
         await this.shape(step, 'end')
       }
       return
@@ -1193,7 +1221,8 @@ class Supervisor {
    * participant runs the wave's `leave` phase (pause, join an extra, observe the transfer, remove
    * the extra, see the paused partitions return), the participants are sampled closed through the
    * gate, every participant resumes, and the wave ends with its operation count and its outcome
-   * note. A failed phase still resumes and ends the wave; the step then fails with the first error.
+   * note. A wave starts no earlier than its planned time. A failed phase still resumes and ends the
+   * wave; no later wave starts, and the step fails with the error. An aborted run starts no wave.
    * @param {object} step the membership execution @param {string[]} participants its processes
    * @returns {Promise<void>}
    * @throws {Error} the first failed phase of any wave
@@ -1201,6 +1230,9 @@ class Supervisor {
   async churnMembers(step, participants) {
     let first = null
     for (const [index, wave] of (this.waves.get(step.id) ?? []).entries()) {
+      if (first || this.aborted) break
+      await this.clock.sleepUntil(wave.at, this.scheduler?.controller.signal)
+      if (this.aborted) break
       await this.shape(wave, 'start')
       const base = { ...step, wave: index, execution: wave.id, waveDeadline: wave.deadline }
       let failed = null
@@ -1249,6 +1281,7 @@ class Supervisor {
     const within = (stage) => {
       if (this.clock.now() >= step.deadline)
         throw new Error(`${step.id}: ${stage} is past the execution deadline`)
+      if (this.aborted) throw new Error(`${step.id}: ${stage} not started, the run is aborted`)
     }
     const stage = async (name, work) => {
       within(name)
@@ -1326,13 +1359,17 @@ class Supervisor {
   }
 
   /**
-   * Runs a docker command.
+   * Runs a docker command, killed if it runs longer than `dockerMs`.
    * @param {string[]} args @returns {Promise<string>} its trimmed stdout
+   * @throws {Error} when it failed or was killed
    */
   docker(args) {
     return new Promise((resolve, reject) =>
-      execFile('docker', args, { env: process.env }, (e, stdout) =>
-        e ? reject(e) : resolve(stdout.trim())
+      execFile(
+        'docker',
+        args,
+        { env: process.env, timeout: this.dockerMs, killSignal: 'SIGKILL' },
+        (e, stdout) => (e ? reject(e) : resolve(stdout.trim()))
       )
     )
   }

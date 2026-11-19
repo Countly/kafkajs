@@ -845,6 +845,9 @@ class Worker {
 
 /** A producing subject: idempotent, transactional or telemetry-enabled. */
 class ProducerWorker extends Worker {
+  /** Aborted when an idle window begins, so a transaction stops retrying its commit. */
+  quiesce = new AbortController()
+
   /** @returns {Promise<void>} */
   async begin() {
     const { runtime } = this
@@ -953,7 +956,9 @@ class ProducerWorker extends Worker {
   /**
    * Ends a transaction by the client's public contract. A commit whose outcome is unknown
    * (`retriable`) is sent again until it is confirmed or the loops stop; a commit the client
-   * refuses is followed by an abort. Only an end the client confirmed is `committed` or `aborted`.
+   * refuses, or one still unconfirmed when an idle window begins, is followed by an abort, so no
+   * transaction runs on into the window. Only an end the client confirmed is `committed` or
+   * `aborted`.
    * @param {object} txn the client's transaction
    * @param {string} transaction the journal's transaction id
    * @param {'commit'|'abort'} decision
@@ -975,7 +980,10 @@ class ProducerWorker extends Worker {
           await this.runtime.failed(`${transaction}.commit`, e)
           if (!e.retriable) break
           if (this.loops?.signal.aborted) return { outcome: 'unknown', errorType, aborted: false }
-          await clock.sleepUntil(clock.now() + 1000, this.loops?.signal)
+          if (this.quiesce?.signal.aborted) break
+          const signals = [this.loops?.signal, this.quiesce?.signal].filter(Boolean)
+          await clock.sleepUntil(clock.now() + 1000, AbortSignal.any(signals))
+          if (this.quiesce?.signal.aborted) break
         }
       }
     }
@@ -989,12 +997,20 @@ class ProducerWorker extends Worker {
   }
 
   /**
-   * @returns {Promise<void>} answers an idle command once the send or transaction in flight, and
-   *   every probe send that outlived its execution deadline, has settled
+   * Ends the retries of a transaction in flight (it is aborted), then answers an idle command once
+   * the send or transaction in flight, and every probe send that outlived its execution deadline,
+   * has settled.
+   * @returns {Promise<void>}
    */
   async onIdle() {
+    this.quiesce?.abort()
     await this.current
     await Promise.all(this.lateSends ?? [])
+  }
+
+  /** @returns {Promise<void>} lets the next transaction retry its commit again */
+  async onActive() {
+    this.quiesce = new AbortController()
   }
 
   /**

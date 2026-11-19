@@ -251,6 +251,10 @@ const TEARDOWN = Object.freeze(['seed-clear', 'disconnect'])
  * it. After `abort()`, every step that has not started is reported `aborted` without being
  * performed, except the teardown steps (`seed-clear`, then `disconnect`), which then run at once so
  * the run is torn down naturally and the seed's clear is still recorded.
+ *
+ * A work step still running `graceMs` after its deadline is reported `error` at that moment, so
+ * its lane goes on and the failure aborts the run; its work cannot be cancelled, so it stays in
+ * `inflight` until it settles. A sample that must see the run quiet asks `quiescent()`.
  */
 class Scheduler {
   /**
@@ -258,14 +262,22 @@ class Scheduler {
    * @param {{ now: () => number, sleepUntil: (at: number) => Promise<void> }} options.clock
    * @param {(step: object) => Promise<void>} options.perform does the step's work
    * @param {(outcome: object) => void} [options.onOutcome] receives each settled step
+   * @param {number} [options.graceMs] how long past its deadline a work step may run
    */
-  constructor({ clock, perform, onOutcome = () => {} }) {
+  constructor({ clock, perform, onOutcome = () => {}, graceMs = Infinity }) {
     this.clock = clock
     this.perform = perform
     this.onOutcome = onOutcome
+    this.graceMs = graceMs
     this.summary = { ok: 0, late: 0, error: 0, aborted: 0 }
     this.aborted = null
     this.controller = new AbortController()
+    this.inflight = new Set()
+  }
+
+  /** @returns {boolean} whether no work step is running, including one already reported late */
+  quiescent() {
+    return this.inflight.size === 0
   }
 
   /**
@@ -307,7 +319,7 @@ class Scheduler {
     else if (startedAt >= deadline && !this.aborted) outcome = 'late'
     else {
       try {
-        await this.perform(step)
+        await this.bounded(step, deadline)
       } catch (e) {
         outcome = 'error'
         error = e.message
@@ -324,6 +336,37 @@ class Scheduler {
       endedAt: this.clock.now(),
       error,
     })
+  }
+
+  /**
+   * Performs one step, tracking a work step in `inflight` until its work settles and giving up
+   * waiting `graceMs` after its deadline.
+   * @param {object} step @param {number} deadline
+   * @returns {Promise<void>}
+   * @throws {Error} the step's own error, or that it still ran past its grace
+   */
+  async bounded(step, deadline) {
+    const running = Promise.resolve().then(() => this.perform(step))
+    if (step.lane !== 'work') return running
+    this.inflight.add(step.id)
+    running.then(
+      () => this.inflight.delete(step.id),
+      () => this.inflight.delete(step.id)
+    )
+    const limit = deadline + this.graceMs
+    if (limit === Infinity) return running
+    const timer = new AbortController()
+    try {
+      const over = Symbol('over')
+      const result = await Promise.race([
+        running,
+        this.clock.sleepUntil(limit, timer.signal).then(() => over),
+      ])
+      if (result === over)
+        throw new Error(`${step.id} still runs ${this.graceMs} ms after its deadline`)
+    } finally {
+      timer.abort()
+    }
   }
 }
 
