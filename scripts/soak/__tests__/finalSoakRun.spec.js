@@ -1406,7 +1406,9 @@ describe('final soak work admission and quiet samples', () => {
     const { s, remove } = supervisor()
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-docker-'))
     const PATH = process.env.PATH
-    const timeouts = () => process.getActiveResourcesInfo().filter((t) => t === 'Timeout').length
+    const timeouts = () =>
+      // eslint-disable-next-line n/no-unsupported-features/node-builtins -- the sampler's own resource source
+      process.getActiveResourcesInfo().filter((t) => t === 'Timeout').length
     try {
       fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nsleep 0.3\necho done\n', {
         mode: 0o755,

@@ -1512,19 +1512,20 @@ class Supervisor {
   }
 
   /**
-   * Runs a docker command, killed if it runs longer than `dockerMs`.
+   * Runs a docker command, killed if it runs longer than `dockerMs`. The bound is a harness timer,
+   * cleared when the command settles, so a resource sample taken meanwhile never counts it.
    * @param {string[]} args @returns {Promise<string>} its trimmed stdout
    * @throws {Error} when it failed or was killed
    */
   docker(args) {
-    return new Promise((resolve, reject) =>
-      execFile(
-        'docker',
-        args,
-        { env: process.env, timeout: this.dockerMs, killSignal: 'SIGKILL' },
-        (e, stdout) => (e ? reject(e) : resolve(stdout.trim()))
-      )
-    )
+    return new Promise((resolve, reject) => {
+      const child = execFile('docker', args, { env: process.env }, (e, stdout) => {
+        clearHarnessTimeout(bound)
+        if (e) reject(e)
+        else resolve(stdout.trim())
+      })
+      const bound = harnessTimeout(() => child.kill('SIGKILL'), this.dockerMs)
+    })
   }
 
   /**
