@@ -3,7 +3,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { AsyncLocalStorage } = require('node:async_hooks')
-const { spawnSync } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 const yaml = require('js-yaml')
 const SubscriptionState = require('../../../src/consumer/subscriptionState')
 const ConsumerGroup = require('../../../src/consumer/consumerGroup')
@@ -676,15 +676,31 @@ describe('final soak driver', () => {
    * exit with `FAIL_STATUS` (1 by default); the docker stub reports share.version 0 until upgraded;
    * the driver stub writes `config.json` first, as the driver's first act does, and a
    * `supervisor.json` (`SUPERVISOR_JSON`, a green receipt by default) as its last, then with `HANG`
-   * never ends by itself; `--driver-limit` prints `DRIVER_LIMIT_S`; the workload check runs the
-   * real driver command. The core checker prints `CORE_REPORT` (a smoke's NOT ACCEPTED by default)
-   * and exits with `CORE_STATUS` (1 by default), or with `CORE_REAL` set runs the real checker.
+   * never ends by itself, and with `WORKER` first starts a worker in its process group whose pid
+   * it writes to `<calls>.worker`; `--driver-limit` prints `DRIVER_LIMIT_S`; the workload check
+   * runs the real driver command. `BLOCK_ON` makes the call containing it touch `<calls>.blocked`
+   * and never end by itself. The core checker prints `CORE_REPORT` (a smoke's NOT ACCEPTED by
+   * default) and exits with `CORE_STATUS` (1 by default), or with `CORE_REAL` set runs the real
+   * checker.
    */
   const runbookHarness = () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-runbook-'))
     const bin = path.join(dir, 'bin')
     const log = path.join(dir, 'calls.log')
     const artifacts = path.join(dir, 'artifacts')
+    const started = []
+    /** @returns {number[]} the driver stub's process group, when it wrote its worker */
+    const stubs = () => {
+      try {
+        const stat = fs.readFileSync(
+          `/proc/${fs.readFileSync(`${log}.worker`, 'utf8').trim()}/stat`,
+          'utf8'
+        )
+        return [Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[2])]
+      } catch {
+        return []
+      }
+    }
     fs.mkdirSync(bin)
     const bodies = {
       docker: [
@@ -710,6 +726,7 @@ describe('final soak driver', () => {
         'limit="$DRIVER_LIMIT_S"; [ -n "$limit" ] || limit=86400',
         'case "$*" in *--driver-limit*) echo "$limit" ;;',
         '*--expose-gc*)',
+        '  if [ -n "$WORKER" ]; then /bin/sleep 300 & echo "$!" > "$CALLS.worker"; fi',
         '  prev=; for a in "$@"; do [ "$prev" = --out ] && echo "{}" > "$a/config.json" && printf "%s" "$receipt" > "$a/supervisor.json"; prev="$a"; done',
         '  [ -z "$HANG" ] || exec /bin/sleep 60 ;;',
         '*--check-workload*) [ -z "$FAIL_ON" ] || case "node $*" in *"$FAIL_ON"*) exit 1 ;; esac',
@@ -723,6 +740,9 @@ describe('final soak driver', () => {
       const script = [
         '#!/bin/sh',
         `echo "${name} $*" >> "$CALLS"`,
+        'if [ -n "$BLOCK_ON" ]; then',
+        `  case "${name} $*" in *"$BLOCK_ON"*) touch "$CALLS.blocked"; exec /bin/sleep 300 ;; esac`,
+        'fi',
         first[name] ?? '',
         'if [ -n "$FAIL_ON" ]; then',
         `  case "${name} $*" in *"$FAIL_ON"*) echo "stub failure: ${name} $*" >&2; exit "\${FAIL_STATUS:-1}" ;; esac`,
@@ -734,25 +754,43 @@ describe('final soak driver', () => {
     }
     return {
       run(args, extra = {}, runbook = RUNBOOK) {
-        for (const suffix of ['', '.env', '.upgraded', '.wait']) {
+        return spawnSync('bash', [runbook, ...args], { env: this.reset(extra), encoding: 'utf8' })
+      },
+      /**
+       * @returns {import('node:child_process').ChildProcess} the runbook, started in the background
+       *   as the leader of its own process group, ended with every stub when the harness is removed
+       */
+      start(args, extra = {}) {
+        const runbook = spawn('bash', [RUNBOOK, ...args], {
+          env: this.reset(extra),
+          stdio: 'ignore',
+          detached: true,
+        })
+        started.push(runbook.pid)
+        return runbook
+      },
+      /** Clears the previous run's files. @returns {object} the runbook's environment */
+      reset(extra) {
+        for (const suffix of ['', '.env', '.upgraded', '.wait', '.worker', '.blocked']) {
           fs.rmSync(`${log}${suffix}`, { force: true })
         }
         fs.rmSync(artifacts, { recursive: true, force: true })
-        return spawnSync('bash', [runbook, ...args], {
-          env: {
-            PATH: `${bin}:/usr/bin:/bin`,
-            CALLS: log,
-            FINAL_SOAK_ARTIFACTS: artifacts,
-            REAL_NODE: process.execPath,
-            GREEN: green,
-            CORE_REPORT:
-              'CORE VERDICT: NOT ACCEPTED (smoke runs are diagnostic and are never ACCEPTED)',
-            CORE_STATUS: '1',
-            ...extra,
-          },
-          encoding: 'utf8',
-        })
+        return {
+          PATH: `${bin}:/usr/bin:/bin`,
+          CALLS: log,
+          FINAL_SOAK_ARTIFACTS: artifacts,
+          REAL_NODE: process.execPath,
+          GREEN: green,
+          CORE_REPORT:
+            'CORE VERDICT: NOT ACCEPTED (smoke runs are diagnostic and are never ACCEPTED)',
+          CORE_STATUS: '1',
+          ...extra,
+        }
       },
+      /** @returns {boolean} whether the stubbed call named by `BLOCK_ON` is blocking now */
+      blocked: () => fs.existsSync(`${log}.blocked`),
+      /** @returns {number} the pid of the driver stub's worker */
+      worker: () => Number(fs.readFileSync(`${log}.worker`, 'utf8')),
       calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
       env: () => fs.readFileSync(`${log}.env`, 'utf8').trim().split('\n'),
       waited: () => fs.readFileSync(`${log}.wait`, 'utf8').trim().split('\n'),
@@ -767,7 +805,13 @@ describe('final soak driver', () => {
           log: fs.readFileSync(`${out}.runbook.log`, 'utf8'),
         }
       },
-      remove: () => fs.rmSync(dir, { recursive: true, force: true }),
+      remove: () => {
+        for (const pid of [...started.splice(0), ...stubs()])
+          try {
+            process.kill(-pid, 'SIGKILL')
+          } catch {}
+        fs.rmSync(dir, { recursive: true, force: true })
+      },
     }
   }
 
@@ -833,6 +877,7 @@ describe('final soak driver', () => {
         failedStage: null,
         exitStatus: 0,
         driverStatus: 0,
+        pendingStage: null,
       })
       expect(log).toContain(`artifact: ${out}.tar.gz`)
 
@@ -870,6 +915,7 @@ describe('final soak driver', () => {
         failedStage: 'workload',
         exitStatus: 1,
         driverStatus: 0,
+        pendingStage: null,
       })
       expect(log).toContain(
         'workload not green: aborted: "step h00m0 failed: h00m0w1 saw no paused partition transfer in p02, p04"'
@@ -941,6 +987,7 @@ describe('final soak driver', () => {
         failedStage: 'core',
         exitStatus: 1,
         driverStatus: 0,
+        pendingStage: null,
       })
       expect(fs.readFileSync(`${out}.core.txt`, 'utf8')).toMatch(/^CORE VERDICT: REJECTED/)
       expect(log).toContain('core checker verdict: REJECTED (exit status 1)')
@@ -1024,6 +1071,7 @@ describe('final soak driver', () => {
         failedStage: 'workload',
         exitStatus: 1,
         driverStatus: 0,
+        pendingStage: null,
       })
       const calls = harness.calls()
       const core = `node scripts/evidence/finalSoakCore.js ${out}`
@@ -1071,6 +1119,7 @@ describe('final soak driver', () => {
         failedStage: 'driver',
         exitStatus: 143,
         driverStatus: 143,
+        pendingStage: null,
       })
       expect(fs.readFileSync(`${out}.watchdog`, 'utf8')).toContain(
         'driver ran past its limit of 1 s: TERM'
@@ -1091,6 +1140,61 @@ describe('final soak driver', () => {
     }
   })
 
+  test.each([
+    ['the dump', 'finalSoakDump.js', 'dump'],
+    ['the cleanup', '--cleanup', 'cleanup'],
+    ['the archive', 'tar -czf', 'archive'],
+  ])(
+    'a driver stopped by the watchdog leaves no process of its group, its failure receipt is readable while %s blocks, and the runbook ends within the stage bound',
+    async (_, block, pendingStage) => {
+      const harness = runbookHarness()
+      /** @returns {boolean} whether the process runs (a zombie has ended) */
+      const alive = (pid) => {
+        try {
+          return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'))
+        } catch {
+          return false
+        }
+      }
+      const until = async (test) => {
+        const limit = Date.now() + 20000
+        while (!test()) {
+          if (Date.now() > limit) throw new Error('timed out')
+          await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+      }
+      try {
+        const began = Date.now()
+        const runbook = harness.start([TREE, 'smoke'], {
+          HANG: '1',
+          WORKER: '1',
+          DRIVER_LIMIT_S: '1',
+          BLOCK_ON: block,
+          FINAL_SOAK_STAGE_S: '3',
+        })
+        const ended = new Promise((resolve) => runbook.on('exit', resolve))
+        await until(harness.blocked)
+        const { out, receipt } = harness.evidence()
+        expect(receipt).toEqual({
+          artifact: path.basename(out),
+          failedStage: 'driver',
+          exitStatus: null,
+          driverStatus: 143,
+          pendingStage,
+        })
+        expect(alive(harness.worker())).toBe(false)
+        expect(await ended).toBe(143)
+        expect(Date.now() - began).toBeLessThan(30000)
+        const final = harness.evidence()
+        expect(final.receipt).toEqual({ ...receipt, exitStatus: 143, pendingStage: null })
+        expect(final.log).toContain(`stage ${pendingStage} did not end within 3 s`)
+      } finally {
+        harness.remove()
+      }
+    },
+    40000
+  )
+
   test('a failing runbook stage keeps its log, names the stage, cleans up what it started and archives', () => {
     const harness = runbookHarness()
     const failAt = (failOn, status = 1) => {
@@ -1110,6 +1214,7 @@ describe('final soak driver', () => {
         failedStage: 'prepare-reporter',
         exitStatus: 1,
         driverStatus: null,
+        pendingStage: null,
       })
       expect(reporter.log).toContain(
         `stub failure: node scripts/soak/finalSoakPreflight.js --prepare-reporter --out ${reporter.out}`
@@ -1129,6 +1234,7 @@ describe('final soak driver', () => {
         failedStage: 'preflight',
         exitStatus: 1,
         driverStatus: null,
+        pendingStage: null,
       })
       expect(preflight.calls.some((c) => c.includes('--expose-gc'))).toBe(false)
       expect(preflight.calls.some((c) => c.includes('--cleanup'))).toBe(false)
@@ -1147,6 +1253,7 @@ describe('final soak driver', () => {
         failedStage: 'driver',
         exitStatus: 3,
         driverStatus: 3,
+        pendingStage: null,
       })
       expect(driver.calls).toContain(
         `node scripts/soak/finalSoak.js --finalize --out ${driver.out} --status 3`
@@ -2158,6 +2265,35 @@ describe('final soak driver', () => {
     })
   })
 
+  test("a plan whose expected offers exceed 80% of the core checker's capacity refuses to start before it writes anything", async () => {
+    const { Supervisor, offerPlan } = require('../finalSoak')
+    expect(offerPlan(matrix, 'acceptance')).toEqual({ expected: 1470745, capacity: 2000000 })
+    expect(1470745 / 2000000).toBeLessThanOrEqual(0.8)
+    expect(offerPlan(matrix, 'smoke')).toEqual({ expected: 24515, capacity: 2000000 })
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-capacity-'))
+    const options = {
+      matrix: 'scripts/soak/finalSoakMatrix.json',
+      expectSha: TREE,
+      brokers: ['k:1'],
+      out,
+    }
+    try {
+      const day = new Supervisor({ ...options, mode: 'acceptance' })
+      day.matrix.traffic.maxOffers.value = 1600000
+      await expect(day.run()).rejects.toThrow(
+        "the plan expects 1470745 offers, more than 80% of the core checker's capacity of 1600000 (traffic.maxOffers)"
+      )
+      const smoke = new Supervisor({ ...options, mode: 'smoke' })
+      smoke.matrix.traffic.maxOffers.value = 30000
+      await expect(smoke.run()).rejects.toThrow(
+        "the plan expects 24515 offers, more than 80% of the core checker's capacity of 30000 (traffic.maxOffers)"
+      )
+      expect(fs.readdirSync(out)).toEqual([])
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
   test('a command to a process whose channel has closed resolves with an error instead of crashing the supervisor', async () => {
     const { Supervisor } = require('../finalSoak')
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-command-'))
@@ -2215,7 +2351,16 @@ describe('final soak driver', () => {
       supervisor.finishStepMs = 50
       supervisor.untilExited = async () => {}
       supervisor.runtime = { stop: async () => {}, channel: { pendingBytes: 0 } }
-      supervisor.collector = { close: async () => {}, streamBytes: 10, queuedBytes: 3, records: 2 }
+      const accounting = {
+        acceptedRecords: 2,
+        acceptedBytes: 10,
+        writtenRecords: 1,
+        writtenBytes: 7,
+        unknownBytes: 0,
+        unwrittenBytes: 3,
+        synced: true,
+      }
+      supervisor.collector = { close: async () => {}, failures: [], accounting: () => accounting }
       const child = { unref: jest.fn(), channel: { unref: jest.fn() } }
       supervisor.children.set('p07', child)
       const missing = await within(supervisor.finish({ close: () => new Promise(() => {}) }), 2000)
@@ -2231,9 +2376,8 @@ describe('final soak driver', () => {
       expect(JSON.parse(fs.readFileSync(path.join(out, 'incomplete.json'), 'utf8'))).toEqual({
         runId: 'r',
         missing,
-        records: 2,
-        streamBytes: 10,
-        unwrittenBytes: 3,
+        collectorFailures: [],
+        ...accounting,
       })
       expect(JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))).toEqual({
         runId: 'r',
@@ -2241,6 +2385,55 @@ describe('final soak driver', () => {
       fs.rmSync(path.join(out, 'incomplete.json'))
       supervisor.writeReceipts({ runId: 'r' }, [])
       expect(fs.existsSync(path.join(out, 'incomplete.json'))).toBe(false)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a collector failure with a finish that completed still writes the incomplete receipt with what was written, and the run ends with an error', async () => {
+    const { Supervisor } = require('../finalSoak')
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-collector-failure-'))
+    try {
+      const supervisor = new Supervisor({
+        mode: 'smoke',
+        matrix: 'scripts/soak/finalSoakMatrix.json',
+        expectSha: TREE,
+        brokers: ['k:1'],
+        out,
+      })
+      let calls = 0
+      const sink = {
+        write: async () => {
+          if (++calls === 1) return { bytesWritten: 5 }
+          throw new Error('disk full')
+        },
+        sync: async () => {},
+      }
+      const clock = { now: () => 0, sleepUntil: () => new Promise(() => {}) }
+      const collector = new Collector({ sink, clock, matrix })
+      const record = { kind: 'diagnostic', recordId: 'p01.0', source: 'p01', seq: 0, at: 0 }
+      const size = Buffer.byteLength(collector.line({ ...record, execution: null }))
+      expect(await collector.append({ ...record, execution: null })).toBe(false)
+      supervisor.collector = collector
+      supervisor.untilExited = async () => {}
+      supervisor.runtime = { stop: async () => {}, channel: { pendingBytes: 0 } }
+      const missing = await supervisor.finish({ close: async () => {} })
+      expect(missing).toEqual([])
+      expect(() => supervisor.writeReceipts({ runId: 'r' }, missing)).toThrow(
+        'the run ended incomplete: collector: sink write failed: disk full'
+      )
+      expect(JSON.parse(fs.readFileSync(path.join(out, 'incomplete.json'), 'utf8'))).toEqual({
+        runId: 'r',
+        missing: [],
+        collectorFailures: ['sink write failed: disk full'],
+        acceptedRecords: 1,
+        acceptedBytes: size,
+        writtenRecords: 0,
+        writtenBytes: 5,
+        unknownBytes: 0,
+        unwrittenBytes: size - 5,
+        synced: true,
+      })
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }

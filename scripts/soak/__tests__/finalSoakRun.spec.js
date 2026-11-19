@@ -4,7 +4,12 @@ const path = require('node:path')
 const { EventEmitter } = require('node:events')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const { buildConfig, Supervisor, workloadProblems } = require('../finalSoak')
-const { MonotonicClock, planSchedule, Scheduler } = require('../finalSoakScheduler')
+const {
+  MonotonicClock,
+  planSchedule,
+  Scheduler,
+  liveHarnessTimers,
+} = require('../finalSoakScheduler')
 const {
   sha256,
   ChildRuntime,
@@ -233,6 +238,31 @@ describe('final soak producer shutdown', () => {
     await worker.disconnect()
   })
 
+  test('a producer whose offers were closed at the core checker capacity makes no offer and journals why', async () => {
+    const sent = []
+    useClient({ connect: async () => {}, send: async () => sent.push(1) && [{ baseOffset: '1' }] })
+    const runtime = workerRuntime('c08', boundedClock())
+    const worker = createWorker(runtime)
+    started.push(worker)
+    await worker.begin()
+    await worker.perform({ type: 'close-offers', id: 'close-offers' })
+    const reply = await worker.onProbe({
+      id: 'p',
+      execution: 'h00t0',
+      topic: config.topics.main,
+      partitions: 1,
+      count: 2,
+    })
+    expect(reply.acknowledged).toBe(0)
+    expect(sent).toEqual([])
+    expect(runtime.records.filter((r) => r.stage === 'offered')).toEqual([])
+    expect(runtime.records.filter((r) => r.kind === 'diagnostic').map((r) => r.message)).toEqual([
+      `offer to ${config.topics.main} not made: offers are closed at the core checker's capacity`,
+      `offer to ${config.topics.main} not made: offers are closed at the core checker's capacity`,
+    ])
+    await worker.disconnect()
+  })
+
   test('a probe whose deadline passes while its offered record is journaled is never sent, is recorded rejected, and the probe stops', async () => {
     const sent = []
     useClient({
@@ -371,6 +401,62 @@ const fakeChild = () => {
 }
 
 describe('final soak supervisor commands', () => {
+  test('a direct admin call of the supervisor that never answers fails readiness and the settled ends by its bound', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      const hung = () => new Promise(() => {})
+      s.admin = { fetchTopicMetadata: hung, fetchTopicOffsets: hung }
+      const main = config.topics.main
+      await expect(within(s.ready(main, IDS.A, 1, 1000), 2000)).rejects.toThrow(
+        `${main} has no ready metadata for ${IDS.A} by the deadline`
+      )
+      await expect(within(s.settledEnds(1000, [main]), 2000)).rejects.toThrow(
+        `fetchTopicOffsets of ${main} did not answer within 30000 ms`
+      )
+    } finally {
+      remove()
+    }
+  })
+
+  test('offers stop at the core checker capacity: the supervisor journals the error, aborts and closes offers in every process once', () => {
+    const { s, remove } = supervisor()
+    try {
+      const capacity = matrix.traffic.maxOffers.value
+      expect(s.offerCapacity).toBe(capacity)
+      s.offerCapacity = 3
+      const sent = []
+      s.children = new Map([
+        ['p01', fakeChild()],
+        ['p02', fakeChild()],
+      ])
+      s.command = async (slot, step) => {
+        sent.push([slot, step.type])
+        return { reply: null, error: null }
+      }
+      const offered = { kind: 'identity', stage: 'offered' }
+      s.count(offered)
+      s.count({ kind: 'identity', stage: 'ack' })
+      s.count(offered)
+      expect(s.aborted).toBeNull()
+      expect(sent).toEqual([])
+      s.count(offered)
+      const reason =
+        "offers reached the core checker's capacity of 3 (traffic.maxOffers); no process makes another"
+      expect(s.problems).toEqual([reason])
+      expect(s.aborted).toBe(reason)
+      expect(sent).toEqual([
+        ['p01', 'close-offers'],
+        ['p02', 'close-offers'],
+      ])
+      s.count(offered)
+      expect(sent).toHaveLength(2)
+      expect(s.problems).toEqual([reason])
+    } finally {
+      remove()
+    }
+  })
+
   test('a command whose child exits after receiving it settles with an error and fails the run', async () => {
     const { s, remove } = supervisor()
     try {
@@ -1397,6 +1483,33 @@ describe('final soak work admission and quiet samples', () => {
     }
   })
 
+  test('a docker command arms its time bound as a harness timer, released once the command ends', async () => {
+    const { s, remove } = supervisor()
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-docker-'))
+    const PATH = process.env.PATH
+    const timeouts = () =>
+      // eslint-disable-next-line n/no-unsupported-features/node-builtins -- the sampler's own resource source
+      process.getActiveResourcesInfo().filter((t) => t === 'Timeout').length
+    try {
+      fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nsleep 0.3\necho done\n', {
+        mode: 0o755,
+      })
+      process.env.PATH = `${bin}:${PATH}`
+      s.dockerMs = 10000
+      const harness = liveHarnessTimers()
+      const client = timeouts() - harness
+      const running = s.docker(['compose', 'ps'])
+      expect(liveHarnessTimers()).toBe(harness + 1)
+      expect(timeouts() - liveHarnessTimers()).toBe(client)
+      await expect(running).resolves.toBe('done')
+      expect(liveHarnessTimers()).toBe(harness)
+    } finally {
+      process.env.PATH = PATH
+      fs.rmSync(bin, { recursive: true, force: true })
+      remove()
+    }
+  })
+
   test('a membership execution starts no wave after a failed one, and no wave before its planned time', async () => {
     const { s, remove } = supervisor()
     try {
@@ -1507,7 +1620,12 @@ describe('final soak retained harness state', () => {
       })
     }
     share.forgetTopic(IDS.A)
-    for (const map of [share.entered, share.activity, share.fetched, share.unconfirmed])
+    for (const map of [
+      share.entered,
+      share.activity,
+      share.unconfirmed,
+      ...share.sessions.values(),
+    ])
       expect([...map.keys()]).toEqual([`${IDS.B}|0`])
     expect(share.evidence()).toEqual({
       unconfirmedAccepts: 2,
@@ -2232,6 +2350,64 @@ describe('final soak final drain', () => {
       })
     }
   })
+
+  /** @returns {void} one answered share fetch of the member with an explicit session change and partition answer */
+  const sessionFetch = (h, session, partitions = []) =>
+    h.worker.onFetch(h.rig, {
+      node: 'h:1',
+      sentAt: h.clock.now(),
+      session: { partitions: [], forgotten: [], ...session },
+      decoded: {
+        errorCode: 0,
+        acquisitionLockTimeoutMs: 30000,
+        topics: [{ topicId: IDS.A, partitions }],
+      },
+    })
+
+  test.each([
+    ['a top-level error ends its session', (h) => h.fetch([IDS.A], { epoch: 1, errorCode: 25 })],
+    ['its session closes', (h) => h.fetch([IDS.A], { epoch: -1 })],
+    ['its session is reset without the partition', (h) => h.fetch([IDS.B], { epoch: 0 })],
+    [
+      'its session forgets the partition',
+      (h) => sessionFetch(h, { epoch: 2, forgotten: [{ topicId: IDS.A, partition: 0 }] }),
+    ],
+    [
+      'the partition fails in a later answer of the same session',
+      (h) =>
+        sessionFetch(h, { epoch: 2 }, [{ partitionIndex: 0, fetchErrorCode: 3, acquired: [] }]),
+    ],
+    [
+      'the member retires',
+      (h) =>
+        ChildRuntime.prototype.forget.call(
+          {
+            observer: { forget() {} },
+            lifetimes: new Map(),
+            revisions: new Map(),
+            worker: h.worker,
+          },
+          h.rig.id
+        ),
+    ],
+  ])(
+    'a quiet fetch witness earned and then lost when %s certifies no drain until a new qualifying fetch after recovery',
+    async (_, lose) => {
+      const h = shareDrain()
+      for (let offset = 0; offset < 10; offset++) h.take(IDS.A, offset)
+      const step = () => ({ ends: { [key]: '10' }, deadline: h.clock.now() })
+      h.clock.t = 35000
+      h.fetch([IDS.A], { epoch: 1 })
+      expect(h.worker.shortOf(IDS.A, 0, '10')).toBeNull()
+      h.clock.t = 35001
+      lose(h)
+      expect(await h.worker.onDrain(step())).toEqual({ reached: false })
+      expect(drainRecord(h.runtime).reached).toBe(false)
+      h.clock.t = 36000
+      h.fetch([IDS.A], { epoch: 0 })
+      expect(await h.worker.onDrain(step())).toEqual({ reached: true })
+    }
+  )
 
   test('a share drain of one topic incarnation is reached while deliveries of another topic never pause', async () => {
     const { ctx, clock, worker, take, fetch } = shareDrain({ lockMs: 1000 })

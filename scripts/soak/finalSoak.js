@@ -66,6 +66,8 @@ const DIAGNOSTIC_RESERVE_BYTES = 2 * GIB
 /** What a command may take beyond its step's deadline, and what one without a deadline may take. */
 const COMMAND_GRACE_MS = 60000
 const DEFAULT_COMMAND_MS = 300000
+/** How long one direct admin call of the supervisor in readiness or the settled ends may take. */
+const ADMIN_CALL_MS = 30000
 /** How long one docker command may run before it is killed. */
 const DOCKER_MS = 60000
 /** How long a child killed at the end of the teardown allowance may take to end. */
@@ -76,6 +78,10 @@ const FINAL_DRAIN_MS = 300000
 const FINISH_STEP_MS = 30000
 /** The driver's own work before its readiness barrier, beyond the planned window and the teardown. */
 const DRIVER_START_MS = 1800000
+/** Probe offers per recreation or regex probe. */
+const PROBE_OFFERS = 10
+/** The share of the core checker's offer capacity a plan may expect to use. */
+const OFFER_HEADROOM = 0.8
 /** How long the decoder may read the reporters for the telemetry clients' terminating pushes. */
 const TELEMETRY_DRAIN_MS = 15000
 /** Problems kept in the supervisor receipt; later ones are counted, not listed. */
@@ -311,6 +317,8 @@ class Supervisor {
     this.aborted = null
     this.quiesced = null
     this.dockerMs = DOCKER_MS
+    this.offerCapacity = valueOf(this.matrix.traffic.maxOffers)
+    this.offers = 0
   }
 
   /**
@@ -398,14 +406,45 @@ class Supervisor {
     return recordId
   }
 
-  /** @param {object} record tallies an ended operation under the execution it carries */
+  /**
+   * Tallies an ended operation under the execution it carries, and every offer: the offer that
+   * reaches the core checker's capacity closes offers (`closeOffers`).
+   * @param {object} record a record entering the stream
+   * @returns {void}
+   */
   count(record) {
+    if (record.kind === 'identity' && record.stage === 'offered')
+      if (++this.offers === this.offerCapacity) this.closeOffers()
     if (record.kind === 'operation' && record.phase === 'end' && record.execution)
       this.ended.set(record.execution, (this.ended.get(record.execution) ?? 0) + 1)
   }
 
-  /** @returns {Promise<void>} runs the whole lifecycle */
+  /**
+   * Stops every process making offers once their count reached the core checker's capacity
+   * (`traffic.maxOffers`): the run's problem and abort name it and every process is told to make
+   * no further offer. Offers already in flight still reach the stream, so the checker sees them.
+   * @returns {void}
+   */
+  closeOffers() {
+    const reason = `offers reached the core checker's capacity of ${this.offerCapacity} (traffic.maxOffers); no process makes another`
+    this.problem(reason)
+    this.abort(reason)
+    for (const slot of this.children.keys())
+      this.command(slot, { type: 'close-offers', id: 'close-offers' })
+  }
+
+  /**
+   * Runs the whole lifecycle. A plan expected to use more than `OFFER_HEADROOM` of the core
+   * checker's offer capacity does not start.
+   * @returns {Promise<void>}
+   * @throws {Error} when the plan's expected offers exceed the headroom, before anything is written
+   */
   async run() {
+    const { expected, capacity } = offerPlan(this.matrix, this.options.mode)
+    if (expected > capacity * OFFER_HEADROOM)
+      throw new Error(
+        `the plan expects ${expected} offers, more than ${OFFER_HEADROOM * 100}% of the core checker's capacity of ${capacity} (traffic.maxOffers)`
+      )
     fs.mkdirSync(path.join(this.out, 'raw'), { recursive: true })
     for (const file of this.matrix.acceptance.archive) {
       fs.mkdirSync(path.dirname(path.join(this.out, 'archive', file)), { recursive: true })
@@ -561,27 +600,28 @@ class Supervisor {
   }
 
   /**
-   * Writes the supervisor receipt and, when the finish left something incomplete, a separate
-   * `incomplete.json` naming what is missing with the stream's record, written and unwritten byte
-   * counts. An incomplete finish then ends the run with an error, never with a clean exit.
+   * Writes the supervisor receipt and, when the finish left something incomplete or the collection
+   * failed, a separate `incomplete.json` naming both with the stream's accounting (accepted,
+   * written, unknown and unwritten lines and bytes, and whether the sync succeeded). The run then
+   * ends with an error, never with a clean exit.
    * @param {object} run the supervisor receipt
    * @param {string[]} missing what `finish` could not complete
    * @returns {void}
-   * @throws {Error} when anything is missing
+   * @throws {Error} when anything is missing or the collection failed
    */
   writeReceipts(run, missing) {
     fs.writeFileSync(path.join(this.out, 'supervisor.json'), JSON.stringify(run) + '\n')
-    if (missing.length === 0) return
-    const { records, streamBytes, queuedBytes } = this.collector
+    const collectorFailures = [...this.collector.failures]
+    if (missing.length === 0 && collectorFailures.length === 0) return
     const incomplete = {
       runId: run.runId,
       missing,
-      records,
-      streamBytes,
-      unwrittenBytes: queuedBytes,
+      collectorFailures,
+      ...this.collector.accounting(),
     }
     fs.writeFileSync(path.join(this.out, 'incomplete.json'), JSON.stringify(incomplete) + '\n')
-    throw new Error(`the run ended incomplete: ${missing.join('; ')}`)
+    const named = [...missing, ...collectorFailures.map((f) => `collector: ${f}`)]
+    throw new Error(`the run ended incomplete: ${named.join('; ')}`)
   }
 
   /**
@@ -730,9 +770,9 @@ class Supervisor {
    */
   async ready(topic, topicId, partitions, deadline) {
     const suitable = async () => {
-      const { topics } = await this.admin
-        .fetchTopicMetadata({ topics: [topic] })
-        .catch(() => ({ topics: [] }))
+      const { topics } = await this.adminCall(`fetchTopicMetadata of ${topic}`, () =>
+        this.admin.fetchTopicMetadata({ topics: [topic] })
+      ).catch(() => ({ topics: [] }))
       const meta = topics[0]
       return (
         normalizeTopicId(meta?.topicId) === topicId &&
@@ -744,6 +784,30 @@ class Supervisor {
       if (this.clock.now() >= deadline)
         throw new Error(`${topic} has no ready metadata for ${topicId} by the deadline`)
       await this.clock.sleepUntil(Math.min(deadline, this.clock.now() + 250))
+    }
+  }
+
+  /**
+   * Awaits one direct admin call of the supervisor for `ADMIN_CALL_MS` at most, so a call the
+   * cluster never answers cannot hold readiness or the final drain; the call itself is left to
+   * settle on its own.
+   * @template T
+   * @param {string} what names the call @param {() => Promise<T>} call
+   * @returns {Promise<T>} its result
+   * @throws {Error} its failure, or that it did not answer in time
+   */
+  async adminCall(what, call) {
+    const timer = new AbortController()
+    const late = Symbol('late')
+    try {
+      const result = await Promise.race([
+        call(),
+        this.clock.sleepUntil(this.clock.now() + ADMIN_CALL_MS, timer.signal).then(() => late),
+      ])
+      if (result === late) throw new Error(`${what} did not answer within ${ADMIN_CALL_MS} ms`)
+      return result
+    } finally {
+      timer.abort()
     }
   }
 
@@ -1342,19 +1406,20 @@ class Supervisor {
    *   open transaction is a problem of the run
    * @param {string[]} [topics] the logs, by default the two standing ones
    * @returns {Promise<Record<string, string>>} `topic|partition` to log end
-   * @throws {Error} when the log ends cannot be read
+   * @throws {Error} when the log ends cannot be read, or a read does not answer within
+   *   `ADMIN_CALL_MS`
    */
   async settledEnds(deadline, topics = [this.config.topics.main, this.config.topics.transactions]) {
     for (;;) {
       const ends = {}
       let open = false
       for (const topic of topics) {
-        const committed = await this.admin.fetchTopicOffsets(topic, {
-          isolationLevel: 'read_committed',
-        })
-        const high = await this.admin.fetchTopicOffsets(topic, {
-          isolationLevel: 'read_uncommitted',
-        })
+        const offsets = (isolationLevel) =>
+          this.adminCall(`fetchTopicOffsets of ${topic}`, () =>
+            this.admin.fetchTopicOffsets(topic, { isolationLevel })
+          )
+        const committed = await offsets('read_committed')
+        const high = await offsets('read_uncommitted')
         for (const { partition, offset } of high) {
           ends[`${topic}|${partition}`] = offset
           open ||= committed.find((c) => c.partition === partition)?.offset !== offset
@@ -1447,7 +1512,7 @@ class Supervisor {
     const producer = this.processOf('producer-idempotent')
     const probe = (topic) =>
       stage('probe', async () => {
-        const count = 10
+        const count = PROBE_OFFERS
         const [{ reply }] = await this.send([producer], {
           type: 'probe',
           id: `${step.id}.probe`,
@@ -1512,19 +1577,20 @@ class Supervisor {
   }
 
   /**
-   * Runs a docker command, killed if it runs longer than `dockerMs`.
+   * Runs a docker command, killed if it runs longer than `dockerMs`. The bound is a harness timer,
+   * cleared when the command settles, so a resource sample taken meanwhile never counts it.
    * @param {string[]} args @returns {Promise<string>} its trimmed stdout
    * @throws {Error} when it failed or was killed
    */
   docker(args) {
-    return new Promise((resolve, reject) =>
-      execFile(
-        'docker',
-        args,
-        { env: process.env, timeout: this.dockerMs, killSignal: 'SIGKILL' },
-        (e, stdout) => (e ? reject(e) : resolve(stdout.trim()))
-      )
-    )
+    return new Promise((resolve, reject) => {
+      const child = execFile('docker', args, { env: process.env }, (e, stdout) => {
+        clearHarnessTimeout(bound)
+        if (e) reject(e)
+        else resolve(stdout.trim())
+      })
+      const bound = harnessTimeout(() => child.kill('SIGKILL'), this.dockerMs)
+    })
   }
 
   /**
@@ -2000,6 +2066,33 @@ function driverLimitMs(matrix, mode) {
   )
 }
 
+/**
+ * The offers a plan is expected to make, against the capacity the core checker shares with it
+ * (`traffic.maxOffers`): main and telemetry offers at their rates over the active time (the window
+ * less its idle windows), whole transactions in that time, the probes of every regex (one probe)
+ * and recreation (two) step, one recovery offer per non-transactional producer and outage, and
+ * the closing record.
+ * @param {object} matrix the reviewed matrix @param {'smoke'|'acceptance'} mode
+ * @returns {{ expected: number, capacity: number }}
+ */
+function offerPlan(matrix, mode) {
+  const { requestedMs, steps } = planSchedule(matrix, mode)
+  const t = matrix.traffic
+  const count = (shape) => steps.filter((s) => s.shape === shape).length
+  const idleMs = steps.filter((s) => s.type === 'idle').reduce((ms, s) => ms + s.until - s.at, 0)
+  const activeMs = requestedMs - idleMs
+  const plain = Object.entries(matrix.clientKinds).filter(
+    ([kind, k]) => k.role === 'producer' && kind !== 'producer-transactional'
+  ).length
+  const expected =
+    Math.ceil((activeMs / 1000) * (valueOf(t.mainRate) + valueOf(t.telemetryProducerRate))) +
+    Math.floor(activeMs / valueOf(t.transactionEveryMs)) * valueOf(t.transactionRecords) +
+    PROBE_OFFERS * (count('regex-churn') + 2 * count('topic-recreation')) +
+    plain * count('broker-outage') +
+    1
+  return { expected, capacity: valueOf(t.maxOffers) }
+}
+
 /** @param {string[]} argv @returns {Promise<void>} the command-line entry */
 async function main(argv) {
   const options = parseArgs(argv, process.env)
@@ -2026,6 +2119,7 @@ if (require.main === module) {
 module.exports = {
   parseArgs,
   driverLimitMs,
+  offerPlan,
   buildConfig,
   recipientGroups,
   digest,

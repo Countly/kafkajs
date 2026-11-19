@@ -19,19 +19,24 @@
 # verdict, or on an acceptance run that is not ACCEPTED; a smoke is never ACCEPTED, so its NOT
 # ACCEPTED passes.
 #
-# The driver runs under a watchdog: past its limit (`finalSoak.js --driver-limit`: the planned window
-# plus its start, teardown and finish allowances) or after 15 minutes without a stream byte it is
-# sent TERM, then KILL, and <artifact>.watchdog names why. A run never ends with a synthetic clean
-# exit: a supervisor that could not finish its evidence writes <artifact>/incomplete.json and exits
-# non-zero.
+# The driver runs in its own process group with its workers, under a watchdog on the host's
+# monotonic clock: past its limit (`finalSoak.js --driver-limit`: the planned window plus its start,
+# teardown and finish allowances) or after 15 minutes without a stream byte the whole group is sent
+# TERM, then KILL, and <artifact>.watchdog names why; a process of the group still running once the
+# driver ended is ended the same way. A run never ends with a synthetic clean exit: a supervisor
+# that could not finish its evidence writes <artifact>/incomplete.json and exits non-zero.
 #
 # Whatever happens after the artifact directory exists, three files sit beside it: <artifact>.runbook.log
 # (everything this script and its steps printed), <artifact>.runbook.json (the failed stage or null,
-# the exit status and the driver's status) and <artifact>.tar.gz; a failed run with a Compose cluster
-# also leaves the brokers' logs in <artifact>.compose.log. Cleanup covers only what was started (run
-# topics and groups only once the driver wrote its config), and the script exits with the first
-# failure's status. They sit beside the artifact so the header, which hashes every file inside it,
-# never binds a file that is still being written.
+# the exit status, the driver's status and the stage still running) and <artifact>.tar.gz; a failed
+# run with a Compose cluster also leaves the brokers' logs in <artifact>.compose.log. The receipt is
+# written before every stage after the driver, with the stage about to run and no exit status yet,
+# so the driver's status and a failed stage are on record even if a later stage never ends; each of
+# those stages has its own limit, past which it is sent TERM, then KILL 30 s later, and what it
+# wrote stays. Cleanup covers only what was started (run topics and groups only once the driver
+# wrote its config), and the script exits with the first failure's status. They sit beside the
+# artifact so the header, which hashes every file inside it, never binds a file that is still
+# being written.
 #
 # Environment:
 #   FINAL_SOAK_ARTIFACTS          artifact root ($HOME/final-soak by default)
@@ -40,6 +45,8 @@
 #                                 and the artifact is marked diagnostic. Never acceptance evidence.
 #   FINAL_SOAK_COMPANIONS         space-separated <name>=<file>[@<run url>] companions for finalize
 #   TELEMETRY_JAVA_CACHE          the pinned Java inputs of the reporter build
+#   FINAL_SOAK_STAGE_S            one limit in s for every stage after the driver, for a rehearsal
+#                                 (the per-stage limits below by default)
 #
 # What a green run does not prove (the core checker's seven rows are the verdict; these are outside it):
 # - The share drain proves delivery (every offset below the end had a handler entry) and quiescence
@@ -85,6 +92,8 @@ exec > >(
   trap '' INT TERM
   exec tee -a "$out.runbook.log"
 ) 2>&1
+# The runbook log, for messages of a stage whose own output goes to a file.
+exec 3>&1
 export TELEMETRY_EVIDENCE_DIR="$out/telemetry-sink"
 export COMPOSE_PROJECT_NAME=kafkajs
 export COMPOSE_FILE="docker-compose.telemetry.yml:$out/broker/compose.json"
@@ -97,21 +106,69 @@ exit_ms=
 sealed=
 dump_status=0
 after=
+ending=
+
+# Limits in s of the stages after the driver. The dump's covers its own bound of 30 min for each of
+# its Apache tool calls (two dumps and up to eight describes) and a margin.
+declare -A limits=(
+  [outer-exit]=300 [dump]=19800 [finalize]=7200 [summary]=3600 [workload]=3600 [core]=7200
+  [cleanup]=1800 [compose-logs]=600 [compose-down]=900 [archive]=7200
+)
+
+# The first failure after the preflight, in the order the run reports it: the driver, the dumps, then
+# a stage after them.
+failed_so_far() {
+  if [[ -n "$ending" ]]; then
+    ((ending != 0)) && echo "$stage"
+  elif [[ "$driver_status" != null ]] && ((driver_status != 0)); then
+    echo driver
+  elif ((dump_status != 0)); then
+    echo dump
+  else
+    echo "$after"
+  fi
+  return 0
+}
+
+# Writes the runbook receipt: <pending> is the stage about to run, or empty once the runbook ends
+# with exit status <status>. A temporary file renamed over the receipt, so a reader never sees half
+# of one.
+receipt() {
+  local pending=$1 status=${2:-null} failed
+  failed="$(failed_so_far)"
+  [[ -n "$failed" ]] && failed="\"$failed\"" || failed=null
+  [[ -n "$pending" ]] && pending="\"$pending\"" || pending=null
+  printf '{"artifact":"%s","failedStage":%s,"exitStatus":%s,"driverStatus":%s,"pendingStage":%s}\n' \
+    "$(basename "$out")" "$failed" "$status" "$driver_status" "$pending" > "$out.runbook.json.tmp" &&
+    mv -f "$out.runbook.json.tmp" "$out.runbook.json"
+}
+
+# Runs one stage after the driver under its limit: the receipt names it first; past the limit it is
+# sent TERM, then KILL 30 s later, and its status is the timeout's.
+bounded() {
+  local name=$1 limit status=0
+  shift
+  limit=${FINAL_SOAK_STAGE_S:-${limits[$name]}}
+  receipt "$name"
+  timeout -k 30s "${limit}s" "$@" || status=$?
+  if ((status == 124 || status == 137)); then echo "stage $name did not end within $limit s" >&3; fi
+  return "$status"
+}
 
 # Removes the run's topics and groups, which exist only once the driver wrote config.json, then on
 # failure keeps the brokers' logs and stops the Compose cluster.
 cleanup() {
   local status=$1
   if [[ -f "$out/config.json" ]]; then
-    node scripts/soak/finalSoak.js --cleanup --out "$out" || true
+    bounded cleanup node scripts/soak/finalSoak.js --cleanup --out "$out" || true
   else
     echo "no driver config: the driver created no run topics or groups, so none are removed"
   fi
   if ((status != 0)); then
-    docker compose logs --no-color --timestamps > "$out.compose.log" 2>&1 || true
+    bounded compose-logs docker compose logs --no-color --timestamps > "$out.compose.log" 2>&1 || true
     echo "broker logs: $out.compose.log"
   fi
-  docker compose down --volumes || true
+  bounded compose-down docker compose down --volumes || true
 }
 
 # Seals the artifact once, while the cluster and the run's topics are still up: the receipt of the
@@ -124,17 +181,17 @@ seal() {
   sealed=1
   [[ -f "$out/config.json" ]] || return 0
   local companions=() companion
-  node scripts/soak/finalSoak.js --outer-exit --out "$out" --status "$driver_status" --exit-wall-ms "$exit_ms" || after=outer-exit
-  node scripts/soak/finalSoakDump.js --out "$out" || dump_status=$?
+  bounded outer-exit node scripts/soak/finalSoak.js --outer-exit --out "$out" --status "$driver_status" --exit-wall-ms "$exit_ms" || after=outer-exit
+  bounded dump node scripts/soak/finalSoakDump.js --out "$out" || dump_status=$?
   for companion in ${FINAL_SOAK_COMPANIONS:-}; do companions+=(--companion "$companion"); done
-  node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after="${after:-finalize}"
+  bounded finalize node scripts/soak/finalSoak.js --finalize --out "$out" --status "$driver_status" "${companions[@]}" || after="${after:-finalize}"
 }
 
 # Runs the core checker on the sealed artifact, writes its report to <artifact>.core.txt beside the
 # receipt (outside the directory the header binds), prints it and sets core_status to its exit status.
 run_core() {
   core_status=0
-  node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt" || core_status=$?
+  bounded core node scripts/evidence/finalSoakCore.js "$out" > "$out.core.txt" || core_status=$?
   cat "$out.core.txt"
 }
 
@@ -147,35 +204,61 @@ diagnose_core() {
   echo "core checker report for diagnosis only (the run failed at stage workload): $out.core.txt"
 }
 
-# Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped
-# (a signal to the process group may already have ended it), cleans up what was started, archives
-# and writes the receipt.
+# Seconds on the host's monotonic clock (since boot), which wall-clock steps never move.
+uptime_s() {
+  local up
+  read -r up _ < /proc/uptime
+  echo "${up%.*}"
+}
+
+# Ends the driver's process group: TERM, then KILL once <grace> s passed with any of it left; the
+# escalation is appended to <artifact>.watchdog with <why>.
+stop_group() {
+  local why=$1 grace=$2 since
+  kill -0 -- "-$driver_group" 2> /dev/null || return 0
+  echo "$why: TERM, then KILL after $grace s" | tee -a "$out.watchdog"
+  kill -TERM -- "-$driver_group" 2> /dev/null || true
+  since=$(uptime_s)
+  until (($(uptime_s) - since >= grace)) || ! kill -0 -- "-$driver_group" 2> /dev/null; do sleep 1; done
+  if kill -KILL -- "-$driver_group" 2> /dev/null; then echo "driver processes killed" | tee -a "$out.watchdog"; fi
+}
+
+# Reaps the driver and ends what is left of its process group: its workers had their natural-exit
+# wait inside the driver, so a process still running after it is stuck.
+reap_driver() {
+  local status=0
+  wait "$driver" || status=$?
+  driver_status=$status
+  exit_ms=$((${EPOCHREALTIME/./} / 1000))
+  driver=
+  stop_group "driver processes outlived the driver" 10
+}
+
+# Runs on every exit after the artifact directory exists: stops and reaps a driver not yet reaped,
+# records the receipt, cleans up what was started, archives and writes the final receipt.
 finish() {
   local status=$?
   trap - EXIT
   set +e
+  ending=$status
   if [[ -n "$driver" ]]; then
-    kill "$driver" 2> /dev/null
-    wait "$driver"
-    driver_status=$?
-    exit_ms=$((${EPOCHREALTIME/./} / 1000))
+    stop_group "the runbook is ending" 60
+    reap_driver
   fi
   if [[ -n "$started" ]]; then
     seal
     cleanup "$status"
   fi
   if ((status != 0)) && [[ "$stage" == workload && -n "$sealed" ]]; then diagnose_core; fi
-  if ! tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
+  if ! bounded archive tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")" && ((status == 0)); then
     stage=archive
     status=1
+    ending=1
   fi
-  local failed=null
   if ((status != 0)); then
-    failed="\"$stage\""
     echo "runbook failed at stage $stage (exit status $status); log: $out.runbook.log"
   fi
-  printf '{"artifact":"%s","failedStage":%s,"exitStatus":%d,"driverStatus":%s}\n' \
-    "$(basename "$out")" "$failed" "$status" "$driver_status" > "$out.runbook.json"
+  receipt "" "$status"
   echo "artifact: $out.tar.gz (receipt $out.runbook.json)"
   exit "$status"
 }
@@ -220,42 +303,42 @@ node scripts/soak/finalSoakPreflight.js --expect-sha "$sha" --mode "$mode" --out
 stage=driver
 limit_s="$(node scripts/soak/finalSoak.js --driver-limit --mode "$mode" --out "$out")"
 [[ "$limit_s" =~ ^[0-9]+$ ]]
-nohup node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode "$mode" --expect-sha "$sha" \
+# setsid makes the driver the leader of a new process group, which its workers join.
+nohup setsid node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode "$mode" --expect-sha "$sha" \
   --matrix scripts/soak/finalSoakMatrix.json --out "$out" "${diagnostic[@]}" > "$out/driver.log" 2>&1 &
 driver=$!
+driver_group=$driver
 # Heartbeat and watchdog. Every 60 s the heartbeat file gets the time, the stream's size and how
 # long that size has not changed, so a live but stalled driver shows. A driver that runs past its
 # limit (planned window plus start and teardown allowances) or writes no stream bytes for
-# $stall_s s is sent TERM, then KILL after 60 s; <artifact>.watchdog names the escalation and the
-# run fails at stage driver with the driver's status.
+# $stall_s s has its process group sent TERM, then KILL after 60 s; <artifact>.watchdog names the
+# escalation and the run fails at stage driver with the driver's status. The limit is checked
+# before the stream is looked at.
 stall_s=900
 (
-  start=$EPOCHSECONDS
+  start=$(uptime_s)
   beat=-60
   size=-1
   moved=$start
   while kill -0 "$driver" 2> /dev/null; do
-    now=$EPOCHSECONDS
-    current=$(stat -c %s "$out/stream.ndjson" 2> /dev/null || echo 0)
-    if ((current != size)); then
-      size=$current
-      moved=$now
-    fi
-    if ((now - beat >= 60)); then
-      printf '%s stream-bytes=%s unchanged-s=%s\n' "$(date -u +%FT%TZ)" "$size" "$((now - moved))" > "$out/heartbeat"
-      beat=$now
-    fi
+    now=$(uptime_s)
     reason=
     if ((now - start >= limit_s)); then
       reason="ran past its limit of $limit_s s"
-    elif ((now - moved >= stall_s)); then
-      reason="wrote no stream bytes for $stall_s s"
+    else
+      current=$(stat -c %s "$out/stream.ndjson" 2> /dev/null || echo 0)
+      if ((current != size)); then
+        size=$current
+        moved=$now
+      fi
+      if ((now - beat >= 60)); then
+        printf '%s stream-bytes=%s unchanged-s=%s\n' "$(date -u +%FT%TZ)" "$size" "$((now - moved))" > "$out/heartbeat"
+        beat=$now
+      fi
+      if ((now - moved >= stall_s)); then reason="wrote no stream bytes for $stall_s s"; fi
     fi
     if [[ -n "$reason" ]]; then
-      echo "driver $reason: TERM, then KILL after 60 s" | tee "$out.watchdog"
-      kill -TERM "$driver" 2> /dev/null
-      until ((EPOCHSECONDS - now >= 60)) || ! kill -0 "$driver" 2> /dev/null; do sleep 1; done
-      if kill -KILL "$driver" 2> /dev/null; then echo "driver killed" | tee -a "$out.watchdog"; fi
+      stop_group "driver $reason" 60
       break
     fi
     sleep 1
@@ -263,13 +346,14 @@ stall_s=900
 ) &
 heartbeat=$!
 
-driver_status=0
-wait "$driver" || driver_status=$?
-exit_ms=$((${EPOCHREALTIME/./} / 1000))
-driver=
-wait "$heartbeat" || true
+reap_driver
+receipt seal
+# The watchdog's work ended with the driver's group; it is not waited for, since a stalled artifact
+# filesystem could hold its last look at the stream.
+kill "$heartbeat" 2> /dev/null || true
 seal
-node scripts/soak/finalSoak.js --summary --out "$out" | tee "$out.summary.json" || after="${after:-summary}"
+bounded summary node scripts/soak/finalSoak.js --summary --out "$out" > "$out.summary.json" || after="${after:-summary}"
+cat "$out.summary.json"
 if ((driver_status != 0)); then exit "$driver_status"; fi
 if ((dump_status != 0)); then
   stage=dump
@@ -282,7 +366,7 @@ fi
 # A workload that aborted or recorded a problem fails the run once its artifact is sealed; the
 # driver's own exit code, observed above, stays in the artifact as it was.
 stage=workload
-node scripts/soak/finalSoak.js --check-workload --out "$out"
+bounded workload node scripts/soak/finalSoak.js --check-workload --out "$out"
 # The core checker judges the sealed artifact. Its report goes beside the receipt, outside the
 # directory the header binds. A smoke is never ACCEPTED (its heap row needs two hourly boundaries),
 # so NOT ACCEPTED, which has no FAIL row, is the smoke's expected verdict; REJECTED, no verdict at
