@@ -218,7 +218,7 @@ describe('final soak producer shutdown', () => {
       deadline: 1000,
     })
     expect(sent).toHaveLength(3)
-    expect(reply).toEqual({ offered: 3, stopped: true })
+    expect(reply).toEqual({ offered: 3, acknowledged: 3, stopped: true })
     await worker.disconnect()
   })
 
@@ -246,7 +246,7 @@ describe('final soak producer shutdown', () => {
       }),
       2000
     )
-    expect(reply).toEqual({ offered: 1, stopped: true })
+    expect(reply).toEqual({ offered: 1, acknowledged: 0, stopped: true })
     expect(clock.now()).toBeLessThan(deadline + 1000)
     const acks = () => runtime.records.filter((r) => r.stage === 'ack')
     expect(acks()).toEqual([
@@ -691,12 +691,13 @@ describe('final soak scheduled work', () => {
       const stages = []
       s.clock = clock
       s.createTopic = async () => stages.push('create') && IDS.A
+      s.ready = async () => {}
       s.deleteTopic = async () => stages.push('delete')
       s.seal = async () => stages.push('seal')
       s.send = async (slots, step) => {
         stages.push(step.type)
         if (step.type === 'probe') clock.t += 200000
-        return [{ reply: { offered: 10 } }]
+        return [{ reply: { offered: 10, acknowledged: 10 } }]
       }
       const step = {
         id: 'h00r0',
@@ -720,6 +721,7 @@ describe('final soak scheduled work', () => {
       const stages = []
       const topic = `${s.config.topics.regex}-h00r0`
       s.createTopic = async () => stages.push('create') && IDS.A
+      s.ready = async () => {}
       s.deleteTopic = async () => stages.push('delete')
       s.seal = async () => stages.push('seal')
       s.settledEnds = async (deadline, topics) => {
@@ -745,6 +747,128 @@ describe('final soak scheduled work', () => {
     } finally {
       remove()
     }
+  })
+
+  /**
+   * A topic execution whose admin, metadata and children are scripted. `probe` is the probe reply,
+   * `replies` maps a stage type to each participant's reply, `admin` overrides admin calls (or is
+   * a function of the recreated topic's name that returns them).
+   */
+  const topicExecution = async ({
+    shape = 'topic-recreation',
+    probe,
+    replies = {},
+    admin = {},
+  }) => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      s.runtime = { ...s.runtime, topicIds: new Map() }
+      const topic = s.config.topics.recreate[0]
+      s.topicIds = [[topic, IDS.A]]
+      const stages = []
+      s.rig = { id: 'p15.1' }
+      s.readback = async () => {}
+      s.publish = async (name, id) => stages.push(`publish ${id}`)
+      s.unpublish = async () => stages.push('unpublish')
+      s.seal = async () => stages.push('seal')
+      s.settledEnds = async () => ({})
+      s.admin = {
+        createTopics: async () => true,
+        deleteTopics: async () => {},
+        listTopics: async () => [],
+        fetchTopicMetadata: async () => ({
+          topics: [
+            {
+              topicId: IDS.B,
+              partitions: [0, 1].map((partitionId) => ({ partitionId, leader: 1, isr: [1, 2] })),
+            },
+          ],
+        }),
+        ...(typeof admin === 'function' ? admin(topic) : admin),
+      }
+      s.send = async (slots, step) => {
+        stages.push(step.type)
+        if (step.type === 'probe') return [{ reply: probe ?? { offered: 10, acknowledged: 10 } }]
+        return slots.map((_, i) => ({ reply: replies[step.type]?.[i] ?? {} }))
+      }
+      const step = { id: 'h00x0', type: 'execution', shape, topic: 0, deadline: 120000 }
+      const error = await s.churnTopic(step, ['p01', 'p02']).then(
+        () => null,
+        (e) => e.message
+      )
+      return { error: error?.replace(s.config.runId, RUN) ?? null, stages }
+    } finally {
+      remove()
+    }
+  }
+
+  test('a recreation creates the new incarnation, waits until every recipient is assigned it, then probes it', async () => {
+    const { error, stages } = await topicExecution({})
+    expect(error).toBeNull()
+    expect(stages).toEqual([
+      'probe',
+      'drain',
+      'seal',
+      'execution',
+      `publish ${IDS.B}`,
+      'recreated',
+      'probe',
+    ])
+  })
+
+  test('a recreation whose creation gives back the old topic id fails before anything is offered to it', async () => {
+    const same = {
+      fetchTopicMetadata: async () => ({ topics: [{ topicId: IDS.A, partitions: [] }] }),
+    }
+    const { error, stages } = await topicExecution({ admin: same })
+    expect(error).toBe(`creating ${config.topics.recreate[0]} gave its old topic id (error code 0)`)
+    expect(stages.filter((st) => st === 'probe')).toHaveLength(1)
+  })
+
+  test('a deletion the broker refuses or never confirms fails the execution before the name is created again', async () => {
+    const refused = await topicExecution({
+      admin: {
+        deleteTopics: async () => Promise.reject(Object.assign(new Error('no'), { code: 41 })),
+      },
+    })
+    expect(refused.error).toBe(`deleting ${config.topics.recreate[0]} failed (error code 41)`)
+    expect(refused.stages).not.toContain(`publish ${IDS.B}`)
+    const listed = await topicExecution({
+      admin: (topic) => ({ listTopics: async () => [topic] }),
+    })
+    expect(listed.error).toBe(`deleting ${config.topics.recreate[0]} left it listed (error code 0)`)
+  })
+
+  test.each([
+    ['ten unacknowledged offers', { offered: 10, acknowledged: 0, stopped: false }, '0 of 10'],
+    ['one fast failed send', { offered: 10, acknowledged: 9, stopped: false }, '9 of 10'],
+  ])('a probe with %s fails its execution', async (_, probe, count) => {
+    const { error, stages } = await topicExecution({ probe })
+    expect(error).toBe(
+      `h00x0: ${count} probe offers to ${config.topics.recreate[0]} were acknowledged`
+    )
+    expect(stages).toEqual(['probe'])
+  })
+
+  test('a recipient that is not assigned the new incarnation fails the recreation before the probe', async () => {
+    const { error, stages } = await topicExecution({
+      replies: { recreated: [{ assigned: true }, { assigned: false }] },
+    })
+    expect(error).toBe('h00x0: recreated failed in p02')
+    expect(stages.at(-1)).toBe('recreated')
+  })
+
+  test('a regex execution whose recipient never accepts the new topic fails before the probe, and a deleted name is forgotten', async () => {
+    const refused = await topicExecution({
+      shape: 'regex-churn',
+      replies: { execution: [{ accepted: false }, { accepted: true }] },
+    })
+    expect(refused.error).toBe('h00x0: accept failed in p01')
+    expect(refused.stages).not.toContain('probe')
+    const done = await topicExecution({ shape: 'regex-churn' })
+    expect(done.error).toBeNull()
+    expect(done.stages.slice(-2)).toEqual(['retired', 'unpublish'])
   })
 
   test('a membership wave works to its scheduled deadline, not to a deadline counted from a late start', async () => {
