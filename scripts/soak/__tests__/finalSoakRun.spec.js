@@ -1229,6 +1229,59 @@ describe('final soak work admission and quiet samples', () => {
     expect(scheduler.quiescent()).toBe(true)
   })
 
+  test('a work step due while a quiet sample runs starts only once the sample settled', async () => {
+    const clock = jumpClock(0)
+    const order = []
+    let release = null
+    const scheduler = new Scheduler({
+      clock,
+      perform: async (step) => {
+        order.push(`${step.id} start`)
+        if (step.type === 'quiet') await new Promise((resolve) => (release = resolve))
+        order.push(`${step.id} end`)
+      },
+    })
+    const running = scheduler.run([
+      { id: 'h00q2', lane: 'timer', type: 'quiet', at: 0, deadline: 100 },
+      { id: 'disconnect', lane: 'work', type: 'disconnect', at: 10 },
+    ])
+    await tick()
+    await tick()
+    expect(order).toEqual(['h00q2 start'])
+    release()
+    await running
+    expect(order).toEqual(['h00q2 start', 'h00q2 end', 'disconnect start', 'disconnect end'])
+  })
+
+  test('an idle window ends only after the quiet sample running in it settled', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      s.runEndAt = 1000
+      let settle = null
+      const quiet = new Promise((resolve) => (settle = resolve))
+      s.scheduler = new Scheduler({ clock: s.clock, perform: async () => {} })
+      s.scheduler.quieting.add(quiet)
+      quiet.then(() => s.scheduler.quieting.delete(quiet))
+      const sent = []
+      s.send = async (slots, step) => sent.push([step.type, s.quiesced])
+      s.shape = async () => null
+      const idle = s.perform({ id: 'h00i', type: 'idle', shape: 'idle', until: 500 })
+      await tick()
+      await tick()
+      expect(s.quiesced).toBe('h00i')
+      settle()
+      await idle
+      expect(sent).toEqual([
+        ['idle', null],
+        ['active', null],
+      ])
+      expect(s.quiesced).toBeNull()
+    } finally {
+      remove()
+    }
+  })
+
   /** A supervisor whose sampling is scripted; returns what each quiet step did. */
   const quiet = async ({ quiesced = 'h00i', inflight = [], aborted = null, during = () => {} }) => {
     const { s, remove } = supervisor()
