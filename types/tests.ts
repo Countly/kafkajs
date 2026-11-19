@@ -2029,3 +2029,13 @@ telemetryShare.registerMetricForSubscription({ name: 'com.example.share', type: 
 // @ts-expect-error the ID getter does not accept signal strings
 telemetryShare.clientInstanceId('SIGTERM')
 void [telemetryShareSurface, telemetryShareId, telemetryShareDisconnect]
+
+import { KafkaJSRebalanceNotConvergedError as NotConverged } from './index'
+{
+  const notConverged = new NotConverged('cooperative rebalance did not converge in 20 rounds')
+  const asBase: KafkaJSError = notConverged
+  const retriable: boolean = notConverged.retriable
+  void asBase
+  void retriable
+  new NotConverged('x', { cause: new Error('y') })
+}
