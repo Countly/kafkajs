@@ -1,17 +1,46 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
 const Broker = require('../../broker')
+const Cluster = require('../../cluster')
 const RequestQueue = require('../../network/requestQueue')
 const ConsumerGroup = require('../consumerGroup')
 const OffsetManager = require('../offsetManager')
 const SeekOffsets = require('../seekOffsets')
 const { KafkaJSNonRetriableError } = require('../../errors')
-const { TOPIC, CloseRig, batchAt, gate, pause } = require('./fixtures/closeRig')
+const { TOPIC, CloseRig, batchAt, gate } = require('./fixtures/closeRig')
 
 const PARTITIONS = [0, 1]
 const LAST = 7
+const LEADER_EPOCH = 5
 const SETTLE_MS = 3
 const QUIET_MS = 2000
 const OPEN_MS = 10000
+const TICK_MS = 5
+
+/**
+ * Advances fake time, running whatever falls due and the I/O turns it schedules.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+const advance = (ms) => jest.advanceTimersByTimeAsync(ms)
+
+/**
+ * Advances fake time until a promise settles.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} [budget=OPEN_MS] fake milliseconds it may take
+ * @returns {Promise<T>} its outcome
+ * @throws {Error} its rejection, or when it is still pending after the budget
+ */
+const drive = async (promise, budget = OPEN_MS) => {
+  const state = { done: false }
+  const settled = promise.finally(() => {
+    state.done = true
+  })
+  settled.catch(() => {})
+  for (let spent = 0; !state.done && spent < budget; spent += TICK_MS) await advance(TICK_MS)
+  if (!state.done) throw new Error(`still pending after ${budget} fake ms`)
+  return settled
+}
 
 /**
  * A seeded linear congruential generator, so a schedule is rebuilt from its seed alone.
@@ -47,12 +76,47 @@ const STEP_KINDS = [
   [1, () => ['rebuild']],
   [1, () => ['recreate']],
   [2, (r) => ['listenerSeek', r.pick(['START', 'COMMIT']), r.pick(PARTITIONS), r.int(LAST + 1)]],
-  [6, (r) => ['reply', r.pick(['held', 'held', 'rejected', 'lost'])]],
+  [6, (r) => ['reply', r.pick(['held', 'held', 'rejected', 'lost', 'lostUnapplied'])]],
   [3, () => ['releaseReplies']],
   [2, () => ['holdWrite']],
   [2, () => ['releaseWrite']],
   [1, (r) => ['outOfRange', r.pick(PARTITIONS)]],
   [1, () => ['releaseFetch']],
+  [1, (r) => ['epoch', r.pick(PARTITIONS)]],
+  [1, (r) => ['releaseValidation', r.int(LAST + 1)]],
+]
+
+/**
+ * Schedules that reach the orderings a named regression pins, so a seed can find them without the
+ * named test: a default commit whose answer is held while one of its cells is sought, and an
+ * accepted seek whose applying call is refused by an assignment change before its answer.
+ * Random steps are inserted into a skeleton.
+ */
+const SKELETONS = [
+  [
+    ['resolve', 0],
+    ['resolve', 1],
+    ['reply', 'held'],
+    ['defaultCommit'],
+    ['seek', 0, 3],
+    ['releaseReplies'],
+  ],
+  [
+    ['resolve', 0],
+    ['seek', 0, 1],
+    ['reply', 'held'],
+    ['position', 0],
+    ['retain'],
+    ['releaseReplies'],
+  ],
+  [
+    ['resolve', 1],
+    ['seek', 1, 0],
+    ['reply', 'held'],
+    ['position', 1],
+    ['rebuild'],
+    ['releaseReplies'],
+  ],
 ]
 const TOTAL_WEIGHT = STEP_KINDS.reduce((sum, [weight]) => sum + weight, 0)
 
@@ -62,18 +126,17 @@ const TOTAL_WEIGHT = STEP_KINDS.reduce((sum, [weight]) => sum + weight, 0)
  */
 const generate = (seed) => {
   const r = lcg(seed)
-  const steps = []
-  const length = 6 + r.int(8)
-  for (let i = 0; i < length; i++) {
+  const random = () => {
     let roll = r.int(TOTAL_WEIGHT)
     for (const [weight, make] of STEP_KINDS) {
-      if (roll < weight) {
-        steps.push(make(r))
-        break
-      }
+      if (roll < weight) return make(r)
       roll -= weight
     }
   }
+  const skeleton = r.int(3) === 0 ? r.pick(SKELETONS) : null
+  const steps = skeleton ? skeleton.map((step) => [...step]) : []
+  const added = skeleton ? r.int(5) : 6 + r.int(8)
+  for (let i = 0; i < added; i++) steps.splice(r.int(steps.length + 1), 0, random())
   return { seed, autoCommit: r.int(2) === 0, steps }
 }
 
@@ -100,10 +163,12 @@ const signature = (topics) =>
 const asPosition = (value) => (value === '-2' ? '0' : value)
 
 /**
- * One run of one schedule against a real consumer on a scripted two-partition topic. Everything
- * the invariants read is an observed event with its order: seek admissions, deliveries and their
- * resolutions, commit selections, every OffsetCommit that reached the broker with the operation
- * that sent it and its fate, the end of each seek application, assignment changes and resets.
+ * One run of one schedule against a real consumer on a scripted two-partition topic, on fake time
+ * so a seed always gives the same interleaving. Everything the invariants read is an observed
+ * event with its order: steps (seek admissions, resolutions, assignment changes, recreations),
+ * deliveries, commit selections, every OffsetCommit, OffsetFetch, out-of-range answer and
+ * validation answer the broker saw with the operation that sent it and its fate, the start and
+ * end of each seek application and when a fetch was built.
  */
 class ScheduleRun {
   /**
@@ -125,6 +190,9 @@ class ScheduleRun {
     this.holdWrites = false
     this.heldFetches = []
     this.outOfRange = new Set()
+    this.epochs = { 0: 0, 1: 0 }
+    this.armedValidations = new Set()
+    this.heldValidations = []
     this.listenerSeeks = []
     this.draining = false
     this.candidates = []
@@ -186,11 +254,9 @@ class ScheduleRun {
       eachMessage: undefined,
       eachBatch: (payload) => this.handle(payload),
     }
-    const { consumer } = await this.rig.started({
-      consumer: { maxWaitTimeInMs: 5 },
-      run,
-      delivered: 0,
-    })
+    const { consumer } = await drive(
+      this.rig.started({ consumer: { maxWaitTimeInMs: 5 }, run, delivered: 0 })
+    )
     this.consumer = consumer
     for (const [name, event] of [
       ['START', consumer.events.START_BATCH_PROCESS],
@@ -205,10 +271,9 @@ class ScheduleRun {
         consumer.seek({ topic: TOPIC, partition, offset: String(offset) })
       })
     }
-    const deadline = Date.now() + OPEN_MS
-    while (!this.group || !this.current[0] || !this.current[1]) {
-      if (Date.now() > deadline) throw new Error('the first deliveries did not arrive')
-      await pause(2)
+    for (let spent = 0; !this.group || !this.current[0] || !this.current[1]; spent += TICK_MS) {
+      if (spent > OPEN_MS) throw new Error('the first deliveries did not arrive')
+      await advance(TICK_MS)
     }
   }
 
@@ -218,8 +283,19 @@ class ScheduleRun {
     const { ops } = this
     this.restores.push(
       around(ConsumerGroup.prototype, 'applyRebalanceResult', function (original, args) {
-        if (run.group !== this) run.adopt(this)
+        run.group ??= this
         return original.apply(this, args)
+      }),
+      around(ConsumerGroup.prototype, 'buildFetchRequests', function (original, args) {
+        const requests = original.apply(this, args)
+        for (const { partitions } of requests) {
+          for (const { partition } of partitions) run.record({ type: 'build', partition })
+        }
+        return requests
+      }),
+      around(Cluster.prototype, 'leaderEpoch', function (original, args) {
+        const epoch = original.apply(this, args)
+        return epoch == null ? epoch : epoch + (run.epochs[args[1]] ?? 0)
       }),
       around(ConsumerGroup.prototype, 'seek', function (original, args) {
         const [{ partition, offset }] = args
@@ -261,6 +337,7 @@ class ScheduleRun {
         const commit = {
           kind: offsets.topics ? 'explicit' : 'default',
           delivery: outer?.delivery ?? null,
+          op: outer?.outside ?? outer?.op ?? null,
           selection: null,
           selectedAt: null,
         }
@@ -310,65 +387,67 @@ class ScheduleRun {
     this.rig.cluster.answer('OffsetCommit', (fields, record) =>
       this.commitArrived(fields, record, answer)
     )
+    const offsetFetch = this.rig.cluster.answerers.get('OffsetFetch')
+    this.rig.cluster.answer('OffsetFetch', (fields, record) => {
+      this.record({ type: 'offsetFetch' })
+      return offsetFetch(fields, record)
+    })
+    this.rig.cluster.answer('OffsetForLeaderEpoch', (fields) => this.validationArrived(fields))
     const fetch = this.rig.cluster.answerers.get('Fetch')
     this.rig.cluster.answer('Fetch', async (fields, record) => {
       const asked = fields.topics[0].partitions.map(({ partition }) => partition)
-      for (const { partition, fetchOffset } of fields.topics[0].partitions) {
-        this.record({ type: 'fetch', partition, offset: String(fetchOffset) })
-      }
       const hit = asked.find((p) => this.outOfRange.has(p))
       if (hit === undefined) return fetch(fields, record)
       this.outOfRange.delete(hit)
-      this.record({ type: 'fetchOutOfRange', partition: hit })
+      const fetched = this.record({
+        type: 'fetchOutOfRange',
+        partition: hit,
+        built: this.latest('build', hit),
+      })
       const opened = gate()
       this.heldFetches.push(opened)
       await opened.promise
+      // Released by the drain, the answer is an empty one: only a step answers out of range.
+      const errorCode = this.draining ? 0 : 1
+      if (errorCode) this.record({ type: 'outOfRangeAnswered', partition: hit, fetched })
       return {
-        partitions: asked.map((partition) =>
-          partition === hit
-            ? { partition, errorCode: 1, records: false, abortedTransactions: [] }
-            : { partition, errorCode: 0, records: false, abortedTransactions: [] }
-        ),
+        partitions: asked.map((partition) => ({
+          partition,
+          errorCode: partition === hit ? errorCode : 0,
+          records: false,
+          abortedTransactions: [],
+        })),
       }
     })
   }
 
   /**
-   * Takes the consumer group and watches its acquisitions, so every revoke, rebuild and
-   * reacquisition is an event at the moment it happens.
-   * @param {ConsumerGroup} group
+   * The broker side of position validation: a partition whose leader epoch a step moved is held
+   * until `releaseValidation` answers its end offset; any other is answered with no truncation.
    */
-  adopt(group) {
-    if (this.group) this.record({ type: 'newGroup' })
-    this.group = group
-    const run = this
-    const record = (key, kind) => {
-      const partition = Number(key.split('|').pop())
-      run.record({ type: 'retire', partition, kind })
+  async validationArrived({ topics }) {
+    const asked = topics[0].partitions.map(({ partition }) => partition)
+    const held = asked.filter((p) => this.armedValidations.delete(p))
+    const entry = { endOffset: null, opened: gate() }
+    if (held.length > 0) {
+      for (const partition of held) this.record({ type: 'validationAsked', partition, entry })
+      this.heldValidations.push(entry)
+      await entry.opened.promise
     }
-    class Watched extends Map {
-      set(key, value) {
-        if (super.has(key) && super.get(key) !== value) record(key, 'replace')
-        return super.set(key, value)
-      }
-
-      delete(key) {
-        if (super.has(key)) record(key, 'revoke')
-        return super.delete(key)
-      }
-
-      clear() {
-        for (const key of super.keys()) record(key, 'rebuild')
-        super.clear()
-      }
+    return {
+      partitions: asked.map((partition) => ({
+        partition,
+        errorCode: 0,
+        leaderEpoch: LEADER_EPOCH + this.epochs[partition],
+        endOffset: held.includes(partition) ? String(entry.endOffset) : String(LAST + 1),
+      })),
     }
-    group.acquired = new Watched(group.acquired)
   }
 
   /**
    * The broker side of every OffsetCommit: the frame is matched to the operation that sent it, and
    * answered as the schedule says: at once, held after it was applied, rejected without applying,
-   * or applied and lost with its connection.
+   * applied and lost with its connection, or lost with its connection before it was applied.
    */
   async commitArrived(fields, record, answer) {
     const sig = signature(fields.topics)
@@ -395,6 +474,7 @@ class ScheduleRun {
         })),
       }
     }
+    if (outcome === 'lostUnapplied') throw new Error('connection lost before the broker applied it')
     for (const { partition, offset } of cells) this.broker[partition] = offset
     arrival.broker = { ...this.broker }
     if (outcome === 'lost') throw new Error('connection lost after the write')
@@ -403,6 +483,7 @@ class ScheduleRun {
       const opened = gate()
       this.heldReplies.push(opened)
       await opened.promise
+      arrival.answeredAt = this.tick()
     }
     return result
   }
@@ -450,8 +531,11 @@ class ScheduleRun {
     const { group, consumer } = this
     if (['retain', 'revoke', 'rebuild', 'recreate'].includes(kind))
       this.record({ type: 'reassign' })
-    const commitIn = (delivery, offsets) =>
-      this.ops.run({ delivery }, () => delivery.payload.commitOffsetsIfNecessary(offsets))
+    if (kind === 'revoke') this.record({ type: 'retire', partition: a, kind })
+    if (kind === 'rebuild')
+      for (const p of PARTITIONS) this.record({ type: 'retire', partition: p, kind })
+    const commitIn = (delivery, op, offsets) =>
+      this.ops.run({ delivery, op }, () => delivery.payload.commitOffsetsIfNecessary(offsets))
     switch (kind) {
       case 'seek':
         consumer.seek({ topic: TOPIC, partition: a, offset: String(b) })
@@ -471,6 +555,7 @@ class ScheduleRun {
       case 'handlerExplicit': {
         const delivery = this.take(a)
         if (!delivery) break
+        const op = { kind, delivery }
         const work = async () => {
           if (kind !== 'handlerExplicit') {
             delivery.payload.resolveOffset(delivery.last)
@@ -481,16 +566,16 @@ class ScheduleRun {
               value: String(Number(delivery.last) + 1),
             })
           }
-          if (kind === 'handlerCommit') await commitIn(delivery)
+          if (kind === 'handlerCommit') await commitIn(delivery, op)
           if (kind === 'handlerExplicit') {
             const offset = String(Number(delivery.last) + 1)
-            await commitIn(delivery, {
+            await commitIn(delivery, op, {
               topics: [{ topic: TOPIC, partitions: [{ partition: a, offset }] }],
             })
           }
         }
         const working = work()
-        this.track(working, { kind, delivery })
+        this.track(working, op)
         working.finally(() => delivery.done.resolve()).catch(() => {})
         break
       }
@@ -557,6 +642,17 @@ class ScheduleRun {
       case 'releaseFetch':
         for (const held of this.heldFetches.splice(0)) held.resolve()
         break
+      case 'epoch':
+        this.epochs[a]++
+        this.armedValidations.add(a)
+        break
+      case 'releaseValidation':
+        for (const entry of this.heldValidations.splice(0)) {
+          entry.endOffset = a
+          this.record({ type: 'validationAnswered', entry, endOffset: String(a) })
+          entry.opened.resolve()
+        }
+        break
       default:
         throw new Error(`unknown step ${kind}`)
     }
@@ -569,19 +665,23 @@ class ScheduleRun {
     this.replies.length = 0
     this.listenerSeeks.length = 0
     this.outOfRange.clear()
-    const deadline = Date.now() + QUIET_MS
-    for (;;) {
+    this.armedValidations.clear()
+    for (let spent = 0; ; spent += TICK_MS) {
       for (const held of [
         ...this.heldWrites.splice(0),
         ...this.heldReplies.splice(0),
         ...this.heldFetches.splice(0),
       ])
         held.resolve()
+      for (const entry of this.heldValidations.splice(0)) {
+        entry.endOffset = LAST + 1
+        entry.opened.resolve()
+      }
       for (const p of PARTITIONS) this.take(p)?.done.resolve()
       const settled = this.pending.every((op) => op.settled) && this.attempts.size === 0
       // An owed seek is applied by the fetch loop on its own; a stranded one is left to checkGates.
       if (settled && this.group.unappliedSeeks.size === 0) break
-      if (Date.now() > deadline) {
+      if (spent > QUIET_MS) {
         if (!settled) {
           this.violate('I6', 'work still in flight after every hold was released', {
             pending: this.pending.filter((op) => !op.settled).map((op) => op.kind),
@@ -590,9 +690,9 @@ class ScheduleRun {
         }
         break
       }
-      await pause(5)
+      await advance(TICK_MS)
     }
-    await pause(20)
+    await advance(20)
   }
 
   /** @param {string} check @param {string} message @param {object} [detail] */
@@ -605,7 +705,7 @@ class ScheduleRun {
     await this.open()
     for (const step of this.schedule.steps) {
       await this.apply(step)
-      await pause(SETTLE_MS)
+      await advance(SETTLE_MS)
     }
     await this.drain()
     new Model(this).check()
@@ -616,9 +716,10 @@ class ScheduleRun {
     this.draining = true
     for (const held of [...this.heldWrites, ...this.heldReplies, ...this.heldFetches])
       held.resolve()
+    for (const entry of this.heldValidations) entry.opened.resolve()
     for (const p of PARTITIONS) this.take(p)?.done.resolve()
     try {
-      await this.rig?.dispose()
+      if (this.rig) await drive(this.rig.dispose())
     } finally {
       for (const restore of this.restores.reverse()) restore()
     }
@@ -627,7 +728,10 @@ class ScheduleRun {
 
 /**
  * The reference model of one partition: what may be committed, what may be delivered, where the
- * position must be, and whether a seek is still owed, computed from the observed events alone.
+ * position must be, and whether a seek is still owed. It is computed from the steps and the
+ * broker's side alone; the client's own state (its acquisitions, positions, cache or fetch
+ * offsets) never decides what is right. The client's timing (when an application starts and
+ * ends, when a fetch is built) only orders the events.
  */
 class Model {
   /** @param {ScheduleRun} run */
@@ -649,13 +753,40 @@ class Model {
   }
 
   /**
-   * The state of one partition at a time: its resolved progress, the latest seek admission and
-   * whether it is still owed, and the broker's offset.
+   * Whether anything that makes an answer to an earlier request stale reached the partition
+   * between two times: a seek admission, the end of its acquisition or a recreation.
+   * @param {number} partition
+   * @param {number} from
+   * @param {number} to
+   * @returns {boolean}
+   */
+  changedBetween(partition, from, to) {
+    return this.events.some(
+      (e) =>
+        e.t > from &&
+        e.t < to &&
+        (e.type === 'recreate' ||
+          ((e.type === 'admit' || e.type === 'retire') && e.partition === partition))
+    )
+  }
+
+  /**
+   * The state of one partition at a time, derived from the steps and the broker's side alone: its
+   * resolved progress, the latest seek admission and whether it is still owed, the broker's
+   * committed offset, and whether a reset put the position at the log start.
    * @param {number} partition
    * @param {number} [until=Infinity]
    */
   stateAt(partition, until = Infinity) {
-    const state = { resolved: null, admission: null, owed: false, applying: false, broker: '2' }
+    const state = {
+      resolved: null,
+      admission: null,
+      owed: false,
+      applying: false,
+      broker: '2',
+      reset: false,
+      truncation: null,
+    }
     for (const e of this.events) {
       if (e.t >= until) break
       if (e.type === 'admit' && e.partition === partition) {
@@ -664,23 +795,57 @@ class Model {
         state.owed = true
         state.applying = false
       } else if (e.type === 'recreate') {
+        // The scripted topic keeps its committed offsets, so the new incarnation resumes there.
         state.resolved = null
         state.owed = false
+        state.reset = false
       } else if (e.type === 'retire' && e.partition === partition) {
         // A rebuild keeps a seek still queued for the next acquisition; a revoke drops it, and
-        // neither keeps one being applied.
+        // neither keeps one being applied. Either reads the position again from the broker, after
+        // the release commit (with autoCommit) wrote the progress.
         state.resolved = null
         if (state.applying || e.kind === 'revoke') state.owed = false
       } else if (e.type === 'attempt' && e.admission === state.admission) {
         state.applying = true
-      } else if (e.type === 'fetch' && e.partition === partition) {
-        if (state.resolved === null && !state.owed) state.resolved = e.offset
+      } else if (e.type === 'offsetFetch') {
+        // With no progress the position is read when the broker answers an offset fetch: the
+        // committed offset (or the reset). A later commit does not move it.
+        if (state.resolved === null && !state.owed) {
+          state.resolved = this.position(state)
+          state.reset = false
+          state.truncation = null
+        }
       } else if (e.type === 'resolve' && e.partition === partition) {
         if (this.authorized(e.delivery, e.t)) state.resolved = e.value
       } else if (e.type === 'arrival') {
         const cell = e.cells.find((c) => c.partition === partition)
-        if (cell && e.outcome !== 'rejected') state.broker = cell.offset
+        if (cell && e.outcome !== 'rejected' && e.outcome !== 'lostUnapplied') {
+          state.broker = cell.offset
+          state.reset = false
+          if (state.truncation === cell.offset) state.truncation = null
+        }
         if (cell && e.reset?.partition === partition) state.resolved = null
+      } else if (
+        e.type === 'outOfRangeAnswered' &&
+        e.partition === partition &&
+        !this.changedBetween(partition, e.fetched.built?.t ?? e.fetched.t, e.t)
+      ) {
+        state.resolved = null
+        state.reset = true
+      } else if (e.type === 'validationAnswered') {
+        const asked = this.events.find(
+          (a) => a.type === 'validationAsked' && a.entry === e.entry && a.partition === partition
+        )
+        if (
+          asked &&
+          !state.owed &&
+          !this.changedBetween(partition, asked.t, e.t) &&
+          Number(this.position(state)) > Number(e.endOffset)
+        ) {
+          state.resolved = this.autoCommit ? null : e.endOffset
+          state.truncation = this.autoCommit ? e.endOffset : null
+          state.reset = false
+        }
       } else if (
         e.type === 'attemptEnd' &&
         e.attempt.partition === partition &&
@@ -691,6 +856,7 @@ class Model {
         const fate = this.fate(e)
         if (fate === 'applied') {
           state.owed = false
+          state.reset = false
           state.resolved = this.autoCommit ? null : String(e.attempt.admission.target)
         } else if (fate !== 'retry') state.owed = false
       }
@@ -715,7 +881,7 @@ class Model {
   /** @param {object} state @returns {string} the position the state stands for */
   position(state) {
     if (state.owed) return String(state.admission.target)
-    return state.resolved ?? asPosition(state.broker)
+    return state.resolved ?? state.truncation ?? (state.reset ? '0' : asPosition(state.broker))
   }
 
   check() {
@@ -773,17 +939,9 @@ class Model {
           })
         }
       }
-      if (arrival.reset) {
+      if (arrival.reset?.fetched) {
         const { partition, fetched } = arrival.reset
-        const stale = this.events.some(
-          (e) =>
-            (e.type === 'admit' || e.type === 'retire') &&
-            e.partition === partition &&
-            fetched &&
-            e.t > fetched.t &&
-            e.t < arrival.t
-        )
-        if (stale) {
+        if (this.changedBetween(partition, fetched.built?.t ?? fetched.t, arrival.t)) {
           this.run.violate('I5', 'an out-of-range answer older than a seek reset the partition', {
             cells: arrival.cells,
           })
@@ -863,11 +1021,12 @@ class Model {
       )
       if (since[0] !== delivery) continue
       const fenced = this.fencedSince(delivery.partition, admission.t, delivery.t)
-      const allowed = new Set([String(admission.target), asPosition(state.broker)])
-      if (!fenced && !allowed.has(delivery.first)) {
+      const expected = this.position(state)
+      if (!fenced && delivery.first !== expected) {
         this.run.violate('I3', 'the first delivery after a seek did not start at its position', {
           partition: delivery.partition,
           first: delivery.first,
+          expected,
           target: admission.target,
         })
       }
@@ -925,41 +1084,117 @@ class Model {
 }
 
 /**
- * Runs a schedule and returns what broke, checking the positions and, after a disconnect, what
- * the final commit wrote.
+ * @param {object[]} events
+ * @param {object} arrival
+ * @returns {number} when the operation that sent the frame ended: until then its caller can still
+ *   be refused publication
+ */
+const settledAt = (events, arrival) => {
+  if (arrival.seek)
+    return events.find((e) => e.type === 'attemptEnd' && e.attempt === arrival.seek)?.t ?? Infinity
+  const op = arrival.commit && (arrival.commit.op ?? null)
+  if (op) return op.settledAt ?? Infinity
+  return arrival.answeredAt ?? arrival.t
+}
+
+/**
+ * @param {object} arrival
+ * @returns {number} when the operation that sent the frame began: its selection, its call or its
+ *   seek application
+ */
+const beganAt = (arrival) =>
+  arrival.commit?.selectedAt ?? arrival.commit?.op?.t ?? arrival.seek?.t ?? arrival.t
+
+/**
+ * Why the committed cache may differ from the broker for a partition, or null when it may not.
+ * The client publishes accepted writes in the order their operations began, so the cache may
+ * keep another value when the last write the broker took was never answered, began before
+ * another accepted write of the partition, or was refused publication: an assignment change
+ * refused its caller, or a seek of the partition was admitted, between its start and its answer.
+ * A cache the client forgot is read again and is never compared.
+ * @param {object[]} events
+ * @param {number} partition
+ * @returns {string|null}
+ */
+const cacheExemption = (events, partition) => {
+  const accepted = events.filter(
+    (e) =>
+      e.type === 'arrival' &&
+      e.outcome !== 'rejected' &&
+      e.outcome !== 'lostUnapplied' &&
+      e.cells.some((c) => c.partition === partition)
+  )
+  const last = accepted[accepted.length - 1]
+  if (!last) return null
+  if (last.outcome === 'lost') return 'the last write was never answered'
+  const began = beganAt(last)
+  if (accepted.some((a) => a !== last && beganAt(a) > began)) {
+    return 'the last write began before another one of the partition'
+  }
+  const answered = settledAt(events, last)
+  if (events.some((e) => e.type === 'reassign' && e.t > last.t && e.t < answered)) {
+    return 'an assignment change refused the caller before the answer'
+  }
+  if (
+    events.some(
+      (e) => e.type === 'admit' && e.partition === partition && e.t > began && e.t < answered
+    )
+  ) {
+    return 'a seek admitted before the answer took the cell, so the write was not published'
+  }
+  return null
+}
+
+/**
+ * Starts a new consumer of the group, as a restart does, and returns the first offset it delivers
+ * for each partition whose committed offset has a record to deliver.
+ * @param {ScheduleRun} run
+ * @returns {Promise<Record<number, string>>}
+ */
+const restart = async (run) => {
+  const first = {}
+  const awaited = PARTITIONS.filter((p) => Number(asPosition(run.broker[p])) <= LAST)
+  await drive(
+    run.rig.started({
+      consumer: { maxWaitTimeInMs: 5 },
+      run: {
+        autoCommit: false,
+        eachMessage: undefined,
+        eachBatch: async ({ batch }) => {
+          if (batch.messages.length > 0) first[batch.partition] ??= batch.messages[0].offset
+        },
+      },
+      delivered: 0,
+    })
+  )
+  for (let spent = 0; awaited.some((p) => first[p] === undefined); spent += TICK_MS) {
+    if (spent > OPEN_MS) break
+    await advance(TICK_MS)
+  }
+  return first
+}
+
+/**
+ * Runs a schedule on fake time, with `Math.random` drawn from the seed, and returns what broke:
+ * the invariants over the events, the positions and the committed cache against the model, what
+ * the final commit wrote, and what a restarted consumer reads back.
  * @param {'classic'|'consumer'} protocol
  * @param {object} schedule
  * @returns {Promise<{check: string, message: string, detail: object}[]>}
  */
 const runSchedule = async (protocol, schedule) => {
+  jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+  const random = lcg(schedule.seed ?? 1)
+  const seeded = jest.spyOn(Math, 'random').mockImplementation(() => random.int(2 ** 32) / 2 ** 32)
   const run = new ScheduleRun(protocol, schedule)
   try {
     await run.execute()
     const model = new Model(run)
     const expected = model.positions()
-    // A commit whose answer was lost, or that was accepted and then refused to its caller,
-    // leaves the cache behind the broker; that is how every commit behaves, seek or not.
-    const unknown = PARTITIONS.filter((p) =>
-      run.events.some(
-        (e) =>
-          e.type === 'arrival' &&
-          e.cells.some((c) => c.partition === p) &&
-          (e.outcome === 'lost' || (e.commit && e.outcome !== 'rejected'))
-      )
-    )
     for (const p of PARTITIONS) {
-      const cache = run.group.offsetManager.committedOffsets()[TOPIC]?.[p]
-      const excused = !schedule.autoCommit || unknown.includes(p)
-      if (cache != null && String(cache) !== run.broker[p] && !excused) {
-        run.violate('I7', 'the committed cache holds a value the broker does not', {
-          partition: p,
-          cache: String(cache),
-          broker: run.broker[p],
-        })
-      }
       let actual
       try {
-        actual = await run.consumer.position({ topic: TOPIC, partition: p })
+        actual = await drive(run.consumer.position({ topic: TOPIC, partition: p }))
       } catch (error) {
         actual = `error: ${error.message}`
       }
@@ -970,21 +1205,42 @@ const runSchedule = async (protocol, schedule) => {
           actual,
         })
       }
+      const cache = run.group.offsetManager.committedOffsets()[TOPIC]?.[p]
+      if (cache != null && String(cache) !== run.broker[p] && !cacheExemption(run.events, p)) {
+        run.violate('I7', 'the committed cache holds a value the broker does not', {
+          partition: p,
+          cache: String(cache),
+          broker: run.broker[p],
+        })
+      }
     }
     if (run.violations.length === 0) {
       const before = run.events.length
-      await run.consumer.disconnect()
+      await drive(run.consumer.disconnect())
       const after = run.events.slice(before).filter((e) => e.type === 'arrival')
       new Model(run).checkFrames(after)
-      if (schedule.autoCommit) {
-        for (const p of PARTITIONS) {
-          if (!unknown.includes(p) && asPosition(run.broker[p]) !== expected[p]) {
-            run.violate('I4', 'the final commit did not leave the position at the broker', {
-              partition: p,
-              expected: expected[p],
-              broker: run.broker[p],
-            })
-          }
+      for (const p of PARTITIONS) {
+        if (
+          schedule.autoCommit &&
+          !cacheExemption(run.events, p) &&
+          asPosition(run.broker[p]) !== expected[p]
+        ) {
+          run.violate('I4', 'the final commit did not leave the position at the broker', {
+            partition: p,
+            expected: expected[p],
+            broker: run.broker[p],
+          })
+        }
+      }
+      const first = await restart(run)
+      for (const p of PARTITIONS) {
+        const durable = asPosition(run.broker[p])
+        if (Number(durable) <= LAST && first[p] !== durable) {
+          run.violate('I4', 'a restarted consumer did not resume at the committed offset', {
+            partition: p,
+            committed: run.broker[p],
+            first: first[p],
+          })
         }
       }
     }
@@ -992,6 +1248,8 @@ const runSchedule = async (protocol, schedule) => {
     run.violate('run', error.message)
   } finally {
     await run.dispose().catch((error) => run.violate('dispose', error.message))
+    seeded.mockRestore()
+    jest.useRealTimers()
   }
   Object.defineProperty(run.violations, 'events', { value: run.events })
   return run.violations
@@ -1036,6 +1294,31 @@ describe.each(['classic', 'consumer'])('seeded seek schedules, %s protocol', (pr
       if (failures.length > 0) throw new Error(JSON.stringify(failures, null, 1))
     }, 120000)
   }
+})
+
+describe.each(['classic', 'consumer'])('a seeded seek schedule, %s protocol', (protocol) => {
+  test('produces the same events and outcome every time it runs', async () => {
+    const trace = (violations) =>
+      JSON.stringify([
+        violations.events.map(({ t, type, partition, first, outcome, cells, value, target }) => [
+          t,
+          type,
+          partition,
+          first,
+          outcome,
+          cells,
+          value,
+          target,
+        ]),
+        violations.map(({ check, message }) => [check, message]),
+      ])
+    for (const seed of SEEDS.slice(0, 10)) {
+      const traces = new Set()
+      for (let run = 0; run < 5; run++)
+        traces.add(trace(await runSchedule(protocol, generate(seed))))
+      expect({ seed, distinct: traces.size }).toEqual({ seed, distinct: 1 })
+    }
+  }, 120000)
 })
 
 module.exports = { generate, runSchedule }
