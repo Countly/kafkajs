@@ -453,6 +453,28 @@ describe('Consumer > a fatal heartbeat answer while a handler runs', () => {
     expect(run.cluster.disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
   }, 60000)
 
+  it.each([
+    ['released before the deadline', true],
+    ['still held at the deadline', false],
+  ])(
+    'the CRASH error for a fatal answer while the handler is %s is the fetch retrier non-retriable error caused by the answer',
+    async (_label, release) => {
+      const run = await startWith((_payload, held) => held.promise)
+      run.arm()
+      await advanceUntil(() => run.faultAt() !== null)
+      if (release) {
+        await jest.advanceTimersByTimeAsync(500)
+        run.held.resolve()
+      }
+      await advanceUntil(() => run.crashes.length > 0, 5000)
+
+      expect(
+        run.crashes.map(({ error }) => [error.name, error.code, error.retriable, error.cause.name])
+      ).toEqual([['KafkaJSNonRetriableError', 30, false, 'KafkaJSProtocolError']])
+    },
+    60000
+  )
+
   it('a disconnect with a deadline shorter than the poll interval ends the held handler wait at its own deadline and still reports one CRASH with restart false', async () => {
     const run = await startWith((_payload, held) => held.promise)
     run.arm()
