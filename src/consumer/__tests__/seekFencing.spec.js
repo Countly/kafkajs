@@ -396,6 +396,63 @@ const failureOf = (promise) =>
     (error) => error
   )
 
+/**
+ * @param {CloseRig} rig
+ * @returns {string[][]} the `partition:offset` cells of every OffsetCommit frame, in order
+ */
+const frameCells = (rig) =>
+  rig
+    .frames('OffsetCommit')
+    .map(({ fields }) =>
+      fields.topics.flatMap(({ partitions }) =>
+        partitions.map(({ partition, offset }) => `${partition}:${offset}`)
+      )
+    )
+
+/**
+ * @param {CloseRig} rig
+ * @param {number} partition
+ * @returns {string[]} the offset every Fetch frame asked for the partition, in order
+ */
+const fetchOffsetsOf = (rig, partition) =>
+  rig
+    .frames('Fetch')
+    .flatMap(({ fields }) => fields.topics.flatMap(({ partitions }) => partitions))
+    .filter((cell) => cell.partition === partition)
+    .map(({ fetchOffset }) => String(fetchOffset))
+
+/**
+ * Answers the next Fetch that asks partition 0 at `offset` with OFFSET_OUT_OF_RANGE for it, held
+ * until released when `hold` is set.
+ * @param {CloseRig} rig
+ * @param {string} offset
+ * @param {boolean} hold
+ * @returns {{ reached: Promise<void>, release: () => void, restore: () => void }}
+ */
+const outOfRangeAt = (rig, offset, hold) => {
+  const reached = gate()
+  const released = gate()
+  if (!hold) released.resolve()
+  const fetch = rig.cluster.answerers.get('Fetch')
+  let answered = false
+  rig.cluster.answer('Fetch', async (fields, record) => {
+    const p0 = fields.topics[0].partitions.find(({ partition }) => partition === 0)
+    if (answered || !p0 || String(p0.fetchOffset) !== offset) return fetch(fields, record)
+    answered = true
+    reached.resolve()
+    await released.promise
+    return {
+      partitions: fields.topics[0].partitions.map(({ partition }) => ({
+        partition,
+        errorCode: partition === 0 ? 1 : 0,
+        records: false,
+        abortedTransactions: [],
+      })),
+    }
+  })
+  return { reached: reached.promise, release: released.resolve, restore: released.resolve }
+}
+
 const MANUAL = { autoCommit: false, autoCommitThreshold: 1, eachBatchAutoResolve: false }
 const PAYLOAD_5 = { topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }] }
 
@@ -740,6 +797,59 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
     expect(scenario.committed).toEqual({ 0: '2', 1: '1' })
     expect(await scenario.position()).toBe('0')
     expect(scenario.errors).toEqual([])
+  })
+
+  describe('a default commit pruned at its write', () => {
+    const PRUNED = (allow) => ({
+      partitions: 2,
+      run: { ...MANUAL, partitionsConsumedConcurrently: 2, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+      other: async ({ resolveOffset, commitOffsetsIfNecessary }) => {
+        await allow.promise
+        resolveOffset('0')
+        await commitOffsetsIfNecessary()
+      },
+    })
+    const cellsOf = ({ topics }) =>
+      topics.flatMap(({ partitions }) =>
+        partitions.map(({ partition, offset }) => `${partition}:${offset}`)
+      )
+
+    test('reports in COMMIT_OFFSETS exactly the cells it sent', async () => {
+      const write = using(holdNextCommitWrite())
+      const allow = gate()
+      await open(PRUNED(allow))
+      const reported = []
+      scenario.consumer.on(scenario.consumer.events.COMMIT_OFFSETS, ({ payload }) =>
+        reported.push(cellsOf(payload))
+      )
+      allow.resolve()
+      await write.reached
+      expect(await scenario.seek('0')).toBe('0')
+
+      write.release()
+      await scenario.otherDone.promise
+
+      expect(frameCells(scenario.rig)).toEqual([['1:1']])
+      expect(reported).toEqual([['1:1']])
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('publishes what it sent even when a COMMIT_OFFSETS listener replaces the reported cells', async () => {
+      const captured = using(captureGroup())
+      const allow = gate()
+      await open(PRUNED(allow))
+      scenario.consumer.on(scenario.consumer.events.COMMIT_OFFSETS, ({ payload }) => {
+        payload.topics = [{ topic: TOPIC, partitions: [{ partition: 0, offset: '9' }] }]
+      })
+
+      allow.resolve()
+      await scenario.otherDone.promise
+
+      expect(frameCells(scenario.rig)).toEqual([['0:5', '1:1']])
+      expect(captured.group().offsetManager.committedOffsets()[TOPIC]).toEqual({ 0: '5', 1: '1' })
+      expect(scenario.errors).toEqual([])
+    })
   })
 
   test('a final commit selected before a pending seek is written without the sought partition', async () => {
@@ -1500,6 +1610,119 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       expect(await scenario.position()).toBe('2')
       expect(scenario.committed[0]).toBe('2')
     })
+
+    test('is not applied again over a deliberate commit of the partition made while its commit was in flight, which stands', async () => {
+      await open(FAILING_SEEK)
+      const {
+        holds: [failing, deliberate],
+      } = using(holdCommitAnswers(scenario, ['failed', 'applied']))
+      const older = failureOf(scenario.seek('0'))
+      await failing.arrived
+      const committing = scenario.consumer.commitOffsets([
+        { topic: TOPIC, partition: 0, offset: '8' },
+      ])
+      await deliberate.arrived
+
+      failing.release()
+      expect((await older).type).toBe('REQUEST_TIMED_OUT')
+      deliberate.release()
+      await committing
+
+      expect(await scenario.position()).toBe('8')
+      expect(scenario.commits()).toEqual(['0', '8'])
+      expect(scenario.committed[0]).toBe('8')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('is not applied again over a deliberate commit of the partition made while it was queued, which stands', async () => {
+      await open(FAILING_SEEK)
+      const {
+        holds: [deliberate, failing],
+      } = using(holdCommitAnswers(scenario, ['applied', 'failed']))
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      const committing = scenario.consumer.commitOffsets([
+        { topic: TOPIC, partition: 0, offset: '8' },
+      ])
+      await deliberate.arrived
+      deliberate.release()
+      await committing
+      const applying = failureOf(scenario.position())
+      await failing.arrived
+
+      failing.release()
+
+      expect((await applying).type).toBe('REQUEST_TIMED_OUT')
+      expect(await scenario.position()).toBe('8')
+      expect(scenario.commits()).toEqual(['8', '0'])
+      expect(scenario.committed[0]).toBe('8')
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a seek popped before a newer seek of its partition', () => {
+    const SEEKING = {
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+
+    test('is not written once the newer seek was applied', async () => {
+      await open(SEEKING)
+      const write = using(holdNextCommitWrite())
+      const older = scenario.seek('0')
+      await write.reached
+      expect(await scenario.seek('7')).toBe('7')
+
+      write.release()
+
+      expect(await older).toBe('7')
+      expect(await scenario.position()).toBe('7')
+      expect(scenario.commits()).toEqual(['7'])
+      expect(scenario.committed[0]).toBe('7')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test.each(['acquired again', 'recreated'])(
+      'leaves the halt of its partition alone when its commit gets no answer after the partition was %s',
+      async (change) => {
+        const captured = using(captureGroup())
+        await open(SEEKING)
+        const group = captured.group()
+        const key = `${TOPIC}|0`
+        const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+        const arrived = gate()
+        const lose = gate()
+        let lost = false
+        scenario.rig.cluster.answer('OffsetCommit', async (fields, record) => {
+          if (lost) return answer(fields, record)
+          lost = true
+          arrived.resolve()
+          await lose.promise
+          throw new Error('connection lost after the write')
+        })
+        using({ restore: () => lose.resolve() })
+        const older = failureOf(scenario.seek('0'))
+        await arrived.promise
+        if (change === 'recreated') group.invalidateTopic(TOPIC)
+        else {
+          await group.applyRebalanceResult(
+            { assignment: { [TOPIC]: [] } },
+            { rebuildOffsets: false }
+          )
+          await group.applyRebalanceResult(
+            { assignment: { [TOPIC]: [0] } },
+            { rebuildOffsets: false }
+          )
+        }
+        const halt = { offset: '3', reason: 'checksum', error: new Error('a later halt') }
+        group.haltedPartitions.set(key, halt)
+
+        lose.resolve()
+
+        expect(await older).not.toBeNull()
+        expect(group.haltedPartitions.get(key)).toBe(halt)
+        expect(scenario.commits()).toEqual(['0'])
+      }
+    )
   })
   describe('a seek a fetch round applied', () => {
     const SEEKING = {
@@ -1613,13 +1836,61 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
         throw new Error('connection lost after the write')
       })
 
-      expect(await failureOf(scenario.seek('0'))).not.toBeNull()
+      expect((await failureOf(scenario.seek('0'))).name).toBe('KafkaJSConnectionError')
 
       expect(await scenario.position()).toBe('0')
       await scenario.release()
       expect(await scenario.nextDelivery()).toEqual(['value-0'])
       expect(scenario.commits()).toEqual(['0'])
       expect(scenario.committed[0]).toBe('0')
+      expect(scenario.errors).toEqual([])
+    })
+
+    /** Drops the connection of the next OffsetCommit before the broker applies it. */
+    const loseNextCommitUnapplied = () => {
+      const answer = scenario.rig.cluster.answerers.get('OffsetCommit')
+      let lost = false
+      scenario.rig.cluster.answer('OffsetCommit', (fields, record) => {
+        if (lost) return answer(fields, record)
+        lost = true
+        throw new Error('connection lost before the broker applied it')
+      })
+    }
+    const SEEKING = {
+      run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+      before: ({ resolveOffset }) => resolveOffset('4'),
+    }
+
+    test('is not taken as applied by position() when the broker did not apply it: the position and the next delivery come from the broker', async () => {
+      await open(SEEKING)
+      loseNextCommitUnapplied()
+
+      expect((await failureOf(scenario.seek('0'))).name).toBe('KafkaJSConnectionError')
+
+      expect(await scenario.position()).toBe('2')
+      await scenario.release()
+      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('2')
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('is not taken as applied by a fetch round when the broker did not apply it: the next delivery comes from the broker', async () => {
+      const captured = using(captureGroup())
+      await open(SEEKING)
+      const applying = jest.spyOn(captured.group(), 'seekOffsets')
+      using({ restore: () => applying.mockRestore() })
+      loseNextCommitUnapplied()
+
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
+      await scenario.release()
+
+      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(applying.mock.calls.some(([, round]) => round instanceof FetchPreparation)).toBe(true)
+      expect(await scenario.position()).toBe('2')
+      expect(scenario.commits()).toEqual(['0'])
+      expect(scenario.committed[0]).toBe('2')
+      expect(captured.group().unappliedSeeks.size).toBe(0)
       expect(scenario.errors).toEqual([])
     })
   })
@@ -1650,6 +1921,64 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
       expect(scenario.rig.frames('OffsetCommit')).toHaveLength(0)
       expect(scenario.committed).toEqual({ 0: '2', 1: '0' })
+      expect(scenario.errors).toEqual([])
+    })
+
+    test('still writes an unsought cell at its selected offset after a newer deliberate commit of that cell, as kafkajs 2.2.4 does', async () => {
+      const captured = using(captureGroup())
+      await open(SIBLING)
+      await scenario.otherDone.promise
+      const group = captured.group()
+      const write = using(holdNextCommitWrite())
+      const committing = group.commitOffsets({}, { auto: true })
+      await write.reached
+      expect(await scenario.seek('0')).toBe('0')
+      await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 1, offset: '9' }])
+
+      write.release()
+      await committing
+      await group.commitOffsets({}, { auto: true })
+
+      expect(frameCells(scenario.rig)).toEqual([['1:9'], ['1:1'], ['0:0', '1:1']])
+      expect(scenario.committed).toEqual({ 0: '0', 1: '1' })
+      expect(group.offsetManager.committedOffsets()[TOPIC]).toEqual({ 0: '0', 1: '1' })
+      expect(scenario.errors).toEqual([])
+    })
+  })
+
+  describe('a fetch round prepared before a seek another caller applied', () => {
+    test('delivers the first batch it fetched at the sought offset', async () => {
+      const captured = using(captureGroup())
+      await open({ run: { ...MANUAL, eachBatch: true } })
+      const group = captured.group()
+      const reached = gate()
+      const opened = gate()
+      const validate = group.validatePositions
+      let held = false
+      const spy = jest.spyOn(group, 'validatePositions').mockImplementation(async function (
+        ...args
+      ) {
+        if (!held && args[1] instanceof FetchPreparation) {
+          held = true
+          reached.resolve()
+          await opened.promise
+        }
+        return validate.apply(this, args)
+      })
+      using({
+        restore: () => {
+          opened.resolve()
+          spy.mockRestore()
+        },
+      })
+      await scenario.release()
+      await reached.promise
+      expect(await scenario.seek('0')).toBe('0')
+
+      opened.resolve()
+
+      expect(await scenario.nextDelivery()).toEqual(['value-0'])
+      expect(fetchOffsetsOf(scenario.rig, 0).filter((offset) => offset === '0')).toEqual(['0'])
       expect(scenario.errors).toEqual([])
     })
   })
@@ -1684,21 +2013,48 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
   describe('a seek with a partition that is not a number', () => {
     test('throws before any state changes, and fetching goes on', async () => {
       const captured = using(captureGroup())
-      await open({ run: { ...MANUAL, eachBatch: true } })
+      await open({
+        run: { ...MANUAL, eachBatch: true },
+        before: ({ resolveOffset }) => resolveOffset('4'),
+      })
       const group = captured.group()
+      const unprintable = {
+        toString() {
+          throw new Error('not printable')
+        },
+      }
+      const inputs = [
+        ['0', '0'],
+        [null, 'null'],
+        ['', ''],
+        [undefined, 'undefined'],
+        [true, 'true'],
+        [NaN, 'NaN'],
+        [1.5, '1.5'],
+        [-1, '-1'],
+        [Infinity, 'Infinity'],
+        [2 ** 31, String(2 ** 31)],
+        [Symbol('p'), 'Symbol(p)'],
+        [unprintable, 'object'],
+      ]
 
-      for (const partition of ['0', null, '', undefined, true]) {
-        expect(() => scenario.consumer.seek({ topic: TOPIC, partition, offset: '0' })).toThrow(
-          new KafkaJSNonRetriableError(`Invalid partition, expected a number received ${partition}`)
-        )
+      for (const [partition, printed] of inputs) {
+        let thrown = null
+        try {
+          scenario.consumer.seek({ topic: TOPIC, partition, offset: '0' })
+        } catch (error) {
+          thrown = error
+        }
+        expect(thrown).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(thrown.message).toBe(`Invalid partition, expected a number received ${printed}`)
       }
 
       expect(scenario.old.isStale()).toBe(false)
       expect(group.unappliedSeeks.size).toBe(0)
       expect(group.seekOffset.size).toBe(0)
-      expect(await scenario.position()).toBe('2')
+      expect(await scenario.position()).toBe('5')
       await scenario.release()
-      expect(await scenario.nextDelivery()).toEqual(BEFORE)
+      expect(await scenario.nextDelivery()).toEqual(['value-5'])
       expect(scenario.errors).toEqual([])
     })
 
@@ -1709,9 +2065,11 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
         await consumer.connect()
         await consumer.assign([{ topic: TOPIC, partitions: [0] }])
 
-        expect(() => consumer.seek({ topic: TOPIC, partition: '0', offset: '1' })).toThrow(
-          new KafkaJSNonRetriableError('Invalid partition, expected a number received 0')
-        )
+        for (const partition of ['0', -1, 1.5]) {
+          const seeking = () => consumer.seek({ topic: TOPIC, partition, offset: '1' })
+          expect(seeking).toThrow(KafkaJSNonRetriableError)
+          expect(seeking).toThrow(`Invalid partition, expected a number received ${partition}`)
+        }
         expect(() => consumer.seek({ topic: TOPIC, partition: 0, offset: '1' })).not.toThrow()
       } finally {
         await rig.dispose()
@@ -1867,6 +2225,75 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
         expect(scenario.errors).toEqual([])
       }
     )
+
+    test.each([true, false])(
+      'an out-of-range answer does not reset the partition while a seek admitted after the fetch was built is still queued (autoCommit %s)',
+      async (autoCommit) => {
+        await open({
+          run: autoCommit
+            ? { autoCommit: true, autoCommitInterval: 60000, eachBatch: true }
+            : { autoCommit: false, eachBatch: true },
+          before: ({ resolveOffset }) => resolveOffset('4'),
+        })
+        const fetch = using(outOfRangeAt(scenario.rig, '5', true))
+        await scenario.release()
+        await fetch.reached
+        scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '6' })
+
+        fetch.release()
+
+        expect(await scenario.nextDelivery()).toEqual(['value-6'])
+        expect(await scenario.position()).toBe('6')
+        expect(scenario.commits()).toEqual(autoCommit ? ['6'] : [])
+        expect(scenario.committed[0]).toBe(autoCommit ? '6' : '2')
+        expect(scenario.errors).toEqual([])
+      }
+    )
+
+    test('a by-duration reset a seek overtakes before its commit is written is dropped, and fetching goes on at the seek', async () => {
+      const captured = using(captureGroup())
+      await open({
+        run: { autoCommit: true, autoCommitInterval: 60000, eachBatch: true },
+        before: ({ resolveOffset }) => resolveOffset('4'),
+      })
+      captured.group().topicConfigurations[TOPIC].resetPolicy = {
+        kind: 'by_duration',
+        durationMs: 3600000,
+      }
+      const crashes = []
+      scenario.consumer.on(scenario.consumer.events.CRASH, ({ payload }) =>
+        crashes.push(payload.error)
+      )
+      using(outOfRangeAt(scenario.rig, '5', false))
+      const reached = gate()
+      const opened = gate()
+      const send = OffsetManager.prototype.sendOffsetCommit
+      const spy = jest
+        .spyOn(OffsetManager.prototype, 'sendOffsetCommit')
+        .mockImplementationOnce(async function (...args) {
+          reached.resolve()
+          await opened.promise
+          return send.apply(this, args)
+        })
+      using({
+        restore: () => {
+          opened.resolve()
+          spy.mockRestore()
+        },
+      })
+      await scenario.release()
+      await reached.promise
+      scenario.consumer.seek({ topic: TOPIC, partition: 0, offset: '6' })
+
+      opened.resolve()
+
+      expect(await scenario.nextDelivery()).toEqual(['value-6'])
+      expect(await scenario.position()).toBe('6')
+      expect(scenario.commits()).toEqual(['6'])
+      expect(scenario.committed[0]).toBe('6')
+      expect(crashes).toEqual([])
+      expect(scenario.errors).toEqual([])
+    })
 
     test('an out-of-range answer to a current request still resets the partition', async () => {
       await open({
