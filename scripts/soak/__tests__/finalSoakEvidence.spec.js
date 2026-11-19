@@ -272,9 +272,15 @@ describe('final soak observer evidence', () => {
     const observer = new PassiveObserver({ owners: {}, watched: {} })
     const runtime = {
       observer,
+      lifetimes: new Map(),
+      revisions: new Map(),
+      worker: {},
       nextId: () => 'p01.0',
       emit: async () => true,
       context: new AsyncLocalStorage(),
+      forget(client) {
+        ChildRuntime.prototype.forget.call(this, client)
+      },
     }
     const slot = config.clients[0]
     for (let wave = 0; wave < 300; wave++) {

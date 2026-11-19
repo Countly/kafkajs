@@ -6,17 +6,25 @@ const { AsyncLocalStorage } = require('node:async_hooks')
 const { buildConfig, Supervisor, workloadProblems } = require('../finalSoak')
 const { MonotonicClock, planSchedule, Scheduler } = require('../finalSoakScheduler')
 const {
+  sha256,
   ChildRuntime,
   ClientRig,
   ConsumerWorker,
   ShareWorker,
+  ReaderWorker,
+  DecoderWorker,
+  WireLog,
   createWorker,
 } = require('../finalSoakWorkers')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
 const TREE = 'b'.repeat(40)
 const RUN = '0123456789ab'
-const IDS = { A: 'AAAAAAAAAAAAAAAAAAAAAA', B: 'BBBBBBBBBBBBBBBBBBBBBB' }
+const IDS = {
+  A: 'AAAAAAAAAAAAAAAAAAAAAA',
+  B: 'BBBBBBBBBBBBBBBBBBBBBB',
+  C: 'CCCCCCCCCCCCCCCCCCCCCC',
+}
 const config = buildConfig(matrix, { mode: 'smoke', runId: RUN, treeSha: TREE, brokers: ['k:1'] })
 const tick = () => new Promise(setImmediate)
 /** @returns {Promise<unknown>} the promise's value, or `{ hung: true }` after `ms` */
@@ -78,6 +86,7 @@ const workerRuntime = (slotId, clock = new MonotonicClock(), observer = {}) => {
     diagnose: async (message) => runtime.records.push({ kind: 'diagnostic', message }),
     problem: async (message) => runtime.problems.push(message),
     failed: (call, error) => ChildRuntime.prototype.failed.call(runtime, call, error),
+    forget: (client) => observer.forget(client),
     request: async () => {},
   }
   return runtime
@@ -1215,6 +1224,223 @@ describe('final soak work admission and quiet samples', () => {
       ])
     } finally {
       remove()
+    }
+  })
+})
+
+describe('final soak retained harness state', () => {
+  /** The per-client and per-incarnation state of one consumer process, without its clients. */
+  const retaining = () => {
+    const runtime = workerRuntime('c01')
+    const worker = new ConsumerWorker(runtime)
+    const forgotten = []
+    const child = {
+      observer: { forget: (client) => forgotten.push(client) },
+      lifetimes: new Map(),
+      revisions: new Map(),
+      topicIds: new Map(),
+      worker,
+    }
+    return { runtime, worker, child, forgotten }
+  }
+  const forget = (child, client) => ChildRuntime.prototype.forget.call(child, client)
+  const setTopicId = (child, topic, id) => ChildRuntime.prototype.setTopicId.call(child, topic, id)
+
+  test("a retired client's subscription lifetimes, revision, exchanges and boundaries are dropped", () => {
+    const { worker, child, forgotten } = retaining()
+    child.lifetimes.set('c01.2/main', 'r/A').set('c01.20/main', 'r/A')
+    child.revisions.set('c01.2', 3).set('c01.20', 1)
+    worker.lastBoundary.set(`c01.2/${IDS.A}/0`, 'x').set(`c01.20/${IDS.A}/0`, 'y')
+    forget(child, 'c01.2')
+    expect([...child.lifetimes.keys()]).toEqual(['c01.20/main'])
+    expect([...child.revisions.keys()]).toEqual(['c01.20'])
+    expect([...worker.lastBoundary.keys()]).toEqual([`c01.20/${IDS.A}/0`])
+    expect(forgotten).toEqual(['c01.2'])
+  })
+
+  test('a replaced or deleted incarnation drops its progress, boundaries and owed counts, and keeps the others', () => {
+    const { worker, child } = retaining()
+    const rig = {
+      id: 'c01.1',
+      uncommitted: new Map([
+        [`${IDS.A}|0`, 4],
+        [`${IDS.B}|0`, 2],
+      ]),
+    }
+    worker.standing.push(rig)
+    worker.progress.set(`g/${IDS.A}/0`, {}).set(`g/${IDS.B}/0`, {})
+    worker.lastBoundary.set(`c01.1/${IDS.A}/0`, 'x')
+    setTopicId(child, 'r', IDS.A)
+    setTopicId(child, 'r', IDS.C)
+    expect([...worker.progress.keys()]).toEqual([`g/${IDS.B}/0`])
+    expect(worker.lastBoundary.size).toBe(0)
+    expect([...rig.uncommitted.keys()]).toEqual([`${IDS.B}|0`])
+    setTopicId(child, 'r', null)
+    expect(child.topicIds.has('r')).toBe(false)
+  })
+
+  test("a share member forgets a retired incarnation's delivered offsets", () => {
+    const share = new ShareWorker(workerRuntime('c07'))
+    share.delivered(`${IDS.A}|0`, '0')
+    share.delivered(`${IDS.B}|0`, '0')
+    share.forgetTopic(IDS.A)
+    expect([...share.entered.keys()]).toEqual([`${IDS.B}|0`])
+  })
+
+  test("a day's membership waves and regex topics leave the retained state at the live set", () => {
+    const { worker, child } = retaining()
+    const rig = { id: 'c01.1', uncommitted: new Map() }
+    worker.standing.push(rig)
+    for (let wave = 0; wave < 288; wave++) {
+      const extra = `c01.${wave + 2}`
+      child.lifetimes.set(`${extra}/main`, 'r/A')
+      child.revisions.set(extra, 1)
+      worker.lastBoundary.set(`${extra}/${IDS.A}/0`, 'x')
+      forget(child, extra)
+    }
+    for (let n = 0; n < 96; n++) {
+      const id = `R${String(n).padStart(21, '0')}`
+      setTopicId(child, `regex-${n}`, id)
+      worker.progress.set(`g/${id}/0`, {})
+      worker.lastBoundary.set(`c01.1/${id}/1`, 'x')
+      rig.uncommitted.set(`${id}|0`, 1)
+      setTopicId(child, `regex-${n}`, null)
+    }
+    expect([child.lifetimes.size, child.revisions.size, child.topicIds.size]).toEqual([0, 0, 0])
+    expect([worker.progress.size, worker.lastBoundary.size, rig.uncommitted.size]).toEqual([
+      0, 0, 0,
+    ])
+  })
+
+  /** A reader whose raw broker answers `fetches` fetches of one record each. */
+  const reader = (fetches, dir) => {
+    fs.mkdirSync(path.join(dir, 'raw'))
+    const runtime = { ...workerRuntime('c21'), out: dir }
+    const worker = new ReaderWorker(runtime)
+    worker.standing.push({ id: 'p14.1' })
+    worker.leaderOf = async () => ({ leader: { host: 'h', port: 1 } })
+    let position = 0
+    worker.openBroker = async (address, onExchange) => {
+      const exchange = (apiKey) =>
+        onExchange({
+          apiKey,
+          request: Buffer.from([apiKey]),
+          response: Buffer.from('x'.repeat(64)),
+        })
+      return {
+        disconnect: async () => {},
+        listOffsets: async () => {
+          exchange(2)
+          return { responses: [{ partitions: [{ offset: String(fetches) }] }] }
+        },
+        fetch: async () => {
+          exchange(1)
+          const offset = String(position++)
+          return {
+            responses: [
+              {
+                partitions: [
+                  {
+                    messages: [
+                      {
+                        offset,
+                        key: null,
+                        value: Buffer.from(`${RUN}|c08.${offset}||`),
+                        headers: {},
+                        batchContext: { isControlBatch: false, inTransaction: false },
+                      },
+                    ],
+                    abortedTransactions: [],
+                  },
+                ],
+              },
+            ],
+          }
+        },
+      }
+    }
+    return { runtime, worker }
+  }
+  const scanStep = { id: 's', topic: config.topics.main, topicId: IDS.A, partition: 0, from: '0' }
+
+  test('a scan over a long missed interval journals each fetch as it arrives and digests the raw file without reading it back', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-scan-'))
+    try {
+      const { runtime, worker } = reader(500, dir)
+      const read = jest.spyOn(fs, 'readFileSync')
+      const reply = await worker.onScan(scanStep)
+      expect(read.mock.calls.filter(([f]) => String(f).includes('raw'))).toEqual([])
+      expect(reply.to).toBe('500')
+      expect(runtime.records.filter((r) => r.stage === 'log')).toHaveLength(500)
+      const [scan] = runtime.records.filter((r) => r.kind === 'scan')
+      const bytes = fs.readFileSync(path.join(dir, scan.rawFile))
+      expect(scan).toMatchObject({ records: 500, rawSha256: sha256(bytes) })
+      expect(worker.rawBytes).toBe(bytes.length)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a scan that would pass the raw byte budget of all scans fails', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-scan-'))
+    try {
+      const { runtime, worker } = reader(5, dir)
+      worker.rawBytes = 8 * 1024 ** 3 - 400
+      await expect(worker.onScan(scanStep)).rejects.toThrow(/raw scan budget of 8589934592 bytes/)
+      expect(runtime.records.filter((r) => r.kind === 'scan')).toEqual([])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('raw share wire files stop at their byte budget, count what they dropped and report it once', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-wire-'))
+    try {
+      const full = []
+      const wire = new WireLog({
+        dir,
+        prefix: 'p05.share',
+        budget: 300,
+        onFull: (m) => full.push(m),
+      })
+      const exchange = { apiKey: 78, request: Buffer.alloc(40), response: Buffer.alloc(40) }
+      const written = [1, 2, 3, 4].map(() => wire.append(exchange))
+      expect(written.map((w) => w !== null)).toEqual([true, false, false, false])
+      expect(wire.dropped).toBe(3)
+      expect(full).toEqual(['raw wire budget of 300 bytes reached'])
+      expect(fs.statSync(path.join(dir, 'raw/p05.share.0.ndjson')).size).toBeLessThanOrEqual(300)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('the telemetry decoder reads a large reporter suffix in bounded polls', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-decoder-'))
+    const sink = path.join(dir, 'sink')
+    fs.mkdirSync(sink)
+    try {
+      const runtime = {
+        out: dir,
+        slotOf: () => undefined,
+        nextId: () => 'p16.0',
+        emit: async () => true,
+        diagnose: async () => true,
+      }
+      const decoder = new DecoderWorker(runtime)
+      decoder.dir = sink
+      fs.writeFileSync(path.join(sink, 'reporter-1.json'), JSON.stringify({ loadedAtMs: 100 }))
+      const line = (seq) =>
+        JSON.stringify({ node: '1', seq, clientId: 'x', parse: 'ok', pad: 'p'.repeat(1000) }) + '\n'
+      const lines = Array.from({ length: 9000 }, (_, i) => line(i + 1)).join('')
+      fs.writeFileSync(path.join(sink, 'exports-1.jsonl'), lines)
+      const alloc = jest.spyOn(Buffer, 'alloc')
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(Math.max(...alloc.mock.calls.map(([n]) => n))).toBeLessThanOrEqual(8 * 1024 * 1024)
+      expect(decoder.offsets.get('exports-1.jsonl')).toBeLessThan(lines.length)
+      expect(await decoder.onTick()).toEqual({ abort: null })
+      expect(decoder.offsets.get('exports-1.jsonl')).toBe(lines.length)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 })
