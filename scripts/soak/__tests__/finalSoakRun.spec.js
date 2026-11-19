@@ -401,6 +401,24 @@ const fakeChild = () => {
 }
 
 describe('final soak supervisor commands', () => {
+  test('a direct admin call of the supervisor that never answers fails readiness and the settled ends by its bound', async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      const hung = () => new Promise(() => {})
+      s.admin = { fetchTopicMetadata: hung, fetchTopicOffsets: hung }
+      const main = config.topics.main
+      await expect(within(s.ready(main, IDS.A, 1, 1000), 2000)).rejects.toThrow(
+        `${main} has no ready metadata for ${IDS.A} by the deadline`
+      )
+      await expect(within(s.settledEnds(1000, [main]), 2000)).rejects.toThrow(
+        `fetchTopicOffsets of ${main} did not answer within 30000 ms`
+      )
+    } finally {
+      remove()
+    }
+  })
+
   test('offers stop at the core checker capacity: the supervisor journals the error, aborts and closes offers in every process once', () => {
     const { s, remove } = supervisor()
     try {
