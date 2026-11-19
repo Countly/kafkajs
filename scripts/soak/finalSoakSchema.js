@@ -738,6 +738,7 @@ const SECTIONS = Object.freeze({
   'share-state': {
     entry: {
       client: Id,
+      run: nullable(Id),
       sessions: listOf(shape('a session', { node: Count, session: Int })),
       records: listOf(
         shape('a held record', {

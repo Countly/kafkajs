@@ -1689,6 +1689,7 @@ describe('final soak driver', () => {
       expect(state()).toEqual({
         entry: {
           client: 'c07.1',
+          run: `c07.1.${observer.idOf(run, 'r')}`,
           sessions: [{ node: 1, session: 4 }],
           records: [
             { acquisition: acquired.acquisition, key: acquired.key, offset: '10', state: 'held' },
@@ -1752,9 +1753,9 @@ describe('final soak driver', () => {
           lockDuration,
           walk,
         })
-        this.cohorts.set(`${topicId}|0`, [
-          { topic: 'main', topicId, partition: 0, token, ledger, walk },
-        ])
+        const row = { topic: 'main', topicId, partition: 0, token, ledger, walk }
+        this.cohorts.set(`${topicId}|0`, [row])
+        return row
       }
     }
     class Run {

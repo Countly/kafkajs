@@ -239,6 +239,7 @@ const ENTRIES = {
   'share-state': (client) => [
     {
       client,
+      run: `${client}.r1`,
       sessions: [{ node: 1, session: 3 }],
       records: [{ acquisition: 'a1', key: KEY, offset: '0', state: 'held' }],
       ranges: [{ acquisition: 'a1', key: KEY, from: '0', to: '0' }],

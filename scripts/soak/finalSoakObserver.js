@@ -1200,15 +1200,23 @@ class PassiveObserver {
   }
 
   /**
-   * The share-state section of one client: live ShareRun node sessions, the held records and decided
-   * ranges of every live acquisition's ledger, and the live cohort rows by acquisition id. The held
-   * set is reconciled with the real ledger's own record and range counts; a disagreement is reported.
+   * The share-state section of one client: the client's current ShareRun (`run`, or null) and its
+   * node sessions, the held records and decided ranges of every acquisition ledger of that run's
+   * fetch loops, and their cohort rows by acquisition id. A run is current by the client's own
+   * check (not retired and still the runner's current run), never by reachability, so a dropped run
+   * that is not yet collected stays out after a restart. A run without a runner, or a loop without
+   * a membership, counts as current. The held set is reconciled with the real ledger's own record
+   * and range counts; a disagreement is reported.
    * @param {string} client actual client id
    * @returns {{ entry: object, mismatches: string[] }}
    */
   shareSections(client) {
+    const runs = this.mine(client, 'ShareRun').filter(
+      (run) => !run.retired && (!run.runner || run.runner.current === run)
+    )
+    const memberships = new Set(runs.map((run) => run.membership))
     const sessions = []
-    for (const run of this.mine(client, 'ShareRun'))
+    for (const run of runs)
       for (const [nodeId, node] of run.nodes ?? [])
         if (node?.session)
           sessions.push({ node: Number(nodeId), session: Number(node.session.epoch) })
@@ -1216,7 +1224,10 @@ class PassiveObserver {
     const ranges = []
     const cohorts = []
     const mismatches = []
-    for (const loop of this.mine(client, 'ShareFetchLoop'))
+    const loops = this.mine(client, 'ShareFetchLoop').filter(
+      (loop) => !loop.membership || memberships.has(loop.membership)
+    )
+    for (const loop of loops)
       for (const rows of loop.cohorts?.values() ?? [])
         for (const row of rows) {
           const mirror = this.ledgers.get(row.ledger)
@@ -1249,7 +1260,8 @@ class PassiveObserver {
               `${mirror.acquisition} holds ${counts.records}/${counts.ranges}, observed ${held}/${decided}`
             )
         }
-    return { entry: { client, sessions, records, ranges, cohorts }, mismatches }
+    const run = runs.length ? `${client}.${this.idOf(runs[0], 'r')}` : null
+    return { entry: { client, run, sessions, records, ranges, cohorts }, mismatches }
   }
 }
 
