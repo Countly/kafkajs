@@ -713,6 +713,40 @@ describe('final soak scheduled work', () => {
     }
   })
 
+  test("a topic execution drains its recipients to the topic's settled ends and fails before the delete when one falls short", async () => {
+    const { s, remove } = supervisor()
+    try {
+      s.clock = jumpClock(0)
+      const stages = []
+      const topic = `${s.config.topics.regex}-h00r0`
+      s.createTopic = async () => stages.push('create') && IDS.A
+      s.deleteTopic = async () => stages.push('delete')
+      s.seal = async () => stages.push('seal')
+      s.settledEnds = async (deadline, topics) => {
+        stages.push(`ends ${topics}`)
+        return { [`${topic}|0`]: '5', [`${topic}|1`]: '5' }
+      }
+      const drains = []
+      s.send = async (slots, step) => {
+        stages.push(step.type)
+        if (step.type === 'drain') drains.push(step.ends)
+        if (step.type === 'probe') return [{ reply: { offered: 10, acknowledged: 10 } }]
+        return slots.map((slot) => ({
+          reply: step.type === 'drain' ? { reached: slot !== 'p02' } : {},
+        }))
+      }
+      const step = { id: 'h00r0', type: 'execution', shape: 'regex-churn', deadline: 120000 }
+      await expect(s.churnTopic(step, ['p01', 'p02'])).rejects.toThrow(
+        `h00r0: p02 did not drain ${topic} to its end`
+      )
+      expect(drains).toEqual([{ [`${topic}|0`]: '5', [`${topic}|1`]: '5' }])
+      expect(stages).not.toContain('seal')
+      expect(stages).not.toContain('delete')
+    } finally {
+      remove()
+    }
+  })
+
   test('a membership wave works to its scheduled deadline, not to a deadline counted from a late start', async () => {
     const clock = jumpClock(1000000)
     const standing = { id: 'c01.1', object: { pause() {}, resume() {} }, slot: config.clients[0] }
@@ -930,142 +964,103 @@ describe('final soak final drain', () => {
   const main = config.topics.main
   const key = `${main}|0`
 
-  /** A consumer worker with one running member that holds main partition 0, and a scripted commit. */
-  const consumer = (commitOffsets = jest.fn(async () => {})) => {
+  /**
+   * A consumer worker with one running member that holds main partition 0 of the run's current
+   * incarnation. Its public `position()` answers `state.position`, `commitOffsets` stores the offset
+   * the group's `committed()` then reads back, and `state.held` says whether it holds the partition.
+   */
+  const consumer = (commitOffsets = null) => {
     const group = { acquired: new Map([[key, { acquiredAt: 7 }]]) }
+    const state = { position: '0', committed: null, held: true, groupTopicId: IDS.A }
     const runtime = workerRuntime('c01', new MonotonicClock(), {
       mine: () => [group],
-      currentAuthority: (g, k) => ({ run: 'now', acquiredAt: g.acquired.get(k).acquiredAt }),
-      topicIdOf: () => IDS.A,
+      currentAuthority: (g, k) => ({ run: 'now', acquiredAt: g.acquired.get(k)?.acquiredAt }),
+      topicIdOf: () => state.groupTopicId,
+      batchAuthority: () => ({ client: 'c01.1', run: 'r1', token: 1, acquiredAt: 7 }),
     })
     const worker = new ConsumerWorker(runtime)
+    const store = jest.fn(async ([{ offset }]) => {
+      state.committed = offset
+    })
     const rig = {
       id: 'c01.1',
       slot: config.clients[0],
-      object: { commitOffsets },
-      processed: new Map(),
+      object: {
+        commitOffsets: commitOffsets
+          ? jest.fn(async (entries) => {
+              await commitOffsets(entries)
+              await store(entries)
+            })
+          : store,
+        assignment: () => (state.held ? [{ topic: main, partitions: [0] }] : []),
+        position: jest.fn(async () => state.position),
+        committed: jest.fn(async ([{ topic, partition }]) => [
+          { topic, partition, offset: state.committed, metadata: null },
+        ]),
+      },
       uncommitted: new Map(),
-      committed: new Map(),
-      authority: new Map([
-        [key, { key: { topic: main, topicId: IDS.A, partition: 0 }, authority: { run: 'r' } }],
-      ]),
       call: async (event, work) => work(),
     }
     worker.standing.push(rig)
-    return { worker, rig, commitOffsets, runtime, group }
+    return { worker, rig, commitOffsets: rig.object.commitOffsets, runtime, group, state }
   }
   const commitsOf = (runtime) =>
     runtime.records.filter((r) => r.stage === 'commit' && r.phase === 'end')
-  const batchEnd = (worker, rig, lastOffset, batchSize = 0) =>
-    worker.onBatchEnd(rig, { topic: main, partition: 0, batchSize, lastOffset })
+  const message = (offset) => ({ offset: String(offset), key: null, value: null, headers: {} })
 
-  test('the drain waits until the member has resolved the log end, then commits that offset through the member', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    rig.processed.set(key, '248')
-    setTimeout(() => batchEnd(worker, rig, '251'), 80)
+  test("the drain waits until the member's live position reaches the log end, then commits that position through the member and reads it back", async () => {
+    const { worker, rig, commitOffsets, state } = consumer()
+    state.position = '248'
+    setTimeout(() => (state.position = '252'), 80)
     const reply = await worker.onDrain({ ends: { [key]: '252' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '252' }])
-  })
-
-  test('a trailing aborted suffix and commit marker are resolved by filtered batches and committed', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    rig.processed.set(key, '250')
-    batchEnd(worker, rig, '258')
-    batchEnd(worker, rig, '259')
-    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(commitOffsets).toHaveBeenCalledTimes(1)
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '260' }])
+    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '252' }])
+    expect(rig.object.committed).toHaveBeenCalledWith([{ topic: main, partition: 0 }])
   })
 
-  test('an intermediate drain commits a key whose acquisition was retained across a membership round, under the current authority', async () => {
-    const { worker, rig, commitOffsets, runtime } = consumer()
-    const then = { run: 'c01.1.r1', token: 10, acquiredAt: 7, recreatedAt: 0 }
-    rig.authority.get(key).authority = then
-    runtime.observer.currentAuthority = () => ({ ...then, token: 11 })
-    rig.processed.set(key, '62')
-    expect(await worker.onDrain()).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '62' }])
-    expect(commitsOf(runtime)[0].authority).toEqual({ ...then, token: 11 })
-  })
-
-  test.each([
-    [
-      'the key was acquired again',
-      { acquiredAt: 8 },
-      'the key was acquired again since its last handler',
-    ],
-    [
-      'the topic was recreated',
-      { recreatedAt: 3 },
-      'the key was acquired again since its last handler',
-    ],
-    [
-      'the client run changed',
-      { run: 'c01.1.r2' },
-      'the client run changed since its last handler',
-    ],
-  ])(
-    'an intermediate drain skips a key when %s and journals the expected skip with its reason',
-    async (_, change, reason) => {
-      const { worker, rig, commitOffsets, runtime } = consumer()
-      const then = { run: 'c01.1.r1', token: 10, acquiredAt: 7, recreatedAt: 0 }
-      rig.authority.get(key).authority = then
-      runtime.observer.currentAuthority = () => ({ ...then, ...change })
-      rig.processed.set(key, '62')
-      expect(await worker.onDrain()).toEqual({ reached: true })
-      expect(commitOffsets).not.toHaveBeenCalled()
-      expect(runtime.records).toContainEqual({
-        kind: 'diagnostic',
-        message: `expected skip: drain commit of ${key} by c01.1: ${reason}; its current owner's progress covers it`,
-      })
-    }
-  )
-
-  test('a batch that carried messages does not move the resolved offset beyond what its handler resolved', () => {
-    const { worker, rig } = consumer()
-    rig.processed.set(key, '100')
-    batchEnd(worker, rig, '149', 50)
-    expect(rig.processed.get(key)).toBe('100')
-  })
-
-  test('a failed commit at the threshold leaves the offsets owed, and the drain commits them again', async () => {
-    const commitOffsets = jest
-      .fn()
-      .mockRejectedValueOnce(
-        Object.assign(new Error('refused'), { name: 'KafkaJSNumberOfRetriesExceeded' })
-      )
-      .mockResolvedValue(undefined)
-    const { worker, rig } = consumer(commitOffsets)
-    rig.processed.set(key, '100')
-    rig.uncommitted.set(key, 100)
-    await worker.commit(rig, key)
-    expect(rig.uncommitted.get(key)).toBe(100)
-    expect(rig.committed.get(key)).toBeUndefined()
-    const reply = await worker.onDrain({ ends: { [key]: '100' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledTimes(2)
-    expect(rig.committed.get(key)).toBe('100')
-  })
-
-  test('a member that never reaches the end by the deadline reports the drain unreached', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    rig.processed.set(key, '90')
-    const reply = await worker.onDrain({
-      ends: { [key]: '100' },
-      deadline: worker.runtime.clock.now() + 40,
+  test("a drain commits the current acquisition's live position, never the offset an earlier acquisition's handler resolved", async () => {
+    const { worker, rig, commitOffsets, runtime, group, state } = consumer()
+    await worker.handle(rig, { topic: main, partition: 0, message: message(41) })
+    group.acquired.set(key, { acquiredAt: 8 })
+    state.position = '30'
+    const behind = await worker.onDrain({
+      ends: { [key]: '42' },
+      deadline: runtime.clock.now() + 120,
     })
-    expect(reply).toEqual({ reached: false })
+    expect(behind).toEqual({ reached: false, confirmed: 0 })
     expect(commitOffsets).not.toHaveBeenCalled()
+    state.position = '42'
+    const caught = await worker.onDrain({ ends: { [key]: '42' }, deadline: Infinity })
+    expect(caught).toEqual({ reached: true, confirmed: 1 })
+    expect(commitsOf(runtime)).toEqual([
+      expect.objectContaining({ next: '42', authority: { run: 'now', acquiredAt: 8 } }),
+    ])
   })
 
-  test('the final commit goes through the member that holds the key now, under its current authority, when only filtered batches resolved the key', async () => {
-    const { worker, rig, commitOffsets, runtime } = consumer()
-    rig.authority.clear()
-    batchEnd(worker, rig, '259')
+  test('a drain commits nothing while the group still reads an earlier incarnation of the same name', async () => {
+    const { worker, commitOffsets, runtime, state } = consumer()
+    runtime.topicIds.set(main, IDS.B)
+    state.position = '260'
+    state.committed = '260'
+    const stale = await worker.onDrain({
+      ends: { [key]: '260' },
+      deadline: runtime.clock.now() + 120,
+    })
+    expect(stale).toEqual({ reached: false, confirmed: 0 })
+    expect(commitOffsets).not.toHaveBeenCalled()
+    state.groupTopicId = IDS.B
+    state.committed = null
+    const fresh = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(fresh).toEqual({ reached: true, confirmed: 1 })
+    expect(commitsOf(runtime)[0].key).toEqual({ topic: main, topicId: IDS.B, partition: 0 })
+  })
+
+  test('a tail the client resolved with only control or aborted records is committed from the live position without any handler', async () => {
+    const { worker, commitOffsets, runtime, state } = consumer()
+    state.position = '260'
     const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '260' }])
     expect(commitsOf(runtime)).toEqual([
       expect.objectContaining({
@@ -1077,14 +1072,45 @@ describe('final soak final drain', () => {
     ])
   })
 
+  test('a position read while the member lost and regained the partition is not committed, and the drain commits the new acquisition once it is stable', async () => {
+    const { worker, rig, commitOffsets, runtime, group, state } = consumer()
+    state.position = '260'
+    let reads = 0
+    rig.object.position.mockImplementation(async () => {
+      if (++reads === 1) group.acquired.set(key, { acquiredAt: 9 })
+      return state.position
+    })
+    const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
+    expect(commitsOf(runtime)[0].authority).toEqual({ run: 'now', acquiredAt: 9 })
+  })
+
+  test('a commit whose readback does not return its offset is not confirmed, and the drain stays unreached', async () => {
+    const { worker, rig, runtime, state } = consumer()
+    state.position = '260'
+    rig.object.committed.mockResolvedValue([
+      { topic: main, partition: 0, offset: '200', metadata: null },
+    ])
+    const reply = await worker.onDrain({
+      ends: { [key]: '260' },
+      deadline: runtime.clock.now() + 120,
+    })
+    expect(reply).toEqual({ reached: false, confirmed: 0 })
+    expect(runtime.records).toContainEqual({
+      kind: 'diagnostic',
+      message: `drain: ${key} not committed to 260`,
+    })
+  })
+
   test('the final commit waits until the member holds the key again', async () => {
     const held = []
-    const { worker, rig, group } = consumer(jest.fn(async () => held.push(group.acquired.has(key))))
-    rig.processed.set(key, '260')
-    group.acquired.clear()
-    setTimeout(() => group.acquired.set(key, { acquiredAt: 8 }), 80)
+    const { worker, state } = consumer(async () => held.push(state.held))
+    state.position = '260'
+    state.held = false
+    setTimeout(() => (state.held = true), 80)
     const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(held).toEqual([true])
   })
 
@@ -1093,48 +1119,89 @@ describe('final soak final drain', () => {
       Object.assign(new Error('rebalancing'), { name: 'KafkaJSCommitFailedError' })
     const once = jest.fn().mockRejectedValueOnce(refused()).mockResolvedValue(undefined)
     const retried = consumer(once)
-    retried.rig.processed.set(key, '260')
+    retried.state.position = '260'
     const reply = await retried.worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 1 })
     expect(once).toHaveBeenCalledTimes(2)
     const never = consumer(jest.fn(async () => Promise.reject(refused())))
-    never.rig.processed.set(key, '260')
+    never.state.position = '260'
     const failed = await never.worker.onDrain({
       ends: { [key]: '260' },
       deadline: never.worker.runtime.clock.now() + 200,
     })
-    expect(failed).toEqual({ reached: false })
+    expect(failed).toEqual({ reached: false, confirmed: 0 })
   })
 
-  test('a key the group already committed to the log end through another member of the process needs no new commit', async () => {
-    const { worker, rig, commitOffsets } = consumer()
-    const extra = { ...rig, id: 'c01.2', processed: new Map([[key, '260']]) }
-    extra.committed = new Map()
-    extra.uncommitted = new Map()
-    await worker.commit(extra, key)
-    expect(commitOffsets).toHaveBeenCalledTimes(1)
-    rig.processed.set(key, '200')
+  test('a key whose group readback already shows the log end for the current incarnation needs no new commit', async () => {
+    const { worker, commitOffsets, state } = consumer()
+    state.committed = '260'
+    state.position = '200'
     const reply = await worker.onDrain({ ends: { [key]: '260' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
-    expect(commitOffsets).toHaveBeenCalledTimes(1)
+    expect(reply).toEqual({ reached: true, confirmed: 0 })
+    expect(commitOffsets).not.toHaveBeenCalled()
   })
 
   test('a member is not asked to reach a log it does not read', async () => {
-    const { worker, rig, commitOffsets } = consumer()
+    const { worker, commitOffsets, rig } = consumer()
     worker.seeded = true
     const txn = `${config.topics.transactions}|0`
     const reply = await worker.onDrain({ ends: { [txn]: '50' }, deadline: Infinity })
-    expect(reply).toEqual({ reached: true })
+    expect(reply).toEqual({ reached: true, confirmed: 0 })
     expect(commitOffsets).not.toHaveBeenCalled()
-    expect(rig.processed.size).toBe(0)
+    expect(rig.object.position).not.toHaveBeenCalled()
+  })
+
+  test('a drain without ends commits and reads back the live position of every held partition, and leaves a partition the member lost to its new owner', async () => {
+    const { worker, rig, commitOffsets, state } = consumer()
+    state.position = '62'
+    expect(await worker.onDrain()).toEqual({ reached: true, confirmed: 1 })
+    expect(commitOffsets).toHaveBeenCalledWith([{ topic: main, partition: 0, offset: '62' }])
+    rig.object.position.mockImplementation(async () => {
+      state.held = false
+      return '70'
+    })
+    expect(await worker.onDrain()).toEqual({ reached: true, confirmed: 0 })
+    expect(commitOffsets).toHaveBeenCalledTimes(1)
+  })
+
+  test('a failed commit at the threshold leaves the offsets owed, and a successful one settles them', async () => {
+    const commitOffsets = jest
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error('refused'), { name: 'KafkaJSNumberOfRetriesExceeded' })
+      )
+      .mockResolvedValue(undefined)
+    const { worker, rig } = consumer(commitOffsets)
+    const captured = {
+      key: { topic: main, topicId: IDS.A, partition: 0 },
+      authority: { run: 'r1' },
+    }
+    rig.uncommitted.set(`${IDS.A}|0`, 100)
+    expect(await worker.commit(rig, captured, '100')).toBe('unknown')
+    expect(rig.uncommitted.get(`${IDS.A}|0`)).toBe(100)
+    expect(await worker.commit(rig, captured, '100')).toBe('ok')
+    expect(rig.uncommitted.has(`${IDS.A}|0`)).toBe(false)
+  })
+
+  test('the recovery witness needs a handler after the recovery and a drain commit that was read back', async () => {
+    const { worker, rig, runtime, state } = consumer()
+    state.position = '5'
+    setTimeout(() => worker.handle(rig, { topic: main, partition: 0, message: message(4) }), 40)
+    expect(await worker.onRecovered({})).toEqual({ ok: true })
+    rig.object.committed.mockResolvedValue([
+      { topic: main, partition: 0, offset: null, metadata: null },
+    ])
+    runtime.clock = jumpClock(0)
+    setTimeout(() => worker.handle(rig, { topic: main, partition: 0, message: message(5) }), 10)
+    expect(await worker.onRecovered({})).toEqual({ ok: false })
   })
 
   test('a share member waits until every offset below the log end had a handler entry and the deliveries go quiet', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
     worker.standing.push({ id: 'c07.1', slot: config.clients.find((c) => c.slot === 'c07') })
-    for (let offset = 0; offset < 99; offset++) worker.delivered(`${main}|0`, String(offset))
-    setTimeout(() => worker.delivered(`${main}|0`, '99'), 60)
+    for (let offset = 0; offset < 99; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
+    setTimeout(() => worker.delivered(`${IDS.A}|0`, '99'), 60)
     const reply = await worker.onDrain({
       ends: { [key]: '100' },
       deadline: runtime.clock.now() + 5000,
@@ -1152,22 +1219,22 @@ describe('final soak final drain', () => {
   test('a share drain fails on a missing early offset even when the last offset was delivered', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
-    for (let offset = 60; offset < 100; offset++) worker.delivered(`${main}|0`, String(offset))
+    for (let offset = 60; offset < 100; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
     const step = { ends: { [key]: '100' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
     expect(await worker.onDrain(step)).toEqual({ reached: false })
     expect(runtime.records).toContainEqual({
       kind: 'diagnostic',
       message: `share drain: ${key} has no handler entry at offset 0`,
     })
-    for (let offset = 0; offset < 60; offset++) worker.delivered(`${main}|0`, String(offset))
+    for (let offset = 0; offset < 60; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
     expect(await worker.onDrain(step)).toEqual({ reached: true })
   })
 
   test('a share gap that is never filled keeps a bounded memory and still fails the drain', async () => {
     const runtime = workerRuntime('c07')
     const worker = new ShareWorker(runtime)
-    for (let offset = 1; offset <= 100001; offset++) worker.delivered(`${main}|0`, String(offset))
-    const state = worker.entered.get(`${main}|0`)
+    for (let offset = 1; offset <= 100001; offset++) worker.delivered(`${IDS.A}|0`, String(offset))
+    const state = worker.entered.get(`${IDS.A}|0`)
     expect(state.ahead.size).toBeLessThanOrEqual(100000)
     expect(state.gap).toBe('0')
     const step = { ends: { [key]: '100002' }, deadline: runtime.clock.now() + 40, quietMs: 0 }
@@ -1410,7 +1477,7 @@ describe('final soak failure evidence', () => {
       type: 'CONSUMER_STOPPING',
       retriable: false,
     })
-    const k = `${config.topics.main}|0`
+    const k = `${IDS.A}|0`
     const rig = {
       id: 'c18.4',
       slot: config.clients.find((c) => c.slot === 'c18'),
@@ -1419,14 +1486,10 @@ describe('final soak failure evidence', () => {
           throw stopping
         },
       },
-      processed: new Map([[k, '4300']]),
       uncommitted: new Map([[k, 100]]),
-      committed: new Map(),
-      authority: new Map([
-        [k, { key: { topic: config.topics.main, topicId: IDS.A, partition: 0 }, authority: {} }],
-      ]),
     }
-    await worker.commit(rig, k)
+    const key = { topic: config.topics.main, topicId: IDS.A, partition: 0 }
+    await worker.commit(rig, { key, authority: {} }, '4300')
     expect(runtime.records.find((r) => r.stage === 'commit' && r.phase === 'end')).toMatchObject({
       outcome: 'unknown',
       errorType: 'KafkaJSError',
