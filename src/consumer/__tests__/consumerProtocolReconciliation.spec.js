@@ -833,6 +833,27 @@ describe('Consumer > the consumer protocol reconciliation', () => {
     expect(onCrash).not.toHaveBeenCalled()
   })
 
+  it('refuses an ordinary apply while the membership carries a loss that moved no state, keeping the lost ownership and assignment, and lets the LOST round apply renew it', async () => {
+    const { group, trip } = build({ script: [assignment(1, [0]), idle(1)] })
+    await trip()
+    const token = group.ownership.token()
+    const fence = new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+    group.ownership.lose(fence, token)
+    expect(['FENCED', 'FATAL']).not.toContain(group.groupMembership.state)
+
+    await expect(
+      group.applyRebalanceResult({ assignment: { [TOPIC]: [0, 1] } }, { rebuildOffsets: false })
+    ).rejects.toBe(fence)
+    expect(group.ownership.token()).toEqual(token)
+    expect(group.ownership.refusal(token).cause).toBe(fence)
+    expect(group.assigned()).toEqual([{ topic: TOPIC, partitions: [0] }])
+
+    await group.applyRebalanceResult({ assignment: { [TOPIC]: [0, 1] } }, { lost: true })
+    expect(group.ownership.token()).toEqual(token + 1)
+    expect(group.ownership.refusal(token + 1)).toBeNull()
+    expect(group.assigned()).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
+  })
+
   it('assigns, then revokes, then assigns again across three heartbeat trips', async () => {
     const { emitted, group, trip } = build({
       script: [assignment(1, [0, 1]), assignment(2, [0]), assignment(3, [0, 2]), idle(3)],
