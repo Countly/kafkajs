@@ -5,7 +5,12 @@
  * monitor that aborts a run on low memory or a short disk reservation.
  */
 const fs = require('node:fs')
-const { valueOf } = require('./finalSoakScheduler')
+const {
+  valueOf,
+  harnessTimeout,
+  clearHarnessTimeout,
+  liveHarnessTimers,
+} = require('./finalSoakScheduler')
 
 const SUPERVISOR = 'p15'
 const OUTER = 'outer'
@@ -248,14 +253,14 @@ class Collector {
       return await Promise.race([
         write,
         new Promise((resolve, reject) => {
-          timer = setTimeout(
+          timer = harnessTimeout(
             () => reject(new Error(`${what} did not settle within ${this.writeTimeoutMs} ms`)),
             this.writeTimeoutMs
           )
         }),
       ])
     } finally {
-      clearTimeout(timer)
+      clearHarnessTimeout(timer)
     }
   }
 
@@ -400,7 +405,8 @@ class SourceChannel {
 /**
  * Takes retained samples: a synchronous inventory cut first, then two new full collections at least
  * the GC gap apart with event-loop turns between, then the memory reading. Every reading carries its
- * GC witness; IDs and the cumulative forced count are never reused.
+ * GC witness; IDs and the cumulative forced count are never reused. The Timeout count leaves out the
+ * harness's own live waits and bounds (`harnessTimeout`), so it counts only the code under test.
  */
 class Sampler {
   /**
@@ -410,6 +416,7 @@ class Sampler {
    * @param {() => Promise<void>} [options.turn] one event-loop turn for finalizers
    * @param {() => { rss: number, heapUsed: number, external: number }} [options.memory]
    * @param {() => string[]} [options.resources] active resource type names
+   * @param {() => number} [options.harnessTimers] the harness's own live timers, left out of Timeout
    * @param {number} [options.gcGapMs] the gap between the two collections
    * @param {string} [options.process] the process slot, for GC ids
    */
@@ -420,11 +427,12 @@ class Sampler {
     memory = () => process.memoryUsage(),
     // eslint-disable-next-line n/no-unsupported-features/node-builtins -- present on every supported Node; the only list of live resource types
     resources = () => process.getActiveResourcesInfo(),
+    harnessTimers = liveHarnessTimers,
     gcGapMs = 100,
     process: slot = 'p00',
   }) {
     if (typeof gc !== 'function') throw new Error('sampling needs --expose-gc')
-    Object.assign(this, { clock, gc, turn, memory, resources, gcGapMs, slot })
+    Object.assign(this, { clock, gc, turn, memory, resources, harnessTimers, gcGapMs, slot })
     this.forced = 0
   }
 
@@ -455,6 +463,7 @@ class Sampler {
     const { rss, heapUsed, external } = this.memory()
     const counts = new Map(EXPLICIT_RESOURCES.map((type) => [type, 0]))
     for (const type of this.resources()) counts.set(type, (counts.get(type) ?? 0) + 1)
+    counts.set('Timeout', counts.get('Timeout') - this.harnessTimers())
     const extra = [...counts.keys()].filter((t) => !EXPLICIT_RESOURCES.includes(t)).sort()
     return {
       role,
@@ -557,14 +566,14 @@ class HostMonitor {
   start(clock, onReading) {
     const tick = () => {
       onReading(this.check(clock.now()))
-      this.timer = setTimeout(tick, Math.min(this.memEveryMs, this.diskEveryMs))
+      this.timer = harnessTimeout(tick, Math.min(this.memEveryMs, this.diskEveryMs))
     }
     tick()
   }
 
   /** @returns {void} cancels the timer, so it never holds the process open */
   stop() {
-    clearTimeout(this.timer)
+    clearHarnessTimeout(this.timer)
     this.timer = null
   }
 }
