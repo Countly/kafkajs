@@ -90,6 +90,7 @@ class World {
       [DOOMED, DOOMED_ID],
     ])
     this.refused = new Map()
+    this.partitionErrors = new Map()
     this.epoch = 0
     this.assigned = null
     this.names = null
@@ -138,7 +139,7 @@ class World {
       topicAuthorizedOperations: -2147483648,
       partitions: [
         {
-          errorCode: 0,
+          errorCode: this.partitionErrors.get(name) ?? 0,
           partitionIndex: 0,
           leaderId: 0,
           leaderEpoch: 5,
@@ -235,9 +236,10 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
   /**
    * @param {'classic'|'consumer'} protocol
    * @param {object} [options] consumer options over the scenario's
+   * @param {object} [script] options of the group script, `committed` say
    * @returns {object} the world, the wire, the consumer and what it observed
    */
-  const scenario = (protocol, options = {}) => {
+  const scenario = (protocol, options = {}, script = {}) => {
     const world = new World()
     let cluster = createScriptedCluster({
       nodes: NODES,
@@ -245,8 +247,8 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
     })
     cluster =
       protocol === 'consumer'
-        ? consumerProtocolScript(cluster, { topic: HEALTHY })
-        : groupScript(cluster, { topic: HEALTHY })
+        ? consumerProtocolScript(cluster, { topic: HEALTHY, ...script })
+        : groupScript(cluster, { topic: HEALTHY, ...script })
     cluster.answer('Metadata', ({ topics }) => world.metadata(topics))
     cluster.answer('Fetch', ({ topics }) => world.fetch(topics))
     if (protocol === 'consumer') {
@@ -258,7 +260,7 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       }))
     }
 
-    const observed = { records: [], statuses: [], crashes: [], warnings: [] }
+    const observed = { records: [], statuses: [], crashes: [], warnings: [], errors: [] }
     const kafka = new Kafka(
       cluster.kafkaOptions({
         retry: RETRY,
@@ -266,8 +268,10 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
         logCreator:
           () =>
           ({ level, log }) => {
+            if (level === logLevel.ERROR) observed.errors.push(log)
             if (level === logLevel.WARN && log.message === UNAVAILABLE_WARN) {
               observed.warnings.push(log)
+              if (observed.loggerThrows) throw new Error('log sink down')
             }
           },
       })
@@ -476,5 +480,136 @@ describe('Consumer > a subscribed topic deleted and recreated', () => {
       expect.objectContaining({ topic: DOOMED, status: 'unavailable' }),
     ])
     expect(wire.observed.crashes).toEqual([])
+  }, 30000)
+
+  /** @param {object} observed @param {number} after @returns {boolean} whether the new incarnation began at 0 */
+  const observedRecreatedFromStart = (observed, after) =>
+    observed.records.slice(after).find(({ topic }) => topic === DOOMED)?.offset === '0'
+
+  /** @param {Error} error a crash error @returns {Error} the first cause that carries a type */
+  const typed = (error) => {
+    let cause = error
+    while (cause.cause && !cause.type) cause = cause.cause
+    return cause
+  }
+
+  test('classic: a subscription whose validation failed is not established, so a later code 3 still stops the run', async () => {
+    const TYPO = 'lifecycle-typo'
+    const wire = scenario('classic')
+    await wire.consumer.connect()
+    wire.world.refused.set(TYPO, 42)
+    await expect(
+      wire.consumer.subscribe({ topics: [HEALTHY, TYPO], fromBeginning: true })
+    ).rejects.toMatchObject({ type: 'INVALID_REQUEST' })
+
+    wire.world.refused.set(TYPO, 3)
+    await wire.run()
+    await until(() => wire.observed.crashes.length === 1, 'the crash')
+
+    expect(typed(wire.observed.crashes[0].error).type).toBe('UNKNOWN_TOPIC_OR_PARTITION')
+    expect(wire.observed.statuses).toEqual([])
+  }, 30000)
+
+  test('manual: a topic deleted after assign() validated it and recreated before it was read starts its new incarnation at the beginning, not at the old committed offset', async () => {
+    const wire = scenario(
+      'classic',
+      { groupId: 'lifecycle-manual-early' },
+      { committed: { 0: '73' } }
+    )
+    await wire.consumer.connect()
+    await wire.consumer.assign([
+      { topic: HEALTHY, partitions: [0] },
+      { topic: DOOMED, partitions: [0] },
+    ])
+    wire.world.remove(DOOMED)
+    await wire.run()
+    await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+    await until(() => offsets(wire.observed, HEALTHY).length >= 3, 'healthy records')
+
+    wire.world.recreate(DOOMED, RECREATED_ID)
+    await until(
+      () => offsets(wire.observed, DOOMED).length >= 1,
+      'a record from the new incarnation'
+    )
+
+    expect(offsets(wire.observed, HEALTHY)[0]).toBe('73')
+    expect(offsets(wire.observed, DOOMED)[0]).toBe('0')
+    const firstAsked = wire.cluster
+      .requests()
+      .filter(({ api }) => api === 'Fetch')
+      .flatMap(({ fields }) => fields.topics)
+      .find(({ topicId }) => topicId === RECREATED_ID)
+    expect(firstAsked.partitions[0].fetchOffset).toBe('0')
+    expect(wire.observed.crashes).toEqual([])
+  }, 30000)
+
+  test.each([
+    [17, 'INVALID_TOPIC_EXCEPTION'],
+    [29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    'classic: code %i for one topic stops the run with %s even when a healthy topic answers a partition error',
+    async (code, type) => {
+      const wire = scenario('classic')
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+
+      wire.world.partitionErrors.set(HEALTHY, 6)
+      wire.world.refused.set(DOOMED, code)
+      await until(() => wire.observed.crashes.length === 1, 'the crash')
+
+      expect(typed(wire.observed.crashes[0].error).type).toBe(type)
+      expect(wire.observed.statuses).toEqual([])
+    },
+    30000
+  )
+
+  test('a status listener that throws null and a log sink that throws cannot stop the run', async () => {
+    const wire = scenario('classic')
+    wire.observed.loggerThrows = true
+    wire.consumer.on(wire.consumer.events.TOPIC_METADATA_STATUS, () => {
+      throw null // eslint-disable-line no-throw-literal
+    })
+    await wire.consumer.connect()
+    await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+    await wire.run()
+
+    const { after } = await deleteAndRecreate(wire)
+
+    expect(wire.observed.crashes).toEqual([])
+    expect(wire.observed.statuses.map(({ status }) => status)).toEqual(['unavailable', 'available'])
+    expect(observedRecreatedFromStart(wire.observed, after)).toBe(true)
+  }, 30000)
+
+  test('a listener whose promise rejects with null is logged, not left as an unhandled rejection', async () => {
+    const wire = scenario('classic')
+    const unhandled = []
+    const onUnhandled = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      wire.consumer.on(wire.consumer.events.TOPIC_METADATA_STATUS, () => Promise.reject(null)) // eslint-disable-line prefer-promise-reject-errors
+      await wire.consumer.connect()
+      await wire.consumer.subscribe({ topics: [HEALTHY, DOOMED], fromBeginning: true })
+      await wire.run()
+      await until(() => offsets(wire.observed, DOOMED).length >= 1, 'a record from the topic')
+      wire.world.remove(DOOMED)
+      await until(() => wire.observed.statuses.length === 1, 'the unavailable status')
+      await until(
+        () =>
+          wire.observed.errors.some(({ message }) =>
+            message.startsWith('Failed to execute listener')
+          ),
+        'the listener failure log'
+      )
+      await sleep(20)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+
+    expect(unhandled).toEqual([])
+    expect(wire.observed.errors).toContainEqual(
+      expect.objectContaining({ message: 'Failed to execute listener: undefined' })
+    )
   }, 30000)
 })

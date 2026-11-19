@@ -10,8 +10,9 @@ const RECREATED_ID = '21222324-2526-2728-292a-2b2c2d2e2f30'
 
 /**
  * A cluster over one broker double whose answers go through the real Metadata v13 parse. A name in
- * `refused` is answered with its code and no partitions; `ids` gives each name's current topic id
- * and `leaders` the leader epoch of its one partition.
+ * `refused` is answered with its code and no partitions; `ids` gives each name's current topic id,
+ * `epochs` the leader epoch of its one partition and `partitionErrors` that partition's code. An
+ * answer waits for the promise at the head of `holds`, when there is one.
  * @param {object} [options] cluster options over the defaults
  * @returns {object} the cluster, the broker double, its controls and the status reports
  */
@@ -24,6 +25,8 @@ const build = (options = {}) => {
     ['other', RECREATED_ID],
   ])
   const epochs = new Map()
+  const partitionErrors = new Map()
+  const holds = []
   const emitter = new InstrumentationEventEmitter()
   const recreated = []
   emitter.addListener(CLUSTER_TOPIC_RECREATED, ({ payload }) => recreated.push(payload))
@@ -43,6 +46,8 @@ const build = (options = {}) => {
     disconnect: async () => {},
     retire: async () => {},
     metadata: jest.fn(async (topics, requestOptions = {}) => {
+      const hold = holds.shift()
+      if (hold) await hold
       const data = {
         errorCode: 0,
         brokers: [{ nodeId: 0, host: 'localhost', port: 9092, rack: null }],
@@ -56,7 +61,7 @@ const build = (options = {}) => {
                 topicErrorCode: 0,
                 partitionMetadata: [
                   {
-                    partitionErrorCode: 0,
+                    partitionErrorCode: partitionErrors.get(topic) ?? 0,
                     partitionId: 0,
                     leader: 0,
                     leaderEpoch: epochs.get(topic) ?? 1,
@@ -74,7 +79,7 @@ const build = (options = {}) => {
   cluster.brokerPool.seedBroker = broker
   cluster.brokerPool.brokers = { 0: broker }
   cluster.brokerPool.findConnectedBroker = async () => broker
-  return { cluster, broker, refused, ids, epochs, reports, recreated }
+  return { cluster, broker, refused, ids, epochs, partitionErrors, holds, reports, recreated }
 }
 
 /** @param {Cluster} cluster @returns {string[]} the topics the installed metadata routes */
@@ -246,6 +251,109 @@ describe('Cluster > a consumer target answered UNKNOWN_TOPIC_OR_PARTITION', () =
 
     expect(cluster.brokerPool.unavailableTopics.size).toBe(0)
   })
+
+  test('a topic whose add failed with another error is not established, so a later code 3 fails the refresh', async () => {
+    const { cluster, refused, reports } = build()
+    await cluster.addMultipleTargetTopics(['healthy'])
+    refused.set('doomed', 42)
+    await expect(cluster.addMultipleTargetTopics(['doomed'])).rejects.toMatchObject({
+      type: 'INVALID_REQUEST',
+    })
+    expect([...cluster.targetTopics]).toEqual(['healthy', 'doomed'])
+
+    refused.set('doomed', 3)
+    await expect(cluster.refreshMetadata()).rejects.toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(reports).toEqual([])
+
+    refused.delete('doomed')
+    await cluster.refreshMetadata()
+    refused.set('doomed', 3)
+    await cluster.refreshMetadata()
+    expect(reports).toEqual([UNAVAILABLE])
+  })
+
+  test('targets a reset declared without an accepted answer are not established', async () => {
+    const { cluster, refused, reports } = build()
+    await cluster.resetTargetTopics(['healthy', 'doomed'])
+    refused.set('doomed', 3)
+
+    await expect(cluster.refreshMetadata()).rejects.toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(reports).toEqual([])
+  })
+
+  test('targets a reset declared with their accepted answer are established under the accepted ids', async () => {
+    const { cluster, broker, refused, ids, reports, recreated } = build()
+    const accepted = await broker.metadata(['healthy', 'doomed'])
+    await cluster.resetTargetTopics(['healthy', 'doomed'], { accepted })
+    expect(cluster.topicId('doomed')).toBe(DOOMED_ID)
+
+    refused.set('doomed', 3)
+    await cluster.refreshMetadata()
+    expect(reports).toEqual([UNAVAILABLE])
+
+    refused.delete('doomed')
+    ids.set('doomed', RECREATED_ID)
+    await cluster.refreshMetadata()
+    expect(recreated).toEqual([
+      expect.objectContaining({
+        topic: 'doomed',
+        previousTopicId: DOOMED_ID,
+        topicId: RECREATED_ID,
+      }),
+    ])
+  })
+
+  test('an answer sent before a topic was removed does not establish the topic declared again', async () => {
+    const { cluster, refused, holds, reports } = build()
+    await cluster.addMultipleTargetTopics(['healthy', 'doomed'])
+    let release
+    holds.push(new Promise((resolve) => (release = resolve)))
+    const early = cluster.refreshMetadata()
+    await cluster.resetTargetTopics(['healthy'])
+    const added = cluster.addMultipleTargetTopics(['doomed'])
+
+    release()
+    await early
+    await added
+    refused.set('doomed', 3)
+
+    await expect(cluster.refreshMetadata()).rejects.toMatchObject({
+      type: 'UNKNOWN_TOPIC_OR_PARTITION',
+    })
+    expect(reports).toEqual([])
+  })
+
+  test.each([
+    [17, 'INVALID_TOPIC_EXCEPTION'],
+    [29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    'code %i for one topic fails the refresh before a partition error of a healthy topic',
+    async (code, type) => {
+      const { cluster, refused, partitionErrors, reports } = build()
+      await cluster.addMultipleTargetTopics(['healthy', 'doomed'])
+      partitionErrors.set('healthy', 6)
+      refused.set('doomed', code)
+
+      await expect(cluster.refreshMetadata()).rejects.toMatchObject({ type })
+      expect(reports).toEqual([])
+    }
+  )
+
+  test('a partition error of a healthy topic beside a missing one fails the refresh and changes no status', async () => {
+    const { cluster, refused, partitionErrors, reports } = build()
+    await cluster.addMultipleTargetTopics(['healthy', 'doomed'])
+    partitionErrors.set('healthy', 6)
+    refused.set('doomed', 3)
+
+    await expect(cluster.refreshMetadata()).rejects.toMatchObject({
+      type: 'NOT_LEADER_FOR_PARTITION',
+    })
+    expect(reports).toEqual([])
+  })
 })
 
 describe('Cluster > lookups that still fail on a missing topic', () => {
@@ -277,4 +385,24 @@ describe('Cluster > lookups that still fail on a missing topic', () => {
       type: 'UNKNOWN_TOPIC_OR_PARTITION',
     })
   })
+})
+
+describe('Cluster > a producer target refusal beside a partition error', () => {
+  test.each([
+    [17, 'INVALID_TOPIC_EXCEPTION'],
+    [29, 'TOPIC_AUTHORIZATION_FAILED'],
+  ])(
+    'a new target answered %i fails the add with %s, not with the partition error',
+    async (code, type) => {
+      const { cluster, refused, partitionErrors } = build({
+        onTopicMetadataStatus: undefined,
+        metadataMaxIdle: 60000,
+      })
+      await cluster.addMultipleTargetTopics(['healthy'])
+      partitionErrors.set('healthy', 6)
+      refused.set('doomed', code)
+
+      await expect(cluster.addMultipleTargetTopics(['doomed'])).rejects.toMatchObject({ type })
+    }
+  )
 })
