@@ -703,7 +703,7 @@ describe('a seek without a commit', () => {
     await ctx.manager.commitOffsets()
     expect(ctx.coordinator.offsetCommit).toHaveBeenCalledTimes(2)
     expect(ctx.coordinator.offsetCommit.mock.calls[1][0].topics).toEqual([
-      { topic: TOPIC, partitions: [expect.objectContaining({ partition: 0, offset: '3' })] },
+      { topic: TOPIC, partitions: [{ partition: '0', offset: '3', leaderEpoch: -1 }] },
     ])
     expect(ctx.stored[0]).toBe('3')
     expect(ctx.committedAt(0)).toBe('3')

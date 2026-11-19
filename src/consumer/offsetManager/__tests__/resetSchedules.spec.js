@@ -1026,6 +1026,10 @@ describe('Consumer > OffsetManager > reset schedules', () => {
       expect(ctx.operations.isSuperseded(publication, TOPIC, 0)).toBe(false)
 
       await ctx.manager.seek({ topic: TOPIC, partition: 0, offset: '5' })
+      expect(ctx.operations.isSuperseded(publication, TOPIC, 0)).toBe(false)
+      const later = ctx.operations.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+      ctx.operations.fence(later, TOPIC, 0)
+      ctx.operations.end(later)
       expect(ctx.operations.isSuperseded(publication, TOPIC, 0)).toBe(true)
       ctx.operations.end(publication)
       expect(ctx.operations.size()).toBe(0)

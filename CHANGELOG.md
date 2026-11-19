@@ -53,6 +53,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - KIP-848 consumers whose heartbeat timer is stopped while a heartbeat or join is still waiting for its answer (for example on a poll-interval expiry) send the replacement round's join at once instead of waiting for the old answer, which could use up the new join's rebalance timeout.
 - **A log creator that changes the logged seek no longer changes the seek.** The `Seek offset` debug entry now carries a copy of the seek; in kafkajs 2.2.4 it was the object the consumer then applied, so a `logCreator` that edited `log.seek` could send the seek to another partition.
 - **An offset commit the broker accepted is recorded in the consumer's committed-offset cache also when its handler batch was superseded by a seek before the answer arrived, or when another partition of the same request was refused.** The caller still gets its refusal or error; the cache no longer stays behind the broker. A commit whose membership was lost, or whose run or call ended, still records nothing.
+- With `autoCommit: false`, a `commitOffsets` the broker accepted while a `seek` of the same partition was applied is again recorded in the committed cache; the seek no longer drops it, so the cache matches the broker and the next commit of the position is sent.
 
 #### Tooling
 

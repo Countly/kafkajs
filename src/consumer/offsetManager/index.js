@@ -777,7 +777,8 @@ module.exports = class OffsetManager {
 
   /**
    * Resolves a duration reset under the mutation intent captured before lookup.
-   * Local resets fence older work; only a confirmed concrete commit discharges debt.
+   * Local resets fence older work; only a confirmed concrete commit discharges debt. The ticket is
+   * owned by this manager, so its own later seek without a commit supersedes it.
    * @private
    * @param {{topic:string,partition:number}} topicPartition current assigned cell
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
@@ -790,7 +791,7 @@ module.exports = class OffsetManager {
    */
   async resetByDuration({ topic, partition }, preparation) {
     this.refuse(preparation)
-    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+    const ticket = this.operations.begin([{ topic, partition }], { mutation: true, owner: this })
     const requestedId = this.cluster.topicId(topic)
     const token = this.ownership?.token()
     const release = this.ownership?.retain(token)
@@ -885,7 +886,8 @@ module.exports = class OffsetManager {
    *
    * A seek is a mutation of the offset ledger: it is applied unless a seek or commit that began
    * after it was applied first, or a barrier reached the partition while its commit was in
-   * flight. A concrete seek without auto-commit changes only the local position. A
+   * flight. A concrete seek without auto-commit changes only the local position and fences only
+   * this manager's own older work, so a commit the broker accepts meanwhile is still cached. A
    * sentinel seek fences older answers at once; publishing its boundary remains local.
    * Recreation debt settles only after a successful concrete commit. Cancellation before
    * publication (stop or rebuild) leaves the reset owed; a failed
@@ -954,7 +956,10 @@ module.exports = class OffsetManager {
 
   /**
    * Applies a concrete offset without a commit: the position and its private fallback, with an
-   * unknown epoch, under a mutation ticket; the pending sentinel and reset refusal of the cell end.
+   * unknown epoch; the pending sentinel and reset refusal of the cell end. It writes nothing
+   * shared, so it fences only this manager's own older work on the cell (an owner barrier: its
+   * resolutions and duration resets), never another participant's or a commit, whose accepted
+   * value still reaches the committed cache.
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -962,14 +967,9 @@ module.exports = class OffsetManager {
    * @returns {true}
    */
   seekLocally(topic, partition, offset) {
-    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
-    try {
-      this.clearPendingSeek(topic, partition)
-      this.installSeekPosition(topic, partition, offset, { local: true })
-      this.operations.fence(ticket, topic, partition)
-    } finally {
-      this.operations.end(ticket)
-    }
+    this.clearPendingSeek(topic, partition)
+    this.installSeekPosition(topic, partition, offset, { local: true })
+    this.operations.touchOwned(this, topic, partition)
     this.retireResetRefusals(topic, partition)
     return true
   }
