@@ -2693,3 +2693,158 @@ describe('Consumer > a whole consumer-protocol consumer > the heartbeat outage c
     }
   })
 })
+
+describe('Consumer > a whole consumer-protocol consumer > a saved eachBatch resolver', () => {
+  let consumer
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(async () => {
+    const stopping = consumer.disconnect().catch(() => {})
+    await jest.advanceTimersByTimeAsync(3000)
+    await stopping
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
+  /**
+   * Runs `eachBatch` without auto-resolve over a coordinator that hands out `targets` in order,
+   * one per accepted heartbeat once `s.next()` is called, and fences every epoch below 100 once
+   * `s.fenced` is set (an epoch 0 join then gets epoch 100 with `rejoinTarget`). The first batch of
+   * topic-a:0 at offset 40 keeps its `resolveOffset` and, while `s.hold` is set, waits for it.
+   * @param {object} options
+   * @param {Object<string, number[]>} options.first the epoch 1 assignment
+   * @param {Object<string, number[]>} [options.rejoinTarget]
+   * @returns {Promise<object>} the built consumer, its switches and what the handler saw
+   */
+  const start = async ({ first, rejoinTarget = first }) => {
+    const built = buildConsumer()
+    consumer = built.consumer
+    const s = { fenced: false, epoch: 1, pending: [], hold: null, saved: null, handled: [] }
+    s.next = (target) => s.pending.push(target)
+    built.state.answer = ({ memberEpoch }) => {
+      if (memberEpoch < 0) return fullTarget(memberEpoch, null)
+      if (s.fenced) {
+        if (memberEpoch === 0) return fullTarget(100, rejoinTarget)
+        if (memberEpoch >= 100) return fullTarget(100, null)
+        throw new KafkaJSProtocolError(createErrorFromCode(FENCED_MEMBER_EPOCH))
+      }
+      if (memberEpoch === 0) return fullTarget(1, first)
+      if (s.pending.length) return fullTarget(++s.epoch, s.pending.shift())
+      return fullTarget(s.epoch, null)
+    }
+    await consumer.subscribe({ topics: ['topic-a', 'topic-b'] })
+    consumer.run({
+      autoCommitInterval: 1000,
+      eachBatchAutoResolve: false,
+      eachBatch: async ({ batch, resolveOffset }) => {
+        const tp = `${batch.topic}|${batch.partition}`
+        for (const message of batch.messages) s.handled.push(`${tp}@${message.offset}`)
+        if (!s.saved && tp === 'topic-a|0') {
+          s.saved = resolveOffset
+          if (s.hold) await s.hold
+          return
+        }
+        for (const message of batch.messages) resolveOffset(message.offset)
+      },
+    })
+    return { ...built, s }
+  }
+
+  /** @returns {string[]} the committed offsets of topic-a:0, in order */
+  const commitsOf = (log, tp) =>
+    log.filter(({ kind, tp: at }) => kind === 'commit' && at === tp).map(({ offset }) => offset)
+
+  it('writes nothing once its partition was lost and the replacement published: the new manager commits only fresh progress', async () => {
+    const run = await start({ first: { 'topic-a': [0] }, rejoinTarget: { 'topic-a': [0, 1] } })
+    run.state.queue['topic-a|0'] = [40]
+    await advanceUntil(() => run.s.saved !== null)
+    run.state.queue['topic-a|0'] = []
+    run.s.fenced = true
+    await advanceUntil(() => run.log.some(({ epoch }) => epoch === 100), 10000)
+    expect(run.log.some(({ kind }) => kind === 'PARTITIONS_LOST')).toBe(true)
+    run.state.queue['topic-a|0'] = [40]
+    await advanceUntil(() => run.s.handled.filter((h) => h === 'topic-a|0@40').length === 2)
+
+    run.s.saved('77')
+    await jest.advanceTimersByTimeAsync(1500)
+    run.state.queue['topic-a|1'] = [40]
+    await advanceUntil(() => run.s.handled.includes('topic-a|1@40'))
+    await advanceUntil(() => commitsOf(run.log, 'topic-a|1').length > 0)
+
+    expect(commitsOf(run.log, 'topic-a|1')).toContain('41')
+    expect(commitsOf(run.log, 'topic-a|0')).not.toContain('78')
+    expect(commitsOf(run.log, 'topic-a|0')).toContain('41')
+  })
+
+  it('writes nothing once its partition was revoked and acquired again under the same manager', async () => {
+    const run = await start({ first: { 'topic-a': [0, 1] } })
+    let release
+    run.s.hold = new Promise((resolve) => (release = resolve))
+    run.state.queue['topic-a|0'] = [40]
+    await advanceUntil(() => run.s.saved !== null)
+    run.s.next({ 'topic-a': [1] })
+    await advanceUntil(() => run.log.some(({ kind }) => kind === 'PARTITIONS_REVOKED'), 10000)
+    run.s.next({ 'topic-a': [0, 1] })
+    await advanceUntil(
+      () => run.log.filter(({ kind }) => kind === 'PARTITIONS_ASSIGNED').length >= 2,
+      10000
+    )
+    release()
+
+    run.s.saved('77')
+    await jest.advanceTimersByTimeAsync(1500)
+    run.state.queue['topic-a|1'] = [40]
+    await advanceUntil(() => run.s.handled.includes('topic-a|1@40'))
+    await advanceUntil(() => commitsOf(run.log, 'topic-a|1').length > 0)
+
+    expect(commitsOf(run.log, 'topic-a|1')).toContain('41')
+    expect(commitsOf(run.log, 'topic-a|0')).not.toContain('78')
+  })
+
+  it('keeps its progress across an ordinary apply that renews the ownership while the handler runs: the partition resumes after it', async () => {
+    const run = await start({ first: { 'topic-a': [0] } })
+    let release
+    run.s.hold = new Promise((resolve) => (release = resolve))
+    run.state.queue['topic-a|0'] = [40]
+    await advanceUntil(() => run.s.saved !== null)
+    run.s.next({ 'topic-a': [0], 'topic-b': [0] })
+    await advanceUntil(
+      () =>
+        run.log.some(
+          ({ kind }) =>
+            kind === 'PARTITIONS_ASSIGNED' &&
+            run.log.filter((e) => e.kind === 'PARTITIONS_ASSIGNED').length >= 2
+        ),
+      10000
+    )
+
+    run.s.saved('40')
+    release()
+    run.state.queue['topic-a|0'] = [40, 41]
+    await advanceUntil(() => run.s.handled.includes('topic-a|0@41'))
+    await jest.advanceTimersByTimeAsync(1500)
+    run.state.queue['topic-b|0'] = [40]
+    await advanceUntil(() => run.s.handled.includes('topic-b|0@40'))
+    await advanceUntil(() => commitsOf(run.log, 'topic-b|0').length > 0)
+
+    expect(run.s.handled.filter((h) => h === 'topic-a|0@40')).toHaveLength(1)
+    expect(commitsOf(run.log, 'topic-a|0')[0]).toBe('42')
+  })
+
+  it('still resolves the progress a natural stop commits while the handler drains', async () => {
+    const run = await start({ first: { 'topic-a': [0] } })
+    let release
+    run.s.hold = new Promise((resolve) => (release = resolve))
+    run.state.queue['topic-a|0'] = [40]
+    await advanceUntil(() => run.s.saved !== null)
+
+    const stopping = consumer.stop()
+    await jest.advanceTimersByTimeAsync(100)
+    run.s.saved('40')
+    release()
+    await jest.advanceTimersByTimeAsync(3000)
+    await stopping
+
+    expect(commitsOf(run.log, 'topic-a|0')).toEqual(['41'])
+  })
+})
