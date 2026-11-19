@@ -183,7 +183,7 @@ class Journal {
     this.heldCount = 0
     this.idsFull = false
     Object.assign(this, { repeatsAfterChange: 0, shareRepeats: 0, redundantAcquires: 0 })
-    this.trafficEnd = null
+    this.trafficEnds = new Map()
     const keys = () => ({ paused: 0, held: 0 })
     this.info = {
       outages: [],
@@ -226,8 +226,7 @@ class Journal {
     else if (r.kind === 'boundary') this.boundary(r)
     else if (r.kind === 'sample') this.sample(r)
     else if (r.kind === 'process') this.process(r)
-    else if (r.kind === 'shape' && r.execution === 'traffic' && r.phase === 'end')
-      this.trafficEnd = Math.max(this.trafficEnd ?? -Infinity, r.at)
+    else if (r.kind === 'shape') this.shape(r)
     else if (r.kind === 'broker-state' && r.event !== 'isr') {
       const { node, event, at, downMs = null, processAt = null } = r
       if (this.info.outages.length < LIST_CAP)
@@ -244,6 +243,17 @@ class Journal {
           first: this.incidents.get(kind)?.first ?? r.message,
         })
     }
+  }
+
+  /**
+   * Keeps, per process of the config, the latest end of a `traffic` shape executed as `traffic`:
+   * the supervisor writes one after the final drain. Other shapes and sources are no candidates.
+   * @param {object} r a `shape` record @returns {void}
+   */
+  shape(r) {
+    if (r.execution !== 'traffic' || r.phase !== 'end' || r.shape !== 'traffic') return
+    if (this.procs.has(r.source))
+      this.trafficEnds.set(r.source, Math.max(this.trafficEnds.get(r.source) ?? -Infinity, r.at))
   }
 
   /**
@@ -1050,13 +1060,21 @@ function judgeHeap(row, { journal, matrix, config, plan, header }) {
 /**
  * K6: every process's final resource counts are at or below its baseline; a type the baseline never
  * had counts against zero, so an unknown type fails. The baseline must precede every other sample
- * of its process and the final follow every other sample and the end of traffic (after the drain).
- * @param {Row} row @param {{ journal: Journal, config: object }} ctx @returns {void}
+ * of its process and the final follow every other sample and the end of traffic. The end of traffic
+ * is the supervisor's (`header.exit.supervisorProcess`) latest `traffic` shape end, written after
+ * the final drain, and must lie between the run's end and the supervisor's observed end.
+ * @param {Row} row @param {{ journal: Journal, config: object, header: object }} ctx @returns {void}
  */
-function judgeResources(row, { journal, config }) {
+function judgeResources(row, { journal, config, header }) {
   let above = 0
-  if (journal.trafficEnd === null)
-    row.gap('the journal records no end of traffic (the final drain)')
+  const end = journal.trafficEnds.get(header.exit.supervisorProcess) ?? null
+  const { runEndAt, observedEndAt } = header.window
+  if (end === null)
+    row.gap('the journal records no end of traffic (the final drain) from the supervisor')
+  else if (end < runEndAt || end > observedEndAt)
+    row.gap(
+      `the end of traffic at ${end} lies outside the run end ${runEndAt} to the observed end ${observedEndAt}`
+    )
   for (const { slot } of config.processes) {
     const { baseline, final, others } = journal.procs.get(slot)
     if (!baseline || !final) {
@@ -1065,7 +1083,7 @@ function judgeResources(row, { journal, config }) {
     }
     if (baseline.completedAt > others.first)
       row.gap(`${slot} baseline was completed after its first other sample`)
-    if (final.admittedAt < Math.max(others.last, journal.trafficEnd ?? Infinity))
+    if (final.admittedAt < Math.max(others.last, end ?? Infinity))
       row.gap(`${slot} final sample was not taken last and after the end of traffic`)
     for (const [type, count] of final.counts) {
       if (count <= (baseline.counts.get(type) ?? 0)) continue
@@ -1075,7 +1093,7 @@ function judgeResources(row, { journal, config }) {
       )
     }
   }
-  row.numbers.typesAboveBaseline = above
+  Object.assign(row.numbers, { trafficEnd: end, typesAboveBaseline: above })
 }
 
 /**
