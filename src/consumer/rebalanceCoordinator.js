@@ -873,7 +873,8 @@ module.exports = class RebalanceCoordinator {
       })
     )
 
-    if (this.runner.stopRequested) {
+    // An accepted fatal answer already ends this membership; nothing here may leave or rejoin it.
+    if (this.runner.stopRequested || this.runner.fatal) {
       return
     }
 

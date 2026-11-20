@@ -313,13 +313,16 @@ module.exports = class ConnectionPool {
 
   /**
    * Closes every connection, each after its requests finished or `drainTimeout` passed. The pool
-   * stays reusable unless it was retired.
+   * stays reusable unless it was retired. Settles once every connection has; a failure rejects
+   * only then, with the first one.
    * @public
    * @param {object} [options]
    * @param {number} [options.drainTimeout] ms to wait for requests; the pool's own when omitted
    * @returns {Promise<void>}
    */
   async destroy({ drainTimeout = this.drainTimeout } = {}) {
-    await Promise.all(this.map((c) => c.disconnect({ drainTimeout })))
+    const results = await Promise.allSettled(this.map((c) => c.disconnect({ drainTimeout })))
+    const failure = results.find(({ status }) => status === 'rejected')
+    if (failure) throw failure.reason
   }
 }
