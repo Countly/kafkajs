@@ -129,7 +129,7 @@ describe('share membership across a rebootstrap', () => {
    * Runs a joined share consumer, then makes its fetch report the topic gone while metadata
    * answers REBOOTSTRAP_REQUIRED, so the fetch loop's metadata refresh rebootstraps the client
    * and retires every broker the run cached, the coordinator included.
-   * @param {number} fenceCode The code the coordinator answers the next heartbeat with.
+   * @param {number} fenceCode The code the coordinator answers the next written heartbeat with.
    * @returns {Promise<{warn: jest.SpyInstance, token: symbol, beatsBefore: number}>}
    */
   const rebootstrapWhileRunning = async (fenceCode) => {
@@ -187,15 +187,28 @@ describe('share membership across a rebootstrap', () => {
     }
   )
 
-  test('logs the type and code of a failing share heartbeat', async () => {
-    const { warn } = await rebootstrapWhileRunning(25)
+  test('logs the name, type and code of each failing share heartbeat', async () => {
+    const { warn } = await rebootstrapWhileRunning(14)
 
-    await until(() => run.membership.memberEpoch === 2, 'the second join')
-    const failures = warn.mock.calls.filter(([message]) => message === 'Share heartbeat failed')
-    expect(failures.map(([, extra]) => extra)).toContainEqual({
+    await until(() => run.membership.coordinator?.broker.retired === false, 'the new coordinator')
+    await until(
+      () => warn.mock.calls.some(([, extra]) => extra?.code === 14),
+      'the logged broker answer'
+    )
+    const failures = warn.mock.calls
+      .filter(([message]) => message === 'Share heartbeat failed')
+      .map(([, extra]) => extra)
+    expect(failures[0]).toEqual({
+      error: 'This broker connection was replaced',
+      name: 'KafkaJSConnectionError',
+      type: undefined,
+      code: undefined,
+    })
+    expect(failures).toContainEqual({
       error: expect.any(String),
-      type: 'UNKNOWN_MEMBER_ID',
-      code: 25,
+      name: 'KafkaJSProtocolError',
+      type: 'GROUP_LOAD_IN_PROGRESS',
+      code: 14,
     })
   })
 })
