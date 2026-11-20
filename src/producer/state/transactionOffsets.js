@@ -1,6 +1,13 @@
+const { isSuperseded } = require('../../consumer/handlerContext')
+
 /**
  * Holds immutable transactional offset calls until a confirmed commit. Fences belong to the
  * outstanding calls, then to their coalesced entries; release permanently retires both.
+ *
+ * It also holds the transaction's input dependencies: the consumer acquisition of each handler
+ * batch whose offsets a `sendOffsets` call carried, with the earliest such batch's fetch clock.
+ * They are kept apart from the staged offsets, so a later call for the same partition cannot drop
+ * one, and are bounded by the distinct acquisitions of one open transaction.
  */
 class TransactionOffsets {
   /**
@@ -11,6 +18,44 @@ class TransactionOffsets {
     this.entries = new Map()
     this.snapshots = new Set()
     this.tail = Promise.resolve()
+    /** @type {Map<import('../../consumer/handlerContext').Acquisition, number>|null} */
+    this.inputs = null
+  }
+
+  /**
+   * Records that the transaction carries offsets of a batch fetched at `acquireClock` under
+   * `acquisition`, keeping the earliest clock per acquisition.
+   * @param {import('../../consumer/handlerContext').Acquisition} acquisition
+   * @param {number} acquireClock
+   * @returns {void}
+   */
+  enlist(acquisition, acquireClock) {
+    this.inputs ??= new Map()
+    const held = this.inputs.get(acquisition)
+    if (held === undefined || acquireClock < held) this.inputs.set(acquisition, acquireClock)
+  }
+
+  /**
+   * @returns {Pick<import('../../consumer/handlerContext').BatchIdentity, 'acquisition'|'acquireClock'>|null}
+   *   the first input a seek, a topic recreation or the end of its acquisition superseded
+   *   (`handlerContext.isSuperseded`); null when every input still stands or there is none
+   */
+  supersededInput() {
+    if (this.inputs === null) return null
+    for (const [acquisition, acquireClock] of this.inputs) {
+      const input = { acquisition, acquireClock }
+      if (isSuperseded(input)) return input
+    }
+    return null
+  }
+
+  /**
+   * Drops the input dependencies once the commit's EndTxn is being written: from then on the
+   * commit may have happened, and only its outcome is left to learn.
+   * @returns {void}
+   */
+  sealInputs() {
+    this.inputs = null
   }
 
   /**
@@ -128,12 +173,14 @@ class TransactionOffsets {
   }
 
   /**
-   * Forfeits outstanding and staged permits permanently; never publishes. Idempotent.
+   * Forfeits outstanding and staged permits permanently and drops the input dependencies;
+   * never publishes. Idempotent.
    * @returns {void}
    */
   release() {
     for (const snapshot of this.snapshots) this.abandon(snapshot)
     this.entries.clear()
+    this.inputs = null
   }
 }
 

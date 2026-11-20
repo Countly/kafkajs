@@ -1816,6 +1816,7 @@ module.exports = class Runner extends EventEmitter {
         acquireClock,
         ownershipKey,
         acquisition,
+        groupId: this.consumerGroup.groupId,
         runIdentity: this.consumerGroup.runIdentity,
       }
       // A START_BATCH_PROCESS listener can seek the partition: such a batch is not handed over,

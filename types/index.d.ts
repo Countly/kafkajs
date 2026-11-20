@@ -3117,7 +3117,9 @@ export class KafkaJSBufferExhaustedError extends KafkaJSError {
  * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
  * `cause` is the loss; it is absent for a stale handler and for a seek. Reason `stale-assignment`
  * also covers a handler commit of offsets for a batch fetched before a `consumer.seek()` of its
- * partition, with no rejoin: it does not by itself mean the group rebalanced.
+ * partition, with no rejoin: it does not by itself mean the group rebalanced. It is also the
+ * `cause` of the `KafkaJSTransactionAbortableError` that refuses a transaction carrying offsets of
+ * such a batch.
  */
 export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'

@@ -172,8 +172,10 @@ const populations = async (each) => {
 
 /**
  * Measures what each population of a scenario retains against what its buffer counts for it.
+ * `residual` is what is still retained after the population drained: growth the records do not
+ * own (compiled code, runtime caches), reported so an excess in `measured` can be attributed.
  * @param {string} scenario a key of `SCENARIOS`
- * @returns {Promise<{ shape: string, capacity: number, measured: number, counted: number }[]>}
+ * @returns {Promise<{ shape: string, capacity: number, measured: number, counted: number, residual: number }[]>}
  *   one sample per population, in bytes
  * @throws {Error} for an unknown scenario
  */
@@ -185,8 +187,8 @@ const measure = async (scenario) => {
   const pinner = pinned ? pinCluster() : undefined
   const generation = new Generation()
   const samples = []
-  await populations(async (capacity, records, shape) => {
-    const before = await retained()
+  /** One population filled, measured and drained; nothing of it is reachable once it returns. */
+  const once = async (before, capacity, records) => {
     const population = await fill(
       capacity,
       records,
@@ -197,8 +199,14 @@ const measure = async (scenario) => {
     const open = snapshot ? accumulator.unsettled() : []
     const after = await retained()
     const counted = admission.reserved + admission.waitingBytes + admission.debts
-    samples.push({ shape, capacity, measured: after - before, counted })
     await Promise.all([drain(population), ...open])
+    return { measured: after - before, counted }
+  }
+  await populations(async (capacity, records, shape) => {
+    const before = await retained()
+    const { measured, counted } = await once(before, capacity, records)
+    const residual = (await retained()) - before
+    samples.push({ shape, capacity, measured, counted, residual })
   })
   return samples
 }
