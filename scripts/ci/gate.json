@@ -1263,6 +1263,7 @@
         "scripts/e2e/__tests__/e2eTooling.spec.js \u203a pinned download from a second source gives protoc the protobuf release archive of the same version after the mirror",
         "scripts/e2e/__tests__/e2eTooling.spec.js \u203a telemetry download cache restores the inputs cache before fetch.sh and saves it even when a later step fails",
         "scripts/e2e/__tests__/e2eTooling.spec.js \u203a telemetry download cache restores the interop cache before fetch-interop.sh and saves it even when a later step fails",
+        "scripts/e2e/__tests__/e2eTooling.spec.js \u203a telemetry download cache gives every step that calls run.sh the private temporary directory it requires",
         "scripts/evidence/__tests__/verify.spec.js \u203a main exits 0 and says what it verified when every line agrees",
         "scripts/evidence/__tests__/verify.spec.js \u203a main exits 1 for a file that does not exist",
         "scripts/evidence/__tests__/verify.spec.js \u203a main exits 1 for a forged lane",

@@ -118,11 +118,15 @@ jobs:
       - name: Verify retained jars offline
         if: matrix.compose == 'docker-compose.telemetry.yml'
         timeout-minutes: 1
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
       - name: Fetch and verify the pinned telemetry inputs
         id: inputs
         if: matrix.compose == 'docker-compose.telemetry.yml'
         timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
       - name: Prepare decoder inputs
         if: matrix.compose == 'docker-compose.telemetry.yml'

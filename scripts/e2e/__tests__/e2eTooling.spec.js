@@ -4313,6 +4313,12 @@ describe('telemetry download cache', () => {
   const pinned = /^actions\/cache\/(restore|save)@[0-9a-f]{40}$/
   const expression = (text) => '$' + `{{ ${text} }}`
 
+  test('gives every step that calls run.sh the private temporary directory it requires', () => {
+    const callers = steps.filter((step) => step.run?.includes('scripts/e2e/telemetry/run.sh'))
+    expect(callers.length).toBeGreaterThanOrEqual(2)
+    for (const step of callers) expect(step.env?.TMPDIR).toBe(expression('runner.temp'))
+  })
+
   test.each([
     [
       'inputs',
