@@ -16,9 +16,12 @@ describe('Consumer > fetch partition error contract', () => {
       })
       // The real reset commits through a coordinator this harness has no broker for; what the
       // contract asserts is that the per-partition recovery is the one that runs.
+      const refusals = []
       const setDefaultOffset = jest
         .spyOn(offsetManager, 'setDefaultOffset')
-        .mockResolvedValue(undefined)
+        .mockImplementation(async (_, { guard }) => {
+          refusals.push(guard())
+        })
 
       setResponse(
         fetchResponse([
@@ -30,8 +33,9 @@ describe('Consumer > fetch partition error contract', () => {
 
       expect(setDefaultOffset).toHaveBeenCalledWith(
         { topic: TOPIC, partition: 0 },
-        { guard: group.idleWait.fence.guard, fence: group.idleWait.fence }
+        { guard: expect.any(Function), fence: group.idleWait.fence }
       )
+      expect(refusals).toEqual([null])
       expect(batches.map(({ partition }) => partition)).toEqual([1])
       // Every delivered batch carries the assignment it was fetched under, so one that outlives
       // that assignment can be recognised before it reaches a handler.
@@ -320,12 +324,15 @@ describe('Consumer > fetch partition error contract', () => {
     it('names the reason a fetched partition was dropped', async () => {
       const { group, logger, setResponse } = await createFetchGroup({ partitions: [0] })
       const debug = jest.spyOn(logger, 'debug')
-      // A seek queued between the round's drain and the response arriving: the response is for a
-      // position the consumer no longer wants, which is exactly what the drop reason names. The
-      // queue is real, so the `size` guard on the drop check sees it; only the drain is stubbed
-      // out, standing in for a seek that arrived after it ran.
-      group.seekOffset.set(TOPIC, 0, '5')
-      jest.spyOn(group.seekOffset, 'pop').mockReturnValue(undefined)
+      // A seek queued after the round's request was built and before its response arrived: the
+      // response is for a position the consumer no longer wants, which is exactly what the drop
+      // reason names. The queue is real, so the `size` guard on the drop check sees it.
+      const build = group.buildFetchRequests.bind(group)
+      jest.spyOn(group, 'buildFetchRequests').mockImplementation((...args) => {
+        const requests = build(...args)
+        group.seekOffset.set(TOPIC, 0, '5')
+        return requests
+      })
 
       setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
       const batches = await group.fetch(NODE_ID)

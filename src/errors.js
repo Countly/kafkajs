@@ -716,19 +716,21 @@ class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
 
 /**
  * An offset commit was refused because the consumer lost its group membership, or because a
- * handler or a retry outlived a rejoin. `cause` is the loss. For a loss the broker reported,
- * `type`, `code` and `helpUrl` are the cause's; a synthetic loss carries no code, a poll-interval
- * loss keeps the type `POLL_INTERVAL_EXCEEDED`, and a stale handler has the type
- * `STALE_ASSIGNMENT` and no `code` or `helpUrl`, whatever its cause carries. `isLostMember` checks
- * only the broker codes; it does not recognize every reason of this class: test `instanceof` and
- * `reason`.
+ * handler or a retry outlived a rejoin. Reason `stale-assignment` also covers a handler commit of
+ * offsets for a batch fetched before a `consumer.seek()` of its partition, with no rejoin, so it
+ * does not by itself mean the group rebalanced. `cause` is the loss, absent for a stale handler
+ * and for a seek. For a loss the broker reported, `type`, `code` and `helpUrl` are the cause's; a synthetic
+ * loss carries no code, a poll-interval loss keeps the type `POLL_INTERVAL_EXCEEDED`, and a stale
+ * handler has the type `STALE_ASSIGNMENT` and no `code` or `helpUrl`, whatever its cause carries.
+ * `isLostMember` checks only the broker codes; it does not recognize every reason of this class:
+ * test `instanceof` and `reason`.
  */
 class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e
    * @param {object} options
    * @param {'membership-lost'|'poll-interval-exceeded'|'stale-assignment'} options.reason
-   * @param {Error} options.cause
+   * @param {Error} [options.cause] the loss; absent for a stale handler or a seek
    */
   constructor(e, { reason, cause } = {}) {
     super(e, { cause })

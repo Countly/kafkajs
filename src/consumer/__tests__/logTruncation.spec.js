@@ -195,7 +195,7 @@ describe('Consumer > position validation', () => {
     const events = []
     const { group, offsetManager } = await createGroup({ validationScenario: 'truncated' })
     group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-    jest.spyOn(offsetManager, 'seek').mockRejectedValueOnce(new Error('coordinator is down'))
+    jest.spyOn(offsetManager, 'reposition').mockRejectedValueOnce(new Error('coordinator is down'))
 
     await group.fetch(NODE_ID)
 
