@@ -1,3 +1,4 @@
+const { assertPartitionId } = require('../utils/partitionId')
 const describeThrown = require('../network/describeThrown')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
@@ -380,9 +381,10 @@ module.exports = (params) => {
    * restarts and never registered on the cluster, so two such consumers cannot see each other.
    * @type {{ offsets: Record<string, object>, operations: OffsetOperations }|null}
    */
+  const privateOffsets = hasGroup ? null : dictionary()
   const privateState = hasGroup
     ? null
-    : { offsets: dictionary(), operations: new OffsetOperations() }
+    : { offsets: privateOffsets, operations: new OffsetOperations(privateOffsets) }
   /** @returns {OffsetOperations} the private ledger, or the group's shared one */
   const offsetOperations = () =>
     privateState ? privateState.operations : cluster.offsetOperations({ groupId })
@@ -1511,17 +1513,20 @@ module.exports = (params) => {
     return withinCall((operation) => committing.commitOffsets(offsets, undefined, { operation }))
   }
 
-  /** @type {import("../../types").Consumer["seek"]} */
+  /**
+   * Requests a seek of one partition. Every argument is checked before any state changes: a
+   * missing topic, a partition that is not a Kafka partition id (an integer from 0 to 2^31 - 1; a
+   * numeric string such as `'0'`, `NaN`, a fraction or a negative number is not) and an offset
+   * that is not a non-negative long or a `'-1'`/`'-2'` sentinel throw `KafkaJSNonRetriableError`.
+   * `admin.setOffsets` seeks through here and is checked the same way.
+   * @type {import("../../types").Consumer["seek"]}
+   */
   const seek = ({ topic, partition, offset }) => {
     if (!topic) {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
 
-    if (isNaN(partition)) {
-      throw new KafkaJSNonRetriableError(
-        `Invalid partition, expected a number received ${partition}`
-      )
-    }
+    assertPartitionId(partition)
 
     let seekOffset
     try {

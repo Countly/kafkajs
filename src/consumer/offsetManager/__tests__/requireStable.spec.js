@@ -566,15 +566,18 @@ describe('Consumer > OffsetManager > a fetch round preparation', () => {
     expect(commit).not.toHaveBeenCalled()
   })
 
-  test('a refusal that arrives with the commit reply throws and leaves the cell as it was', async () => {
+  test('a refusal that arrives with the commit reply rejects the seek, and the offset the broker accepted is still published', async () => {
     const prepared = preparation()
-    const { manager } = build()
-    jest.spyOn(manager, 'sendOffsetCommit').mockImplementation(async () => {
+    const { manager, coordinator } = build()
+    coordinator.offsetCommit = jest.fn(async () => {
       prepared.state.refusal = new Error('replaced')
+      return {}
     })
-    const before = { ...manager.committedOffsets()[TOPIC] }
-    expect(await manager.seek({ topic: TOPIC, partition: 0, offset: '5' }, prepared)).toBe(false)
-    expect(manager.committedOffsets()[TOPIC]).toEqual(before)
+    await expect(
+      manager.seek({ topic: TOPIC, partition: 0, offset: '5' }, prepared)
+    ).rejects.toThrow('replaced')
+    expect(manager.committedOffsets()[TOPIC][0]).toBe('5')
+    expect(manager.resolvedOffsetAt(TOPIC, 0)).toBe('5')
   })
 })
 

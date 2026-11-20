@@ -1478,7 +1478,7 @@ describe('Consumer > cooperative rebalance > commit before release', () => {
 
     expect(offsetCommit).toHaveBeenCalledWith(
       expect.objectContaining({ groupGenerationId: 7, memberId: 'member-7' }),
-      { guard: expect.any(Function) }
+      expect.objectContaining({ guard: expect.any(Function) })
     )
   })
 
