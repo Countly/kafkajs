@@ -70,7 +70,7 @@ function buildConfig() {
     clients,
     topics: { main: MAIN, transactions: TXN },
     heapSnapshots: processes
-      .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+      .filter((p) => ['subject', 'seed', 'reader', 'decoder'].includes(p.role))
       .map((p) => p.slot),
   }
 }
@@ -91,7 +91,7 @@ function heapReceipts(config, mode) {
         file: `heap/${slot}.${boundary}.heapsnapshot`,
         at: START + h * matrix.schedule.hourMs + plan.quietAt[2] + 10000 + i,
         ms: 400,
-        bytes: 1000,
+        bytes: null,
         error: null,
       }
     })
@@ -102,7 +102,8 @@ function heapReceipts(config, mode) {
  * Writes the world's heap snapshots under `dir/heap` and summarises them as the driver's finalize
  * does: synthetic snapshots of `heap.judged(slot, h)` judged bytes and `heap.code(slot, h)` code
  * bytes, or the real files `heap.real[slot]` holds for that process (`<slot>.<boundary>.heapsnapshot`).
- * A receipt with an error gets no file.
+ * A receipt with an error gets no file; every other receipt gets its file's size, as the worker
+ * records it.
  * @param {object} world @param {string} dir @returns {void}
  */
 function writeHeap(world, dir) {
@@ -120,8 +121,9 @@ function writeHeap(world, dir) {
         { type: 'object', name: 'Judged', bytes: world.heap.judged(r.slot, h) },
         { type: 'code', name: '(code)', bytes: world.heap.code(r.slot, h) },
       ])
+    r.bytes = fs.statSync(file).size
   }
-  summarizeRun(dir, receipts, matrix.bounds['heap-endpoint'].value)
+  summarizeRun(dir, receipts)
   world.heap.edit(dir)
 }
 
@@ -525,7 +527,7 @@ function healthy({ mode = 'acceptance', withInventory = false } = {}) {
       companions: [],
     },
     heap: {
-      judged: () => 9e6,
+      judged: (slot, h) => (slot === 'p13' ? 9e6 + h * 2 * 1024 * 1024 : 9e6),
       code: (slot, h) => 3e6 + h * 3 * 1024 * 1024,
       real: {},
       edit: () => {},
@@ -600,6 +602,7 @@ function writeArtifact(world, dir) {
   const stream = `${lines.join('\n')}\n`
   put('config.json', JSON.stringify(world.config))
   put('stream.ndjson', stream)
+  writeHeap(world, dir)
   put('supervisor.json', JSON.stringify(world.supervisor))
   const { code, observedAt } = world.header.exit
   put('outer-exit.json', JSON.stringify({ status: code, observedAt, ...world.outerExit }))
@@ -612,7 +615,6 @@ function writeArtifact(world, dir) {
     )
   for (const f of ['provenance.json', 'capabilities.json', 'compose.yml']) put(`broker/${f}`, f)
   for (const [name, text] of Object.entries(world.apache)) put(`apache/${name}`, text)
-  writeHeap(world, dir)
   const header = copy(world.header)
   const walk = (rel) =>
     fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).flatMap((e) => {

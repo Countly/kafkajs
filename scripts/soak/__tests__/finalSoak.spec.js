@@ -298,10 +298,11 @@ describe('final soak driver', () => {
     )
   })
 
-  test('heap snapshots are taken in every mode, acceptance included, by every subject, the reader and the decoder, and the config must list exactly those', () => {
+  test('heap snapshots are taken in every mode, acceptance included, by every subject, the seed, the reader and the decoder, and the config must list exactly those', () => {
     const options = { runId: RUN, treeSha: TREE, brokers: ['k:1'] }
     const slots = [
       ...Array.from({ length: 12 }, (_, i) => `p${String(i + 1).padStart(2, '0')}`),
+      'p13',
       'p14',
       'p16',
     ]
@@ -313,12 +314,13 @@ describe('final soak driver', () => {
     }
     const day = buildConfig(matrix, { ...options, mode: 'acceptance' })
     const wrong =
-      'config.heapSnapshots does not list every subject, the reader and the decoder, in process order'
+      'config.heapSnapshots does not list every subject, the seed, the reader and the decoder, in process order'
     for (const heapSnapshots of [
       null,
       undefined,
       slots.slice(1),
-      [...slots, 'p13'],
+      slots.filter((slot) => slot !== 'p13'),
+      [...slots, 'p15'],
       [...slots].reverse(),
     ])
       expect(validateConfig({ ...day, heapSnapshots }, matrix)).toEqual([wrong])

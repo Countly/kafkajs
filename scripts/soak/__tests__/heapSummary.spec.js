@@ -8,7 +8,6 @@ const heapSummary = require('../heapSummary')
 
 const ROOT = path.join(__dirname, '../../..')
 const MIB = 1024 * 1024
-const BOUND = 2097152
 const dirs = []
 const tmp = () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'heap-summary-'))
@@ -16,8 +15,10 @@ const tmp = () => {
   return dir
 }
 afterAll(() => dirs.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })))
+/** @param {string} out @param {object} r @returns {object} `r` with its file's size */
+const sized = (out, r) => ({ ...r, bytes: fs.statSync(path.join(out, r.file)).size })
 
-/** @returns {object} a receipt of `slot` at hour `h` */
+/** @returns {object} a receipt of `slot` at hour `h`; `bytes` is set once its file is written */
 const receipt = (slot, h, extra = {}) => {
   const boundary = `h${String(h).padStart(2, '0')}`
   return {
@@ -26,6 +27,7 @@ const receipt = (slot, h, extra = {}) => {
     file: `heap/${slot}.${boundary}.heapsnapshot`,
     at: h * 60,
     ms: 1,
+    bytes: null,
     error: null,
     ...extra,
   }
@@ -97,7 +99,7 @@ describe('heap snapshot summary', () => {
       ])
   })
 
-  test('a run summary round-trips through its file, keeps the first, the last and any snapshot past half the bound, and deletes the rest', () => {
+  test('a run summary round-trips through its file and keeps every snapshot file it summarised', () => {
     const out = tmp()
     const judged = [9e6, 9e6 + 1.5 * MIB, 9e6 + 0.25 * MIB, 9e6 + 0.125 * MIB]
     const receipts = judged.map((bytes, h) => {
@@ -106,27 +108,28 @@ describe('heap snapshot summary', () => {
         { type: 'object', name: 'Judged', bytes },
         { type: 'code', name: '(code)', bytes: 3e6 + h * MIB },
       ])
-      return r
+      return sized(out, r)
     })
     receipts.push(receipt('p05', 0, { at: null, ms: null, error: 'not taken: step h00q2 late' }))
-    const written = heapSummary.summarizeRun(out, receipts, BOUND)
+    const written = heapSummary.summarizeRun(out, receipts)
     const read = JSON.parse(fs.readFileSync(path.join(out, heapSummary.SUMMARY_FILE), 'utf8'))
     expect(read).toEqual(written)
     expect(read.excludedType).toBe('code')
-    expect(read.records.map((r) => [r.slot, r.boundary, r.kept, r.error, r.judgedBytes])).toEqual([
-      ['p04', 'h00', true, null, judged[0]],
-      ['p04', 'h01', true, null, judged[1]],
-      ['p04', 'h02', false, null, judged[2]],
-      ['p04', 'h03', true, null, judged[3]],
-      ['p05', 'h00', false, 'not taken: step h00q2 late', undefined],
+    expect(read.records.map((r) => [r.slot, r.boundary, r.error, r.judgedBytes])).toEqual([
+      ['p04', 'h00', null, judged[0]],
+      ['p04', 'h01', null, judged[1]],
+      ['p04', 'h02', null, judged[2]],
+      ['p04', 'h03', null, judged[3]],
+      ['p05', 'h00', 'not taken: step h00q2 late', undefined],
     ])
     expect(fs.readdirSync(path.join(out, 'heap')).sort()).toEqual([
       'p04.h00.heapsnapshot',
       'p04.h01.heapsnapshot',
+      'p04.h02.heapsnapshot',
       'p04.h03.heapsnapshot',
       'summary.json',
     ])
-    for (const r of read.records.filter((x) => x.kept)) {
+    for (const r of read.records.filter((x) => x.error === null)) {
       const totals = heapSummary.totalsOf(readSnapshot(path.join(out, r.file)))
       expect(totals).toEqual({
         nodes: r.nodes,
@@ -140,22 +143,52 @@ describe('heap snapshot summary', () => {
     expect(read.records[3]).toMatchObject({ excludedBytes: 3e6 + 3 * MIB, growingSince: 'h02' })
   })
 
-  test('a snapshot that cannot be read is recorded with its error and kept, and judges nothing', () => {
+  test('a snapshot that cannot be read is recorded with its error, its file left in place, and judges nothing', () => {
     const out = tmp()
     const r = receipt('p06', 0)
     fs.mkdirSync(path.join(out, 'heap'))
     fs.writeFileSync(path.join(out, r.file), '{"snapshot":')
-    const outside = receipt('p07', 0, { file: '../escape.heapsnapshot' })
-    const { records } = heapSummary.summarizeRun(out, [r, outside], BOUND)
-    expect(records[0]).toMatchObject({ kept: true })
+    const { records } = heapSummary.summarizeRun(out, [sized(out, r)])
     expect(Object.keys(records[0])).not.toContain('judgedBytes')
     expect(records[0].error).toMatch(/^unreadable snapshot: Malformed heap snapshot/)
-    expect(records[1]).toMatchObject({
-      kept: false,
-      error: 'unreadable snapshot: ../escape.heapsnapshot is not a heap snapshot path',
-    })
     expect(fs.existsSync(path.join(out, r.file))).toBe(true)
   })
+
+  test.each([
+    [
+      'a path outside the heap directory',
+      { file: '../escape.heapsnapshot' },
+      'is not heap/p04.h00.heapsnapshot',
+    ],
+    [
+      'another process’s snapshot',
+      { file: 'heap/p05.h00.heapsnapshot' },
+      'is not heap/p04.h00.heapsnapshot',
+    ],
+    [
+      'another boundary’s snapshot',
+      { file: 'heap/p04.h01.heapsnapshot' },
+      'is not heap/p04.h00.heapsnapshot',
+    ],
+    ['a size other than the file’s', { bytes: 1 }, 'bytes, its receipt 1'],
+  ])(
+    'a receipt naming %s is summarised as an error, never read as that snapshot',
+    (_, change, why) => {
+      const out = tmp()
+      for (const [slot, h] of [
+        ['p04', 0],
+        ['p05', 0],
+        ['p04', 1],
+      ])
+        writeSyntheticSnapshot(path.join(out, receipt(slot, h).file), [
+          { type: 'object', name: 'Judged', bytes: 9e6 },
+        ])
+      const r = { ...sized(out, receipt('p04', 0)), ...change }
+      const [record] = heapSummary.summarizeRun(out, [r]).records
+      expect(Object.keys(record)).not.toContain('judgedBytes')
+      expect(record.error).toContain(why)
+    }
+  )
 
   test('summarises real snapshots: 7 MiB of new bytecode and feedback is excluded, and the growing constructor of a harness array is named with its retainer path', () => {
     const fixture = path.join(__dirname, 'fixtures/heapJudged.js')
@@ -166,8 +199,8 @@ describe('heap snapshot summary', () => {
         encoding: 'utf8',
       })
       expect([child.status, child.stderr]).toEqual([0, ''])
-      const receipts = [0, 1, 2].map((h) => receipt('p04', h))
-      totals[kind] = heapSummary.summarizeRun(out, receipts, BOUND).records
+      const receipts = [0, 1, 2].map((h) => sized(out, receipt('p04', h)))
+      totals[kind] = heapSummary.summarizeRun(out, receipts).records
     }
     const [code0, , code2] = totals.code
     expect(code2.excludedBytes - code0.excludedBytes).toBeGreaterThan(6 * MIB)

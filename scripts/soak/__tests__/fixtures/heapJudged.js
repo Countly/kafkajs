@@ -8,6 +8,8 @@
  *   map      3 MiB of entries in the `topics` Map of a product `MetadataCache`
  *   array    3 MiB of objects in an array of this harness file
  *   strings  3 MiB of distinct strings appended to a `URLSearchParams` (node internals)
+ *   seed     3 MiB of entries in a Map shaped as the soak seed's retained offset map
+ *            (`<partition>:<offset>` to the offset string, `finalSoakWorkers.js`)
  *
  *   node scripts/soak/__tests__/fixtures/heapJudged.js <dir> <slot> <case>
  */
@@ -37,7 +39,7 @@ class HarnessMarker {
   }
 }
 
-const kept = { functions: [], cache: null, harness: [], params: null }
+const kept = { functions: [], cache: null, harness: [], params: null, retained: new Map() }
 if (kind === 'code')
   kept.functions = vm.runInThisContext(`[${Array.from({ length: FUNCTIONS }, (_, i) => body(i))}]`)
 if (kind === 'map') kept.cache = new MetadataCache({ logger: { namespace: () => ({}) } })
@@ -62,6 +64,12 @@ const grow = {
   array: () => {
     for (let i = 0; kept.harness.length * 270 < 3 * MIB; i++)
       kept.harness.push(new HarnessMarker(i))
+  },
+  seed: () => {
+    for (let offset = 0; kept.retained.size * 100 < 3 * MIB; offset++) {
+      const message = { offset: String(offset) }
+      kept.retained.set(`${offset % 12}:${message.offset}`, String(message.offset))
+    }
   },
   strings: () => {
     for (let i = 0; i * 340 < 3 * MIB; i++)

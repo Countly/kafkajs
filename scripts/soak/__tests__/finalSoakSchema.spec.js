@@ -94,7 +94,7 @@ const buildConfig = () => {
     }
   )
   const heapSnapshots = processes
-    .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+    .filter((p) => ['subject', 'seed', 'reader', 'decoder'].includes(p.role))
     .map((p) => p.slot)
   return { schema: 3, mode: 'smoke', runId: RUN, processes, clients, heapSnapshots }
 }

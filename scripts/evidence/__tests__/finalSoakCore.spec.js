@@ -1369,6 +1369,201 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    /** @returns {(dir: string) => void} an edit setting the judged bytes of `slot`'s records */
+    const forge = (slot, judgedOf) => (dir) =>
+      resummarise(dir, (r) => {
+        const h = Number(r.boundary.slice(1))
+        if (r.slot === slot && judgedOf(h) !== undefined) r.judgedBytes = judgedOf(h)
+      })
+    const leak = (h) => 9e6 + (h >= 21 ? 3 * MIB : 0)
+
+    it.each([
+      [
+        'its files deleted',
+        leak,
+        (h) => (h === 21 || h === 22 ? 9e6 : undefined),
+        ['h21', 'h22'],
+        /p04 h21 snapshot does not confirm its summary: heap\/p04\.h21\.heapsnapshot cannot be read/,
+      ],
+      [
+        'its files still on disk',
+        leak,
+        (h) => (h === 21 || h === 22 ? 9e6 : undefined),
+        [],
+        /p04 h21 snapshot does not confirm its summary: heap\/p04\.h21\.heapsnapshot has judgedBytes 12145728, its summary 9000000/,
+      ],
+      [
+        'a steady leak raised at the start and lowered at the end',
+        (h) => 9e6 + h * 150000,
+        (h) => ({ 1: 11e6, 2: 11e6, 21: 9e6, 22: 9e6 })[h],
+        [],
+        /p04 h01 snapshot does not confirm its summary: heap\/p04\.h01\.heapsnapshot has judgedBytes 9150000, its summary 11000000/,
+      ],
+    ])(
+      'never passes a day whose middle summary records lie about the endpoint inputs, %s: every snapshot is re-derived from its file',
+      async (_, bytes, lie, deleted, reason) => {
+        const world = judged('p04', bytes)
+        world.heap.edit = (dir) => {
+          forge('p04', lie)(dir)
+          for (const b of deleted) fs.rmSync(path.join(dir, `heap/p04.${b}.heapsnapshot`))
+        }
+        const report = await check(world)
+        expectRow(report, 'K5', 'INCONCLUSIVE', reason)
+        expect(row(report, 'K5').numbers.p04).toBeUndefined()
+      }
+    )
+
+    /** @returns {(dir: string) => void} an edit making p04's h23 record a copy of `slot`'s `boundary` record */
+    const pointAt = (slot, boundary) => (dir) => {
+      const summary = summaryOf(dir)
+      const source = summary.records.find((r) => r.slot === slot && r.boundary === boundary)
+      const i = summary.records.findIndex((r) => r.slot === 'p04' && r.boundary === 'h23')
+      const { at, ms } = summary.records[i]
+      summary.records[i] = { ...source, slot: 'p04', boundary: 'h23', at, ms }
+      fs.writeFileSync(path.join(dir, 'heap/summary.json'), JSON.stringify(summary))
+    }
+    /** @returns {(dir: string) => void} an edit changing p04's h23 record by `fn` */
+    const lastRecord = (fn) => (dir) =>
+      resummarise(dir, (r) => {
+        if (r.slot === 'p04' && r.boundary === 'h23') fn(r)
+      })
+
+    it.each([
+      ['another process’s snapshot of the same boundary', pointAt('p05', 'h23'), {}],
+      ['its own process’s snapshot of another boundary', pointAt('p04', 'h00'), {}],
+      [
+        'a size other than the one the worker recorded',
+        lastRecord((r) => (r.snapshotBytes += 1)),
+        {},
+      ],
+      ['a receipt whose size is not the file’s', () => {}, { bytes: (r) => r.bytes + 1 }],
+      [
+        'a receipt naming another process’s file',
+        lastRecord((r) => (r.file = 'heap/p05.h23.heapsnapshot')),
+        { file: () => 'heap/p05.h23.heapsnapshot' },
+      ],
+    ])(
+      'never passes a leaking process whose last record is bound to %s',
+      async (_, edit, fields) => {
+        const world = judged('p04', leak)
+        world.heap.edit = edit
+        const changed = (r) =>
+          Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, value(r)]))
+        const supervisor = (s) => ({
+          ...s,
+          heapSnapshots: s.heapSnapshots.map((r) =>
+            r.slot === 'p04' && r.boundary === 'h23' ? { ...r, ...changed(r) } : r
+          ),
+        })
+        const report = await check(world, { supervisor })
+        expectRow(
+          report,
+          'K5',
+          'INCONCLUSIVE',
+          /p04 h23 has a heap snapshot summary that disagrees with the supervisor receipt/
+        )
+        expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p04 judged heap endpoint/)
+      }
+    )
+
+    it('judges the seed as the positive control of the snapshot pipeline: its judged endpoint above the breach bound is printed and lets the row pass', async () => {
+      const report = await check(fx.healthy())
+      expectRow(report, 'K5', 'PASS')
+      expect(report.information.heap.control).toEqual({
+        p13: { endpoint: 42 * MIB, slopePerMinute: Math.round((2 * MIB) / 60) },
+      })
+      expect(formatReport(report)).toContain(
+        `  seed control p13 (judged heap, must exceed 2097152 bytes): endpoint ${42 * MIB} bytes, slope ${Math.round((2 * MIB) / 60)} B/min`
+      )
+    })
+
+    it.each([
+      [
+        'grows nothing',
+        () => 9e6,
+        /seed p13 does not show its leak: judged heap endpoint 0 bytes is not above 2097152/,
+      ],
+      [
+        'grows exactly the breach bound',
+        (h) => 9e6 + (h >= 21 ? 2 * MIB : 0),
+        /seed p13 does not show its leak: judged heap endpoint 2097152 bytes is not above 2097152/,
+      ],
+    ])('cannot pass the heap row when the seed %s', async (_, bytes, reason) => {
+      const report = await check(judged('p13', bytes))
+      expectRow(report, 'K5', 'INCONCLUSIVE', reason)
+      expect(Object.keys(row(report, 'K5').numbers)).toHaveLength(12)
+    })
+
+    it('cannot pass the heap row when the seed took no usable snapshot', async () => {
+      const failed = (r) => ({ at: null, ms: null, error: 'ENOSPC: no space left on device' })
+      const world = fx.healthy()
+      world.supervisor.heapSnapshots = world.supervisor.heapSnapshots.map((r) =>
+        r.slot === 'p13' ? { ...r, ...failed(r) } : r
+      )
+      expectRow(
+        await check(world),
+        'K5',
+        'INCONCLUSIVE',
+        /seed p13 does not show its leak: p13 h00 has no usable heap snapshot: ENOSPC/
+      )
+    })
+
+    it('is inconclusive, naming why, when finalize could not summarise the heap snapshots', async () => {
+      const world = fx.healthy()
+      world.heap.edit = (dir) => {
+        fs.rmSync(path.join(dir, 'heap/summary.json'))
+        fs.writeFileSync(
+          path.join(dir, 'heap/summary-error.txt'),
+          'EISDIR: illegal operation on a directory\n'
+        )
+      }
+      expectRow(
+        await check(world),
+        'K5',
+        'INCONCLUSIVE',
+        /heap\/summary\.json: missing; finalize could not summarise the heap snapshots: EISDIR: illegal operation on a directory/
+      )
+    })
+
+    it('is inconclusive for a boundary summarised twice', async () => {
+      const world = fx.healthy()
+      world.heap.edit = (dir) => {
+        const summary = summaryOf(dir)
+        summary.records.push(summary.records.find((r) => r.slot === 'p03' && r.boundary === 'h10'))
+        fs.writeFileSync(path.join(dir, 'heap/summary.json'), JSON.stringify(summary))
+      }
+      expectRow(
+        await check(world),
+        'K5',
+        'INCONCLUSIVE',
+        /heap\/summary\.json: p03 h10 is summarised twice/
+      )
+    })
+
+    it('is inconclusive for a summary that excludes any node type but code', async () => {
+      const world = fx.healthy()
+      world.heap.edit = (dir) =>
+        fs.writeFileSync(
+          path.join(dir, 'heap/summary.json'),
+          JSON.stringify({ ...summaryOf(dir), excludedType: 'hidden' })
+        )
+      expectRow(
+        await check(world),
+        'K5',
+        'INCONCLUSIVE',
+        /heap\/summary\.json: not a summary that excludes only node type code/
+      )
+    })
+
+    it('leaves a boundary whose quiet readings completed after its hour out of the whole-process heapUsed information line', async () => {
+      const late = (h) => h === 21 || h === 22
+      const edit = quiet('p04', (h, r) =>
+        late(h) ? { heapUsed: r.heapUsed + 10 * MIB, completedAt: r.completedAt + 3600000 } : {}
+      )
+      const report = await check(fx.healthy(), { edit })
+      expect(report.information.heap.heapUsed.p04.endpoint).toBe(0)
+    })
+
     it('does not let the seed process substitute for or fail an unseeded process', async () => {
       const edit = quiet('p13', (h, r) => ({ heapUsed: r.heapUsed + h * 50 * 1024 * 1024 }))
       const report = await check(fx.healthy(), { edit })
@@ -1411,19 +1606,21 @@ describe('scripts/evidence/finalSoakCore', () => {
     const MIB = 1024 * 1024
     const snapshots = {}
     beforeAll(() => {
-      for (const kind of ['code', 'map', 'array', 'strings']) {
+      for (const kind of ['code', 'map', 'array', 'strings', 'seed']) {
         snapshots[kind] = tmp()
-        const child = spawnSync(process.execPath, [FIXTURE, snapshots[kind], 'p04', kind], {
+        const slot = kind === 'seed' ? 'p13' : 'p04'
+        const child = spawnSync(process.execPath, [FIXTURE, snapshots[kind], slot, kind], {
           encoding: 'utf8',
         })
         expect([kind, child.status, child.stderr]).toEqual([kind, 0, ''])
       }
     }, 120000)
 
-    /** Judges a rehearsal whose p04 snapshots are the real files of `kind`. */
-    const judgeReal = async (kind) => {
+    /** Judges a rehearsal whose p04 snapshots are the real files of `kind`, and p13's `seed`'s. */
+    const judgeReal = async (kind, seed = null) => {
       const world = rehearsal()
       world.heap.real.p04 = snapshots[kind]
+      if (seed) world.heap.real.p13 = snapshots[seed]
       let summary = null
       world.heap.edit = (dir) => {
         summary = JSON.parse(fs.readFileSync(path.join(dir, 'heap/summary.json'), 'utf8'))
@@ -1459,6 +1656,12 @@ describe('scripts/evidence/finalSoakCore', () => {
       },
       60000
     )
+
+    it('judges what the seed retains: real snapshots of its offset map show the leak to the control', async () => {
+      const { report } = await judgeReal('code', 'seed')
+      expectRow(report, 'K5', 'PASS')
+      expect(report.information.heap.control.p13.endpoint).toBeGreaterThan(2 * MIB)
+    }, 60000)
   })
 
   describe('K6 resources', () => {
@@ -2342,7 +2545,8 @@ describe('scripts/evidence/finalSoakCore', () => {
     /** @returns {object} a rehearsal whose judged bytes of `slot` follow `bytes(h)` */
     const judgedRehearsal = (slot, bytes) => {
       const world = rehearsal()
-      world.heap.judged = (s, h) => (s === slot ? bytes(h) : 9e6)
+      const base = world.heap.judged
+      world.heap.judged = (s, h) => (s === slot ? bytes(h) : base(s, h))
       return world
     }
 

@@ -1526,7 +1526,7 @@ describe('final soak work admission and quiet samples', () => {
   })
 
   test.each(['smoke', 'rehearsal', 'acceptance'])(
-    'in %s mode the last quiet reading of a boundary has every subject, the reader and the decoder write a heap snapshot while work is held, and gets no skipped receipt',
+    'in %s mode the last quiet reading of a boundary has every subject, the seed, the reader and the decoder write a heap snapshot while work is held, and gets no skipped receipt',
     async (mode) => {
       const { s, remove } = supervisor({ mode })
       try {
@@ -1545,9 +1545,9 @@ describe('final soak work admission and quiet samples', () => {
         expect(held).toHaveLength(1)
         await Promise.all(held)
         const slots = s.config.processes
-          .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+          .filter((p) => ['subject', 'seed', 'reader', 'decoder'].includes(p.role))
           .map((p) => p.slot)
-        expect(slots).toHaveLength(14)
+        expect(slots).toHaveLength(15)
         expect(commands).toEqual(slots.map((slot) => [slot, 'heap-snapshot', 'h00']))
         expect(s.missedSnapshot(step, 'late')).toBeUndefined()
         expect(s.heapSnapshots.map((r) => [r.slot, r.error])).toEqual(
