@@ -26,12 +26,28 @@
           "unit": "ms",
           "source": "design: teardown allowance after the smoke ends"
         }
+      },
+      "rehearsal": {
+        "requestedMs": {
+          "value": 10800000,
+          "unit": "ms",
+          "source": "design: the first three hours of the day plan, three quiet boundaries per measured process, so the heap row is judged on a hosted runner before the day"
+        },
+        "teardownAllowanceMs": {
+          "value": 900000,
+          "unit": "ms",
+          "source": "design: teardown allowance after the rehearsal ends"
+        }
       }
     },
     "archive": [
       "scripts/soak/finalSoakMatrix.json",
       "scripts/soak/finalSoakSchema.js",
-      "scripts/soak/finalSoak.js"
+      "scripts/soak/finalSoak.js",
+      "scripts/soak/finalSoakScheduler.js",
+      "scripts/soak/finalSoakCollector.js",
+      "scripts/soak/finalSoakObserver.js",
+      "scripts/soak/finalSoakWorkers.js"
     ],
     "companions": ["natural-exit", "consume-retention", "prior-checkpoints"],
     "cli": ["--expect-sha", "--expect-profile", "--matrix", "--companion rs-l14=<run url>"],
@@ -102,7 +118,7 @@
       "source": "design: every offered value is exactly this long"
     },
     "maxOffers": {
-      "value": 1600000,
+      "value": 2000000,
       "unit": "records",
       "source": "design: total offers cap including probes and aborted records"
     },
@@ -413,11 +429,12 @@
       "activeMs": { "from": 0, "to": 1200000 },
       "idleMs": { "from": 1200000, "to": 1800000 },
       "quietAtMs": [1740000, 1750000, 1760000],
-      "membershipAtMs": 120000,
-      "regexAtMs": 480000,
-      "recreationAtMs": 600000,
-      "outageAtMs": 720000,
-      "recoveredByMs": 900000,
+      "membershipAtMs": 60000,
+      "regexAtMs": 360000,
+      "recreationAtMs": 480000,
+      "outageAtMs": 600000,
+      "recoveredByMs": 960000,
+      "abortAtTransaction": 2,
       "periodicSlots": 61,
       "floors": {
         "mainPerGroup": 100,
@@ -484,6 +501,11 @@
           "starts": "after-baseline-before-traffic",
           "clears": "after-only-quiet-triplet-before-disconnect",
           "sensitivity": "report-only"
+        },
+        "rehearsal": {
+          "starts": "after-first-quiet-triplet",
+          "clears": "after-last-quiet-triplet-before-disconnect",
+          "sensitivity": "report-only"
         }
       },
       "breachBytes": {
@@ -519,6 +541,9 @@
     "round": "successful round after awaited hooks",
     "seed": "actual seed map start and clear",
     "broker-state": "supervisor process and container plus raw metadata and ISR",
+    "partition-state": "raw leader and ISR of one run partition at a broker state",
+    "wave": "paused keys a membership wave's extra and standing member held when the wave observed the transfer and the return",
+    "wave-key": "one paused key of a wave and whether the wave's member held it",
     "identity": "producer, independent reader, handler, commit and broker readback stages",
     "scan": "independent completed sealed read_committed scan",
     "replay": "observed retry, loss or revoke plus broker boundary",
