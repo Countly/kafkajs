@@ -1,5 +1,6 @@
 const { ShareRun } = require('../shareRun')
 const {
+  ShareClock,
   fetchAnswer,
   flush,
   part,
@@ -210,5 +211,141 @@ describe('share membership across a rebootstrap', () => {
       type: 'GROUP_LOAD_IN_PROGRESS',
       code: 14,
     })
+  })
+})
+
+describe('share membership across a coordinator outage longer than one lookup', () => {
+  const OUTAGE_MS = 30000
+  let h
+  let run
+  let clock
+
+  afterEach(async () => {
+    await h?.close()
+    clock?.restore()
+    h = run = clock = undefined
+    jest.restoreAllMocks()
+  })
+
+  /**
+   * Joins a share consumer under the fake clock, counts its coordinator lookups, then takes the
+   * only broker down for longer than one lookup's retry budget and brings it back.
+   * @returns {Promise<object>} The crashes, the lookup spans and the heartbeat count at recovery.
+   */
+  const outage = async () => {
+    clock = new ShareClock().install()
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const crashes = []
+    h.consumer.on(h.consumer.events.CRASH, (event) => crashes.push(event.payload.error))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await until(() => h.frames(78).length > 0, 'the first fetch')
+
+    const { cluster } = run.options
+    const find = cluster.findGroupCoordinator
+    const lookups = []
+    let inFlight = 0
+    let overlapping = 0
+    jest.spyOn(cluster, 'findGroupCoordinator').mockImplementation(async function (args) {
+      const span = { start: performance.now(), end: null }
+      lookups.push(span)
+      if (++inFlight > 1) overlapping++
+      try {
+        return await find.call(this, args)
+      } finally {
+        inFlight--
+        span.end = performance.now()
+      }
+    })
+
+    h.cluster.down(0)
+    for (const socket of h.cluster.sockets()) socket.emit('end')
+    for (let elapsed = 0; elapsed < OUTAGE_MS; elapsed += 50) await clock.advance(50)
+    const during = lookups.length
+    h.cluster.up(0)
+    return { crashes, lookups, during, overlapping, beatsAtRecovery: h.frames(76).length }
+  }
+
+  test('rides out the outage without a crash and heartbeats at its epoch when the broker returns', async () => {
+    const { crashes, lookups, during, overlapping, beatsAtRecovery } = await outage()
+
+    expect(crashes).toEqual([])
+    expect(overlapping).toBe(0)
+    expect(during).toBeGreaterThanOrEqual(5)
+    expect(during).toBeLessThanOrEqual(15)
+    for (let i = 1; i < lookups.length; i++) {
+      expect(lookups[i].start - lookups[i - 1].end).toBeGreaterThanOrEqual(50)
+    }
+    for (let step = 0; step < 100 && h.frames(76).length === beatsAtRecovery; step++)
+      await clock.advance(20)
+    await clock.advance(200)
+    const after = h.frames(76).slice(beatsAtRecovery)
+    expect(after.length).toBeGreaterThan(1)
+    expect(after.every(({ fields }) => fields.memberEpoch === 1)).toBe(true)
+    expect(run.membership.memberEpoch).toBe(1)
+    expect(run.membership.coordinator.broker.retired).toBe(false)
+    expect(crashes).toEqual([])
+  })
+
+  test('rejoins at epoch 0 and fetches again when the member was fenced during the outage', async () => {
+    const { crashes, beatsAtRecovery } = await outage()
+    h.script('ShareGroupHeartbeat', [{ errorCode: 25, memberEpoch: 0 }])
+    const fetches = h.frames(78).length
+
+    for (let step = 0; step < 200 && run.membership.memberEpoch !== 2; step++)
+      await clock.advance(20)
+    for (let step = 0; step < 200 && h.frames(78).length === fetches; step++)
+      await clock.advance(20)
+
+    const after = h.frames(76).slice(beatsAtRecovery)
+    expect(after[0].fields.memberEpoch).toBe(1)
+    expect(after[1].fields).toMatchObject({
+      memberEpoch: 0,
+      memberId: run.membership.memberId,
+      subscribedTopicNames: ['topic-a'],
+    })
+    expect(run.membership.memberEpoch).toBe(2)
+    expect(h.frames(78).length).toBeGreaterThan(fetches)
+    expect(crashes).toEqual([])
+  })
+
+  test.each([
+    ['GROUP_AUTHORIZATION_FAILED', 30],
+    ['INVALID_REQUEST', 42],
+  ])('still ends the run when the lookup is answered %s', async (_name, code) => {
+    clock = new ShareClock().install()
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const crashes = []
+    h.consumer.on(h.consumer.events.CRASH, (event) => crashes.push(event.payload))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    h.cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+      coordinators: coordinatorKeys.map((key) => ({
+        key,
+        nodeId: -1,
+        host: '',
+        port: -1,
+        errorCode: code,
+        errorMessage: null,
+      })),
+    }))
+    h.script('ShareGroupHeartbeat', [{ errorCode: 15, memberEpoch: 1 }])
+
+    for (let step = 0; step < 200 && crashes.length === 0; step++) await clock.advance(20)
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].error).toMatchObject({ code, retriable: false })
   })
 })
