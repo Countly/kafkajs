@@ -22122,6 +22122,8 @@
         "scripts/soak/__tests__/finalSoakRun.spec.js \u203a final soak share request capture a share request summary names its version, session epoch and acknowledged ranges, and a frame it cannot read yields nulls and the reason",
         "scripts/soak/__tests__/finalSoakRun.spec.js \u203a final soak share request capture a share member writes a short wire line for each request it sends and one with the full bytes for each request its socket closed without an answer, inside the wire budget",
         "scripts/soak/__tests__/finalSoakRun.spec.js \u203a final soak work admission and quiet samples a harness wait and a harness bound of one length arm the same delay at the real rate; a faster harness clock shortens only the wait; both count as harness timers",
+        "scripts/soak/__tests__/finalSoakRun.spec.js \u203a final soak work admission and quiet samples a boundary whose last quiet reading starts past its deadline has a skipped heap snapshot receipt for each snapshot process and sends no snapshot command",
+        "scripts/soak/__tests__/finalSoakRun.spec.js \u203a final soak work admission and quiet samples a boundary whose last quiet reading took the heap snapshots gets no skipped receipt, and a run without snapshots gets none",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver the schedule covers every matrix workload, client kind and shape",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver smoke mode keeps every shape in a shortened schedule",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver rehearsal mode runs the first three hours of the day plan unchanged, so each measured process gets three quiet boundaries",
