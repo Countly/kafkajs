@@ -759,6 +759,60 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       )
     })
 
+    it.each([
+      ['INVALID_TOPIC_EXCEPTION (17)', 17],
+      ['TOPIC_AUTHORIZATION_FAILED (29)', 29],
+    ])(
+      'a lookup by id of a newly assigned topic answered %s ends the membership with that error, and the next round fails with it',
+      async (_, code) => {
+        const h = await memberOwningTopicA({
+          names: { [TOPIC_ID_A]: 'topic-a' },
+          later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+        })
+        const answered = createErrorFromCode(code)
+        h.cluster.refreshMetadataForTopicIds.mockRejectedValue(answered)
+
+        await h.manager.tick()
+        await flushRefresh()
+
+        expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith(
+          [TOPIC_ID_B],
+          expect.anything()
+        )
+        expect(h.protocol.state).toEqual(FATAL)
+        expect(h.protocol.target).toBeNull()
+        expect(h.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
+        await expect(h.protocol.rebalance(context())).rejects.toBe(answered)
+      }
+    )
+
+    it('a lookup by id answered TOPIC_AUTHORIZATION_FAILED after the target was cleared changes nothing', async () => {
+      const h = await memberOwningTopicA({
+        names: { [TOPIC_ID_A]: 'topic-a' },
+        later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+      })
+      const rejects = []
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(
+        () => new Promise((_resolve, reject) => rejects.push(reject))
+      )
+
+      await h.manager.tick()
+      expect(rejects).toHaveLength(1)
+      h.protocol.onMembershipError(createErrorFromCode(25))
+      expect(h.protocol.state).toEqual(FENCED)
+
+      rejects[0](createErrorFromCode(29))
+      await flushRefresh()
+
+      expect(h.protocol.state).toEqual(FENCED)
+      expect(h.protocol.fatalError).toBeFalsy()
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+      expect(h.logged.debug).not.toHaveBeenCalledWith(
+        'Could not re-read the target after refreshing its topic ids',
+        expect.anything()
+      )
+    })
+
     it('drops a refresh that lands after the target was cleared', async () => {
       const names = { [TOPIC_ID_A]: 'topic-a' }
       const h = await memberOwningTopicA({
@@ -824,9 +878,79 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
       expect(h.protocol.state).toEqual(ACKNOWLEDGING)
     })
+
+    it('a step whose target a newer one replaced while it resolved fails with the round refusal instead of resolving again', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      let answer = heartbeatResponse({
+        memberEpoch: 2,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0, 1]],
+          [TOPIC_ID_B, [0]],
+        ]),
+      })
+      const h = await memberOwningTopicA({ names, later: () => answer })
+      await h.manager.tick()
+      await flushRefresh()
+      expect(h.protocol.state).toEqual(RECONCILING)
+
+      const releases = []
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        await new Promise((resolve) => releases.push(resolve))
+        return { resolved: [], unresolved: ids }
+      })
+      const refusal = new Error('the round was retired')
+      let refused = false
+      const round = { guard: jest.fn(() => (refused ? refusal : null)) }
+      const step = h.protocol.rebalance(context({ round }))
+      step.catch(() => {})
+      await flushRefresh()
+      expect(releases).toHaveLength(1)
+
+      answer = heartbeatResponse({
+        memberEpoch: 3,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0, 1]],
+          [TOPIC_ID_B, [0, 1]],
+        ]),
+      })
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+      refused = true
+      releases[0]()
+
+      await expect(step).rejects.toBe(refusal)
+      expect(releases).toHaveLength(1)
+    })
   })
 
   describe('Fencing on the heartbeat path', () => {
+    it('a HEARTBEAT listener that retires the run keeps the answer it reports from applying', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 1, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          heartbeatResponse({ memberEpoch: 1 }),
+          heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0, 1]]]) }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      expect(h.protocol.state).toEqual(STABLE)
+      let retired = false
+      const guard = () => (retired ? new Error('the run was stopped') : null)
+      h.protocol.instrumentationEmitter.addListener(events.HEARTBEAT, () => (retired = true))
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      jest.advanceTimersByTime(5000)
+      const accepted = await h.protocol.heartbeat({ interval: 5000, guard })
+
+      expect(accepted).toBe(false)
+      expect(h.heartbeats).toHaveLength(3)
+      expect(h.protocol.state).toEqual(STABLE)
+      expect(h.protocol.memberEpoch).toEqual(1)
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+    })
+
     it('goes to FENCED, keeps the epoch and the member id, resets the sent fields and rejoins', async () => {
       const fenced = createErrorFromCode(110)
       const h = build({
@@ -1121,6 +1245,33 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('Leaving', () => {
+    it('a fatal error learned while the leave heartbeat is in flight leaves the member FATAL when the leave is answered', async () => {
+      let answerLeave
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          () => new Promise((resolve) => (answerLeave = resolve)),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      h.manager.stop()
+
+      const leaving = h.protocol.leave()
+      await flushRefresh()
+      expect(h.sent.at(-1).memberEpoch).toEqual(-1)
+      expect(h.protocol.state).toEqual(LEAVING)
+
+      const fatal = createErrorFromCode(30)
+      h.protocol.onMembershipError(fatal)
+      expect(h.protocol.state).toEqual(FATAL)
+      answerLeave(heartbeatResponse({ memberEpoch: -1 }))
+      await leaving
+
+      expect(h.protocol.state).toEqual(FATAL)
+      expect(h.protocol.fatalError).toBe(fatal)
+    })
+
     it('commits, reports the partitions as revoked and sends epoch -1', async () => {
       const commitBeforeRelease = jest.fn(async () => {})
       const h = build({
@@ -2467,6 +2618,30 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('A defect raised while handling a response', () => {
+    it('a defect raised on the request path, a duplicate correlation id, reaches the caller as itself and keeps the coordinator and the cadence', async () => {
+      const { KafkaJSInvariantViolation } = require('../../errors')
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          heartbeatResponse({ memberEpoch: 3 }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      const coordinator = h.protocol.coordinator
+      const defect = new KafkaJSInvariantViolation('Correlation id already exists')
+      h.coordinator.consumerGroupHeartbeat.mockRejectedValueOnce(defect)
+
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+
+      expect(h.manager.errors).toEqual([defect])
+      expect(h.protocol.coordinator).toBe(coordinator)
+      expect(h.protocol.heartbeatInterval()).toEqual(5000)
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+
     it('is not mistaken for a transport failure', async () => {
       const { KafkaJSInvariantViolation } = require('../../errors')
       const h = build({
