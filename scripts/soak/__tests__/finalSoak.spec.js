@@ -1485,6 +1485,70 @@ describe('final soak driver', () => {
     ])
   })
 
+  describe('weak bookkeeping', () => {
+    const gc = () => {
+      require('node:v8').setFlagsFromString('--expose-gc')
+      return require('node:vm').runInNewContext('gc')
+    }
+    const settle = async (collect) => {
+      for (let i = 0; i < 5; i++) {
+        await new Promise((resolve) => setImmediate(resolve))
+        collect()
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+    }
+
+    test('the observer holds only live watched receivers after thousands were collected', async () => {
+      const collect = gc()
+      class Owner {
+        touch() {
+          return this
+        }
+      }
+      const context = new AsyncLocalStorage()
+      const observer = new PassiveObserver({
+        owners: { Owner },
+        watched: { Owner: ['touch'] },
+        context,
+      })
+      observer.install()
+      try {
+        const kept = [new Owner(), new Owner(), new Owner()]
+        context.run('c01.1', () => kept[0].touch())
+        context.run('c02.1', () => kept[1].touch())
+        context.run('c02.1', () => kept[2].touch())
+        for (let round = 0; round < 5; round++) {
+          context.run('c01.1', () => {
+            for (let i = 0; i < 1000; i++) new Owner().touch()
+          })
+          await new Promise((resolve) => setImmediate(resolve))
+        }
+        await settle(collect)
+        expect([...observer.refs.Owner]).toHaveLength(3)
+        expect(observer.live('Owner')).toEqual(kept)
+        expect(observer.mine('c01.1', 'Owner')).toEqual([kept[0]])
+        expect(observer.mine('c02.1', 'Owner')).toEqual([kept[1], kept[2]])
+      } finally {
+        observer.restore()
+      }
+    })
+
+    test('the socket registry holds only sockets not yet collected', async () => {
+      const collect = gc()
+      const registry = new SocketRegistry({ base: () => () => new EventEmitter() })
+      const factory = registry.factory('c01.1')
+      const kept = factory({ host: 'b1', port: 9092 })
+      for (let round = 0; round < 5; round++) {
+        for (let i = 0; i < 1000; i++) factory({ host: 'b2', port: 9092 })
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      await settle(collect)
+      expect([...registry.refs]).toHaveLength(1)
+      expect(registry.live()).toEqual([{ socket: kept, client: 'c01.1', node: 'b1:9092' }])
+      expect(registry.created).toBe(5001)
+    })
+  })
+
   test('the passive observer keeps receivers, results, errors and timing, and inventories every pause state', async () => {
     class Owner {
       plain(x) {
