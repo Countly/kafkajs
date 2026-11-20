@@ -214,6 +214,65 @@ describe('share membership across a rebootstrap', () => {
   })
 })
 
+describe('share node fetch loops across a rebootstrap', () => {
+  let h
+  let run
+
+  afterEach(async () => {
+    await h?.close()
+    h = run = undefined
+    jest.restoreAllMocks()
+  })
+
+  test('a rebootstrap ends every node loop and fetching resumes on a fresh broker of the same membership', async () => {
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const rebootstraps = []
+    const crashes = []
+    h.consumer.on(h.consumer.events.REBOOTSTRAP, (event) => rebootstraps.push(event.payload))
+    h.consumer.on(h.consumer.events.CRASH, (event) => crashes.push(event.payload.error))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await until(() => h.frames(78).length > 0, 'the first fetch')
+    const warn = jest.spyOn(run.options.logger, 'warn')
+    const leaders = []
+    const sync = run.syncNodes
+    jest.spyOn(run, 'syncNodes').mockImplementation(function () {
+      leaders.push(run.options.cluster.cachedLeader('topic-a', 0))
+      return sync.call(this)
+    })
+    const [node] = run.nodes.values()
+    const { broker } = node.loop
+    const token = run.membership.token
+
+    h.cluster.outage('Metadata', { errorCode: REBOOTSTRAP_REQUIRED })
+    const refresh = await run.options.cluster.refreshMetadata().catch((error) => error)
+    await until(() => rebootstraps.length > 0, 'the rebootstrap')
+    h.cluster.recover('Metadata')
+    const fetches = h.frames(78).length
+    await until(() => run.nodes.get(0) && run.nodes.get(0) !== node, 'a new node record')
+    await until(() => h.frames(78).length > fetches, 'a fetch after the rebootstrap')
+
+    expect(refresh.type).toBe('REBOOTSTRAP_REQUIRED')
+    expect(broker.retired).toBe(true)
+    expect(node.ended).toBe(true)
+    expect(leaders).toContain(-1)
+    expect(run.nodes.get(0).loop.broker).not.toBe(broker)
+    expect(run.nodes.get(0).loop.broker.retired).toBe(false)
+    expect(warn.mock.calls.map(([message]) => message)).not.toContain(
+      'Share request failed before it was written'
+    )
+    expect(run.membership.token).toBe(token)
+    expect(run.membership.memberEpoch).toBe(1)
+    expect(crashes).toEqual([])
+  })
+})
+
 describe('share membership across a coordinator outage longer than one lookup', () => {
   const OUTAGE_MS = 30000
   let h
