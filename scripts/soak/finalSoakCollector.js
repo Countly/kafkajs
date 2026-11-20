@@ -7,7 +7,9 @@
 const fs = require('node:fs')
 const {
   valueOf,
-  harnessTimeout,
+  harnessWait,
+  harnessBound,
+  realSpan,
   clearHarnessTimeout,
   liveHarnessTimers,
 } = require('./finalSoakScheduler')
@@ -222,11 +224,13 @@ class Collector {
         },
       }
       this.waiters.push(waiter)
-      this.clock.sleepUntil(this.clock.now() + ENQUEUE_TIMEOUT_MS, timer.signal).then(() => {
-        if (!this.waiters.includes(waiter)) return
-        this.fail(`write queue did not drain within ${ENQUEUE_TIMEOUT_MS} ms`)
-        this.stop()
-      })
+      this.clock
+        .sleepUntil(this.clock.now() + realSpan(ENQUEUE_TIMEOUT_MS), timer.signal)
+        .then(() => {
+          if (!this.waiters.includes(waiter)) return
+          this.fail(`write queue did not drain within ${ENQUEUE_TIMEOUT_MS} ms`)
+          this.stop()
+        })
     })
   }
 
@@ -257,7 +261,7 @@ class Collector {
       return await Promise.race([
         write,
         new Promise((resolve, reject) => {
-          timer = harnessTimeout(() => {
+          timer = harnessBound(() => {
             const late = new Error(`${what} did not settle within ${this.writeTimeoutMs} ms`)
             reject(Object.assign(late, { unsettled: true }))
           }, this.writeTimeoutMs)
@@ -398,7 +402,7 @@ class SourceChannel {
     return new Promise((resolve) => {
       waiter.resolve = resolve
       this.waiters.push(waiter)
-      this.clock.sleepUntil(this.clock.now() + ENQUEUE_TIMEOUT_MS).then(() => {
+      this.clock.sleepUntil(this.clock.now() + realSpan(ENQUEUE_TIMEOUT_MS)).then(() => {
         if (!this.waiters.includes(waiter)) return
         this.incomplete = `${this.source} could not enqueue ${record.recordId} within ${ENQUEUE_TIMEOUT_MS} ms`
         for (const w of this.waiters.splice(0)) w.resolve(false)
@@ -441,7 +445,7 @@ class SourceChannel {
  * Takes retained samples: a synchronous inventory cut first, then two new full collections at least
  * the GC gap apart with event-loop turns between, then the memory reading. Every reading carries its
  * GC witness; IDs and the cumulative forced count are never reused. The Timeout count leaves out the
- * harness's own live waits and bounds (`harnessTimeout`), so it counts only the code under test.
+ * harness's own live waits and bounds (`harnessWait`, `harnessBound`), so it counts only the code under test.
  */
 class Sampler {
   /**
@@ -649,7 +653,7 @@ class HostMonitor {
   start(clock, onReading) {
     const tick = () => {
       onReading(this.check(clock.now()))
-      this.timer = harnessTimeout(tick, Math.min(this.memEveryMs, this.diskEveryMs))
+      this.timer = harnessWait(tick, Math.min(this.memEveryMs, this.diskEveryMs))
     }
     tick()
   }

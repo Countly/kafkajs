@@ -39,7 +39,9 @@ const { spawn, execFile } = require('node:child_process')
 const { SHAPES, validateRecord, validateConfig } = require('./finalSoakSchema')
 const {
   valueOf,
-  harnessTimeout,
+  harnessWait,
+  harnessBound,
+  realSpan,
   clearHarnessTimeout,
   MonotonicClock,
   planSchedule,
@@ -344,14 +346,15 @@ class Supervisor {
 
   /**
    * @param {object} step a command's step
-   * @returns {number} how long a child may take to answer it: the teardown allowance for the
-   *   disconnect, the step's deadline plus a grace for one that has one, else a fixed bound
+   * @returns {number} how long a child may take to answer it, in harness-clock ms: the teardown
+   *   allowance for the disconnect, the step's deadline plus a grace for one that has one, else a
+   *   fixed bound; the allowance, the grace and the fixed bound are real-time bounds
    */
   budget(step) {
-    if (step.type === 'disconnect') return this.teardownAllowanceMs()
+    if (step.type === 'disconnect') return realSpan(this.teardownAllowanceMs())
     if (step.deadline !== undefined && step.deadline !== Infinity)
-      return Math.max(0, step.deadline - this.clock.now()) + COMMAND_GRACE_MS
-    return DEFAULT_COMMAND_MS
+      return Math.max(0, step.deadline - this.clock.now()) + realSpan(COMMAND_GRACE_MS)
+    return realSpan(DEFAULT_COMMAND_MS)
   }
 
   /**
@@ -565,7 +568,7 @@ class Supervisor {
     const step = async (name, work) => {
       let timer = null
       const late = new Promise((resolve) => {
-        timer = harnessTimeout(
+        timer = harnessBound(
           resolve,
           this.finishStepMs,
           `did not settle within ${this.finishStepMs} ms`
@@ -583,7 +586,7 @@ class Supervisor {
     }
     await this.untilExited()
     await step('supervisor sources', () => this.runtime.stop())
-    const sent = this.clock.now() + this.finishStepMs
+    const sent = this.clock.now() + realSpan(this.finishStepMs)
     await step('supervisor source records', async () => {
       while (this.runtime.channel.pendingBytes > 0 && this.clock.now() < sent)
         await new Promise((resolve) => setImmediate(resolve))
@@ -807,7 +810,9 @@ class Supervisor {
     try {
       const result = await Promise.race([
         call(),
-        this.clock.sleepUntil(this.clock.now() + ADMIN_CALL_MS, timer.signal).then(() => late),
+        this.clock
+          .sleepUntil(this.clock.now() + realSpan(ADMIN_CALL_MS), timer.signal)
+          .then(() => late),
       ])
       if (result === late) throw new Error(`${what} did not answer within ${ADMIN_CALL_MS} ms`)
       return result
@@ -1051,12 +1056,15 @@ class Supervisor {
       }
   }
 
-  /** @param {number} ms @returns {Promise<boolean>} whether every child ended within `ms` */
+  /**
+   * @param {number} ms a real-time bound @returns {Promise<boolean>} whether every child ended
+   *   within `ms`
+   */
   async exitedWithin(ms) {
     const timer = new AbortController()
     const winner = await Promise.race([
       (this.exited ?? Promise.resolve()).then(() => true),
-      this.clock.sleepUntil(this.clock.now() + ms, timer.signal).then(() => false),
+      this.clock.sleepUntil(this.clock.now() + realSpan(ms), timer.signal).then(() => false),
     ])
     timer.abort()
     return winner
@@ -1147,7 +1155,8 @@ class Supervisor {
         },
       }
       const ms = this.budget(step)
-      entry.timer = harnessTimeout(() => {
+      // `budget` is already on the harness clock, its bounds as real-time spans.
+      entry.timer = harnessWait(() => {
         const reason = `process ${slot} did not answer ${step.type} ${step.id} within ${ms} ms`
         this.problem(reason)
         this.abort(reason)
@@ -1355,7 +1364,7 @@ class Supervisor {
    * @throws {Error} when the log ends cannot be read
    */
   async finalDrain() {
-    const deadline = this.clock.now() + FINAL_DRAIN_MS
+    const deadline = this.clock.now() + realSpan(FINAL_DRAIN_MS)
     await this.closeTransactions(deadline)
     const slots = [...new Set([...this.consumers(), this.processOf('share')])]
     let ends = await this.settledEnds(deadline)
@@ -1594,7 +1603,7 @@ class Supervisor {
         if (e) reject(e)
         else resolve(stdout.trim())
       })
-      const bound = harnessTimeout(() => child.kill('SIGKILL'), this.dockerMs)
+      const bound = harnessBound(() => child.kill('SIGKILL'), this.dockerMs)
     })
   }
 

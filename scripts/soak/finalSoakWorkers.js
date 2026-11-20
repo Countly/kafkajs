@@ -10,7 +10,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { AsyncLocalStorage } = require('node:async_hooks')
-const { valueOf, MonotonicClock, harnessTimeout } = require('./finalSoakScheduler')
+const { valueOf, MonotonicClock, harnessWait } = require('./finalSoakScheduler')
 const {
   SUPERVISOR,
   OUTER,
@@ -3116,7 +3116,7 @@ function child(options, { proc = process, Runtime = ChildRuntime } = {}) {
       if (runtime) await runtime.handle(message)
       if (message.step.type === 'disconnect') {
         const pending = () => proc.connected && (runtime?.channel.pendingBytes ?? 0) > 0
-        while (pending()) await new Promise((resolve) => harnessTimeout(resolve, 10))
+        while (pending()) await new Promise((resolve) => harnessWait(resolve, 10))
         if (proc.connected) proc.disconnect()
       }
     }

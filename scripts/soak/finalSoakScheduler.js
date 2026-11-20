@@ -12,25 +12,41 @@ const valueOf = (setting) => setting.value
 /** The timers the harness armed for its own waits and bounds, until each fires or is cleared. */
 const harnessTimers = new Set()
 
-/**
- * `setTimeout` for a wait or bound the harness itself arms. A resource sample subtracts these, so
- * it never counts a timer the harness made for the measurement or the teardown.
- * @param {(...args: unknown[]) => void} fn @param {number} ms @param {...unknown} args
- * @returns {NodeJS.Timeout} the timer, cleared with `clearHarnessTimeout`
- */
-const harnessTimeout = (fn, ms, ...args) => {
-  const timer = setTimeout(
-    () => {
-      harnessTimers.delete(timer)
-      fn(...args)
-    },
-    (Number(ms) || 0) / MonotonicClock.rate
-  )
+/** @param {Function} fn @param {number} realMs @param {unknown[]} args @returns {NodeJS.Timeout} */
+const arm = (fn, realMs, args) => {
+  const timer = setTimeout(() => {
+    harnessTimers.delete(timer)
+    fn(...args)
+  }, realMs)
   harnessTimers.add(timer)
   return timer
 }
 
-/** @param {NodeJS.Timeout|null} timer a `harnessTimeout` timer @returns {void} */
+/**
+ * Arms a harness WAIT: how long the harness sleeps on its own clock (a schedule step, a poll
+ * interval), shortened when a rehearsal runs that clock faster. A resource sample subtracts every
+ * harness timer, so it never counts one the harness made for the measurement or the teardown.
+ * @param {(...args: unknown[]) => void} fn @param {number} ms harness-clock ms @param {...unknown} args
+ * @returns {NodeJS.Timeout} the timer, cleared with `clearHarnessTimeout`
+ */
+const harnessWait = (fn, ms, ...args) => arm(fn, (Number(ms) || 0) / MonotonicClock.rate, args)
+
+/**
+ * Arms a harness BOUND: a limit that catches a hang, counted in real time whatever the harness
+ * clock's rate, so a faster clock never turns it into a race against the CPU or the disk.
+ * @param {(...args: unknown[]) => void} fn @param {number} ms real ms @param {...unknown} args
+ * @returns {NodeJS.Timeout} the timer, cleared with `clearHarnessTimeout`
+ */
+const harnessBound = (fn, ms, ...args) => arm(fn, Number(ms) || 0, args)
+
+/**
+ * The harness-clock span of a real-time bound, for a bound kept as a run-clock deadline
+ * (`clock.now() + realSpan(ms)`): equal to `ms` at the real rate.
+ * @param {number} ms real ms @returns {number} harness-clock ms
+ */
+const realSpan = (ms) => ms * MonotonicClock.rate
+
+/** @param {NodeJS.Timeout|null} timer a `harnessWait` or `harnessBound` timer @returns {void} */
 const clearHarnessTimeout = (timer) => {
   harnessTimers.delete(timer)
   clearTimeout(timer)
@@ -42,7 +58,8 @@ const liveHarnessTimers = () => [...harnessTimers].filter((t) => t.hasRef()).len
 /**
  * The host's monotonic clock, relative to an origin captured once per run. A rehearsal may run it
  * `rate` times faster than real time from the shared real instant `anchor` (monotonic ns); the
- * harness's own timers (`harnessTimeout`) follow it, while the clients' timers stay on real time.
+ * harness's waits (`harnessWait`) follow it, while its bounds (`harnessBound`, `realSpan`) and the
+ * clients' timers stay on real time.
  */
 class MonotonicClock {
   /** How many times faster than real time the harness clock runs. */
@@ -84,7 +101,7 @@ class MonotonicClock {
       const check = () => {
         const wait = at - this.now()
         if (wait <= 0) done()
-        else timer = harnessTimeout(check, Math.ceil(wait))
+        else timer = harnessWait(check, Math.ceil(wait))
       }
       signal?.addEventListener('abort', done, { once: true })
       check()
@@ -305,7 +322,8 @@ class Scheduler {
    * @param {{ now: () => number, sleepUntil: (at: number) => Promise<void> }} options.clock
    * @param {(step: object) => Promise<void>} options.perform does the step's work
    * @param {(outcome: object) => void} [options.onOutcome] receives each settled step
-   * @param {number} [options.graceMs] how long past its deadline a work step may run
+   * @param {number} [options.graceMs] how long past its deadline a work step may run, a real-time
+   *   bound
    */
   constructor({ clock, perform, onOutcome = () => {}, graceMs = Infinity }) {
     this.clock = clock
@@ -410,7 +428,7 @@ class Scheduler {
       () => this.inflight.delete(step.id),
       () => this.inflight.delete(step.id)
     )
-    const limit = deadline + this.graceMs
+    const limit = deadline + realSpan(this.graceMs)
     if (limit === Infinity) return running
     const timer = new AbortController()
     try {
@@ -471,7 +489,9 @@ class SamplingGate {
 
 module.exports = {
   valueOf,
-  harnessTimeout,
+  harnessWait,
+  harnessBound,
+  realSpan,
   clearHarnessTimeout,
   liveHarnessTimers,
   MonotonicClock,
