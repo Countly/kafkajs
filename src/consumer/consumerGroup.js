@@ -495,14 +495,17 @@ module.exports = class ConsumerGroup {
    *
    * The membership is also given the pre-release commit, because a leave at epoch > 0 has to
    * commit before it gives its partitions up and the membership cannot reach an offset manager.
-   * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object }} deps
+   * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object,
+   *   onHeartbeatFatal?: (error: Error) => void }} deps `onHeartbeatFatal` is forwarded to a
+   *   membership that hands its fatal heartbeat answers to the run
    * @returns {void}
    */
-  attach({ rebalanceCoordinator, heartbeatManager }) {
+  attach({ rebalanceCoordinator, heartbeatManager, onHeartbeatFatal }) {
     this.rebalanceCoordinator = rebalanceCoordinator
     this.groupMembership.attach({
       rebalanceCoordinator,
       heartbeatManager,
+      onHeartbeatFatal,
       commitBeforeRelease: (...args) => this.commitBeforeRelease(...args),
     })
   }

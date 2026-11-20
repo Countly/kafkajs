@@ -237,8 +237,8 @@ describe('a consumer-protocol commit answered after its public call expired', ()
     held.release(answerWith(69))
     await pause(200)
     expect(lose).not.toHaveBeenCalled()
-    leave.release()
-    await stopping.catch(() => {})
+    await stopping
+    expect(leave.call).toBeNull()
   })
 
   describe('when the run was retired before the late answer arrives', () => {
