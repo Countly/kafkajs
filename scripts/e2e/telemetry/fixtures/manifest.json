@@ -436,7 +436,7 @@
     "prepare-reporter-source.sh": "3748442ebfa83bed146058594ef3942acd8dd7808431f1f285e5e46278d73797",
     "legacy/JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
     "prepare-client-source.sh": "640576304be9ede6093c089c659955cbd67fe12083e6e01d19a8d9b7ce95c5de",
-    "download.sh": "02c47381b63f7a7a1543ee651a368a43bf160103655c49d06601b70fcc95ff5e"
+    "download.sh": "f972641652b5b2ec5714f6210a2e0a50646a92457c4f2d0745aa9cae36ba49d7"
   },
   "composeSha256": {
     "docker-compose.telemetry.yml": "cd6640b6553198f0a3b57479f74faffe4df44dbe52e2c990ce9f7136b8974075"
@@ -547,6 +547,13 @@
       "change": "download.sh gives each source of a file an equal share of what is left of the 150 s deadline (the last source gets all of it), so a first source that hangs no longer spends the time of the next. A file with one source is unchanged. fetch.sh, inputs.sha256, interop.sha256 and every retained jar are unchanged.",
       "downloadSha256Before": "fc15c7b010e65c5960698ebb42480b7c443539f9370ee3c45411c090d95ec440",
       "downloadSha256After": "02c47381b63f7a7a1543ee651a368a43bf160103655c49d06601b70fcc95ff5e"
+    },
+    {
+      "id": "fetch-source-share-round-up",
+      "date": "2026-11-20",
+      "change": "download.sh rounds each source's share of the deadline up, so the first source still gets an attempt when fewer seconds than sources are left; the later sources still recompute from the clock, so the total stays inside the 150 s deadline. fetch.sh, inputs.sha256, interop.sha256 and every retained jar are unchanged.",
+      "downloadSha256Before": "02c47381b63f7a7a1543ee651a368a43bf160103655c49d06601b70fcc95ff5e",
+      "downloadSha256After": "f972641652b5b2ec5714f6210a2e0a50646a92457c4f2d0745aa9cae36ba49d7"
     }
   ]
 }

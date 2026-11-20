@@ -1,5 +1,12 @@
 const { createErrorFromCode } = require('../../protocol/error')
-const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSShareGroupsNotSupportedError,
+  KafkaJSServerDoesNotSupportApiKey,
+  KafkaJSSASLAuthenticationError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSLockTimeout,
+} = require('../../errors')
 
 /**
  * What a share membership does with a failed heartbeat, by protocol code. The action classes:
@@ -35,14 +42,57 @@ const MEMBERSHIP_ERRORS = Object.freeze({
  * response of a retired membership must discard it first. A retriable failure that is not a broker
  * answer (no numeric code: a failed, closed, replaced or timed-out connection) is `coordinator`,
  * because the cached coordinator may be unusable for good, for example retired by a rebootstrap;
- * the Java client marks its coordinator unknown on a disconnect the same way.
+ * the Java client marks its coordinator unknown on a disconnect the same way. A lock timeout
+ * (another caller held the broker's connect for too long) is also `coordinator`: it is not
+ * retriable by flag, but a later attempt can pass.
  * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
  * @param {Error} error Decoded protocol or transport error.
  * @returns {'coordinator'|'fence'|'unsupported'|'fatal'|'groupNotFound'|'retry'} Membership action.
  */
-const membershipAction = (error) =>
-  MEMBERSHIP_ERRORS[error.code] ||
-  (error.retriable === false ? 'fatal' : typeof error.code === 'number' ? 'retry' : 'coordinator')
+const membershipAction = (error) => {
+  if (MEMBERSHIP_ERRORS[error.code]) return MEMBERSHIP_ERRORS[error.code]
+  if (error instanceof KafkaJSLockTimeout) return 'coordinator'
+  if (error.retriable === false) return 'fatal'
+  return typeof error.code === 'number' ? 'retry' : 'coordinator'
+}
+
+/**
+ * Classifies a failed coordinator lookup on its own, never by the heartbeat table: the lookup's
+ * retrier gives up with a non-retriable wrapper even when a later attempt could succeed, so only
+ * what can never succeed ends the membership:
+ * - `unsupported`: the broker cannot serve a required API (the share capability check or version
+ *   negotiation);
+ * - `fatal`: a SASL authentication failure, an invalid configuration, or a FindCoordinator error
+ *   answer whose protocol code is not retriable, such as GROUP_AUTHORIZATION_FAILED;
+ * - `coordinator`: everything else (refused or lost connections, timeouts, exhausted retries,
+ *   retriable answers, no coordinator found), which keeps the membership and looks the coordinator
+ *   up again under the membership's own backoff, without a deadline.
+ *
+ * The Java client treats a failed FindCoordinator the same way: a retriable failure backs off and
+ * retries, a group authorization or other non-retriable failure is fatal.
+ * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CoordinatorRequestManager.java
+ * @param {Error} error What the lookup rejected with, wrappers included.
+ * @returns {{action: 'coordinator'|'unsupported'|'fatal', error: Error}} The action and the error
+ *   to report: for a terminal action the link that decided it (for an answer, the innermost link
+ *   carrying its code, or the `lastError` of a coordinator not found), so a broker's answer keeps
+ *   its code; otherwise `error` unchanged.
+ */
+const lookupFailure = (error) => {
+  const seen = new Set()
+  let answer = null
+  for (let link = error; link instanceof Error && !seen.has(link); link = link.cause) {
+    seen.add(link)
+    if (link instanceof KafkaJSServerDoesNotSupportApiKey)
+      return { action: 'unsupported', error: link }
+    if (link instanceof KafkaJSSASLAuthenticationError) return { action: 'fatal', error: link }
+    if (link instanceof KafkaJSInvalidConfigurationError) return { action: 'fatal', error: link }
+    if (typeof link.code === 'number') answer = link
+    else if (typeof link.lastError?.code === 'number') answer = link.lastError
+  }
+  return answer && createErrorFromCode(answer.code).retriable === false
+    ? { action: 'fatal', error: answer }
+    : { action: 'coordinator', error }
+}
 
 /**
  * Builds the terminal error of a membership, keeping the protocol code and the cause.
@@ -152,6 +202,7 @@ const transportAction = (error) => ({
 module.exports = {
   MEMBERSHIP_ERRORS,
   membershipAction,
+  lookupFailure,
   fatalMembershipError,
   sessionAction,
   transportAction,

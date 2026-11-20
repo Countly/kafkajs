@@ -638,20 +638,23 @@ module.exports = (params) => {
   }
 
   /**
-   * The wait a connect, run or start owes the close that was already running when it began, so
-   * that close can never tear down the connection that replaces it: its cluster disconnect and
-   * group-registry cleanup finish first. A forced close bounds the wait by its own deadline; a
-   * plain one waits naturally, which is the order `disconnect()` then `connect()` always had. A
-   * close's own failure is its caller's to see, not the replacement's. A caller that is part of
-   * the run being closed (a handler or a rebalance callback) does not wait, because that close is
-   * waiting for it. Returns null with no close to wait for, so the caller stays synchronous up to
-   * the lifetime it acquires and a `disconnect()` made right after still retires it.
+   * The wait a connect, run or start owes the close or crash cleanup that was already running
+   * when it began, so it can never tear down the connection that replaces it: its cluster
+   * disconnect, group-registry cleanup and a forced crash's loss callback finish first. A close
+   * joins the crash cleanup it overlaps, so waiting for the close covers both. A forced close
+   * bounds the wait by its own deadline; a plain one waits naturally, which is the order
+   * `disconnect()` then `connect()` always had. A close's own failure is its caller's to see, not
+   * the replacement's. A caller that is part of the run being closed (a handler or a rebalance
+   * callback) does not wait, because that close is waiting for it; a CRASH listener or
+   * `restartOnFailure` runs after its cleanup has settled. Returns null with nothing to wait for,
+   * so the caller stays synchronous up to the lifetime it acquires and a `disconnect()` made right
+   * after still retires it.
    * The caller passes the resolved value to `refuseLaterClose` before it acquires a lifetime.
    * @returns {Promise<number>|null} resolves, never rejects, when that close has settled, to the
    *   `disconnect()` count taken at this call
    */
   const earlierClose = () => {
-    const earlier = closing
+    const earlier = closing ?? crashCleanup
     if (!earlier || RebalanceHooks.current() || handlerContext.current()) return null
     const asked = closeRequests
     return earlier.promise.catch(() => {}).then(() => asked)
