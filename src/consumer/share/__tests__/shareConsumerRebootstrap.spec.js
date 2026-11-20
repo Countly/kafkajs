@@ -1,4 +1,11 @@
-const { flush, shareClient } = require('../../../../testHelpers/shareHarness')
+const { ShareRun } = require('../shareRun')
+const {
+  fetchAnswer,
+  flush,
+  part,
+  shareClient,
+  until,
+} = require('../../../../testHelpers/shareHarness')
 
 const REBOOTSTRAP = 'share_consumer.cluster.rebootstrap'
 const REBOOTSTRAP_REQUIRED = 129
@@ -101,5 +108,94 @@ describe('share consumer rebootstrap event', () => {
       metadataFrames: 1,
     })
     expect(result.after).toEqual(['topic-a'])
+  })
+})
+
+describe('share membership across a rebootstrap', () => {
+  const UNKNOWN_TOPIC_OR_PARTITION = 3
+  let h
+  let run
+
+  afterEach(async () => {
+    await h?.close()
+    h = run = undefined
+    jest.restoreAllMocks()
+  })
+
+  /** @returns {object[]} The share heartbeats the client wrote, oldest first. */
+  const beats = () => h.frames(76)
+
+  /**
+   * Runs a joined share consumer, then makes its fetch report the topic gone while metadata
+   * answers REBOOTSTRAP_REQUIRED, so the fetch loop's metadata refresh rebootstraps the client
+   * and retires every broker the run cached, the coordinator included.
+   * @param {number} fenceCode The code the coordinator answers the next heartbeat with.
+   * @returns {Promise<{warn: jest.SpyInstance, token: symbol, beatsBefore: number}>}
+   */
+  const rebootstrapWhileRunning = async (fenceCode) => {
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const rebootstraps = []
+    h.consumer.on(h.consumer.events.REBOOTSTRAP, (event) => rebootstraps.push(event.payload))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await until(() => h.frames(78).length > 0, 'the first fetch')
+    const warn = jest.spyOn(run.options.logger, 'warn')
+    const coordinator = run.membership.coordinator
+    const token = run.membership.token
+
+    h.cluster.outage('Metadata', { errorCode: REBOOTSTRAP_REQUIRED })
+    h.script('ShareFetch', [
+      fetchAnswer([part({ partition: 0, code: UNKNOWN_TOPIC_OR_PARTITION })]),
+    ])
+    await until(() => rebootstraps.length > 0, 'the rebootstrap')
+    expect(coordinator.broker.retired).toBe(true)
+    h.script('ShareGroupHeartbeat', [{ errorCode: fenceCode, memberEpoch: 0 }])
+    h.cluster.recover('Metadata')
+    return { warn, token, beatsBefore: beats().length }
+  }
+
+  test.each([
+    ['UNKNOWN_MEMBER_ID', 25],
+    ['FENCED_MEMBER_EPOCH', 110],
+  ])(
+    'looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on %s',
+    async (_name, code) => {
+      const { token, beatsBefore } = await rebootstrapWhileRunning(code)
+
+      await until(
+        () => beats().some(({ fields }, i) => i >= beatsBefore && fields.memberEpoch === 0),
+        'the rejoin at epoch 0'
+      )
+      await until(() => run.membership.memberEpoch === 2, 'the second join')
+      const after = beats().slice(beatsBefore)
+      expect(after[0].fields.memberEpoch).toBe(1)
+      expect(after[1].fields).toMatchObject({
+        memberEpoch: 0,
+        memberId: run.membership.memberId,
+        subscribedTopicNames: ['topic-a'],
+      })
+      expect(run.membership.token).not.toBe(token)
+      expect(run.membership.coordinator.broker.retired).toBe(false)
+      const fetches = h.frames(78).length
+      await until(() => h.frames(78).length > fetches, 'fetching after the rejoin')
+    }
+  )
+
+  test('logs the type and code of a failing share heartbeat', async () => {
+    const { warn } = await rebootstrapWhileRunning(25)
+
+    await until(() => run.membership.memberEpoch === 2, 'the second join')
+    const failures = warn.mock.calls.filter(([message]) => message === 'Share heartbeat failed')
+    expect(failures.map(([, extra]) => extra)).toContainEqual({
+      error: expect.any(String),
+      type: 'UNKNOWN_MEMBER_ID',
+      code: 25,
+    })
   })
 })
