@@ -808,6 +808,15 @@ module.exports = class RebalanceCoordinator {
     return this.verdict !== null
   }
 
+  /**
+   * Whether the slot holds a verdict that ends the run: a fatal consumer-protocol error. A
+   * recoverable loss only leads to another recovery. The slot stays untouched.
+   * @returns {boolean}
+   */
+  hasFatalVerdict() {
+    return this.verdict !== null && isConsumerProtocolFatal(this.verdict.error)
+  }
+
   /** Drops whatever is in the slot, without acting on it. @returns {void} */
   clearVerdict() {
     this.verdict = null

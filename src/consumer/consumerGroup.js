@@ -3279,9 +3279,9 @@ module.exports = class ConsumerGroup {
 
   /**
    * Reports an accepted halt with optional nextOffset, codec and limit copied from its error.
-   * Emits one `consumer.partition_halted` event and one error log. Both are
-   * contained, so a listener or a logger that throws neither undoes the halt nor reaches the other
-   * partitions of the round; a listener's error is named in the log.
+   * Emits one `consumer.partition_halted` event and one error log. Neither can throw: `Consumer.on`
+   * contains its listeners and the logger contains its sink, so the halt stands and the other
+   * partitions of the round go on.
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -3295,13 +3295,7 @@ module.exports = class ConsumerGroup {
     if (nextOffset !== undefined) payload.nextOffset = nextOffset
     if (codec !== undefined) payload.codec = codec
     if (limit !== undefined) payload.limit = limit
-    let listenerError
-
-    try {
-      this.instrumentationEmitter.emit(PARTITION_HALTED, payload)
-    } catch (e) {
-      listenerError = e
-    }
+    this.instrumentationEmitter.emit(PARTITION_HALTED, payload)
 
     try {
       this.logger.error('Halted a partition; seek it to resume', {
@@ -3312,7 +3306,6 @@ module.exports = class ConsumerGroup {
         offset,
         reason,
         error: error.message,
-        ...(listenerError !== undefined && { listenerError: describeThrown(listenerError) }),
       })
     } catch {}
   }

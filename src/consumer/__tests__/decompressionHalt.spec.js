@@ -295,19 +295,6 @@ describe('Consumer > a batch that breaks the decompression bound, in the consume
     expect(events[0].payload).toMatchObject({ offset: '0', nextOffset: '3', codec: 'gzip' })
   })
 
-  test('a listener that throws neither undoes the halt nor stops the other partition', async () => {
-    harness.group.instrumentationEmitter.addListener('consumer.partition_halted', () => {
-      throw new Error('listener failure')
-    })
-
-    const fetched = await harness.group.fetch(NODE_ID)
-    await harness.group.fetch(NODE_ID)
-
-    expect(offsetsOfPartition(fetched, 1)).toEqual(['5', '6'])
-    expect(harness.group.haltedPartitions.has(KEY)).toBe(true)
-    expect(events).toHaveLength(1)
-  })
-
   test('a seek to the next offset made inside the event resumes the partition', async () => {
     harness.group.instrumentationEmitter.addListener('consumer.partition_halted', ({ payload }) =>
       harness.group.seek({

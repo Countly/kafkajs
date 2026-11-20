@@ -174,6 +174,30 @@ describe('Loggers', () => {
       expect(sink).not.toHaveBeenCalled()
     })
 
+    it('a log function whose returned promise rejects leaves no unhandled rejection, and later lines still reach it', async () => {
+      const unhandled = []
+      const track = (reason) => unhandled.push(reason)
+      process.on('unhandledRejection', track)
+      try {
+        const sink = jest.fn(({ log }) =>
+          log.message === 'boom' ? Promise.reject(new Error('sink failed')) : undefined
+        )
+        const root = createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+
+        expect(root.error('boom')).toBeUndefined()
+        expect(root.namespace('Ns').warn('boom')).toBeUndefined()
+        root.info('after')
+        await new Promise((resolve) => setImmediate(resolve))
+        await new Promise((resolve) => setImmediate(resolve))
+
+        expect(unhandled).toEqual([])
+        expect(sink).toHaveBeenCalledTimes(3)
+        expect(sink.mock.calls[2][0].log.message).toBe('after')
+      } finally {
+        process.off('unhandledRejection', track)
+      }
+    })
+
     it('leaves a throwing log creator failing the logger construction', () => {
       const creator = () => {
         throw new Error('creator failed')

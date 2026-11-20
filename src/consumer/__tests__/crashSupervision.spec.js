@@ -183,7 +183,7 @@ describe('Consumer > crash supervision', () => {
           throw new Error('subscriber threw')
         },
       ],
-      ['rejects', async () => Promise.reject(new Error('subscriber threw'))],
+      ['rejects (unchanged behaviour)', async () => Promise.reject(new Error('subscriber threw'))],
     ])(
       'a first subscriber that %s: the second runs, one diagnostic, and the run crashes as with a working subscriber',
       async (_, failing) => {
@@ -300,7 +300,7 @@ describe('Consumer > crash supervision', () => {
       120000
     )
 
-    it('GROUP_ID_NOT_FOUND answering the leave heartbeat completes the disconnect without a CRASH', async () => {
+    it('GROUP_ID_NOT_FOUND answering the leave heartbeat still completes the disconnect without a CRASH', async () => {
       const run = await start({})
       const answer = run.state.answer
       run.state.answer = (req) =>
@@ -376,7 +376,7 @@ describe('Consumer > crash supervision', () => {
       60000
     )
 
-    it('a handler rethrowing the refusal of its own commit recovers without a CRASH', async () => {
+    it('a handler rethrowing the refusal of its own commit still recovers without a CRASH', async () => {
       let refused = null
       const observed = await fenceThenRelease({
         settle: async ({ topic, partition }, run) => {
@@ -396,7 +396,7 @@ describe('Consumer > crash supervision', () => {
       expect(observed.run.crashes).toEqual([])
     }, 60000)
 
-    it('a stop requested while the loss callback is held leaves no late CRASH for the handler failure', async () => {
+    it('a stop requested while the loss callback is held still leaves no late CRASH for the handler failure', async () => {
       const hookHeld = deferred()
       const lostEntered = jest.fn()
       const { run, policy } = await fenceThenRelease({
@@ -424,7 +424,7 @@ describe('Consumer > crash supervision', () => {
       expect(run.crashes).toEqual([])
     }, 60000)
 
-    it('a loss callback that throws during the recovery wins over the handler failure', async () => {
+    it('a loss callback that throws during the recovery still wins over the handler failure', async () => {
       const hookFailure = new Error('lost hook failed')
       const handlerFailure = Object.assign(new Error('handler failed'), { retriable: false })
       const observed = await fenceThenRelease({
