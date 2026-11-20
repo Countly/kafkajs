@@ -48,9 +48,10 @@ fetch_from() {
 
 # fetch <sums> <dir> <name> <source>...: publishes <dir>/<name> only with the SHA-256 that the sha256sum list <sums>
 # pins for <name>. A present file with that digest is kept without network access; any other present file is fetched
-# again. Tries each source in order through fetch_from, each with an equal share of the deadline left, all into a temporary name beside the file that is renamed only
-# after its digest matches, so neither an interrupted download nor wrong bytes reach the cache. On final failure
-# prints the file and every source URL with its reason to stderr and returns 1.
+# again. Tries each source in order through fetch_from, each with an equal share of the deadline left, rounded up so
+# the first source still gets an attempt when fewer seconds than sources are left. All go into a temporary name
+# beside the file that is renamed only after its digest matches, so neither an interrupted download nor wrong bytes
+# reach the cache. On final failure prints the file and every source URL with its reason to stderr and returns 1.
 fetch() {
   local file=$2/$3 want source failures= sources=$(($# - 3)) now
   want=$(awk -v name="$3" '$2 == name { print $1 }' "$1")
@@ -63,7 +64,7 @@ fetch() {
   FETCH_PART=$(mktemp "$file.part.XXXXXX")
   for source in "${@:4}"; do
     now=$(date +%s)
-    if fetch_from "$source" "$want" $((now + (FETCH_DEADLINE - now) / sources)); then
+    if fetch_from "$source" "$want" $((now + (FETCH_DEADLINE - now + sources - 1) / sources)); then
       mv "$FETCH_PART" "$file"
       FETCH_PART=
       return 0

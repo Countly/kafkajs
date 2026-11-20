@@ -856,6 +856,7 @@ module.exports = class Runner extends EventEmitter {
       // manager, so stopping it first cannot strand the round.
       await scope.wait(() => this.rebalanceCoordinator.idle())
       await scope.wait(() => this.waitForConsumer(scope))
+      this.disarmFatal()
       if (closing) await scope.wait(() => this.invokeCloseHook(closing, scope))
 
       await this.commitFinalOffsetsContained(scope)

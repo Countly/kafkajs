@@ -622,6 +622,41 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.refreshedIds).toHaveLength(6)
       expect(h.protocol.needsReconciliation()).toBe(false)
     })
+
+    it('warns once per episode, naming the assigned topic ids that stay unresolved', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      const h = build({
+        names,
+        metadataMaxAge: 1000,
+        answers: [
+          heartbeatResponse({
+            assignment: assignmentOf([
+              [TOPIC_ID_A, [0]],
+              [TOPIC_ID_B, [0]],
+            ]),
+          }),
+        ],
+      })
+      const unresolvedWarnings = () =>
+        h.logged.warn.mock.calls.filter(([message]) =>
+          message.startsWith('Assigned topic ids are still unresolved')
+        )
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      for (let i = 0; i < 4; i++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+
+      expect(h.refreshedIds.length).toBeGreaterThan(3)
+      expect(unresolvedWarnings()).toEqual([
+        [
+          'Assigned topic ids are still unresolved; their partitions are not consumed until metadata names them',
+          { groupId: GROUP_ID, topicIds: [TOPIC_ID_B] },
+        ],
+      ])
+    })
   })
 
   describe('A target naming a topic id this member has never seen', () => {

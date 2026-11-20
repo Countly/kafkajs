@@ -903,7 +903,8 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Resolves unknown ids once at a time per target. Two fast misses switch to metadata-age retries;
-   * they never permanently abandon an id. Retired work cannot install metadata or update counters.
+   * they never permanently abandon an id. The second miss of an id is logged at WARN, once until
+   * the id resolves or leaves the target. Retired work cannot install metadata or update counters.
    * @private
    * @param {string[]} topicIds ids still unnamed
    * @param {{ periodic?: boolean }} [options] permits one slow retry after the fast budget
@@ -933,10 +934,16 @@ module.exports = class ConsumerGroupProtocol {
           surface: true,
         })
         if (!isCurrent()) return
+        const stalled = []
         for (const topicId of outcome?.unresolved || []) {
-          this.unresolvedAttempts.set(
-            topicId,
-            Math.min(MAX_UNRESOLVED_ATTEMPTS, (this.unresolvedAttempts.get(topicId) || 0) + 1)
+          const attempts = (this.unresolvedAttempts.get(topicId) || 0) + 1
+          if (attempts === MAX_UNRESOLVED_ATTEMPTS) stalled.push(topicId)
+          this.unresolvedAttempts.set(topicId, Math.min(MAX_UNRESOLVED_ATTEMPTS, attempts))
+        }
+        if (stalled.length) {
+          this.logger.warn(
+            'Assigned topic ids are still unresolved; their partitions are not consumed until metadata names them',
+            { groupId: this.groupId, topicIds: stalled }
           )
         }
       } catch (error) {
