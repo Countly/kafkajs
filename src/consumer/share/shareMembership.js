@@ -12,7 +12,7 @@ const {
 /** Until the coordinator has answered once there is no interval; this keeps the join retry alive. */
 const INITIAL_HEARTBEAT_INTERVAL_MS = 1000
 
-/** Metadata misses of one target before its unresolved topic IDs are logged at WARN. */
+/** Metadata misses of one unresolved topic ID before it is named at WARN. */
 const UNRESOLVED_WARNING_ATTEMPTS = 2
 
 /** The member epoch of a leave. */
@@ -80,6 +80,8 @@ class ShareMembership {
     this.interval = INITIAL_HEARTBEAT_INTERVAL_MS
     this.backoff = new HeartbeatBackoff(retry)
     this.metadataBackoff = new HeartbeatBackoff(retry)
+    /** @type {Map<string, number>} misses per unresolved ID of the target, saturating at the warning count */
+    this.unresolvedMisses = new Map()
     this.coordinator = null
     this.inFlight = null
     this.resolution = null
@@ -201,6 +203,7 @@ class ShareMembership {
         this.targetRevision = Symbol('assignment')
         this.resolution = null
         this.metadataBackoff.reset()
+        this.unresolvedMisses.clear()
         const accepted = this.token
         this.notify(this.onInvalidate, previous, 'joined')
         if (this.closed || this.token !== accepted) return
@@ -242,6 +245,7 @@ class ShareMembership {
     this.target = target
     this.resolution = null
     this.metadataBackoff.reset()
+    this.unresolvedMisses.clear()
   }
 
   /**
@@ -285,7 +289,8 @@ class ShareMembership {
 
   /**
    * Publishes the known target IDs; unknown IDs never hold up known partitions or revoke them.
-   * Notifies `onAssignment` only when the resolved set changed.
+   * Notifies `onAssignment` only when the resolved set changed. Forgets the misses of IDs that
+   * resolved or left the target, so an ID lost again is a new episode.
    * @private
    * @returns {void}
    */
@@ -298,6 +303,9 @@ class ShareMembership {
       else assignment.push({ topicId, topic, partitions: partitions.slice() })
     }
     this.unresolved = unresolved
+    for (const topicId of this.unresolvedMisses.keys()) {
+      if (!unresolved.includes(topicId)) this.unresolvedMisses.delete(topicId)
+    }
     const previous = JSON.stringify(this.assignment)
     this.assignment = assignment
     if (JSON.stringify(assignment) !== previous) this.notify(this.onAssignment, this.snapshot())
@@ -349,18 +357,25 @@ class ShareMembership {
   }
 
   /**
-   * Advances the metadata backoff after a miss or a failed refresh. The second miss of a target
-   * is logged at WARN with the IDs still unresolved, once per target: the backoff, and with it the
-   * count, starts again only for a new target or after every ID resolved.
+   * Advances the metadata backoff after a miss or a failed refresh and counts the miss for each
+   * unresolved ID. An ID's second miss is logged at WARN, naming every ID that reached it in this
+   * miss, so each ID is named once per episode and never per heartbeat: its count saturates and
+   * starts again only when it resolved or left the target, for a new target or after a join.
    * @private
    * @returns {void}
    */
   missedResolution() {
     this.metadataBackoff.onFailedAttempt(performance.now())
-    if (this.metadataBackoff.attempts !== UNRESOLVED_WARNING_ATTEMPTS) return
+    const stalled = []
+    for (const topicId of this.unresolved) {
+      const misses = (this.unresolvedMisses.get(topicId) || 0) + 1
+      if (misses === UNRESOLVED_WARNING_ATTEMPTS) stalled.push(topicId)
+      this.unresolvedMisses.set(topicId, Math.min(UNRESOLVED_WARNING_ATTEMPTS, misses))
+    }
+    if (!stalled.length) return
     this.logger.warn(
       'Assigned topic IDs are still unresolved; their partitions are not fetched until metadata names them',
-      { groupId: this.groupId, topicIds: this.unresolved.slice() }
+      { groupId: this.groupId, topicIds: stalled }
     )
   }
 
@@ -378,6 +393,7 @@ class ShareMembership {
     this.target = []
     this.resolution = null
     this.metadataBackoff.reset()
+    this.unresolvedMisses.clear()
     this.notify(this.onInvalidate, old, reason)
     this.publishAssignment()
   }
