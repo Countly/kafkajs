@@ -35,7 +35,7 @@ jobs:
     # step's own limit and stays inside a hosted runner's six hours.
     timeout-minutes: 335
     env:
-      FINAL_SOAK_MODE: ${{ inputs.mode || 'smoke' }}
+      FINAL_SOAK_MODE: ${{ inputs.mode || 'rehearsal' }}
       KAFKA_VERSION: '4.4.0'
       FINAL_SOAK_DIAGNOSTIC: '1'
       FINAL_SOAK_ARTIFACTS: ${{ github.workspace }}/.tmp/final-soak
