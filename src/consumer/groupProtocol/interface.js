@@ -79,8 +79,8 @@ const COOPERATIVE = 'cooperative'
  *   classic protocol on its next join
  */
 
-/** Precedence: the highest id in the intersection wins, matching the Java client. */
-const PROTOCOL_IDS = { [EAGER]: 0, [COOPERATIVE]: 1 }
+/** Every rebalance protocol, lowest id first: the last one a set shares wins, as in the Java client. */
+const BY_PRECEDENCE = Object.freeze([EAGER, COOPERATIVE])
 
 /**
  * Chooses the rebalance protocol for a set of assigners, once, at consumer construction.
@@ -111,7 +111,7 @@ const selectRebalanceProtocol = (assigners) => {
 
   const intersection = supported.reduce(
     (shared, { protocols }) => shared.filter((protocol) => protocols.includes(protocol)),
-    [EAGER, COOPERATIVE]
+    BY_PRECEDENCE
   )
 
   if (intersection.length === 0) {
@@ -124,9 +124,7 @@ const selectRebalanceProtocol = (assigners) => {
     )
   }
 
-  return intersection.reduce((best, protocol) =>
-    PROTOCOL_IDS[protocol] > PROTOCOL_IDS[best] ? protocol : best
-  )
+  return intersection[intersection.length - 1]
 }
 
 const callDeadlines = new WeakSet()

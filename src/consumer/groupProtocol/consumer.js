@@ -834,9 +834,10 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Remembers what resolved and what did not.
+   * Remembers what resolved, what did not and what is held.
    * @private
-   * @param {{ byTopicId: Map<string, number[]>, names: string[], unresolved: string[] }} resolved
+   * @param {{ byTopicId: Map<string, number[]>, names: string[], unresolved: string[],
+   *   held: Array<[string, string]> }} resolved a `resolveFromCache` result
    * @returns {boolean} whether a name resolved that had not resolved before
    */
   recordResolution(resolved) {
@@ -856,12 +857,12 @@ module.exports = class ConsumerGroupProtocol {
       this.unresolvedTopicIds.add(topicId)
     }
 
-    for (const [topicId, name] of resolved.held || []) {
+    for (const [topicId, name] of resolved.held) {
       this.assignedTopicNames.set(topicId, name)
       this.unresolvedTopicIds.delete(topicId)
       this.unresolvedAttempts.delete(topicId)
     }
-    this.holdsTopics = (resolved.held || []).length > 0
+    this.holdsTopics = resolved.held.length > 0
 
     return grew
   }
@@ -1645,7 +1646,7 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     if (error.name === 'KafkaJSInvariantViolation') {
-      // This client's own bug, raised from inside the response handling. Backing off and dropping
+      // This client's own bug, raised on the request path. Backing off and dropping
       // the coordinator would treat a defect that recurs on every heartbeat as a network problem.
       return error
     }
