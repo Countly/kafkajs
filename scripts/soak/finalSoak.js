@@ -58,7 +58,7 @@ const {
 } = require('./finalSoakCollector')
 const { normalizeTopicId } = require('./finalSoakObserver')
 const { bootId, ChildRuntime, child } = require('./finalSoakWorkers')
-const { summarizeRun } = require('./heapSummary')
+const { summarizeRun, SUMMARY_FILE, SUMMARY_ERROR_FILE } = require('./heapSummary')
 
 const ROOT = path.resolve(__dirname, '../..')
 const MATRIX = 'scripts/soak/finalSoakMatrix.json'
@@ -97,13 +97,16 @@ const MAX_PROBLEMS = 200
 const HEAP_SNAPSHOT_MS = 60000
 /**
  * The process roles that write a heap snapshot at every quiet boundary in every mode: the twelve
- * subjects the heap row judges, and the reader (an admin client and the harness) and the decoder
- * (no client) as harness-only comparisons. The seed grows by design and the supervisor writes the
- * stream, so neither takes one.
+ * subjects the heap row judges, the seed whose deliberate leak is the row's positive control, and
+ * the reader (an admin client and the harness) and the decoder (no client) as harness-only
+ * comparisons. The supervisor writes the stream and takes none.
  */
-const HEAP_SNAPSHOT_ROLES = Object.freeze(['subject', 'reader', 'decoder'])
-/** Free disk kept back for a day's heap snapshots until the post-run summary deletes most of them. */
-const HEAP_SNAPSHOT_BYTES = 8 * GIB
+const HEAP_SNAPSHOT_ROLES = Object.freeze(['subject', 'seed', 'reader', 'decoder'])
+/**
+ * Free disk kept back for a day's heap snapshots, all of which stay in the artifact: 14 processes
+ * × 24 of 15 to 25 MB, and the seed's 24 growing to about 200 MB, about 7.5 to 11 GB.
+ */
+const HEAP_SNAPSHOT_BYTES = 16 * GIB
 
 /** @param {string} prefix @param {number} n @returns {string} a two-digit slot id */
 const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
@@ -2008,9 +2011,10 @@ function digestArtifact(out) {
 /**
  * The outer handover after the supervisor has exited: appends the parent-observed supervisor exit
  * as the `outer` source, copies each supplied companion into the artifact, summarises the heap
- * snapshots into `heap/summary.json` and deletes those it does not keep (`summarizeRun`, outside
- * every measured process), hashes and fsyncs every file (streamed, never read whole) and writes
- * `header.json`. The exit is what the runbook's
+ * snapshots into `heap/summary.json` (`summarizeRun`, outside every measured process; when that
+ * fails, `heap/summary-error.txt` says why and the run is sealed without a summary), hashes and
+ * fsyncs every file (streamed, never read whole) and writes `header.json`. The exit is what the
+ * runbook's
  * receipt says it observed, at the time it observed it; the window's observed end is that time, so
  * every record (the supervisor's closing ones and this receipt) is within it. When the supervisor
  * left no receipt there is no run to describe: only `manifest.partial.json` is written, naming the
@@ -2075,8 +2079,15 @@ function finalize({ out, status, companions = [] }) {
     fs.copyFileSync(file, path.join(out, rel))
     return { name, treeSha: run.treeSha, file: rel, sha256: digestFile(file).sha256, runUrl }
   })
-  const matrix = JSON.parse(fs.readFileSync(path.join(ROOT, MATRIX), 'utf8'))
-  summarizeRun(out, run.heapSnapshots ?? [], valueOf(matrix.bounds['heap-endpoint']))
+  try {
+    summarizeRun(out, run.heapSnapshots ?? [])
+  } catch (e) {
+    // A missing summary leaves the heap row INCONCLUSIVE whether or not the reason can be written.
+    try {
+      fs.rmSync(path.join(out, SUMMARY_FILE), { recursive: true, force: true })
+      fs.writeFileSync(path.join(out, SUMMARY_ERROR_FILE), `${e.message}`.slice(0, 500) + '\n')
+    } catch {}
+  }
   const files = digestArtifact(out)
   const stream = files.find((f) => f.file === 'stream.ndjson')
   const preflight = read('preflight.json')

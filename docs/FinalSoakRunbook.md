@@ -105,7 +105,7 @@ That verdict never changes the receipt: `failedStage` stays `workload`, exit sta
 | `outer-exit.json` | must agree with `header.exit` (status = code, same `observedAt`) | K7 FAIL |
 | `apache/{main,transactions}.dump` + `.stderr` + `.end` | K1, K2 (stderr must say `Processed a total of <lines> messages` once) | K1, K2 INCONCLUSIVE |
 | `apache/groups/<group>.describe` + `.end` (ordinary groups only) | K4, and the log ends K1 uses | K4 (and K1) INCONCLUSIVE |
-| `heap/summary.json`, `heap/<slot>.<boundary>.heapsnapshot` (kept files) | K5 (section 6a) | K5 INCONCLUSIVE; the summary is read only up to 16 MiB, a kept snapshot up to 1 GiB |
+| `heap/summary.json` (or `heap/summary-error.txt` when finalize could not write it), every `heap/<slot>.<boundary>.heapsnapshot` | K5 (section 6a) | K5 INCONCLUSIVE; the summary is read only up to 16 MiB, a snapshot up to 1 GiB |
 
 The checker does not read `.cmd` files, the describes' `.stderr` or the share group's `.unavailable` file.
 
@@ -154,10 +154,13 @@ Verdicts: `ACCEPTED` (all seven rows PASS in an acceptance run; a smoke or a reh
   assignment is skipped; a LAG that disagrees, a repeated partition row or a non-Kafka header is INCONCLUSIVE.
 - **K5** endpoint and least-squares slope of the **judged heap** of each subject process (p01 to p12): every live heap byte
   of the heap snapshot it wrote after each hourly quiet boundary, except V8 code (section 6a), whoever owns it. A boundary
-  counts only when its snapshot was written without error inside the hour's quiet window and its summary agrees with the
-  supervisor's receipt; the first and last counted snapshot of each process must be kept files whose totals the checker
-  re-derives. Any boundary that does not count leaves K5 INCONCLUSIVE, never PASS. The whole-process `heapUsed` of the quiet
-  triplets is printed as information only (section 5b).
+  counts only when its snapshot was written without error inside the hour's quiet window and its summary record agrees with
+  the supervisor's receipt (the process's own file of that boundary, the size the worker recorded, the same start time);
+  the checker then re-derives the totals of every counted snapshot from the file itself, so no judged number rests on the
+  summary alone. Any boundary that does not count, or a file that does not confirm its record, leaves K5 INCONCLUSIVE, never
+  PASS. The seed's snapshots are the positive control: unless its judged endpoint exceeds its breach bound (2,097,152 bytes)
+  K5 is INCONCLUSIVE; the seed never fails K5. The whole-process `heapUsed` of the quiet triplets is printed as information
+  only (section 5b).
 - **K6** final resource counts at or below baseline; the baseline must be the process's first sample and the final its last,
   taken after the end of traffic: the supervisor's own `traffic` shape end (written after the final drain), which must lie
   between the run's end and the supervisor's observed end. The supervisor is the config's one `collector` process: the
@@ -201,9 +204,11 @@ checkout with K1 to K4, K6 and K7 PASS and K5 INCONCLUSIVE only for its single b
 ## 6a. The judged heap and the triage of a K5 FAIL
 
 **What K5 judges.** Right after each quiet boundary's last reading, in every mode (acceptance included), every subject
-(p01 to p12), the reader (p14) and the decoder (p16) write `heap/<slot>.<boundary>.heapsnapshot`, all at once, while the
-scheduler holds work; each write has 60 s of real time. The seed (p13) grows by design and the supervisor (p15) writes the
-stream, so neither takes one. V8 runs a full collection before it writes, so a snapshot holds only live nodes. The judged
+(p01 to p12), the seed (p13), the reader (p14) and the decoder (p16) write `heap/<slot>.<boundary>.heapsnapshot`, all at
+once, while the scheduler holds work; each write has 60 s of real time. The supervisor (p15) writes the stream and takes
+none. The seed's retained offset map (a `Map` of `<partition>:<offset>` strings to offset strings, started after `h00` and
+cleared at the end) is judged bytes like any other, so the seed's judged endpoint must exceed its breach bound in every run
+that judges K5: that shows, inside the run, that capture, summary and checker see a leak. V8 runs a full collection before it writes, so a snapshot holds only live nodes. The judged
 bytes of a snapshot are the self bytes of every node except those of the excluded node type below; K5 applies the matrix
 endpoint (2,097,152 bytes, median of the last three boundaries minus the first three) and slope (262,144 B/min over the
 snapshot start times) bounds to them, in every mode that judges the row.
@@ -263,7 +268,11 @@ grew 0.27 to 0.39 MB an hour in `heapUsed`, judged bytes 27 to 30 KB an hour). T
 maps and hidden classes (`object shape`), `hidden` system objects even when their name looks like code (a `hidden`
 `system / WeakArrayList` or `system / ProtectedFixedArray`), strings, `native` nodes, and any node type a future V8 adds.
 There is no unattributed escape: a byte counts whether the summary attributes it to the product, the harness, node
-internals, a dependency or nothing.
+internals, a dependency or nothing. The backing stores of `Buffer` and `ArrayBuffer` are `native` nodes, so a leak of them
+is judged in full although `heapUsed` misses it (it counts them as external memory).
+
+After its first snapshot a process keeps V8's object-move tracking on for the rest of the run. That costs native memory and
+some collector time, never judged bytes, and every measured process now pays it in every mode.
 
 The compilation cache that a process's first snapshot frees (about 0.9 to 1.2 MB, part of it old-space and script-source
 bytes) does not reach the judged bytes: every snapshot, the first included, is written after V8's own full collection, so
@@ -275,13 +284,19 @@ all readings stand on the same footing. In run 3afda68743d9 the judged growth fr
 receipt's snapshot and writes one record per receipt to `heap/summary.json`: the receipt (`at`, `ms`, `error`), the file's
 size and sha256, its node count, total, judged and excluded bytes, the excluded bytes by the categories above, the judged
 bytes by node type and by owner class, and the ten constructors and closures that grew most since the previous usable
-snapshot, each with the retainer path of one new instance. It keeps the snapshot files of each process's first and last
-usable boundary, every one whose judged bytes exceed the first by more than half the bound, and every one it could not read;
-it deletes the rest. A day writes 14 processes × 24 snapshots of 10 to 35 MB (up to about 8 GiB, which the run's disk monitor
-keeps free); 28 of them and any past half the bound stay (about 0.5 to 1 GiB) beside a summary of about 2.5 KB a record (under 1 MB). Summarising
-takes about one second and 140 MB to 400 MB of RSS per snapshot (about six minutes for a day, inside the finalize limit).
-The checker judges from the sealed summary and re-derives the totals of each kept first and last snapshot from the file
-itself; a disagreement leaves that process INCONCLUSIVE.
+snapshot, each with the retainer path of one new instance. A receipt that names another file than its own process's of
+that boundary, or a size other than the file's, gets a record with that error and no totals. Every snapshot file stays in
+the artifact. When the summary cannot be written, finalize records why in `heap/summary-error.txt`, still seals the run, and
+K5 is INCONCLUSIVE with that reason.
+
+Sizes for a day (estimates from rehearsal 3afda68743d9, not yet measured on a day): 14 processes × 24 snapshots of 15 to
+25 MB, plus the seed's 24 growing with its map to about 200 MB, about 7.5 to 11 GB in all, which the run's disk monitor keeps
+free (16 GiB reserved); a rehearsal writes 15 × 3 snapshots, about 0.7 to 1 GB. Summarising takes about one second and
+140 MB to 400 MB of RSS per 15 MB snapshot (about ten minutes for a day, the seed's last snapshots up to about 1 GB of RSS,
+inside the finalize limit). The checker reads every counted snapshot, one at a time (subjects, seed, reader and decoder,
+360 on a day, about the same time again, inside its own limit), and re-derives node count, total, judged and excluded
+bytes, size and sha256 from the file itself; any disagreement leaves that process without numbers and K5 INCONCLUSIVE. The
+summary's other fields (`growing`, owner classes) are triage aids and judge nothing.
 
 **Triage of a FAIL.** A FAIL names a process whose live non-code heap grew past the bound; it is not yet a client leak.
 
@@ -290,8 +305,7 @@ itself; a disagreement leaves that process INCONCLUSIVE.
    path of a new instance.
 2. Compare with the reader (p14) and the decoder (p16) under `judged heap of harness-only`: growth of the same shape there
    points at the harness.
-3. Run `node scripts/soak/heapSnapshotReport.js <artifact dir> <slot>` on the kept snapshots (first, last and any past half
-   the bound) for the full owner rows, the files that grew and twenty constructors with their retainer paths. It holds two
+3. Run `node scripts/soak/heapSnapshotReport.js <artifact dir> <slot>` on the snapshots for the full owner rows, the files that grew and twenty constructors with their retainer paths. It holds two
    snapshots at once, at about five times their file size each. A node is owned by the script of its constructor or
    closure, else by its dominator.
 
@@ -311,4 +325,6 @@ On a hosted runner, dispatch the `Final soak smoke (diagnostic)` workflow with `
 workflow's smoke branches always runs a smoke. The job takes about 3.5 hours (three hours of plan, about 15 minutes of start,
 teardown, dumps, heap summary, check and archive, and the upload); its runbook step is limited to 17,400 s and the job to 335
 minutes, inside the runner's six hours. Read K5 with section 6a before the day: forecast the day from the judged growth per
-hour of each subject (about 21 hours separate the day's endpoint medians).
+hour of each subject (about 21 hours separate the day's endpoint medians). Rehearsal 3afda68743d9 snapshotted only two
+subjects (p03 and p09, forecast 0.60 and 0.22 MB for the day); a forecast for the other ten from it is an extrapolation
+from their `heapUsed`, not a measurement, until a rehearsal of this tree snapshots every subject.

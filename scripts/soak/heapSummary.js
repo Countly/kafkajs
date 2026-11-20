@@ -16,9 +16,10 @@
  * `heap/summary.json` holds the supervisor's receipt, the snapshot's size and sha256, its total,
  * judged and excluded bytes, the excluded bytes by name category, the judged bytes by node type
  * and by owner class, and the constructors and closures that grew most since the process's
- * previous usable snapshot. The snapshot files kept are the first and the last usable one of each
- * process, each whose judged bytes exceed the first by more than half the endpoint bound, and each
- * that could not be read; the others are deleted once summarised.
+ * previous usable snapshot. A record is bound to its own snapshot: the receipt must name
+ * `snapshotFile(slot, boundary)` and the size the worker recorded, else the record carries an
+ * error and no totals. Every snapshot file stays, so the checker can re-derive each number it
+ * judges from the file itself.
  *
  * Cost per snapshot: about five times its file size in memory while two are held (a 15 MB file
  * parsed, analysed and compared in under a second and 140 MB of RSS).
@@ -31,11 +32,16 @@ const { ownersOf, compare, classOf } = require('./heapSnapshotReport')
 
 /** The one snapshot node type the heap row does not judge. */
 const EXCLUDED_TYPE = 'code'
-/** A snapshot whose judged bytes exceed its process's first by this share of the bound is kept. */
-const KEEP_FRACTION = 0.5
 const SUMMARY_FILE = 'heap/summary.json'
-const SNAPSHOT_FILE = /^heap\/p\d\d\.h\d\d\.heapsnapshot$/
+/** Why finalize could not write `SUMMARY_FILE`, when it could not. */
+const SUMMARY_ERROR_FILE = 'heap/summary-error.txt'
 const TOP_GROWING = 10
+
+/**
+ * @param {string} slot a process slot @param {string} boundary a quiet boundary
+ * @returns {string} the artifact path of that process's snapshot of that boundary
+ */
+const snapshotFile = (slot, boundary) => `heap/${slot}.${boundary}.heapsnapshot`
 
 /**
  * @param {string} name the name of a `code` node
@@ -106,31 +112,39 @@ function judgedByOwner(graph, owners) {
 }
 
 /**
- * Summarises every snapshot receipt of a finished run into `heap/summary.json` and deletes the
- * snapshot files it does not keep. Each process's receipts are read in boundary order, holding at
- * most two parsed snapshots at a time.
+ * Summarises every snapshot receipt of a finished run into `heap/summary.json`, keeping every
+ * snapshot file. Each process's receipts are read in boundary order, holding at most two parsed
+ * snapshots at a time. A receipt that names another file than its own slot and boundary's, or a
+ * size other than the file's, gets an error record and is never read as that snapshot.
  * @param {string} out the artifact directory
  * @param {{ slot: string, boundary: string, file: string, at: number|null, ms: number|null,
- *   error: string|null }[]} receipts the supervisor's heap snapshot receipts
- * @param {number} bound the heap endpoint bound in bytes
- * @returns {{ excludedType: string, keepFraction: number, records: object[] }} what was written
+ *   bytes: number|null, error: string|null }[]} receipts the supervisor's heap snapshot receipts
+ * @returns {{ excludedType: string, records: object[] }} what was written
+ * @throws {Error} when the summary cannot be written
  */
-function summarizeRun(out, receipts, bound) {
+function summarizeRun(out, receipts) {
   const bySlot = new Map()
   for (const r of receipts) bySlot.set(r.slot, [...(bySlot.get(r.slot) ?? []), r])
   const records = []
   for (const list of bySlot.values()) {
-    const usable = []
     let previous = null
     for (const receipt of [...list].sort((a, b) => a.boundary.localeCompare(b.boundary))) {
       const { slot, boundary, file, at, ms } = receipt
-      const record = { slot, boundary, file, at, ms, error: receipt.error ?? null, kept: false }
+      const record = { slot, boundary, file, at, ms, error: receipt.error ?? null }
       records.push(record)
       if (record.error !== null) continue
+      const own = snapshotFile(slot, boundary)
+      if (file !== own) {
+        record.error = `the receipt names ${file}, which is not ${own}`.slice(0, 200)
+        continue
+      }
       try {
-        if (!SNAPSHOT_FILE.test(file)) throw new Error(`${file} is not a heap snapshot path`)
         const full = path.join(out, file)
         const bytes = fs.readFileSync(full)
+        if (bytes.length !== receipt.bytes) {
+          record.error = `${file} has ${bytes.length} bytes, its receipt ${receipt.bytes}`
+          continue
+        }
         const parsed = readSnapshot(full)
         const graph = analyseSnapshot(parsed)
         const current = { graph, owners: ownersOf(graph), boundary }
@@ -156,19 +170,12 @@ function summarizeRun(out, receipts, bound) {
             : [],
         })
         previous = current
-        if (usable.length > 0 && record.judgedBytes - usable[0].judgedBytes > KEEP_FRACTION * bound)
-          record.kept = true
-        usable.push(record)
       } catch (e) {
         record.error = `unreadable snapshot: ${e.message}`.slice(0, 200)
-        record.kept = SNAPSHOT_FILE.test(file) && fs.existsSync(path.join(out, file))
       }
     }
-    if (usable.length > 0) usable[0].kept = usable.at(-1).kept = true
   }
-  for (const r of records)
-    if (!r.kept && r.error === null) fs.rmSync(path.join(out, r.file), { force: true })
-  const summary = { excludedType: EXCLUDED_TYPE, keepFraction: KEEP_FRACTION, records }
+  const summary = { excludedType: EXCLUDED_TYPE, records }
   fs.mkdirSync(path.join(out, 'heap'), { recursive: true })
   fs.writeFileSync(path.join(out, SUMMARY_FILE), JSON.stringify(summary) + '\n')
   return summary
@@ -176,9 +183,9 @@ function summarizeRun(out, receipts, bound) {
 
 module.exports = {
   EXCLUDED_TYPE,
-  KEEP_FRACTION,
   SUMMARY_FILE,
-  SNAPSHOT_FILE,
+  SUMMARY_ERROR_FILE,
+  snapshotFile,
   categoryOf,
   totalsOf,
   summarizeRun,

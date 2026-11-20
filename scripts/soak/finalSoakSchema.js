@@ -1589,7 +1589,8 @@ const ClientSlot = shape('a client slot', {
  * their arms; one standing subject of each kind alone in its own process (churn extras of the same
  * churn kind may share it); exactly one isolated seed process holding exactly one control client of
  * the seeded kind; observers only in observer processes; group, static id and telemetry per kind;
- * heap snapshot processes (`heapSnapshots`): every subject, the reader and the decoder, in every mode.
+ * heap snapshot processes (`heapSnapshots`): every subject, the seed, the reader and the decoder,
+ * in every mode.
  * Other config sections belong to the driver profile and are compared by the verifier.
  * @param {unknown} config parsed config JSON
  * @param {object} matrix a valid matrix
@@ -1677,11 +1678,11 @@ const validateConfig = (config, matrix) => {
     }
   }
   const snapshotSlots = config.processes
-    .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+    .filter((p) => ['subject', 'seed', 'reader', 'decoder'].includes(p.role))
     .map((p) => p.slot)
   if (JSON.stringify(config.heapSnapshots) !== JSON.stringify(snapshotSlots))
     problems.push(
-      'config.heapSnapshots does not list every subject, the reader and the decoder, in process order'
+      'config.heapSnapshots does not list every subject, the seed, the reader and the decoder, in process order'
     )
   for (const c of config.clients) {
     if (c.purpose === 'observer' || !matrix.clientKinds[c.clientKind].grouped) continue

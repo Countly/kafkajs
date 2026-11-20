@@ -700,7 +700,8 @@
         "Only the 12 unseeded subject processes are judged; for process p and h = 0..23, Y[h] = the judged bytes of the V8 heap snapshot p writes after the last quiet reading of boundary h, the self bytes of every snapshot node except those of node type code (compiled code, bytecode and their bookkeeping), whoever owns them; X[h] = the minute the snapshot began.",
         "endpoint = median(Y[21..23]) - median(Y[0..2]); slope = the least-squares slope of Y over X; HeapOK(p) iff endpoint <= the heap endpoint bound and slope <= the heap slope bound.",
         "Medians of an even count take the upper middle.",
-        "A boundary without a usable snapshot leaves HeapOK(p) INCONCLUSIVE, never PASS.",
+        "A boundary without a usable snapshot leaves HeapOK(p) INCONCLUSIVE, never PASS. Every judged Y[h] is re-derived from its own sealed snapshot file (the process's file of boundary h, with the size the worker recorded); a summary record its file does not confirm leaves HeapOK(p) INCONCLUSIVE.",
+        "The seed writes the same snapshots and its endpoint is computed the same way; it is the positive control of the snapshot pipeline: unless it exceeds the seed's breach bound, HeapOK is INCONCLUSIVE for every process, and the seed never fails an unseeded process.",
         "The whole-process heapUsed endpoint and slope of the quiet readings, the judged heap of the reader and the decoder, RSS, external memory and decreases are reported, never gated."
       ]
     },
@@ -1037,7 +1038,7 @@
       },
       "evidence": ["identity", "scan", "sample", "seed", "process", "client"],
       "uses": ["HeapOK"],
-      "predicate": "For p in {eager-dynamic, consumer-dynamic, share, seed}: V[p] = distinct main offsets actually entered in p between its first quiet triplet completion and its last quiet triplet admission; require |V[p]| >= 1 000 000 from the same main corpus and method. The seed's HeapOK endpoint must exceed the breach bound; every unseeded process passes HeapOK. A missing, under-volume or under-bound seed is INCONCLUSIVE, never PASS; a seed breach never fails an unseeded memory row. closure COMPLETE also needs the consume-retention companion with the candidate and reference retained and control report; otherwise the row stays OPEN.",
+      "predicate": "For p in {eager-dynamic, consumer-dynamic, share, seed}: V[p] = distinct main offsets actually entered in p between its first quiet triplet completion and its last quiet triplet admission; require |V[p]| >= 1 000 000 from the same main corpus and method. The seed's judged-heap endpoint, from its own snapshots as in HeapOK, must exceed the breach bound; every unseeded process passes HeapOK. A missing, under-volume or under-bound seed is INCONCLUSIVE, never PASS; a seed breach never fails an unseeded memory row. closure COMPLETE also needs the consume-retention companion with the candidate and reference retained and control report; otherwise the row stays OPEN.",
       "bounds": [
         "traffic.floors.distinctOffsets",
         "controls.interning-seeded.breachBytes",

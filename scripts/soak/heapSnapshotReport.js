@@ -2,8 +2,7 @@
 'use strict'
 /**
  * Offline heap-growth report over the V8 heap snapshots a final soak run wrote at its quiet
- * boundaries (`<run dir>/heap/<slot>.<boundary>.heapsnapshot`, the files the run's heap summary
- * kept). For
+ * boundaries (`<run dir>/heap/<slot>.<boundary>.heapsnapshot`, all kept in the artifact). For
  * each process it compares consecutive boundaries and prints where the live heap grew, by owner:
  * every reachable node is owned by the script of its own constructor or closure where the snapshot
  * names one, else by its immediate dominator's owner, and V8 code is its own rows (bytecode,

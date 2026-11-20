@@ -19,7 +19,7 @@
  * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
  * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE. K5
  * reads `heap/summary.json` (`scripts/soak/heapSummary.js`, written after the run) and re-derives
- * the totals of the snapshot files it kept for each process's first and last boundary.
+ * the totals of every snapshot whose number it judges from the snapshot file itself.
  *
  * Memory: about 86 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
  * 172 MB at 2 million; pages are touched only as ids arrive): the full 32-byte payload digest,
@@ -29,7 +29,7 @@
  * aborted member's offset, each capped at the same capacity; open membership waves and printed
  * outages capped by the matrix schedule; a fixed sample grid per process. Any cap that is reached
  * is a reported problem that leaves K1 to K6 INCONCLUSIVE. Side files are read whole only below a
- * size cap; a kept heap snapshot (at most 1 GiB) is read and parsed one at a time, at about five
+ * size cap; a heap snapshot (at most 1 GiB) is read and parsed one at a time, at about five
  * times its file size.
  */
 const crypto = require('node:crypto')
@@ -68,7 +68,7 @@ const ROW_NAMES = {
 const NOT_JUDGED = Object.freeze([
   { name: 'share lock lifecycle and authority replay', lane: 'share-soak' },
   { name: 'ownership tables', lane: 'consumer-churn' },
-  { name: 'seed sensitivity control', lane: 'telemetry' },
+  { name: 'seed offset volume', lane: 'telemetry' },
   { name: 'latency denominators', lane: 'consumer-churn' },
   { name: 'cooperative round counts', lane: 'consumer-churn' },
   { name: 'restart leave mode and stop mode', lane: 'consumer-churn' },
@@ -1210,6 +1210,8 @@ function readingScreen({ journal, plan, header }, slot) {
 
 /**
  * Reads `heap/summary.json` (at most `MAX_JSON` bytes) and checks it against the header manifest.
+ * When it is missing, the reason finalize recorded in `heapSummary.SUMMARY_ERROR_FILE`, if any, is
+ * named with it.
  * @param {object} ctx `{ dir, manifest }` @param {string[]} problems receives every problem
  * @returns {Map<string, object>} its records by `<slot> <boundary>`, empty when it is unusable
  */
@@ -1219,7 +1221,18 @@ function readHeapSummary({ dir, manifest }, problems) {
   try {
     bytes = readCapped(path.join(dir, heapSummary.SUMMARY_FILE), MAX_JSON)
   } catch (e) {
-    problems.push(`${heapSummary.SUMMARY_FILE}: ${e.code === 'ENOENT' ? 'missing' : e.message}`)
+    let why = e.code === 'ENOENT' ? 'missing' : e.message
+    try {
+      const error = readCapped(path.join(dir, heapSummary.SUMMARY_ERROR_FILE), 1024)
+      checkBound(
+        manifest,
+        heapSummary.SUMMARY_ERROR_FILE,
+        { bytes: error.length, sha256: sha(error) },
+        problems
+      )
+      why += `; finalize could not summarise the heap snapshots: ${error.toString('utf8').trim()}`
+    } catch {}
+    problems.push(`${heapSummary.SUMMARY_FILE}: ${why}`)
     return records
   }
   checkBound(
@@ -1246,19 +1259,19 @@ function readHeapSummary({ dir, manifest }, problems) {
 }
 
 /**
- * Re-derives a kept snapshot's totals from the file itself, bound by the header manifest.
+ * Re-derives a snapshot's totals from the file itself, bound by the header manifest. The caller
+ * has bound the record's file to its slot and boundary.
  * @param {object} ctx `{ dir, manifest }` @param {object} record its summary record
  * @returns {string|null} why the file does not confirm the record, or null when it does
  */
-function keptProblem({ dir, manifest }, record) {
-  if (record.kept !== true) return 'its snapshot file was not kept'
-  if (!heapSummary.SNAPSHOT_FILE.test(record.file)) return `${record.file} is not a snapshot path`
+function snapshotProblem({ dir, manifest }, record) {
   const file = path.join(dir, record.file)
   const problems = []
   try {
     const bytes = readCapped(file, MAX_SNAPSHOT)
     checkBound(manifest, record.file, { bytes: bytes.length, sha256: sha(bytes) }, problems)
-    if (sha(bytes) !== record.sha256) problems.push(`${record.file} is not the snapshot summarised`)
+    if (sha(bytes) !== record.sha256 || bytes.length !== record.snapshotBytes)
+      problems.push(`${record.file} is not the snapshot summarised`)
     const totals = heapSummary.totalsOf(readSnapshot(file))
     for (const key of ['nodes', 'totalBytes', 'judgedBytes', 'excludedBytes'])
       if (totals[key] !== record[key])
@@ -1272,8 +1285,10 @@ function keptProblem({ dir, manifest }, record) {
 /**
  * The judged-heap series of one process: one summary record per hour whose snapshot was written
  * without error inside the hour's quiet window (from its last quiet reading's time to the hour's
- * end) and agrees with the supervisor's receipt; the first and last of them must be kept snapshot
- * files that confirm their records.
+ * end) and agrees with the supervisor's receipt: the receipt names the process's own file of that
+ * boundary, and the record names that file with the size the worker recorded. Every such snapshot
+ * file is re-read and must confirm its record, so no judged number rests on the summary alone; one
+ * that does not leaves the process without numbers.
  * @param {object} ctx `{ dir, manifest, plan, header }` @param {string} slot
  * @param {Map<string, object>} records the summary records @param {Map<string, object>} receipts
  *   the supervisor's receipts by `<slot> <boundary>`
@@ -1294,7 +1309,10 @@ function snapshotSeries(ctx, slot, records, receipts) {
     else if (
       !receipt ||
       receipt.at !== r.at ||
-      (receipt.error !== null && receipt.error !== r.error)
+      receipt.file !== heapSummary.snapshotFile(slot, label) ||
+      r.file !== receipt.file ||
+      (receipt.error !== null && receipt.error !== r.error) ||
+      (r.error === null && r.snapshotBytes !== receipt.bytes)
     )
       why = 'has a heap snapshot summary that disagrees with the supervisor receipt'
     else if (r.error !== null) why = `has no usable heap snapshot: ${r.error}`
@@ -1313,8 +1331,8 @@ function snapshotSeries(ctx, slot, records, receipts) {
       `${slot} has ${points.length} of ${plan.hours} usable heap snapshots (at least 2 needed)`
     )
   if (points.length >= 2)
-    for (const r of new Set([usable[0], usable.at(-1)])) {
-      const why = keptProblem(ctx, r)
+    for (const r of usable) {
+      const why = snapshotProblem(ctx, r)
       if (why) {
         gaps.push(`${slot} ${r.boundary} snapshot does not confirm its summary: ${why}`)
         points.length = 0
@@ -1328,10 +1346,14 @@ function snapshotSeries(ctx, slot, records, receipts) {
  * boundary: every live byte but V8 code (`heapSummary.EXCLUDED_TYPE`), whoever owns it. The
  * endpoint and slope of `heapScreen` must stay within the matrix bounds. A boundary without a
  * usable snapshot leaves the process INCONCLUSIVE, never PASS, and fewer than two usable
- * boundaries cannot be screened. The harness-only snapshot processes (reader, decoder) and every
- * subject's whole-process `heapUsed` screen are returned as information, never a verdict.
+ * boundaries cannot be screened. The seed's snapshots, judged the same way, are the positive
+ * control: unless its endpoint exceeds the seed's breach bound the row cannot PASS, and the seed
+ * never fails it. The harness-only snapshot processes (reader, decoder) and every subject's
+ * whole-process `heapUsed` screen are returned as information, never a verdict.
  * @param {Row} row @param {object} ctx `{ dir, manifest, journal, matrix, config, plan, header,
- *   supervisor }` @returns {{ heapUsed: object, comparison: object }} the information lines
+ *   supervisor }`
+ * @returns {{ heapUsed: object, comparison: object, control: object, controlBound: number }} the
+ *   information lines
  */
 function judgeHeap(row, ctx) {
   const { matrix, config, supervisor } = ctx
@@ -1348,7 +1370,8 @@ function judgeHeap(row, ctx) {
       r,
     ])
   )
-  const info = { heapUsed: {}, comparison: {} }
+  const controlBound = matrix.controls['interning-seeded'].breachBytes.value
+  const info = { heapUsed: {}, comparison: {}, control: {}, controlBound }
   const subjects = config.processes.filter((p) => p.role === 'subject').map((p) => p.slot)
   for (const slot of subjects) {
     info.heapUsed[slot] = readingScreen(ctx, slot)
@@ -1362,7 +1385,20 @@ function judgeHeap(row, ctx) {
     if (!(r.slope <= limits.slope))
       row.fail(`${slot} judged heap slope ${Math.round(r.slope)} B/min exceeds ${limits.slope}`)
   }
-  for (const slot of (config.heapSnapshots ?? []).filter((s) => !subjects.includes(s))) {
+  const seeds = config.processes.filter((p) => p.role === 'seed').map((p) => p.slot)
+  for (const slot of seeds) {
+    const { points, gaps } = snapshotSeries(ctx, slot, records, receipts)
+    const control = points.length >= 2 ? screenNumbers(heapScreen(points)) : { reason: gaps[0] }
+    info.control[slot] = control
+    if (!(control.endpoint > controlBound))
+      row.gap(
+        `seed ${slot} does not show its leak: ${control.reason ?? `judged heap endpoint ${control.endpoint} bytes is not above ${controlBound}`}`
+      )
+  }
+  const others = (config.heapSnapshots ?? []).filter(
+    (s) => !subjects.includes(s) && !seeds.includes(s)
+  )
+  for (const slot of others) {
     const { points, gaps } = snapshotSeries(ctx, slot, records, receipts)
     info.comparison[slot] =
       points.length >= 2 ? screenNumbers(heapScreen(points)) : { reason: gaps[0] }
@@ -1747,6 +1783,10 @@ function formatReport(report) {
       lines.push(`  whole-process heapUsed ${slot}: ${screen(s)}`)
     for (const [slot, s] of Object.entries(info.heap?.comparison ?? {}))
       lines.push(`  judged heap of harness-only ${slot}: ${screen(s)}`)
+    for (const [slot, s] of Object.entries(info.heap?.control ?? {}))
+      lines.push(
+        `  seed control ${slot} (judged heap, must exceed ${info.heap.controlBound} bytes): ${screen(s)}`
+      )
     const share = info.shareOutcomes
     if (share) {
       const reasons = share.byReason.map(([reason, n]) => `${reason} ${n}`).join(', ') || 'none'

@@ -99,17 +99,17 @@ describe('scripts/evidence/finalSoakCore', () => {
       }
       expect(text.split('\n').filter((l) => /NOT JUDGED/.test(l) && /PASS/.test(l))).toEqual([])
       expect(core.NOT_JUDGED.map((i) => i.name).join('|')).toMatch(
-        /share lock lifecycle.*ownership tables.*seed sensitivity.*latency.*cooperative round.*restart leave.*receipts identity.*companions.*recreate/s
+        /share lock lifecycle.*ownership tables.*seed offset volume.*latency.*cooperative round.*restart leave.*receipts identity.*companions.*recreate/s
       )
     })
 
-    it('lists the seed control, receipt identity, share lock and checkpoint rows as NOT JUDGED even when the supervisor receipt contradicts the run', async () => {
+    it('lists the seed offset volume, receipt identity, share lock and checkpoint rows as NOT JUDGED even when the supervisor receipt contradicts the run', async () => {
       const report = await check(fx.healthy(), {
         supervisor: (s) => ({ ...s, runId: 'ffffffffffff' }),
       })
       expectRow(report, 'K7', 'FAIL', /runId.*differs/)
       const names = report.notJudged.map((i) => i.name)
-      for (const part of ['seed sensitivity', 'receipts identity', 'share lock', 'checkpoints'])
+      for (const part of ['seed offset volume', 'receipts identity', 'share lock', 'checkpoints'])
         expect(names.some((n) => n.includes(part))).toBe(true)
       expect(report.notJudged.every((i) => i.verdict === 'NOT JUDGED')).toBe(true)
     })
@@ -1445,7 +1445,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     ])(
       'never passes a leaking process whose last record is bound to %s',
       async (_, edit, fields) => {
-        const world = judged('p04', leak)
+        const world = judged('p04', (h) => 9e6 + (h >= 22 ? 3 * MIB : 0))
         world.heap.edit = edit
         const changed = (r) =>
           Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, value(r)]))
@@ -2578,7 +2578,7 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(world), 'K5', 'INCONCLUSIVE', /p03 has 2 of 3 usable heap snapshots/)
     })
 
-    it('keeps the summary and only the first and last snapshot of each process on disk, and re-derives the verdict from those sealed files alone', async () => {
+    it('keeps the summary and every snapshot of each process on disk, and re-derives the verdict from those sealed files', async () => {
       const world = judgedRehearsal('p04', (h) => 9e6 + (h === 2 ? 3 * 1024 * 1024 : 0))
       let dir = null
       const report = await onDisk(world, (d) => {
@@ -2589,6 +2589,7 @@ describe('scripts/evidence/finalSoakCore', () => {
           'summary.json',
           ...world.config.heapSnapshots.flatMap((slot) => [
             `${slot}.h00.heapsnapshot`,
+            `${slot}.h01.heapsnapshot`,
             `${slot}.h02.heapsnapshot`,
           ]),
         ].sort()
