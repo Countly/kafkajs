@@ -293,24 +293,32 @@ describe('Network > request observation', () => {
 
     test('a connection whose queued write throws on the throttle timer ends its generation and settles every request', async () => {
       const { connection, state } = await connected()
-      connection.requestQueue.maybeThrottle(30)
-      const answer = { decode: async (payload) => payload, parse: async (payload) => payload }
-      const first = connection.send(protocol(answer))
-      const second = connection.send(protocol(answer))
-      const settled = Promise.allSettled([first, second])
-      await flush()
-      expect(connection.requestQueue.pending).toHaveLength(2)
-      const failure = new Error('write failed')
-      state.socket.write = () => {
-        throw failure
-      }
+      // The throttle timer is advanced, not slept: under load a real 30 ms could pass before the
+      // queue is inspected.
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+      try {
+        connection.requestQueue.maybeThrottle(30)
+        const answer = { decode: async (payload) => payload, parse: async (payload) => payload }
+        const first = connection.send(protocol(answer))
+        const second = connection.send(protocol(answer))
+        const settled = Promise.allSettled([first, second])
+        await flush()
+        expect(connection.requestQueue.pending).toHaveLength(2)
+        const failure = new Error('write failed')
+        state.socket.write = () => {
+          throw failure
+        }
 
-      const [one, two] = await settled
-      expect(one).toEqual({ status: 'rejected', reason: failure })
-      expect(two).toEqual({ status: 'rejected', reason: failure })
-      expect(connection.isConnected()).toBe(false)
-      expect(connection.requestQueue.isIdle()).toBe(true)
-      expect(connection.requestQueue.throttleCheckTimeoutId).toBeNull()
+        jest.advanceTimersByTime(30)
+        const [one, two] = await settled
+        expect(one).toEqual({ status: 'rejected', reason: failure })
+        expect(two).toEqual({ status: 'rejected', reason: failure })
+        expect(connection.isConnected()).toBe(false)
+        expect(connection.requestQueue.isIdle()).toBe(true)
+        expect(connection.requestQueue.throttleCheckTimeoutId).toBeNull()
+      } finally {
+        jest.useRealTimers()
+      }
     })
 
     test('a correlation collision rejects the new request and keeps the existing one in flight', () => {
