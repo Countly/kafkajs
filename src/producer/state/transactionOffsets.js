@@ -36,9 +36,9 @@ class TransactionOffsets {
   }
 
   /**
-   * @returns {import('../../consumer/handlerContext').BatchIdentity|null} the first input a seek,
-   *   a topic recreation or the end of its acquisition superseded (`handlerContext.isSuperseded`),
-   *   as `{ acquisition, acquireClock }`; null when every input still stands or there is none
+   * @returns {Pick<import('../../consumer/handlerContext').BatchIdentity, 'acquisition'|'acquireClock'>|null}
+   *   the first input a seek, a topic recreation or the end of its acquisition superseded
+   *   (`handlerContext.isSuperseded`); null when every input still stands or there is none
    */
   supersededInput() {
     if (this.inputs === null) return null

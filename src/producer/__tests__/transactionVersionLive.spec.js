@@ -599,7 +599,7 @@ describeTransactionVersion('Producer > transactional seek fence (live)', () => {
   )
 
   test(
-    'an applied seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged',
+    'a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged',
     async () => {
       const run = await scenario()
       const transaction = await run.producer.transaction()

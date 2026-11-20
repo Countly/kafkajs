@@ -158,7 +158,8 @@ const unknownOutcome = (error) =>
  * The refusal of a transaction that carries offsets of a consumer batch a seek, a topic recreation
  * or the end of its acquisition superseded: the transaction can only be aborted, and the records
  * processed again in a new one. The cause is the commit refusal the consumer gives such a batch.
- * @param {import('../../consumer/handlerContext').BatchIdentity} input the superseded input
+ * @param {Pick<import('../../consumer/handlerContext').BatchIdentity, 'acquisition'|'acquireClock'>} input
+ *   the superseded input
  * @returns {KafkaJSTransactionAbortableError}
  */
 const supersededInputError = (input) =>
