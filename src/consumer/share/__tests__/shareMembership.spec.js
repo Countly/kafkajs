@@ -675,6 +675,75 @@ describe('share membership', () => {
     expect(unresolvedWarnings()).toHaveLength(2)
     expect(unresolvedWarnings()[1][1]).toEqual({ groupId: 'group', topicIds: [C] })
   })
+  test.each([
+    ['after the first one resolves', true],
+    ['while the first one stays unresolved', false],
+  ])(
+    'names a second topic ID that goes unresolved later in the same target once, %s, and never names the first again',
+    async (_, firstResolves) => {
+      f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+      const warn = jest.spyOn(f.member.logger, 'warn')
+      const named = () =>
+        warn.mock.calls
+          .filter(([message]) => message.startsWith('Assigned topic IDs are still unresolved'))
+          .map(([, extra]) => extra.topicIds)
+      let now = 0
+      jest.spyOn(performance, 'now').mockImplementation(() => now)
+      f.response.assignment = {
+        topicPartitions: [
+          { topicId: A, partitions: [0] },
+          { topicId: B, partitions: [1] },
+        ],
+      }
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+      for (let i = 0; i < 4; i++) {
+        now += 1000
+        await f.member.heartbeat()
+        await settled()
+      }
+      expect(named()).toEqual([[B]])
+
+      if (firstResolves) f.names.set(B, 'topic-b')
+      f.names.delete(A)
+      for (let i = 0; i < 12; i++) {
+        now += 5000
+        await f.member.heartbeat()
+        await settled()
+      }
+      expect(f.member.snapshot().unresolved).toEqual(firstResolves ? [A] : [A, B])
+      expect(f.cluster.refreshMetadataForTopicIds.mock.calls.length).toBeGreaterThan(8)
+      expect(named()).toEqual([[B], [A]])
+    }
+  )
+  test('names a topic ID that stays unresolved again for a new target', async () => {
+    f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+    const warn = jest.spyOn(f.member.logger, 'warn')
+    const named = () =>
+      warn.mock.calls
+        .filter(([message]) => message.startsWith('Assigned topic IDs are still unresolved'))
+        .map(([, extra]) => extra.topicIds)
+    let now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1] }] }
+    for (let i = 0; i < 4; i++) {
+      now += 1000
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+    }
+    expect(named()).toEqual([[B]])
+
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1, 2] }] }
+    for (let i = 0; i < 6; i++) {
+      now += 5000
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+    }
+    expect(named()).toEqual([[B], [B]])
+  })
   test('permits only one metadata flight and respects its next retry deadline', async () => {
     f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
     let now = 0
