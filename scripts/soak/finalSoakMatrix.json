@@ -697,10 +697,11 @@
     },
     "HeapOK": {
       "rules": [
-        "Only the 12 unseeded subject processes are judged; for process p and h = 0..23, Y[h] = median of the three heapUsed readings at quiet boundary h and X[h] = median of their completedAt, in minutes.",
+        "Only the 12 unseeded subject processes are judged; for process p and h = 0..23, Y[h] = the judged bytes of the V8 heap snapshot p writes after the last quiet reading of boundary h, the self bytes of every snapshot node except those of node type code (compiled code, bytecode and their bookkeeping), whoever owns them; X[h] = the minute the snapshot began.",
         "endpoint = median(Y[21..23]) - median(Y[0..2]); slope = the least-squares slope of Y over X; HeapOK(p) iff endpoint <= the heap endpoint bound and slope <= the heap slope bound.",
         "Medians of an even count take the upper middle.",
-        "All readings, the signed endpoint and slope, RSS, external memory and slope x (last X - first X) are reported; projected growth and decreases are recorded, never gated."
+        "A boundary without a usable snapshot leaves HeapOK(p) INCONCLUSIVE, never PASS.",
+        "The whole-process heapUsed endpoint and slope of the quiet readings, the judged heap of the reader and the decoder, RSS, external memory and decreases are reported, never gated."
       ]
     },
     "TablesOK": {

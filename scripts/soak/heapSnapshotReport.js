@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 'use strict'
 /**
- * Offline heap-growth report over the V8 heap snapshots a final soak rehearsal wrote at its quiet
- * boundaries (`<run dir>/heap/<slot>.<boundary>.heapsnapshot`, opt-in `--heap-snapshots`). For
+ * Offline heap-growth report over the V8 heap snapshots a final soak run wrote at its quiet
+ * boundaries (`<run dir>/heap/<slot>.<boundary>.heapsnapshot`, the files the run's heap summary
+ * kept). For
  * each process it compares consecutive boundaries and prints where the live heap grew, by owner:
  * every reachable node is owned by the script of its own constructor or closure where the snapshot
  * names one, else by its immediate dominator's owner, and V8 code is its own rows (bytecode,
@@ -276,4 +277,4 @@ if (require.main === module) {
   process.stdout.write(format(results))
 }
 
-module.exports = { report, format, classOf, ownersOf }
+module.exports = { report, format, classOf, ownersOf, compare }

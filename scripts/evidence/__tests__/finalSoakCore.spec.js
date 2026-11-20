@@ -1321,6 +1321,23 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
+    it('is inconclusive for a boundary whose snapshot was written but could not be summarised, and names why', async () => {
+      const world = fx.healthy()
+      world.heap.edit = (dir) =>
+        resummarise(dir, (r) => {
+          if (r.slot === 'p03' && r.boundary === 'h10') {
+            for (const key of ['judgedBytes', 'totalBytes']) delete r[key]
+            r.error = 'unreadable snapshot: Malformed heap snapshot: truncated value at byte 9'
+          }
+        })
+      expectRow(
+        await check(world),
+        'K5',
+        'INCONCLUSIVE',
+        /p03 h10 has no usable heap snapshot: unreadable snapshot: Malformed heap snapshot/
+      )
+    })
+
     it('is inconclusive without a heap summary, and fails no process on one', async () => {
       const world = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
       world.heap.edit = (dir) => fs.rmSync(path.join(dir, 'heap/summary.json'))

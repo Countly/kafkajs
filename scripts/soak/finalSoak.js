@@ -11,7 +11,7 @@
  *     node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js \
  *       --mode smoke|rehearsal|acceptance \
  *       --expect-sha <40-hex> --matrix scripts/soak/finalSoakMatrix.json --out <artifact dir> \
- *       [--diagnostic] [--heap-snapshots]
+ *       [--diagnostic]
  *   node scripts/soak/finalSoak.js --outer-exit --out <artifact dir> --status <wait status> \
  *     --exit-wall-ms <epoch ms the wait returned>
  *   node scripts/soak/finalSoak.js --finalize --out <artifact dir> --status <wait status> \
@@ -58,6 +58,7 @@ const {
 } = require('./finalSoakCollector')
 const { normalizeTopicId } = require('./finalSoakObserver')
 const { bootId, ChildRuntime, child } = require('./finalSoakWorkers')
+const { summarizeRun } = require('./heapSummary')
 
 const ROOT = path.resolve(__dirname, '../..')
 const MATRIX = 'scripts/soak/finalSoakMatrix.json'
@@ -95,16 +96,14 @@ const MAX_PROBLEMS = 200
 /** How long a heap snapshot may take before its receipt says it timed out, a real-time bound. */
 const HEAP_SNAPSHOT_MS = 60000
 /**
- * The processes that write heap snapshots when a run opts in, named by the client kind of their
- * standing subject or by their role: one classic consumer, one producer, the reader (an admin
- * client and the harness) and the decoder (no client).
+ * The process roles that write a heap snapshot at every quiet boundary in every mode: the twelve
+ * subjects the heap row judges, and the reader (an admin client and the harness) and the decoder
+ * (no client) as harness-only comparisons. The seed grows by design and the supervisor writes the
+ * stream, so neither takes one.
  */
-const HEAP_SNAPSHOT_KINDS = Object.freeze([
-  'classic-cooperative-dynamic',
-  'producer-transactional',
-  'reader',
-  'decoder',
-])
+const HEAP_SNAPSHOT_ROLES = Object.freeze(['subject', 'reader', 'decoder'])
+/** Free disk kept back for a day's heap snapshots until the post-run summary deletes most of them. */
+const HEAP_SNAPSHOT_BYTES = 8 * GIB
 
 /** @param {string} prefix @param {number} n @returns {string} a two-digit slot id */
 const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
@@ -114,9 +113,9 @@ const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
  * @param {string[]} argv arguments after the script name
  * @param {Record<string, string|undefined>} env the environment, read for `KAFKA_BROKERS`
  * @returns {object} the parsed options of the chosen command
- * @throws {Error} for an unknown mode, `--duration` outside smoke mode, `--diagnostic` or
- *   `--heap-snapshots` in acceptance mode, a smoke
- *   length other than the matrix's, a malformed SHA, or missing brokers or output directory
+ * @throws {Error} for an unknown mode, `--duration` outside smoke mode, `--diagnostic` in
+ *   acceptance mode, a smoke length other than the matrix's, a malformed SHA, or missing brokers or
+ *   output directory
  */
 function parseArgs(argv, env) {
   const flags = { companion: [] }
@@ -128,7 +127,6 @@ function parseArgs(argv, env) {
     '--outer-exit',
     '--check-workload',
     '--driver-limit',
-    '--heap-snapshots',
   ]
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]
@@ -170,8 +168,6 @@ function parseArgs(argv, env) {
   }
   if (flags.diagnostic && flags.mode === 'acceptance')
     throw new Error('--diagnostic is accepted only in smoke mode or rehearsal mode')
-  if (flags['heap-snapshots'] && flags.mode === 'acceptance')
-    throw new Error('--heap-snapshots is accepted only in smoke mode or rehearsal mode')
   if (!/^[0-9a-f]{40}$/.test(flags['expect-sha'] ?? ''))
     throw new Error('--expect-sha must be a 40-hex commit')
   const brokers = (env.KAFKA_BROKERS ?? '').split(',').filter(Boolean)
@@ -185,7 +181,6 @@ function parseArgs(argv, env) {
     matrix: flags.matrix ?? MATRIX,
     out,
     diagnostic: flags.diagnostic === true,
-    heapSnapshots: flags['heap-snapshots'] === true,
   }
 }
 
@@ -194,17 +189,14 @@ function parseArgs(argv, env) {
  * seed, reader, collector/supervisor and telemetry decoder), one standing subject per kind, one
  * churn extra per churn kind in its own kind's process, the seed's single control client and the
  * observer clients (the reader's c21 and the supervisor's c22). Names follow the short profile ids
- * so every ordinary record fits its line cap. With `heapSnapshots` the config lists the processes
- * that write heap snapshots (`HEAP_SNAPSHOT_KINDS`), else `heapSnapshots` is null.
+ * so every ordinary record fits its line cap. `heapSnapshots` lists the processes that write heap
+ * snapshots (`HEAP_SNAPSHOT_ROLES`), in every mode.
  * @param {object} matrix the reviewed matrix
  * @param {{ mode: string, runId: string, treeSha: string, brokers: string[],
- *   diagnostic?: boolean, heapSnapshots?: boolean }} options
+ *   diagnostic?: boolean }} options
  * @returns {object} a config that `validateConfig` accepts
  */
-function buildConfig(
-  matrix,
-  { mode, runId, treeSha, brokers, diagnostic = false, heapSnapshots = false }
-) {
+function buildConfig(matrix, { mode, runId, treeSha, brokers, diagnostic = false }) {
   const kinds = Object.keys(matrix.clientKinds)
   const processes = kinds.map((kind, i) => ({
     slot: slotId('p', i + 1),
@@ -256,9 +248,6 @@ function buildConfig(
   add('p14', 'admin', 'observer')
   add(SUPERVISOR, 'admin', 'observer')
   const topic = (role) => `fs-${runId}-${role}`
-  const snapshotSlot = (kind) =>
-    processes.find((p) => p.role === kind)?.slot ??
-    clients.find((c) => c.clientKind === kind && c.purpose === 'subject').process
   return {
     schema: matrix.schema,
     mode,
@@ -266,7 +255,7 @@ function buildConfig(
     treeSha,
     brokers,
     diagnostic,
-    heapSnapshots: heapSnapshots ? HEAP_SNAPSHOT_KINDS.map(snapshotSlot) : null,
+    heapSnapshots: processes.filter((p) => HEAP_SNAPSHOT_ROLES.includes(p.role)).map((p) => p.slot),
     processes: processes.map(({ kind, ...p }) => p),
     clients,
     topics: {
@@ -327,7 +316,6 @@ class Supervisor {
       treeSha: options.expectSha,
       brokers: options.brokers,
       diagnostic: options.diagnostic,
-      heapSnapshots: options.heapSnapshots,
     })
     const problems = validateConfig(this.config, this.matrix)
     if (problems.length > 0) throw new Error(`invalid config: ${problems.join('; ')}`)
@@ -484,7 +472,7 @@ class Supervisor {
         `the plan expects ${expected} offers, more than ${OFFER_HEADROOM * 100}% of the core checker's capacity of ${capacity} (traffic.maxOffers)`
       )
     fs.mkdirSync(path.join(this.out, 'raw'), { recursive: true })
-    if (this.config.heapSnapshots) fs.mkdirSync(path.join(this.out, 'heap'), { recursive: true })
+    fs.mkdirSync(path.join(this.out, 'heap'), { recursive: true })
     for (const file of this.matrix.acceptance.archive) {
       fs.mkdirSync(path.dirname(path.join(this.out, 'archive', file)), { recursive: true })
       fs.copyFileSync(path.join(ROOT, file), path.join(this.out, 'archive', file))
@@ -559,6 +547,7 @@ class Supervisor {
           ? DIAGNOSTIC_RESERVE_BYTES
           : Math.max(0, valueOf(this.matrix.host.maxStreamBytes) - this.collector.streamBytes) +
             AUXILIARY_BYTES +
+            HEAP_SNAPSHOT_BYTES +
             SAFETY_BYTES,
     })
     this.monitor.start(this.clock, (reading) => {
@@ -1253,9 +1242,11 @@ class Supervisor {
    * Has each heap snapshot process write its snapshot of a quiet boundary, all at once, and records
    * each receipt in the stream and the supervisor receipt. It runs once the boundary's last quiet
    * reading is taken, so no reading sees it, and the scheduler holds work and the end of the idle
-   * window until it settles. The next periodic sample is due about ten seconds later, past the one
-   * to three seconds a snapshot stalls its process. A snapshot that fails, or is not answered
-   * within `HEAP_SNAPSHOT_MS` of real time, is recorded with its error and never fails the run.
+   * window until it settles. The next periodic sample is due about ten seconds later, past the
+   * half second or so a snapshot stalls its process (fourteen at once, measured 0.26 to 0.48 s for
+   * four). A snapshot that fails, or is not answered within `HEAP_SNAPSHOT_MS` of real time, is
+   * recorded with its error and never fails the run; the heap row leaves that process
+   * INCONCLUSIVE.
    * When the boundary's last quiet reading was not taken (late, failed or aborted), `skipped` says
    * so and each process gets a receipt with that error and no command.
    * @param {string} boundary the quiet boundary
@@ -1289,8 +1280,8 @@ class Supervisor {
   }
 
   /**
-   * Records why a quiet boundary has no heap snapshot: when a run takes snapshots and the boundary's
-   * last quiet reading ended without one (it started past its deadline, failed or was aborted), each
+   * Records why a quiet boundary has no heap snapshot: when the boundary's last quiet reading ended
+   * without one (it started past its deadline, failed or was aborted), each
    * snapshot process gets a skipped receipt naming the step and its outcome, so no boundary's
    * snapshot is missing silently.
    * @param {object|undefined} step the step that ended
@@ -1299,7 +1290,6 @@ class Supervisor {
    */
   missedSnapshot(step, outcome) {
     if (
-      this.config.heapSnapshots &&
       step?.type === 'quiet' &&
       step.reading === valueOf(this.matrix.sampling.quietReadings) - 1 &&
       !this.snapshotBoundaries.has(step.boundary)
@@ -1334,10 +1324,7 @@ class Supervisor {
       this.requireQuiet(step)
       await this.sampleAll(judged, step)
       this.requireQuiet(step)
-      if (
-        this.config.heapSnapshots &&
-        step.reading === valueOf(this.matrix.sampling.quietReadings) - 1
-      )
+      if (step.reading === valueOf(this.matrix.sampling.quietReadings) - 1)
         this.scheduler.hold(this.snapshotHeaps(step.boundary))
       return
     }
@@ -2020,8 +2007,10 @@ function digestArtifact(out) {
 
 /**
  * The outer handover after the supervisor has exited: appends the parent-observed supervisor exit
- * as the `outer` source, copies each supplied companion into the artifact, hashes and fsyncs every
- * file (streamed, never read whole) and writes `header.json`. The exit is what the runbook's
+ * as the `outer` source, copies each supplied companion into the artifact, summarises the heap
+ * snapshots into `heap/summary.json` and deletes those it does not keep (`summarizeRun`, outside
+ * every measured process), hashes and fsyncs every file (streamed, never read whole) and writes
+ * `header.json`. The exit is what the runbook's
  * receipt says it observed, at the time it observed it; the window's observed end is that time, so
  * every record (the supervisor's closing ones and this receipt) is within it. When the supervisor
  * left no receipt there is no run to describe: only `manifest.partial.json` is written, naming the
@@ -2086,6 +2075,8 @@ function finalize({ out, status, companions = [] }) {
     fs.copyFileSync(file, path.join(out, rel))
     return { name, treeSha: run.treeSha, file: rel, sha256: digestFile(file).sha256, runUrl }
   })
+  const matrix = JSON.parse(fs.readFileSync(path.join(ROOT, MATRIX), 'utf8'))
+  summarizeRun(out, run.heapSnapshots ?? [], valueOf(matrix.bounds['heap-endpoint']))
   const files = digestArtifact(out)
   const stream = files.find((f) => f.file === 'stream.ndjson')
   const preflight = read('preflight.json')
