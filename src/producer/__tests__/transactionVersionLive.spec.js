@@ -38,6 +38,32 @@ const TRANSACTIONS = 10
 // timed-out transactions every 10 s (`transaction.abort.timed.out.transaction.cleanup.interval.ms`).
 const SHORT_TRANSACTION_TIMEOUT_MS = 2000
 const COORDINATOR_ABORT_BUDGET = { attempts: 120, delay: 250 } // 30 s
+// Group join and the first fetch, inside the scenario budget so the stage, not Jest, reports it.
+const HOLD_BUDGET_MS = 60000
+
+/**
+ * Resolves with what `promise` resolves to, or rejects naming `name` when `ms` elapses first.
+ * The timer is always cleared.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} name the stage awaited, for the timeout message
+ * @returns {Promise<T>}
+ * @throws {Error} when the deadline wins, or whatever `promise` rejects with
+ */
+const stage = async (promise, ms, name) => {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out after ${ms} ms: ${name}`)), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 const INVALID_TXN_STATE = 48
 const PRODUCER_FENCED = 90
 
@@ -493,13 +519,13 @@ describeTransactionVersion('Producer > transactional seek fence (live)', () => {
         }
       },
     })
-    const { next } = await withTimeout(held, SCENARIO_BUDGET_MS)
     clients.push({
       disconnect: async () => {
         closed = true
         wake?.()
       },
     })
+    const { next } = await stage(held, HOLD_BUDGET_MS, 'the first partition-0 batch handler')
     const inHandler = (work) =>
       new Promise((resolve, reject) => {
         tasks.push({ work, resolve, reject })
