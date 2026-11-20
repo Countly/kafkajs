@@ -2892,10 +2892,6 @@ describe('final soak driver', () => {
     expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch', 'push'])
     for (const input of Object.values(workflow.on.workflow_dispatch.inputs ?? {}))
       expect(input.default).toBeDefined()
-    expect(workflow.on.workflow_dispatch.inputs.heap_snapshots).toMatchObject({
-      type: 'boolean',
-      default: false,
-    })
     expect(workflow.on.workflow_dispatch.inputs.mode).toMatchObject({
       type: 'choice',
       options: ['smoke', 'rehearsal'],
@@ -2907,7 +2903,6 @@ describe('final soak driver', () => {
       KAFKA_VERSION: '4.4.0',
       FINAL_SOAK_DIAGNOSTIC: '1',
       FINAL_SOAK_MODE: expression("inputs.mode || 'smoke'"),
-      FINAL_SOAK_HEAP_SNAPSHOTS: expression("inputs.heap_snapshots && '1' || ''"),
     })
     const runbook = job.steps.find((s) => (s.run ?? '').includes('finalSoakNode.sh'))
     expect(runbook.run).toMatch(
