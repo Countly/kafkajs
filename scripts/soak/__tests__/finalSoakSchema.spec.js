@@ -12,6 +12,7 @@ const {
   validateMatrix,
   validateProvenance,
   validateRecord,
+  mergePieces,
 } = require('../finalSoakSchema')
 
 const ROOT = path.join(__dirname, '../../..')
@@ -239,6 +240,7 @@ const ENTRIES = {
   'share-state': (client) => [
     {
       client,
+      run: `${client}.r1`,
       sessions: [{ node: 1, session: 3 }],
       records: [{ acquisition: 'a1', key: KEY, offset: '0', state: 'held' }],
       ranges: [{ acquisition: 'a1', key: KEY, from: '0', to: '0' }],
@@ -262,6 +264,7 @@ const cut = (inventory, process, owners) =>
       chunk: 0,
       chunks: 1,
       entries: ENTRIES[section](client ?? 'c01.0'),
+      piece: null,
     }))
   )
 
@@ -295,6 +298,17 @@ const sample = (process, role, inventory, clients, fields = {}) => ({
   gc: { ...GC },
   inventory,
   clients,
+  ...fields,
+})
+
+/** A heap record citing the sample of `process` with the given record id. */
+const heap = (process, sample, fields = {}) => ({
+  kind: 'heap',
+  source: process,
+  process,
+  sample,
+  spaces: { old: 8000000, code: 300000, trusted: 1400000, large_object: 1200000 },
+  code: { code: 2500000, bytecode: 880000, scripts: 2290000 },
   ...fields,
 })
 
@@ -557,6 +571,16 @@ const baseRecords = () => {
       wireFile: 'wire/share-1.bin',
       wireSha256: SHA,
     })),
+    identity('share-outcome', 'p07', {
+      client: SHARE,
+      group: G7,
+      key: KEY,
+      from: '0',
+      to: '0',
+      type: 'accept',
+      reason: 'session-lost',
+      errorType: 'KafkaJSShareAcknowledgementError',
+    }),
     {
       kind: 'telemetry',
       source: 'p16',
@@ -602,9 +626,24 @@ const baseRecords = () => {
       container: 'kafka-1',
       event: 'ready',
       members: [1, 2, 3],
-      partitions: [{ key: KEY, leader: 1, isr: [1, 2, 3] }],
+      partitions: 1,
       cause: 'o9',
+      downMs: 2000,
+      processAt: 12,
+      processTime: '2026-11-18T16:00:00.012345678Z',
     },
+    { kind: 'partition-state', source: 'p15', key: KEY, leader: 1, isr: [1, 2, 3] },
+    {
+      kind: 'wave',
+      source: 'p01',
+      event: 'transfer',
+      client: EAGER,
+      member: 'c15.0',
+      paused: 1,
+      held: 1,
+      observed: true,
+    },
+    { kind: 'wave-key', source: 'p01', key: KEY, held: true },
     ...['begin', 'end'].map((phase) => ({
       kind: 'ticket',
       source: 'p01',
@@ -646,6 +685,7 @@ const baseRecords = () => {
       [EAGER, ORDINARY_SECTIONS],
     ]),
     sample('p01', 'periodic', 'i1', [EAGER]),
+    heap('p01', 'p01.1'),
     ...cut('i7', 'p07', [
       [null, PROCESS_SECTIONS],
       [SHARE, ['share-state']],
@@ -671,26 +711,35 @@ const baseRecords = () => {
 }
 
 /**
- * Adds envelopes: per-source gap-free seq, `recordId`, `t` one per line and `at` = `t`, except
- * that all chunks of one inventory cut share the first chunk's `at`.
+ * Adds envelopes: per-source gap-free seq, `recordId`, `t` one per line and `at` = `t` unless the
+ * record sets its own, except that all chunks of one inventory cut share the first chunk's `at`. A
+ * `wave-key` or `partition-state` without a `cause` cites its source's latest `wave` or
+ * `broker-state`.
  * @returns {string[]} the stream lines
  */
 const encode = (records) => {
   const seqs = new Map()
   const cutAt = new Map()
+  const summaries = new Map()
   return records.map((record, i) => {
     const seq = seqs.has(record.source) ? seqs.get(record.source) + 1 : 0
     seqs.set(record.source, seq)
     const t = i + 1
-    let at = t
+    let at = record.at ?? t
     if (record.kind === 'inventory') {
       if (!cutAt.has(record.inventory)) cutAt.set(record.inventory, t)
       at = cutAt.get(record.inventory)
     }
+    const recordId = `${record.source}.${seq}`
+    if (['wave', 'broker-state'].includes(record.kind)) summaries.set(record.source, recordId)
+    const cause = ['wave-key', 'partition-state'].includes(record.kind)
+      ? { cause: record.cause ?? summaries.get(record.source) }
+      : {}
     return JSON.stringify({
       execution: null,
       ...record,
-      recordId: `${record.source}.${seq}`,
+      ...cause,
+      recordId,
       seq,
       at,
       t,
@@ -810,6 +859,40 @@ const minimumOf = (minimum) =>
   }, 1)
 
 const at = (records, predicate) => records.findIndex(predicate)
+
+/** A broker-commit the observer process writes about the churn client `c15.0` of process p02. */
+const observed = () => ({
+  kind: 'identity',
+  stage: 'broker-commit',
+  source: 'p10',
+  client: 'c15.0',
+  group: groupOf('c15'),
+  commit: null,
+  key: KEY,
+  next: null,
+  errorCode: 0,
+})
+
+/** A call of `c15.0` from its own process p02. */
+const ownCall = { ...call('connect', 'p02', 'c15.0', 'begin', 'k15') }
+
+/** Moves the construction of `c15.0` to just after the first record matching `predicate`. */
+const moveConstructAfter = (records, predicate) => {
+  const [construction] = records.splice(
+    at(records, (x) => x.event === 'construct' && x.slot === 'c15'),
+    1
+  )
+  records.splice(at(records, predicate) + 1, 0, construction)
+}
+
+/** @returns {string[]} the problems of the records' stream under a validator with `options` */
+const validateWith = (records, options) => {
+  const lines = encode(records)
+  const header = buildHeader(lines)
+  const stream = new StreamValidator({ matrix, config: buildConfig(), header, ...options })
+  lines.forEach((line) => stream.push(line))
+  return stream.finish()
+}
 const isSample = (process) => (r) => r.kind === 'sample' && r.process === process
 
 /**
@@ -930,6 +1013,23 @@ describe('scripts/soak/finalSoakSchema', () => {
     }
   })
 
+  it('a rehearsal is a third mode of whole day hours, at least three, with the seed timed as on the day and its sensitivity only reported, and a rehearsal stream is structurally valid', () => {
+    expect(matrix.acceptance.modes.rehearsal.requestedMs.value).toBe(3 * matrix.schedule.hourMs)
+    const seed = matrix.controls['interning-seeded'].timing
+    expect(seed.rehearsal).toEqual({ ...seed.acceptance, sensitivity: 'report-only' })
+    expect(run({ mode: 'rehearsal' })).toEqual([])
+    const lengthOf = (ms) => {
+      const copy = JSON.parse(JSON.stringify(matrix))
+      copy.acceptance.modes.rehearsal.requestedMs.value = ms
+      return validateMatrix(copy)
+    }
+    const problem =
+      'matrix.acceptance.modes.rehearsal.requestedMs is not a whole number of hours, at least three'
+    expect(lengthOf(4 * matrix.schedule.hourMs)).toEqual([])
+    expect(lengthOf(2 * matrix.schedule.hourMs)).toEqual([problem])
+    expect(lengthOf(3.5 * matrix.schedule.hourMs)).toEqual([problem])
+  })
+
   it('a complete fixture with every record kind and variant is structurally valid', () => {
     expect(run()).toEqual([])
     expect(run({ mode: 'acceptance' })).toEqual([])
@@ -958,6 +1058,7 @@ describe('scripts/soak/finalSoakSchema', () => {
       'handler-end',
       'commit',
       'broker-commit',
+      'share-outcome',
     ]) {
       expect(variants.has(`identity/${stage}`)).toBe(true)
     }
@@ -1340,6 +1441,15 @@ describe('scripts/soak/finalSoakSchema', () => {
     expectCases(cases)
   })
 
+  it('an acknowledged send whose location the broker did not return has no offset', () => {
+    const lines = encode(baseRecords()).map((line) => JSON.parse(line))
+    const ack = lines.find((r) => r.kind === 'identity' && r.stage === 'ack')
+    expect(validateRecord({ ...ack, offset: null })).toEqual([])
+    expect(validateRecord({ ...ack, offset: '-1' })).toEqual([
+      expect.stringContaining('.offset is not an Offset or null'),
+    ])
+  })
+
   it('cross-field rules reject contradictory records', () => {
     const lines = encode(baseRecords()).map((line) => JSON.parse(line))
     const find = (kind, extra = () => true) => ({
@@ -1347,8 +1457,8 @@ describe('scripts/soak/finalSoakSchema', () => {
     })
     const enter = find('identity', (r) => r.stage === 'handler-enter' && r.authority !== null)
     expectCases({
-      'acknowledged without an offset': [
-        () => validateRecord({ ...find('identity', (r) => r.stage === 'ack'), offset: null }),
+      'an unknown send with an offset': [
+        () => validateRecord({ ...find('identity', (r) => r.stage === 'ack'), outcome: 'unknown' }),
         'only an acknowledged send has an offset',
       ],
       'commit decision seen aborted': [
@@ -1840,6 +1950,93 @@ describe('scripts/soak/finalSoakSchema', () => {
         () => run({ edit: (r) => (r.find((x) => x.kind === 'topic').client = 'c10.7') }),
         'names a client that was never constructed',
       ],
+      "a record of the client's own process before its construction": [
+        () =>
+          run({
+            edit: (r) =>
+              r.splice(
+                at(r, (x) => x.client === 'c15.0'),
+                0,
+                ownCall
+              ),
+          }),
+        'names a client before its construction',
+      ],
+      'a held record whose client turns out to lack what it needs': [
+        () =>
+          run({
+            edit: (r) => {
+              r.find((x) => x.kind === 'telemetry').client = 'c15.0'
+              moveConstructAfter(r, (x) => x.kind === 'telemetry')
+            },
+          }),
+        'telemetry from a client without telemetry',
+      ],
+      'more held records than the bound': [
+        () => {
+          const records = baseRecords()
+          moveConstructAfter(records, (x) => x.kind === 'wave')
+          records.splice(
+            at(records, (x) => x.kind === 'wave'),
+            0,
+            observed(),
+            observed(),
+            observed()
+          )
+          return validateWith(records, { maxHeld: 2 })
+        },
+        'more than 2 records wait for a client not yet constructed',
+      ],
+      'a key record citing no wave of its source': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave-key').cause = 'p01.0') }),
+        'cites no open wave of its source',
+      ],
+      'a wave missing a key record': [
+        () =>
+          run({
+            edit: (r) =>
+              r.splice(
+                at(r, (x) => x.kind === 'wave-key'),
+                1
+              ),
+          }),
+        'misses 1 of its wave-key records',
+      ],
+      'a wave whose two key records name the same key, leaving a paused key unnamed': [
+        () =>
+          run({
+            edit: (r) => {
+              const wave = r.find((x) => x.kind === 'wave')
+              wave.paused = 2
+              wave.held = 2
+              const i = at(r, (x) => x.kind === 'wave-key')
+              r.splice(i, 0, { ...r[i] })
+            },
+          }),
+        'repeats a key of its wave',
+      ],
+      'a wave whose held count differs from its key records': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave-key').held = false) }),
+        'wave held count differs from its wave-key records',
+      ],
+      'a key record of another execution than its wave': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave-key').execution = 'x1') }),
+        'is of another execution than its wave',
+      ],
+      'a wave whose member was never constructed': [
+        () => run({ edit: (r) => (r.find((x) => x.kind === 'wave').member = 'c15.9') }),
+        'names a client that was never constructed',
+      ],
+      'a broker state with a partition record too many': [
+        () =>
+          run({
+            edit: (r) => {
+              const i = at(r, (x) => x.kind === 'partition-state')
+              r.splice(i, 0, { ...r[i] })
+            },
+          }),
+        'cites no open broker-state of its source',
+      ],
       'a blank line': [
         () => {
           const edited = [...lines.slice(0, 5), '', ...lines.slice(5)]
@@ -1886,6 +2083,117 @@ describe('scripts/soak/finalSoakSchema', () => {
         'operation names no open execution',
       ],
     })
+  })
+
+  it("a day's membership waves validate with their live state released as each closes", () => {
+    const records = baseRecords()
+    const exit = records.pop()
+    for (let w = 0; w < 288; w++) {
+      const execution = `h${String(Math.floor(w / 12)).padStart(2, '0')}m${w % 12}`
+      const shape = (phase) => ({
+        kind: 'shape',
+        phase,
+        source: 'p15',
+        execution,
+        shape: 'pause-resume',
+        participants: [EAGER],
+        operationCount: 0,
+      })
+      const wave = (event) => ({
+        kind: 'wave',
+        source: 'p01',
+        execution,
+        event,
+        client: EAGER,
+        member: event === 'transfer' ? 'c15.0' : EAGER,
+        paused: 2,
+        held: 1,
+        observed: true,
+      })
+      const key = (partition, held) => ({
+        kind: 'wave-key',
+        source: 'p01',
+        execution,
+        key: { ...KEY, partition },
+        held,
+      })
+      records.push(
+        shape('start'),
+        wave('transfer'),
+        key(0, true),
+        key(1, false),
+        wave('return'),
+        key(0, false),
+        key(1, true),
+        shape('end')
+      )
+    }
+    records.push(exit)
+    const lines = encode(records)
+    const stream = new StreamValidator({
+      matrix,
+      config: buildConfig(),
+      header: buildHeader(lines),
+    })
+    lines.forEach((line) => stream.push(line))
+    expect(stream.finish()).toEqual([])
+    expect([stream.summaries.size, stream.openItems, stream.executions.size]).toEqual([0, 0, 0])
+  })
+
+  it('a stream with many executions that never end fails once at its cap and keeps its problems bounded', () => {
+    const records = baseRecords()
+    const exit = records.pop()
+    for (let n = 0; n < 3000; n++)
+      records.push({
+        kind: 'shape',
+        phase: 'start',
+        source: 'p15',
+        execution: `orphan${n}`,
+        shape: 'pause-resume',
+        participants: [EAGER],
+        operationCount: 0,
+      })
+    records.push(exit)
+    const problems = validateWith(records, { maxOpen: 100 })
+    expect(problems.filter((p) => p.includes('more than 100 open executions'))).toHaveLength(1)
+    expect(problems.filter((p) => p.includes('never ends'))).toHaveLength(100)
+    expect(problems.length).toBeLessThanOrEqual(1001)
+    const unbounded = validateWith(records, {})
+    expect(unbounded.length).toBeLessThanOrEqual(1001)
+    expect(unbounded.at(-1)).toMatch(/^\d+ more problems omitted$/)
+  })
+
+  it('a record from another process naming a client is judged when the construction arrives, in any stream order', () => {
+    expect(
+      run({
+        edit: (r) => {
+          r.splice(
+            at(r, (x) => x.kind === 'wave'),
+            0,
+            observed()
+          )
+          moveConstructAfter(r, (x) => x.kind === 'wave')
+        },
+      })
+    ).toEqual([])
+  })
+
+  it('a record its process wrote before it exited is valid wherever the exit record falls in the stream', () => {
+    expect(
+      run({
+        edit: (r) => {
+          const exitT = r.length
+          r.push({ ...call('connect', 'p01', EAGER, 'begin', 'k9'), at: exitT - 0.5 })
+        },
+      })
+    ).toEqual([])
+    expect(
+      run({
+        edit: (r) => {
+          r.at(-1).at = r.length - 1.5
+        },
+      })
+    ).toEqual([expect.stringContaining('the process has a record after its exit')])
   })
 
   it('inventory cuts are complete per client section and chunk before a sample uses them', () => {
@@ -2016,6 +2324,161 @@ describe('scripts/soak/finalSoakSchema', () => {
         },
       })
     ).toEqual([])
+  })
+
+  it('a share-state entry larger than one inventory line is journalled in pieces that validate and reassemble to the held set of one entry', () => {
+    const { chunk } = require('../finalSoakCollector')
+    const held = Array.from({ length: 3000 }, (_, i) => ({
+      acquisition: `${SHARE}.a${Math.floor(i / 500)}`,
+      key: KEY,
+      offset: String(i),
+      state: i % 2 ? 'held' : 'settling',
+    }))
+    const entry = { ...ENTRIES['share-state'](SHARE)[0], records: held }
+    const budget = matrix.host.maxInventoryLineBytes.value - 1024
+    expect(Buffer.byteLength(JSON.stringify(entry))).toBeGreaterThan(budget)
+    const parts = chunk([entry], budget)
+    expect(parts.length).toBeGreaterThan(1)
+    expect(parts.map((p) => p.piece)).toEqual(
+      parts.map((_, index) => ({ index, pieces: parts.length }))
+    )
+    expect(mergePieces(parts.map((p) => p.entries[0]))).toEqual({ entry, problems: [] })
+
+    /** Swaps the share-state record of cut i7 for the pieces `shape` returns. */
+    const split =
+      (shape = (records) => records) =>
+      (r) => {
+        const i = at(r, (x) => x.inventory === 'i7' && x.section === 'share-state')
+        const records = parts.map(({ entries, piece }, n) => ({
+          ...r[i],
+          chunk: n,
+          chunks: parts.length,
+          entries,
+          piece,
+        }))
+        r.splice(i, 1, ...shape(records))
+      }
+    expect(run({ edit: split() })).toEqual([])
+    expectCases({
+      'a piece missing': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.filter((_, n) => n !== 1).map((x, n) => ({ ...x, chunk: n, chunks: p.length - 1 }))
+            ),
+          }),
+        'inventory cut misses a share-state piece',
+      ],
+      'pieces disagreeing on a field outside their lists': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.map((x, n) => (n === 1 ? { ...x, entries: [{ ...x.entries[0], run: 'r9' }] } : x))
+            ),
+          }),
+        'pieces of one entry disagree on run',
+      ],
+      'pieces disagreeing on their count': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.map((x, n) => (n === 1 ? { ...x, piece: { ...x.piece, pieces: 99 } } : x))
+            ),
+          }),
+        'pieces of one entry disagree on their count',
+      ],
+      'a whole entry repeating a split key': [
+        () =>
+          run({
+            edit: split((p) =>
+              [
+                ...p,
+                {
+                  ...p[0],
+                  chunk: p.length,
+                  chunks: p.length + 1,
+                  entries: ENTRIES['share-state'](SHARE),
+                  piece: null,
+                },
+              ].map((x) => ({ ...x, chunks: p.length + 1 }))
+            ),
+          }),
+        'share-state entry key repeats',
+      ],
+      'a piece holding two entries': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.map((x, n) =>
+                n === 0 ? { ...x, entries: [...x.entries, ...ENTRIES['share-state']('c07.9')] } : x
+              )
+            ),
+          }),
+        'a piece is one entry',
+      ],
+    })
+  })
+
+  it('entry rules judge a split entry once reassembled, not each piece', () => {
+    const { chunk } = require('../finalSoakCollector')
+    const tickets = Array.from({ length: 12000 }, (_, i) => `t${i}`)
+    const cell = { ledger: 'L1', topic: 'main', partition: 0, open: tickets.length, tickets }
+    const budget = matrix.host.maxInventoryLineBytes.value - 1024
+    const edit = (open) => (r) => {
+      const i = at(r, (x) => x.inventory === 'i1' && x.section === 'operation-cell')
+      const parts = chunk([{ ...cell, open }], budget)
+      expect(parts.length).toBeGreaterThan(1)
+      r.splice(
+        i,
+        1,
+        ...parts.map(({ entries, piece }, n) => ({
+          ...r[i],
+          chunk: n,
+          chunks: parts.length,
+          entries,
+          piece,
+        }))
+      )
+    }
+    expect(run({ edit: edit(tickets.length) })).toEqual([])
+    expect(run({ edit: edit(tickets.length - 1) })).toEqual([
+      expect.stringContaining('open differs from its tickets'),
+    ])
+  })
+
+  it('a heap record holds the used bytes of named V8 spaces and the code statistics, citing a sample of its own process', () => {
+    const edited = (fields) => (r) =>
+      Object.assign(
+        r.find((x) => x.kind === 'heap'),
+        fields
+      )
+    expectCases({
+      'negative space bytes': [
+        () => run({ edit: edited({ spaces: { old: -1 } }) }),
+        'spaces is not',
+      ],
+      'unnamed space': [
+        () => run({ edit: edited({ spaces: { 'Old Space': 1 } }) }),
+        'spaces is not',
+      ],
+      'more spaces than V8 has': [
+        () =>
+          run({
+            edit: edited({
+              spaces: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`s${i}`, 1])),
+            }),
+          }),
+        'spaces is not',
+      ],
+      'code statistics without bytecode': [
+        () => run({ edit: edited({ code: { code: 1, scripts: 1 } }) }),
+        'code is not',
+      ],
+      'sample of another process': [
+        () => run({ edit: edited({ sample: 'p02.1' }) }),
+        'a heap record cites a sample of its own process',
+      ],
+    })
   })
 
   it('samples carry their role fields and two new forced collections per reading', () => {
@@ -2271,5 +2734,138 @@ describe('scripts/soak/finalSoakSchema', () => {
         'provenance.nodes is not',
       ],
     })
+  })
+})
+
+describe('inventory cuts across a consumer crash restart', () => {
+  const { AsyncLocalStorage } = require('node:async_hooks')
+  const ConsumerGroup = require('../../../src/consumer/consumerGroup')
+  const GroupOwnership = require('../../../src/consumer/groupOwnership')
+  const OffsetOperations = require('../../../src/consumer/offsetManager/offsetOperations')
+  const ResetObligations = require('../../../src/consumer/offsetManager/resetObligations')
+  const SeekOffsets = require('../../../src/consumer/seekOffsets')
+  const SubscriptionState = require('../../../src/consumer/subscriptionState')
+  const dictionary = require('../../../src/utils/dictionary')
+  const { PassiveObserver } = require('../finalSoakObserver')
+
+  /**
+   * One run of a consumer as the consumer factory starts it: a fresh group whose run identity is
+   * current while the factory's run slot holds its token; every run shares the consumer's ledger.
+   * @returns {ConsumerGroup}
+   */
+  const startRun = (consumer, context) => {
+    const token = {}
+    consumer.slot = token
+    const group = Object.create(ConsumerGroup.prototype)
+    Object.assign(group, {
+      groupId: groupOf('c01'),
+      runIdentity: { isCurrent: () => consumer.slot === token },
+      topicsSubscribed: [],
+      topicConfigurations: { main: {} },
+      preferredReadReplicasPerTopicPartition: dictionary(),
+      seekOffset: new SeekOffsets(),
+      acquired: new Map([['main|0', { acquiredAt: 1, changedAt: 1, recreatedAt: 0 }]]),
+      acquireClock: 1,
+      haltedPartitions: new Map(),
+      ownership: new GroupOwnership(),
+      subscriptionState: new SubscriptionState(),
+      operations: consumer.ledger,
+      obligations: new ResetObligations(),
+      assignmentEpoch: 1,
+      groupMembership: {
+        kind: 'classic',
+        grownTopicNames: new Set(),
+        memberId: 'm1',
+        generationId: 5,
+      },
+      cluster: { topicId: (t) => (t === 'main' ? A : null), targetTopics: new Set(['main']) },
+    })
+    context.run(EAGER, () => {
+      group.retainSubscription(['main'])
+      group.subscriptionState.pause([{ topic: 'main', partitions: [0] }])
+    })
+    return group
+  }
+
+  /** @returns {(r: object[]) => void} puts the observer's sections into cut `inventory` of p01 */
+  const fill = (inventory, sections) => (r) => {
+    for (const x of r)
+      if (x.kind === 'inventory' && x.inventory === inventory && x.client === EAGER)
+        x.entries = sections[x.section]
+  }
+
+  it('a cut taken after a crash restart, while the dropped run is not yet collected, holds only the restarted run and passes the stream validator; a ticket on the shared ledger names the restarted run', () => {
+    const context = new AsyncLocalStorage()
+    const tickets = []
+    const observer = new PassiveObserver({
+      owners: { ConsumerGroup, SubscriptionState, OffsetOperations },
+      watched: {
+        ConsumerGroup: ['retainSubscription'],
+        SubscriptionState: ['pause'],
+        OffsetOperations: ['begin'],
+      },
+      context,
+      onEvent: (e) => e.type === 'ticket' && tickets.push(e.record),
+    })
+    observer.lives = () => `p01.20/${A}`
+    observer.install()
+    try {
+      const consumer = { slot: null, ledger: new OffsetOperations() }
+      const crashed = startRun(consumer, context)
+      const before = observer.ordinarySections(EAGER).sections
+      consumer.slot = null
+      const restarted = startRun(consumer, context)
+      const after = observer.ordinarySections(EAGER).sections
+      context.run(EAGER, () => consumer.ledger.begin([{ topic: 'main', partition: 0 }]))
+      const secondCut = (r) => {
+        r.splice(
+          at(r, isSample('p01')) + 1,
+          0,
+          ...cut('i1b', 'p01', [
+            [null, PROCESS_SECTIONS],
+            [EAGER, ORDINARY_SECTIONS],
+          ]),
+          {
+            ...sample('p01', 'periodic', 'i1b', [EAGER], { slot: 1 }),
+            gc: {
+              ...GC,
+              id: 'gc-2',
+              firstBeginAt: 200,
+              firstEndAt: 201,
+              secondBeginAt: 302,
+              secondEndAt: 303,
+              cumulativeForced: 4,
+            },
+            admittedAt: 199,
+            completedAt: 304,
+          }
+        )
+        fill('i1', before)(r)
+        fill('i1b', after)(r)
+      }
+      expect(run({ edit: secondCut })).toEqual([])
+      const runs = (sections) => [
+        ...new Set(
+          ['subscription', 'pause-state', 'membership-state'].flatMap((s) =>
+            sections[s].map((e) => e.run)
+          )
+        ),
+      ]
+      expect(runs(before)).toEqual([observer.runOf(crashed)])
+      expect(runs(after)).toEqual([observer.runOf(restarted)])
+      expect(after.assignment.map((e) => e.authority.run)).toEqual([observer.runOf(restarted)])
+      expect(tickets.map((t) => t.ownerRun)).toEqual([observer.runOf(restarted)])
+      expect(after['other-table'].map((t) => t.table)).toEqual([
+        'acquired',
+        'halted',
+        'topic-configurations',
+        'preferred-replicas',
+        'queued-seeks',
+        'grown-topic-names',
+        'cluster-targets',
+      ])
+    } finally {
+      observer.restore()
+    }
   })
 })

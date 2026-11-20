@@ -14,6 +14,7 @@
  * `header.clock.originMs`. Offsets are canonical decimal int64 strings compared as BigInt.
  */
 const crypto = require('node:crypto')
+const { isDeepStrictEqual } = require('node:util')
 
 const SCHEMA_VERSION = 3
 
@@ -105,6 +106,10 @@ const ARCHIVE = Object.freeze([
   'scripts/soak/finalSoakMatrix.json',
   'scripts/soak/finalSoakSchema.js',
   'scripts/soak/finalSoak.js',
+  'scripts/soak/finalSoakScheduler.js',
+  'scripts/soak/finalSoakCollector.js',
+  'scripts/soak/finalSoakObserver.js',
+  'scripts/soak/finalSoakWorkers.js',
 ])
 /** The seed's fixed start, clear and sensitivity rule in each mode. */
 const SEED_TIMING = Object.freeze({
@@ -118,11 +123,17 @@ const SEED_TIMING = Object.freeze({
     clears: 'after-only-quiet-triplet-before-disconnect',
     sensitivity: 'report-only',
   },
+  rehearsal: {
+    starts: 'after-first-quiet-triplet',
+    clears: 'after-last-quiet-triplet-before-disconnect',
+    sensitivity: 'report-only',
+  },
 })
 
 const COMPANIONS = Object.freeze(['natural-exit', 'consume-retention', 'prior-checkpoints'])
 const CONTROL = 'interning-seeded'
-const MODES = Object.freeze(['smoke', 'acceptance'])
+/** The run modes: smoke and rehearsal are diagnostic and never ACCEPTED; acceptance is the day. */
+const MODES = Object.freeze(['smoke', 'rehearsal', 'acceptance'])
 const PROCESS_ROLES = Object.freeze(['subject', 'seed', 'reader', 'collector', 'decoder'])
 const SAMPLE_ROLES = Object.freeze(['baseline', 'periodic', 'quiet', 'closed', 'final'])
 const REQUIRED_FLAGS = Object.freeze(['--expose-gc', '--no-flush-bytecode'])
@@ -130,6 +141,16 @@ const EXPLICIT_RESOURCES = Object.freeze(['TCPSocketWrap', 'Timeout'])
 const OUTER = 'outer'
 const MAX_OFFSET = 2n ** 63n - 1n
 const MAX_PROBLEMS = 1000
+/** Records the stream validator holds at once for a client whose construction has not arrived. */
+const MAX_HELD = 100000
+/**
+ * Entries the stream validator keeps of any one kind of live state (constructed clients, open and
+ * closed executions, open inventory cuts, open counting records and their open items); a normal day
+ * keeps far fewer, and a stream that needs more fails.
+ */
+const MAX_OPEN = 100000
+/** Each item record kind and the counting record kind it cites by `cause`. */
+const ITEM_KINDS = Object.freeze({ 'wave-key': 'wave', 'partition-state': 'broker-state' })
 
 /** The arm and control id each process role runs with. */
 const ROLE_ARMS = Object.freeze({
@@ -288,7 +309,11 @@ const SEED = { process: Id, client: Id, controlId: oneOf(CONTROL), mapEntries: C
 
 /**
  * Every record kind: `fields`, or `by` (the discriminator field) and its `variants`. `open` admits
- * fields beyond those listed (the diagnostic note only).
+ * fields beyond those listed (the diagnostic note only). A `wave` or `broker-state` carries the
+ * count of its keys or partitions; each one is its own `wave-key` or `partition-state` record of
+ * the same source citing it by `cause`, so no record grows with the topology past its line cap.
+ * For the same reason a sample's V8 space and code statistics are the `heap` record that follows
+ * it, citing it by `sample`.
  */
 const RECORDS = Object.freeze({
   process: {
@@ -393,10 +418,25 @@ const RECORDS = Object.freeze({
       container: Id,
       event: oneOf('down', 'ready', 'isr'),
       members: listOf(Count),
-      partitions: listOf(shape('a partition state', { key: Key, leader: Int, isr: listOf(Count) })),
+      partitions: Count,
       cause: Id,
+      downMs: Ms,
+      processAt: nullable(Ms),
+      processTime: nullable(Id),
     },
   },
+  'partition-state': { fields: { cause: Id, key: Key, leader: Int, isr: listOf(Count) } },
+  wave: {
+    fields: {
+      client: Id,
+      event: oneOf('transfer', 'return'),
+      member: Id,
+      paused: Count,
+      held: Count,
+      observed: Bool,
+    },
+  },
+  'wave-key': { fields: { cause: Id, key: Key, held: Bool } },
   identity: {
     by: 'stage',
     variants: {
@@ -468,6 +508,16 @@ const RECORDS = Object.freeze({
         key: Key,
         next: nullable(Offset),
         errorCode: Int,
+      },
+      'share-outcome': {
+        client: Id,
+        group: Id,
+        key: Key,
+        from: Offset,
+        to: Offset,
+        type: oneOf('accept', 'release', 'reject', 'renew'),
+        reason: nullable(Id),
+        errorType: nullable(Id),
       },
     },
   },
@@ -558,6 +608,22 @@ const RECORDS = Object.freeze({
       clients: listOf(Id),
     },
   },
+  heap: {
+    fields: {
+      process: Id,
+      sample: Id,
+      spaces: type(
+        'used bytes by V8 space name',
+        (v) =>
+          isObject(v) &&
+          Object.keys(v).length <= 16 &&
+          Object.entries(v).every(
+            ([name, bytes]) => /^[a-z_]{1,32}$/.test(name) && Count.test(bytes)
+          )
+      ),
+      code: shape('code statistics', { code: Count, bytecode: Count, scripts: Count }),
+    },
+  },
   inventory: {
     fields: {
       inventory: Id,
@@ -567,6 +633,7 @@ const RECORDS = Object.freeze({
       chunk: Count,
       chunks: Count,
       entries: listOf(type('an object', isObject)),
+      piece: nullable(shape('a piece', { index: Count, pieces: Count })),
     },
   },
   ticket: {
@@ -688,6 +755,7 @@ const SECTIONS = Object.freeze({
   'share-state': {
     entry: {
       client: Id,
+      run: nullable(Id),
       sessions: listOf(shape('a session', { node: Count, session: Int })),
       records: listOf(
         shape('a held record', {
@@ -789,7 +857,7 @@ const RULES = Object.freeze({
     ),
   'identity/ack': (r) =>
     unless(
-      sameNullness(r.offset, r.outcome === 'acknowledged' ? 1 : null),
+      r.offset === null || r.outcome === 'acknowledged',
       'only an acknowledged send has an offset'
     ),
   'identity/transaction': (r) =>
@@ -825,11 +893,26 @@ const RULES = Object.freeze({
       'only a response has an errorCode'
     ),
   sample: (r) => sampleRules(r),
+  heap: (r) =>
+    unless(
+      r.process === r.source && r.sample.startsWith(`${r.process}.`),
+      'a heap record cites a sample of its own process'
+    ),
   inventory: (r) => [
     ...unless(r.chunks >= 1 && r.chunk < r.chunks, 'chunk is not below chunks'),
-    ...r.entries.flatMap((entry, i) => entryProblems(r.section, entry, `entries[${i}]`)),
+    ...unless(
+      r.piece === null ||
+        (r.entries.length === 1 && r.piece.pieces >= 2 && r.piece.index < r.piece.pieces),
+      'a piece is one entry, one of at least two'
+    ),
+    ...r.entries.flatMap((entry, i) =>
+      r.piece === null
+        ? entryProblems(r.section, entry, `entries[${i}]`)
+        : fieldProblems(entry, SECTIONS[r.section].entry, `entries[${i}]`)
+    ),
   ],
   ticket: (r) => unless(sameNullness(r.ownerRun, r.token), 'ownerRun and token go together'),
+  wave: (r) => unless(r.held <= r.paused, 'a wave holds no more keys than it paused'),
 })
 
 /** @param {object} r a typed sample @returns {string[]} */
@@ -897,6 +980,25 @@ const entryProblems = (section, entry, path) => {
   const problems = fieldProblems(entry, SECTIONS[section].entry, path)
   if (problems.length > 0 || !ENTRY_RULES[section]) return problems
   return ENTRY_RULES[section](entry).map((p) => `${path}: ${p}`)
+}
+
+/**
+ * Reassembles one inventory entry from its pieces: their lists concatenated in piece order, every
+ * other field equal in all pieces.
+ * @param {object[]} parts the pieces' entries, in piece order
+ * @returns {{ entry: object, problems: string[] }} the entry and the fields the pieces disagree on
+ */
+const mergePieces = (parts) => {
+  const [first, ...rest] = parts
+  const entry = { ...first }
+  const problems = new Set()
+  for (const part of rest)
+    for (const k of Object.keys(first)) {
+      if (Array.isArray(first[k]) && Array.isArray(part[k])) entry[k] = [...entry[k], ...part[k]]
+      else if (!isDeepStrictEqual(first[k], part[k]))
+        problems.add(`pieces of one entry disagree on ${k}`)
+    }
+  return { entry, problems: [...problems] }
 }
 
 /**
@@ -1092,7 +1194,7 @@ const ACCEPTANCE_FIELDS = Object.freeze({
   profile: Id,
   modes: Any,
   archive: type(
-    'a list of relative paths holding the archived matrix, schema and driver',
+    'a list of relative paths holding the archived matrix, schema and driver modules',
     (v) => Array.isArray(v) && v.every(isRelativePath) && ARCHIVE.every((f) => v.includes(f))
   ),
   companions: type('the companion list', (v) => sameList(v, COMPANIONS)),
@@ -1202,6 +1304,7 @@ const SMOKE_FIELDS = Object.freeze({
   idleMs: Window,
   quietAtMs: QuietTimes,
   ...each(['membershipAtMs', 'regexAtMs', 'recreationAtMs', 'outageAtMs', 'recoveredByMs'], Ms),
+  abortAtTransaction: Positive,
   periodicSlots: Positive,
   floors: Any,
 })
@@ -1346,7 +1449,19 @@ const validateMatrix = (matrix) => {
       problems.push(
         'matrix.schedule.smoke.periodicSlots does not cover the smoke at the sample period'
       )
+    const rehearsalHours = acceptance.modes.rehearsal.requestedMs.value / schedule.hourMs
+    if (!(Number.isInteger(rehearsalHours) && rehearsalHours >= 3))
+      problems.push(
+        'matrix.acceptance.modes.rehearsal.requestedMs is not a whole number of hours, at least three'
+      )
     if (sampling.gcCollections.value !== 2) problems.push('matrix.sampling.gcCollections is not 2')
+    if (
+      (schedule.smoke.abortAtTransaction - 1) * matrix.traffic.transactionEveryMs.value >=
+      schedule.smoke.outageAtMs
+    )
+      problems.push(
+        'matrix.schedule.smoke.abortAtTransaction does not abort before the first outage'
+      )
   }
   if (matrix.rows.length !== ROWS.length)
     problems.push(`matrix.rows does not hold the ${ROWS.length} rows`)
@@ -1406,7 +1521,8 @@ const topologyProblems = (topology, kinds) => {
 /**
  * Checks the single isolated seed control, including its fixed per-mode timing: the day starts the
  * map after the first quiet triplet and requires sensitivity; the smoke starts it after the
- * baseline before traffic and only reports growth.
+ * baseline before traffic and only reports growth; the rehearsal times it as the day does and only
+ * reports growth.
  * @param {object} controls
  * @param {object} kinds
  * @returns {string[]}
@@ -1472,7 +1588,8 @@ const ClientSlot = shape('a client slot', {
  * Checks the run config's binding of every process and client slot: 16 persistent processes with
  * their arms; one standing subject of each kind alone in its own process (churn extras of the same
  * churn kind may share it); exactly one isolated seed process holding exactly one control client of
- * the seeded kind; observers only in observer processes; group, static id and telemetry per kind.
+ * the seeded kind; observers only in observer processes; group, static id and telemetry per kind;
+ * heap snapshot processes (`heapSnapshots`, absent or null when off) only outside acceptance mode.
  * Other config sections belong to the driver profile and are compared by the verifier.
  * @param {unknown} config parsed config JSON
  * @param {object} matrix a valid matrix
@@ -1483,7 +1600,7 @@ const validateConfig = (config, matrix) => {
   const runIdOk = isString(config.runId) && /^[0-9a-f]{12}$/.test(config.runId)
   const problems = [
     ...unless(config.schema === SCHEMA_VERSION, `config.schema is not ${SCHEMA_VERSION}`),
-    ...unless(MODES.includes(config.mode), 'config.mode is not smoke or acceptance'),
+    ...unless(MODES.includes(config.mode), 'config.mode is not smoke, rehearsal or acceptance'),
     ...unless(runIdOk, 'config.runId is not 12 hex digits'),
   ]
   if (!Array.isArray(config.processes) || !config.processes.every(ProcessSlot.test)) {
@@ -1558,6 +1675,13 @@ const validateConfig = (config, matrix) => {
     if (p.role === 'seed' && (hosted.length !== 1 || hosted[0].purpose !== 'control')) {
       problems.push(`config seed process ${p.slot} does not host exactly one control client`)
     }
+  }
+  const snapshots = config.heapSnapshots ?? null
+  if (snapshots !== null) {
+    if (!Array.isArray(snapshots) || !snapshots.every((slot) => processes.has(slot)))
+      problems.push('config.heapSnapshots is not null or a list of config process slots')
+    else if (config.mode === 'acceptance')
+      problems.push('config.heapSnapshots is set in acceptance mode')
   }
   for (const c of config.clients) {
     if (c.purpose === 'observer' || !matrix.clientKinds[c.clientKind].grouped) continue
@@ -1778,11 +1902,22 @@ const validateProvenance = (json, kind) => {
  * and clients, open executions and inventory cuts, and the stream digest. It never holds the
  * stream. Checks: config and header agree on run id and mode; exact record types; `recordId` = `<source>.<seq>` with gap-free per-source
  * `seq` from 0; `at <= t`, `t` non-decreasing, per-source `at` non-decreasing, `t` within the
- * observed window; processes on the header's boot and Node; no record from an exited process; clients constructed in a started process as
- * their config slot says, never reusing an id; seed records only from the isolated seed's control
- * client; telemetry only from telemetry-enabled clients; executions opened once and closed with
- * their operation count; inventory cuts complete in every chunk and required section before the
- * sample that cites them; gc witnesses with two new forced collections per reading.
+ * observed window; processes on the header's boot and Node; no record of a process later than its
+ * exit; clients constructed in a started process as their config slot says, never reusing an id;
+ * seed records only from the isolated seed's control client; telemetry only from telemetry-enabled
+ * clients; executions opened once and closed with their operation count; every `wave-key` and
+ * `partition-state` record its `wave` or `broker-state` counts; inventory cuts complete in every
+ * chunk and required section before the sample that cites them; gc witnesses with two new forced
+ * collections per reading.
+ *
+ * The merged stream keeps each source's order, not the order between sources. Facts about another
+ * process are therefore judged independently of stream position: a process's exit is compared with
+ * the event times of its records, and a record naming a client whose construction (by another
+ * process) has not arrived yet is held, bounded, and judged when it arrives.
+ *
+ * Every kind of live state is capped at `maxOpen` entries; a stream that needs more fails once per
+ * kind and the excess is not tracked (its later references then fail too), and the problems found
+ * at the end of the stream count against the same problem cap as the others.
  */
 class StreamValidator {
   /**
@@ -1790,8 +1925,10 @@ class StreamValidator {
    * @param {object} options.matrix a valid matrix
    * @param {object} options.config a valid config
    * @param {object} options.header a valid header
+   * @param {number} [options.maxHeld] records held at once for clients not yet constructed
+   * @param {number} [options.maxOpen] entries kept of any one kind of live state
    */
-  constructor({ matrix, config, header }) {
+  constructor({ matrix, config, header, maxHeld = MAX_HELD, maxOpen = MAX_OPEN }) {
     this.matrix = matrix
     this.header = header
     this.slots = new Map(config.clients.map((c) => [c.slot, c]))
@@ -1800,6 +1937,14 @@ class StreamValidator {
     this.processes = new Map()
     this.sources = new Map()
     this.clients = new Map()
+    this.exits = new Map()
+    this.held = new Map()
+    this.heldCount = 0
+    this.maxHeld = maxHeld
+    this.maxOpen = maxOpen
+    this.full = new Set()
+    this.openItems = 0
+    this.summaries = new Map()
     this.executions = new Map()
     this.closedExecutions = new Set()
     this.cuts = new Map()
@@ -1814,9 +1959,21 @@ class StreamValidator {
       this.problems.push('config and header disagree on run id or mode')
   }
 
-  /** @param {string} problem */
-  fail(problem) {
-    if (this.problems.length < MAX_PROBLEMS) this.problems.push(`line ${this.lines}: ${problem}`)
+  /**
+   * @param {number} size how many entries of one kind of state are kept
+   * @param {string} what the kind, as the problem names it
+   * @returns {boolean} whether one more fits; the first refusal of a kind fails the stream
+   */
+  room(size, what) {
+    if (size < this.maxOpen) return true
+    if (!this.full.has(what)) this.fail(`more than ${this.maxOpen} ${what}`)
+    this.full.add(what)
+    return false
+  }
+
+  /** @param {string} problem @param {number} [line] the line it is about, the current by default */
+  fail(problem, line = this.lines) {
+    if (this.problems.length < MAX_PROBLEMS) this.problems.push(`line ${line}: ${problem}`)
     else this.omitted++
   }
 
@@ -1861,16 +2018,67 @@ class StreamValidator {
     if (r.t < this.lastT) this.fail('t decreases')
     if (r.at < last.at) this.fail('at decreases within its source')
     if (r.t > this.header.window.observedEndAt) this.fail('t is after the observed end')
-    if (this.processes.get(r.source) === 'exited') this.fail('its source process has exited')
+    if (r.at > (this.exits.get(r.source) ?? Infinity)) this.fail('its source process has exited')
     this.sources.set(r.source, { seq: r.seq, at: Math.max(r.at, last.at) })
     this.lastT = Math.max(this.lastT, r.t)
   }
 
-  /** @param {string} client @returns {object|undefined} the client's config slot, if constructed */
-  client(client) {
+  /**
+   * The config slot of a constructed client. A record naming one not constructed yet is held,
+   * reduced to what `slotChecks` reads, and judged when the construction arrives; beyond
+   * `maxHeld` held records it is not held and the stream fails once.
+   * @param {string} client @param {object} r the record naming it
+   * @returns {object|undefined} the slot, undefined while the client is not constructed
+   */
+  client(client, r) {
     const slot = this.clients.get(client)
-    if (!slot) this.fail('names a client that was never constructed')
-    return slot
+    if (slot) return slot
+    if (this.heldCount >= this.maxHeld) {
+      if (!this.heldFull)
+        this.fail(`more than ${this.maxHeld} records wait for a client not yet constructed`)
+      this.heldFull = true
+      return undefined
+    }
+    const { kind, source, process, acquisition, group } = r
+    const fact = { line: this.lines, kind, source, process, acquisition, group }
+    fact.variant = RECORDS[kind].by ? r[RECORDS[kind].by] : null
+    this.heldCount++
+    if (this.held.has(client)) this.held.get(client).push(fact)
+    else this.held.set(client, [fact])
+    return undefined
+  }
+
+  /**
+   * The checks of a record that need its client's config slot.
+   * @param {{ kind: string, variant: ?string, process?: string, acquisition?: ?string,
+   *   group?: string }} r the record, or the fact held of it
+   * @param {object} slot @param {number} [line] the record's line
+   */
+  slotChecks(r, slot, line = this.lines) {
+    if (r.kind === 'telemetry' && !slot.telemetryEnabled)
+      this.fail('telemetry from a client without telemetry', line)
+    if (
+      r.kind === 'seed' &&
+      (r.process !== this.seedProcess || slot.purpose !== 'control' || slot.process !== r.process)
+    ) {
+      this.fail('seed record is not from the isolated seed process and its control client', line)
+    }
+    if (r.kind === 'sample' && slot.process !== r.process)
+      this.fail('sample lists a client of another process', line)
+    if (r.kind === 'identity' && r.variant === 'handler-enter') {
+      const share = this.matrix.clientKinds[slot.clientKind].role === 'share'
+      if (share === (r.acquisition === null))
+        this.fail('handler authority does not match the client kind', line)
+      if (r.group !== slot.group) this.fail('handler group is not its client group', line)
+    }
+  }
+
+  /**
+   * @param {string} process @param {number} at an event time
+   * @returns {boolean} whether the process had started and not yet exited at `at`
+   */
+  liveAt(process, at) {
+    return this.processes.has(process) && !(at > (this.exits.get(process) ?? Infinity))
   }
 
   /** @param {object} r a typed, chronologically checked record */
@@ -1882,28 +2090,54 @@ class StreamValidator {
     if (r.kind === 'shape') return this.shape(r, variant)
     if (r.kind === 'sample') return this.sample(r)
     if (r.kind === 'inventory') return this.inventory(r)
-    if (r.kind === 'identity' && variant === 'log') this.client(r.reader)
+    if (own(ITEM_KINDS, r.kind)) return this.item(r)
+    const left = r.kind === 'wave' ? r.paused : r.kind === 'broker-state' ? r.partitions : 0
+    if (left > 0 && this.room(this.summaries.size, 'open wave or broker-state records')) {
+      if (this.room(this.openItems + left - 1, 'open wave-key or partition-state items')) {
+        this.openItems += left
+        this.summaries.set(r.recordId, {
+          kind: r.kind,
+          source: r.source,
+          execution: r.execution,
+          left,
+          keys: new Set(),
+          held: r.kind === 'wave' ? r.held : null,
+          line: this.lines,
+        })
+      }
+    }
+    if (r.kind === 'wave') this.client(r.member, r)
+    if (r.kind === 'identity' && variant === 'log') this.client(r.reader, r)
     if (r.kind === 'operation' && r.execution !== null) {
       const open = this.executions.get(r.execution)
       if (!open) this.fail('operation names no open execution')
       else if (variant === 'end') open.operations++
     }
-    const slot = isString(r.client) ? this.client(r.client) : undefined
-    if (!slot) return
-    if (r.kind === 'telemetry' && !slot.telemetryEnabled)
-      this.fail('telemetry from a client without telemetry')
-    if (
-      r.kind === 'seed' &&
-      (r.process !== this.seedProcess || slot.purpose !== 'control' || slot.process !== r.process)
-    ) {
-      this.fail('seed record is not from the isolated seed process and its control client')
-    }
-    if (r.kind === 'identity' && variant === 'handler-enter') {
-      const share = this.matrix.clientKinds[slot.clientKind].role === 'share'
-      if (share === (r.acquisition === null))
-        this.fail('handler authority does not match the client kind')
-      if (r.group !== slot.group) this.fail('handler group is not its client group')
-    }
+    const slot = isString(r.client) ? this.client(r.client, r) : undefined
+    if (slot) this.slotChecks({ ...r, variant }, slot)
+  }
+
+  /**
+   * One of a counting record's items: it must cite an open one of its source and execution and
+   * name a key no other item of it named. When the last item arrives, a wave's `held` count must
+   * equal its items held.
+   * @param {object} r a `wave-key` or `partition-state` record
+   */
+  item(r) {
+    const kind = ITEM_KINDS[r.kind]
+    const open = this.summaries.get(r.cause)
+    if (!open || open.kind !== kind || open.source !== r.source)
+      return this.fail(`cites no open ${kind} of its source`)
+    if (open.execution !== r.execution) return this.fail(`is of another execution than its ${kind}`)
+    const key = JSON.stringify([r.key.topicId, r.key.partition])
+    if (open.keys.has(key)) return this.fail(`repeats a key of its ${kind}`)
+    open.keys.add(key)
+    if (r.kind === 'wave-key' && r.held) open.held--
+    this.openItems--
+    if (--open.left > 0) return
+    this.summaries.delete(r.cause)
+    if (open.held !== null && open.held !== 0)
+      this.fail(`${kind} held count differs from its ${r.kind} records`)
   }
 
   /** @param {object} r */
@@ -1922,7 +2156,10 @@ class StreamValidator {
   processExit(r) {
     if (this.processes.get(r.process) !== 'live') this.fail('exit of a process that is not live')
     if (r.source === r.process) this.fail('a process cannot observe its own exit')
+    if ((this.sources.get(r.process)?.at ?? 0) > r.at)
+      this.fail('the process has a record after its exit')
     this.processes.set(r.process, 'exited')
+    this.exits.set(r.process, r.at)
   }
 
   /** @param {object} r */
@@ -1932,8 +2169,8 @@ class StreamValidator {
     if (!new RegExp(`^${r.slot}\\.(0|[1-9][0-9]*)$`).test(r.client))
       this.fail('client id is not <slot>.<incarnation>')
     if (this.clients.has(r.client)) this.fail('client id is reused')
-    if (this.processes.get(r.process) !== 'live')
-      this.fail('client is constructed outside a live process')
+    else if (!this.room(this.clients.size, 'constructed clients')) return
+    if (!this.liveAt(r.process, r.at)) this.fail('client is constructed outside a live process')
     for (const field of [
       'clientKind',
       'process',
@@ -1948,6 +2185,13 @@ class StreamValidator {
       if (r[field] !== slot[field]) this.fail(`client ${field} differs from its config slot`)
     }
     this.clients.set(r.client, slot)
+    for (const fact of this.held.get(r.client) ?? []) {
+      if (fact.source === slot.process)
+        this.fail('names a client before its construction', fact.line)
+      else this.slotChecks(fact, slot, fact.line)
+      this.heldCount--
+    }
+    this.held.delete(r.client)
   }
 
   /** @param {object} r @param {string} phase */
@@ -1955,6 +2199,7 @@ class StreamValidator {
     if (phase === 'start') {
       if (this.executions.has(r.execution) || this.closedExecutions.has(r.execution))
         return this.fail('execution id is reused')
+      if (!this.room(this.executions.size, 'open executions')) return
       return this.executions.set(r.execution, { shape: r.shape, operations: 0 })
     }
     const open = this.executions.get(r.execution)
@@ -1962,14 +2207,14 @@ class StreamValidator {
     if (open.operations !== r.operationCount)
       this.fail('operationCount differs from the ended operations')
     this.executions.delete(r.execution)
-    this.closedExecutions.add(r.execution)
+    if (this.room(this.closedExecutions.size, 'closed executions'))
+      this.closedExecutions.add(r.execution)
   }
 
   /** @param {object} r */
   inventory(r) {
-    if (this.processes.get(r.process) !== 'live')
-      this.fail('inventory of a process that is not live')
-    const slot = r.client === null ? null : this.client(r.client)
+    if (!this.liveAt(r.process, r.at)) this.fail('inventory of a process that is not live')
+    const slot = r.client === null ? null : this.client(r.client, r)
     const sections =
       r.client === null
         ? SECTION_SETS.process
@@ -1980,6 +2225,7 @@ class StreamValidator {
       this.fail('section does not apply to this owner')
     let cut = this.cuts.get(r.inventory)
     if (!cut) {
+      if (!this.room(this.cuts.size, 'open inventory cuts')) return
       cut = { process: r.process, at: r.at, groups: new Map() }
       this.cuts.set(r.inventory, cut)
     }
@@ -1988,25 +2234,53 @@ class StreamValidator {
     const name = `${r.client}\0${r.section}`
     let group = cut.groups.get(name)
     if (!group) {
-      group = { chunks: r.chunks, seen: new Set(), keys: new Set() }
+      group = { chunks: r.chunks, seen: new Set(), keys: new Set(), split: new Map() }
       cut.groups.set(name, group)
     }
     if (group.chunks !== r.chunks) this.fail('chunks of one section disagree on their count')
     if (group.seen.has(r.chunk)) this.fail('chunk repeats')
     group.seen.add(r.chunk)
+    if (r.piece !== null) return this.piece(r, group)
     for (const entry of r.entries) {
       const key = SECTIONS[r.section].key(entry)
-      if (group.keys.has(key)) this.fail(`${r.section} entry key repeats`)
+      if (group.keys.has(key) || group.split.has(key)) this.fail(`${r.section} entry key repeats`)
       group.keys.add(key)
     }
   }
 
+  /**
+   * Keeps one piece of a split entry until its last piece arrives, then judges the reassembled
+   * entry by its section's rules and counts its key once.
+   * @param {object} r an inventory record with a `piece`
+   * @param {{ keys: Set<string>, split: Map<string, object> }} group its cut's section group
+   */
+  piece(r, group) {
+    const key = SECTIONS[r.section].key(r.entries[0])
+    let split = group.split.get(key)
+    if (!split) {
+      if (group.keys.has(key)) this.fail(`${r.section} entry key repeats`)
+      split = { pieces: r.piece.pieces, parts: new Map() }
+      group.split.set(key, split)
+    }
+    if (split.pieces !== r.piece.pieces)
+      return this.fail('pieces of one entry disagree on their count')
+    if (split.parts.has(r.piece.index)) return this.fail('an entry piece repeats')
+    split.parts.set(r.piece.index, r.entries[0])
+    if (split.parts.size < split.pieces) return
+    group.split.delete(key)
+    group.keys.add(key)
+    const parts = [...split.parts.keys()].sort((a, b) => a - b).map((i) => split.parts.get(i))
+    const { entry, problems } = mergePieces(parts)
+    for (const p of problems.length > 0 ? problems : entryProblems(r.section, entry, 'entry'))
+      this.fail(p)
+  }
+
   /** @param {object} r */
   sample(r) {
-    if (this.processes.get(r.process) !== 'live') this.fail('sample of a process that is not live')
+    if (!this.liveAt(r.process, r.at)) this.fail('sample of a process that is not live')
     for (const client of r.clients) {
-      const slot = this.client(client)
-      if (slot && slot.process !== r.process) this.fail('sample lists a client of another process')
+      const slot = this.client(client, r)
+      if (slot) this.slotChecks(r, slot)
     }
     const cut = this.cuts.get(r.inventory)
     if (!cut || cut.process !== r.process) this.fail('sample cites no inventory cut of its process')
@@ -2024,6 +2298,7 @@ class StreamValidator {
           if (!group) this.fail(`inventory cut omits ${section}`)
           else if (group.seen.size !== group.chunks)
             this.fail(`inventory cut misses a ${section} chunk`)
+          else if (group.split.size > 0) this.fail(`inventory cut misses a ${section} piece`)
         }
       }
       this.cuts.delete(r.inventory)
@@ -2047,18 +2322,24 @@ class StreamValidator {
    * @returns {string[]} every problem found, capped with a count of those omitted
    */
   finish() {
+    for (const facts of this.held.values())
+      for (const fact of facts) this.fail('names a client that was never constructed', fact.line)
+    this.held.clear()
+    for (const [recordId, open] of this.summaries) {
+      const item = Object.keys(ITEM_KINDS).find((k) => ITEM_KINDS[k] === open.kind)
+      this.fail(`${nameOf(recordId)} misses ${open.left} of its ${item} records`, open.line)
+    }
+    for (const [execution] of this.executions)
+      this.fail(`execution ${nameOf(execution)} never ends`)
+    for (const [inventory, cut] of this.cuts)
+      if (
+        [...cut.groups.values()].some(
+          (group) => group.seen.size !== group.chunks || group.split.size > 0
+        )
+      )
+        this.fail(`inventory ${nameOf(inventory)} misses a chunk or piece`)
     const problems = [...this.problems]
     if (this.omitted > 0) problems.push(`${this.omitted} more problems omitted`)
-    for (const [execution] of this.executions)
-      problems.push(`execution ${nameOf(execution)} never ends`)
-    for (const [inventory, cut] of this.cuts) {
-      for (const group of cut.groups.values()) {
-        if (group.seen.size !== group.chunks) {
-          problems.push(`inventory ${nameOf(inventory)} misses a chunk`)
-          break
-        }
-      }
-    }
     const stream = this.header.stream
     if (stream.records !== this.lines)
       problems.push('the stream record count differs from the header')
@@ -2074,6 +2355,7 @@ module.exports = {
   ROWS,
   CLIENT_KINDS,
   SHAPES,
+  RECORDS,
   RECORD_KINDS,
   SECTION_SETS,
   StreamValidator,
@@ -2083,4 +2365,5 @@ module.exports = {
   validateMatrix,
   validateProvenance,
   validateRecord,
+  mergePieces,
 }
