@@ -3306,6 +3306,8 @@ export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
+  /** The last failure a broker's FindCoordinator request ended with, when there was one. */
+  lastError?: Error
   constructor()
 }
 
