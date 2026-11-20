@@ -22,21 +22,27 @@ module.exports = class IdleWait {
    * stale, settles immediately. Currentness is checked again after registration, with no await in
    * between, so a change before registration prevents the wait and a change after it finds the
    * waiter through `wake()`. Nothing about the evidence is remembered.
-   * @param {number} ms idle duration in milliseconds
+   * @param {number} ms idle duration in milliseconds; `Infinity` arms no timer, so only a wake,
+   *   `dispose()` or `fence` ends the wait
    * @param {() => boolean} [isCurrent] whether the evidence the caller sleeps on still holds
-   * @returns {Promise<void>} settles once, with its timer and entry removed
+   * @param {import('../producer/generation')|null} [fence] the caller's lifetime: its close ends the
+   *   wait and removes the waiter
+   * @returns {Promise<void>} settles once, with its timer, entry and fence registration removed
    */
-  wait(ms, isCurrent = alwaysCurrent) {
-    if (this.disposed || !isCurrent()) return Promise.resolve()
+  wait(ms, isCurrent = alwaysCurrent, fence = null) {
+    if (this.disposed || !isCurrent() || fence?.closed) return Promise.resolve()
     return new Promise((resolve) => {
       const waiter = { timer: null, finish: null }
+      let unregister = null
       waiter.finish = () => {
         if (!this.waiters.delete(waiter)) return
         clearTimeout(waiter.timer)
+        unregister?.()
         resolve()
       }
-      waiter.timer = setTimeout(waiter.finish, ms)
+      if (ms !== Infinity) waiter.timer = setTimeout(waiter.finish, ms)
       this.waiters.add(waiter)
+      unregister = fence?.register(waiter.finish) ?? null
       if (this.disposed || !isCurrent()) waiter.finish()
     })
   }

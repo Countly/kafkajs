@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('1bea7a4b7378cacec239676fb947e51fa675ae2edf2185841e1fa461c8c07c45')
+    expect(digest(file)).toBe('2a855b7eb63e6a15d49dcebc7f2fee80248d0cabecd054e548d8302fb0cae08e')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -3804,20 +3804,12 @@ describe('Java node export capture', () => {
   })
 })
 
-describe.each([
-  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256'],
-  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256'],
-])('pinned input download by %s', (script, cacheVariable, sums) => {
-  const { createHash } = require('crypto')
-  const { spawn } = require('child_process')
-  const telemetry = path.resolve(__dirname, '../telemetry')
-  const names = fs
-    .readFileSync(path.join(telemetry, sums), 'utf8')
-    .trim()
-    .split('\n')
-    .map((line) => line.split(/\s+/)[1])
-  const body = (name) => `pinned ${path.basename(name)}\n`
-  const tool = `#!/usr/bin/env node
+/**
+ * A curl, sleep and date double for the pinned download scripts: a fake clock in FAKE_STATE, every call logged to
+ * FAKE_LOG, and curl answers chosen by FAKE_FAILURES/FAKE_FAILURE, FAKE_PLAN (`[seconds, exit, kind]` per call, kind
+ * `pinned`, `partial`, `wrong`, `archive` copying FAKE_ARCHIVE, or none) or FAKE_BLOCK.
+ */
+const fetchDouble = `#!/usr/bin/env node
 const fs = require('fs')
 const path = require('path')
 const tool = path.basename(process.argv[1])
@@ -3852,11 +3844,26 @@ if (tool === 'date') {
     if (kind === 'partial') fs.writeFileSync(out, 'partial')
     if (kind === 'wrong') fs.writeFileSync(out, '<html>error page</html>\\n')
     if (kind === 'pinned') fs.writeFileSync(out, 'pinned ' + path.basename(url) + '\\n')
+    if (kind === 'archive') fs.copyFileSync(process.env.FAKE_ARCHIVE, out)
     if (process.env.FAKE_BLOCK === 'curl') block()
     else process.exit(exit)
   }
 }
 `
+
+describe.each([
+  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256', 2],
+  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256', 1],
+])('pinned input download by %s', (script, cacheVariable, sums, sources) => {
+  const { createHash } = require('crypto')
+  const { spawn } = require('child_process')
+  const telemetry = path.resolve(__dirname, '../telemetry')
+  const names = fs
+    .readFileSync(path.join(telemetry, sums), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => line.split(/\s+/)[1])
+  const body = (name) => `pinned ${path.basename(name)}\n`
   let directory
   let cache
 
@@ -3875,7 +3882,7 @@ if (tool === 'date') {
       names.map((name) => `${digest(name)}  ${name}\n`).join('')
     )
     for (const name of ['curl', 'sleep', 'date']) {
-      fs.writeFileSync(path.join(directory, 'bin', name), tool, { mode: 0o755 })
+      fs.writeFileSync(path.join(directory, 'bin', name), fetchDouble, { mode: 0o755 })
     }
   })
 
@@ -3967,15 +3974,19 @@ if (tool === 'date') {
     expect(cached().filter((name) => name.includes('.part'))).toEqual([])
   })
 
-  test('stops after four attempts with a 2, 4 and 6 second backoff and names the file and URL that failed', () => {
+  test('stops after four attempts per source with a 2, 4 and 6 second backoff and names the file and URL that failed', () => {
     const result = fetch(Infinity)
     expect(result.signal).toBeNull()
     expect(result.status).toBe(1)
     const attempts = curls(result.calls)
-    expect(attempts).toHaveLength(4)
+    expect(attempts).toHaveLength(4 * sources)
     const url = attempts[0].args.at(-1)
-    expect(attempts.every(({ args }) => args.at(-1) === url)).toBe(true)
-    expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['6']])
+    expect(attempts.filter(({ args }) => args.at(-1) === url)).toHaveLength(4)
+    expect(sleeps(result.calls)).toEqual(
+      Array(sources)
+        .fill([['2'], ['4'], ['6']])
+        .flat()
+    )
     expect(result.stderr).toContain(`${names[0]} from ${url}: curl exit 18`)
     expect(cached()).toEqual([])
   })
@@ -4018,7 +4029,7 @@ if (tool === 'date') {
     const result = fetch(Infinity, { FAKE_FAILURE: 'wrong' })
     expect(result.status).toBe(1)
     const attempts = curls(result.calls)
-    expect(attempts).toHaveLength(4)
+    expect(attempts).toHaveLength(4 * sources)
     expect(result.stderr).toContain(`${names[0]} from ${attempts[0].args.at(-1)}: digest mismatch`)
     expect(cached()).toEqual([])
     const retry = fetch(0)
@@ -4053,4 +4064,157 @@ if (tool === 'date') {
     expect(exit.code === 143 || exit.signal === 'SIGTERM').toBe(true)
     expect(cached()).toEqual([])
   }, 30000)
+})
+
+describe('pinned download from a second source', () => {
+  const { createHash, randomBytes } = require('crypto')
+  const telemetry = path.resolve(__dirname, '../telemetry')
+  const name = 'tools/protoc'
+  const pinned = 'pinned protoc\n'
+  const first = 'https://first.example/protoc.exe'
+  const second = 'https://second.example/protoc.zip'
+  let directory
+  let cache
+
+  /**
+   * Computes the CRC-32 a zip entry header records.
+   * @param {Buffer} data the bytes
+   * @returns {number} the unsigned checksum
+   */
+  const crc32 = (data) => {
+    let crc = ~0
+    for (const byte of data) {
+      crc ^= byte
+      for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+    }
+    return ~crc >>> 0
+  }
+
+  /**
+   * Writes a zip archive holding one stored (uncompressed) member.
+   * @param {string} member member path inside the archive
+   * @param {string} text member content
+   * @returns {string} the archive path
+   */
+  const archive = (member, text) => {
+    const data = Buffer.from(text)
+    const file = Buffer.from(member)
+    const entry = (signature, size) => {
+      const header = Buffer.alloc(size)
+      header.writeUInt32LE(signature, 0)
+      return header
+    }
+    const local = entry(0x04034b50, 30)
+    local.writeUInt16LE(10, 4)
+    local.writeUInt32LE(crc32(data), 14)
+    local.writeUInt32LE(data.length, 18)
+    local.writeUInt32LE(data.length, 22)
+    local.writeUInt16LE(file.length, 26)
+    const central = entry(0x02014b50, 46)
+    central.writeUInt16LE(10, 4)
+    central.writeUInt16LE(10, 6)
+    central.writeUInt32LE(crc32(data), 16)
+    central.writeUInt32LE(data.length, 20)
+    central.writeUInt32LE(data.length, 24)
+    central.writeUInt16LE(file.length, 28)
+    const end = entry(0x06054b50, 22)
+    end.writeUInt16LE(1, 8)
+    end.writeUInt16LE(1, 10)
+    end.writeUInt32LE(46 + file.length, 12)
+    end.writeUInt32LE(30 + file.length + data.length, 16)
+    const out = path.join(directory, `archive-${randomBytes(4).toString('hex')}.zip`)
+    fs.writeFileSync(out, Buffer.concat([local, file, data, central, file, end]))
+    return out
+  }
+
+  /**
+   * Sources the real download.sh and fetches the pinned file from the first URL, then the second URL's zip member.
+   * @param {Array<[number, number, string]>} plan the double's answer per curl call
+   * @param {string} member the archive member content served by the second source
+   * @returns {{status: number|null, stderr: string, calls: object[]}}
+   */
+  const fetch = (plan, member) => {
+    const log = path.join(directory, 'tools.jsonl')
+    const run = spawnSync(
+      'bash',
+      [
+        '-c',
+        '. "$1/download.sh"; fetch "$2" "$3" tools/protoc "$4" "$5#bin/protoc"',
+        'fetch',
+        telemetry,
+        path.join(directory, 'inputs.sha256'),
+        cache,
+        first,
+        second,
+      ],
+      {
+        env: {
+          ...process.env,
+          PATH: `${path.join(directory, 'bin')}${path.delimiter}${process.env.PATH}`,
+          FAKE_LOG: log,
+          FAKE_STATE: path.join(directory, 'state'),
+          FAKE_FAILURES: '0',
+          FAKE_PLAN: JSON.stringify(plan),
+          FAKE_ARCHIVE: archive('bin/protoc', member),
+        },
+        encoding: 'utf8',
+        timeout: 60000,
+      }
+    )
+    const calls = fs.existsSync(log)
+      ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse)
+      : []
+    return { status: run.status, stderr: run.stderr, calls }
+  }
+  const urls = (calls) =>
+    calls.filter((call) => call.tool === 'curl').map(({ args }) => args.at(-1))
+  const cached = () => fs.readdirSync(cache, { recursive: true }).map(String)
+  const missing = [0, 22, 'none']
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pinned-second-'))
+    cache = path.join(directory, 'cache')
+    fs.mkdirSync(path.join(directory, 'state'))
+    fs.mkdirSync(path.join(directory, 'bin'))
+    for (const tool of ['curl', 'sleep', 'date'])
+      fs.writeFileSync(path.join(directory, 'bin', tool), fetchDouble, { mode: 0o755 })
+    const digest = createHash('sha256').update(pinned).digest('hex')
+    fs.writeFileSync(path.join(directory, 'inputs.sha256'), `${digest}  ${name}\n`)
+  })
+
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  test('accepts the archive member from the second source when the first source answers 404', () => {
+    const result = fetch([missing, missing, missing, missing, [0, 0, 'archive']], pinned)
+    expect(result.status).toBe(0)
+    expect(urls(result.calls)).toEqual([first, first, first, first, second])
+    expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
+    expect(cached().sort()).toEqual(['tools', name])
+  })
+
+  test('rejects a second-source member with the wrong digest and caches nothing', () => {
+    const wrong = [0, 0, 'archive']
+    const result = fetch([missing, missing, missing, missing, wrong, wrong, wrong, wrong], 'evil\n')
+    expect(result.status).toBe(1)
+    expect(urls(result.calls)).toEqual([first, first, first, first, second, second, second, second])
+    expect(cached()).toEqual(['tools'])
+    expect(result.stderr).toContain(`from ${second}: digest mismatch`)
+  })
+
+  test('fails with one error naming both sources when both fail', () => {
+    const result = fetch(Array(8).fill(missing), pinned)
+    expect(result.status).toBe(1)
+    expect(result.stderr.trim().split('\n')).toEqual([
+      `Download failed: ${path.join(cache, name)} from ${first}: curl exit 22; from ${second}: curl exit 22`,
+    ])
+    expect(cached()).toEqual(['tools'])
+  })
+
+  test('gives protoc the protobuf release archive of the same version as its second source', () => {
+    const script = fs.readFileSync(path.join(telemetry, 'fetch.sh'), 'utf8')
+    expect(script).toContain(
+      'tools/protoc-3.25.5-linux-x86_64.exe $M/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe ' +
+        'https://github.com/protocolbuffers/protobuf/releases/download/v25.5/protoc-25.5-linux-x86_64.zip#bin/protoc\n'
+    )
+  })
 })

@@ -460,4 +460,51 @@ describe('Consumer > OffsetOperations', () => {
       expect(obligations.isOwed(T, 0)).toBe(true)
     })
   })
+
+  describe('the seek reservation of a cell', () => {
+    test('is taken by one owner at a time, keeps its cell open and is released once', () => {
+      const first = { name: 'first' }
+      const reservation = operations.reserve(T, 0, first)
+
+      expect(operations.reservation(T, '0')).toBe(reservation)
+      expect(reservation.owner).toBe(first)
+      expect(operations.reserve(T, 0, { name: 'second' })).toBeNull()
+      expect(operations.reserve(T, 1, { name: 'sibling' })).not.toBeNull()
+      expect(operations.size()).toBe(2)
+      expect(operations.isIdle()).toBe(false)
+
+      operations.release(reservation)
+      operations.release(reservation)
+
+      expect(operations.reservation(T, 0)).toBeNull()
+      expect(operations.reserved).toBe(1)
+      expect(operations.reserve(T, 0, { name: 'second' })).not.toBeNull()
+    })
+
+    test('a release wakes every registered run, and an unregistered one is not woken', () => {
+      const woken = []
+      const unregister = operations.onRelease(() => woken.push('a'))
+      operations.onRelease(() => woken.push('b'))
+      operations.release(operations.reserve(T, 0, {}))
+      unregister()
+
+      operations.release(operations.reserve(T, 0, {}))
+
+      expect(woken).toEqual(['a', 'b', 'b'])
+    })
+
+    test('a release registration does not keep an idle ledger from being idle', () => {
+      const idle = jest.fn()
+      operations.onIdle = idle
+      operations.onRelease(() => {})
+      const reservation = operations.reserve(T, 0, {})
+      expect(operations.isIdle()).toBe(false)
+
+      operations.release(reservation)
+
+      expect(operations.isIdle()).toBe(true)
+      expect(operations.size()).toBe(0)
+      expect(idle).toHaveBeenCalled()
+    })
+  })
 })

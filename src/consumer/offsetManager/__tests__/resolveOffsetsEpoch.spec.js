@@ -74,14 +74,12 @@ describe('Consumer > OffsetManager > resolveOffsets > committed-epoch seeding', 
     expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(0)
   })
 
-  it('keeps the -1 of a seek applied before the first resolution', async () => {
+  it('keeps the -1 of a seek applied before the first resolution, which asks nothing for it', async () => {
     const { pending, manager } = setup()
     await manager.seek({ topic: TOPIC, partition: 0, offset: '500' })
-    const round = manager.resolveOffsets()
-    await flush()
+    await manager.resolveOffsets()
 
-    pending[0](reply('100', 4))
-    await round
+    expect(pending).toHaveLength(0)
 
     expect(manager.uncommittedOffsets().topics[0].partitions[0]).toEqual({
       partition: '0',
@@ -94,7 +92,7 @@ describe('Consumer > OffsetManager > resolveOffsets > committed-epoch seeding', 
     // A position equal to the committed offset has not moved since the commit, so the committed
     // epoch describes it: the same seed a freshly assigned partition takes.
     const { pending, manager } = setup()
-    await manager.seek({ topic: TOPIC, partition: 0, offset: '100' })
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '99', leaderEpoch: -1 })
     const round = manager.resolveOffsets()
     await flush()
 
