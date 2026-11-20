@@ -11,7 +11,7 @@
  *     node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js \
  *       --mode smoke|rehearsal|acceptance \
  *       --expect-sha <40-hex> --matrix scripts/soak/finalSoakMatrix.json --out <artifact dir> \
- *       [--diagnostic]
+ *       [--diagnostic] [--heap-snapshots]
  *   node scripts/soak/finalSoak.js --outer-exit --out <artifact dir> --status <wait status> \
  *     --exit-wall-ms <epoch ms the wait returned>
  *   node scripts/soak/finalSoak.js --finalize --out <artifact dir> --status <wait status> \
@@ -92,6 +92,19 @@ const OFFER_HEADROOM = 0.8
 const TELEMETRY_DRAIN_MS = 15000
 /** Problems kept in the supervisor receipt; later ones are counted, not listed. */
 const MAX_PROBLEMS = 200
+/** How long a heap snapshot may take before its receipt says it timed out, a real-time bound. */
+const HEAP_SNAPSHOT_MS = 60000
+/**
+ * The processes that write heap snapshots when a run opts in, named by the client kind of their
+ * standing subject or by their role: one classic consumer, one producer, the reader (an admin
+ * client and the harness) and the decoder (no client).
+ */
+const HEAP_SNAPSHOT_KINDS = Object.freeze([
+  'classic-cooperative-dynamic',
+  'producer-transactional',
+  'reader',
+  'decoder',
+])
 
 /** @param {string} prefix @param {number} n @returns {string} a two-digit slot id */
 const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
@@ -101,8 +114,8 @@ const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
  * @param {string[]} argv arguments after the script name
  * @param {Record<string, string|undefined>} env the environment, read for `KAFKA_BROKERS`
  * @returns {object} the parsed options of the chosen command
- * @throws {Error} for an unknown mode, `--duration` outside smoke mode, `--diagnostic` in acceptance
- *   mode, a smoke
+ * @throws {Error} for an unknown mode, `--duration` outside smoke mode, `--diagnostic` or
+ *   `--heap-snapshots` in acceptance mode, a smoke
  *   length other than the matrix's, a malformed SHA, or missing brokers or output directory
  */
 function parseArgs(argv, env) {
@@ -115,6 +128,7 @@ function parseArgs(argv, env) {
     '--outer-exit',
     '--check-workload',
     '--driver-limit',
+    '--heap-snapshots',
   ]
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]
@@ -156,6 +170,8 @@ function parseArgs(argv, env) {
   }
   if (flags.diagnostic && flags.mode === 'acceptance')
     throw new Error('--diagnostic is accepted only in smoke mode or rehearsal mode')
+  if (flags['heap-snapshots'] && flags.mode === 'acceptance')
+    throw new Error('--heap-snapshots is accepted only in smoke mode or rehearsal mode')
   if (!/^[0-9a-f]{40}$/.test(flags['expect-sha'] ?? ''))
     throw new Error('--expect-sha must be a 40-hex commit')
   const brokers = (env.KAFKA_BROKERS ?? '').split(',').filter(Boolean)
@@ -169,6 +185,7 @@ function parseArgs(argv, env) {
     matrix: flags.matrix ?? MATRIX,
     out,
     diagnostic: flags.diagnostic === true,
+    heapSnapshots: flags['heap-snapshots'] === true,
   }
 }
 
@@ -177,13 +194,17 @@ function parseArgs(argv, env) {
  * seed, reader, collector/supervisor and telemetry decoder), one standing subject per kind, one
  * churn extra per churn kind in its own kind's process, the seed's single control client and the
  * observer clients (the reader's c21 and the supervisor's c22). Names follow the short profile ids
- * so every ordinary record fits its line cap.
+ * so every ordinary record fits its line cap. With `heapSnapshots` the config lists the processes
+ * that write heap snapshots (`HEAP_SNAPSHOT_KINDS`), else `heapSnapshots` is null.
  * @param {object} matrix the reviewed matrix
  * @param {{ mode: string, runId: string, treeSha: string, brokers: string[],
- *   diagnostic?: boolean }} options
+ *   diagnostic?: boolean, heapSnapshots?: boolean }} options
  * @returns {object} a config that `validateConfig` accepts
  */
-function buildConfig(matrix, { mode, runId, treeSha, brokers, diagnostic = false }) {
+function buildConfig(
+  matrix,
+  { mode, runId, treeSha, brokers, diagnostic = false, heapSnapshots = false }
+) {
   const kinds = Object.keys(matrix.clientKinds)
   const processes = kinds.map((kind, i) => ({
     slot: slotId('p', i + 1),
@@ -235,6 +256,9 @@ function buildConfig(matrix, { mode, runId, treeSha, brokers, diagnostic = false
   add('p14', 'admin', 'observer')
   add(SUPERVISOR, 'admin', 'observer')
   const topic = (role) => `fs-${runId}-${role}`
+  const snapshotSlot = (kind) =>
+    processes.find((p) => p.role === kind)?.slot ??
+    clients.find((c) => c.clientKind === kind && c.purpose === 'subject').process
   return {
     schema: matrix.schema,
     mode,
@@ -242,6 +266,7 @@ function buildConfig(matrix, { mode, runId, treeSha, brokers, diagnostic = false
     treeSha,
     brokers,
     diagnostic,
+    heapSnapshots: heapSnapshots ? HEAP_SNAPSHOT_KINDS.map(snapshotSlot) : null,
     processes: processes.map(({ kind, ...p }) => p),
     clients,
     topics: {
@@ -302,6 +327,7 @@ class Supervisor {
       treeSha: options.expectSha,
       brokers: options.brokers,
       diagnostic: options.diagnostic,
+      heapSnapshots: options.heapSnapshots,
     })
     const problems = validateConfig(this.config, this.matrix)
     if (problems.length > 0) throw new Error(`invalid config: ${problems.join('; ')}`)
@@ -326,6 +352,7 @@ class Supervisor {
     this.dockerMs = DOCKER_MS
     this.offerCapacity = valueOf(this.matrix.traffic.maxOffers)
     this.offers = 0
+    this.heapSnapshots = []
   }
 
   /**
@@ -347,11 +374,13 @@ class Supervisor {
   /**
    * @param {object} step a command's step
    * @returns {number} how long a child may take to answer it, in harness-clock ms: the teardown
-   *   allowance for the disconnect, the step's deadline plus a grace for one that has one, else a
-   *   fixed bound; the allowance, the grace and the fixed bound are real-time bounds
+   *   allowance for the disconnect, `HEAP_SNAPSHOT_MS` for a heap snapshot, the step's deadline
+   *   plus a grace for one that has one, else a fixed bound; all but the deadline are real-time
+   *   bounds
    */
   budget(step) {
     if (step.type === 'disconnect') return realSpan(this.teardownAllowanceMs())
+    if (step.type === 'heap-snapshot') return realSpan(HEAP_SNAPSHOT_MS)
     if (step.deadline !== undefined && step.deadline !== Infinity)
       return Math.max(0, step.deadline - this.clock.now()) + realSpan(COMMAND_GRACE_MS)
     return realSpan(DEFAULT_COMMAND_MS)
@@ -454,6 +483,7 @@ class Supervisor {
         `the plan expects ${expected} offers, more than ${OFFER_HEADROOM * 100}% of the core checker's capacity of ${capacity} (traffic.maxOffers)`
       )
     fs.mkdirSync(path.join(this.out, 'raw'), { recursive: true })
+    if (this.config.heapSnapshots) fs.mkdirSync(path.join(this.out, 'heap'), { recursive: true })
     for (const file of this.matrix.acceptance.archive) {
       fs.mkdirSync(path.dirname(path.join(this.out, 'archive', file)), { recursive: true })
       fs.copyFileSync(path.join(ROOT, file), path.join(this.out, 'archive', file))
@@ -550,6 +580,7 @@ class Supervisor {
       mode: this.options.mode,
       diagnostic: this.config.diagnostic,
       treeSha: this.options.expectSha,
+      heapSnapshots: this.heapSnapshots,
     }
     this.writeReceipts(run, missing)
   }
@@ -1158,8 +1189,10 @@ class Supervisor {
       // `budget` is already on the harness clock, its bounds as real-time spans.
       entry.timer = harnessWait(() => {
         const reason = `process ${slot} did not answer ${step.type} ${step.id} within ${ms} ms`
-        this.problem(reason)
-        this.abort(reason)
+        if (step.type !== 'heap-snapshot') {
+          this.problem(reason)
+          this.abort(reason)
+        }
         entry.settle(closed(reason))
       }, ms)
       this.waiting.set(id, entry)
@@ -1214,6 +1247,41 @@ class Supervisor {
   }
 
   /**
+   * Has each heap snapshot process write its snapshot of a quiet boundary, all at once, and records
+   * each receipt in the stream and the supervisor receipt. It runs once the boundary's last quiet
+   * reading is taken, so no reading sees it, and the scheduler holds work and the end of the idle
+   * window until it settles. The next periodic sample is due about ten seconds later, past the one
+   * to three seconds a snapshot stalls its process. A snapshot that fails, or is not answered
+   * within `HEAP_SNAPSHOT_MS` of real time, is recorded with its error and never fails the run.
+   * @param {string} boundary the quiet boundary
+   * @returns {Promise<void>}
+   */
+  async snapshotHeaps(boundary) {
+    const step = { type: 'heap-snapshot', id: `${boundary}s`, boundary }
+    await Promise.all(
+      this.config.heapSnapshots.map(async (slot) => {
+        const { error, reply } = await this.command(slot, step)
+        const receipt = {
+          slot,
+          boundary,
+          file: `heap/${slot}.${boundary}.heapsnapshot`,
+          at: null,
+          ms: null,
+          bytes: null,
+          ...reply,
+          error: reply?.error ?? error ?? null,
+        }
+        if (receipt.error) receipt.error = receipt.error.slice(0, 200)
+        this.heapSnapshots.push(receipt)
+        await this.collector.note(
+          `heap snapshot ${slot} ${boundary} ${receipt.error ? 'failed' : `${receipt.bytes} bytes`}`,
+          { snapshot: receipt }
+        )
+      })
+    )
+  }
+
+  /**
    * Refuses a quiet sample unless the run is quiet: every process confirmed the idle window, no
    * work step is running (one reported late included) and the run was not aborted.
    * @param {object} step the quiet step
@@ -1239,7 +1307,13 @@ class Supervisor {
     if (step.type === 'quiet') {
       this.requireQuiet(step)
       await this.sampleAll(judged, step)
-      return this.requireQuiet(step)
+      this.requireQuiet(step)
+      if (
+        this.config.heapSnapshots &&
+        step.reading === valueOf(this.matrix.sampling.quietReadings) - 1
+      )
+        this.scheduler.hold(this.snapshotHeaps(step.boundary))
+      return
     }
     if (step.type === 'seed-start' || step.type === 'seed-clear') return this.send(['p13'], step)
     if (step.type === 'disconnect') return this.teardown(step)

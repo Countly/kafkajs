@@ -46,6 +46,10 @@
 #   FINAL_SOAK_DIAGNOSTIC=1       smoke or rehearsal: a host that cannot meet the quiet-host floors (a hosted
 #                                 CI runner); preflight records those checks without failing on them
 #                                 and the artifact is marked diagnostic. Never acceptance evidence.
+#   FINAL_SOAK_HEAP_SNAPSHOTS=1   smoke or rehearsal: the selected processes write a V8 heap snapshot
+#                                 into <artifact>/heap after each quiet boundary's last reading, for
+#                                 scripts/soak/heapSnapshotReport.js; the config records them.
+#                                 Refused in acceptance mode.
 #   FINAL_SOAK_COMPANIONS         space-separated <name>=<file>[@<run url>] companions for finalize
 #   TELEMETRY_JAVA_CACHE          the pinned Java inputs of the reporter build
 #   FINAL_SOAK_STAGE_S            one limit in s for every stage after the driver, for a test of
@@ -82,6 +86,14 @@ if [[ "${FINAL_SOAK_DIAGNOSTIC:-}" == 1 ]]; then
     exit 2
   fi
   diagnostic=(--diagnostic)
+fi
+snapshots=()
+if [[ "${FINAL_SOAK_HEAP_SNAPSHOTS:-}" == 1 ]]; then
+  if [[ "$mode" == acceptance ]]; then
+    echo "FINAL_SOAK_HEAP_SNAPSHOTS is accepted only in smoke or rehearsal mode" >&2
+    exit 2
+  fi
+  snapshots=(--heap-snapshots)
 fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -308,7 +320,7 @@ limit_s="$(node scripts/soak/finalSoak.js --driver-limit --mode "$mode" --out "$
 [[ "$limit_s" =~ ^[0-9]+$ ]]
 # setsid makes the driver the leader of a new process group, which its workers join.
 nohup setsid node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode "$mode" --expect-sha "$sha" \
-  --matrix scripts/soak/finalSoakMatrix.json --out "$out" "${diagnostic[@]}" > "$out/driver.log" 2>&1 &
+  --matrix scripts/soak/finalSoakMatrix.json --out "$out" "${diagnostic[@]}" "${snapshots[@]}" > "$out/driver.log" 2>&1 &
 driver=$!
 driver_group=$driver
 # Heartbeat and watchdog. Every 60 s the heartbeat file gets the time, the stream's size and how

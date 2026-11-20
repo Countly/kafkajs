@@ -312,6 +312,8 @@ const SEED = { process: Id, client: Id, controlId: oneOf(CONTROL), mapEntries: C
  * fields beyond those listed (the diagnostic note only). A `wave` or `broker-state` carries the
  * count of its keys or partitions; each one is its own `wave-key` or `partition-state` record of
  * the same source citing it by `cause`, so no record grows with the topology past its line cap.
+ * For the same reason a sample's V8 space and code statistics are the `heap` record that follows
+ * it, citing it by `sample`.
  */
 const RECORDS = Object.freeze({
   process: {
@@ -606,6 +608,22 @@ const RECORDS = Object.freeze({
       clients: listOf(Id),
     },
   },
+  heap: {
+    fields: {
+      process: Id,
+      sample: Id,
+      spaces: type(
+        'used bytes by V8 space name',
+        (v) =>
+          isObject(v) &&
+          Object.keys(v).length <= 16 &&
+          Object.entries(v).every(
+            ([name, bytes]) => /^[a-z_]{1,32}$/.test(name) && Count.test(bytes)
+          )
+      ),
+      code: shape('code statistics', { code: Count, bytecode: Count, scripts: Count }),
+    },
+  },
   inventory: {
     fields: {
       inventory: Id,
@@ -875,6 +893,11 @@ const RULES = Object.freeze({
       'only a response has an errorCode'
     ),
   sample: (r) => sampleRules(r),
+  heap: (r) =>
+    unless(
+      r.process === r.source && r.sample.startsWith(`${r.process}.`),
+      'a heap record cites a sample of its own process'
+    ),
   inventory: (r) => [
     ...unless(r.chunks >= 1 && r.chunk < r.chunks, 'chunk is not below chunks'),
     ...unless(
@@ -1565,7 +1588,8 @@ const ClientSlot = shape('a client slot', {
  * Checks the run config's binding of every process and client slot: 16 persistent processes with
  * their arms; one standing subject of each kind alone in its own process (churn extras of the same
  * churn kind may share it); exactly one isolated seed process holding exactly one control client of
- * the seeded kind; observers only in observer processes; group, static id and telemetry per kind.
+ * the seeded kind; observers only in observer processes; group, static id and telemetry per kind;
+ * heap snapshot processes (`heapSnapshots`, absent or null when off) only outside acceptance mode.
  * Other config sections belong to the driver profile and are compared by the verifier.
  * @param {unknown} config parsed config JSON
  * @param {object} matrix a valid matrix
@@ -1651,6 +1675,13 @@ const validateConfig = (config, matrix) => {
     if (p.role === 'seed' && (hosted.length !== 1 || hosted[0].purpose !== 'control')) {
       problems.push(`config seed process ${p.slot} does not host exactly one control client`)
     }
+  }
+  const snapshots = config.heapSnapshots ?? null
+  if (snapshots !== null) {
+    if (!Array.isArray(snapshots) || !snapshots.every((slot) => processes.has(slot)))
+      problems.push('config.heapSnapshots is not null or a list of config process slots')
+    else if (config.mode === 'acceptance')
+      problems.push('config.heapSnapshots is set in acceptance mode')
   }
   for (const c of config.clients) {
     if (c.purpose === 'observer' || !matrix.clientKinds[c.clientKind].grouped) continue

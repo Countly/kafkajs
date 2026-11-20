@@ -337,7 +337,19 @@ class Scheduler {
     this.quieting = new Set()
   }
 
-  /** @returns {Promise<void>} resolves once no quiet sample is running */
+  /**
+   * Holds work steps and the end of an idle window until `work` settles, as a running quiet sample
+   * does.
+   * @param {Promise<unknown>} work @returns {void}
+   */
+  hold(work) {
+    const held = Promise.resolve(work)
+    this.quieting.add(held)
+    const release = () => this.quieting.delete(held)
+    held.then(release, release)
+  }
+
+  /** @returns {Promise<void>} resolves once no quiet sample or held work is running */
   async quietSettled() {
     while (this.quieting.size > 0) await Promise.allSettled([...this.quieting])
   }

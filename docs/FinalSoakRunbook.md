@@ -206,6 +206,22 @@ as **unattributed**, not as a client leak:
 3. Explain the retained bytes (for example with a heap snapshot from a rerun) before the FAIL is attributed to the client or to
    the driver. The verdict stays REJECTED either way; the triage decides what gets fixed.
 
+Every sample is followed by a `heap` record holding the used bytes of each non-empty V8 space and the code, bytecode and script
+sizes, so a slope can be split into old space, code and bytecode without a rerun. To name the owner, rerun a rehearsal (or a
+smoke) with `FINAL_SOAK_HEAP_SNAPSHOTS=1` (the workflow's `heap_snapshots` input). It is refused in acceptance mode and recorded
+in `config.json` (`heapSnapshots`). Right after each boundary's last quiet reading, so no K5 reading sees it, four processes write
+`heap/<slot>.<boundary>.heapsnapshot`: the classic cooperative dynamic consumer, the transactional producer, the reader and the
+decoder. Each write stalls its process for about one to three seconds and adds a file of one to one and a half times its live heap
+(20 to 35 MB for a subject), so a three-hour rehearsal adds twelve files of 300 to 400 MB in all. Each receipt (size, duration, or
+the error of a write that failed or did not answer within 60 s) is a `heap snapshot` diagnostic and is listed under
+`heapSnapshots` in `supervisor.json`. A failed snapshot never fails the run. Then run
+`node scripts/soak/heapSnapshotReport.js <artifact dir> [<slot>...]`. For each process it compares consecutive boundaries and
+prints the growth of live self bytes by owner: product (`src/`), harness (`scripts/soak/`, `testHelpers/`), `node:`
+internals, dependencies, V8 bytecode, feedback and compiled code, and unattributed. It then prints the files that grew and the
+twenty constructors or closures that grew most, each with the retainer path of one new instance. A node is owned by the
+script of its constructor or closure, else by its dominator. Growth in the V8 rows that flattens across boundaries is warm-up
+of code paths kept by `--no-flush-bytecode`. The report holds two snapshots at once, at about five times their file size each.
+
 ## 6b. A rehearsal before the day
 
 A smoke has one quiet boundary per measured process, so K5 is always INCONCLUSIVE there. A rehearsal

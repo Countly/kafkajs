@@ -551,6 +551,7 @@
     "share-settle": "actual acknowledgement request and result",
     "telemetry": "independently decoded broker reporter bytes",
     "sample": "process sampler at baseline, periodic, quiet, closed and final cuts",
+    "heap": "process sampler's V8 space and code statistics, right after each of its samples",
     "inventory": "passive weak observer synchronous cut before collection",
     "ticket": "actual ledger begin and end",
     "diagnostic": "free diagnostic note; contributes to no predicate"

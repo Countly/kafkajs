@@ -5,6 +5,7 @@
  * monitor that aborts a run on low memory or a short disk reservation.
  */
 const fs = require('node:fs')
+const v8 = require('node:v8')
 const {
   valueOf,
   harnessWait,
@@ -443,9 +444,11 @@ class SourceChannel {
 
 /**
  * Takes retained samples: a synchronous inventory cut first, then two new full collections at least
- * the GC gap apart with event-loop turns between, then the memory reading. Every reading carries its
- * GC witness; IDs and the cumulative forced count are never reused. The Timeout count leaves out the
- * harness's own live waits and bounds (`harnessWait`, `harnessBound`), so it counts only the code under test.
+ * the GC gap apart with event-loop turns between, then the memory reading and the V8 heap statistics
+ * (`heap`: the used bytes of each non-empty space, its name without `_space`, and the code and
+ * bytecode sizes). Every reading carries its GC witness; IDs and the cumulative forced count are
+ * never reused. The Timeout count leaves out the harness's own live waits and bounds
+ * (`harnessWait`, `harnessBound`), so it counts only the code under test.
  */
 class Sampler {
   /**
@@ -456,6 +459,9 @@ class Sampler {
    * @param {() => { rss: number, heapUsed: number, external: number }} [options.memory]
    * @param {() => string[]} [options.resources] active resource type names
    * @param {() => number} [options.harnessTimers] the harness's own live timers, left out of Timeout
+   * @param {() => { space_name: string, space_used_size: number }[]} [options.spaces] V8 heap
+   *   space statistics
+   * @param {() => object} [options.codeStatistics] V8 heap code statistics
    * @param {number} [options.gcGapMs] the gap between the two collections
    * @param {string} [options.process] the process slot, for GC ids
    */
@@ -467,11 +473,14 @@ class Sampler {
     // eslint-disable-next-line n/no-unsupported-features/node-builtins -- present on every supported Node; the only list of live resource types
     resources = () => process.getActiveResourcesInfo(),
     harnessTimers = liveHarnessTimers,
+    spaces = v8.getHeapSpaceStatistics,
+    codeStatistics = v8.getHeapCodeStatistics,
     gcGapMs = 100,
     process: slot = 'p00',
   }) {
     if (typeof gc !== 'function') throw new Error('sampling needs --expose-gc')
     Object.assign(this, { clock, gc, turn, memory, resources, harnessTimers, gcGapMs, slot })
+    Object.assign(this, { spaces, codeStatistics })
     this.forced = 0
   }
 
@@ -482,7 +491,8 @@ class Sampler {
    * @param {string|null} options.boundary quiet boundary
    * @param {number|null} options.reading quiet reading
    * @param {() => string} options.cut takes the inventory cut synchronously, returns its id
-   * @returns {Promise<object>} the sample fields without envelope or `process`/`clients`
+   * @returns {Promise<object>} the sample fields without envelope or `process`/`clients`, and
+   *   `heap`, the fields of the sample's `heap` record without `process` and `sample`
    */
   async read({ role, slot = null, boundary = null, reading = null, cut }) {
     const admittedAt = this.clock.now()
@@ -500,6 +510,10 @@ class Sampler {
     await this.turn()
     const [secondBeginAt, secondEndAt] = await collect()
     const { rss, heapUsed, external } = this.memory()
+    const spaces = {}
+    for (const { space_name: name, space_used_size: used } of this.spaces())
+      if (used > 0) spaces[name.replace(/_space$/, '')] = used
+    const code = this.codeStatistics()
     const counts = new Map(EXPLICIT_RESOURCES.map((type) => [type, 0]))
     for (const type of this.resources()) counts.set(type, (counts.get(type) ?? 0) + 1)
     counts.set('Timeout', counts.get('Timeout') - this.harnessTimers())
@@ -528,6 +542,14 @@ class Sampler {
         cumulativeForced: this.forced,
       },
       inventory,
+      heap: {
+        spaces,
+        code: {
+          code: code.code_and_metadata_size,
+          bytecode: code.bytecode_and_metadata_size,
+          scripts: code.external_script_source_size,
+        },
+      },
     }
   }
 }

@@ -9,6 +9,7 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
+const v8 = require('node:v8')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const { valueOf, MonotonicClock, harnessWait } = require('./finalSoakScheduler')
 const {
@@ -834,7 +835,7 @@ class ChildRuntime {
       }
       return inventory
     }
-    const reading = await this.sampler.read({ ...options, cut })
+    const { heap, ...reading } = await this.sampler.read({ ...options, cut })
     await Promise.all(sent)
     await this.reportObserverFailures()
     for (const note of notes) await this.diagnose(note)
@@ -842,13 +843,36 @@ class ChildRuntime {
       await this.diagnose(`missing-source topic id for ${this.observer.unknownTopicIds} entries`)
       this.observer.unknownTopicIds = 0
     }
-    await this.emit({
-      kind: 'sample',
-      recordId: this.nextId(),
-      process: this.slot,
-      clients,
-      ...reading,
-    })
+    const sample = this.nextId()
+    await this.emit({ kind: 'sample', recordId: sample, process: this.slot, clients, ...reading })
+    await this.emit({ kind: 'heap', recordId: this.nextId(), process: this.slot, sample, ...heap })
+  }
+
+  /**
+   * Writes a V8 heap snapshot of this process to `heap/<slot>.<boundary>.heapsnapshot` in the
+   * artifact, after any sample still running, so no reading sees the snapshot's work. The write
+   * stalls the process for its whole length. A failed write is returned, never thrown.
+   * @param {{ boundary: string }} step the heap-snapshot step
+   * @returns {Promise<{ file: string, at: number, ms: number, bytes: number|null,
+   *   error: string|null }>} the receipt: the file, when the write began on the run clock, its
+   *   real duration in ms, and the file's size or the write's error
+   */
+  heapSnapshot({ boundary }) {
+    const write = () => {
+      const file = `heap/${this.slot}.${boundary}.heapsnapshot`
+      const at = this.clock.now()
+      const began = performance.now()
+      try {
+        v8.writeHeapSnapshot(path.join(this.out, file))
+        const ms = performance.now() - began
+        return { file, at, ms, bytes: fs.statSync(path.join(this.out, file)).size, error: null }
+      } catch (e) {
+        return { file, at, ms: performance.now() - began, bytes: null, error: e.message }
+      }
+    }
+    const next = (this.sampling ?? Promise.resolve()).then(write)
+    this.sampling = next.catch(() => {})
+    return next
   }
 
   /**
@@ -867,6 +891,7 @@ class ChildRuntime {
         await this.sample({ role: 'quiet', boundary: step.boundary, reading: step.reading })
       else if (step.type === 'closed')
         await this.sample({ role: 'closed', boundary: step.boundary })
+      else if (step.type === 'heap-snapshot') reply = await this.heapSnapshot(step)
       else if (step.type === 'topic-ids')
         for (const [topic, topicId] of step.topicIds) this.setTopicId(topic, topicId)
       else if (step.type === 'disconnect') await this.stop()

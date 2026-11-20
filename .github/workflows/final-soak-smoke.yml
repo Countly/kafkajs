@@ -20,6 +20,10 @@ on:
         type: choice
         options: ['26', '24', '22']
         default: '26'
+      heap_snapshots:
+        description: Write V8 heap snapshots of four processes at each quiet boundary (diagnostic)
+        type: boolean
+        default: false
   push:
     branches: ['p11/soak-smoke*']
 permissions:
@@ -38,6 +42,7 @@ jobs:
       FINAL_SOAK_MODE: ${{ inputs.mode || 'smoke' }}
       KAFKA_VERSION: '4.4.0'
       FINAL_SOAK_DIAGNOSTIC: '1'
+      FINAL_SOAK_HEAP_SNAPSHOTS: ${{ inputs.heap_snapshots && '1' || '' }}
       FINAL_SOAK_ARTIFACTS: ${{ github.workspace }}/.tmp/final-soak
       TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
       TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache

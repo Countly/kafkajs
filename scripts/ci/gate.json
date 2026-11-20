@@ -21281,6 +21281,7 @@
         "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a inventory cuts across a consumer crash restart a cut taken after a crash restart, while the dropped run is not yet collected, holds only the restarted run and passes the stream validator; a ticket on the shared ledger names the restarted run",
         "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema a share-state entry larger than one inventory line is journalled in pieces that validate and reassemble to the held set of one entry",
         "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema entry rules judge a split entry once reassembled, not each piece",
+        "scripts/soak/__tests__/finalSoakSchema.spec.js \u203a scripts/soak/finalSoakSchema a heap record holds the used bytes of named V8 spaces and the code statistics, citing a sample of its own process",
         "src/__tests__/monotonicClock.spec.js \u203a One monotonic clock under fake timers on a long-lived worker a rebalance hook deadline is measured on the faked global clock",
         "src/__tests__/monotonicClock.spec.js \u203a One monotonic clock under fake timers on a long-lived worker the default telemetry clocks read the faked global clock and arm faked timers",
         "src/__tests__/monotonicClock.spec.js \u203a Lint forbids the imported clock in client code rejects require('node:perf_hooks') under src/",
@@ -22172,6 +22173,8 @@
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver the smoke workflow runs the runbook diagnostic on dispatch or a smoke branch push, in smoke mode unless a dispatch selects rehearsal, inside the hosted six hours",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver weak bookkeeping the observer holds only live watched receivers after thousands were collected",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver weak bookkeeping the socket registry holds only sockets not yet collected",
+        "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver heap snapshots are an opt-in of smoke and rehearsal runs, recorded in the config by client kind and process role, and refused in acceptance mode",
+        "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver each sample reads every non-empty V8 heap space and the code statistics after its second collection",
         "scripts/soak/__tests__/finalSoakEvidence.spec.js \u203a final soak collector writes a short write is continued with the rest of the chunk until every byte is in the file",
         "scripts/soak/__tests__/finalSoakEvidence.spec.js \u203a final soak collector writes a rejected write stops admission, is listed and reported at once, and never loses order",
         "scripts/soak/__tests__/finalSoakEvidence.spec.js \u203a final soak collector writes an append is acknowledged only once its bytes are in the sink, not when it is queued",
@@ -22431,6 +22434,9 @@
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a whole artifact on disk exits 1 for a smoke artifact, 2 for a usage error, and prints the report",
         "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal preflight and the sixteen-process smoke run start, connect, run every schedule step, sample and exit naturally without a broker",
         "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp speeds the harness clock only: a raw reader connection outlives a 200 ms CPU stall in its setup",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots each selected process writes its heap snapshot into the run directory only after every quiet reading of the boundary, and the sealed header binds the file",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots a heap snapshot that fails is recorded with its error and the run still ends naturally with no problem of its own",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots every sample is followed by its own heap record of V8 space and code statistics, and the stream stays valid",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on UNKNOWN_MEMBER_ID",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on FENCED_MEMBER_EPOCH",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap logs the name, type and code of each failing share heartbeat",
@@ -22471,7 +22477,9 @@
         "src/consumer/__tests__/forcedCrashAdmission.spec.js \u203a Consumer > starting again from inside a forced crash does not wait for itself a run() from a CRASH listener starts and delivers without waiting for the crash that emitted it",
         "src/consumer/__tests__/forcedCrashAdmission.spec.js \u203a Consumer > starting again from inside a forced crash does not wait for itself a connect() awaited inside restartOnFailure returns at once, so the crash policy decides and CRASH follows",
         "src/consumer/__tests__/forcedCrashAdmission.spec.js \u203a Consumer > a run that ends before its fatal deadline leaves that deadline disarmed a first round that fails after a background heartbeat answered fatally crashes with its own error, and the fatal deadline later neither delivers the loss callback nor reports a second CRASH",
-        "src/consumer/__tests__/forcedCrashAdmission.spec.js \u203a Consumer > a run that ends before its fatal deadline leaves that deadline disarmed a stop made from the fatal membership log line whose stage fails ends the fatal deadline: no CRASH and no loss callback follow it"
+        "src/consumer/__tests__/forcedCrashAdmission.spec.js \u203a Consumer > a run that ends before its fatal deadline leaves that deadline disarmed a stop made from the fatal membership log line whose stage fails ends the fatal deadline: no CRASH and no loss callback follow it",
+        "scripts/soak/__tests__/heapSnapshotReport.spec.js \u203a final soak heap report two real snapshots of a process that retained a known array name its owner file as the top growing file and constructor, with the retainer path",
+        "scripts/soak/__tests__/heapSnapshotReport.spec.js \u203a final soak heap report the command line prints the owner rows, the growing file and the constructor with its retainer path"
       ],
       "capMinutes": 85,
       "allowedSkips": [
