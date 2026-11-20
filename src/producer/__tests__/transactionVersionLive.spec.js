@@ -541,10 +541,19 @@ describeTransactionVersion('Producer > transactional seek fence (live)', () => {
     return { input, output, groupId, next, consumer, producer, requests, admin, inHandler }
   }
 
-  /** The group's committed offsets of the input topic, read from the broker, by partition. */
-  const committedOffsets = async ({ admin, groupId, input }) => {
-    const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [input] })
-    return Object.fromEntries(partitions.map(({ partition, offset }) => [partition, offset]))
+  /**
+   * The group's committed offsets of the input topic, read from the broker, by partition. A
+   * transaction's offsets become visible only once its commit marker is applied, which the
+   * coordinator does after it answers EndTxn, so the read repeats until it shows `expected`.
+   */
+  const committedOffsets = async ({ admin, groupId, input }, expected) => {
+    let offsets
+    await waitForCondition(async () => {
+      const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [input] })
+      offsets = Object.fromEntries(partitions.map(({ partition, offset }) => [partition, offset]))
+      return Object.entries(expected).every(([partition, offset]) => offsets[partition] === offset)
+    }, WAIT_BUDGET)
+    return offsets
   }
 
   /** Every value a read_committed reader sees on `topic` once it has gone quiet. */
@@ -588,7 +597,7 @@ describeTransactionVersion('Producer > transactional seek fence (live)', () => {
       })
       await transaction.commit()
 
-      const offsets = await committedOffsets(run)
+      const offsets = await committedOffsets(run, { 0: run.next, 1: '1' })
       writeEvidence(EVIDENCE, { scenario: 'seek-fence-control', cluster, offsets, ended })
       expect(ended).toEqual([{ transactionResult: true, error: null }])
       expect(offsets).toEqual({ 0: run.next, 1: '1' })
@@ -619,7 +628,7 @@ describeTransactionVersion('Producer > transactional seek fence (live)', () => {
       expect(run.requests).not.toContain('TxnOffsetCommit')
       await transaction.abort()
 
-      const offsets = await committedOffsets(run)
+      const offsets = await committedOffsets(run, { 0: '-1', 1: '-1' })
       writeEvidence(EVIDENCE, { scenario: 'seek-fence-before', cluster, offsets, ended })
       expect(ended.map(({ transactionResult }) => transactionResult)).toEqual([false])
       expect(offsets).toEqual({ 0: '-1', 1: '-1' })
@@ -663,7 +672,7 @@ describeTransactionVersion('Producer > transactional seek fence (live)', () => {
       })
       await next.commit()
 
-      const offsets = await committedOffsets(run)
+      const offsets = await committedOffsets(run, { 0: '-1', 1: '1' })
       writeEvidence(EVIDENCE, { scenario: 'seek-fence-after', cluster, offsets, ended })
       expect(ended.map(({ transactionResult }) => transactionResult)).toEqual([false, true])
       expect(offsets).toEqual({ 0: '-1', 1: '1' })
