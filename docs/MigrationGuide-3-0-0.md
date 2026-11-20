@@ -863,7 +863,7 @@ says so, `groupProtocol: 'consumer'`.
   sends epoch −1 instead, which removes the member (see "`consumer.disconnect({ leaveGroup })`
   overrides how a member leaves its group").
 
-With consumer group protocol, after a fatal heartbeat the consumer waits for in-flight handlers for up to the resolved maxPollInterval from receipt, or a shorter explicit disconnect deadline. Cleanup and crash reporting can proceed while an old handler promise is still pending. After retirement its commit and heartbeat calls fail locally with CONSUMER_STOPPING. The loss is delivered once to onPartitionsLost (or onPartitionsRevoked when lost is absent) at that deadline, without waiting for the handler.
+With consumer group protocol, after a fatal heartbeat the consumer waits for in-flight handlers for up to the resolved maxPollInterval from receipt, or a shorter explicit disconnect deadline. Cleanup and crash reporting can proceed while an old handler promise is still pending. After retirement its commit and heartbeat calls fail locally with CONSUMER_STOPPING. The loss is delivered once to onPartitionsLost (or onPartitionsRevoked when lost is absent) at that deadline, without waiting for the handler. A run started after that crash does not wait for the old handler, which can still be running: wait for it yourself if two handlers must not process one partition at once.
 
 - **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** These conditions
   will be answered the same way by every rejoin, so the consumer stops instead of looping: the group
