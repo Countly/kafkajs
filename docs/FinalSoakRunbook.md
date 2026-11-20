@@ -1,6 +1,6 @@
 # Runbook: the Apache dumps and the core checker
 
-Applies to a smoke or acceptance run of `scripts/soak/finalSoakNode.sh`. The canonical dump procedure is the driver's own
+Applies to a smoke, rehearsal or acceptance run of `scripts/soak/finalSoakNode.sh`. The canonical dump procedure is the driver's own
 `scripts/soak/finalSoakDump.js`, which `finalSoakNode.sh` runs; this page says what it must leave in the artifact, how to
 reproduce one dump by hand if ever needed, and how to run and read the checker.
 
@@ -86,6 +86,7 @@ header binds, so it never changes the sealed artifact; the workflow uploads it w
 | Mode | Verdict and checker exit status | Stage `core` |
 |---|---|---|
 | smoke | `NOT ACCEPTED`, 1 | passes; the log and job summary say "A smoke is never ACCEPTED; NOT ACCEPTED with no FAIL row is its expected verdict." |
+| rehearsal | `NOT ACCEPTED`, 1 | passes; the log says "A rehearsal is never ACCEPTED; …" as for a smoke |
 | acceptance | `ACCEPTED`, 0 | passes |
 | any | `REJECTED`, no `CORE VERDICT:` line (the checker crashed), any other pairing, or acceptance `NOT ACCEPTED` | fails: receipt `failedStage: "core"`, exit status 1 |
 
@@ -119,8 +120,8 @@ the dumps, and prints one block per row. Memory: about 86 bytes of typed arrays 
 group) plus one id string and map entry per offered id. A synthetic replay of about one day of offers (60 copies of a smoke)
 took about 15 minutes and stayed under 0.6 GiB RSS; plan for under 1 GiB RSS and tens of minutes.
 
-Verdicts: `ACCEPTED` (all seven rows PASS; a smoke cannot reach it, because K5 needs two hourly boundaries), `REJECTED` (any
-FAIL), `NOT ACCEPTED` (otherwise). Exit status 0 for ACCEPTED, 1 otherwise, 2 for a usage error.
+Verdicts: `ACCEPTED` (all seven rows PASS in an acceptance run; a smoke or a rehearsal is diagnostic and never reaches it),
+`REJECTED` (any FAIL), `NOT ACCEPTED` (otherwise). Exit status 0 for ACCEPTED, 1 otherwise, 2 for a usage error.
 
 ## 5. What each row proves
 
@@ -204,3 +205,18 @@ as **unattributed**, not as a client leak:
    during traffic differs from growth that also continues in the idle windows.
 3. Explain the retained bytes (for example with a heap snapshot from a rerun) before the FAIL is attributed to the client or to
    the driver. The verdict stays REJECTED either way; the triage decides what gets fixed.
+
+## 6b. A rehearsal before the day
+
+A smoke has one quiet boundary per measured process, so K5 is always INCONCLUSIVE there. A rehearsal
+(`finalSoakNode.sh <sha> rehearsal`) runs the first three hours of the day plan unchanged: the same hourly executions,
+outages on even hours, idle windows, quiet triplets (`h00` to `h02`) and seed timing, for 10,800,000 ms
+(`acceptance.modes.rehearsal`). The checker judges it with the day's rules: every periodic slot of its length, and K5 on its
+three boundaries with the same endpoint bound (absolute bytes, not scaled to the length, so it fails above about 1 MiB of
+sustained growth per hour instead of about 0.1 MiB on the day) and the same slope bound per minute. Its verdict is at best
+NOT ACCEPTED. `FINAL_SOAK_DIAGNOSTIC=1` is accepted, as for a smoke.
+
+On a hosted runner, dispatch the `Final soak smoke (diagnostic)` workflow with `mode: rehearsal`. A push to one of the
+workflow's smoke branches always runs a smoke. The job takes about 3.5 hours (three hours of plan, about 15 minutes of start,
+teardown, dumps, check and archive, and the upload); its runbook step is limited to 17,400 s and the job to 335 minutes,
+inside the runner's six hours. Read K5 with section 6a before the day.
