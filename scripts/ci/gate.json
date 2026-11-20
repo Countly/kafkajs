@@ -22396,7 +22396,8 @@
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a whole artifact on disk rejects an artifact without a header",
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a whole artifact on disk rejects a partial artifact that has a partial manifest and no header",
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a whole artifact on disk exits 1 for a smoke artifact, 2 for a usage error, and prints the report",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal preflight and the sixteen-process smoke run start, connect, run every schedule step, sample and exit naturally without a broker"
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal preflight and the sixteen-process smoke run start, connect, run every schedule step, sample and exit naturally without a broker",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp speeds the harness clock only: a raw reader connection outlives a 200 ms CPU stall in its setup"
       ],
       "capMinutes": 85,
       "allowedSkips": [

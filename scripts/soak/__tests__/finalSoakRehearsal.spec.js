@@ -270,4 +270,37 @@ describe('final soak rehearsal', () => {
       ws.remove()
     }
   }, 240000)
+
+  test('the warp speeds the harness clock only: a raw reader connection outlives a 200 ms CPU stall in its setup', () => {
+    // A stall the host can impose at any moment (a collection, a busy CPU) during the reader's
+    // ApiVersions exchange; its 3000 ms setup bound must stay 3000 ms of real time.
+    const script = `
+      const { MonotonicClock } = require('./scripts/soak/finalSoakScheduler')
+      const { ReaderWorker } = require('./scripts/soak/finalSoakWorkers')
+      const stall = (ms) => { const end = performance.now() + ms; while (performance.now() < end); }
+      ;(async () => {
+        const before = MonotonicClock.raw()
+        stall(20)
+        const warped = MonotonicClock.raw() - before
+        let stalled = false
+        const broker = await ReaderWorker.prototype.openBroker({ host: 'kafka1', port: 9092 }, (e) => {
+          if (e.apiKey === 18 && !stalled) { stalled = true; stall(200) }
+        })
+        await broker.disconnect()
+        process.stdout.write(JSON.stringify({ fast: warped >= 20 * ${WARP} * 0.9, stalled }))
+      })().catch((e) => { process.stdout.write(JSON.stringify({ error: e.message })) })
+    `
+    const run = spawnSync(process.execPath, ['-e', script], {
+      cwd: ROOT,
+      env: {
+        PATH: process.env.PATH,
+        KAFKA_BROKERS: BROKERS,
+        NODE_OPTIONS: `--require ${PRELOAD}`,
+        FINAL_SOAK_REHEARSAL_WARP: String(WARP),
+        FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+      },
+      encoding: 'utf8',
+    })
+    expect([run.stderr, JSON.parse(run.stdout)]).toEqual(['', { fast: true, stalled: true }])
+  }, 30000)
 })
