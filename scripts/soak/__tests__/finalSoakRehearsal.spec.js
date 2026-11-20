@@ -143,6 +143,7 @@ describe('final soak rehearsal', () => {
         ...ws.env,
         FINAL_SOAK_REHEARSAL_WARP: String(WARP),
         FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+        FINAL_SOAK_REHEARSAL_HOLDS: path.join(ws.dir, 'holds'),
       }
       const driver = await runDriver(
         [
@@ -303,6 +304,57 @@ describe('final soak rehearsal', () => {
     })
     expect([run.stderr, JSON.parse(run.stdout)]).toEqual(['', { fast: true, stalled: true }])
   }, 30000)
+
+  test('the warp runs at the real rate while the scheduler holds work: a 300 ms stall inside a hold advances every process run clock by its real length only', () => {
+    const script = `
+      const { execFileSync } = require('node:child_process')
+      const { MonotonicClock, Scheduler } = require('./scripts/soak/finalSoakScheduler')
+      const stall = (ms) => { const end = performance.now() + ms; while (performance.now() < end); }
+      ;(async () => {
+        const t0 = MonotonicClock.raw()
+        stall(100)
+        const free = MonotonicClock.raw() - t0
+        const scheduler = new Scheduler({ clock: null, perform: async () => {} })
+        let settle
+        const t1 = MonotonicClock.raw()
+        scheduler.hold(new Promise((resolve) => (settle = resolve)))
+        stall(300)
+        settle()
+        await scheduler.quietSettled()
+        const held = MonotonicClock.raw() - t1
+        const before = MonotonicClock.raw()
+        const other = Number(execFileSync(process.execPath, ['-e',
+          'process.stdout.write(String(require("./scripts/soak/finalSoakScheduler").MonotonicClock.raw()))']))
+        const after = MonotonicClock.raw()
+        process.stdout.write(JSON.stringify({
+          free: free >= 100 * ${WARP} * 0.9,
+          held: held >= 300 && held < 600 ? 'real' : held,
+          shared: before <= other && other <= after ? 'one clock' : { before, other, after },
+        }))
+      })().catch((e) => { process.stdout.write(JSON.stringify({ error: e.message })) })
+    `
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-holds-'))
+    try {
+      const run = spawnSync(process.execPath, ['-e', script], {
+        cwd: ROOT,
+        env: {
+          PATH: process.env.PATH,
+          KAFKA_BROKERS: BROKERS,
+          NODE_OPTIONS: `--require ${PRELOAD}`,
+          FINAL_SOAK_REHEARSAL_WARP: String(WARP),
+          FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+          FINAL_SOAK_REHEARSAL_HOLDS: path.join(dir, 'holds'),
+        },
+        encoding: 'utf8',
+      })
+      expect([run.stderr, JSON.parse(run.stdout)]).toEqual([
+        '',
+        { free: true, held: 'real', shared: 'one clock' },
+      ])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30000)
 })
 
 describe('final soak rehearsal heap snapshots', () => {
@@ -337,6 +389,7 @@ describe('final soak rehearsal heap snapshots', () => {
       ...run.ws.env,
       FINAL_SOAK_REHEARSAL_WARP: String(WARP),
       FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+      FINAL_SOAK_REHEARSAL_HOLDS: path.join(run.ws.dir, 'holds'),
     }
     run.driver = await runDriver(
       [
