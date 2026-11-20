@@ -1,4 +1,16 @@
-const { advanceUntil, deferred, settled, start, teardown } = require('./fixtures/scriptedConsumer')
+const Runner = require('../runner')
+const ConsumerGroup = require('../consumerGroup')
+const { createLogger, LEVELS } = require('../../loggers')
+const {
+  advanceUntil,
+  buildConsumer,
+  deferred,
+  groupAuthorization,
+  settled,
+  start,
+  target,
+  teardown,
+} = require('./fixtures/scriptedConsumer')
 
 beforeEach(() => jest.useFakeTimers())
 afterEach(async () => {
@@ -160,5 +172,78 @@ describe('Consumer > starting again from inside a forced crash does not wait for
 
     expect(order).toEqual(['loss:start', 'loss:end', 'policy', 'CRASH'])
     expect(run.crashes.map(({ restart }) => restart)).toEqual([false])
+  })
+})
+
+describe('Consumer > a run that ends before its fatal deadline leaves that deadline disarmed', () => {
+  it('a first round that fails after a background heartbeat answered fatally crashes with its own error, and the fatal deadline later neither delivers the loss callback nor reports a second CRASH', async () => {
+    const order = []
+    const failure = new Error('first round failed')
+    const fatal = deferred()
+    const runInitialRound = Runner.prototype.runInitialRound
+    jest.spyOn(Runner.prototype, 'runInitialRound').mockImplementationOnce(async function () {
+      await runInitialRound.call(this)
+      await fatal.promise
+      throw failure
+    })
+    const { consumer, state, crashes } = buildConsumer({ maxPollInterval: 4000 })
+    let armed = false
+    state.answer = (req) => {
+      if (req.memberEpoch === 0) return target(1, { 'topic-a': [0] })
+      if (!armed) return target(req.memberEpoch, null)
+      armed = false
+      fatal.resolve()
+      throw groupAuthorization()
+    }
+    await consumer.subscribe({ topic: 'topic-a' })
+    const started = settled(
+      consumer.run({
+        eachMessage: async () => {},
+        rebalanceListener: {
+          onPartitionsAssigned: async () => {
+            armed = true
+          },
+          onPartitionsLost: async () => order.push('loss'),
+        },
+      })
+    )
+    await advanceUntil(() => started.done && crashes.length > 0, 2000)
+    await jest.advanceTimersByTimeAsync(6000)
+    const end = settled(consumer.disconnect())
+    await advanceUntil(() => end.done, 500)
+
+    expect(crashes.map(({ error }) => error)).toEqual([failure])
+    expect(order).toEqual([])
+    expect(end).toEqual({ done: true, value: undefined })
+  })
+
+  it('a stop made from the fatal membership log line whose stage fails ends the fatal deadline: no CRASH and no loss callback follow it', async () => {
+    const order = []
+    const ref = {}
+    let stopped = null
+    const logger = createLogger({
+      level: LEVELS.ERROR,
+      logCreator:
+        () =>
+        ({ log }) => {
+          if (stopped || !log.message.includes('failed fatally')) return
+          stopped = settled(ref.consumer.stop())
+        },
+    })
+    jest
+      .spyOn(ConsumerGroup.prototype, 'closeFetchSessions')
+      .mockImplementationOnce(async () => Promise.reject(new Error('stage failed')))
+    const run = await start({
+      logger,
+      hook: { onPartitionsLost: async () => order.push('loss') },
+      eachMessage: async () => {},
+    })
+    ref.consumer = run.consumer
+    run.arm()
+    await advanceUntil(() => stopped?.done, 2000)
+    await jest.advanceTimersByTimeAsync(run.faultAt() + 6000 - Date.now())
+
+    expect(stopped).toEqual({ done: true, value: undefined })
+    expect([order, run.crashes]).toEqual([[], []])
   })
 })
