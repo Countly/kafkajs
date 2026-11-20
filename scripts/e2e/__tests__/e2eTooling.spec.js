@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('aa4bdd901df3980ba0e93f76659e8a7ff180e532019632ffcd1f8147a54eb56f')
+    expect(digest(file)).toBe('8140de34b9682909a40757275e755053a0af954e858ba1f1a40fc72fdadefab4')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
