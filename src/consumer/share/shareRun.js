@@ -344,7 +344,8 @@ class ShareRun {
    *   rest is retried by the manager's chain under the membership's backoff.
    */
   onHeartbeatError(error) {
-    this.options.logger.warn('Share heartbeat failed', { error: error.message })
+    const { message, name, type, code } = error
+    this.options.logger.warn('Share heartbeat failed', { error: message, name, type, code })
   }
 
   /**
