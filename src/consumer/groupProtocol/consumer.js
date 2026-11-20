@@ -27,6 +27,7 @@ const {
   joinDeadlineError,
   unsupportedConsumerProtocolError,
   isConsumerProtocolFatal,
+  isFatalTopicError,
   stampHeartbeatFatal,
   REBALANCE_PATHS,
 } = require('../rebalanceErrorContract')
@@ -107,9 +108,6 @@ const INVALID_REGEX_PREFIX = 'Invalid RE2J SubscriptionPattern provided in the c
  * settles before the round awaits from reaching the process as unhandled without swallowing it.
  * @returns {{ promise: Promise<void>, resolve: () => void, reject: (e: Error) => void }}
  */
-/** Topic errors for an id of the member's own target that stop its run, as for a named target. */
-const FATAL_TOPIC_ERRORS = ['INVALID_TOPIC_EXCEPTION', 'TOPIC_AUTHORIZATION_FAILED']
-
 const deferred = () => {
   let resolve
   let reject
@@ -836,9 +834,10 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * Remembers what resolved and what did not.
+   * Remembers what resolved, what did not and what is held.
    * @private
-   * @param {{ byTopicId: Map<string, number[]>, names: string[], unresolved: string[] }} resolved
+   * @param {{ byTopicId: Map<string, number[]>, names: string[], unresolved: string[],
+   *   held: Array<[string, string]> }} resolved a `resolveFromCache` result
    * @returns {boolean} whether a name resolved that had not resolved before
    */
   recordResolution(resolved) {
@@ -858,12 +857,12 @@ module.exports = class ConsumerGroupProtocol {
       this.unresolvedTopicIds.add(topicId)
     }
 
-    for (const [topicId, name] of resolved.held || []) {
+    for (const [topicId, name] of resolved.held) {
       this.assignedTopicNames.set(topicId, name)
       this.unresolvedTopicIds.delete(topicId)
       this.unresolvedAttempts.delete(topicId)
     }
-    this.holdsTopics = (resolved.held || []).length > 0
+    this.holdsTopics = resolved.held.length > 0
 
     return grew
   }
@@ -931,7 +930,7 @@ module.exports = class ConsumerGroupProtocol {
           )
         }
       } catch (error) {
-        if (isCurrent() && FATAL_TOPIC_ERRORS.includes(error?.type)) throw error
+        if (isCurrent() && isFatalTopicError(error)) throw error
         if (isCurrent())
           this.logger.debug('Could not refresh metadata for the assigned topic ids', {
             groupId: this.groupId,
@@ -1466,7 +1465,8 @@ module.exports = class ConsumerGroupProtocol {
       )
       this.acknowledge()
     } else if (converged) {
-      if (wasReconciling || wasJoining) {
+      // An apply still running stays RECONCILING, so its `setOwned` acknowledges what it applied.
+      if ((wasReconciling && this.pendingResolved == null) || wasJoining) {
         this.transitionTo(STABLE)
       }
     } else {
@@ -1511,7 +1511,7 @@ module.exports = class ConsumerGroupProtocol {
     this.refreshMetadataForTopicIds(topicIds, { periodic })
       .then(() => this.onTopicIdsRefreshed(topicIds, isCurrent))
       .catch((error) => {
-        if (isCurrent() && FATAL_TOPIC_ERRORS.includes(error?.type)) {
+        if (isCurrent() && isFatalTopicError(error)) {
           this.transitionToFatal(error)
           this.requestRejoinForAssignmentChange()
           return
@@ -1646,7 +1646,7 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     if (error.name === 'KafkaJSInvariantViolation') {
-      // This client's own bug, raised from inside the response handling. Backing off and dropping
+      // This client's own bug, raised on the request path. Backing off and dropping
       // the coordinator would treat a defect that recurs on every heartbeat as a network problem.
       return error
     }

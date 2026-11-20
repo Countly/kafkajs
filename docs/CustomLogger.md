@@ -10,7 +10,7 @@ The logger is customized using log creators. A log creator is a function which r
 - `label` is a text representation of the log level, example: 'INFO'.
 - `log` is an object with the following keys: `timestamp`, `logger`, `message`, and the extra keys given by the user. (`logger.info('test', { extra_data: true })`)
 
-The log function is called synchronously. If it throws, the client discards that line and continues; the error never reaches the code that logged. The log creator itself is called once when the client is created, and an error it throws still fails client creation. A promise returned by the log function is not awaited.
+The log function is called synchronously. If it throws, the client discards that line and continues; the error never reaches the code that logged. The log creator itself is called once when the client is created, and an error it throws still fails client creation. A promise returned by the log function is not awaited, and its rejection is discarded.
 
 ```javascript
 {

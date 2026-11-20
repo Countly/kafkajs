@@ -92,7 +92,7 @@ describe('share poll recovery and the shared heartbeat scheduler', () => {
     return { beat, joinsBefore }
   }
 
-  test('a tick the share recovery requests while the old heartbeat is held sends one join when that heartbeat settles, then one cadence', async () => {
+  test('a tick the share recovery requests while the old heartbeat is held still sends one join when that heartbeat settles, then one cadence', async () => {
     const { joinsBefore } = await recoverUnderHeldBeat()
 
     expect(joins()).toBe(joinsBefore + 1)
@@ -105,7 +105,7 @@ describe('share poll recovery and the shared heartbeat scheduler', () => {
     expect(epochs().at(-1)).toBeGreaterThan(0)
   })
 
-  test('a terminal shutdown after the request and before the old heartbeat settles sends nothing more', async () => {
+  test('a terminal shutdown after the request and before the old heartbeat settles still sends nothing more', async () => {
     let sent = 0
     await recoverUnderHeldBeat((current) => {
       current.manager.shutdown()

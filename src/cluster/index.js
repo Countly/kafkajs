@@ -3,7 +3,7 @@ const { checked, waitOf, shareMetadata, retrierOf, sharedSetup } = require('../a
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
-const { joinDeadlineError } = require('../consumer/rebalanceErrorContract')
+const { joinDeadlineError, isFatalTopicError } = require('../consumer/rebalanceErrorContract')
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
@@ -55,14 +55,12 @@ const PER_TOPIC_METADATA_ERRORS = [
  */
 const isPerTopicError = (e) => PER_TOPIC_METADATA_ERRORS.includes(e.type)
 
-/** Topic errors a consumer's own target cannot outlive: they stop its run. */
-const FATAL_TOPIC_ERRORS = ['INVALID_TOPIC_EXCEPTION', 'TOPIC_AUTHORIZATION_FAILED']
 /**
  * @param {Error} e
  * @param {boolean} surface whether the caller asked for fatal topic errors
  * @returns {boolean}
  */
-const surfaced = (e, surface) => surface && FATAL_TOPIC_ERRORS.includes(e?.type)
+const surfaced = (e, surface) => surface && isFatalTopicError(e)
 
 /** A broker was asked by id and its answer reached the metadata cache. */
 const RESOLVED = 'resolved'
