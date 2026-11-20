@@ -1,13 +1,15 @@
 'use strict'
 /**
  * Final soak driver: runs the reviewed matrix's twelve real client kinds, the isolated interning
- * seed and the observer processes for one exactly timed smoke or 24-hour acceptance run, and writes
+ * seed and the observer processes for one exactly timed smoke, rehearsal or 24-hour acceptance run,
+ * and writes
  * the schema-3 artifact the independent verifier judges. It judges nothing itself.
  *
  * Usage (the runbook `finalSoakNode.sh <sha> <mode>` is the normal entry point):
  *
  *   KAFKA_BROKERS=localhost:19092,localhost:19095,localhost:19098 \
- *     node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js --mode smoke|acceptance \
+ *     node --expose-gc --no-flush-bytecode scripts/soak/finalSoak.js \
+ *       --mode smoke|rehearsal|acceptance \
  *       --expect-sha <40-hex> --matrix scripts/soak/finalSoakMatrix.json --out <artifact dir> \
  *       [--diagnostic]
  *   node scripts/soak/finalSoak.js --outer-exit --out <artifact dir> --status <wait status> \
@@ -22,9 +24,11 @@
  * has. The outer observer (the runbook) witnesses that exit at once with `--outer-exit`, then runs
  * `--finalize`, which appends the parent-observed supervisor exit, hashes every file and writes
  * `header.json`; without a supervisor receipt it writes a partial manifest naming what is absent. `--duration` is
- * accepted only in smoke mode, where the matrix fixes its length. `--diagnostic` (smoke only) marks
- * a run on a host that does not meet the quiet-host floors, such as a hosted CI runner; such a run
- * proves only that the driver works against a live cluster. The modules it is split into
+ * accepted only in smoke mode, where the matrix fixes its length. A rehearsal runs the first hours
+ * of the day plan unchanged (the matrix fixes how many), so the heap row has several quiet
+ * boundaries to judge before the day; like a smoke it is never acceptance evidence. `--diagnostic`
+ * (smoke or rehearsal) marks a run on a host that does not meet the quiet-host floors, such as a
+ * hosted CI runner; such a run proves only that the driver works against a live cluster. The modules it is split into
  * (scheduler, collector, observer, workers) are archived with it.
  */
 const crypto = require('node:crypto')
@@ -95,7 +99,8 @@ const slotId = (prefix, n) => `${prefix}${String(n).padStart(2, '0')}`
  * @param {string[]} argv arguments after the script name
  * @param {Record<string, string|undefined>} env the environment, read for `KAFKA_BROKERS`
  * @returns {object} the parsed options of the chosen command
- * @throws {Error} for an unknown mode, `--duration` or `--diagnostic` outside smoke mode, a smoke
+ * @throws {Error} for an unknown mode, `--duration` outside smoke mode, `--diagnostic` in acceptance
+ *   mode, a smoke
  *   length other than the matrix's, a malformed SHA, or missing brokers or output directory
  */
 function parseArgs(argv, env) {
@@ -137,8 +142,8 @@ function parseArgs(argv, env) {
   if (flags['check-workload']) return { command: 'check-workload', out }
   if (flags.summary) return { command: 'summary', out }
   if (flags.child) return { command: 'child', child: flags.child, out }
-  if (!['smoke', 'acceptance'].includes(flags.mode))
-    throw new Error('--mode must be smoke or acceptance')
+  if (!['smoke', 'rehearsal', 'acceptance'].includes(flags.mode))
+    throw new Error('--mode must be smoke, rehearsal or acceptance')
   const matrix = JSON.parse(fs.readFileSync(path.resolve(ROOT, flags.matrix ?? MATRIX), 'utf8'))
   if (flags['driver-limit']) return { command: 'driver-limit', mode: flags.mode, matrix }
   const fixed = valueOf(matrix.acceptance.modes[flags.mode].requestedMs)
@@ -147,8 +152,8 @@ function parseArgs(argv, env) {
     if (Number(flags.duration) !== fixed)
       throw new Error(`the smoke length is fixed at ${fixed} ms`)
   }
-  if (flags.diagnostic && flags.mode !== 'smoke')
-    throw new Error('--diagnostic is accepted only in smoke mode')
+  if (flags.diagnostic && flags.mode === 'acceptance')
+    throw new Error('--diagnostic is accepted only in smoke mode or rehearsal mode')
   if (!/^[0-9a-f]{40}$/.test(flags['expect-sha'] ?? ''))
     throw new Error('--expect-sha must be a 40-hex commit')
   const brokers = (env.KAFKA_BROKERS ?? '').split(',').filter(Boolean)
@@ -2052,7 +2057,7 @@ async function summarize({ out }) {
  * readiness barrier (`DRIVER_START_MS`), the planned window, the teardown step and the wait for
  * the children's exits (each the mode's teardown allowance), the kill wait and the four bounded
  * finish steps.
- * @param {object} matrix the reviewed matrix @param {'smoke'|'acceptance'} mode
+ * @param {object} matrix the reviewed matrix @param {'smoke'|'rehearsal'|'acceptance'} mode
  * @returns {number} milliseconds
  */
 function driverLimitMs(matrix, mode) {
@@ -2072,7 +2077,7 @@ function driverLimitMs(matrix, mode) {
  * less its idle windows), whole transactions in that time, the probes of every regex (one probe)
  * and recreation (two) step, one recovery offer per non-transactional producer and outage, and
  * the closing record.
- * @param {object} matrix the reviewed matrix @param {'smoke'|'acceptance'} mode
+ * @param {object} matrix the reviewed matrix @param {'smoke'|'rehearsal'|'acceptance'} mode
  * @returns {{ expected: number, capacity: number }}
  */
 function offerPlan(matrix, mode) {

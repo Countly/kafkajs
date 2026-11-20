@@ -1,13 +1,20 @@
 name: Final soak smoke (diagnostic)
-# Runs the final soak runbook in smoke mode against the repository's three-broker Kafka 4.4.0
-# telemetry Compose cluster on a hosted runner. Diagnostic only: a hosted runner cannot meet the
-# quiet-host floors, so preflight records those checks without failing on them and the artifact is
-# marked diagnostic. It closes no evidence row and gates nothing; it is how the driver's live parts
+# Runs the final soak runbook in smoke mode (or, when a dispatch selects it, rehearsal mode: the
+# first three hours of the day plan, so the heap row is judged on three quiet boundaries) against
+# the repository's three-broker Kafka 4.4.0 telemetry Compose cluster on a hosted runner. A smoke
+# job takes about 35 minutes, a rehearsal about 3.5 hours. Diagnostic only: a hosted runner cannot
+# meet the quiet-host floors, so preflight records those checks without failing on them and the
+# artifact is marked diagnostic. It closes no evidence row and gates nothing; it is how the driver's live parts
 # get exercised against a real cluster. A push to a branch named p11/soak-smoke* runs it with every
 # default, since a dispatch-only workflow must first exist on the default branch.
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Run mode (smoke 30 min; rehearsal 3 h of the day plan)
+        type: choice
+        options: ['smoke', 'rehearsal']
+        default: 'smoke'
       node:
         description: Node.js major version
         type: choice
@@ -23,10 +30,12 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    # The runbook needs the 30 min smoke window, the matrix's 15 min teardown allowance, setup and a
-    # cleanup grace after a timeout; the job limit covers every step's own limit.
-    timeout-minutes: 100
+    # The runbook step's limit is the mode's window, the matrix's 15 min teardown allowance, setup,
+    # dumps, check and archive, and a cleanup grace after a timeout; the job limit covers every
+    # step's own limit and stays inside a hosted runner's six hours.
+    timeout-minutes: 335
     env:
+      FINAL_SOAK_MODE: ${{ inputs.mode || 'smoke' }}
       KAFKA_VERSION: '4.4.0'
       FINAL_SOAK_DIAGNOSTIC: '1'
       FINAL_SOAK_ARTIFACTS: ${{ github.workspace }}/.tmp/final-soak
@@ -49,9 +58,15 @@ jobs:
       - name: Pull the broker image
         timeout-minutes: 4
         run: timeout -k 5s 210s docker pull "apache/kafka:$KAFKA_VERSION"
-      - name: Run the smoke runbook
-        timeout-minutes: 75
-        run: timeout -k 120s 4200s bash scripts/soak/finalSoakNode.sh "$(git rev-parse HEAD)" smoke
+      - name: Run the soak runbook
+        timeout-minutes: 295
+        run: |
+          case "$FINAL_SOAK_MODE" in
+            smoke) limit=4200 ;;
+            rehearsal) limit=17400 ;;
+            *) echo "unknown mode $FINAL_SOAK_MODE" >&2; exit 2 ;;
+          esac
+          timeout -k 120s "${limit}s" bash scripts/soak/finalSoakNode.sh "$(git rev-parse HEAD)" "$FINAL_SOAK_MODE"
       - name: Print the runbook receipt and the driver summary
         if: always()
         timeout-minutes: 2
@@ -70,10 +85,10 @@ jobs:
         run: docker compose -p kafkajs -f docker-compose.telemetry.yml down --volumes || true
       - name: Upload the artifact
         if: always()
-        timeout-minutes: 5
+        timeout-minutes: 15
         uses: actions/upload-artifact@v4
         with:
-          name: final-soak-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          name: final-soak-${{ env.FINAL_SOAK_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             .tmp/final-soak/
           if-no-files-found: error

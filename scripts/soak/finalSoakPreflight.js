@@ -6,7 +6,7 @@
  *
  * Usage:
  *   KAFKA_BROKERS=... TELEMETRY_EVIDENCE_DIR=... node scripts/soak/finalSoakPreflight.js \
- *     --expect-sha <40-hex> --mode smoke|acceptance --out <artifact dir> [--diagnostic]
+ *     --expect-sha <40-hex> --mode smoke|rehearsal|acceptance --out <artifact dir> [--diagnostic]
  *   TELEMETRY_JAVA_CACHE=... node scripts/soak/finalSoakPreflight.js --prepare-reporter --out <artifact dir>
  *
  * Checks: Node 22, 24 or 26 on Linux with a boot id; dependencies installed by `npm ci`; a clean
@@ -17,7 +17,7 @@
  * cluster); the prepared reporter's file cap, mounted jar digest and the cap each broker's load proof
  * reports; a quiet host (no agent or test
  * process), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
- * only, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
+ * or rehearsal, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
  * fail the preflight, and the record says so; such a run is never acceptance evidence.
  */
 const crypto = require('node:crypto')
@@ -52,15 +52,16 @@ class Preflight {
   /**
    * @param {object} options
    * @param {string} options.sha the expected candidate commit
-   * @param {string} options.mode smoke or acceptance
+   * @param {string} options.mode smoke, rehearsal or acceptance
    * @param {object} options.matrix the reviewed matrix
    * @param {() => Promise<object>} [options.read] gathers the facts; the live gatherer by default
-   * @param {boolean} [options.diagnostic] smoke only: host-capacity misses are recorded, not failed
-   * @throws {Error} for a diagnostic preflight outside smoke mode
+   * @param {boolean} [options.diagnostic] smoke or rehearsal: host-capacity misses are recorded,
+   *   not failed
+   * @throws {Error} for a diagnostic acceptance preflight
    */
   constructor({ sha, mode, matrix, read, diagnostic = false }) {
-    if (diagnostic && mode !== 'smoke')
-      throw new Error('--diagnostic is accepted only in smoke mode')
+    if (diagnostic && mode === 'acceptance')
+      throw new Error('--diagnostic is accepted only in smoke mode or rehearsal mode')
     this.sha = sha
     this.mode = mode
     this.matrix = matrix

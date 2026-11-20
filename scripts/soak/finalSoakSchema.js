@@ -122,11 +122,17 @@ const SEED_TIMING = Object.freeze({
     clears: 'after-only-quiet-triplet-before-disconnect',
     sensitivity: 'report-only',
   },
+  rehearsal: {
+    starts: 'after-first-quiet-triplet',
+    clears: 'after-last-quiet-triplet-before-disconnect',
+    sensitivity: 'report-only',
+  },
 })
 
 const COMPANIONS = Object.freeze(['natural-exit', 'consume-retention', 'prior-checkpoints'])
 const CONTROL = 'interning-seeded'
-const MODES = Object.freeze(['smoke', 'acceptance'])
+/** The run modes: smoke and rehearsal are diagnostic and never ACCEPTED; acceptance is the day. */
+const MODES = Object.freeze(['smoke', 'rehearsal', 'acceptance'])
 const PROCESS_ROLES = Object.freeze(['subject', 'seed', 'reader', 'collector', 'decoder'])
 const SAMPLE_ROLES = Object.freeze(['baseline', 'periodic', 'quiet', 'closed', 'final'])
 const REQUIRED_FLAGS = Object.freeze(['--expose-gc', '--no-flush-bytecode'])
@@ -1390,6 +1396,11 @@ const validateMatrix = (matrix) => {
       problems.push(
         'matrix.schedule.smoke.periodicSlots does not cover the smoke at the sample period'
       )
+    const rehearsalHours = acceptance.modes.rehearsal.requestedMs.value / schedule.hourMs
+    if (!(Number.isInteger(rehearsalHours) && rehearsalHours >= 3))
+      problems.push(
+        'matrix.acceptance.modes.rehearsal.requestedMs is not a whole number of hours, at least three'
+      )
     if (sampling.gcCollections.value !== 2) problems.push('matrix.sampling.gcCollections is not 2')
     if (
       (schedule.smoke.abortAtTransaction - 1) * matrix.traffic.transactionEveryMs.value >=
@@ -1457,7 +1468,8 @@ const topologyProblems = (topology, kinds) => {
 /**
  * Checks the single isolated seed control, including its fixed per-mode timing: the day starts the
  * map after the first quiet triplet and requires sensitivity; the smoke starts it after the
- * baseline before traffic and only reports growth.
+ * baseline before traffic and only reports growth; the rehearsal times it as the day does and only
+ * reports growth.
  * @param {object} controls
  * @param {object} kinds
  * @returns {string[]}
@@ -1534,7 +1546,7 @@ const validateConfig = (config, matrix) => {
   const runIdOk = isString(config.runId) && /^[0-9a-f]{12}$/.test(config.runId)
   const problems = [
     ...unless(config.schema === SCHEMA_VERSION, `config.schema is not ${SCHEMA_VERSION}`),
-    ...unless(MODES.includes(config.mode), 'config.mode is not smoke or acceptance'),
+    ...unless(MODES.includes(config.mode), 'config.mode is not smoke, rehearsal or acceptance'),
     ...unless(runIdOk, 'config.runId is not 12 hex digits'),
   ]
   if (!Array.isArray(config.processes) || !config.processes.every(ProcessSlot.test)) {

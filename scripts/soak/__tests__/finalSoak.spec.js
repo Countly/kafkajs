@@ -1107,7 +1107,7 @@ describe('final soak driver', () => {
       expect(result.stderr).toBe('')
       expect(result.status).toBe(0)
       const calls = harness.calls()
-      expect(calls.find((c) => c.includes('finalSoakPreflight.js'))).toMatch(
+      expect(calls.find((c) => c.includes('finalSoakPreflight.js --expect-sha'))).toMatch(
         /--mode rehearsal --out \S+ --diagnostic$/
       )
       expect(calls.find((c) => c.includes('--expose-gc'))).toMatch(

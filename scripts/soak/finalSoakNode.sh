@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Final soak runbook: one smoke or 24-hour acceptance run on this host, on the frozen candidate.
+# Final soak runbook: one smoke, rehearsal or 24-hour acceptance run on this host, on the frozen
+# candidate. A rehearsal runs the first hours of the day plan (the matrix fixes how many), so the
+# core checker judges the heap row on several quiet boundaries before the day; like a smoke it is
+# diagnostic and never ACCEPTED.
 #
-#   scripts/soak/finalSoakNode.sh <40-hex sha> <smoke|acceptance>
+#   scripts/soak/finalSoakNode.sh <40-hex sha> <smoke|rehearsal|acceptance>
 #
 # Pause every other agent and test on the host first; preflight fails on a busy host. Steps:
 # checkout of <sha> (detached), `npm ci --ignore-scripts`, reporter preparation with the run's file
@@ -16,8 +19,8 @@
 # exits, an abort or an incomplete source fails at stage `workload`, after sealing; the core checker
 # still judges it into <artifact>.core.txt for diagnosis, never changing the failed status. A passed
 # workload check is followed by stage `core`: the same checker run, failing on REJECTED, on no
-# verdict, or on an acceptance run that is not ACCEPTED; a smoke is never ACCEPTED, so its NOT
-# ACCEPTED passes.
+# verdict, or on an acceptance run that is not ACCEPTED; a smoke or a rehearsal is never ACCEPTED,
+# so its NOT ACCEPTED passes.
 #
 # The driver runs in its own process group with its workers, under a watchdog on the host's
 # monotonic clock: past its limit (`finalSoak.js --driver-limit`: the planned window plus its start,
@@ -40,13 +43,13 @@
 #
 # Environment:
 #   FINAL_SOAK_ARTIFACTS          artifact root ($HOME/final-soak by default)
-#   FINAL_SOAK_DIAGNOSTIC=1       smoke only: a host that cannot meet the quiet-host floors (a hosted
+#   FINAL_SOAK_DIAGNOSTIC=1       smoke or rehearsal: a host that cannot meet the quiet-host floors (a hosted
 #                                 CI runner); preflight records those checks without failing on them
 #                                 and the artifact is marked diagnostic. Never acceptance evidence.
 #   FINAL_SOAK_COMPANIONS         space-separated <name>=<file>[@<run url>] companions for finalize
 #   TELEMETRY_JAVA_CACHE          the pinned Java inputs of the reporter build
-#   FINAL_SOAK_STAGE_S            one limit in s for every stage after the driver, for a rehearsal
-#                                 (the per-stage limits below by default)
+#   FINAL_SOAK_STAGE_S            one limit in s for every stage after the driver, for a test of
+#                                 this script (the per-stage limits below by default)
 #
 # What a green run does not prove (the core checker's seven rows are the verdict; these are outside it):
 # - The share drain proves delivery (every offset below the end had a handler entry) and quiescence
@@ -64,8 +67,8 @@ set -euo pipefail
 
 sha="${1:-}"
 mode="${2:-}"
-if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$mode" != smoke && "$mode" != acceptance ]]; then
-  echo "usage: $0 <40-hex sha> <smoke|acceptance>" >&2
+if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$mode" != smoke && "$mode" != rehearsal && "$mode" != acceptance ]]; then
+  echo "usage: $0 <40-hex sha> <smoke|rehearsal|acceptance>" >&2
   exit 2
 fi
 if [[ -n "${FINAL_SOAK_SUPPLIED_BROKERS:-}" ]]; then
@@ -74,8 +77,8 @@ if [[ -n "${FINAL_SOAK_SUPPLIED_BROKERS:-}" ]]; then
 fi
 diagnostic=()
 if [[ "${FINAL_SOAK_DIAGNOSTIC:-}" == 1 ]]; then
-  if [[ "$mode" != smoke ]]; then
-    echo "FINAL_SOAK_DIAGNOSTIC is accepted only in smoke mode" >&2
+  if [[ "$mode" == acceptance ]]; then
+    echo "FINAL_SOAK_DIAGNOSTIC is accepted only in smoke or rehearsal mode" >&2
     exit 2
   fi
   diagnostic=(--diagnostic)
@@ -368,20 +371,20 @@ fi
 stage=workload
 bounded workload node scripts/soak/finalSoak.js --check-workload --out "$out"
 # The core checker judges the sealed artifact. Its report goes beside the receipt, outside the
-# directory the header binds. A smoke is never ACCEPTED (its heap row needs two hourly boundaries),
-# so NOT ACCEPTED, which has no FAIL row, is the smoke's expected verdict; REJECTED, no verdict at
-# all, or an acceptance run that is not ACCEPTED fails here.
+# directory the header binds. A smoke or a rehearsal is never ACCEPTED (both are diagnostic), so NOT
+# ACCEPTED, which has no FAIL row, is its expected verdict; REJECTED, no verdict at all, or an
+# acceptance run that is not ACCEPTED fails here.
 stage=core
 run_core
 verdict="$(sed -n '1s/^CORE VERDICT: \([A-Z ]*[A-Z]\).*/\1/p' "$out.core.txt")"
 note="core checker verdict: ${verdict:-none} (exit status $core_status), report $out.core.txt"
-if [[ "$mode" == smoke ]]; then note="$note. A smoke is never ACCEPTED; NOT ACCEPTED with no FAIL row is its expected verdict."; fi
+if [[ "$mode" != acceptance ]]; then note="$note. A $mode is never ACCEPTED; NOT ACCEPTED with no FAIL row is its expected verdict."; fi
 echo "$note"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   printf '### Final soak core checker\n\n%s\n\n```\n%s\n```\n' "$note" "$(cat "$out.core.txt")" >> "$GITHUB_STEP_SUMMARY"
 fi
 case "$mode:$verdict:$core_status" in
-  acceptance:ACCEPTED:0 | "smoke:NOT ACCEPTED:1") ;;
+  acceptance:ACCEPTED:0 | "smoke:NOT ACCEPTED:1" | "rehearsal:NOT ACCEPTED:1") ;;
   *) exit 1 ;;
 esac
 stage=done

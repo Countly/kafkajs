@@ -7,8 +7,9 @@
  *   K5 heap                K6 resources            K7 exit and completeness
  *
  * Each row is PASS, FAIL or INCONCLUSIVE with the numbers behind it; the overall verdict is
- * ACCEPTED only when all seven PASS, which a smoke run cannot reach (K5 needs two hourly
- * boundaries). Every other contract row is printed as NOT JUDGED with the CI lane that covers it.
+ * ACCEPTED only when all seven PASS in an acceptance run. A smoke or a rehearsal is diagnostic and
+ * at best NOT ACCEPTED; K5 judges a rehearsal's hourly boundaries by the day's rule, while a smoke
+ * has one boundary and leaves K5 INCONCLUSIVE. Every other contract row is printed as NOT JUDGED with the CI lane that covers it.
  *
  * Inputs (the runbook's artifact directory): `config.json`, `header.json`, `supervisor.json`,
  * `outer-exit.json`, the archived matrix and `stream.ndjson` (read once, line by line, never held),
@@ -115,7 +116,7 @@ function planOf(matrix, mode) {
     requestedMs,
     periodMs: sampling.periodMs.value,
     jitterMs: sampling.jitterMs.value,
-    slots: smoke ? schedule.smoke.periodicSlots : sampling.periodicSlots.value,
+    slots: requestedMs / sampling.periodMs.value + 1,
     hours: smoke ? 1 : requestedMs / schedule.hourMs,
     hourMs: smoke ? requestedMs : schedule.hourMs,
     readings: sampling.quietReadings.value,
@@ -1429,7 +1430,11 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
     rows: done,
     notJudged: NOT_JUDGED_ROWS,
     information: informationOf(journal),
-    overall: has('FAIL') ? 'REJECTED' : has('INCONCLUSIVE') ? 'NOT ACCEPTED' : 'ACCEPTED',
+    overall: has('FAIL')
+      ? 'REJECTED'
+      : has('INCONCLUSIVE') || mode !== 'acceptance'
+        ? 'NOT ACCEPTED'
+        : 'ACCEPTED',
   }
 }
 
@@ -1532,9 +1537,12 @@ async function checkArtifact(dir) {
 
 /** @param {object} report @returns {string} the printable report */
 function formatReport(report) {
-  const smoke = report.mode === 'smoke' ? ' (smoke runs are diagnostic and are never ACCEPTED)' : ''
+  const diagnostic =
+    report.mode === 'acceptance'
+      ? ''
+      : ` (${report.mode} runs are diagnostic and are never ACCEPTED)`
   const lines = [
-    `CORE VERDICT: ${report.overall}${smoke}`,
+    `CORE VERDICT: ${report.overall}${diagnostic}`,
     `run ${report.runId ?? '-'}  mode ${report.mode}  tree ${(report.treeSha ?? '-').slice(0, 12)}`,
     'This is a core checker verdict on K1 to K7 only; the items under NOT JUDGED are not judged here.',
     '',

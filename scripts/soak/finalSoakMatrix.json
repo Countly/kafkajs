@@ -26,6 +26,18 @@
           "unit": "ms",
           "source": "design: teardown allowance after the smoke ends"
         }
+      },
+      "rehearsal": {
+        "requestedMs": {
+          "value": 10800000,
+          "unit": "ms",
+          "source": "design: the first three hours of the day plan, three quiet boundaries per measured process, so the heap row is judged on a hosted runner before the day"
+        },
+        "teardownAllowanceMs": {
+          "value": 900000,
+          "unit": "ms",
+          "source": "design: teardown allowance after the rehearsal ends"
+        }
       }
     },
     "archive": [
@@ -488,6 +500,11 @@
         "smoke": {
           "starts": "after-baseline-before-traffic",
           "clears": "after-only-quiet-triplet-before-disconnect",
+          "sensitivity": "report-only"
+        },
+        "rehearsal": {
+          "starts": "after-first-quiet-triplet",
+          "clears": "after-last-quiet-triplet-before-disconnect",
           "sensitivity": "report-only"
         }
       },
