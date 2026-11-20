@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('2a855b7eb63e6a15d49dcebc7f2fee80248d0cabecd054e548d8302fb0cae08e')
+    expect(digest(file)).toBe('aa4bdd901df3980ba0e93f76659e8a7ff180e532019632ffcd1f8147a54eb56f')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -3807,7 +3807,8 @@ describe('Java node export capture', () => {
 /**
  * A curl, sleep and date double for the pinned download scripts: a fake clock in FAKE_STATE, every call logged to
  * FAKE_LOG, and curl answers chosen by FAKE_FAILURES/FAKE_FAILURE, FAKE_PLAN (`[seconds, exit, kind]` per call, kind
- * `pinned`, `partial`, `wrong`, `archive` copying FAKE_ARCHIVE, or none) or FAKE_BLOCK.
+ * `pinned`, `partial`, `wrong`, `archive` copying FAKE_ARCHIVE, `hang` spending the call's whole `--max-time` with no
+ * answer, or none) or FAKE_BLOCK.
  */
 const fetchDouble = `#!/usr/bin/env node
 const fs = require('fs')
@@ -3841,6 +3842,7 @@ if (tool === 'date') {
     const planned = process.env.FAKE_PLAN ? JSON.parse(process.env.FAKE_PLAN)[index] : undefined
     const [cost, exit, kind] = planned || (seen < Number(process.env.FAKE_FAILURES) ? failure : [0, 0, 'pinned'])
     advance(cost)
+    if (kind === 'hang') advance(Number(args[args.indexOf('--max-time') + 1]))
     if (kind === 'partial') fs.writeFileSync(out, 'partial')
     if (kind === 'wrong') fs.writeFileSync(out, '<html>error page</html>\\n')
     if (kind === 'pinned') fs.writeFileSync(out, 'pinned ' + path.basename(url) + '\\n')
@@ -3993,6 +3995,7 @@ describe.each([
 
   test('shares one deadline across files, shortening the last attempt and its backoff', () => {
     const plan = [
+      [0, 0, 'pinned'],
       [60, 28, 'partial'],
       [60, 28, 'partial'],
       [21, 0, 'pinned'],
@@ -4001,11 +4004,11 @@ describe.each([
     const result = fetch(0, { FAKE_PLAN: JSON.stringify(plan) })
     expect(result.signal).toBeNull()
     expect(result.status).toBe(1)
-    expect(limits(result.calls)).toEqual([60, 60, 24, 3])
+    expect(limits(result.calls)).toEqual([60, 60, 60, 24, 3])
     expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['1']])
-    const url = curls(result.calls)[3].args.at(-1)
-    expect(result.stderr).toContain(`${names[1]} from ${url}: curl exit 22`)
-    expect(cached()).toEqual([names[0]])
+    const url = curls(result.calls)[4].args.at(-1)
+    expect(result.stderr).toContain(`${names[2]} from ${url}: curl exit 22`)
+    expect(cached().sort()).toEqual([names[0], names[1]].sort())
   })
 
   test('never lets an interrupted download satisfy the cache check', () => {
@@ -4190,6 +4193,19 @@ describe('pinned download from a second source', () => {
     expect(urls(result.calls)).toEqual([first, first, first, first, second])
     expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
     expect(cached().sort()).toEqual(['tools', name])
+  })
+
+  test('gives the second source its own share of the deadline when the first source hangs', () => {
+    const hang = [0, 28, 'hang']
+    const result = fetch([hang, hang, [0, 0, 'archive']], pinned)
+    expect(result.status).toBe(0)
+    expect(urls(result.calls)).toEqual([first, first, second])
+    expect(
+      result.calls
+        .filter((call) => call.tool === 'curl')
+        .map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+    ).toEqual([60, 13, 60])
+    expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
   })
 
   test('rejects a second-source member with the wrong digest and caches nothing', () => {
