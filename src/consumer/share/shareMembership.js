@@ -12,6 +12,9 @@ const {
 /** Until the coordinator has answered once there is no interval; this keeps the join retry alive. */
 const INITIAL_HEARTBEAT_INTERVAL_MS = 1000
 
+/** Metadata misses of one target before its unresolved topic IDs are logged at WARN. */
+const UNRESOLVED_WARNING_ATTEMPTS = 2
+
 /** The member epoch of a leave. */
 const LEAVE_EPOCH = -1
 
@@ -305,7 +308,7 @@ class ShareMembership {
    * backoff allows it. Every heartbeat answer is another chance, there is no attempt ceiling and
    * no metadata-age timer. The flight is bound to the captured token and target revision, and the
    * same predicate goes to the cluster helper, so a retired flight cannot install, follow up or
-   * publish. Misses and failures both advance the backoff.
+   * publish. Misses and failures both advance the backoff; see {@link missedResolution}.
    * @private
    * @param {() => Error|null} [ordinaryGuard] The authority of the heartbeat that started this work.
    * @returns {void}
@@ -334,15 +337,31 @@ class ShareMembership {
         await this.cluster.refreshMetadataForTopicIds(this.unresolved.slice(), { isCurrent })
         if (!isCurrent()) return
         this.publishAssignment()
-        if (this.unresolved.length) this.metadataBackoff.onFailedAttempt(performance.now())
+        if (this.unresolved.length) this.missedResolution()
         else this.metadataBackoff.reset()
       } catch (error) {
-        if (isCurrent()) this.metadataBackoff.onFailedAttempt(performance.now())
+        if (isCurrent()) this.missedResolution()
       } finally {
         if (this.resolution === flight) this.resolution = null
       }
     }
     work()
+  }
+
+  /**
+   * Advances the metadata backoff after a miss or a failed refresh. The second miss of a target
+   * is logged at WARN with the IDs still unresolved, once per target: the backoff, and with it the
+   * count, starts again only for a new target or after every ID resolved.
+   * @private
+   * @returns {void}
+   */
+  missedResolution() {
+    this.metadataBackoff.onFailedAttempt(performance.now())
+    if (this.metadataBackoff.attempts !== UNRESOLVED_WARNING_ATTEMPTS) return
+    this.logger.warn(
+      'Assigned topic IDs are still unresolved; their partitions are not fetched until metadata names them',
+      { groupId: this.groupId, topicIds: this.unresolved.slice() }
+    )
   }
 
   /**
