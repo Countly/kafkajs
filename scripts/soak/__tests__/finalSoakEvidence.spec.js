@@ -967,7 +967,7 @@ describe('final soak container dumps', () => {
 })
 
 describe('final soak record line sizes', () => {
-  const { RECORDS, CLIENT_KINDS } = require('../finalSoakSchema')
+  const { RECORDS, CLIENT_KINDS, mergePieces } = require('../finalSoakSchema')
   const { chunk } = require('../finalSoakCollector')
   const CAP = matrix.host.maxEventLineBytes.value
   const INVENTORY_CAP = matrix.host.maxInventoryLineBytes.value
@@ -1435,6 +1435,79 @@ describe('final soak record line sizes', () => {
     execution: 'h23m3w2',
     ...record,
     t: T,
+  })
+
+  test('an inventory entry larger than one line is journalled in pieces that each fit the inventory cap, whatever its lists hold', () => {
+    const owner = { client: C, scope: `${C}.w${N}` }
+    const keyOf = (i) => ({ ...KEYS[i % KEYS.length], partition: N })
+    /** One entry per section with a list, each list far past one line at its largest items. */
+    const huge = {
+      'share-state': {
+        client: C,
+        run: RUN_ID,
+        sessions: Array.from({ length: 3 }, (_, node) => ({ node, session: N })),
+        records: Array.from({ length: 6000 }, (_, i) => ({
+          acquisition: `${C}.a${N}${i}`,
+          key: keyOf(i),
+          offset: OFFSET,
+          state: 'settling',
+        })),
+        ranges: Array.from({ length: 3000 }, (_, i) => ({
+          acquisition: `${C}.a${N}${i}`,
+          key: keyOf(i),
+          from: OFFSET,
+          to: OFFSET,
+        })),
+        cohorts: Array.from({ length: 3000 }, (_, i) => `${C}.k${N}${i}`),
+      },
+      listeners: {
+        emitter: `${C}.e${N}`,
+        client: C,
+        scope: owner.scope,
+        event: 'request',
+        registrations: Array.from({ length: 3000 }, (_, i) => ({
+          listener: `${C}.l${N}${i}`,
+          scope: owner.scope,
+        })),
+      },
+      'operation-cell': {
+        ledger: `o${N}`,
+        topic: topic('main'),
+        partition: N,
+        open: 3000,
+        tickets: Array.from({ length: 3000 }, (_, i) => `t${N}${i}`),
+      },
+      'other-table': {
+        client: C,
+        table: 'preferred-replicas',
+        keys: Array.from({ length: 3000 }, (_, i) => keyOf(i)),
+      },
+    }
+    for (const [section, entry] of Object.entries(huge)) {
+      expect(Buffer.byteLength(JSON.stringify(entry))).toBeGreaterThan(INVENTORY_CAP)
+      const parts = chunk([entry], INVENTORY_CAP - 1024)
+      const records = parts.map(({ entries, piece }, i) =>
+        enveloped({
+          kind: 'inventory',
+          inventory: `p06.i${N}`,
+          process: 'p06',
+          client: C,
+          section,
+          chunk: i,
+          chunks: parts.length,
+          entries,
+          piece,
+        })
+      )
+      expect(
+        records.map((r) => ({
+          section,
+          problems: validateRecord(r),
+          fits: Buffer.byteLength(JSON.stringify(r)) <= INVENTORY_CAP,
+        }))
+      ).toEqual(records.map(() => ({ section, problems: [], fits: true })))
+      expect(mergePieces(parts.map((p) => p.entries[0])).entry).toEqual(entry)
+    }
   })
 
   test('every record kind and variant the driver emits fits its line cap at its largest realistic size', async () => {

@@ -12,6 +12,7 @@ const {
   validateMatrix,
   validateProvenance,
   validateRecord,
+  mergePieces,
 } = require('../finalSoakSchema')
 
 const ROOT = path.join(__dirname, '../../..')
@@ -2310,6 +2311,126 @@ describe('scripts/soak/finalSoakSchema', () => {
         },
       })
     ).toEqual([])
+  })
+
+  it('a share-state entry larger than one inventory line is journalled in pieces that validate and reassemble to the held set of one entry', () => {
+    const { chunk } = require('../finalSoakCollector')
+    const held = Array.from({ length: 3000 }, (_, i) => ({
+      acquisition: `${SHARE}.a${Math.floor(i / 500)}`,
+      key: KEY,
+      offset: String(i),
+      state: i % 2 ? 'held' : 'settling',
+    }))
+    const entry = { ...ENTRIES['share-state'](SHARE)[0], records: held }
+    const budget = matrix.host.maxInventoryLineBytes.value - 1024
+    expect(Buffer.byteLength(JSON.stringify(entry))).toBeGreaterThan(budget)
+    const parts = chunk([entry], budget)
+    expect(parts.length).toBeGreaterThan(1)
+    expect(parts.map((p) => p.piece)).toEqual(
+      parts.map((_, index) => ({ index, pieces: parts.length }))
+    )
+    expect(mergePieces(parts.map((p) => p.entries[0]))).toEqual({ entry, problems: [] })
+
+    /** Swaps the share-state record of cut i7 for the pieces `shape` returns. */
+    const split =
+      (shape = (records) => records) =>
+      (r) => {
+        const i = at(r, (x) => x.inventory === 'i7' && x.section === 'share-state')
+        const records = parts.map(({ entries, piece }, n) => ({
+          ...r[i],
+          chunk: n,
+          chunks: parts.length,
+          entries,
+          piece,
+        }))
+        r.splice(i, 1, ...shape(records))
+      }
+    expect(run({ edit: split() })).toEqual([])
+    expectCases({
+      'a piece missing': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.filter((_, n) => n !== 1).map((x, n) => ({ ...x, chunk: n, chunks: p.length - 1 }))
+            ),
+          }),
+        'misses a piece',
+      ],
+      'pieces disagreeing on a field outside their lists': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.map((x, n) => (n === 1 ? { ...x, entries: [{ ...x.entries[0], run: 'r9' }] } : x))
+            ),
+          }),
+        'pieces of one entry disagree on run',
+      ],
+      'pieces disagreeing on their count': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.map((x, n) => (n === 1 ? { ...x, piece: { ...x.piece, pieces: 99 } } : x))
+            ),
+          }),
+        'pieces of one entry disagree on their count',
+      ],
+      'a whole entry repeating a split key': [
+        () =>
+          run({
+            edit: split((p) =>
+              [
+                ...p,
+                {
+                  ...p[0],
+                  chunk: p.length,
+                  chunks: p.length + 1,
+                  entries: ENTRIES['share-state'](SHARE),
+                  piece: null,
+                },
+              ].map((x) => ({ ...x, chunks: p.length + 1 }))
+            ),
+          }),
+        'share-state entry key repeats',
+      ],
+      'a piece holding two entries': [
+        () =>
+          run({
+            edit: split((p) =>
+              p.map((x, n) =>
+                n === 0 ? { ...x, entries: [...x.entries, ...ENTRIES['share-state']('c07.9')] } : x
+              )
+            ),
+          }),
+        'a piece is one entry',
+      ],
+    })
+  })
+
+  it('entry rules judge a split entry once reassembled, not each piece', () => {
+    const { chunk } = require('../finalSoakCollector')
+    const tickets = Array.from({ length: 6000 }, (_, i) => `t${i}`)
+    const cell = { ledger: 'L1', topic: 'main', partition: 0, open: tickets.length, tickets }
+    const budget = matrix.host.maxInventoryLineBytes.value - 1024
+    const edit = (open) => (r) => {
+      const i = at(r, (x) => x.inventory === 'i1' && x.section === 'operation-cell')
+      const parts = chunk([{ ...cell, open }], budget)
+      expect(parts.length).toBeGreaterThan(1)
+      r.splice(
+        i,
+        1,
+        ...parts.map(({ entries, piece }, n) => ({
+          ...r[i],
+          chunk: n,
+          chunks: parts.length,
+          entries,
+          piece,
+        }))
+      )
+    }
+    expect(run({ edit: edit(tickets.length) })).toEqual([])
+    expect(run({ edit: edit(tickets.length - 1) })).toEqual([
+      expect.stringContaining('open differs from its tickets'),
+    ])
   })
 
   it('samples carry their role fields and two new forced collections per reading', () => {
