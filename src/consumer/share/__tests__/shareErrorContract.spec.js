@@ -13,6 +13,11 @@ const {
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSProtocolError,
   KafkaJSShareGroupsNotSupportedError,
+  KafkaJSConnectionError,
+  KafkaJSConnectionClosedError,
+  KafkaJSRequestTimeoutError,
+  KafkaJSNonRetriableError,
+  KafkaJSInvariantViolation,
 } = require('../../../errors')
 
 describe('share membership failure policy', () => {
@@ -33,6 +38,23 @@ describe('share membership failure policy', () => {
     [31, 'fatal'],
   ])('classifies code %s as %s', (code, action) => {
     expect(membershipAction(createErrorFromCode(code))).toBe(action)
+  })
+  test.each([
+    ['a replaced connection', new KafkaJSConnectionError('This broker connection was replaced')],
+    [
+      'a refused connection with a system code',
+      new KafkaJSConnectionError('Connection error', { code: 'ECONNREFUSED' }),
+    ],
+    ['a closed connection', new KafkaJSConnectionClosedError('Closed connection')],
+    ['a request timeout', new KafkaJSRequestTimeoutError('Request timed out')],
+  ])('forgets the coordinator after %s, which is not a broker answer', (_name, error) => {
+    expect(membershipAction(error)).toBe('coordinator')
+  })
+  test.each([
+    ['a non-retriable failure', new KafkaJSNonRetriableError('refused')],
+    ['an invariant violation', new KafkaJSInvariantViolation('broken')],
+  ])('keeps %s without a broker code fatal', (_name, error) => {
+    expect(membershipAction(error)).toBe('fatal')
   })
   test('keeps the membership table read-only', () => {
     expect(Object.isFrozen(MEMBERSHIP_ERRORS)).toBe(true)
