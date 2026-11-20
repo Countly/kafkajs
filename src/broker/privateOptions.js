@@ -23,26 +23,14 @@ const acceptedIndex = (decoded) => {
   return index
 }
 
-/**
- * Whether a decoded OffsetCommit reply accepted one cell (see `acceptedIndex`). For many cells of
- * one reply, build the index once instead.
- * @param {object} decoded the decoded reply
- * @param {string} topic
- * @param {number} partition
- * @returns {boolean}
- */
-const acceptsCell = (decoded, topic, partition) =>
-  acceptedIndex(decoded).get(topic)?.has(partition) ?? false
-
 module.exports = {
   /** `offsetCommit`: called once, immediately before the request is written to the socket. */
   ON_WRITE: Symbol('onWrite'),
   /**
    * `offsetCommit`: called once with the decoded reply, before a caller refusal, the throttle or
    * parse can end the request, so what the broker accepted is seen even when the caller is not
-   * answered. Read it with `acceptedIndex` or `acceptsCell`.
+   * answered. Read it with `acceptedIndex`.
    */
   ON_DECODED: Symbol('onDecoded'),
   acceptedIndex,
-  acceptsCell,
 }
