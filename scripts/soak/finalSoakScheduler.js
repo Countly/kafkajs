@@ -19,10 +19,13 @@ const harnessTimers = new Set()
  * @returns {NodeJS.Timeout} the timer, cleared with `clearHarnessTimeout`
  */
 const harnessTimeout = (fn, ms, ...args) => {
-  const timer = setTimeout(() => {
-    harnessTimers.delete(timer)
-    fn(...args)
-  }, ms)
+  const timer = setTimeout(
+    () => {
+      harnessTimers.delete(timer)
+      fn(...args)
+    },
+    (Number(ms) || 0) / MonotonicClock.rate
+  )
   harnessTimers.add(timer)
   return timer
 }
@@ -36,8 +39,17 @@ const clearHarnessTimeout = (timer) => {
 /** @returns {number} the harness timers that keep the event loop alive now */
 const liveHarnessTimers = () => [...harnessTimers].filter((t) => t.hasRef()).length
 
-/** The host's monotonic clock, relative to an origin captured once per run. */
+/**
+ * The host's monotonic clock, relative to an origin captured once per run. A rehearsal may run it
+ * `rate` times faster than real time from the shared real instant `anchor` (monotonic ns); the
+ * harness's own timers (`harnessTimeout`) follow it, while the clients' timers stay on real time.
+ */
 class MonotonicClock {
+  /** How many times faster than real time the harness clock runs. */
+  static rate = 1
+  /** The real monotonic instant, in ns, the faster clock is counted from. */
+  static anchor = 0n
+
   /** @param {number} [originMs] the run origin in monotonic ms; now by default */
   constructor(originMs = MonotonicClock.raw()) {
     this.originMs = originMs
@@ -45,7 +57,8 @@ class MonotonicClock {
 
   /** @returns {number} monotonic milliseconds since boot */
   static raw() {
-    return Number(process.hrtime.bigint()) / 1e6
+    const { rate, anchor } = MonotonicClock
+    return Number(anchor + (process.hrtime.bigint() - anchor) * BigInt(rate)) / 1e6
   }
 
   /** @returns {number} milliseconds since the origin */

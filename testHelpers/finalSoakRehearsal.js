@@ -8,9 +8,11 @@
  * answers that check the arguments the soak passes. The private cluster the preflight reads
  * ApiVersions ranges through stays the product's own, served by a three-node `ScriptedCluster` on
  * the in-process socket seam, as is the raw reader's own broker connection. Any real dial or name
- * lookup throws, so the rehearsal cannot pass or fail by the host's network. With `FINAL_SOAK_REHEARSAL_WARP=<k>` the monotonic clock runs k times
- * faster and timers wait 1/k of their delay, from the shared `FINAL_SOAK_REHEARSAL_ANCHOR`, so a
- * smoke schedule runs in a fraction of its length with every process on one clock.
+ * lookup throws, so the rehearsal cannot pass or fail by the host's network. With
+ * `FINAL_SOAK_REHEARSAL_WARP=<k>` the harness clock (`MonotonicClock`) and the harness's own timers
+ * run k times faster from the shared `FINAL_SOAK_REHEARSAL_ANCHOR`, so a smoke schedule runs in a
+ * fraction of its length with every process on one clock; the clients' own timeouts stay on real
+ * time.
  *
  * Environment: `KAFKA_BROKERS` (three `host:port`, the scripted nodes 1–3);
  * `TELEMETRY_EVIDENCE_DIR` and `FINAL_SOAK_REHEARSAL_PUSH=1` make a telemetry-enabled client's
@@ -35,16 +37,6 @@ net.Socket.prototype.connect = function (...args) {
 }
 dns.lookup = (host) => offline(`lookup ${host}`)
 dns.promises.lookup = async (host) => offline(`lookup ${host}`)
-
-const warp = Number(process.env.FINAL_SOAK_REHEARSAL_WARP ?? 1)
-if (warp > 1) {
-  const anchor = BigInt(process.env.FINAL_SOAK_REHEARSAL_ANCHOR)
-  const bigint = process.hrtime.bigint
-  process.hrtime.bigint = () => anchor + (bigint() - anchor) * BigInt(warp)
-  const { setTimeout: timeout, setInterval: interval } = globalThis
-  globalThis.setTimeout = (fn, ms, ...args) => timeout(fn, (Number(ms) || 0) / warp, ...args)
-  globalThis.setInterval = (fn, ms, ...args) => interval(fn, (Number(ms) || 0) / warp, ...args)
-}
 
 // The scripted cluster's fixtures name the helpers by the bare id Jest maps; resolve it the same way.
 const Module = require('node:module')
@@ -348,6 +340,14 @@ kafkajs.Kafka = RehearsalKafka
 // The in-memory clients never join a group, so no partition is ever assigned: every consumer
 // member reads as holding the main topic's one partition, which is what the readiness check and
 // the membership waves look for.
+// Only the harness clock and the harness's own timers run faster: a client's connection and request
+// bounds stay on real time, so a CPU stall cannot expire them on an in-memory network.
+const { MonotonicClock } = require('../scripts/soak/finalSoakScheduler')
+const warp = Number(process.env.FINAL_SOAK_REHEARSAL_WARP ?? 1)
+if (warp > 1) {
+  MonotonicClock.rate = warp
+  MonotonicClock.anchor = BigInt(process.env.FINAL_SOAK_REHEARSAL_ANCHOR)
+}
 const {
   ConsumerWorker,
   ShareWorker,
