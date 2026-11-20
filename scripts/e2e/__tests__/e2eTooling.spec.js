@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('8140de34b9682909a40757275e755053a0af954e858ba1f1a40fc72fdadefab4')
+    expect(digest(file)).toBe('7ff429d35f29b68431235e3303dbdd6c9d4e6a5cce6fe5eb7f103265b8de51be')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -1357,7 +1357,7 @@ describe('broker telemetry fixture', () => {
     expect(stop.if).toBe('always()')
     expect(stop.run).toContain('timeout -k 5s 150s')
     expect(job.steps.at(-1).if).toBe('always()')
-    expect(steps[position('run.sh verify')]['timeout-minutes']).toBeGreaterThanOrEqual(5)
+    expect(steps[position('telemetry/fetch.sh')]['timeout-minutes']).toBeGreaterThanOrEqual(5)
     const serialized = JSON.stringify(job)
     expect(serialized).not.toContain('build.sh')
     expect(serialized).not.toContain('testWithKafka')
@@ -3840,7 +3840,12 @@ if (tool === 'date') {
     fs.appendFileSync(path.join(state, 'curls'), '.')
     const failure = { partial: [0, 18, 'partial'], wrong: [0, 0, 'wrong'] }[process.env.FAKE_FAILURE]
     const planned = process.env.FAKE_PLAN ? JSON.parse(process.env.FAKE_PLAN)[index] : undefined
-    const [cost, exit, kind] = planned || (seen < Number(process.env.FAKE_FAILURES) ? failure : [0, 0, 'pinned'])
+    const served = (prefix) => process.env[prefix] && url.startsWith(process.env[prefix])
+    const [cost, exit, kind] = served('FAKE_MISSING')
+      ? [0, 22, 'none']
+      : served('FAKE_WRONG')
+        ? [0, 0, 'wrong']
+        : planned || (seen < Number(process.env.FAKE_FAILURES) ? failure : [0, 0, 'pinned'])
     advance(cost)
     if (kind === 'hang') advance(Number(args[args.indexOf('--max-time') + 1]))
     if (kind === 'partial') fs.writeFileSync(out, 'partial')
@@ -3854,9 +3859,9 @@ if (tool === 'date') {
 `
 
 describe.each([
-  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256', 2],
-  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256', 1],
-])('pinned input download by %s', (script, cacheVariable, sums, sources) => {
+  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256', 3, 6],
+  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256', 2, 5],
+])('pinned input download by %s', (script, cacheVariable, sums, sources, mavenFiles) => {
   const { createHash } = require('crypto')
   const { spawn } = require('child_process')
   const telemetry = path.resolve(__dirname, '../telemetry')
@@ -3866,6 +3871,7 @@ describe.each([
     .split('\n')
     .map((line) => line.split(/\s+/)[1])
   const body = (name) => `pinned ${path.basename(name)}\n`
+  const share = Math.ceil(150 / sources)
   let directory
   let cache
 
@@ -3972,7 +3978,9 @@ describe.each([
     for (const name of names)
       expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
     expect(curls(result.calls)).toHaveLength(names.length * 3)
-    expect(limits(result.calls).every((limit) => limit === 60)).toBe(true)
+    expect(limits(result.calls).slice(0, 3)).toEqual(
+      [0, 2, 6].map((spent) => Math.min(60, share - spent))
+    )
     expect(cached().filter((name) => name.includes('.part'))).toEqual([])
   })
 
@@ -3997,17 +4005,23 @@ describe.each([
     const plan = [
       [0, 0, 'pinned'],
       [60, 28, 'partial'],
+      [13, 28, 'partial'],
       [60, 28, 'partial'],
-      [21, 0, 'pinned'],
+      [5, 0, 'pinned'],
       [2, 22, 'none'],
+      [3, 22, 'none'],
     ]
     const result = fetch(0, { FAKE_PLAN: JSON.stringify(plan) })
     expect(result.signal).toBeNull()
     expect(result.status).toBe(1)
-    expect(limits(result.calls)).toEqual([60, 60, 60, 24, 3])
-    expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['1']])
-    const url = curls(result.calls)[4].args.at(-1)
-    expect(result.stderr).toContain(`${names[2]} from ${url}: curl exit 22`)
+    expect(limits(result.calls)).toEqual([Math.min(60, share), 60, 13, 60, 13, 4, 4])
+    expect(sleeps(result.calls)).toEqual([['2'], ['2'], ['2'], ['1']])
+    const [first, second] = curls(result.calls)
+      .slice(5)
+      .map(({ args }) => args.at(-1))
+    expect(result.stderr).toContain(
+      `${names[2]} from ${first}: curl exit 22; from ${second}: curl exit 22`
+    )
     expect(cached().sort()).toEqual([names[0], names[1]].sort())
   })
 
@@ -4067,6 +4081,47 @@ describe.each([
     expect(exit.code === 143 || exit.signal === 'SIGTERM').toBe(true)
     expect(cached()).toEqual([])
   }, 30000)
+
+  const central = 'https://repo1.maven.org/maven2/'
+  const mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+  test('gives every Maven Central file a second source at the same path on the Google mirror', () => {
+    const text = fs.readFileSync(path.join(telemetry, script), 'utf8')
+    expect(text).toContain(`\nM=${central.slice(0, -1)}\nG=${mirror.slice(0, -1)}\n`)
+    const entries = text
+      .slice(text.indexOf('<<LIST\n') + 7, text.indexOf('\nLIST\n'))
+      .split('\n')
+      .map((line) => line.split(' '))
+    expect(entries.map(([name]) => name).sort()).toEqual([...names].sort())
+    const maven = entries.filter(([, first]) => first.startsWith('$M/'))
+    expect(maven).toHaveLength(mavenFiles)
+    for (const [, first, second] of maven) expect(second).toBe('$G/' + first.slice(3))
+  })
+
+  test('fetches every Maven Central file from the mirror when Maven Central answers 404', () => {
+    const result = fetch(0, { FAKE_MISSING: central })
+    expect(result.status).toBe(0)
+    for (const name of names)
+      expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
+    const urls = curls(result.calls).map(({ args }) => args.at(-1))
+    const failed = urls.filter((url) => url.startsWith(central))
+    expect(failed).toHaveLength(4 * mavenFiles)
+    expect(urls.filter((url) => url.startsWith(mirror))).toEqual(
+      [...new Set(failed)].map((url) => mirror + url.slice(central.length))
+    )
+    expect(urls).toHaveLength(5 * mavenFiles + names.length - mavenFiles)
+  })
+
+  test('rejects a mirror copy with the wrong digest and caches nothing', () => {
+    const result = fetch(0, { FAKE_MISSING: central, FAKE_WRONG: mirror })
+    expect(result.status).toBe(1)
+    const first = curls(result.calls)[0].args.at(-1)
+    expect(first.startsWith(central)).toBe(true)
+    expect(result.stderr).toContain(
+      `${names[0]} from ${first}: curl exit 22; from ${mirror + first.slice(central.length)}: digest mismatch`
+    )
+    expect(cached()).toEqual([])
+  })
 })
 
 describe('pinned download from a second source', () => {
@@ -4240,11 +4295,65 @@ describe('pinned download from a second source', () => {
     expect(cached()).toEqual(['tools'])
   })
 
-  test('gives protoc the protobuf release archive of the same version as its second source', () => {
+  test('gives protoc the protobuf release archive of the same version after the mirror', () => {
     const script = fs.readFileSync(path.join(telemetry, 'fetch.sh'), 'utf8')
     expect(script).toContain(
       'tools/protoc-3.25.5-linux-x86_64.exe $M/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe ' +
+        '$G/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe ' +
         'https://github.com/protocolbuffers/protobuf/releases/download/v25.5/protoc-25.5-linux-x86_64.zip#bin/protoc\n'
     )
   })
+})
+
+describe('telemetry download cache', () => {
+  const root = path.resolve(__dirname, '../../..')
+  const steps = require('js-yaml').load(
+    fs.readFileSync(path.join(root, '.github/workflows/telemetry.yml'), 'utf8')
+  ).jobs.telemetry.steps
+  const pinned = /^actions\/cache\/(restore|save)@[0-9a-f]{40}$/
+  const expression = (text) => '$' + `{{ ${text} }}`
+
+  test.each([
+    [
+      'inputs',
+      'fetch.sh',
+      ['.tmp/telemetry-cache/tools', '.tmp/telemetry-cache/jars', '.tmp/telemetry-cache/proto'],
+      'scripts/e2e/telemetry/fixtures/inputs.sha256',
+    ],
+    [
+      'interop',
+      'fetch-interop.sh',
+      ['.tmp/telemetry-interop'],
+      'scripts/e2e/telemetry/interop.sha256',
+    ],
+  ])(
+    'restores the %s cache before %s and saves it even when a later step fails',
+    (id, script, paths, sums) => {
+      const index = (predicate) => steps.findIndex(predicate)
+      const fetch = index((step) => step.run?.includes(`scripts/e2e/telemetry/${script}`))
+      const restore = index((step) => step.id === `${id}-cache`)
+      const save = index(
+        (step) => step.uses?.startsWith('actions/cache/save@') && step.if?.includes(`steps.${id}.`)
+      )
+      expect(steps[fetch].id).toBe(id)
+      expect(restore).toBeGreaterThanOrEqual(0)
+      expect(restore).toBeLessThan(fetch)
+      expect(steps[restore].uses).toMatch(pinned)
+      expect(steps[restore].if).toBe(steps[fetch].if)
+      expect(steps[restore].with.path.trim().split('\n')).toEqual(paths)
+      expect(steps[restore].with.key).toBe(
+        `telemetry-${id}-${expression('runner.os')}-${expression(`hashFiles('${sums}')`)}`
+      )
+      expect(save).toBeGreaterThan(fetch)
+      expect(steps[save].uses).toMatch(pinned)
+      expect(steps[save].uses.split('@')[1]).toBe(steps[restore].uses.split('@')[1])
+      expect(steps[save].if).toBe(
+        `always() && steps.${id}.outcome == 'success' && steps.${id}-cache.outputs.cache-hit != 'true'`
+      )
+      expect(steps[save].with).toEqual({
+        path: steps[restore].with.path,
+        key: expression(`steps.${id}-cache.outputs.cache-primary-key`),
+      })
+    }
+  )
 })
