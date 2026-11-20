@@ -1680,10 +1680,13 @@ module.exports = class Cluster {
    *   it closed, no broker is asked and no socket opens
    * @returns {Promise<Object>}
    * @throws {KafkaJSBrokerNotFound} when the seed broker's connection failed or timed out
-   * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered
+   * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered; its `lastError` is the
+   *   last failure a broker's FindCoordinator request ended with (for example the broker's error
+   *   answer), so a caller can tell an authorization refusal from an unavailable coordinator
    * @throws {Error} the lifecycle's close error
    */
   async findGroupCoordinatorMetadata({ groupId, coordinatorType, fence }) {
+    let lastError
     const findCoordinator = async ({ nodeId, broker }) => {
       return await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         try {
@@ -1709,6 +1712,7 @@ module.exports = class Cluster {
             groupId,
             error: e,
           })
+          lastError = e
 
           if (e.type === 'GROUP_COORDINATOR_NOT_AVAILABLE') {
             this.logger.debug('Group coordinator not available, retrying...', {
@@ -1749,7 +1753,9 @@ module.exports = class Cluster {
       return brokerMetadata
     }
 
-    throw new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+    const notFound = new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+    notFound.lastError = lastError
+    throw notFound
   }
 
   /**
