@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('1bea7a4b7378cacec239676fb947e51fa675ae2edf2185841e1fa461c8c07c45')
+    expect(digest(file)).toBe('2a855b7eb63e6a15d49dcebc7f2fee80248d0cabecd054e548d8302fb0cae08e')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -3852,9 +3852,9 @@ if (tool === 'date') {
 `
 
 describe.each([
-  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256'],
-  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256'],
-])('pinned input download by %s', (script, cacheVariable, sums) => {
+  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256', 2],
+  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256', 1],
+])('pinned input download by %s', (script, cacheVariable, sums, sources) => {
   const { createHash } = require('crypto')
   const { spawn } = require('child_process')
   const telemetry = path.resolve(__dirname, '../telemetry')
@@ -3974,15 +3974,19 @@ describe.each([
     expect(cached().filter((name) => name.includes('.part'))).toEqual([])
   })
 
-  test('stops after four attempts with a 2, 4 and 6 second backoff and names the file and URL that failed', () => {
+  test('stops after four attempts per source with a 2, 4 and 6 second backoff and names the file and URL that failed', () => {
     const result = fetch(Infinity)
     expect(result.signal).toBeNull()
     expect(result.status).toBe(1)
     const attempts = curls(result.calls)
-    expect(attempts).toHaveLength(4)
+    expect(attempts).toHaveLength(4 * sources)
     const url = attempts[0].args.at(-1)
-    expect(attempts.every(({ args }) => args.at(-1) === url)).toBe(true)
-    expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['6']])
+    expect(attempts.filter(({ args }) => args.at(-1) === url)).toHaveLength(4)
+    expect(sleeps(result.calls)).toEqual(
+      Array(sources)
+        .fill([['2'], ['4'], ['6']])
+        .flat()
+    )
     expect(result.stderr).toContain(`${names[0]} from ${url}: curl exit 18`)
     expect(cached()).toEqual([])
   })
@@ -4025,7 +4029,7 @@ describe.each([
     const result = fetch(Infinity, { FAKE_FAILURE: 'wrong' })
     expect(result.status).toBe(1)
     const attempts = curls(result.calls)
-    expect(attempts).toHaveLength(4)
+    expect(attempts).toHaveLength(4 * sources)
     expect(result.stderr).toContain(`${names[0]} from ${attempts[0].args.at(-1)}: digest mismatch`)
     expect(cached()).toEqual([])
     const retry = fetch(0)
