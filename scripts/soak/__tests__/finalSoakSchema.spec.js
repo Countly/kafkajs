@@ -264,6 +264,7 @@ const cut = (inventory, process, owners) =>
       chunk: 0,
       chunks: 1,
       entries: ENTRIES[section](client ?? 'c01.0'),
+      piece: null,
     }))
   )
 
@@ -2354,7 +2355,7 @@ describe('scripts/soak/finalSoakSchema', () => {
               p.filter((_, n) => n !== 1).map((x, n) => ({ ...x, chunk: n, chunks: p.length - 1 }))
             ),
           }),
-        'misses a piece',
+        'inventory cut misses a share-state piece',
       ],
       'pieces disagreeing on a field outside their lists': [
         () =>
@@ -2408,7 +2409,7 @@ describe('scripts/soak/finalSoakSchema', () => {
 
   it('entry rules judge a split entry once reassembled, not each piece', () => {
     const { chunk } = require('../finalSoakCollector')
-    const tickets = Array.from({ length: 6000 }, (_, i) => `t${i}`)
+    const tickets = Array.from({ length: 12000 }, (_, i) => `t${i}`)
     const cell = { ledger: 'L1', topic: 'main', partition: 0, open: tickets.length, tickets }
     const budget = matrix.host.maxInventoryLineBytes.value - 1024
     const edit = (open) => (r) => {

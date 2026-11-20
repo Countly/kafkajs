@@ -528,20 +528,68 @@ class Sampler {
   }
 }
 
-/** @param {object[]} entries @param {number} budget @returns {object[][]} entries split by serialized size */
-const chunk = (entries, budget) => {
-  const parts = [[]]
-  let size = 0
-  for (const entry of entries) {
-    const bytes = Buffer.byteLength(JSON.stringify(entry)) + 1
-    if (size + bytes > budget && parts.at(-1).length > 0) {
-      parts.push([])
-      size = 0
+/** @param {unknown} value @returns {number} its JSON bytes plus one separator */
+const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value)) + 1
+
+/**
+ * Splits one entry larger than `budget` into pieces: each keeps every field outside its lists and
+ * takes the next run of list items, lists in field order, so concatenating the pieces' lists
+ * restores the entry.
+ * @param {object} entry
+ * @param {number} budget
+ * @returns {object[]} the pieces, in order
+ * @throws {Error} when one list item alone cannot fit the budget
+ */
+const pieces = (entry, budget) => {
+  const lists = Object.keys(entry).filter((k) => Array.isArray(entry[k]))
+  const empty = () => ({ ...entry, ...Object.fromEntries(lists.map((k) => [k, []])) })
+  const base = jsonBytes(empty())
+  const out = [empty()]
+  let size = base
+  for (const k of lists)
+    for (const item of entry[k]) {
+      const bytes = jsonBytes(item)
+      if (base + bytes > budget) throw new Error(`an inventory ${k} item exceeds ${budget} bytes`)
+      if (size + bytes > budget) {
+        out.push(empty())
+        size = base
+      }
+      out.at(-1)[k].push(item)
+      size += bytes
     }
-    parts.at(-1).push(entry)
-    size += bytes
+  return out
+}
+
+/**
+ * Splits a section's entries into inventory chunks whose `entries` serialize within `budget`.
+ * Entries are packed whole; an entry larger than the budget on its own fills chunks of its own, one
+ * piece each, numbered by `piece` so the stream validator reassembles it.
+ * @param {object[]} entries
+ * @param {number} budget bytes for one chunk's entries
+ * @returns {Array<{ entries: object[], piece: { index: number, pieces: number }|null }>} at least one
+ * @throws {Error} when one list item alone cannot fit the budget
+ */
+const chunk = (entries, budget) => {
+  const parts = []
+  let open = null
+  for (const entry of entries) {
+    const bytes = jsonBytes(entry)
+    if (bytes > budget) {
+      const split = pieces(entry, budget)
+      for (const [index, piece] of split.entries())
+        parts.push({ entries: [piece], piece: { index, pieces: split.length } })
+      open = null
+      continue
+    }
+    if (!open || open.size + bytes > budget) {
+      open = { entries: [], piece: null, size: 0 }
+      parts.push(open)
+    }
+    open.entries.push(entry)
+    open.size += bytes
   }
-  return parts
+  if (parts.length === 0) parts.push({ entries: [], piece: null })
+  return parts.map(({ entries, piece }) => ({ entries, piece }))
 }
 
 /**

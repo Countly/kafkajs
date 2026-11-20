@@ -14,6 +14,7 @@
  * `header.clock.originMs`. Offsets are canonical decimal int64 strings compared as BigInt.
  */
 const crypto = require('node:crypto')
+const { isDeepStrictEqual } = require('node:util')
 
 const SCHEMA_VERSION = 3
 
@@ -614,6 +615,7 @@ const RECORDS = Object.freeze({
       chunk: Count,
       chunks: Count,
       entries: listOf(type('an object', isObject)),
+      piece: nullable(shape('a piece', { index: Count, pieces: Count })),
     },
   },
   ticket: {
@@ -875,7 +877,16 @@ const RULES = Object.freeze({
   sample: (r) => sampleRules(r),
   inventory: (r) => [
     ...unless(r.chunks >= 1 && r.chunk < r.chunks, 'chunk is not below chunks'),
-    ...r.entries.flatMap((entry, i) => entryProblems(r.section, entry, `entries[${i}]`)),
+    ...unless(
+      r.piece === null ||
+        (r.entries.length === 1 && r.piece.pieces >= 2 && r.piece.index < r.piece.pieces),
+      'a piece is one entry, one of at least two'
+    ),
+    ...r.entries.flatMap((entry, i) =>
+      r.piece === null
+        ? entryProblems(r.section, entry, `entries[${i}]`)
+        : fieldProblems(entry, SECTIONS[r.section].entry, `entries[${i}]`)
+    ),
   ],
   ticket: (r) => unless(sameNullness(r.ownerRun, r.token), 'ownerRun and token go together'),
   wave: (r) => unless(r.held <= r.paused, 'a wave holds no more keys than it paused'),
@@ -946,6 +957,25 @@ const entryProblems = (section, entry, path) => {
   const problems = fieldProblems(entry, SECTIONS[section].entry, path)
   if (problems.length > 0 || !ENTRY_RULES[section]) return problems
   return ENTRY_RULES[section](entry).map((p) => `${path}: ${p}`)
+}
+
+/**
+ * Reassembles one inventory entry from its pieces: their lists concatenated in piece order, every
+ * other field equal in all pieces.
+ * @param {object[]} parts the pieces' entries, in piece order
+ * @returns {{ entry: object, problems: string[] }} the entry and the fields the pieces disagree on
+ */
+const mergePieces = (parts) => {
+  const [first, ...rest] = parts
+  const entry = { ...first }
+  const problems = new Set()
+  for (const part of rest)
+    for (const k of Object.keys(first)) {
+      if (Array.isArray(first[k]) && Array.isArray(part[k])) entry[k] = [...entry[k], ...part[k]]
+      else if (!isDeepStrictEqual(first[k], part[k]))
+        problems.add(`pieces of one entry disagree on ${k}`)
+    }
+  return { entry, problems: [...problems] }
 }
 
 /**
@@ -2173,17 +2203,45 @@ class StreamValidator {
     const name = `${r.client}\0${r.section}`
     let group = cut.groups.get(name)
     if (!group) {
-      group = { chunks: r.chunks, seen: new Set(), keys: new Set() }
+      group = { chunks: r.chunks, seen: new Set(), keys: new Set(), split: new Map() }
       cut.groups.set(name, group)
     }
     if (group.chunks !== r.chunks) this.fail('chunks of one section disagree on their count')
     if (group.seen.has(r.chunk)) this.fail('chunk repeats')
     group.seen.add(r.chunk)
+    if (r.piece !== null) return this.piece(r, group)
     for (const entry of r.entries) {
       const key = SECTIONS[r.section].key(entry)
-      if (group.keys.has(key)) this.fail(`${r.section} entry key repeats`)
+      if (group.keys.has(key) || group.split.has(key)) this.fail(`${r.section} entry key repeats`)
       group.keys.add(key)
     }
+  }
+
+  /**
+   * Keeps one piece of a split entry until its last piece arrives, then judges the reassembled
+   * entry by its section's rules and counts its key once.
+   * @param {object} r an inventory record with a `piece`
+   * @param {{ keys: Set<string>, split: Map<string, object> }} group its cut's section group
+   */
+  piece(r, group) {
+    const key = SECTIONS[r.section].key(r.entries[0])
+    let split = group.split.get(key)
+    if (!split) {
+      if (group.keys.has(key)) this.fail(`${r.section} entry key repeats`)
+      split = { pieces: r.piece.pieces, parts: new Map() }
+      group.split.set(key, split)
+    }
+    if (split.pieces !== r.piece.pieces)
+      return this.fail('pieces of one entry disagree on their count')
+    if (split.parts.has(r.piece.index)) return this.fail('an entry piece repeats')
+    split.parts.set(r.piece.index, r.entries[0])
+    if (split.parts.size < split.pieces) return
+    group.split.delete(key)
+    group.keys.add(key)
+    const parts = [...split.parts.keys()].sort((a, b) => a - b).map((i) => split.parts.get(i))
+    const { entry, problems } = mergePieces(parts)
+    for (const p of problems.length > 0 ? problems : entryProblems(r.section, entry, 'entry'))
+      this.fail(p)
   }
 
   /** @param {object} r */
@@ -2209,6 +2267,7 @@ class StreamValidator {
           if (!group) this.fail(`inventory cut omits ${section}`)
           else if (group.seen.size !== group.chunks)
             this.fail(`inventory cut misses a ${section} chunk`)
+          else if (group.split.size > 0) this.fail(`inventory cut misses a ${section} piece`)
         }
       }
       this.cuts.delete(r.inventory)
@@ -2242,8 +2301,12 @@ class StreamValidator {
     for (const [execution] of this.executions)
       this.fail(`execution ${nameOf(execution)} never ends`)
     for (const [inventory, cut] of this.cuts)
-      if ([...cut.groups.values()].some((group) => group.seen.size !== group.chunks))
-        this.fail(`inventory ${nameOf(inventory)} misses a chunk`)
+      if (
+        [...cut.groups.values()].some(
+          (group) => group.seen.size !== group.chunks || group.split.size > 0
+        )
+      )
+        this.fail(`inventory ${nameOf(inventory)} misses a chunk or piece`)
     const problems = [...this.problems]
     if (this.omitted > 0) problems.push(`${this.omitted} more problems omitted`)
     const stream = this.header.stream
@@ -2271,4 +2334,5 @@ module.exports = {
   validateMatrix,
   validateProvenance,
   validateRecord,
+  mergePieces,
 }

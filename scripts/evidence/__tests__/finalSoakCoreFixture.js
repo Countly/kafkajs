@@ -254,6 +254,7 @@ function processRecords(config, mode, withInventory) {
           chunk: 0,
           chunks: 1,
           entries: [],
+          piece: null,
         })
     records.push({
       t: at,

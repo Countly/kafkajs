@@ -815,7 +815,7 @@ class ChildRuntime {
       }
       for (const [client, section, entries] of parts) {
         const pieces = chunk(entries, valueOf(this.matrix.host.maxInventoryLineBytes) - 1024)
-        for (const [i, piece] of pieces.entries())
+        for (const [i, { entries: part, piece }] of pieces.entries())
           sent.push(
             this.emit({
               kind: 'inventory',
@@ -827,7 +827,8 @@ class ChildRuntime {
               section,
               chunk: i,
               chunks: pieces.length,
-              entries: piece,
+              entries: part,
+              piece,
             })
           )
       }

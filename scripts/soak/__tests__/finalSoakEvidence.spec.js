@@ -392,6 +392,7 @@ describe('final soak observer evidence', () => {
             chunk: 0,
             chunks: 1,
             entries: sections[section],
+            piece: null,
           })
         ).toEqual([])
     } finally {
@@ -1326,7 +1327,7 @@ describe('final soak record line sizes', () => {
       section: 'requests',
       chunk: N - 1,
       chunks: N,
-      entries: chunk(
+      ...chunk(
         Array.from({ length: 2000 }, (_, i) => ({
           request: `${C}.q${N}.${i}`,
           queue: `${C}.n${N}`,
@@ -1452,20 +1453,20 @@ describe('final soak record line sizes', () => {
           offset: OFFSET,
           state: 'settling',
         })),
-        ranges: Array.from({ length: 3000 }, (_, i) => ({
+        ranges: Array.from({ length: 6000 }, (_, i) => ({
           acquisition: `${C}.a${N}${i}`,
           key: keyOf(i),
           from: OFFSET,
           to: OFFSET,
         })),
-        cohorts: Array.from({ length: 3000 }, (_, i) => `${C}.k${N}${i}`),
+        cohorts: Array.from({ length: 6000 }, (_, i) => `${C}.k${N}${i}`),
       },
       listeners: {
         emitter: `${C}.e${N}`,
         client: C,
         scope: owner.scope,
         event: 'request',
-        registrations: Array.from({ length: 3000 }, (_, i) => ({
+        registrations: Array.from({ length: 6000 }, (_, i) => ({
           listener: `${C}.l${N}${i}`,
           scope: owner.scope,
         })),
@@ -1474,13 +1475,13 @@ describe('final soak record line sizes', () => {
         ledger: `o${N}`,
         topic: topic('main'),
         partition: N,
-        open: 3000,
-        tickets: Array.from({ length: 3000 }, (_, i) => `t${N}${i}`),
+        open: 6000,
+        tickets: Array.from({ length: 6000 }, (_, i) => `t${N}${i}`),
       },
       'other-table': {
         client: C,
         table: 'preferred-replicas',
-        keys: Array.from({ length: 3000 }, (_, i) => keyOf(i)),
+        keys: Array.from({ length: 6000 }, (_, i) => keyOf(i)),
       },
     }
     for (const [section, entry] of Object.entries(huge)) {

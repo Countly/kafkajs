@@ -70,6 +70,7 @@ const sectionProblems = (section, entries, client = 'c03.1') =>
     chunk: 0,
     chunks: 1,
     entries,
+    piece: null,
   })
 
 /** A clock whose sleepers wake in time order when `drive` runs; no wall time passes. */
