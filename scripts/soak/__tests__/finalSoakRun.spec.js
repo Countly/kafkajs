@@ -8,7 +8,11 @@ const {
   MonotonicClock,
   planSchedule,
   Scheduler,
+  harnessWait,
+  harnessBound,
+  clearHarnessTimeout,
   liveHarnessTimers,
+  realSpan,
 } = require('../finalSoakScheduler')
 const {
   sha256,
@@ -1480,6 +1484,29 @@ describe('final soak work admission and quiet samples', () => {
       process.env.PATH = PATH
       fs.rmSync(bin, { recursive: true, force: true })
       remove()
+    }
+  })
+
+  test('a harness wait and a harness bound of one length arm the same delay at the real rate; a faster harness clock shortens only the wait; both count as harness timers', () => {
+    const spy = jest.spyOn(global, 'setTimeout')
+    const before = liveHarnessTimers()
+    const armed = (rate) => {
+      MonotonicClock.rate = rate
+      const timers = [harnessWait(() => {}, 6000), harnessBound(() => {}, 6000)]
+      const delays = spy.mock.calls.slice(-2).map((call) => call[1])
+      const live = liveHarnessTimers() - before
+      timers.forEach(clearHarnessTimeout)
+      return { delays, live, span: realSpan(6000) }
+    }
+    try {
+      expect([armed(1), armed(60), liveHarnessTimers() - before]).toEqual([
+        { delays: [6000, 6000], live: 2, span: 6000 },
+        { delays: [100, 6000], live: 2, span: 360000 },
+        0,
+      ])
+    } finally {
+      MonotonicClock.rate = 1
+      spy.mockRestore()
     }
   })
 

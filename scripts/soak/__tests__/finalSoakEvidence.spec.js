@@ -29,6 +29,7 @@ const {
 } = require('../finalSoakWorkers')
 const { ContainerDumper, describeProblem } = require('../finalSoakDump')
 const { validateRecord } = require('../finalSoakSchema')
+const { MonotonicClock } = require('../finalSoakScheduler')
 
 const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, '../finalSoakMatrix.json'), 'utf8'))
 const TREE = 'b'.repeat(40)
@@ -54,6 +55,22 @@ describe('final soak collector writes', () => {
     at: 0,
     execution: null,
     message: `note ${seq}`,
+  })
+
+  test('at a sixty-fold harness clock a sink write taking 1.5 s of real time stays within its 60 s write bound', async () => {
+    MonotonicClock.rate = 60
+    try {
+      const sink = {
+        write: (buffer) =>
+          new Promise((resolve) => setTimeout(resolve, 1500, { bytesWritten: buffer.length })),
+        sync: async () => {},
+      }
+      const collector = new Collector({ sink, clock, matrix })
+      const written = await collector.append(record(0))
+      expect([written, collector.failures]).toEqual([true, []])
+    } finally {
+      MonotonicClock.rate = 1
+    }
   })
 
   test('a short write is continued with the rest of the chunk until every byte is in the file', async () => {
