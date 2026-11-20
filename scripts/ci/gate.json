@@ -22480,6 +22480,7 @@
         "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots a heap snapshot that fails is recorded with its error and the run still ends naturally with no problem of its own",
         "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots every sample is followed by its own heap record of V8 space and code statistics, and the stream stays valid",
         "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots without any opt-in every subject, the seed, the reader and the decoder write a snapshot, and finalize binds their summary, one record per receipt",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp runs at the real rate while the scheduler holds work: a 300 ms stall inside a hold advances every process run clock by its real length only",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on UNKNOWN_MEMBER_ID",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on FENCED_MEMBER_EPOCH",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap logs the name, type and code of each failing share heartbeat",
