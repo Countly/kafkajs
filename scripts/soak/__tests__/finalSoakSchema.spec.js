@@ -999,6 +999,23 @@ describe('scripts/soak/finalSoakSchema', () => {
     }
   })
 
+  it('a rehearsal is a third mode of whole day hours, at least three, with the seed timed as on the day and its sensitivity only reported, and a rehearsal stream is structurally valid', () => {
+    expect(matrix.acceptance.modes.rehearsal.requestedMs.value).toBe(3 * matrix.schedule.hourMs)
+    const seed = matrix.controls['interning-seeded'].timing
+    expect(seed.rehearsal).toEqual({ ...seed.acceptance, sensitivity: 'report-only' })
+    expect(run({ mode: 'rehearsal' })).toEqual([])
+    const lengthOf = (ms) => {
+      const copy = JSON.parse(JSON.stringify(matrix))
+      copy.acceptance.modes.rehearsal.requestedMs.value = ms
+      return validateMatrix(copy)
+    }
+    const problem =
+      'matrix.acceptance.modes.rehearsal.requestedMs is not a whole number of hours, at least three'
+    expect(lengthOf(4 * matrix.schedule.hourMs)).toEqual([])
+    expect(lengthOf(2 * matrix.schedule.hourMs)).toEqual([problem])
+    expect(lengthOf(3.5 * matrix.schedule.hourMs)).toEqual([problem])
+  })
+
   it('a complete fixture with every record kind and variant is structurally valid', () => {
     expect(run()).toEqual([])
     expect(run({ mode: 'acceptance' })).toEqual([])

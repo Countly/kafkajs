@@ -222,7 +222,7 @@ function planOf(mode) {
   const smoke = mode === 'smoke'
   return {
     requestedMs,
-    slots: smoke ? matrix.schedule.smoke.periodicSlots : matrix.sampling.periodicSlots.value,
+    slots: requestedMs / matrix.sampling.periodMs.value + 1,
     hours: smoke ? 1 : requestedMs / matrix.schedule.hourMs,
     quietAt: smoke ? matrix.schedule.smoke.quietAtMs : matrix.schedule.quietAtMs,
   }

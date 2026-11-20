@@ -2163,6 +2163,56 @@ describe('scripts/evidence/finalSoakCore', () => {
     )
   })
 
+  describe('a rehearsal', () => {
+    const rehearsal = () => fx.healthy({ mode: 'rehearsal', withInventory: true })
+    const quiet = (process, fn) =>
+      mapRecords(isSample(process, 'quiet'), (r) => fn(Number(r.boundary.slice(1)), r))
+
+    it('passes every row of a healthy three-hour artifact on disk, K5 on its three boundaries, yet is NOT ACCEPTED and says rehearsal runs are diagnostic', async () => {
+      const world = rehearsal()
+      world.supervisor.diagnostic = true
+      const report = await onDisk(world)
+      expect(report.rows.map((r) => `${r.id}:${r.verdict}`)).toEqual(
+        ['K1', 'K2', 'K3', 'K4', 'K5', 'K6', 'K7'].map((id) => `${id}:PASS`)
+      )
+      expect(Object.keys(row(report, 'K5').numbers)).toHaveLength(12)
+      expect(report.overall).toBe('NOT ACCEPTED')
+      expect(formatReport(report)).toMatch(
+        /^CORE VERDICT: NOT ACCEPTED \(rehearsal runs are diagnostic and are never ACCEPTED\)/
+      )
+    })
+
+    it('judges K5 by the day’s endpoint bound, not scaled to its length: growth of exactly the bound passes, one byte more fails', async () => {
+      const bound = fx.matrix.bounds['heap-endpoint'].value
+      const grown = (bytes) =>
+        quiet('p04', (h, r) => (h === 2 ? { heapUsed: r.heapUsed + bytes } : {}))
+      const at = await check(rehearsal(), { edit: grown(bound) })
+      expectRow(at, 'K5', 'PASS')
+      expect(row(at, 'K5').numbers.p04.endpoint).toBe(bound)
+      expectRow(
+        await check(rehearsal(), { edit: grown(bound + 1) }),
+        'K5',
+        'FAIL',
+        /p04 heap endpoint/
+      )
+    })
+
+    it('judges K5 by the day’s slope bound per minute: just under it no slope reason, just over it a slope FAIL', async () => {
+      const slope = fx.matrix.bounds['heap-slope'].value
+      const perHour = (minutes) =>
+        quiet('p05', (h, r) => ({ heapUsed: r.heapUsed + h * minutes * slope }))
+      const reasons = async (minutes) =>
+        row(await check(rehearsal(), { edit: perHour(minutes) }), 'K5').reasons.join('\n')
+      expect(await reasons(59)).not.toMatch(/p05 heap slope/)
+      expect(await reasons(61)).toMatch(/p05 heap slope \d+ B\/min exceeds/)
+    })
+
+    it('is inconclusive in K5 when a process has fewer than its three boundaries', async () => {
+      const edit = without((r) => isSample('p03', 'quiet')(r) && r.boundary === 'h01')
+      expectRow(await check(rehearsal(), { edit }), 'K5', 'INCONCLUSIVE', /p03 has 2 of 3/)
+    })
+  })
+
   describe('a whole artifact on disk', () => {
     it('is checked end to end: stream validated, manifest bound, smoke named diagnostic', async () => {
       const report = await onDisk(smoke())

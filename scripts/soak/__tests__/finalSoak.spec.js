@@ -249,6 +249,54 @@ describe('final soak driver', () => {
     )
   })
 
+  test('rehearsal mode runs the first three hours of the day plan unchanged, so each measured process gets three quiet boundaries', () => {
+    const { offerPlan } = require('../finalSoak')
+    const hourMs = matrix.schedule.hourMs
+    const plan = planSchedule(matrix, 'rehearsal')
+    expect(plan.requestedMs).toBe(3 * hourMs)
+    expect(scheduleTotals(plan)).toMatchObject({
+      idleWindows: 3,
+      regexExecutions: 12,
+      recreations: 6,
+      membershipExecutions: 12,
+      outages: 2,
+      periodicSlots: (3 * hourMs) / matrix.sampling.periodMs.value + 1,
+      quietReadings: 9,
+      shapes: sorted(SHAPES),
+      kinds: sorted(CLIENT_KINDS),
+    })
+    const boundaries = plan.steps.filter((s) => s.type === 'quiet').map((s) => s.boundary)
+    expect([...new Set(boundaries)]).toEqual(['h00', 'h01', 'h02'])
+    const shaped = (steps) =>
+      steps
+        .filter(
+          (s) => s.shape !== 'traffic' && !['periodic', 'seed-clear', 'disconnect'].includes(s.type)
+        )
+        .map(({ order, ...step }) => step)
+    const day = planSchedule(matrix, 'acceptance').steps.filter((s) => s.at < 3 * hourMs)
+    expect(shaped(plan.steps)).toEqual(shaped(day))
+    const seedStart = plan.steps.find((s) => s.type === 'seed-start')
+    expect(seedStart.at).toBeGreaterThan(plan.steps.find((s) => s.id === 'h00q2').at)
+    const { expected, capacity } = offerPlan(matrix, 'rehearsal')
+    expect(expected).toBeGreaterThan(offerPlan(matrix, 'smoke').expected)
+    expect(expected / capacity).toBeLessThanOrEqual(0.8)
+  })
+
+  test('rehearsal mode takes its length from the matrix, refuses --duration and may run diagnostic in the driver and the preflight', () => {
+    expect(parseArgs(['--mode', 'rehearsal', '--diagnostic', ...ARGS], ENV)).toMatchObject({
+      mode: 'rehearsal',
+      requestedMs: matrix.acceptance.modes.rehearsal.requestedMs.value,
+      diagnostic: true,
+    })
+    expect(parseArgs(['--mode', 'rehearsal', ...ARGS], ENV).diagnostic).toBe(false)
+    expect(() =>
+      parseArgs(['--mode', 'rehearsal', '--duration', '10800000', ...ARGS], ENV)
+    ).toThrow('--duration is accepted only in smoke mode')
+    expect(new Preflight({ sha: TREE, mode: 'rehearsal', matrix, diagnostic: true }).mode).toBe(
+      'rehearsal'
+    )
+  })
+
   test('acceptance mode rejects --duration', () => {
     expect(() => parseArgs(['--mode', 'acceptance', '--duration', '600000', ...ARGS], ENV)).toThrow(
       '--duration is accepted only in smoke mode'
@@ -1007,6 +1055,18 @@ describe('final soak driver', () => {
     ],
     ['an acceptance run that is NOT ACCEPTED', 'acceptance', {}, 'NOT ACCEPTED (exit status 1)'],
     [
+      'a rehearsal that is REJECTED',
+      'rehearsal',
+      { CORE_REPORT: 'CORE VERDICT: REJECTED', CORE_STATUS: '1' },
+      'REJECTED (exit status 1)',
+    ],
+    [
+      'a rehearsal whose checker says ACCEPTED',
+      'rehearsal',
+      { CORE_REPORT: 'CORE VERDICT: ACCEPTED', CORE_STATUS: '0' },
+      'ACCEPTED (exit status 0)',
+    ],
+    [
       'a smoke whose checker says ACCEPTED with a failing exit status',
       'smoke',
       { CORE_REPORT: 'CORE VERDICT: ACCEPTED', CORE_STATUS: '1' },
@@ -1031,6 +1091,33 @@ describe('final soak driver', () => {
       const { receipt, log } = harness.evidence()
       expect(receipt).toMatchObject({ failedStage: 'core', exitStatus: 1 })
       expect(log).toContain(`core checker verdict: ${said}`)
+    } finally {
+      harness.remove()
+    }
+  })
+
+  test('a diagnostic rehearsal runs preflight and driver in rehearsal mode and passes the core stage with NOT ACCEPTED, which it expects', () => {
+    const harness = runbookHarness()
+    try {
+      const result = harness.run([TREE, 'rehearsal'], {
+        FINAL_SOAK_DIAGNOSTIC: '1',
+        CORE_REPORT:
+          'CORE VERDICT: NOT ACCEPTED (rehearsal runs are diagnostic and are never ACCEPTED)',
+      })
+      expect(result.stderr).toBe('')
+      expect(result.status).toBe(0)
+      const calls = harness.calls()
+      expect(calls.find((c) => c.includes('finalSoakPreflight.js'))).toMatch(
+        /--mode rehearsal --out \S+ --diagnostic$/
+      )
+      expect(calls.find((c) => c.includes('--expose-gc'))).toMatch(
+        /--mode rehearsal .*--diagnostic$/
+      )
+      expect(calls.some((c) => /--driver-limit --mode rehearsal /.test(c))).toBe(true)
+      const { receipt, log } = harness.evidence()
+      expect(receipt).toMatchObject({ failedStage: null, exitStatus: 0 })
+      expect(log).toContain('core checker verdict: NOT ACCEPTED (exit status 1)')
+      expect(log).toContain('A rehearsal is never ACCEPTED')
     } finally {
       harness.remove()
     }
@@ -2665,34 +2752,57 @@ describe('final soak driver', () => {
     expect(parseValue(null, RUN)).toBeNull()
   })
 
-  test('the smoke workflow runs the runbook in diagnostic smoke mode on dispatch or a smoke branch push', () => {
+  test('the smoke workflow runs the runbook diagnostic on dispatch or a smoke branch push, in smoke mode unless a dispatch selects rehearsal, inside the hosted six hours', () => {
     const workflow = yaml.load(fs.readFileSync(WORKFLOW, 'utf8'))
+    /** @param {string} body @returns {string} the GitHub expression around `body` */
+    const expression = (body) => `$${'{{'} ${body} }}`
     expect(workflow.on.push).toEqual({ branches: ['p11/soak-smoke*'] })
     expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch', 'push'])
     for (const input of Object.values(workflow.on.workflow_dispatch.inputs ?? {}))
       expect(input.default).toBeDefined()
+    expect(workflow.on.workflow_dispatch.inputs.mode).toMatchObject({
+      type: 'choice',
+      options: ['smoke', 'rehearsal'],
+      default: 'smoke',
+    })
     const [job] = Object.values(workflow.jobs)
     expect(Object.keys(workflow.jobs)).toHaveLength(1)
-    const smoke = matrix.acceptance.modes.smoke
+    expect(job.env).toMatchObject({
+      KAFKA_VERSION: '4.4.0',
+      FINAL_SOAK_DIAGNOSTIC: '1',
+      FINAL_SOAK_MODE: expression("inputs.mode || 'smoke'"),
+    })
     const runbook = job.steps.find((s) => (s.run ?? '').includes('finalSoakNode.sh'))
-    const [, grace, limit] = /^timeout -k (\d+)s (\d+)s bash /.exec(runbook.run).map(Number)
-    expect(limit * 1000).toBeGreaterThanOrEqual(
-      smoke.requestedMs.value + smoke.teardownAllowanceMs.value + 15 * 60000
+    expect(runbook.run).toMatch(
+      /timeout -k (\d+)s "\$\{limit\}s" bash scripts\/soak\/finalSoakNode\.sh "\$\(git rev-parse HEAD\)" "\$FINAL_SOAK_MODE"$/m
     )
+    const grace = Number(/timeout -k (\d+)s/.exec(runbook.run)[1])
     expect(grace).toBeGreaterThanOrEqual(120)
-    expect(runbook['timeout-minutes'] * 60).toBeGreaterThan(limit + grace)
+    const limits = ['smoke', 'rehearsal'].map((mode) => {
+      const limit = Number(new RegExp(`^\\s*${mode}\\) limit=(\\d+) ;;$`, 'm').exec(runbook.run)[1])
+      const { requestedMs, teardownAllowanceMs } = matrix.acceptance.modes[mode]
+      expect([
+        mode,
+        limit * 1000 >= requestedMs.value + teardownAllowanceMs.value + 15 * 60000,
+      ]).toEqual([mode, true])
+      return limit
+    })
+    expect(runbook['timeout-minutes'] * 60).toBeGreaterThan(Math.max(...limits) + grace)
     const steps = job.steps.reduce((sum, s) => sum + s['timeout-minutes'], 0)
     expect(job['timeout-minutes']).toBeGreaterThanOrEqual(steps)
-    expect(job.env).toMatchObject({ KAFKA_VERSION: '4.4.0', FINAL_SOAK_DIAGNOSTIC: '1' })
+    expect(job['timeout-minutes']).toBeLessThanOrEqual(360)
     const runs = job.steps.map((s) => s.run ?? '')
-    expect(
-      runs.some((r) =>
-        /bash scripts\/soak\/finalSoakNode\.sh "\$\(git rev-parse HEAD\)" smoke$/.test(r)
-      )
-    ).toBe(true)
     expect(runs.some((r) => r.includes('acceptance'))).toBe(false)
     const upload = job.steps.find((s) => s.uses?.startsWith('actions/upload-artifact'))
-    expect(upload).toMatchObject({ if: 'always()', with: { 'if-no-files-found': 'error' } })
+    expect(upload).toMatchObject({
+      if: 'always()',
+      with: {
+        name: ['env.FINAL_SOAK_MODE', 'github.run_id', 'github.run_attempt']
+          .map(expression)
+          .reduce((name, part) => `${name}-${part}`, 'final-soak'),
+        'if-no-files-found': 'error',
+      },
+    })
     const print = job.steps.find((s) => (s.run ?? '').includes('summary.json'))
     expect(print).toMatchObject({ if: 'always()' })
     expect(print.run).toContain('*.runbook.json')
