@@ -7,7 +7,8 @@
  * option validation and construction run) and swaps only the client's network calls for in-memory
  * answers that check the arguments the soak passes. The private cluster the preflight reads
  * ApiVersions ranges through stays the product's own, served by a three-node `ScriptedCluster` on
- * the in-process socket seam. With `FINAL_SOAK_REHEARSAL_WARP=<k>` the monotonic clock runs k times
+ * the in-process socket seam, as is the raw reader's own broker connection. Any real dial or name
+ * lookup throws, so the rehearsal cannot pass or fail by the host's network. With `FINAL_SOAK_REHEARSAL_WARP=<k>` the monotonic clock runs k times
  * faster and timers wait 1/k of their delay, from the shared `FINAL_SOAK_REHEARSAL_ANCHOR`, so a
  * smoke schedule runs in a fraction of its length with every process on one clock.
  *
@@ -347,7 +348,12 @@ kafkajs.Kafka = RehearsalKafka
 // The in-memory clients never join a group, so no partition is ever assigned: every consumer
 // member reads as holding the main topic's one partition, which is what the readiness check and
 // the membership waves look for.
-const { ConsumerWorker, ShareWorker } = require('../scripts/soak/finalSoakWorkers')
+const {
+  ConsumerWorker,
+  ShareWorker,
+  ReaderWorker,
+  openRawBroker,
+} = require('../scripts/soak/finalSoakWorkers')
 ConsumerWorker.prototype.assignedKeys = function () {
   const { main } = this.runtime.config.topics
   return [{ topic: main, topicId: idOf(main), partition: 0 }]
@@ -362,3 +368,21 @@ ConsumerWorker.prototype.onRecovered = async () => ({ ok: true })
 ShareWorker.prototype.onRecovered = async () => ({ ok: true })
 // No share session exists here, so no fetch answer can show the member is ready to acquire.
 ShareWorker.prototype.fetchAnswered = () => true
+// The raw reader dials its own broker connection, outside any `Kafka`: it reads through a scripted
+// cluster where nothing was ever written, so each scan archives its raw exchanges and ends at 0.
+let readerWire = null
+ReaderWorker.prototype.openBroker = (address, onExchange) => {
+  readerWire ??= scripted().answer('ListOffsets', ({ topics: list }) => ({
+    topics: list.map(({ name, partitions }) => ({
+      name,
+      partitions: partitions.map(({ partitionIndex }) => ({
+        partitionIndex,
+        errorCode: 0,
+        timestamp: '-1',
+        offset: '0',
+        leaderEpoch: 0,
+      })),
+    })),
+  }))
+  return openRawBroker(address, onExchange, () => readerWire.socketFactory)
+}

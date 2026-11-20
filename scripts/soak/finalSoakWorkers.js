@@ -2679,8 +2679,15 @@ class ReaderWorker extends Worker {
 
   /** Raw scan bytes written so far, against `RAW_SCAN_BYTES`. */
   rawBytes = 0
-  /** Opens the raw broker connection a scan reads through. */
-  openBroker = openRawBroker
+  /**
+   * Opens the raw broker connection a scan reads through.
+   * @param {{ host: string, port: number }} address
+   * @param {(exchange: object) => void} onExchange
+   * @returns {Promise<object>} a connected `Broker`
+   */
+  openBroker(address, onExchange) {
+    return openRawBroker(address, onExchange)
+  }
 
   /**
    * Scans one key and journals each committed record as it arrives, one fetch at a time, so the
@@ -2784,14 +2791,15 @@ class ReaderWorker extends Worker {
  * Opens one broker connection whose frames are all handed to `onExchange`.
  * @param {{ host: string, port: number }} address
  * @param {(exchange: object) => void} onExchange
+ * @param {() => Function} [base] the socket factory maker, the real network's by default
  * @returns {Promise<object>} a connected `Broker`
  */
-const openRawBroker = async ({ host, port }, onExchange) => {
+const openRawBroker = async ({ host, port }, onExchange, base = undefined) => {
   const Broker = require('../../src/broker')
   const ConnectionPool = require('../../src/network/connectionPool')
   const { createLogger, LEVELS } = require('../../src/loggers')
   const LoggerConsole = require('../../src/loggers/console')
-  const registry = new SocketRegistry()
+  const registry = new SocketRegistry({ base })
   const logger = createLogger({ level: LEVELS.NOTHING, logCreator: LoggerConsole })
   const broker = new Broker({
     connectionPool: new ConnectionPool({
