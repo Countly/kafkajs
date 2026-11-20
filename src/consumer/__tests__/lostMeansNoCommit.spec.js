@@ -1923,9 +1923,13 @@ const { TOPIC_ID } = require('./fixtures/fetchHarness')
  * Schedulers wrap completion only; every request and answer uses the strict seam's wire pair.
  */
 class TransportMember {
-  /** @param {string} kind protocol @param {boolean} isStatic static member @param {string} api handler */
-  constructor(kind, isStatic, api) {
+  /**
+   * @param {string} kind protocol @param {boolean} isStatic static member @param {string} api handler
+   * @param {number} [requestTimeout=20000] how long a request held at a gate waits for its answer
+   */
+  constructor(kind, isStatic, api, requestTimeout = 20000) {
     this.kind = kind
+    this.requestTimeout = requestTimeout
     this.isStatic = isStatic
     this.api = api
     this.releases = []
@@ -1982,7 +1986,7 @@ class TransportMember {
       this.cluster.kafkaOptions({
         socketFactory,
         sasl: { mechanism: 'plain', username: 'user', password: 'password' },
-        requestTimeout: 20000,
+        requestTimeout: this.requestTimeout,
         connectionTimeout: 10000,
         retry: { initialRetryTime: 321, factor: 0, retries: 3 },
       })
@@ -2018,6 +2022,13 @@ class TransportMember {
     this.group = this.runner.consumerGroup
     this.manager = this.group.offsetManager
     this.broker = this.manager.coordinator
+    // The wait between two rounds of one chain lasts the broker's heartbeat interval: advanced at
+    // once instead of slept, so a chain that owes another round never meets a 5 s guard.
+    this.wrap(this.runner.rebalanceCoordinator, 'yieldBetweenRounds', (wait) => () => {
+      const waited = wait()
+      this.runner.rebalanceCoordinator.notifyStopRequested()
+      return waited
+    })
     this.pauseTimers()
     await until(() => !this.runner.heartbeatManager.inFlight, 'the initial heartbeat settling')
     if (this.kind === 'consumer' && this.group.groupMembership.state === 'ACKNOWLEDGING') {
@@ -2606,7 +2617,8 @@ describe('real ownership transport on consumer for a heartbeat coordinator looku
   let member
   beforeAll(() => prepareRecordBatches())
   beforeEach(async () => {
-    member = new TransportMember('consumer', false, 'eachMessage')
+    // The late lookup's held request times out and its retry finds the coordinator.
+    member = new TransportMember('consumer', false, 'eachMessage', 1000)
     await member.open()
   })
   afterEach(async () => {

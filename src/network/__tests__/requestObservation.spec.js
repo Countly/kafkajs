@@ -4,7 +4,11 @@ const Encoder = require('../../protocol/encoder')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const events = require('../instrumentationEvents')
-const { ON_DECODED, acceptsCell } = require('../../broker/privateOptions')
+const { ON_DECODED, acceptedIndex } = require('../../broker/privateOptions')
+
+/** @returns {object} `acceptedIndex(decoded)` as plain data: accepted partitions by topic */
+const indexed = (decoded) =>
+  Object.fromEntries([...acceptedIndex(decoded)].map(([topic, cells]) => [topic, [...cells]]))
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 const { newLogger, createFakeSocketFactory, respondWithFrame } = require('testHelpers')
 
@@ -414,10 +418,10 @@ describe('Network > request observation', () => {
       const seen = []
 
       await harness.broker.offsetCommit(commit({ topic: 'test-topic' }), {
-        [ON_DECODED]: (decoded) => seen.push(acceptsCell(decoded, 'test-topic', 0)),
+        [ON_DECODED]: (decoded) => seen.push(indexed(decoded)),
       })
 
-      expect(seen).toEqual([true])
+      expect(seen).toEqual([{ 'test-topic': [0] }])
     })
 
     test('a v10 reply naming a topic id the request did not carry accepts no cell', async () => {
@@ -429,25 +433,25 @@ describe('Network > request observation', () => {
       const seen = []
 
       await harness.broker.offsetCommit(commit({ topic: 'test-topic', topicId: TOPIC_ID }), {
-        [ON_DECODED]: (decoded) => seen.push(acceptsCell(decoded, 'test-topic', 0)),
+        [ON_DECODED]: (decoded) => seen.push(indexed(decoded)),
       })
 
       expect(harness.requests.map(({ apiVersion }) => apiVersion)).toEqual([10])
-      expect(seen).toEqual([false])
+      expect(seen).toEqual([{ null: [0] }])
     })
 
     test.each([
       [
         { responses: [{ topic: 'test-topic', partitions: [{ partition: 0, errorCode: 0 }] }] },
-        true,
+        { 'test-topic': [0] },
       ],
       [
         { responses: [{ topic: 'test-topic', partitions: [{ partition: 0, errorCode: 7 }] }] },
-        false,
+        { 'test-topic': [] },
       ],
       [
         { responses: [{ topic: 'test-topic', partitions: [{ partition: 1, errorCode: 0 }] }] },
-        false,
+        { 'test-topic': [1] },
       ],
       [
         {
@@ -455,11 +459,11 @@ describe('Network > request observation', () => {
             { topic: null, topicId: OTHER_ID, partitions: [{ partition: 0, errorCode: 0 }] },
           ],
         },
-        false,
+        { null: [0] },
       ],
-      [{ responses: [] }, false],
-    ])('acceptsCell(%j, test-topic, 0) is %s', (decoded, accepted) => {
-      expect(acceptsCell(decoded, 'test-topic', 0)).toBe(accepted)
+      [{ responses: [] }, {}],
+    ])('acceptedIndex(%j) is %j', (decoded, accepted) => {
+      expect(indexed(decoded)).toEqual(accepted)
     })
   })
 })
