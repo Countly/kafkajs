@@ -337,11 +337,26 @@ module.exports = (params) => {
   let restart = null
   /**
    * The cleanup of the crash being reported, published before its first diagnostic and settled
-   * once its stop and cluster disconnect are done, before the restart decision. Every public close
-   * joins it, so it returns only after that cleanup's transport and registry work.
-   * @type {Promise<void>|null}
+   * once its stop, cluster disconnect and forced `loss` callback are done, before the restart
+   * decision. Every public close joins it, so it returns only after that cleanup's transport and
+   * registry work.
+   * @type {{ promise: Promise<void>, loss?: import('./runner').ForcedLoss }|null}
    */
   let crashCleanup = null
+
+  /**
+   * Retires a forced crash's loss callback at a close's absolute deadline, if that is finite. The
+   * wake is a timer even when the deadline has passed, so the callback is entered first.
+   * @param {import('./runner').ForcedLoss|undefined} loss
+   * @param {ConsumerOperation} operation the close; read for its deadline only
+   * @returns {void}
+   */
+  const boundLoss = (loss, operation) => {
+    if (!loss || operation.deadlineAt === Infinity) return
+    const timer = setTimeout(loss.retire, Math.min(2147483647, Math.ceil(operation.remaining())))
+    const clear = () => clearTimeout(timer)
+    loss.promise.then(clear, clear)
+  }
 
   /**
    * Cancels the pending crash restart, both while its timer is armed and while it waits for a close.
@@ -758,7 +773,7 @@ module.exports = (params) => {
         disconnectCluster(deadlineAt === Infinity ? undefined : operation.remaining())
       const results = await Promise.allSettled(transport)
       // Covers the crash cleanup it overlaps, never the crash report, which may await this close.
-      await crashCleanup
+      await crashCleanup?.promise
       const failure = results.find(({ status }) => status === 'rejected')
       if (failure && !forced) throw failure.reason
       if (failure)
@@ -787,6 +802,7 @@ module.exports = (params) => {
     const operation = new ConsumerOperation({
       deadlineAt: timeout === undefined ? Infinity : performance.now() + timeout,
     })
+    boundLoss(crashCleanup?.loss, operation)
     const { promise, resolve, reject } = deferred()
     const record = {
       operation,
@@ -1296,20 +1312,26 @@ module.exports = (params) => {
      * @param {Error} e what the run failed with
      * @param {ControlLifetime} owned the lifetime the run belongs to
      * @param {number} startGeneration `stopGeneration` when the run started
-     * @param {{ forced?: boolean }} [claim] `forced` when a fatal deadline retired the run while a
-     *   handler may still run: such a crash joins a close already in progress instead of tearing
-     *   down beside it, and never restarts
+     * @param {{ forced?: boolean, loss?: import('./runner').ForcedLoss }} [claim] `forced` when a
+     *   fatal deadline retired the run while a handler may still run: such a crash joins a close
+     *   already in progress instead of tearing down beside it, and never restarts. Its cleanup also
+     *   waits for `loss`, the close callback the claim delivered, which the first close's deadline
+     *   retires early.
      * @returns {Promise<void>}
      */
-    const onCrash = async (e, owned, startGeneration, { forced = false } = {}) => {
+    const onCrash = async (e, owned, startGeneration, { forced = false, loss } = {}) => {
       const admitted = !owned.fence.closed
       // Published before the first diagnostic, so a close that diagnostic starts joins the cleanup.
-      const cleaned = admitted ? deferred() : null
-      if (cleaned) crashCleanup = cleaned.promise
+      const cleaned = admitted ? { ...deferred(), loss } : null
+      if (cleaned) {
+        crashCleanup = cleaned
+        if (closing) boundLoss(loss, closing.operation)
+      }
       const settleCleanup = () => {
         cleaned?.resolve()
-        if (crashCleanup === cleaned?.promise) crashCleanup = null
+        if (crashCleanup === cleaned) crashCleanup = null
       }
+      let joining = null
       const getOriginalCause = (error) => (error.cause ? getOriginalCause(error.cause) : error)
       const crashStopGeneration = startGeneration + 1
 
@@ -1339,16 +1361,15 @@ module.exports = (params) => {
           cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
         }
         // Read after the diagnostic: a forced crash joins a close admitted before or during it, for
-        // one stop and one teardown. Its own cleanup is released first, since that close joins it.
-        const joining = forced ? closing : null
-        if (joining) {
-          settleCleanup()
-          await joining.promise
-        } else await shutDown(undefined, { keepResets: true, preserveSetupState: true })
+        // one stop and one teardown. That close joins this cleanup, so it is awaited only after.
+        joining = forced ? closing : null
+        if (!joining) await shutDown(undefined, { keepResets: true, preserveSetupState: true })
       } catch {
       } finally {
+        if (loss) await loss.promise.catch(() => {})
         settleCleanup()
       }
+      if (joining) await joining.promise.catch(() => {})
 
       const isErrorRetriable =
         e.name === 'KafkaJSNumberOfRetriesExceeded' || getOriginalCause(e).retriable === true

@@ -235,8 +235,9 @@ describe('Consumer > the loss callback of a crash the fatal deadline forces', ()
   )
 
   it('a timed disconnect waiting in its stop when the deadline forces the crash ends the wait for the held loss callback at its own deadline, though the forced retirement cancelled that close timer', async () => {
-    const loss = heldLoss()
+    const loss = heldLoss(lateCalls)
     const run = await startHeld({ onPartitionsLost: loss.callback })
+    loss.consumer = run.consumer
     run.arm()
     await advanceUntil(() => run.faultAt() !== null)
     const closeAt = Date.now()

@@ -46,6 +46,13 @@ const CONSUMING_START = 'consuming-start'
 const CONSUMING_STOP = 'consuming-stop'
 const HANDLERS_IDLE = 'handlers-idle'
 
+/**
+ * The close callback a forced fatal claim delivered.
+ * @typedef {object} ForcedLoss
+ * @property {Promise<void>} promise settles once the callback has ended, expired or been retired
+ * @property {() => void} retire ends the wait for the callback and its authority, at once
+ */
+
 module.exports = class Runner extends EventEmitter {
   /**
    * @param {object} options
@@ -60,8 +67,9 @@ module.exports = class Runner extends EventEmitter {
    * @param {number} options.maxPollInterval the resolved poll deadline, in milliseconds
    * @param {number} [options.sessionTimeout=30000] how long a classic member's fetch loop rides
    *   out lost connections and coordinator moves before they count against `retry.retries`
-   * @param {(reason: Error, claim?: { forced: boolean }) => Promise<void>} options.onCrash the
-   *   crash report; `forced` when a deadline retired the run while its handlers may still run
+   * @param {(reason: Error, claim?: { forced: boolean, loss?: ForcedLoss }) => Promise<void>} options.onCrash
+   *   the crash report; `forced` when a deadline retired the run while its handlers may still run,
+   *   with the `loss` callback that claim delivered when the run has a listener
    * @param {() => void} [options.onJoinComplete] forwarded to the rebalance coordinator
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {boolean} [options.autoCommit=true]
@@ -243,7 +251,10 @@ module.exports = class Runner extends EventEmitter {
 
   /**
    * Claims the accepted fatal answer for the crash report, once: the forced claim when the run is
-   * retired before the fetch loop took it, so the crash names the original answer.
+   * retired before the fetch loop took it, so the crash names the original answer. That claim
+   * delivers the loss without waiting for the handler and hands the crash report its `loss`: a
+   * promise settling once the callback has ended, and `retire`, which ends that wait and the
+   * callback's authority before the rebalance timeout does.
    * @private
    * @returns {void}
    */
@@ -252,20 +263,26 @@ module.exports = class Runner extends EventEmitter {
     if (!fatal || fatal.claimed) return
     this.disarmFatal()
     const episode = this.rebalanceHooks ? this.closeEpisode() : null
+    const scope = episode && new ConsumerOperation()
+    let deliver
+    const loss = episode && {
+      promise: new Promise((resolve) => (deliver = resolve)),
+      retire: () => scope.retire(consumerStoppingError()),
+    }
+    const claim = { forced: true, loss }
     this.rebalanceCoordinator.runInternal(() => {
       // Wrapped as the fetch retrier wraps it on the prompt claim, so both claims report one shape.
       const error = new KafkaJSNonRetriableError(fatal.error, {
         cause: fatal.error.cause || fatal.error,
       })
-      const report = Promise.resolve(this.onCrash(error, { forced: true })).catch((failure) =>
+      const report = Promise.resolve(this.onCrash(error, claim)).catch((failure) =>
         this.logger.error('Crash handler failed', {
           groupId: this.consumerGroup.groupId,
           error: describeThrown(failure),
           cause: fatal.error.message,
         })
       )
-      // The loss is delivered without waiting for the handler, beside the crash cleanup.
-      if (episode) this.invokeCloseHook(episode)
+      if (episode) deliver(this.invokeCloseHook(episode, scope))
       return report
     })
   }
