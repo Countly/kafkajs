@@ -105,17 +105,46 @@ jobs:
           echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
           chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
-      - name: Verify retained jars offline and prepare decoder inputs
+      - name: Restore the pinned telemetry inputs
+        id: inputs-cache
+        if: matrix.compose == 'docker-compose.telemetry.yml'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tmp/telemetry-cache/tools
+            .tmp/telemetry-cache/jars
+            .tmp/telemetry-cache/proto
+          key: telemetry-inputs-${{ runner.os }}-${{ hashFiles('scripts/e2e/telemetry/fixtures/inputs.sha256') }}
+      - name: Verify retained jars offline
+        if: matrix.compose == 'docker-compose.telemetry.yml'
+        timeout-minutes: 1
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+      - name: Fetch and verify the pinned telemetry inputs
+        id: inputs
         if: matrix.compose == 'docker-compose.telemetry.yml'
         timeout-minutes: 5
         env:
           TMPDIR: ${{ runner.temp }}
+        run: timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+      - name: Prepare decoder inputs
+        if: matrix.compose == 'docker-compose.telemetry.yml'
+        timeout-minutes: 2
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
-          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
-          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Restore the pinned Java interop jars
+        id: interop-cache
+        if: matrix.group == 'telemetry-java'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tmp/telemetry-interop
+          key: telemetry-interop-${{ runner.os }}-${{ hashFiles('scripts/e2e/telemetry/interop.sha256') }}
       - name: Fetch and verify the pinned Java interop jars
+        id: interop
         if: matrix.group == 'telemetry-java'
         timeout-minutes: 4
         run: timeout -k 5s 200s bash scripts/e2e/telemetry/fetch-interop.sh
@@ -181,6 +210,21 @@ jobs:
         run: |
           timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
           node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - name: Save the pinned telemetry inputs
+        if: always() && steps.inputs.outcome == 'success' && steps.inputs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tmp/telemetry-cache/tools
+            .tmp/telemetry-cache/jars
+            .tmp/telemetry-cache/proto
+          key: ${{ steps.inputs-cache.outputs.cache-primary-key }}
+      - name: Save the pinned Java interop jars
+        if: always() && steps.interop.outcome == 'success' && steps.interop-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tmp/telemetry-interop
+          key: ${{ steps.interop-cache.outputs.cache-primary-key }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
