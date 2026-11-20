@@ -420,7 +420,7 @@
     "check-exports.py": "3b607b9c28b5e855a9f65d9ff82952fe399ca5fac0c1b644a6604faa9c98df67",
     "check-golden-protoc.py": "047fdb999918513e22cba75164197e5a92d29b40324dd3d2daf5c537fbf4540c",
     "check-golden.py": "e7734ff4569b0317505238e380f638095b2e6a0edf8ceec2a8d3910116514b83",
-    "fetch.sh": "2ed6819dd196dcfebd13aa4325a3ca145567db3ff7d5cbd9e193c2c02e8ee28f",
+    "fetch.sh": "737d7c43fa6ea3c0191da1ef5ff50a20aee6f8647af585f40303cfd3cf0a07b8",
     "lib.sh": "e439e1d349bb8e2e9f8c7e97d1175a5671c89ca2596f4a3b0e523c756f6d5cdc",
     "make-golden.sh": "fe81af51242bff3d7c98de7be40911ab1a9a581caaba1fffaba98a6616db12ca",
     "protoc-text-to-semantic.py": "996dbb4b65a6f128a61d22d614c4f61fc1d467d97b5ca0c3cae4b063be12870f",
@@ -554,6 +554,13 @@
       "change": "download.sh rounds each source's share of the deadline up, so the first source still gets an attempt when fewer seconds than sources are left; the later sources still recompute from the clock, so the total stays inside the 150 s deadline. fetch.sh, inputs.sha256, interop.sha256 and every retained jar are unchanged.",
       "downloadSha256Before": "02c47381b63f7a7a1543ee651a368a43bf160103655c49d06601b70fcc95ff5e",
       "downloadSha256After": "f972641652b5b2ec5714f6210a2e0a50646a92457c4f2d0745aa9cae36ba49d7"
+    },
+    {
+      "id": "fetch-maven-mirror",
+      "date": "2026-11-20",
+      "change": "fetch.sh and fetch-interop.sh give every Maven Central file a second source at the same path on Google's Maven Central mirror (https://maven-central.storage-download.googleapis.com/maven2); protoc keeps the protobuf v25.5 release archive as its third source. download.sh, inputs.sha256, interop.sha256 and every retained jar are unchanged; a file still enters the cache only with its pinned SHA-256.",
+      "fetchSha256Before": "2ed6819dd196dcfebd13aa4325a3ca145567db3ff7d5cbd9e193c2c02e8ee28f",
+      "fetchSha256After": "737d7c43fa6ea3c0191da1ef5ff50a20aee6f8647af585f40303cfd3cf0a07b8"
     }
   ]
 }
