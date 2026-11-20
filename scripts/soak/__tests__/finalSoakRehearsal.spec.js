@@ -22,8 +22,6 @@ const BROKERS = 'kafka1:9092,kafka2:9092,kafka3:9092'
 const WARP = 60
 /** Sixty-fold sampling is late by the real cost of two collections, which no broker-free run avoids. */
 const EXPECTED_PROBLEM = /^step \S+ late$/
-/** The rehearsal's only failing steps: the raw reader has no broker to open a connection to. */
-const UNREACHABLE = /^step scan\.\S+ failed: Connection timeout$/
 
 /**
  * A rehearsal workspace: the artifact directory with the reporter receipt the runbook's preparation
@@ -219,9 +217,14 @@ describe('final soak rehearsal', () => {
           step.id,
           true,
         ])
-      expect(
-        notes.filter((n) => /^step \S+ (failed|error)/.test(n) && !UNREACHABLE.test(n))
-      ).toEqual([])
+      expect(notes.filter((n) => /^step \S+ (failed|error)/.test(n))).toEqual([])
+      const scans = of('scan')
+      expect(scans.length).toBeGreaterThan(0)
+      for (const scan of scans)
+        expect([scan.scan, fs.existsSync(path.join(ws.out, scan.rawFile))]).toEqual([
+          scan.scan,
+          true,
+        ])
       expect(notes.filter((n) => /^producer loop failed/.test(n))).toEqual([])
       const shareGroup = config.clients.find((c) => c.clientKind === 'share').group
       const configured = records.findIndex(

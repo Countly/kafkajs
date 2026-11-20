@@ -17,8 +17,23 @@
  * worker's assignment read is replaced, since nothing joins a group.
  */
 const crypto = require('node:crypto')
+const dns = require('node:dns')
 const fs = require('node:fs')
+const net = require('node:net')
 const path = require('node:path')
+
+// Nothing here may reach a real network: a dial or a name lookup fails loudly instead of passing or
+// failing by whatever the host's resolver and ports happen to do.
+const offline = (what) => {
+  throw new Error(`rehearsal: real network use (${what})`)
+}
+net.Socket.prototype.connect = function (...args) {
+  // `net.connect` hands over its normalized `[options, callback]` pair as the first argument.
+  const target = Array.isArray(args[0]) ? args[0][0] : args[0]
+  offline(`connect ${target?.host ?? target?.path ?? target}:${target?.port ?? args[1] ?? ''}`)
+}
+dns.lookup = (host) => offline(`lookup ${host}`)
+dns.promises.lookup = async (host) => offline(`lookup ${host}`)
 
 const warp = Number(process.env.FINAL_SOAK_REHEARSAL_WARP ?? 1)
 if (warp > 1) {
