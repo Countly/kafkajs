@@ -1,6 +1,9 @@
 const createRetry = require('../../retry')
+const handlerContext = require('../../consumer/handlerContext')
+const { ON_WRITE } = require('../../broker/privateOptions')
 const {
   KafkaJSBrokerNotFound,
+  KafkaJSCommitFailedError,
   KafkaJSDeliveryTimeout,
   KafkaJSError,
   KafkaJSGroupCoordinatorNotFound,
@@ -152,6 +155,39 @@ const unknownOutcome = (error) =>
     : null
 
 /**
+ * The refusal of a transaction that carries offsets of a consumer batch a seek, a topic recreation
+ * or the end of its acquisition superseded: the transaction can only be aborted, and the records
+ * processed again in a new one. The cause is the commit refusal the consumer gives such a batch.
+ * @param {Pick<import('../../consumer/handlerContext').BatchIdentity, 'acquisition'|'acquireClock'>} input
+ *   the superseded input
+ * @returns {KafkaJSTransactionAbortableError}
+ */
+const supersededInputError = (input) =>
+  new KafkaJSTransactionAbortableError(
+    'A consumer batch whose offsets this transaction carries was superseded; call abort() on it and process the records again in a new transaction',
+    {
+      cause: new KafkaJSCommitFailedError(
+        handlerContext.isSought(input)
+          ? 'A seek superseded the handler batch'
+          : 'The handler outlived its assignment',
+        { reason: 'stale-assignment' }
+      ),
+    }
+  )
+
+/**
+ * @param {ReadonlyArray<{ topic: string, partitions: ReadonlyArray<{ partition: number|string }> }>} topics
+ * @param {{ topic: string, partition: number }} cell
+ * @returns {boolean} whether the offsets name the cell's partition
+ */
+const carries = (topics, { topic, partition }) =>
+  topics.some(
+    (entry) =>
+      entry.topic === topic &&
+      entry.partitions.some((offset) => Number(offset.partition) === partition)
+  )
+
+/**
  * The consumer group a transactional offset commit is for: the membership `consumerGroupMetadata`
  * names (KIP-447), or a bare `consumerGroupId`, which commits with no member to fence.
  * @param {{ consumerGroupId?: string, consumerGroupMetadata?: { groupId: string,
@@ -236,6 +272,40 @@ const createEosManager = ({
 
   /** The private options a broker request takes for a captured lifecycle; none without one. */
   const guardOf = (generation) => (generation ? { guard: generation.guard } : {})
+
+  /**
+   * @returns {KafkaJSTransactionAbortableError|null} the refusal of this transaction once one of
+   *   its input batches was superseded (`TransactionOffsets#supersededInput`)
+   */
+  const inputRefusal = () => {
+    const input = stateManager.offsets.supersededInput()
+    return input && supersededInputError(input)
+  }
+
+  /**
+   * The private options of an AddOffsetsToTxn or TxnOffsetCommit attempt: the lifecycle's guard,
+   * and, while the transaction holds input dependencies, their refusal too, so a request is not
+   * written once an input was superseded.
+   * @param {import('../generation')} [generation]
+   * @returns {{ guard?: (frameLength?: number) => Error|null }}
+   */
+  const offsetGuardOf = (generation) =>
+    stateManager.offsets.inputs === null
+      ? guardOf(generation)
+      : { guard: () => generation?.guard() || inputRefusal() }
+
+  /**
+   * Runs immediately before a commit EndTxn that carries input dependencies is written: refuses
+   * the write once an input was superseded, else drops the dependencies, since from this write on
+   * the commit may have happened and a later seek must not turn it, or its retry, into an abort.
+   * @returns {void}
+   * @throws {KafkaJSTransactionAbortableError} the refusal; the request is not written
+   */
+  const sealInputs = () => {
+    const refusal = inputRefusal()
+    if (refusal) throw refusal
+    stateManager.offsets.sealInputs()
+  }
 
   /**
    * Re-reads the metadata the producer's cluster tracks after the broker answered UNKNOWN_TOPIC_ID,
@@ -536,6 +606,7 @@ const createEosManager = ({
           transactionResult: committed,
           transactionVersion,
           ...guardOf(generation),
+          ...(committed && stateManager.offsets.inputs !== null ? { [ON_WRITE]: sealInputs } : {}),
         })
       } catch (e) {
         generation?.check()
@@ -774,6 +845,8 @@ const createEosManager = ({
       generation?.check()
       stateManager.resolveSequences()
       stateManager.transaction.guard('commit')
+      const refusal = inputRefusal()
+      if (refusal) throw armWith(refusal)
       stateManager.transitionTo(STATES.COMMITTING)
 
       try {
@@ -929,6 +1002,11 @@ const createEosManager = ({
      *   are given, or neither; nothing is armed then
      * @throws {TypeError} when `topics`, or the `partitions` of one, is not an array; nothing is
      *   sent and nothing is armed
+     * @throws {import('../../errors').KafkaJSTransactionAbortableError} armed, `cause` a
+     *   `KafkaJSCommitFailedError` (`stale-assignment`), when an input batch of the transaction was
+     *   superseded (a seek, a topic recreation, the end of its acquisition); nothing more of the
+     *   call is sent. Called from a consumer handler with offsets of its own group and partition,
+     *   the call ties the transaction to that batch until the commit EndTxn is written
      *
      * @typedef {Object} OffsetCommitTopic
      * @property {string} topic
@@ -953,6 +1031,19 @@ const createEosManager = ({
         groupId,
         topics
       )
+      const identity = handlerContext.current()
+      if (
+        identity?.acquisition !== undefined &&
+        identity.groupId === groupId &&
+        carries(snapshot.topics, identity)
+      ) {
+        stateManager.offsets.enlist(identity.acquisition, identity.acquireClock)
+      }
+      const refusal = inputRefusal()
+      if (refusal) {
+        stateManager.offsets.abandon(snapshot)
+        throw armWith(refusal)
+      }
       return stateManager.offsets.enqueue(snapshot, async () => {
         const transactionVersion = stateManager.transactionVersion()
 
@@ -975,7 +1066,7 @@ const createEosManager = ({
                   producerId: stateManager.producerId,
                   producerEpoch: stateManager.producerEpoch,
                   groupId,
-                  ...guardOf(generation),
+                  ...offsetGuardOf(generation),
                 })
               } catch (e) {
                 generation?.check()
@@ -1017,7 +1108,7 @@ const createEosManager = ({
                 groupInstanceId,
                 transactionVersion,
                 ...(topicIds ? { topicIds } : {}),
-                ...guardOf(generation),
+                ...offsetGuardOf(generation),
               })
             } catch (e) {
               generation?.check()

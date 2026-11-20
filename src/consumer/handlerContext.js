@@ -10,8 +10,9 @@ const storage = new AsyncLocalStorage()
  */
 
 /**
- * The fields `Runner#isBatchStale` reads, plus the acquisition the batch was fetched under.
- * @typedef {{ topic: string, partition: number, assignmentEpoch: number|null, acquireClock: number, ownershipKey: string, acquisition?: Acquisition }} BatchIdentity
+ * The fields `Runner#isBatchStale` reads, plus the acquisition the batch was fetched under and the
+ * group that fetched it (a transaction's `sendOffsets` matches it to the offsets' group).
+ * @typedef {{ topic: string, partition: number, assignmentEpoch: number|null, acquireClock: number, ownershipKey: string, acquisition?: Acquisition, groupId?: string|null }} BatchIdentity
  */
 
 /**

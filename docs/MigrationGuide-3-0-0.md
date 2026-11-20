@@ -292,6 +292,20 @@ notice and what, if anything, to do.
 Transactions move to the transaction protocol Kafka 4.x brokers speak, and a failed send now ends a
 transaction in a way its error decides.
 
+- **A seek can now make a transaction abort-only.** `transaction.sendOffsets()` called from a
+  consumer handler, or from work it started, with that handler's group and partition among the
+  offsets (with `consumerGroupMetadata` or `consumerGroupId`) ties the transaction to that batch.
+  If a seek of the partition, a topic recreation or the end of the batch's assignment supersedes
+  the batch before the commit `EndTxn` is written, `sendOffsets()` or `commit()` rejects with
+  `KafkaJSTransactionAbortableError` (cause: `KafkaJSCommitFailedError`, `reason:
+  'stale-assignment'`). The whole offset set is refused, never a filtered subset, and a fresh
+  `sendOffsets()` cannot repair the transaction. *What to do:* a handler that seeks its own
+  partition must commit or abort its transaction first, then seek; after such a refusal, `abort()`
+  and process the records again in a new transaction, from a handler of a batch fetched after the
+  seek. Offsets sent outside any handler, for another partition or another group are not fenced.
+  A commit `EndTxn` already written is never turned into an abort by a later seek: retry an
+  unknown commit outcome as before.
+
 - **A consumer resolving its position waits for open transactions** (KIP-447). Every `OffsetFetch`
   a consumer sends to find its committed offsets now asks for stable offsets (`RequireStable`),
   under both group protocols and whatever the isolation level, as the Java consumer does. A

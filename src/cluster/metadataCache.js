@@ -31,10 +31,13 @@ module.exports = class MetadataCache {
    * @param {object} options
    * @param {import('../../types').Logger} options.logger
    * @param {import('../instrumentation/emitter')|null} [options.instrumentationEmitter]
+   * @param {(topic: string) => boolean} [options.isWanted] whether the client still targets a
+   *   topic; a scoped refresh keeps an absent topic only while this says so (every topic by default)
    */
-  constructor({ logger, instrumentationEmitter = null }) {
+  constructor({ logger, instrumentationEmitter = null, isWanted = () => true }) {
     this.logger = logger.namespace('MetadataCache')
     this.instrumentationEmitter = instrumentationEmitter
+    this.isWanted = isWanted
 
     /**
      * Per topic: its id, and per partition the accepted leader/epoch pair plus `decoded` - a
@@ -67,9 +70,11 @@ module.exports = class MetadataCache {
    * Applies a decoded Metadata response, in three ordered steps, and writes accepted
    * leader/leaderEpoch pairs back onto the response's own partition objects.
    *
-   * A topic absent from the response keeps its id and its epochs - a Metadata response is scoped
-   * to the topics it was asked for, so absence is never evidence of deletion or recreation - but
-   * releases its `decoded` references, which belong to a response no route reads any more. When
+   * A topic absent from the response keeps its id and its epochs while the client still wants it -
+   * a Metadata response is scoped to the topics it was asked for, so absence is never evidence of
+   * deletion or recreation - but releases its `decoded` references, which belong to a response no
+   * route reads any more. An absent topic nothing wants any more is dropped, as the Java client's
+   * `retainTopic` drops it, so describing short-lived names cannot grow the cache. When
    * the response is a **full-cluster** one (the refresh asked for no topics, so the broker
    * answered with every topic it has), absence *is* evidence: those topics are pruned outright,
    * which is what stops one regex subscription or one `listTopics()` from seeding this cache with
@@ -215,8 +220,9 @@ module.exports = class MetadataCache {
   /**
    * Second pass of `update()`: every cached topic the response did not carry either loses its
    * `decoded` references (a scoped response says nothing about it) or is dropped entirely (a
-   * full-cluster response says it no longer exists). Bounded by the number of cached topics, and
-   * skipped per topic once released, so a steady state costs one comparison per topic.
+   * full-cluster response says it no longer exists, or nothing wants it any more). A topic that
+   * only `updateTopicsById` recorded (`seenAt` 0) is kept: it is a pending id resolution its
+   * owner registers as a target or retires. Bounded by the number of cached topics.
    *
    * @private
    * @param {boolean} full true when the response described the whole cluster
@@ -228,7 +234,7 @@ module.exports = class MetadataCache {
         continue
       }
 
-      if (full) {
+      if (full || (entry.seenAt > 0 && !this.isWanted(name))) {
         this.topics.delete(name)
         entry.topicId != null && this.topicIds.delete(entry.topicId)
         continue

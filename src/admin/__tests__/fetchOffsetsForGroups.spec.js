@@ -250,12 +250,45 @@ describe('offset result boundaries', () => {
     }
   })
   it('inherits a short API deadline and prevents the next coordinator lookup', async () => {
-    const cluster = { findGroupCoordinator: jest.fn(() => new Promise(() => {})) }
-    const admin = createAdmin({ cluster, logger, retry })
-    await expect(admin.fetchOffsetsForGroups({ groups, apiTimeout: 10 })).rejects.toMatchObject({
-      name: 'KafkaJSTimeout',
-    })
-    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    jest.useFakeTimers()
+    try {
+      const b = broker(0, 9)
+      let entered
+      const lookupEntered = new Promise((resolve) => {
+        entered = resolve
+      })
+      let release
+      const held = new Promise((resolve) => {
+        release = resolve
+      })
+      const cluster = {
+        findGroupCoordinator: jest.fn(() => {
+          entered()
+          return held
+        }),
+      }
+      let outcome
+      createAdmin({ cluster, logger, retry })
+        .fetchOffsetsForGroups({ groups, apiTimeout: 10 })
+        .then(
+          (value) => (outcome = { value }),
+          (error) => (outcome = { error })
+        )
+      await lookupEntered
+      await jest.advanceTimersByTimeAsync(9)
+      expect(outcome).toBeUndefined()
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      await jest.advanceTimersByTimeAsync(1)
+      expect(outcome.error).toMatchObject({ name: 'KafkaJSTimeout' })
+      release(b)
+      await jest.advanceTimersByTimeAsync(100)
+      expect(outcome.value).toBeUndefined()
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      expect(b.offsetFetch).not.toHaveBeenCalled()
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      jest.useRealTimers()
+    }
   })
 })
 

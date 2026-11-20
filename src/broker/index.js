@@ -2416,6 +2416,8 @@ module.exports = class Broker {
    *   producer id and epoch the coordinator bumped to (KIP-890)
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
+   * @param {() => void} [request[ON_WRITE]] internal (`./privateOptions`): called once, immediately
+   *   before the request is written to the socket; a throw rejects the request unwritten
    * @returns {Promise}
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
@@ -2426,6 +2428,7 @@ module.exports = class Broker {
     transactionResult,
     transactionVersion = 1,
     guard,
+    [ON_WRITE]: onWrite,
   }) {
     this.throwIfRefused(guard)
     const endTxn = this.lookupRequestWithMax(
@@ -2433,10 +2436,14 @@ module.exports = class Broker {
       requests.EndTxn,
       transactionVersionCap(apiKeys.EndTxn, transactionVersion)
     )
-    return await this[PRIVATE.SEND_REQUEST](
-      endTxn({ transactionalId, producerId, producerEpoch, transactionResult }),
-      guard
-    )
+    const protocolRequest = endTxn({
+      transactionalId,
+      producerId,
+      producerEpoch,
+      transactionResult,
+    })
+    if (onWrite) protocolRequest.onWrite = onWrite
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**
