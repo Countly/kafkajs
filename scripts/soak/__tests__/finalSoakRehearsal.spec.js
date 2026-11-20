@@ -304,3 +304,115 @@ describe('final soak rehearsal', () => {
     expect([run.stderr, JSON.parse(run.stdout)]).toEqual(['', { fast: true, stalled: true }])
   }, 30000)
 })
+
+describe('final soak rehearsal heap snapshots', () => {
+  const run = {}
+
+  beforeAll(async () => {
+    run.ws = workspace()
+    // The decoder's snapshot path is a directory, so its snapshot fails and the others do not.
+    fs.mkdirSync(path.join(run.ws.out, 'heap/p16.h00.heapsnapshot'), { recursive: true })
+    const env = {
+      ...run.ws.env,
+      FINAL_SOAK_REHEARSAL_WARP: String(WARP),
+      FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+    }
+    run.driver = await runDriver(
+      [
+        '--expose-gc',
+        '--no-flush-bytecode',
+        'scripts/soak/finalSoak.js',
+        '--mode',
+        'smoke',
+        '--expect-sha',
+        TREE,
+        '--matrix',
+        MATRIX_FILE,
+        '--out',
+        run.ws.out,
+        '--diagnostic',
+        '--heap-snapshots',
+      ],
+      env
+    )
+    run.finalize = spawnSync(
+      process.execPath,
+      ['scripts/soak/finalSoak.js', '--finalize', '--out', run.ws.out, '--status', '0'],
+      { cwd: ROOT, env, encoding: 'utf8' }
+    )
+    const read = (file) => JSON.parse(fs.readFileSync(path.join(run.ws.out, file), 'utf8'))
+    run.config = read('config.json')
+    run.supervisor = read('supervisor.json')
+    run.header = read('header.json')
+    run.records = recordsOf(run.ws.out)
+  }, 240000)
+
+  afterAll(() => run.ws?.remove())
+
+  test('each selected process writes its heap snapshot into the run directory only after every quiet reading of the boundary, and the sealed header binds the file', () => {
+    expect(run.driver).toMatchObject({ code: 0, signal: null })
+    expect(run.finalize.status).toBe(0)
+    const { records, config, supervisor, header } = run
+    const quiet = records.filter((r) => r.kind === 'sample' && r.role === 'quiet')
+    expect(new Set(quiet.map((r) => r.reading))).toEqual(new Set([0, 1, 2]))
+    const lastReading = Math.max(...quiet.map((r) => r.completedAt))
+    const lastQuietLine = records.lastIndexOf(quiet.at(-1))
+    expect(supervisor.heapSnapshots.map((s) => `${s.slot} ${s.boundary}`).sort()).toEqual(
+      config.heapSnapshots.map((slot) => `${slot} h00`).sort()
+    )
+    for (const receipt of supervisor.heapSnapshots)
+      expect([receipt.slot, receipt.at > lastReading]).toEqual([receipt.slot, true])
+    const notes = records
+      .map((r, line) => ({ r, line }))
+      .filter(({ r }) => r.kind === 'diagnostic' && r.message.startsWith('heap snapshot '))
+    expect(notes.map(({ r }) => r.snapshot)).toEqual(supervisor.heapSnapshots)
+    for (const { r, line } of notes)
+      expect([r.message, line > lastQuietLine]).toEqual([r.message, true])
+    const written = supervisor.heapSnapshots.filter((s) => s.error === null)
+    expect(written.map((s) => s.slot).sort()).toEqual(
+      config.heapSnapshots.filter((s) => s !== 'p16').sort()
+    )
+    const bound = new Map(header.files.map((f) => [f.file, f.bytes]))
+    for (const { file, bytes } of written) {
+      expect(file).toMatch(/^heap\/p\d\d\.h00\.heapsnapshot$/)
+      expect([file, fs.statSync(path.join(run.ws.out, file)).size, bound.get(file)]).toEqual([
+        file,
+        bytes,
+        bytes,
+      ])
+      expect(bytes).toBeGreaterThan(1024 * 1024)
+    }
+  })
+
+  test('a heap snapshot that fails is recorded with its error and the run still ends naturally with no problem of its own', () => {
+    const failed = run.supervisor.heapSnapshots.find((s) => s.slot === 'p16')
+    expect(failed).toMatchObject({ file: 'heap/p16.h00.heapsnapshot', bytes: null })
+    expect(failed.error).toMatch(/EISDIR/)
+    expect(run.supervisor).toMatchObject({ aborted: null, incomplete: null, failures: [] })
+    expect(run.supervisor.problems.filter((p) => !EXPECTED_PROBLEM.test(p))).toEqual([])
+    // The finalize step appends the supervisor's exit as the outer observer saw it.
+    const exits = run.records.filter((r) => r.kind === 'process' && r.event === 'exit')
+    expect(exits.map((r) => `${r.process}:${r.code}`).sort()).toEqual(
+      run.config.processes.map((p) => `${p.slot}:0`).sort()
+    )
+  })
+
+  test('every sample is followed by its own heap record of V8 space and code statistics, and the stream stays valid', () => {
+    const next = new Map()
+    const unmatched = []
+    for (const r of run.records) {
+      const sample = next.get(r.source)
+      if (sample && !(r.kind === 'heap' && r.sample === sample)) unmatched.push(sample)
+      next.set(r.source, r.kind === 'sample' ? r.recordId : null)
+    }
+    expect(unmatched).toEqual([])
+    const heaps = run.records.filter((r) => r.kind === 'heap')
+    expect(heaps).toHaveLength(run.records.filter((r) => r.kind === 'sample').length)
+    for (const h of heaps)
+      expect([h.sample, h.spaces.old > 0, h.code.bytecode > 0]).toEqual([h.sample, true, true])
+    const validator = new StreamValidator({ matrix, config: run.config, header: run.header })
+    for (const line of fs.readFileSync(path.join(run.ws.out, 'stream.ndjson'), 'utf8').split('\n'))
+      if (line) validator.push(line)
+    expect(validator.finish().slice(0, 30)).toEqual([])
+  })
+})

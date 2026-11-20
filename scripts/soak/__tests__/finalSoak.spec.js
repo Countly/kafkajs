@@ -298,6 +298,41 @@ describe('final soak driver', () => {
     )
   })
 
+  test('heap snapshots are an opt-in of smoke and rehearsal runs, recorded in the config by client kind and process role, and refused in acceptance mode', () => {
+    expect(parseArgs(['--mode', 'rehearsal', '--heap-snapshots', ...ARGS], ENV)).toMatchObject({
+      mode: 'rehearsal',
+      heapSnapshots: true,
+    })
+    expect(parseArgs(['--mode', 'smoke', '--heap-snapshots', ...ARGS], ENV).heapSnapshots).toBe(
+      true
+    )
+    expect(parseArgs(['--mode', 'rehearsal', ...ARGS], ENV).heapSnapshots).toBe(false)
+    expect(() => parseArgs(['--mode', 'acceptance', '--heap-snapshots', ...ARGS], ENV)).toThrow(
+      '--heap-snapshots is accepted only in smoke mode or rehearsal mode'
+    )
+
+    const options = { runId: RUN, treeSha: TREE, brokers: ['k:1'] }
+    const config = buildConfig(matrix, { ...options, mode: 'rehearsal', heapSnapshots: true })
+    const kindOf = (slot) =>
+      config.clients.find((c) => c.process === slot && c.purpose !== 'observer')?.clientKind ??
+      config.processes.find((p) => p.slot === slot).role
+    expect(config.heapSnapshots.map(kindOf)).toEqual([
+      'classic-cooperative-dynamic',
+      'producer-transactional',
+      'reader',
+      'decoder',
+    ])
+    expect(validateConfig(config, matrix)).toEqual([])
+    expect(buildConfig(matrix, { ...options, mode: 'rehearsal' }).heapSnapshots).toBeNull()
+    const day = buildConfig(matrix, { ...options, mode: 'acceptance' })
+    expect(validateConfig({ ...day, heapSnapshots: config.heapSnapshots }, matrix)).toEqual([
+      'config.heapSnapshots is set in acceptance mode',
+    ])
+    expect(validateConfig({ ...config, heapSnapshots: ['p99'] }, matrix)).toEqual([
+      'config.heapSnapshots is not null or a list of config process slots',
+    ])
+  })
+
   test('acceptance mode rejects --duration', () => {
     expect(() => parseArgs(['--mode', 'acceptance', '--duration', '600000', ...ARGS], ENV)).toThrow(
       '--duration is accepted only in smoke mode'
@@ -937,7 +972,18 @@ describe('final soak driver', () => {
       )
       expect(diagnostic.find((c) => c.includes('--expose-gc'))).toMatch(/--diagnostic$/)
 
+      expect(harness.run([TREE, 'rehearsal'], { FINAL_SOAK_HEAP_SNAPSHOTS: '1' }).status).toBe(0)
+      expect(harness.calls().find((c) => c.includes('--expose-gc'))).toMatch(
+        /--mode rehearsal .* --heap-snapshots$/
+      )
+      expect(harness.calls().find((c) => c.includes('--expose-gc'))).not.toMatch(/--diagnostic/)
+
       expect(harness.run([TREE, 'acceptance'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(2)
+      const refused = harness.run([TREE, 'acceptance'], { FINAL_SOAK_HEAP_SNAPSHOTS: '1' })
+      expect(refused.status).toBe(2)
+      expect(refused.stderr).toContain(
+        'FINAL_SOAK_HEAP_SNAPSHOTS is accepted only in smoke or rehearsal mode'
+      )
       expect(harness.run(['main', 'smoke']).status).toBe(2)
       expect(harness.run([TREE, 'day']).status).toBe(2)
       expect(harness.calls()).toEqual([])
@@ -1483,6 +1529,42 @@ describe('final soak driver', () => {
       { type: 'Timeout', count: 0 },
       { type: 'TTYWrap', count: 1 },
     ])
+  })
+
+  test('each sample reads every non-empty V8 heap space and the code statistics after its second collection', async () => {
+    const clock = new VirtualClock()
+    const calls = []
+    const sampler = new Sampler({
+      clock,
+      gc: () => calls.push('gc'),
+      turn: () => clock.sleepUntil(clock.now()),
+      memory: () => ({ rss: 9, heapUsed: 8, external: 7 }),
+      resources: () => [],
+      spaces: () => {
+        calls.push('spaces')
+        return [
+          { space_name: 'new_space', space_used_size: 0 },
+          { space_name: 'old_space', space_used_size: 5000 },
+          { space_name: 'code_space', space_used_size: 300 },
+          { space_name: 'trusted_large_object_space', space_used_size: 40 },
+        ]
+      },
+      codeStatistics: () => {
+        calls.push('code')
+        return {
+          code_and_metadata_size: 11,
+          bytecode_and_metadata_size: 12,
+          external_script_source_size: 13,
+          cpu_profiler_metadata_size: 14,
+        }
+      },
+    })
+    const reading = await clock.drive(sampler.read({ role: 'periodic', slot: 3, cut: () => 'i0' }))
+    expect(calls).toEqual(['gc', 'gc', 'spaces', 'code'])
+    expect(reading.heap).toEqual({
+      spaces: { old: 5000, code: 300, trusted_large_object: 40 },
+      code: { code: 11, bytecode: 12, scripts: 13 },
+    })
   })
 
   describe('weak bookkeeping', () => {
@@ -2825,6 +2907,10 @@ describe('final soak driver', () => {
     expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch', 'push'])
     for (const input of Object.values(workflow.on.workflow_dispatch.inputs ?? {}))
       expect(input.default).toBeDefined()
+    expect(workflow.on.workflow_dispatch.inputs.heap_snapshots).toMatchObject({
+      type: 'boolean',
+      default: false,
+    })
     expect(workflow.on.workflow_dispatch.inputs.mode).toMatchObject({
       type: 'choice',
       options: ['smoke', 'rehearsal'],
@@ -2836,6 +2922,7 @@ describe('final soak driver', () => {
       KAFKA_VERSION: '4.4.0',
       FINAL_SOAK_DIAGNOSTIC: '1',
       FINAL_SOAK_MODE: expression("inputs.mode || 'smoke'"),
+      FINAL_SOAK_HEAP_SNAPSHOTS: expression("inputs.heap_snapshots && '1' || ''"),
     })
     const runbook = job.steps.find((s) => (s.run ?? '').includes('finalSoakNode.sh'))
     expect(runbook.run).toMatch(

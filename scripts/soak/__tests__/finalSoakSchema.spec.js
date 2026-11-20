@@ -301,6 +301,17 @@ const sample = (process, role, inventory, clients, fields = {}) => ({
   ...fields,
 })
 
+/** A heap record citing the sample of `process` with the given record id. */
+const heap = (process, sample, fields = {}) => ({
+  kind: 'heap',
+  source: process,
+  process,
+  sample,
+  spaces: { old: 8000000, code: 300000, trusted: 1400000, large_object: 1200000 },
+  code: { code: 2500000, bytecode: 880000, scripts: 2290000 },
+  ...fields,
+})
+
 const identity = (stage, source, fields) => ({ kind: 'identity', stage, source, ...fields })
 
 /** @returns {object[]} a valid stream holding every record kind and variant */
@@ -674,6 +685,7 @@ const baseRecords = () => {
       [EAGER, ORDINARY_SECTIONS],
     ]),
     sample('p01', 'periodic', 'i1', [EAGER]),
+    heap('p01', 'p01.1'),
     ...cut('i7', 'p07', [
       [null, PROCESS_SECTIONS],
       [SHARE, ['share-state']],
@@ -2432,6 +2444,41 @@ describe('scripts/soak/finalSoakSchema', () => {
     expect(run({ edit: edit(tickets.length - 1) })).toEqual([
       expect.stringContaining('open differs from its tickets'),
     ])
+  })
+
+  it('a heap record holds the used bytes of named V8 spaces and the code statistics, citing a sample of its own process', () => {
+    const edited = (fields) => (r) =>
+      Object.assign(
+        r.find((x) => x.kind === 'heap'),
+        fields
+      )
+    expectCases({
+      'negative space bytes': [
+        () => run({ edit: edited({ spaces: { old: -1 } }) }),
+        'spaces is not',
+      ],
+      'unnamed space': [
+        () => run({ edit: edited({ spaces: { 'Old Space': 1 } }) }),
+        'spaces is not',
+      ],
+      'more spaces than V8 has': [
+        () =>
+          run({
+            edit: edited({
+              spaces: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`s${i}`, 1])),
+            }),
+          }),
+        'spaces is not',
+      ],
+      'code statistics without bytecode': [
+        () => run({ edit: edited({ code: { code: 1, scripts: 1 } }) }),
+        'code is not',
+      ],
+      'sample of another process': [
+        () => run({ edit: edited({ sample: 'p02.1' }) }),
+        'a heap record cites a sample of its own process',
+      ],
+    })
   })
 
   it('samples carry their role fields and two new forced collections per reading', () => {

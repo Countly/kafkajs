@@ -1337,6 +1337,32 @@ describe('final soak record line sizes', () => {
       clients: ['c06.9999', C],
     },
     {
+      kind: 'heap',
+      process: 'p06',
+      sample: `p06.${N}`,
+      spaces: Object.fromEntries(
+        [
+          'read_only',
+          'new',
+          'old',
+          'code',
+          'shared',
+          'trusted',
+          'shared_trusted',
+          'new_large_object',
+          'large_object',
+          'code_large_object',
+          'shared_large_object',
+          'shared_trusted_large_object',
+          'trusted_large_object',
+          'future_large_object',
+          'future_space_one',
+          'future_space_two',
+        ].map((name) => [name, 99999999999])
+      ),
+      code: { code: 99999999999, bytecode: 99999999999, scripts: 99999999999 },
+    },
+    {
       kind: 'inventory',
       inventory: `p06.i${N}`,
       process: 'p06',
