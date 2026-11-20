@@ -3,7 +3,8 @@ const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = requir
 
 /**
  * What a share membership does with a failed heartbeat, by protocol code. The action classes:
- * - `coordinator`: forget the cached coordinator, keep the membership, retry under backoff;
+ * - `coordinator`: forget the cached coordinator, keep the membership, retry under backoff; also
+ *   every retriable failure that is not a broker answer, such as a lost connection;
  * - `fence`: the member was removed, so rejoin at epoch zero with the same member ID;
  * - `unsupported`: the broker refused the API at runtime, a terminal capability failure;
  * - `fatal`: terminal for this run, never retried;
@@ -11,7 +12,7 @@ const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = requir
  *   current membership as terminal, but is the expected answer to a member's own leave and is
  *   ignored once the membership is retired, so the membership decides, not this table.
  *
- * A code not listed follows its own `retriable` flag. Independent of transport retries and of the
+ * A broker code not listed follows its own `retriable` flag. Independent of transport retries and of the
  * fetch and acknowledgement policy.
  * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/ShareGroupHeartbeatResponse.json
  */
@@ -31,12 +32,17 @@ const MEMBERSHIP_ERRORS = Object.freeze({
 
 /**
  * Classifies a membership failure. Only a current membership may call this: a caller holding the
- * response of a retired membership must discard it first.
+ * response of a retired membership must discard it first. A retriable failure that is not a broker
+ * answer (no numeric code: a failed, closed, replaced or timed-out connection) is `coordinator`,
+ * because the cached coordinator may be unusable for good, for example retired by a rebootstrap;
+ * the Java client marks its coordinator unknown on a disconnect the same way.
+ * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
  * @param {Error} error Decoded protocol or transport error.
  * @returns {'coordinator'|'fence'|'unsupported'|'fatal'|'groupNotFound'|'retry'} Membership action.
  */
 const membershipAction = (error) =>
-  MEMBERSHIP_ERRORS[error.code] || (error.retriable === false ? 'fatal' : 'retry')
+  MEMBERSHIP_ERRORS[error.code] ||
+  (error.retriable === false ? 'fatal' : typeof error.code === 'number' ? 'retry' : 'coordinator')
 
 /**
  * Builds the terminal error of a membership, keeping the protocol code and the cause.
