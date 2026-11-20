@@ -12,7 +12,8 @@
  * `FINAL_SOAK_REHEARSAL_WARP=<k>` the harness clock (`MonotonicClock`) and the harness's own timers
  * run k times faster from the shared `FINAL_SOAK_REHEARSAL_ANCHOR`, so a smoke schedule runs in a
  * fraction of its length with every process on one clock; the clients' own timeouts stay on real
- * time.
+ * time. `FINAL_SOAK_REHEARSAL_HOLDS=<file>` names a ledger, shared by the run's processes, through
+ * which that clock runs at the real rate while the scheduler holds work for a measurement.
  *
  * Environment: `KAFKA_BROKERS` (three `host:port`, the scripted nodes 1–3);
  * `TELEMETRY_EVIDENCE_DIR` and `FINAL_SOAK_REHEARSAL_PUSH=1` make a telemetry-enabled client's
@@ -342,11 +343,66 @@ kafkajs.Kafka = RehearsalKafka
 // the membership waves look for.
 // Only the harness clock and the harness's own timers run faster: a client's connection and request
 // bounds stay on real time, so a CPU stall cannot expire them on an in-memory network.
-const { MonotonicClock } = require('../scripts/soak/finalSoakScheduler')
+const { MonotonicClock, Scheduler } = require('../scripts/soak/finalSoakScheduler')
 const warp = Number(process.env.FINAL_SOAK_REHEARSAL_WARP ?? 1)
 if (warp > 1) {
   MonotonicClock.rate = warp
   MonotonicClock.anchor = BigInt(process.env.FINAL_SOAK_REHEARSAL_ANCHOR)
+  if (process.env.FINAL_SOAK_REHEARSAL_HOLDS) holdAtRealRate(process.env.FINAL_SOAK_REHEARSAL_HOLDS)
+}
+
+/**
+ * Runs the warped clock at the real rate while the scheduler holds work for a measurement (a quiet
+ * sample's forced collections, a boundary's heap snapshots): that cost is real CPU and disk time,
+ * which no warp shortens, so at the warped rate it would spend sixty times its length of plan time.
+ * The supervisor appends each hold's real begin (`b <ns>`) and end (`e <ns>`) to the shared ledger
+ * file, and every process's clock reads them, so all processes keep one run clock.
+ * @param {string} file the hold ledger, shared by every process of the run
+ * @returns {void}
+ */
+function holdAtRealRate(file) {
+  const { rate, anchor } = MonotonicClock
+  const fd = fs.openSync(file, 'a+')
+  const holds = []
+  let offset = 0
+  let rest = ''
+  let last = 0
+  const read = () => {
+    const chunk = Buffer.alloc(4096)
+    for (let n; (n = fs.readSync(fd, chunk, 0, chunk.length, offset)) > 0; offset += n) {
+      const lines = (rest + chunk.toString('latin1', 0, n)).split('\n')
+      rest = lines.pop()
+      for (const line of lines) {
+        const [mark, ns] = line.split(' ')
+        if (mark === 'b') holds.push({ from: BigInt(ns), to: null })
+        else holds.at(-1).to = BigInt(ns)
+      }
+    }
+  }
+  MonotonicClock.raw = () => {
+    const now = process.hrtime.bigint()
+    read()
+    let held = 0n
+    for (const { from, to } of holds) {
+      const end = to === null || to > now ? now : to
+      if (end > from) held += end - from
+    }
+    const ns = anchor + (now - anchor) * BigInt(rate) - held * BigInt(rate - 1)
+    // A hold's mark lands a moment after its instant, so a reading in between can run ahead.
+    last = Math.max(last, Number(ns) / 1e6)
+    return last
+  }
+  let depth = 0
+  const mark = (kind) => fs.appendFileSync(fd, `${kind} ${process.hrtime.bigint()}\n`)
+  const hold = Scheduler.prototype.hold
+  Scheduler.prototype.hold = function (work) {
+    if (depth++ === 0) mark('b')
+    const release = () => {
+      if (--depth === 0) mark('e')
+    }
+    Promise.resolve(work).then(release, release)
+    return hold.call(this, work)
+  }
 }
 const {
   ConsumerWorker,
