@@ -24,7 +24,7 @@ const acceptedIndex = (decoded) => {
 }
 
 module.exports = {
-  /** `offsetCommit`: called once, immediately before the request is written to the socket. */
+  /** `offsetCommit` and `endTxn`: called once, immediately before the request is written to the socket. */
   ON_WRITE: Symbol('onWrite'),
   /**
    * `offsetCommit`: called once with the decoded reply, before a caller refusal, the throttle or

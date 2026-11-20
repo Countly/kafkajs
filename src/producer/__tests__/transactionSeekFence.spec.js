@@ -1,3 +1,4 @@
+const Cluster = require('../../cluster')
 const { producerScript } = require('../../../testHelpers/scriptedCluster')
 const { CloseRig, GROUP, TOPIC, gate } = require('../../consumer/__tests__/fixtures/closeRig')
 const TransactionOffsets = require('../state/transactionOffsets')
@@ -97,7 +98,13 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
   const openInput = async () => {
     const rig = await CloseRig.open({ profile, partitions: 2 })
     rigs.push(rig)
-    producerScript(rig.cluster, { partitions: 2 })
+    producerScript(rig.cluster, { partitions: 2 }).answer(
+      'InitProducerId',
+      ({ producerEpoch = -1 }) => ({
+        producerId: '1000',
+        producerEpoch: Math.max(0, producerEpoch + 1),
+      })
+    )
     const handler = new Handler()
     handlers.push(handler)
     const consumer = rig.consumer()
@@ -248,8 +255,12 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
   it('a seek after the commit EndTxn was written keeps the commit', async () => {
     const input = await openInput()
     const { producer, transaction } = await begin(input)
+    const published = jest.spyOn(Cluster.prototype, 'markOffsetAsCommitted')
     await input.handler.run(() =>
-      transaction.sendOffsets({ consumerGroupId: GROUP, topics: offsetsOf([0, '1']) })
+      transaction.sendOffsets({
+        consumerGroupId: GROUP,
+        topics: offsetsOf([0, '1'], [1, '7']),
+      })
     )
     const held = holdAnswer(input.rig.cluster, 'EndTxn')
     const committed = transaction.commit()
@@ -260,6 +271,12 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
     await committed
     expect(endResults(input.rig)).toEqual([true])
     expect(inputs()).toBeNull()
+    // The broker committed both offsets, so the shared cache records both: a local seek fences
+    // only its own manager's work, never a commit's accepted value.
+    expect(published.mock.calls.map(([offsets]) => offsets)).toEqual([
+      { groupId: GROUP, topic: TOPIC, partition: 0, offset: '1' },
+      { groupId: GROUP, topic: TOPIC, partition: 1, offset: '7' },
+    ])
     const next = await producer.transaction()
     await next.abort()
   })

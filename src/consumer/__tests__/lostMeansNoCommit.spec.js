@@ -523,6 +523,7 @@ describe('handler context contents', () => {
           assignmentEpoch: fixture.group.assignmentEpoch,
           acquireClock: fixture.group.acquireClock,
           ownershipKey: `${SCHEDULED_TOPIC}|0`,
+          groupId: fixture.group.groupId,
           runIdentity: fixture.group.runIdentity,
         })
         // Everything but the run's own identity is a primitive: no batch, message or buffer is kept.
