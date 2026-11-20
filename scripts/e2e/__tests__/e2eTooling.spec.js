@@ -4134,15 +4134,16 @@ describe('pinned download from a second source', () => {
    * Sources the real download.sh and fetches the pinned file from the first URL, then the second URL's zip member.
    * @param {Array<[number, number, string]>} plan the double's answer per curl call
    * @param {string} member the archive member content served by the second source
+   * @param {number} [left] seconds of the shared deadline left when the fetch starts; 150 if absent
    * @returns {{status: number|null, stderr: string, calls: object[]}}
    */
-  const fetch = (plan, member) => {
+  const fetch = (plan, member, left) => {
     const log = path.join(directory, 'tools.jsonl')
     const run = spawnSync(
       'bash',
       [
         '-c',
-        '. "$1/download.sh"; fetch "$2" "$3" tools/protoc "$4" "$5#bin/protoc"',
+        '. "$1/download.sh"; [ -z "$FETCH_LEFT" ] || FETCH_DEADLINE=$(($(date +%s) + FETCH_LEFT)); fetch "$2" "$3" tools/protoc "$4" "$5#bin/protoc"',
         'fetch',
         telemetry,
         path.join(directory, 'inputs.sha256'),
@@ -4159,6 +4160,7 @@ describe('pinned download from a second source', () => {
           FAKE_FAILURES: '0',
           FAKE_PLAN: JSON.stringify(plan),
           FAKE_ARCHIVE: archive('bin/protoc', member),
+          FETCH_LEFT: left === undefined ? '' : String(left),
         },
         encoding: 'utf8',
         timeout: 60000,
@@ -4206,6 +4208,18 @@ describe('pinned download from a second source', () => {
         .map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
     ).toEqual([60, 13, 60])
     expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
+  })
+
+  test('gives the first source an attempt when fewer seconds than sources are left', () => {
+    const result = fetch([missing], pinned, 1)
+    expect(result.status).toBe(1)
+    expect(urls(result.calls)).toEqual([first])
+    expect(
+      result.calls
+        .filter((call) => call.tool === 'curl')
+        .map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+    ).toEqual([1])
+    expect(result.stderr).toContain(`from ${first}: curl exit 22; from ${second}: deadline spent`)
   })
 
   test('rejects a second-source member with the wrong digest and caches nothing', () => {
