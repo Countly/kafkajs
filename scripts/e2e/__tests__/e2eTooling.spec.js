@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('2a855b7eb63e6a15d49dcebc7f2fee80248d0cabecd054e548d8302fb0cae08e')
+    expect(digest(file)).toBe('aa4bdd901df3980ba0e93f76659e8a7ff180e532019632ffcd1f8147a54eb56f')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -3995,6 +3995,7 @@ describe.each([
 
   test('shares one deadline across files, shortening the last attempt and its backoff', () => {
     const plan = [
+      [0, 0, 'pinned'],
       [60, 28, 'partial'],
       [60, 28, 'partial'],
       [21, 0, 'pinned'],
@@ -4003,11 +4004,11 @@ describe.each([
     const result = fetch(0, { FAKE_PLAN: JSON.stringify(plan) })
     expect(result.signal).toBeNull()
     expect(result.status).toBe(1)
-    expect(limits(result.calls)).toEqual([60, 60, 24, 3])
+    expect(limits(result.calls)).toEqual([60, 60, 60, 24, 3])
     expect(sleeps(result.calls)).toEqual([['2'], ['4'], ['1']])
-    const url = curls(result.calls)[3].args.at(-1)
-    expect(result.stderr).toContain(`${names[1]} from ${url}: curl exit 22`)
-    expect(cached()).toEqual([names[0]])
+    const url = curls(result.calls)[4].args.at(-1)
+    expect(result.stderr).toContain(`${names[2]} from ${url}: curl exit 22`)
+    expect(cached().sort()).toEqual([names[0], names[1]].sort())
   })
 
   test('never lets an interrupted download satisfy the cache check', () => {
@@ -4196,7 +4197,7 @@ describe('pinned download from a second source', () => {
 
   test('gives the second source its own share of the deadline when the first source hangs', () => {
     const hang = [0, 28, 'hang']
-    const result = fetch([hang, hang, hang, hang, [0, 0, 'archive']], pinned)
+    const result = fetch([hang, hang, [0, 0, 'archive']], pinned)
     expect(result.status).toBe(0)
     expect(urls(result.calls)).toEqual([first, first, second])
     expect(
