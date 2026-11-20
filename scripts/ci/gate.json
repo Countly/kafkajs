@@ -22519,7 +22519,11 @@
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a later offset for the same partition cannot discard an older input",
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) several input consumers keep their own origins until the commit",
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) disconnecting the producer drops the input dependencies of its open transaction",
-        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a send that is not transactional does no input fence work"
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a send that is not transactional does no input fence work",
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv1) a stale handler call is refused at admission while an earlier offset call is in flight",
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv1) a stale input refuses the commit before its coordinator is looked up",
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale handler call is refused at admission while an earlier offset call is in flight",
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale input refuses the commit before its coordinator is looked up"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -22928,8 +22932,8 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 2 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) without a seek a handler transaction commits its output and both input offsets",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) an applied seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits",
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
         "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) a topic id the cache does not hold keeps the whole offset commit at v5, where the broker offers v6",
         "src/producer/__tests__/txnOffsetCommitV6Live.spec.js \u203a Producer > TxnOffsetCommit v6 (live) commits offsets at the version the broker offers, only after the transaction commits, and an abort commits nothing",
         "src/admin/__tests__/floorConditionalLive.spec.js \u203a Conditional features on the negotiated floor ApiVersions retains the old identity-free path on the floor",
@@ -23297,8 +23301,8 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) without a seek a handler transaction commits its output and both input offsets",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) an applied seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits",
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) the default partitioner of a rack-aware producer sends keyless records to a partition led in its rack",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) DefaultPartitioner of a rack-aware producer alternates over exactly the partitions led in its rack",
         "src/producer/__tests__/rackAwareProducerLive.spec.js \u203a Producer > rack-aware partitioning (live) a rack that no partition leader is in falls back to every partition",
@@ -24981,8 +24985,8 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) without a seek a handler transaction commits its output and both input offsets",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) an applied seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits"
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits",
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged"
       ],
       "capMinutes": 60
     },
@@ -25960,8 +25964,8 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) without a seek a handler transaction commits its output and both input offsets",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) an applied seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits"
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits",
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged"
       ],
       "capMinutes": 60
     },
@@ -27824,8 +27828,8 @@
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 ten transactions in a row: version 2 adopts the epoch each EndTxn returns and restarts sequences at 0, version 1 keeps one epoch and carries the sequences on",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transaction protocol versions (live) transaction version 1 a transaction the coordinator aborted on its timeout: version 2 aborts and carries on, version 1 is fenced, and a commit of one is refused under both",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) without a seek a handler transaction commits its output and both input offsets",
-        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) an applied seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
         "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits",
+        "src/producer/__tests__/transactionVersionLive.spec.js \u203a Producer > transactional seek fence (live) a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged",
         "src/producer/__tests__/transactionRestartLive.spec.js \u203a Producer > transaction recovery (live) a producer killed between Produce and EndTxn leaves records no read_committed reader sees, and the next owner of its transactional id commits",
         "src/producer/__tests__/transactionRestartLive.spec.js \u203a Producer > transaction recovery (live) a send to a partition with no leader makes the transaction abort-only: commit() rejects without EndTxn, abort() resolves, and the same producer commits the next one",
         "src/producer/__tests__/transactionRestartLive.spec.js \u203a Producer > transaction recovery (live) a commit whose outcome is unknown, under transaction version tv2 with the EndTxn answers lost: commit() rejects retriable, abort() is refused, and commit() sent again completes it once",

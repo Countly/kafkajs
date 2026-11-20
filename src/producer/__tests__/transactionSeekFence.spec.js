@@ -77,6 +77,14 @@ const offsetWrites = (rig) =>
       )
     )
 
+/**
+ * @param {number} count
+ * @returns {Promise<void>} settles after `count` event-loop turns
+ */
+const turns = async (count) => {
+  for (let i = 0; i < count; i++) await new Promise((resolve) => setImmediate(resolve))
+}
+
 /** @returns {boolean[]} the `transactionResult` of each EndTxn written */
 const endResults = (rig) => rig.frames('EndTxn').map(({ fields }) => fields.transactionResult)
 
@@ -184,6 +192,65 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
     await transaction.abort()
     expect(endResults(input.rig)).toEqual([false])
     expect(inputs()).toBeNull()
+  })
+
+  it('a stale handler call is refused at admission while an earlier offset call is in flight', async () => {
+    const input = await openInput()
+    const { transaction } = await begin(input)
+    const held = holdAnswer(input.rig.cluster, 'TxnOffsetCommit')
+    const earlier = transaction.sendOffsets({ consumerGroupId: GROUP, topics: offsetsOf([1, '7']) })
+    await held.arrived
+    seekBack(input.consumer)
+
+    const stale = input.handler
+      .run(() => transaction.sendOffsets({ consumerGroupId: GROUP, topics: offsetsOf([0, '1']) }))
+      .catch((e) => e)
+    // The earlier call stays held, so only a refusal at admission can settle the stale one.
+    const error = await Promise.race([stale, turns(50).then(() => 'still queued')])
+    expectFenced(error)
+    held.release()
+    await earlier
+    expect(offsetWrites(input.rig)).toEqual([[`${TOPIC}|1|7`]])
+    await expect(transaction.commit()).rejects.toBe(error)
+    await transaction.abort()
+    expect(endResults(input.rig)).toEqual([false])
+  })
+
+  it('a stale input refuses the commit before its coordinator is looked up', async () => {
+    const input = await openInput()
+    const { transaction } = await begin(input)
+    await input.handler.run(() =>
+      transaction.sendOffsets({ consumerGroupId: GROUP, topics: offsetsOf([0, '1']) })
+    )
+    seekBack(input.consumer)
+    const lookups = () =>
+      input.rig.frames('FindCoordinator').filter(({ fields }) => fields.keyType === 1).length
+    const before = lookups()
+    expect(before).toBeGreaterThan(0)
+    // An unreachable transaction coordinator would leave a looked-up commit pending and retriable.
+    const original = input.rig.cluster.answerers.get('FindCoordinator')
+    input.rig.cluster.answer('FindCoordinator', (fields, record) =>
+      fields.keyType === 1
+        ? {
+            coordinators: fields.coordinatorKeys.map((key) => ({
+              key,
+              nodeId: -1,
+              host: '',
+              port: -1,
+              errorCode: 15,
+              errorMessage: null,
+            })),
+          }
+        : original(fields, record)
+    )
+
+    const error = await transaction.commit().catch((e) => e)
+    expectFenced(error)
+    expect(lookups()).toBe(before)
+    expect(endResults(input.rig)).toEqual([])
+    input.rig.cluster.answer('FindCoordinator', original)
+    await transaction.abort()
+    expect(endResults(input.rig)).toEqual([false])
   })
 
   it('a seek before the TxnOffsetCommit is written refuses the whole call', async () => {
