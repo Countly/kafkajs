@@ -42,12 +42,10 @@ describe('Transactional offset staging', () => {
     expect(offsets.snapshots.size).toBe(1)
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted).toHaveBeenCalledTimes(1)
-    expect(cluster.markOffsetAsCommitted).toHaveBeenCalledWith({
-      groupId: 'group',
-      topic: 'topic',
-      partition: 0,
-      offset: last,
-    })
+    expect(cluster.markOffsetAsCommitted).toHaveBeenCalledWith(
+      { groupId: 'group', topic: 'topic', partition: 0, offset: last },
+      expect.objectContaining({ mutation: true })
+    )
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted).toHaveBeenCalledTimes(1)
     expect(ledger.size()).toBe(0)
@@ -111,7 +109,10 @@ describe('Transactional offset staging', () => {
     ledger.end(mutation)
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted.mock.calls).toEqual([
-      [{ groupId: 'group', topic: 'topic', partition: 1, offset: '7' }],
+      [
+        { groupId: 'group', topic: 'topic', partition: 1, offset: '7' },
+        expect.objectContaining({ mutation: true }),
+      ],
     ])
     expect(ledger.size()).toBe(0)
   })
@@ -153,7 +154,10 @@ describe('Transactional offset staging', () => {
     offsets.abandon(failed)
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted.mock.calls).toEqual([
-      [{ groupId: 'group', topic: 'topic', partition: 0, offset: '2' }],
+      [
+        { groupId: 'group', topic: 'topic', partition: 0, offset: '2' },
+        expect.objectContaining({ mutation: true }),
+      ],
     ])
     expect(ledger.size()).toBe(0)
   })

@@ -770,16 +770,16 @@ const commitError = new KafkaJSCommitFailedError('x', { reason: 'membership-lost
 const commitIsNonRetriable: KafkaJSNonRetriableError = commitError
 const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment' =
   commitError.reason
-const commitCause: Error = commitError.cause
+const commitCause: Error | undefined = commitError.cause
 const commitType: string | undefined = commitError.type
 const commitCode: number | undefined = commitError.code
-// @ts-expect-error `cause` is required: a refused commit always names the loss
-new KafkaJSCommitFailedError('x', { reason: 'membership-lost' })
+const staleCommit = new KafkaJSCommitFailedError('x', { reason: 'stale-assignment' })
+const staleCause: Error | undefined = staleCommit.cause
 // @ts-expect-error not a reason
 new KafkaJSInvalidFrameError('x', { reason: 'too-big' })
 void [frameIsConnectionError, frameReason, frameSize, corruptIsNonRetriable, corruptReason]
 void [boundNext, boundCodec, boundLimit]
-void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode]
+void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode, staleCause]
 
 // The error classes of a closed connection, a join that needs its member id, a broken invariant,
 // an undecodable number, a refused topic creation and a consumer with no broker to fetch from.

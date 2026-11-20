@@ -1,5 +1,6 @@
 const ConsumerGroup = require('../consumerGroup')
 const GroupOwnership = require('../groupOwnership')
+const OffsetOperations = require('../offsetManager/offsetOperations')
 
 /**
  * Uses the real seekOffsets path and an inert manager whose resolver completion is controllable.
@@ -24,6 +25,7 @@ const create = () => {
     acquired: new Map([['records|0', { acquiredAt: 4, changedAt: 4 }]]),
     haltedPartitions: new Map(),
     ownership: new GroupOwnership(),
+    operations: new OffsetOperations(),
     cluster: { topicId: () => 'current-id' },
     seekOffset: { pop: () => null, has: () => false },
     logger: { debugEnabled: () => false },

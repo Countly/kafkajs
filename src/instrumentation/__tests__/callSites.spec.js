@@ -14,7 +14,8 @@ const { newLogger, waitFor } = require('testHelpers')
 
 /**
  * An emitter that records what the code under test emits, under the internal name it emits it
- * with, and delivers it to nobody.
+ * with, and delivers it to nobody. It reports a listener for every event, so code that skips an
+ * unobserved event still emits to it.
  */
 const createRecorder = () => {
   const events = []
@@ -22,6 +23,7 @@ const createRecorder = () => {
     events,
     emit: (name, payload) => events.push({ name, payload }),
     addListener: () => () => {},
+    hasListeners: () => true,
   }
 }
 

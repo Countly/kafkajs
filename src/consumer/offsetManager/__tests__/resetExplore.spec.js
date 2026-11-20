@@ -163,10 +163,11 @@ const start = async (ctx, kind, { index, partition, partitions }) => {
 
 /**
  * What the ordering must leave, from the precedence rules alone: operations are fenced by what
- * was applied to their cell, or by a barrier, before they completed. A mutation applies unless a
- * newer-begun mutation applied first or a barrier came first; a read writes an unresolved cell
+ * was applied to their cell, or by a barrier, before they completed. A mutation (an accepted seek
+ * included) publishes its value unless a newer-begun mutation applied first or a barrier came first; a read writes an unresolved cell
  * only if neither happened; an owed cell stays owed through any write of a read and is settled
- * only by a confirmed seek, commit or publication.
+ * only by a confirmed seek, commit or publication. An applied seek is also the cell's position until
+ * a barrier, whatever is committed after it.
  * @returns {{ before: object[], after: string[], obligations: number }} each cell's state before
  *   and after quiescence, and how many topics still owe a reset
  */
@@ -178,6 +179,7 @@ const expectedState = (shape, partitionCount, order) => {
     fenced: false,
     barrier: false,
     newest: 0,
+    position: undefined,
   }))
   const stored = Array(partitionCount).fill('99')
   let intent = 0
@@ -206,8 +208,9 @@ const expectedState = (shape, partitionCount, order) => {
         cell.newest = own
         cell.fenced = true
         cell.owed = false
-        cell.cache = kind.startsWith('seek') ? undefined : value
-        cell.shared = cell.cache
+        cell.cache = value
+        cell.shared = value
+        if (kind.startsWith('seek')) cell.position = value
       }
     } else if (kind === 'recreate') {
       for (const cell of cells) {
@@ -217,6 +220,7 @@ const expectedState = (shape, partitionCount, order) => {
           owed: true,
           fenced: true,
           barrier: true,
+          position: undefined,
         })
       }
     } else if (kind === 'revoke') {
@@ -225,13 +229,15 @@ const expectedState = (shape, partitionCount, order) => {
         shared: undefined,
         fenced: true,
         barrier: true,
+        position: undefined,
       })
     }
   }
 
   const before = cells.map(({ cache, shared, owed }) => ({ cache, shared, owed }))
-  const after = cells.map(({ cache, owed }, partition) =>
-    cache === undefined ? (owed ? '0' : stored[partition]) : cache
+  const after = cells.map(
+    ({ cache, owed, position }, partition) =>
+      position ?? (cache === undefined ? (owed ? '0' : stored[partition]) : cache)
   )
 
   const committed = cells.map(({ cache, shared, owed }, partition) =>
