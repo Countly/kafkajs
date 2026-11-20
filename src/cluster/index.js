@@ -237,7 +237,11 @@ module.exports = class Cluster {
     // retrying, rather than a real "no such topic".
     this.allowAutoTopicCreation = allowAutoTopicCreation
     this.instrumentationEmitter = instrumentationEmitter
-    this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
+    this.metadataCache = new MetadataCache({
+      logger: rootLogger,
+      instrumentationEmitter,
+      isWanted: (topic) => this.targetTopics.has(topic),
+    })
     this.brokerPool = new BrokerPool({
       telemetryMetrics,
       connectionPoolBuilder: this.connectionPoolBuilder,
