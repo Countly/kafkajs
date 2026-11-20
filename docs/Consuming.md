@@ -394,7 +394,7 @@ await consumer.disconnect({timeout:3000,leaveGroup:true}) bounds cleanup for the
 
 `connect()` or `run()` called while an earlier `disconnect()` is still running waits for that close to finish (a forced `timeout` ends the wait at its deadline), so a late close never disconnects the new connection. Calls made from a handler or rebalance callback of the run being closed do not wait.
 
-A `disconnect()` made while a crashed run is being cleaned up resolves after that cleanup: the run's stop, its broker disconnects and its `DISCONNECT` event. It does not wait for `restartOnFailure` or for `CRASH`, and a `disconnect({ timeout })` still ends at its deadline. A crash can also leave a handler running; see [Membership errors during rebalance](#membership-errors).
+A `disconnect()` made while a crashed run is being cleaned up resolves after that cleanup: the run's stop, its broker disconnects, its `DISCONNECT` event and, for a crash forced by a fatal heartbeat answer's deadline, its loss callback (see [Awaited rebalance listeners](#rebalance-listeners)). It does not wait for `restartOnFailure` or for `CRASH`, and a `disconnect({ timeout })` still ends at its deadline. A crash can also leave a handler running; see [Membership errors during rebalance](#membership-errors).
 
 A classic static member that leaves with `true` sends its member id and its `groupInstanceId`, so the coordinator checks the pair and answers `FENCED_INSTANCE_ID` for a member id that is no longer the instance's current one instead of removing someone else's membership. The Java client sends the member id alone.
 
