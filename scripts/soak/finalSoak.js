@@ -353,6 +353,7 @@ class Supervisor {
     this.offerCapacity = valueOf(this.matrix.traffic.maxOffers)
     this.offers = 0
     this.heapSnapshots = []
+    this.snapshotBoundaries = new Set()
   }
 
   /**
@@ -537,6 +538,7 @@ class Supervisor {
     const outages = new Map(
       steps.filter((s) => s.shape === 'broker-outage').map((s) => [s.id, null])
     )
+    const stepsById = new Map(steps.map((s) => [s.id, s]))
     this.scheduler = new Scheduler({
       clock: this.clock,
       graceMs: COMMAND_GRACE_MS,
@@ -545,6 +547,7 @@ class Supervisor {
         this.collector.note(`step ${o.id} ${o.outcome}`, { step: o.id })
         this.stepOutcome(o)
         if (outages.has(o.id)) outages.set(o.id, o.outcome)
+        this.missedSnapshot(stepsById.get(o.id), o.outcome)
       },
     })
     if (this.aborted) this.scheduler.abort(this.aborted)
@@ -1253,14 +1256,18 @@ class Supervisor {
    * window until it settles. The next periodic sample is due about ten seconds later, past the one
    * to three seconds a snapshot stalls its process. A snapshot that fails, or is not answered
    * within `HEAP_SNAPSHOT_MS` of real time, is recorded with its error and never fails the run.
+   * When the boundary's last quiet reading was not taken (late, failed or aborted), `skipped` says
+   * so and each process gets a receipt with that error and no command.
    * @param {string} boundary the quiet boundary
+   * @param {string|null} [skipped] why the boundary has no snapshot
    * @returns {Promise<void>}
    */
-  async snapshotHeaps(boundary) {
+  async snapshotHeaps(boundary, skipped = null) {
+    this.snapshotBoundaries.add(boundary)
     const step = { type: 'heap-snapshot', id: `${boundary}s`, boundary }
     await Promise.all(
       this.config.heapSnapshots.map(async (slot) => {
-        const { error, reply } = await this.command(slot, step)
+        const { error, reply } = skipped ? { error: skipped } : await this.command(slot, step)
         const receipt = {
           slot,
           boundary,
@@ -1274,11 +1281,30 @@ class Supervisor {
         if (receipt.error) receipt.error = receipt.error.slice(0, 200)
         this.heapSnapshots.push(receipt)
         await this.collector.note(
-          `heap snapshot ${slot} ${boundary} ${receipt.error ? 'failed' : `${receipt.bytes} bytes`}`,
+          `heap snapshot ${slot} ${boundary} ${skipped ? 'skipped' : receipt.error ? 'failed' : `${receipt.bytes} bytes`}`,
           { snapshot: receipt }
         )
       })
     )
+  }
+
+  /**
+   * Records why a quiet boundary has no heap snapshot: when a run takes snapshots and the boundary's
+   * last quiet reading ended without one (it started past its deadline, failed or was aborted), each
+   * snapshot process gets a skipped receipt naming the step and its outcome, so no boundary's
+   * snapshot is missing silently.
+   * @param {object|undefined} step the step that ended
+   * @param {string} outcome its outcome
+   * @returns {Promise<void>|undefined} the receipts' recording, when there are any
+   */
+  missedSnapshot(step, outcome) {
+    if (
+      this.config.heapSnapshots &&
+      step?.type === 'quiet' &&
+      step.reading === valueOf(this.matrix.sampling.quietReadings) - 1 &&
+      !this.snapshotBoundaries.has(step.boundary)
+    )
+      return this.snapshotHeaps(step.boundary, `not taken: step ${step.id} ${outcome}`)
   }
 
   /**

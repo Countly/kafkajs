@@ -214,7 +214,9 @@ in `config.json` (`heapSnapshots`). Right after each boundary's last quiet readi
 decoder. Each write stalls its process for about one to three seconds and adds a file of one to one and a half times its live heap
 (20 to 35 MB for a subject), so a three-hour rehearsal adds twelve files of 300 to 400 MB in all. Each receipt (size, duration, or
 the error of a write that failed or did not answer within 60 s) is a `heap snapshot` diagnostic and is listed under
-`heapSnapshots` in `supervisor.json`. A failed snapshot never fails the run. Then run
+`heapSnapshots` in `supervisor.json`. A boundary whose last quiet reading was not taken (late, failed or aborted) gets a
+`skipped` receipt per process whose error names that step and its outcome, for example `not taken: step h02q2 late`. A failed or
+skipped snapshot never fails the run. Then run
 `node scripts/soak/heapSnapshotReport.js <artifact dir> [<slot>...]`. For each process it compares consecutive boundaries and
 prints the growth of live self bytes by owner: product (`src/`), harness (`scripts/soak/`, `testHelpers/`), `node:`
 internals, dependencies, V8 bytecode, feedback and compiled code, and unattributed. It then prints the files that grew and the

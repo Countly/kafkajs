@@ -307,9 +307,30 @@ describe('final soak rehearsal', () => {
 
 describe('final soak rehearsal heap snapshots', () => {
   const run = {}
+  /**
+   * The reviewed matrix with the smoke quiet readings moved from the idle window's last minute to
+   * its middle, with the deadline at the window's end. A sixty-fold run pays the real cost of each
+   * reading's collections sixty times over, about twenty harness seconds, so on a loaded host the
+   * reviewed triplet's last reading would start past its fifty-second deadline or the window's end
+   * and be skipped. These tests are about the snapshots; the supervisor's unit tests cover a
+   * boundary whose last reading is skipped.
+   */
+  const snapshotMatrix = (() => {
+    const { schedule } = matrix
+    const idle = schedule.smoke.idleMs
+    const first = (idle.from + idle.to) / 2
+    const quietAtMs = schedule.smoke.quietAtMs.map((q) => q - schedule.smoke.quietAtMs[0] + first)
+    const quietDeadlineMs = schedule.quietAtMs[0] + (idle.to - first)
+    return {
+      ...matrix,
+      schedule: { ...schedule, quietDeadlineMs, smoke: { ...schedule.smoke, quietAtMs } },
+    }
+  })()
 
   beforeAll(async () => {
     run.ws = workspace()
+    run.matrixFile = path.join(run.ws.dir, 'matrix.json')
+    fs.writeFileSync(run.matrixFile, JSON.stringify(snapshotMatrix))
     // The decoder's snapshot path is a directory, so its snapshot fails and the others do not.
     fs.mkdirSync(path.join(run.ws.out, 'heap/p16.h00.heapsnapshot'), { recursive: true })
     const env = {
@@ -327,7 +348,7 @@ describe('final soak rehearsal heap snapshots', () => {
         '--expect-sha',
         TREE,
         '--matrix',
-        MATRIX_FILE,
+        run.matrixFile,
         '--out',
         run.ws.out,
         '--diagnostic',
@@ -410,7 +431,11 @@ describe('final soak rehearsal heap snapshots', () => {
     expect(heaps).toHaveLength(run.records.filter((r) => r.kind === 'sample').length)
     for (const h of heaps)
       expect([h.sample, h.spaces.old > 0, h.code.bytecode > 0]).toEqual([h.sample, true, true])
-    const validator = new StreamValidator({ matrix, config: run.config, header: run.header })
+    const validator = new StreamValidator({
+      matrix: snapshotMatrix,
+      config: run.config,
+      header: run.header,
+    })
     for (const line of fs.readFileSync(path.join(run.ws.out, 'stream.ndjson'), 'utf8').split('\n'))
       if (line) validator.push(line)
     expect(validator.finish().slice(0, 30)).toEqual([])
