@@ -352,7 +352,6 @@ describe('final soak rehearsal heap snapshots', () => {
         '--out',
         run.ws.out,
         '--diagnostic',
-        '--heap-snapshots',
       ],
       env
     )
@@ -403,6 +402,28 @@ describe('final soak rehearsal heap snapshots', () => {
       ])
       expect(bytes).toBeGreaterThan(1024 * 1024)
     }
+  })
+
+  test('without any opt-in every subject, the reader and the decoder write a snapshot, and finalize binds their summary, one record per receipt', () => {
+    const { config, supervisor, header } = run
+    expect(config.heapSnapshots).toEqual(
+      config.processes
+        .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+        .map((p) => p.slot)
+    )
+    expect(header.files.map((f) => f.file)).toContain('heap/summary.json')
+    const summary = JSON.parse(fs.readFileSync(path.join(run.ws.out, 'heap/summary.json'), 'utf8'))
+    expect(summary.records.map((r) => `${r.slot} ${r.boundary} ${r.at}`).sort()).toEqual(
+      supervisor.heapSnapshots.map((r) => `${r.slot} ${r.boundary} ${r.at}`).sort()
+    )
+    for (const r of summary.records.filter((x) => x.slot !== 'p16'))
+      expect([r.slot, r.kept, r.judgedBytes > 1024 * 1024, r.excludedBytes > 0]).toEqual([
+        r.slot,
+        true,
+        true,
+        true,
+      ])
+    expect(summary.records.find((r) => r.slot === 'p16')).toMatchObject({ kept: false })
   })
 
   test('a heap snapshot that fails is recorded with its error and the run still ends naturally with no problem of its own', () => {

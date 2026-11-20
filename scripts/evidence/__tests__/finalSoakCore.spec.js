@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const core = require('../finalSoakCore')
 const fx = require('./finalSoakCoreFixture')
 
@@ -24,6 +25,11 @@ async function check(
     fs.mkdirSync(path.dirname(path.join(dir, 'apache', name)), { recursive: true })
     fs.writeFileSync(path.join(dir, 'apache', name), text)
     files.push({ file: `apache/${name}`, bytes: Buffer.byteLength(text), sha256: fx.sha256(text) })
+  }
+  fx.writeHeap(world, dir)
+  for (const name of fs.readdirSync(path.join(dir, 'heap'))) {
+    const bytes = fs.readFileSync(path.join(dir, 'heap', name))
+    files.push({ file: `heap/${name}`, bytes: bytes.length, sha256: fx.sha256(bytes) })
   }
   const { matrix, config, mode } = world
   const journal = new Journal({ matrix, config, mode, capacity })
@@ -68,6 +74,7 @@ const onDisk = async (world, mutate = () => {}) => {
   return checkArtifact(dir)
 }
 const smoke = () => fx.healthy({ mode: 'smoke', withInventory: true })
+const rehearsal = () => fx.healthy({ mode: 'rehearsal', withInventory: true })
 
 describe('scripts/evidence/finalSoakCore', () => {
   describe('a healthy day', () => {
@@ -1214,90 +1221,227 @@ describe('scripts/evidence/finalSoakCore', () => {
   })
 
   describe('K5 heap', () => {
+    const MIB = 1024 * 1024
     const quiet = (process, fn) =>
       mapRecords(isSample(process, 'quiet'), (r) => fn(Number(r.boundary.slice(1)), r))
-
-    it('fails an endpoint above the bound', async () => {
-      const edit = quiet('p04', (h, r) =>
-        h >= 21 ? { heapUsed: r.heapUsed + 3 * 1024 * 1024 } : {}
+    /** @returns {object} a healthy world whose judged bytes of `slot` follow `bytes(h)` */
+    const judged = (slot, bytes, world = fx.healthy()) => {
+      const base = world.heap.judged
+      world.heap.judged = (s, h) => (s === slot ? bytes(h) : base(s, h))
+      return world
+    }
+    /** @returns {object} a healthy world whose receipt of `slot` at `boundary` is changed by `fn` */
+    const receipt = (slot, boundary, fn, world = fx.healthy()) => {
+      world.supervisor.heapSnapshots = world.supervisor.heapSnapshots.map((r) =>
+        r.slot === slot && r.boundary === boundary ? { ...r, ...fn(r) } : r
       )
-      expectRow(await check(fx.healthy(), { edit }), 'K5', 'FAIL', /p04 heap endpoint/)
+      return world
+    }
+    const summaryOf = (dir) =>
+      JSON.parse(fs.readFileSync(path.join(dir, 'heap/summary.json'), 'utf8'))
+    const resummarise = (dir, fn) => {
+      const summary = summaryOf(dir)
+      summary.records.forEach(fn)
+      fs.writeFileSync(path.join(dir, 'heap/summary.json'), JSON.stringify(summary))
+    }
+
+    it('fails a judged endpoint above the bound', async () => {
+      const world = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
+      expectRow(await check(world), 'K5', 'FAIL', /p04 judged heap endpoint 3145728 bytes/)
     })
 
-    it('fails a slope above the bound even when the endpoint is clean', async () => {
-      const edit = quiet('p05', (h, r) =>
-        h >= 12 && h <= 20 ? { heapUsed: r.heapUsed + 500 * 1024 * 1024 } : {}
-      )
-      const report = await check(fx.healthy(), { edit })
-      expectRow(report, 'K5', 'FAIL', /p05 heap slope/)
+    it('fails a judged slope above the bound even when the endpoint is clean', async () => {
+      const world = judged('p05', (h) => 9e6 + (h >= 12 && h <= 20 ? 500 * MIB : 0))
+      const report = await check(world)
+      expectRow(report, 'K5', 'FAIL', /p05 judged heap slope/)
       expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p05.*endpoint/)
     })
 
-    it('is inconclusive, not a zero slope, when every quiet reading of a process completed at one time', async () => {
-      const end = fx.healthy().header.window.runEndAt
-      const edit = quiet('p05', (h, r) => ({
-        completedAt: end,
-        heapUsed: h >= 12 && h <= 20 ? r.heapUsed + 500 * 1024 * 1024 : r.heapUsed,
-      }))
-      const report = await check(fx.healthy(), { edit })
-      expectRow(report, 'K5', 'INCONCLUSIVE', /p05 h00 readings lie outside/)
-      expect(report.overall).not.toBe('ACCEPTED')
+    it('passes a day whose whole-process heap grows 69 MiB of excluded code and prints that growth as information', async () => {
+      const world = fx.healthy()
+      const edit = quiet('p04', (h, r) => ({ heapUsed: r.heapUsed + h * 3 * MIB }))
+      const report = await check(world, { edit })
+      expectRow(report, 'K5', 'PASS')
+      expect(row(report, 'K5').numbers.p04).toEqual({ endpoint: 0, slopePerMinute: 0 })
+      expect(report.information.heap.heapUsed.p04).toEqual({
+        endpoint: 63 * MIB,
+        slopePerMinute: Math.round((3 * MIB) / 60),
+      })
+      expect(formatReport(report)).toContain(
+        `  whole-process heapUsed p04: endpoint ${63 * MIB} bytes, slope ${Math.round((3 * MIB) / 60)} B/min`
+      )
     })
 
-    it('is inconclusive when a boundary’s readings were admitted before the hour’s quiet window', async () => {
-      const edit = quiet('p03', (h, r) =>
-        h === 10 ? { admittedAt: r.admittedAt - 600000, completedAt: r.completedAt - 600000 } : {}
-      )
+    it.each([
+      [
+        'a skipped receipt',
+        (r) => ({ at: null, ms: null, error: 'not taken: step h10q2 late' }),
+        /p03 h10 has no usable heap snapshot: not taken: step h10q2 late/,
+      ],
+      [
+        'a failed write',
+        () => ({ error: 'ENOSPC: no space left on device' }),
+        /p03 h10 has no usable heap snapshot: ENOSPC/,
+      ],
+      [
+        'a snapshot begun before the last quiet reading',
+        (r) => ({ at: r.at - 20000 }),
+        /p03 h10 heap snapshot at \d+ lies outside the hour's quiet window/,
+      ],
+      [
+        'a snapshot begun after the hour',
+        (r) => ({ at: r.at + 3600000 }),
+        /p03 h10 heap snapshot at \d+ lies outside/,
+      ],
+    ])('is inconclusive, never PASS, for a boundary with %s', async (_, fn, reason) => {
+      const report = await check(receipt('p03', 'h10', fn))
+      expectRow(report, 'K5', 'INCONCLUSIVE', reason)
+      expect(row(report, 'K5').reasons.join('\n')).toMatch(/p03 has 23 of 24 usable heap snapshots/)
+      expect(report.overall).toBe('NOT ACCEPTED')
+    })
+
+    it('is inconclusive for a boundary with no summary record, or one that disagrees with the supervisor receipt', async () => {
+      const missing = fx.healthy()
+      missing.heap.edit = (dir) => {
+        const summary = summaryOf(dir)
+        summary.records = summary.records.filter((r) => !(r.slot === 'p03' && r.boundary === 'h10'))
+        fs.writeFileSync(path.join(dir, 'heap/summary.json'), JSON.stringify(summary))
+      }
+      expectRow(await check(missing), 'K5', 'INCONCLUSIVE', /p03 h10 has no heap snapshot summary/)
+      const moved = fx.healthy()
+      moved.heap.edit = (dir) =>
+        resummarise(dir, (r) => {
+          if (r.slot === 'p03' && r.boundary === 'h10') r.at += 1
+        })
       expectRow(
-        await check(fx.healthy(), { edit }),
+        await check(moved),
         'K5',
         'INCONCLUSIVE',
-        /p03 h10 readings lie outside/
+        /p03 h10 has a heap snapshot summary that disagrees with the supervisor receipt/
       )
     })
 
-    it('is inconclusive when a boundary’s reading was admitted after the quiet deadline', async () => {
-      const edit = mapRecords(
-        (r) => isSample('p03', 'quiet')(r) && r.boundary === 'h10' && r.reading === 0,
-        (r) => ({ admittedAt: r.admittedAt + 55000, completedAt: r.completedAt + 55000 })
-      )
+    it('is inconclusive without a heap summary, and fails no process on one', async () => {
+      const world = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
+      world.heap.edit = (dir) => fs.rmSync(path.join(dir, 'heap/summary.json'))
+      const report = await check(world)
+      expectRow(report, 'K5', 'INCONCLUSIVE', /heap\/summary\.json: missing/)
+    })
+
+    it('re-derives the endpoints from the kept snapshot files: a summary that disagrees with its kept snapshot, or a kept snapshot that is gone, leaves the process inconclusive', async () => {
+      const lied = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
+      lied.heap.edit = (dir) =>
+        resummarise(dir, (r) => {
+          if (r.slot === 'p04' && r.boundary === 'h23') r.judgedBytes = 9e6
+        })
+      const report = await check(lied)
       expectRow(
-        await check(fx.healthy(), { edit }),
+        report,
         'K5',
         'INCONCLUSIVE',
-        /p03 h10 readings lie outside/
+        /p04 h23 snapshot does not confirm its summary: heap\/p04\.h23\.heapsnapshot has judgedBytes 12145728, its summary 9000000/
       )
-    })
-
-    it('does not count a boundary that lacks one of its readings', async () => {
-      const edit = without(
-        (r) => isSample('p03', 'quiet')(r) && r.boundary === 'h10' && r.reading === 2
+      expect(row(report, 'K5').numbers.p04).toBeUndefined()
+      const gone = fx.healthy()
+      gone.heap.edit = (dir) => fs.rmSync(path.join(dir, 'heap/p04.h00.heapsnapshot'))
+      expectRow(
+        await check(gone),
+        'K5',
+        'INCONCLUSIVE',
+        /p04 h00 snapshot does not confirm its summary: heap\/p04\.h00\.heapsnapshot cannot be read/
       )
-      expectRow(await check(fx.healthy(), { edit }), 'K5', 'INCONCLUSIVE', /p03 has 23 of 24/)
-    })
-
-    it('is inconclusive when a process has fewer than 24 quiet boundaries', async () => {
-      const edit = without(
-        (r) => r.kind === 'sample' && r.process === 'p03' && r.boundary === 'h10'
-      )
-      expectRow(await check(fx.healthy(), { edit }), 'K5', 'INCONCLUSIVE', /p03.*23 of 24/)
     })
 
     it('does not let the seed process substitute for or fail an unseeded process', async () => {
       const edit = quiet('p13', (h, r) => ({ heapUsed: r.heapUsed + h * 50 * 1024 * 1024 }))
-      expectRow(await check(fx.healthy(), { edit }), 'K5', 'PASS')
+      const report = await check(fx.healthy(), { edit })
+      expectRow(report, 'K5', 'PASS')
+      expect(Object.keys(row(report, 'K5').numbers)).toEqual(
+        fx
+          .healthy()
+          .config.processes.filter((p) => p.role === 'subject')
+          .map((p) => p.slot)
+      )
     })
 
-    it('computes the screen from the median of each boundary and a least-squares slope, NaN without time spread', () => {
-      const boundaries = Array.from({ length: 24 }, (_, h) =>
-        [0, 1, 2].map((i) => ({ heapUsed: 1000 + h * 100 + i, completedAt: (h * 3600 + i) * 1000 }))
+    it('prints the judged heap of the reader and the decoder as information and never judges it', async () => {
+      const world = judged('p14', (h) => 9e6 + h * 3 * MIB)
+      const report = await check(world)
+      expectRow(report, 'K5', 'PASS')
+      expect(report.information.heap.comparison).toEqual({
+        p14: { endpoint: 63 * MIB, slopePerMinute: Math.round((3 * MIB) / 60) },
+        p16: { endpoint: 0, slopePerMinute: 0 },
+      })
+      expect(formatReport(report)).toContain(
+        `  judged heap of harness-only p14: endpoint ${63 * MIB} bytes`
       )
-      const result = core.heapScreen(boundaries)
-      expect(result.endpoint).toBe(2100)
-      expect(result.slope).toBeCloseTo(100 / 60, 3)
-      const flat = boundaries.map((b) => b.map((r) => ({ ...r, completedAt: 5 })))
-      expect(core.heapScreen(flat).slope).toBeNaN()
     })
+
+    it('computes the screen from the medians of the edge boundaries and a least-squares slope, NaN without time spread', () => {
+      const points = Array.from({ length: 24 }, (_, h) => ({
+        bytes: 1000 + h * 100,
+        minutes: h * 60,
+      }))
+      const result = core.heapScreen(points)
+      expect(result.endpoint).toBe(2100)
+      expect(result.slope).toBeCloseTo(100 / 60, 6)
+      expect(core.heapScreen(points.map((p) => ({ ...p, minutes: 5 }))).slope).toBeNaN()
+    })
+  })
+
+  describe('K5 on real heap snapshots', () => {
+    const FIXTURE = path.join(__dirname, '../../soak/__tests__/fixtures/heapJudged.js')
+    const MIB = 1024 * 1024
+    const snapshots = {}
+    beforeAll(() => {
+      for (const kind of ['code', 'map', 'array', 'strings']) {
+        snapshots[kind] = tmp()
+        const child = spawnSync(process.execPath, [FIXTURE, snapshots[kind], 'p04', kind], {
+          encoding: 'utf8',
+        })
+        expect([kind, child.status, child.stderr]).toEqual([kind, 0, ''])
+      }
+    }, 120000)
+
+    /** Judges a rehearsal whose p04 snapshots are the real files of `kind`. */
+    const judgeReal = async (kind) => {
+      const world = rehearsal()
+      world.heap.real.p04 = snapshots[kind]
+      let summary = null
+      world.heap.edit = (dir) => {
+        summary = JSON.parse(fs.readFileSync(path.join(dir, 'heap/summary.json'), 'utf8'))
+      }
+      const report = await check(world)
+      const [first, last] = ['h00', 'h02'].map((b) =>
+        summary.records.find((r) => r.slot === 'p04' && r.boundary === b)
+      )
+      return { report, first, last }
+    }
+
+    it('passes a run whose whole-process heap grows 6 MiB of excluded V8 code', async () => {
+      const { report, first, last } = await judgeReal('code')
+      expect(last.totalBytes - first.totalBytes).toBeGreaterThan(6 * MIB)
+      expect(last.excluded['system / BytecodeArray']).toBeGreaterThan(
+        first.excluded['system / BytecodeArray'] + MIB
+      )
+      expectRow(report, 'K5', 'PASS')
+      expect(row(report, 'K5').numbers.p04.endpoint).toBeLessThan(64 * 1024)
+    }, 60000)
+
+    it.each([
+      ['a product Map', 'map', 'product'],
+      ['a harness array', 'array', 'harness'],
+      ['strings owned by node internals', 'strings', 'node'],
+    ])(
+      'fails a run whose judged bytes grow 3 MiB in %s, and attributes the growth',
+      async (_, kind, owner) => {
+        const { report, first, last } = await judgeReal(kind)
+        expect(last.judgedBytes - first.judgedBytes).toBeGreaterThan(2.5 * MIB)
+        expect(last.judgedByOwner[owner] - first.judgedByOwner[owner]).toBeGreaterThan(2 * MIB)
+        expectRow(report, 'K5', 'FAIL', /p04 judged heap endpoint \d+ bytes exceeds 2097152/)
+      },
+      60000
+    )
   })
 
   describe('K6 resources', () => {
@@ -2164,10 +2308,6 @@ describe('scripts/evidence/finalSoakCore', () => {
   })
 
   describe('a rehearsal', () => {
-    const rehearsal = () => fx.healthy({ mode: 'rehearsal', withInventory: true })
-    const quiet = (process, fn) =>
-      mapRecords(isSample(process, 'quiet'), (r) => fn(Number(r.boundary.slice(1)), r))
-
     it('passes every row of a healthy three-hour artifact on disk, K5 on its three boundaries, yet is NOT ACCEPTED and says rehearsal runs are diagnostic', async () => {
       const world = rehearsal()
       world.supervisor.diagnostic = true
@@ -2182,34 +2322,62 @@ describe('scripts/evidence/finalSoakCore', () => {
       )
     })
 
-    it('judges K5 by the day’s endpoint bound, not scaled to its length: growth of exactly the bound passes, one byte more fails', async () => {
+    /** @returns {object} a rehearsal whose judged bytes of `slot` follow `bytes(h)` */
+    const judgedRehearsal = (slot, bytes) => {
+      const world = rehearsal()
+      world.heap.judged = (s, h) => (s === slot ? bytes(h) : 9e6)
+      return world
+    }
+
+    it('judges K5 by the day’s endpoint bound on judged bytes, not scaled to its length: growth of exactly the bound passes, one byte more fails', async () => {
       const bound = fx.matrix.bounds['heap-endpoint'].value
-      const grown = (bytes) =>
-        quiet('p04', (h, r) => (h === 2 ? { heapUsed: r.heapUsed + bytes } : {}))
-      const at = await check(rehearsal(), { edit: grown(bound) })
+      const grown = (bytes) => judgedRehearsal('p04', (h) => 9e6 + (h === 2 ? bytes : 0))
+      const at = await check(grown(bound))
       expectRow(at, 'K5', 'PASS')
       expect(row(at, 'K5').numbers.p04.endpoint).toBe(bound)
-      expectRow(
-        await check(rehearsal(), { edit: grown(bound + 1) }),
-        'K5',
-        'FAIL',
-        /p04 heap endpoint/
-      )
+      expectRow(await check(grown(bound + 1)), 'K5', 'FAIL', /p04 judged heap endpoint/)
     })
 
-    it('judges K5 by the day’s slope bound per minute: just under it no slope reason, just over it a slope FAIL', async () => {
+    it('judges K5 by the day’s slope bound per minute on judged bytes: just under it no slope reason, just over it a slope FAIL', async () => {
       const slope = fx.matrix.bounds['heap-slope'].value
-      const perHour = (minutes) =>
-        quiet('p05', (h, r) => ({ heapUsed: r.heapUsed + h * minutes * slope }))
       const reasons = async (minutes) =>
-        row(await check(rehearsal(), { edit: perHour(minutes) }), 'K5').reasons.join('\n')
-      expect(await reasons(59)).not.toMatch(/p05 heap slope/)
-      expect(await reasons(61)).toMatch(/p05 heap slope \d+ B\/min exceeds/)
+        row(
+          await check(judgedRehearsal('p05', (h) => 9e6 + h * minutes * slope)),
+          'K5'
+        ).reasons.join('\n')
+      expect(await reasons(59)).not.toMatch(/p05 judged heap slope/)
+      expect(await reasons(61)).toMatch(/p05 judged heap slope \d+ B\/min exceeds/)
     })
 
-    it('is inconclusive in K5 when a process has fewer than its three boundaries', async () => {
-      const edit = without((r) => isSample('p03', 'quiet')(r) && r.boundary === 'h01')
-      expectRow(await check(rehearsal(), { edit }), 'K5', 'INCONCLUSIVE', /p03 has 2 of 3/)
+    it('is inconclusive in K5 when a process has fewer than its three usable heap snapshots', async () => {
+      const world = rehearsal()
+      world.supervisor.heapSnapshots = world.supervisor.heapSnapshots.filter(
+        (r) => !(r.slot === 'p03' && r.boundary === 'h01')
+      )
+      expectRow(await check(world), 'K5', 'INCONCLUSIVE', /p03 has 2 of 3 usable heap snapshots/)
+    })
+
+    it('keeps the summary and only the first and last snapshot of each process on disk, and re-derives the verdict from those sealed files alone', async () => {
+      const world = judgedRehearsal('p04', (h) => 9e6 + (h === 2 ? 3 * 1024 * 1024 : 0))
+      let dir = null
+      const report = await onDisk(world, (d) => {
+        dir = d
+      })
+      expect(fs.readdirSync(path.join(dir, 'heap')).sort()).toEqual(
+        [
+          'summary.json',
+          ...world.config.heapSnapshots.flatMap((slot) => [
+            `${slot}.h00.heapsnapshot`,
+            `${slot}.h02.heapsnapshot`,
+          ]),
+        ].sort()
+      )
+      const header = JSON.parse(fs.readFileSync(path.join(dir, 'header.json'), 'utf8'))
+      expect(header.files.map((f) => f.file)).toContain('heap/summary.json')
+      const summary = JSON.parse(fs.readFileSync(path.join(dir, 'heap/summary.json'), 'utf8'))
+      expect(summary.records).toHaveLength(world.config.heapSnapshots.length * 3)
+      expectRow(report, 'K5', 'FAIL', /p04 judged heap endpoint 3145728 bytes exceeds 2097152/)
+      expect(row(report, 'K5').reasons).toHaveLength(1)
     })
   })
 

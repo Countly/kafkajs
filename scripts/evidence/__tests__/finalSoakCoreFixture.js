@@ -10,6 +10,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const schema = require('../../soak/finalSoakSchema')
+const { summarizeRun } = require('../../soak/heapSummary')
+const { writeSyntheticSnapshot } = require('../../soak/__tests__/fixtures/syntheticSnapshot')
 
 const matrix = JSON.parse(
   fs.readFileSync(path.join(__dirname, '../../soak/finalSoakMatrix.json'), 'utf8')
@@ -67,7 +69,60 @@ function buildConfig() {
     processes,
     clients,
     topics: { main: MAIN, transactions: TXN },
+    heapSnapshots: processes
+      .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+      .map((p) => p.slot),
   }
+}
+
+/**
+ * The supervisor's heap snapshot receipts: one per snapshot process and boundary, written ten
+ * seconds after the boundary's last quiet reading.
+ * @param {object} config @param {string} mode @returns {object[]}
+ */
+function heapReceipts(config, mode) {
+  const plan = planOf(mode)
+  return config.heapSnapshots.flatMap((slot, i) =>
+    Array.from({ length: plan.hours }, (_, h) => {
+      const boundary = `h${String(h).padStart(2, '0')}`
+      return {
+        slot,
+        boundary,
+        file: `heap/${slot}.${boundary}.heapsnapshot`,
+        at: START + h * matrix.schedule.hourMs + plan.quietAt[2] + 10000 + i,
+        ms: 400,
+        bytes: 1000,
+        error: null,
+      }
+    })
+  )
+}
+
+/**
+ * Writes the world's heap snapshots under `dir/heap` and summarises them as the driver's finalize
+ * does: synthetic snapshots of `heap.judged(slot, h)` judged bytes and `heap.code(slot, h)` code
+ * bytes, or the real files `heap.real[slot]` holds for that process (`<slot>.<boundary>.heapsnapshot`).
+ * A receipt with an error gets no file.
+ * @param {object} world @param {string} dir @returns {void}
+ */
+function writeHeap(world, dir) {
+  const receipts = world.supervisor.heapSnapshots ?? []
+  for (const r of receipts) {
+    if (r.error !== null) continue
+    const h = Number(r.boundary.slice(1))
+    const file = path.join(dir, r.file)
+    const real = world.heap.real[r.slot]
+    if (real) {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.copyFileSync(path.join(real, `${r.slot}.${r.boundary}.heapsnapshot`), file)
+    } else
+      writeSyntheticSnapshot(file, [
+        { type: 'object', name: 'Judged', bytes: world.heap.judged(r.slot, h) },
+        { type: 'code', name: '(code)', bytes: world.heap.code(r.slot, h) },
+      ])
+  }
+  summarizeRun(dir, receipts, matrix.bounds['heap-endpoint'].value)
+  world.heap.edit(dir)
 }
 
 /** @param {object} config @returns {Map<string, object>} client slot to its subject/control config */
@@ -469,7 +524,14 @@ function healthy({ mode = 'acceptance', withInventory = false } = {}) {
       stream: { file: 'stream.ndjson', bytes: 0, records: 0, sha256: '0'.repeat(64) },
       companions: [],
     },
+    heap: {
+      judged: () => 9e6,
+      code: (slot, h) => 3e6 + h * 3 * 1024 * 1024,
+      real: {},
+      edit: () => {},
+    },
     supervisor: {
+      heapSnapshots: heapReceipts(config, mode),
       runId: RUN,
       mode,
       treeSha: 'b'.repeat(40),
@@ -550,6 +612,7 @@ function writeArtifact(world, dir) {
     )
   for (const f of ['provenance.json', 'capabilities.json', 'compose.yml']) put(`broker/${f}`, f)
   for (const [name, text] of Object.entries(world.apache)) put(`apache/${name}`, text)
+  writeHeap(world, dir)
   const header = copy(world.header)
   const walk = (rel) =>
     fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).flatMap((e) => {
@@ -586,6 +649,7 @@ module.exports = {
   describeText,
   putStep,
   writeArtifact,
+  writeHeap,
   key,
   authority,
   planOf,

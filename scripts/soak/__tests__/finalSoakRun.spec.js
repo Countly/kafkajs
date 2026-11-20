@@ -372,18 +372,17 @@ describe('final soak producer shutdown', () => {
 })
 
 /**
- * @param {{ heapSnapshots?: boolean }} [options]
+ * @param {{ mode?: string }} [options]
  * @returns {{ s: Supervisor, out: string, remove: () => void }} a supervisor with no cluster
  */
-const supervisor = ({ heapSnapshots = false } = {}) => {
+const supervisor = ({ mode = 'smoke' } = {}) => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-run-'))
   const s = new Supervisor({
-    mode: 'smoke',
+    mode,
     matrix: 'scripts/soak/finalSoakMatrix.json',
     expectSha: TREE,
     brokers: ['k:1'],
     out,
-    heapSnapshots,
   })
   s.runtime = { ids: 0, nextId: () => `p15.${s.runtime.ids++}` }
   s.emit = async () => 'p15.1'
@@ -1471,7 +1470,7 @@ describe('final soak work admission and quiet samples', () => {
   })
 
   test('a boundary whose last quiet reading starts past its deadline has a skipped heap snapshot receipt for each snapshot process and sends no snapshot command', async () => {
-    const { s, remove } = supervisor({ heapSnapshots: true })
+    const { s, remove } = supervisor()
     try {
       const notes = []
       s.collector.note = async (message, extra) => notes.push([message, extra.snapshot])
@@ -1526,30 +1525,39 @@ describe('final soak work admission and quiet samples', () => {
     }
   })
 
-  test('a boundary whose last quiet reading took the heap snapshots gets no skipped receipt, and a run without snapshots gets none', async () => {
-    const { s, remove } = supervisor({ heapSnapshots: true })
-    const off = supervisor()
-    try {
-      s.collector.note = async () => {}
-      s.command = async () => ({ error: null, reply: { at: 1, ms: 2, bytes: 3, error: null } })
-      s.sampleAll = async () => {}
-      s.quiesced = 'h00i'
-      const held = []
-      s.scheduler = { inflight: new Set(), hold: (work) => held.push(work) }
-      const step = { id: 'h00q2', type: 'quiet', boundary: 'h00', reading: 2 }
-      await s.perform(step)
-      await Promise.all(held)
-      expect(s.missedSnapshot(step, 'late')).toBeUndefined()
-      expect(s.heapSnapshots.map((r) => [r.slot, r.error])).toEqual(
-        s.config.heapSnapshots.map((slot) => [slot, null])
-      )
-      expect(off.s.missedSnapshot(step, 'late')).toBeUndefined()
-      expect(off.s.heapSnapshots).toEqual([])
-    } finally {
-      remove()
-      off.remove()
+  test.each(['smoke', 'rehearsal', 'acceptance'])(
+    'in %s mode the last quiet reading of a boundary has every subject, the reader and the decoder write a heap snapshot while work is held, and gets no skipped receipt',
+    async (mode) => {
+      const { s, remove } = supervisor({ mode })
+      try {
+        s.collector.note = async () => {}
+        const commands = []
+        s.command = async (slot, step) => {
+          commands.push([slot, step.type, step.boundary])
+          return { error: null, reply: { at: 1, ms: 2, bytes: 3, error: null } }
+        }
+        s.sampleAll = async () => {}
+        s.quiesced = 'h00i'
+        const held = []
+        s.scheduler = { inflight: new Set(), hold: (work) => held.push(work) }
+        const step = { id: 'h00q2', type: 'quiet', boundary: 'h00', reading: 2 }
+        await s.perform(step)
+        expect(held).toHaveLength(1)
+        await Promise.all(held)
+        const slots = s.config.processes
+          .filter((p) => ['subject', 'reader', 'decoder'].includes(p.role))
+          .map((p) => p.slot)
+        expect(slots).toHaveLength(14)
+        expect(commands).toEqual(slots.map((slot) => [slot, 'heap-snapshot', 'h00']))
+        expect(s.missedSnapshot(step, 'late')).toBeUndefined()
+        expect(s.heapSnapshots.map((r) => [r.slot, r.error])).toEqual(
+          slots.map((slot) => [slot, null])
+        )
+      } finally {
+        remove()
+      }
     }
-  })
+  )
 
   test('a docker command that does not end in time is killed and fails', async () => {
     const { s, remove } = supervisor()

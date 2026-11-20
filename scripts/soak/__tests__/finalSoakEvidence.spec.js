@@ -3,6 +3,7 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { AsyncLocalStorage } = require('node:async_hooks')
+const { writeSyntheticSnapshot } = require('./fixtures/syntheticSnapshot')
 const ConsumerGroup = require('../../../src/consumer/consumerGroup')
 const GroupOwnership = require('../../../src/consumer/groupOwnership')
 const OffsetOperations = require('../../../src/consumer/offsetManager/offsetOperations')
@@ -782,6 +783,40 @@ describe('final soak finalization', () => {
       })
       expect(header.files.map((f) => f.file)).toContain('dump/log-main.txt')
       expect(header.stream.records).toBe(2)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('finalize summarises the heap snapshots before it hashes: the summary is bound, the first and last snapshot of a process kept and bound, the middle one deleted', () => {
+    const out = artifact({ outer: { status: 0, observedAt: 12345 } })
+    try {
+      const receipts = ['h00', 'h01', 'h02'].map((boundary, h) => {
+        const file = `heap/p04.${boundary}.heapsnapshot`
+        writeSyntheticSnapshot(path.join(out, file), [
+          { type: 'object', name: 'Judged', bytes: 9000000 + h },
+          { type: 'code', name: '(code)', bytes: 3000000 * (h + 1) },
+        ])
+        return { slot: 'p04', boundary, file, at: h, ms: 1, bytes: 1, error: null }
+      })
+      const run = JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))
+      fs.writeFileSync(
+        path.join(out, 'supervisor.json'),
+        JSON.stringify({ ...run, heapSnapshots: receipts })
+      )
+      const header = finalize({ out, status: 0 })
+      const bound = header.files.map((f) => f.file).filter((f) => f.startsWith('heap/'))
+      expect(bound.sort()).toEqual([
+        'heap/p04.h00.heapsnapshot',
+        'heap/p04.h02.heapsnapshot',
+        'heap/summary.json',
+      ])
+      const summary = JSON.parse(fs.readFileSync(path.join(out, 'heap/summary.json'), 'utf8'))
+      expect(summary.records.map((r) => [r.boundary, r.kept, r.judgedBytes])).toEqual([
+        ['h00', true, 9000000],
+        ['h01', false, 9000001],
+        ['h02', true, 9000002],
+      ])
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
