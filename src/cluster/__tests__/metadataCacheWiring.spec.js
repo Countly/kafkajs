@@ -339,9 +339,10 @@ describe('Cluster > metadata cache wiring', () => {
     expect(refresh).not.toHaveBeenCalled()
   })
 
-  test('an unscoped refresh prunes vanished topics, a scoped one leaves them alone', async () => {
+  test('an unscoped refresh prunes vanished topics, a scoped one leaves targeted ones alone', async () => {
     // An empty topic list is encoded as the null array, so the response describes the whole
     // cluster - which is what makes a topic missing from it evidence that it is gone.
+    cluster.targetTopics.add('test-topic')
     const empty = { ...metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 }), topicMetadata: [] }
     stubBrokers(cluster, [
       metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 }),
