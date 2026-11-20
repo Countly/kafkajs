@@ -371,8 +371,11 @@ describe('final soak producer shutdown', () => {
   })
 })
 
-/** @returns {{ s: Supervisor, out: string, remove: () => void }} a supervisor with no cluster */
-const supervisor = () => {
+/**
+ * @param {{ heapSnapshots?: boolean }} [options]
+ * @returns {{ s: Supervisor, out: string, remove: () => void }} a supervisor with no cluster
+ */
+const supervisor = ({ heapSnapshots = false } = {}) => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-run-'))
   const s = new Supervisor({
     mode: 'smoke',
@@ -380,6 +383,7 @@ const supervisor = () => {
     expectSha: TREE,
     brokers: ['k:1'],
     out,
+    heapSnapshots,
   })
   s.runtime = { ids: 0, nextId: () => `p15.${s.runtime.ids++}` }
   s.emit = async () => 'p15.1'
@@ -1464,6 +1468,87 @@ describe('final soak work admission and quiet samples', () => {
       error: 'h00q0 is not a quiet sample: h00d is still running',
       sampled: ['h00q0'],
     })
+  })
+
+  test('a boundary whose last quiet reading starts past its deadline has a skipped heap snapshot receipt for each snapshot process and sends no snapshot command', async () => {
+    const { s, remove } = supervisor({ heapSnapshots: true })
+    try {
+      const notes = []
+      s.collector.note = async (message, extra) => notes.push([message, extra.snapshot])
+      const commands = []
+      s.command = async (slot, step) => commands.push([slot, step.type])
+      s.sampleAll = async (slots, step) => commands.push(['sample', step.id])
+      s.quiesced = 'h00i'
+      const steps = [0, 1, 2].map((reading) => ({
+        id: `h00q${reading}`,
+        type: 'quiet',
+        lane: 'timer',
+        boundary: 'h00',
+        reading,
+        at: reading * 10,
+        deadline: 50,
+      }))
+      const clock = jumpClock(0)
+      const outcomes = []
+      const recorded = []
+      s.scheduler = new Scheduler({
+        clock,
+        perform: async (step) => {
+          await s.perform(step)
+          // The first two readings run so long that the last one starts past the deadline.
+          clock.t += 30
+        },
+        onOutcome: (o) => {
+          outcomes.push(`${o.id} ${o.outcome}`)
+          recorded.push(s.missedSnapshot(steps[o.id.at(-1)], o.outcome))
+        },
+      })
+      await s.scheduler.run(steps)
+      await Promise.all(recorded)
+      expect(outcomes).toEqual(['h00q0 ok', 'h00q1 late', 'h00q2 late'])
+      expect(commands).toEqual([
+        ['sample', 'h00q0'],
+        ['sample', 'h00q1'],
+      ])
+      const receipts = s.config.heapSnapshots.map((slot) => ({
+        slot,
+        boundary: 'h00',
+        file: `heap/${slot}.h00.heapsnapshot`,
+        at: null,
+        ms: null,
+        bytes: null,
+        error: 'not taken: step h00q2 late',
+      }))
+      expect(s.heapSnapshots).toEqual(receipts)
+      expect(notes).toEqual(receipts.map((r) => [`heap snapshot ${r.slot} h00 skipped`, r]))
+    } finally {
+      remove()
+    }
+  })
+
+  test('a boundary whose last quiet reading took the heap snapshots gets no skipped receipt, and a run without snapshots gets none', async () => {
+    const { s, remove } = supervisor({ heapSnapshots: true })
+    const off = supervisor()
+    try {
+      s.collector.note = async () => {}
+      s.command = async () => ({ error: null, reply: { at: 1, ms: 2, bytes: 3, error: null } })
+      s.sampleAll = async () => {}
+      s.quiesced = 'h00i'
+      const held = []
+      s.scheduler = { inflight: new Set(), hold: (work) => held.push(work) }
+      const step = { id: 'h00q2', type: 'quiet', boundary: 'h00', reading: 2 }
+      await s.perform(step)
+      await Promise.all(held)
+      expect(s.missedSnapshot(step, 'late')).toBeUndefined()
+      expect(s.heapSnapshots.map((r) => [r.slot, r.error])).toEqual(
+        s.config.heapSnapshots.map((slot) => [slot, null])
+      )
+      expect(off.s.missedSnapshot(step, 'late')).toBeUndefined()
+      expect(off.s.heapSnapshots).toEqual([])
+    } finally {
+      remove()
+      off.remove()
+    }
   })
 
   test('a docker command that does not end in time is killed and fails', async () => {
