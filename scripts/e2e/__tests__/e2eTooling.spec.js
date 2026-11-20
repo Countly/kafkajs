@@ -3807,7 +3807,8 @@ describe('Java node export capture', () => {
 /**
  * A curl, sleep and date double for the pinned download scripts: a fake clock in FAKE_STATE, every call logged to
  * FAKE_LOG, and curl answers chosen by FAKE_FAILURES/FAKE_FAILURE, FAKE_PLAN (`[seconds, exit, kind]` per call, kind
- * `pinned`, `partial`, `wrong`, `archive` copying FAKE_ARCHIVE, or none) or FAKE_BLOCK.
+ * `pinned`, `partial`, `wrong`, `archive` copying FAKE_ARCHIVE, `hang` spending the call's whole `--max-time` with no
+ * answer, or none) or FAKE_BLOCK.
  */
 const fetchDouble = `#!/usr/bin/env node
 const fs = require('fs')
@@ -3841,6 +3842,7 @@ if (tool === 'date') {
     const planned = process.env.FAKE_PLAN ? JSON.parse(process.env.FAKE_PLAN)[index] : undefined
     const [cost, exit, kind] = planned || (seen < Number(process.env.FAKE_FAILURES) ? failure : [0, 0, 'pinned'])
     advance(cost)
+    if (kind === 'hang') advance(Number(args[args.indexOf('--max-time') + 1]))
     if (kind === 'partial') fs.writeFileSync(out, 'partial')
     if (kind === 'wrong') fs.writeFileSync(out, '<html>error page</html>\\n')
     if (kind === 'pinned') fs.writeFileSync(out, 'pinned ' + path.basename(url) + '\\n')
@@ -4190,6 +4192,19 @@ describe('pinned download from a second source', () => {
     expect(urls(result.calls)).toEqual([first, first, first, first, second])
     expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
     expect(cached().sort()).toEqual(['tools', name])
+  })
+
+  test('gives the second source its own share of the deadline when the first source hangs', () => {
+    const hang = [0, 28, 'hang']
+    const result = fetch([hang, hang, hang, hang, [0, 0, 'archive']], pinned)
+    expect(result.status).toBe(0)
+    expect(urls(result.calls)).toEqual([first, first, second])
+    expect(
+      result.calls
+        .filter((call) => call.tool === 'curl')
+        .map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+    ).toEqual([60, 13, 60])
+    expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
   })
 
   test('rejects a second-source member with the wrong digest and caches nothing', () => {
