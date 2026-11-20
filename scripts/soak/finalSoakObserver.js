@@ -44,6 +44,44 @@ const splitKey = (key) => {
 /** @param {Iterable<number>} values @returns {number[]} ascending */
 const ascending = (values) => [...values].map(Number).sort((a, b) => a - b)
 
+/**
+ * Weak entries that leave on their own: each entry reaches its target only through a `WeakRef`, and
+ * a `FinalizationRegistry` deletes the entry once the target is collected. The set is bounded by the
+ * live targets, not by how many were ever added, whether or not anyone reads it.
+ */
+class WeakEntries {
+  constructor() {
+    this.entries = new Set()
+    this.registry = new FinalizationRegistry((entry) => this.entries.delete(entry))
+  }
+
+  /**
+   * @param {object} target held weakly
+   * @param {object} [data] kept with the entry and returned by `live`
+   * @returns {void}
+   */
+  add(target, data = {}) {
+    const entry = { ...data, ref: new WeakRef(target) }
+    this.entries.add(entry)
+    this.registry.register(target, entry)
+  }
+
+  /** @returns {IterableIterator<object>} the entries not yet removed, collected or not */
+  [Symbol.iterator]() {
+    return this.entries.values()
+  }
+
+  /** @returns {object[]} `{ target, ...data }` of every live target, in insertion order */
+  live() {
+    const out = []
+    for (const { ref, ...data } of this.entries) {
+      const target = ref.deref()
+      if (target !== undefined) out.push({ ...data, target })
+    }
+    return out
+  }
+}
+
 class PassiveObserver {
   /** The internal methods the driver watches, by class. */
   static WATCHED = Object.freeze({
@@ -252,7 +290,7 @@ class PassiveObserver {
     this.idOf(receiver, name[0].toLowerCase())
     const client = this.context?.getStore()
     if (client) this.owner.set(receiver, client)
-    ;(this.refs[name] ??= []).push(new WeakRef(receiver))
+    ;(this.refs[name] ??= new WeakEntries()).add(receiver)
     if (name === 'ConsumerGroup' && receiver.ownership)
       this.ownershipGroup.set(receiver.ownership, receiver)
     if (name === 'Connection' && receiver.requestQueue) {
@@ -276,16 +314,10 @@ class PassiveObserver {
 
   /**
    * @param {string} name a watched class
-   * @returns {object[]} its live discovered receivers; dead references are dropped
+   * @returns {object[]} its live discovered receivers, in discovery order
    */
   live(name) {
-    const out = []
-    this.refs[name] = (this.refs[name] ?? []).filter((ref) => {
-      const value = ref.deref()
-      if (value !== undefined) out.push(value)
-      return value !== undefined
-    })
-    return out
+    return (this.refs[name]?.live() ?? []).map(({ target }) => target)
   }
 
   /**
@@ -1293,7 +1325,7 @@ class SocketRegistry {
     this.make = base()
     this.readHeader = readHeader
     this.now = now
-    this.refs = []
+    this.refs = new WeakEntries()
     this.created = 0
   }
 
@@ -1310,7 +1342,7 @@ class SocketRegistry {
       const socket = this.make(options)
       this.created++
       const node = `${options.host}:${options.port}`
-      this.refs.push({ ref: new WeakRef(socket), client, node })
+      this.refs.add(socket, { client, node })
       if (capture) this.capture(socket, capture, node, this.created)
       return socket
     }
@@ -1318,13 +1350,7 @@ class SocketRegistry {
 
   /** @returns {{ socket: object, client: string, node: string }[]} sockets not yet collected */
   live() {
-    const out = []
-    this.refs = this.refs.filter(({ ref, client, node }) => {
-      const socket = ref.deref()
-      if (socket) out.push({ socket, client, node })
-      return socket !== undefined
-    })
-    return out
+    return this.refs.live().map(({ target, client, node }) => ({ socket: target, client, node }))
   }
 
   /**

@@ -22170,6 +22170,8 @@
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver routes are declared for every recipient group, the seed group on the main topic too",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver topic ids are normalized to their printed form and values carry their id and transaction",
         "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver the smoke workflow runs the runbook diagnostic on dispatch or a smoke branch push, in smoke mode unless a dispatch selects rehearsal, inside the hosted six hours",
+        "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver weak bookkeeping the observer holds only live watched receivers after thousands were collected",
+        "scripts/soak/__tests__/finalSoak.spec.js \u203a final soak driver weak bookkeeping the socket registry holds only sockets not yet collected",
         "scripts/soak/__tests__/finalSoakEvidence.spec.js \u203a final soak collector writes a short write is continued with the rest of the chunk until every byte is in the file",
         "scripts/soak/__tests__/finalSoakEvidence.spec.js \u203a final soak collector writes a rejected write stops admission, is listed and reported at once, and never loses order",
         "scripts/soak/__tests__/finalSoakEvidence.spec.js \u203a final soak collector writes an append is acknowledged only once its bytes are in the sink, not when it is queued",
