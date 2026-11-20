@@ -53,7 +53,8 @@ const stubBrokers = (cluster, responses) => {
     isConnected: () => true,
     connect: async () => {},
     disconnect: async () => {},
-    metadata: async () => responses.shift(),
+    metadata: async (topics) =>
+      typeof responses === 'function' ? responses(topics) : responses.shift(),
     connectionPool: { host: '127.0.0.1', port: 9092, rack: null },
   }
   cluster.brokerPool.seedBroker = broker
@@ -124,6 +125,61 @@ describe('Cluster > metadata cache wiring', () => {
     await cluster.brokerPool.refreshMetadata(['test-topic'])
 
     expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_B }])
+  })
+
+  describe('topics the client no longer wants', () => {
+    const ID_C = '21222324-2526-2728-292a-2b2c2d2e2f30'
+    const shortId = (i) => `00000000-0000-0000-0000-0000000000${String(i + 1).padStart(2, '0')}`
+
+    /** Answers like a broker holding `live` (name -> id): a deleted name fails with code 3. */
+    const brokerOf = (live) => (topics) => {
+      const names = topics && topics.length > 0 ? topics : [...live.keys()]
+      const missing = names.find((name) => !live.has(name))
+      if (missing) throw createErrorFromCode(3)
+      const answer = metadata({ topicId: null, leader: 1, leaderEpoch: 0 })
+      const [row] = answer.topicMetadata
+      answer.topicMetadata = names.map((name) => ({ ...row, topic: name, topicId: live.get(name) }))
+      return answer
+    }
+
+    test('an admin that described short-lived topics holds no entry for them once they are gone', async () => {
+      const live = new Map()
+      stubBrokers(cluster, brokerOf(live))
+      for (let i = 0; i < 5; i++) {
+        live.set(`short-${i}`, shortId(i))
+        await cluster.metadata({ topics: [`short-${i}`] })
+      }
+      for (let i = 0; i < 5; i++) live.delete(`short-${i}`)
+      live.set('other-topic', ID_B)
+
+      await cluster.metadata({ topics: ['other-topic'] })
+      await expect(cluster.metadata({ topics: ['short-0'] })).rejects.toHaveProperty(
+        'type',
+        'UNKNOWN_TOPIC_OR_PARTITION'
+      )
+
+      expect([...cluster.metadataCache.topics.keys()]).toEqual(['other-topic'])
+      for (let i = 0; i < 5; i++) expect(cluster.topicName(shortId(i))).toBeUndefined()
+    })
+
+    test('a targeted topic deleted and recreated meanwhile is still reported as recreated', async () => {
+      const live = new Map([
+        ['test-topic', ID_A],
+        ['other-topic', ID_B],
+      ])
+      stubBrokers(cluster, brokerOf(live))
+      await cluster.addTargetTopic('test-topic')
+
+      await cluster.metadata({ topics: ['other-topic'] })
+      live.delete('test-topic')
+      await cluster.metadata({ topics: ['other-topic'] })
+      expect(cluster.topicId('test-topic')).toEqual(ID_A)
+
+      live.set('test-topic', ID_C)
+      await cluster.refreshMetadata()
+
+      expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_C }])
+    })
   })
 
   test('onTopicRecreated subscribes and its return value unsubscribes', async () => {
