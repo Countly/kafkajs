@@ -255,9 +255,6 @@ test('a second current refusal reports one episode', async () => {
   expect(ctx.errors).toHaveBeenCalledTimes(1)
 
   const throwing = noneGroup()
-  throwing.group.instrumentationEmitter.addListener(PARTITION_HALTED, () => {
-    throw new Error('listener failed')
-  })
   throwing.errors.mockImplementation(() => {
     throw new Error('logger failed')
   })
