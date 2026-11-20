@@ -21075,6 +21075,12 @@
         "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls revoke rejects a delete that removed other ACLs than expected",
         "testHelpers/__tests__/ledgerAcls.spec.js \u203a LedgerAcls an acquisition aborted before its connect settles is closed by the cleanup registered first",
         "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share fetch and acknowledgement failure policy a code 35 refusal carries the protocol error as cause",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share membership failure policy forgets the coordinator after a replaced connection, which is not a broker answer",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share membership failure policy forgets the coordinator after a refused connection with a system code, which is not a broker answer",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share membership failure policy forgets the coordinator after a closed connection, which is not a broker answer",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share membership failure policy forgets the coordinator after a request timeout, which is not a broker answer",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share membership failure policy keeps a non-retriable failure without a broker code fatal",
+        "src/consumer/share/__tests__/shareErrorContract.spec.js \u203a share membership failure policy keeps an invariant violation without a broker code fatal",
         "scripts/mutants/__tests__/runner.spec.js \u203a scripts/mutants/runner.js a mutant whose witness fails by assertion is killed",
         "scripts/mutants/__tests__/runner.spec.js \u203a scripts/mutants/runner.js a mutant whose witness passes is a survivor",
         "scripts/mutants/__tests__/runner.spec.js \u203a scripts/mutants/runner.js a generated mutant without a witness title is killed by a test of its spec failing by assertion",
@@ -21934,7 +21940,10 @@
         "src/cluster/__tests__/disconnectDrains.spec.js \u203a BrokerPool > a disconnect reaches the drains an earlier one started a first failed drain neither stops the dispatch to later brokers nor settles the disconnect before they have",
         "src/cluster/__tests__/disconnectDrains.spec.js \u203a BrokerPool > a disconnect reaches the drains an earlier one started a broker leaves the drain record once its drains settle, so the next disconnect does not dispatch to it (control)",
         "src/consumer/share/__tests__/shareHeartbeatRearm.spec.js \u203a share poll recovery and the shared heartbeat scheduler a tick the share recovery requests while the old heartbeat is held still sends one join when that heartbeat settles, then one cadence",
-        "src/consumer/share/__tests__/shareHeartbeatRearm.spec.js \u203a share poll recovery and the shared heartbeat scheduler a terminal shutdown after the request and before the old heartbeat settles still sends nothing more"
+        "src/consumer/share/__tests__/shareHeartbeatRearm.spec.js \u203a share poll recovery and the shared heartbeat scheduler a terminal shutdown after the request and before the old heartbeat settles still sends nothing more",
+        "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on UNKNOWN_MEMBER_ID",
+        "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on FENCED_MEMBER_EPOCH",
+        "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap logs the name, type and code of each failing share heartbeat"
       ],
       "capMinutes": 85,
       "allowedSkips": [
