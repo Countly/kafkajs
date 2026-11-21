@@ -11,7 +11,12 @@ const NOT_COORDINATOR = 16
 /** What the broker sends when authorized operations were not requested. */
 const NO_AUTHORIZED_OPERATIONS = -2147483648
 
-/** Group-level codes on a ConsumerGroupDescribe row that mean "ask the older API instead". */
+/**
+ * Group-level codes on a ConsumerGroupDescribe row that mean "ask the older API instead": the group
+ * is not a consumer-protocol group (69), or the cluster has the consumer protocol off and answers
+ * every row 35, which says nothing about the group.
+ * @see https://github.com/apache/kafka/blob/4.4.0/core/src/main/scala/kafka/server/KafkaApis.scala
+ */
 const ROUTES_TO_CLASSIC = new Set([GROUP_ID_NOT_FOUND, UNSUPPORTED_VERSION])
 /** Codes that mean the coordinator moved: find it again before the next attempt. */
 const RE_FINDS_COORDINATOR = new Set([COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR])
@@ -48,10 +53,11 @@ const doesNotSupportApiKey = (error) => {
  *
  * Routing is PER COORDINATOR, as it has always been: the ids are grouped by their coordinator and
  * each coordinator is asked once for a ConsumerGroupDescribe (key 69). Only the fallback decision is
- * per id - the ids whose row says the group is unknown to the new API, or that the broker does not
- * offer key 69 at all, are re-asked in one DescribeGroups (key 15) per coordinator. When both calls
- * report that the group is unknown, the message from the newer API is the one reported, because it
- * says which of the two answers actually applies.
+ * per id - the ids whose row says the group is unknown to the new API or that the cluster has that
+ * API off (UNSUPPORTED_VERSION), or that the broker does not offer key 69 at all, are re-asked in one
+ * DescribeGroups (key 15) per coordinator. When both calls report that the group is unknown, the
+ * message from the newer API is the one reported, because it says which of the two answers actually
+ * applies; after an UNSUPPORTED_VERSION the DescribeGroups row is reported as it is.
  *
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeConsumerGroupsHandler.java
  */
@@ -327,9 +333,13 @@ class GroupDescriptions {
     const { groupId, errorCode, errorMessage } = row
 
     if (ROUTES_TO_CLASSIC.has(errorCode)) {
-      // Not an error the caller sees: it is the signal that this group belongs to the older API.
-      // The message is stashed, because a double miss reports THIS one.
-      return { groupId, needsFallback: true, error: { errorCode, errorMessage } }
+      // Only a 69 is stashed, because a double miss reports its message; a 35 is about the cluster,
+      // so the older API's own answer is what the caller sees.
+      return {
+        groupId,
+        needsFallback: true,
+        ...(errorCode === GROUP_ID_NOT_FOUND && { error: { errorCode, errorMessage } }),
+      }
     }
 
     // Anything else - including an authorization failure - surfaces on the row rather than

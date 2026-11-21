@@ -129,16 +129,16 @@ describe.each(['classic', 'consumer'])('%s retention core', (kind) => {
   })
 })
 
-jest.mock('../index', () => jest.fn())
-jest.mock('../disposal', () => ({ disposeConsumer: jest.fn(async () => {}) }))
-const createConsumer = require('../index')
 const createAdmin = require('../../admin')
 const Cluster = require('../../cluster')
 const BootstrapResolution = require('../../cluster/bootstrapResolution')
 const GroupRegistry = require('../../cluster/groupRegistry')
-const { EventEmitter } = require('events')
+const { ON_DECODED } = require('../../broker/privateOptions')
 
-/** @returns {object} actual shared registry and public admin with no broker operations */
+/**
+ * @param {Error|null} [failure] what every OffsetCommit rejects with
+ * @returns {object} actual shared registry and public admin over a stub coordinator
+ */
 const adminRegistry = (
   failure = null,
   { offsets, operations } = { offsets: new Map(), operations: new Map() }
@@ -161,7 +161,20 @@ const adminRegistry = (
     offsetFetch: async () => ({
       responses: [{ topic: 'orders', partitions: [{ partition: 0, offset: '-1' }] }],
     }),
-    offsetCommit: async () => ({}),
+    consumerGroupDescribe: async ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => ({ groupId, errorCode: 0, groupState: 'Empty' })),
+    }),
+    offsetCommit: async ({ topics }, options) => {
+      if (failure) throw failure
+      const reply = {
+        responses: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        })),
+      }
+      options[ON_DECODED](reply)
+      return reply
+    },
   })
   const logger = {
     namespace() {
@@ -172,28 +185,6 @@ const adminRegistry = (
     warn() {},
   }
   const admin = createAdmin({ cluster, logger })
-  createConsumer.mockImplementation(({ groupId }) => {
-    cluster.offsetOperations({ groupId })
-    const events = new EventEmitter()
-    return {
-      events: { GROUP_JOIN: 'join', FETCH: 'fetch' },
-      groupMetadata: () => ({ generationId: 1, memberId: 'member', groupInstanceId: null }),
-      on: (event, handler) => events.on(event, handler),
-      subscribe: async () => {
-        if (failure) throw failure
-      },
-      describeGroup: async () => ({ state: 'Empty' }),
-      pause() {},
-      seek() {},
-      stop: async () => {},
-      run: async () => {
-        queueMicrotask(() => {
-          events.emit('join')
-          events.emit('fetch')
-        })
-      },
-    }
-  })
   return { cluster, admin, offsets, operations }
 }
 
@@ -220,7 +211,7 @@ describe('admin registry operation lifetime', () => {
     expect(cluster.groupRegistry.entries.size).toBe(0)
   })
   it('releases fifty failed public operations without masking their error', async () => {
-    const failure = new Error('subscription failed')
+    const failure = Object.assign(new Error('commit failed'), { retriable: false })
     const { cluster, admin } = adminRegistry(failure)
     for (let n = 0; n < 50; n++) {
       await expect(
@@ -327,7 +318,7 @@ describe('independent holders and durable reset debt', () => {
     expect(offsets.size).toBe(0)
     expect(operations.size).toBe(0)
 
-    const failure = new Error('subscription failed')
+    const failure = Object.assign(new Error('commit failed'), { retriable: false })
     const failing = adminRegistry(failure)
     await expect(
       failing.admin.setOffsets({
@@ -473,7 +464,7 @@ describe('completed admin offset operations', () => {
     expectNoHolders(seam)
     expect(cluster.brokerPool.disconnect).toHaveBeenCalledTimes(1)
 
-    const failure = new Error('subscription failed')
+    const failure = Object.assign(new Error('commit failed'), { retriable: false })
     const failing = adminRegistry(failure)
     for (let n = 0; n < 50; n++) {
       await expect(
