@@ -22718,7 +22718,16 @@
         "src/admin/__tests__/setOffsetsLifecycle.spec.js \u203a Admin > setOffsets > commits without a group member with several topics at once on the one admin fetchOffsets resolving two topics commits each topic once and joins nothing",
         "src/admin/__tests__/setOffsetsLifecycle.spec.js \u203a Admin > setOffsets > commits without a group member with several topics at once on the one admin two resolving fetchOffsets and a setOffsets side by side on one admin all complete, each with its own commit",
         "src/admin/__tests__/borrowedLifecycle.spec.js \u203a admin setOffsets close boundaries natural close drains a pending describe and leaves a sibling registry holder alone",
-        "src/admin/__tests__/borrowedLifecycle.spec.js \u203a admin setOffsets close boundaries natural close drains a pending commit and leaves a sibling registry holder alone"
+        "src/admin/__tests__/borrowedLifecycle.spec.js \u203a admin setOffsets close boundaries natural close drains a pending commit and leaves a sibling registry holder alone",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a send partitioned before an earlier send of its topic waits for it, then both join in call order",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order an earlier send whose partitioning fails for good leaves the order, and the later ones join",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a send of another topic is not delayed by an earlier send still waiting for its partitions",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a send of two topics waits for the earlier sends of each, and holds the later sends of each",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a forced close rejects the sends waiting for an earlier one with the existing error and joins none of them",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a send waiting for an earlier one still ends at its own delivery deadline, and the later ones then join",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a waiting send that reaches its deadline first ends alone, and the earlier one still joins",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order with no failure, sends join exactly as before the batches handed on and every send\u2019s result match those recorded before call order was kept",
+        "src/producer/__tests__/partitionRetryOrder.spec.js \u203a Producer > concurrent sends to one partition across a failed metadata refresh are written in call order when the expired-metadata refresh they all wait on fails"
       ],
       "capMinutes": 85,
       "allowedSkips": [
