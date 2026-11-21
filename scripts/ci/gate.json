@@ -22727,6 +22727,8 @@
         "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a send waiting for an earlier one still ends at its own delivery deadline, and the later ones then join",
         "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order a waiting send that reaches its deadline first ends alone, and the earlier one still joins",
         "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order with no failure, sends join exactly as before the batches handed on and every send\u2019s result match those recorded before call order was kept",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order the order itself keeps no lane once every send has joined or ended, in any order",
+        "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order the order itself joins a long run of waiting sends without recursing",
         "src/producer/__tests__/partitionRetryOrder.spec.js \u203a Producer > concurrent sends to one partition across a failed metadata refresh are written in call order when the expired-metadata refresh they all wait on fails"
       ],
       "capMinutes": 85,

@@ -68,7 +68,7 @@ const producer = kafka.producer({ deliveryTimeout: 120000 })
 
 ### <a name="accumulator"></a> Accumulator
 
-Every producer gathers the records of several sends to one topic-partition into one batch, in the order their records reach the accumulator, normally the order the sends were made, and sends them together - so a busy partition sends fewer, larger requests. It works the same with or without idempotence, and inside transactions. `linger` (default 5 ms) and `batchSize` (default 16384 bytes) are the Java client's settings and defaults (`linger.ms`, `batch.size`).
+Every producer gathers the records of several sends to one topic-partition into one batch and sends them together - so a busy partition sends fewer, larger requests. A send's records join their partitions' batches in the order the sends were made on that producer (or on that transaction): a send whose partitions are known waits until every earlier send to any of the same topics has joined its batches or failed, even when the earlier one is still waiting for metadata or retrying a failed metadata load, so on an idempotent producer each partition receives its records in call order. Sends to other topics never wait for it, and a send that fails or reaches its delivery deadline while it waits lets the later ones go. It works the same with or without idempotence, and inside transactions. `linger` (default 5 ms) and `batchSize` (default 16384 bytes) are the Java client's settings and defaults (`linger.ms`, `batch.size`).
 
 ```javascript
 const producer = kafka.producer({ linger: 10, batchSize: 65536 })

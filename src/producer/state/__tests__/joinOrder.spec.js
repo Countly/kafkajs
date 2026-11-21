@@ -1,6 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const Accumulator = require('../accumulator')
+const JoinOrder = require('../joinOrder')
 const { KafkaJSDeliveryTimeout, KafkaJSProducerClosedError } = require('../../../errors')
 
 const TOPIC = 'topic-a'
@@ -212,6 +213,63 @@ describe('Producer > the accumulator joins sends to their batches in call order'
     } finally {
       jest.useRealTimers()
     }
+  })
+
+  describe('the order itself', () => {
+    /** A send as `JoinOrder` sees it. */
+    const orderedSend = (lanes) => ({ lanes, settled: false, entries: null })
+
+    test('keeps no lane once every send has joined or ended, in any order', () => {
+      const joined = []
+      const order = new JoinOrder((send) => {
+        joined.push(send)
+        send.settled = true
+      })
+      const sends = [
+        orderedSend('a'),
+        orderedSend(['a', 'b']),
+        orderedSend('b'),
+        orderedSend('c'),
+        orderedSend('a'),
+      ]
+      sends.forEach((send) => order.enter(send))
+      expect(order.size).toBe(3)
+
+      sends[4].entries = []
+      order.ready(sends[4])
+      sends[2].settled = true
+      order.passed(sends[2])
+      sends[1].entries = []
+      order.ready(sends[1])
+      sends[3].entries = []
+      order.ready(sends[3])
+      expect(joined).toEqual([sends[3]])
+
+      sends[0].settled = true
+      order.passed(sends[0])
+      expect(joined).toEqual([sends[3], sends[1], sends[4]])
+      expect(order.size).toBe(0)
+    })
+
+    test('joins a long run of waiting sends without recursing', () => {
+      let count = 0
+      const order = new JoinOrder((send) => {
+        count += 1
+        send.settled = true
+      })
+      const sends = Array.from({ length: 100000 }, () => orderedSend('a'))
+      sends.forEach((send) => order.enter(send))
+      for (const send of sends.slice(1)) {
+        send.entries = []
+        order.ready(send)
+      }
+      expect(count).toBe(0)
+
+      sends[0].entries = []
+      order.ready(sends[0])
+      expect(count).toBe(sends.length)
+      expect(order.size).toBe(0)
+    })
   })
 
   describe('with no failure, sends join exactly as before', () => {
