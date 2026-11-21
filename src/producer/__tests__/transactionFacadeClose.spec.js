@@ -80,3 +80,219 @@ describe('transaction facade after a forced close', () => {
     }
   )
 })
+
+describe('reconnecting after a close that forced an abort or a commit', () => {
+  const { deferred, flushAll } = require('./fixtures/bufferHarness')
+  const TOPIC = 'forced-close'
+
+  /**
+   * A transactional producer on transaction version `version` whose broker logs every request in
+   * order, bumps the epoch on each InitProducerId, and holds an EndTxn while `holdEndTxn` is set.
+   * @param {number} version
+   * @returns {{ producer: object, log: string[], hold: (on: boolean) => void }}
+   */
+  const setUp = (version) => {
+    const { producer, cluster } = bufferedProducer({
+      transactionalId: 'forced-close',
+      idempotent: true,
+      deliveryTimeout: 60000,
+    })
+    const { broker } = cluster
+    const log = []
+    let holdEndTxn = false
+    broker.initProducerId.mockImplementation(async ({ producerEpoch = -1 }) => {
+      log.push(`initProducerId:${producerEpoch}`)
+      return { producerId: '1000', producerEpoch: producerEpoch + 1 }
+    })
+    const addPartitions = broker.addPartitionsToTxn.getMockImplementation()
+    broker.addPartitionsToTxn.mockImplementation(async (request) => {
+      log.push(`addPartitionsToTxn:${request.producerEpoch}`)
+      return addPartitions(request)
+    })
+    const produce = broker.produce.getMockImplementation()
+    broker.produce.mockImplementation(async (request) => {
+      log.push(`produce:${request.producerEpoch}`)
+      return produce(request)
+    })
+    broker.endTxn.mockImplementation(async ({ producerEpoch, transactionResult }) => {
+      log.push(`endTxn:${transactionResult ? 'commit' : 'abort'}:${producerEpoch}`)
+      if (holdEndTxn) await deferred().promise
+      return { producerId: '-1', producerEpoch: -1 }
+    })
+    Object.assign(broker, {
+      finalizedFeatures: { 'transaction.version': { maxVersionLevel: version } },
+      finalizedFeaturesEpoch: 1,
+      negotiatedVersion: () => 5,
+    })
+    return { producer, log, hold: (on) => (holdEndTxn = on) }
+  }
+
+  /**
+   * Starts a transaction and sends one record in it.
+   * @param {object} producer
+   * @returns {Promise<object>} the transaction
+   */
+  const openTransaction = async (producer) => {
+    const transaction = await producer.transaction()
+    await transaction.send({ topic: TOPIC, messages: [{ value: 'v' }] })
+    return transaction
+  }
+
+  /**
+   * Waits until the broker has seen an EndTxn.
+   * @param {string[]} log
+   * @returns {Promise<void>}
+   */
+  const untilEndTxn = async (log) => {
+    for (let turn = 0; turn < 50 && !log.some((entry) => entry.startsWith('endTxn')); turn += 1) {
+      await flushAll()
+    }
+    if (!log.some((entry) => entry.startsWith('endTxn'))) throw new Error(`no EndTxn: ${log}`)
+  }
+
+  /**
+   * After a reconnect, runs a whole transaction and returns the requests it sent, in order.
+   * @param {object} producer
+   * @param {string[]} log
+   * @returns {Promise<string[]>}
+   */
+  const runTransaction = async (producer, log) => {
+    await producer.connect()
+    const from = log.length
+    const transaction = await openTransaction(producer)
+    await transaction.commit()
+    return log.slice(from)
+  }
+
+  test.each([1, 2])(
+    'a close forced while abort() waits for its EndTxn leaves a producer whose next transaction bumps the epoch first and commits, transaction version %i',
+    async (version) => {
+      const { producer, log, hold } = setUp(version)
+      try {
+        await producer.connect()
+        const transaction = await openTransaction(producer)
+        hold(true)
+        const aborted = transaction.abort().then(
+          () => null,
+          (error) => error
+        )
+        await untilEndTxn(log)
+        await producer.disconnect({ timeout: 0 })
+        const abortError = await aborted
+        hold(false)
+
+        const requests = await runTransaction(producer, log)
+        expect({ abortError: abortError?.name, requests }).toEqual({
+          abortError: 'KafkaJSProducerClosedError',
+          requests:
+            version === 1
+              ? ['initProducerId:0', 'addPartitionsToTxn:1', 'produce:1', 'endTxn:commit:1']
+              : ['initProducerId:0', 'produce:1', 'endTxn:commit:1'],
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    }
+  )
+
+  test.each([1, 2])(
+    'a disconnect whose timeout ends the abort of an open transaction leaves a producer whose next transaction bumps the epoch first and commits, transaction version %i',
+    async (version) => {
+      const { producer, log, hold } = setUp(version)
+      try {
+        await producer.connect()
+        await openTransaction(producer)
+        hold(true)
+        jest.useFakeTimers({ doNotFake: ['Date', 'nextTick', 'setImmediate', 'queueMicrotask'] })
+        const closing = producer.disconnect({ timeout: 1000 })
+        await untilEndTxn(log)
+        expect(log.at(-1)).toBe('endTxn:abort:0')
+        await jest.advanceTimersByTimeAsync(1000)
+        await closing
+        jest.useRealTimers()
+        hold(false)
+
+        const requests = await runTransaction(producer, log)
+        expect(requests).toEqual(
+          version === 1
+            ? ['initProducerId:0', 'addPartitionsToTxn:1', 'produce:1', 'endTxn:commit:1']
+            : ['initProducerId:0', 'produce:1', 'endTxn:commit:1']
+        )
+      } finally {
+        jest.useRealTimers()
+        await producer.disconnect({ timeout: 0 })
+      }
+    }
+  )
+
+  test.each([1, 2])(
+    'a disconnect that completes the abort of an open transaction owes no epoch bump, transaction version %i',
+    async (version) => {
+      const { producer, log } = setUp(version)
+      try {
+        await producer.connect()
+        await openTransaction(producer)
+        await producer.disconnect()
+        expect(log.at(-1)).toBe('endTxn:abort:0')
+
+        const requests = await runTransaction(producer, log)
+        expect(requests).toEqual(
+          version === 1
+            ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:0']
+            : ['produce:0', 'endTxn:commit:0']
+        )
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    }
+  )
+
+  test.each([1, 2])(
+    'a close forced while commit() waits for its EndTxn keeps the commit pending across a reconnect, transaction version %i',
+    async (version) => {
+      const { producer, log, hold } = setUp(version)
+      try {
+        await producer.connect()
+        const transaction = await openTransaction(producer)
+        hold(true)
+        const committed = transaction.commit().then(
+          () => null,
+          (error) => error
+        )
+        await untilEndTxn(log)
+        await producer.disconnect({ timeout: 0 })
+        const commitError = await committed
+        hold(false)
+
+        await producer.connect()
+        const begin = await producer.transaction().then(
+          () => null,
+          (error) => error.message
+        )
+        const from = log.length
+        await transaction.commit()
+        const retried = log.slice(from)
+        const requests = await runTransaction(producer, log)
+        expect({
+          commitError: commitError?.name,
+          outcome: commitError?.outcome,
+          begin,
+          retried,
+          requests,
+        }).toEqual({
+          commitError: 'KafkaJSProducerClosedError',
+          outcome: 'unknown',
+          begin:
+            'Transaction state exception: Cannot call "beginTransaction" while a commit is pending: commit() did not complete; call commit() again',
+          retried: ['endTxn:commit:0'],
+          requests:
+            version === 1
+              ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:0']
+              : ['produce:0', 'endTxn:commit:0'],
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    }
+  )
+})
