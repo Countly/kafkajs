@@ -29,6 +29,8 @@ const part = (leader, partitionId) => ({
  * The admin's cluster, built as `kafka.admin()` builds it, over two broker doubles whose Metadata
  * answers go through the real v13 parse. `live` maps each existing topic to its partition leaders,
  * `ids` to its topic id and `refused` to the topic error code a named request gets for it. A
+ * ListOffsets request to a broker that does not lead every partition it names (by `live`) gets
+ * `NOT_LEADER_OR_FOLLOWER`; one that does gets `offsets.get(nodeId)`, '5' by default, and is logged. A
  * Metadata answer waits for `gate(topics, n)` when one is set; `n` counts the Metadata requests;
  * a Map the gate returns replaces `live` for that answer. Its broker list is `nodes` as it was when the request was sent; its topics are read after the
  * gate. A ListOffsets request waits for `listHook(n, topics)` when one is set; `n` counts those
@@ -46,6 +48,7 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
     ['U', ID(2)],
   ])
   const refused = new Map()
+  const offsets = new Map()
   const calls = []
   let gate = null
   let sent = 0
@@ -114,13 +117,22 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
           [...ids].filter(([, id]) => topicIds.includes(id)).map(([t]) => t))
           live.delete(topic)
       },
-      listOffsets: async ({ topics }) => {
+      async listOffsets({ topics }) {
         if (listHook) await listHook(++listed, topics)
-        calls.push({ api: 'ListOffsets', nodeId, topics: topics.map(({ topic }) => topic) })
+        const led = ({ topic, partitions }) =>
+          !live.has(topic) ||
+          partitions.every(({ partition }) => live.get(topic)[partition] === this.nodeId)
+        if (!topics.every(led)) throw createErrorFromCode(6)
+        calls.push({
+          api: 'ListOffsets',
+          nodeId: this.nodeId,
+          topics: topics.map(({ topic }) => topic),
+        })
+        const offset = offsets.get(this.nodeId) ?? '5'
         return {
           responses: topics.map(({ topic, partitions }) => ({
             topic,
-            partitions: partitions.map(({ partition }) => ({ partition, offset: '5' })),
+            partitions: partitions.map(({ partition }) => ({ partition, offset })),
           })),
         }
       },
@@ -168,6 +180,7 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
     live,
     ids,
     refused,
+    offsets,
     calls,
     md,
     recreated,
@@ -706,6 +719,94 @@ describe('Admin > each call targets its topics only while it runs', () => {
       expect(await read).toEqual({ ok: T_OFFSETS })
       await newer
       expect(h.calls.filter(({ api }) => api === 'ListOffsets').length).toBeGreaterThan(0)
+    })
+  })
+
+  describe('a held topic keeps a usable route', () => {
+    test("an older answer of another topic, whose broker list predates a held topic's moved leader, keeps that leader's broker until the hold ends", async () => {
+      h = build()
+      await h.admin.connect()
+      const sent = latch()
+      const answer = latch()
+      h.setGate(async (topics) => {
+        if (topics.length === 1 && topics[0] === 'U') {
+          sent.release()
+          await answer.promise
+        }
+      })
+      const older = h.cluster.brokerPool.refreshMetadata(['U'])
+      await sent.promise
+      h.setGate(null)
+      h.nodes.push({ nodeId: 3, host: 'kafka3', port: 9092, rack: null })
+      h.live.set('T', [3, 3])
+      h.offsets.set(3, '9')
+      const paused = latch()
+      const resume = latch()
+      h.setListHook(async (n) => {
+        if (n === 1) {
+          paused.release()
+          await resume.promise
+        }
+      })
+      const read = outcome(h.admin.fetchTopicOffsets('T'))
+      await paused.promise
+      const broker3 = h.cluster.brokerPool.brokers[3]
+      expect(broker3.isConnected()).toBe(true)
+
+      answer.release()
+      await older
+      expect(routed(h.cluster)).toContain('T')
+      expect(h.cluster.brokerPool.brokers[3]).toBe(broker3)
+      resume.release()
+
+      expect(await read).toEqual({
+        ok: [
+          { partition: 0, offset: '9', high: '9', low: '9' },
+          { partition: 1, offset: '9', high: '9', low: '9' },
+        ],
+      })
+      const listed = h.calls.filter(({ api }) => api === 'ListOffsets')
+      expect(listed.map(({ nodeId, topics }) => [nodeId, topics])).toEqual([
+        [3, ['T']],
+        [3, ['T']],
+      ])
+      expect([...h.cluster.targetHolds]).toEqual([])
+
+      h.nodes.pop()
+      h.live.set('T', [1, 2])
+      await h.cluster.brokerPool.refreshMetadata(['U'])
+      expect(h.cluster.brokerPool.hasNode(3)).toBe(false)
+      expect(broker3.isConnected()).toBe(false)
+    })
+
+    test('a refresh whose last hold on a topic ends before it is sent still sends the names it is joined by', async () => {
+      h = build()
+      await h.admin.connect()
+      const releaseU = h.cluster.holdTargetTopics(['U'])
+      const releaseOldT = h.cluster.holdTargetTopics(['T'])
+      h.cluster.targetTopics.add('U')
+      h.cluster.targetTopics.add('T')
+      const sent = latch()
+      const answer = latch()
+      h.setGate(async () => {
+        sent.release()
+        await answer.promise
+      })
+      const before = h.md().length
+      const first = h.cluster.refreshMetadata()
+      releaseOldT()
+      await sent.promise
+
+      const releaseNewT = h.cluster.holdTargetTopics(['T'])
+      const second = h.cluster.addTargetTopic('T')
+      await tick()
+      answer.release()
+      await Promise.all([first, second])
+
+      expect(h.md().slice(before)).toEqual([{ api: 'Metadata', topics: ['T', 'U'] }])
+      expect(h.cluster.findTopicPartitionMetadata('T')).toHaveLength(2)
+      releaseNewT()
+      releaseU()
     })
   })
 
