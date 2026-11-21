@@ -325,10 +325,11 @@ const assignmentChangedError = () => {
  * Fails whatever the membership is waiting on because the consumer is stopping. The round loop
  * returns rather than rethrowing when it sees this while a stop is in progress, so a normal
  * shutdown reports no crash.
+ * @param {Error} [cause] the failure the stop overtook, for a call that was already admitted
  * @returns {KafkaJSError}
  */
-const consumerStoppingError = () => {
-  const error = new KafkaJSError('The consumer is stopping', { retriable: false })
+const consumerStoppingError = (cause) => {
+  const error = new KafkaJSError('The consumer is stopping', { retriable: false, cause })
   error.type = 'CONSUMER_STOPPING'
   return error
 }

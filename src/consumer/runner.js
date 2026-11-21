@@ -2199,8 +2199,11 @@ module.exports = class Runner extends EventEmitter {
    * operation with no deadline keeps the ordinary retrier's schedule, as an unset `retry.maxTotalTime`
    * always did, on backoff timers the operation owns: its guard refuses writes once the call is
    * retired, and retirement removes a pending backoff timer and settles the call.
-   * A commit made from a close callback runs while the stop is in progress; any other call
-   * resolves at once, committing nothing, once the runner is no longer running.
+   * A commit made from a close callback runs while the stop is in progress; any other call that
+   * starts once the runner is no longer running resolves at once, committing nothing, as in 2.2.4.
+   * A call admitted while the runner was running that then fails after the stop began rejects with
+   * `CONSUMER_STOPPING`, the failure as its `cause`, and is not retried; a `KafkaJSCommitFailedError`
+   * (the membership was lost) still rejects as itself.
    * A commit answered with a rebalance in progress still rejects with that answer, and also asks
    * the group to rejoin, as the same answer to a heartbeat does.
    * @param {Object} offsets the offsets to commit
@@ -2208,7 +2211,8 @@ module.exports = class Runner extends EventEmitter {
    * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
    *   public call's private deadline scope
    * @returns {Promise<void>} resolves at once, committing nothing, when the runner is not running
-   * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|Error}
+   * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|import('../errors').KafkaJSCommitFailedError|Error}
+   *   `CONSUMER_STOPPING` when an admitted call fails after the stop began
    */
   commitOffsets(offsets, batch = handlerContext.current() ?? null, { operation } = {}) {
     const ownership = this.consumerGroup.ownership
@@ -2258,13 +2262,13 @@ module.exports = class Runner extends EventEmitter {
       } catch (e) {
         if (e instanceof KafkaJSCommitFailedError) return bail(e)
         if (!this.running && !closing) {
-          this.logger.debug('consumer not running, exiting', {
+          this.logger.debug('consumer not running, the commit failed', {
             error: e.message,
             groupId: this.consumerGroup.groupId,
             memberId: this.consumerGroup.memberId,
             offsets,
           })
-          return
+          return bail(consumerStoppingError(e))
         }
 
         if (e.name === 'KafkaJSNotImplemented') {
