@@ -147,7 +147,7 @@ module.exports = class BrokerPool {
    *   `onTopicMetadataStatus`: captures, when a named refresh begins, which targets a metadata
    *   answer has accepted (see `Cluster#captureEstablishment`)
    * @param {(topic: string) => boolean} [options.retainTopic] given only for the admin's cluster:
-   *   whether a topic is still a target. A scoped answer then keeps the installed metadata of every
+   *   whether a running call holds a topic. Every answer then keeps the installed metadata of each
    *   such topic it does not carry, whichever request or path it answers (see `withRetainedTopics`)
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
@@ -1117,7 +1117,7 @@ module.exports = class BrokerPool {
               }),
             }
           } else {
-            this.metadata = this.withRetainedTopics(response, topics)
+            this.metadata = this.withRetainedTopics(response)
           }
           // Captured synchronously, in the same statement-tick as the assignment above and
           // before anything below can `await` - a concurrent rebootstrap nulls `this.metadata`
@@ -1239,17 +1239,18 @@ module.exports = class BrokerPool {
 
   /**
    * The answer to install, with the installed metadata of every topic it does not carry that
-   * `retainTopic` still names: overlapping admin calls share one target set, but a scoped answer
-   * (another call's named read, a fenced refresh, a retry or a late answer of an older request)
-   * asks only for the names of its own request. Retaining the rest keeps the routing
-   * of every topic a running call holds; a topic no call holds any more is not retained, so the
-   * next scoped answer drops it. An answer for every topic is authoritative and installed as it is.
+   * `retainTopic` names: a held topic's routing is replaced only by an answer that carries it.
+   * Overlapping admin calls share one target set, but any answer (another call's named read, a
+   * fenced refresh, a retry, a late answer of an older request, an older all-topics answer, or one
+   * sent after the admin's own `deleteTopics` pruned the name) may lack a topic a running call still
+   * routes. A topic no call holds is not retained, so the next answer that lacks it drops it; a
+   * held topic that was deleted keeps its old routing until its holder asks for it by name and
+   * gets `UNKNOWN_TOPIC_OR_PARTITION`.
    * @param {object} response the decoded answer
-   * @param {string[]} [topics] the names the request asked for; none means every topic
    * @returns {object} `response`, or a copy whose topics include the retained ones
    */
-  withRetainedTopics(response, topics) {
-    if (!this.retainTopic || !topics?.length || !this.metadata) return response
+  withRetainedTopics(response) {
+    if (!this.retainTopic || !this.metadata) return response
     const answered = new Set(response.topicMetadata.map(({ topic }) => topic))
     const retained = this.metadata.topicMetadata.filter(
       ({ topic }) => !answered.has(topic) && this.retainTopic(topic)

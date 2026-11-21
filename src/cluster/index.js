@@ -143,10 +143,10 @@ module.exports = class Cluster {
    *   established target the broker answers `UNKNOWN_TOPIC_OR_PARTITION`, instead of failing for
    *   every topic, and reports each change of that topic's status here (see
    *   `BrokerPool#isolateUnknownTopics`). Producer and admin clusters do not pass it.
-   * @param {boolean} [options.retainTargets] the admin cluster passes true: a scoped metadata answer
-   *   keeps the installed metadata of every topic still a target (see
-   *   `BrokerPool#withRetainedTopics`), so the routing of a topic a running admin call holds
-   *   survives every other answer
+   * @param {boolean} [options.retainTargets] the admin cluster passes true: a metadata answer keeps
+   *   the installed metadata of every topic a running admin call holds and the answer lacks (see
+   *   `BrokerPool#withRetainedTopics`), so a held topic's routing is replaced only by an answer
+   *   that carries it
    */
   constructor({
     logger: rootLogger,
@@ -263,7 +263,7 @@ module.exports = class Cluster {
         this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
       onTopicMetadataStatus,
       captureEstablishment: () => this.captureEstablishment(),
-      retainTopic: retainTargets ? (topic) => this.targetTopics.has(topic) : undefined,
+      retainTopic: retainTargets ? (topic) => this.targetHolds.has(topic) : undefined,
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
