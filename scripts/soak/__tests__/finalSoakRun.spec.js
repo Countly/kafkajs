@@ -2871,6 +2871,36 @@ describe('final soak failure evidence', () => {
     ])
   })
 
+  test('a commit the client refuses because the run is still starting is journaled as an expected refusal, not a failed call', async () => {
+    const { KafkaJSNonRetriableError } = require('../../../src/errors')
+    const runtime = workerRuntime('c18')
+    const worker = new ConsumerWorker(runtime)
+    const k = `${IDS.A}|0`
+    const rig = {
+      id: 'c18.4',
+      slot: config.clients.find((c) => c.slot === 'c18'),
+      object: {
+        commitOffsets: async () => {
+          throw new KafkaJSNonRetriableError(
+            'Consumer is not running, wait for consumer#run to resolve first'
+          )
+        },
+      },
+      uncommitted: new Map([[k, 100]]),
+    }
+    const key = { topic: config.topics.main, topicId: IDS.A, partition: 0 }
+    expect(await worker.commit(rig, { key, authority: {} }, '4300')).toBe('refused')
+    const end = runtime.records.find((r) => r.stage === 'commit' && r.phase === 'end')
+    expect(end).toMatchObject({ outcome: 'refused', errorType: 'KafkaJSNonRetriableError' })
+    expect(runtime.records.filter((r) => r.kind === 'diagnostic')).toEqual([
+      {
+        kind: 'diagnostic',
+        message: `expected refusal: commit ${end.commit} not sent, the run is starting`,
+      },
+    ])
+    expect(rig.uncommitted.get(k)).toBe(100)
+  })
+
   test('a commit whose public call failed is journaled with what the client returned', async () => {
     const runtime = workerRuntime('c18')
     const worker = new ConsumerWorker(runtime)

@@ -174,6 +174,21 @@ describe('Workflow timeouts', () => {
     expect(job['timeout-minutes']).toBeGreaterThan(run['timeout-minutes'])
   })
 
+  test('runs the heavy unit specs alone on every Node line and mirrors them in the memory-gate unit job', () => {
+    const memory = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
+    const ci = yaml.load(fs.readFileSync(path.join(workflows, 'ci.yml'), 'utf8'))
+    const heavy = ci.jobs['unit-heavy']
+    expect(heavy.strategy.matrix.node).toEqual(ci.jobs.unit.strategy.matrix.node)
+    expect(heavy.steps.filter((step) => step.run?.startsWith('npm run test:'))).toEqual([
+      expect.objectContaining({ run: 'npm run test:unit:heavy -- --ci' }),
+    ])
+    const job = memory.jobs.unit
+    const step = job.steps.find((entry) => entry.run?.startsWith('npm run test:unit:heavy'))
+    expect(step['timeout-minutes']).toBeGreaterThanOrEqual(heavy['timeout-minutes'] - 5)
+    const budget = job.steps.reduce((sum, entry) => sum + entry['timeout-minutes'], 0)
+    expect(job['timeout-minutes']).toBeGreaterThan(budget)
+  })
+
   test('bounds the isolated share peak arms and keeps expressions outside shell commands', () => {
     const workflow = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
     const job = workflow.jobs['share-peak']

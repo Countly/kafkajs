@@ -692,6 +692,50 @@ describe('Consumer churn profile > a member', () => {
     expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
   })
 
+  test('a commit the client sends nothing for, because the run is stopping or still starting, stays owed and is no observation', async () => {
+    const { KafkaJSError, KafkaJSNonRetriableError } = require('../../../index')
+    const { member, appended, handlers, consumer } = setup()
+    await member.start(['t'])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
+    await handlers.each(message(0))
+    const sendCommit = consumer.commitOffsets.getMockImplementation()
+    const stopping = Object.assign(new KafkaJSError('The consumer is stopping'), {
+      type: 'CONSUMER_STOPPING',
+    })
+    const starting = new KafkaJSNonRetriableError(
+      'Consumer is not running, wait for consumer#run to resolve first'
+    )
+    for (const refusal of [stopping, starting]) {
+      consumer.commitOffsets.mockImplementationOnce(async () => {
+        throw refusal
+      })
+      await expect(member.commitAll()).resolves.toBeUndefined()
+    }
+    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
+
+    consumer.commitOffsets.mockImplementationOnce(sendCommit)
+    await member.commitAll()
+    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler', 'commit'])
+    expect(appended[3]).toMatchObject({ next: '1', brokerNext: '1' })
+  })
+
+  test('a stop error after an admitted commit failed still fails the commit', async () => {
+    const { KafkaJSError } = require('../../../index')
+    const { member, appended, handlers, consumer } = setup()
+    await member.start(['t'])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
+    await handlers.each(message(0))
+    const admitted = Object.assign(
+      new KafkaJSError('The consumer is stopping', { cause: new Error('lookup failed') }),
+      { type: 'CONSUMER_STOPPING' }
+    )
+    consumer.commitOffsets.mockImplementationOnce(async () => {
+      throw admitted
+    })
+    await expect(member.commitAll()).rejects.toBe(admitted)
+    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
+  })
+
   describe('a commit that fails inside the handler', () => {
     const owned = async (options) => {
       const harness = setup(options)
