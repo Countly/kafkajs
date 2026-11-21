@@ -93,7 +93,10 @@ const buildConfig = () => {
       telemetryEnabled: false,
     }
   )
-  return { schema: 3, mode: 'smoke', runId: RUN, processes, clients }
+  const heapSnapshots = processes
+    .filter((p) => ['subject', 'seed', 'reader', 'decoder'].includes(p.role))
+    .map((p) => p.slot)
+  return { schema: 3, mode: 'smoke', runId: RUN, processes, clients, heapSnapshots }
 }
 
 const BASE_CONFIG = buildConfig()

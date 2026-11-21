@@ -1589,7 +1589,8 @@ const ClientSlot = shape('a client slot', {
  * their arms; one standing subject of each kind alone in its own process (churn extras of the same
  * churn kind may share it); exactly one isolated seed process holding exactly one control client of
  * the seeded kind; observers only in observer processes; group, static id and telemetry per kind;
- * heap snapshot processes (`heapSnapshots`, absent or null when off) only outside acceptance mode.
+ * heap snapshot processes (`heapSnapshots`): every subject, the seed, the reader and the decoder,
+ * in every mode.
  * Other config sections belong to the driver profile and are compared by the verifier.
  * @param {unknown} config parsed config JSON
  * @param {object} matrix a valid matrix
@@ -1676,13 +1677,13 @@ const validateConfig = (config, matrix) => {
       problems.push(`config seed process ${p.slot} does not host exactly one control client`)
     }
   }
-  const snapshots = config.heapSnapshots ?? null
-  if (snapshots !== null) {
-    if (!Array.isArray(snapshots) || !snapshots.every((slot) => processes.has(slot)))
-      problems.push('config.heapSnapshots is not null or a list of config process slots')
-    else if (config.mode === 'acceptance')
-      problems.push('config.heapSnapshots is set in acceptance mode')
-  }
+  const snapshotSlots = config.processes
+    .filter((p) => ['subject', 'seed', 'reader', 'decoder'].includes(p.role))
+    .map((p) => p.slot)
+  if (JSON.stringify(config.heapSnapshots) !== JSON.stringify(snapshotSlots))
+    problems.push(
+      'config.heapSnapshots does not list every subject, the seed, the reader and the decoder, in process order'
+    )
   for (const c of config.clients) {
     if (c.purpose === 'observer' || !matrix.clientKinds[c.clientKind].grouped) continue
     const owner = c.purpose === 'churn' ? subjectOf.get(c.clientKind) : c

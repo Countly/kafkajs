@@ -338,8 +338,8 @@ class Scheduler {
   }
 
   /**
-   * Holds work steps and the end of an idle window until `work` settles, as a running quiet sample
-   * does.
+   * Holds work steps and the end of an idle window until `work` settles. Every running quiet sample
+   * is held this way, and so is any other measurement whose real cost must not overlap work.
    * @param {Promise<unknown>} work @returns {void}
    */
   hold(work) {
@@ -427,13 +427,7 @@ class Scheduler {
    */
   async bounded(step, deadline) {
     const running = Promise.resolve().then(() => this.perform(step))
-    if (step.type === 'quiet') {
-      this.quieting.add(running)
-      running.then(
-        () => this.quieting.delete(running),
-        () => this.quieting.delete(running)
-      )
-    }
+    if (step.type === 'quiet') this.hold(running)
     if (step.lane !== 'work') return running
     this.inflight.add(step.id)
     running.then(

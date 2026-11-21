@@ -298,39 +298,32 @@ describe('final soak driver', () => {
     )
   })
 
-  test('heap snapshots are an opt-in of smoke and rehearsal runs, recorded in the config by client kind and process role, and refused in acceptance mode', () => {
-    expect(parseArgs(['--mode', 'rehearsal', '--heap-snapshots', ...ARGS], ENV)).toMatchObject({
-      mode: 'rehearsal',
-      heapSnapshots: true,
-    })
-    expect(parseArgs(['--mode', 'smoke', '--heap-snapshots', ...ARGS], ENV).heapSnapshots).toBe(
-      true
-    )
-    expect(parseArgs(['--mode', 'rehearsal', ...ARGS], ENV).heapSnapshots).toBe(false)
-    expect(() => parseArgs(['--mode', 'acceptance', '--heap-snapshots', ...ARGS], ENV)).toThrow(
-      '--heap-snapshots is accepted only in smoke mode or rehearsal mode'
-    )
-
+  test('heap snapshots are taken in every mode, acceptance included, by every subject, the seed, the reader and the decoder, and the config must list exactly those', () => {
     const options = { runId: RUN, treeSha: TREE, brokers: ['k:1'] }
-    const config = buildConfig(matrix, { ...options, mode: 'rehearsal', heapSnapshots: true })
-    const kindOf = (slot) =>
-      config.clients.find((c) => c.process === slot && c.purpose !== 'observer')?.clientKind ??
-      config.processes.find((p) => p.slot === slot).role
-    expect(config.heapSnapshots.map(kindOf)).toEqual([
-      'classic-cooperative-dynamic',
-      'producer-transactional',
-      'reader',
-      'decoder',
-    ])
-    expect(validateConfig(config, matrix)).toEqual([])
-    expect(buildConfig(matrix, { ...options, mode: 'rehearsal' }).heapSnapshots).toBeNull()
+    const slots = [
+      ...Array.from({ length: 12 }, (_, i) => `p${String(i + 1).padStart(2, '0')}`),
+      'p13',
+      'p14',
+      'p16',
+    ]
+    for (const mode of ['smoke', 'rehearsal', 'acceptance']) {
+      const config = buildConfig(matrix, { ...options, mode })
+      expect([mode, config.heapSnapshots]).toEqual([mode, slots])
+      expect(validateConfig(config, matrix)).toEqual([])
+      expect(parseArgs(['--mode', mode, ...ARGS], ENV)).not.toHaveProperty('heapSnapshots')
+    }
     const day = buildConfig(matrix, { ...options, mode: 'acceptance' })
-    expect(validateConfig({ ...day, heapSnapshots: config.heapSnapshots }, matrix)).toEqual([
-      'config.heapSnapshots is set in acceptance mode',
+    const wrong =
+      'config.heapSnapshots does not list every subject, the seed, the reader and the decoder, in process order'
+    for (const heapSnapshots of [
+      null,
+      undefined,
+      slots.slice(1),
+      slots.filter((slot) => slot !== 'p13'),
+      [...slots, 'p15'],
+      [...slots].reverse(),
     ])
-    expect(validateConfig({ ...config, heapSnapshots: ['p99'] }, matrix)).toEqual([
-      'config.heapSnapshots is not null or a list of config process slots',
-    ])
+      expect(validateConfig({ ...day, heapSnapshots }, matrix)).toEqual([wrong])
   })
 
   test('acceptance mode rejects --duration', () => {
@@ -972,18 +965,12 @@ describe('final soak driver', () => {
       )
       expect(diagnostic.find((c) => c.includes('--expose-gc'))).toMatch(/--diagnostic$/)
 
-      expect(harness.run([TREE, 'rehearsal'], { FINAL_SOAK_HEAP_SNAPSHOTS: '1' }).status).toBe(0)
+      expect(harness.run([TREE, 'rehearsal']).status).toBe(0)
       expect(harness.calls().find((c) => c.includes('--expose-gc'))).toMatch(
-        /--mode rehearsal .* --heap-snapshots$/
+        /--mode rehearsal --expect-sha \S+ --matrix \S+ --out \S+$/
       )
-      expect(harness.calls().find((c) => c.includes('--expose-gc'))).not.toMatch(/--diagnostic/)
 
       expect(harness.run([TREE, 'acceptance'], { FINAL_SOAK_DIAGNOSTIC: '1' }).status).toBe(2)
-      const refused = harness.run([TREE, 'acceptance'], { FINAL_SOAK_HEAP_SNAPSHOTS: '1' })
-      expect(refused.status).toBe(2)
-      expect(refused.stderr).toContain(
-        'FINAL_SOAK_HEAP_SNAPSHOTS is accepted only in smoke or rehearsal mode'
-      )
       expect(harness.run(['main', 'smoke']).status).toBe(2)
       expect(harness.run([TREE, 'day']).status).toBe(2)
       expect(harness.calls()).toEqual([])
@@ -2907,10 +2894,6 @@ describe('final soak driver', () => {
     expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch', 'push'])
     for (const input of Object.values(workflow.on.workflow_dispatch.inputs ?? {}))
       expect(input.default).toBeDefined()
-    expect(workflow.on.workflow_dispatch.inputs.heap_snapshots).toMatchObject({
-      type: 'boolean',
-      default: false,
-    })
     expect(workflow.on.workflow_dispatch.inputs.mode).toMatchObject({
       type: 'choice',
       options: ['smoke', 'rehearsal'],
@@ -2922,7 +2905,6 @@ describe('final soak driver', () => {
       KAFKA_VERSION: '4.4.0',
       FINAL_SOAK_DIAGNOSTIC: '1',
       FINAL_SOAK_MODE: expression("inputs.mode || 'smoke'"),
-      FINAL_SOAK_HEAP_SNAPSHOTS: expression("inputs.heap_snapshots && '1' || ''"),
     })
     const runbook = job.steps.find((s) => (s.run ?? '').includes('finalSoakNode.sh'))
     expect(runbook.run).toMatch(

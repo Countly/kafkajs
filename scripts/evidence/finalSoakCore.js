@@ -17,7 +17,9 @@
  * `apache/`: `<main|transactions>.dump` (`kafka-console-consumer.sh`, read_committed, partition 0,
  * lines `Partition:<p>\tOffset:<o>\t<key>\t<value>`) and `groups/<group>.describe`
  * (`kafka-consumer-groups.sh --describe`), each with `.stderr` and `.end` (`exit=<n> lines=<n>`). A
- * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE.
+ * missing, truncated, unparseable or unbound ground-truth file makes its rows INCONCLUSIVE. K5
+ * reads `heap/summary.json` (`scripts/soak/heapSummary.js`, written after the run) and re-derives
+ * the totals of every snapshot whose number it judges from the snapshot file itself.
  *
  * Memory: about 86 bytes of typed arrays per offered-id slot (`matrix.traffic.maxOffers`, about
  * 172 MB at 2 million; pages are touched only as ids arrive): the full 32-byte payload digest,
@@ -27,12 +29,15 @@
  * aborted member's offset, each capped at the same capacity; open membership waves and printed
  * outages capped by the matrix schedule; a fixed sample grid per process. Any cap that is reached
  * is a reported problem that leaves K1 to K6 INCONCLUSIVE. Side files are read whole only below a
- * size cap.
+ * size cap; a heap snapshot (at most 1 GiB) is read and parsed one at a time, at about five
+ * times its file size.
  */
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const schema = require('../soak/finalSoakSchema')
+const heapSummary = require('../soak/heapSummary')
+const { readSnapshot } = require('../e2e/telemetry/retained/heapDiff')
 
 const CHECKOUT = path.resolve(__dirname, '../..')
 const REVIEWED_MATRIX = path.join(CHECKOUT, 'scripts/soak/finalSoakMatrix.json')
@@ -43,6 +48,7 @@ const LIST_CAP = 20
 const MAX_LINE = 1 << 20
 const MAX_SMALL_FILE = 1 << 20
 const MAX_JSON = 16 << 20
+const MAX_SNAPSHOT = 1 << 30
 /** @param {string|Buffer} data @returns {string} its sha256 in hex */
 const sha = (data) => crypto.createHash('sha256').update(data).digest('hex')
 /** The `entered` value of an id a group entered outside every ownership interval; serials start above it. */
@@ -62,7 +68,7 @@ const ROW_NAMES = {
 const NOT_JUDGED = Object.freeze([
   { name: 'share lock lifecycle and authority replay', lane: 'share-soak' },
   { name: 'ownership tables', lane: 'consumer-churn' },
-  { name: 'seed sensitivity control', lane: 'telemetry' },
+  { name: 'seed offset volume', lane: 'telemetry' },
   { name: 'latency denominators', lane: 'consumer-churn' },
   { name: 'cooperative round counts', lane: 'consumer-churn' },
   { name: 'restart leave mode and stop mode', lane: 'consumer-churn' },
@@ -1143,15 +1149,15 @@ function judgeCommits(row, { journal, describes, config }) {
 const upperMedian = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
 
 /**
- * The heap screen over matched quiet boundaries: Y[h] is the median heapUsed of boundary h, X[h]
- * the median completion time in minutes; the endpoint compares the medians of the last and first
- * three boundaries and the slope is the least-squares fit of Y over X (NaN without time spread).
- * @param {{ heapUsed: number, completedAt: number }[][]} boundaries readings per boundary, in order
+ * The heap screen over one value per boundary, in boundary order: the endpoint compares the
+ * medians of the last and first three boundaries (one each below six) and the slope is the
+ * least-squares fit of the bytes over the minutes (NaN without time spread).
+ * @param {{ bytes: number, minutes: number }[]} points one per boundary
  * @returns {{ endpoint: number, slope: number }}
  */
-function heapScreen(boundaries) {
-  const Y = boundaries.map((b) => upperMedian(b.map((r) => r.heapUsed)))
-  const X = boundaries.map((b) => upperMedian(b.map((r) => r.completedAt)) / 60000)
+function heapScreen(points) {
+  const Y = points.map((p) => p.bytes)
+  const X = points.map((p) => p.minutes)
   const n = Y.length
   const edge = Math.max(1, Math.min(3, Math.floor(n / 2)))
   const endpoint = upperMedian(Y.slice(n - edge)) - upperMedian(Y.slice(0, edge))
@@ -1165,44 +1171,239 @@ function heapScreen(boundaries) {
   return { endpoint, slope }
 }
 
+/** @param {{ endpoint: number, slope: number }} r @returns {object} the screen as printed */
+const screenNumbers = (r) => ({ endpoint: r.endpoint, slopePerMinute: Math.round(r.slope) })
+
+/** @param {number} h @returns {string} the boundary label of hour `h` */
+const boundaryOf = (h) => `h${String(h).padStart(2, '0')}`
+
 /**
- * K5: the heap screen of each unseeded standing process on its quiet triplets, one boundary per
- * hour. A boundary counts only when all its readings were admitted inside its hour's quiet window
- * (from the reading's time to the quiet deadline) and completed within that hour. Fewer than two
- * boundaries cannot be screened and are INCONCLUSIVE.
- * @param {Row} row @param {object} ctx `{ journal, matrix, config, plan, header }` @returns {void}
+ * The whole-process `heapUsed` screen of one process on its quiet triplets, printed for the
+ * reader and never a verdict: Y is the median of a boundary's readings, X their median completion
+ * time. A boundary counts only when all its readings were admitted inside its hour's quiet window
+ * and completed within that hour.
+ * @param {object} ctx `{ journal, plan, header }` @param {string} slot
+ * @returns {object} the screen, or `{ reason }` when fewer than two boundaries count
  */
-function judgeHeap(row, { journal, matrix, config, plan, header }) {
+function readingScreen({ journal, plan, header }, slot) {
+  const points = []
+  for (let h = 0; h < plan.hours; h++) {
+    const readings = journal.procs.get(slot).quiet.get(boundaryOf(h))
+    if (!readings || readings.size < plan.readings) continue
+    const H = header.window.runStartAt + h * plan.hourMs
+    const inside = [...readings].every(
+      ([n, r]) =>
+        r.admittedAt >= H + plan.quietAt[n] &&
+        r.admittedAt <= H + plan.quietDeadline &&
+        r.completedAt <= H + plan.hourMs
+    )
+    const values = [...readings.values()]
+    if (inside)
+      points.push({
+        bytes: upperMedian(values.map((r) => r.heapUsed)),
+        minutes: upperMedian(values.map((r) => r.completedAt)) / 60000,
+      })
+  }
+  if (points.length < 2) return { reason: `${points.length} quiet boundaries inside their window` }
+  return screenNumbers(heapScreen(points))
+}
+
+/**
+ * Reads `heap/summary.json` (at most `MAX_JSON` bytes) and checks it against the header manifest.
+ * When it is missing, the reason finalize recorded in `heapSummary.SUMMARY_ERROR_FILE`, if any, is
+ * named with it.
+ * @param {object} ctx `{ dir, manifest }` @param {string[]} problems receives every problem
+ * @returns {Map<string, object>} its records by `<slot> <boundary>`, empty when it is unusable
+ */
+function readHeapSummary({ dir, manifest }, problems) {
+  const records = new Map()
+  let bytes
+  try {
+    bytes = readCapped(path.join(dir, heapSummary.SUMMARY_FILE), MAX_JSON)
+  } catch (e) {
+    let why = e.code === 'ENOENT' ? 'missing' : e.message
+    try {
+      const error = readCapped(path.join(dir, heapSummary.SUMMARY_ERROR_FILE), 1024)
+      checkBound(
+        manifest,
+        heapSummary.SUMMARY_ERROR_FILE,
+        { bytes: error.length, sha256: sha(error) },
+        problems
+      )
+      why += `; finalize could not summarise the heap snapshots: ${error.toString('utf8').trim()}`
+    } catch {}
+    problems.push(`${heapSummary.SUMMARY_FILE}: ${why}`)
+    return records
+  }
+  checkBound(
+    manifest,
+    heapSummary.SUMMARY_FILE,
+    { bytes: bytes.length, sha256: sha(bytes) },
+    problems
+  )
+  let summary = null
+  try {
+    summary = JSON.parse(bytes)
+  } catch {}
+  if (summary?.excludedType !== heapSummary.EXCLUDED_TYPE || !Array.isArray(summary.records))
+    problems.push(
+      `${heapSummary.SUMMARY_FILE}: not a summary that excludes only node type ${heapSummary.EXCLUDED_TYPE}`
+    )
+  else
+    for (const r of summary.records) {
+      const key = `${r?.slot} ${r?.boundary}`
+      if (records.has(key)) problems.push(`${heapSummary.SUMMARY_FILE}: ${key} is summarised twice`)
+      records.set(key, r)
+    }
+  return records
+}
+
+/**
+ * Re-derives a snapshot's totals from the file itself, bound by the header manifest. The caller
+ * has bound the record's file to its slot and boundary.
+ * @param {object} ctx `{ dir, manifest }` @param {object} record its summary record
+ * @returns {string|null} why the file does not confirm the record, or null when it does
+ */
+function snapshotProblem({ dir, manifest }, record) {
+  const file = path.join(dir, record.file)
+  const problems = []
+  try {
+    const bytes = readCapped(file, MAX_SNAPSHOT)
+    checkBound(manifest, record.file, { bytes: bytes.length, sha256: sha(bytes) }, problems)
+    if (sha(bytes) !== record.sha256 || bytes.length !== record.snapshotBytes)
+      problems.push(`${record.file} is not the snapshot summarised`)
+    const totals = heapSummary.totalsOf(readSnapshot(file))
+    for (const key of ['nodes', 'totalBytes', 'judgedBytes', 'excludedBytes'])
+      if (totals[key] !== record[key])
+        problems.push(`${record.file} has ${key} ${totals[key]}, its summary ${record[key]}`)
+  } catch (e) {
+    problems.push(`${record.file} cannot be read: ${e.message}`)
+  }
+  return problems[0] ?? null
+}
+
+/**
+ * The judged-heap series of one process: one summary record per hour whose snapshot was written
+ * without error inside the hour's quiet window (from its last quiet reading's time to the hour's
+ * end) and agrees with the supervisor's receipt: the receipt names the process's own file of that
+ * boundary, and the record names that file with the size the worker recorded. Every such snapshot
+ * file is re-read and must confirm its record, so no judged number rests on the summary alone; one
+ * that does not leaves the process without numbers.
+ * @param {object} ctx `{ dir, manifest, plan, header }` @param {string} slot
+ * @param {Map<string, object>} records the summary records @param {Map<string, object>} receipts
+ *   the supervisor's receipts by `<slot> <boundary>`
+ * @returns {{ points: { bytes: number, minutes: number }[], gaps: string[] }}
+ */
+function snapshotSeries(ctx, slot, records, receipts) {
+  const { plan, header } = ctx
+  const points = []
+  const usable = []
+  const gaps = []
+  for (let h = 0; h < plan.hours; h++) {
+    const label = boundaryOf(h)
+    const r = records.get(`${slot} ${label}`)
+    const receipt = receipts.get(`${slot} ${label}`)
+    const H = header.window.runStartAt + h * plan.hourMs
+    let why = null
+    if (!r) why = 'has no heap snapshot summary'
+    else if (
+      !receipt ||
+      receipt.at !== r.at ||
+      receipt.file !== heapSummary.snapshotFile(slot, label) ||
+      r.file !== receipt.file ||
+      (receipt.error !== null && receipt.error !== r.error) ||
+      (r.error === null && r.snapshotBytes !== receipt.bytes)
+    )
+      why = 'has a heap snapshot summary that disagrees with the supervisor receipt'
+    else if (r.error !== null) why = `has no usable heap snapshot: ${r.error}`
+    else if (!Number.isSafeInteger(r.judgedBytes) || !Number.isFinite(r.at))
+      why = 'has a heap snapshot summary without judged bytes or time'
+    else if (r.at < H + plan.quietAt[plan.readings - 1] || r.at > H + plan.hourMs)
+      why = `heap snapshot at ${r.at} lies outside the hour's quiet window`
+    if (why) gaps.push(`${slot} ${label} ${why}`)
+    else {
+      usable.push(r)
+      points.push({ bytes: r.judgedBytes, minutes: r.at / 60000 })
+    }
+  }
+  if (points.length < Math.max(plan.hours, 2))
+    gaps.push(
+      `${slot} has ${points.length} of ${plan.hours} usable heap snapshots (at least 2 needed)`
+    )
+  if (points.length >= 2)
+    for (const r of usable) {
+      const why = snapshotProblem(ctx, r)
+      if (why) {
+        gaps.push(`${slot} ${r.boundary} snapshot does not confirm its summary: ${why}`)
+        points.length = 0
+      }
+    }
+  return { points, gaps }
+}
+
+/**
+ * K5: the judged heap of each unseeded subject process, one heap snapshot per hourly quiet
+ * boundary: every live byte but V8 code (`heapSummary.EXCLUDED_TYPE`), whoever owns it. The
+ * endpoint and slope of `heapScreen` must stay within the matrix bounds. A boundary without a
+ * usable snapshot leaves the process INCONCLUSIVE, never PASS, and fewer than two usable
+ * boundaries cannot be screened. The seed's snapshots, judged the same way, are the positive
+ * control: unless its endpoint exceeds the seed's breach bound the row cannot PASS, and the seed
+ * never fails it. The harness-only snapshot processes (reader, decoder) and every subject's
+ * whole-process `heapUsed` screen are returned as information, never a verdict.
+ * @param {Row} row @param {object} ctx `{ dir, manifest, journal, matrix, config, plan, header,
+ *   supervisor }`
+ * @returns {{ heapUsed: object, comparison: object, control: object, controlBound: number }} the
+ *   information lines
+ */
+function judgeHeap(row, ctx) {
+  const { matrix, config, supervisor } = ctx
   const limits = {
     endpoint: matrix.bounds['heap-endpoint'].value,
     slope: matrix.bounds['heap-slope'].value,
   }
-  for (const { slot } of config.processes.filter((p) => p.role === 'subject')) {
-    const series = []
-    for (let h = 0; h < plan.hours; h++) {
-      const label = `h${String(h).padStart(2, '0')}`
-      const readings = journal.procs.get(slot).quiet.get(label)
-      if (!readings || readings.size < plan.readings) continue
-      const H = header.window.runStartAt + h * plan.hourMs
-      const inside = [...readings].every(
-        ([n, r]) =>
-          r.admittedAt >= H + plan.quietAt[n] &&
-          r.admittedAt <= H + plan.quietDeadline &&
-          r.completedAt <= H + plan.hourMs
-      )
-      if (inside) series.push([...readings.values()])
-      else row.gap(`${slot} ${label} readings lie outside the hour's quiet window`)
-    }
-    if (series.length < Math.max(plan.hours, 2))
-      row.gap(`${slot} has ${series.length} of ${plan.hours} quiet boundaries (at least 2 needed)`)
-    if (series.length < 2) continue
-    const r = heapScreen(series)
-    row.numbers[slot] = { endpoint: r.endpoint, slopePerMinute: Math.round(r.slope) }
+  const problems = []
+  const records = readHeapSummary(ctx, problems)
+  problems.forEach((p) => row.gap(p))
+  const receipts = new Map(
+    (Array.isArray(supervisor?.heapSnapshots) ? supervisor.heapSnapshots : []).map((r) => [
+      `${r.slot} ${r.boundary}`,
+      r,
+    ])
+  )
+  const controlBound = matrix.controls['interning-seeded'].breachBytes.value
+  const info = { heapUsed: {}, comparison: {}, control: {}, controlBound }
+  const subjects = config.processes.filter((p) => p.role === 'subject').map((p) => p.slot)
+  for (const slot of subjects) {
+    info.heapUsed[slot] = readingScreen(ctx, slot)
+    const { points, gaps } = snapshotSeries(ctx, slot, records, receipts)
+    gaps.forEach((g) => row.gap(g))
+    if (points.length < 2) continue
+    const r = heapScreen(points)
+    row.numbers[slot] = screenNumbers(r)
     if (!(r.endpoint <= limits.endpoint))
-      row.fail(`${slot} heap endpoint ${r.endpoint} bytes exceeds ${limits.endpoint}`)
+      row.fail(`${slot} judged heap endpoint ${r.endpoint} bytes exceeds ${limits.endpoint}`)
     if (!(r.slope <= limits.slope))
-      row.fail(`${slot} heap slope ${Math.round(r.slope)} B/min exceeds ${limits.slope}`)
+      row.fail(`${slot} judged heap slope ${Math.round(r.slope)} B/min exceeds ${limits.slope}`)
   }
+  const seeds = config.processes.filter((p) => p.role === 'seed').map((p) => p.slot)
+  for (const slot of seeds) {
+    const { points, gaps } = snapshotSeries(ctx, slot, records, receipts)
+    const control = points.length >= 2 ? screenNumbers(heapScreen(points)) : { reason: gaps[0] }
+    info.control[slot] = control
+    if (!(control.endpoint > controlBound))
+      row.gap(
+        `seed ${slot} does not show its leak: ${control.reason ?? `judged heap endpoint ${control.endpoint} bytes is not above ${controlBound}`}`
+      )
+  }
+  const others = (config.heapSnapshots ?? []).filter(
+    (s) => !subjects.includes(s) && !seeds.includes(s)
+  )
+  for (const slot of others) {
+    const { points, gaps } = snapshotSeries(ctx, slot, records, receipts)
+    info.comparison[slot] =
+      points.length >= 2 ? screenNumbers(heapScreen(points)) : { reason: gaps[0] }
+  }
+  return info
 }
 
 /**
@@ -1417,7 +1618,7 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
         rows[id].gap(
           `${partial.count} handler calls were journaled only in part (first: ${partial.first.slice(0, 120)})`
         )
-    judgeHeap(rows.K5, ctx)
+    ctx.heap = judgeHeap(rows.K5, ctx)
     judgeResources(rows.K6, ctx)
   }
   const done = Object.values(rows).map((r) => r.done())
@@ -1429,7 +1630,7 @@ async function judge({ dir, matrix, config, mode, header, supervisor, journal, p
     treeSha: header.treeSha,
     rows: done,
     notJudged: NOT_JUDGED_ROWS,
-    information: informationOf(journal),
+    information: { ...informationOf(journal), heap: ctx.heap ?? null },
     overall: has('FAIL')
       ? 'REJECTED'
       : has('INCONCLUSIVE') || mode !== 'acceptance'
@@ -1575,6 +1776,17 @@ function formatReport(report) {
     for (const wave of info.incompleteWaves) lines.push(`  incomplete wave: ${wave}`)
     lines.push(`  probe sends settled after their step: ${info.lateProbeSends}`)
     lines.push(`  drain commits skipped as expected: ${info.expectedSkips}`)
+    /** @param {object} s a screen or `{ reason }` @returns {string} it as printed */
+    const screen = (s) =>
+      s.reason ?? `endpoint ${s.endpoint} bytes, slope ${s.slopePerMinute} B/min`
+    for (const [slot, s] of Object.entries(info.heap?.heapUsed ?? {}))
+      lines.push(`  whole-process heapUsed ${slot}: ${screen(s)}`)
+    for (const [slot, s] of Object.entries(info.heap?.comparison ?? {}))
+      lines.push(`  judged heap of harness-only ${slot}: ${screen(s)}`)
+    for (const [slot, s] of Object.entries(info.heap?.control ?? {}))
+      lines.push(
+        `  seed control ${slot} (judged heap, must exceed ${info.heap.controlBound} bytes): ${screen(s)}`
+      )
     const share = info.shareOutcomes
     if (share) {
       const reasons = share.byReason.map(([reason, n]) => `${reason} ${n}`).join(', ') || 'none'
@@ -1608,4 +1820,13 @@ if (require.main === module) {
   })
 }
 
-module.exports = { Journal, NOT_JUDGED, checkArtifact, formatReport, heapScreen, judge, main }
+module.exports = {
+  Journal,
+  NOT_JUDGED,
+  checkArtifact,
+  formatReport,
+  heapScreen,
+  judge,
+  judgeHeap,
+  main,
+}

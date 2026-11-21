@@ -27,7 +27,7 @@ jobs:
       - run: npm run test:types
   unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix: { node: [22, 24, 26] }

@@ -3,6 +3,7 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { AsyncLocalStorage } = require('node:async_hooks')
+const { writeSyntheticSnapshot } = require('./fixtures/syntheticSnapshot')
 const ConsumerGroup = require('../../../src/consumer/consumerGroup')
 const GroupOwnership = require('../../../src/consumer/groupOwnership')
 const OffsetOperations = require('../../../src/consumer/offsetManager/offsetOperations')
@@ -782,6 +783,56 @@ describe('final soak finalization', () => {
       })
       expect(header.files.map((f) => f.file)).toContain('dump/log-main.txt')
       expect(header.stream.records).toBe(2)
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('finalize summarises the heap snapshots before it hashes: the summary and every snapshot it summarised are kept and bound', () => {
+    const out = artifact({ outer: { status: 0, observedAt: 12345 } })
+    try {
+      const receipts = ['h00', 'h01', 'h02'].map((boundary, h) => {
+        const file = `heap/p04.${boundary}.heapsnapshot`
+        writeSyntheticSnapshot(path.join(out, file), [
+          { type: 'object', name: 'Judged', bytes: 9000000 + h },
+          { type: 'code', name: '(code)', bytes: 3000000 * (h + 1) },
+        ])
+        const bytes = fs.statSync(path.join(out, file)).size
+        return { slot: 'p04', boundary, file, at: h, ms: 1, bytes, error: null }
+      })
+      const run = JSON.parse(fs.readFileSync(path.join(out, 'supervisor.json'), 'utf8'))
+      fs.writeFileSync(
+        path.join(out, 'supervisor.json'),
+        JSON.stringify({ ...run, heapSnapshots: receipts })
+      )
+      const header = finalize({ out, status: 0 })
+      const bound = header.files.map((f) => f.file).filter((f) => f.startsWith('heap/'))
+      expect(bound.sort()).toEqual([
+        'heap/p04.h00.heapsnapshot',
+        'heap/p04.h01.heapsnapshot',
+        'heap/p04.h02.heapsnapshot',
+        'heap/summary.json',
+      ])
+      const summary = JSON.parse(fs.readFileSync(path.join(out, 'heap/summary.json'), 'utf8'))
+      expect(summary.records.map((r) => [r.boundary, r.error, r.judgedBytes])).toEqual([
+        ['h00', null, 9000000],
+        ['h01', null, 9000001],
+        ['h02', null, 9000002],
+      ])
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true })
+    }
+  })
+
+  test('finalize still seals the run when the heap summary cannot be written, and records why beside it', () => {
+    const out = artifact({ outer: { status: 0, observedAt: 12345 } })
+    try {
+      fs.mkdirSync(path.join(out, 'heap/summary.json'), { recursive: true })
+      const header = finalize({ out, status: 0 })
+      expect(fs.existsSync(path.join(out, 'header.json'))).toBe(true)
+      const bound = header.files.map((f) => f.file).filter((f) => f.startsWith('heap/'))
+      expect(bound).toEqual(['heap/summary-error.txt'])
+      expect(fs.readFileSync(path.join(out, 'heap/summary-error.txt'), 'utf8')).toMatch(/^EISDIR/)
     } finally {
       fs.rmSync(out, { recursive: true, force: true })
     }
