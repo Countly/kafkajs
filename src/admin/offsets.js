@@ -7,7 +7,7 @@ const {
 } = require('../errors')
 const { createErrorFromCode, failure } = require('../protocol/error')
 const { ON_DECODED } = require('../broker/privateOptions')
-const { itemRetry } = require('./itemRetry')
+const { itemRetry, isLocal } = require('./itemRetry')
 const { checked, waitOf, currentDeadline } = require('./deadline')
 const { exact, validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const apiKeys = require('../protocol/requests/apiKeys')
@@ -134,7 +134,8 @@ const COMMIT_RETRIES = [14, 15, 16, 27]
 const COORDINATOR_MOVED = [15, 16]
 
 /** Whether an OffsetCommit rejection is the parser's throw for the first failed partition of the
- * reply it decoded, rather than a transport, deadline or decode failure.
+ * reply it decoded, rather than a transport, deadline or decode failure. Matched by topic and
+ * partition, since a code this client does not know is thrown under another code.
  * @param {Error} error what the request rejected with
  * @param {{responses: object[]}|null} decoded the reply this attempt decoded, if any
  * @returns {boolean}
@@ -143,42 +144,34 @@ const isFirstFailedPartition = (error, decoded) => {
   if (!decoded || !(error instanceof KafkaJSProtocolError)) return false
   for (const { topic, partitions } of decoded.responses) {
     const failed = partitions.find((partition) => failure(partition.errorCode))
-    if (failed) {
-      return (
-        error.code === failed.errorCode &&
-        error.topic === topic &&
-        error.partition === failed.partition
-      )
-    }
+    if (failed) return error.topic === topic && error.partition === failed.partition
   }
   return false
 }
 
 /** Rejects unless every committed row was accepted.
- * @param {object[]} rows itemRetry results: errorCode 0, a broker code, or -1 with a local error
+ * @param {object[]} rows itemRetry results: errorCode 0, a broker code, or a local failure row
  * @returns {void}
- * @throws {Error} the local failure itself when no partition got a broker code; otherwise a
- *   `KafkaJSAggregateError` with one child per partition not committed
+ * @throws {Error} the local failure itself when no partition was confirmed or answered with a code;
+ *   otherwise a `KafkaJSAggregateError` with one child per partition not committed
  */
 const assertCommitted = (rows) => {
   const failed = rows.filter((row) => row.errorCode !== 0)
   if (failed.length === 0) return
-  const coded = (row) =>
-    row.error instanceof KafkaJSProtocolError && row.error.code === row.errorCode
-  if (!failed.some(coded)) throw failed[0].error
+  if (failed.length === rows.length && failed.every(isLocal)) throw failed[0].error
   const children = failed.map((row) => {
-    const child = coded(row)
-      ? row.error
-      : new KafkaJSError(`Offset not confirmed: ${row.error.message}`, {
+    const child = isLocal(row)
+      ? new KafkaJSError(`Offset not confirmed: ${row.error.message}`, {
           retriable: row.error.retriable !== false,
           cause: row.error,
         })
+      : row.error
     return Object.assign(child, { topic: row.topic, partition: row.partition })
   })
-  const causes = failed.map((row, index) =>
-    coded(row)
-      ? `${row.partition} (${row.error.type})`
-      : `${row.partition} (not confirmed: ${children[index].cause.name})`
+  const causes = failed.map((row) =>
+    isLocal(row)
+      ? `${row.partition} (not confirmed: ${row.error.name})`
+      : `${row.partition} (${row.error.type})`
   )
   throw new KafkaJSAggregateError(
     `Offsets not committed for ${failed.length} of ${rows.length} partitions: ${causes.join(', ')}`,
@@ -284,8 +277,7 @@ class OffsetAdmin {
         keyOf: cellKey,
         retry: this.retry,
         retryable: (row) => COMMIT_RETRIES.includes(row.errorCode),
-        callFailure: (error) =>
-          failureOf(error) instanceof KafkaJSInvariantViolation || (!worked && callFailure(error)),
+        callFailure: (error) => !worked && callFailure(error),
         sanitize: (message) => message,
       },
       async (pending) => {
@@ -308,9 +300,8 @@ class OffsetAdmin {
             throw error
           }
         }
-        if (!decoded) throw new KafkaJSInvariantViolation('OffsetCommit reply was not observed')
         worked = true
-        const rows = decoded.responses.flatMap(({ topic, partitions }) =>
+        const rows = (decoded?.responses ?? []).flatMap(({ topic, partitions }) =>
           partitions.map(({ partition, errorCode }) => ({ topic, partition, errorCode }))
         )
         if (rows.some((row) => COORDINATOR_MOVED.includes(row.errorCode))) coordinator = null

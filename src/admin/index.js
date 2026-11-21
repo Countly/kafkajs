@@ -50,7 +50,6 @@ const ACL_OPERATION_TYPES = require('../protocol/aclOperationTypes')
 const ACL_PERMISSION_TYPES = require('../protocol/aclPermissionTypes')
 const RESOURCE_PATTERN_TYPES = require('../protocol/resourcePatternTypes')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
-const Long = require('../utils/long')
 
 /** Maps the public isolation option without changing shared cluster defaults.
  * @param {object} [options] invocation options, including its inherited API budget
@@ -133,21 +132,21 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
 const isConsumerGroupRunning = (description) => ['Empty', 'Dead'].includes(description.state)
 
 /**
- * An offset as a commit carries it: the rules `consumer.seek` applies, with values outside the
- * signed int64 range refused rather than wrapped by the encoder.
+ * An offset as a commit carries it. Only a decimal integer string (an optional `-` and digits) or a
+ * safe integer number is read; anything else, `'NaN'`, a blank or prefixed string, a boolean or an
+ * array say, is refused rather than read as 0 the way `Long.fromValue` would.
  * @param {string|number} offset a long of at least 0, or `-1` (latest) or `-2` (earliest)
  * @returns {string} the offset in decimal
- * @throws {KafkaJSNonRetriableError} for anything else
+ * @throws {KafkaJSNonRetriableError} for anything else, a value above the signed int64 range
+ *   included
  */
 const commitOffsetOf = (offset) => {
-  let value
-  try {
-    value = Long.fromValue(offset).value
-  } catch (_) {
-    value = null
-  }
+  const value =
+    (typeof offset === 'string' && /^-?\d+$/.test(offset)) || Number.isSafeInteger(offset)
+      ? BigInt(offset)
+      : null
   if (value === null || value > MAX_OFFSET) {
-    throw new KafkaJSNonRetriableError(`Invalid offset, expected a long received ${offset}`)
+    throw new KafkaJSNonRetriableError(`Invalid offset, expected a long received ${String(offset)}`)
   }
   if (value < 0n && value !== BigInt(EARLIEST_OFFSET) && value !== BigInt(LATEST_OFFSET)) {
     throw new KafkaJSNonRetriableError('Offset must not be a negative number')
@@ -217,7 +216,7 @@ const findTopicPartitions = async (cluster, topic) => {
   return cluster
     .findTopicPartitionMetadata(topic)
     .map(({ partitionId }) => partitionId)
-    .sort()
+    .sort((a, b) => a - b)
 }
 const indexByPartition = (array) =>
   array.reduce(
@@ -1188,16 +1187,20 @@ module.exports = ({
    * Sets the committed offsets of a consumer group that has no running members. The admin writes
    * them itself, with one OffsetCommit to the group's coordinator that carries no member id and
    * generation -1, as the Java admin's `alterConsumerGroupOffsets` does; it never joins the group.
-   * The last entry for a partition wins, and an entry for a partition the topic does not have is
-   * ignored; each commit carries only the partition and offset, so stored metadata becomes empty
-   * and the leader epoch unknown. An offset of `-1` (latest) or `-2` (earliest) is committed as
+   * The last entry for a partition wins, and every named partition is sent, in partition order: the
+   * coordinator refuses one the topic does not have with `UNKNOWN_TOPIC_OR_PARTITION`. Each commit
+   * carries only the partition and offset, so stored metadata becomes empty and the leader epoch
+   * unknown. An offset of `-1` (latest) or `-2` (earliest) is committed as
    * given and stays that marker until it is resolved (`fetchOffsets` with `resolveOffsets` does so,
    * and a consumer without a seek applies its reset policy to it). A group that does not exist is
    * created by the coordinator. A member that starts during the call makes the coordinator refuse
    * the commit with `UNKNOWN_MEMBER_ID`. Partitions answered with a retriable coordinator code are
    * sent again within the retry budget; a confirmed partition is never sent again by this call.
-   * A rejection means "not confirmed": partitions it does not name were committed, and a commit
-   * that timed out may still have been applied. Sending the call again writes the offsets again,
+   * A `KafkaJSAggregateError` names every partition not confirmed, and the partitions it does not
+   * name were committed; any other rejection means no partition was confirmed. A commit that timed
+   * out may still have been applied. On a classic group that is already empty the commit does not
+   * restart the group's empty-since time, so these offsets can expire `offsets.retention.minutes`
+   * after the group became empty rather than after this call. Sending the call again writes the offsets again,
    * over anything committed in between.
    * @param {object} request
    * @param {string} request.groupId
@@ -1206,13 +1209,15 @@ module.exports = ({
    * @returns {Promise<void>} once the coordinator accepted every offset
    * @throws {KafkaJSNonRetriableError} before any request, for a missing `groupId` or `topic`, no
    *   `partitions`, an entry whose partition is not a partition id, or an offset that is not a
-   *   long of at least 0 or exactly `-1`/`-2`; and, before any commit, for a group whose state is
+   *   decimal integer string or safe integer number of at least 0 (and at most the int64 maximum)
+   *   or exactly `-1`/`-2`; and, before any commit, for a group whose state is
    *   not `Empty` or `Dead`
    * @throws {KafkaJSProtocolError} `UNKNOWN_TOPIC_OR_PARTITION` for a topic the cluster does not
    *   have, or the code a group description was refused with
    * @throws {KafkaJSAggregateError} one child per partition not committed (see
    *   `OffsetAdmin#commitOffsets`)
-   * @throws {Error} the commit request's own failure, a timeout say, when no partition got a code
+   * @throws {Error} the commit request's own failure, a timeout say, when no partition was confirmed
+   *   or answered with a code
    * @throws {KafkaJSInvariantViolation} for a malformed commit reply
    * @throws {KafkaJSTimeout} once the API deadline passed
    */
@@ -1249,11 +1254,9 @@ module.exports = ({
       )
     }
 
-    const cells = existing
-      .filter((partition) => offsets.has(partition))
-      .map((partition) => ({ partition, offset: offsets.get(partition) }))
-    if (cells.length === 0) return
-
+    const cells = [...offsets]
+      .sort(([a], [b]) => a - b)
+      .map(([partition, offset]) => ({ partition, offset }))
     await offsetAdmin.commitOffsets({ groupId, topic, cells })
   }
 

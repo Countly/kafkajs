@@ -531,7 +531,7 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
       ['', 'Invalid offset, expected a long received '],
       ['0x1F', 'Invalid offset, expected a long received 0x1F'],
       ['0b11', 'Invalid offset, expected a long received 0b11'],
-      ['\t7\n', 'Invalid offset, expected a long received \t7\n'],
+      [' 7 ', 'Invalid offset, expected a long received  7 '],
       [NaN, 'Invalid offset, expected a long received NaN'],
       [Infinity, 'Invalid offset, expected a long received Infinity'],
       [1.5, 'Invalid offset, expected a long received 1.5'],
@@ -740,15 +740,13 @@ describe('Admin > setOffsets > commits the offsets itself, over a stub coordinat
         },
       ],
     }
-    let lookups = 0
     const { admin, coordinator } = adminOver(
       async (_, options) => {
         options[ON_DECODED](moved)
         throw Object.assign(createErrorFromCode(16), { topic: 't', partition: 1 })
       },
       async (found) => {
-        lookups += 1
-        if (lookups === 1) return found
+        if (found.offsetCommit.mock.calls.length === 0) return found
         throw new KafkaJSSASLAuthenticationError('sign-in refused')
       }
     )

@@ -83,17 +83,35 @@ describe('Admin > setOffsets and resetOffsets > on the scripted cluster', () => 
     })
   })
 
-  test('setOffsets drops a sentinel for a partition the topic does not have', async () => {
-    await admin.setOffsets({
-      groupId: 'set-group',
-      topic: TOPIC,
-      partitions: [
-        { partition: 0, offset: '-1' },
-        { partition: 5, offset: '-2' },
-      ],
-    })
+  test('setOffsets sends a sentinel for a partition the topic does not have, and rejects naming the refused partition', async () => {
+    scripted.answer('OffsetCommit', ({ topics }) => ({
+      topics: topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          errorCode: partition === 0 ? 0 : 3,
+        })),
+      })),
+    }))
 
-    expect(committed()).toEqual([{ topic: TOPIC, partition: 0, offset: '-1' }])
+    const error = await admin
+      .setOffsets({
+        groupId: 'set-group',
+        topic: TOPIC,
+        partitions: [
+          { partition: 0, offset: '-1' },
+          { partition: 5, offset: '-2' },
+        ],
+      })
+      .catch((e) => e)
+
+    expect(error.errors.map(({ partition, type }) => [partition, type])).toEqual([
+      [5, 'UNKNOWN_TOPIC_OR_PARTITION'],
+    ])
+    expect(committed()).toEqual([
+      { topic: TOPIC, partition: 0, offset: '-1' },
+      { topic: TOPIC, partition: 5, offset: '-2' },
+    ])
     expect(memberless()).toBe(true)
   })
 
