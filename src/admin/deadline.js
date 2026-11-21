@@ -307,7 +307,8 @@ const runWithDeadline = async (
  * Creates a metadata-only coalescer. Key identity preserves existing producer/consumer scoping.
  * @param {Function} work original refresh implementation
  * @param {Function} [keyOf] existing scope key selector
- * @param {() => any} [epochOf] a call never joins an episode started in another epoch
+ * @param {() => any} [epochOf] a call never joins an episode started in another epoch, and an
+ *   episode whose epoch moved before its deferred start skips the work and resolves undefined
  * @returns {Function} enrollment wrapper; each argument list is captured once per episode
  */
 const shareMetadata = (work, keyOf = () => undefined, epochOf = () => undefined) => {
@@ -318,7 +319,7 @@ const shareMetadata = (work, keyOf = () => undefined, epochOf = () => undefined)
     let episode = entries.get(key)
     if (!episode || episode.epoch !== epoch || episode.refusal()) {
       episode = new MetadataDiscovery(
-        () => work.apply(this, args),
+        () => (epochOf() === epoch ? work.apply(this, args) : undefined),
         () => {
           if (entries.get(key) === episode) entries.delete(key)
         },
