@@ -20,12 +20,19 @@ a mutation already sent may have been applied. Inspect the broker state before r
 A call that reads offsets or partitions of named topics (`fetchTopicOffsets`,
 `fetchTopicOffsetsByTimestamp`, `fetchOffsets` with `topics`, `fetchOffsetsForGroups`,
 `resetOffsets`, `setOffsets`, `deleteTopicRecords`, `describeProducers`, `abortTransaction`) asks
-for its topics in the admin client's metadata requests only while it runs. A topic another client
-deletes therefore fails only the calls that name it. While such a call is running, other calls on
-the same admin client that refresh metadata ask for its topics too, so they can fail with
-`UNKNOWN_TOPIC_OR_PARTITION` if that topic was deleted, until the call ends. When no such call is
-running, the metadata request before a cluster-level call (`createTopics`, `describeConfigs`, …)
-asks for every topic, as a new admin client does.
+for its topics in the admin client's metadata requests only while it runs, retries included;
+`setOffsets` and `resetOffsets` until their internal consumer is disposed. A topic this client has
+read and another client then deletes therefore fails only the calls that name it, with the error
+those calls raise for a topic that never existed. While such a call is running, other calls on the
+same admin client that refresh metadata ask for its topics too, so they can fail with
+`UNKNOWN_TOPIC_OR_PARTITION` if that topic was deleted, for as long as the holding call runs,
+retries included, or its internal consumer takes to be disposed. A `deleteTopics` of this
+client stops asking for the topics it deleted at once, even while another call holds them; that
+call asks for them again on its next attempt, and then fails with `UNKNOWN_TOPIC_OR_PARTITION`
+itself. When no such call is running, the metadata request before a cluster-level call
+(`createTopics`, `describeConfigs`, …) asks for every topic, as a new admin client does; on a
+cluster with many topics that request is larger than the request of a 2.2.4 admin client that had
+read offsets, which asked only for the topics it had read.
 
 ## Admin API ledger
 

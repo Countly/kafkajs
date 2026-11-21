@@ -937,8 +937,9 @@ module.exports = ({
       if (!topic || typeof topic !== 'string')
         throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
       const [fromTimestamp, minVersion] = specs[timestamp]
+      const retrier = retrierOf(retry)
       const release = cluster.holdTargetTopics([topic])
-      return retrierOf(retry)(async (bail) => {
+      return retrier(async (bail) => {
         try {
           checked(await waitOf(() => cluster.addTargetTopic(topic)))
           checked(await waitOf(() => cluster.refreshMetadataIfNecessary()))
@@ -1310,8 +1311,11 @@ module.exports = ({
         // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
         // stop is already logged by the consumer and must not replace the call's own outcome.
         unown()
-        await dispose()
-        release()
+        try {
+          await dispose()
+        } finally {
+          release()
+        }
       }
     })
   }
@@ -2108,6 +2112,7 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
 
+    const retrier = retrierOf(retry)
     const release = cluster.holdTargetTopics([topic])
     let topicOffsets
     try {
@@ -2119,7 +2124,6 @@ module.exports = ({
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
 
-    const retrier = retrierOf(retry)
     return retrier(async (bail) => {
       try {
         if (seekEntriesByBroker === null) {

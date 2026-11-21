@@ -63,7 +63,7 @@ describe('Admin', () => {
     test('a topic another client deletes fails only the calls that name it, and parallel reads each get their own offsets', async () => {
       const others = Array.from({ length: 5 }, () => `test-topic-${secureRandom()}`)
       for (const topic of [topicName, ...others]) await createTopic({ topic })
-      const cluster = createCluster({ allowAutoTopicCreation: false, orderedMetadata: true })
+      const cluster = createCluster({ allowAutoTopicCreation: false, retainTargets: true })
       admin = createAdmin({
         cluster,
         logger: newLogger(),

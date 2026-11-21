@@ -62,7 +62,7 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
     retry,
     allowAutoTopicCreation: false,
     instrumentationEmitter: emitter,
-    orderedMetadata: true,
+    retainTargets: true,
   })
   const pool = cluster.brokerPool
   pool.buildConnectionPool = async ({ host = 'kafka1', port = 9092, rack = null } = {}) => {
@@ -676,6 +676,14 @@ describe('Admin > each call targets its topics only while it runs', () => {
       const acquire = lock.acquire.bind(lock)
       let acquires = 0
       lock.acquire = () => (++acquires === 2 ? queued.promise.then(acquire) : acquire())
+      const hold = h.cluster.holdTargetTopics.bind(h.cluster)
+      h.cluster.holdTargetTopics = (topics) => {
+        const release = hold(topics)
+        return () => {
+          release()
+          queued.release()
+        }
+      }
 
       const call = await outcome(
         h.admin.fetchOffsetsForGroups({
@@ -684,15 +692,11 @@ describe('Admin > each call targets its topics only while it runs', () => {
       )
       expect(call.error).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION', code: 3 })
       expect(acquires).toBe(2)
-      queued.release()
-      for (let n = 0; n < 50 && h.md().every(({ topics }) => !topics.includes('U')); n++) {
-        await tick(1)
-      }
+      for (let n = 0; n < 50 && h.cluster.targetHolds.size > 0; n++) await tick(1)
       await tick()
 
-      expect(h.md().some(({ topics }) => topics.includes('U'))).toBe(true)
-      expect([...h.cluster.targetTopics]).toEqual([])
       expect([...h.cluster.targetHolds]).toEqual([])
+      expect([...h.cluster.targetTopics]).toEqual([])
     })
 
     test.each([

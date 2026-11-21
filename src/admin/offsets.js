@@ -188,24 +188,23 @@ class OffsetAdmin {
     return { topics: byTopic(rows) }
   }
 
-  /** Resolves explicitly named topics with omitted partition filters before OffsetFetch. Those
-   * topics are targets of the admin's metadata refreshes until the resolution ends; a selection
-   * of explicit partitions needs no metadata and takes no hold.
+  /** Resolves explicitly named topics with omitted partition filters before OffsetFetch. Each such
+   * row holds its topic as a target of the admin's metadata refreshes from its start until that
+   * row ends, even after a sibling row failed the batch; a row of explicit partitions needs no
+   * metadata and takes no hold.
    * @param {object[]|null} topics normalized selection
    * @returns {Promise<object[]|null>} explicit partition cells or all-topic marker
    * @throws {Error} metadata/deadline refusal
    */
   async resolve(topics) {
     if (topics === null) return null
-    const unfiltered = topics.filter((row) => row.partitions === null)
-    if (unfiltered.length === 0) return topics.filter((row) => row.partitions.length > 0)
-    const release = this.cluster.holdTargetTopics(unfiltered.map((row) => row.topic))
-    try {
-      return checked(
-        await waitOf(() =>
-          Promise.all(
-            topics.map(async (row) => {
-              if (row.partitions !== null) return row
+    return checked(
+      await waitOf(() =>
+        Promise.all(
+          topics.map(async (row) => {
+            if (row.partitions !== null) return row
+            const release = this.cluster.holdTargetTopics([row.topic])
+            try {
               checked(await waitOf(() => this.cluster.addTargetTopic(row.topic)))
               checked(await waitOf(() => this.cluster.refreshMetadataIfNecessary()))
               return {
@@ -214,13 +213,13 @@ class OffsetAdmin {
                   .findTopicPartitionMetadata(row.topic)
                   .map((p) => ({ partition: p.partitionId })),
               }
-            })
-          )
+            } finally {
+              release()
+            }
+          })
         )
-      ).filter((row) => row.partitions.length > 0)
-    } finally {
-      release()
-    }
+      )
+    ).filter((row) => row.partitions.length > 0)
   }
 
   /** Restores explicit caller partition order while retaining broker order for all-topic reads.

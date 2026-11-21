@@ -450,6 +450,7 @@ class TransactionAdmin {
     const producerId = this.producerId(input.producerId)
     const producerEpoch = this.integer(input.producerEpoch, 32767, 'producerEpoch')
     const coordinatorEpoch = this.integer(input.coordinatorEpoch, 2147483647, 'coordinatorEpoch')
+    const retrier = retrierOf(this.retry)
     const release = this.cluster.holdTargetTopics([topic])
     try {
       checked(await waitOf(() => this.cluster.addTargetTopic(topic)))
@@ -458,7 +459,7 @@ class TransactionAdmin {
       throw error
     }
     let refresh = true
-    await retrierOf(this.retry)(async (bail) => {
+    await retrier(async (bail) => {
       try {
         if (refresh) {
           checked(await waitOf(() => this.cluster.refreshMetadata()))

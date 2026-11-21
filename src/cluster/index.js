@@ -143,7 +143,10 @@ module.exports = class Cluster {
    *   established target the broker answers `UNKNOWN_TOPIC_OR_PARTITION`, instead of failing for
    *   every topic, and reports each change of that topic's status here (see
    *   `BrokerPool#isolateUnknownTopics`). Producer and admin clusters do not pass it.
-   * @param {boolean} [options.orderedMetadata] see `BrokerPool`; the admin cluster passes true
+   * @param {boolean} [options.retainTargets] the admin cluster passes true: a scoped metadata answer
+   *   keeps the installed metadata of every topic still a target (see
+   *   `BrokerPool#withRetainedTopics`), so the routing of a topic a running admin call holds
+   *   survives every other answer
    */
   constructor({
     logger: rootLogger,
@@ -178,7 +181,7 @@ module.exports = class Cluster {
     metadataRecoveryRebootstrapTriggerMs,
     bootstrapResolveTimeout = 0,
     onTopicMetadataStatus,
-    orderedMetadata = false,
+    retainTargets = false,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -260,12 +263,12 @@ module.exports = class Cluster {
         this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
       onTopicMetadataStatus,
       captureEstablishment: () => this.captureEstablishment(),
+      retainTopic: retainTargets ? (topic) => this.targetTopics.has(topic) : undefined,
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
       authenticationTimeout,
       metadataMaxAge,
-      orderedMetadata,
       metadataRecoveryStrategy,
       metadataClusterCheck,
       metadataRecoveryRebootstrapTriggerMs,
@@ -287,7 +290,8 @@ module.exports = class Cluster {
     // A refresh joins only calls of its own scope: a producer's fence, else the consumer's
     // subscription key (it moves with the generation and the declaration revision), else the
     // registration generation, so nothing joins a refresh begun before a mode change. While admin
-    // calls hold targets, a refresh is joined only by calls whose targets it asks for.
+    // calls hold targets, an unfenced refresh is joined only by calls that see the target set it
+    // reads when it starts, so a call never waits on an answer that lacks its own topics.
     const shareScopeOf = ({ fence, metadataScope } = {}) =>
       fence ??
       (metadataScope ?? this.brokerPool.consumerMetadataScope)?.shareKey() ??

@@ -232,7 +232,7 @@ describe('Cluster > metadata cache wiring', () => {
     // This asserts the no-intervening-await guarantee directly, by inspecting the method body
     // between the two statements for a bare `await`.
     const source = BrokerPool.prototype.refreshMetadataUnshared.toString()
-    const assignmentText = 'this.metadata = response'
+    const assignmentText = 'this.metadata = this.withRetainedTopics(response, topics)'
     const assignmentIndex = source.lastIndexOf(assignmentText)
     const updateIndex = source.indexOf('this.metadataCache.update(', assignmentIndex)
 

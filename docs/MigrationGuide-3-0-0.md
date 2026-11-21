@@ -1150,19 +1150,28 @@ Group visibility and the admin client.
   client read offsets of stayed in all its later metadata requests until its own `deleteTopics`
   removed it, so a topic deleted by another client made every later call that refreshes metadata
   fail with `UNKNOWN_TOPIC_OR_PARTITION` (or `TOPIC_AUTHORIZATION_FAILED` for a topic that became
-  unauthorized). Now a call holds its topics only while it runs. A call that names the missing topic
-  still fails as before: `fetchTopicOffsets`, `fetchTopicOffsetsByTimestamp` and
-  `deleteTopicRecords` with `KafkaJSNumberOfRetriesExceeded` whose `cause` is
-  `UNKNOWN_TOPIC_OR_PARTITION`, the others with `UNKNOWN_TOPIC_OR_PARTITION` at once. One window
-  remains: while one call on an admin client is running for a topic that another client deletes,
-  other calls on the same client that refresh metadata can fail with that error until the first
-  call ends (with default retry settings, about 10 seconds at most). When no call is running, the
-  metadata request before cluster-level calls (`createTopics`, `describeConfigs`, …) asks for every
-  topic, as on a new admin client; on a cluster with many topics that request is larger than
-  before. *What to do:* an application that recreated its admin client to recover from these
-  failures no longer needs to; retry a cluster-level call that fails with
-  `UNKNOWN_TOPIC_OR_PARTITION` while another call on the same client is reading a topic that may
-  be deleted.
+  unauthorized). Now a call holds its topics only while it runs, retries included; `setOffsets` and
+  `resetOffsets` until their internal consumer is disposed. A call that names a deleted topic fails
+  as for a topic that never existed: `fetchTopicOffsets`, `fetchTopicOffsetsByTimestamp` and the
+  offset read of `deleteTopicRecords` with `KafkaJSNumberOfRetriesExceeded` once their retries are
+  spent, its `cause` the `KafkaJSProtocolError` `UNKNOWN_TOPIC_OR_PARTITION` (this fork also copies
+  the cause's `type` and `code` onto it); `fetchOffsets` and `fetchOffsetsForGroups` for a topic
+  without a partition filter, `resetOffsets`, `setOffsets`, `abortTransaction` and
+  `describeProducers` without `brokerId` with that `KafkaJSProtocolError` at once, for the whole
+  call when it names other topics too. `fetchTopicMetadata`, `describeProducers` with `brokerId`,
+  partition-filtered group offset reads and the delete, config and reassignment calls keep their
+  own errors. One window remains: while one call on an admin client holds a topic that another
+  client deletes, other calls on the same client that refresh metadata can fail with
+  `UNKNOWN_TOPIC_OR_PARTITION` for as long as that call runs, retries included, or its internal
+  consumer takes to be disposed. The client's own `deleteTopics` stops asking for the
+  topics it deleted at once, but a call that still holds one asks for it again on its next attempt,
+  which reopens that window until the call ends. When no call is running, the metadata request
+  before cluster-level calls (`createTopics`, `describeConfigs`, …) asks for every topic, as on a
+  new 2.2.4 admin client; a 2.2.4 admin client that had read offsets asked only for the topics it
+  had read, so on a cluster with many topics that request is larger for a long-lived client. *What
+  to do:* an application that recreated its admin client to recover from these failures no longer
+  needs to; retry a cluster-level call that fails with `UNKNOWN_TOPIC_OR_PARTITION` while another
+  call on the same client may hold a deleted topic.
 - **`describeCluster`, `listTopics` and `fetchTopicMetadata()` no longer fail while a partition
   has no leader.** Neither do the admin calls that refresh the metadata first, such as
   `createTopics` and `describeConfigs`, unless another call on the same admin client is reading

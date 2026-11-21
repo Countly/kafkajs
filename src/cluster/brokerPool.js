@@ -146,14 +146,15 @@ module.exports = class BrokerPool {
    * @param {() => TargetEstablishment} [options.captureEstablishment] required with
    *   `onTopicMetadataStatus`: captures, when a named refresh begins, which targets a metadata
    *   answer has accepted (see `Cluster#captureEstablishment`)
+   * @param {(topic: string) => boolean} [options.retainTopic] given only for the admin's cluster:
+   *   whether a topic is still a target. A scoped answer then keeps the installed metadata of every
+   *   such topic it does not carry, whichever request or path it answers (see `withRetainedTopics`)
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
    * @param {boolean} [options.allowAutoTopicCreation]
    * @param {number} [options.authenticationTimeout]
    * @param {number} [options.metadataMaxAge]
-   * @param {boolean} [options.orderedMetadata] an answer never replaces the installed answer of a
-   *   request sent after it (the admin cluster, whose calls hold their topics as targets)
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
    *   `'rebootstrap'` enables all three triggers in `refreshMetadata`/`findConnectedBroker`, and
    *   the same recovery on a `REBOOTSTRAP_REQUIRED` answer to ApiVersions (KIP-1242);
@@ -175,12 +176,12 @@ module.exports = class BrokerPool {
     isNewTarget,
     onTopicMetadataStatus,
     captureEstablishment,
+    retainTopic,
     instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
     authenticationTimeout,
     metadataMaxAge,
-    orderedMetadata = false,
     metadataRecoveryStrategy,
     metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
@@ -191,6 +192,7 @@ module.exports = class BrokerPool {
     this.isNewTarget = isNewTarget
     this.onTopicMetadataStatus = onTopicMetadataStatus
     this.captureEstablishment = captureEstablishment
+    this.retainTopic = retainTopic
     /** @type {Set<string>|null} the isolated targets: never more than the current targets */
     this.unavailableTopics = onTopicMetadataStatus ? new Set() : null
     /** When an isolated target stops counting as known to `refreshMetadataIfNecessary`. */
@@ -209,9 +211,6 @@ module.exports = class BrokerPool {
     this.connectionPoolBuilder = connectionPoolBuilder
     this.bootstrapResolution = bootstrapResolution
     this.metadataMaxAge = metadataMaxAge || 0
-    this.metadataRequests = 0
-    /** @type {number|null} when ordered, the number of the request whose answer is installed */
-    this.installedRequest = orderedMetadata ? 0 : null
     this.logger = logger.namespace('BrokerPool')
     this.retryOptions = assign({}, retry)
     this.retrier = (action) => retrierOf(this.retryOptions)(action)
@@ -973,7 +972,10 @@ module.exports = class BrokerPool {
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
    * and rebuilds the seed, so re-resolving both on every iteration is what keeps a later attempt
    * from calling a disconnected object or building a duplicate `Broker` for the seed's own node
-   * id via a stale `seedHost`/`seedPort` pair. `findConnectedBroker()`'s own throw is `bail()`ed
+   * id via a stale `seedHost`/`seedPort` pair. An answer that arrives after a rebootstrap (or a
+   * removed seed) replaced the seed is not installed: the attempt is retried on the new seed, within the same retry
+   * budget, so no caller is handed routing whose brokers were never reconciled.
+   * `findConnectedBroker()`'s own throw is `bail()`ed
    * immediately rather than left for the retrier to reclassify - the retrier's generic
    * catch-and-wrap would otherwise turn e.g. a `KafkaJSSASLAuthenticationError` into a
    * `KafkaJSNonRetriableError` and replace its `retryCount`/`retryTime`, breaking callers (the
@@ -1086,16 +1088,17 @@ module.exports = class BrokerPool {
         if (!applicable()) return
         const seedBroker = this.seedBroker
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
+        let superseded = null
 
         try {
-          const request = ++this.metadataRequests
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
           if (!applicable()) return
-          if (this.installedRequest !== null) {
-            if (request < this.installedRequest) return
-            this.installedRequest = request
+          // A seed replaced while the request was out (a rebootstrap, a removed seed) leaves an
+          // answer that could not reconcile the broker table it routes to: ask the new seed.
+          if (this.seedBroker !== seedBroker) {
+            throw (superseded = new KafkaJSConnectionError('A rebootstrap superseded the request'))
           }
           if (accept) {
             const settled = this.settleTopicErrors(response.topicMetadata, accept)
@@ -1114,7 +1117,7 @@ module.exports = class BrokerPool {
               }),
             }
           } else {
-            this.metadata = response
+            this.metadata = this.withRetainedTopics(response, topics)
           }
           // Captured synchronously, in the same statement-tick as the assignment above and
           // before anything below can `await` - a concurrent rebootstrap nulls `this.metadata`
@@ -1212,6 +1215,7 @@ module.exports = class BrokerPool {
           if (guard?.()) return bail(e)
           if (!applicable()) return
           if (
+            e === superseded ||
             e.type === 'LEADER_NOT_AVAILABLE' ||
             ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
               e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
@@ -1231,6 +1235,27 @@ module.exports = class BrokerPool {
       if (!fence?.closed) await this.onMetadataFailure(e, { fence })
       throw e
     }
+  }
+
+  /**
+   * The answer to install, with the installed metadata of every topic it does not carry that
+   * `retainTopic` still names: overlapping admin calls share one target set, but a scoped answer
+   * (another call's named read, a fenced refresh, a retry or a late answer of an older request)
+   * asks only for the names of its own request. Retaining the rest keeps the routing
+   * of every topic a running call holds; a topic no call holds any more is not retained, so the
+   * next scoped answer drops it. An answer for every topic is authoritative and installed as it is.
+   * @param {object} response the decoded answer
+   * @param {string[]} [topics] the names the request asked for; none means every topic
+   * @returns {object} `response`, or a copy whose topics include the retained ones
+   */
+  withRetainedTopics(response, topics) {
+    if (!this.retainTopic || !topics?.length || !this.metadata) return response
+    const answered = new Set(response.topicMetadata.map(({ topic }) => topic))
+    const retained = this.metadata.topicMetadata.filter(
+      ({ topic }) => !answered.has(topic) && this.retainTopic(topic)
+    )
+    if (retained.length === 0) return response
+    return { ...response, topicMetadata: [...retained, ...response.topicMetadata] }
   }
 
   /**
