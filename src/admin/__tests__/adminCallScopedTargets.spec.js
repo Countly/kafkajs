@@ -569,8 +569,13 @@ describe('Admin > each call targets its topics only while it runs', () => {
         (h) => h.admin.fetchTopicMetadata({ topics: ['U'] }),
       ],
       [
-        'a named fetchTopicMetadata of the same topic',
-        (h) => h.admin.fetchTopicMetadata({ topics: ['T'] }),
+        'a second read of the same topic that ends, then a named fetchTopicMetadata of another topic,',
+        async (h) => {
+          await expect(h.admin.fetchTopicOffsets('T')).resolves.toEqual(T_OFFSETS)
+          expect(h.cluster.targetHolds.get('T')).toBe(1)
+          await h.admin.fetchTopicMetadata({ topics: ['U'] })
+          expect(h.md().at(-1)).toEqual({ api: 'Metadata', topics: ['U'] })
+        },
       ],
       [
         'a fenced refresh of another topic',
@@ -704,6 +709,8 @@ describe('Admin > each call targets its topics only while it runs', () => {
 
       h.nodes.push({ nodeId: 3, host: 'kafka3', port: 9092, rack: null })
       h.live.set('T', [3, 3])
+      h.offsets.set(3, '9')
+      const listedBefore = h.calls.filter(({ api }) => api === 'ListOffsets').length
       h.setPoolHook(async (host) => {
         if (host === 'kafka3') {
           building.release()
@@ -716,9 +723,18 @@ describe('Admin > each call targets its topics only while it runs', () => {
       await tick()
       built.release()
 
-      expect(await read).toEqual({ ok: T_OFFSETS })
+      expect(await read).toEqual({
+        ok: [
+          { partition: 0, offset: '9', high: '9', low: '9' },
+          { partition: 1, offset: '9', high: '9', low: '9' },
+        ],
+      })
       await newer
-      expect(h.calls.filter(({ api }) => api === 'ListOffsets').length).toBeGreaterThan(0)
+      const listed = h.calls.filter(({ api }) => api === 'ListOffsets').slice(listedBefore)
+      expect(listed.map(({ nodeId, topics }) => [nodeId, topics])).toEqual([
+        [3, ['T']],
+        [3, ['T']],
+      ])
     })
   })
 

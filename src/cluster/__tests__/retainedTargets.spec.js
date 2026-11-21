@@ -82,10 +82,11 @@ const routed = (cluster) => cluster.brokerPool.metadata.topicMetadata.map(({ top
  * @param {Cluster} cluster
  * @param {string[]} older the topics of the first request
  * @param {string[]} newer the topics of the second request
+ * @param {string[]} [all] the topics of the cluster
  * @returns {Promise<{ observed: string[][], requests: string[][] }>} what `onMetadata` saw
  */
-const olderAnswersLast = async (cluster, older, newer) => {
-  const { requests, gates } = front(cluster)
+const olderAnswersLast = async (cluster, older, newer, all) => {
+  const { requests, gates } = front(cluster, all)
   const held = latch()
   gates.set(1, held.promise)
   const observed = []
@@ -158,37 +159,70 @@ describe('Cluster > a scoped answer keeps the routing of current targets', () =>
     ;[cluster] = mockClusters
     front(cluster)
     await cluster.addMultipleTargetTopics(['a', 'b'])
+    cluster.holdTargetTopics(['a', 'b'])
 
     const { observed } = await olderAnswersLast(cluster, ['a'], ['a', 'b'])
 
     expect(mockClusters).toHaveLength(1)
+    expect(cluster.brokerPool.retainTopic).toBeUndefined()
     expect(observed.map((topics) => topics.sort())).toEqual([['a', 'b']])
     expect(routed(cluster).sort()).toEqual(['a', 'b'])
   })
 
-  test('a consumer installs the scoped answer that lands last as it is', async () => {
+  test('a consumer installs the scoped answer that lands last as it is, held topics included', async () => {
     new Kafka({ ...connectionOpts(), logLevel: 0 }).consumer({ groupId: 'g' })
     ;[cluster] = mockClusters
+    cluster.holdTargetTopics(['a', 'b'])
     cluster.targetTopics.add('a')
     cluster.targetTopics.add('b')
 
     const { observed } = await olderAnswersLast(cluster, ['a'], ['a', 'b'])
 
     expect(mockClusters).toHaveLength(1)
+    expect(cluster.brokerPool.retainTopic).toBeUndefined()
     expect(observed).toEqual([['a']])
     expect(routed(cluster)).toEqual(['a'])
   })
 
-  test('a pattern consumer keeps installing and evaluating the answer that lands last', async () => {
+  test('a pattern consumer keeps installing and evaluating the answer that lands last, which drops a held topic it lacks', async () => {
     new Kafka({ ...connectionOpts(), logLevel: 0 }).consumer({ groupId: 'g' })
     ;[cluster] = mockClusters
+    cluster.holdTargetTopics(['b'])
+    cluster.targetTopics.add('a')
+    cluster.targetTopics.add('b')
 
-    const { observed } = await olderAnswersLast(cluster, [], ['a'])
+    const { observed } = await olderAnswersLast(cluster, [], ['a', 'b'], ['a'])
 
     expect(mockClusters).toHaveLength(1)
-    expect(observed).toEqual([['a', 'b']])
-    expect(routed(cluster)).toEqual(['a', 'b'])
+    expect(cluster.brokerPool.retainTopic).toBeUndefined()
+    expect(observed).toEqual([['a']])
+    expect(routed(cluster)).toEqual(['a'])
   })
+
+  test.each([
+    ['a producer', (kafka) => kafka.producer()],
+    ['a consumer', (kafka) => kafka.consumer({ groupId: 'g' })],
+  ])(
+    '%s joins a refresh begun before a target was added while topics are held, as before',
+    async (_, create) => {
+      create(new Kafka({ ...connectionOpts(), logLevel: 0 }))
+      ;[cluster] = mockClusters
+      const { requests, gates } = front(cluster)
+      cluster.holdTargetTopics(['a', 'b'])
+      cluster.targetTopics.add('a')
+      const held = latch()
+      gates.set(1, held.promise)
+      const older = cluster.refreshMetadata()
+      await new Promise(setImmediate)
+
+      cluster.targetTopics.add('b')
+      const joined = cluster.refreshMetadata()
+      held.release()
+      await Promise.all([older, joined])
+
+      expect(requests).toEqual([['a']])
+    }
+  )
 
   test('an admin client keeps the routing of its held targets', async () => {
     new Kafka({ ...connectionOpts(), logLevel: 0 }).admin()
