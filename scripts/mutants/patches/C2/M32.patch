@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -290,7 +290,6 @@
+     if (memberId !== undefined) {
+       this.currentMemberId = memberId
+       if (memberId === null) {
+-        this.pendingMemberId = null
+         this.membershipRevision += 1
+         this.coordinatorLookup.detach()
+       }

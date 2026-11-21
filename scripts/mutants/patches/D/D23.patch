@@ -1,0 +1,12 @@
+--- a/src/index.js
++++ b/src/index.js
+@@ -575,9 +575,6 @@
+     if (typeof fetchSessions !== 'boolean') {
+       throw new KafkaJSNonRetriableError('fetchSessions must be a boolean')
+     }
+-    if (typeof rackAwareAssignment !== 'boolean') {
+-      throw new KafkaJSNonRetriableError('rackAwareAssignment must be a boolean')
+-    }
+     validateMaxDecompressedBatchBytes(maxDecompressedBatchBytes)
+ 
+     const isolationLevel = readUncommitted

@@ -38,6 +38,9 @@ class Round {
  * readiness: the connection still dials the original hostname, so TLS server names and custom
  * socket factories are unaffected. With `timeout` 0 it does nothing.
  *
+ * The deadline is absolute: a host list or its failure, a lookup or a lookup result that arrives
+ * once it has passed fails the round with the cached error, even before the deadline timer fires.
+ *
  * States: idle, pending, open (permanent) and failed (permanent, until the client is recreated).
  * `cancel()` ends a pending round and returns to idle, so the next `wait()` starts a fresh one.
  */
@@ -117,8 +120,24 @@ class BootstrapResolution {
     round.deadline = setTimeout(() => this.expire(round), this.timeout)
     new Promise((resolve) => resolve(this.resolveHosts())).then(
       (hosts) => this.dispatch(round, hosts),
-      (error) => this.isCurrent(round) && this.end(IDLE, () => round.reject(error))
+      (error) => this.listFailed(round, error)
     )
+  }
+
+  /**
+   * A bootstrap list source that fails before the deadline ends the round with its own error and
+   * returns to idle; one that fails once the deadline has passed fails the round with the cached
+   * error, the source's error as its cause.
+   * @private
+   * @param {Round} round
+   * @param {Error} error
+   * @returns {void}
+   */
+  listFailed(round, error) {
+    if (!this.isCurrent(round)) return
+    if (!this.expired(round)) return this.end(IDLE, () => round.reject(error))
+    round.lastError = error
+    this.expire(round)
   }
 
   /**
@@ -131,7 +150,17 @@ class BootstrapResolution {
   }
 
   /**
-   * Starts one lookup per distinct host, all at once.
+   * @private
+   * @param {Round} round
+   * @returns {boolean} whether the round's absolute deadline has passed
+   */
+  expired(round) {
+    return this.now() >= round.deadlineAt
+  }
+
+  /**
+   * Starts one lookup per distinct host, all at once. A list that arrives after the deadline
+   * fails the round instead.
    * @private
    * @param {Round} round
    * @param {string[]} hosts
@@ -139,6 +168,7 @@ class BootstrapResolution {
    */
   dispatch(round, hosts) {
     if (!this.isCurrent(round)) return
+    if (this.expired(round)) return this.expire(round)
     for (const host of new Set(hosts)) {
       if (!this.isCurrent(round)) return
       round.hosts.set(host, { delay: null, timer: null })
@@ -147,13 +177,15 @@ class BootstrapResolution {
   }
 
   /**
-   * One lookup of `host`. A synchronous throw counts as a failed lookup.
+   * One lookup of `host`, or the round's failure once the deadline has passed. A synchronous
+   * throw counts as a failed lookup.
    * @private
    * @param {Round} round
    * @param {string} host
    * @returns {void}
    */
   attempt(round, host) {
+    if (this.expired(round)) return this.expire(round)
     const settle = (error, addresses) => this.settle(round, host, error, addresses)
     try {
       this.lookup(host, { all: true }, settle)
@@ -163,7 +195,8 @@ class BootstrapResolution {
   }
 
   /**
-   * Opens the gate on an address, otherwise schedules the host's next attempt.
+   * Opens the gate on an address, otherwise schedules the host's next attempt. Any result that
+   * arrives after the deadline fails the round, a failed lookup still supplying the last error.
    * @private
    * @param {Round} round
    * @param {string} host
@@ -173,17 +206,16 @@ class BootstrapResolution {
    */
   settle(round, host, error, addresses) {
     if (!this.isCurrent(round)) return
-    if (!error && addresses?.length > 0) {
-      this.end(OPEN, (current) => current.resolve())
-      return
-    }
-    round.lastError = error ?? new Error(`${host} resolved to no address`)
+    const resolved = !error && addresses?.length > 0
+    if (!resolved) round.lastError = error ?? new Error(`${host} resolved to no address`)
+    if (this.expired(round)) return this.expire(round)
+    if (resolved) return this.end(OPEN, (current) => current.resolve())
     this.retryLater(round, host)
   }
 
   /**
    * Waits the retry schedule's next delay, clamped to the time left and to at least 1 ms, so a
-   * failing lookup can never become a busy loop. Nothing is scheduled once the deadline is due.
+   * failing lookup can never become a busy loop. The round fails instead once the deadline is due.
    * @private
    * @param {Round} round
    * @param {string} host
@@ -191,13 +223,13 @@ class BootstrapResolution {
    */
   retryLater(round, host) {
     const remaining = round.deadlineAt - this.now()
-    if (remaining <= 0) return
+    if (remaining <= 0) return this.expire(round)
     const entry = round.hosts.get(host)
     entry.delay = entry.delay === null ? this.backoff.initial() : this.backoff.next(entry.delay)
     entry.timer = setTimeout(
       () => {
         entry.timer = null
-        if (this.isCurrent(round) && this.now() < round.deadlineAt) this.attempt(round, host)
+        if (this.isCurrent(round)) this.attempt(round, host)
       },
       Math.max(1, Math.min(entry.delay, remaining))
     )

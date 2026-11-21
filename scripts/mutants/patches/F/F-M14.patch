@@ -1,0 +1,10 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -1233,7 +1233,6 @@
+       if (!isCurrent()) return false
+       for (const topic of this.targetTopics) {
+         if (next.has(topic)) continue
+-        this.metadataCache.forget(topic)
+         this.brokerPool.forgetTopic(topic)
+         this.establishedTopics.delete(topic)
+         this.firstAddTopics.delete(topic)

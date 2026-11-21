@@ -1,3 +1,4 @@
+const { AsyncLocalStorage } = require('node:async_hooks')
 const createRetry = require('../../retry')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { ConsumerOperation } = require('../groupProtocol/interface')
@@ -12,6 +13,8 @@ const { events } = require('./instrumentationEvents')
 const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
 
 const INITIAL_HEARTBEAT_MS = 1000
+/** Holds only the identity of the run whose handler is executing, never a record or batch. */
+const handlerScope = new AsyncLocalStorage()
 
 /**
  * @returns {{promise: Promise<void>, resolve: () => void, reject: (error: Error) => void, settled: boolean}}
@@ -79,6 +82,7 @@ class ShareRun {
     this.committed = []
     this.tap = null
     this.heartbeatRevision = Symbol('heartbeat')
+    this.identity = Symbol('share run')
     this.coordinator = null
     this.facade = null
     this.waiters = new Set()
@@ -340,7 +344,8 @@ class ShareRun {
    *   rest is retried by the manager's chain under the membership's backoff.
    */
   onHeartbeatError(error) {
-    this.options.logger.warn('Share heartbeat failed', { error: error.message })
+    const { message, name, type, code } = error
+    this.options.logger.warn('Share heartbeat failed', { error: message, name, type, code })
   }
 
   /**
@@ -633,15 +638,26 @@ class ShareRun {
   }
 
   /**
-   * Hands one answer's acquisitions to the handlers, one cohort after another. Resolves only
-   * after every record was handled, dropped or released.
+   * Hands one answer's acquisitions to the handlers, one cohort after another, inside one entry of
+   * this run's handler context, so a handler's own calls and the async work it starts carry the
+   * run's identity. Resolves only after every record was handled, dropped or released.
    * @private
    * @param {object} node The node record.
    * @param {object[]} cohorts The adopted acquisitions of the answer.
    * @returns {Promise<void>}
    * @throws {Error} The explicit-omission verdict, after its releases were flushed.
    */
-  async dispatch(node, cohorts) {
+  dispatch(node, cohorts) {
+    return handlerScope.run(this.identity, () => this.dispatchAnswer(node, cohorts))
+  }
+
+  /**
+   * @private
+   * @param {object} node The node record.
+   * @param {object[]} cohorts The adopted acquisitions of the answer.
+   * @returns {Promise<void>}
+   */
+  async dispatchAnswer(node, cohorts) {
     node.queue = { cohorts, index: 0 }
     try {
       for (; node.queue.index < cohorts.length; node.queue.index++) {
@@ -811,9 +827,11 @@ class ShareRun {
    */
   flushIfDue(node, cohort) {
     if (!cohort.ledger.needsFlush(performance.now())) return
-    node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
-      this.options.logger.debug('Share boundary flush failed', { error: error.message })
-    })
+    outsideHandler(() =>
+      node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
+        this.options.logger.debug('Share boundary flush failed', { error: error.message })
+      })
+    )
   }
 
   /**
@@ -895,9 +913,11 @@ class ShareRun {
       offsets: call.offsets(),
       error,
     })
-    node.loop.acknowledge({ cohorts: [cohort] }).catch((failure) => {
-      this.options.logger.error('Share handler release flush failed', { error: failure.message })
-    })
+    outsideHandler(() =>
+      node.loop.acknowledge({ cohorts: [cohort] }).catch((failure) => {
+        this.options.logger.error('Share handler release flush failed', { error: failure.message })
+      })
+    )
     node.retryTime =
       node.retryTime === null ? node.schedule.initial() : node.schedule.next(node.retryTime)
     await node.pacing.sleep(node.retryTime).catch(() => {})
@@ -914,9 +934,11 @@ class ShareRun {
    * @throws {Error} The verdict.
    */
   async afterOmission(node, cohort, verdict) {
-    await node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
-      this.options.logger.error('Share omission flush failed', { error: error.message })
-    })
+    await outsideHandler(() =>
+      node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
+        this.options.logger.error('Share omission flush failed', { error: error.message })
+      })
+    )
     throw verdict
   }
 
@@ -934,7 +956,9 @@ class ShareRun {
    */
   renew(node, cohort, offsets) {
     const promise = (async () => {
-      const result = await node.loop.acknowledge({ renew: [{ cohort, offsets }] })
+      const result = await outsideHandler(() =>
+        node.loop.acknowledge({ renew: [{ cohort, offsets }] })
+      )
       const refused = this.ordinaryRefusal(node.issued)
       if (refused) throw refused
       if (result.lockDuration !== undefined) {
@@ -1475,4 +1499,19 @@ class ShareRun {
   }
 }
 
-module.exports = { ShareRun }
+/**
+ * @returns {symbol|undefined} The identity of the run whose handler, or async work it started, is
+ *   calling; undefined outside a share handler.
+ */
+const handlerRunIdentity = () => handlerScope.getStore()
+
+/**
+ * Runs client work outside any handler's identity: queued acknowledgements, and the FIFO drain,
+ * connections, crash supervision and listeners they reach, must never pass as a handler's own call.
+ * @template T
+ * @param {() => T} work The work to start.
+ * @returns {T} What `work` returned.
+ */
+const outsideHandler = (work) => handlerScope.run(undefined, work)
+
+module.exports = { ShareRun, handlerRunIdentity, outsideHandler }

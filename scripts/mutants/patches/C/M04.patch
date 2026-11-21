@@ -1,0 +1,10 @@
+--- a/src/consumer/subscriptionState.js
++++ b/src/consumer/subscriptionState.js
+@@ -60,6 +60,7 @@
+    * @returns {void}
+    */
+   update(topicPartitions = []) {
++    this.clearPauses()
+     this.assign(topicPartitions)
+   }
+ 

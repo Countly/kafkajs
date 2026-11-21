@@ -165,6 +165,52 @@ describe('Protocol > Requests', () => {
       })
     })
 
+    describe('within the broker range', () => {
+      const apiKey = apiKeys.Fetch
+      const definition = (implemented) => ({
+        versions: implemented.map(String),
+        protocol: ({ version }) => ({ version }),
+      })
+
+      test('refuses a gapped set with no common version', () => {
+        const versions = { [apiKey]: { minVersion: 3, maxVersion: 4 } }
+
+        expect(() => lookup(versions)(apiKey, definition([2, 5]))).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+        expect(() => lookup(versions)(apiKey, definition([2, 5]))).toThrow(
+          /Fetch.*client implements v2-v5.*broker supports v3-v4/
+        )
+      })
+
+      test('selects the one common version inside a gap', () => {
+        const versions = { [apiKey]: { minVersion: 3, maxVersion: 4 } }
+
+        expect(lookup(versions)(apiKey, definition([2, 4, 5]))).toEqual({ version: 4 })
+      })
+
+      test('refuses a capped set below the broker minimum', () => {
+        const versions = { [apiKey]: { minVersion: 3, maxVersion: 4 } }
+        const select = lookup(versions, { [apiKey]: 6 })
+
+        expect(() => select(apiKey, definition([2, 5, 7]))).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+        expect(() => select(apiKey, definition([2, 5, 7]))).toThrow(
+          /Fetch.*client implements v2-v5.*broker supports v3-v4/
+        )
+      })
+
+      test('treats a missing minVersion as 0', () => {
+        const versions = { [apiKey]: { maxVersion: 3 } }
+
+        expect(lookup(versions)(apiKey, definition([0, 5]))).toEqual({ version: 0 })
+        expect(() => lookup(versions)(apiKey, definition([4, 5]))).toThrow(
+          /Fetch.*client implements v4-v5.*broker supports v0-v3/
+        )
+      })
+    })
+
     describe('against the real Kafka 4.x version table', () => {
       // Kafka 4.3 ranges, as recorded in docs/KafkaCompatibility.md (generated from the apache/kafka 4.3 message JSON)
       const KAFKA_4_3 = {

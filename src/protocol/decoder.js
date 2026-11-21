@@ -452,12 +452,22 @@ module.exports = class Decoder {
     return array
   }
 
+  /**
+   * Reads a signed INT32 varint (ZigZag), as a record writes its lengths and deltas.
+   * @returns {number}
+   * @throws {KafkaJSInvalidVarIntError} when the fifth byte still has its continuation bit: an INT32
+   *         takes at most 5 bytes, and a longer one would wrap the shift into a wrong value
+   * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
+   */
   readVarInt() {
     let currentByte
     let result = 0
     let i = 0
 
     do {
+      if (i > 28) {
+        throw new KafkaJSInvalidVarIntError('Invalid VarInt, must contain 5 bytes or less')
+      }
       this.ensureReadable(1, 'readVarInt')
       currentByte = this.buffer[this.offset++]
       result += (currentByte & OTHER_BITS) << i

@@ -367,11 +367,13 @@ class ShareGroups {
    */
   #refused(key, code) {
     if (code !== UNSUPPORTED_VERSION) return
-    throw new KafkaJSShareGroupsNotSupportedError(createErrorFromCode(code), {
+    const cause = createErrorFromCode(code)
+    throw new KafkaJSShareGroupsNotSupportedError(cause, {
       apiKey: key,
       apiName: APIS[key],
       reason: 'refused-by-broker',
       shareVersion: null,
+      cause,
     })
   }
 
@@ -610,7 +612,7 @@ class ShareGroups {
       })
     } catch (error) {
       currentDeadline()?.check()
-      throw causeOf(error, [KafkaJSProtocolError]) || error
+      throw causeOf(error, [KafkaJSShareGroupsNotSupportedError, KafkaJSProtocolError]) || error
     }
   }
 

@@ -12,6 +12,7 @@ const {
   FrameJournal,
   windowTotals,
   main,
+  mutantControl,
 } = require('../fetchSessions')
 const { EventEmitter } = require('events')
 const fs = require('fs')
@@ -153,10 +154,24 @@ test('only the control and the explicit arm arguments are accepted', async () =>
     expect(record.frames.bytes).toBe(33231)
     expect(record.delivery.map((sample) => sample.handlerEntries)).toEqual([2, 4, 12])
     expect(record.retainedControlBytes).toBeGreaterThan(3 * 1024 * 1024)
+    expect(record.mutant).toEqual({
+      rejected: true,
+      reason: 'Fetch bytes: expected 33231, received 0',
+    })
   } finally {
     write.mockRestore()
     global.gc = gc
   }
+})
+
+test('the remove-byte-counter mutant fails the transcript comparison over the known control frames', () => {
+  expect(mutantControl()).toEqual({
+    rejected: true,
+    reason: 'Fetch bytes: expected 33231, received 0',
+  })
+  expect(() => mutantControl({ remove: () => {} })).toThrow(
+    'The remove-byte-counter mutant passed the transcript comparison'
+  )
 })
 
 test('the same twelve messages in different batches keep messages separate from entries and gaps', () => {

@@ -1,0 +1,10 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -978,6 +978,7 @@
+     this.clearPendingSeek(topic, partition)
+     this.installSeekPosition(topic, partition, offset, { local: true })
+     this.operations.touchOwned(this, topic, partition)
++    this.obligations.discharge(topic, partition)
+     this.retireResetRefusals(topic, partition)
+     return true
+   }

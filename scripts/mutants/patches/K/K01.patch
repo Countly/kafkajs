@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -63,7 +63,7 @@
+     const token = { session: this, seq: ++this.seq }
+     const wire = {
+       sessionId: this.sessionId,
+-      sessionEpoch: this.epoch,
++      sessionEpoch: this.epoch++,
+       topics: group(changed, false),
+       forgottenTopics: group(forgotten, true),
+       topicIds: usesTopicIds ? new Map(topicIds) : undefined,

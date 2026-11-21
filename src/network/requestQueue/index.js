@@ -28,6 +28,10 @@ module.exports = class RequestQueue extends EventEmitter {
    *   exceeds its timeout, after that request was rejected with its own timeout error and before
    *   the `NETWORK_REQUEST_TIMEOUT` event. The queue does nothing else about the timeout: the owner
    *   decides what happens to the requests that remain (the connection fails its generation).
+   * @param {(error: Error) => void} [options.onDispatchFailure] Called when sending a queued request
+   *   from the queue's own dispatch timer threw (the write, or an observer of it); the owner ends
+   *   the transport (the connection fails its generation). Whatever the owner leaves unsettled is
+   *   then rejected with the same error.
    */
   constructor({
     instrumentationEmitter = null,
@@ -39,6 +43,7 @@ module.exports = class RequestQueue extends EventEmitter {
     logger,
     isConnected = () => true,
     onRequestTimeout = () => {},
+    onDispatchFailure = () => {},
   }) {
     super()
     this.instrumentationEmitter = instrumentationEmitter
@@ -50,6 +55,7 @@ module.exports = class RequestQueue extends EventEmitter {
     this.logger = logger
     this.isConnected = isConnected
     this.onRequestTimeout = onRequestTimeout
+    this.onDispatchFailure = onDispatchFailure
     this.afterTimeout = (socketRequest) => {
       this.onRequestTimeout(socketRequest)
       this.emitQueueState()
@@ -137,11 +143,33 @@ module.exports = class RequestQueue extends EventEmitter {
     }
   }
 
+  /**
+   * Records a broker-requested client-side throttle. The diagnostic runs after the throttle is
+   * recorded and is contained, so a throwing logger cannot keep a parsed reply from its caller.
+   * @param {number|null} clientSideThrottleTime ms to hold new requests back
+   * @returns {void}
+   */
   maybeThrottle(clientSideThrottleTime) {
     if (clientSideThrottleTime !== null && clientSideThrottleTime > 0) {
-      this.logger.debug(`Client side throttling in effect for ${clientSideThrottleTime}ms`)
       const minimumThrottledUntil = Date.now() + clientSideThrottleTime
       this.throttledUntil = Math.max(minimumThrottledUntil, this.throttledUntil)
+      this.debugContained(`Client side throttling in effect for ${clientSideThrottleTime}ms`)
+    }
+  }
+
+  /**
+   * Logs a diagnostic of a request the queue already owns. A throw is reported, never propagated:
+   * once a request is enrolled, only its own settlement may reject its promise.
+   * @private
+   * @param {string} message
+   * @param {object} [extra]
+   * @returns {void}
+   */
+  debugContained(message, extra) {
+    try {
+      this.logger.debug(message, extra)
+    } catch (error) {
+      this.reportObserverFailure(error)
     }
   }
 
@@ -256,20 +284,29 @@ module.exports = class RequestQueue extends EventEmitter {
     enrolling = false
     this.scheduleCheckPendingRequests()
 
-    this.logger.debug(`Request enqueued`, {
+    this.debugContained(`Request enqueued`, {
       clientId: this.clientId,
       broker: this.broker,
       correlationId,
     })
 
-    this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+    try {
+      this[PRIVATE.EMIT_QUEUE_SIZE_EVENT]()
+    } catch (error) {
+      this.reportObserverFailure(error)
+    }
   }
 
   /**
    * Commits private transmission after authority checks and before synchronous send. A failed
    * commit settles only this request, including when dispatch runs inside a timer or response.
+   * A send that throws (the socket write, or a correlation collision) withdraws this request's
+   * own in-flight entry and rejects it before the throw propagates, so no entry is left that
+   * neither a reply nor the timeout sweep can settle; bytes already handed to the socket are
+   * indeterminate.
    * @param {SocketRequest} socketRequest captured pending request
-   * @returns {void} foreground send failures keep their existing propagation
+   * @returns {void}
+   * @throws {Error} what the send threw, after this request was rejected with it
    */
   sendSocketRequest(socketRequest) {
     const refusal = socketRequest.refusal()
@@ -288,11 +325,20 @@ module.exports = class RequestQueue extends EventEmitter {
       }
     }
 
-    socketRequest.send()
+    try {
+      socketRequest.send()
+    } catch (error) {
+      if (this.inflight.get(socketRequest.correlationId) === socketRequest) {
+        this.inflight.delete(socketRequest.correlationId)
+      }
+      socketRequest.rejected(error)
+      this.emitQueueState()
+      throw error
+    }
 
     if (!socketRequest.expectResponse) {
       this.lastActivityAt = socketRequest.sentAt
-      this.logger.debug(`Request does not expect a response, resolving immediately`, {
+      this.debugContained(`Request does not expect a response, resolving immediately`, {
         clientId: this.clientId,
         broker: this.broker,
         correlationId: socketRequest.correlationId,
@@ -448,10 +494,11 @@ module.exports = class RequestQueue extends EventEmitter {
   }
 
   /**
-   * Check and process pending requests either now or in the future
-   *
-   * This function will send out as many pending requests as possible taking throttling and
-   * in-flight limits into account.
+   * Sends as many pending requests as throttling and the in-flight limit allow, first in first
+   * out, then schedules the next check.
+   * @returns {void}
+   * @throws {Error} what sending a pending request, or an observer of that, threw; a failed send
+   *   has already rejected its own request
    */
   checkPendingRequests() {
     while (this.pending.length > 0 && this.canSendSocketRequestImmediately()) {
@@ -470,6 +517,25 @@ module.exports = class RequestQueue extends EventEmitter {
     }
 
     this.scheduleCheckPendingRequests()
+  }
+
+  /**
+   * Ends the queue's work after its own dispatch timer threw (a send or an observer of it), where
+   * no caller can receive the error, as a response's dispatch failure ends the generation: the
+   * owner ends the transport, and anything still queued or in flight is then rejected with the
+   * same error.
+   * @private
+   * @param {Error} error what the send threw
+   * @returns {void}
+   */
+  dispatchFailed(error) {
+    try {
+      this.onDispatchFailure(error)
+    } catch (failure) {
+      this.reportObserverFailure(failure)
+    } finally {
+      if (!this.isIdle()) this.rejectAll(error)
+    }
   }
 
   /**
@@ -504,7 +570,11 @@ module.exports = class RequestQueue extends EventEmitter {
     sharedSetup(() => {
       this.throttleCheckTimeoutId = setTimeout(() => {
         this.throttleCheckTimeoutId = null
-        this.checkPendingRequests()
+        try {
+          this.checkPendingRequests()
+        } catch (error) {
+          this.dispatchFailed(error)
+        }
       }, scheduleAt)
     })
   }

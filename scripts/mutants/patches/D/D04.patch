@@ -1,0 +1,10 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -489,7 +489,6 @@
+     try {
+       if (!isCurrent()) return FAILED
+       const response = await broker.metadata(ids.map((topicId) => ({ topicId })))
+-      if (!isCurrent()) return FAILED
+       this.metadataCache.updateTopicsById(response)
+       return RESOLVED
+     } catch (e) {

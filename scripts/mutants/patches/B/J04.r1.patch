@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/fixtures/range/subscription_v2_java.json
++++ b/src/consumer/assigners/fixtures/range/subscription_v2_java.json
+@@ -1,7 +1,7 @@
+ {
+   "assignor": "range",
+   "caseId": "subscription_v2",
+-  "subscriptionVersion": 2,
++  "subscriptionVersion": 1,
+   "assignmentVersion": 3,
+   "nodes": [
+     { "id": 0, "host": "broker-0", "port": 9092 },

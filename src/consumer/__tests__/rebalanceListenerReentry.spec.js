@@ -40,9 +40,6 @@ describe('hook quiescence and captured reentry', () => {
   })
   it('times out a held handler without false quiescence', async () => {
     jest.useFakeTimers()
-    jest
-      .spyOn(require('node:perf_hooks').performance, 'now')
-      .mockImplementation(() => performance.now())
     const baseline = jest.getTimerCount()
     const runner = makeRunner()
     const r = round()

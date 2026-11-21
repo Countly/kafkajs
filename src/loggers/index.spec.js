@@ -147,4 +147,62 @@ describe('Loggers', () => {
       expect(logger.debugEnabled()).toBe(true)
     })
   })
+  describe('a throwing log sink', () => {
+    const throwing = () =>
+      jest.fn(({ log }) => {
+        if (log.message === 'boom') throw new Error('sink failed')
+      })
+
+    it('does not escape a root or namespaced call, and later lines still reach the sink', () => {
+      const sink = throwing()
+      const root = createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+      const namespaced = root.namespace('Ns')
+
+      expect(root.error('boom')).toBeUndefined()
+      expect(namespaced.info('boom')).toBeUndefined()
+      namespaced.warn('after')
+
+      expect(sink).toHaveBeenCalledTimes(3)
+      expect(sink.mock.calls[2][0]).toMatchObject({ namespace: 'Ns', label: 'WARN' })
+      expect(sink.mock.calls[2][0].log.message).toBe('after')
+    })
+
+    it('is not invoked for a filtered line', () => {
+      const sink = throwing()
+      const root = createLogger({ level: LEVELS.ERROR, logCreator: () => sink })
+      root.namespace('Ns').debug('boom')
+      expect(sink).not.toHaveBeenCalled()
+    })
+
+    it('a log function whose returned promise rejects leaves no unhandled rejection, and later lines still reach it', async () => {
+      const unhandled = []
+      const track = (reason) => unhandled.push(reason)
+      process.on('unhandledRejection', track)
+      try {
+        const sink = jest.fn(({ log }) =>
+          log.message === 'boom' ? Promise.reject(new Error('sink failed')) : undefined
+        )
+        const root = createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+
+        expect(root.error('boom')).toBeUndefined()
+        expect(root.namespace('Ns').warn('boom')).toBeUndefined()
+        root.info('after')
+        await new Promise((resolve) => setImmediate(resolve))
+        await new Promise((resolve) => setImmediate(resolve))
+
+        expect(unhandled).toEqual([])
+        expect(sink).toHaveBeenCalledTimes(3)
+        expect(sink.mock.calls[2][0].log.message).toBe('after')
+      } finally {
+        process.off('unhandledRejection', track)
+      }
+    })
+
+    it('leaves a throwing log creator failing the logger construction', () => {
+      const creator = () => {
+        throw new Error('creator failed')
+      }
+      expect(() => createLogger({ logCreator: creator })).toThrow('creator failed')
+    })
+  })
 })

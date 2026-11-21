@@ -1,0 +1,10 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -568,6 +568,7 @@
+         guard: refusal,
+       })
+       check()
++      this.brokerPool.metadata = result
+       return result
+     }
+     try {

@@ -840,6 +840,77 @@ describe('a consumer close over a scripted broker', () => {
     expect(frames(rig.cluster, 'OffsetCommit')).toHaveLength(before)
   })
 
+  test('a classic close waits for a held handler, then calls the close callback, makes the final commit and leaves, with STOP and DISCONNECT and no CRASH', async () => {
+    await open()
+    const release = gate()
+    const order = []
+    let entered = false
+    const { consumer, events } = await started({
+      delivered: 0,
+      run: {
+        eachMessage: async () => {
+          if (entered) return
+          entered = true
+          await release.promise
+          order.push('handler:end')
+        },
+        rebalanceListener: {
+          // Every eager round revokes the empty assignment first; only the owned one is recorded.
+          onPartitionsRevoked: async ({ partitions }) => {
+            if (partitions.length === 0) return
+            order.push(`revoked:${frames(rig.cluster, 'OffsetCommit').length}`)
+          },
+        },
+      },
+    })
+    consumer.on(consumer.events.CRASH, () => events.push('CRASH'))
+    await until(() => entered, 'the handler')
+    const closing = consumer.disconnect()
+    await pause(2 * BOUND_MS)
+
+    expect(order).toEqual([])
+
+    release.resolve()
+    await closing
+    const apis = rig.cluster.requests().map(({ api }) => api)
+
+    expect(order).toEqual(['handler:end', 'revoked:0'])
+    expect(frames(rig.cluster, 'OffsetCommit')).toHaveLength(1)
+    expect(frames(rig.cluster, 'LeaveGroup')).toHaveLength(1)
+    expect(apis.indexOf('OffsetCommit')).toBeLessThan(apis.indexOf('LeaveGroup'))
+    expect(events).toEqual(['STOP', 'DISCONNECT'])
+  })
+
+  test('a timed classic close ends the wait for a held close callback at its deadline and sends no leave, with STOP and DISCONNECT and no CRASH', async () => {
+    await open()
+    const hookGate = gate()
+    let hookHeld = false
+    const { consumer, events } = await started({
+      run: {
+        rebalanceListener: {
+          onPartitionsRevoked: async ({ partitions }) => {
+            if (partitions.length === 0) return
+            hookHeld = true
+            await hookGate.promise
+          },
+        },
+      },
+    })
+    consumer.on(consumer.events.CRASH, () => events.push('CRASH'))
+    const startedAt = Date.now()
+    await consumer.disconnect({ timeout: BOUND_MS })
+
+    expect(hookHeld).toBe(true)
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(BOUND_MS - 50)
+    expect(Date.now() - startedAt).toBeLessThan(BOUND_MS + 2700)
+
+    hookGate.resolve()
+    await pause(100)
+
+    expect(frames(rig.cluster, 'LeaveGroup')).toHaveLength(0)
+    expect(events).toEqual(['STOP', 'DISCONNECT'])
+  })
+
   test('a replacement run starts after a held handler and a held hook are each detached', async () => {
     await open()
     const handlerGate = gate()

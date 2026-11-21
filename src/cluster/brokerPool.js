@@ -21,8 +21,40 @@ const {
   KafkaJSNonRetriableError,
 } = require('../errors')
 const { isConnectionFailure } = require('../network/connectionFailure')
+const { failure, createErrorFromCode } = require('../protocol/error')
+const { checkPartitions } = require('../protocol/requests/metadata')
+
+/** The code a consumer's named refresh isolates for an established target. */
+const UNKNOWN_TOPIC_OR_PARTITION = 3
+/** How long an isolated target counts as known before it is asked for again, at most. */
+const ISOLATED_RECHECK_MS = 1000
+
+/** Topic errors that drop an earlier producer target the broker no longer serves. */
+const DROPPED_TOPIC_ERRORS = new Set([
+  'UNKNOWN_TOPIC_OR_PARTITION',
+  'INVALID_TOPIC_EXCEPTION',
+  'TOPIC_AUTHORIZATION_FAILED',
+])
 
 const { keys, assign, values } = Object
+
+/**
+ * @typedef {object} TopicMetadataStatus
+ * @property {string} topic a consumer target
+ * @property {'unavailable'|'available'} status
+ * @property {string|null} type `UNKNOWN_TOPIC_OR_PARTITION` when unavailable, null when available
+ * @property {number} code 3 when unavailable, 0 when available
+ */
+
+/**
+ * @typedef {object} TargetEstablishment
+ * @property {(topic: string) => boolean} isEstablished whether a metadata answer accepted the
+ *   topic for its current declaration, or it is a first-add row
+ * @property {(topic: string) => boolean} isTarget whether the topic is still a target
+ * @property {(topics: string[]) => void} establish records the topics an answer accepted, unless a
+ *   target was removed since the capture
+ */
+
 /**
  * Whether a cached broker now has another address. A rack is not part of a broker's identity: a
  * new rack is written onto the cached connection pool in place, with no new connection.
@@ -82,6 +114,9 @@ const isAuthenticationFailure = (error) => {
   return false
 }
 
+/** @type {WeakMap<object[], Map<string, object>>} see `BrokerPool.topicRowsByName` */
+const topicRowIndexes = new WeakMap()
+
 const PRIVATE = {
   REBOOTSTRAP: Symbol('private:BrokerPool:rebootstrap'),
 }
@@ -101,6 +136,19 @@ module.exports = class BrokerPool {
    *   a collaborator it can build itself. `Cluster` always injects its own, which is then the
    *   single instance every route reads.
    * @param {(topics: string[]) => ((topic: string) => boolean)} [options.captureTopics] scoped producer publication predicate
+   * @param {(topic: string) => boolean} [options.dropTopic] required when `captureTopics` is
+   *   given: forgets a producer target the broker no longer serves, unless producer work still
+   *   owns it; returns whether it did
+   * @param {(topic: string) => boolean} [options.isNewTarget] required when `captureTopics` is
+   *   given: whether a producer target is being added by the call in progress, so its refusal
+   *   fails that call instead of being dropped
+   * @param {(status: TopicMetadataStatus) => void} [options.onTopicMetadataStatus] given only
+   *   for a consumer's cluster: its named refreshes isolate an established target answered
+   *   `UNKNOWN_TOPIC_OR_PARTITION` (see `isolateUnknownTopics`) and report each change of that
+   *   topic's status here
+   * @param {() => TargetEstablishment} [options.captureEstablishment] required with
+   *   `onTopicMetadataStatus`: captures, when a named refresh begins, which targets a metadata
+   *   answer has accepted (see `Cluster#captureEstablishment`)
    * @param {import("../instrumentation/emitter")|null} [options.instrumentationEmitter]
    * @param {import("../../types").RetryOptions} [options.retry]
    * @param {number} [options.drainTimeout] obsolete-resource drain bound in milliseconds
@@ -124,6 +172,10 @@ module.exports = class BrokerPool {
     logger,
     metadataCache,
     captureTopics,
+    dropTopic,
+    isNewTarget,
+    onTopicMetadataStatus,
+    captureEstablishment,
     instrumentationEmitter,
     retry,
     allowAutoTopicCreation,
@@ -135,10 +187,24 @@ module.exports = class BrokerPool {
     drainTimeout,
   }) {
     this.captureTopics = captureTopics
+    this.dropTopic = dropTopic
+    this.isNewTarget = isNewTarget
+    this.onTopicMetadataStatus = onTopicMetadataStatus
+    this.captureEstablishment = captureEstablishment
+    /** @type {Set<string>|null} the isolated targets: never more than the current targets */
+    this.unavailableTopics = onTopicMetadataStatus ? new Set() : null
+    /** When an isolated target stops counting as known to `refreshMetadataIfNecessary`. */
+    this.isolatedRecheckAt = 0
     this.telemetryMetrics = telemetryMetrics
     this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
     this.retiredBrokers = new WeakSet()
+    /**
+     * Brokers a disconnect or a failure removal detached, each with the settlement of its drains,
+     * until those settle: a later disconnect reaches their sockets again and awaits them.
+     * @type {Map<import('../broker'), Promise<unknown>>}
+     */
+    this.draining = new Map()
     this.rootLogger = logger
     this.connectionPoolBuilder = connectionPoolBuilder
     this.bootstrapResolution = bootstrapResolution
@@ -194,12 +260,16 @@ module.exports = class BrokerPool {
     /** @type {import("../../types").BrokerMetadata | null} */
     this.metadata = null
     this.metadataExpireAt = null
+    /** Counts `disconnect()` calls: a refresh started before one installs nothing after it. */
+    this.disconnects = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
     this.consumerMetadataScope = null
     /** Advances when the default scope is registered or released, fencing earlier unscoped work. */
     this.consumerMetadataGeneration = 0
+    /** Whether the consumer subscribes by a broker-side regex; no lookup by name may create then. */
+    this.consumerBrokerRegex = false
     this.versions = null
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
@@ -538,7 +608,7 @@ module.exports = class BrokerPool {
    * shared with direct seed users and must be replaced before it can be retired.
    * @private
    * @param {import('../broker')|undefined} broker replaced broker
-   * @returns {void} never waits for a drain
+   * @returns {Promise<void>|undefined} the drain this call started, which it never waits for
    */
   closeObsolete(broker) {
     if (!broker || broker === this.seedBroker) return
@@ -548,7 +618,24 @@ module.exports = class BrokerPool {
     if (this.retiredBrokers.has(broker)) return
     this.retiredBrokers.add(broker)
     this.retireTelemetryNode(broker.connectionPool)
-    this.closeInBackground(broker.retire({ drainTimeout: this.drainTimeout }))
+    const drain = broker.retire({ drainTimeout: this.drainTimeout })
+    this.closeInBackground(drain)
+    return drain
+  }
+
+  /**
+   * Records one drain of a detached broker, joined with the earlier ones of that broker; the
+   * broker leaves the record once all of them have settled.
+   * @private
+   * @param {import('../broker')} broker
+   * @param {Promise<void>} drain
+   * @returns {void}
+   */
+  trackDrain(broker, drain) {
+    const all = Promise.allSettled([this.draining.get(broker), drain]).then(() => {
+      if (this.draining.get(broker) === all) this.draining.delete(broker)
+    })
+    this.draining.set(broker, all)
   }
 
   /**
@@ -788,11 +875,13 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Disconnects the seed and every broker in the table once, starting all drains concurrently.
-   * Detaches the captured table before draining, and retires its non-seed brokers so a stale
-   * lookup cannot reconnect an orphan. The seed stays reusable and owned. Work resumed during
-   * the drain builds a new table, which this call leaves intact. If one drain fails, this call
-   * rejects while the other drains continue; the captured table stays detached.
+   * Disconnects the seed, every broker in the table and every broker an earlier disconnect or a
+   * failure removal detached that is still draining, starting all drains concurrently, so a
+   * shorter `drainTimeout` reaches a drain already in progress. Detaches the captured table before
+   * draining, and retires its non-seed brokers so a stale lookup cannot reconnect an orphan. The
+   * seed stays reusable and owned. Work resumed during the drain builds a new table, which this
+   * call leaves intact. Resolves once every drain of those brokers, earlier ones included, has
+   * settled; if one of this call's drains failed, it then rejects with the first failure.
    * @public
    * @param {object} [options]
    * @param {number} [options.drainTimeout] ms each connection waits for its requests, 0 closing
@@ -806,20 +895,24 @@ module.exports = class BrokerPool {
       this.setupMetadataEndpoints.clear()
     }
     this.retainSetupEndpoints()
-    const brokers = new Set(values(this.brokers))
+    const brokers = new Set([...values(this.brokers), ...this.draining.keys()])
     if (this.seedBroker) brokers.add(this.seedBroker)
+    this.disconnects++
     this.brokers = {}
     this.metadata = null
     this.versions = null
     this.authenticationBlackout.clear()
 
-    await Promise.all(
-      [...brokers].map((broker) =>
-        broker === this.seedBroker
-          ? broker.disconnect(...(options ? [options] : []))
-          : broker.retire(...(options ? [options] : []))
-      )
-    )
+    const args = options ? [options] : []
+    const drains = [...brokers].map((broker) => {
+      const drain = (async () =>
+        broker === this.seedBroker ? broker.disconnect(...args) : broker.retire(...args))()
+      this.trackDrain(broker, drain)
+      return drain
+    })
+    await Promise.all([...brokers].map((broker) => this.draining.get(broker)))
+    const failure = (await Promise.allSettled(drains)).find(({ status }) => status === 'rejected')
+    if (failure) throw failure.reason
   }
 
   /**
@@ -849,7 +942,8 @@ module.exports = class BrokerPool {
       this.seedBroker = shuffle(values(this.brokers).filter((candidate) => candidate !== broker))[0]
     }
     this.metadataExpireAt = null
-    this.closeObsolete(broker)
+    const drain = this.closeObsolete(broker)
+    if (drain) this.trackDrain(broker, drain)
   }
 
   /**
@@ -916,7 +1010,8 @@ module.exports = class BrokerPool {
               this.consumerMetadataGeneration ?? 0,
               this.consumerMetadataScope?.shareKey() ?? null,
               names || [],
-            ])
+            ]),
+      () => this.disconnects
     )
     return this.metadataDiscovery(topics, options)
   }
@@ -949,23 +1044,27 @@ module.exports = class BrokerPool {
     }
     if (!isCurrent()) return
     const modeGeneration = this.consumerMetadataGeneration ?? 0
+    const disconnects = this.disconnects
     const ticket = metadataScope?.captureMetadata()
     const applicable = () =>
+      this.disconnects === disconnects &&
       !fence?.closed &&
       !guard?.() &&
       (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
       isCurrent() &&
       (!ticket || ticket.isCurrent())
-    if (metadataScope?.hasPatterns()) {
-      topics = []
-      allowAutoTopicCreation = false
-    }
+    const clientPattern = metadataScope?.hasPatterns()
+    if (clientPattern) topics = []
+    if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = false
     const accept = this.captureTopics?.(topics || [])
+    const establishment =
+      this.unavailableTopics !== null && topics?.length > 0 ? this.captureEstablishment() : null
     const requestOptions = {
       ...guardArgs(fence)[0],
       ...(guard && { guard }),
       ...(allowAutoTopicCreation !== undefined && { allowAutoTopicCreation }),
       ...(allowLeaderless && { allowLeaderless }),
+      ...((accept || establishment) && { retainTopicErrors: true }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
     try {
@@ -997,12 +1096,21 @@ module.exports = class BrokerPool {
           check()
           if (!applicable()) return
           if (accept) {
-            const incoming = response.topicMetadata.filter(({ topic }) => accept(topic))
+            const settled = this.settleTopicErrors(response.topicMetadata, accept)
+            checkPartitions(settled, { allowLeaderless })
+            const incoming = settled.filter(({ topic }) => accept(topic))
             const replaced = new Set(incoming.map(({ topic }) => topic))
             const retained = (this.metadata?.topicMetadata || []).filter(
               ({ topic }) => !replaced.has(topic)
             )
             this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
+          } else if (establishment) {
+            this.metadata = {
+              ...response,
+              topicMetadata: this.isolateUnknownTopics(response.topicMetadata, establishment, {
+                allowLeaderless,
+              }),
+            }
           } else {
             this.metadata = response
           }
@@ -1124,11 +1232,116 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Drops one producer target from the retained decoded response, preserving broker discovery.
+   * Judges the topics a producer refresh got back with their own error code; the Java client keeps
+   * such errors per topic too. An earlier target that is now unknown, invalid or unauthorized (a
+   * deleted topic, say) never fails the refresh of the other targets, whether or not any metadata
+   * is installed, as after a reconnect or a rebootstrap: it is dropped through `dropTopic`, and a
+   * later send to it adds it again and fails on its own. One whose sends still own it is kept with
+   * the metadata it had, if any, so they keep their routing and their retries ask about it again;
+   * they recover once the broker serves it again, or end as any send does: with the broker's
+   * answer, a routing error or the delivery timeout. A topic being added is not judged this way:
+   * its refusal fails the call. A topic this refresh no longer captures is skipped. Any other
+   * topic error is thrown, as the version's own parse would throw it, after the drops. The caller
+   * checks the partitions of the returned topics only afterwards, so a topic error takes
+   * precedence over a partition error, as in the strict parse.
+   * @param {object[]} topicMetadata the answer's topics, topic and partition errors retained
+   * @param {(topic: string) => boolean} accept this refresh's publication predicate
+   * @returns {object[]} the topics answered without an error
+   * @throws {import('../errors').KafkaJSProtocolError} the first other topic error
+   */
+  settleTopicErrors(topicMetadata, accept) {
+    const failed = topicMetadata.filter(
+      ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
+    )
+    if (failed.length === 0) return topicMetadata
+    let thrown = null
+    for (const { topic, topicErrorCode } of failed) {
+      if (!accept(topic)) continue
+      const error = createErrorFromCode(topicErrorCode)
+      if (!this.isNewTarget(topic) && DROPPED_TOPIC_ERRORS.has(error.type)) {
+        const dropped = this.dropTopic(topic)
+        this.logger.warn(
+          dropped
+            ? 'Dropping a target topic the broker no longer serves'
+            : 'Keeping the metadata of a target topic its sends still own',
+          { topic, error: error.message }
+        )
+      } else {
+        thrown ??= error
+      }
+    }
+    if (thrown) throw thrown
+    return topicMetadata.filter((entry) => !failed.includes(entry))
+  }
+
+  /**
+   * Judges the topics a consumer's named refresh got back with their own error code. Only
+   * `UNKNOWN_TOPIC_OR_PARTITION` (code 3) for an established target, one a metadata answer
+   * accepted since it was declared, is isolated: the topic is left out of the installed metadata,
+   * so nothing routes to it, while it stays a target that every later refresh asks for again, and
+   * its cached id stays, so a recreation is seen as one. Any other topic error, or code 3 for a
+   * topic no answer accepted yet (a subscription whose validation failed, say), is thrown. Any other
+   * code wins over code 3, whatever the wire order, so a missing topic never hides a fatal one (17,
+   * 29); between two such codes the first in wire order wins. The healthy topics' partitions are
+   * checked only then, so a topic error takes precedence over a partition error as in the strict
+   * parse, and nothing changes before the whole answer passed. Then the healthy topics are
+   * established and installed. A topic that stopped being a target since the refresh began (a
+   * withdrawn first-add row, say) is left out first: it is neither judged, installed nor reported.
+   * The Java consumer and franz-go keep a missing topic per topic too.
+   *
+   * A status is reported only when it changes: once when a topic becomes unavailable, once when a
+   * refresh answers it again. The state is bounded by the targets; `forgetTopic` drops it. An
+   * isolated topic is asked for again within a second (see `refreshMetadataIfNecessary`), so a
+   * recreation is seen against its kept id and reset as any recreation is.
+   * @param {object[]} answered the answer's topics, topic and partition errors retained
+   * @param {TargetEstablishment} establishment captured when the refresh began
+   * @param {{ allowLeaderless?: boolean }} options lets a partition without a leader through
+   * @returns {object[]} the topics answered without an error
+   * @throws {import('../errors').KafkaJSProtocolError} the first topic error other than code 3,
+   *   else the first code 3 not isolated, else the first partition error
+   */
+  isolateUnknownTopics(answered, { isEstablished, isTarget, establish }, { allowLeaderless }) {
+    const topicMetadata = answered.filter(({ topic }) => isTarget(topic))
+    const failed = topicMetadata.filter(
+      ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
+    )
+    const thrown =
+      failed.find(({ topicErrorCode }) => topicErrorCode !== UNKNOWN_TOPIC_OR_PARTITION) ??
+      failed.find(({ topic }) => !isEstablished(topic))
+    if (thrown) throw createErrorFromCode(thrown.topicErrorCode)
+    const healthy = failed.length
+      ? topicMetadata.filter((entry) => !failed.includes(entry))
+      : topicMetadata
+    checkPartitions(healthy, { allowLeaderless })
+    establish(healthy.map(({ topic }) => topic))
+    this.isolatedRecheckAt = Date.now() + Math.min(this.metadataMaxAge, ISOLATED_RECHECK_MS)
+
+    for (const { topic } of failed) {
+      if (this.unavailableTopics.has(topic)) continue
+      this.unavailableTopics.add(topic)
+      this.onTopicMetadataStatus({
+        topic,
+        status: 'unavailable',
+        type: 'UNKNOWN_TOPIC_OR_PARTITION',
+        code: UNKNOWN_TOPIC_OR_PARTITION,
+      })
+    }
+    for (const topic of this.unavailableTopics) {
+      if (!healthy.some((entry) => entry.topic === topic)) continue
+      this.unavailableTopics.delete(topic)
+      this.onTopicMetadataStatus({ topic, status: 'available', type: null, code: 0 })
+    }
+    return healthy
+  }
+
+  /**
+   * Drops one target from the retained decoded response, preserving broker discovery, and from
+   * the isolated targets.
    * @param {string} topic forgotten name
    * @returns {void}
    */
   forgetTopic(topic) {
+    this.unavailableTopics?.delete(topic)
     if (this.metadata) {
       this.metadata = {
         ...this.metadata,
@@ -1252,7 +1465,29 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * How the cached metadata stands for `topics`, as `refreshMetadataIfNecessary` judges it:
+   * `missing` without an answer or when a topic is not in it (an isolated consumer target counts as
+   * in it, see there), else `aged` past `metadataMaxAge`, else `fresh`.
+   * @param {string[]} topics
+   * @param {object} [metadataScope] a pattern scope judges no topics
+   * @returns {'missing'|'aged'|'fresh'}
+   */
+  metadataState(topics, metadataScope = this.consumerMetadataScope) {
+    if (this.metadata == null || this.metadataExpireAt == null) return 'missing'
+    const now = Date.now()
+    const known = (topic) =>
+      (this.unavailableTopics?.has(topic) && now <= this.isolatedRecheckAt) ||
+      BrokerPool.topicRowsByName(this.metadata).has(topic)
+    if (!metadataScope?.hasPatterns() && !topics.every(known)) return 'missing'
+    return now > this.metadataExpireAt ? 'aged' : 'fresh'
+  }
+
+  /**
    * Only refreshes metadata if the data is stale according to the `metadataMaxAge` param or does not contain information about the provided topics
+   * An isolated consumer target counts as known for at most a second after the refresh that
+   * isolated it (or `metadataMaxAge`, when shorter), so a recreated topic is found again within
+   * that second, as the Java consumer keeps asking for a partition without a leader, while a fetch
+   * loop that calls this on every round does not ask for it on every round.
    *
    * @public
    * @param {Array<String>} topics
@@ -1263,20 +1498,35 @@ module.exports = class BrokerPool {
   async refreshMetadataIfNecessary(topics, options = {}) {
     const metadataScope = options.metadataScope ?? this.consumerMetadataScope
     if (metadataScope?.hasPatterns()) topics = []
-    const shouldRefresh =
-      this.metadata == null ||
-      this.metadataExpireAt == null ||
-      Date.now() > this.metadataExpireAt ||
-      !topics.every((topic) =>
-        this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
-      )
-
-    if (shouldRefresh) {
+    if (this.metadataState(topics, metadataScope) !== 'fresh') {
       const context = metadataScope ? { ...options, metadataScope } : options
       return Object.keys(context).length
         ? this.refreshMetadata(topics, context)
         : this.refreshMetadata(topics)
     }
+  }
+
+  /**
+   * An answer's rows by topic name; of two rows with one name, the first wins, as a search of the
+   * array would find it. Cached per `topicMetadata` array: every writer of `metadata` installs a
+   * new array and none renames, adds or removes rows in place, so a new array is the one
+   * invalidation point. Held weakly by that array, so it lives as long as the answer it indexes.
+   * @param {{ topicMetadata?: object[] } | null} metadata
+   * @returns {Map<string, object>} empty for no answer
+   */
+  static topicRowsByName(metadata) {
+    const rows = metadata?.topicMetadata
+    if (!rows) return new Map()
+    let byName = topicRowIndexes.get(rows)
+    if (!byName) {
+      byName = new Map()
+      for (const row of rows) {
+        const { topic } = row
+        if (!byName.has(topic)) byName.set(topic, row)
+      }
+      topicRowIndexes.set(rows, byName)
+    }
+    return byName
   }
 
   /** @type {() => string[]} */

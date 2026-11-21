@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -135,7 +135,7 @@
+    * @throws Never.
+    */
+   handleError(token) {
+-    if (this.current(token)) this.reset(false)
++    if (this.current(token)) this.pending = null
+   }
+ 
+   /**

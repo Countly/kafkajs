@@ -8,14 +8,6 @@ const { KafkaJSNonRetriableError } = require('../errors')
  */
 const DEFAULT_MAX_POLL_INTERVAL = 300000
 
-/**
- * The client-side ceiling on how long a SyncGroup request may block. Mirrors `MAX_TIMEOUT` in
- * `../protocol/requests/syncGroup/index.js`, which is where the codec actually derives the
- * request timeout; the value reported here is a prediction of that derivation, so the two
- * constants must move together.
- */
-const SYNC_GROUP_MAX_TIMEOUT = 60000
-
 /** Slack added to every derived request timeout, matching the protocol layer's own constant. */
 const NETWORK_DELAY = 5000
 
@@ -29,7 +21,8 @@ const NETWORK_DELAY = 5000
  * configuration cannot silently acquire a short handler-eviction deadline.
  *
  * @param {object} options
- * @param {number} [options.maxPollInterval] explicit; validated, and it wins over the alias
+ * @param {number} [options.maxPollInterval] explicit; an integer from 1 to 2147483647 (the INT32
+ *   wire field), and it wins over the alias
  * @param {number} [options.rebalanceTimeout] the deprecated alias; sent on the wire when it is
  *   the only one given, degenerate values (0, non-integers) grandfathered
  * @param {number} [options.sessionTimeout=45000]
@@ -37,11 +30,12 @@ const NETWORK_DELAY = 5000
  * @param {import('../../types').Logger} options.logger
  * @returns {{ rebalanceTimeout: number, pollDeadline: number, sessionTimeout: number,
  *   heartbeatInterval: number, syncGroupTimeout: number }} `rebalanceTimeout` is the wire value;
- *   `syncGroupTimeout` reports the capped SyncGroup request timeout the protocol layer derives
- *   from it — it is logged, never sent, and the codec remains the authority on that number
+ *   `syncGroupTimeout` reports the SyncGroup per-request allowance the protocol layer derives
+ *   from it (`../protocol/requests/syncGroup/index.js`) — it is logged, never sent, and the codec
+ *   remains the authority on that number
  * @throws {KafkaJSNonRetriableError} when either timeout is invalid or `heartbeatInterval`
  *   is not lower than `sessionTimeout`,
- *   or when an explicit `maxPollInterval` is not an integer of at least 1
+ *   or when an explicit `maxPollInterval` is not an integer from 1 to 2147483647
  */
 const resolveGroupTimeouts = ({
   maxPollInterval,
@@ -78,9 +72,12 @@ const resolveGroupTimeouts = ({
   const hasMaxPollInterval = maxPollInterval !== undefined
   const hasRebalanceTimeout = rebalanceTimeout !== undefined
 
-  if (hasMaxPollInterval && (!Number.isInteger(maxPollInterval) || maxPollInterval < 1)) {
+  if (
+    hasMaxPollInterval &&
+    (!Number.isInteger(maxPollInterval) || maxPollInterval < 1 || maxPollInterval > 2147483647)
+  ) {
     throw new KafkaJSNonRetriableError(
-      `Consumer maxPollInterval must be an integer of at least 1, got ${inspect(maxPollInterval)}`
+      `Consumer maxPollInterval must be an integer from 1 to 2147483647, got ${inspect(maxPollInterval)}`
     )
   }
 
@@ -98,7 +95,10 @@ const resolveGroupTimeouts = ({
 
   // `||`, matching the two shipped request-timeout helpers: a configured 0 falls back to
   // sessionTimeout rather than producing a 5 s request timeout.
-  const syncGroupTimeout = Math.min(wire || sessionTimeout, SYNC_GROUP_MAX_TIMEOUT) + NETWORK_DELAY
+  const syncTimeout = wire || sessionTimeout
+  const syncGroupTimeout = Number.isSafeInteger(syncTimeout + NETWORK_DELAY)
+    ? syncTimeout + NETWORK_DELAY
+    : syncTimeout
 
   if (hasRebalanceTimeout && hasMaxPollInterval && rebalanceTimeout !== maxPollInterval) {
     logger.warn(

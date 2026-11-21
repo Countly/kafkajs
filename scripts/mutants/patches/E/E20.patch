@@ -1,0 +1,19 @@
+--- a/scripts/benchmarks/fetchFrameCounter.js
++++ b/scripts/benchmarks/fetchFrameCounter.js
+@@ -29,14 +29,14 @@
+    * @throws {Error} malformed frame, duplicate request or uncorrelated response
+    */
+   push(connection, direction, chunk, at = performance.now()) {
+-    let state = this.connections.get(connection)
++    let state = this.connections.get('shared')
+     if (!state) {
+       state = {
+         request: Buffer.alloc(0),
+         response: Buffer.alloc(0),
+         pending: new Map(),
+       }
+-      this.connections.set(connection, state)
++      this.connections.set('shared', state)
+     }
+     state[direction] = Buffer.concat([state[direction], chunk])
+     while (state[direction].length >= 4) {

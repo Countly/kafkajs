@@ -1,5 +1,4 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
-const { performance } = require('node:perf_hooks')
 const { isNativeError } = require('node:util').types
 const describeThrown = require('../network/describeThrown')
 const Generation = require('../producer/generation')

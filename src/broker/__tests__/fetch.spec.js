@@ -9,8 +9,6 @@ const {
   newLogger,
   createTopic,
   retryProtocol,
-  testIfKafkaAtMost_0_10,
-  testIfKafkaAtLeast_0_11,
   generateMessages,
 } = require('testHelpers')
 const { Types: Compression } = require('../../protocol/message/compression')
@@ -117,156 +115,6 @@ describe('Broker > Fetch', () => {
     await expect(broker.fetch({ topics: [] })).rejects.toEqual(new Error('Broker not connected'))
   })
 
-  testIfKafkaAtMost_0_10('request', async () => {
-    const targetPartition = 0
-    const messages = createMessages()
-    let topicData = createTopicData(targetPartition, messages)
-    await broker.produce({ topicData })
-
-    const topics = [
-      {
-        topic: topicName,
-        partitions: [
-          {
-            partition: targetPartition,
-            fetchOffset: 0,
-            maxBytes: maxBytesPerPartition,
-          },
-        ],
-      },
-    ]
-
-    let fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
-    expect(fetchResponse).toEqual({
-      clientSideThrottleTime: expect.optional(0),
-      throttleTime: 0,
-      responses: [
-        {
-          topicName,
-          partitions: [
-            {
-              errorCode: 0,
-              partition: 0,
-              highWatermark: '3',
-              messages: [
-                {
-                  offset: '0',
-                  size: 39,
-                  crc: 924859032,
-                  magicByte: 1,
-                  attributes: 0,
-                  timestamp: '1509827900073',
-                  key: Buffer.from(messages[0].key),
-                  value: Buffer.from(messages[0].value),
-                },
-                {
-                  offset: '1',
-                  size: 39,
-                  crc: -947797683,
-                  magicByte: 1,
-                  attributes: 0,
-                  timestamp: '1509827900073',
-                  key: Buffer.from(messages[1].key),
-                  value: Buffer.from(messages[1].value),
-                },
-                {
-                  offset: '2',
-                  size: 39,
-                  crc: 219335539,
-                  magicByte: 1,
-                  attributes: 0,
-                  timestamp: '1509827900073',
-                  key: Buffer.from(messages[2].key),
-                  value: Buffer.from(messages[2].value),
-                },
-              ],
-            },
-          ],
-        },
-      ],
-    })
-
-    topicData = createTopicData(targetPartition, createMessages(1))
-    await broker.produce({ topicData })
-    fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
-    expect(fetchResponse.responses[0].partitions[0].highWatermark).toEqual('6')
-  })
-
-  testIfKafkaAtMost_0_10('request with GZIP', async () => {
-    const targetPartition = 0
-    const messages = createMessages()
-    let topicData = createTopicData(targetPartition, messages)
-    await broker.produce({ topicData, compression: Compression.GZIP })
-
-    const topics = [
-      {
-        topic: topicName,
-        partitions: [
-          {
-            partition: targetPartition,
-            fetchOffset: 0,
-            maxBytes: maxBytesPerPartition,
-          },
-        ],
-      },
-    ]
-
-    let fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
-    expect(fetchResponse).toEqual({
-      clientSideThrottleTime: expect.optional(0),
-      throttleTime: 0,
-      responses: [
-        {
-          topicName,
-          partitions: [
-            {
-              errorCode: 0,
-              partition: 0,
-              highWatermark: '3',
-              messages: [
-                {
-                  offset: '0',
-                  size: 39,
-                  crc: 924859032,
-                  magicByte: 1,
-                  attributes: 0,
-                  timestamp: '1509827900073',
-                  key: Buffer.from(messages[0].key),
-                  value: Buffer.from(messages[0].value),
-                },
-                {
-                  offset: '1',
-                  size: 39,
-                  crc: -947797683,
-                  magicByte: 1,
-                  attributes: 0,
-                  timestamp: '1509827900073',
-                  key: Buffer.from(messages[1].key),
-                  value: Buffer.from(messages[1].value),
-                },
-                {
-                  offset: '2',
-                  size: 39,
-                  crc: 219335539,
-                  magicByte: 1,
-                  attributes: 0,
-                  timestamp: '1509827900073',
-                  key: Buffer.from(messages[2].key),
-                  value: Buffer.from(messages[2].value),
-                },
-              ],
-            },
-          ],
-        },
-      ],
-    })
-
-    topicData = createTopicData(targetPartition, createMessages(1))
-    await broker.produce({ topicData, compression: Compression.GZIP })
-    fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
-    expect(fetchResponse.responses[0].partitions[0].highWatermark).toEqual('6')
-  })
-
   describe('Record batch', () => {
     beforeEach(async () => {
       await broker.disconnect()
@@ -278,7 +126,7 @@ describe('Broker > Fetch', () => {
       await broker.connect()
     })
 
-    testIfKafkaAtLeast_0_11('request', async () => {
+    test('request', async () => {
       const targetPartition = 0
       const messages = createMessages()
       let topicData = createTopicData(targetPartition, messages)
@@ -365,7 +213,7 @@ describe('Broker > Fetch', () => {
       expect(fetchResponse.responses[0].partitions[0].highWatermark).toEqual('6')
     })
 
-    testIfKafkaAtLeast_0_11('request with headers', async () => {
+    test('request with headers', async () => {
       const targetPartition = 0
       const messages = createMessages(0, true)
       let topicData = createTopicData(targetPartition, messages)
@@ -452,7 +300,7 @@ describe('Broker > Fetch', () => {
       expect(fetchResponse.responses[0].partitions[0].highWatermark).toEqual('6')
     })
 
-    testIfKafkaAtLeast_0_11('request with GZIP', async () => {
+    test('request with GZIP', async () => {
       const targetPartition = 0
       const messages = createMessages()
       let topicData = createTopicData(targetPartition, messages)
@@ -571,204 +419,69 @@ describe('Broker > Fetch', () => {
       await broker.disconnect()
     })
 
-    testIfKafkaAtLeast_0_11(
-      'returns transactional messages only after transaction has ended for an isolation level of "read_committed" (default)',
-      async () => {
-        const targetPartition = 0
-        const messages = generateMessages({ prefix: 'aborted', number: 3 }).map((m) => ({
-          ...m,
-          partition: targetPartition,
-        }))
+    test('returns transactional messages only after transaction has ended for an isolation level of "read_committed" (default)', async () => {
+      const targetPartition = 0
+      const messages = generateMessages({ prefix: 'aborted', number: 3 }).map((m) => ({
+        ...m,
+        partition: targetPartition,
+      }))
 
-        const txn = await producer.transaction()
-        await txn.send({
+      const txn = await producer.transaction()
+      await txn.send({
+        topic: topicName,
+        messages,
+      })
+
+      const topics = [
+        {
           topic: topicName,
-          messages,
-        })
-
-        const topics = [
-          {
-            topic: topicName,
-            partitions: [
-              {
-                partition: targetPartition,
-                fetchOffset: 0,
-                maxBytes: maxBytesPerPartition,
-              },
-            ],
-          },
-        ]
-
-        let fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
-        expect(fetchResponse).toEqual({
-          clientSideThrottleTime: expect.optional(0),
-          throttleTime: 0,
-          errorCode: 0,
-          sessionId: 0,
-          responses: [
+          partitions: [
             {
-              topicName,
-              partitions: [
-                {
-                  abortedTransactions: [],
-                  lastStableOffset: '0',
-                  lastStartOffset: '0',
-                  errorCode: 0,
-                  highWatermark: '3',
-                  partition: 0,
-                  preferredReadReplica: expect.optional(-1),
-                  divergingEpoch: null,
-                  currentLeader: null,
-                  snapshotId: null,
-                  messages: [],
-                },
-              ],
+              partition: targetPartition,
+              fetchOffset: 0,
+              maxBytes: maxBytesPerPartition,
             },
           ],
-        })
+        },
+      ]
 
-        await txn.abort()
-
-        // It appears there can be a delay between the EndTxn response
-        // and the control record appearing in the partition, likely because the
-        // transaction coordinator does not wait for the control record to
-        // be fully replicated. Retry since it should eventually appear.
-        // @see https://docs.google.com/document/d/11Jqy_GjUGtdXJK94XGsEIK7CP1SnQGdp2eF0wSw9ra8/edit#bookmark=id.3af5934pfogc
-        await retry(async () => {
-          fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
-          expect(fetchResponse).toEqual({
-            clientSideThrottleTime: expect.optional(0),
-            throttleTime: 0,
-            errorCode: 0,
-            sessionId: 0,
-            responses: [
-              {
-                topicName,
-                partitions: [
-                  {
-                    abortedTransactions: [
-                      {
-                        firstOffset: '0',
-                        producerId: expect.any(String),
-                      },
-                    ],
-                    errorCode: 0,
-                    highWatermark: '4', // Number of produced messages + 1 control record
-                    lastStableOffset: '4',
-                    lastStartOffset: '0',
-                    partition: 0,
-                    preferredReadReplica: expect.optional(-1),
-                    divergingEpoch: null,
-                    currentLeader: null,
-                    snapshotId: null,
-                    messages: [
-                      {
-                        magicByte: 2,
-                        attributes: 0,
-                        batchContext: expectedBatchContext({
-                          producerEpoch: expect.any(Number),
-                          producerId: expect.any(String),
-                          inTransaction: true,
-                        }),
-                        offset: '0',
-                        timestamp: expect.any(String),
-                        headers: {},
-                        key: Buffer.from(messages[0].key),
-                        value: Buffer.from(messages[0].value),
-                        isControlRecord: false,
-                      },
-                      {
-                        magicByte: 2,
-                        attributes: 0,
-                        batchContext: expectedBatchContext({
-                          producerEpoch: expect.any(Number),
-                          producerId: expect.any(String),
-                          inTransaction: true,
-                        }),
-                        offset: '1',
-                        timestamp: expect.any(String),
-                        headers: {},
-                        key: Buffer.from(messages[1].key),
-                        value: Buffer.from(messages[1].value),
-                        isControlRecord: false,
-                      },
-                      {
-                        magicByte: 2,
-                        attributes: 0,
-                        batchContext: expectedBatchContext({
-                          producerEpoch: expect.any(Number),
-                          producerId: expect.any(String),
-                          inTransaction: true,
-                        }),
-                        offset: '2',
-                        timestamp: expect.any(String),
-                        headers: {},
-                        key: Buffer.from(messages[2].key),
-                        value: Buffer.from(messages[2].value),
-                        isControlRecord: false,
-                      },
-                      // Control record
-                      {
-                        magicByte: 2,
-                        attributes: 0,
-                        batchContext: expectedBatchContext({
-                          producerEpoch: expect.any(Number),
-                          producerId: expect.any(String),
-                          inTransaction: true,
-                          isControlBatch: true,
-                        }),
-                        offset: '3',
-                        timestamp: expect.any(String),
-                        key: Buffer.from([0, 0, 0, 0]), // Aborted
-                        value: expect.any(Buffer),
-                        headers: {},
-                        isControlRecord: true,
-                      },
-                    ],
-                  },
-                ],
-              },
-            ],
-          })
-        })
-      }
-    )
-
-    testIfKafkaAtLeast_0_11(
-      'returns transactional messages immediately for an isolation level of "read_uncommitted"',
-      async () => {
-        const targetPartition = 0
-        const messages = generateMessages({ prefix: 'aborted', number: 3 }).map((m) => ({
-          ...m,
-          partition: targetPartition,
-        }))
-
-        const txn = await producer.transaction()
-        await txn.send({
-          topic: topicName,
-          messages,
-        })
-
-        const topics = [
+      let fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
+      expect(fetchResponse).toEqual({
+        clientSideThrottleTime: expect.optional(0),
+        throttleTime: 0,
+        errorCode: 0,
+        sessionId: 0,
+        responses: [
           {
-            topic: topicName,
+            topicName,
             partitions: [
               {
-                partition: targetPartition,
-                fetchOffset: 0,
-                maxBytes: maxBytesPerPartition,
+                abortedTransactions: [],
+                lastStableOffset: '0',
+                lastStartOffset: '0',
+                errorCode: 0,
+                highWatermark: '3',
+                partition: 0,
+                preferredReadReplica: expect.optional(-1),
+                divergingEpoch: null,
+                currentLeader: null,
+                snapshotId: null,
+                messages: [],
               },
             ],
           },
-        ]
+        ],
+      })
 
-        let fetchResponse = await broker.fetch({
-          maxWaitTime,
-          minBytes,
-          maxBytes,
-          topics,
-          isolationLevel: ISOLATION_LEVEL.READ_UNCOMMITTED,
-        })
+      await txn.abort()
+
+      // It appears there can be a delay between the EndTxn response
+      // and the control record appearing in the partition, likely because the
+      // transaction coordinator does not wait for the control record to
+      // be fully replicated. Retry since it should eventually appear.
+      // @see https://docs.google.com/document/d/11Jqy_GjUGtdXJK94XGsEIK7CP1SnQGdp2eF0wSw9ra8/edit#bookmark=id.3af5934pfogc
+      await retry(async () => {
+        fetchResponse = await broker.fetch({ maxWaitTime, minBytes, maxBytes, topics })
         expect(fetchResponse).toEqual({
           clientSideThrottleTime: expect.optional(0),
           throttleTime: 0,
@@ -779,14 +492,15 @@ describe('Broker > Fetch', () => {
               topicName,
               partitions: [
                 {
-                  abortedTransactions: [], // None of these messages have been aborted yet
+                  abortedTransactions: [
+                    {
+                      firstOffset: '0',
+                      producerId: expect.any(String),
+                    },
+                  ],
                   errorCode: 0,
-                  highWatermark: '3', // Number of produced messages
-                  // The end offset of a partition for a read_committed consumer would be the
-                  // offset of the first message in the partition belonging to an open transaction.
-                  //
-                  // Note: In version < 2 this was '-1'
-                  lastStableOffset: '0',
+                  highWatermark: '4', // Number of produced messages + 1 control record
+                  lastStableOffset: '4',
                   lastStartOffset: '0',
                   partition: 0,
                   preferredReadReplica: expect.optional(-1),
@@ -839,78 +553,206 @@ describe('Broker > Fetch', () => {
                       value: Buffer.from(messages[2].value),
                       isControlRecord: false,
                     },
+                    // Control record
+                    {
+                      magicByte: 2,
+                      attributes: 0,
+                      batchContext: expectedBatchContext({
+                        producerEpoch: expect.any(Number),
+                        producerId: expect.any(String),
+                        inTransaction: true,
+                        isControlBatch: true,
+                      }),
+                      offset: '3',
+                      timestamp: expect.any(String),
+                      key: Buffer.from([0, 0, 0, 0]), // Aborted
+                      value: expect.any(Buffer),
+                      headers: {},
+                      isControlRecord: true,
+                    },
                   ],
                 },
               ],
             },
           ],
         })
+      })
+    })
 
-        await txn.abort()
+    test('returns transactional messages immediately for an isolation level of "read_uncommitted"', async () => {
+      const targetPartition = 0
+      const messages = generateMessages({ prefix: 'aborted', number: 3 }).map((m) => ({
+        ...m,
+        partition: targetPartition,
+      }))
 
-        // Although the messages are aborted, they will still be there in the log,
-        // so the offset will still increase
-        topics[0].partitions[0].fetchOffset = 3
+      const txn = await producer.transaction()
+      await txn.send({
+        topic: topicName,
+        messages,
+      })
 
-        // It appears there can be a delay between the EndTxn response
-        // and the control record appearing in the partition, likely because the
-        // transaction coordinator does not wait for the control record to
-        // be fully replicated. Retry since it should eventually appear.
-        // @see https://docs.google.com/document/d/11Jqy_GjUGtdXJK94XGsEIK7CP1SnQGdp2eF0wSw9ra8/edit#bookmark=id.3af5934pfogc
-        await retry(async () => {
-          fetchResponse = await broker.fetch({
-            maxWaitTime,
-            minBytes,
-            maxBytes,
-            topics,
-            isolationLevel: ISOLATION_LEVEL.READ_UNCOMMITTED,
-          })
-          expect(fetchResponse).toEqual({
-            clientSideThrottleTime: expect.optional(0),
-            throttleTime: 0,
-            errorCode: 0,
-            sessionId: 0,
-            responses: [
+      const topics = [
+        {
+          topic: topicName,
+          partitions: [
+            {
+              partition: targetPartition,
+              fetchOffset: 0,
+              maxBytes: maxBytesPerPartition,
+            },
+          ],
+        },
+      ]
+
+      let fetchResponse = await broker.fetch({
+        maxWaitTime,
+        minBytes,
+        maxBytes,
+        topics,
+        isolationLevel: ISOLATION_LEVEL.READ_UNCOMMITTED,
+      })
+      expect(fetchResponse).toEqual({
+        clientSideThrottleTime: expect.optional(0),
+        throttleTime: 0,
+        errorCode: 0,
+        sessionId: 0,
+        responses: [
+          {
+            topicName,
+            partitions: [
               {
-                topicName,
-                partitions: [
+                abortedTransactions: [], // None of these messages have been aborted yet
+                errorCode: 0,
+                highWatermark: '3', // Number of produced messages
+                // The end offset of a partition for a read_committed consumer would be the
+                // offset of the first message in the partition belonging to an open transaction.
+                //
+                // Note: In version < 2 this was '-1'
+                lastStableOffset: '0',
+                lastStartOffset: '0',
+                partition: 0,
+                preferredReadReplica: expect.optional(-1),
+                divergingEpoch: null,
+                currentLeader: null,
+                snapshotId: null,
+                messages: [
                   {
-                    abortedTransactions: [],
-                    errorCode: 0,
-                    highWatermark: '4',
-                    lastStableOffset: '4',
-                    lastStartOffset: '0',
-                    partition: 0,
-                    preferredReadReplica: expect.optional(-1),
-                    divergingEpoch: null,
-                    currentLeader: null,
-                    snapshotId: null,
-                    messages: [
-                      // Control record
-                      {
-                        magicByte: 2,
-                        attributes: 0,
-                        batchContext: expectedBatchContext({
-                          producerEpoch: expect.any(Number),
-                          producerId: expect.any(String),
-                          inTransaction: true,
-                          isControlBatch: true,
-                        }),
-                        offset: '3',
-                        timestamp: expect.any(String),
-                        key: Buffer.from([0, 0, 0, 0]), // Aborted
-                        value: expect.any(Buffer),
-                        headers: {},
-                        isControlRecord: true,
-                      },
-                    ],
+                    magicByte: 2,
+                    attributes: 0,
+                    batchContext: expectedBatchContext({
+                      producerEpoch: expect.any(Number),
+                      producerId: expect.any(String),
+                      inTransaction: true,
+                    }),
+                    offset: '0',
+                    timestamp: expect.any(String),
+                    headers: {},
+                    key: Buffer.from(messages[0].key),
+                    value: Buffer.from(messages[0].value),
+                    isControlRecord: false,
+                  },
+                  {
+                    magicByte: 2,
+                    attributes: 0,
+                    batchContext: expectedBatchContext({
+                      producerEpoch: expect.any(Number),
+                      producerId: expect.any(String),
+                      inTransaction: true,
+                    }),
+                    offset: '1',
+                    timestamp: expect.any(String),
+                    headers: {},
+                    key: Buffer.from(messages[1].key),
+                    value: Buffer.from(messages[1].value),
+                    isControlRecord: false,
+                  },
+                  {
+                    magicByte: 2,
+                    attributes: 0,
+                    batchContext: expectedBatchContext({
+                      producerEpoch: expect.any(Number),
+                      producerId: expect.any(String),
+                      inTransaction: true,
+                    }),
+                    offset: '2',
+                    timestamp: expect.any(String),
+                    headers: {},
+                    key: Buffer.from(messages[2].key),
+                    value: Buffer.from(messages[2].value),
+                    isControlRecord: false,
                   },
                 ],
               },
             ],
-          })
+          },
+        ],
+      })
+
+      await txn.abort()
+
+      // Although the messages are aborted, they will still be there in the log,
+      // so the offset will still increase
+      topics[0].partitions[0].fetchOffset = 3
+
+      // It appears there can be a delay between the EndTxn response
+      // and the control record appearing in the partition, likely because the
+      // transaction coordinator does not wait for the control record to
+      // be fully replicated. Retry since it should eventually appear.
+      // @see https://docs.google.com/document/d/11Jqy_GjUGtdXJK94XGsEIK7CP1SnQGdp2eF0wSw9ra8/edit#bookmark=id.3af5934pfogc
+      await retry(async () => {
+        fetchResponse = await broker.fetch({
+          maxWaitTime,
+          minBytes,
+          maxBytes,
+          topics,
+          isolationLevel: ISOLATION_LEVEL.READ_UNCOMMITTED,
         })
-      }
-    )
+        expect(fetchResponse).toEqual({
+          clientSideThrottleTime: expect.optional(0),
+          throttleTime: 0,
+          errorCode: 0,
+          sessionId: 0,
+          responses: [
+            {
+              topicName,
+              partitions: [
+                {
+                  abortedTransactions: [],
+                  errorCode: 0,
+                  highWatermark: '4',
+                  lastStableOffset: '4',
+                  lastStartOffset: '0',
+                  partition: 0,
+                  preferredReadReplica: expect.optional(-1),
+                  divergingEpoch: null,
+                  currentLeader: null,
+                  snapshotId: null,
+                  messages: [
+                    // Control record
+                    {
+                      magicByte: 2,
+                      attributes: 0,
+                      batchContext: expectedBatchContext({
+                        producerEpoch: expect.any(Number),
+                        producerId: expect.any(String),
+                        inTransaction: true,
+                        isControlBatch: true,
+                      }),
+                      offset: '3',
+                      timestamp: expect.any(String),
+                      key: Buffer.from([0, 0, 0, 0]), // Aborted
+                      value: expect.any(Buffer),
+                      headers: {},
+                      isControlRecord: true,
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        })
+      })
+    })
   })
 })

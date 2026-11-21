@@ -13,8 +13,11 @@ module.exports = {
    */
   JavaCompatiblePartitioner: DefaultPartitioner,
   /**
-   * KIP-794 uniform sticky partitioner, opt-in. Call it with its options to get a partitioner:
-   * `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384 })`.
+   * KIP-794 uniform sticky partitioner, the producer's default partitioner (adaptive, sticking for
+   * `batchSize` bytes). Call it with its options to get a partitioner; its own `adaptive` default
+   * is `false`. For the previous non-adaptive sticky behavior pass `createPartitioner:
+   * Partitioners.UniformStickyPartitioner({ stickyBytes: batchSize, adaptive: false })` with the
+   * producer's `batchSize` (16384 by default); KafkaJS 2.2.4's round-robin is `DefaultPartitioner`.
    */
   UniformStickyPartitioner,
 }

@@ -22,6 +22,7 @@ const localReasons = new Set([
   'The server final message reports an error',
   'Invalid server signature in server final message',
   'The server first message reports an error',
+  'The server answered the token with an error challenge',
   'Invalid server nonce, it does not start with the client nonce',
   'Invalid server nonce, it adds no server part',
   'Missing salt in the server first message',

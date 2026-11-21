@@ -761,6 +761,7 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.heartbeat).toHaveBeenCalledWith({
         interval: 500,
         guard: expect.any(Function),
+        onAccepted: expect.any(Function),
       })
     })
 
@@ -1175,7 +1176,7 @@ describe('Consumer > Runner', () => {
     it('expires a quiescence once even when the round reports its own join deadline later', async () => {
       jest.useFakeTimers()
       let now = 0
-      jest.spyOn(require('node:perf_hooks').performance, 'now').mockImplementation(() => now)
+      jest.spyOn(performance, 'now').mockImplementation(() => now)
       try {
         const lose = jest.fn()
         consumerGroup.ownership = { lose }
@@ -1214,7 +1215,7 @@ describe('Consumer > Runner', () => {
 
     it('settles on an early timer callback once the handlers are no longer busy', async () => {
       jest.useFakeTimers()
-      jest.spyOn(require('node:perf_hooks').performance, 'now').mockImplementation(() => 0)
+      jest.spyOn(performance, 'now').mockImplementation(() => 0)
       try {
         let busy = true
         const baseline = jest.getTimerCount()

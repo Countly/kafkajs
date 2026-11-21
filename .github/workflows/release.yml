@@ -1,5 +1,7 @@
-# Publishes a pushed v* tag to npm. verify checks the tag and the CI evidence for its exact commit, pack
-# builds the tarball, publish waits for approval of the npm-release environment and publishes that tarball.
+# Publishes a pushed v* tag to npm. verify checks the tag, the CI evidence for its exact commit and the
+# OTel manifest, pack builds the main tarball, publish waits for approval of the npm-release environment
+# and publishes that tarball. pack-otel packs, guards and smokes the OTel tarball against the exact main
+# tarball on every tag; publish-otel publishes it only on the final v3.0.0 tag.
 # npm registers this file name as the trusted publisher: do not rename it.
 name: Release
 on:
@@ -16,6 +18,7 @@ jobs:
       version: ${{ steps.verify.outputs.version }}
       dist-tag: ${{ steps.verify.outputs.dist-tag }}
       sha: ${{ steps.verify.outputs.sha }}
+      otel-version: ${{ steps.verify.outputs.otel-version }}
     steps:
       # Full history: the verifier needs origin/master to see whether the tagged commit is on it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,6 +39,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      sri: ${{ steps.pack.outputs.sri }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,15 +55,74 @@ jobs:
           VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
       - run: npm ci --ignore-scripts
       - name: Pack and check the tarball
+        id: pack
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/pack"
           npm pack --pack-destination "$RUNNER_TEMP/pack"
           ./scripts/assertCleanTarball.sh "$RUNNER_TEMP"/pack/*.tgz
+          sri="$(./scripts/sri.sh "$RUNNER_TEMP"/pack/*.tgz)"
+          echo "sri=$sri" >> "$GITHUB_OUTPUT"
+          echo "- main tarball integrity: $sri" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-tarball
           path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+  # Runs on every tag, so an rc run leaves the otel-tarball artifact the Countly canary installs.
+  pack-otel:
+    needs: [verify, pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check the checkout is the verified commit
+        run: test "$(git rev-parse HEAD)" = "$VERIFIED_SHA"
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+      - run: npm ci --ignore-scripts
+        working-directory: otel
+      # The exact main tarball pack built; it is smoked with the OTel tarball and never repacked.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-tarball
+          path: ${{ runner.temp }}/main
+      - name: Pack, guard and smoke the OTel tarball
+        env:
+          MAIN_SRI: ${{ needs.pack.outputs.sri }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mains=("$RUNNER_TEMP"/main/*.tgz)
+          if [ "${#mains[@]}" -ne 1 ]; then
+            echo "expected exactly one main tarball in release-tarball, found ${#mains[@]}" >&2
+            exit 1
+          fi
+          main=${mains[0]}
+          mkdir -p "$RUNNER_TEMP/otel"
+          otel="$RUNNER_TEMP/otel/$(cd otel && npm pack --silent --pack-destination "$RUNNER_TEMP/otel")"
+          ./scripts/assertCleanOtelTarball.sh "$otel"
+          ./scripts/otelPackSmoke.sh "$otel" "$main"
+          node scripts/release/verify.js --post-pack "$main" "$otel"
+          sri="$(./scripts/sri.sh "$otel")"
+          {
+            echo "### OTel tarball"
+            echo
+            echo "- file: ${otel##*/}"
+            echo "- integrity: $sri"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: otel-tarball
+          path: ${{ runner.temp }}/otel/*.tgz
           if-no-files-found: error
   publish:
     needs: [verify, pack]
@@ -119,3 +183,76 @@ jobs:
           FILE: ${{ steps.tarball.outputs.file }}
           DIST_TAG: ${{ needs.verify.outputs.dist-tag }}
         run: npm publish "./$FILE" --access public --tag "$DIST_TAG" --provenance --ignore-scripts --registry https://registry.npmjs.org
+  # Only the final tag publishes OTel. An existing version stops the job; the release owner completes
+  # the integrity and verified-provenance readback in RELEASING.md. No automatic recovery skip is used.
+  publish-otel:
+    needs: [verify, publish, pack-otel]
+    if: github.ref == 'refs/tags/v3.0.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: otel-tarball
+          path: otel-release
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check OTel tarball, npm and registry
+        id: tarball
+        working-directory: otel-release
+        env:
+          VERSION: ${{ needs.verify.outputs.otel-version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          name=@countly/opentelemetry-instrumentation-kafkajs
+          files=(*.tgz)
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "expected exactly one tarball in the artifact, found ${#files[@]}" >&2
+            exit 1
+          fi
+          file=${files[0]}
+          packed_name=$(tar -xOf "$file" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")
+          version=$(tar -xOf "$file" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          if [ "$packed_name" != "$name" ] || [ "$version" != "$VERSION" ]; then
+            echo "tarball holds $packed_name@$version, expected $name@$VERSION" >&2
+            exit 1
+          fi
+          npm_version=$(npm --version)
+          IFS=. read -r major minor patch <<< "${npm_version%%-*}"
+          if (( major < 11 || (major == 11 && (minor < 5 || (minor == 5 && patch < 1))) )); then
+            echo "npm $npm_version is older than 11.5.1, which trusted publishing needs" >&2
+            exit 1
+          fi
+          digest="sha512-$(openssl dgst -sha512 -binary "$file" | base64 | tr -d '\n')"
+          {
+            echo "### OTel release tarball"
+            echo
+            echo "- file: $file"
+            echo "- integrity: $digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+          id=${name/\//%2f}
+          status=$(curl -sS -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/$id/$version")
+          case "$status" in
+            404) ;;
+            200)
+              echo "::error::$name@$version already exists on npm. Automatic recovery is disabled. Stop and complete the integrity and verified-provenance readback in RELEASING.md; do not publish this version again." >&2
+              exit 1
+              ;;
+            *)
+              echo "::error::The npm registry answered $status for $name@$version; publication is blocked." >&2
+              exit 1
+              ;;
+          esac
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+      - name: Publish OTel
+        working-directory: otel-release
+        env:
+          FILE: ${{ steps.tarball.outputs.file }}
+        run: npm publish "./$FILE" --access public --tag latest --provenance --ignore-scripts --registry https://registry.npmjs.org

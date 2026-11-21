@@ -1,0 +1,12 @@
+--- a/src/consumer/committedOffsets.js
++++ b/src/consumer/committedOffsets.js
+@@ -54,6 +54,9 @@
+           ...(operation && { fence: operation }),
+         })
+         operation?.check()
++        if (operation && operation.deadlineAt !== Infinity) {
++          operation.deadlineAt = operation.now() + this.retryOptions.maxTotalTime
++        }
+         return await coordinator.offsetFetch({
+           groupId: this.groupId,
+           topics,

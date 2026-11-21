@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -4084,7 +4084,7 @@
+     let attempt = this.leaderlessRefresh
+     if (!attempt) {
+       const now = performance.now()
+-      if (now - this.leaderlessRefreshAt < this.leaderlessRefreshInterval) return
++      if (false) return
+       this.leaderlessRefreshAt = now
+       attempt = { promise: null }
+       attempt.promise = this.refreshCluster({ fence: run.fence })

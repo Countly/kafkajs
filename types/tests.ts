@@ -490,6 +490,23 @@ consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   void isStatic
   void generationId
 })
+consumer.on(consumer.events.TOPIC_METADATA_STATUS, e => {
+  const topic: string = e.payload.topic
+  const groupId: string | null = e.payload.groupId
+  if (e.payload.status === 'unavailable') {
+    const code: 3 = e.payload.code
+    const type: 'UNKNOWN_TOPIC_OR_PARTITION' = e.payload.type
+    void code
+    void type
+  } else {
+    const code: 0 = e.payload.code
+    const type: null = e.payload.type
+    void code
+    void type
+  }
+  void topic
+  void groupId
+})
 // The option and the deprecated alias both compile.
 kafka.consumer({ groupId: 'g', maxPollInterval: 300000 })
 kafka.consumer({ groupId: 'g', rebalanceTimeout: 60000 })
@@ -753,16 +770,16 @@ const commitError = new KafkaJSCommitFailedError('x', { reason: 'membership-lost
 const commitIsNonRetriable: KafkaJSNonRetriableError = commitError
 const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment' =
   commitError.reason
-const commitCause: Error = commitError.cause
+const commitCause: Error | undefined = commitError.cause
 const commitType: string | undefined = commitError.type
 const commitCode: number | undefined = commitError.code
-// @ts-expect-error `cause` is required: a refused commit always names the loss
-new KafkaJSCommitFailedError('x', { reason: 'membership-lost' })
+const staleCommit = new KafkaJSCommitFailedError('x', { reason: 'stale-assignment' })
+const staleCause: Error | undefined = staleCommit.cause
 // @ts-expect-error not a reason
 new KafkaJSInvalidFrameError('x', { reason: 'too-big' })
 void [frameIsConnectionError, frameReason, frameSize, corruptIsNonRetriable, corruptReason]
 void [boundNext, boundCodec, boundLimit]
-void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode]
+void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode, staleCause]
 
 // The error classes of a closed connection, a join that needs its member id, a broken invariant,
 // an undecodable number, a refused topic creation and a consumer with no broker to fetch from.
@@ -1614,6 +1631,7 @@ const legacyCallback: kafkajs.SASLOptions = {
   oauthBearerProvider: async () => ({ value: 'token', extensions: { trace: 'one' } }),
 }
 const helperCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider }
+const authzCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider, authorizationIdentity: 'principal' }
 // @ts-expect-error secret and assertion are exclusive
 oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientSecret: 'secret', clientAssertion: signedAssertion })
 // @ts-expect-error one credential form is required
@@ -2011,3 +2029,13 @@ telemetryShare.registerMetricForSubscription({ name: 'com.example.share', type: 
 // @ts-expect-error the ID getter does not accept signal strings
 telemetryShare.clientInstanceId('SIGTERM')
 void [telemetryShareSurface, telemetryShareId, telemetryShareDisconnect]
+
+import { KafkaJSRebalanceNotConvergedError as NotConverged } from './index'
+{
+  const notConverged = new NotConverged('cooperative rebalance did not converge in 20 rounds')
+  const asBase: KafkaJSError = notConverged
+  const retriable: boolean = notConverged.retriable
+  void asBase
+  void retriable
+  new NotConverged('x', { cause: new Error('y') })
+}

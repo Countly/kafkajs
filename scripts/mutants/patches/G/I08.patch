@@ -1,0 +1,10 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1072,7 +1072,6 @@
+       let group = null
+       // Taken before the first await, so a crash restart cannot replay a queued seek.
+       const seeks = [...queuedSeeks.values()]
+-      queuedSeeks.clear()
+ 
+       group = consumerGroup = new ConsumerGroup({
+         logger: rootLogger,

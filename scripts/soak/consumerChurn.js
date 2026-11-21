@@ -4,7 +4,9 @@
  * The consumer-churn profile: a verifier that works only on a journal of public observations, the
  * public probe that counts what the clients leave behind, and the run that joins them. Nothing
  * here imports the client's sources or reads its private state, so a client defect cannot hide in
- * its own bookkeeping.
+ * its own bookkeeping. The one exception is outside this file: the run receives counts of a group's
+ * private offset state (`offset-state` rows), which `offsetStateViolations` bounds by the live
+ * topics the workload itself created; they never reach the delivery oracle.
  */
 const fs = require('node:fs')
 const { ENDPOINT_BYTES, SLOPE_BYTES_PER_MINUTE, median, slope } = require('./bounds')
@@ -992,6 +994,149 @@ const countByType = (types) => {
 }
 
 /**
+ * The regex workload's shape: one control topic beside at most `window` rotating topics, and a
+ * periodic offset-state sample after every `sampleEvery` rotating deletions.
+ */
+const REGEX_ROTATION = Object.freeze({
+  controlPartitions: 6,
+  partitions: 3,
+  window: 3,
+  sampleEvery: 5,
+})
+
+/**
+ * Bounds the private offset state each regex pass sampled while its members ran. Every expected
+ * group has one final sample at the pass's deletion count and one periodic sample at each multiple
+ * of `sampleEvery` up to it; every sample settled, read present stores, keeps no cache key that is
+ * neither a live name nor still claimed (named in the failure), and stays within the live topics
+ * (stamp topics) and live partitions (stamp cells). A sample whose group still claimed a deleted
+ * name at the cutoff fails as a subscription not applied for the names still subscribed and as
+ * claims not released for the rest, not on its counts; its unclaimed cache keys still fail by
+ * name. The expected groups come
+ * from the plan, the deletion counts from the workload's `regex-rotation` records and the live
+ * denominators must fit `shape`, never taken from the rows alone.
+ * @param {object[]} rows the run's `offset-state` rows
+ * @param {object} expected
+ * @param {string[]} expected.passes the warm-up passes and phases that ran the regex workload
+ * @param {(phase: string) => string[]} expected.groupsOf the group ids a pass's members joined
+ * @param {(phase: string) => number|undefined} expected.deletionsOf the rotating topics a pass
+ *   deleted while its members ran; undefined when the pass recorded none
+ * @param {typeof REGEX_ROTATION} [expected.shape=REGEX_ROTATION]
+ * @returns {string[]} one violation per defect; empty when every bound holds
+ */
+const offsetStateViolations = (rows, { passes, groupsOf, deletionsOf, shape = REGEX_ROTATION }) => {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0
+  const violations = []
+  const expected = new Map()
+  for (const phase of passes) {
+    const deletions = deletionsOf(phase)
+    if (!count(deletions)) violations.push(`regex pass ${phase}: no rotation record`)
+    for (const group of groupsOf(phase))
+      expected.set(`${phase}|${group}`, {
+        phase,
+        group,
+        deletions: count(deletions) ? deletions : undefined,
+      })
+  }
+  const seen = new Set()
+  const fits = ({ checkpoint }, live) =>
+    count(live?.topics) &&
+    live.topics >= 1 &&
+    live.topics <= 1 + shape.window &&
+    (checkpoint === 'final' || live.topics === 1 + shape.window) &&
+    live.partitions === shape.controlPartitions + shape.partitions * (live.topics - 1)
+  for (const row of rows) {
+    const where = `offset state of ${row?.group} in ${row?.phase} (${row?.checkpoint})`
+    const key = `${row?.phase}|${row?.group}`
+    const pass = expected.get(key)
+    if (!pass) {
+      violations.push(`${where}: unexpected group or phase`)
+      continue
+    }
+    if (row.checkpoint !== 'periodic' && row.checkpoint !== 'final') {
+      violations.push(`${where}: unknown checkpoint`)
+      continue
+    }
+    const at = row.deletions
+    const due =
+      row.checkpoint === 'final'
+        ? pass.deletions === undefined || at === pass.deletions
+        : at > 0 &&
+          at % shape.sampleEvery === 0 &&
+          (pass.deletions === undefined || at <= pass.deletions)
+    if (!count(at) || !due) {
+      violations.push(`${where}: unexpected checkpoint at ${at} deletions`)
+      continue
+    }
+    const id = row.checkpoint === 'final' ? `${key}|final` : `${key}|${at}`
+    if (seen.has(id)) {
+      violations.push(`${where}: duplicate sample`)
+      continue
+    }
+    seen.add(id)
+    const { offsetState: state, live } = row
+    const outstanding = row.quiescent !== true && state?.unapplied?.length > 0
+    if (outstanding) {
+      const within = (row.waitedMs / 1000).toFixed(1)
+      const subscribed = state.unapplied.filter((topic) => state.subscribed?.includes(topic))
+      const held = state.unapplied.filter((topic) => !subscribed.includes(topic))
+      if (subscribed.length > 0)
+        violations.push(
+          `${where}: subscription not applied within ${within} s: still subscribes ${subscribed.join(', ')}`
+        )
+      if (held.length > 0)
+        violations.push(
+          `${where}: claims not released within ${within} s: still claims ${held.join(', ')}`
+        )
+    } else if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
+    if (state?.present !== true) {
+      violations.push(`${where}: stores absent`)
+      continue
+    }
+    if (!count(state.topics) || !count(state.cells) || !count(state.cache)) {
+      violations.push(`${where}: malformed counts`)
+      continue
+    }
+    if (!fits(row, live)) {
+      violations.push(`${where}: live denominators do not fit the workload`)
+      continue
+    }
+    const names = (list, size) =>
+      Array.isArray(list) && (size === undefined || list.length === size)
+    if (
+      !names(live.names, live.topics) ||
+      !names(state.cacheKeys, state.cache) ||
+      !names(state.claimed) ||
+      !names(state.subscribed)
+    ) {
+      violations.push(`${where}: malformed names`)
+      continue
+    }
+    const stale = state.cacheKeys.filter(
+      (topic) => !live.names.includes(topic) && !state.claimed.includes(topic)
+    )
+    if (stale.length > 0)
+      violations.push(
+        `${where}: cache keys outside the live and claimed topics: ${stale.join(', ')}`
+      )
+    if (outstanding) continue
+    if (state.topics > live.topics)
+      violations.push(`${where}: ${state.topics} stamp topics for ${live.topics} live topics`)
+    if (state.cells > live.partitions)
+      violations.push(`${where}: ${state.cells} stamp cells for ${live.partitions} live partitions`)
+  }
+  for (const [key, { phase, group, deletions }] of expected) {
+    const missing = `offset state of ${group} in ${phase}`
+    for (let at = shape.sampleEvery; at <= (deletions ?? 0); at += shape.sampleEvery) {
+      if (!seen.has(`${key}|${at}`))
+        violations.push(`${missing}: no periodic sample at ${at} deletions`)
+    }
+    if (!seen.has(`${key}|final`)) violations.push(`${missing}: no final sample`)
+  }
+  return violations
+}
+
+/**
  * Holds the records each phase acknowledged to the offered rate over the phase's offering window, the
  * five planned minutes: the drain, the log read and the deletion that follow it are not offering time.
  * @param {Map<string, { acked?: number, measuredMs?: number }>} stats what each phase recorded
@@ -1290,6 +1435,7 @@ module.exports = {
   GapSampler,
   OfferScheduler,
   PublicConsumerProbe,
+  REGEX_ROTATION,
   YIELD_EVERY,
   acknowledgedViolations,
   consumerChurnPlan,
@@ -1297,6 +1443,7 @@ module.exports = {
   countByType,
   interningControl,
   judgeQuietHeap,
+  offsetStateViolations,
   publicSocketFactory,
   quietViolations,
   runControls,

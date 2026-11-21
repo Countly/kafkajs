@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -535,7 +535,6 @@
+     if (refused) throw refused
+     const groupTopics = [
+       ...new Set([
+-        ...topicsSubscribed,
+         ...members.flatMap(
+           ({ memberMetadata }) => this.decodeSubscription(memberMetadata)?.topics ?? []
+         ),

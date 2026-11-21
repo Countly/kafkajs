@@ -1,0 +1,11 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -179,7 +179,7 @@
+         continue
+       const topicId =
+         row.topicId && row.topicId !== '00000000-0000-0000-0000-000000000000' ? row.topicId : null
+-      if (this.initialized && (topicId === null || this.observed.get(row.topic) !== topicId)) {
++      if (topicId === null || this.observed.get(row.topic) !== topicId) {
+         resets.push({ topic: row.topic, topicId })
+       }
+       next.set(row.topic, topicId)

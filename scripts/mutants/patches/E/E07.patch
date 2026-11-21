@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetReset.js
++++ b/src/consumer/offsetReset.js
+@@ -12,7 +12,7 @@
+  * @throws {KafkaJSNonRetriableError} invalid grammar, precision or range
+  */
+ function durationMilliseconds(text, original) {
+-  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)(?:\.(\d{1,9}))?S)?)?$/i.exec(text)
++  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)(?:\.(\d{1,10}))?S)?)?$/i.exec(text)
+   if (!m || !m.slice(1).some((v) => v !== undefined) || /T$/i.test(text)) throw invalid(original)
+   const units = [86400000000000n, 3600000000000n, 60000000000n, 1000000000n]
+   const max = BigInt(Number.MAX_SAFE_INTEGER) * 1000000n

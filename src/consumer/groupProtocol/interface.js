@@ -51,7 +51,9 @@ const COOPERATIVE = 'cooperative'
  * @property {(deps: { rebalanceCoordinator: Object, heartbeatManager: Object,
  *   commitBeforeRelease?: Function }) => void} attach
  *   Late-bound collaborators, forwarded by `ConsumerGroup#attach`.
- * @property {(options: { interval: number }) => Promise<void>} heartbeat
+ * @property {(options: { interval: number }) => Promise<boolean|void>} heartbeat
+ *   classic and manual resolve void; the consumer protocol resolves true only when a heartbeat was
+ *   sent and answered with success for the membership the member still holds
  * @property {() => number} heartbeatInterval how long until the next heartbeat should go out; the
  *   heartbeat manager reads this and nothing else when it schedules
  * @property {() => boolean} needsReconciliation whether the coordinator wants something this member
@@ -77,8 +79,8 @@ const COOPERATIVE = 'cooperative'
  *   classic protocol on its next join
  */
 
-/** Precedence: the highest id in the intersection wins, matching the Java client. */
-const PROTOCOL_IDS = { [EAGER]: 0, [COOPERATIVE]: 1 }
+/** Every rebalance protocol, lowest id first: the last one a set shares wins, as in the Java client. */
+const BY_PRECEDENCE = Object.freeze([EAGER, COOPERATIVE])
 
 /**
  * Chooses the rebalance protocol for a set of assigners, once, at consumer construction.
@@ -109,7 +111,7 @@ const selectRebalanceProtocol = (assigners) => {
 
   const intersection = supported.reduce(
     (shared, { protocols }) => shared.filter((protocol) => protocols.includes(protocol)),
-    [EAGER, COOPERATIVE]
+    BY_PRECEDENCE
   )
 
   if (intersection.length === 0) {
@@ -122,9 +124,7 @@ const selectRebalanceProtocol = (assigners) => {
     )
   }
 
-  return intersection.reduce((best, protocol) =>
-    PROTOCOL_IDS[protocol] > PROTOCOL_IDS[best] ? protocol : best
-  )
+  return intersection[intersection.length - 1]
 }
 
 const callDeadlines = new WeakSet()

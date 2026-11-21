@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3995,7 +3995,7 @@
+         throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
+       }
+ 
+-      if (metadata.leader < 0) {
++      if (metadata.leader <= 0) {
+         if (routing) routing.leaderless = true
+         return result
+       }

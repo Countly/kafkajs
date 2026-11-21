@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -276,7 +276,7 @@
+    * @throws Never for operational close failures.
+    */
+   closeAll({ deadlineAt, guard = () => null } = {}) {
+-    if (this.closing) return this.closing
++    if (this.closing) return Promise.resolve()
+     const deadline = Number.isFinite(deadlineAt)
+       ? deadlineAt
+       : performance.now() + Math.min(this.requestTimeout, 2000)

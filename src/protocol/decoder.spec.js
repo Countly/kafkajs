@@ -1,5 +1,5 @@
 const Decoder = require('./decoder')
-const { KafkaJSPartialMessageError } = require('../errors')
+const { KafkaJSInvalidVarIntError, KafkaJSPartialMessageError } = require('../errors')
 
 describe('Protocol > Decoder', () => {
   describe('bounds checking on VarInt/UVarInt-prefixed readers', () => {
@@ -90,6 +90,49 @@ describe('Protocol > Decoder', () => {
       )
 
       expect(() => Decoder.requireArray(array, 'Message.Field')).toThrow(KafkaJSPartialMessageError)
+    })
+  })
+
+  describe('signed varint', () => {
+    const read = (bytes) => new Decoder(Buffer.from(bytes)).readVarInt()
+
+    it('rejects a signed varint longer than 5 bytes', () => {
+      // Without a cap the shift wraps: the first input used to decode to 512
+      for (const bytes of [
+        [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01],
+        [0xff, 0xff, 0xff, 0xff, 0xff, 0x0f],
+        [0x80, 0x80, 0x80, 0x80, 0x80],
+      ]) {
+        expect(() => read(bytes)).toThrow(KafkaJSInvalidVarIntError)
+        expect(() => read(bytes)).toThrow('Invalid VarInt, must contain 5 bytes or less')
+      }
+    })
+
+    it('decodes the INT32 minimum and maximum', () => {
+      const minimum = new Decoder(Buffer.from([0xff, 0xff, 0xff, 0xff, 0x0f]))
+      expect(minimum.readVarInt()).toBe(-2147483648)
+      expect(minimum.offset).toBe(5)
+
+      const maximum = new Decoder(Buffer.from([0xfe, 0xff, 0xff, 0xff, 0x0f]))
+      expect(maximum.readVarInt()).toBe(2147483647)
+      expect(maximum.offset).toBe(5)
+    })
+
+    it('rejects a truncated signed varint', () => {
+      for (const bytes of [[], [0x80, 0x80], [0xff, 0xff, 0xff, 0xff]]) {
+        expect(() => read(bytes)).toThrow(KafkaJSPartialMessageError)
+      }
+    })
+  })
+
+  describe('readInt64', () => {
+    const read = (bytes) => new Decoder(Buffer.from(bytes)).readInt64()
+
+    it('decodes -1, both extremes and a set top byte from the sign byte up', () => {
+      expect(read([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])).toBe(-1n)
+      expect(read([0x80, 0, 0, 0, 0, 0, 0, 0])).toBe(-(2n ** 63n))
+      expect(read([0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])).toBe(2n ** 63n - 1n)
+      expect(read([0x01, 0, 0, 0, 0, 0, 0, 0])).toBe(2n ** 56n)
     })
   })
 

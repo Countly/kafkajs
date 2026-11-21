@@ -44,6 +44,7 @@ class AdminLifecycle {
     this.active = new Set()
     this.closing = null
     this.closed = false
+    this.closeRequests = 0
     this.episode = null
     this.generation = this.newGeneration()
   }
@@ -98,12 +99,25 @@ class AdminLifecycle {
 
   /**
    * Joins the full cleanup before admitting an explicit connection on a replacement lifecycle.
+   * A `disconnect()` called while it waits was asked after it, so it is refused instead of
+   * reopening the admin that call closed.
    * @param {(generation: Generation) => Promise<void>} work fenced cluster connect and event
    * @returns {Promise<void>}
-   * @throws {Error} original setup failure or captured lifecycle refusal
+   * @throws {KafkaJSNonRetriableError} when a `disconnect()` was called while it waited for a
+   *   close; the admin stays disconnected and no `CONNECT` is emitted
+   * @throws {Error} original setup failure, captured lifecycle refusal, or the awaited close's
+   *   own failure
    */
   async connect(work) {
-    while (this.closing) await this.closing
+    if (this.closing) {
+      const asked = this.closeRequests
+      await this.closing
+      if (this.closeRequests !== asked) {
+        throw new KafkaJSNonRetriableError(
+          'The admin was disconnected while connect() waited for an earlier close; call connect() again to resume'
+        )
+      }
+    }
     if (this.closed) {
       this.generation = this.newGeneration()
       this.closed = false
@@ -114,7 +128,8 @@ class AdminLifecycle {
   /**
    * Validates before mutation and captures the first valid call's single absolute deadline.
    * Repeated calls share the same Promise. Natural cleanup retains its original rejection;
-   * bounded cleanup errors are logged as in producer close.
+   * bounded cleanup errors are logged as in producer close. Each valid call, joined or not,
+   * refuses a `connect()` still waiting for a close.
    * @param {{ timeout?: number }|unknown} [options] omitted timeout drains admitted work
    * @returns {Promise<void>} shared episode, or immediate success after completed cleanup
    * @throws {KafkaJSInvalidConfigurationError} as a rejection for invalid object options
@@ -128,6 +143,7 @@ class AdminLifecycle {
     } catch (error) {
       return Promise.reject(error)
     }
+    this.closeRequests++
     if (this.closing) return this.closing
     if (this.closed) return Promise.resolve()
     this.cluster.cancelPendingBootstrapResolution?.()
@@ -163,7 +179,7 @@ class AdminLifecycle {
       episode.forced = true
       generation.close(
         new KafkaJSNonRetriableError(
-          'The admin was closed; outcome is unknown; a mutation may have been applied'
+          'The admin was closed; outcome is unknown; a mutation, if any, may have been applied'
         )
       )
       disconnectCluster().then(forcedDone)

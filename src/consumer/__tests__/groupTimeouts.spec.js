@@ -12,7 +12,7 @@ describe('Consumer > group timeouts', () => {
   describe('the alias table', () => {
     const ROWS = [
       // [maxPollInterval, rebalanceTimeout, wire, joinGroupReq, syncGroupReq, deadline, warns]
-      [undefined, undefined, 300000, 305000, 65000, 300000, false],
+      [undefined, undefined, 300000, 305000, 305000, 300000, false],
       [undefined, 20000, 20000, 25000, 25000, 300000, true],
       [undefined, 0, 0, 50000, 50000, 300000, true],
       [30000, undefined, 30000, 35000, 35000, 30000, false],
@@ -33,6 +33,37 @@ describe('Consumer > group timeouts', () => {
         expect(warn.mock.calls.length > 0).toBe(warns)
       }
     )
+
+    it('the logged syncGroupTimeout equals the codec value', () => {
+      const { requests, lookup } = require('../../protocol/requests')
+      const apiKeys = require('../../protocol/requests/apiKeys')
+      const codecTimeout = ({ rebalanceTimeout, sessionTimeout }) =>
+        lookup({ [apiKeys.SyncGroup]: { minVersion: 0, maxVersion: 5 } })(
+          apiKeys.SyncGroup,
+          requests.SyncGroup
+        )({
+          groupId: 'g',
+          generationId: 1,
+          memberId: 'm',
+          groupAssignment: [],
+          rebalanceTimeout,
+          sessionTimeout,
+        }).requestTimeout
+
+      const cases = [
+        [{}, 305000],
+        [{ maxPollInterval: 120000 }, 125000],
+        [{ maxPollInterval: 30000 }, 35000],
+        [{ rebalanceTimeout: 0, sessionTimeout: 30000 }, 35000],
+        [{ maxPollInterval: 2147483647 }, 2147488647],
+        [{ rebalanceTimeout: Number.MAX_SAFE_INTEGER }, Number.MAX_SAFE_INTEGER],
+      ]
+      for (const [options, expected] of cases) {
+        const { resolved } = resolve(options)
+        expect(resolved.syncGroupTimeout).toEqual(expected)
+        expect(codecTimeout(resolved)).toEqual(expected)
+      }
+    })
 
     it('names both values and the winner when they disagree', () => {
       const { warn } = resolve({ maxPollInterval: 45000, rebalanceTimeout: 20000 })
@@ -84,6 +115,46 @@ describe('Consumer > group timeouts', () => {
 
       expect(resolveWith).toThrow(KafkaJSNonRetriableError)
       expect(resolveWith).toThrow(`got ${shown}`)
+    })
+
+    it('rejects maxPollInterval 2147483648', () => {
+      const resolveWith = () =>
+        resolveGroupTimeouts({ logger: newLogger(), maxPollInterval: 2147483648 })
+
+      expect(resolveWith).toThrow(KafkaJSNonRetriableError)
+      expect(resolveWith).toThrow(
+        'Consumer maxPollInterval must be an integer from 1 to 2147483647, got 2147483648'
+      )
+    })
+
+    it('rejects maxPollInterval Number.MAX_SAFE_INTEGER', () => {
+      const resolveWith = () =>
+        resolveGroupTimeouts({ logger: newLogger(), maxPollInterval: Number.MAX_SAFE_INTEGER })
+
+      expect(resolveWith).toThrow(KafkaJSNonRetriableError)
+      expect(resolveWith).toThrow(
+        `Consumer maxPollInterval must be an integer from 1 to 2147483647, got ${Number.MAX_SAFE_INTEGER}`
+      )
+    })
+
+    it('accepts maxPollInterval 2147483647', () => {
+      const { resolved } = resolve({ maxPollInterval: 2147483647 })
+
+      expect(resolved.rebalanceTimeout).toEqual(2147483647)
+      expect(resolved.pollDeadline).toEqual(2147483647)
+      expect(resolved.syncGroupTimeout).toEqual(2147488647)
+      expect(Number.isSafeInteger(resolved.syncGroupTimeout)).toBe(true)
+    })
+
+    it('accepts maxPollInterval 1 as both the wire rebalance timeout and the poll deadline', () => {
+      const resolveWith = () => resolve({ maxPollInterval: 1 }).resolved
+
+      expect(resolveWith).not.toThrow()
+      expect(resolveWith()).toMatchObject({
+        rebalanceTimeout: 1,
+        pollDeadline: 1,
+        syncGroupTimeout: 5001,
+      })
     })
 
     it.each([0, 1.5])('grandfathers a rebalanceTimeout of %p', (value) => {

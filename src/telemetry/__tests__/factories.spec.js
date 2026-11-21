@@ -1004,7 +1004,8 @@ describe('owner lifecycle joins', () => {
       const cluster = bind.mock.calls.at(-1)[0]
       const encode = held()
       let building = false
-      let clock = owner.machine.clock.now()
+      // Just below 2^14 ms, where (clock + 1000) - clock rounds above 1000.
+      let clock = 16383.101
       owner.machine.clock = { ...owner.machine.clock, now: () => clock }
       let build
       try {
@@ -1026,7 +1027,7 @@ describe('owner lifecycle joins', () => {
         if (timeout > 0) {
           await until(() => building)
           const episode = owner.machine.closing
-          expect(episode.deadline - clock).toBeLessThanOrEqual(Math.min(1000, timeout))
+          expect(episode.deadline).toBeLessThanOrEqual(clock + Math.min(1000, timeout))
           clock = episode.deadline
         }
         encode.release()

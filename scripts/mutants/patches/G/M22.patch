@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -992,7 +992,7 @@
+    */
+   ridesOutages() {
+     const kind = this.consumerGroup.kind || 'classic'
+-    return kind === 'classic' || kind === 'consumer'
++    return kind === 'classic' || kind === 'consumer' || kind === 'manual'
+   }
+ 
+   /**

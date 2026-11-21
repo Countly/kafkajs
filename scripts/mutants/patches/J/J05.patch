@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -4087,7 +4087,7 @@
+       if (now - this.leaderlessRefreshAt < this.leaderlessRefreshInterval) return
+       this.leaderlessRefreshAt = now
+       attempt = { promise: null }
+-      attempt.promise = this.refreshCluster({ fence: run.fence })
++      attempt.promise = Promise.resolve()
+         .catch((error) => {
+           if (!run.fence.closed) {
+             this.logger.debug('Metadata refresh for unavailable leaders failed', {

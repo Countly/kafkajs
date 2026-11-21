@@ -8,6 +8,9 @@ const {
   fetchResponse,
 } = require('./fixtures/fetchHarness')
 const { mulberry32 } = require('../../../testHelpers/fuzz')
+const ConsumerGroup = require('../consumerGroup')
+const SubscriptionState = require('../subscriptionState')
+const { KafkaJSError } = require('../../errors')
 
 /** Hand-built magic 2 batch at offset 0, one record `A`, correct CRC32C. */
 const FIRST = Buffer.from(
@@ -284,4 +287,412 @@ describe('decoder limits of concurrent consumers', () => {
       }
     }
   )
+})
+
+/**
+ * The linear-search routing this client shipped before, kept verbatim as the oracle.
+ * @this {ConsumerGroup}
+ * @param {string} topic
+ * @param {Array<number|string>} partitions
+ * @param {{expiresAt?: number, leaderless?: boolean}} [routing]
+ * @returns {{[nodeId: number]: number[]}}
+ */
+function oracleReadReplicas(topic, partitions, routing) {
+  const partitionMetadata = this.cluster.findTopicPartitionMetadata(topic)
+  const preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topic]
+  return partitions.reduce((result, id) => {
+    const partitionId = parseInt(id, 10)
+    const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
+    if (!metadata) {
+      return result
+    }
+    if (metadata.leader == null) {
+      throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
+    }
+    if (metadata.leader < 0) {
+      if (routing) routing.leaderless = true
+      return result
+    }
+    let nodeId = metadata.leader
+    if (preferredReadReplicas) {
+      const { nodeId: preferredReadReplica, expireAt } = preferredReadReplicas[partitionId] || {}
+      if (Date.now() >= expireAt) {
+        this.logger.debug('Preferred read replica information has expired, using leader', {
+          topic,
+          partitionId,
+          groupId: this.groupId,
+          memberId: this.memberId,
+          preferredReadReplica,
+          leader: metadata.leader,
+        })
+        delete preferredReadReplicas[partitionId]
+        this.routingChanged()
+      } else if (preferredReadReplica != null) {
+        const offlineReplicas = metadata.offlineReplicas
+        if (Array.isArray(offlineReplicas) && offlineReplicas.includes(preferredReadReplica)) {
+          this.logger.debug('Preferred read replica is offline, using leader', {
+            topic,
+            partitionId,
+            groupId: this.groupId,
+            memberId: this.memberId,
+            preferredReadReplica,
+            leader: metadata.leader,
+          })
+        } else {
+          nodeId = preferredReadReplica
+          if (routing && expireAt < routing.expiresAt) routing.expiresAt = expireAt
+        }
+      }
+    }
+    const current = result[nodeId] || []
+    return { ...result, [nodeId]: [...current, partitionId] }
+  }, {})
+}
+
+/**
+ * The request builder this client shipped before, with its whole-assignment active set, kept
+ * verbatim as the oracle.
+ * @this {ConsumerGroup}
+ * @param {{topic: string, partitions: number[]}[]} topicPartitions
+ * @returns {object[]}
+ */
+function oracleBuildFetchRequests(topicPartitions) {
+  const manager = this.offsetManager
+  const activeTopicPartitions = {}
+  this.subscriptionState.active().forEach(({ topic, partitions }) => {
+    activeTopicPartitions[topic] = new Set(partitions)
+  })
+  return topicPartitions
+    .filter(({ topic }) => this.obligations.current(topic) !== null)
+    .map(({ topic, partitions }) => ({
+      topic,
+      partitions: partitions.reduce((requests, partition) => {
+        const baseline = manager.heldOffsetAt(topic, partition)
+        if (
+          baseline != null &&
+          activeTopicPartitions[topic].has(partition) &&
+          !this.positionValidator.isAwaiting(topic, partition) &&
+          (this.haltedPartitions.size === 0 ||
+            !this.haltedPartitions.has(`${topic}|${partition}`)) &&
+          !(this.hasSeekGates() && this.isSeekGated(topic, partition))
+        ) {
+          requests.push({
+            partition,
+            fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
+            currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+            maxBytes: this.maxBytesPerPartition,
+          })
+        }
+        return requests
+      }, []),
+    }))
+    .filter(({ partitions }) => partitions.length)
+}
+
+/**
+ * A group with only the fields the fetch-round derivation reads, over generated state.
+ * @param {object} fields overrides
+ * @returns {ConsumerGroup}
+ */
+const derivationGroup = (fields) =>
+  Object.assign(Object.create(ConsumerGroup.prototype), {
+    groupId: 'g',
+    groupMembership: { memberId: 'm' },
+    logger: { debug: jest.fn() },
+    routingChanged: jest.fn(),
+    preferredReadReplicasPerTopicPartition: {},
+    haltedPartitions: new Set(),
+    hasSeekGates: () => false,
+    maxBytesPerPartition: 1024,
+    ...fields,
+  })
+
+/**
+ * @param {() => number} random
+ * @param {number} size how many partition ids to draw from
+ * @returns {{ids: Array<number|string>, rows: object[], preferences: object}}
+ */
+const generateRouting = (random, size) => {
+  const ids = Array.from({ length: size }, (_, i) => (random() < 0.05 ? String(i) : i))
+  const rows = []
+  for (let partitionId = 0; partitionId < size; partitionId++) {
+    if (random() < 0.1) continue
+    const leader = random() < 0.1 ? -1 : Math.floor(random() * 4)
+    rows.push({ partitionId, leader, offlineReplicas: random() < 0.3 ? [7] : [] })
+    if (random() < 0.05) rows.push({ partitionId, leader: 9, offlineReplicas: [] })
+  }
+  rows.sort(() => random() - 0.5)
+  const preferences = {}
+  for (let id = 0; id < size; id++) {
+    if (random() < 0.3) {
+      const expired = random() < 0.3
+      preferences[id] = { nodeId: random() < 0.5 ? 7 : 5, expireAt: expired ? 0 : 1e15 + id }
+    }
+  }
+  return { ids: random() < 0.5 ? ids : ids.reverse(), rows, preferences }
+}
+
+describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
+  it('routes generated assignments exactly as the linear search did', () => {
+    for (let seed = 1; seed <= 300; seed++) {
+      const random = mulberry32(seed)
+      const size = [0, 1, 3, 8, 9, 17, 64, 200][seed % 8]
+      const { ids, rows, preferences } = generateRouting(random, size)
+      const run = (route) => {
+        const group = derivationGroup({
+          cluster: { findTopicPartitionMetadata: () => rows },
+          preferredReadReplicasPerTopicPartition: { t: structuredClone(preferences) },
+        })
+        const routing = { expiresAt: Infinity, leaderless: false }
+        const result = route.call(group, 't', ids, routing)
+        return {
+          result,
+          routing,
+          remaining: { ...group.preferredReadReplicasPerTopicPartition.t },
+          changed: group.routingChanged.mock.calls.length,
+          logs: group.logger.debug.mock.calls,
+        }
+      }
+      try {
+        const actual = run(ConsumerGroup.prototype.findReadReplicaForPartitions)
+        expect(actual).toEqual(run(oracleReadReplicas))
+        expect(Object.keys(actual.result)).toEqual(Object.keys(run(oracleReadReplicas).result))
+      } catch (error) {
+        error.message += ` seed=${seed}`
+        throw error
+      }
+    }
+  })
+
+  it('builds the same request entries as the whole-assignment active set', () => {
+    for (let seed = 1; seed <= 200; seed++) {
+      const random = mulberry32(seed)
+      const topics = Array.from({ length: 1 + (seed % 6) }, (_, i) => `t${i}`)
+      const assignment = topics.map((topic) => ({
+        topic,
+        partitions: Array.from({ length: 1 + Math.floor(random() * 12) }, (_, i) => i),
+      }))
+      const state = new SubscriptionState()
+      state.assign(assignment)
+      for (const { topic, partitions } of assignment) {
+        const roll = random()
+        if (roll < 0.2) state.pause([{ topic }])
+        if (roll < 0.1)
+          state.resume([{ topic, partitions: partitions.filter(() => random() < 0.5) }])
+        if (roll >= 0.2 && roll < 0.5) {
+          state.pause([{ topic, partitions: partitions.filter(() => random() < 0.3) }])
+        }
+      }
+      if (random() < 0.3) state.hold([{ topic: topics[0], partitions: [0, 1] }], {})
+      const coin = (salt) => (topic, partition) =>
+        mulberry32(seed * 1000 + salt + partition)() < 0.15
+      const group = derivationGroup({
+        subscriptionState: state,
+        offsetManager: {
+          heldOffsetAt: (topic, partition) => (coin(1)(topic, partition) ? null : '4'),
+          nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
+        },
+        obligations: { current: (topic) => (topic === 't5' ? null : {}) },
+        positionValidator: { isAwaiting: coin(2) },
+        haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
+        hasSeekGates: () => true,
+        isSeekGated: coin(3),
+        cluster: { leaderEpoch: (topic, partition) => partition % 3 },
+      })
+      // Node-filtered parts as a round sees them: every topic, a subset of its partitions.
+      const parts = state.assigned().map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.filter(() => random() < 0.6),
+      }))
+      try {
+        expect(group.buildFetchRequests(parts)).toEqual(oracleBuildFetchRequests.call(group, parts))
+      } catch (error) {
+        error.message += ` seed=${seed}`
+        throw error
+      }
+    }
+  })
+
+  it('follows every change of its inputs from one round to the next', () => {
+    const rows = [0, 1, 2].map((partitionId) => ({ partitionId, leader: 1 }))
+    const cluster = { findTopicPartitionMetadata: () => rows, leaderEpoch: () => 0 }
+    const state = new SubscriptionState()
+    state.assign([{ topic: 't', partitions: [0, 1, 2] }])
+    const group = derivationGroup({
+      cluster,
+      subscriptionState: state,
+      offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
+      obligations: { current: () => ({}) },
+      positionValidator: { isAwaiting: () => false },
+    })
+    const route = () => group.filterPartitionsByNode(1, state.assigned())[0].partitions
+    const fetched = () =>
+      group
+        .buildFetchRequests(state.assigned())
+        .flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+
+    expect(route()).toEqual([0, 1, 2])
+    rows[1].leader = 2
+    expect(route()).toEqual([0, 2])
+    cluster.findTopicPartitionMetadata = () => [{ partitionId: 0, leader: 2 }]
+    expect(route()).toEqual([])
+    group.preferredReadReplicasPerTopicPartition.t = { 0: { nodeId: 1, expireAt: 1e15 } }
+    expect(route()).toEqual([0])
+
+    state.pause([{ topic: 't', partitions: [1] }])
+    expect(fetched()).toEqual([0, 2])
+    state.resume([{ topic: 't', partitions: [1] }])
+    expect(fetched()).toEqual([0, 1, 2])
+    const token = {}
+    state.hold([{ topic: 't', partitions: [2] }], token)
+    expect(fetched()).toEqual([0, 1])
+    state.release(token)
+    state.assign([{ topic: 't', partitions: [1] }])
+    expect(group.buildFetchRequests([{ topic: 't', partitions: [0, 1] }])).toEqual([
+      {
+        topic: 't',
+        partitions: [{ partition: 1, fetchOffset: '0', currentLeaderEpoch: 0, maxBytes: 1024 }],
+      },
+    ])
+  })
+
+  it('reads each metadata row a bounded number of times, however many partitions a topic has', () => {
+    const reads = { count: 0 }
+    const rows = Array.from({ length: 2000 }, (_, id) => {
+      const row = { leader: id % 3 }
+      Object.defineProperty(row, 'partitionId', {
+        get: () => {
+          reads.count += 1
+          return id
+        },
+      })
+      return row
+    })
+    const group = derivationGroup({ cluster: { findTopicPartitionMetadata: () => rows } })
+    const ids = Array.from({ length: 2000 }, (_, id) => id)
+
+    const result = group.findReadReplicaForPartitions('t', ids)
+
+    expect(result[0]).toHaveLength(667)
+    expect(reads.count).toBeLessThanOrEqual(2 * rows.length)
+  })
+
+  it('consults the pause and hold state only for the partitions the round asks for', () => {
+    const state = new SubscriptionState()
+    const assignment = Array.from({ length: 50 }, (_, i) => ({
+      topic: `t${i}`,
+      partitions: Array.from({ length: 40 }, (_, p) => p),
+    }))
+    state.assign(assignment)
+    const isPaused = jest.spyOn(state, 'isPaused')
+    const isHeld = jest.spyOn(state, 'isHeld')
+    const group = derivationGroup({
+      subscriptionState: state,
+      offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
+      obligations: { current: () => ({}) },
+      positionValidator: { isAwaiting: () => false },
+      cluster: { leaderEpoch: () => 0 },
+    })
+    const parts = assignment.map(({ topic }) => ({
+      topic,
+      partitions: topic === 't7' ? [3, 9] : [],
+    }))
+
+    expect(group.buildFetchRequests(parts)).toHaveLength(1)
+    expect(isPaused).toHaveBeenCalledTimes(2)
+    expect(isHeld).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
+  afterEach(async () => {
+    for (const rig of rigs.splice(0)) await rig.broker.disconnect()
+  })
+  const rigs = []
+
+  /**
+   * Runs one round over generated leaders and pauses; the answer lists the requested partitions
+   * in reverse order.
+   * @param {number} seed
+   * @param {boolean} oracle whether the group derives the round with the previous code
+   * @returns {Promise<{frames: Buffer[], batches: object[]}>}
+   */
+  const round = async (seed, oracle) => {
+    const random = mulberry32(seed)
+    const partitions = Array.from({ length: 5 + (seed % 40) }, (_, i) => i).sort(
+      () => random() - 0.5
+    )
+    // Partition 0 stays on this node and unpaused, so every round sends a Fetch.
+    const partitionLeaders = Object.fromEntries(
+      partitions.map((p) => [p, p === 0 || random() < 0.6 ? NODE_ID : 1 + Math.floor(random() * 2)])
+    )
+    const rig = await createFetchGroup({ partitions, partitionLeaders, knownNodes: [0, 1, 2] })
+    rigs.push(rig)
+    if (oracle) {
+      rig.group.findReadReplicaForPartitions = oracleReadReplicas
+      rig.group.buildFetchRequests = oracleBuildFetchRequests
+    }
+    rig.group.pause([
+      { topic: TOPIC, partitions: partitions.filter((p) => p !== 0 && random() < 0.2) },
+    ])
+    rig.setResponse(() =>
+      fetchResponse(
+        rig
+          .fetchRequestPartitions()
+          .reverse()
+          .map((partition) => ({ partition, errorCode: 0, records: true }))
+      )
+    )
+    // The broker shuffles a Fetch's partitions; both runs get the same shuffle.
+    const shuffle = jest.spyOn(Math, 'random').mockImplementation(mulberry32(seed + 1000))
+    const batches = await rig.group.fetch(NODE_ID).finally(() => shuffle.mockRestore())
+    return {
+      frames: rig.fetchFrames(),
+      batches: batches.map(({ topic, partition, fetchedOffset, messages }) => ({
+        topic,
+        partition,
+        fetchedOffset,
+        offsets: messages.map(({ offset }) => offset),
+      })),
+    }
+  }
+
+  it('sends the same Fetch frames and delivers the same batches as the linear search did', async () => {
+    for (let seed = 1; seed <= 12; seed++) {
+      const actual = await round(seed, false)
+      const expected = await round(seed, true)
+      expect(actual.batches.length).toBeGreaterThan(0)
+      expect(actual).toEqual(expected)
+    }
+  })
+
+  it('looks up each answered partition in its request once', async () => {
+    const partitions = Array.from({ length: 300 }, (_, i) => i)
+    const rig = await createFetchGroup({ partitions })
+    rigs.push(rig)
+    const reads = { count: 0 }
+    const build = rig.group.buildFetchRequests.bind(rig.group)
+    rig.group.buildFetchRequests = (parts) =>
+      build(parts).map(({ topic, partitions: entries }) => ({
+        topic,
+        partitions: entries.map((entry) => {
+          const { partition, ...rest } = entry
+          return Object.defineProperty(rest, 'partition', {
+            enumerable: true,
+            get: () => {
+              reads.count += 1
+              return partition
+            },
+          })
+        }),
+      }))
+    rig.setResponse(
+      fetchResponse(partitions.map((partition) => ({ partition, errorCode: 0, records: true })))
+    )
+
+    const batches = await rig.group.fetch(NODE_ID)
+
+    expect(batches).toHaveLength(300)
+    expect(reads.count).toBeLessThanOrEqual(5 * partitions.length)
+  })
 })

@@ -1,0 +1,11 @@
+--- a/testHelpers/wire/joinGroupV8.js
++++ b/testHelpers/wire/joinGroupV8.js
+@@ -37,7 +37,7 @@
+ 
+     return new Encoder()
+       .writeInt32(response.throttleTime)
+-      .writeInt16(response.errorCode)
++      .writeInt16(0)
+       .writeInt32(response.generationId)
+       .writeUVarIntString(response.protocolType)
+       .writeUVarIntString(response.groupProtocol)

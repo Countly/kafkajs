@@ -36,6 +36,27 @@ const patternsOf = (check) => {
   return patterns
 }
 
+/** The two slow tooling specs that run one at a time in their own job, never in the whole-suite unit run. */
+const HEAVY = [
+  'scripts/soak/__tests__/finalSoakRehearsal.spec.js',
+  'scripts/soak/__tests__/originalSharePriming.spec.js',
+]
+
+/**
+ * @param {string} command a package script
+ * @param {string} flag a Jest array option
+ * @returns {RegExp[]} the quoted or bare values that follow the flag, up to the next option
+ */
+const valuesOf = (command, flag) => {
+  const words = command.match(/'[^']*'|\S+/g).map((word) => word.replace(/^'|'$/g, ''))
+  const from = words.indexOf(flag)
+  if (from < 0) return []
+  const values = []
+  for (let at = from + 1; at < words.length && !words[at].startsWith('--'); at++)
+    values.push(new RegExp(words[at]))
+  return values
+}
+
 describe('exit gate manifest', () => {
   test('decoder performance uses three parallel capped partitions and a combined check with the original id', () => {
     const yaml = require('js-yaml')
@@ -151,6 +172,42 @@ describe('exit gate manifest', () => {
   test('the KDC image builds on the host network so its package fetch uses the runner DNS', () => {
     const build = workflow.split('\n').find((line) => /docker build .*gate-kdc:local/.test(line))
     expect(build).toMatch(/docker build --network=host /)
+  })
+
+  test('the heavy tooling specs run in their own check, and the whole-suite runs leave them out', () => {
+    const { scripts } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    const byId = (wanted) => gate.checks.find(({ id }) => id === wanted)
+    const filesOf = (check) => [...new Set(check.titles.map((title) => title.split(' › ')[0]))]
+    const heavy = byId('unit-heavy')
+    expect(heavy.jestScript).toBe('test:unit:heavy')
+    expect(scripts['test:unit:heavy']).toMatch(/^jest --runInBand /)
+    expect(filesOf(heavy).sort()).toEqual(HEAVY)
+    const selected = valuesOf(scripts['test:unit:heavy'], '--testPathPatterns')
+    for (const file of [
+      ...HEAVY,
+      'scripts/soak/__tests__/soak.spec.js',
+      'scripts/soak/__tests__/sharePriming.spec.js',
+    ])
+      expect([file, selected.some((pattern) => pattern.test(file))]).toEqual([
+        file,
+        HEAVY.includes(file),
+      ])
+
+    const unit = byId('unit')
+    const ignored = valuesOf(scripts[unit.jestScript], '--testPathIgnorePatterns')
+    expect(HEAVY.filter((file) => !ignored.some((pattern) => pattern.test(file)))).toEqual([])
+    expect(ignored.some((pattern) => pattern.test('scripts/soak/__tests__/soak.spec.js'))).toBe(
+      false
+    )
+    expect(filesOf(unit).filter((file) => HEAVY.includes(file))).toEqual([])
+
+    const frozen = byId('coverage-frozen')
+    const skipped = frozen.jest
+      .slice(frozen.jest.indexOf('--testPathIgnorePatterns') + 1)
+      .map((pattern) => new RegExp(pattern))
+    expect(skipped.some((pattern) => pattern.test(HEAVY[0]))).toBe(true)
+    expect(skipped.some((pattern) => pattern.test(HEAVY[1]))).toBe(false)
+    expect(filesOf(frozen)).not.toContain(HEAVY[0])
   })
 
   test('every expected title names an existing spec that its check selects', () => {

@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1781,7 +1781,7 @@
+       const subscribed = new Set(this.topicsSubscribed)
+       for (const [key] of this.seekOffset) {
+         const [topic, partition] = JSON.parse(key)
+-        if (!assigned.get(topic)?.has(partition) && !subscribed.has(topic)) {
++        if (false) {
+           this.seekOffset.delete(key)
+         }
+       }

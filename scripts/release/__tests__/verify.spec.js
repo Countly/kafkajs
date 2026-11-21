@@ -1,4 +1,5 @@
 const { execFileSync, spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -6,6 +7,10 @@ const {
   verifyRelease,
   distTagOf,
   createListRuns,
+  createListJobs,
+  createRegistry,
+  verifyOtelManifest,
+  verifyMemoryEvidence,
   ReleaseVerificationError,
   main,
 } = require('../verify')
@@ -17,6 +22,30 @@ const TAG = `v${VERSION}`
 const CHANGELOG = `# Changelog\n\n## Unreleased — 3.0.0\n\n## ${VERSION} — 2026-11-20\n`
 const TOKEN = 'ghs_never_print_this_token'
 const REPOSITORY = 'Countly/kafkajs'
+const MAIN_NAME = '@countly/kafkajs'
+const OTEL_NAME = '@countly/opentelemetry-instrumentation-kafkajs'
+const OTEL_VERSION = '0.1.1'
+const PEER_RANGE = '>=3.0.0-0 <4'
+const FINAL = { tag: 'v3.0.0', mainVersion: '3.0.0' }
+
+const otelManifest = (overrides = {}) => ({
+  name: OTEL_NAME,
+  version: OTEL_VERSION,
+  peerDependencies: { [MAIN_NAME]: PEER_RANGE, '@opentelemetry/api': '^1.3.0' },
+  ...overrides,
+})
+const sriOf = (bytes) => `sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`
+
+/** A registry lookup that answers `published` for every version and records its calls. */
+const fakeLookup = (published = false) => {
+  const calls = []
+  const lookup = async (name, version) => {
+    calls.push([name, version])
+    return published
+  }
+  lookup.calls = calls
+  return lookup
+}
 
 let nextId = 1
 const run = (overrides = {}) => ({
@@ -53,6 +82,57 @@ const green = () => ({
   'gate.yml': [run()],
   'weekly.yml': [run({ event: 'workflow_dispatch' })],
 })
+
+const MEMORY = 'memory-gates.yml'
+const LONG_WINDOW_GROUPS = [22, 24, 26].flatMap((node) =>
+  ['4.2.2', '4.3.1'].flatMap((kafka) =>
+    ['unseeded', 'seeded'].map((arm) => `${node}, ${kafka}, ${arm}`)
+  )
+)
+
+/** The latest-attempt jobs of a memory-gates run: a full three-replicate selection unless overridden. */
+const memoryJobs = ({ replicates = [1, 2, 3], verdict = 'success', extra = [] } = {}) => [
+  { name: 'select', conclusion: 'success' },
+  { name: 'share-soak-controls', conclusion: 'success' },
+  { name: 'share-soak-verdict', conclusion: 'success' },
+  ...LONG_WINDOW_GROUPS.flatMap((group) =>
+    replicates.map((r) => ({
+      name: `telemetry-long-window (${group}, ${r})`,
+      conclusion: 'success',
+    }))
+  ),
+  ...[22, 24, 26].map((node) => ({
+    name: `telemetry-long-window (${node}, 4.3.1, warmup-seed, 1)`,
+    conclusion: 'success',
+  })),
+  { name: 'telemetry-long-window-verdict', conclusion: 'success' },
+  { name: 'telemetry-seeded-control', conclusion: 'skipped' },
+  ...extra,
+  { name: 'memory-gates-verdict', conclusion: verdict },
+]
+const memoryRun = (overrides = {}) => run({ event: 'workflow_dispatch', ...overrides })
+
+/** A `listJobs` over `{ [runId]: jobs }` that records the run ids it is asked for. */
+const fakeListJobs = (byRun) => {
+  const calls = []
+  const listJobs = async (runId) => {
+    calls.push(runId)
+    return byRun[runId] ?? []
+  }
+  listJobs.calls = calls
+  return listJobs
+}
+
+/** `listRuns`/`listJobs` over memory-gates runs, each paired with its jobs (a full set by default). */
+const memorySeams = (...entries) => {
+  const pairs = entries.map((entry) => (Array.isArray(entry) ? entry : [entry, memoryJobs()]))
+  return {
+    listRuns: fakeListRuns({ [MEMORY]: pairs.map(([r]) => r) }),
+    listJobs: fakeListJobs(Object.fromEntries(pairs.map(([r, jobs]) => [r.id, jobs]))),
+  }
+}
+
+const checkMemory = (seams) => verifyMemoryEvidence({ sha: SHA, ...seams })
 
 const verify = (overrides = {}) =>
   verifyRelease({
@@ -291,6 +371,172 @@ describe('verifyRelease', () => {
   })
 })
 
+describe('memory-gates evidence', () => {
+  test('rejects a memory run on another SHA', async () => {
+    await expectRule(
+      checkMemory(memorySeams(memoryRun({ head_sha: OTHER_SHA }))),
+      11,
+      /no workflow_dispatch run of memory-gates\.yml for commit a{40}/
+    )
+    await expectRule(checkMemory(memorySeams(memoryRun({ event: 'pull_request' }))), 11)
+  })
+
+  test('rejects a partial memory dispatch', async () => {
+    const skipped = memoryJobs({ verdict: 'skipped' })
+    await expectRule(
+      checkMemory(memorySeams([memoryRun(), skipped])),
+      11,
+      /memory-gates-verdict is skipped/
+    )
+    const noVerdict = memoryJobs().filter(({ name }) => name !== 'memory-gates-verdict')
+    await expectRule(checkMemory(memorySeams([memoryRun(), noVerdict])), 11, /memory-gates-verdict/)
+    for (const replicates of [[1], [1, 2], [1, 3], [1, 2, 3, 4]]) {
+      await expectRule(
+        checkMemory(memorySeams([memoryRun(), memoryJobs({ replicates })])),
+        11,
+        /replicates/
+      )
+    }
+  })
+
+  test('rejects a failed or cancelled memory run', async () => {
+    for (const conclusion of ['failure', 'cancelled']) {
+      await expectRule(
+        checkMemory(memorySeams(memoryRun({ conclusion }))),
+        11,
+        new RegExp(`completed/${conclusion}`)
+      )
+    }
+    await expectRule(
+      checkMemory(memorySeams(memoryRun({ status: 'in_progress', conclusion: null }))),
+      11
+    )
+    const cancelledJob = memoryJobs({
+      extra: [{ name: 'share-peak (22, 4.2.2, enabled)', conclusion: 'cancelled' }],
+    })
+    await expectRule(
+      checkMemory(memorySeams([memoryRun(), cancelledJob])),
+      11,
+      /share-peak \(22, 4\.2\.2, enabled\) is cancelled/
+    )
+  })
+
+  test('accepts a full green memory run on the SHA', async () => {
+    const green = memoryRun({ created_at: '2026-11-10T08:00:00Z' })
+    const partial = memoryRun({ created_at: '2026-11-10T09:00:00Z' })
+    const seams = memorySeams(green, [partial, memoryJobs({ verdict: 'failure' })])
+    await expect(checkMemory(seams)).resolves.toBeUndefined()
+    expect(seams.listRuns.calls).toEqual([[MEMORY, { event: 'workflow_dispatch', head_sha: SHA }]])
+    expect(seams.listJobs.calls).toContain(green.id)
+  })
+})
+
+describe('the OTel package', () => {
+  const checkOtel = (overrides = {}) =>
+    verifyOtelManifest({
+      tag: TAG,
+      mainVersion: VERSION,
+      otelPackageJson: otelManifest(),
+      lookup: fakeLookup(),
+      ...overrides,
+    })
+
+  test('pre-pack mode checks manifests, versions and the peer range without any tarball', async () => {
+    const rcLookup = fakeLookup()
+    await expect(checkOtel({ lookup: rcLookup })).resolves.toEqual({ otelVersion: OTEL_VERSION })
+    expect(rcLookup.calls).toEqual([])
+
+    const finalLookup = fakeLookup()
+    await expect(checkOtel({ ...FINAL, lookup: finalLookup })).resolves.toEqual({
+      otelVersion: OTEL_VERSION,
+    })
+    expect(finalLookup.calls).toEqual([[OTEL_NAME, OTEL_VERSION]])
+
+    for (const version of ['1.0.0', '0.1.1-rc.0', '0.1.1-alpha.9f', '0.1.1-0a', '0.1.1-x-y']) {
+      await expect(checkOtel({ otelPackageJson: otelManifest({ version }) })).resolves.toEqual({
+        otelVersion: version,
+      })
+    }
+    for (const otelPackageJson of [
+      otelManifest({ version: undefined }),
+      otelManifest({ version: '0.1' }),
+      otelManifest({ version: 'v0.1.1' }),
+      otelManifest({ version: '0.1.1+build' }),
+      otelManifest({ version: '01.1.1' }),
+      otelManifest({ version: '0.01.1' }),
+      otelManifest({ version: '0.1.1-rc..0' }),
+      otelManifest({ version: '0.1.1-01' }),
+      otelManifest({ version: '0.1.1-.' }),
+      otelManifest({ version: '0.1.1-' }),
+      otelManifest({ version: '9007199254740992.0.0' }),
+      otelManifest({ name: 'kafkajs-otel' }),
+    ]) {
+      await expectRule(checkOtel({ otelPackageJson }), 6)
+    }
+  })
+
+  test('rejects a peer range that excludes the main version', async () => {
+    const withPeer = (range) =>
+      otelManifest({ peerDependencies: range === undefined ? {} : { [MAIN_NAME]: range } })
+    for (const [range, mainVersion] of [
+      ['>=3.0.0 <4', '3.0.0-rc.1'],
+      ['>=2.0.0 <4', '3.0.0-rc.1'],
+      ['>=4.0.0-alpha <4', '4.0.0-beta'],
+      ['>=3.0.0-0 <3.0.0-rc.1', '3.0.0-rc.1'],
+      [PEER_RANGE, '4.0.0-rc.1'],
+      [PEER_RANGE, '4.0.0'],
+      [PEER_RANGE, '2.2.4'],
+      ['>=3.1', '3.0.0'],
+      ['^3.0.0', '3.0.0'],
+      ['3.x', '3.0.0'],
+      ['>=03.0.0 <4', '3.0.0'],
+      ['>=3.0.0-rc..0 <4', '3.0.0'],
+      ['>=3.0.0-01 <4', '3.0.0-1'],
+      ['', '3.0.0'],
+      [undefined, '3.0.0'],
+    ]) {
+      await expectRule(checkOtel({ mainVersion, otelPackageJson: withPeer(range) }), 7)
+    }
+    for (const [range, mainVersion] of [
+      [PEER_RANGE, '3.0.0-rc.1'],
+      [PEER_RANGE, '3.0.0-alpha.9f'],
+      [PEER_RANGE, '3.0.0'],
+      [PEER_RANGE, '3.9.1'],
+      ['<2 || >=3.0.0', '3.0.0'],
+      ['=3.0.0-rc.1', '3.0.0-rc.1'],
+    ]) {
+      await expect(checkOtel({ mainVersion, otelPackageJson: withPeer(range) })).resolves.toEqual({
+        otelVersion: OTEL_VERSION,
+      })
+    }
+  })
+
+  test('rejects a v3.0.0 OTel version that is already on the registry, whatever its integrity or provenance', async () => {
+    const requested = []
+    const registry = (status) =>
+      createRegistry({
+        fetch: async (url) => {
+          requested.push(String(url))
+          return Response.json({ dist: { integrity: 'sha512-any' } }, { status })
+        },
+      })
+    await expect(checkOtel({ ...FINAL, lookup: registry(404) })).resolves.toEqual({
+      otelVersion: OTEL_VERSION,
+    })
+    await expectRule(checkOtel({ ...FINAL, lookup: registry(200) }), 8, /already on the registry/)
+    await expect(checkOtel({ ...FINAL, lookup: registry(500) })).rejects.toThrow(/500/)
+    expect(requested).toEqual(
+      Array(3).fill(
+        `https://registry.npmjs.org/@countly%2fopentelemetry-instrumentation-kafkajs/${OTEL_VERSION}`
+      )
+    )
+
+    const rcLookup = fakeLookup(true)
+    await expect(checkOtel({ lookup: rcLookup })).resolves.toEqual({ otelVersion: OTEL_VERSION })
+    expect(rcLookup.calls).toEqual([])
+  })
+})
+
 describe('distTagOf', () => {
   test.each([
     ['3.0.0-rc.1', 'next'],
@@ -435,6 +681,33 @@ describe('createListRuns', () => {
   )
 })
 
+describe('createListJobs', () => {
+  test("createListJobs reads every page of a run's latest-attempt jobs", async () => {
+    const all = Array.from({ length: 122 }, (_, i) => ({ name: `job ${i}`, conclusion: 'success' }))
+    const requests = []
+    const fetch = async (url, init) => {
+      const parsed = new URL(String(url))
+      requests.push({ url: parsed, init })
+      const page = Number(parsed.searchParams.get('page'))
+      const jobs = all.slice((page - 1) * 100, page * 100)
+      return new Response(JSON.stringify({ total_count: all.length, jobs }), { status: 200 })
+    }
+    const jobs = await createListJobs({ repository: REPOSITORY, token: TOKEN, fetch })(42)
+    expect(jobs).toEqual(all)
+    expect(requests).toHaveLength(2)
+    expect(requests[0].url.pathname).toBe(`/repos/${REPOSITORY}/actions/runs/42/jobs`)
+    expect(Object.fromEntries(requests[1].url.searchParams)).toEqual({
+      filter: 'latest',
+      per_page: '100',
+      page: '2',
+    })
+    expect(requests[0].init.headers.Authorization).toBe(`Bearer ${TOKEN}`)
+    await expect(
+      createListJobs({ repository: REPOSITORY, token: TOKEN, fetch })('42/../../x')
+    ).rejects.toThrow(ReleaseVerificationError)
+  })
+})
+
 describe('main', () => {
   const sandboxes = []
   const git = (cwd, ...args) =>
@@ -462,8 +735,10 @@ describe('main', () => {
   const makeRepo = ({ version = VERSION, changelog = CHANGELOG } = {}) => {
     const dir = sandbox()
     git(dir, 'init', '-q', '-b', 'master')
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version }))
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: MAIN_NAME, version }))
     fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog)
+    fs.mkdirSync(path.join(dir, 'otel'))
+    fs.writeFileSync(path.join(dir, 'otel', 'package.json'), JSON.stringify(otelManifest()))
     git(dir, 'add', '.')
     git(dir, 'commit', '-q', '-m', 'release')
     const sha = git(dir, 'rev-parse', 'HEAD')
@@ -481,6 +756,22 @@ describe('main', () => {
     ...overrides,
   })
 
+  /**
+   * Answers GitHub and the registry: green CI runs for the queried commit, `memory(sha)` as the
+   * memory-gates runs (returned unfiltered, as a server might) and `jobs` as every run's jobs.
+   */
+  const fakeGitHub =
+    ({ memory = (sha) => [memoryRun({ head_sha: sha })], jobs = memoryJobs() } = {}) =>
+    async (url) => {
+      const parsed = new URL(String(url))
+      const respond = (body) => new Response(JSON.stringify(body), { status: 200 })
+      if (parsed.origin === 'https://registry.npmjs.org') return new Response('', { status: 404 })
+      if (parsed.pathname.endsWith('/jobs')) return respond({ jobs })
+      const sha = parsed.searchParams.get('head_sha')
+      if (parsed.pathname.includes(`/${MEMORY}/`)) return respond({ workflow_runs: memory(sha) })
+      return respond({ workflow_runs: [run({ head_sha: sha })] })
+    }
+
   let writes
   const spies = []
   beforeEach(() => {
@@ -488,14 +779,7 @@ describe('main', () => {
     for (const method of ['log', 'info', 'warn', 'error']) {
       spies.push(jest.spyOn(console, method).mockImplementation((...args) => writes.push(args)))
     }
-    spies.push(
-      jest.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-        const sha = new URL(String(url)).searchParams.get('head_sha')
-        return new Response(JSON.stringify({ workflow_runs: [run({ head_sha: sha })] }), {
-          status: 200,
-        })
-      })
-    )
+    spies.push(jest.spyOn(globalThis, 'fetch').mockImplementation(fakeGitHub()))
   })
   afterEach(() => {
     for (const spy of spies.splice(0)) spy.mockRestore()
@@ -507,8 +791,9 @@ describe('main', () => {
     const env = environment(repo)
     await main(env)
     expect(fs.readFileSync(env.GITHUB_OUTPUT, 'utf8')).toBe(
-      `version=${VERSION}\ndist-tag=next\nsha=${repo.sha}\n`
+      `version=${VERSION}\ndist-tag=next\nsha=${repo.sha}\notel-version=${OTEL_VERSION}\n`
     )
+    expect(fs.readdirSync(repo.dir).filter((file) => file.endsWith('.tgz'))).toEqual([])
     expect(JSON.stringify(writes)).not.toContain(TOKEN)
   })
 
@@ -562,11 +847,105 @@ describe('main', () => {
     await expect(main(environment(repo, { GITHUB_SHA: '--all' }))).rejects.toThrow(/GITHUB_SHA/)
   })
 
+  test('without arguments, rejects a tagged commit with no full green memory-gates dispatch and writes nothing', async () => {
+    const repo = makeRepo()
+    const cases = [
+      { memory: () => [] },
+      { memory: () => [memoryRun({ head_sha: OTHER_SHA })] },
+      { memory: (sha) => [run({ head_sha: sha, event: 'pull_request' })] },
+      { memory: (sha) => [memoryRun({ head_sha: sha, conclusion: 'failure' })] },
+      { memory: (sha) => [memoryRun({ head_sha: sha, conclusion: 'cancelled' })] },
+      { jobs: memoryJobs({ verdict: 'skipped' }) },
+      { jobs: memoryJobs({ replicates: [1, 2] }) },
+    ]
+    for (const github of cases) {
+      globalThis.fetch.mockImplementation(fakeGitHub(github))
+      const env = environment(repo)
+      await expectRule(main(env, []), 11, new RegExp(`commit ${repo.sha}`))
+      expect(fs.existsSync(env.GITHUB_OUTPUT)).toBe(false)
+    }
+  })
+
+  test('needs memory evidence on the tagged commit itself, even when an rc tag is named', async () => {
+    const repo = makeRepo()
+    git(repo.dir, 'tag', TAG)
+    fs.writeFileSync(
+      path.join(repo.dir, 'package.json'),
+      JSON.stringify({ name: MAIN_NAME, version: '3.0.0' })
+    )
+    fs.writeFileSync(
+      path.join(repo.dir, 'CHANGELOG.md'),
+      CHANGELOG.replace(`## ${VERSION} — 2026-11-20`, '## 3.0.0 — 2026-11-25')
+    )
+    git(repo.dir, 'commit', '-q', '-am', 'final')
+    const sha = git(repo.dir, 'rev-parse', 'HEAD')
+    git(repo.dir, 'update-ref', 'refs/remotes/origin/master', sha)
+    const rcOnly = () => [memoryRun({ head_sha: repo.sha })]
+    globalThis.fetch.mockImplementation(fakeGitHub({ memory: rcOnly }))
+    const env = environment({ ...repo, sha }, { GITHUB_REF_NAME: 'v3.0.0' })
+    await expectRule(main(env, ['--reuse-from', TAG]), 11, new RegExp(`commit ${sha}`))
+    expect(fs.existsSync(env.GITHUB_OUTPUT)).toBe(false)
+  })
+
   test('writes nothing when verification fails', async () => {
     const repo = makeRepo({ changelog: '# Changelog\n' })
     const env = environment(repo)
     await expectRule(main(env), 3)
     expect(fs.existsSync(env.GITHUB_OUTPUT)).toBe(false)
+  })
+
+  describe('post-pack mode', () => {
+    /** Writes a gzip tarball whose package/package.json holds `manifest` and returns its path. */
+    const tarball = (file, manifest) => {
+      const content = sandbox()
+      fs.mkdirSync(path.join(content, 'package'))
+      fs.writeFileSync(path.join(content, 'package', 'package.json'), JSON.stringify(manifest))
+      const target = path.join(sandbox(), file)
+      execFileSync('tar', ['-czf', target, '-C', content, 'package'])
+      return target
+    }
+    const postPack = (repo, { mainManifest, otelManifest: otel, mainSri } = {}) => {
+      const mainTgz = tarball('main.tgz', mainManifest ?? { name: MAIN_NAME, version: VERSION })
+      const otelTgz = tarball('otel.tgz', otel ?? otelManifest())
+      const env = {
+        GITHUB_REF_NAME: TAG,
+        GITHUB_WORKSPACE: repo.dir,
+        MAIN_SRI: mainSri ?? sriOf(fs.readFileSync(mainTgz)),
+      }
+      return {
+        run: (args = [mainTgz, otelTgz]) => main(env, ['--post-pack', ...args]),
+        mainTgz,
+        otelTgz,
+      }
+    }
+
+    test('post-pack mode rejects an OTel tarball whose name or version differs from its manifest', async () => {
+      const repo = makeRepo()
+      await expect(postPack(repo).run()).resolves.toBeUndefined()
+      await expectRule(
+        postPack(repo, { otelManifest: otelManifest({ version: '0.1.2' }) }).run(),
+        9
+      )
+      await expectRule(
+        postPack(repo, { otelManifest: otelManifest({ name: 'other-otel' }) }).run(),
+        9
+      )
+      await expectRule(
+        postPack(repo, { mainManifest: { name: MAIN_NAME, version: '3.0.0-rc.2' } }).run(),
+        9
+      )
+      const swapped = postPack(repo)
+      await expectRule(swapped.run([swapped.otelTgz, swapped.mainTgz]), 9)
+    })
+
+    test("post-pack mode rejects a main tarball whose SRI differs from the pack job's record", async () => {
+      const repo = makeRepo()
+      await expectRule(postPack(repo, { mainSri: sriOf('a different main tarball') }).run(), 10)
+      await expect(postPack(repo, { mainSri: '' }).run()).rejects.toThrow(/MAIN_SRI/)
+      const { run, mainTgz, otelTgz } = postPack(repo)
+      await expect(run([mainTgz])).rejects.toThrow(/usage/)
+      await expect(run([mainTgz, otelTgz, otelTgz])).rejects.toThrow(/usage/)
+    })
   })
 
   test('the command line exits non-zero and names the problem without a stack', () => {

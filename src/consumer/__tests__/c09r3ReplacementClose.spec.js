@@ -1,9 +1,10 @@
+const Cluster = require('../../cluster')
 const createConsumer = require('../index')
 const Runner = require('../runner')
 const OffsetOperations = require('../offsetManager/offsetOperations')
 const handlerContext = require('../handlerContext')
 const { newLogger } = require('testHelpers')
-const { CloseRig, GROUP, gate, pause, until } = require('./fixtures/closeRig')
+const { CloseRig, GROUP, TOPIC, gate, pause, until } = require('./fixtures/closeRig')
 
 jest.setTimeout(20000)
 
@@ -36,6 +37,7 @@ const scriptedCluster = () => {
     addMultipleTargetTopics: jest.fn(async () => {}),
     useConsumerMetadataScope: jest.fn(),
     releaseConsumerMetadataScope: jest.fn(),
+    useBrokerRegex: jest.fn(),
     onTopicRecreated: jest.fn(() => jest.fn()),
     offsetOperations: () => operations,
     retry: {},
@@ -58,7 +60,14 @@ describe('a close that is still running when a replacement connects', () => {
     jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
     jest
       .spyOn(Runner.prototype, 'stop')
-      .mockImplementationOnce(() => stopped.promise)
+      // Like the real stop, it unwinds once a forced close retires its scope.
+      .mockImplementationOnce((_options, operation) =>
+        operation
+          .wait(() => stopped.promise)
+          .catch((error) => {
+            if (!operation.guard()) throw error
+          })
+      )
       .mockResolvedValue()
     const { cluster, log, state } = scriptedCluster()
     const consumer = build(cluster)
@@ -259,5 +268,71 @@ describe.each([true, false])(
       expect(cluster.isConnected()).toBe(false)
       expect(cluster.groupEntries.has(GROUP)).toBe(false)
     })
+  }
+)
+
+describe.each(['classic', 'consumer'])(
+  'a call queued behind a close, then a second close, over the %s protocol',
+  (protocol) => {
+    /** @type {CloseRig} */
+    let rig
+    afterEach(async () => {
+      jest.restoreAllMocks()
+      await rig.dispose()
+    })
+
+    const natural = { kind: 'a natural', secondOptions: undefined }
+    const zeroTimeout = { kind: 'a zero-timeout', secondOptions: { timeout: 0 } }
+    it.each([
+      { call: 'run', ...natural, arrangedFirst: false },
+      { call: 'run', ...zeroTimeout, arrangedFirst: false },
+      { call: 'connect', ...natural, arrangedFirst: false },
+      { call: 'connect', ...zeroTimeout, arrangedFirst: false },
+      { call: 'run', ...natural, arrangedFirst: true },
+      { call: 'connect', ...natural, arrangedFirst: true },
+    ])(
+      'a queued $call rejects and leaves no membership or socket after $kind second close (second close arranged first: $arrangedFirst)',
+      async ({ call, secondOptions, arrangedFirst }) => {
+        rig = await CloseRig.open({ protocol })
+        const consumer = rig.consumer()
+        const events = []
+        for (const name of ['CONNECT', 'DISCONNECT', 'GROUP_JOIN'])
+          consumer.on(consumer.events[name], () => events.push(name))
+        await consumer.connect()
+        await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+
+        const teardown = gate()
+        let teardowns = 0
+        const original = Cluster.prototype.disconnect
+        jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+          if (++teardowns === 1) await teardown.promise
+          return original.apply(this, args)
+        })
+
+        const first = consumer.disconnect()
+        await until(() => teardowns === 1, 'the held teardown')
+        const closeAgain = () => first.then(() => consumer.disconnect(secondOptions))
+        const second = arrangedFirst ? closeAgain() : null
+        const queued = (
+          call === 'run' ? consumer.run({ eachMessage: async () => {} }) : consumer.connect()
+        ).then(
+          () => null,
+          (error) => error
+        )
+        const closed = second ?? closeAgain()
+        teardown.resolve()
+
+        expect((await queued)?.type).toBe('CONSUMER_STOPPING')
+        await closed
+        await pause(150)
+
+        expect(events).toEqual(['CONNECT', 'DISCONNECT', 'DISCONNECT'])
+        const membership = rig.cluster
+          .requests()
+          .filter(({ api }) => ['JoinGroup', 'SyncGroup', 'ConsumerGroupHeartbeat'].includes(api))
+        expect(membership).toEqual([])
+        expect(rig.cluster.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      }
+    )
   }
 )

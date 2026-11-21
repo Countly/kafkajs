@@ -191,6 +191,9 @@ The OAuth bearer token must be an object with properties value and
 (optionally) extensions, that will be sent during the SASL/OAUTHBEARER
 request.
 
+`authorizationIdentity` (optional) is sent as the SASL authorization identity.
+Apache Kafka accepts it only when it equals the token's principal name.
+
 The implementation of the oauthBearerProvider must take care that tokens are
 reused and refreshed when appropriate. An example implementation using
 [`simple-oauth2`](https://github.com/lelylan/simple-oauth2) would look something
@@ -437,6 +440,50 @@ kafka.producer({
 
 An idempotent producer - the default - allows at most 5. A producer that did not ask for idempotence and passes more, or `null`, runs without it and logs one warning; with `idempotent: true` or a `transactionalId` the combination throws `KafkaJSInvalidConfigurationError`. See [Idempotence](Producing.md#idempotence).
 
+## Queued requests and memory
+
+Each broker connection keeps a queue of requests that wait to be written. The queue has no size limit. A request waits there while the connection has `maxInFlightRequests` requests in flight, and while a broker throttle asks the client to hold back. A waiting request keeps its encoded frame and its promise in memory until it is written, answered or removed.
+
+| Setting | What it bounds | What it does not bound |
+|---|---|---|
+| `requestTimeout` | How long a request that was written waits for its answer. Fetch, JoinGroup and SyncGroup use a longer timeout derived from their wait or rebalance time. | How long a request waits in the queue. The timer starts when the request is written, so a queued request is never timed out for waiting. |
+| `maxInFlightRequests` | How many written requests wait for an answer on one connection. | How many requests wait to be written, or how many bytes they hold. |
+
+With `enforceRequestTimeout: false`, a written request is not timed out either.
+
+A finite budget ends the call that holds it: an admin call's `apiTimeout`, or the `retry.maxTotalTime` of the consumer calls that honour it (see [Default Retry](#default-retry)). A request made under such a budget is not written once the budget has passed. An admin call also removes its own unsent requests from the queue at that moment. A budget limits how long one call can wait. It does not limit how many calls you start, so it is not a memory limit.
+
+### Bounding calls in your application
+
+If your code can start many calls at once, for example one admin call for each incoming request, bound them yourself. The client does not.
+
+1. Count the calls you started and have not seen settle. At your limit, stop creating calls: reject them, drop them, or hold them in a queue of your own with a fixed size.
+2. Free a slot when the Kafka call itself settles. Never free it when your own timer fires.
+3. Give every call a finite budget so that it does settle: `apiTimeout` on admin calls, `retry.maxTotalTime` for the consumer calls that honour it, and `disconnect({ timeout })` to close.
+
+```javascript
+const MAX_CALLS = 20
+let active = 0
+
+const admit = async (call) => {
+  if (active >= MAX_CALLS) throw new Error('Too many Kafka calls in progress')
+  active += 1
+  try {
+    return await call()
+  } finally {
+    active -= 1
+  }
+}
+
+const topics = await admit(() => admin.listTopics({ apiTimeout: 10000 }))
+```
+
+`Promise.race([call, timer])` does not cancel a call. It only stops your code from waiting for it. The call keeps running. Its request stays queued until it is written, or until an admin call's budget removes it. A written request stays in flight until it is answered or `requestTimeout` ends it. If you free your slot when the race timer fires, the calls still running can exceed your limit. No call takes an `AbortSignal`.
+
+`producer.send()` is bounded separately: the records of a send are charged against `bufferMemory`, and a send that does not fit waits at most `maxBlockMs` before it rejects (see [Memory](Producing.md#memory)). That bound counts the records of sends. It does not limit other requests on the same connections.
+
+The `REQUEST_QUEUE_SIZE` instrumentation event reports how many requests wait on a connection (see [Instrumentation events](InstrumentationEvents.md)). It shows the queue. It does not limit it.
+
 ## Max Response Size
 
 `maxResponseSize` is the response-size limit passed to every connection, in bytes, not counting
@@ -590,7 +637,7 @@ An async function that will be invoked after the consumer exhausts all retries, 
 
 A fenced static instance and a fatal membership error under the consumer protocol never restart, even if `restartOnFailure` returns `true`. A duplicate `groupInstanceId` must be removed, or the rejected membership configuration, authorization or broker capability must be corrected first. Other terminal errors retain the callback policy.
 
-For a classic consumer, a lost broker connection or a moved group coordinator on its own requests is not a terminal death while it lasts less than `sessionTimeout`: the consumer retries it without crashing and without calling this function (see [Membership errors during rebalance](Consuming.md#membership-errors)). An error from your handler, and a consumer with `groupProtocol: 'consumer'`, still count against `retry.retries`.
+For a classic consumer, a lost broker connection or a moved group coordinator on its own requests is not a terminal death while it lasts less than `sessionTimeout`: the consumer retries it without crashing and without calling this function (see [Membership errors during rebalance](Consuming.md#membership-errors)). An error from your handler still counts against `retry.retries`. So does a failure during the join of a consumer with `groupProtocol: 'consumer'`. The requests of that consumer's running fetch loop are different: it retries a lost connection, a request timeout or a moved, unavailable or loading coordinator on them without spending `retry.retries` and without a time limit. That ends when the requests succeed again, the coordinator reports the membership lost, a handler overruns `maxPollInterval` or you stop the consumer. See [Choosing a server-side assignor](Consuming.md#choosing-a-server-side-assignor).
 
 The function has the following signature: `(error: Error) => Promise<boolean>`
 

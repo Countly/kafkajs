@@ -1,0 +1,11 @@
+--- a/testHelpers/wire/metadataV13.js
++++ b/testHelpers/wire/metadataV13.js
+@@ -26,7 +26,7 @@
+ 
+ const encodeTopic = (topic) =>
+   new Encoder()
+-    .writeInt16(topic.errorCode)
++    .writeInt16(0)
+     .writeUVarIntString(topic.name)
+     .writeUuid(topic.topicId)
+     .writeBoolean(topic.isInternal)

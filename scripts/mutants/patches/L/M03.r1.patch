@@ -1,0 +1,11 @@
+--- a/testHelpers/lifecycle.js
++++ b/testHelpers/lifecycle.js
+@@ -84,7 +84,7 @@
+           if (boundary === 'pre-release-commit' && event !== 'rejoin') continue
+           cells.push({ event, boundary, protocol, membership })
+         }
+-  return [...cells, ...manualCells()]
++  return cells
+ }
+ 
+ module.exports = {

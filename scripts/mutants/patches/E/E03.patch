@@ -1,0 +1,10 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -1398,6 +1398,7 @@
+       return
+     }
+     this.clearPendingSeek(topic, partition)
++    this.operations.discharge(topic, partition)
+   }
+ 
+   /**

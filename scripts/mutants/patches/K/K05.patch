@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -99,7 +99,7 @@
+   handleResponse(token, response) {
+     if (!this.current(token)) return false
+     const { full } = this.pending
+-    this.pending = null
++    this.pending = this.pending
+     if (response.errorCode) {
+       this.reset(response.errorCode === 70)
+       return false

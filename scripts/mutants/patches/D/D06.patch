@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/consumer.js
++++ b/src/consumer/groupProtocol/consumer.js
+@@ -933,7 +933,6 @@
+           isCurrent,
+           surface: true,
+         })
+-        if (!isCurrent()) return
+         const stalled = []
+         for (const topicId of outcome?.unresolved || []) {
+           const attempts = (this.unresolvedAttempts.get(topicId) || 0) + 1

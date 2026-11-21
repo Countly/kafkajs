@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const { inspect } = require('util')
 const createRetry = require('../retry')
 const Generation = require('./generation')
@@ -107,8 +108,8 @@ const DEFAULTS = Object.freeze({
   bufferMemory: 33554432,
   maxBlockMs: 60000,
   maxRequestSize: 1048576,
-  // KIP-794's adaptive weighting stays off by default until its measured gate passes.
-  adaptive: false,
+  // The default partitioner weighs each pick by the partitions' queues (KIP-794's adaptive partitioning).
+  adaptive: true,
 })
 
 /**
@@ -204,6 +205,8 @@ const createProducer = ({
   let closing = null
   /** Whether a `disconnect()` has completed since the last `connect()`: later calls do nothing. */
   let closed = false
+  /** Counts every valid `disconnect()` call, so a `connect()` waiting for a close sees a later one. */
+  let closeRequests = 0
   const isClosing = () => closing !== null
   /**
    * The lifecycle every operation of this producer captures when it starts and checks after each
@@ -400,9 +403,9 @@ const createProducer = ({
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })
@@ -873,16 +876,24 @@ const createProducer = ({
     ...telemetry?.methods(),
     /**
      * Connects the producer, starting a new lifecycle after a close: it first joins a close still
-     * under way, and opens no connection while that close owns the cleanup. Operations of an
-     * earlier lifecycle stay fenced.
+     * under way, and opens no connection while that close owns the cleanup. A `disconnect()`
+     * called while it waits was asked after it, so it is refused instead of reopening the
+     * producer that call closed. Operations of an earlier lifecycle stay fenced.
      * @returns {Promise}
      * @throws {import('../errors').KafkaJSApplicationRecoverableError} as a rejection, once the
      *   producer is unusable: a connect never revives it
+     * @throws {KafkaJSNonRetriableError} as a rejection, when a `disconnect()` was called while it
+     *   waited for a close; the producer stays disconnected and no `CONNECT` is emitted
      */
     connect: guardFatal(async () => {
-      // eslint-disable-next-line no-unmodified-loop-condition -- the close clears it when it ends
-      while (closing !== null) {
+      if (closing !== null) {
+        const asked = closeRequests
         await closing
+        if (closeRequests !== asked) {
+          throw new KafkaJSNonRetriableError(
+            'The producer was disconnected while connect() waited for an earlier close; call connect() again to resume'
+          )
+        }
       }
       if (closed || generation.closed) {
         generation = new Generation()
@@ -956,8 +967,8 @@ const createProducer = ({
      * with `'unknown'`, pending retries are cancelled, no old operation opens a connection or
      * writes, an unknown commit stays unknown and is not aborted, and the connections close. The
      * first call's `timeout` governs concurrent ones, which share its one cleanup; a call after
-     * the close completed does nothing until `connect()`. The call resolves whatever the
-     * cleanup answers.
+     * the close completed does nothing until `connect()`. A `connect()` still waiting for a close
+     * is refused by a later call, joined or not. The call resolves whatever the cleanup answers.
      * @param {{ timeout?: number }} [options] `timeout` in ms, an integer from 0 to 2147483647; an
      *   argument that is not an object is ignored, so the method can be a signal handler
      * @returns {Promise<void>}
@@ -973,6 +984,7 @@ const createProducer = ({
         return Promise.reject(error)
       }
 
+      closeRequests++
       if (closing !== null) return closing
       if (closed) return Promise.resolve()
       closing = close(startedAt, timeout)

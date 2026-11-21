@@ -284,6 +284,38 @@ describe('Consumer > external cluster.disconnect() under a running consumer', ()
     }, 20000)
   })
 
+  describe('a disconnect after the listener close has settled', () => {
+    it('clears the armed restart timer at once and leaves no listener or join', async () => {
+      const { timers, clears, restartTimers } = spyOnTimers()
+      let mark
+      let listenerClose
+      const { cluster, joins, recreationListeners } = await startConsumer({
+        onCrash: ({ payload }) => {
+          payload.error.retryTime = LONG
+          mark = timers.mock.calls.length
+          listenerClose = consumer.disconnect()
+        },
+      })
+      const before = joins()
+
+      try {
+        await crashed(cluster)
+        await listenerClose
+        const handles = restartTimers(mark)
+        expect(handles.length).toBeGreaterThan(0)
+        expect(handles.some((timer) => clears().includes(timer))).toBe(false)
+
+        await consumer.disconnect()
+
+        expect(handles.every((timer) => clears().includes(timer))).toBe(true)
+        expect(recreationListeners()).toBe(0)
+        expect(joins()).toBe(before)
+      } finally {
+        timers.mockRestore()
+      }
+    }, 20000)
+  })
+
   describe('an explicit run and a pending automatic restart', () => {
     /** CRASH listener that makes the restart wait `LONG` ms, or `delay`, after a plain disconnect. */
     const delayedRestart =

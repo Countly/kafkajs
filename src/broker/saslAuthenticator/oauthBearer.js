@@ -10,14 +10,30 @@
  * reused and refreshed when appropriate.
  */
 
-const { request } = require('../../protocol/sasl/oauthBearer')
+const { request, response } = require('../../protocol/sasl/oauthBearer')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
-const { failureDetail } = require('./failure')
+const { failureDetail, trustedError } = require('./failure')
 
+/**
+ * Built-in SASL OAUTHBEARER mechanism.
+ * @param {{ oauthBearerProvider: Function, authorizationIdentity?: string }} sasl the SASL config
+ * @returns {(context: object) => { authenticate: () => Promise<void> }} the provider the
+ *   authenticator calls with the connection's `saslAuthenticate`
+ */
 const oauthBearerAuthenticatorProvider =
   (sasl) =>
-  ({ host, port, logger, saslAuthenticate }) => {
+  ({ host, port, logger, saslAuthenticate, passesThrough = () => false }) => {
     return {
+      /**
+       * Sends the token. A broker that refuses it answers with an error challenge in a response
+       * that carries no error code (RFC 7628 section 3.2.3); the challenge is answered with a lone
+       * %x01 so the broker ends the exchange with its own rejection, and the login fails whatever
+       * that last reply is. The challenge text is never logged or put in the error.
+       * @returns {Promise<void>}
+       * @throws {KafkaJSSASLAuthenticationError} for a missing provider or token, a broker
+       *   rejection or an error challenge
+       * @throws {Error} the connection's own refusal when it ended the exchange
+       */
       authenticate: async () => {
         const { oauthBearerProvider } = sasl
 
@@ -37,9 +53,20 @@ const oauthBearerAuthenticatorProvider =
 
         try {
           logger.debug('Authenticate with SASL OAUTHBEARER', { broker })
-          await saslAuthenticate({ request: await request(sasl, oauthBearerToken) })
+          const challenged = await saslAuthenticate({
+            request: await request(sasl, oauthBearerToken),
+            response,
+          })
+          if (challenged) {
+            await saslAuthenticate({ request: request.acknowledgeError() })
+            throw trustedError(
+              KafkaJSSASLAuthenticationError,
+              'The server answered the token with an error challenge'
+            )
+          }
           logger.debug('SASL OAUTHBEARER authentication successful', { broker })
         } catch (e) {
+          if (passesThrough(e)) throw e
           const error = new KafkaJSSASLAuthenticationError(
             `SASL OAUTHBEARER authentication failed: ${failureDetail(e)}`
           )

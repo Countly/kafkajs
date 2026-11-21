@@ -1,0 +1,11 @@
+--- a/scripts/protocol/javaVectors/GenerateAssignorVectors.java
++++ b/scripts/protocol/javaVectors/GenerateAssignorVectors.java
+@@ -641,7 +641,7 @@
+     for (String memberId : List.of("m-1", "m-2", "m-3", "m-4")) {
+       fourCooperative.add(cooperativeMember(memberId, a, Collections.emptyList(), DEFAULT_GENERATION));
+     }
+-    cases.add(vector("more_consumers_than_partitions", COOPERATIVE, scarce, fourCooperative));
++
+ 
+     // Range divides each topic separately; sticky divides the pooled partitions.
+     Map<String, Integer> twoTopics = topology("t-a", 4, "t-b", 7);

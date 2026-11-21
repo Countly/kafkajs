@@ -1,21 +1,54 @@
 #!/bin/bash -e
-# Packs the library, installs the tarball into a throwaway project and runs the smoke tests against it.
+# Installs the library's tarball into a throwaway project and runs the smoke tests against it.
+# Usage: packSmoke.sh [<tarball.tgz>]
+# With a tarball, smokes exactly that file and never packs; without one, packs the library first.
+# The project is PACK_DIR when set (kept afterwards), else a temporary directory removed on exit.
+set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PACK_DIR="${PACK_DIR:-$(mktemp -d)}"
+
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [<tarball.tgz>]" >&2
+  exit 2
+fi
+if [ "$#" -eq 1 ]; then
+  if [[ "$1" != *.tgz ]] || [ ! -f "$1" ]; then
+    echo "not a regular .tgz file: $1" >&2
+    exit 2
+  fi
+  name="$(tar -xOzf "$1" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).name')" || {
+    echo "cannot read package/package.json from $1" >&2
+    exit 2
+  }
+  if [ "$name" != "@countly/kafkajs" ]; then
+    echo "$1 holds $name, expected @countly/kafkajs" >&2
+    exit 2
+  fi
+  TARBALL_PATH="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+fi
+
+if [ -z "$PACK_DIR" ]; then
+  PACK_DIR="$(mktemp -d)"
+  # Absolute, so the trap still finds it after the cd below when TMPDIR is relative.
+  PACK_DIR="$(cd "$PACK_DIR" && pwd)"
+  trap 'rm -rf "$PACK_DIR"' EXIT
+fi
 export PACK_DIR
 
-TARBALL="$(cd "$ROOT" && npm pack --silent --pack-destination "$PACK_DIR")"
-echo "tarball: $PACK_DIR/$TARBALL"
+if [ "$#" -eq 0 ]; then
+  TARBALL_PATH="$PACK_DIR/$(cd "$ROOT" && npm pack --silent --pack-destination "$PACK_DIR")"
+fi
+echo "tarball: $TARBALL_PATH"
 
 # The tarball must not contain tests, fixtures or the otel/ sub-package.
-"$ROOT/scripts/assertCleanTarball.sh" "$PACK_DIR/$TARBALL"
+"$ROOT/scripts/assertCleanTarball.sh" "$TARBALL_PATH"
 # The guard also requires the public share guide and excludes other documentation.
 
 cd "$PACK_DIR"
 [ -f package.json ] || echo '{ "name": "pack-smoke", "private": true, "type": "commonjs" }' > package.json
-npm install --silent --no-audit --no-fund "./$TARBALL"
+# --ignore-scripts: neither install needs a lifecycle script, so none runs.
+npm install --silent --no-audit --no-fund --ignore-scripts "$TARBALL_PATH"
 # Complete dependency installation before creating the alias: reification can prune symlinks.
-npm install --silent --no-audit --no-fund --no-save @types/node@^24
+npm install --silent --no-audit --no-fund --no-save --ignore-scripts @types/node@^24
 # The supported `kafkajs` alias resolves to this one installation, so module identity is shared.
 [ -e node_modules/kafkajs ] || ln -s @countly/kafkajs node_modules/kafkajs
 node -e 'if (require.resolve("kafkajs") !== require.resolve("@countly/kafkajs") || require("kafkajs") !== require("@countly/kafkajs")) throw new Error("Package alias differs")'

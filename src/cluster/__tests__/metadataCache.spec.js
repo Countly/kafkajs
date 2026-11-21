@@ -439,6 +439,123 @@ describe('Cluster > MetadataCache', () => {
       expect(cached.decoded).toBe(partition0(fresh))
     })
 
+    describe('with a wanted-topic predicate', () => {
+      let wanted
+      let owned
+
+      beforeEach(() => {
+        wanted = new Set()
+        owned = new MetadataCache({
+          logger: newLogger(),
+          instrumentationEmitter: emitter,
+          isWanted: (topic) => wanted.has(topic),
+        })
+      })
+
+      const named = (topic, topicId, partitions = [0]) => {
+        const metadata = response({ topicId })
+        metadata.topicMetadata[0].topic = topic
+        metadata.topicMetadata[0].partitionMetadata = partitions.map((partitionId) => ({
+          ...partition0(response()),
+          partitionId,
+        }))
+        return metadata
+      }
+      const shortId = (i) => `00000000-0000-0000-0000-0000000000${String(i + 1).padStart(2, '0')}`
+
+      test('a scoped refresh drops every unwanted topic it does not carry, ids included', () => {
+        for (let i = 0; i < 5; i++) owned.update(named(`short-${i}`, shortId(i)))
+
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect([...owned.topics.keys()]).toEqual(['other-topic'])
+        expect([...owned.topicIds.keys()]).toEqual([ID_B])
+        for (let i = 0; i < 5; i++) expect(owned.topicName(shortId(i))).toBeUndefined()
+      })
+
+      test('a wanted topic keeps its id across a deleted window and its recreation is detected', () => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A, leaderEpoch: 9 }))
+        owned.update(otherTopic({ topicId: ID_B }))
+        owned.update(named('test-topic', NO_TOPIC_ID, []))
+        owned.update(otherTopic({ topicId: ID_B }))
+        expect(owned.topicId('test-topic')).toEqual(ID_A)
+
+        const recreated = response({ topicId: '21222324-2526-2728-292a-2b2c2d2e2f30' })
+        owned.update(recreated)
+
+        expect(events).toEqual([
+          {
+            topic: 'test-topic',
+            previousTopicId: ID_A,
+            topicId: '21222324-2526-2728-292a-2b2c2d2e2f30',
+          },
+        ])
+      })
+
+      test('a topic only an id lookup recorded is kept until its owner registers or retires it', () => {
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+      })
+
+      test('an id lookup keeps a name an earlier full refresh carried until its owner registers it', () => {
+        owned.update(named('test-topic', ID_A), { full: true })
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+      })
+
+      test('a registered name is no longer pending: once unwanted, a scoped refresh drops it', () => {
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        wanted.add('test-topic')
+        owned.update(otherTopic({ topicId: ID_B }))
+        wanted.delete('test-topic')
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toBeUndefined()
+      })
+
+      test('releasing pending names drops every unwanted one not kept and keeps the kept ones', () => {
+        const ID_K = '21222324-2526-2728-292a-2b2c2d2e2f30'
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.updateTopicsById(named('kept-topic', ID_K))
+        owned.releasePending(['kept-topic'])
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toBeUndefined()
+        expect(owned.topicName(ID_K)).toEqual('kept-topic')
+        owned.releasePending([])
+        expect(owned.topicName(ID_K)).toBeUndefined()
+      })
+
+      test('Cluster#retireFirstAddTopics releases the pending names its owner no longer keeps', () => {
+        const cluster = new Cluster({
+          logger: newLogger(),
+          brokers: ['localhost:9092'],
+          socketFactory: () => {},
+          retry: { retries: 0 },
+        })
+        const ID_K = '21222324-2526-2728-292a-2b2c2d2e2f30'
+        cluster.metadataCache.updateTopicsById(response({ topicId: ID_A }))
+        cluster.metadataCache.updateTopicsById(named('kept-topic', ID_K))
+        cluster.retireFirstAddTopics(['kept-topic'])
+
+        expect(cluster.topicName(ID_A)).toBeUndefined()
+        expect(cluster.topicName(ID_K)).toEqual('kept-topic')
+      })
+
+      test('a full-cluster refresh still prunes a wanted topic it does not carry', () => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }), { full: true })
+
+        expect(owned.topics.has('test-topic')).toBe(false)
+      })
+    })
+
     test('a hint still moves the leader for a topic whose decoded object was released', () => {
       cache.update(response({ leader: 1, leaderEpoch: 5 }))
       cache.update(otherTopic({ topicId: ID_B }))

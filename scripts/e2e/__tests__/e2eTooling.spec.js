@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('b75a444cd969d490ac896539430a0585ea9155a5a8250592ae837a71b0ecacc5')
+    expect(digest(file)).toBe('7ff429d35f29b68431235e3303dbdd6c9d4e6a5cce6fe5eb7f103265b8de51be')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -1114,7 +1114,8 @@ describe('broker telemetry fixture', () => {
       'legacy/JavaTelemetryClient.java',
     ])
       expect(digest(fixture + name)).toBe(manifest.scripts[name])
-    expect(digest(fixture + 'fetch.sh')).toBe(manifest.scripts['fetch.sh'])
+    for (const name of ['fetch.sh', 'download.sh'])
+      expect(digest(fixture + name)).toBe(manifest.scripts[name])
     expect(digest(fixture + 'fixtures/inputs.sha256')).toBe(
       '221be9594f870c453fc4a56126fcadaadcb4d3741750a0d727e6a08e332553b3'
     )
@@ -1356,7 +1357,7 @@ describe('broker telemetry fixture', () => {
     expect(stop.if).toBe('always()')
     expect(stop.run).toContain('timeout -k 5s 150s')
     expect(job.steps.at(-1).if).toBe('always()')
-    expect(steps[position('run.sh verify')]['timeout-minutes']).toBeGreaterThanOrEqual(5)
+    expect(steps[position('telemetry/fetch.sh')]['timeout-minutes']).toBeGreaterThanOrEqual(5)
     const serialized = JSON.stringify(job)
     expect(serialized).not.toContain('build.sh')
     expect(serialized).not.toContain('testWithKafka')
@@ -1767,7 +1768,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('requires the adopted long-window lane on pull requests with three replicates and bounded jobs', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const expr = (text) => '$' + `{{ ${text} }}`
@@ -1836,7 +1836,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('covers all six live census lanes with capture and scalar companions', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const census = workflow.jobs['live-owner-census']
@@ -1893,7 +1892,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const { LIVE_SEED } = require('../../soak/liveSeed')
     const { TELEMETRY } = require('../../soak/soak')
@@ -3804,4 +3802,564 @@ describe('Java node export capture', () => {
     }
     expect(() => assertJavaCaptures([receipt(prefixes)], dir)).toThrow('Invalid capture length')
   })
+})
+
+/**
+ * A curl, sleep and date double for the pinned download scripts: a fake clock in FAKE_STATE, every call logged to
+ * FAKE_LOG, and curl answers chosen by FAKE_FAILURES/FAKE_FAILURE, FAKE_PLAN (`[seconds, exit, kind]` per call, kind
+ * `pinned`, `partial`, `wrong`, `archive` copying FAKE_ARCHIVE, `hang` spending the call's whole `--max-time` with no
+ * answer, or none) or FAKE_BLOCK.
+ */
+const fetchDouble = `#!/usr/bin/env node
+const fs = require('fs')
+const path = require('path')
+const tool = path.basename(process.argv[1])
+const args = process.argv.slice(2)
+const state = process.env.FAKE_STATE
+const clock = path.join(state, 'clock')
+const now = () => (fs.existsSync(clock) ? Number(fs.readFileSync(clock, 'utf8')) : 1000000)
+const advance = (seconds) => fs.writeFileSync(clock, String(now() + seconds))
+const block = () => {
+  fs.writeFileSync(path.join(state, 'blocked'), '')
+  setInterval(() => {}, 1000)
+}
+if (tool === 'date') {
+  process.stdout.write(now() + '\\n')
+} else {
+  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ tool, args }) + '\\n')
+  if (tool === 'sleep') {
+    if (process.env.FAKE_BLOCK === 'sleep') block()
+    else advance(Number(args[0]))
+  } else {
+    const url = args.at(-1)
+    const out = args[args.indexOf('-o') + 1]
+    const counter = path.join(state, encodeURIComponent(url))
+    const seen = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0
+    fs.writeFileSync(counter, String(seen + 1))
+    const index = fs.existsSync(path.join(state, 'curls')) ? fs.readFileSync(path.join(state, 'curls'), 'utf8').length : 0
+    fs.appendFileSync(path.join(state, 'curls'), '.')
+    const failure = { partial: [0, 18, 'partial'], wrong: [0, 0, 'wrong'] }[process.env.FAKE_FAILURE]
+    const planned = process.env.FAKE_PLAN ? JSON.parse(process.env.FAKE_PLAN)[index] : undefined
+    const served = (prefix) => process.env[prefix] && url.startsWith(process.env[prefix])
+    const [cost, exit, kind] = served('FAKE_MISSING')
+      ? [0, 22, 'none']
+      : served('FAKE_WRONG')
+        ? [0, 0, 'wrong']
+        : planned || (seen < Number(process.env.FAKE_FAILURES) ? failure : [0, 0, 'pinned'])
+    advance(cost)
+    if (kind === 'hang') advance(Number(args[args.indexOf('--max-time') + 1]))
+    if (kind === 'partial') fs.writeFileSync(out, 'partial')
+    if (kind === 'wrong') fs.writeFileSync(out, '<html>error page</html>\\n')
+    if (kind === 'pinned') fs.writeFileSync(out, 'pinned ' + path.basename(url) + '\\n')
+    if (kind === 'archive') fs.copyFileSync(process.env.FAKE_ARCHIVE, out)
+    if (process.env.FAKE_BLOCK === 'curl') block()
+    else process.exit(exit)
+  }
+}
+`
+
+describe.each([
+  ['fetch.sh', 'TF1_CACHE', 'fixtures/inputs.sha256', 3, 6],
+  ['fetch-interop.sh', 'TELEMETRY_INTEROP_CACHE', 'interop.sha256', 2, 5],
+])('pinned input download by %s', (script, cacheVariable, sums, sources, mavenFiles) => {
+  const { createHash } = require('crypto')
+  const { spawn } = require('child_process')
+  const telemetry = path.resolve(__dirname, '../telemetry')
+  const names = fs
+    .readFileSync(path.join(telemetry, sums), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => line.split(/\s+/)[1])
+  const body = (name) => `pinned ${path.basename(name)}\n`
+  const share = Math.ceil(150 / sources)
+  let directory
+  let cache
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pinned-fetch-'))
+    cache = path.join(directory, 'cache')
+    for (const name of ['bin', 'state', 'scripts/fixtures']) {
+      fs.mkdirSync(path.join(directory, name), { recursive: true })
+    }
+    for (const name of fs.readdirSync(telemetry).filter((file) => file.endsWith('.sh'))) {
+      fs.copyFileSync(path.join(telemetry, name), path.join(directory, 'scripts', name))
+    }
+    const digest = (name) => createHash('sha256').update(body(name)).digest('hex')
+    fs.writeFileSync(
+      path.join(directory, 'scripts', sums),
+      names.map((name) => `${digest(name)}  ${name}\n`).join('')
+    )
+    for (const name of ['curl', 'sleep', 'date']) {
+      fs.writeFileSync(path.join(directory, 'bin', name), fetchDouble, { mode: 0o755 })
+    }
+  })
+
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  /**
+   * Builds the environment for a copy of the real fetch script run against the curl, sleep and date doubles.
+   * @param {number} failures attempts per URL that fail before one succeeds
+   * @param {object} [extra] further variables: FAKE_FAILURE (`partial` exits 18 after a partial body, `wrong` exits 0
+   *   with the wrong bytes), FAKE_PLAN (JSON `[seconds, exit, body]` per curl call) or FAKE_BLOCK (`curl` or `sleep`)
+   * @returns {object} the environment
+   */
+  const environment = (failures, extra) => ({
+    ...process.env,
+    PATH: `${path.join(directory, 'bin')}${path.delimiter}${process.env.PATH}`,
+    [cacheVariable]: cache,
+    FAKE_LOG: path.join(directory, 'tools.jsonl'),
+    FAKE_STATE: path.join(directory, 'state'),
+    FAKE_FAILURES: String(failures),
+    FAKE_FAILURE: 'partial',
+    ...extra,
+  })
+  const calls = () => {
+    const log = path.join(directory, 'tools.jsonl')
+    return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : []
+  }
+
+  /**
+   * Runs a copy of the real fetch script to completion against the doubles.
+   * @param {number} failures attempts per URL that fail before one succeeds
+   * @param {object} [extra] further double variables, see `environment`
+   * @returns {{status: number|null, signal: string|null, stdout: string, stderr: string, calls: object[]}}
+   */
+  const fetch = (failures, extra = {}) => {
+    fs.rmSync(path.join(directory, 'tools.jsonl'), { force: true })
+    const run = spawnSync('bash', [path.join(directory, 'scripts', script)], {
+      env: environment(failures, extra),
+      encoding: 'utf8',
+      timeout: 60000,
+    })
+    const { status, signal, stdout, stderr } = run
+    return { status, signal, stdout, stderr, calls: calls() }
+  }
+
+  /**
+   * Starts the fetch script in its own process group, waits until a double blocks, then sends SIGTERM to the whole
+   * group as `timeout` does.
+   * @param {object} extra double variables; must set FAKE_BLOCK
+   * @returns {Promise<{code: number|null, signal: string|null}>}
+   */
+  const kill = async (extra) => {
+    const child = spawn('bash', [path.join(directory, 'scripts', script)], {
+      env: environment(Infinity, extra),
+      detached: true,
+      stdio: 'ignore',
+    })
+    const exited = new Promise((resolve) =>
+      child.on('exit', (code, signal) => resolve({ code, signal }))
+    )
+    while (!fs.existsSync(path.join(directory, 'state', 'blocked'))) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    process.kill(-child.pid, 'SIGTERM')
+    return exited
+  }
+  const curls = (list) => list.filter((call) => call.tool === 'curl')
+  const sleeps = (list) => list.filter((call) => call.tool === 'sleep').map(({ args }) => args)
+  const limits = (list) =>
+    curls(list).map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+  const cached = () =>
+    fs
+      .readdirSync(cache, { recursive: true })
+      .map(String)
+      .filter((name) => fs.statSync(path.join(cache, name)).isFile())
+  const fill = () => {
+    for (const name of names) {
+      fs.mkdirSync(path.dirname(path.join(cache, name)), { recursive: true })
+      fs.writeFileSync(path.join(cache, name), body(name))
+    }
+  }
+
+  test('retries a failed download and keeps the file once it arrives', () => {
+    const result = fetch(2)
+    expect(result.status).toBe(0)
+    for (const name of names)
+      expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
+    expect(curls(result.calls)).toHaveLength(names.length * 3)
+    expect(limits(result.calls).slice(0, 3)).toEqual(
+      [0, 2, 6].map((spent) => Math.min(60, share - spent))
+    )
+    expect(cached().filter((name) => name.includes('.part'))).toEqual([])
+  })
+
+  test('stops after four attempts per source with a 2, 4 and 6 second backoff and names the file and URL that failed', () => {
+    const result = fetch(Infinity)
+    expect(result.signal).toBeNull()
+    expect(result.status).toBe(1)
+    const attempts = curls(result.calls)
+    expect(attempts).toHaveLength(4 * sources)
+    const url = attempts[0].args.at(-1)
+    expect(attempts.filter(({ args }) => args.at(-1) === url)).toHaveLength(4)
+    expect(sleeps(result.calls)).toEqual(
+      Array(sources)
+        .fill([['2'], ['4'], ['6']])
+        .flat()
+    )
+    expect(result.stderr).toContain(`${names[0]} from ${url}: curl exit 18`)
+    expect(cached()).toEqual([])
+  })
+
+  test('shares one deadline across files, shortening the last attempt and its backoff', () => {
+    const plan = [
+      [0, 0, 'pinned'],
+      [60, 28, 'partial'],
+      [13, 28, 'partial'],
+      [60, 28, 'partial'],
+      [5, 0, 'pinned'],
+      [2, 22, 'none'],
+      [3, 22, 'none'],
+    ]
+    const result = fetch(0, { FAKE_PLAN: JSON.stringify(plan) })
+    expect(result.signal).toBeNull()
+    expect(result.status).toBe(1)
+    expect(limits(result.calls)).toEqual([Math.min(60, share), 60, 13, 60, 13, 4, 4])
+    expect(sleeps(result.calls)).toEqual([['2'], ['2'], ['2'], ['1']])
+    const [first, second] = curls(result.calls)
+      .slice(5)
+      .map(({ args }) => args.at(-1))
+    expect(result.stderr).toContain(
+      `${names[2]} from ${first}: curl exit 22; from ${second}: curl exit 22`
+    )
+    expect(cached().sort()).toEqual([names[0], names[1]].sort())
+  })
+
+  test('never lets an interrupted download satisfy the cache check', () => {
+    expect(fetch(Infinity).status).toBe(1)
+    const retry = fetch(0)
+    expect(retry.status).toBe(0)
+    expect(curls(retry.calls)).toHaveLength(names.length)
+    expect(fs.readFileSync(path.join(cache, names[0]), 'utf8')).toBe(body(names[0]))
+  })
+
+  test('retries a response with the wrong bytes without publishing it', () => {
+    const result = fetch(1, { FAKE_FAILURE: 'wrong' })
+    expect(result.status).toBe(0)
+    expect(curls(result.calls)).toHaveLength(names.length * 2)
+    for (const name of names)
+      expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
+    expect(cached().filter((name) => name.includes('.part'))).toEqual([])
+  })
+
+  test('fails on wrong bytes naming the file, URL and digest mismatch, and a clean rerun recovers', () => {
+    const result = fetch(Infinity, { FAKE_FAILURE: 'wrong' })
+    expect(result.status).toBe(1)
+    const attempts = curls(result.calls)
+    expect(attempts).toHaveLength(4 * sources)
+    expect(result.stderr).toContain(`${names[0]} from ${attempts[0].args.at(-1)}: digest mismatch`)
+    expect(cached()).toEqual([])
+    const retry = fetch(0)
+    expect(retry.status).toBe(0)
+    expect(curls(retry.calls)).toHaveLength(names.length)
+  })
+
+  test('keeps a present file with the pinned digest offline', () => {
+    fill()
+    const result = fetch(0)
+    expect(result.status).toBe(0)
+    expect(result.calls).toEqual([])
+  })
+
+  test('fetches a cached file whose digest is wrong again', () => {
+    fill()
+    fs.writeFileSync(path.join(cache, names[0]), 'wrong\n')
+    const result = fetch(0)
+    expect(result.status).toBe(0)
+    expect(curls(result.calls)).toHaveLength(1)
+    expect(fs.readFileSync(path.join(cache, names[0]), 'utf8')).toBe(body(names[0]))
+  })
+
+  test('leaves no file under the real name when killed after the bytes arrive', async () => {
+    const exit = await kill({ FAKE_FAILURES: '0', FAKE_BLOCK: 'curl' })
+    expect(exit.code === 143 || exit.signal === 'SIGTERM').toBe(true)
+    expect(cached()).toEqual([])
+  }, 30000)
+
+  test('leaves no file under the real name when killed during the backoff', async () => {
+    const exit = await kill({ FAKE_BLOCK: 'sleep' })
+    expect(exit.code === 143 || exit.signal === 'SIGTERM').toBe(true)
+    expect(cached()).toEqual([])
+  }, 30000)
+
+  const central = 'https://repo1.maven.org/maven2/'
+  const mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+  test('gives every Maven Central file a second source at the same path on the Google mirror', () => {
+    const text = fs.readFileSync(path.join(telemetry, script), 'utf8')
+    expect(text).toContain(`\nM=${central.slice(0, -1)}\nG=${mirror.slice(0, -1)}\n`)
+    const entries = text
+      .slice(text.indexOf('<<LIST\n') + 7, text.indexOf('\nLIST\n'))
+      .split('\n')
+      .map((line) => line.split(' '))
+    expect(entries.map(([name]) => name).sort()).toEqual([...names].sort())
+    const maven = entries.filter(([, first]) => first.startsWith('$M/'))
+    expect(maven).toHaveLength(mavenFiles)
+    for (const [, first, second] of maven) expect(second).toBe('$G/' + first.slice(3))
+  })
+
+  test('fetches every Maven Central file from the mirror when Maven Central answers 404', () => {
+    const result = fetch(0, { FAKE_MISSING: central })
+    expect(result.status).toBe(0)
+    for (const name of names)
+      expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(body(name))
+    const urls = curls(result.calls).map(({ args }) => args.at(-1))
+    const failed = urls.filter((url) => url.startsWith(central))
+    expect(failed).toHaveLength(4 * mavenFiles)
+    expect(urls.filter((url) => url.startsWith(mirror))).toEqual(
+      [...new Set(failed)].map((url) => mirror + url.slice(central.length))
+    )
+    expect(urls).toHaveLength(5 * mavenFiles + names.length - mavenFiles)
+  })
+
+  test('rejects a mirror copy with the wrong digest and caches nothing', () => {
+    const result = fetch(0, { FAKE_MISSING: central, FAKE_WRONG: mirror })
+    expect(result.status).toBe(1)
+    const first = curls(result.calls)[0].args.at(-1)
+    expect(first.startsWith(central)).toBe(true)
+    expect(result.stderr).toContain(
+      `${names[0]} from ${first}: curl exit 22; from ${mirror + first.slice(central.length)}: digest mismatch`
+    )
+    expect(cached()).toEqual([])
+  })
+})
+
+describe('pinned download from a second source', () => {
+  const { createHash, randomBytes } = require('crypto')
+  const telemetry = path.resolve(__dirname, '../telemetry')
+  const name = 'tools/protoc'
+  const pinned = 'pinned protoc\n'
+  const first = 'https://first.example/protoc.exe'
+  const second = 'https://second.example/protoc.zip'
+  let directory
+  let cache
+
+  /**
+   * Computes the CRC-32 a zip entry header records.
+   * @param {Buffer} data the bytes
+   * @returns {number} the unsigned checksum
+   */
+  const crc32 = (data) => {
+    let crc = ~0
+    for (const byte of data) {
+      crc ^= byte
+      for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+    }
+    return ~crc >>> 0
+  }
+
+  /**
+   * Writes a zip archive holding one stored (uncompressed) member.
+   * @param {string} member member path inside the archive
+   * @param {string} text member content
+   * @returns {string} the archive path
+   */
+  const archive = (member, text) => {
+    const data = Buffer.from(text)
+    const file = Buffer.from(member)
+    const entry = (signature, size) => {
+      const header = Buffer.alloc(size)
+      header.writeUInt32LE(signature, 0)
+      return header
+    }
+    const local = entry(0x04034b50, 30)
+    local.writeUInt16LE(10, 4)
+    local.writeUInt32LE(crc32(data), 14)
+    local.writeUInt32LE(data.length, 18)
+    local.writeUInt32LE(data.length, 22)
+    local.writeUInt16LE(file.length, 26)
+    const central = entry(0x02014b50, 46)
+    central.writeUInt16LE(10, 4)
+    central.writeUInt16LE(10, 6)
+    central.writeUInt32LE(crc32(data), 16)
+    central.writeUInt32LE(data.length, 20)
+    central.writeUInt32LE(data.length, 24)
+    central.writeUInt16LE(file.length, 28)
+    const end = entry(0x06054b50, 22)
+    end.writeUInt16LE(1, 8)
+    end.writeUInt16LE(1, 10)
+    end.writeUInt32LE(46 + file.length, 12)
+    end.writeUInt32LE(30 + file.length + data.length, 16)
+    const out = path.join(directory, `archive-${randomBytes(4).toString('hex')}.zip`)
+    fs.writeFileSync(out, Buffer.concat([local, file, data, central, file, end]))
+    return out
+  }
+
+  /**
+   * Sources the real download.sh and fetches the pinned file from the first URL, then the second URL's zip member.
+   * @param {Array<[number, number, string]>} plan the double's answer per curl call
+   * @param {string} member the archive member content served by the second source
+   * @param {number} [left] seconds of the shared deadline left when the fetch starts; 150 if absent
+   * @returns {{status: number|null, stderr: string, calls: object[]}}
+   */
+  const fetch = (plan, member, left) => {
+    const log = path.join(directory, 'tools.jsonl')
+    const run = spawnSync(
+      'bash',
+      [
+        '-c',
+        '. "$1/download.sh"; [ -z "$FETCH_LEFT" ] || FETCH_DEADLINE=$(($(date +%s) + FETCH_LEFT)); fetch "$2" "$3" tools/protoc "$4" "$5#bin/protoc"',
+        'fetch',
+        telemetry,
+        path.join(directory, 'inputs.sha256'),
+        cache,
+        first,
+        second,
+      ],
+      {
+        env: {
+          ...process.env,
+          PATH: `${path.join(directory, 'bin')}${path.delimiter}${process.env.PATH}`,
+          FAKE_LOG: log,
+          FAKE_STATE: path.join(directory, 'state'),
+          FAKE_FAILURES: '0',
+          FAKE_PLAN: JSON.stringify(plan),
+          FAKE_ARCHIVE: archive('bin/protoc', member),
+          FETCH_LEFT: left === undefined ? '' : String(left),
+        },
+        encoding: 'utf8',
+        timeout: 60000,
+      }
+    )
+    const calls = fs.existsSync(log)
+      ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse)
+      : []
+    return { status: run.status, stderr: run.stderr, calls }
+  }
+  const urls = (calls) =>
+    calls.filter((call) => call.tool === 'curl').map(({ args }) => args.at(-1))
+  const cached = () => fs.readdirSync(cache, { recursive: true }).map(String)
+  const missing = [0, 22, 'none']
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pinned-second-'))
+    cache = path.join(directory, 'cache')
+    fs.mkdirSync(path.join(directory, 'state'))
+    fs.mkdirSync(path.join(directory, 'bin'))
+    for (const tool of ['curl', 'sleep', 'date'])
+      fs.writeFileSync(path.join(directory, 'bin', tool), fetchDouble, { mode: 0o755 })
+    const digest = createHash('sha256').update(pinned).digest('hex')
+    fs.writeFileSync(path.join(directory, 'inputs.sha256'), `${digest}  ${name}\n`)
+  })
+
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  test('accepts the archive member from the second source when the first source answers 404', () => {
+    const result = fetch([missing, missing, missing, missing, [0, 0, 'archive']], pinned)
+    expect(result.status).toBe(0)
+    expect(urls(result.calls)).toEqual([first, first, first, first, second])
+    expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
+    expect(cached().sort()).toEqual(['tools', name])
+  })
+
+  test('gives the second source its own share of the deadline when the first source hangs', () => {
+    const hang = [0, 28, 'hang']
+    const result = fetch([hang, hang, [0, 0, 'archive']], pinned)
+    expect(result.status).toBe(0)
+    expect(urls(result.calls)).toEqual([first, first, second])
+    expect(
+      result.calls
+        .filter((call) => call.tool === 'curl')
+        .map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+    ).toEqual([60, 13, 60])
+    expect(fs.readFileSync(path.join(cache, name), 'utf8')).toBe(pinned)
+  })
+
+  test('gives the first source an attempt when fewer seconds than sources are left', () => {
+    const result = fetch([missing], pinned, 1)
+    expect(result.status).toBe(1)
+    expect(urls(result.calls)).toEqual([first])
+    expect(
+      result.calls
+        .filter((call) => call.tool === 'curl')
+        .map(({ args }) => Number(args[args.indexOf('--max-time') + 1]))
+    ).toEqual([1])
+    expect(result.stderr).toContain(`from ${first}: curl exit 22; from ${second}: deadline spent`)
+  })
+
+  test('rejects a second-source member with the wrong digest and caches nothing', () => {
+    const wrong = [0, 0, 'archive']
+    const result = fetch([missing, missing, missing, missing, wrong, wrong, wrong, wrong], 'evil\n')
+    expect(result.status).toBe(1)
+    expect(urls(result.calls)).toEqual([first, first, first, first, second, second, second, second])
+    expect(cached()).toEqual(['tools'])
+    expect(result.stderr).toContain(`from ${second}: digest mismatch`)
+  })
+
+  test('fails with one error naming both sources when both fail', () => {
+    const result = fetch(Array(8).fill(missing), pinned)
+    expect(result.status).toBe(1)
+    expect(result.stderr.trim().split('\n')).toEqual([
+      `Download failed: ${path.join(cache, name)} from ${first}: curl exit 22; from ${second}: curl exit 22`,
+    ])
+    expect(cached()).toEqual(['tools'])
+  })
+
+  test('gives protoc the protobuf release archive of the same version after the mirror', () => {
+    const script = fs.readFileSync(path.join(telemetry, 'fetch.sh'), 'utf8')
+    expect(script).toContain(
+      'tools/protoc-3.25.5-linux-x86_64.exe $M/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe ' +
+        '$G/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe ' +
+        'https://github.com/protocolbuffers/protobuf/releases/download/v25.5/protoc-25.5-linux-x86_64.zip#bin/protoc\n'
+    )
+  })
+})
+
+describe('telemetry download cache', () => {
+  const root = path.resolve(__dirname, '../../..')
+  const steps = require('js-yaml').load(
+    fs.readFileSync(path.join(root, '.github/workflows/telemetry.yml'), 'utf8')
+  ).jobs.telemetry.steps
+  const pinned = /^actions\/cache\/(restore|save)@[0-9a-f]{40}$/
+  const expression = (text) => '$' + `{{ ${text} }}`
+
+  test('gives every step that calls run.sh the private temporary directory it requires', () => {
+    const callers = steps.filter((step) => step.run?.includes('scripts/e2e/telemetry/run.sh'))
+    expect(callers.length).toBeGreaterThanOrEqual(2)
+    for (const step of callers) expect(step.env?.TMPDIR).toBe(expression('runner.temp'))
+  })
+
+  test.each([
+    [
+      'inputs',
+      'fetch.sh',
+      ['.tmp/telemetry-cache/tools', '.tmp/telemetry-cache/jars', '.tmp/telemetry-cache/proto'],
+      'scripts/e2e/telemetry/fixtures/inputs.sha256',
+    ],
+    [
+      'interop',
+      'fetch-interop.sh',
+      ['.tmp/telemetry-interop'],
+      'scripts/e2e/telemetry/interop.sha256',
+    ],
+  ])(
+    'restores the %s cache before %s and saves it even when a later step fails',
+    (id, script, paths, sums) => {
+      const index = (predicate) => steps.findIndex(predicate)
+      const fetch = index((step) => step.run?.includes(`scripts/e2e/telemetry/${script}`))
+      const restore = index((step) => step.id === `${id}-cache`)
+      const save = index(
+        (step) => step.uses?.startsWith('actions/cache/save@') && step.if?.includes(`steps.${id}.`)
+      )
+      expect(steps[fetch].id).toBe(id)
+      expect(restore).toBeGreaterThanOrEqual(0)
+      expect(restore).toBeLessThan(fetch)
+      expect(steps[restore].uses).toMatch(pinned)
+      expect(steps[restore].if).toBe(steps[fetch].if)
+      expect(steps[restore].with.path.trim().split('\n')).toEqual(paths)
+      expect(steps[restore].with.key).toBe(
+        `telemetry-${id}-${expression('runner.os')}-${expression(`hashFiles('${sums}')`)}`
+      )
+      expect(save).toBeGreaterThan(fetch)
+      expect(steps[save].uses).toMatch(pinned)
+      expect(steps[save].uses.split('@')[1]).toBe(steps[restore].uses.split('@')[1])
+      expect(steps[save].if).toBe(
+        `always() && steps.${id}.outcome == 'success' && steps.${id}-cache.outputs.cache-hit != 'true'`
+      )
+      expect(steps[save].with).toEqual({
+        path: steps[restore].with.path,
+        key: expression(`steps.${id}-cache.outputs.cache-primary-key`),
+      })
+    }
+  )
 })

@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -606,7 +606,7 @@
+     ...commits,
+     eachMessage: async ({ partition, message }) => {
+       const messageStartedAt = now()
+-      accounting.enter(1, messageStartedAt)
++      accounting.enter(2, messageStartedAt)
+       sizing?.observe(partition)
+       if (startedAt === undefined) {
+         startedAt = messageStartedAt

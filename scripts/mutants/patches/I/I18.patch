@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1865,7 +1865,7 @@
+       (this.consumerGroup !== group || group.offsetManager !== manager
+         ? new KafkaJSCommitFailedError('The closing assignment was replaced')
+         : this.commitRefusal(token, null))
+-    await operation.wait(() => group.commitOffsets({}, { auto: true, guard, fence: operation }))
++    return
+   }
+ 
+   /**

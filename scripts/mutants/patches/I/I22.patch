@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -162,7 +162,7 @@
+   }
+ 
+   if (
+-    timeout !== undefined &&
++    false &&
+     (!Number.isInteger(timeout) || timeout < 0 || timeout > 2147483647)
+   ) {
+     throw new KafkaJSInvalidConfigurationError(

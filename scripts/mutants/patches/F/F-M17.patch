@@ -1,0 +1,14 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -114,10 +114,7 @@
+    * @returns {{generation: number, declarationRevision: number}} the same object until either changes
+    */
+   shareKey() {
+-    if (
+-      this.sharedKey?.generation !== this.generation ||
+-      this.sharedKey.declarationRevision !== this.order
+-    ) {
++    if (this.sharedKey?.generation !== this.generation) {
+       this.sharedKey = { generation: this.generation, declarationRevision: this.order }
+     }
+     return this.sharedKey

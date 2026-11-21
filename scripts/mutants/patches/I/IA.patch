@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -859,8 +859,6 @@
+       this.disarmFatal()
+       if (closing) await scope.wait(() => this.invokeCloseHook(closing, scope))
+ 
+-      await this.commitFinalOffsetsContained(scope)
+-
+       this.consumerGroup.clearAssignerState()
+ 
+       // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member tells

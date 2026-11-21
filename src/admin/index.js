@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const createDelegationTokens = require('./delegationTokens')
 const createClientQuotas = require('./clientQuotas')
 const createScramCredentials = require('./scramCredentials')
@@ -9,7 +10,6 @@ const { inspect } = require('util')
 const AdminLifecycle = require('./lifecycle')
 const {
   retrierOf,
-  currentDeadline,
   wrapAdmin,
   validateApiTimeout,
   checked,
@@ -17,14 +17,13 @@ const {
   sharedSetup,
   waitForOf: waitFor,
 } = require('./deadline')
-const { createOffsets } = require('./offsets')
+const { createOffsets, OffsetAdmin } = require('./offsets')
 const createLogDirs = require('./logDirs')
 const groupBy = require('../utils/groupBy')
-const createConsumer = require('../consumer')
-const { disposeConsumer } = require('../consumer/disposal')
+const Long = require('../utils/long')
+const { assertPartitionId } = require('../utils/partitionId')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
-const { LEVELS } = require('../loggers')
 const {
   KafkaJSNonRetriableError,
   KafkaJSInvalidConfigurationError,
@@ -75,6 +74,9 @@ const { CONNECT, DISCONNECT } = events
 
 const NOT_CONTROLLER_CODE = 41
 const GROUP_ID_NOT_FOUND_CODE = 69
+const UNKNOWN_TOPIC_OR_PARTITION_CODE = 3
+/** The largest offset a commit can carry: OffsetCommit offsets are signed int64. */
+const MAX_OFFSET = 2n ** 63n - 1n
 const CONSUMER_PROTOCOL_TYPE = 'consumer'
 const UNANSWERED_MEMBER_CODE = -1
 const THROTTLING_QUOTA_EXCEEDED_CODE = 89
@@ -129,6 +131,30 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
 }
 
 const isConsumerGroupRunning = (description) => ['Empty', 'Dead'].includes(description.state)
+
+/**
+ * An offset as a commit carries it. Only a decimal integer string (an optional sign and digits), a
+ * safe integer number, a bigint or a `Long` is read; anything else, `'NaN'`, a blank or prefixed
+ * string, a boolean or an array say, is refused rather than read as 0 the way `Long.fromValue` would.
+ * @param {string|number|bigint|Long} offset a long of at least 0, or `-1` (latest) or `-2` (earliest)
+ * @returns {string} the offset in decimal
+ * @throws {KafkaJSNonRetriableError} for anything else, a value above the signed int64 range
+ *   included
+ */
+const commitOffsetOf = (offset) => {
+  const text = typeof offset === 'bigint' || offset instanceof Long ? offset.toString() : offset
+  const value =
+    (typeof text === 'string' && /^[+-]?\d+$/.test(text)) || Number.isSafeInteger(text)
+      ? BigInt(text)
+      : null
+  if (value === null || value > MAX_OFFSET) {
+    throw new KafkaJSNonRetriableError(`Invalid offset, expected a long received ${String(offset)}`)
+  }
+  if (value < 0n && value !== BigInt(EARLIEST_OFFSET) && value !== BigInt(LATEST_OFFSET)) {
+    throw new KafkaJSNonRetriableError('Offset must not be a negative number')
+  }
+  return value.toString()
+}
 
 /**
  * The static members `removeMembersFromConsumerGroup` was asked to remove, once each, as LeaveGroup
@@ -192,7 +218,7 @@ const findTopicPartitions = async (cluster, topic) => {
   return cluster
     .findTopicPartitionMetadata(topic)
     .map(({ partitionId }) => partitionId)
-    .sort()
+    .sort((a, b) => a - b)
 }
 const indexByPartition = (array) =>
   array.reduce(
@@ -440,6 +466,7 @@ module.exports = ({
   const logger = rootLogger.namespace('Admin')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
   const shareGroups = createShareGroups({ cluster, retry })
+  const offsetAdmin = new OffsetAdmin({ cluster, retry })
 
   const lifecycle = new AdminLifecycle({
     cluster,
@@ -1153,69 +1180,48 @@ module.exports = ({
   }
 
   /**
-   * Commits the `-1` (latest) and `-2` (earliest) entries of a `setOffsets` call as the group's
-   * offsets, as the admin's joined member. A consumer seek to a sentinel only moves that consumer's
-   * position and commits nothing, so `setOffsets` commits the sentinels itself; the seeks commit the
-   * concrete offsets. The last entry for a partition wins, as it does for the seeks, and an entry
-   * for a partition the topic does not have is dropped, as a seek to one is.
-   * @param {import('../../types').Consumer} consumer the admin's member of the group, joined
-   * @param {{ groupId: string, topic: string, partitions: Array<SeekEntry> }} request
-   * @returns {Promise<void>}
-   * @throws {KafkaJSProtocolError} the coordinator's answer when it rejects the commit
-   */
-  const commitSentinels = async (consumer, { groupId, topic, partitions }) => {
-    const last = new Map(partitions.map(({ partition, offset }) => [partition, Number(offset)]))
-    const existing = new Set(
-      cluster.findTopicPartitionMetadata(topic).map(({ partitionId }) => partitionId)
-    )
-    const sentinels = [...last]
-      .filter(
-        ([partition, offset]) =>
-          existing.has(partition) && (offset === EARLIEST_OFFSET || offset === LATEST_OFFSET)
-      )
-      .map(([partition, offset]) => ({ partition, offset: String(offset) }))
-    if (sentinels.length === 0) return
-
-    const { generationId, memberId, groupInstanceId } = consumer.groupMetadata()
-    const coordinator = checked(await waitOf(async () => cluster.findGroupCoordinator({ groupId })))
-    checked(
-      await waitOf(async () =>
-        coordinator.offsetCommit({
-          groupId,
-          groupGenerationId: generationId,
-          memberId,
-          groupInstanceId,
-          topics: [{ topic, partitions: sentinels }],
-        })
-      )
-    )
-  }
-
-  /**
    * @typedef {Object} SeekEntry
    * @property {number} partition
    * @property {string} offset
    */
 
   /**
-   * Sets the committed offsets of a consumer group that has no running members, through a
-   * temporary member of the group. The last entry for a partition wins, and an entry for a
-   * partition the topic does not have is ignored. An offset of `-1` (latest) or `-2` (earliest) is
-   * committed as given and stays that marker until it is resolved (`fetchOffsets` with
-   * `resolveOffsets` does so); any other offset is committed by a seek of the member. On every
-   * exit the call awaits disposal of the member, which releases its cluster subscriptions even if
-   * stopping fails. A disposal failure does not replace the call's outcome. Disposal itself does
-   * not disconnect the admin's shared cluster.
+   * Sets the committed offsets of a consumer group that has no running members. The admin writes
+   * them itself, with one OffsetCommit to the group's coordinator that carries no member id and
+   * generation -1, as the Java admin's `alterConsumerGroupOffsets` does; it never joins the group.
+   * The last entry for a partition wins, and every named partition is sent, in partition order: the
+   * coordinator refuses one the topic does not have with `UNKNOWN_TOPIC_OR_PARTITION`. Each commit
+   * carries only the partition and offset, so stored metadata becomes empty and the leader epoch
+   * unknown. An offset of `-1` (latest) or `-2` (earliest) is committed as
+   * given and stays that marker until it is resolved (`fetchOffsets` with `resolveOffsets` does so,
+   * and a consumer without a seek applies its reset policy to it). A group that does not exist is
+   * created by the coordinator. A member that starts during the call makes the coordinator refuse
+   * the commit with `UNKNOWN_MEMBER_ID`. Partitions answered with a retriable coordinator code are
+   * sent again within the retry budget; a confirmed partition is never sent again by this call.
+   * A `KafkaJSAggregateError` names every partition not confirmed, and the partitions it does not
+   * name were committed; any other rejection means no partition was confirmed. A commit that timed
+   * out may still have been applied. On a classic group that is already empty the commit does not
+   * restart the group's empty-since time, so these offsets can expire `offsets.retention.minutes`
+   * after the group became empty rather than after this call. Sending the call again writes the offsets again,
+   * over anything committed in between.
    * @param {object} request
    * @param {string} request.groupId
    * @param {string} request.topic
    * @param {Array<SeekEntry>} request.partitions at least one entry
-   * @returns {Promise<void>}
-   * @throws {KafkaJSNonRetriableError} for a missing `groupId` or `topic`, no `partitions`, an
-   *   entry with an invalid partition or offset, or a group whose state is not `Empty` or `Dead`
-   * @throws {Error} what subscribing, describing the group, starting the member, committing a
-   *   sentinel offset or stopping the member raised; a stop failure can replace a sentinel-commit
-   *   failure
+   * @returns {Promise<void>} once the coordinator accepted every offset
+   * @throws {KafkaJSNonRetriableError} before any request, for a missing `groupId` or `topic`, no
+   *   `partitions`, an entry whose partition is not a partition id, or an offset that is not a
+   *   decimal integer string or safe integer number of at least 0 (and at most the int64 maximum)
+   *   or exactly `-1`/`-2`; and, before any commit, for a group whose state is
+   *   not `Empty` or `Dead`
+   * @throws {KafkaJSProtocolError} `UNKNOWN_TOPIC_OR_PARTITION` for a topic the cluster does not
+   *   have, or the code a group description was refused with
+   * @throws {KafkaJSAggregateError} one child per partition not committed (see
+   *   `OffsetAdmin#commitOffsets`)
+   * @throws {Error} the commit request's own failure, a timeout say, when no partition was confirmed
+   *   or answered with a code
+   * @throws {KafkaJSInvariantViolation} for a malformed commit reply
+   * @throws {KafkaJSTimeout} once the API deadline passed
    */
   const setOffsets = async ({ groupId, topic, partitions }) => {
     if (!groupId) {
@@ -1229,76 +1235,31 @@ module.exports = ({
     if (!partitions || partitions.length === 0) {
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
+    for (const { partition } of partitions) assertPartitionId(partition)
+    const offsets = new Map(
+      partitions.map(({ partition, offset }) => [partition, commitOffsetOf(offset)])
+    )
 
-    return cluster.withGroup(groupId, async () => {
-      const round = currentDeadline()
-      const consumer = createConsumer({
-        logger: rootLogger.namespace('Admin', LEVELS.NOTHING),
-        cluster,
-        groupId,
-        ownsCluster: false,
-      })
-      /** Releases only the borrowed consumer under its original invocation's wire fence.
-       * @returns {Promise<void>} disposal failure cannot replace the call's own outcome
-       */
-      const dispose = () => round.run(() => disposeConsumer(consumer).catch(() => {}))
-      const unown = round.own(() => {
-        dispose().catch(() => {})
-      })
+    const existing = checked(await waitOf(async () => findTopicPartitions(cluster, topic)))
+    if (existing.length === 0) throw createErrorFromCode(UNKNOWN_TOPIC_OR_PARTITION_CODE)
 
-      try {
-        checked(await waitOf(async () => consumer.subscribe({ topic, fromBeginning: true })))
-        const description = checked(await waitOf(async () => consumer.describeGroup()))
+    const { groups } = checked(await waitOf(async () => describeGroups([groupId])))
+    const group = groups.find((row) => row.groupId === groupId)
+    if (group === undefined) {
+      throw new KafkaJSNonRetriableError(`The coordinator described no group for ${groupId}`)
+    }
+    const missing = group.state === 'Dead' && group.errorCode === GROUP_ID_NOT_FOUND_CODE
+    if (group.errorCode !== 0 && !missing) throw createErrorFromCode(group.errorCode)
+    if (!isConsumerGroupRunning(group)) {
+      throw new KafkaJSNonRetriableError(
+        `The consumer group must have no running instances, current state: ${group.state}`
+      )
+    }
 
-        if (!isConsumerGroupRunning(description)) {
-          throw new KafkaJSNonRetriableError(
-            `The consumer group must have no running instances, current state: ${description.state}`
-          )
-        }
-
-        checked(
-          await waitOf(
-            async () =>
-              new Promise((resolve, reject) => {
-                consumer.on(consumer.events.CRASH, ({ payload }) => reject(payload.error))
-                let committed = null
-                consumer.on(consumer.events.GROUP_JOIN, () => {
-                  committed ??= round.wait(() =>
-                    commitSentinels(consumer, { groupId, topic, partitions })
-                  )
-                  committed.catch(() => {})
-                })
-                consumer.on(consumer.events.FETCH, () => {
-                  if (round.expired) return
-                  committed
-                    .finally(() => disposeConsumer(consumer))
-                    .then(resolve)
-                    .catch(reject)
-                })
-
-                consumer
-                  .run({
-                    eachBatchAutoResolve: false,
-                    eachBatch: async () => true,
-                  })
-                  .catch(reject)
-
-                // This consumer doesn't need to consume any data
-                consumer.pause([{ topic }])
-
-                for (const seekData of partitions) {
-                  consumer.seek({ topic, ...seekData })
-                }
-              })
-          )
-        )
-      } finally {
-        // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
-        // stop is already logged by the consumer and must not replace the call's own outcome.
-        unown()
-        await dispose()
-      }
-    })
+    const cells = [...offsets]
+      .sort(([a], [b]) => a - b)
+      .map(([partition, offset]) => ({ partition, offset }))
+    await offsetAdmin.commitOffsets({ groupId, topic, cells })
   }
 
   /**
@@ -1592,8 +1553,8 @@ module.exports = ({
    * is never retried: it rejects once every page is in. A topic recreated between pages is read
    * again from the start the same way.
    *
-   * The whole read, the metadata refresh and every attempt included, has one deadline of 60 s
-   * inherited from the public call. At its actual monotonic deadline it rejects with
+   * The whole read, including metadata refresh, every page and every attempt, inherits the
+   * public call's `apiTimeout` (60000 ms by default). At its actual monotonic deadline it rejects with
    * `KafkaJSTimeout`, also with request timeout enforcement disabled. Expiry detaches local
    * waits, pages, retry timers and unsent requests. Shared discovery stops only when no live
    * caller remains; physical setup keeps its own budget. Already-written mutations may apply.
@@ -1666,15 +1627,18 @@ module.exports = ({
    * leader is returned with `leader: -1` instead of being waited for (Kafka 4.1.2 and 4.3 brokers
    * leave its `partitionErrorCode` at 0; a non-zero code is passed through), and a topic that does
    * not exist fails the call rather than being created. A failed request is retried on the `retry`
-   * budget, as the other admin calls are, and the whole read has one deadline of 60 s, after which
-   * it rejects with `KafkaJSTimeout`. A broker that does not offer the API is asked through
-   * Metadata after all. The option applies only to topics named explicitly: empty or omitted `topics` go through Metadata.
+   * budget, as the other admin calls are. Metadata discovery, every page and retry, and an
+   * unsupported-API Metadata fallback share the public call's `apiTimeout` (60000 ms by default).
+   * At that deadline the call rejects with `KafkaJSTimeout`; the fallback's shorter Metadata
+   * polling cap is nested inside it, never added. The option applies only to topics named
+   * explicitly: empty or omitted `topics` go through Metadata.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
    *
    * @param {Object} [options]
    * @param {string[]} [options.topics]
    * @param {boolean} [options.useDescribeTopicPartitions=false]
+   * @param {number} [options.apiTimeout] per-call budget in ms; defaults to the admin's configured budget
    * @return {Promise<TopicsMetadata>}
    * @throws {KafkaJSNonRetriableError} if a topic name is not a valid string
    *
@@ -2764,9 +2728,9 @@ module.exports = ({
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })

@@ -9,8 +9,12 @@ const { TOPIC, TOPIC_ID, fetchResponse } = require('./fixtures/fetchHarness')
 const { MemberAssignment } = require('../assignerProtocol')
 const { RecordBatch } = require('../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../protocol/recordBatch/record/v0')
-const { KafkaJSCorruptRecordError } = require('../../errors')
+const { KafkaJSCorruptRecordError, KafkaJSInvalidVarIntError } = require('../../errors')
 const { compressedBatch } = require('../../protocol/message/compression/fixtures/compressedBatch')
+const {
+  batch,
+  varint,
+} = require('../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 
 const NODES = [
   { id: 0, host: 'node-0', port: 9092 },
@@ -49,13 +53,38 @@ const batchAt = async (offset, options = {}) =>
   )
 
 /**
- * Builds a complete batch with either an invalid magic byte or a malformed gzip body. The gzip
- * batch has a valid checksum and boundary, so its decoder marker carries nextOffset and codec.
+ * A CRC-valid batch of one record whose offset delta is a 6-byte signed varint, one byte past the
+ * limit. A reader without the 5-byte cap wraps it to 4.
  * @param {number} offset first batch offset
- * @param {'magic'|'decompression'} reason corruption kind
+ * @returns {Buffer}
+ */
+const overlongVarIntAt = (offset) => {
+  const body = Buffer.concat([
+    Buffer.from([0]),
+    varint(0),
+    Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80, 0x01]),
+    varint(-1),
+    varint(-1),
+    varint(0),
+  ])
+  return batch({
+    baseOffset: BigInt(offset),
+    records: [Buffer.concat([varint(body.length), body])],
+  })
+}
+
+/**
+ * Builds a complete batch with an invalid magic byte, a malformed gzip body or an overlong signed
+ * varint. The gzip and varint batches have a valid checksum and boundary, so their decoder marker
+ * carries nextOffset; the gzip one also carries its codec.
+ * @param {number} offset first batch offset
+ * @param {'magic'|'decompression'|'varint'} reason corruption kind
  * @returns {Promise<Buffer>} corrupt batch bytes
  */
 const corruptAt = async (offset, reason) => {
+  if (reason === 'varint') {
+    return overlongVarIntAt(offset)
+  }
   if (reason === 'decompression') {
     return compressedBatch({
       baseOffset: BigInt(offset),
@@ -107,7 +136,7 @@ const responseForTopicId = (partitions, topicId) => {
 class HaltCase {
   /**
    * @param {object} options
-   * @param {'magic'|'decompression'} options.corruption corruption used in every schedule
+   * @param {'magic'|'decompression'|'varint'} options.corruption corruption used in every schedule
    * @param {Record<number, number>} options.leaders the leader node of each partition
    * @param {'classic'|'consumer'} [options.protocol='classic']
    * @param {object} [options.consumer] over the consumer's options
@@ -371,6 +400,8 @@ class HaltCase {
         acquiredAt: expect.any(Number),
         changedAt: expect.any(Number),
         recreatedAt: 0,
+        soughtAt: 0,
+        retired: false,
       })
       expect(acquired.acquiredAt).toBeGreaterThan(0)
       expect(acquired.changedAt).toBe(acquired.acquiredAt)
@@ -647,11 +678,10 @@ describe.each(['magic', 'decompression'])(
       await halt.appendCorrupt(0, 1)
       await halt.append(1, 0, 1)
       await halt.start()
-      halt.listeners.push(
-        halt.consumer.on(halt.consumer.events.PARTITION_HALTED, () => {
-          throw new Error('listener failure')
-        })
-      )
+      const listener = jest.fn(() => {
+        throw new Error('listener failure')
+      })
+      halt.listeners.push(halt.consumer.on(halt.consumer.events.PARTITION_HALTED, listener))
       const error = jest.spyOn(halt.group.logger, 'error').mockImplementation(() => {
         throw new Error('logger failure')
       })
@@ -665,11 +695,10 @@ describe.each(['magic', 'decompression'])(
       expect(halt.offsets(0)).toEqual(['0'])
       expect(halt.halts).toHaveLength(1)
       expect(error).toHaveBeenCalledTimes(1)
-      expect(error.mock.calls[0][1]).toMatchObject({
-        partition: 0,
-        offset: '1',
-        listenerError: 'listener failure',
-      })
+      expect(listener).toHaveBeenCalledTimes(1)
+      // Consumer.on contains and logs its own listener's failure, so the halt never sees it.
+      expect(error.mock.calls[0][1]).toMatchObject({ partition: 0, offset: '1' })
+      expect(error.mock.calls[0][1]).not.toHaveProperty('listenerError')
       expect(later).not.toContain(0)
       expect(halt.group.haltedPartitions.has(`${TOPIC}|0`)).toBe(true)
     })
@@ -1161,3 +1190,55 @@ describe.each(['magic', 'decompression'])(
     })
   }
 )
+
+describe('Consumer > a record batch with an overlong signed varint', () => {
+  let halt
+
+  afterEach(async () => {
+    const closing = halt
+    halt = null
+    if (closing) await closing.close()
+  })
+
+  test('an overlong varint halts only its partition and other partitions keep fetching', async () => {
+    halt = new HaltCase({ leaders: { 0: 0, 1: 0, 2: 1 }, corruption: 'varint' })
+    await halt.append(0, 0, 1, 2)
+    await halt.appendCorrupt(0, 3)
+    await halt.append(0, 4)
+    await halt.append(1, 0, 1)
+    await halt.append(2, 0, 1)
+    await halt.start()
+
+    await halt.until(
+      () => halt.halts.length === 1 && halt.offsets(1).length === 2 && halt.offsets(2).length === 2,
+      'the halt and the other partitions'
+    )
+    await halt.append(1, 2)
+    await halt.append(2, 2)
+    await halt.until(
+      () => halt.offsets(1).includes('2') && halt.offsets(2).includes('2'),
+      'the other partitions after the halt'
+    )
+    const later = await halt.laterRounds()
+
+    expect(halt.offsets(0)).toEqual(['0', '1', '2'])
+    expect(halt.offsets(1)).toEqual(['0', '1', '2'])
+    expect(halt.offsets(2)).toEqual(['0', '1', '2'])
+    expect(halt.crashes).toEqual([])
+    expect(halt.halts).toHaveLength(1)
+    const [{ payload }] = halt.halts
+    expect(payload).toEqual({
+      groupId: 'halt-group',
+      memberId: 'member-1',
+      topic: TOPIC,
+      partition: 0,
+      offset: '3',
+      reason: 'length',
+      nextOffset: '4',
+      error: expect.any(KafkaJSCorruptRecordError),
+    })
+    expect(payload.error.cause).toBeInstanceOf(KafkaJSInvalidVarIntError)
+    expect(later).not.toContain(0)
+    expect(halt.position(0)).toBe('3')
+  })
+})

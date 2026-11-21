@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3708,7 +3708,7 @@
+     check()
+     const quiescent = invocation !== undefined && this.isStopping()
+     for (let pass = 0; pass < MAX_RESOLUTION_PASSES;) {
+-      if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
++      if (!quiescent) this.seekOffsets([{ topic, partitions: [partition] }], preparation)
+       check()
+       if (!quiescent && this.isSeekGated(topic, partition)) {
+         const held = this.operations.reservation(topic, partition)

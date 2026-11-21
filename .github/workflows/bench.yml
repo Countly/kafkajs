@@ -1,16 +1,53 @@
-# Manual benchmark report (no thresholds, nothing here gates a release). It runs scripts/benchmarks/manifest.json
-# against one Compose cluster on Kafka 4.4.0 for the packed fork and, through the public API only, for kafkajs 2.2.4.
-# A benchmark that fails is an error row in the report; the report is uploaded either way.
+# Manual benchmark report (no thresholds, nothing here gates a release). The plan job gives every row of
+# scripts/benchmarks/manifest.json that the dispatch selects exactly one owning job (scripts/ci/benchJobs.js):
+# the ordinary rows run in `bench` on one Compose cluster on Kafka 4.4.0, for the packed fork and, through the
+# public API only, for kafkajs 2.2.4; share throughput, Snappy, consumer and telemetry rows run in jobs of their
+# own, each on a fresh runner with its own cluster where it needs one. A row run anywhere else reports omitted.
+# A benchmark that fails is an error row, a job whose setup failed reports its selected rows as error rows, and
+# the `report` job joins every job's report into one; every report is uploaded either way.
 name: Benchmarks
 on:
   workflow_dispatch:
+    inputs:
+      rows:
+        description: Comma-separated manifest row names to run; empty runs every row
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ordinary: ${{ steps.plan.outputs.ordinary }}
+      share: ${{ steps.plan.outputs.share }}
+      snappy: ${{ steps.plan.outputs.snappy }}
+      consumer: ${{ steps.plan.outputs.consumer }}
+      audit: ${{ steps.plan.outputs.audit }}
+      telemetry: ${{ steps.plan.outputs.telemetry }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      # An unknown row name fails here, before any job sets up.
+      - name: Plan the selected rows
+        id: plan
+        env:
+          ROWS: ${{ inputs.rows }}
+        run: node scripts/ci/benchJobs.js plan >> "$GITHUB_OUTPUT"
+
   bench:
+    needs: plan
+    if: needs.plan.outputs.ordinary != ''
     runs-on: ubuntu-latest
     # Starting value; tightened to the first run's wall-clock time plus headroom.
-    timeout-minutes: 120
+    timeout-minutes: 300
     env:
       KAFKA_VERSION: '4.4.0'
     steps:
@@ -21,21 +58,535 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
-      - run: npm ci
+      - id: install
+        run: npm ci --ignore-scripts
       - name: Install the packed fork and kafkajs 2.2.4 into separate prefixes
+        id: prefixes
         run: |
           set -euo pipefail
           tarball=$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename")
-          npm install --prefix "$RUNNER_TEMP/fork" "$RUNNER_TEMP/$tarball"
-          npm install --prefix "$RUNNER_TEMP/base" kafkajs@2.2.4
+          npm install --prefix "$RUNNER_TEMP/fork" --ignore-scripts "$RUNNER_TEMP/$tarball"
+          npm install --prefix "$RUNNER_TEMP/base" kafkajs@2.2.4 --ignore-scripts
       # Without a non-empty NO_LOGS the script ends in `docker compose logs -f` and never returns.
       - name: Start the cluster
+        id: start
         env:
           NO_LOGS: '1'
         run: ./scripts/dockerComposeUp.sh
-      - run: node scripts/waitForKafka.js
+      - id: wait
+        run: node scripts/waitForKafka.js
+      - name: Keep the setup diagnostics
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench"
+          { df -h; docker compose ps -a; docker compose logs --no-color; } > "$RUNNER_TEMP/bench/setup-diagnostics.log" 2>&1 || true
       - name: Run the benchmarks
-        run: node scripts/benchmarks/report.js --runs 3 --fork-dir "$RUNNER_TEMP/fork" --baseline-dir "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/bench"
+        if: ${{ !cancelled() }}
+        env:
+          ROWS: ${{ needs.plan.outputs.ordinary }}
+          BENCH_SETUP: install=${{ steps.install.outcome }} prefixes=${{ steps.prefixes.outcome }} start=${{ steps.start.outcome }} wait=${{ steps.wait.outcome }}
+        run: node scripts/benchmarks/report.js --runs 3 --fork-dir "$RUNNER_TEMP/fork" --baseline-dir "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/bench" --only "$ROWS"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-ordinary
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-ordinary
+          path: ${{ runner.temp }}/bench/
+          if-no-files-found: warn
+      - name: Show the report in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Stop the cluster
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  share-rows:
+    needs: plan
+    if: needs.plan.outputs.share != '[]'
+    runs-on: ubuntu-latest
+    # The session stops at 290 min with its corpus removed and its row at 300 min; the rest is
+    # setup, trace compression and upload, under the hosted 360-minute limit.
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.share) }}
+    env:
+      KAFKA_VERSION: '4.4.0'
+      COMPOSE_FILE: docker-compose.share.yml
+      BENCH_SHARE_ROWS: '1'
+      BENCH_ROW: ${{ matrix.row }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - id: install
+        run: npm ci
+      - name: Start the share cluster
+        id: start
+        env:
+          NO_LOGS: '1'
+        run: ./scripts/dockerComposeUp.sh
+      - id: wait
+        run: node scripts/waitForKafka.js
+      - name: Enable share and read it back
+        id: share
+        run: ./scripts/e2e/shareKafka44Setup.sh
+      - name: Record the cluster this job owns
+        id: guard
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bench"
+          node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ compose: process.env.COMPOSE_FILE, kafka: process.env.KAFKA_VERSION, row: process.env.BENCH_ROW, run: process.env.GITHUB_RUN_ID, sha: process.env.GITHUB_SHA }) + "\n")' "$RUNNER_TEMP/bench/cluster.json"
+      - name: Keep the setup diagnostics
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench"
+          { df -h; docker compose -f docker-compose.share.yml ps -a; docker compose -f docker-compose.share.yml logs --no-color; } > "$RUNNER_TEMP/bench/setup-diagnostics.log" 2>&1 || true
+      - name: Run the share row
+        if: ${{ !cancelled() }}
+        env:
+          KAFKAJS_CLUSTER_MANIFEST: ${{ runner.temp }}/bench/cluster.json
+          BENCH_SETUP: install=${{ steps.install.outcome }} start=${{ steps.start.outcome }} wait=${{ steps.wait.outcome }} share=${{ steps.share.outcome }} guard=${{ steps.guard.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/none"
+          node scripts/benchmarks/report.js --runs 1 --fork-dir "$RUNNER_TEMP/none" --baseline-dir "$RUNNER_TEMP/none" --out "$RUNNER_TEMP/bench" --only "$BENCH_ROW"
+      - name: Compress the share traces
+        if: always()
+        run: find "$RUNNER_TEMP/bench/bench-raw" -name '*.trace.jsonl' -exec gzip -9 {} + || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.key }}
+          path: ${{ runner.temp }}/bench/
+          if-no-files-found: warn
+      - name: Show the row in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Stop the cluster
+        if: always()
+        run: docker compose -f docker-compose.share.yml down --volumes --remove-orphans
+
+  snappy-row:
+    needs: plan
+    if: needs.plan.outputs.snappy != '[]'
+    runs-on: ubuntu-latest
+    # The session stops at 100 min and its row at 110 min; the rest is setup, the Java read-back and upload.
+    timeout-minutes: 140
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.snappy) }}
+    env:
+      BENCH_SNAPPY_ROWS: '1'
+      BENCH_ROW: ${{ matrix.row }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: install
+        run: npm ci
+      - id: java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      # The row reads this receipt (a copy goes with the raw evidence); a failed read-back leaves it
+      # incomplete and the row an error row.
+      - name: Read the Snappy encoder artifacts back with Java
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/bench "$RUNNER_TEMP/bench"
+          scripts/protocol/javaVectors/runAssignors.sh snappy src/protocol/message/compression/fixtures/encoder --read-back | tee .tmp/bench/snappy-java-readback.log "$RUNNER_TEMP/bench/snappy-java-readback.log"
+      - name: Run the Snappy row
+        if: ${{ !cancelled() }}
+        env:
+          BENCH_SETUP: install=${{ steps.install.outcome }} java=${{ steps.java.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/none"
+          node scripts/benchmarks/report.js --runs 1 --fork-dir "$RUNNER_TEMP/none" --baseline-dir "$RUNNER_TEMP/none" --out "$RUNNER_TEMP/bench" --only "$BENCH_ROW"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.key }}
+          path: ${{ runner.temp }}/bench/
+          if-no-files-found: warn
+      - name: Show the row in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+
+  # One consumer row per job. Broker rows start the plain or the racks cluster, broker-free rows
+  # none; the archived trees (and, for the retirement row, the tree before the committed-offset
+  # retirement) get this tree's drivers, so every arm runs a byte-identical comparison driver.
+  consumer-rows:
+    needs: plan
+    if: needs.plan.outputs.consumer != '[]'
+    runs-on: ubuntu-latest
+    # The controller's own row limit (330 min) reports an error row before this.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.consumer) }}
+    env:
+      KAFKA_VERSION: '4.4.0'
+      BENCH_CONSUMER_ROWS: '1'
+      BENCH_ROW: ${{ matrix.row }}
+      BENCH_COMPOSE: ${{ matrix.compose }}
+      BENCH_TREE_LABELS: ${{ matrix.trees }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: install
+        run: npm ci
+      # A history without the retirement leaves that tree out; only the retirement row then errors.
+      - name: Check out the comparison trees with this tree's drivers
+        id: trees
+        run: |
+          set -euo pipefail
+          trees="$RUNNER_TEMP/trees"
+          mkdir -p "$trees"
+          IFS=, read -ra labels <<< "$BENCH_TREE_LABELS"
+          for label in "${labels[@]}"; do
+            if [ "$label" = before-retirement ]; then
+              added=$(git log --diff-filter=A --format=%H -1 -- src/cluster/__tests__/committedOffsetRetirement.spec.js)
+              if [ -z "$added" ]; then
+                echo "::notice::No committed-offset retirement in this history; the before-retirement tree is left out."
+                continue
+              fi
+              ref="$added^"
+            else
+              ref="refs/tags/3.0.0-$label"
+            fi
+            git worktree add --detach "$trees/$label" "$ref"
+            echo "$label: $(git -C "$trees/$label" rev-parse HEAD)"
+            mkdir -p "$trees/$label/scripts/benchmarks"
+            cp scripts/clients.js "$trees/$label/scripts/clients.js"
+            cp scripts/benchmarks/*.js "$trees/$label/scripts/benchmarks/"
+          done
+          node -e 'const fs = require("fs"), d = process.argv[1]; console.log("BENCH_TREES=" + JSON.stringify(Object.fromEntries(fs.readdirSync(d).map((l) => [l, `${d}/${l}`]))))' "$trees" >> "$GITHUB_ENV"
+      # Without a non-empty NO_LOGS the script ends in `docker compose logs -f` and never returns.
+      - name: Start the row's cluster
+        id: start
+        env:
+          NO_LOGS: '1'
+        run: |
+          set -euo pipefail
+          if [ -z "$BENCH_COMPOSE" ]; then echo "A broker-free row: no cluster."; exit 0; fi
+          COMPOSE_FILE="$BENCH_COMPOSE" ./scripts/dockerComposeUp.sh
+      - name: Wait for the cluster
+        id: wait
+        run: |
+          set -euo pipefail
+          if [ -z "$BENCH_COMPOSE" ]; then exit 0; fi
+          COMPOSE_FILE="$BENCH_COMPOSE" node scripts/waitForKafka.js
+      # The sessions rows read the node inventory of the racks cluster: node id and PLAINTEXT_HOST listener.
+      - name: Read BENCH_NODES from the started containers
+        id: nodes
+        run: |
+          set -euo pipefail
+          if [ "$BENCH_COMPOSE" != docker-compose.racks.yml ]; then exit 0; fi
+          for c in kafka1 kafka2 kafka3; do docker inspect --format '{{json .Config.Env}}' "$c"; done |
+            node -e 'const lines=require("fs").readFileSync(0,"utf8").trim().split("\n");const nodes=lines.map((l)=>{const env=Object.fromEntries(JSON.parse(l).map((e)=>[e.slice(0,e.indexOf("=")),e.slice(e.indexOf("=")+1)]));const [,host,port]=/PLAINTEXT_HOST:\/\/([^:,]+):(\d+)/.exec(env.KAFKA_ADVERTISED_LISTENERS);return {nodeId:Number(env.KAFKA_NODE_ID),host,port:Number(port)}});if(nodes.length!==3)throw new Error("expected 3 brokers");console.log("BENCH_NODES="+JSON.stringify(nodes))' >> "$GITHUB_ENV"
+      - name: Keep the setup diagnostics
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench"
+          { df -h; git worktree list; if [ -n "$BENCH_COMPOSE" ]; then docker compose -f "$BENCH_COMPOSE" ps -a; docker compose -f "$BENCH_COMPOSE" logs --no-color; fi; } > "$RUNNER_TEMP/bench/setup-diagnostics.log" 2>&1 || true
+      - name: Run the consumer row
+        if: ${{ !cancelled() }}
+        env:
+          BENCH_SETUP: install=${{ steps.install.outcome }} trees=${{ steps.trees.outcome }} start=${{ steps.start.outcome }} wait=${{ steps.wait.outcome }} nodes=${{ steps.nodes.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/none"
+          node scripts/benchmarks/report.js --runs 1 --fork-dir "$RUNNER_TEMP/none" --baseline-dir "$RUNNER_TEMP/none" --out "$RUNNER_TEMP/bench" --only "$BENCH_ROW"
+      # The report artifact carries the row's session receipt, which the audit joins.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+            ${{ runner.temp }}/bench/bench-raw/*/fork.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.key }}
+          path: ${{ runner.temp }}/bench/
+          if-no-files-found: warn
+      - name: Show the row in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Stop the cluster
+        if: always()
+        run: |
+          if [ -n "$BENCH_COMPOSE" ]; then docker compose -f "$BENCH_COMPOSE" down --volumes --remove-orphans; fi
+
+  # The audit joins the session receipts of the consumer rows this dispatch selected; a selected
+  # row without one is an error row of the audit.
+  consumer-audit:
+    needs: [plan, consumer-rows]
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.audit != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.audit) }}
+    env:
+      BENCH_CONSUMER_ROWS: '1'
+      BENCH_ROW: ${{ matrix.row }}
+      BENCH_AUDIT_ROWS: ${{ matrix.scope }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: install
+        run: npm ci
+      - id: download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: report-consumer-*
+          path: ${{ runner.temp }}/rows
+      - name: Join the rows' session receipts
+        id: join
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bench/bench-raw"
+          shopt -s nullglob
+          for raw in "$RUNNER_TEMP"/rows/*/bench-raw; do cp -R "$raw"/. "$RUNNER_TEMP/bench/bench-raw/"; done
+      - name: Audit the A/A arms, warm-ups and frozen repeat of the selected rows
+        if: ${{ !cancelled() }}
+        env:
+          BENCH_SETUP: install=${{ steps.install.outcome }} download=${{ steps.download.outcome }} join=${{ steps.join.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/none"
+          node scripts/benchmarks/report.js --runs 1 --fork-dir "$RUNNER_TEMP/none" --baseline-dir "$RUNNER_TEMP/none" --out "$RUNNER_TEMP/bench" --only "$BENCH_ROW"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.key }}
+          path: ${{ runner.temp }}/bench/
+          if-no-files-found: warn
+      - name: Show the audit in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+
+  # One telemetry session per job, on its own hosted runner with its declared sample count: a delivery
+  # row starts only the telemetry cluster (so readiness finds one container per broker) with a fresh
+  # reporter and an empty sink. The adapter stops a session 20 minutes before TELEMETRY_JOB_DEADLINE; a
+  # session cut off there is an error row with its elapsed time and completed children, still owed.
+  telemetry-rows:
+    needs: plan
+    if: needs.plan.outputs.telemetry != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.telemetry) }}
+    env:
+      KAFKA_VERSION: '4.4.0'
+      BENCH_TELEMETRY_ROW: ${{ matrix.row }}
+      TELEMETRY_DELIVERY: ${{ matrix.delivery }}
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: bench-telemetry
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-4.4.0.jsa
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+      TELEMETRY_PREVIOUS_ROOT: ${{ github.workspace }}/.tmp/previous-baseline
+    steps:
+      - name: Record the job deadline
+        id: deadline
+        run: echo "TELEMETRY_JOB_DEADLINE=$(( $(date +%s) + 355 * 60 ))" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - id: install
+        run: npm ci
+      # The adapter checks this checkout against the accepted tag and commit before it runs a previous arm.
+      - name: Check out the accepted telemetry baseline
+        id: baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 3.0.0-alpha.9e
+          path: .tmp/previous-baseline
+          persist-credentials: false
+      - name: Free runner disk for the session ledgers
+        id: disk
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -B1 "$RUNNER_TEMP"
+      - name: Verify the reporter jar and prepare the decoder
+        id: prepare
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          if [ "$TELEMETRY_DELIVERY" != true ]; then echo "A broker-free row: no reporter."; exit 0; fi
+          mkdir -p "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      # Without a non-empty NO_LOGS the script ends in `docker compose logs -f` and never returns.
+      - name: Start the telemetry cluster
+        id: start
+        env:
+          NO_LOGS: '1'
+        run: |
+          set -euo pipefail
+          if [ "$TELEMETRY_DELIVERY" != true ]; then echo "A broker-free row: no cluster."; exit 0; fi
+          ./scripts/dockerComposeUp.sh
+      - name: Wait for the telemetry cluster
+        id: wait
+        run: |
+          set -euo pipefail
+          if [ "$TELEMETRY_DELIVERY" != true ]; then exit 0; fi
+          node scripts/waitForKafka.js
+      - name: Keep the setup diagnostics
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench"
+          { df -h; docker compose ps -a; docker compose logs --no-color; } > "$RUNNER_TEMP/bench/setup-diagnostics.log" 2>&1 || true
+      - name: Run the telemetry row
+        if: ${{ !cancelled() }}
+        env:
+          TMPDIR: ${{ runner.temp }}
+          BENCH_SETUP: deadline=${{ steps.deadline.outcome }} java=${{ steps.java.outcome }} install=${{ steps.install.outcome }} baseline=${{ steps.baseline.outcome }} disk=${{ steps.disk.outcome }} prepare=${{ steps.prepare.outcome }} start=${{ steps.start.outcome }} wait=${{ steps.wait.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/none"
+          node scripts/benchmarks/report.js --runs 1 --fork-dir "$RUNNER_TEMP/none" --baseline-dir "$RUNNER_TEMP/none" --out "$RUNNER_TEMP/bench" --only "$BENCH_TELEMETRY_ROW"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-${{ matrix.key }}
+          path: ${{ runner.temp }}/bench/
+          if-no-files-found: warn
+      - name: Show the row in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Stop the telemetry cluster
+        if: always()
+        run: |
+          if [ "$TELEMETRY_DELIVERY" = true ]; then docker compose down --volumes --remove-orphans; fi
+
+  # One report from every job's report, by manifest row: a selected row whose job left no report,
+  # or that another job also ran, is an error row there.
+  report:
+    needs: [plan, bench, share-rows, snappy-row, consumer-rows, consumer-audit, telemetry-rows]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: report-*
+          path: ${{ runner.temp }}/reports
+      - name: Join the jobs' reports
+        env:
+          ROWS: ${{ inputs.rows }}
+          NEEDS: ${{ toJSON(needs) }}
+          DOWNLOAD: ${{ steps.download.outcome }}
+        run: node scripts/ci/benchJobs.js collect "$RUNNER_TEMP/reports" "$RUNNER_TEMP/bench"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -49,6 +600,3 @@ jobs:
         run: |
           report="$RUNNER_TEMP/bench/bench-report.md"
           if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
-      - name: Stop the cluster
-        if: always()
-        run: docker compose down --volumes --remove-orphans

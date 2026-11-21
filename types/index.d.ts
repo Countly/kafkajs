@@ -215,7 +215,11 @@ type SASLMechanismOptionsMap = {
     secretAccessKey: string
     sessionToken?: string
   }
-  oauthbearer: { oauthBearerProvider: () => Promise<OauthbearerProviderResponse> }
+  oauthbearer: {
+    oauthBearerProvider: () => Promise<OauthbearerProviderResponse>
+    /** SASL authorization identity; Apache Kafka requires it to equal the token's principal name. Empty means none. */
+    authorizationIdentity?: string
+  }
 }
 
 export type SASLMechanism = keyof SASLMechanismOptionsMap
@@ -345,7 +349,7 @@ export const Partitioners: {
   JavaCompatiblePartitioner: DefaultPartitioner
   /**
    * KIP-794 uniform sticky partitioner, the producer's default when `createPartitioner` is
-   * omitted (sticking for `batchSize` bytes): keyless records stick to a partition for
+   * omitted (adaptive, sticking for `batchSize` bytes): keyless records stick to a partition for
    * `stickyBytes`, each record counting its wire size, keyed ones keep `DefaultPartitioner`'s
    * mapping unless `ignoreKeys`.
    */
@@ -355,7 +359,9 @@ export const Partitioners: {
     /**
      * Weight the choice of the next partition by queue depth (KIP-794). A boolean (a non-boolean
      * throws KafkaJSInvalidConfigurationError); default false for a partitioner you construct. The
-     * producer's built-in default uses it when the measured gate of the release passed.
+     * producer's default partitioner is adaptive. For the previous non-adaptive sticky behavior pass
+     * `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: batchSize, adaptive:
+     * false })` with the producer's `batchSize` (16384 by default).
      */
     adaptive?: boolean
   }) => ICustomPartitioner
@@ -414,8 +420,10 @@ export interface ConsumerConfig extends ClientTelemetryConfig {
   /**
    * The maximum time between two batches handed to your handler, in milliseconds, and the
    * rebalance timeout sent on the wire. Default 300000, matching the Java client's
-   * `max.poll.interval.ms`. A handler that exceeds it loses its partitions and the consumer
-   * rejoins.
+   * `max.poll.interval.ms`. An integer from 1 to 2147483647; any other value throws when the
+   * consumer is created. The deadline is global progress across partitions, checked on heartbeat
+   * opportunities, not a separate deadline per handler; when it passes, the consumer gives up its
+   * partitions and rejoins.
    */
   maxPollInterval?: number
   /**
@@ -2078,6 +2086,7 @@ export type ConsumerEvents = {
   PARTITIONS_LOST: 'consumer.partitions_lost'
   POLL_INTERVAL_EXCEEDED: 'consumer.poll_interval_exceeded'
   RECEIVED_UNSUBSCRIBED_TOPICS: 'consumer.received_unsubscribed_topics'
+  TOPIC_METADATA_STATUS: 'consumer.topic_metadata_status'
   REQUEST: 'consumer.network.request'
   REQUEST_TIMEOUT: 'consumer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size'
@@ -2156,7 +2165,7 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
   memberId: string | null
   /** Which membership protocol this round belongs to. */
   membershipProtocol: 'classic' | 'consumer'
-  /** Why the rebalance started. Absent on the first join of a run, which reports no reason. */
+  /** Why the rebalance started. Absent when no reason was recorded. */
   reason?:
     | 'rebalance-in-progress'
     | 'lost'
@@ -2231,6 +2240,22 @@ export type ConsumerReceivedUnsubcribedTopicsEvent = InstrumentationEvent<{
   topicsSubscribed: string[]
   topicsNotSubscribed: string[]
 }>
+/**
+ * A subscribed topic's metadata changed between unavailable (a refresh answered
+ * UNKNOWN_TOPIC_OR_PARTITION; the other topics keep consuming and the topic stays subscribed) and
+ * available again. Emitted on change only. `available` means the metadata is back, not that
+ * records or an assignment arrived.
+ */
+export type ConsumerTopicMetadataStatusEvent = InstrumentationEvent<
+  | {
+      groupId: string | null
+      topic: string
+      status: 'unavailable'
+      type: 'UNKNOWN_TOPIC_OR_PARTITION'
+      code: 3
+    }
+  | { groupId: string | null; topic: string; status: 'available'; type: null; code: 0 }
+>
 
 export interface OffsetsByTopicPartition {
   topics: Array<{
@@ -2486,6 +2511,10 @@ export type Consumer = ClientTelemetry & {
     listener: (event: ConsumerReceivedUnsubcribedTopicsEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
+    eventName: ConsumerEvents['TOPIC_METADATA_STATUS'],
+    listener: (event: ConsumerTopicMetadataStatusEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
     eventName: ConsumerEvents['REQUEST'],
     listener: (event: RequestEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
@@ -2718,7 +2747,7 @@ export type ShareConsumer = ClientTelemetry & {
   assignment(): TopicPartitions[]
   run(config: ShareConsumerRunConfig): Promise<void>
   stop(): Promise<void>
-  /** The lock duration of the latest fetch, in ms; `null` before the first one. */
+  /** Latest broker lock duration from a fetch or a successful renew, in ms; `null` until one arrives. */
   acquisitionLockTimeoutMs(): number | null
   on(
     eventName: ShareConsumerEvents['HEARTBEAT'],
@@ -2902,7 +2931,7 @@ export class KafkaJSAggregateError extends Error {
   constructor(message: Error | string, errors: (Error | string)[])
 }
 
-/** Raised inside the consumer's fetch loop when the group rebalances; its `name` is `'Error'`. */
+/** Kept for compatibility; no longer thrown. Its `name` is `'Error'`. */
 export class KafkaJSFetcherRebalanceError extends Error {
   readonly category: KafkaJSErrorCategory
 }
@@ -3003,13 +3032,6 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
 }
 
 /**
- * An offset commit was refused because the consumer lost its group membership, or a handler or
- * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
- * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
- * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
- * `cause` is the loss.
- */
-/**
  * A record or a send cannot ever fit: its size is above `maxRequestSize` (checked on the encoded
  * frame where compression applies) or `bufferMemory`. Non-retriable. Carries the type and code of
  * the broker's own MESSAGE_TOO_LARGE so a check on either catches both; unlike a real broker
@@ -3058,6 +3080,16 @@ export class KafkaJSRebalanceListenerError extends KafkaJSNonRetriableError {
   )
 }
 
+/**
+ * A classic-protocol rebalance chain with a cooperative assignor completed 20 rounds and another was
+ * still required. Retriable: the default `restartOnFailure` policy restarts the consumer, and a
+ * custom one receives this error itself. Classic eager chains and consumer-protocol (KIP-848)
+ * groups have no round limit and never raise it.
+ */
+export class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
 /** No buffer memory became available within `maxBlockMs`, or too many sends were already waiting. Retriable. */
 export class KafkaJSBufferExhaustedError extends KafkaJSError {
   readonly reason: 'timeout' | 'queue-full'
@@ -3078,10 +3110,21 @@ export class KafkaJSBufferExhaustedError extends KafkaJSError {
   )
 }
 
+/**
+ * An offset commit was refused because the consumer lost its group membership, or a handler or
+ * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
+ * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
+ * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
+ * `cause` is the loss; it is absent for a stale handler and for a seek. Reason `stale-assignment`
+ * also covers a handler commit of offsets for a batch fetched before a `consumer.seek()` of its
+ * partition, with no rejoin: it does not by itself mean the group rebalanced. It is also the
+ * `cause` of the `KafkaJSTransactionAbortableError` that refuses a transaction carrying offsets of
+ * such a batch.
+ */
 export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'
-  readonly cause: Error
-  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause: Error })
+  readonly cause?: Error
+  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause?: Error })
 }
 
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
@@ -3265,6 +3308,8 @@ export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
+  /** The last failure a broker's FindCoordinator request ended with, when there was one. */
+  lastError?: Error
   constructor()
 }
 
@@ -3355,6 +3400,8 @@ export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
   apiKey: number
   apiName: string
+  /** The broker's error, when the broker refused the request. */
+  cause?: Error
 }
 
 export interface ClientTelemetryConfig {

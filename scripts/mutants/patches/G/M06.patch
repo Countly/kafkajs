@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceErrorContract.js
++++ b/src/consumer/rebalanceErrorContract.js
+@@ -229,7 +229,7 @@
+  *   supplied by whoever raises the verdict, because no error describes it
+  */
+ const rebalanceReason = (error, { kind = 'classic' } = {}) => {
+-  if (kind === 'manual') return null
++  if (kind === 'manual') return 'lost'
+ 
+   if (isPollIntervalExceeded(error)) {
+     return 'poll-interval-exceeded'

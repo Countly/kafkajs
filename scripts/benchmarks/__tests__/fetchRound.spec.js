@@ -1,4 +1,4 @@
-const { FetchRoundDriver, measure, main } = require('../fetchRound')
+const { FetchRoundDriver, measure, main, WINDOW_ATTEMPTS } = require('../fetchRound')
 
 test('a complete three-node round counts every required lookup and batch', async () => {
   const driver = new FetchRoundDriver({ partitions: 1000 })
@@ -136,6 +136,40 @@ describe('measure', () => {
     await expect(measure(driver, env)).rejects.toThrow('boom')
     expect(observers[0].disconnected).toBe(true)
     await expect(driver.round()).resolves.toEqual({ lookups: 3 })
+  })
+  test('the 1000-partition round fits its GC window or reports error with a reason', async () => {
+    const driver = new FetchRoundDriver({ partitions: 1000 })
+    let window = 0
+    const collecting = (windows) => {
+      const now = { value: 0 }
+      class Observer {
+        observe() {
+          window++
+        }
+
+        takeRecords() {
+          return windows.includes(window) ? [{ startTime: now.value - 0.5 }] : []
+        }
+
+        disconnect() {}
+      }
+      return { Observer, clock: { now: () => ++now.value }, heapUsed: () => 1000 + window }
+    }
+    try {
+      const fits = await measure(driver, { ...collecting([1]), attempts: WINDOW_ATTEMPTS })
+      expect(fits).toMatchObject({ batches: 1000, lookups: 3, windowAttempts: 2 })
+      expect(fits.allocatedBytesPerRound).toBe(0)
+
+      window = 0
+      await expect(
+        measure(driver, { ...collecting([1, 2, 3]), attempts: WINDOW_ATTEMPTS })
+      ).rejects.toThrow(
+        'Void no-GC window in 3 attempt(s): the last saw 1 collection(s) and 0 allocated bytes; ' +
+          'run with --expose-gc --max-semi-space-size=256'
+      )
+    } finally {
+      driver.close()
+    }
   })
   test('collection must be exposed', async () => {
     global.gc = undefined

@@ -1,0 +1,10 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2183,6 +2183,7 @@
+             topicIds,
+             version >= FETCH_TOPIC_IDS_MIN_VERSION
+           )
++          if (!tracked.wire.topics.length) return []
+         }
+       }
+ 

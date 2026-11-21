@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchErrorContract.js
++++ b/src/consumer/fetchErrorContract.js
+@@ -81,7 +81,7 @@
+  * @returns {'stale-metadata'|'session-reset'|'throw'}
+  */
+ const topLevelFetchAction = (errorCode, { session = false } = {}) => {
+-  if (session && (errorCode === 70 || errorCode === 71)) return 'session-reset'
++  if (session && errorCode === 71) return 'session-reset'
+   return TOP_LEVEL_ACTIONS.get(errorCode) || 'throw'
+ }
+ 

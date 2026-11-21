@@ -1,0 +1,10 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -90,7 +90,6 @@
+       sequence,
+       declarationRevision,
+       isCurrent: () =>
+-        this.generation === generation &&
+         this.sequence === sequence &&
+         this.order === declarationRevision,
+     }

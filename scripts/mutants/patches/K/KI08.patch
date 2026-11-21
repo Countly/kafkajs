@@ -1,0 +1,16 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -845,7 +845,12 @@
+    * @throws {Error} the operation's refusal or the transport failure; the caller logs it
+    */
+   async sendSessionClose(nodeId, fields, operation) {
+-    const broker = await this.cluster.findBroker({ nodeId, fence: operation })
++    const broker = await this.cluster.findBroker({
++      nodeId,
++      fence: new (require('./groupProtocol/interface').ConsumerOperation)({
++        deadlineAt: performance.now() + 60000,
++      }),
++    })
+     operation.check()
+     await broker.fetch({
+       ...fields,

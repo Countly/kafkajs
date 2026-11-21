@@ -1,0 +1,14 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -170,10 +170,7 @@
+           }
+           // A heartbeat sent before a rebalance and answered after it is answered about the
+           // generation it was sent under, not the one this member holds by then.
+-          throw stampMembership(
+-            stampOwnership(stampGeneration(e, generationId), token),
+-            membershipRevision
+-          )
++          throw stampOwnership(stampGeneration(e, generationId), token)
+         }
+ 
+         this.instrumentationEmitter.emit(HEARTBEAT, payload)

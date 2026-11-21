@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/manual.js
++++ b/src/consumer/groupProtocol/manual.js
+@@ -45,7 +45,7 @@
+       Array.isArray(entry) ||
+       typeof entry.topic !== 'string' ||
+       entry.topic.length === 0 ||
+-      !Number.isInteger(entry.partition) ||
++      !Number.isFinite(entry.partition) ||
+       entry.partition < 0 ||
+       entry.partition > 2147483647
+     ) {

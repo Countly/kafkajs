@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -629,7 +629,7 @@
+   await Clients.use(kafka, async (clients) => {
+     const consumer = clients.consumer({
+       groupId: `${TOPIC}-run-${run}`,
+-      ...(maxBytes !== undefined && { maxBytes }),
++      ...(maxBytes !== undefined && { maxBytes: 10485760 }),
+       ...(MAX_BYTES_PER_PARTITION !== undefined && {
+         maxBytesPerPartition: MAX_BYTES_PER_PARTITION,
+       }),

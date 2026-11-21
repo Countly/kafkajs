@@ -1,4 +1,12 @@
-const { flush, shareClient } = require('../../../../testHelpers/shareHarness')
+const { ShareRun } = require('../shareRun')
+const {
+  ShareClock,
+  fetchAnswer,
+  flush,
+  part,
+  shareClient,
+  until,
+} = require('../../../../testHelpers/shareHarness')
 
 const REBOOTSTRAP = 'share_consumer.cluster.rebootstrap'
 const REBOOTSTRAP_REQUIRED = 129
@@ -101,5 +109,302 @@ describe('share consumer rebootstrap event', () => {
       metadataFrames: 1,
     })
     expect(result.after).toEqual(['topic-a'])
+  })
+})
+
+describe('share membership across a rebootstrap', () => {
+  const UNKNOWN_TOPIC_OR_PARTITION = 3
+  let h
+  let run
+
+  afterEach(async () => {
+    await h?.close()
+    h = run = undefined
+    jest.restoreAllMocks()
+  })
+
+  /** @returns {object[]} The share heartbeats the client wrote, oldest first. */
+  const beats = () => h.frames(76)
+
+  /**
+   * Runs a joined share consumer, then makes its fetch report the topic gone while metadata
+   * answers REBOOTSTRAP_REQUIRED, so the fetch loop's metadata refresh rebootstraps the client
+   * and retires every broker the run cached, the coordinator included.
+   * @param {number} fenceCode The code the coordinator answers the next written heartbeat with.
+   * @returns {Promise<{warn: jest.SpyInstance, token: symbol, beatsBefore: number}>}
+   */
+  const rebootstrapWhileRunning = async (fenceCode) => {
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const rebootstraps = []
+    h.consumer.on(h.consumer.events.REBOOTSTRAP, (event) => rebootstraps.push(event.payload))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await until(() => h.frames(78).length > 0, 'the first fetch')
+    const warn = jest.spyOn(run.options.logger, 'warn')
+    const coordinator = run.membership.coordinator
+    const token = run.membership.token
+
+    h.cluster.outage('Metadata', { errorCode: REBOOTSTRAP_REQUIRED })
+    h.script('ShareFetch', [
+      fetchAnswer([part({ partition: 0, code: UNKNOWN_TOPIC_OR_PARTITION })]),
+    ])
+    await until(() => rebootstraps.length > 0, 'the rebootstrap')
+    expect(coordinator.broker.retired).toBe(true)
+    h.script('ShareGroupHeartbeat', [{ errorCode: fenceCode, memberEpoch: 0 }])
+    h.cluster.recover('Metadata')
+    return { warn, token, beatsBefore: beats().length }
+  }
+
+  test.each([
+    ['UNKNOWN_MEMBER_ID', 25],
+    ['FENCED_MEMBER_EPOCH', 110],
+  ])(
+    'looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on %s',
+    async (_name, code) => {
+      const { token, beatsBefore } = await rebootstrapWhileRunning(code)
+
+      await until(
+        () => beats().some(({ fields }, i) => i >= beatsBefore && fields.memberEpoch === 0),
+        'the rejoin at epoch 0'
+      )
+      await until(() => run.membership.memberEpoch === 2, 'the second join')
+      const after = beats().slice(beatsBefore)
+      expect(after[0].fields.memberEpoch).toBe(1)
+      expect(after[1].fields).toMatchObject({
+        memberEpoch: 0,
+        memberId: run.membership.memberId,
+        subscribedTopicNames: ['topic-a'],
+      })
+      expect(run.membership.token).not.toBe(token)
+      expect(run.membership.coordinator.broker.retired).toBe(false)
+      const fetches = h.frames(78).length
+      await until(() => h.frames(78).length > fetches, 'fetching after the rejoin')
+    }
+  )
+
+  test('logs the name, type and code of each failing share heartbeat', async () => {
+    const { warn } = await rebootstrapWhileRunning(14)
+
+    await until(() => run.membership.coordinator?.broker.retired === false, 'the new coordinator')
+    await until(
+      () => warn.mock.calls.some(([, extra]) => extra?.code === 14),
+      'the logged broker answer'
+    )
+    const failures = warn.mock.calls
+      .filter(([message]) => message === 'Share heartbeat failed')
+      .map(([, extra]) => extra)
+    expect(failures[0]).toEqual({
+      error: 'This broker connection was replaced',
+      name: 'KafkaJSConnectionError',
+      type: undefined,
+      code: undefined,
+    })
+    expect(failures).toContainEqual({
+      error: expect.any(String),
+      name: 'KafkaJSProtocolError',
+      type: 'GROUP_LOAD_IN_PROGRESS',
+      code: 14,
+    })
+  })
+})
+
+describe('share node fetch loops across a rebootstrap', () => {
+  let h
+  let run
+
+  afterEach(async () => {
+    await h?.close()
+    h = run = undefined
+    jest.restoreAllMocks()
+  })
+
+  test('a rebootstrap ends every node loop and fetching resumes on a fresh broker of the same membership', async () => {
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const rebootstraps = []
+    const crashes = []
+    h.consumer.on(h.consumer.events.REBOOTSTRAP, (event) => rebootstraps.push(event.payload))
+    h.consumer.on(h.consumer.events.CRASH, (event) => crashes.push(event.payload.error))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await until(() => h.frames(78).length > 0, 'the first fetch')
+    const warn = jest.spyOn(run.options.logger, 'warn')
+    const leaders = []
+    const sync = run.syncNodes
+    jest.spyOn(run, 'syncNodes').mockImplementation(function () {
+      leaders.push(run.options.cluster.cachedLeader('topic-a', 0))
+      return sync.call(this)
+    })
+    const [node] = run.nodes.values()
+    const { broker } = node.loop
+    const token = run.membership.token
+
+    h.cluster.outage('Metadata', { errorCode: REBOOTSTRAP_REQUIRED })
+    const refresh = await run.options.cluster.refreshMetadata().catch((error) => error)
+    await until(() => rebootstraps.length > 0, 'the rebootstrap')
+    h.cluster.recover('Metadata')
+    const fetches = h.frames(78).length
+    await until(() => run.nodes.get(0) && run.nodes.get(0) !== node, 'a new node record')
+    await until(() => h.frames(78).length > fetches, 'a fetch after the rebootstrap')
+
+    expect(refresh.type).toBe('REBOOTSTRAP_REQUIRED')
+    expect(broker.retired).toBe(true)
+    expect(node.ended).toBe(true)
+    expect(leaders).toContain(-1)
+    expect(run.nodes.get(0).loop.broker).not.toBe(broker)
+    expect(run.nodes.get(0).loop.broker.retired).toBe(false)
+    expect(warn.mock.calls.map(([message]) => message)).not.toContain(
+      'Share request failed before it was written'
+    )
+    expect(run.membership.token).toBe(token)
+    expect(run.membership.memberEpoch).toBe(1)
+    expect(crashes).toEqual([])
+  })
+})
+
+describe('share membership across a coordinator outage longer than one lookup', () => {
+  const OUTAGE_MS = 30000
+  let h
+  let run
+  let clock
+
+  afterEach(async () => {
+    await h?.close()
+    clock?.restore()
+    h = run = clock = undefined
+    jest.restoreAllMocks()
+  })
+
+  /**
+   * Joins a share consumer under the fake clock, counts its coordinator lookups, then takes the
+   * only broker down for longer than one lookup's retry budget and brings it back.
+   * @returns {Promise<object>} The crashes, the lookup spans and the heartbeat count at recovery.
+   */
+  const outage = async () => {
+    clock = new ShareClock().install()
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const crashes = []
+    h.consumer.on(h.consumer.events.CRASH, (event) => crashes.push(event.payload.error))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await until(() => h.frames(78).length > 0, 'the first fetch')
+
+    const { cluster } = run.options
+    const find = cluster.findGroupCoordinator
+    const lookups = []
+    let inFlight = 0
+    let overlapping = 0
+    jest.spyOn(cluster, 'findGroupCoordinator').mockImplementation(async function (args) {
+      const span = { start: performance.now(), end: null }
+      lookups.push(span)
+      if (++inFlight > 1) overlapping++
+      try {
+        return await find.call(this, args)
+      } finally {
+        inFlight--
+        span.end = performance.now()
+      }
+    })
+
+    h.cluster.down(0)
+    for (const socket of h.cluster.sockets()) socket.emit('end')
+    for (let elapsed = 0; elapsed < OUTAGE_MS; elapsed += 50) await clock.advance(50)
+    const during = lookups.length
+    h.cluster.up(0)
+    return { crashes, lookups, during, overlapping, beatsAtRecovery: h.frames(76).length }
+  }
+
+  test('rides out the outage without a crash and heartbeats at its epoch when the broker returns', async () => {
+    const { crashes, lookups, during, overlapping, beatsAtRecovery } = await outage()
+
+    expect(crashes).toEqual([])
+    expect(overlapping).toBe(0)
+    expect(during).toBeGreaterThanOrEqual(5)
+    expect(during).toBeLessThanOrEqual(15)
+    for (let i = 1; i < lookups.length; i++) {
+      expect(lookups[i].start - lookups[i - 1].end).toBeGreaterThanOrEqual(50)
+    }
+    for (let step = 0; step < 100 && h.frames(76).length === beatsAtRecovery; step++)
+      await clock.advance(20)
+    await clock.advance(200)
+    const after = h.frames(76).slice(beatsAtRecovery)
+    expect(after.length).toBeGreaterThan(1)
+    expect(after.every(({ fields }) => fields.memberEpoch === 1)).toBe(true)
+    expect(run.membership.memberEpoch).toBe(1)
+    expect(run.membership.coordinator.broker.retired).toBe(false)
+    expect(crashes).toEqual([])
+  })
+
+  test('rejoins at epoch 0 and fetches again when the member was fenced during the outage', async () => {
+    const { crashes, beatsAtRecovery } = await outage()
+    h.script('ShareGroupHeartbeat', [{ errorCode: 25, memberEpoch: 0 }])
+    const fetches = h.frames(78).length
+
+    for (let step = 0; step < 200 && run.membership.memberEpoch !== 2; step++)
+      await clock.advance(20)
+    for (let step = 0; step < 200 && h.frames(78).length === fetches; step++)
+      await clock.advance(20)
+
+    const after = h.frames(76).slice(beatsAtRecovery)
+    expect(after[0].fields.memberEpoch).toBe(1)
+    expect(after[1].fields).toMatchObject({
+      memberEpoch: 0,
+      memberId: run.membership.memberId,
+      subscribedTopicNames: ['topic-a'],
+    })
+    expect(run.membership.memberEpoch).toBe(2)
+    expect(h.frames(78).length).toBeGreaterThan(fetches)
+    expect(crashes).toEqual([])
+  })
+
+  test.each([
+    ['GROUP_AUTHORIZATION_FAILED', 30],
+    ['INVALID_REQUEST', 42],
+  ])('still ends the run when the lookup is answered %s', async (_name, code) => {
+    clock = new ShareClock().install()
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({ interval: 20 })
+    const crashes = []
+    h.consumer.on(h.consumer.events.CRASH, (event) => crashes.push(event.payload))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    h.cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+      coordinators: coordinatorKeys.map((key) => ({
+        key,
+        nodeId: -1,
+        host: '',
+        port: -1,
+        errorCode: code,
+        errorMessage: null,
+      })),
+    }))
+    h.script('ShareGroupHeartbeat', [{ errorCode: 15, memberEpoch: 1 }])
+
+    for (let step = 0; step < 200 && crashes.length === 0; step++) await clock.advance(20)
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].error).toMatchObject({ code, retriable: false })
   })
 })

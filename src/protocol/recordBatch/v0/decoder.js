@@ -2,6 +2,7 @@ const Decoder = require('../../decoder')
 const {
   KafkaJSCorruptRecordError,
   KafkaJSInvalidLongError,
+  KafkaJSInvalidVarIntError,
   KafkaJSPartialMessageError,
 } = require('../../../errors')
 const {
@@ -210,8 +211,9 @@ const assertControlRecord = ({ key, value }, firstOffset) => {
  *         its length or magic and its CRC (judged first, so a forged length cannot pass for a
  *         mismatch), its record count (judged after the CRC, so it also guards `checkCrcs: false`),
  *         a compressed body that is malformed or decompresses past the bound, a record that runs
- *         past the batch, or a malformed control record. `nextOffset` is set once the header and,
- *         with `checkCrcs`, the CRC have been accepted
+ *         past the batch or holds a signed varint longer than 5 bytes (reason `length`, the
+ *         primitive's error as `cause`), or a malformed control record. `nextOffset` is set once the
+ *         header and, with `checkCrcs`, the CRC have been accepted
  */
 module.exports = async (
   fetchDecoder,
@@ -305,9 +307,11 @@ module.exports = async (
     }
   } catch (error) {
     // The batch is all here, so a read that runs out of bytes inside it is a length that lies, not
-    // a tail that was cut.
+    // a tail that was cut; an over-long varint or long in it is a malformed body too.
     const failure =
-      error instanceof KafkaJSPartialMessageError || error instanceof KafkaJSInvalidLongError
+      error instanceof KafkaJSPartialMessageError ||
+      error instanceof KafkaJSInvalidLongError ||
+      error instanceof KafkaJSInvalidVarIntError
         ? corrupt(`Record batch body is malformed: ${error.message}`, 'length', firstOffset, error)
         : error
 

@@ -1,0 +1,11 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -39,7 +39,7 @@
+       if (topic instanceof RegExp) {
+         this.patterns.push({
+           ...entry,
+-          pattern: new RegExp(topic.source, topic.flags.replace(/[gy]/g, '')),
++          pattern: new RegExp(topic.source, topic.flags.replace(/y/g, '')),
+         })
+       } else {
+         this.literals.set(topic, entry)

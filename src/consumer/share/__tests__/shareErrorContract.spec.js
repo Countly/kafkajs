@@ -1,6 +1,7 @@
 const {
   MEMBERSHIP_ERRORS,
   membershipAction,
+  lookupFailure,
   fatalMembershipError,
   createErrorFromCode,
   sessionAction,
@@ -13,6 +14,16 @@ const {
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSProtocolError,
   KafkaJSShareGroupsNotSupportedError,
+  KafkaJSConnectionError,
+  KafkaJSConnectionClosedError,
+  KafkaJSRequestTimeoutError,
+  KafkaJSNonRetriableError,
+  KafkaJSInvariantViolation,
+  KafkaJSNumberOfRetriesExceeded,
+  KafkaJSGroupCoordinatorNotFound,
+  KafkaJSLockTimeout,
+  KafkaJSSASLAuthenticationError,
+  KafkaJSInvalidConfigurationError,
 } = require('../../../errors')
 
 describe('share membership failure policy', () => {
@@ -33,6 +44,28 @@ describe('share membership failure policy', () => {
     [31, 'fatal'],
   ])('classifies code %s as %s', (code, action) => {
     expect(membershipAction(createErrorFromCode(code))).toBe(action)
+  })
+  test.each([
+    ['a replaced connection', new KafkaJSConnectionError('This broker connection was replaced')],
+    [
+      'a refused connection with a system code',
+      new KafkaJSConnectionError('Connection error', { code: 'ECONNREFUSED' }),
+    ],
+    ['a closed connection', new KafkaJSConnectionClosedError('Closed connection')],
+    ['a request timeout', new KafkaJSRequestTimeoutError('Request timed out')],
+  ])('forgets the coordinator after %s, which is not a broker answer', (_name, error) => {
+    expect(membershipAction(error)).toBe('coordinator')
+  })
+  test.each([
+    ['a non-retriable failure', new KafkaJSNonRetriableError('refused')],
+    ['an invariant violation', new KafkaJSInvariantViolation('broken')],
+  ])('keeps %s without a broker code fatal', (_name, error) => {
+    expect(membershipAction(error)).toBe('fatal')
+  })
+  test('forgets the coordinator after a lock timeout, which a later attempt can pass', () => {
+    expect(membershipAction(new KafkaJSLockTimeout('Timeout while acquiring lock'))).toBe(
+      'coordinator'
+    )
   })
   test('keeps the membership table read-only', () => {
     expect(Object.isFrozen(MEMBERSHIP_ERRORS)).toBe(true)
@@ -89,6 +122,18 @@ describe('share fetch and acknowledgement failure policy', () => {
   test('a top-level unknown error such as a deleted topic is paced and never resets', () => {
     expect(sessionAction(78, -1)).toMatchObject({ action: 'retry', backoff: true })
     expect(sessionAction(78, 0)).toEqual({ action: 'ok', backoff: false, error: null })
+  })
+
+  test('a code 35 refusal carries the protocol error as cause', () => {
+    for (const api of [78, 79]) {
+      const { error } = sessionAction(api, 35)
+      expect(error.cause).toBeInstanceOf(KafkaJSProtocolError)
+      expect(error.cause).toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
+    }
+    const heartbeat = createErrorFromCode(35)
+    const fatal = fatalMembershipError(heartbeat)
+    expect(fatal).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
+    expect(fatal.cause).toBe(heartbeat)
   })
 
   test.each([78, 79])('runtime 35 on API %s names its actual API', (api) => {
@@ -149,5 +194,70 @@ describe('share fetch and acknowledgement failure policy', () => {
   test('a rejected acknowledgement keeps the broker code as its cause and a confirmed one has none', () => {
     expect(acknowledgementAction(121).cause).toMatchObject({ code: 121 })
     expect(acknowledgementAction(0).cause).toBeUndefined()
+  })
+})
+
+describe('share coordinator lookup failure policy', () => {
+  const refused = () => new KafkaJSConnectionError('Connection error', { code: 'ECONNREFUSED' })
+  const exhausted = (error) =>
+    new KafkaJSNumberOfRetriesExceeded(error, { retryCount: 5, retryTime: 300 })
+  const bailed = (error) => new KafkaJSNonRetriableError(error, { cause: error })
+
+  test.each([
+    ['retries exhausted on a refused connection', exhausted(refused())],
+    ['a bailed refused connection', bailed(refused())],
+    ['no coordinator found', new KafkaJSGroupCoordinatorNotFound('Failed to find coordinator')],
+    ['retries exhausted on COORDINATOR_NOT_AVAILABLE', exhausted(createErrorFromCode(15))],
+    ['retries exhausted on a request timeout', exhausted(new KafkaJSRequestTimeoutError('late'))],
+    ['a lock timeout', new KafkaJSLockTimeout('Timeout while acquiring lock')],
+    ['a retriable answer', createErrorFromCode(14)],
+    ['an invariant violation', new KafkaJSInvariantViolation('broken')],
+  ])('forgets the coordinator and retries after %s', (_name, error) => {
+    expect(lookupFailure(error)).toEqual({ action: 'coordinator', error })
+  })
+
+  test.each([
+    ['GROUP_AUTHORIZATION_FAILED', bailed(createErrorFromCode(30))],
+    ['GROUP_AUTHORIZATION_FAILED unwrapped', createErrorFromCode(30)],
+    ['INVALID_REQUEST', bailed(createErrorFromCode(42))],
+    ['an unknown server error', bailed(createErrorFromCode(-1))],
+    ['a SASL authentication failure', bailed(new KafkaJSSASLAuthenticationError('bad password'))],
+    ['an invalid configuration', bailed(new KafkaJSInvalidConfigurationError('bad timeout'))],
+  ])('ends the membership after %s, reporting the failure that decided it', (_name, error) => {
+    const decided = lookupFailure(error)
+    expect(decided.action).toBe('fatal')
+    expect(decided.error).toBe(error.cause ?? error)
+  })
+
+  test('ends the membership when no coordinator was found because a broker refused the group', () => {
+    const answer = createErrorFromCode(30)
+    const notFound = new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+    notFound.lastError = answer
+    expect(lookupFailure(bailed(notFound))).toEqual({ action: 'fatal', error: answer })
+  })
+
+  test('retries when no coordinator was found because the coordinator was unavailable', () => {
+    const notFound = new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+    notFound.lastError = createErrorFromCode(15)
+    const error = bailed(notFound)
+    expect(lookupFailure(error)).toEqual({ action: 'coordinator', error })
+  })
+
+  test.each([
+    ['an API the broker does not support', new KafkaJSServerDoesNotSupportApiKey('no API')],
+    [
+      'a broker that cannot run share groups',
+      bailed(
+        new KafkaJSShareGroupsNotSupportedError('Share groups refused', {
+          apiKey: 76,
+          apiName: 'ShareGroupHeartbeat',
+          reason: 'api-not-advertised',
+        })
+      ),
+    ],
+  ])('reports %s as unsupported', (_name, error) => {
+    const decided = lookupFailure(error)
+    expect(decided.action).toBe('unsupported')
+    expect(decided.error).toBe(error.cause ?? error)
   })
 })

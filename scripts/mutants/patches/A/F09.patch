@@ -1,0 +1,11 @@
+--- a/testHelpers/wire/leaveGroupV5.js
++++ b/testHelpers/wire/leaveGroupV5.js
+@@ -33,7 +33,7 @@
+ 
+     return new Encoder()
+       .writeInt32(response.throttleTime)
+-      .writeInt16(response.errorCode)
++      .writeInt16(0)
+       .writeUVarIntArray(response.members.map(encodeMember))
+       .writeTaggedFields().buffer
+   },

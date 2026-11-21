@@ -1,0 +1,11 @@
+--- a/src/consumer/groupTimeouts.js
++++ b/src/consumer/groupTimeouts.js
+@@ -68,7 +68,7 @@
+     )
+   }
+ 
+-  if (heartbeatInterval > sessionTimeout / 3) {
++  if (false) {
+     logger.warn(
+       'Consumer heartbeatInterval is more than a third of sessionTimeout; the heartbeat timer drifts by one request duration per tick, so the member may be evicted',
+       { heartbeatInterval, sessionTimeout }

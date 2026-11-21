@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceErrorContract.js
++++ b/src/consumer/rebalanceErrorContract.js
+@@ -188,7 +188,7 @@
+     return {
+       action: 'lost',
+       fatal: isFencedInstance(error),
+-      clearsMemberId: isUnknownMemberId(error),
++      clearsMemberId: true,
+     }
+   }
+ 

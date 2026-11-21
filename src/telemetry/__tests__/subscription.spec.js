@@ -1,4 +1,3 @@
-const { performance } = require('node:perf_hooks')
 const ClientTelemetry = require('../client')
 const TelemetryMetrics = require('../metrics')
 const ID = '01020304-0506-0708-090a-0b0c0d0e0f10'

@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3341,7 +3341,7 @@
+       (invocation !== undefined || !this.isStopping()) &&
+       this.offsetManager === manager &&
+       this.assignmentEpoch === epoch &&
+-      this.acquired.get(key)?.acquiredAt === acquiredAt &&
++      true &&
+       this.cluster.topicId(topic) === topicId &&
+       !this.ownership.refusal(token)
+     const refusal = () =>

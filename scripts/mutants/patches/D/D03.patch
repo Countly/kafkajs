@@ -1,0 +1,21 @@
+--- a/src/consumer/groupProtocol/consumer.js
++++ b/src/consumer/groupProtocol/consumer.js
+@@ -888,15 +888,14 @@
+    *   target, a leave only after its commit, hence the state check)
+    */
+   targetGuard() {
+-    const membership = this.membershipRevision
+-    const target = this.targetRevision
++    const epoch = this.target?.localEpoch
+     const scope = this.subscription?.captureScope()
+     const member = () =>
+-      membership === this.membershipRevision &&
+       this.target != null &&
++      this.target.localEpoch === epoch &&
+       !isNotInGroup(this.state) &&
+       !isLeavingGroup(this.state)
+-    return Object.assign(() => (!scope || scope()) && target === this.targetRevision && member(), {
++    return Object.assign(() => (!scope || scope()) && member(), {
+       member,
+     })
+   }

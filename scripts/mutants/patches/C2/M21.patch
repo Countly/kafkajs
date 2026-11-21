@@ -1,0 +1,11 @@
+--- a/src/broker/index.js
++++ b/src/broker/index.js
+@@ -1246,7 +1246,7 @@
+         sessionTimeout,
+         rebalanceTimeout,
+       }),
+-      guard
++      undefined
+     )
+ 
+     assertSameProtocol(response.protocolType, protocolType)

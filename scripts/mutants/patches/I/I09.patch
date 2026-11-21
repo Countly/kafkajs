@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -294,7 +294,7 @@
+   wait(action) {
+     return new Promise((resolve, reject) => {
+       try {
+-        this.check()
++        void 0
+       } catch (error) {
+         reject(error)
+         return

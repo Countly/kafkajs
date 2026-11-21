@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -28,7 +28,7 @@
+    */
+   build(requests, { topicIds, usesTopicIds }) {
+     if (this.closed) throw new Error('Fetch session is closed')
+-    if (this.usesTopicIds !== undefined && this.usesTopicIds !== usesTopicIds) this.reset(false)
++    if (this.usesTopicIds !== undefined && this.usesTopicIds !== usesTopicIds) this.pending = null
+     this.usesTopicIds = usesTopicIds
+     const desired = new Map()
+     for (const { topic, partitions } of requests) {

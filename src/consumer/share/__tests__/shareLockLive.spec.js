@@ -1850,31 +1850,7 @@ class LockCase {
       )
     })
     const a = this.members.get('A')
-    const own = this.entriesOf('A')
-    const second = this.entriesOf('B')
-    expect(this.gateAcquisitions).toHaveLength(1)
-    expect(this.gateAcquisitions[0].lockDuration).toBe(LOCK_MS)
-    expect([...this.gateAcquisitions[0].identities].sort()).toEqual([...this.expected].sort())
-    expect(this.gateExpiry).not.toBeNull()
-    const { processed: frozenProcessed, dropped, inFlight: frozenInvocations } = this.gateExpiry
-    const inFlight = frozenInvocations.map(({ identity }) => identity)
-    expect(inFlight.length).toBeLessThanOrEqual(1)
-    const firstStart = own[0].at
-    expect(own.filter(({ at }) => at > firstStart + LOCK_MS)).toEqual([])
-    expect(own.every(({ deliveryCount }) => deliveryCount === 1)).toBe(true)
-    const processed = new Set(frozenProcessed)
-    expect(processed.size).toBe(own.length)
-    expect([...processed].sort()).toEqual(own.map(({ identity }) => identity).sort())
-    expect([...processed, ...dropped].sort()).toEqual([...this.expected].sort())
-    const received = tally(second.map(({ identity }) => identity))
-    expect(second.every(({ deliveryCount }) => deliveryCount === 2)).toBe(true)
-    expect([...received.values()].every((n) => n === 1)).toBe(true)
-    const duplicated = [...received.keys()].filter((identity) => processed.has(identity))
-    expect(duplicated.filter((identity) => !inFlight.includes(identity))).toEqual([])
-    expect(duplicated.length).toBeLessThanOrEqual(1)
-    expect(dropped.filter((identity) => !received.has(identity))).toEqual([])
-    expect(received.size).toBe(dropped.length + duplicated.length)
-    this.expectedHandled = this.gateExpectation()
+    const { own, processed, dropped, inFlight, duplicated, firstStart } = this.checkGate()
     this.row('held-set', {
       acquiredAt: this.acquiredAt('A'),
       processed: [...processed],
@@ -1903,6 +1879,50 @@ class LockCase {
       )
     })
     this.recordAcknowledgements()
+  }
+
+  /**
+   * Checks the gate's acquisitions and handler entries against the frozen expiry, then sets the
+   * expected handled multiset. Records released at the lapse may go back to A or to B: the
+   * broker hands them to whichever member's fetch it completes, so only A's first acquisition and
+   * its count-one entries are the gated original.
+   * @returns {{own: object[], processed: Set<string>, dropped: string[], inFlight: string[],
+   *   duplicated: string[], firstStart: number}} A's original entries and the expiry partition.
+   * @throws {Error} The first mismatch.
+   */
+  checkGate() {
+    const [first, ...later] = this.gateAcquisitions
+    expect(this.gateAcquisitions.length).toBeGreaterThanOrEqual(1)
+    expect(first.lockDuration).toBe(LOCK_MS)
+    expect([...first.identities].sort()).toEqual([...this.expected].sort())
+    expect(later.filter(({ sentAt }) => sentAt < first.deadline)).toEqual([])
+    expect(this.gateExpiry).not.toBeNull()
+    expect(
+      this.entries.filter(
+        ({ member, deliveryCount }) =>
+          deliveryCount !== 2 && !(member === 'A' && deliveryCount === 1)
+      )
+    ).toEqual([])
+    const own = this.entriesOf('A').filter(({ deliveryCount }) => deliveryCount === 1)
+    const second = this.entries.filter(({ deliveryCount }) => deliveryCount === 2)
+    const { processed: frozenProcessed, dropped, inFlight: frozenInvocations } = this.gateExpiry
+    const inFlight = frozenInvocations.map(({ identity }) => identity)
+    expect(inFlight.length).toBeLessThanOrEqual(1)
+    const firstStart = own[0].at
+    expect(own.filter(({ at }) => at > firstStart + LOCK_MS)).toEqual([])
+    const processed = new Set(frozenProcessed)
+    expect(processed.size).toBe(own.length)
+    expect([...processed].sort()).toEqual(own.map(({ identity }) => identity).sort())
+    expect([...processed, ...dropped].sort()).toEqual([...this.expected].sort())
+    const received = tally(second.map(({ identity }) => identity))
+    expect([...received.values()].every((n) => n === 1)).toBe(true)
+    const duplicated = [...received.keys()].filter((identity) => processed.has(identity))
+    expect(duplicated.filter((identity) => !inFlight.includes(identity))).toEqual([])
+    expect(duplicated.length).toBeLessThanOrEqual(1)
+    expect(dropped.filter((identity) => !received.has(identity))).toEqual([])
+    expect(received.size).toBe(dropped.length + duplicated.length)
+    this.expectedHandled = this.gateExpectation()
+    return { own, processed, dropped, inFlight, duplicated, firstStart }
   }
 
   /**
@@ -2462,6 +2482,7 @@ describe('share gate expiry snapshot', () => {
         invocation: 1,
         member: 'A',
         identity: 'completed',
+        deliveryCount: 1,
         at: deadline - 400,
         returnedAt: deadline - 200,
       },
@@ -2469,6 +2490,7 @@ describe('share gate expiry snapshot', () => {
         invocation: 2,
         member: 'A',
         identity: 'active',
+        deliveryCount: 1,
         at: deadline - 200,
         returnedAt: deadline + 50,
       }
@@ -2476,6 +2498,49 @@ describe('share gate expiry snapshot', () => {
     run.freezeGateExpiry()
     return run
   }
+
+  /**
+   * @param {string} [fault] One departure from the gate contract, or none.
+   * @returns {LockCase} A frozen gate whose released record went back to A, as a broker may do.
+   */
+  const reacquired = (fault) => {
+    const run = fixture()
+    const { deadline } = run.gateAcquisitions[0]
+    run.expected = ['completed', 'active', 'dropped']
+    const sentAt = fault === 'early-reacquisition' ? deadline - 10 : deadline + 65
+    run.gateAcquisitions.push({
+      sentAt,
+      lockDuration: LOCK_MS,
+      deadline: sentAt + LOCK_MS,
+      identities: ['dropped'],
+    })
+    run.entries.push({
+      invocation: 3,
+      member: fault === 'b-original' ? 'B' : 'A',
+      identity: 'dropped',
+      deliveryCount: fault === 'late-original' || fault === 'b-original' ? 1 : 2,
+      at: deadline + 250,
+      returnedAt: deadline + 450,
+    })
+    return run
+  }
+
+  it('admits a released record that the broker hands back to the original member', () => {
+    const run = reacquired()
+    const { own, processed, dropped, duplicated } = run.checkGate()
+    expect(own.map(({ identity }) => identity)).toEqual(['completed', 'active'])
+    expect([...processed]).toEqual(['completed', 'active'])
+    expect(dropped).toEqual(['dropped'])
+    expect(duplicated).toEqual([])
+    expect(run.expectedHandled.get('dropped')).toBe(1)
+  })
+
+  it.each(['late-original', 'b-original', 'early-reacquisition'])(
+    'rejects %s in a gate whose released record returned to the original member',
+    (fault) => {
+      expect(() => reacquired(fault).checkGate()).toThrow()
+    }
+  )
 
   it('freezes the active original at expiry even when the callback resumes after its return', () => {
     const run = fixture()

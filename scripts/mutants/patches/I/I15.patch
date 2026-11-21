@@ -1,0 +1,12 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1535,8 +1535,7 @@
+       }
+ 
+       if (
+-        this.consumerGroup.offsetManager?.autoCommitInterval != null ||
+-        this.consumerGroup.offsetManager?.autoCommitThreshold != null
++        false
+       ) {
+         await this.autoCommitOffsetsIfNecessary(batch)
+       } else {

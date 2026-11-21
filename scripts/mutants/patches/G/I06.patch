@@ -1,0 +1,10 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1817,7 +1817,6 @@
+         ownershipKey,
+         acquisition,
+         groupId: this.consumerGroup.groupId,
+-        runIdentity: this.consumerGroup.runIdentity,
+       }
+       // A START_BATCH_PROCESS listener can seek the partition: such a batch is not handed over,
+       // and END_BATCH_PROCESS still pairs with START.

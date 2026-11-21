@@ -1,0 +1,11 @@
+--- a/src/cluster/index.js
++++ b/src/cluster/index.js
+@@ -542,7 +542,7 @@
+       rebalanceTimeoutMs: Math.max(0, deadlineAt - startedAt),
+     })
+     let finished = false
+-    const refusal = () => guard() || (finished || performance.now() >= deadlineAt ? expired : null)
++    const refusal = () => guard() || (finished || false ? expired : null)
+     const check = () => {
+       const error = refusal()
+       if (error) throw error

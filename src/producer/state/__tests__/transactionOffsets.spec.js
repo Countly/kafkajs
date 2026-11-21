@@ -42,12 +42,10 @@ describe('Transactional offset staging', () => {
     expect(offsets.snapshots.size).toBe(1)
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted).toHaveBeenCalledTimes(1)
-    expect(cluster.markOffsetAsCommitted).toHaveBeenCalledWith({
-      groupId: 'group',
-      topic: 'topic',
-      partition: 0,
-      offset: last,
-    })
+    expect(cluster.markOffsetAsCommitted).toHaveBeenCalledWith(
+      { groupId: 'group', topic: 'topic', partition: 0, offset: last },
+      expect.objectContaining({ mutation: true })
+    )
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted).toHaveBeenCalledTimes(1)
     expect(ledger.size()).toBe(0)
@@ -111,7 +109,10 @@ describe('Transactional offset staging', () => {
     ledger.end(mutation)
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted.mock.calls).toEqual([
-      [{ groupId: 'group', topic: 'topic', partition: 1, offset: '7' }],
+      [
+        { groupId: 'group', topic: 'topic', partition: 1, offset: '7' },
+        expect.objectContaining({ mutation: true }),
+      ],
     ])
     expect(ledger.size()).toBe(0)
   })
@@ -153,7 +154,10 @@ describe('Transactional offset staging', () => {
     offsets.abandon(failed)
     offsets.publish(cluster)
     expect(cluster.markOffsetAsCommitted.mock.calls).toEqual([
-      [{ groupId: 'group', topic: 'topic', partition: 0, offset: '2' }],
+      [
+        { groupId: 'group', topic: 'topic', partition: 0, offset: '2' },
+        expect.objectContaining({ mutation: true }),
+      ],
     ])
     expect(ledger.size()).toBe(0)
   })
@@ -206,4 +210,65 @@ describe('Transactional offset staging', () => {
       expect(ledger.size()).toBe(0)
     }
   )
+})
+
+describe('Transactional offset input dependencies', () => {
+  const acquisition = () => ({
+    acquiredAt: 1,
+    changedAt: 1,
+    recreatedAt: 0,
+    soughtAt: 0,
+    retired: false,
+  })
+
+  test('each acquisition keeps its earliest batch, whatever the offsets staged later', () => {
+    const { offsets, call } = build()
+    const cell = acquisition()
+    offsets.enlist(cell, 5)
+    offsets.enlist(cell, 3)
+    offsets.enlist(cell, 9)
+    offsets.stage(call(topics('1')))
+    offsets.stage(call(topics('2')))
+    expect([...offsets.inputs]).toEqual([[cell, 3]])
+
+    cell.soughtAt = 4
+    expect(offsets.supersededInput()).toEqual({ acquisition: cell, acquireClock: 3 })
+    offsets.release()
+  })
+
+  test('a retired or recreated acquisition supersedes its input; another acquisition is unaffected', () => {
+    const { offsets } = build()
+    const retired = acquisition()
+    const recreated = acquisition()
+    const healthy = acquisition()
+    offsets.enlist(healthy, 2)
+    expect(offsets.supersededInput()).toBeNull()
+
+    offsets.enlist(retired, 2)
+    retired.retired = true
+    expect(offsets.supersededInput()).toEqual({ acquisition: retired, acquireClock: 2 })
+
+    offsets.sealInputs()
+    offsets.enlist(recreated, 2)
+    recreated.recreatedAt = 3
+    expect(offsets.supersededInput()).toEqual({ acquisition: recreated, acquireClock: 2 })
+  })
+
+  test('sealing and release drop every input; a new transaction starts with none', () => {
+    const { offsets } = build()
+    expect(offsets.inputs).toBeNull()
+    expect(offsets.supersededInput()).toBeNull()
+
+    const cell = acquisition()
+    offsets.enlist(cell, 1)
+    cell.soughtAt = 2
+    offsets.sealInputs()
+    expect(offsets.inputs).toBeNull()
+    expect(offsets.supersededInput()).toBeNull()
+
+    offsets.enlist(cell, 1)
+    offsets.release()
+    expect(offsets.inputs).toBeNull()
+    expect(offsets.supersededInput()).toBeNull()
+  })
 })

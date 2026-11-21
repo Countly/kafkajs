@@ -1011,6 +1011,30 @@ test('create-topic detail does not replace the protocol message', () => {
   expect(new KafkaJSCreateTopicError(source, 't').errorMessage).toBeNull()
 })
 
+test('KafkaJSServerDoesNotSupportApiKey keeps cause', () => {
+  const cause = createErrorFromCode(35)
+  const error = new errors.KafkaJSServerDoesNotSupportApiKey(cause, {
+    apiKey: 76,
+    apiName: 'ShareGroupHeartbeat',
+    cause,
+  })
+
+  expect(error.cause).toBe(cause)
+  expect(error).toMatchObject({
+    name: 'KafkaJSServerDoesNotSupportApiKey',
+    type: 'UNSUPPORTED_VERSION',
+    code: 35,
+    apiKey: 76,
+    apiName: 'ShareGroupHeartbeat',
+    retriable: false,
+    category: cause.category,
+    message: cause.message,
+  })
+  expect(new errors.KafkaJSServerDoesNotSupportApiKey('refused', { apiKey: 1 }).cause).toBe(
+    undefined
+  )
+})
+
 describe('share capability errors', () => {
   test.each(['api-not-advertised', 'api-version-range', 'feature-disabled', 'refused-by-broker'])(
     'preserves the unsupported API contract for %s',
@@ -1036,6 +1060,31 @@ describe('share capability errors', () => {
       )
     }
   )
+
+  test('KafkaJSShareGroupsNotSupportedError keeps cause, apiKey, apiName, reason and shareVersion', () => {
+    const cause = createErrorFromCode(35)
+    const error = new errors.KafkaJSShareGroupsNotSupportedError(cause, {
+      apiKey: 78,
+      apiName: 'ShareFetch',
+      reason: 'refused-by-broker',
+      shareVersion: 1,
+      cause,
+    })
+
+    expect(error.cause).toBe(cause)
+    expect(error).toBeInstanceOf(errors.KafkaJSServerDoesNotSupportApiKey)
+    expect(error).toMatchObject({
+      name: 'KafkaJSShareGroupsNotSupportedError',
+      type: 'UNSUPPORTED_VERSION',
+      code: 35,
+      apiKey: 78,
+      apiName: 'ShareFetch',
+      reason: 'refused-by-broker',
+      shareVersion: 1,
+      retriable: false,
+      category: cause.category,
+    })
+  })
 
   test('retains null when no feature level was reported', () => {
     expect(

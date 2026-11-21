@@ -13,9 +13,14 @@ Concurrent closes share the first valid call's deadline and one cleanup episode.
 
 Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
 Call `await admin.connect()` to resume. A connect issued during close joins its cleanup first.
-An old lookup, authentication, encoder, queued write, response or temporary consumer cannot
+An old lookup, authentication, encoder, queued write or response cannot
 send, reconnect or clear the replacement lifecycle. A forced close reports an unknown outcome;
 a mutation already sent may have been applied. Inspect the broker state before repeating it.
+
+An admin client keeps every topic it has read offsets of as a metadata target, until its own
+`deleteTopics` removes it. If another client deletes such a topic, later calls of this admin
+client that refresh metadata fail with `UNKNOWN_TOPIC_OR_PARTITION`, until you create a new admin
+client. See [Known issues](MigrationGuide-3-0-0.md#known-issues).
 
 ## Admin API ledger
 
@@ -118,7 +123,7 @@ live script below is a single owner even when it contains several cases or fixtu
 This inventory follows Apache Kafka 4.3.1 Admin, including deprecated aliases, plus the 4.4 unregisterController method. Every method
 also has the inherited AbstractOptions timeout unless the row states an excluded or deferred
 surface. Share administration is implemented; Streams administration
-and quorum/voter administration are excluded from this package. Client telemetry belongs to
+and quorum/voter administration are excluded from this package. A `partial` row names what is missing. Client telemetry belongs to
 the telemetry extension; JVM metric registration has no JavaScript equivalent.
 
 | Java method or configuration | Disposition | JavaScript equivalent or reason | Java options and differences |
@@ -161,7 +166,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | describeReplicaLogDirs | implemented | describeReplicaLogDirs | replicas |
 | describeShareGroups | implemented | describeShareGroups | group ids; includeAuthorizedOperations as a raw signed mask; apiTimeout; rows in caller order |
 | describeStreamsGroups | excluded | Streams-group administration excluded | not implemented |
-| describeTopics | equivalent | fetchTopicMetadata | includeAuthorizedOperations maps to includeTopicAuthorizedOperations; partitionSizeLimitPerResponse uses the internal responsePartitionLimit |
+| describeTopics | partial | fetchTopicMetadata | by topic name only: there is no topicIds option, and a lookup by name cannot find an earlier topic that had the same name; includeAuthorizedOperations maps to includeTopicAuthorizedOperations; partitionSizeLimitPerResponse uses the internal responsePartitionLimit |
 | describeTransactions | implemented | describeTransactions | transactionalIds |
 | describeUserScramCredentials | implemented | describeUserScramCredentials | users optional |
 | electLeaders | implemented | electLeaders | ElectionType; partitions |
@@ -176,7 +181,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | listGroups | implemented | listGroups | states; types |
 | listOffsets | equivalent | fetchTopicOffsets / fetchTopicOffsetsByTimestamp | earliest; latest; timestamp; maxTimestamp; earliestLocal; latestTiered; earliestPendingUpload; isolationLevel |
 | listPartitionReassignments | implemented | listPartitionReassignments | ordinary method fields and apiTimeout; no semantic option is silently dropped |
-| listShareGroupOffsets | implemented | listShareGroupOffsets | group id; optional topic partitions; apiTimeout; offsets and lag as decimal strings, unknown lag null |
+| listShareGroupOffsets | implemented | listShareGroupOffsets | one group id per call; optional topic partitions; apiTimeout; offsets and lag as decimal strings, unknown lag null |
 | listStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | listTopics | implemented | listTopics | listInternal: fetchTopicMetadata returns isInternal for caller filtering |
 | listTransactions | implemented | listTransactions | filterStates maps to states; filterProducerIds maps to producerIds; filterOnDuration maps to durationFilter; filterOnTransactionalIdPattern maps to transactionalIdPattern |
@@ -406,14 +411,14 @@ await admin.fetchTopicMetadata()
 
 Without `topics`, a partition that has no leader is returned as the broker reports it, with its `partitionErrorCode` (`LEADER_NOT_AVAILABLE`, 5) and `leader: -1`: the call neither waits for a leader nor fails. `listTopics` and `describeCluster` do not fail on such a partition either, and neither do the admin calls that refresh the metadata first (`createTopics` and `describeConfigs`, for example), unless the partition belongs to a topic the admin refreshes by name: one it has read or reset offsets of, or deleted records from. To wait for the leaders of topics you just created, name them: a request that names topics still waits while one of their partitions has no leader.
 
-On the Metadata path, `fetchTopicMetadata`, `listTopics` and `describeCluster` reject, when every broker is connected to and every Metadata request fails, with the last broker's own error (its class and `cause` intact) after one pass over the brokers. `listTopics` and `describeCluster` always take this path; `fetchTopicMetadata` takes it when `useDescribeTopicPartitions` is not set, when no topics are named, or when the broker does not offer DescribeTopicPartitions. A broker that cannot be found or connected to is retried within the client's `retry` budget first (the `retry` given to `new Kafka()`; `admin({ retry })` does not apply); if that budget runs out the call rejects with `KafkaJSNumberOfRetriesExceeded` (`KafkaJSDeliveryTimeout` when `retry.maxTotalTime` ends it first), whose `cause` is the connection error, or `KafkaJSBrokerNotFound` when the broker table is empty. On the Metadata path, the polling wait rejects with `KafkaJSTimeout` if it is still unsettled 10 s after that path is entered, whether waiting for a leader or for a reachable broker. DescribeTopicPartitions has its own deadline of 60 s (below); time spent there before an unsupported-API fallback is additional. While the broker it asks last answers `LEADER_NOT_AVAILABLE` it asks again every 50 ms. Any other error, an authorization failure for example, is thrown at once.
+On the Metadata path, `fetchTopicMetadata`, `listTopics` and `describeCluster` reject, when every broker is connected to and every Metadata request fails, with the last broker's own error (its class and `cause` intact) after one pass over the brokers. `listTopics` and `describeCluster` always take this path; `fetchTopicMetadata` takes it when `useDescribeTopicPartitions` is not set, when no topics are named, or when the broker does not offer DescribeTopicPartitions. A broker that cannot be found or connected to is retried within the client's `retry` budget first (the `retry` given to `new Kafka()`; `admin({ retry })` does not apply); if that budget runs out the call rejects with `KafkaJSNumberOfRetriesExceeded` (`KafkaJSDeliveryTimeout` when `retry.maxTotalTime` ends it first), whose `cause` is the connection error, or `KafkaJSBrokerNotFound` when the broker table is empty. On the Metadata path, the polling wait rejects with `KafkaJSTimeout` if it is still unsettled 10 s after that path is entered, whether waiting for a leader or for a reachable broker. That cap is nested inside the call's `apiTimeout` (60000 by default), never added to it; with `useDescribeTopicPartitions`, the DescribeTopicPartitions read and an unsupported-API fallback share that one `apiTimeout` (below). While the broker it asks last answers `LEADER_NOT_AVAILABLE` it asks again every 50 ms. Any other error, an authorization failure for example, is thrown at once.
 
 ### Describing topics partition by partition
 
 With `useDescribeTopicPartitions: true` and at least one topic name, the topics are read with DescribeTopicPartitions (KIP-966) instead of Metadata:
 
 - Any broker answers. The client follows the broker's pages to the end (up to 2000 partitions a page, fewer if the broker's `max.request.partition.size.limit` is lower), so a topic with many partitions is not cut off; a broker whose pages repeat, or that does not answer for a topic, fails the call with `KafkaJSNonRetriableError` instead of returning a partial answer. A request that fails in a way that can pass (a dropped connection, a timeout) is asked again on the `retry` budget after a metadata refresh, as the other admin calls are. The topics come back in name order.
-- The whole read, every page and every retry included, has one deadline of 60 s (Java's `default.api.timeout.ms`). At the deadline the call rejects with `KafkaJSTimeout`, whatever request is stalled and also with `enforceRequestTimeout: false`; a page that arrives later is ignored, and the call starts no new attempt and creates no new page request. Work already in progress at the deadline is not cancelled, and its result is ignored: a metadata refresh may finish its own retries (bounded by `retry`, and shared with other calls on the same client), a broker selection may go on to connect to the next broker, and a page already queued may still be sent. A topic whose id changes between two pages (it was deleted and recreated while it was read) fails the attempt retriably, and the read starts again after a metadata refresh. If your cluster pages more slowly than that, use the default Metadata path, `useDescribeTopicPartitions: false`.
+- The whole read — every page, every retry and the Metadata fallback — shares one `apiTimeout` (60000 by default). A shorter Metadata polling cap is nested inside it, never added. At the deadline the call rejects with `KafkaJSTimeout`, whatever request is stalled and also with `enforceRequestTimeout: false`; a page that arrives later is ignored, and the call starts no new attempt and creates no new page request. Work already in progress at the deadline is not cancelled, and its result is ignored: a metadata refresh may finish its own retries (bounded by `retry`, and shared with other calls on the same client), a broker selection may go on to connect to the next broker, and a page already queued may still be sent. A topic whose id changes between two pages (it was deleted and recreated while it was read) fails the attempt retriably, and the read starts again after a metadata refresh. A cluster that pages more slowly needs a larger `apiTimeout`.
 - Each partition also carries `eligibleLeaderReplicas` and `lastKnownElr`. They are `null` when the cluster does not track eligible leader replicas, `[]` when it does and none are eligible, and broker ids otherwise; accept all three. (Eligible leader replicas are off by default on Kafka 4.0 and on by default for new clusters from Kafka 4.1.)
 - A partition without a leader is returned with `leader: -1`. Kafka 4.1.2 and 4.3 brokers leave its `partitionErrorCode` at 0 (a Metadata answer sets `LEADER_NOT_AVAILABLE`, 5), so check `leader` to find it; a non-zero `partitionErrorCode` is passed through when a broker sends one. Unlike a Metadata request for named topics, this path does not wait for leaders.
 - A topic that does not exist, or that you may not describe, fails the call with that topic's error once every page has been read; when several fail, the first in name order is thrown. DescribeTopicPartitions never creates a topic. A Metadata request may, when the cluster allows automatic topic creation and `allowAutoTopicCreation` is on.
@@ -427,6 +432,12 @@ const { topics } = await admin.fetchTopicMetadata({
 ```
 
 `listTopics()` returns only names as `string[]`. `fetchTopicMetadata()` with no topics returns all those topics with `name`, `topicId`, `isInternal` and partition detail from one fresh Metadata request. Omitted `topicId` support is represented as null. Listing all topics does not add them to the target-topic set.
+
+### Topics are described by name only
+
+`fetchTopicMetadata` takes topic names. It has no `topicIds` option, so you cannot describe a topic by its ID. The Java admin client can. `deleteTopics({ topicIds })` is the only admin call that takes topic IDs.
+
+A lookup by name describes the topic that holds that name now. If a topic was deleted and created again under the same name, the lookup describes the new one and cannot find the earlier one. Every described topic carries its `topicId`. Compare it with the ID you hold to tell whether the name now refers to a different topic.
 
 ## <a name="fetch-topic-offsets"></a> Fetch topic offsets
 
@@ -443,6 +454,8 @@ await admin.fetchTopicOffsets(topic)
 ```
 
 `fetchTopicOffsets` and consumer offset resolution keep their existing behavior. Named offset specifications are selected through `fetchTopicOffsetsByTimestamp`.
+
+Parallel `fetchTopicOffsets` calls on one admin client can fail with `TypeError: Cannot destructure property 'partitions'…` when one of them reads a topic this client has not read before; read each topic once, awaited, before reading in parallel. The topic stays a metadata target of the admin client, so another client deleting it breaks later admin calls. See [Known issues](MigrationGuide-3-0-0.md#known-issues).
 
 ## <a name="fetch-topic-offsets-by-timestamp"></a> Fetch topic offsets by timestamp
 
@@ -574,6 +587,8 @@ await admin.resetOffsets({ groupId, topic }) // latest by default
 // await admin.resetOffsets({ groupId, topic, earliest: true })
 ```
 
+`resetOffsets` writes its offsets through `setOffsets` and has the same outcome contract: see [Set consumer group offsets](#a-name-set-offsets-a-set-consumer-group-offsets).
+
 ## <a name="set-offsets"></a> Set consumer group offsets
 
 `setOffsets` allows you to set the consumer group offset to any value.
@@ -607,6 +622,14 @@ await admin.setOffsets({
     ]
 })
 ```
+
+`setOffsets` writes the offsets in one OffsetCommit to the group's coordinator, without joining the group, and resolves only when the coordinator accepted every partition. The commit carries no member id and generation -1, as the Java admin's `alterConsumerGroupOffsets` does. The last entry for a partition wins, and every partition named is sent: a partition the topic does not have is refused by the coordinator (`UNKNOWN_TOPIC_OR_PARTITION`) and reported in the rejection. Each commit stores only the offset: its metadata becomes empty and its leader epoch unknown. An offset must be a decimal integer string (digits with an optional leading `-`) or a safe integer number, of at least 0 or exactly `-1`/`-2`; anything else, such as `'NaN'`, `'Infinity'`, a blank or `0x`-prefixed string, a boolean, or a value outside the signed 64-bit range, is refused with a `KafkaJSNonRetriableError` before any request.
+
+The group must have no members: a group that has members is refused before anything is sent, and a member that starts during the call makes the coordinator refuse the commit (`UNKNOWN_MEMBER_ID`). A group that does not exist is created by the coordinator, with an empty protocol type, also on a cluster that has the consumer group protocol turned off. An empty classic group keeps its earlier empty-since time for offset expiry: this write does not refresh it. So on a classic group that has been empty for a while, the offsets set here expire `offsets.retention.minutes` after the group became empty, not after this call. Start the group's consumers before then, or the offsets can be deleted and the consumers fall back to their `fromBeginning` reset policy. Earlier versions joined and left the group with a temporary consumer, which restarted that time.
+
+If any partition was not committed the call rejects with a `KafkaJSAggregateError` whose `errors` name each such partition (`partition`, `topic`) and its cause (`type`, or `cause` for a partition whose last attempt got no answer); the partitions it does not name are committed. If no partition was confirmed or refused with a code (the coordinator never answered), the call rejects with the request's own error, and nothing can be assumed about which partitions were written. Partitions are listed in partition order. A coordinator that moved or is loading, or a rebalance in progress, is retried within the retry budget, sending only the partitions still pending. A rejection means "not confirmed", not "not written": a commit that timed out, or one that was in flight when the API deadline passed, may still have been applied. Sending the call again writes the offsets again, over any offset committed in between, even when the value is the same. If a transaction that already sent offsets for this group commits later, its offsets replace the ones set here.
+
+`-1` and `-2` are stored as given. `fetchOffsets({ resolveOffsets: true })` resolves them to the latest or earliest offset and commits that concrete offset; a consumer that starts without a seek applies its own reset policy to a stored marker.
 
 ## <a name="reset-offsets-by-timestamp"></a> Reset consumer group offsets by timestamp
 

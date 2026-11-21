@@ -175,9 +175,22 @@ const createAccumulator = ({
   return { accumulator, calls, sent, partition }
 }
 
-/** A send of `messages` with the request-level options a `send()` passes. */
-const append = (accumulator, messages, { acks = -1, timeout = 30000, compression = 0 } = {}) =>
-  accumulator.append({ acks, timeout, compression, topicMessages: [{ topic: TOPIC, messages }] })
+/**
+ * A send of `messages` with the request-level options a `send()` passes; `startedAt` is the public
+ * call's time when it is earlier than now.
+ */
+const append = (
+  accumulator,
+  messages,
+  { acks = -1, timeout = 30000, compression = 0, startedAt } = {}
+) =>
+  accumulator.append({
+    acks,
+    timeout,
+    compression,
+    topicMessages: [{ topic: TOPIC, messages }],
+    startedAt,
+  })
 
 /**
  * Runs an accumulator whose send path throws synchronously, in a child process, and reports where
@@ -696,26 +709,17 @@ describe('Producer > the accumulator', () => {
 
       test('a held batch an older send joins goes on at that send’s deadline', async () => {
         const { sendPartitioned, values } = heldFirstCall()
-        const gate = deferred()
-        const partition = jest.fn(async (send) => {
-          if (send.records[0].messages[0].value === 'c-0') {
-            await gate.promise
-          }
-          return byMessage(send)
-        })
         const { accumulator } = createAccumulator({
           sendPartitioned,
-          partition,
           holds: () => true,
           deadline: 50,
         })
 
-        append(accumulator, records(0, 'c'))
         append(accumulator, records(0, 'a'))
         await jest.advanceTimersByTimeAsync(LINGER + 1)
         append(accumulator, records(0, 'b'))
         await jest.advanceTimersByTimeAsync(LINGER + 1)
-        gate.resolve()
+        append(accumulator, records(0, 'c'), { startedAt: 0 })
         await jest.advanceTimersByTimeAsync(37)
         expect(values()).toEqual([['a-0']])
         await jest.advanceTimersByTimeAsync(1)
@@ -932,20 +936,12 @@ describe('Producer > the accumulator', () => {
     })
 
     test('a batch’s delivery deadline counts from the earliest send in it', async () => {
-      const held = deferred()
-      const partition = jest.fn(async (send) => {
-        if (send.records[0].messages[0].value === 'a-0') {
-          await held.promise
-        }
-        return byMessage(send)
-      })
-      const { accumulator, calls } = createAccumulator({ linger: 10, partition })
+      const { accumulator, calls } = createAccumulator({ linger: 10 })
 
-      append(accumulator, records(0, 'a'))
       await jest.advanceTimersByTimeAsync(2)
       append(accumulator, records(0, 'b'))
       await jest.advanceTimersByTimeAsync(1)
-      held.resolve()
+      append(accumulator, records(0, 'a'), { startedAt: 0 })
       await jest.advanceTimersByTimeAsync(10)
 
       expect(calls).toHaveLength(1)
@@ -961,28 +957,13 @@ describe('Producer > the accumulator', () => {
     })
 
     describe('an older send that joins a lingering batch late', () => {
-      /** A partition callback that waits for `held` before assigning the records of `a-0`. */
-      const lateFirst = (held) =>
-        jest.fn(async (send) => {
-          if (send.records[0].messages[0].value === 'a-0') {
-            await held.promise
-          }
-          return byMessage(send)
-        })
-
       test('brings the batch’s timer forward to its own delivery deadline', async () => {
-        const held = deferred()
-        const { accumulator, calls } = createAccumulator({
-          linger: 100,
-          deadline: 80,
-          partition: lateFirst(held),
-        })
+        const { accumulator, calls } = createAccumulator({ linger: 100, deadline: 80 })
 
-        append(accumulator, records(0, 'a'))
         await jest.advanceTimersByTimeAsync(20)
         append(accumulator, records(0, 'b'))
         await jest.advanceTimersByTimeAsync(30)
-        held.resolve()
+        append(accumulator, records(0, 'a'), { startedAt: 0 })
         await jest.advanceTimersByTimeAsync(29)
         expect(calls).toHaveLength(0)
         await jest.advanceTimersByTimeAsync(1)
@@ -992,18 +973,12 @@ describe('Producer > the accumulator', () => {
       })
 
       test('does not restart the batch’s linger', async () => {
-        const held = deferred()
-        const { accumulator, calls } = createAccumulator({
-          linger: 50,
-          deadline: 1000,
-          partition: lateFirst(held),
-        })
+        const { accumulator, calls } = createAccumulator({ linger: 50, deadline: 1000 })
 
-        append(accumulator, records(0, 'a'))
         await jest.advanceTimersByTimeAsync(20)
         append(accumulator, records(0, 'b'))
         await jest.advanceTimersByTimeAsync(10)
-        held.resolve()
+        append(accumulator, records(0, 'a'), { startedAt: 0 })
         await jest.advanceTimersByTimeAsync(39)
         expect(calls).toHaveLength(0)
         await jest.advanceTimersByTimeAsync(1)
@@ -2852,8 +2827,8 @@ describe('Producer > the accumulator', () => {
           partitions[0].values,
         ])
       ).toEqual([
-        [1, -1, ['b']],
         [-1, -1, ['a']],
+        [1, -1, ['b']],
       ])
     })
 
@@ -3503,6 +3478,31 @@ describe('Producer > the accumulator > the flush inventory', () => {
     expect(jest.getTimerCount()).toBe(0)
     expect(admission.reserved).toBe(1536)
     assigned.resolve([{ topic: 'held', partition: 0, messages: [] }])
+    await jest.advanceTimersByTimeAsync(0)
+    expect(admission.reserved).toBe(0)
+    expect(accumulator.unsettled()).toEqual([])
+  })
+
+  test('close settles when the last send waiting for its partitions expires, and its shell is freed once the assignment returns', async () => {
+    const assigned = deferred()
+    const { accumulator, admission } = inventory({
+      deadline: 1000,
+      partition: () => assigned.promise,
+    })
+    const held = append(accumulator, records(0, 'a'))
+    held.catch(() => {})
+    await jest.advanceTimersByTimeAsync(0)
+    const closed = settledFlag(accumulator.close())
+
+    await jest.advanceTimersByTimeAsync(999)
+    expect(closed()).toBe(false)
+    await jest.advanceTimersByTimeAsync(1)
+    await expect(held).rejects.toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
+    expect(closed()).toBe(true)
+    expect(jest.getTimerCount()).toBe(0)
+    expect(admission.reserved).toBeGreaterThan(0)
+
+    assigned.resolve([{ topic: TOPIC, partition: 0, messages: [] }])
     await jest.advanceTimersByTimeAsync(0)
     expect(admission.reserved).toBe(0)
     expect(accumulator.unsettled()).toEqual([])

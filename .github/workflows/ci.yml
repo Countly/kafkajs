@@ -8,6 +8,8 @@ on:
         description: 'Integration groups, comma-separated (empty runs all; e.g. share-base,admin)'
         required: false
         type: string
+permissions:
+  contents: read
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -25,7 +27,8 @@ jobs:
       - run: npm run test:types
   unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Node 22 took 27 to 29 minutes with the two heavy specs (2026-11-20); 40 leaves over 10 minutes.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix: { node: [22, 24, 26] }
@@ -35,6 +38,19 @@ jobs:
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
       - run: npm run test:unit -- --testPathIgnorePatterns 'scripts/soak/__tests__/soak\.spec\.js$'
+  unit-heavy:
+    runs-on: ubuntu-latest
+    # The two specs measured about 19 and 3.5 minutes inside the unit job; 50 is twice that plus setup.
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix: { node: [22, 24, 26] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+      - run: npm run test:unit:heavy -- --ci
         env:
           KAFKAJS_PRIMING_RETAINERS: '1'
   unit-soak:
@@ -59,8 +75,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
-      - run: npm ci
-      - run: npm run test:pack
+      - run: npm ci --ignore-scripts
+      - name: Pack once, then guard and smoke both tarballs
+        run: |
+          set -eo pipefail
+          dir="$RUNNER_TEMP/tarballs"
+          mkdir -p "$dir"
+          main="$dir/$(npm pack --silent --pack-destination "$dir")"
+          ./scripts/packSmoke.sh "$main"
+          otel="$dir/$(cd otel && npm pack --silent --pack-destination "$dir")"
+          ./scripts/assertCleanOtelTarball.sh "$otel"
+          ./scripts/otelPackSmoke.sh "$otel" "$main"
+          main_sri="$(./scripts/sri.sh "$main")"
+          otel_sri="$(./scripts/sri.sh "$otel")"
+          echo "main: $main_sri"
+          echo "otel: $otel_sri"
   otel:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -68,7 +97,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run test:otel
   integration-plan:
     runs-on: ubuntu-latest
@@ -104,7 +133,34 @@ jobs:
       - run: npm ci
       - run: docker compose version
       - if: ${{ !startsWith(matrix.group, 'share') }}
+        env:
+          DO_NOT_STOP: ${{ matrix.group == 'others' && '1' || '' }}
         run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"
+      - name: Prove ordinary clients exit naturally
+        if: matrix.group == 'others'
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          NATURAL_EXIT_E2E: '1'
+        run: |
+          mkdir -p .tmp/e2e
+          node scripts/ci/naturalExit.js ordinary
+      - name: Prove a retained timer fails the ordinary natural-exit lane
+        if: matrix.group == 'others'
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          NATURAL_EXIT_E2E: '1'
+          NATURAL_EXIT_CONTROL: '1'
+        run: |
+          if node scripts/ci/naturalExit.js ordinary; then
+            echo "::error::The seeded-timer control exited on its own: the lane cannot see a retained handle"
+            exit 1
+          fi
+          node -e "require('./scripts/ci/naturalExit').verifyControlFailure()"
+      - name: Stop ordinary cluster
+        if: always() && matrix.group == 'others'
+        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
       - name: Prepare share evidence
         if: startsWith(matrix.group, 'share')
         run: |
@@ -141,7 +197,7 @@ jobs:
       - name: Stop share cluster
         if: always() && startsWith(matrix.group, 'share')
         run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
-      - if: always() && startsWith(matrix.group, 'share')
+      - if: always() && (startsWith(matrix.group, 'share') || matrix.group == 'others')
         uses: actions/upload-artifact@v4
         with:
           name: e2e-${{ matrix.group }}-${{ matrix.kafka }}-node${{ matrix.node }}

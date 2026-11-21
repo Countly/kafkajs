@@ -779,10 +779,7 @@ class PublicTelemetryRound {
   installClocks() {
     this.patchClock(Date, 'now', () => 1000 + this.clock.now())
     this.patchClock(process.hrtime, 'bigint', () => BigInt(this.clock.now()) * 1000000n)
-    const imported = require('node:perf_hooks').performance
-    this.patchClock(imported, 'now', () => this.clock.now())
-    if (global.performance !== imported)
-      this.patchClock(global.performance, 'now', () => this.clock.now())
+    this.patchClock(global.performance, 'now', () => this.clock.now())
   }
 
   /**
@@ -1928,7 +1925,10 @@ class PublicTelemetryRound {
       clientInstanceId: fields.clientInstanceId ?? this.subscription.clientInstanceId,
     }))
     this.wire.answer('PushTelemetry', () => ({}))
-    if (sasl) this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
+    if (sasl) {
+      this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
+      this.wire.answer('SaslAuthenticate', () => ({ authBytes: Buffer.alloc(0) }))
+    }
     if (this.kind !== 'shareConsumer') await this.wait(() => this.createClient(client))
     if (this.kind === 'producer' || this.kind === 'admin') scripted.producerScript(this.wire)
     if (this.kind === 'producer' && client.transactionalId)

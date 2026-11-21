@@ -13,6 +13,7 @@ const {
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
+const { ON_WRITE, ON_DECODED } = require('./privateOptions')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -59,9 +60,9 @@ const offsetsTopicIds = (topics) => {
 // @see clients/src/main/java/org/apache/kafka/common/requests/SyncGroupRequest.java (Apache Kafka 4.3.1, areMandatoryProtocolTypeAndNamePresent)
 const SYNC_GROUP_NO_PROTOCOL_MAX_VERSION = 4
 
-// The last Produce version keyed by topic name. A request that supplies no topic ids cannot be
-// sent above it, whatever the broker advertises.
-// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+// v11 is the retained ceiling for a request that carries no topic ids (safe for transaction
+// version 1); v12 is still name-keyed, v13+ uses TopicId.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.4.0)
 const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
 
 // The last Produce, EndTxn and TxnOffsetCommit versions a transaction may use while its
@@ -792,6 +793,9 @@ module.exports = class Broker {
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
    * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
    *   other errors still throw
+   * @param {boolean} [options.retainTopicErrors=false] keeps every topic and partition error in
+   *   data for the caller to judge, topics first (see the Metadata `checkPartitions`); only a
+   *   top-level error throws
    * @returns {Promise<object>} decoded response; no cache installation
    * @throws {Error} original transport/auth/parse failure or guard refusal
    */
@@ -800,6 +804,7 @@ module.exports = class Broker {
       guard,
       lenient = false,
       allowLeaderless = false,
+      retainTopicErrors = false,
       includeTopicAuthorizedOperations = false,
       includeClusterAuthorizedOperations = false,
       allowAutoTopicCreation = this.allowAutoTopicCreation,
@@ -819,6 +824,7 @@ module.exports = class Broker {
         allowAutoTopicCreation,
         lenient,
         allowLeaderless,
+        retainTopicErrors,
         includeTopicAuthorizedOperations,
         includeClusterAuthorizedOperations,
       }),
@@ -1084,7 +1090,6 @@ module.exports = class Broker {
     guard,
   }) {
     this.throwIfRefused(guard)
-    // TODO: validate topics not null/empty
     // Ids are what v13+ is keyed by, so a request without them cannot be sent above v12. A caller
     // may still ask for something lower.
     const cap =
@@ -1412,7 +1417,6 @@ module.exports = class Broker {
    * @returns {Promise}
    */
   async findGroupCoordinator({ groupId, coordinatorType, guard }) {
-    // TODO: validate groupId, mandatory
     this.throwIfRefused(guard)
     const findCoordinator = this.lookupRequest(apiKeys.GroupCoordinator, requests.GroupCoordinator)
     return await this[PRIVATE.SEND_REQUEST](findCoordinator({ groupId, coordinatorType }), guard)
@@ -1704,6 +1708,13 @@ module.exports = class Broker {
    *   connection was acquired and connected, after the request was authenticated and encoded, and
    *   at the instant of transmission; an error it returns rejects this one request, which is then
    *   written nowhere, takes no in-flight slot and leaves the connection open.
+   * @param {() => void} [options[ON_WRITE]] internal (`./privateOptions`): called once,
+   *   immediately before the request is written to the socket, so a caller can tell a request
+   *   refused before its write from one that may have reached the broker. A synchronous failure
+   *   of the write after it counts as possibly written
+   * @param {(decoded: object) => void} [options[ON_DECODED]] internal (`./privateOptions`): called
+   *   once with the decoded reply, before a caller refusal, the throttle or parse can end the
+   *   request
    * @returns {Promise}
    */
   async offsetCommit(
@@ -1718,18 +1729,18 @@ module.exports = class Broker {
       requests.OffsetCommit,
       topicIds === undefined ? OFFSETS_TOPIC_NAMES_MAX_VERSION : undefined
     )
-    return await this[PRIVATE.SEND_REQUEST](
-      offsetCommit({
-        groupId,
-        groupGenerationId,
-        memberId,
-        groupInstanceId,
-        retentionTime,
-        topics,
-        topicIds,
-      }),
-      guard
-    )
+    const protocolRequest = offsetCommit({
+      groupId,
+      groupGenerationId,
+      memberId,
+      groupInstanceId,
+      retentionTime,
+      topics,
+      topicIds,
+    })
+    if (options?.[ON_WRITE]) protocolRequest.onWrite = options[ON_WRITE]
+    if (options?.[ON_DECODED]) protocolRequest.onDecoded = options[ON_DECODED]
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**
@@ -2405,6 +2416,8 @@ module.exports = class Broker {
    *   producer id and epoch the coordinator bumped to (KIP-890)
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
+   * @param {() => void} [request[ON_WRITE]] internal (`./privateOptions`): called once, immediately
+   *   before the request is written to the socket; a throw rejects the request unwritten
    * @returns {Promise}
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
    */
@@ -2415,6 +2428,7 @@ module.exports = class Broker {
     transactionResult,
     transactionVersion = 1,
     guard,
+    [ON_WRITE]: onWrite,
   }) {
     this.throwIfRefused(guard)
     const endTxn = this.lookupRequestWithMax(
@@ -2422,10 +2436,14 @@ module.exports = class Broker {
       requests.EndTxn,
       transactionVersionCap(apiKeys.EndTxn, transactionVersion)
     )
-    return await this[PRIVATE.SEND_REQUEST](
-      endTxn({ transactionalId, producerId, producerEpoch, transactionResult }),
-      guard
-    )
+    const protocolRequest = endTxn({
+      transactionalId,
+      producerId,
+      producerEpoch,
+      transactionResult,
+    })
+    if (onWrite) protocolRequest.onWrite = onWrite
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**

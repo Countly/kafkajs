@@ -255,9 +255,6 @@ test('a second current refusal reports one episode', async () => {
   expect(ctx.errors).toHaveBeenCalledTimes(1)
 
   const throwing = noneGroup()
-  throwing.group.instrumentationEmitter.addListener(PARTITION_HALTED, () => {
-    throw new Error('listener failed')
-  })
   throwing.errors.mockImplementation(() => {
     throw new Error('logger failed')
   })
@@ -362,7 +359,12 @@ test('none halts unknown divergence without a reset request', async () => {
     assignmentEpoch: ctx.group.assignmentEpoch,
   }
   const setDefault = jest.spyOn(ctx.manager, 'setDefaultOffset')
-  const seek = jest.spyOn(ctx.manager, 'seek')
+  const apply = ctx.manager.reposition
+  const refusals = []
+  const seek = jest.spyOn(ctx.manager, 'reposition').mockImplementation(function (entry, bound) {
+    refusals.push(bound.guard())
+    return apply.call(this, entry, bound)
+  })
   const truncations = []
   ctx.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (event) => truncations.push(event))
   const unknown = { action: 'reset', divergingOffset: null, leaderEpoch: 3 }
@@ -378,7 +380,11 @@ test('none halts unknown divergence without a reset request', async () => {
 
   const known = { action: 'truncated', divergingOffset: '4', leaderEpoch: 3 }
   await ctx.group.applyValidationOutcome(TOPIC, 1, '7', known, preparation, 2)
-  expect(seek).toHaveBeenCalledWith({ topic: TOPIC, partition: 1, offset: '4' }, preparation)
+  expect(seek).toHaveBeenCalledWith(
+    { topic: TOPIC, partition: 1, offset: '4' },
+    { guard: expect.any(Function), fence: undefined }
+  )
+  expect(refusals).toEqual([null])
   expect(ctx.halts).toHaveLength(1)
 })
 

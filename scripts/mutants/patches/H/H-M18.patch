@@ -1,0 +1,18 @@
+--- a/src/consumer/rebalanceCoordinator.js
++++ b/src/consumer/rebalanceCoordinator.js
+@@ -349,7 +349,6 @@
+             rebuildOffsets,
+             lost: kind === 'lost',
+             round,
+-            ...(additionHold && { additionHold }),
+           })
+         // A listener's apply awaits user callbacks that carry their own deadline and retirement,
+         // so their typed outcome is not raced against the round's wait.
+@@ -381,6 +380,7 @@
+             tookOn,
+             group.hookIdentity(round, tookOn)
+           )
++          group.subscriptionState.hold(tookOn, additionHold)
+           const stale = round.guard()
+           if (stale) throw stale
+         }

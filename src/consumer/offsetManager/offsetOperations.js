@@ -1,5 +1,12 @@
+const CommittedOffsetRevisions = require('../../cluster/committedOffsetRevisions')
+
+const NO_TOPICS = Object.freeze([])
+
 /**
- * Orders the writes to one group's committed-offset cache and resolved positions.
+ * Orders the writes to one group's committed-offset cache and resolved positions, and is the one
+ * writer of that cache: every publication, read fill, eviction and topic invalidation goes
+ * through the ledger bound to it, so each write advances the cell's revision and the ledger sees
+ * every published mutation.
  *
  * An operation takes a ticket over the cells (topic and partition) it will write. The ledger
  * remembers a cell only while some open ticket covers it, so its size follows the outstanding
@@ -13,18 +20,45 @@
  *
  * A ticket may name an owner, and an owner barrier fences only the tickets of that owner, so one
  * participant can cancel its own pending work without invalidating anybody else's.
+ *
+ * Barriers come in two kinds. An ordinary eviction (revoke, assignment rebuild) clears cached
+ * cells; a hard barrier (topic recreation or reset) ends the incarnation. Both fence older work
+ * alike. Each covered cell also keeps its durable winner, the highest-intent mutation published
+ * to it: an eviction keeps it, a hard barrier drops it.
+ *
+ * A cell also holds at most one seek reservation, from the step that pops a user seek until its
+ * one raw commit request settles, whichever consumer, acquisition or run took it: two seek
+ * commits of one cell are never outstanding at once on this client. The reservation keeps its
+ * cell open, and every release wakes the registered runs.
+ *
+ * The ledger also answers who owns a topic of the group (an open ticket, or an attached consumer
+ * table that holds it) and tells its registry when a topic's last ticket ends or ownership changed,
+ * so the group's committed state can retire topics nobody owns.
  */
 class OffsetOperations {
-  constructor() {
-    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, appliedIntent: number, ownerBarriers: WeakMap<object, number>|null}>>} */
+  /**
+   * @param {object|null} [cache=null] the committed-offset cache this ledger writes, a topic to
+   *   partition to offset dictionary; a ledger built without one is bound by `bind`
+   */
+  constructor(cache = null) {
+    this.cache = cache
+    /** @type {Map<string, Map<number, {open: number, appliedAt: number, barrierAt: number, hardAt: number, appliedIntent: number, durable: {intent: number, offset: string}|null, ownerBarriers: WeakMap<object, number>|null, reservation: Reservation|null}>>} */
     this.topics = new Map()
     this.cells = 0
     this.clock = 0
     this.intent = 0
     this.openTickets = 0
     this.onIdle = null
+    /** @type {((topic: string) => void)|null} told when the last open ticket of a topic ends */
+    this.onTopicIdle = null
+    /** @type {(() => void)|null} told when an owner gave up topics */
+    this.onRetire = null
     /** @type {Set<{discharge: (topic: string, partition: number) => void}>} */
     this.attached = new Set()
+    /** The reservations held, so an empty ledger answers `reservation` without a lookup. */
+    this.reserved = 0
+    /** @type {Set<() => void>} told after every release; registrations do not count as work */
+    this.releaseWakes = new Set()
   }
 
   /**
@@ -56,7 +90,16 @@ class OffsetOperations {
 
       let state = partitions.get(number)
       if (!state) {
-        state = { open: 0, appliedAt: 0, barrierAt: 0, appliedIntent: 0, ownerBarriers: null }
+        state = {
+          open: 0,
+          appliedAt: 0,
+          barrierAt: 0,
+          hardAt: 0,
+          appliedIntent: 0,
+          durable: null,
+          ownerBarriers: null,
+          reservation: null,
+        }
         partitions.set(number, state)
         this.cells += 1
       }
@@ -70,6 +113,8 @@ class OffsetOperations {
 
   /**
    * Closes a ticket and releases the cells and topics no other open ticket covers. Idempotent.
+   * Once the whole ticket is released, each topic it left uncovered is reported to `onTopicIdle`,
+   * then idleness to `onIdle`.
    * @param {object} ticket
    * @returns {void}
    */
@@ -80,6 +125,7 @@ class OffsetOperations {
 
     ticket.ended = true
     this.openTickets -= 1
+    let released = null
     for (const { topic, partition } of ticket.cells) {
       const partitions = this.topics.get(topic)
       const state = partitions.get(partition)
@@ -90,9 +136,12 @@ class OffsetOperations {
         this.cells -= 1
         if (partitions.size === 0) {
           this.topics.delete(topic)
+          released ??= []
+          released.push(topic)
         }
       }
     }
+    for (const topic of released ?? NO_TOPICS) this.onTopicIdle?.(topic)
     this.notifyIdle()
   }
 
@@ -201,7 +250,8 @@ class OffsetOperations {
   }
 
   /**
-   * A barrier over every covered cell of a topic: a recreation or a topic reset.
+   * A hard barrier over every covered cell of a topic: a recreation or a topic reset. It fences
+   * like `touch` and also drops each cell's durable winner.
    * @param {string} topic
    * @returns {void}
    */
@@ -214,7 +264,142 @@ class OffsetOperations {
     const at = ++this.clock
     for (const state of partitions.values()) {
       state.barrierAt = at
+      state.hardAt = at
+      state.durable = null
     }
+  }
+
+  /**
+   * Binds this ledger to its cache once; a bound ledger keeps its own.
+   * @param {object} cache the cache a participant would otherwise use
+   * @returns {object} the bound cache, which every writer and reader of the pair uses
+   */
+  bind(cache) {
+    this.cache ??= cache
+    return this.cache
+  }
+
+  /**
+   * Publishes a mutation's committed offset: writes the cell, advances its revision and, when the
+   * mutation outranks the cell's durable winner, records it as the new one. Callers check
+   * `isSuperseded` first and record `apply` or `fence` themselves.
+   * @param {object|null} ticket the publishing mutation's ticket; null records no winner
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string} offset
+   * @returns {void}
+   */
+  publish(ticket, topic, partition, offset) {
+    this.write(topic, partition, offset)
+    const state = this.state(topic, partition)
+    if (state && ticket?.mutation && ticket.intent >= (state.durable?.intent ?? 0)) {
+      state.durable = { intent: ticket.intent, offset }
+    }
+  }
+
+  /**
+   * Fills a cell from a read (offset resolution): writes it and advances its revision, never
+   * recording a durable winner.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string} offset
+   * @returns {void}
+   */
+  fill(topic, partition, offset) {
+    this.write(topic, partition, offset)
+  }
+
+  /**
+   * Forgets a cached cell without a barrier and advances its revision, so the next resolution
+   * reads the coordinator.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {void}
+   */
+  forget(topic, partition) {
+    CommittedOffsetRevisions.forCache(this.cache).advance(topic, partition)
+    if (this.cache[topic]) delete this.cache[topic][partition]
+  }
+
+  /**
+   * Ordinary eviction of one cell (revoke, assignment rebuild): forgets it and fences older work
+   * like `touch`, keeping the cell's durable winner.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {void}
+   */
+  evict(topic, partition) {
+    this.topicCells(topic)
+    this.forget(topic, partition)
+    this.touch(topic, partition)
+  }
+
+  /**
+   * Hard invalidation of a topic's cache (topic reset): the barrier of `touchTopic`, a topic
+   * revision stamp and an empty topic entry.
+   * @param {string} topic
+   * @returns {void}
+   */
+  invalidateTopic(topic) {
+    this.touchTopic(topic)
+    CommittedOffsetRevisions.forCache(this.cache).clearTopic(topic)
+    this.cache[topic] = {}
+  }
+
+  /**
+   * The cached cells of a topic, created empty when missing: readers index a topic's cells
+   * without a guard.
+   * @param {string} topic
+   * @returns {object} the topic's partition to offset table
+   */
+  topicCells(topic) {
+    this.cache[topic] ??= {}
+    return this.cache[topic]
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {{intent: number, offset: string}|null} the highest-intent mutation
+   *   published to the cell since its last hard barrier, while a ticket covers the cell
+   */
+  durable(topic, partition) {
+    return this.state(topic, partition)?.durable ?? null
+  }
+
+  /**
+   * @param {object} ticket a mutation ticket
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {boolean} whether a mutation that began after the ticket was already applied to the
+   *   cell; barriers do not count
+   */
+  isOutranked(ticket, topic, partition) {
+    const state = this.state(topic, partition)
+    return state !== undefined && state.appliedIntent > ticket.intent
+  }
+
+  /**
+   * @param {object} ticket
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {boolean} whether a hard barrier reached the cell after the ticket began
+   */
+  isHardBarred(ticket, topic, partition) {
+    const state = this.state(topic, partition)
+    return state !== undefined && state.hardAt > ticket.began
+  }
+
+  /**
+   * @private
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {string} offset
+   * @returns {void}
+   */
+  write(topic, partition, offset) {
+    CommittedOffsetRevisions.forCache(this.cache).advance(topic, partition)
+    this.topicCells(topic)[partition] = offset
   }
 
   /**
@@ -228,6 +413,79 @@ class OffsetOperations {
       this.attached.delete(obligations)
       this.notifyIdle()
     }
+  }
+
+  /**
+   * Takes the cell's seek reservation for `owner` when no one holds it.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {object} owner who took it, read back by `reservation`
+   * @returns {Reservation|null} the reservation, open until `release`; null when the cell is held
+   */
+  reserve(topic, partition, owner) {
+    if (this.reservation(topic, partition) !== null) return null
+    const ticket = this.begin([{ topic, partition }])
+    const reservation = { owner, ticket, released: false }
+    this.state(topic, partition).reservation = reservation
+    this.reserved += 1
+    return reservation
+  }
+
+  /**
+   * Releases a reservation, ends its ticket and wakes the registered runs. Idempotent.
+   * @param {Reservation} reservation
+   * @returns {void}
+   */
+  release(reservation) {
+    if (reservation.released) return
+    reservation.released = true
+    const { topic, partition } = reservation.ticket.cells[0]
+    this.state(topic, partition).reservation = null
+    this.reserved -= 1
+    this.end(reservation.ticket)
+    for (const wake of [...this.releaseWakes]) wake()
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {Reservation|null} the cell's held seek reservation
+   */
+  reservation(topic, partition) {
+    if (this.reserved === 0) return null
+    return this.state(topic, partition)?.reservation ?? null
+  }
+
+  /**
+   * Registers a callback run after every release.
+   * @param {() => void} wake must not throw
+   * @returns {() => void} idempotent unregister
+   */
+  onRelease(wake) {
+    this.releaseWakes.add(wake)
+    return () => this.releaseWakes.delete(wake)
+  }
+
+  /**
+   * Whether a topic of this group is owned: an open ticket covers it, or an attached consumer table
+   * holds it (subscription, assignment or owed reset). Reads only.
+   * @param {string} topic
+   * @returns {boolean}
+   */
+  isOwned(topic) {
+    if (this.topics.has(topic)) return true
+    for (const table of this.attached) {
+      if (table.holds?.(topic)) return true
+    }
+    return false
+  }
+
+  /**
+   * Asks the registry to retire the topics nobody owns any longer; a standalone ledger has none.
+   * @returns {void}
+   */
+  retireUnowned() {
+    this.onRetire?.()
   }
 
   /**
@@ -264,5 +522,12 @@ class OffsetOperations {
     return partitions && partitions.get(Number(partition))
   }
 }
+
+/**
+ * @typedef {object} Reservation
+ * @property {object} owner who took it
+ * @property {object} ticket the read ticket that keeps its cell open
+ * @property {boolean} released
+ */
 
 module.exports = OffsetOperations

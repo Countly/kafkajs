@@ -24,7 +24,7 @@ const producer = kafka.producer({
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | createPartitioner      | Take a look at [Custom Partitioner](#custom-partitioner) for more information                                                                                                                | `null`               |
 | retry                  | Take a look at [Producer Retry](#retry) for more information                                                                                                                                 | `null`               |
-| metadataMaxAge         | The period of time in milliseconds after which we force a refresh of metadata even if we haven't seen any partition leadership changes to proactively discover any new brokers or partitions | `300000` - 5 minutes |
+| metadataMaxAge         | The period of time in milliseconds after which we force a refresh of metadata even if we haven't seen any partition leadership changes to proactively discover any new brokers or partitions. When the cached metadata names every topic the producer targets, a send does not wait for this refresh: it runs in the background | `300000` - 5 minutes |
 | allowAutoTopicCreation | Allow topic creation when querying metadata for non-existent topics                                                                                                                          | `true`               |
 | transactionTimeout | The maximum amount of time in ms that the transaction coordinator will wait for a transaction status update from the producer before proactively aborting the ongoing transaction. If this value is larger than the `transaction.max.timeout.ms` setting in the __broker__, the request will fail with a `InvalidTransactionTimeout` error | `60000`                            |
 | idempotent         | Write every message exactly once per partition, in order, even when the client retries a request (KIP-679). On unless `false` is passed: the producer allocates a producer id at `connect()` and needs `acks` -1 on every send, at most 5 requests in flight per connection and `retry.retries` of at least 1. A setting that conflicts turns idempotence off with one warning, or throws when `idempotent: true` or a `transactionalId` asked for it — see [Idempotence](#idempotence). If `retry.retries` is set below `5` a warning is logged that EoS guarantees may be invalidated. | `true`                            |
@@ -68,7 +68,7 @@ const producer = kafka.producer({ deliveryTimeout: 120000 })
 
 ### <a name="accumulator"></a> Accumulator
 
-Every producer gathers the records of several sends to one topic-partition into one batch, in the order their records reach the accumulator, normally the order the sends were made, and sends them together - so a busy partition sends fewer, larger requests. It works the same with or without idempotence, and inside transactions. `linger` (default 5 ms) and `batchSize` (default 16384 bytes) are the Java client's settings and defaults (`linger.ms`, `batch.size`).
+Every producer gathers the records of several sends to one topic-partition into one batch and sends them together - so a busy partition sends fewer, larger requests. Records join their partitions' batches in the order the send calls were made, per topic, on that producer (or in that transaction): a send takes its place when it is called, and once its partitions are known it waits until every earlier send to any of the same topics has joined its batches or failed, also while the earlier one waits for buffer room (`maxBlockMs`), for metadata, or retries a failed metadata load. So on an idempotent producer each partition receives its records in call order. Sends to other topics never wait for it, and a send that fails or reaches its delivery deadline while it waits lets the later ones go. A later send therefore waits at most until the earlier send's delivery deadline: 120000 ms by default, and as long as the `deliveryTimeout` or `retry.maxTotalTime` you set (leaving both unset or `null` keeps the default). It works the same with or without idempotence, and inside transactions. `linger` (default 5 ms) and `batchSize` (default 16384 bytes) are the Java client's settings and defaults (`linger.ms`, `batch.size`).
 
 ```javascript
 const producer = kafka.producer({ linger: 10, batchSize: 65536 })
@@ -79,7 +79,7 @@ const producer = kafka.producer({ linger: 10, batchSize: 65536 })
 - **`linger: 0`** sends a batch as soon as it forms, with no timer: the sends made in the same tick still go out together, and on an idempotent producer the sends that queue behind a partition's batch in flight still merge into one batch. No setting sends every `send()` as its own request.
 - **Request size.** A request carries at most one batch for each partition its broker leads, and at most `maxRequestSize` bytes: see [Request size](#request-size).
 - Every batch settles on its own partition's answer, with or without idempotence, as in the Java client: written, it resolves at once and is never sent again; refused with an error that is not retriable, it rejects alone; refused with a retriable one, it alone goes out again, within the retry budget. Without idempotence the batches that went out together share one `retry.retries` budget: a topic or broker that cannot be looked up holds back only its own batches, and each attempt waits for every broker's answer, so the slowest broker paces the retries - by at most `requestTimeout` per attempt. Records are assigned to partitions once, within the send's delivery deadline, before they are sent.
-- An idempotent producer keeps one batch of a partition in flight at a time. While it waits for that batch's answer, the partition's next batch stays open past its `linger` and keeps gathering records, up to `batchSize`, and goes out when the answer arrives, so a busy partition sends batches as large as its round trip allows rather than many small ones queued behind each other.
+- An idempotent producer keeps one batch of a partition in flight at a time. While it waits for that batch's answer, the partition's next batch stays open past its `linger` and keeps gathering records, up to `batchSize`, and goes out when the answer arrives, so a busy partition sends batches as large as its round trip allows rather than many small ones queued behind each other. What that means for throughput: [Running at high throughput](#high-throughput).
 - A send whose `acks`, `timeout` or `compression` differs from the batch waiting for its partition sends that batch first and starts a new one. A send with `acks` 0 or 1 that turns idempotence off sends every waiting batch first, while they still carry the producer id.
 - A send resolves once every batch carrying its records has been acknowledged, with one `RecordMetadata` per partition, sorted by topic and then partition, whose `baseOffset` is the offset of its own first record there, and rejects with the error of the batch that failed - the sends that share a batch succeed or fail together. `deliveryTimeout` counts from the moment the batch's first send was made, so the bound includes waiting for `linger` and, on an idempotent producer, for the producer id, as in the Java client.
 - A record whose key, value, header values or timestamp cannot be encoded fails its own send at once with `KafkaJSInvalidConfigurationError`, before it joins a batch: a key, value or header value must be a string, a `Buffer` or `null` (header values: not `null`), and a timestamp must be an integer from `0` to 2^63 - 1, the largest int64 - a number, a numeric string, a `Date`, a `BigInt` or a `Long`. The exact value is checked as it arrives, so a negative one, as Java also refuses, and one above the range, which used to wrap into another timestamp, fail the send. A timestamp of numeric `0` or `0n`, or none, means the send time, as in 2.2.4; the string `'0'`, `new Date(0)` and a `Long` of 0 are the epoch itself.
@@ -116,6 +116,30 @@ const producer = kafka.producer({ maxRequestSize: 4194304 })
 - **A send larger than one request is split** at record boundaries, per partition: no record is ever cut. Its admission (see [Memory](#memory)) is whole, its delivery is per chunk, in order: a chunk waiting for a retry stays ahead of the later ones, and one that failed for good lets the next one go. The send settles once every chunk has; it resolves with one `RecordMetadata` per partition, whose `baseOffset` is that of the send's first record there, whatever order the answers came in, or rejects with the first error a chunk failed with, unchanged. **A rejected split send may have written some of its records**: resending it whole can duplicate those. With `acks: 0` it resolves `[]`, as any send does. A send that fits one request is unchanged.
 - **The plan and the limit.** Requests are planned on the records' sizes before compression, plus the worst case of each built-in codec (about 0.03 % for gzip, 0.4 % for zstd, 0.01 % for LZ4 and 3 % for Snappy), so a compressible send is split sooner than its compressed size would need. Every frame is compared with `maxRequestSize` just before it is written; one above it - only possible with a codec you registered yourself, whose worst case the client does not know - is not written, and its batches, none of which was ever sent, go out in smaller requests. A batch already sent once is never divided again: if its retry would exceed the limit it fails with `KafkaJSRecordTooLargeError` without another write, and that error does **not** show that the earlier attempt was unsent.
 - **The broker's limits.** Raise `maxRequestSize` only as far as the brokers' `message.max.bytes` and `socket.request.max.bytes` allow. A record under `maxRequestSize` but over a topic's `max.message.bytes` is refused by the broker with `MESSAGE_TOO_LARGE` for its partition: the send rejects with that `KafkaJSProtocolError`, a broker answer, which has the same `type` and `code` as the client's `KafkaJSRecordTooLargeError`. With `acks: 0` such a record is dropped without an error.
+
+## <a name="high-throughput"></a> Running at high throughput
+
+Two limits decide how fast one producer can write: [one batch in flight per partition](#partition-throughput), and [the fixed cost of each `send()` call](#send-cost). This guide does not state a tested scale: see the release notes for the scale this release has been tested at.
+
+### <a name="partition-throughput"></a> One batch in flight per partition
+
+An idempotent producer (the default) and a transactional producer keep one batch of each partition unacknowledged at a time; the limit is not configurable. While that batch waits for its answer, the partition's next batch keeps gathering records past its `linger`, up to `batchSize`, and goes out when the answer arrives (see [Accumulator](#accumulator)). So a busy partition carries one batch per round trip, and its throughput is what fits in one batch, divided by the round trip. With records of 200 bytes of key and value, a batch of the default `batchSize` (16384 bytes) holds 81 records; with a 5 ms round trip that partition can take at most 81 records every 5 ms, about 16 000 records per second, whatever the number of concurrent sends to it. The round trip includes the broker's own write and replication time for `acks: -1`.
+
+What raises it:
+
+- **`batchSize`** (default 16384 bytes) is the main lever: the records per round trip grow with it. It counts keys and values before compression. Larger batches mean larger requests and more of `bufferMemory` held per partition, so raise `bufferMemory` with it. A single `send()` whose records for one partition exceed `batchSize` forms one batch of its own, up to what one request carries (`maxRequestSize`, see [Request size](#request-size)), so passing arrays also fills batches.
+- **`linger`** (default 5 ms) does not raise the limit of a partition that already has a batch in flight, because that partition's next batch waits for the answer anyway. It fills batches on partitions that are not busy, so the producer makes fewer, larger requests, at the price of up to `linger` ms more latency per send.
+- **Compression** (per send, none by default, see [Compression](#compression)) does not put more records into a batch, because `batchSize` counts bytes before compression. It makes each request smaller, which helps when network bandwidth rather than the round trip is the limit, at the price of CPU on the producer and the consumers.
+- **More partitions.** Batches of different partitions are sent at the same time, up to 5 requests per broker connection (`maxInFlightRequests`). More partitions add throughput; more concurrent sends to one partition do not, because they join the same queue of batches.
+- **`idempotent: false`** removes the limit: batches of one partition may then be in flight together. It also removes the guarantee: a retried batch can then be written twice, or after a later batch of its partition.
+
+When a partition receives more than it can send, its records wait in the producer and the buffer fills. What the producer holds stays bounded by a charge derived from `bufferMemory`, as [Memory](#memory) describes; it does not grow with the backlog. A send that does not fit waits up to `maxBlockMs` (default 60000 ms) and then rejects with the retriable `KafkaJSBufferExhaustedError`, `reason: 'timeout'`; a send that would take the sends already waiting past `bufferMemory` rejects at once with `KafkaJSBufferExhaustedError`, `reason: 'queue-full'`. Nothing of a refused send is queued, so the application can back off and send it again.
+
+### <a name="send-cost"></a> The cost of one `send()` call
+
+Each `send()` or `sendBatch()` call has a fixed cost (promises, a delivery deadline, the buffer charge of 1536 bytes, the partition and metadata steps) that is large compared with the cost of one more record in the same call. In a measurement without encoding, compression or a network, a send of one record cost about six times the CPU per record of a send of 100 records. For high rates, pass an array of messages per call, or use `sendBatch()` for several topics.
+
+A caller that awaits each single `send()` before making the next waits for `linger` every time, because a lone send's batch goes out only when its `linger` runs out: with the default 5 ms such a loop makes fewer than 200 sends per second, however fast the brokers are. Either pass `linger: 0`, so each batch goes out at once, or collect records and send them as one array, or make sends without awaiting each one and await them together.
 
 ## Producing messages
 
@@ -304,11 +328,11 @@ KafkaJS ships with 3 partitioners: `DefaultPartitioner`, `UniformStickyPartition
 
 | Partitioner | Keyed records | Records without a key | Choose it when |
 |---|---|---|---|
-| `UniformStickyPartitioner()` (the default) | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
+| `UniformStickyPartitioner()` (the default) | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random, weighted by queue depth by default (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
 | `DefaultPartitioner` | `murmur2(key)`, as the Java client | round-robin over the partitions that have a leader | you need Java-compatible keyed placement and an even spread of every keyless record |
 | `LegacyPartitioner` | the hash KafkaJS used before v2.0.0 | round-robin | you need the partitioning of KafkaJS before v2.0.0 |
 
-When `createPartitioner` is omitted the producer uses the uniform sticky partitioner, sticking for its `batchSize` bytes (KIP-794, the Java client's built-in behaviour). Keyed records and records with an explicit `partition` go exactly where `DefaultPartitioner` sends them; only records without a key are placed differently. To keep the placement of earlier versions, record by record, pass `createPartitioner: Partitioners.DefaultPartitioner` (or its alias `JavaCompatiblePartitioner`). `LegacyPartitioner` is not the way back: it hashes keys differently.
+When `createPartitioner` is omitted the producer uses the uniform sticky partitioner, sticking for its `batchSize` bytes and weighing queues (KIP-794, the Java client's built-in behaviour). Keyed records and records with an explicit `partition` go exactly where `DefaultPartitioner` sends them; only records without a key are placed differently. To keep the placement of earlier versions, record by record, pass `createPartitioner: Partitioners.DefaultPartitioner` (or its alias `JavaCompatiblePartitioner`). `LegacyPartitioner` is not the way back: it hashes keys differently.
 
 The `DefaultPartitioner` should be compatible with the default partitioner that ships with the Java Kafka client. This can be important to meet the [co-partitioning requirement](https://docs.confluent.io/current/ksql/docs/developer-guide/partition-data.html#co-partitioning-requirements) when joining multiple topics.
 
@@ -325,8 +349,8 @@ by importing it and providing it to the Producer constructor:**
 
 #### Uniform sticky partitioner
 
-`UniformStickyPartitioner` is the strictly uniform sticky partitioner of KIP-794, and the producer's
-default, with `stickyBytes` the producer's `batchSize`. To choose its options, unlike the other two
+`UniformStickyPartitioner` is the uniform sticky partitioner of KIP-794, and the producer's
+default, with `stickyBytes` the producer's `batchSize` and `adaptive: true`. To choose its options, unlike the other two
 you call it: pass `Partitioners.UniformStickyPartitioner()` for its own defaults, or call it with
 options:
 
@@ -339,12 +363,13 @@ kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ stic
 |---|---|---|
 | stickyBytes | Bytes assigned to one partition before the next record without a key picks another; each record counts its wire size - 21 bytes plus its key, value and headers with their lengths, a string in its UTF-8 bytes, as a `Buffer` of the same text - so records with no bytes move on too | `16384` |
 | ignoreKeys | Partition keyed records by the sticky rule too, instead of by key | `false` |
-| adaptive | Pick the next partition weighted by the batches waiting for each one (KIP-794's adaptive partitioning), so partitions of a slow broker get fewer records. A boolean | `false` |
+| adaptive | Pick the next partition weighted by the batches waiting for each one (KIP-794's adaptive partitioning), so partitions of a slow broker get fewer records. A boolean | `false` (`true` for the producer's default) |
 
 A record without a key goes to its topic's sticky partition until `stickyBytes` have been assigned
 to it; the record that reaches the threshold still goes there, and the next one
-goes to a partition picked uniformly at random among those with a leader (among all of them when
-none has a leader — the pick can land on the same partition again). The stickiness carries across
+goes to a partition picked at random among those with a leader (among all of them when none has a
+leader — the pick can land on the same partition again): uniformly with `adaptive: false`, weighted
+by queue depth with `adaptive: true`, the producer's default (see below). The stickiness carries across
 `send()` calls: the keyless records of one `send()` with many messages fill a few batches instead
 of one record per partition, and records from separate `send()` calls share a batch in the
 [accumulator](#accumulator). A
@@ -359,8 +384,20 @@ partition has one, and a topic's state is dropped once it has had no record with
 With `adaptive: true` each pick weighs the partitions that have a leader by the batches waiting for
 them: a partition is picked with probability proportional to the deepest queue plus one, less its
 own, as the Java client's `partitioner.adaptive.partitioning.enable` does; equal queues pick
-uniformly. The producer's own default does not weigh. `partitioner.availability.timeout.ms` is not
-implemented.
+uniformly. The producer's default partitioner weighs; for the previous non-adaptive sticky
+behavior, pass
+`createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384, adaptive: false })`
+with your `batchSize` as `stickyBytes` (16384 is the default `batchSize`). Keyed records and records with an explicit `partition`
+are placed the same either way. `partitioner.availability.timeout.ms` is not implemented.
+
+In one measured workload (Kafka 4.4.0, Node 24), a healthy cluster showed no measurable difference
+between the two. With one broker answering 300 ms slow and 120 000 keyless records offered,
+the producer without weighting delivered 67 % and `send()` rejected 33 % once the 32 MiB buffer
+filled; with weighting every record was delivered, with a p99 latency of 5.2 s instead of 45.6 s.
+Under a slow broker the weighting deliberately spreads keyless records unevenly: in that workload
+the busiest partition received about 9.7 times as many records as the least busy. These numbers
+describe that workload, not a guarantee: weighting reduces pressure on the buffer, and a full
+buffer still refuses sends.
 
 ### <a name="rack-aware-partitioning"></a> Rack-aware partitioning
 
@@ -381,7 +418,7 @@ The option `retry` can be used to customize the configuration for the producer.
 
 Take a look at [Retry](Configuration.md#retry) for more information.
 
-The retries of a send run until its [delivery deadline](#delivery-timeout) unless you set `retry.retries`: the producer retries a retriable answer, backing off from 100 ms up to 1000 ms with the retrier's jitter, for as long as the deadline lasts, and then rejects with `KafkaJSDeliveryTimeout` whose `cause` is the last error. An explicit `retry.retries`, `retry.maxTotalTime`, `retry.initialRetryTime` or `retry.maxRetryTime` is honoured, each key on its own, and `retry.retries` ends a send with `KafkaJSNumberOfRetriesExceeded` as before. The requests of a transaction (`initTransactions`, `commit`, `abort`, `sendOffsets`) and the producer id and partition registrations keep the retrier's own defaults.
+The retries of a send run until its [delivery deadline](#delivery-timeout) unless you set `retry.retries`: the producer retries a retriable answer, backing off from 100 ms up to 1000 ms with the retrier's jitter, for as long as the deadline lasts, and then rejects with `KafkaJSDeliveryTimeout` whose `cause` is the last error. An explicit `retry.retries`, `retry.maxTotalTime`, `retry.initialRetryTime` or `retry.maxRetryTime` is honoured, each key on its own, and `retry.retries` ends a send with `KafkaJSNumberOfRetriesExceeded` as before. The requests of a transaction (InitProducerId at connect and at a transaction's start, `commit`, `abort`, `sendOffsets`) and the producer id and partition registrations keep the retrier's own defaults.
 
 ## Broker client telemetry
 

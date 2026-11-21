@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/heartbeatState.js
++++ b/src/consumer/groupProtocol/heartbeatState.js
+@@ -171,7 +171,7 @@
+     request.InstanceId = protocol.groupInstanceId
+   }
+ 
+-  if (request.MemberEpoch === -1 || request.MemberEpoch === -2) {
++  if (false) {
+     return request
+   }
+ 

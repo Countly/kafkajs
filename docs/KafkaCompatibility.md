@@ -125,7 +125,7 @@ Keys this client declares but deliberately does not track in the matrix: they ar
 
 | API | Key | apiKeys.js name | Why untracked |
 |---|--:|---|---|
-| LeaderAndIsr | 4 | LeaderAndIsr | ZooKeeper-era controller-to-broker API; still defined upstream at 4.3.1 but never sent by a client. Stub in requests/index.js. |
+| LeaderAndIsr | 4 | LeaderAndIsr | ZooKeeper-era controller-to-broker API, never sent by a client. Stub in requests/index.js. |
 | StopReplica | 5 | StopReplica | ZooKeeper-era controller-to-broker API. Stub in requests/index.js. |
 | UpdateMetadata | 6 | UpdateMetadata | ZooKeeper-era controller-to-broker API. Stub in requests/index.js. |
 | ControlledShutdown | 7 | ControlledShutdown | Broker shutdown handshake, not a client API. Stub in requests/index.js. |

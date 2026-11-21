@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -110,7 +110,7 @@
+       if (topicName == null) invalid = true
+       for (const { partition } of partitions) {
+         const key = JSON.stringify([topicName, partition])
+-        if (!this.partitions.has(key) || seen.has(key)) invalid = true
++        if (seen.has(key)) invalid = true
+         seen.add(key)
+       }
+     }

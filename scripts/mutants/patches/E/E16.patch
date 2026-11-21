@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchRound.js
++++ b/scripts/benchmarks/fetchRound.js
+@@ -143,7 +143,7 @@
+           return original.apply(owner, args)
+         } finally {
+           this.counts[site] += Number(process.hrtime.bigint() - started)
+-          if (site === 'lookupNs') this.counts.lookups++
++          if (false && site === 'lookupNs') this.counts.lookups++
+         }
+       }
+     }

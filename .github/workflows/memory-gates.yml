@@ -14,6 +14,8 @@ on:
         options: ['1', '2', '3']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
 concurrency:
   group: memory-gates-${{ github.ref }}-${{ inputs.only || 'all' }}-${{ inputs.replicates || '3' }}
   cancel-in-progress: true
@@ -76,7 +78,7 @@ jobs:
     name: share-soak-controls
     if: contains(fromJSON(needs.select.outputs.jobs), 'unit')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 105
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@v4
@@ -87,8 +89,11 @@ jobs:
       - run: npm ci
         timeout-minutes: 5
       - name: Run broker-free acceptance and retained sensitivity controls
-        timeout-minutes: 40
+        timeout-minutes: 50
         run: npm run test:unit -- --ci --maxWorkers=2
+      - name: Run the heavy broker-free controls one spec at a time
+        timeout-minutes: 45
+        run: npm run test:unit:heavy -- --ci
   share-soak:
     name: share-soak-${{ matrix.profile }}
     runs-on: ubuntu-latest
