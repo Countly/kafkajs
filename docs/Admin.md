@@ -20,8 +20,10 @@ a mutation already sent may have been applied. Inspect the broker state before r
 A call that reads offsets or partitions of named topics (`fetchTopicOffsets`,
 `fetchTopicOffsetsByTimestamp`, `fetchOffsets` with `topics`, `fetchOffsetsForGroups`,
 `resetOffsets`, `setOffsets`, `deleteTopicRecords`, `describeProducers`, `abortTransaction`) asks
-for its topics in the admin client's metadata requests only while it runs, retries included;
-`setOffsets` and `resetOffsets` until their internal consumer is disposed. A topic this client has
+for its topics in the admin client's metadata requests at most while it runs, retries included.
+`fetchOffsets` and `fetchOffsetsForGroups` ask for a topic only while they look up its partitions,
+before the OffsetFetch request; `resetOffsets` while it looks up partitions, then again from the
+subscription of its internal consumer until that consumer is disposed, as `setOffsets` does. A topic this client has
 read and another client then deletes therefore fails only the calls that name it, with the error
 those calls raise for a topic that never existed. While such a call is running, other calls on the
 same admin client that refresh metadata ask for its topics too, so they can fail with
@@ -33,7 +35,16 @@ the metadata request of its next attempt, gets `UNKNOWN_TOPIC_OR_PARTITION`, and
 with the error it raises for a topic that never existed. When no such call is running, the metadata request before a cluster-level call
 (`createTopics`, `describeConfigs`, …) asks for every topic, as a new admin client does; on a
 cluster with many topics that request is larger than the request of a 2.2.4 admin client that had
-read offsets, which asked only for the topics it had read.
+read offsets, which asked only for the topics it had read, and an answer above `maxResponseSize`
+fails the call.
+
+The Metadata requests differ from 2.2.4 in three more ways. A read of a topic that no other call
+holds asks for that topic alone first, also when this client has read it before; the admin
+client's metadata age is zero, so the refresh check that follows can send a second request. Calls
+running in parallel share a Metadata request only when they ask for the same topics, so they can
+send one request each where 2.2.4 sent one for all of them. A retrying read of a topic that never
+existed, when no other call holds a topic, alternates a request for that topic with a request for
+every topic, and can end at its deadline before its retries are spent.
 
 ## Admin API ledger
 

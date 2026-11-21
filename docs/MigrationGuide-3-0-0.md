@@ -1150,8 +1150,10 @@ Group visibility and the admin client.
   client read offsets of stayed in all its later metadata requests until its own `deleteTopics`
   removed it, so a topic deleted by another client made every later call that refreshes metadata
   fail with `UNKNOWN_TOPIC_OR_PARTITION` (or `TOPIC_AUTHORIZATION_FAILED` for a topic that became
-  unauthorized). Now a call holds its topics only while it runs, retries included; `setOffsets` and
-  `resetOffsets` until their internal consumer is disposed. A call that names a deleted topic fails
+  unauthorized). Now a call holds its topics at most while it runs, retries included:
+  `fetchOffsets` and `fetchOffsetsForGroups` only while they look up a topic's partitions, before
+  the OffsetFetch request; `resetOffsets` while it looks up partitions, then from the subscription
+  of its internal consumer until that consumer is disposed, as `setOffsets` does. A call that names a deleted topic fails
   as for a topic that never existed: `fetchTopicOffsets`, `fetchTopicOffsetsByTimestamp` and the
   offset read of `deleteTopicRecords` with `KafkaJSNumberOfRetriesExceeded` once their retries are
   spent, its `cause` the `KafkaJSProtocolError` `UNKNOWN_TOPIC_OR_PARTITION` (this fork also copies
@@ -1169,7 +1171,19 @@ Group visibility and the admin client.
   fails with the error above for a topic that never existed. When no call is running, the metadata request
   before cluster-level calls (`createTopics`, `describeConfigs`, …) asks for every topic, as on a
   new 2.2.4 admin client; a 2.2.4 admin client that had read offsets asked only for the topics it
-  had read, so on a cluster with many topics that request is larger for a long-lived client. *What
+  had read, so on a cluster with many topics that request is larger for a long-lived client, and
+  an answer above `maxResponseSize` fails the call (`KafkaJSInvalidFrameError`, or its timeout
+  after retries). Such an answer does not fail on a topic or partition error, so the call no longer
+  fails for an earlier read's leaderless partition. The Metadata traffic changes too: a read of a
+  topic that no other call holds asks for that topic alone first, also when the client read it
+  before, and with the admin client's metadata age of zero the refresh check that follows can send
+  a second request; parallel calls share a Metadata request only when they ask for the same topics,
+  so they can send one each where 2.2.4 sent one; a retrying read of a topic that never existed,
+  when no other call holds a topic, alternates a request for that topic with a request for every
+  topic and can end at its deadline before its retries are spent. `TOPIC_RECREATED` is reported only
+  while the metadata cache still holds the topic's earlier id: a recreation between two reads is
+  not reported when a refresh for other topics came between them, and a refresh before a
+  cluster-level call can report a recreation of any topic the cache still holds. *What
   to do:* an application that recreated its admin client to recover from these failures no longer
   needs to; retry a cluster-level call that fails with `UNKNOWN_TOPIC_OR_PARTITION` while another
   call on the same client may hold a deleted topic.
@@ -1644,6 +1658,15 @@ Broker client telemetry (KIP-714) is opt-in on every client. The table gives eac
 | “Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.” | UUID is per returned client, stable through reconnect, not a group instance ID. Cached IDs are available without a new network request. Call after connect; timeout0 means cached-only. | Do not call getter or disable metrics; ordinary Kafka calls keep their old error/result identity. |
 | “Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.” | Re-register the same identity to update its value; there is no callback invocation or OTel SDK bridge. Unregister before resetting a Sum or changing immutable name type/unit. All four client kinds have this API. | Use existing instrumentation/optional OTel instead of registering; registered data only transmits when telemetry is enabled and selected. |
 | “Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.” | Final failure cannot delay core close past its inherited deadline or change its result. No reconnect/Get occurs for a final. Internal crash recovery and stop alone are not terminal. Explicit reconnect retains UUID and stays provisional through Get until its first successful normal Push. Only a first-Push 42 in that captured post-final reopen permits one corrective telemetry-transport retirement, ordinary backoff, nonzero-ID Get and additional normal Push; Get cannot replenish the allowance. A second 42 or other fatal result stops only telemetry; close/expiry tears down under existing limits. No UUID rotation, final resend, foreground reconnect or exception for established streams. | `disconnect({ timeout: 0 })` where inherited, or disable metrics; no new close overload/default. |
+
+### Known issues
+
+- **A metadata answer can arrive without its brokers.** This applies to every client. When the
+  seed broker is replaced while a metadata request is in flight (for example, a connection failure
+  removed it), the answer's topic metadata is installed, but the brokers it lists that the client
+  did not already know, or knew at another address, are not added. The next request to such a broker fails with the transient
+  `KafkaJSBrokerNotFound` error `Broker N not found in the cached metadata`, and the client refreshes
+  its metadata. A call with retries left recovers on its next attempt. A fix is planned for 3.1.
 
 ### Coming from the Java or Go client
 
