@@ -109,8 +109,10 @@ describe('Cluster > a scoped answer keeps the routing of current targets', () =>
     cluster = null
   })
 
-  test('with retainTargets, a scoped answer that lands last keeps the routing of every topic still a target, and drops the others', async () => {
+  test('with retainTargets, a scoped answer that lands last keeps the routing of every held topic, and drops a topic no call holds even while it is a target', async () => {
     cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retainTargets: true })
+    cluster.holdTargetTopics(['a'])
+    const releaseB = cluster.holdTargetTopics(['b'])
     cluster.targetTopics.add('a')
     cluster.targetTopics.add('b')
 
@@ -121,20 +123,23 @@ describe('Cluster > a scoped answer keeps the routing of current targets', () =>
     expect(observed.map((topics) => topics.sort())).toEqual([['a', 'b']])
     expect(cluster.metadataCache.leader('b', 0)).toBe(0)
 
-    cluster.targetTopics.delete('b')
+    releaseB()
+    cluster.targetTopics.add('b')
     await cluster.brokerPool.refreshMetadata(['a'])
     expect(routed(cluster)).toEqual(['a'])
   })
 
-  test('with retainTargets, an answer for every topic is installed as it is', async () => {
+  test('with retainTargets, an answer for every topic keeps the routing of a held topic it lacks, and drops an unheld one', async () => {
     cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retainTargets: true })
     front(cluster, ['b'])
+    cluster.holdTargetTopics(['a'])
     cluster.targetTopics.add('a')
-    await cluster.brokerPool.refreshMetadata(['a'])
+    cluster.targetTopics.add('c')
+    await cluster.brokerPool.refreshMetadata(['a', 'c'])
 
     await cluster.brokerPool.refreshMetadata([])
 
-    expect(routed(cluster)).toEqual(['b'])
+    expect(routed(cluster).sort()).toEqual(['a', 'b'])
   })
 
   test('without retainTargets, the answer that lands last is installed and observed, as before', async () => {
@@ -185,9 +190,10 @@ describe('Cluster > a scoped answer keeps the routing of current targets', () =>
     expect(routed(cluster)).toEqual(['a', 'b'])
   })
 
-  test('an admin client keeps the routing of its targets', async () => {
+  test('an admin client keeps the routing of its held targets', async () => {
     new Kafka({ ...connectionOpts(), logLevel: 0 }).admin()
     ;[cluster] = mockClusters
+    cluster.holdTargetTopics(['a', 'b'])
     cluster.targetTopics.add('a')
     cluster.targetTopics.add('b')
 

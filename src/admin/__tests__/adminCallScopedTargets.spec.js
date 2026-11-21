@@ -516,6 +516,37 @@ describe('Admin > each call targets its topics only while it runs', () => {
         await h.cluster.disconnect()
       }
     })
+
+    test('the same admin deleting a topic between the two offset requests of a read that holds it fails that read with code 3', async () => {
+      h = build()
+      await h.admin.connect()
+      alwaysStale(h.cluster)
+      const paused = latch()
+      const resume = latch()
+      h.setListHook(async (n, topics) => {
+        if (n === 1) {
+          paused.release()
+          await resume.promise
+          return
+        }
+        if (topics.some(({ topic }) => !h.live.has(topic))) throw createErrorFromCode(3)
+      })
+      const reader = outcome(h.admin.fetchTopicOffsets('T'))
+      await paused.promise
+
+      await expect(h.admin.deleteTopics({ topics: ['T'] })).resolves.toBeUndefined()
+      expect([...h.cluster.targetTopics]).toEqual([])
+      expect(routed(h.cluster)).toContain('T')
+      resume.release()
+
+      const { error } = await reader
+      expect(error).toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: { name: 'KafkaJSProtocolError', type: 'UNKNOWN_TOPIC_OR_PARTITION', code: 3 },
+      })
+      expect([...h.cluster.targetTopics]).toEqual([])
+      expect([...h.cluster.targetHolds]).toEqual([])
+    })
   })
 
   describe('every metadata answer keeps the routing of the topics calls hold', () => {
@@ -557,6 +588,46 @@ describe('Admin > each call targets its topics only while it runs', () => {
         expect([...h.cluster.targetTopics]).toEqual([])
       }
     )
+
+    test('an older answer for every topic that lacks a held topic, landing while a read routes it, leaves that read its offsets', async () => {
+      h = build()
+      await h.admin.connect()
+      alwaysStale(h.cluster)
+      const allSent = latch()
+      const allGo = latch()
+      let armed = true
+      h.setGate(async (topics) => {
+        if (armed && topics.length === 0) {
+          armed = false
+          const before = new Map(h.live)
+          before.delete('T')
+          allSent.release()
+          await allGo.promise
+          return before
+        }
+      })
+      const create = outcome(h.admin.createTopics(CREATE('N')))
+      await allSent.promise
+      const paused = latch()
+      const resume = latch()
+      h.setListHook(async (n) => {
+        if (n === 1) {
+          paused.release()
+          await resume.promise
+        }
+      })
+      const read = outcome(h.admin.fetchTopicOffsets('T'))
+      await paused.promise
+
+      allGo.release()
+      expect(await create).toEqual({ ok: true })
+      expect(routed(h.cluster)).toContain('T')
+      resume.release()
+
+      expect(await read).toEqual({ ok: T_OFFSETS })
+      expect([...h.cluster.targetTopics]).toEqual([])
+      expect([...h.cluster.targetHolds]).toEqual([])
+    })
 
     test('an older refresh of another topic that retries after a newer answer leaves a routing read its offsets', async () => {
       h = build()
