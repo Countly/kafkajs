@@ -718,14 +718,16 @@ describe('Admin > each call targets its topics only while it runs', () => {
       const acquire = lock.acquire.bind(lock)
       let acquires = 0
       lock.acquire = () => (++acquires === 2 ? queued.promise.then(acquire) : acquire())
-      const hold = h.cluster.holdTargetTopics.bind(h.cluster)
-      h.cluster.holdTargetTopics = (topics) => {
-        const release = hold(topics)
-        return () => {
-          release()
-          queued.release()
-        }
-      }
+      const add = h.cluster.addTargetTopic.bind(h.cluster)
+      h.cluster.addTargetTopic = (topic) =>
+        add(topic).catch((e) => {
+          if (topic === 'absent') queued.release()
+          throw e
+        })
+      const heldWhileAdding = []
+      h.setGate(async (topics) => {
+        if (topics.includes('U')) heldWhileAdding.push(h.cluster.targetHolds.get('U'))
+      })
 
       const call = await outcome(
         h.admin.fetchOffsetsForGroups({
@@ -734,9 +736,51 @@ describe('Admin > each call targets its topics only while it runs', () => {
       )
       expect(call.error).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION', code: 3 })
       expect(acquires).toBe(2)
-      for (let n = 0; n < 50 && h.cluster.targetHolds.size > 0; n++) await tick(1)
+      for (let n = 0; n < 50 && heldWhileAdding.length === 0; n++) await tick(1)
       await tick()
 
+      expect(heldWhileAdding[0]).toBe(1)
+      expect([...h.cluster.targetHolds]).toEqual([])
+      expect([...h.cluster.targetTopics]).toEqual([])
+    })
+
+    test('a group-offset read of topics without partitions holds each topic while it resolves it, and leaves no target', async () => {
+      h = build()
+      await h.admin.connect()
+      const heldWhileAsked = []
+      h.setGate(async (topics) => {
+        heldWhileAsked.push([[...topics].sort(), [...h.cluster.targetHolds].sort()])
+      })
+      h.cluster.findGroupCoordinator = async () => ({
+        nodeId: 1,
+        lookupRequestWithMax: () => () => ({ request: { apiVersion: 9 } }),
+        offsetFetch: async ({ groups }) => ({
+          groups: groups.map(({ groupId, topics }) => ({
+            groupId,
+            errorCode: 0,
+            topics: topics.map(({ topic, partitions }) => ({
+              topic,
+              partitions: partitions.map(({ partition }) => ({
+                partition,
+                committedOffset: '3',
+                committedLeaderEpoch: -1,
+                metadata: null,
+                errorCode: 0,
+              })),
+            })),
+          })),
+        }),
+      })
+
+      const [result] = await h.admin.fetchOffsetsForGroups({
+        groups: [{ groupId: 'g', topics: [{ topic: 'T' }, { topic: 'U' }] }],
+      })
+
+      expect(result.groupId).toBe('g')
+      expect(heldWhileAsked.length).toBeGreaterThan(0)
+      for (const [topics, holds] of heldWhileAsked) {
+        expect(holds.map(([t]) => t)).toEqual(expect.arrayContaining(topics))
+      }
       expect([...h.cluster.targetHolds]).toEqual([])
       expect([...h.cluster.targetTopics]).toEqual([])
     })

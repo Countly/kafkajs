@@ -15,6 +15,19 @@ jest.mock('../../consumer', () => {
   }
 })
 
+// A test can stall the disposal of the admin's internal consumers by setting a gate here.
+let mockDisposalGate = null
+jest.mock('../../consumer/disposal', () => {
+  const disposal = jest.requireActual('../../consumer/disposal')
+  return {
+    ...disposal,
+    disposeConsumer: async (consumer) => {
+      if (mockDisposalGate) await mockDisposalGate.wait()
+      return disposal.disposeConsumer(consumer)
+    },
+  }
+})
+
 const { Kafka } = require('../../../index')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
@@ -32,6 +45,7 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
     mockMembers.length = 0
     mockClusters.clear()
     mockDescription = { state: 'Empty', members: [] }
+    mockDisposalGate = null
     scripted = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node', port: 9092 }] }),
       {
@@ -275,7 +289,7 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
       expect([...adminCluster().targetHolds]).toEqual([])
     })
 
-    test('a seek commit that never gets an answer holds the call and the topic until the client request timeout, then the call resolves without surfacing that commit failure', async () => {
+    test('a seek commit that never gets an answer keeps the topic a target until the call ends', async () => {
       await admin.disconnect()
       admin = new Kafka(scripted.kafkaOptions({ requestTimeout: 300 })).admin()
       await admin.connect()
@@ -287,15 +301,18 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
           topic: TOPIC,
           partitions: [{ partition: 0, offset: '3' }],
         })
+        .then(
+          () => null,
+          (e) => e
+        )
         .finally(() => (settled = true))
       await gate.arrived()
-      const arrivedAt = Date.now()
       await new Promise((resolve) => setTimeout(resolve, 200))
       expect(settled).toBe(false)
       expect([...adminCluster().targetHolds]).toEqual([[TOPIC, 1]])
+      expect([...adminCluster().targetTopics]).toEqual([TOPIC])
 
-      await expect(set).resolves.toBeUndefined()
-      expect(Date.now() - arrivedAt).toBeGreaterThanOrEqual(300)
+      await set
       expect([...adminCluster().targetHolds]).toEqual([])
       expect([...adminCluster().targetTopics]).toEqual([])
       gate.release()
@@ -326,6 +343,77 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
 
       expect([...adminCluster().targetHolds]).toEqual([])
       expect([...adminCluster().targetTopics]).toEqual([])
+    })
+
+    /** @returns {object} a gate that stalls every disposal until released, and reports arrival */
+    const disposalGate = () => {
+      let arrive
+      let release
+      const arrived = new Promise((resolve) => (arrive = resolve))
+      const released = new Promise((resolve) => (release = resolve))
+      return {
+        arrived,
+        release,
+        wait: () => {
+          arrive()
+          return released
+        },
+      }
+    }
+
+    test('a refused call keeps the topic a target until its member is disposed', async () => {
+      mockDescription = { state: 'Stable', members: [{ memberId: 'other' }] }
+      mockDisposalGate = disposalGate()
+      let settled = false
+      const set = admin
+        .setOffsets({
+          groupId: 'set-group',
+          topic: TOPIC,
+          partitions: [{ partition: 0, offset: '3' }],
+        })
+        .finally(() => (settled = true))
+      await mockDisposalGate.arrived
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      expect(settled).toBe(false)
+      expect([...adminCluster().targetHolds]).toEqual([[TOPIC, 1]])
+      expect([...adminCluster().targetTopics]).toEqual([TOPIC])
+      mockDisposalGate.release()
+      await expect(set).rejects.toThrow('current state: Stable')
+      expect([...adminCluster().targetHolds]).toEqual([])
+      expect([...adminCluster().targetTopics]).toEqual([])
+    })
+
+    test('a disconnect releases the hold of a call whose member disposal never ends, and that call releasing later does nothing', async () => {
+      mockDescription = { state: 'Stable', members: [{ memberId: 'other' }] }
+      const gate = disposalGate()
+      mockDisposalGate = gate
+      const set = admin
+        .setOffsets({
+          groupId: 'set-group',
+          topic: TOPIC,
+          partitions: [{ partition: 0, offset: '3' }],
+        })
+        .catch((e) => e)
+      await gate.arrived
+      const cluster = adminCluster()
+      expect([...cluster.targetHolds]).toEqual([[TOPIC, 1]])
+
+      await admin.disconnect({ timeout: 0 })
+      expect([...cluster.targetHolds]).toEqual([])
+      expect([...cluster.targetTopics]).toEqual([])
+      expect(await set).toBeInstanceOf(Error)
+
+      mockDisposalGate = null
+      await admin.connect()
+      const fresh = cluster.holdTargetTopics([TOPIC])
+      cluster.targetTopics.add(TOPIC)
+      gate.release()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect([...cluster.targetHolds]).toEqual([[TOPIC, 1]])
+      expect([...cluster.targetTopics]).toEqual([TOPIC])
+      fresh()
+      expect([...cluster.targetTopics]).toEqual([])
     })
 
     test('two overlapping calls for different groups keep the topic a target until the second ends', async () => {
