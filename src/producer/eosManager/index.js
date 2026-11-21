@@ -901,6 +901,9 @@ const createEosManager = ({
      * transaction, and the abort resolves with the producer `READY`; only a bump that fails fatally
      * rejects it, after a successful EndTxn, with the producer in `FATAL_ERROR`. A transaction
      * coordinator that could not be found is never fatal here, for the EndTxn or for the bump.
+     * A producer closed while the abort runs rejects it with the close error, and leaves the
+     * producer `READY` with the epoch bump owed, as a failed EndTxn does: after a reconnect the next
+     * transaction bumps the epoch first, which aborts whatever the coordinator still holds.
      * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
      * @param {object} [options]
      * @param {boolean} [options.droppedSequences=false] whether the caller dropped queued batches
@@ -908,6 +911,8 @@ const createEosManager = ({
      * @returns {Promise<void>}
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} when the abort itself
      *   failed fatally, or a fatal answer armed `FATAL_ERROR` while it waited
+     * @throws {import('../../errors').KafkaJSProducerClosedError} the lifecycle's close error once
+     *   the producer was closed; the producer is `READY`, the bump owed
      */
     async abort({ droppedSequences = false } = {}) {
       const generation = getGeneration()
@@ -916,23 +921,33 @@ const createEosManager = ({
       stateManager.resolveSequences()
       const bump = droppedSequences || stateManager.state() === STATES.ABORTABLE_ERROR
       stateManager.transitionTo(STATES.ABORTING)
-      await stateManager.whenPartitionsAdded()
-      generation?.check()
-      if (stateManager.state() === STATES.FATAL_ERROR) {
-        throw stateManager.transaction.armedError()
-      }
 
       let ended = true
       let adopted = false
       try {
-        adopted = await endTransaction(false, generation)
-      } catch (error) {
+        await stateManager.whenPartitionsAdded()
         generation?.check()
-        swallowUnlessFatal(error)
-        ended = false
-      }
+        if (stateManager.state() === STATES.FATAL_ERROR) {
+          throw stateManager.transaction.armedError()
+        }
 
-      generation?.check()
+        try {
+          adopted = await endTransaction(false, generation)
+        } catch (error) {
+          generation?.check()
+          swallowUnlessFatal(error)
+          ended = false
+        }
+
+        generation?.check()
+      } catch (error) {
+        // A close leaves the outcome unknown, as a failed EndTxn does: end locally, owe the bump.
+        if (generation?.closed && stateManager.state() === STATES.ABORTING) {
+          stateManager.transitionTo(STATES.READY)
+          bumpOwed = true
+        }
+        throw error
+      }
       stateManager.transitionTo(STATES.READY)
 
       if (!ended || (bump && !adopted)) {
