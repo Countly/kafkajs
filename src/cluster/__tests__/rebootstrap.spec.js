@@ -653,6 +653,11 @@ describe('BrokerPool > rebootstrap', () => {
         ],
       }
       stubSeed(pool, async () => twoBrokerResponse)
+      pool.createBroker = ({ connectionPool, nodeId }) => ({
+        ...pool.seedBroker,
+        nodeId,
+        connectionPool,
+      })
 
       let triggered = false
       const stubbedBuildConnectionPool = pool.buildConnectionPool.bind(pool)
@@ -667,6 +672,8 @@ describe('BrokerPool > rebootstrap', () => {
       }
 
       await expect(pool.refreshMetadata([])).resolves.toBeUndefined()
+      expect(pool.metadata.brokers).toHaveLength(2)
+      expect(pool.getNodeIds().sort()).toEqual(['0', '1'])
     })
 
     test('the seed broker is never unset while a rebootstrap is in flight', async () => {

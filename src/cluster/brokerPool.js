@@ -271,6 +271,9 @@ module.exports = class BrokerPool {
     this.metadataClusterCheck = metadataClusterCheck ?? true
     this.metadataRecoveryRebootstrapTriggerMs = metadataRecoveryRebootstrapTriggerMs ?? 300000
 
+    /** Why each replaced seed was replaced, read when a metadata answer it was asked under lands. */
+    this.seedReplacements = new WeakMap()
+
     /** Failures `onApiVersionsFailure` already recovered from, so a surrounding catch skips them. */
     this.recoveredFailures = new WeakSet()
 
@@ -301,6 +304,7 @@ module.exports = class BrokerPool {
         const installed = await this.createSeedBroker({
           fence,
           isCurrent: () => ownsRouting() && this.seedBroker === seed,
+          reason: 'a rebootstrap',
         })
         fence?.check()
         checked(null)
@@ -758,10 +762,12 @@ module.exports = class BrokerPool {
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, a pool built meanwhile is retired unused instead of installed
    * @param {() => boolean} [options.isCurrent] captured recovery routing identity
+   * @param {string} [options.reason] what replaces the seed, as a metadata answer asked under the
+   *   replaced one reports it (see `supersededSeed`)
    * @returns {Promise<Broker>} installed seed
    * @throws {Error} original caller refusal or superseded recovery identity
    */
-  async createSeedBroker({ fence, isCurrent = () => true } = {}) {
+  async createSeedBroker({ fence, isCurrent = () => true, reason } = {}) {
     fence?.check()
     checked(null)
     const previousSeedBroker = this.seedBroker
@@ -784,6 +790,7 @@ module.exports = class BrokerPool {
       connectionPool,
       logger: this.rootLogger,
     })
+    if (previousSeedBroker && reason) this.seedReplacements.set(previousSeedBroker, reason)
     this.closeObsolete(previousSeedBroker)
     return this.seedBroker
   }
@@ -850,7 +857,7 @@ module.exports = class BrokerPool {
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
         if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
           // Connection builder will always rotate the seed broker
-          await this.createSeedBroker({ fence })
+          await this.createSeedBroker({ fence, reason: 'a failed seed broker connection' })
           try {
             this.logger.error(
               `Failed to connect to seed broker, trying another broker from the list: ${describeThrown(e)}`,
@@ -913,6 +920,7 @@ module.exports = class BrokerPool {
    * Removes a failed broker only when its identity and established pool generation are current.
    * An inherited baseline can name an old pre-write refusal, so it cannot authorize removal.
    * A sourced stale failure never falls back to address matching. Unsourced callers retain it.
+   * Removing the seed records why, for a metadata answer asked under it (see `supersededSeed`).
    * @public
    * @param {{host: string, port: number, source?: {broker: object, generation: number}}} destination
    * @returns {void}
@@ -934,6 +942,7 @@ module.exports = class BrokerPool {
       return
     if (this.seedBroker === broker) {
       this.seedBroker = shuffle(values(this.brokers).filter((candidate) => candidate !== broker))[0]
+      this.seedReplacements.set(broker, 'the removal of the failed seed broker')
     }
     this.metadataExpireAt = null
     const drain = this.closeObsolete(broker)
@@ -967,7 +976,11 @@ module.exports = class BrokerPool {
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
    * and rebuilds the seed, so re-resolving both on every iteration is what keeps a later attempt
    * from calling a disconnected object or building a duplicate `Broker` for the seed's own node
-   * id via a stale `seedHost`/`seedPort` pair. `findConnectedBroker()`'s own throw is `bail()`ed
+   * id via a stale `seedHost`/`seedPort` pair. The broker table is reconciled against that captured
+   * seed, so an answer that lands after a rebootstrap, a removed seed or a seed rotation replaced
+   * it is not installed, and an attempt whose seed is replaced while its answer is reconciled is
+   * not kept: either way the attempt is asked again of the current seed within the same retry
+   * budget and deadline (see `supersededSeed`). `findConnectedBroker()`'s own throw is `bail()`ed
    * immediately rather than left for the retrier to reclassify - the retrier's generic
    * catch-and-wrap would otherwise turn e.g. a `KafkaJSSASLAuthenticationError` into a
    * `KafkaJSNonRetriableError` and replace its `retryCount`/`retryTime`, breaking callers (the
@@ -1080,12 +1093,14 @@ module.exports = class BrokerPool {
         if (!applicable()) return
         const seedBroker = this.seedBroker
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
+        let superseded = null
 
         try {
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
           if (!applicable()) return
+          if ((superseded = this.supersededSeed(seedBroker))) throw superseded
           if (accept) {
             const settled = this.settleTopicErrors(response.topicMetadata, accept)
             checkPartitions(settled, { allowLeaderless })
@@ -1196,11 +1211,16 @@ module.exports = class BrokerPool {
               else this.closeObsolete(previous)
             }
           }
+          if (isLatest() && (superseded = this.supersededSeed(seedBroker))) {
+            this.metadataExpireAt = null
+            throw superseded
+          }
         } catch (e) {
           fence?.check()
           if (guard?.()) return bail(e)
           if (!applicable()) return
           if (
+            e === superseded ||
             e.type === 'LEADER_NOT_AVAILABLE' ||
             ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
               e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
@@ -1220,6 +1240,24 @@ module.exports = class BrokerPool {
       if (!fence?.closed) await this.onMetadataFailure(e, { fence })
       throw e
     }
+  }
+
+  /**
+   * The error of a metadata attempt asked while `seed` was the seed broker, when it no longer is.
+   * The broker table is reconciled against the seed an attempt captured, so an answer that lands
+   * after a rebootstrap, the removal of a failed seed or a seed rotation replaced it cannot be
+   * reconciled: installing it would route to brokers that were never set up. The caller throws
+   * this retriable error into its retrier, so the attempt is asked again of the current seed
+   * within the same retry budget and deadline, and callers joined to the refresh get that result.
+   * @param {Broker|undefined} seed the seed captured when the attempt was asked
+   * @returns {KafkaJSConnectionError|null} null while `seed` is still the seed
+   */
+  supersededSeed(seed) {
+    if (this.seedBroker === seed) return null
+    const cause = this.seedReplacements.get(seed) ?? 'a seed broker replacement'
+    return new KafkaJSConnectionError(
+      `Metadata answer discarded: ${cause} replaced the seed broker while the request was in flight`
+    )
   }
 
   /**

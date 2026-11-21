@@ -281,7 +281,11 @@ describe('Obsolete broker dispatch', () => {
       await pool.createSeedBroker()
       return unused
     })
-    await pool.refreshMetadata([])
+    await expect(pool.refreshMetadata([])).rejects.toMatchObject({
+      name: 'KafkaJSNumberOfRetriesExceeded',
+      cause: { name: 'KafkaJSConnectionError', retriable: true },
+    })
+    expect(pool.metadataExpireAt).toBeNull()
     expect(pool.seedBroker).not.toBe(seed)
     expect(pool.brokers[1]).toBe(old)
     expect(pool.brokers[2]).toBe(peer)
