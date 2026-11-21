@@ -51,6 +51,11 @@ on:
         type: choice
         options: ['3', '1']
         default: '3'
+      producer_processes:
+        description: Processes the three producers are spread over
+        type: choice
+        options: ['1', '2', '3']
+        default: '1'
       node:
         description: Node.js major version
         type: choice
@@ -80,6 +85,7 @@ jobs:
       LOAD_COMPRESSION: ${{ inputs.compression || 'none' }}
       LOAD_FAULTS: ${{ inputs.faults || 'rolling-restarts' }}
       LOAD_REPLICATION_FACTOR: ${{ inputs.replication_factor || '3' }}
+      LOAD_PRODUCER_PROCESSES: ${{ inputs.producer_processes || '1' }}
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 2
@@ -102,13 +108,13 @@ jobs:
         # The command string is evaluated by testWithKafka.sh; it names environment variables only,
         # each set from a choice input, so no input text reaches the shell.
         run: |
-          timeout -k 30s 1410s ./scripts/testWithKafka.sh 'node scripts/soak/loadRun.js --out "$LOAD_OUT" --rate "$LOAD_RATE" --record-bytes "$LOAD_RECORD_BYTES" --topics "$LOAD_TOPICS" --partitions "$LOAD_PARTITIONS" --duration "$LOAD_DURATION" --compression "$LOAD_COMPRESSION" --faults "$LOAD_FAULTS" --replication-factor "$LOAD_REPLICATION_FACTOR"'
+          timeout -k 30s 1410s ./scripts/testWithKafka.sh 'node scripts/soak/loadRun.js --out "$LOAD_OUT" --rate "$LOAD_RATE" --record-bytes "$LOAD_RECORD_BYTES" --topics "$LOAD_TOPICS" --partitions "$LOAD_PARTITIONS" --duration "$LOAD_DURATION" --compression "$LOAD_COMPRESSION" --faults "$LOAD_FAULTS" --replication-factor "$LOAD_REPLICATION_FACTOR" --producer-processes "$LOAD_PRODUCER_PROCESSES"'
       - name: Print the report
         if: always()
         timeout-minutes: 1
         run: |
           if [ -f "$LOAD_OUT/report.json" ]; then
-            node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ verdict: r.verdict, rate: r.rate, flow: r.flow, memory: r.memory, cluster: r.cluster, latencyMs: r.latencyMs, eventLoopDelayMs: r.eventLoopDelayMs, findings: r.oracle && Object.fromEntries(Object.entries(r.oracle.findings).map(([k, f]) => [k, f.count])), reads: r.oracle && r.oracle.reads, faults: r.faults, errors: r.errors }, null, 2))' "$LOAD_OUT/report.json"
+            node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ verdict: r.verdict, rate: r.rate, flow: r.flow, memory: r.memory, cpu: r.cpu, cluster: r.cluster, latencyMs: r.latencyMs, eventLoopDelayMs: r.eventLoopDelayMs, findings: r.oracle && Object.fromEntries(Object.entries(r.oracle.findings).map(([k, f]) => [k, f.count])), reads: r.oracle && r.oracle.reads, faults: r.faults, errors: r.errors }, null, 2))' "$LOAD_OUT/report.json"
           else
             echo "no report: the driver stopped before writing it"
           fi

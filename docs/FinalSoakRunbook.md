@@ -341,13 +341,21 @@ are unchanged by it, and nothing here judges a final soak.
 # 3-broker Compose cluster (docker-compose.yml) up, then:
 node scripts/soak/loadRun.js --out .tmp/load-profile --rate 10000 --record-bytes 1024 --topics 12 --partitions 16 \
   --producers 3 --producer-kinds idempotent,plain,transactional --consumers 3 --duration 600 \
-  --compression none --faults rolling-restarts
+  --compression none --faults rolling-restarts --producer-processes 1
 node scripts/soak/loadRun.js --recheck .tmp/load-profile   # replay the sealed artifact offline
 ```
 
+`--producer-processes N` (at most `--producers`) runs the producers in N child processes (`loadProducerChild.js`),
+producer `p<i>` in process `i % N`; consumers, the fault schedule and the judgement stay in the run's own process. A record
+key names its producer, so each producer still writes its own sequence per partition from one process and the oracle is
+unchanged. Each child offers its share on the same deadline schedule from the window's start, joins its producers and
+sends back its send ledgers, counts, latency histogram and CPU; a run that is missing a child's ledgers is not judged
+(exit 2). `slow-broker` needs one process: its flow verdict counts acknowledgements in the run's process. With more than
+one process, `cluster.metadata` counts the consumers' Metadata requests only.
+
 Every flag has a default (`LOAD_DEFAULTS` in `scripts/soak/loadProfile.js`). On a hosted runner, dispatch the
 `Load profile (diagnostic)` workflow (`.github/workflows/load-profile.yml`): choice inputs for rate, record size, topics,
-partitions, duration, codec, fault schedule, replication factor and Node; a push to a branch named `p12/load-profile*` runs
+partitions, duration, codec, fault schedule, replication factor, producer processes and Node; a push to a branch named `p12/load-profile*` runs
 it with the defaults.
 The job is limited to 30 minutes; the 600 s default window leaves about 10 minutes of slack, 900 s leaves little.
 
@@ -412,11 +420,32 @@ coordinated omission). Transactional records are timed to their commit.
 A shortfall names whether records were not sent (the runner or the unsettled cap) or not acknowledged, and how many sends
 the client rejected; rejections are the client refusing, so read them before blaming the runner.
 
+**Why a rate was not reached.** `report.cpu` holds what the CPU did: `cpus` (cores the run may use), the 1-minute load
+average (`loadAverage1m`, its maximum over the window's samples and its last), the run's own process per stage
+(`stages.offer`, `.join`, `.drain`: CPU as a share of one core, and the machine's busy share of all its cores; producers and
+consumers share the process, and the drain is the consumers' alone), the same per fault phase (`phases`), each producer
+process's offer and join (`producerProcesses`, with `--producer-processes` above 1), and the broker containers
+(`brokers`: `docker stats --no-stream` every 10 s while the window is open, mean and maximum percent of one core per
+container; a failed call is counted). `rate.limitedBy` (null when the rate was reached; `rateLimitedBy` in
+`loadProfile.js`):
+
+| Value | Rule (offer window) | Read it as |
+|---|---|---|
+| `client-cpu` | a load process used 90 % of one core or more | the client's JavaScript runs on one thread: spread the producers (`--producer-processes`) or measure the client |
+| `machine` | every core of the machine 90 % busy or more | brokers, clients and reads share the runner: the runner, not the client, set the rate |
+| `unknown` | neither | look at the brokers' CPU, the unsettled cap, rejected sends and latency |
+
 ### 7.5 Fault schedules
 
 `FAULT_SCHEDULES` in `loadProfile.js`. `none` is the plain profile. `rolling-restarts`: from a third of the window, every
 broker stopped and restarted in turn, then every broker killed and restarted in turn, 20 s apart, through `BrokerBouncer`
 (each step waits for the node to answer and the ISR to be full).
+
+A schedule never runs past the offer window. When the window ends, a broker already down is restarted by its own step, no
+later broker is taken down, and each fault not run is in `faults` with `skipped: "window ended"`; that is not an error and
+does not make the run inconclusive. Only a fault mechanism's own failure is reported as `fault schedule: ...`. With
+thousands of partitions each restart waits much longer for the full ISR, so a 600 s window may hold only part of the
+`rolling-restarts` schedule: read `faults` to see which restarts ran.
 
 **`slow-broker`** (needs `--duration` ≥ 195). In the middle third of the window, kafka2 (node 2) is:
 
