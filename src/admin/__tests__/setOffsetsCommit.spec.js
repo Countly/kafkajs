@@ -647,6 +647,8 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
     expect(error.errors.map(({ partition }) => partition)).toEqual(order)
     expect(cells()[1].map(([partition]) => partition)).toEqual([2, 10])
     expect(listed.errors.map(({ partition }) => partition)).toEqual([2, 10])
+    const [fetched] = await admin.fetchOffsets({ groupId: 'reset-group', topics: [TOPIC] })
+    expect(fetched.partitions.map(({ partition }) => partition)).toEqual(order)
   })
 
   test.each([
