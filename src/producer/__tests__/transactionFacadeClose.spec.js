@@ -85,16 +85,17 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
   const { flushAll } = require('./fixtures/bufferHarness')
   const { TransactionCoordinatorModel } = require('./fixtures/transactionCoordinator')
   const { KafkaJSApplicationRecoverableError } = require('../../errors')
+  const { createErrorFromCode } = require('../../protocol/error')
   const TOPIC = 'forced-close'
   const TAKEN_OVER =
-    /^Another producer took over transactional id forced-close, or the transaction coordinator aborted its transaction on the transaction timeout \(.+\); create a new producer$/
+    /^The transaction coordinator no longer accepts this producer's id and epoch: another producer took over transactional id forced-close, its transaction timed out, or the transactional id expired \(.+\); create a new producer$/
 
   /**
    * A transactional producer on transaction version `version` over a coordinator that follows the
    * Kafka 4.4.0 rules (`fixtures/transactionCoordinator.js`), logging every request in order.
    * @param {number} version
-   * @returns {{ producer: object, coordinator: TransactionCoordinatorModel, log: string[],
-   *   setEndTxn: (mode: string) => void, holdAddPartitions: (hold: boolean) => void }}
+   * @returns {{ producer: object, cluster: object, coordinator: TransactionCoordinatorModel,
+   *   log: string[], setEndTxn: (mode: string) => void, setAdd: (mode: string) => void }}
    */
   const setUp = (version) => {
     const { producer, cluster } = bufferedProducer({
@@ -109,7 +110,7 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
       finalizedFeaturesEpoch: 1,
       negotiatedVersion: () => 5,
     })
-    return { producer, coordinator, ...coordinator.install(cluster.broker) }
+    return { producer, cluster, coordinator, ...coordinator.install(cluster.broker) }
   }
 
   /**
@@ -328,7 +329,8 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
         try {
           await abortUnknown(setup)
           const { producerEpoch } = rivalInit(coordinator)
-          if (rival !== 'idle') coordinator.addPartitions({ producerEpoch })
+          if (rival !== 'idle')
+            coordinator.addPartitions({ producerId: coordinator.producerId, producerEpoch })
           const from = log.length
 
           const { first, second } = await twoRefusedStarts(producer)
@@ -591,12 +593,12 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
     }
   )
 
-  test('a close forced while abort() waits for an AddPartitionsToTxn of an otherwise empty transaction owes no EndTxn, and the next transaction commits, transaction version 1', async () => {
-    const { producer, coordinator, log, holdAddPartitions } = setUp(1)
+  test('a close forced while abort() waits for an AddPartitionsToTxn the coordinator applied but never answered owes the abort, which the next transaction sends again before it starts, transaction version 1', async () => {
+    const { producer, coordinator, log, setAdd } = setUp(1)
     try {
       await producer.connect()
       const transaction = await producer.transaction()
-      holdAddPartitions(true)
+      setAdd('unanswered')
       const sent = transaction.send({ topic: TOPIC, messages: [{ value: 'v' }] }).then(
         () => null,
         (error) => error
@@ -612,20 +614,182 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
       await producer.disconnect({ timeout: 0 })
       const abortError = await aborted
       await sent
-      holdAddPartitions(false)
+      setAdd('answer')
 
       await producer.connect()
       const requests = await runTransaction(producer, log)
-      expect({
-        abortError: abortError?.name,
-        endTxn: log.filter((entry) => entry.startsWith('endTxn')),
-        requests,
-        at: coordinatorAt(coordinator),
-      }).toEqual({
+      expect({ abortError: abortError?.name, requests, at: coordinatorAt(coordinator) }).toEqual({
         abortError: 'KafkaJSProducerClosedError',
-        endTxn: ['endTxn:commit:1000/0'],
-        requests: ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:1000/0'],
-        at: { state: 'COMPLETE_COMMIT', epoch: 0 },
+        requests: afterResend(1),
+        at: { state: 'COMPLETE_COMMIT', epoch: 1 },
+      })
+    } finally {
+      await producer.disconnect({ timeout: 0 })
+    }
+  })
+
+  describe('an abort after an add request whose answer never came, transaction version 1', () => {
+    const OFFSETS = {
+      consumerGroupId: 'forced-close-group',
+      topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }],
+    }
+
+    /**
+     * Starts a transaction and makes one add request in it under `mode`: a record sent
+     * (AddPartitionsToTxn), or offsets (AddOffsetsToTxn).
+     * @param {ReturnType<typeof setUp>} setup
+     * @param {'partitions'|'offsets'} kind
+     * @param {string} mode the add mode while the request runs
+     * @returns {Promise<{ transaction: object, failure: ?Error }>}
+     */
+    const failAdd = async ({ producer, setAdd }, kind, mode) => {
+      await producer.connect()
+      const transaction = await producer.transaction()
+      setAdd(mode)
+      const failure = await (
+        kind === 'partitions'
+          ? transaction.send({ topic: TOPIC, messages: [{ value: 'v' }] })
+          : transaction.sendOffsets(OFFSETS)
+      ).then(
+        () => null,
+        (error) => error
+      )
+      setAdd('answer')
+      return { transaction, failure }
+    }
+
+    test.each(['partitions', 'offsets'])(
+      'an add of %s the coordinator applied whose every answer was lost is aborted with an EndTxn, the epoch bumped, and the next transaction commits',
+      async (kind) => {
+        const setup = setUp(1)
+        const { producer, coordinator, log } = setup
+        try {
+          const { transaction, failure } = await failAdd(setup, kind, 'timeout')
+          const from = log.length
+          const abortError = await transaction.abort().then(
+            () => null,
+            (error) => error
+          )
+          const abort = log.slice(from)
+          const requests = await runTransaction(producer, log)
+          expect({
+            failure: failure?.name,
+            abortError,
+            abort,
+            requests,
+            at: coordinatorAt(coordinator),
+          }).toEqual({
+            failure: 'KafkaJSTransactionAbortableError',
+            abortError: null,
+            abort: ['endTxn:abort:1000/0', 'initProducerId:1000/0'],
+            requests: ['addPartitionsToTxn:1', 'produce:1', 'endTxn:commit:1000/1'],
+            at: { state: 'COMPLETE_COMMIT', epoch: 1 },
+          })
+        } finally {
+          await producer.disconnect({ timeout: 0 })
+        }
+      }
+    )
+
+    test.each(['partitions', 'offsets'])(
+      'an abort answered INVALID_TXN_STATE after an add of %s the coordinator never applied has nothing to abort: the epoch is bumped and the next transaction commits',
+      async (kind) => {
+        const setup = setUp(1)
+        const { producer, coordinator, log } = setup
+        try {
+          const { transaction } = await failAdd(setup, kind, 'refuse')
+          const from = log.length
+          const abortError = await transaction.abort().then(
+            () => null,
+            (error) => error
+          )
+          const abort = log.slice(from)
+          const requests = await runTransaction(producer, log)
+          expect({ abortError, abort, requests, at: coordinatorAt(coordinator) }).toEqual({
+            abortError: null,
+            abort: ['endTxn:abort:1000/0', 'initProducerId:1000/0'],
+            requests: ['addPartitionsToTxn:1', 'produce:1', 'endTxn:commit:1000/1'],
+            at: { state: 'COMPLETE_COMMIT', epoch: 1 },
+          })
+        } finally {
+          await producer.disconnect({ timeout: 0 })
+        }
+      }
+    )
+
+    test('an abort owed after an AddPartitionsToTxn the coordinator never applied is sent again, its INVALID_TXN_STATE means nothing to abort, and the next transaction commits', async () => {
+      const setup = setUp(1)
+      const { producer, coordinator, log, setEndTxn } = setup
+      try {
+        const { transaction } = await failAdd(setup, 'partitions', 'refuse')
+        setEndTxn('refuse')
+        await transaction.abort()
+        setEndTxn('answer')
+        const requests = await runTransaction(producer, log)
+        expect({ requests, at: coordinatorAt(coordinator) }).toEqual({
+          requests: afterResend(1),
+          at: { state: 'COMPLETE_COMMIT', epoch: 1 },
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
+
+    test('an abort answered INVALID_TXN_STATE after a confirmed AddPartitionsToTxn makes the producer fatal', async () => {
+      const { producer, cluster, log } = setUp(1)
+      try {
+        await producer.connect()
+        const transaction = await openTransaction(producer)
+        cluster.broker.endTxn.mockImplementationOnce(async () => {
+          log.push('endTxn:refused-48')
+          throw createErrorFromCode(48)
+        })
+        const abortError = await transaction.abort().then(
+          () => null,
+          (error) => error
+        )
+        expect({
+          name: abortError?.name,
+          cause: abortError?.cause?.type,
+          next: await producer.transaction().then(
+            () => 'started',
+            (error) => error.name
+          ),
+        }).toEqual({
+          name: 'KafkaJSApplicationRecoverableError',
+          cause: 'INVALID_TXN_STATE',
+          next: 'KafkaJSApplicationRecoverableError',
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
+  })
+
+  test('an owed abort that adopted an epoch sends no InitProducerId before the next transaction, transaction version 2', async () => {
+    const { producer, cluster, coordinator, log, setEndTxn } = setUp(2)
+    try {
+      await producer.connect()
+      const transaction = await producer.transaction()
+      const produce = cluster.broker.produce.getMockImplementation()
+      cluster.broker.produce.mockImplementationOnce(async (request) => {
+        log.push(`produce:${request.producerEpoch}`)
+        coordinator.addPartitions(request)
+        throw createErrorFromCode(48)
+      })
+      const failure = await transaction.send({ topic: TOPIC, messages: [{ value: 'v' }] }).then(
+        () => null,
+        (error) => error
+      )
+      cluster.broker.produce.mockImplementation(produce)
+      setEndTxn('refuse')
+      await transaction.abort()
+      setEndTxn('answer')
+      const requests = await runTransaction(producer, log)
+      expect({ failure: failure?.type, requests, at: coordinatorAt(coordinator) }).toEqual({
+        failure: 'INVALID_TXN_STATE',
+        requests: afterResend(2),
+        at: { state: 'COMPLETE_COMMIT', epoch: 2 },
       })
     } finally {
       await producer.disconnect({ timeout: 0 })

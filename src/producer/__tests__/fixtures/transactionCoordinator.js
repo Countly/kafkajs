@@ -5,6 +5,7 @@ const PRODUCER_FENCED = 90
 const INVALID_PRODUCER_ID_MAPPING = 49
 const INVALID_TXN_STATE = 48
 const COORDINATOR_LOAD_IN_PROGRESS = 14
+const REQUEST_TIMED_OUT = 7
 
 /**
  * A transaction coordinator for one transactional id, following the rules of Kafka 4.4.0's
@@ -69,13 +70,23 @@ class TransactionCoordinatorModel {
   }
 
   /**
-   * AddPartitionsToTxn (version 1), or the partition a version 2 Produce adds implicitly.
-   * @param {{ producerEpoch: number }} request
+   * AddPartitionsToTxn or AddOffsetsToTxn (version 1), or the partition a version 2 Produce adds
+   * implicitly, checked in the order of `handleAddPartitionsToTransaction`: the producer id, the
+   * exact epoch, then a PREPARE_* state, which answers CONCURRENT_TRANSACTIONS.
+   * @param {{ producerId: string|number, producerEpoch: number }} request
    * @returns {void}
-   * @throws {Error} PRODUCER_FENCED (90) for another epoch
+   * @throws {Error} INVALID_PRODUCER_ID_MAPPING (49), PRODUCER_FENCED (90) or
+   *   CONCURRENT_TRANSACTIONS (51)
    */
-  addPartitions({ producerEpoch }) {
+  addPartitions({ producerId, producerEpoch }) {
+    if (String(producerId) !== this.producerId) {
+      throw createErrorFromCode(INVALID_PRODUCER_ID_MAPPING)
+    }
     if (producerEpoch !== this.epoch) throw createErrorFromCode(PRODUCER_FENCED)
+    if (this.state.startsWith('PREPARE_')) {
+      this.#completeMarkersAfterRound()
+      throw createErrorFromCode(CONCURRENT_TRANSACTIONS)
+    }
     this.state = 'ONGOING'
   }
 
@@ -128,20 +139,23 @@ class TransactionCoordinatorModel {
 
   /**
    * Installs the model behind a fake broker's InitProducerId (for the transactional id; one
-   * without it keeps the fake's answer), AddPartitionsToTxn, Produce and EndTxn mocks, logging
-   * every request in order: `initProducerId:<id>/<epoch>`, `endTxn:<result>:<id>/<epoch>`, and
-   * `<api>:<epoch>` for the others. `endTxn` decides what
+   * without it keeps the fake's answer), AddPartitionsToTxn, AddOffsetsToTxn, Produce and EndTxn
+   * mocks, logging every request in order: `initProducerId:<id>/<epoch>`,
+   * `endTxn:<result>:<id>/<epoch>`, and `<api>:<epoch>` for the others. `endTxn` decides what
    * happens to each EndTxn: `'answer'` applies and answers it, `'lost'` never delivers it,
    * `'unanswered'` applies it and never answers, `'refuse'` answers COORDINATOR_LOAD_IN_PROGRESS
-   * (14, retriable) without applying it.
+   * (14, retriable) without applying it. `setAdd` does the same for AddPartitionsToTxn and
+   * AddOffsetsToTxn: `'answer'`, `'unanswered'` (applied, never answered), `'timeout'`
+   * (applied, answered REQUEST_TIMED_OUT, as a lost answer looks) and `'refuse'` (not applied,
+   * answered REQUEST_TIMED_OUT).
    * @param {object} broker a fake cluster broker (`fixtures/fakeCluster.js`)
    * @returns {{ log: string[], setEndTxn: (mode: 'answer'|'lost'|'unanswered'|'refuse') => void,
-   *   holdAddPartitions: (hold: boolean) => void }}
+   *   setAdd: (mode: 'answer'|'unanswered'|'timeout'|'refuse') => void }}
    */
   install(broker) {
     const log = []
     let endTxnMode = 'answer'
-    let addPartitionsHeld = false
+    let addMode = 'answer'
     const never = () => new Promise(() => {})
     const initProducerId = broker.initProducerId.getMockImplementation()
     broker.initProducerId.mockImplementation(async (request) => {
@@ -149,13 +163,16 @@ class TransactionCoordinatorModel {
       log.push(`initProducerId:${request.producerId ?? -1}/${request.producerEpoch ?? -1}`)
       return this.initProducerId(request)
     })
-    const addPartitions = broker.addPartitionsToTxn.getMockImplementation()
-    broker.addPartitionsToTxn.mockImplementation(async (request) => {
-      log.push(`addPartitionsToTxn:${request.producerEpoch}`)
-      this.addPartitions(request)
-      if (addPartitionsHeld) await never()
-      return addPartitions(request)
-    })
+    for (const api of ['addPartitionsToTxn', 'addOffsetsToTxn']) {
+      broker[api] = jest.fn(async (request) => {
+        log.push(`${api}:${request.producerEpoch}`)
+        if (addMode === 'refuse') throw createErrorFromCode(REQUEST_TIMED_OUT)
+        this.addPartitions(request)
+        if (addMode === 'unanswered') await never()
+        if (addMode === 'timeout') throw createErrorFromCode(REQUEST_TIMED_OUT)
+        return {}
+      })
+    }
     const produce = broker.produce.getMockImplementation()
     broker.produce.mockImplementation(async (request) => {
       log.push(`produce:${request.producerEpoch}`)
@@ -174,7 +191,7 @@ class TransactionCoordinatorModel {
     return {
       log,
       setEndTxn: (mode) => (endTxnMode = mode),
-      holdAddPartitions: (hold) => (addPartitionsHeld = hold),
+      setAdd: (mode) => (addMode = mode),
     }
   }
 

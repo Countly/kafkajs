@@ -411,10 +411,10 @@ describe('Producer > state > ProducerStateManager', () => {
 
   describe('the fatal error of a coordinator that no longer holds the producer id and epoch', () => {
     const TAKEN_OVER =
-      /^Another producer took over transactional id test-transactional-id, or the transaction coordinator aborted its transaction on the transaction timeout \(.+\); create a new producer$/
+      /^The transaction coordinator no longer accepts this producer's id and epoch: another producer took over transactional id test-transactional-id, its transaction timed out, or the transactional id expired \(.+\); create a new producer$/
 
     test.each([PRODUCER_FENCED, INVALID_PRODUCER_ID_MAPPING])(
-      'a transactional producer arms code %i as an error saying another producer took over or the coordinator timed the transaction out',
+      'a transactional producer arms code %i as an error saying the coordinator no longer accepts its producer id and epoch: a takeover, a timed-out transaction or an expired transactional id',
       async (code) => {
         const manager = await transactionalManager()
         const error = failure(code)
