@@ -151,6 +151,8 @@ const adminRegistry = (
   cluster.brokerPool = { disconnect: jest.fn(async () => {}) }
   cluster.findTopicPartitionMetadata = () => [{ partitionId: 0 }]
   cluster.connect = async () => {}
+  cluster.targetHolds = new Map()
+  cluster.holdTargetTopics = () => () => {}
   cluster.addTargetTopic = async () => {}
   cluster.refreshMetadataIfNecessary = async () => {}
   cluster.defaultOffset = ({ fromBeginning }) => (fromBeginning ? -2 : -1)

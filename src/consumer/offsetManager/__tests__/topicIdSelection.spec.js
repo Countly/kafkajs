@@ -275,6 +275,7 @@ describe('Consumer > OffsetManager > topic ids', () => {
 
 describe('Admin > offset reads', () => {
   const stubCluster = (coordinator) => ({
+    holdTargetTopics: () => () => {},
     addTargetTopic: async () => {},
     refreshMetadataIfNecessary: async () => {},
     findTopicPartitionMetadata: () => [{ partitionId: 0 }],
