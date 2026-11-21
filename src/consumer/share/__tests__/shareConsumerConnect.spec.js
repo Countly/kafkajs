@@ -1,6 +1,7 @@
 const Cluster = require('../../../cluster')
 const BrokerPool = require('../../../cluster/brokerPool')
 const { ShareRun } = require('../shareRun')
+const { TelemetryFactory } = require('../../../telemetry/factory')
 const { LEVELS: logLevel } = require('../../../loggers')
 const {
   A,
@@ -520,6 +521,32 @@ describe('public share connection contract', () => {
     await clock.advance(1000)
     expect(seen.joins).toHaveLength(restart ? 2 : 1)
     expect(seen.crashes).toHaveLength(1)
+  })
+
+  test('a run after a crash without restart resumes the telemetry the crash suspended', async () => {
+    const clock = new Clock()
+    clock.install()
+    const calls = []
+    jest
+      .spyOn(TelemetryFactory.prototype, 'suspend')
+      .mockImplementation(() => calls.push('suspend'))
+    jest.spyOn(TelemetryFactory.prototype, 'resume').mockImplementation(() => calls.push('resume'))
+    const h = open()
+    const seen = observe(h)
+    jest
+      .spyOn(ShareRun.prototype, 'pollNode')
+      .mockRejectedValueOnce(new KafkaJSNonRetriableError('fatal'))
+    await subscribe(h)
+    await run(h)
+    await until(() => seen.crashes.length === 1, 'the crash event')
+    await clock.advance(1000)
+    expect(seen.crashes[0].restart).toBe(false)
+    expect(calls.at(-1)).toBe('suspend')
+
+    await run(h)
+    await clock.advanceUntil(() => seen.joins.length === 2, 'the second join')
+    expect(calls.at(-1)).toBe('resume')
+    expect(seen.connects).toHaveLength(1)
   })
 
   test('restarts with a fresh member only after bounded cleanup', async () => {
