@@ -1618,6 +1618,40 @@ Broker client telemetry (KIP-714) is opt-in on every client. The table gives eac
 | “Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.” | Re-register the same identity to update its value; there is no callback invocation or OTel SDK bridge. Unregister before resetting a Sum or changing immutable name type/unit. All four client kinds have this API. | Use existing instrumentation/optional OTel instead of registering; registered data only transmits when telemetry is enabled and selected. |
 | “Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.” | Final failure cannot delay core close past its inherited deadline or change its result. No reconnect/Get occurs for a final. Internal crash recovery and stop alone are not terminal. Explicit reconnect retains UUID and stays provisional through Get until its first successful normal Push. Only a first-Push 42 in that captured post-final reopen permits one corrective telemetry-transport retirement, ordinary backoff, nonzero-ID Get and additional normal Push; Get cannot replenish the allowance. A second 42 or other fatal result stops only telemetry; close/expiry tears down under existing limits. No UUID rotation, final resend, foreground reconnect or exception for established streams. | `disconnect({ timeout: 0 })` where inherited, or disable metrics; no new close overload/default. |
 
+### Known issues
+
+These issues are known in 3.0.0. A fix for each is planned for a later release.
+
+- **An admin client keeps the topics it reads as long-lived targets.** As in kafkajs 2.2.4, every
+  topic named in `fetchTopicOffsets`, `fetchTopicOffsetsByTimestamp`, `fetchOffsets` with `topics`,
+  `fetchOffsetsForGroups` (a topic without a partition list), `resetOffsets`, `setOffsets`,
+  `deleteTopicRecords`, `describeProducers` without `brokerId` or `abortTransaction` stays in every
+  later metadata request of that admin client. Only the client's own `deleteTopics` of that topic
+  removes it. If another client deletes such a topic, every later call of this admin client that
+  refreshes its metadata fails with `UNKNOWN_TOPIC_OR_PARTITION`, also when the call is about other
+  topics: `createTopics`, `deleteTopics` (also of the deleted topic), `describeConfigs`, an offset
+  read of another topic, and so on. `listTopics` and `fetchTopicMetadata` are not affected.
+  `disconnect()` and `connect()` on the same admin client do not clear it. Who is affected: a
+  long-lived admin client that reads offsets of topics that other clients delete. *What to do:*
+  create a new admin client with `kafka.admin()` (and disconnect the old one), or use one admin
+  client per task, as short-lived jobs already do.
+- **Parallel offset reads of a topic read for the first time can fail with a `TypeError`.**
+  Inherited from kafkajs 2.2.4 (tulios/kafkajs#461). When `fetchTopicOffsets` calls run in parallel
+  on one admin client and one of them reads a topic this client has not read before, that call
+  can join an older metadata request that does not ask for its topic, and fail with
+  `TypeError: Cannot destructure property 'partitions' of 'high.pop(...)' as it is undefined`. It
+  depends on the order the metadata answers arrive in, so it is intermittent. Once every topic has
+  been read once by that client, later parallel reads of those topics are not affected. *What to
+  do:* read each topic once, awaited, before you read topics in parallel, or await the calls in
+  sequence.
+- **A metadata answer can arrive without its brokers.** This applies to every client. When the
+  seed broker is replaced while a metadata request is in flight (a rebootstrap, or a connection
+  failure that removed the seed broker), the answer's topic metadata is installed, but the brokers
+  it lists that the client did not already know, or knew at another address, are not added. The
+  next request to such a broker fails with the transient `KafkaJSBrokerNotFound` error
+  `Broker N not found in the cached metadata`, and the client refreshes its metadata. A call with
+  retries left recovers on its next attempt; a call with no retries left fails with that error.
+
 ### Coming from the Java or Go client
 
 Read this if you run the Apache Kafka Java client or franz-go today, or if you share consumer groups or a cluster with them. It lists the differences that change how you configure or operate this client. Each item links the page that explains it.
