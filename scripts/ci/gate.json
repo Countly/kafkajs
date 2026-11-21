@@ -22747,7 +22747,6 @@
         "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order with no failure, sends join exactly as before the batches handed on and every send\u2019s result match those recorded before call order was kept",
         "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order the order itself keeps no lane once every send has joined or ended, in any order",
         "src/producer/state/__tests__/joinOrder.spec.js \u203a Producer > the accumulator joins sends to their batches in call order the order itself joins a long run of waiting sends without recursing",
-        "src/producer/__tests__/partitionRetryOrder.spec.js \u203a Producer > concurrent sends to one partition across a failed metadata refresh are written in call order when the expired-metadata refresh they all wait on fails",
         "src/producer/__tests__/agedMetadata.spec.js \u203a Producer > sends on metadata that is only past metadataMaxAge an idempotent producer completes sends on the cached leaders while one refresh that never answers is in flight",
         "src/producer/__tests__/agedMetadata.spec.js \u203a Producer > sends on metadata that is only past metadataMaxAge an idempotent producer fails no send when the refresh fails, and waits out a doubling backoff before the next one",
         "src/producer/__tests__/agedMetadata.spec.js \u203a Producer > sends on metadata that is only past metadataMaxAge a non-idempotent producer completes sends on the cached leaders while one refresh that never answers is in flight",
@@ -22759,7 +22758,8 @@
         "src/producer/__tests__/agedMetadata.spec.js \u203a Producer > sends on metadata that is only past metadataMaxAge lets a disconnect end a background refresh within the request drain and installs nothing after it",
         "src/producer/__tests__/agedMetadata.spec.js \u203a Producer > sends on metadata that is only past metadataMaxAge keeps the call order of idempotent sends when the refresh installs mid-drain",
         "src/producer/__tests__/agedMetadata.spec.js \u203a Cluster > refreshMetadataIfNecessary without the producer option consumer and admin callers still wait for the refresh of aged metadata",
-        "src/producer/__tests__/agedMetadata.spec.js \u203a Cluster > refreshMetadataIfNecessary without the producer option a scoped caller still wait for the refresh of aged metadata"
+        "src/producer/__tests__/agedMetadata.spec.js \u203a Cluster > refreshMetadataIfNecessary without the producer option a scoped caller still wait for the refresh of aged metadata",
+        "src/producer/__tests__/partitionRetryOrder.spec.js \u203a Producer > concurrent sends to one partition across a failed metadata refresh are written in call order when the first refresh of their topic, which they all wait on, fails"
       ],
       "capMinutes": 85,
       "allowedSkips": [
