@@ -80,7 +80,9 @@ const INTEGER_FLAGS = Object.freeze({
  * A schedule may also carry `profile` (parameters it sets), `validate` (refuses a profile it
  * cannot run) and `check` (proves its fault mechanism before anything is created). Every `start`
  * gets `{ bouncer, netem, admin, topics, windowMs, windowStart, clock, signal, sleep }`; a record
- * with `phase` has `startMs` and `endMs` in ms from the window's start.
+ * with `phase` has `startMs` and `endMs` in ms from the window's start. The window's end aborts
+ * `signal` and stops a schedule without failing it: a fault it stopped is recorded with
+ * `skipped: 'window ended'`, so only a fault mechanism's own failure is a schedule error.
  */
 /**
  * Waits on the run's clock until `ms` after the window started.
@@ -94,6 +96,58 @@ const untilWindowMs = ({ clock, windowStart, sleep, signal }, ms) =>
 /** @param {{ clock: { now: () => number }, windowStart: number }} context @returns {number} */
 const windowMsOf = ({ clock, windowStart }) => Math.round(clock.now() - windowStart)
 
+/** The brokers of the run's Compose cluster, in the order a rolling restart takes them. */
+const BROKER_SERVICES = Object.freeze(['kafka1', 'kafka2', 'kafka3'])
+
+/** What a fault step the window's end stopped from running records as `skipped`. */
+const WINDOW_ENDED = 'window ended'
+
+/**
+ * Whether `error` is the offer window ending: the driver aborts the schedule's signal then, and a
+ * `BrokerBouncer` step asked for after that rejects with the signal's reason.
+ * @param {*} error @param {AbortSignal} signal
+ * @returns {boolean}
+ */
+const windowEnded = (error, signal) => signal.aborted && error === signal.reason
+
+/**
+ * Restarts each broker in turn, `between` ms apart, while the window is open. The window's end
+ * stops it without failing it: a node already down is restored by its own step, no later node is
+ * taken down, and each restart not run is recorded with `skipped`, so a schedule longer than its
+ * window says so in the report.
+ * @param {object} context
+ * @param {{ rollingBounce: Function }} context.bouncer
+ * @param {boolean} [context.hard=false] kill rather than stop
+ * @param {number} context.between @param {object} context.admin @param {string[]} context.topics
+ * @param {AbortSignal} context.signal the window
+ * @param {(ms: number, signal?: AbortSignal) => Promise<void>} context.sleep
+ * @returns {Promise<object[]>} per broker in order, its outage or `{ service, kind, skipped }`
+ * @throws {Error} a restart's own failure, after its node was restored
+ */
+const restartEach = async ({ bouncer, hard = false, between, admin, topics, signal, sleep }) => {
+  const records = []
+  for (const [i, service] of BROKER_SERVICES.entries()) {
+    if (i > 0) await sleep(between, signal)
+    if (!signal.aborted) {
+      try {
+        const outages = await bouncer.rollingBounce({
+          hard,
+          admin,
+          topics,
+          services: [service],
+          signal,
+        })
+        records.push(...outages)
+        continue
+      } catch (error) {
+        if (!windowEnded(error, signal)) throw error
+      }
+    }
+    records.push({ service, kind: hard ? 'kill' : 'stop', skipped: WINDOW_ENDED })
+  }
+  return records
+}
+
 const FAULT_SCHEDULES = Object.freeze({
   none: Object.freeze({ start: async () => [] }),
   'rolling-restarts': Object.freeze({
@@ -104,16 +158,16 @@ const FAULT_SCHEDULES = Object.freeze({
      * @param {object} context.admin @param {string[]} context.topics
      * @param {number} context.windowMs @param {AbortSignal} context.signal
      * @param {(ms: number, signal?: AbortSignal) => Promise<void>} context.sleep
-     * @returns {Promise<object[]>} every bounce step's outage, clean steps first
+     * @returns {Promise<object[]>} every restart's outage, clean ones first; a restart the
+     *   window's end stopped is recorded with `skipped` (`restartEach`)
      */
-    async start({ bouncer, admin, topics, windowMs, signal, sleep }) {
-      await sleep(Math.floor(windowMs / 3), signal)
-      if (signal.aborted) return []
+    async start(context) {
+      const { windowMs, signal, sleep } = context
       const between = FAULT_SCHEDULES['rolling-restarts'].betweenMs
-      const clean = await bouncer.rollingBounce({ between, admin, topics, signal })
+      await sleep(Math.floor(windowMs / 3), signal)
+      const clean = await restartEach({ ...context, between })
       await sleep(between, signal)
-      if (signal.aborted) return clean
-      const hard = await bouncer.rollingBounce({ hard: true, between, admin, topics, signal })
+      const hard = await restartEach({ ...context, hard: true, between })
       return [...clean, ...hard]
     },
   }),
@@ -151,7 +205,8 @@ const FAULT_SCHEDULES = Object.freeze({
     /**
      * @param {object} context see `FAULT_SCHEDULES`
      * @returns {Promise<object[]>} the slow, frozen and recovery phases as they ran; the delay is
-     *   always removed, and `BrokerBouncer#step` always unpauses
+     *   always removed, and `BrokerBouncer#step` always unpauses; a freeze the window's end
+     *   stopped is recorded with `skipped`
      */
     async start(context) {
       const { netem, bouncer, admin, topics, windowMs, signal } = context
@@ -172,10 +227,17 @@ const FAULT_SCHEDULES = Object.freeze({
       if (signal.aborted) return records
       const frozen = { phase: 'frozen', service, kind: 'pause', requestedMs: windowMsOf(context) }
       records.push(frozen)
-      const outage = await bouncer.step(
-        { service, kind: 'pause', holdMs: freezeMs },
-        { admin, topics, signal }
-      )
+      let outage
+      try {
+        outage = await bouncer.step(
+          { service, kind: 'pause', holdMs: freezeMs },
+          { admin, topics, signal }
+        )
+      } catch (error) {
+        if (!windowEnded(error, signal)) throw error
+        frozen.skipped = WINDOW_ENDED
+        return records
+      }
       frozen.endMs = windowMsOf(context)
       frozen.startMs = frozen.endMs - outage.outageMs
       frozen.outageMs = outage.outageMs
@@ -199,15 +261,16 @@ const FAULT_SCHEDULES = Object.freeze({
         : `fault schedule many-topics needs at least ${FAULT_SCHEDULES['many-topics'].minPartitions} partitions (--topics × --partitions)`,
     /**
      * @param {object} context see `FAULT_SCHEDULES`
-     * @returns {Promise<object[]>} the rolling restart's phase, then each step's outage
+     * @returns {Promise<object[]>} the rolling restart's phase, then each restart's outage or,
+     *   when the window's end stopped it, `skipped` (`restartEach`)
      */
     async start(context) {
-      const { bouncer, admin, topics, windowMs, signal } = context
+      const { windowMs, signal } = context
       await untilWindowMs(context, windowMs / 3)
       if (signal.aborted) return []
       const phase = { phase: 'rolling-restart', kind: 'stop', startMs: windowMsOf(context) }
       const between = FAULT_SCHEDULES['many-topics'].betweenMs
-      const outages = await bouncer.rollingBounce({ between, admin, topics, signal })
+      const outages = await restartEach({ ...context, between })
       phase.endMs = windowMsOf(context)
       return [phase, ...outages]
     },

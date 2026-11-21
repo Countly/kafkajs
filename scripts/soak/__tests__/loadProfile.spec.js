@@ -205,9 +205,9 @@ describe('load profile fault schedules', () => {
         if (!signal?.aborted) time.t += ms
       },
       bouncer: {
-        rollingBounce: async ({ hard = false, between, topics }) => {
-          calls.push({ at: time.t, hard, between, topics })
-          return [{ service: 'kafka1', kind: hard ? 'kill' : 'stop', outageMs: 1 }]
+        rollingBounce: async ({ hard = false, services: [service], topics }) => {
+          calls.push({ at: time.t, hard, service, topics })
+          return [{ service, kind: hard ? 'kill' : 'stop', outageMs: 1 }]
         },
       },
     }
@@ -224,11 +224,22 @@ describe('load profile fault schedules', () => {
       sleep,
     })
     expect(calls).toEqual([
-      { at: 200000, hard: false, between: 20000, topics: ['t'] },
-      { at: 220000, hard: true, between: 20000, topics: ['t'] },
+      { at: 200000, hard: false, service: 'kafka1', topics: ['t'] },
+      { at: 220000, hard: false, service: 'kafka2', topics: ['t'] },
+      { at: 240000, hard: false, service: 'kafka3', topics: ['t'] },
+      { at: 260000, hard: true, service: 'kafka1', topics: ['t'] },
+      { at: 280000, hard: true, service: 'kafka2', topics: ['t'] },
+      { at: 300000, hard: true, service: 'kafka3', topics: ['t'] },
     ])
-    expect(outages.map((o) => o.kind)).toEqual(['stop', 'kill'])
-    expect(time.t).toBe(220000)
+    expect(outages.map((o) => `${o.kind} ${o.service}`)).toEqual([
+      'stop kafka1',
+      'stop kafka2',
+      'stop kafka3',
+      'kill kafka1',
+      'kill kafka2',
+      'kill kafka3',
+    ])
+    expect(time.t).toBe(300000)
   })
 
   it('starts no restart once the window has ended', async () => {
@@ -243,7 +254,8 @@ describe('load profile fault schedules', () => {
       signal: window.signal,
       sleep,
     })
-    expect(outages).toEqual([])
+    expect(outages.every((o) => o.skipped === 'window ended')).toBe(true)
+    expect(outages).toHaveLength(6)
     expect(calls).toEqual([])
   })
 })
@@ -438,10 +450,10 @@ describe('load profile slow-broker and many-topics schedules', () => {
           log.push(['un' + kind, at(), service])
           return { service, kind, outageMs: holdMs + 700 }
         },
-        rollingBounce: async ({ between, topics }) => {
-          log.push(['rolling', at(), between, topics.length])
-          clock.t += 90000
-          return ['kafka1', 'kafka2', 'kafka3'].map((service) => ({ service, kind: 'stop' }))
+        rollingBounce: async ({ services: [service], topics }) => {
+          log.push(['rolling', at(), service, topics.length])
+          clock.t += 30000
+          return [{ service, kind: 'stop' }]
         },
       },
     }
@@ -532,12 +544,16 @@ describe('load profile slow-broker and many-topics schedules', () => {
       signal: new AbortController().signal,
       sleep,
     })
-    expect(log).toEqual([['rolling', 100000, 20000, 2000]])
+    expect(log).toEqual([
+      ['rolling', 100000, 'kafka1', 2000],
+      ['rolling', 150000, 'kafka2', 2000],
+      ['rolling', 200000, 'kafka3', 2000],
+    ])
     expect(records[0]).toEqual({
       phase: 'rolling-restart',
       kind: 'stop',
       startMs: 100000,
-      endMs: 190000,
+      endMs: 230000,
     })
     expect(records.slice(1).map((r) => r.service)).toEqual(['kafka1', 'kafka2', 'kafka3'])
   })

@@ -596,7 +596,12 @@ describe('load run fault schedules', () => {
     })
     expect(report.cluster.fetchRoundMs.samples).toBeGreaterThan(10)
     expect(report.cluster.fetchRoundMs.max).toBe(5)
-    expect(report.faults.map((f) => f.phase ?? f.kind)).toEqual(['rolling-restart', 'stop'])
+    expect(report.faults.map((f) => f.phase ?? `${f.kind} ${f.skipped ?? f.outageMs}`)).toEqual([
+      'rolling-restart',
+      'stop 1',
+      'stop window ended',
+      'stop window ended',
+    ])
 
     expect(cluster.readTopicCalls).toBe(0)
     expect(cluster.readAllPatterns).toHaveLength(1)

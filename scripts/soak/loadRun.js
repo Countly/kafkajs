@@ -747,13 +747,14 @@ class LoadRun {
         delivered: c.delivered,
         crashes: c.crashes,
       })),
-      faults: faults.map(({ phase, service, kind, startMs, endMs, outageMs }) => ({
+      faults: faults.map(({ phase, service, kind, startMs, endMs, outageMs, skipped }) => ({
         phase,
         service,
         kind,
         startMs,
         endMs,
         outageMs,
+        skipped,
       })),
       errors: this.errors,
     }
