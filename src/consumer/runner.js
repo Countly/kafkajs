@@ -2205,8 +2205,9 @@ module.exports = class Runner extends EventEmitter {
    * with `KafkaJSNonRetriableError`. 2.2.4 resolved such a call. An empty offsets list sends
    * nothing in any state and still resolves.
    * A call admitted while the runner was running that then fails after the run stopped, whether by
-   * `stop()`, `disconnect()` or a crash, rejects with `CONSUMER_STOPPING`, the failure as its
-   * `cause`, and is not retried: a crash stops the run the same way, and a restart is a new run
+   * `stop()`, `disconnect()` or a crash, rejects with `CONSUMER_STOPPING` (the failure as its
+   * `cause`; none after a forced close or an expired deadline, though an attempt may have been
+   * sent) and is not retried: a crash stops the run the same way, and a restart is a new run
    * that does not take the call over. A `KafkaJSCommitFailedError` (the membership was lost) still
    * rejects as itself.
    * A commit answered with a rebalance in progress still rejects with that answer, and also asks

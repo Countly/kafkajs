@@ -719,21 +719,34 @@ describe('Consumer churn profile > a member', () => {
     expect(appended[3]).toMatchObject({ next: '1', brokerNext: '1' })
   })
 
-  test('a stop error after an admitted commit failed still fails the commit', async () => {
+  test('a stop error after an attempt that may have been sent, with or without a cause, stays owed and is sent again', async () => {
     const { KafkaJSError } = require('../../../index')
-    const { member, appended, handlers, consumer } = setup()
+    const { member, appended, handlers, consumer, committed } = setup()
     await member.start(['t'])
     await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
     await handlers.each(message(0))
-    const admitted = Object.assign(
-      new KafkaJSError('The consumer is stopping', { cause: new Error('lookup failed') }),
-      { type: 'CONSUMER_STOPPING' }
-    )
-    consumer.commitOffsets.mockImplementationOnce(async () => {
-      throw admitted
-    })
-    await expect(member.commitAll()).rejects.toBe(admitted)
+    const sendCommit = consumer.commitOffsets.getMockImplementation()
+    const stopping = (cause) =>
+      Object.assign(new KafkaJSError('The consumer is stopping', { cause }), {
+        type: 'CONSUMER_STOPPING',
+      })
+    // A forced close or a call deadline rejects with no cause after the request reached the broker.
+    for (const error of [stopping(undefined), stopping(new Error('lookup failed'))]) {
+      consumer.commitOffsets.mockImplementationOnce(async (offsets) => {
+        await sendCommit(offsets)
+        throw error
+      })
+      await expect(member.commitAll()).resolves.toBeUndefined()
+    }
+    expect(committed[0]).toBe('1')
     expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
+
+    await member.commitAll()
+    expect(consumer.commitOffsets).toHaveBeenCalledTimes(3)
+    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler', 'commit'])
+    expect(appended[3]).toMatchObject({ next: '1', brokerNext: '1' })
+    const rows = [...acknowledgedAndRead(0), ...appended]
+    await expect(new ConsumerChurnOracle([], ['g']).feed(rows)).resolves.toBeUndefined()
   })
 
   describe('a commit that fails inside the handler', () => {
