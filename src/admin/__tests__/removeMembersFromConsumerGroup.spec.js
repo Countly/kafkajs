@@ -192,6 +192,16 @@ describe('Admin > removeMembersFromConsumerGroup', () => {
       expect(coordinator.leaveGroup).not.toHaveBeenCalled()
     })
 
+    test('resolves [] without a request for a missing group on a cluster without the consumer protocol (ConsumerGroupDescribe answers 35)', async () => {
+      const { admin, coordinator } = build({
+        group: { groupId: GROUP, errorCode: 35, members: [] },
+      })
+
+      await expect(admin.removeMembersFromConsumerGroup({ groupId: GROUP })).resolves.toEqual([])
+      expect(coordinator.describeGroups).toHaveBeenCalledTimes(1)
+      expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+    })
+
     test("rejects a group of another protocol type, as Java's describeConsumerGroups does", async () => {
       const connect = {
         groupId: GROUP,

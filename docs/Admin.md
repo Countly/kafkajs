@@ -13,7 +13,7 @@ Concurrent closes share the first valid call's deadline and one cleanup episode.
 
 Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
 Call `await admin.connect()` to resume. A connect issued during close joins its cleanup first.
-An old lookup, authentication, encoder, queued write, response or temporary consumer cannot
+An old lookup, authentication, encoder, queued write or response cannot
 send, reconnect or clear the replacement lifecycle. A forced close reports an unknown outcome;
 a mutation already sent may have been applied. Inspect the broker state before repeating it.
 
@@ -587,6 +587,8 @@ await admin.resetOffsets({ groupId, topic }) // latest by default
 // await admin.resetOffsets({ groupId, topic, earliest: true })
 ```
 
+`resetOffsets` writes its offsets through `setOffsets` and has the same outcome contract: see [Set consumer group offsets](#a-name-set-offsets-a-set-consumer-group-offsets).
+
 ## <a name="set-offsets"></a> Set consumer group offsets
 
 `setOffsets` allows you to set the consumer group offset to any value.
@@ -620,6 +622,14 @@ await admin.setOffsets({
     ]
 })
 ```
+
+`setOffsets` writes the offsets in one OffsetCommit to the group's coordinator, without joining the group, and resolves only when the coordinator accepted every partition. The commit carries no member id and generation -1, as the Java admin's `alterConsumerGroupOffsets` does. The last entry for a partition wins, and every partition named is sent: a partition the topic does not have is refused by the coordinator (`UNKNOWN_TOPIC_OR_PARTITION`) and reported in the rejection. Each commit stores only the offset: its metadata becomes empty and its leader epoch unknown. An offset must be a decimal integer string (digits with an optional leading `-`) or a safe integer number, of at least 0 or exactly `-1`/`-2`; anything else, such as `'NaN'`, `'Infinity'`, a blank or `0x`-prefixed string, a boolean, or a value outside the signed 64-bit range, is refused with a `KafkaJSNonRetriableError` before any request.
+
+The group must have no members: a group that has members is refused before anything is sent, and a member that starts during the call makes the coordinator refuse the commit (`UNKNOWN_MEMBER_ID`). A group that does not exist is created by the coordinator, with an empty protocol type, also on a cluster that has the consumer group protocol turned off. An empty classic group keeps its earlier empty-since time for offset expiry: this write does not refresh it. So on a classic group that has been empty for a while, the offsets set here expire `offsets.retention.minutes` after the group became empty, not after this call. Start the group's consumers before then, or the offsets can be deleted and the consumers fall back to their `fromBeginning` reset policy. Earlier versions joined and left the group with a temporary consumer, which restarted that time.
+
+If any partition was not committed the call rejects with a `KafkaJSAggregateError` whose `errors` name each such partition (`partition`, `topic`) and its cause (`type`, or `cause` for a partition whose last attempt got no answer); the partitions it does not name are committed. If no partition was confirmed or refused with a code (the coordinator never answered), the call rejects with the request's own error, and nothing can be assumed about which partitions were written. Partitions are listed in partition order. A coordinator that moved or is loading, or a rebalance in progress, is retried within the retry budget, sending only the partitions still pending. A rejection means "not confirmed", not "not written": a commit that timed out, or one that was in flight when the API deadline passed, may still have been applied. Sending the call again writes the offsets again, over any offset committed in between, even when the value is the same. If a transaction that already sent offsets for this group commits later, its offsets replace the ones set here.
+
+`-1` and `-2` are stored as given. `fetchOffsets({ resolveOffsets: true })` resolves them to the latest or earliest offset and commits that concrete offset; a consumer that starts without a seek applies its own reset policy to a stored marker.
 
 ## <a name="reset-offsets-by-timestamp"></a> Reset consumer group offsets by timestamp
 

@@ -8,6 +8,19 @@ const DG = '../../protocol/requests/describeGroups/fixtures/java/'
 const CONSUMER_GROUP = require(`${CGD}consumerGroupDescribeResponse-v1-memberType.json`)
 const GROUP_ID_NOT_FOUND = require(`${CGD}consumerGroupDescribeResponse-v0-groupIdNotFound.json`)
 const CLASSIC_GROUP = require(`${DG}describeGroupsResponse-v6-describedGroup.json`)
+const CLASSIC_NOT_FOUND = require(`${DG}describeGroupsResponse-v6-groupIdNotFound.json`)
+/** What a broker without the consumer protocol answers: code 35 on the group's row, all else default. */
+const UNSUPPORTED_VERSION_HEX =
+  '00000000' +
+  '02' +
+  '0023' +
+  '00' +
+  '0b746573742d67726f7570' +
+  '01' +
+  '0000000000000000' +
+  '0101' +
+  '80000000' +
+  '0000'
 
 /** The group id every committed fixture describes. */
 const GROUP_ID = 'test-group'
@@ -18,8 +31,13 @@ const GROUP_ID = 'test-group'
  *
  * @param {string} consumerGroupDescribeHex the ConsumerGroupDescribe response body
  * @param {number} [describeGroupsMaxVersion] `0` leaves the newer API as the only answer
+ * @param {string} [describeGroupsHex] the DescribeGroups response body
  */
-const build = (consumerGroupDescribeHex, describeGroupsMaxVersion = 6) => {
+const build = (
+  consumerGroupDescribeHex,
+  describeGroupsMaxVersion = 6,
+  describeGroupsHex = CLASSIC_GROUP.hex
+) => {
   const harness = createGroupApiBroker({
     versions: {
       [apiKeys.ConsumerGroupDescribe]: { minVersion: 0, maxVersion: 1 },
@@ -27,7 +45,7 @@ const build = (consumerGroupDescribeHex, describeGroupsMaxVersion = 6) => {
     },
     respond: ({ apiKey }) =>
       Buffer.from(
-        apiKey === apiKeys.ConsumerGroupDescribe ? consumerGroupDescribeHex : CLASSIC_GROUP.hex,
+        apiKey === apiKeys.ConsumerGroupDescribe ? consumerGroupDescribeHex : describeGroupsHex,
         'hex'
       ),
   })
@@ -114,6 +132,25 @@ describe('Consumer > describeGroup > routing', () => {
     })
     expect(Buffer.isBuffer(description.members[0].memberMetadata)).toBe(true)
     expect(Buffer.isBuffer(description.members[0].memberAssignment)).toBe(true)
+  })
+
+  it('describes a missing group by the DescribeGroups answer on a cluster without the consumer protocol', async () => {
+    let consumer
+    ;({ consumer, harness } = build(UNSUPPORTED_VERSION_HEX, 6, CLASSIC_NOT_FOUND.hex))
+
+    const description = await consumer.describeGroup()
+
+    expect(harness.requests.map(({ apiKey }) => apiKey)).toEqual([
+      apiKeys.ConsumerGroupDescribe,
+      apiKeys.DescribeGroups,
+    ])
+    expect(description).toMatchObject({
+      groupId: GROUP_ID,
+      state: 'Dead',
+      errorCode: 69,
+      errorMessage: CLASSIC_NOT_FOUND.fields.groups[0].errorMessage,
+      groupType: 'classic',
+    })
   })
 
   // `admin.describeGroups` maps the "not requested" sentinel to null and this now agrees,
