@@ -9,6 +9,7 @@ const {
 } = require('../../errors')
 const { Deadline, ExpiryTimer } = require('../deadline')
 const { Admission } = require('./admission')
+const JoinOrder = require('./joinOrder')
 const {
   chargeOf,
   share,
@@ -738,6 +739,14 @@ class PendingSend {
     this.topics = null
     /** @type {?FlushEpoch} the flush epoch it counts in until it settles */
     this.epoch = null
+    /** @type {?(string|string[])} the topics whose call order it keeps (see `JoinOrder`) */
+    this.lanes = null
+    /** @type {?object[]} its records assigned to partitions, while it waits to join */
+    this.entries = null
+    /** @type {?(outcome: Promise<object[]>) => void} resolves the send; set while it is held */
+    this.resolve = null
+    /** @type {?{ acks: number, timeout?: number, compression?: number }} its request options */
+    this.options = null
   }
 
   /**
@@ -955,6 +964,8 @@ class Accumulator {
   #appending = 0
   /** @type {(() => void)[]} the `close()` calls waiting for nothing to be left to deliver */
   #closers = []
+  /** the call order sends join their batches in, per topic */
+  #order = new JoinOrder((send) => this.#joinHeld(send))
 
   /**
    * @param {object} options
@@ -1104,7 +1115,10 @@ class Accumulator {
    * admitted: at once when it fits and no send waits, else after the sends ahead of it, within
    * `maxBlockMs` and its deadline. Its records are the caller's owned copy (`Accumulator.snapshot`),
    * held by the send while it waits; a refusal drops them. A refusal goes through `expired`, so it
-   * arms a transaction and the send rejects with the refusal itself.
+   * arms a transaction and the send rejects with the refusal itself. It takes its place in its
+   * topics' call order there too (see `JoinOrder`), so a send admitted after a wait still joins
+   * before every later send of its topics; a refusal gives the place up. Admission is FIFO, so no
+   * later send holds buffer room while it waits for this one to be admitted.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} [request.timeout]
@@ -1141,6 +1155,8 @@ class Accumulator {
 
     this.#appending += 1
     send.holdTopics()
+    send.lanes = send.topics
+    this.#order.enter(send)
     this.track(send)
     try {
       this.#assertFits(topicMessages, compression)
@@ -1149,9 +1165,11 @@ class Accumulator {
       send.admit(granted instanceof Promise ? this.#granted(await granted) : granted, charge)
     } catch (error) {
       send.records = null
+      send.settled = true
       send.releaseTopics()
       send.untrack()
       this.#end()
+      this.#order.passed(send)
       throw this.#expired(error)
     }
     return this.#hold(send, { acks, timeout, compression })
@@ -1211,6 +1229,7 @@ class Accumulator {
    * @returns {void}
    */
   forceClose(surfaced) {
+    this.#order.clear()
     for (let send = this.#holders.peek(); send !== undefined; send = this.#holders.peek()) {
       this.#settleHolder(
         send,
@@ -1268,9 +1287,12 @@ class Accumulator {
   }
 
   /**
-   * Holds a send while its records are assigned their partitions, then joins them to batches. The
-   * send settles at its deadline even while the assignment never returns: its records are dropped,
-   * and what the assignment does afterwards is ignored.
+   * Holds a send while its records are assigned their partitions, then joins them to batches in
+   * call order: after every earlier send that shares a topic with it has joined or ended (see
+   * `JoinOrder`), so partitioning that finishes out of order (a failed metadata refresh retried
+   * on each send's own backoff) cannot reorder records within a partition. The send settles at its
+   * deadline even while the assignment never returns or it waits for an earlier send: its records
+   * are dropped, and what the assignment does afterwards is ignored.
    * @param {PendingSend} send
    * @param {{ acks: number, timeout?: number, compression?: number }} options
    * @returns {Promise<object[]>} the send's outcome, as `append()` describes it
@@ -1278,6 +1300,8 @@ class Accumulator {
   #hold(send, options) {
     return new Promise((resolve, reject) => {
       send.reject = reject
+      send.resolve = resolve
+      send.options = options
       this.#register(send)
 
       send.pin()
@@ -1290,16 +1314,9 @@ class Accumulator {
       assigned.then(
         (entries) => {
           send.unpin()
-          if (this.#leave(send)) {
-            try {
-              resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
-            } catch (error) {
-              reject(error)
-              send.untrack()
-            } finally {
-              send.release()
-              this.#end()
-            }
+          if (!send.settled) {
+            send.entries = entries
+            this.#order.ready(send)
           }
         },
         (error) => {
@@ -1309,10 +1326,30 @@ class Accumulator {
             reject(error)
             send.untrack()
             this.#end()
+            this.#order.passed(send)
           }
         }
       )
     })
+  }
+
+  /**
+   * Joins a held send's assigned records to their batches, once `JoinOrder` lets it.
+   * @param {PendingSend} send not settled, with its `entries`
+   * @returns {void}
+   */
+  #joinHeld(send) {
+    const { entries, resolve, reject, options } = send
+    this.#leave(send)
+    try {
+      resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
+    } catch (error) {
+      reject(error)
+      send.untrack()
+    } finally {
+      send.release()
+      this.#end()
+    }
   }
 
   /**
@@ -1345,7 +1382,10 @@ class Accumulator {
 
     send.settled = true
     send.records = null
+    send.entries = null
     send.reject = null
+    send.resolve = null
+    send.options = null
     if (this.#holders.peek() === send) {
       this.#holders.shift()
     } else {
@@ -1399,6 +1439,7 @@ class Accumulator {
     reject(this.#expired(error))
     send.untrack()
     this.#end()
+    this.#order.passed(send)
   }
 
   /**

@@ -821,9 +821,10 @@ describe('Producer > the idempotent drain loop', () => {
 
       const pending = producer.send({ topic: TOPIC, messages: [{ value: 'second' }] })
       await settle()
-      await producer.send({ topic: TOPIC, acks: 1, messages: [{ value: 'third' }] })
+      const third = producer.send({ topic: TOPIC, acks: 1, messages: [{ value: 'third' }] })
+      expect(producer.isIdempotent()).toBe(false)
       partitioned.resolve()
-      await pending
+      await Promise.all([pending, third])
 
       const second = cluster.broker.produce.mock.calls
         .map(([request]) => request)
