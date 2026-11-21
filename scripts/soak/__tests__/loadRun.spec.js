@@ -5,8 +5,16 @@ const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
 const { fakeTime } = require('./churnFakes')
-const { parseLoadArgs } = require('../loadProfile')
-const { LoadProducer, LoadRun, parseDescribe, recheck } = require('../loadRun')
+const { LatencyHistogram, parseLoadArgs } = require('../loadProfile')
+const {
+  LoadProducer,
+  LoadRun,
+  ProducerProcess,
+  forkProducerChild,
+  parseDescribe,
+  realSleep,
+  recheck,
+} = require('../loadRun')
 const { ProducerHost } = require('../loadProducerChild')
 
 /**
@@ -519,6 +527,31 @@ describe('load run producer processes', () => {
     expect(report.oracle.counts.records).toBeGreaterThan(5000)
     const replayed = await recheck(out)
     expect(replayed.counts.records).toBe(report.oracle.counts.records)
+  })
+
+  it('runs a real producer process through setup, its window, its report and close over IPC', async () => {
+    const profile = { ...parseLoadArgs(['--out', 'o', '--duration', '1']), ticksPerSecond: 10 }
+    const latency = new LatencyHistogram()
+    const child = new ProducerProcess({
+      id: 'process-0',
+      producers: [],
+      profile,
+      runId: 'smoke',
+      topics: ['smoke-0'],
+      latency,
+      clock: performance,
+      sleep: realSleep,
+      fork: forkProducerChild,
+    })
+    await child.connect()
+    child.begin(performance.now())
+    expect(await child.join(5000)).toBe(true)
+    expect(child.cpu.offer.coreShare).toEqual(expect.any(Number))
+    await child.close()
+    expect({ closed: child.closed, failure: child.failure }).toEqual({
+      closed: true,
+      failure: null,
+    })
   })
 
   it('does not judge a run whose producer process failed before it sent its ledgers', async () => {

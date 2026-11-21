@@ -26,6 +26,8 @@ const LOAD_DEFAULTS = Object.freeze({
   topics: 12,
   partitions: 16,
   producers: 3,
+  /** Processes the producers are spread over; 1 keeps them in the run's own process. */
+  producerProcesses: 1,
   producerKinds: Object.freeze(['idempotent', 'plain', 'transactional']),
   consumers: 3,
   durationSeconds: 600,
@@ -58,6 +60,7 @@ const INTEGER_FLAGS = Object.freeze({
   '--topics': 'topics',
   '--partitions': 'partitions',
   '--producers': 'producers',
+  '--producer-processes': 'producerProcesses',
   '--consumers': 'consumers',
   '--duration': 'durationSeconds',
   '--replication-factor': 'replicationFactor',
@@ -281,7 +284,9 @@ const USAGE = `usage: node scripts/soak/loadRun.js --out <dir> [--rate <n>] [--r
   [--topics <n>] [--partitions <n>] [--producers <n>] [--producer-kinds <${KINDS.join('|')},...>]
   [--consumers <n>] [--duration <seconds>] [--compression <${CODECS.join('|')}>]
   [--faults <${Object.keys(FAULT_SCHEDULES).join('|')}>] [--replication-factor <n>]
-  slow-broker needs --duration of at least 195; many-topics needs at least 1000 partitions`
+  [--producer-processes <n>]
+  slow-broker needs --duration of at least 195 and one producer process; many-topics needs at least
+  1000 partitions; --producer-processes is at most --producers`
 
 /**
  * @param {string[]} argv arguments after the script name
@@ -320,6 +325,10 @@ const parseLoadArgs = (argv) => {
   Object.assign(profile, schedule.profile)
   const refusal = schedule.validate?.(profile)
   if (refusal) fail(refusal)
+  if (profile.producerProcesses > profile.producers)
+    fail('--producer-processes must be at most --producers')
+  if (profile.leaderLanes && profile.producerProcesses > 1)
+    fail(`fault schedule ${profile.faults} needs --producer-processes 1`)
   if (profile.minInsyncReplicas > profile.replicationFactor)
     profile.minInsyncReplicas = profile.replicationFactor
   return profile
@@ -392,6 +401,18 @@ class LatencyHistogram {
       if (seen >= rank) return Math.min(this.maxMs, Math.exp(i * LatencyHistogram.#BASE) / 1000)
     }
     return this.maxMs
+  }
+
+  /** @returns {{ counts: number[], total: number, maxMs: number }} for `merge` in another process */
+  snapshot() {
+    return { counts: Array.from(this.counts), total: this.total, maxMs: this.maxMs }
+  }
+
+  /** @param {{ counts: number[], total: number, maxMs: number }} other a `snapshot` @returns {void} */
+  merge({ counts, total, maxMs }) {
+    for (let i = 0; i < counts.length; i++) this.counts[i] += counts[i]
+    this.total += total
+    this.maxMs = Math.max(this.maxMs, maxMs)
   }
 
   /** @returns {{ samples: number, p50: ?number, p90: ?number, p99: ?number, p999: ?number, max: number }} */

@@ -22,7 +22,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const readline = require('node:readline')
 const zlib = require('node:zlib')
-const { execFile, spawn } = require('node:child_process')
+const { execFile, fork, spawn } = require('node:child_process')
 const { promisify } = require('node:util')
 const { monitorEventLoopDelay } = require('node:perf_hooks')
 const { finished } = require('node:stream/promises')
@@ -416,6 +416,11 @@ class LoadProducer {
     await this.producer?.disconnect()
   }
 
+  /** @returns {object[]} `SendLedger#toJSON` of every incarnation, in order */
+  ledgerReports() {
+    return this.ledgers.map((l) => l.toJSON())
+  }
+
   /** @param {number} now @returns {boolean} whether a transaction is open for sends */
   #transactionReady(now) {
     if (this.txEnding || this.txOpening) return false
@@ -511,6 +516,132 @@ class LoadProducer {
   }
 }
 
+/** How long a producer process may take to connect its producers. */
+const PROCESS_CONNECT_MS = 120000
+/** How much longer than the join budget the parent waits for a producer process's report. */
+const PROCESS_REPORT_MARGIN_MS = 30000
+/** How long a producer process may take to disconnect its producers and exit. */
+const PROCESS_CLOSE_MS = 30000
+
+/**
+ * The parent side of one producer process (`loadProducerChild.js`): forks it, hands it its
+ * producers, and stands in for them in the run. Its `views` carry each hosted producer's id, kind,
+ * rate, stats, errors and ledger reports, which the child's messages fill in; `reported` turns true
+ * once the child sent its ledgers.
+ */
+class ProducerProcess {
+  /**
+   * @param {object} options
+   * @param {string} options.id `process-<n>`
+   * @param {{ id: string, kind: string }[]} options.producers the producers it hosts
+   * @param {object} options.profile @param {string} options.runId @param {string[]} options.topics
+   * @param {LatencyHistogram} options.latency the run's, which the child's histogram is merged into
+   * @param {{ now: () => number, timeOrigin?: number }} options.clock
+   * @param {(ms: number) => Promise<void>} options.sleep
+   * @param {() => object} options.fork starts the child: an object with `send`, `on` and `kill`
+   */
+  constructor({ id, producers, profile, runId, topics, latency, clock, sleep, fork: start }) {
+    Object.assign(this, { id, profile, runId, topics, latency, clock, sleep, start })
+    this.hosted = producers
+    this.views = producers.map(({ id: producerId, kind }) => ({
+      id: producerId,
+      kind,
+      rate: profile.rate / profile.producers,
+      stats: { sent: 0, acked: 0, failed: 0, aborted: 0, incarnations: 0, transactions: 0 },
+      errors: [],
+      ledgers: [],
+      settled: false,
+      ledgerReports() {
+        return this.ledgers
+      },
+    }))
+    Object.assign(this, { ready: false, reported: false, closed: false, exited: false })
+    this.failure = null
+    this.cpu = null
+  }
+
+  /**
+   * Starts the child and waits until it connected its producers.
+   * @returns {Promise<void>}
+   * @throws {Error} when the child failed, exited or did not connect in time
+   */
+  async connect() {
+    this.child = this.start()
+    this.child.on('message', (message) => this.#receive(message))
+    this.child.on('exit', (code) => {
+      this.exited = true
+      if (!this.closed) this.failure ??= `exited with code ${code}`
+    })
+    const { profile, runId, topics, hosted } = this
+    this.child.send({ type: 'setup', profile, runId, topics, producers: hosted })
+    if (!(await this.#until(() => this.ready, PROCESS_CONNECT_MS)))
+      throw new Error(`${this.id}: producers not connected after ${PROCESS_CONNECT_MS} ms`)
+  }
+
+  /** @param {number} start the window's start on the run's clock @returns {void} */
+  begin(start) {
+    this.child.send({ type: 'begin', startEpochMs: start + (this.clock.timeOrigin ?? 0) })
+  }
+
+  /** The child offers on its own schedule. @returns {void} */
+  tick() {}
+
+  /**
+   * Waits for the child's report, sent once it joined its producers.
+   * @param {number} budgetMs the producers' join budget
+   * @returns {Promise<boolean>} whether it reported and every one of its producers settled
+   * @throws {Error} when the child failed or exited first
+   */
+  async join(budgetMs) {
+    const reported = await this.#until(() => this.reported, budgetMs + PROCESS_REPORT_MARGIN_MS)
+    return reported && this.views.every((v) => v.settled)
+  }
+
+  /**
+   * Asks the child to disconnect its producers and waits for it, then ends it if it is still
+   * running.
+   * @returns {Promise<void>}
+   */
+  async close() {
+    if (!this.child || this.exited) return
+    this.child.send({ type: 'close' })
+    const deadline = this.clock.now() + PROCESS_CLOSE_MS
+    while (!this.closed && !this.exited && !this.failure && this.clock.now() < deadline)
+      await this.sleep(100)
+    if (!this.exited) this.child.kill()
+    if (!this.closed) throw new Error(`${this.id}: ${this.failure ?? 'did not close in time'}`)
+  }
+
+  #receive(message) {
+    if (message.type === 'ready') this.ready = true
+    else if (message.type === 'progress')
+      message.sent.forEach((n, i) => {
+        this.views[i].stats.sent = n
+      })
+    else if (message.type === 'done') {
+      message.producers.forEach(({ stats, errors, ledgers, settled }, i) =>
+        Object.assign(this.views[i], { stats, errors, ledgers, settled })
+      )
+      this.latency.merge(message.latency)
+      this.cpu = message.cpu
+      this.reported = true
+    } else if (message.type === 'closed') this.closed = true
+    else if (message.type === 'failed') this.failure ??= message.error
+  }
+
+  /**
+   * @param {() => boolean} done @param {number} budgetMs
+   * @returns {Promise<boolean>} `done()` at the end
+   * @throws {Error} the child's failure
+   */
+  async #until(done, budgetMs) {
+    const deadline = this.clock.now() + budgetMs
+    while (!done() && !this.failure && this.clock.now() < deadline) await this.sleep(100)
+    if (this.failure && !done()) throw new Error(`${this.id}: ${this.failure}`)
+    return done()
+  }
+}
+
 /**
  * One member of the load group, recording what it was delivered. Commits are the client's own
  * (auto-commit after each batch is resolved, and on disconnect).
@@ -582,6 +713,7 @@ class LoadRun {
    * @param {HostMeter} [options.host] this process's and the machine's CPU
    * @param {{ start: Function, stop: Function, toJSON: Function }|null} [options.brokerCpu] a
    *   `BrokerCpuProbe`, run while the window is open
+   * @param {() => object} [options.fork] starts one producer process (`ProducerProcess`)
    */
   constructor({
     profile,
@@ -596,9 +728,10 @@ class LoadRun {
     treeSha = null,
     host = new HostMeter(),
     brokerCpu = null,
+    fork: start = forkProducerChild,
   }) {
     Object.assign(this, { profile, kafka, reader, bouncer, netem, clock, sleep, log, treeSha })
-    Object.assign(this, { host, brokerCpu })
+    Object.assign(this, { host, brokerCpu, fork: start })
     this.lagProbe = lagProbe ?? new LagProbe({ clock })
     this.runId = `load-${Date.now()}`
     this.topics = Array.from({ length: profile.topics }, (_, i) => `${this.runId}-${i}`)
@@ -625,6 +758,8 @@ class LoadRun {
     this.flow = profile.leaderLanes ? new FlowMeter() : null
     const setup = { createTopicsMs: null, leaders: null }
     let producers = []
+    let units = []
+    let processes = []
     let consumers = []
     const resources = { samples: [], maxHeapUsed: 0, maxRss: 0 }
     const loop = monitorEventLoopDelay({ resolution: 20 })
@@ -647,24 +782,7 @@ class LoadRun {
         setup.leaders = {}
         for (const node of leaders.values()) setup.leaders[node] = (setup.leaders[node] ?? 0) + 1
       }
-      producers = Array.from(
-        { length: profile.producers },
-        (_, i) =>
-          new LoadProducer({
-            kafka: this.kafka,
-            id: `p${i}`,
-            kind: profile.producerKinds[i % profile.producerKinds.length],
-            profile,
-            topics: this.topics,
-            runId: this.runId,
-            latency: this.latency,
-            clock: this.clock,
-            sleep: this.sleep,
-            laneOf,
-            flow: this.flow,
-            meter,
-          })
-      )
+      ;({ producers, units, processes } = this.#producers(laneOf, meter))
       consumers = Array.from(
         { length: profile.consumers },
         (_, i) =>
@@ -680,17 +798,18 @@ class LoadRun {
           })
       )
       for (const consumer of consumers) await consumer.start()
-      for (const producer of producers) await producer.connect()
+      for (const unit of units) await unit.connect()
       loop.enable()
       mark('start')
-      const result = await this.#offer(producers, admin, resources)
+      const result = await this.#offer(producers, units, admin, resources)
       mark('offer')
       ;({ faults, windowMs } = result)
       totals = result.totals
-      for (const producer of producers)
-        if (!(await producer.join(profile.joinSeconds * 1000)))
-          this.errors.push(`${producer.id}: sends still unsettled after ${profile.joinSeconds} s`)
+      for (const unit of units)
+        if (!(await unit.join(profile.joinSeconds * 1000)))
+          this.errors.push(`${unit.id}: sends still unsettled after ${profile.joinSeconds} s`)
       mark('join')
+      totals.sent = producers.reduce((n, p) => n + p.stats.sent, 0)
       for (const producer of producers) {
         totals.acked += producer.stats.acked + producer.stats.aborted
         totals.failed += producer.stats.failed
@@ -702,7 +821,7 @@ class LoadRun {
     } finally {
       loop.disable()
       this.lagProbe.stop()
-      for (const client of [...producers, ...consumers]) {
+      for (const client of [...units, ...consumers]) {
         try {
           await (client.close?.() ?? client.stop())
         } catch (error) {
@@ -710,17 +829,21 @@ class LoadRun {
         }
       }
     }
-    const producerReports = producers.flatMap((p) => p.ledgers.map((l) => l.toJSON()))
+    const producerReports = producers.flatMap((p) => p.ledgerReports())
     const consumerReports = consumers.map((c) => c.ledger.toJSON())
     this.#write('producers.json', producerReports)
     this.#write('consumers.json', consumerReports)
     this.#write('faults.json', faults)
-    try {
-      oracle = await this.#judge(producerReports, consumerReports)
-    } catch (error) {
-      oracle = error.verdict ?? null
-      this.errors.push(`read: ${error?.message}`)
-    }
+    const unreported = processes.filter((p) => !p.reported).map((p) => p.id)
+    if (unreported.length)
+      this.errors.push(`read: not judged, no send ledgers from ${unreported.join(', ')}`)
+    else
+      try {
+        oracle = await this.#judge(producerReports, consumerReports)
+      } catch (error) {
+        oracle = error.verdict ?? null
+        this.errors.push(`read: ${error?.message}`)
+      }
     try {
       await admin.deleteTopics({ topics: this.topics, timeout: ADMIN_TIMEOUT_MS })
     } catch (error) {
@@ -737,9 +860,19 @@ class LoadRun {
     })
     rate.limitedBy = rateLimitedBy({
       reached: rate.reached,
-      coreShares: [cpu.stages.offer?.coreShare ?? null],
+      coreShares: [
+        cpu.stages.offer?.coreShare ?? null,
+        ...processes.map((p) => p.cpu?.offer.coreShare ?? null),
+      ],
       machineBusyShare: cpu.stages.offer?.machineBusyShare ?? null,
     })
+    if (processes.length)
+      cpu.producerProcesses = processes.map((p) => ({
+        id: p.id,
+        producers: p.views.map((v) => v.id),
+        offer: p.cpu?.offer ?? null,
+        join: p.cpu?.join ?? null,
+      }))
     const flow = this.flow && this.#flowVerdict(producers, phases)
     const verdict = verdictOf({
       oracle,
@@ -791,17 +924,73 @@ class LoadRun {
   }
 
   /**
+   * The run's producers: in this process, or with `producerProcesses` above 1 spread over that
+   * many child processes, producer `p<i>` in process `i % producerProcesses`.
+   * @param {Function} [laneOf] @param {ClientMeter} meter
+   * @returns {{ producers: object[], units: object[], processes: ProducerProcess[] }} `producers`
+   *   carry each producer's id, kind, rate, stats, errors and ledger reports, in order; `units` are
+   *   what connects, begins, ticks, joins and closes (the producers themselves, or the processes)
+   */
+  #producers(laneOf, meter) {
+    const { profile } = this
+    const specs = Array.from({ length: profile.producers }, (_, i) => ({
+      id: `p${i}`,
+      kind: profile.producerKinds[i % profile.producerKinds.length],
+    }))
+    if (profile.producerProcesses === 1) {
+      const producers = specs.map(
+        ({ id, kind }) =>
+          new LoadProducer({
+            kafka: this.kafka,
+            id,
+            kind,
+            profile,
+            topics: this.topics,
+            runId: this.runId,
+            latency: this.latency,
+            clock: this.clock,
+            sleep: this.sleep,
+            laneOf,
+            flow: this.flow,
+            meter,
+          })
+      )
+      return { producers, units: producers, processes: [] }
+    }
+    const processes = Array.from(
+      { length: profile.producerProcesses },
+      (_, n) =>
+        new ProducerProcess({
+          id: `process-${n}`,
+          producers: specs.filter((_, i) => i % profile.producerProcesses === n),
+          profile,
+          runId: this.runId,
+          topics: this.topics,
+          latency: this.latency,
+          clock: this.clock,
+          sleep: this.sleep,
+          fork: this.fork,
+        })
+    )
+    const byId = new Map(processes.flatMap((p) => p.views.map((v) => [v.id, v])))
+    return { producers: specs.map(({ id }) => byId.get(id)), units: processes, processes }
+  }
+
+  /**
    * The offer window: ticks every producer on a deadline schedule while the fault schedule runs.
-   * @param {LoadProducer[]} producers @param {object} admin @param {object} resources
+   * `totals.sent` is what this process saw sent by the window's end; the run takes the producers'
+   * final count after the join, which a producer process reports only then.
+   * @param {object[]} producers see `#producers` @param {object[]} units
+   * @param {object} admin @param {object} resources
    * @returns {Promise<{ totals: { offered: number, sent: number, acked: number, failed: number }, faults: object[], windowMs: number }>}
    */
-  async #offer(producers, admin, resources) {
+  async #offer(producers, units, admin, resources) {
     const { profile } = this
     const start = this.clock.now()
     const windowMs = profile.durationSeconds * 1000
     const end = start + windowMs
     const tickMs = 1000 / profile.ticksPerSecond
-    for (const producer of producers) producer.begin(start)
+    for (const unit of units) unit.begin(start)
     this.flow?.begin(start)
     const window = new AbortController()
     this.brokerCpu?.start(window.signal)
@@ -833,7 +1022,7 @@ class LoadRun {
     let nextSample = start + SAMPLE_MS
     for (let n = 1; ; n++) {
       const now = Math.min(this.clock.now(), end)
-      for (const producer of producers) producer.tick(now)
+      for (const unit of units) unit.tick(now)
       if (now >= nextSample) {
         nextSample += SAMPLE_MS
         sample(now)
@@ -1069,6 +1258,19 @@ class LoadRun {
   }
 }
 
+/** @returns {object} the client under test, as every process of a run builds it */
+const loadKafka = () => {
+  const { Kafka, logLevel } = require('../../index')
+  return new Kafka({ clientId: 'load', brokers: [...BROKERS], logLevel: logLevel.WARN })
+}
+
+/** @returns {import('node:child_process').ChildProcess} one producer process */
+const forkProducerChild = () =>
+  fork(path.join(__dirname, 'loadProducerChild.js'), [], {
+    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    serialization: 'advanced',
+  })
+
 /**
  * Hands one line of the read of every topic to the checker.
  * @param {SequenceChecker} checker @param {string} line
@@ -1140,8 +1342,7 @@ const main = async (argv) => {
     return verdict.ok ? 0 : 1
   }
   const profile = parseLoadArgs(argv)
-  const { Kafka, logLevel } = require('../../index')
-  const kafka = new Kafka({ clientId: 'load', brokers: [...BROKERS], logLevel: logLevel.WARN })
+  const kafka = loadKafka()
   const composeFile = path.resolve(
     __dirname,
     '../..',
@@ -1210,9 +1411,13 @@ module.exports = {
   LoadConsumer,
   LoadProducer,
   LoadRun,
+  ProducerProcess,
+  forkProducerChild,
+  loadKafka,
   main,
   parseDescribe,
   parseTopicLine,
+  realSleep,
   recheck,
 }
 
