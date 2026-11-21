@@ -2,7 +2,7 @@ const createAdmin = require('../index')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 
-const { secureRandom, createCluster, newLogger } = require('testHelpers')
+const { secureRandom, createCluster, createTopic, newLogger, waitFor } = require('testHelpers')
 
 const NOT_CONTROLLER = 41
 const REQUEST_TIMED_OUT = 7
@@ -48,16 +48,53 @@ describe('Admin', () => {
       await expect(admin.deleteTopics({ topics: [topicName] })).resolves.toBe()
     })
 
-    test('remove deleted topics from the cluster target group', async () => {
+    test('an offset read leaves no target behind, before and after the topic is deleted', async () => {
       const cluster = createCluster()
       admin = createAdmin({ cluster, logger: newLogger() })
       await admin.connect()
 
       await expect(admin.fetchTopicOffsets(topicName)).resolves.toBeTruthy()
-      expect(cluster.targetTopics.size).toEqual(1)
+      expect(cluster.targetTopics.size).toEqual(0)
 
       await admin.deleteTopics({ topics: [topicName] })
       expect(cluster.targetTopics.size).toEqual(0)
+    })
+
+    test('a topic another client deletes fails only the calls that name it, and parallel reads each get their own offsets', async () => {
+      const others = Array.from({ length: 5 }, () => `test-topic-${secureRandom()}`)
+      for (const topic of [topicName, ...others]) await createTopic({ topic })
+      const cluster = createCluster({ allowAutoTopicCreation: false, orderedMetadata: true })
+      admin = createAdmin({
+        cluster,
+        logger: newLogger(),
+        retry: { retries: 3, initialRetryTime: 100 },
+      })
+      const other = createAdmin({ cluster: createCluster(), logger: newLogger() })
+      await admin.connect()
+      await other.connect()
+      try {
+        await admin.fetchTopicOffsets(topicName)
+        await other.deleteTopics({ topics: [topicName] })
+        await waitFor(async () => !(await other.listTopics()).includes(topicName))
+
+        await expect(
+          admin.createTopics({ topics: [{ topic: `test-topic-${secureRandom()}` }] })
+        ).resolves.toBe(true)
+        await expect(admin.fetchTopicOffsets(others[0])).resolves.toHaveLength(1)
+        await expect(admin.fetchTopicOffsets(topicName)).rejects.toMatchObject({
+          name: 'KafkaJSNumberOfRetriesExceeded',
+          cause: { type: 'UNKNOWN_TOPIC_OR_PARTITION' },
+        })
+        expect(cluster.targetTopics.size).toEqual(0)
+
+        for (let round = 0; round < 2; round++) {
+          const offsets = await Promise.all(others.map((topic) => admin.fetchTopicOffsets(topic)))
+          expect(offsets.map((partitions) => partitions.length)).toEqual(others.map(() => 1))
+        }
+        expect(cluster.targetTopics.size).toEqual(0)
+      } finally {
+        await other.disconnect()
+      }
     })
 
     test('retries if the controller has moved', async () => {

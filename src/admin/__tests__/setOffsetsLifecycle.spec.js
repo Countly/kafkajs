@@ -1,10 +1,12 @@
 // The admin's internal consumers are real; only their group description is stubbed (the scripted
 // cluster has no DescribeGroups pair), and each one is recorded with the cluster it was given.
 const mockMembers = []
+const mockClusters = new Set()
 let mockDescription = { state: 'Empty', members: [] }
 jest.mock('../../consumer', () => {
   const createConsumer = jest.requireActual('../../consumer')
   return (params) => {
+    mockClusters.add(params.cluster)
     const consumer = Object.assign(createConsumer(params), {
       describeGroup: async () => mockDescription,
     })
@@ -28,6 +30,7 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
 
   beforeEach(async () => {
     mockMembers.length = 0
+    mockClusters.clear()
     mockDescription = { state: 'Empty', members: [] }
     scripted = groupScript(
       createScriptedCluster({ nodes: [{ id: 0, host: 'node', port: 9092 }] }),
@@ -221,6 +224,93 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
       expect(
         await admin.fetchOffsets({ groupId: 'resolve-group', topics: ['topic-a'] })
       ).toHaveLength(1)
+    })
+  })
+
+  describe('the topic is a target of the admin only while the call runs', () => {
+    /** @returns {object} the admin's cluster, as its internal consumers were given it */
+    const adminCluster = () => {
+      expect(mockClusters.size).toBe(1)
+      return [...mockClusters][0]
+    }
+    const rejectCommits = () =>
+      scripted.answer('OffsetCommit', ({ topics }) => ({
+        topics: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({ partition, errorCode: 30 })),
+        })),
+      }))
+
+    test('after success, a running group and a crashed member', async () => {
+      const gate = scripted.schedule.hold({ api: 'OffsetCommit' })
+      const reset = admin.resetOffsets({ groupId: 'reset-group', topic: TOPIC })
+      await gate.arrived()
+      expect([...adminCluster().targetTopics]).toEqual([TOPIC])
+      gate.release()
+      await reset
+      expect([...adminCluster().targetTopics]).toEqual([])
+
+      mockDescription = { state: 'Stable', members: [{ memberId: 'other' }] }
+      await expect(admin.resetOffsets({ groupId: 'busy-group', topic: TOPIC })).rejects.toThrow(
+        'current state: Stable'
+      )
+      expect([...adminCluster().targetTopics]).toEqual([])
+
+      mockDescription = { state: 'Empty', members: [] }
+      rejectCommits()
+      await expect(
+        admin.setOffsets({
+          groupId: 'set-group',
+          topic: TOPIC,
+          partitions: [{ partition: 0, offset: '3' }],
+        })
+      ).rejects.toMatchObject({ type: 'GROUP_AUTHORIZATION_FAILED' })
+      expect([...adminCluster().targetTopics]).toEqual([])
+      expect([...adminCluster().targetHolds]).toEqual([])
+    })
+
+    test('a member that cannot be built takes no hold', async () => {
+      await expect(
+        admin.setOffsets({ groupId: {}, topic: TOPIC, partitions: [{ partition: 0, offset: '3' }] })
+      ).rejects.toThrow('Consumer groupId must be a non-empty string.')
+
+      expect([...adminCluster().targetHolds]).toEqual([])
+      expect([...adminCluster().targetTopics]).toEqual([])
+    })
+
+    test('past the API deadline the topic stays a target until the member is disposed', async () => {
+      await admin.disconnect()
+      admin = new Kafka(scripted.kafkaOptions()).admin({ apiTimeout: 300 })
+      await admin.connect()
+      const gate = scripted.schedule.hold({ api: 'OffsetCommit' })
+
+      const reset = admin.resetOffsets({ groupId: 'reset-group', topic: TOPIC }).catch((e) => e)
+      await gate.arrived()
+      expect(await reset).toMatchObject({ name: 'KafkaJSTimeout' })
+      gate.release()
+      for (let n = 0; n < 100 && adminCluster().targetHolds.size > 0; n++) {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+
+      expect([...adminCluster().targetHolds]).toEqual([])
+      expect([...adminCluster().targetTopics]).toEqual([])
+    })
+
+    test('two overlapping calls for different groups keep the topic a target until the second ends', async () => {
+      const gate = scripted.schedule.hold({
+        api: 'JoinGroup',
+        match: ({ fields }) => fields.groupId === 'second-group',
+      })
+      const second = admin.resetOffsets({ groupId: 'second-group', topic: TOPIC })
+      await gate.arrived()
+
+      await admin.resetOffsets({ groupId: 'first-group', topic: TOPIC })
+      expect([...adminCluster().targetTopics]).toEqual([TOPIC])
+      expect(adminCluster().targetHolds.get(TOPIC)).toBe(1)
+
+      gate.release()
+      await second
+      expect([...adminCluster().targetTopics]).toEqual([])
     })
   })
 })
