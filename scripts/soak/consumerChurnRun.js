@@ -26,6 +26,18 @@ const {
 
 const { subscribeNamedTopic } = require('./subscribeNamedTopic')
 
+/**
+ * Whether `commitOffsets()` refused at its start because the run was stopping or not yet running,
+ * so nothing was sent. A stop error with a cause failed after the call was admitted, and its
+ * outcome is unknown.
+ * @param {any} error what the call rejected with
+ * @returns {boolean}
+ */
+const sentNothing = (error) =>
+  (error?.type === 'CONSUMER_STOPPING' && error.cause === undefined) ||
+  (error?.name === 'KafkaJSNonRetriableError' &&
+    error.message.startsWith('Consumer is not running'))
+
 const COMMIT_EVERY = 25
 const DRAIN_POLL_MS = 100
 const DRAIN_MS = 45000
@@ -279,7 +291,8 @@ class ChurnMember {
 
   /**
    * Commits every partition whose contiguous processed position moved, then reads the broker back.
-   * A commit the client refuses because ownership ended is not an error and not an observation.
+   * A commit the client refuses because ownership ended, or sends nothing for because the run is
+   * stopping or not yet running, is not an error and not an observation; it stays owed.
    * Calls run one at a time, so a commit in flight is journaled before a later boundary and is
    * never repeated by it.
    * @returns {Promise<void>}
@@ -300,7 +313,7 @@ class ChurnMember {
       try {
         await this.consumer.commitOffsets([{ topic, partition, offset: String(next) }])
       } catch (error) {
-        if (error instanceof KafkaJSCommitFailedError) continue
+        if (error instanceof KafkaJSCommitFailedError || sentNothing(error)) continue
         throw error
       }
       const brokerNext = (await this.#positions(topic)).get(partition)

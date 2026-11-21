@@ -776,12 +776,12 @@ describe.each(['classic', 'consumer'])(
       expect(held.rig.frames('OffsetCommit')).toHaveLength(1)
     })
 
-    test('a commit that enters after a graceful stop began resolves and writes nothing', async () => {
+    test('a commit that enters after a graceful stop began rejects with CONSUMER_STOPPING and writes nothing', async () => {
       held = await HeldLookup.open(protocol)
       const stopping = held.consumer.stop()
-      const late = settle(held.consumer.commitOffsets(COMMIT))
+      const late = held.consumer.commitOffsets(COMMIT).catch((error) => error)
 
-      expect(await late).toBe('committed')
+      expect((await late).type).toBe('CONSUMER_STOPPING')
       held.release()
       await stopping
       await held.answered()

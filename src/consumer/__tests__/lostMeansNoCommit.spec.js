@@ -2978,18 +2978,27 @@ describe.each(['classic', 'consumer'])('commit edges on %s', (kind) => {
     }
   })
 
-  it('releases the retained identity when a commit finds the runner stopped', async () => {
-    const fixture = ownershipFixture({ kind })
-    fixture.runner.running = false
-    try {
-      expect(fixture.runner.commitOffsets(explicit(0, '4'))).toBeUndefined()
-      expect(fixture.coordinator.offsetCommit).not.toHaveBeenCalled()
-      fixture.ownership.renew()
-      expect(fixture.ownership.states.size).toBe(1)
-    } finally {
-      await fixture.close()
+  it.each([
+    ['still starting', false, { name: 'KafkaJSNonRetriableError' }],
+    ['stopping', true, { type: 'CONSUMER_STOPPING' }],
+  ])(
+    'releases the retained identity when a commit finds the runner %s, and rejects',
+    async (_, stopRequested, refusal) => {
+      const fixture = ownershipFixture({ kind })
+      fixture.runner.running = false
+      fixture.runner.stopRequested = stopRequested
+      try {
+        const call = fixture.runner.commitOffsets(explicit(0, '4'))
+        expect(call).toBeInstanceOf(Promise)
+        await expect(call).rejects.toMatchObject(refusal)
+        expect(fixture.coordinator.offsetCommit).not.toHaveBeenCalled()
+        fixture.ownership.renew()
+        expect(fixture.ownership.states.size).toBe(1)
+      } finally {
+        await fixture.close()
+      }
     }
-  })
+  )
 
   it('never looks up a coordinator for a reset commit that starts after the loss', async () => {
     const fixture = ownershipFixture({ kind })
