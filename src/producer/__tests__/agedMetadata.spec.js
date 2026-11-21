@@ -11,13 +11,19 @@ const NODES = [
 const MAX_AGE = 10000
 const RETRY = { initialRetryTime: 100, maxRetryTime: 30000, retries: 3, factor: 0 }
 
-/** Jumps added to `Date.now`, so the metadata age and the backoff are driven by the test. */
+/**
+ * Jumps added to `Date.now` and `performance.now`, so the metadata age and the backoff are driven
+ * by the test.
+ */
 let skew = 0
-/** When set, the real time `Date.now` stands still at, between jumps. */
+/** When set, the real times both clocks stand still at, between jumps. */
 let frozenAt = null
+let frozenPerfAt = null
 const realNow = Date.now.bind(Date)
+const realPerfNow = performance.now.bind(performance)
 const freeze = () => {
   frozenAt = realNow()
+  frozenPerfAt = realPerfNow()
 }
 const advance = (ms) => {
   skew += ms
@@ -123,16 +129,21 @@ const recordingCluster = () => {
 /**
  * A connected producer over a scripted cluster, warmed by one send so the topic's metadata is
  * cached.
- * @param {{ idempotent?: boolean, createPartitioner?: Function, requestTimeout?: number }} [options]
+ * @param {{ idempotent?: boolean, createPartitioner?: Function, requestTimeout?: number, retry?: object }} [options]
  * @returns {Promise<{ cluster: object, produced: object[], producer: object }>}
  */
-const warmProducer = async ({ idempotent = true, createPartitioner, requestTimeout } = {}) => {
+const warmProducer = async ({
+  idempotent = true,
+  createPartitioner,
+  requestTimeout,
+  retry = RETRY,
+} = {}) => {
   const { cluster, produced } = recordingCluster()
   cluster.answer('Metadata', () => metadataAnswer())
   const kafka = new Kafka(
     cluster.kafkaOptions({
       metadataRecoveryStrategy: 'none',
-      retry: RETRY,
+      retry,
       ...(requestTimeout && { requestTimeout }),
     })
   )
@@ -140,6 +151,20 @@ const warmProducer = async ({ idempotent = true, createPartitioner, requestTimeo
   await producer.connect()
   await producer.send({ topic: TOPIC, messages: [{ value: 'warm' }] })
   return { cluster, produced, producer }
+}
+
+/**
+ * Captures the Cluster the next producer connects with, so a test can read its broker pool.
+ * @returns {() => Cluster} the captured cluster
+ */
+const captureCluster = () => {
+  let captured
+  const connect = Cluster.prototype.connect
+  jest.spyOn(Cluster.prototype, 'connect').mockImplementation(function (...args) {
+    captured ??= this
+    return connect.apply(this, args)
+  })
+  return () => captured
 }
 
 /** @param {object} cluster @returns {number} Metadata requests not yet answered or cancelled */
@@ -161,7 +186,9 @@ describe('Producer > sends on metadata that is only past metadataMaxAge', () => 
     unhandled.length = 0
     producer = null
     frozenAt = null
+    frozenPerfAt = null
     jest.spyOn(Date, 'now').mockImplementation(() => (frozenAt ?? realNow()) + skew)
+    jest.spyOn(performance, 'now').mockImplementation(() => (frozenPerfAt ?? realPerfNow()) + skew)
     process.on('unhandledRejection', onUnhandled)
   })
 
@@ -248,6 +275,44 @@ describe('Producer > sends on metadata that is only past metadataMaxAge', () => 
       expect(unhandled).toEqual([])
       cluster.assertClean()
     })
+  })
+
+  it('waits at least 10 ms between failed background refreshes when initialRetryTime is 0', async () => {
+    const setup = await warmProducer({ retry: { ...RETRY, initialRetryTime: 0 } })
+    producer = setup.producer
+    const { cluster } = setup
+    freeze()
+    const before = cluster.tally('Metadata')
+    cluster.outage('Metadata', { errorCode: 7 })
+    ageMetadata()
+    const requests = () => cluster.tally('Metadata') - before
+    const sendSome = async (count) => {
+      for (let i = 0; i < count; i++) await within(send(producer, i), 'a send on aged metadata')
+      await turns()
+    }
+
+    await sendSome(20)
+    expect(requests()).toBe(1)
+    // 10 ms after the first failure, then 20, 40, 80, then capped at 100.
+    for (const [ms, total] of [
+      [9, 1],
+      [1, 2],
+      [19, 2],
+      [1, 3],
+      [39, 3],
+      [1, 4],
+      [79, 4],
+      [1, 5],
+      [99, 5],
+      [1, 6],
+      [99, 6],
+      [1, 7],
+    ]) {
+      advance(ms)
+      await sendSome(10)
+      expect(requests()).toBe(total)
+    }
+    cluster.assertClean()
   })
 
   it('still waits for the refresh, and fails with its error, when the topic is not in the metadata', async () => {
@@ -343,8 +408,10 @@ describe('Producer > sends on metadata that is only past metadataMaxAge', () => 
   })
 
   it('lets a disconnect end a background refresh within the request drain and installs nothing after it', async () => {
+    const clusterOf = captureCluster()
     const setup = await warmProducer({ requestTimeout: 500 })
     const { cluster } = setup
+    const pool = clusterOf().brokerPool
     const held = hold()
     cluster.answer('Metadata', () => held.promise)
     ageMetadata()
@@ -357,7 +424,48 @@ describe('Producer > sends on metadata that is only past metadataMaxAge', () => 
 
     expect(cluster.tally('Metadata', 'answered')).toBe(cluster.tally('Metadata') - 1)
     expect(metadataInFlight(cluster)).toBe(0)
+    expect(pool.metadata).toBeNull()
+    expect(pool.brokers).toEqual({})
     expect(unhandled).toEqual([])
+  })
+
+  it('installs nothing from a background refresh answered during the disconnect drain, and the first send after a reconnect fetches metadata again', async () => {
+    const clusterOf = captureCluster()
+    const setup = await warmProducer({
+      requestTimeout: 2000,
+      createPartitioner:
+        () =>
+        ({ partitionMetadata }) =>
+          partitionMetadata.length - 1,
+    })
+    producer = setup.producer
+    const { cluster, produced } = setup
+    const pool = clusterOf().brokerPool
+    const held = hold()
+    cluster.answer('Metadata', () => held.promise)
+    ageMetadata()
+    await within(send(producer, 1), 'a send on aged metadata')
+    expect(metadataInFlight(cluster)).toBe(1)
+
+    const closing = producer.disconnect()
+    await turns(5)
+    held.release(metadataAnswer({ partitions: 3 }))
+    await within(closing, 'the disconnect', 4000)
+    await turns()
+
+    expect(cluster.tally('Metadata', 'answered')).toBe(cluster.tally('Metadata'))
+    expect(pool.metadata).toBeNull()
+    expect(pool.brokers).toEqual({})
+
+    cluster.answer('Metadata', () => metadataAnswer({ partitions: 2 }))
+    await producer.connect()
+    expect(pool.metadata).toBeNull()
+    const before = cluster.tally('Metadata')
+    const start = produced.length
+    await within(send(producer, 2), 'the send after the reconnect')
+    expect(cluster.tally('Metadata')).toBe(before + 1)
+    expect(produced.slice(start).flatMap(({ partitions }) => partitions)).toEqual([1])
+    cluster.assertClean()
   })
 
   it('keeps the call order of idempotent sends when the refresh installs mid-drain', async () => {
@@ -380,6 +488,41 @@ describe('Producer > sends on metadata that is only past metadataMaxAge', () => 
       Array.from({ length: 30 }, (_, i) => i)
     )
     cluster.assertClean()
+  })
+})
+
+describe('Cluster > a refresh across a disconnect', () => {
+  afterEach(() => jest.restoreAllMocks())
+
+  it('does not join a caller after a reconnect to a refresh begun before the disconnect, and installs its own answer', async () => {
+    const scripted = producerScript(createScriptedCluster({ nodes: NODES }))
+    scripted.answer('Metadata', () => metadataAnswer())
+    const clusterOf = captureCluster()
+    const admin = new Kafka(
+      scripted.kafkaOptions({
+        metadataRecoveryStrategy: 'none',
+        retry: { initialRetryTime: 3000, retries: 1, factor: 0, multiplier: 1 },
+      })
+    ).admin()
+    await admin.connect()
+    const cluster = clusterOf()
+    cluster.targetTopics.add(TOPIC)
+    const leaderless = metadataAnswer()
+    leaderless.topics[0].errorCode = 5
+    scripted.answer('Metadata', () => leaderless)
+    const old = cluster.refreshMetadata().catch(() => {})
+    await turns()
+    try {
+      await admin.disconnect()
+      scripted.answer('Metadata', () => metadataAnswer({ partitions: 2 }))
+      await admin.connect()
+      await within(cluster.refreshMetadata(), 'the refresh after the reconnect', 1500)
+
+      expect(cluster.findTopicPartitionMetadata(TOPIC)).toHaveLength(2)
+    } finally {
+      await admin.disconnect()
+      await old
+    }
   })
 })
 
