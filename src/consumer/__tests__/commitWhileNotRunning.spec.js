@@ -72,7 +72,7 @@ describe.each(['classic', 'consumer'])(
     test('a commit made while run() is still connecting rejects as not running and writes nothing', async () => {
       const connect = scriptConnect(['hold'])
       const consumer = await subscribed()
-      const running = consumer.run({ eachMessage: async () => {} })
+      const running = consumer.run({ autoCommit: false, eachMessage: async () => {} })
       await until(() => connect.held.length === 1, 'the held connect')
       const ownership = connect.calls[0].ownership
 
@@ -93,7 +93,7 @@ describe.each(['classic', 'consumer'])(
         'hold',
       ])
       const consumer = await subscribed()
-      await consumer.run({ eachMessage: async () => {} })
+      await consumer.run({ autoCommit: false, eachMessage: async () => {} })
       await until(() => connect.held.length === 1, 'the restart held in its connect')
 
       const error = await settle(consumer.commitOffsets(COMMIT))
@@ -119,7 +119,8 @@ describe.each(['classic', 'consumer'])(
         return stopping
       })
       const consumer = await subscribed()
-      await consumer.run({ eachMessage: async () => {} })
+      // run() settles only once the crash it started has been cleaned up.
+      const running = consumer.run({ autoCommit: false, eachMessage: async () => {} })
       await until(() => stopped.length === 1, 'the crash cleanup stopping the run')
 
       const error = await settle(consumer.commitOffsets(COMMIT))
@@ -128,6 +129,7 @@ describe.each(['classic', 'consumer'])(
       expect(error.cause).toBeUndefined()
       expect(holders(stopped[0].consumerGroup.ownership)).toBe(0)
       cleanup.resolve()
+      await running
       await pause(100)
       expect(rig.frames('OffsetCommit')).toHaveLength(0)
     })
