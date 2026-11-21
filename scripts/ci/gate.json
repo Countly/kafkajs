@@ -19917,13 +19917,6 @@
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak CI receipt consumption controls refuses substituted repeat and cannot use another run latest green",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak CI receipt consumption controls refuses substituted artifactDigest and cannot use another run latest green",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak CI receipt consumption controls refuses substituted replaySemanticSha256 and cannot use another run latest green",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver matches scripted cluster discovery to the public admin option semantics",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver selects API 60 through the real public admin during share setup",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver archives decodable negotiation replies from the scripted public boundary",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver keeps scripted reply mutations separate from original metadata and assignment results",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver derives both complete workloads, UUID-bearing assignments, cleanup and sealed archive verdicts from original operations, short=true",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver derives both complete workloads, UUID-bearing assignments, cleanup and sealed archive verdicts from original operations, short=false",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver detects retained orchestration roots for the prime driver and its corpus",
         "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false producer a closed client retains its close result but releases the retired transport and can reopen",
         "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false consumer a closed client retains its close result but releases the retired transport and can reopen",
         "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false admin a closed client retains its close result but releases the retired transport and can reopen",
@@ -22514,13 +22507,6 @@
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore K5 heap leaves a boundary whose quiet readings completed after its hour out of the whole-process heapUsed information line",
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore K5 on real heap snapshots judges what the seed retains: real snapshots of its offset map show the leak to the control",
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a rehearsal keeps the summary and every snapshot of each process on disk, and re-derives the verdict from those sealed files",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal preflight and the sixteen-process smoke run start, connect, run every schedule step, sample and exit naturally without a broker",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp speeds the harness clock only: a raw reader connection outlives a 200 ms CPU stall in its setup",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots each selected process writes its heap snapshot into the run directory only after every quiet reading of the boundary, and the sealed header binds the file",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots a heap snapshot that fails is recorded with its error and the run still ends naturally with no problem of its own",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots every sample is followed by its own heap record of V8 space and code statistics, and the stream stays valid",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots without any opt-in every subject, the seed, the reader and the decoder write a snapshot, and finalize binds their summary, one record per receipt",
-        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp runs at the real rate while the scheduler holds work: a 300 ms stall inside a hold advances every process run clock by its real length only",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on UNKNOWN_MEMBER_ID",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on FENCED_MEMBER_EPOCH",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap logs the name, type and code of each failing share heartbeat",
@@ -23099,6 +23085,37 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
         "src/admin/__tests__/unregisterControllerLive.spec.js \u203a Admin > unregisterController (live) an unknown controller id is refused with code 136 and unregisters nothing"
       ]
+    },
+    {
+      "id": "unit-heavy",
+      "kind": "host",
+      "compose": null,
+      "env": {
+        "KAFKAJS_LANE": "fake"
+      },
+      "jest": null,
+      "jestScript": "test:unit:heavy",
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [],
+      "titles": [
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver matches scripted cluster discovery to the public admin option semantics",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver selects API 60 through the real public admin during share setup",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver archives decodable negotiation replies from the scripted public boundary",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver keeps scripted reply mutations separate from original metadata and assignment results",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver derives both complete workloads, UUID-bearing assignments, cleanup and sealed archive verdicts from original operations, short=true",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver derives both complete workloads, UUID-bearing assignments, cleanup and sealed archive verdicts from original operations, short=false",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver detects retained orchestration roots for the prime driver and its corpus",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal preflight and the sixteen-process smoke run start, connect, run every schedule step, sample and exit naturally without a broker",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp speeds the harness clock only: a raw reader connection outlives a 200 ms CPU stall in its setup",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots each selected process writes its heap snapshot into the run directory only after every quiet reading of the boundary, and the sealed header binds the file",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots a heap snapshot that fails is recorded with its error and the run still ends naturally with no problem of its own",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots every sample is followed by its own heap record of V8 space and code statistics, and the stream stays valid",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal heap snapshots without any opt-in every subject, the seed, the reader and the decoder write a snapshot, and finalize binds their summary, one record per receipt",
+        "scripts/soak/__tests__/finalSoakRehearsal.spec.js \u203a final soak rehearsal the warp runs at the real rate while the scheduler holds work: a 300 ms stall inside a hold advances every process run clock by its real length only"
+      ],
+      "capMinutes": 50
     },
     {
       "id": "obsolete-bound",
@@ -26494,7 +26511,10 @@
         "--ci",
         "--coverage",
         "--maxWorkers=4",
-        "--forceExit"
+        "--forceExit",
+        "--testPathIgnorePatterns",
+        "/node_modules/",
+        "scripts/soak/__tests__/finalSoakRehearsal\\.spec\\.js$"
       ],
       "jestScript": null,
       "nodeTest": null,
