@@ -1885,12 +1885,13 @@ const createSendMessages = ({
 
   /**
    * Assigns each record to a partition once, after making sure the topics' metadata is loaded:
-   * the partitioner never runs again for these records. Retried while the metadata cannot be
-   * loaded, within the send's delivery budget. The records are read from `send` after each await:
-   * a send that settled meanwhile has none, and the wait ends without enqueuing anything. A
-   * failure that arrives after the send settled is ignored: it refreshes no metadata, is not
-   * retried and arms no transaction. Otherwise a transactional producer's failure arms the
-   * transaction as `inTransaction` says.
+   * the partitioner never runs again for these records. Metadata that names every target and is
+   * only past `metadataMaxAge` is used as it is while it refreshes in the background. Retried
+   * while the metadata cannot be loaded, within the send's delivery budget. The records are read
+   * from `send` after each await: a send that settled meanwhile has none, and the wait ends without
+   * enqueuing anything. A failure that arrives after the send settled is ignored: it refreshes no
+   * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure
+   * arms the transaction as `inTransaction` says.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
@@ -1911,7 +1912,7 @@ const createSendMessages = ({
         )
         fence?.check()
         recordsOf(send)
-        await cluster.refreshMetadataIfNecessary(...fenceArgs(fence))
+        await cluster.refreshMetadataIfNecessary({ fence, background: true })
         fence?.check()
 
         const entries = []
@@ -2445,7 +2446,7 @@ const createSendMessages = ({
             generation?.check()
             if (unsettled.size === 0) return
             try {
-              await cluster.refreshMetadataIfNecessary(...fenceArgs(generation))
+              await cluster.refreshMetadataIfNecessary({ fence: generation, background: true })
               generation?.check()
               if (unsettled.size === 0) return
               const left = []

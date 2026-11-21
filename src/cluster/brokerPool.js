@@ -260,6 +260,8 @@ module.exports = class BrokerPool {
     /** @type {import("../../types").BrokerMetadata | null} */
     this.metadata = null
     this.metadataExpireAt = null
+    /** Counts `disconnect()` calls: a refresh started before one installs nothing after it. */
+    this.disconnects = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
@@ -895,6 +897,7 @@ module.exports = class BrokerPool {
     this.retainSetupEndpoints()
     const brokers = new Set([...values(this.brokers), ...this.draining.keys()])
     if (this.seedBroker) brokers.add(this.seedBroker)
+    this.disconnects++
     this.brokers = {}
     this.metadata = null
     this.versions = null
@@ -1007,7 +1010,8 @@ module.exports = class BrokerPool {
               this.consumerMetadataGeneration ?? 0,
               this.consumerMetadataScope?.shareKey() ?? null,
               names || [],
-            ])
+            ]),
+      () => this.disconnects
     )
     return this.metadataDiscovery(topics, options)
   }
@@ -1040,8 +1044,10 @@ module.exports = class BrokerPool {
     }
     if (!isCurrent()) return
     const modeGeneration = this.consumerMetadataGeneration ?? 0
+    const disconnects = this.disconnects
     const ticket = metadataScope?.captureMetadata()
     const applicable = () =>
+      this.disconnects === disconnects &&
       !fence?.closed &&
       !guard?.() &&
       (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
@@ -1459,6 +1465,24 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * How the cached metadata stands for `topics`, as `refreshMetadataIfNecessary` judges it:
+   * `missing` without an answer or when a topic is not in it (an isolated consumer target counts as
+   * in it, see there), else `aged` past `metadataMaxAge`, else `fresh`.
+   * @param {string[]} topics
+   * @param {object} [metadataScope] a pattern scope judges no topics
+   * @returns {'missing'|'aged'|'fresh'}
+   */
+  metadataState(topics, metadataScope = this.consumerMetadataScope) {
+    if (this.metadata == null || this.metadataExpireAt == null) return 'missing'
+    const now = Date.now()
+    const known = (topic) =>
+      (this.unavailableTopics?.has(topic) && now <= this.isolatedRecheckAt) ||
+      BrokerPool.topicRowsByName(this.metadata).has(topic)
+    if (!metadataScope?.hasPatterns() && !topics.every(known)) return 'missing'
+    return now > this.metadataExpireAt ? 'aged' : 'fresh'
+  }
+
+  /**
    * Only refreshes metadata if the data is stale according to the `metadataMaxAge` param or does not contain information about the provided topics
    * An isolated consumer target counts as known for at most a second after the refresh that
    * isolated it (or `metadataMaxAge`, when shorter), so a recreated topic is found again within
@@ -1474,17 +1498,7 @@ module.exports = class BrokerPool {
   async refreshMetadataIfNecessary(topics, options = {}) {
     const metadataScope = options.metadataScope ?? this.consumerMetadataScope
     if (metadataScope?.hasPatterns()) topics = []
-    const shouldRefresh =
-      this.metadata == null ||
-      this.metadataExpireAt == null ||
-      Date.now() > this.metadataExpireAt ||
-      !topics.every(
-        (topic) =>
-          (this.unavailableTopics?.has(topic) && Date.now() <= this.isolatedRecheckAt) ||
-          BrokerPool.topicRowsByName(this.metadata).has(topic)
-      )
-
-    if (shouldRefresh) {
+    if (this.metadataState(topics, metadataScope) !== 'fresh') {
       const context = metadataScope ? { ...options, metadataScope } : options
       return Object.keys(context).length
         ? this.refreshMetadata(topics, context)
