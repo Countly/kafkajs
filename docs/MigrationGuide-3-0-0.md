@@ -1165,7 +1165,8 @@ Group visibility and the admin client.
   `UNKNOWN_TOPIC_OR_PARTITION` for as long as that call runs, retries included, or its internal
   consumer takes to be disposed. The client's own `deleteTopics` stops asking for the
   topics it deleted at once, but a call that still holds one asks for it again on its next attempt,
-  which reopens that window until the call ends. When no call is running, the metadata request
+  which reopens that window until the call ends; that call keeps its routing meanwhile and itself
+  fails with the error above for a topic that never existed. When no call is running, the metadata request
   before cluster-level calls (`createTopics`, `describeConfigs`, …) asks for every topic, as on a
   new 2.2.4 admin client; a 2.2.4 admin client that had read offsets asked only for the topics it
   had read, so on a cluster with many topics that request is larger for a long-lived client. *What

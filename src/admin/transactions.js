@@ -285,8 +285,10 @@ class TransactionAdmin {
   }
 
   /** Describes the validated partitions, routed by leader unless a broker is given.
-   * @param {object[]} items validated partitions @param {number} [brokerId] fixed replica
-   * @returns {Promise<object[]>} topic/partition results @throws {Error} as `describeProducers`
+   * @param {object[]} items validated partitions
+   * @param {number} [brokerId] fixed replica
+   * @returns {Promise<object[]>} topic/partition results
+   * @throws {Error} as `describeProducers`
    */
   async describeProducerItems(items, brokerId) {
     let refresh = brokerId === undefined

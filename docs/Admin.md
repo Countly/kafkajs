@@ -27,9 +27,10 @@ those calls raise for a topic that never existed. While such a call is running, 
 same admin client that refresh metadata ask for its topics too, so they can fail with
 `UNKNOWN_TOPIC_OR_PARTITION` if that topic was deleted, for as long as the holding call runs,
 retries included, or its internal consumer takes to be disposed. A `deleteTopics` of this
-client stops asking for the topics it deleted at once, even while another call holds them; that
-call asks for them again on its next attempt, and then fails with `UNKNOWN_TOPIC_OR_PARTITION`
-itself. When no such call is running, the metadata request before a cluster-level call
+client stops asking for the topics it deleted at once, even while another call holds them. That
+call keeps the routing it had for them: its next request for such a topic, an offset request or
+the metadata request of its next attempt, gets `UNKNOWN_TOPIC_OR_PARTITION`, and the call fails
+with the error it raises for a topic that never existed. When no such call is running, the metadata request before a cluster-level call
 (`createTopics`, `describeConfigs`, …) asks for every topic, as a new admin client does; on a
 cluster with many topics that request is larger than the request of a 2.2.4 admin client that had
 read offsets, which asked only for the topics it had read.
