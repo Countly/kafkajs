@@ -2199,8 +2199,11 @@ module.exports = class Runner extends EventEmitter {
    * operation with no deadline keeps the ordinary retrier's schedule, as an unset `retry.maxTotalTime`
    * always did, on backoff timers the operation owns: its guard refuses writes once the call is
    * retired, and retirement removes a pending backoff timer and settles the call.
-   * A commit made from a close callback runs while the stop is in progress; any other call that
-   * starts once the runner is no longer running resolves at once, committing nothing, as in 2.2.4.
+   * A commit made from a close callback runs while the stop is in progress. Any other call that
+   * starts while the runner is not running sends nothing and rejects: with `CONSUMER_STOPPING`
+   * once a stop or a crash cleanup has begun, otherwise (the run or its restart is still starting)
+   * with `KafkaJSNonRetriableError`. 2.2.4 resolved such a call. An empty offsets list sends
+   * nothing in any state and still resolves.
    * A call admitted while the runner was running that then fails after the run stopped, whether by
    * `stop()`, `disconnect()` or a crash, rejects with `CONSUMER_STOPPING`, the failure as its
    * `cause`, and is not retried: a crash stops the run the same way, and a restart is a new run
@@ -2212,9 +2215,12 @@ module.exports = class Runner extends EventEmitter {
    * @param {object} [batch] the original handler batch, absent for detached calls
    * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
    *   public call's private deadline scope
-   * @returns {Promise<void>} resolves at once, committing nothing, when the runner is not running
-   * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|import('../errors').KafkaJSCommitFailedError|Error}
-   *   `CONSUMER_STOPPING` when an admitted call fails after the run stopped
+   * @returns {Promise<void>|undefined} settles once the offsets are committed; `undefined` for an
+   *   empty list on a runner that is not running
+   * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|import('../errors').KafkaJSCommitFailedError|import('../errors').KafkaJSNonRetriableError|Error}
+   *   as a rejection, never synchronously: `CONSUMER_STOPPING` when the call starts during a stop
+   *   or a crash cleanup, or an admitted call fails after the run stopped;
+   *   `KafkaJSNonRetriableError` when it starts before the run is running
    */
   commitOffsets(offsets, batch = handlerContext.current() ?? null, { operation } = {}) {
     const ownership = this.consumerGroup.ownership
@@ -2246,7 +2252,14 @@ module.exports = class Runner extends EventEmitter {
         offsets,
       })
       release?.()
-      return
+      if (!offsets.topics?.length) return
+      return Promise.reject(
+        this.stopRequested
+          ? consumerStoppingError()
+          : new KafkaJSNonRetriableError(
+              'Consumer is not running, wait for consumer#run to resolve first'
+            )
+      )
     }
 
     const retrier =

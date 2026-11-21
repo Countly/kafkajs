@@ -1658,7 +1658,9 @@ class ConsumerWorker extends Worker {
    * succeeded settles the offsets the member owed on the key; a failed one leaves them owed.
    * `current` is asked synchronously at the public call, after the begin record was journaled: when
    * the view the offset came from moved meanwhile, nothing is sent and the commit ends `refused`
-   * (`DrainViewMoved`), so an offset is never sent under an authority it was not read under.
+   * (`DrainViewMoved`), so an offset is never sent under an authority it was not read under. A
+   * call the client refuses at its start because the run is still starting sends nothing and also
+   * ends `refused`; `CONSUMER_STOPPING` stays `unknown`, since it can follow a transmitted attempt.
    * @param {ClientRig} rig
    * @param {{ key: { topic: string, topicId: string, partition: number }, authority: object }} captured
    *   the key and the authority the commit is made under
@@ -1704,9 +1706,13 @@ class ConsumerWorker extends Worker {
       else rig.uncommitted.delete(k)
     } catch (e) {
       const refused = ['KafkaJSCommitFailedError', 'KafkaJSStaleAssignmentError', 'DrainViewMoved']
-      outcome = refused.includes(e.name) ? 'refused' : 'unknown'
+      const notRunning =
+        e.name === 'KafkaJSNonRetriableError' && e.message?.startsWith('Consumer is not running')
+      outcome = refused.includes(e.name) || notRunning ? 'refused' : 'unknown'
       errorType = e.name ?? 'Error'
-      if (e.name === 'DrainViewMoved')
+      if (notRunning)
+        await runtime.diagnose(`expected refusal: commit ${commit} not sent, the run is starting`)
+      else if (e.name === 'DrainViewMoved')
         await runtime.diagnose(`expected skip: commit ${commit} not sent, ${e.message}`)
       else if (e.name === 'KafkaJSCommitFailedError' && e.reason === 'stale-assignment')
         await runtime.diagnose(
