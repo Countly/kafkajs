@@ -1,10 +1,10 @@
 --- a/src/cluster/brokerPool.js
 +++ b/src/cluster/brokerPool.js
-@@ -705,7 +705,6 @@
+@@ -1084,7 +1084,6 @@
          try {
            const response = await broker.metadata(topics, ...requestArgs)
            fence?.check()
 -          check()
            if (!applicable()) return
            if (accept) {
-             const incoming = response.topicMetadata.filter(({ topic }) => accept(topic))
+             const settled = this.settleTopicErrors(response.topicMetadata, accept)

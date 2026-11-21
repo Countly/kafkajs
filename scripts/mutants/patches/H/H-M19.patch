@@ -1,6 +1,6 @@
 --- a/src/consumer/rebalanceCoordinator.js
 +++ b/src/consumer/rebalanceCoordinator.js
-@@ -289,6 +289,7 @@
+@@ -308,6 +308,7 @@
        const group = this.consumerGroup
        const hooks = group.rebalanceHooks
        const additionHold = hooks ? Object.freeze({}) : null
@@ -8,7 +8,7 @@
        try {
          if (reason) {
            this.instrumentationEmitter.emit(REBALANCING, {
-@@ -398,7 +399,10 @@
+@@ -418,11 +419,14 @@
          // An ordinary callback failure finishes the live transitions above and then ends the chain,
          // unchanged, before fetch admission restarts.
          const listenerFailure = hooks && group.takeListenerFailure(round)
@@ -18,11 +18,7 @@
 +          throw listenerFailure
 +        }
  
-         // `kind` here is the ROUND kind, only 'lost' | 'revoked'. The MEMBERSHIP kind is a separate
-         // variable: testing the round kind against 'classic' would be permanently false and would
-@@ -424,7 +428,7 @@
-           await this.yieldBetweenRounds()
-         }
+         ;({ kind, reason } = await this.followUp(revoked.length > 0 && cooperative))
        } finally {
 -        if (hooks) this.finishListenerRound(round, additionHold)
 +        if (hooks) this.finishListenerRound(round, ordinaryThrow ? null : additionHold)

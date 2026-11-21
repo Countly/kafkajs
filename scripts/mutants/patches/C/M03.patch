@@ -1,11 +1,11 @@
 --- a/src/consumer/idleWait.js
 +++ b/src/consumer/idleWait.js
-@@ -32,7 +32,7 @@
-       const waiter = { timer: null, finish: null }
+@@ -36,7 +36,7 @@
+       let unregister = null
        waiter.finish = () => {
          if (!this.waiters.delete(waiter)) return
 -        clearTimeout(waiter.timer)
 +        void waiter.timer
+         unregister?.()
          resolve()
        }
-       waiter.timer = setTimeout(waiter.finish, ms)

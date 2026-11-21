@@ -564,14 +564,14 @@
       "id": "C/M03",
       "area": "C",
       "target": "src/consumer/idleWait.js",
-      "line": 35,
+      "line": 39,
       "operator": "patch",
       "original": "        clearTimeout(waiter.timer)",
       "mutated": "        void waiter.timer",
       "spec": "src/consumer/__tests__/idleWait.spec.js",
       "title": "idle waiter ownership wakes all waiters once without saving a wake credit",
       "commandClass": "unit",
-      "patchSha": "94cf5be63994e1c56c82026339a0f8ac71b60eec9da41f5b5283a24468ffddc9"
+      "patchSha": "c8e17325b7e2e1573a7ceca027f89e4587ae38dc2eb7f06eee4732882a04b664"
     },
     {
       "id": "C/M04",
@@ -616,14 +616,14 @@
       "id": "C/M07",
       "area": "C",
       "target": "src/consumer/consumerGroup.js",
-      "line": 1716,
+      "line": 1784,
       "operator": "patch",
-      "original": "      if (!assigned.get(topic)?.has(partition)) this.seekOffset.delete(key)",
-      "mutated": "      if (false) this.seekOffset.delete(key)",
+      "original": "        if (!assigned.get(topic)?.has(partition) && !subscribed.has(topic)) {",
+      "mutated": "        if (false) {",
       "spec": "src/consumer/__tests__/consumerRetention.spec.js",
       "title": "classic retention core bounds pause, configuration, replica, grown-name and queued-seek state over churn",
       "commandClass": "unit",
-      "patchSha": "2e45816d97770fa335fbe872dc48a4fe20878ace32c2d7abd45ea71db9662870"
+      "patchSha": "9c29303fa9f1d4394b2b150438878d4273ef0d4bc8300f786e8e0603b1556fc9"
     },
     {
       "id": "C/M08",
@@ -811,14 +811,14 @@
       "id": "C2/M23",
       "area": "C2",
       "target": "src/cluster/brokerPool.js",
-      "line": 708,
+      "line": 1087,
       "operator": "patch",
       "original": "          check()",
       "mutated": "",
       "spec": "src/cluster/__tests__/metadataContract.spec.js",
       "title": "Cluster > metadata contract stage 3: the call on a broker a refresh rejects with the guard error when the guard fails while the answer is in flight",
       "commandClass": "unit",
-      "patchSha": "6db3041ae91790b0125d5d6329c15ef3c04ca8c288a8aaf9c1c307cdaae5a8ce"
+      "patchSha": "68d8e8aa267027bbe8036f4c3657d59d892b46adb18cb381bb41fbb054d10d8c"
     },
     {
       "id": "C2/M24",
@@ -993,14 +993,14 @@
       "id": "C2/M37.r1",
       "area": "C2",
       "target": "src/consumer/groupProtocol/classic.js",
-      "line": 342,
+      "line": 347,
       "operator": "patch",
       "original": "    const coordinator = await this.coordinatorLookup.find(round?.fence)",
       "mutated": "    const coordinator = await this.coordinatorLookup.find()",
       "spec": "src/consumer/__tests__/roundRetirement.spec.js",
       "title": "a coordinator lookup the stop abandons does not ask again when a held lookup fails after the stop",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "eac45423bfef43ef8863b0174b09966718422eb05823e63201f63158193c19db"
     },
     {
       "id": "C2/M38",
@@ -1214,14 +1214,14 @@
       "id": "D/D03",
       "area": "D",
       "target": "src/consumer/groupProtocol/consumer.js",
-      "line": 847,
+      "line": 891,
       "operator": "patch",
       "original": "    const membership = this.membershipRevision",
       "mutated": "    const epoch = this.target?.localEpoch",
       "spec": "src/consumer/__tests__/consumerDiscovery.spec.js",
       "title": "Consumer > target discovery retires the background re-read across an equal-valued replacement target",
       "commandClass": "unit",
-      "patchSha": "0fbae01429a4ff7d2bc8ffeeee9ed36fc5140f4c986556fc748cb8214b19c06a"
+      "patchSha": "41cba880eb415965b59055e7d3d679d143de154b27bf44d4114e4f6ee0eedf75"
     },
     {
       "id": "D/D04",
@@ -1253,14 +1253,14 @@
       "id": "D/D06",
       "area": "D",
       "target": "src/consumer/groupProtocol/consumer.js",
-      "line": 886,
+      "line": 936,
       "operator": "patch",
       "original": "        if (!isCurrent()) return",
       "mutated": "",
       "spec": "src/consumer/__tests__/consumerDiscovery.spec.js",
       "title": "Consumer > target discovery does not publish counters from an obsolete resolution even if its helper returns ids",
       "commandClass": "unit",
-      "patchSha": "8645f95579985989aedc3100678b2a97329acda4d728396642d9a45a7907b844"
+      "patchSha": "1e58e992fa75474fd4cd21ab9c46bd0dae95357834350968d2210c8769b163f5"
     },
     {
       "id": "D/D08",
@@ -1279,14 +1279,14 @@
       "id": "D/D09",
       "area": "D",
       "target": "src/consumer/groupProtocol/consumer.js",
-      "line": 1469,
+      "line": 1630,
       "operator": "patch",
       "original": "      learnOwnershipLoss(this.ownership, unsupported, REBALANCE_PATHS.HEARTBEAT, 'consumer')",
       "mutated": "",
       "spec": "src/consumer/__tests__/consumerProtocolFaults.spec.js",
       "title": "Consumer > heartbeat fault matrix before join in JOINING with fault 35 has outcome FATAL",
       "commandClass": "unit",
-      "patchSha": "964939aca2790b6ad9e33dd8a3daee5706f0a509bb25336bd418bd34e4f96ea9"
+      "patchSha": "42b68f43840ca9c730773e612f78e44d84c8cb1646bf02c8b6129924842b40f1"
     },
     {
       "id": "D/D10",
@@ -1526,14 +1526,14 @@
       "id": "E/E02",
       "area": "E",
       "target": "src/consumer/offsetManager/index.js",
-      "line": 783,
+      "line": 981,
       "operator": "patch",
-      "original": "        this.operations.fence(ticket, topic, partition)",
-      "mutated": "        this.operations.apply(ticket, topic, partition)",
+      "original": "",
+      "mutated": "    this.operations.discharge(topic, partition)",
       "spec": "src/consumer/__tests__/offsetReset.spec.js",
       "title": "offset reset a local concrete seek fences old work without settling recreation debt",
       "commandClass": "unit",
-      "patchSha": "543817915d016836f8d0f81f0c0ac6f04d7bb9ffe8099c7fd7da590fe7b95cf3"
+      "patchSha": "b851a551600f95fd1e4e10fbd6237bc8244e8c2eb0c0d41c5f3ed8aa54654b71"
     },
     {
       "id": "E/E03",
@@ -1630,14 +1630,14 @@
       "id": "E/E10",
       "area": "E",
       "target": "src/consumer/offsetManager/index.js",
-      "line": 684,
+      "line": 839,
       "operator": "patch",
       "original": "          topics: [{ topic, partitions: [{ partition, offset: actualOffset }] }],",
       "mutated": "          topics: [{ topic, partitions: [{ partition, offset: '-1' }] }],",
       "spec": "src/consumer/__tests__/offsetReset.spec.js",
       "title": "duration default reset uses an actual offset with autoCommit true",
       "commandClass": "unit",
-      "patchSha": "777526c0fdd544800261471260ecee236576c0e90ed18b49c1268d6e94aca750"
+      "patchSha": "82bc595717f35026899274f5bca7cb38ac9fdb7c5dfcc771957157ff7000723f"
     },
     {
       "id": "E/E11",
@@ -1890,40 +1890,40 @@
       "id": "F/F-M08",
       "area": "F",
       "target": "src/cluster/brokerPool.js",
-      "line": 709,
+      "line": 1088,
       "operator": "patch",
       "original": "          if (!applicable()) return",
       "mutated": "",
       "spec": "src/consumer/__tests__/regexDiscovery.spec.js",
       "title": "subscription matching and metadata scope an older full reply cannot install over a newer full reply",
       "commandClass": "unit",
-      "patchSha": "739bb248f082fd406eabb4f53dce51628eec7d40bb9eef2796ba53b7bb63fda3"
+      "patchSha": "ef954d639ba1cb1150a9b1bd8dbd82c7636b153c2430592834ca82b2b179e4ec"
     },
     {
       "id": "F/F-M09",
       "area": "F",
       "target": "src/cluster/brokerPool.js",
-      "line": 672,
+      "line": 1048,
       "operator": "patch",
-      "original": "      topics = []",
-      "mutated": "      topics = topics",
+      "original": "    if (clientPattern) topics = []",
+      "mutated": "    if (clientPattern) topics = topics",
       "spec": "src/consumer/__tests__/regexDiscovery.spec.js",
       "title": "subscription matching and metadata scope pattern scope asks all topics with auto creation disabled, including zero matches",
       "commandClass": "unit",
-      "patchSha": "517cfda4ff2ffbffcb043209620376e3c85b71698d0348e7bc5b34107f207a6d"
+      "patchSha": "8a49db5760724d58d46479e13a8c4b492a40168b74600ab0844ca6bf24c4b2a4"
     },
     {
       "id": "F/F-M10",
       "area": "F",
       "target": "src/cluster/brokerPool.js",
-      "line": 673,
+      "line": 1049,
       "operator": "patch",
-      "original": "      allowAutoTopicCreation = false",
-      "mutated": "      allowAutoTopicCreation = true",
+      "original": "    if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = false",
+      "mutated": "    if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = true",
       "spec": "src/consumer/__tests__/regexDiscovery.spec.js",
       "title": "subscription matching and metadata scope pattern scope asks all topics with auto creation disabled, including zero matches",
       "commandClass": "unit",
-      "patchSha": "963d6b0ab0e8dd295c33b9ce9b1ab8e4f65e48000d11ca9da184ca62ac9b37a2"
+      "patchSha": "ecc3c3d927e2f8e3d1cf584dfc7971bb1f97cedb61cccf896a99b8942a140640"
     },
     {
       "id": "F/F-M11",
@@ -1968,14 +1968,14 @@
       "id": "F/F-M14",
       "area": "F",
       "target": "src/cluster/index.js",
-      "line": 870,
+      "line": 1236,
       "operator": "patch",
       "original": "        this.metadataCache.forget(topic)",
       "mutated": "",
       "spec": "src/consumer/__tests__/regexDiscovery.spec.js",
       "title": "subscription matching and metadata scope replacement targets prune both caches and keep prototype-looking names indexed",
       "commandClass": "unit",
-      "patchSha": "440d6711ccc30567035bae8b9877c1ce8a760cad4c44b86f95a0dae9513798dd"
+      "patchSha": "9fe0c4d592721c7222355e6df2f0d5f74b7dbd354c3343813556c02ba01922bc"
     },
     {
       "id": "F/F-M15",
@@ -2033,27 +2033,27 @@
       "id": "G/M01",
       "area": "G",
       "target": "src/broker/index.js",
-      "line": 1433,
+      "line": 1827,
       "operator": "patch",
-      "original": "    if (apiVersion === 8 || apiVersion === 9) {",
-      "mutated": "    if (apiVersion === 8) {",
+      "original": "          if (apiVersion >= 8 && data.groupId !== groupId) {",
+      "mutated": "          if (apiVersion === 8 && data.groupId !== groupId) {",
       "spec": "src/consumer/__tests__/directConsumerWire.spec.js",
       "title": "Consumer offset response identity refuses another group at version 9 before returning offsets",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "539a3acb91245644ff9469e1d93f91400de90942841f33ddba8ec2eb18de5765"
     },
     {
       "id": "G/M02",
       "area": "G",
       "target": "src/broker/index.js",
-      "line": 1445,
+      "line": 1827,
       "operator": "patch",
-      "original": "          if (data.groupId !== groupId) {",
+      "original": "          if (apiVersion >= 8 && data.groupId !== groupId) {",
       "mutated": "          if (false) {",
       "spec": "src/consumer/__tests__/directConsumerWire.spec.js",
       "title": "Consumer offset response identity refuses another group at version 8 before returning offsets",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "c5a6ad239132538d3004943dcbb50a78fb5f53b430ff5acff37a26c6b42b9865"
     },
     {
       "id": "G/M03",
@@ -2072,14 +2072,14 @@
       "id": "G/M04",
       "area": "G",
       "target": "src/protocol/requests/offsetFetch/v8/response.js",
-      "line": 42,
+      "line": 55,
       "operator": "patch",
       "original": "  if (groups.length !== 1) {",
       "mutated": "  if (false) {",
       "spec": "src/protocol/requests/offsetFetch/v8/response.spec.js",
       "title": "Protocol > Requests > OffsetFetch > v8 a response with anything other than exactly one group is rejected",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "1d796cb535eddb48ac0cebac4ad20d55e97ba8c256b4f7745cf64ffcefb2f1ee"
     },
     {
       "id": "G/M05",
@@ -2267,14 +2267,14 @@
       "id": "G/M19",
       "area": "G",
       "target": "src/consumer/consumerGroup.js",
-      "line": 3370,
+      "line": 3720,
       "operator": "patch",
       "original": "      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error",
       "mutated": "      if (false) throw halted.error",
       "spec": "src/consumer/__tests__/position.spec.js",
       "title": "Consumer next position rejects with the stored reset refusal instead of zero",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "6f4fffed0a47a15f6235ce2e10eb07c18a5df0156baa86fd89f4b5267363f245"
     },
     {
       "id": "G/M20",
@@ -2293,14 +2293,14 @@
       "id": "G/M21",
       "area": "G",
       "target": "src/consumer/consumerGroup.js",
-      "line": 3367,
+      "line": 3711,
       "operator": "patch",
-      "original": "      await this.seekOffsets([{ topic, partitions: [partition] }], preparation)",
-      "mutated": "      this.seekOffsets([{ topic, partitions: [partition] }], preparation)",
+      "original": "      if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)",
+      "mutated": "      if (!quiescent) this.seekOffsets([{ topic, partitions: [partition] }], preparation)",
       "spec": "src/consumer/__tests__/position.spec.js",
       "title": "Consumer next position rejects a position that outlives its assignment",
       "commandClass": "unit",
-      "patchSha": "ce3b8b5edb7524408bc47a8ea22040240730fa3429ca05959be70dad67f30b3e"
+      "patchSha": "a695072385601bd52d40c2927cd05185df53598ca481d58d99843695bddbdac2"
     },
     {
       "id": "G/M22",
@@ -2345,27 +2345,27 @@
       "id": "G/I02",
       "area": "G",
       "target": "src/consumer/index.js",
-      "line": 363,
+      "line": 405,
       "operator": "patch",
       "original": "    privateState ? privateState.operations : cluster.offsetOperations({ groupId })",
       "mutated": "    cluster.offsetOperations({ groupId })",
       "spec": "src/consumer/__tests__/directConsumerPublic.spec.js",
       "title": "A manual consumer over a scripted broker two consumers without a group on one client keep independent positions",
       "commandClass": "unit",
-      "patchSha": "93a64e3b9d8e92ce932ddace1cb8e61d258dbbff4f6aaf0a4deb49eda9544de8"
+      "patchSha": "083133049ec4e2e8b05008d4b9c3acb8f1e483983be4f66b8f19005c7f34b200"
     },
     {
       "id": "G/I02.b",
       "area": "G",
-      "target": "src/consumer/offsetManager/index.js",
-      "line": 1908,
+      "target": "src/consumer/index.js",
+      "line": 402,
       "operator": "patch",
-      "original": "        this.groupId === undefined",
-      "mutated": "        this.cluster.committedOffsets({ groupId: this.groupId })",
+      "original": "    : { offsets: privateOffsets, operations: new OffsetOperations(privateOffsets) }",
+      "mutated": "    : { offsets: privateOffsets, operations: new OffsetOperations(cluster.committedOffsets({ groupId })) }",
       "spec": "src/consumer/__tests__/directConsumerPublic.spec.js",
       "title": "A manual consumer over a scripted broker two consumers without a group on one client keep independent positions",
       "commandClass": "unit",
-      "patchSha": "0af3f46aa595365d3ca5caca0f7e3a165e46e0b9fd60188efb637228522645b4"
+      "patchSha": "93fad2819b2e96e2306860017ac9e964a134f4cc3346bfea71bf2c873739532f"
     },
     {
       "id": "G/I04",
@@ -2410,14 +2410,14 @@
       "id": "G/I06",
       "area": "G",
       "target": "src/consumer/runner.js",
-      "line": 1508,
+      "line": 1820,
       "operator": "patch",
       "original": "        runIdentity: this.consumerGroup.runIdentity,",
       "mutated": "",
       "spec": "src/consumer/__tests__/directConsumerPublic.spec.js",
       "title": "A manual consumer over a scripted broker work a retired grouped handler left behind cannot touch the replacement manual run, including stop()",
       "commandClass": "unit",
-      "patchSha": "6c77705a16194e08c70fdaccf9e06403e2627f98e4ed5c268f5e8268c8a3a7e1"
+      "patchSha": "0e7913505e55561aee198ee8461b3d3355505c0a69945e5876e2dd22a38d3591"
     },
     {
       "id": "G/I07",
@@ -2462,14 +2462,14 @@
       "id": "G/I10",
       "area": "G",
       "target": "src/consumer/consumerGroup.js",
-      "line": 3370,
+      "line": 3720,
       "operator": "patch",
       "original": "      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error",
       "mutated": "      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) return '0'",
       "spec": "src/consumer/__tests__/position.spec.js",
       "title": "Consumer next position rejects with the stored reset refusal instead of zero",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "042af5ef61e95e0da6cc831f8a73c093374b3d9a810ccbffa9701d289688ad5a"
     },
     {
       "id": "G/I11",
@@ -2514,14 +2514,14 @@
       "id": "G/I12.b",
       "area": "G",
       "target": "src/consumer/offsetManager/index.js",
-      "line": 684,
+      "line": 839,
       "operator": "patch",
       "original": "          topics: [{ topic, partitions: [{ partition, offset: actualOffset }] }],",
       "mutated": "          topics: [{ topic, partitions: [{ partition, offset: '-1' }] }],",
       "spec": "src/consumer/__tests__/offsetReset.spec.js",
       "title": "duration default reset uses an actual offset with autoCommit true",
       "commandClass": "unit",
-      "patchSha": "777526c0fdd544800261471260ecee236576c0e90ed18b49c1268d6e94aca750"
+      "patchSha": "82bc595717f35026899274f5bca7cb38ac9fdb7c5dfcc771957157ff7000723f"
     },
     {
       "id": "G/I13",
@@ -2540,27 +2540,27 @@
       "id": "G/I13.b",
       "area": "G",
       "target": "src/consumer/offsetManager/index.js",
-      "line": 783,
+      "line": 981,
       "operator": "patch",
       "original": "",
-      "mutated": "        this.obligations.discharge(topic, partition)",
+      "mutated": "    this.obligations.discharge(topic, partition)",
       "spec": "src/consumer/__tests__/offsetReset.spec.js",
       "title": "offset reset a local concrete seek fences old work without settling recreation debt",
       "commandClass": "unit",
-      "patchSha": "c40c8d29f09b48bbeea6e9b566a6dda56a74e3865b1fa84cd38e767ccf5b1165"
+      "patchSha": "270d2235669f86970f04726dfa9f03c75780666ff2cec440ce43ba62094bdb97"
     },
     {
       "id": "G/I13.c",
       "area": "G",
       "target": "src/consumer/offsetManager/index.js",
-      "line": 1639,
+      "line": 2119,
       "operator": "patch",
       "original": "",
       "mutated": "      for (const partition of written) this.obligations.discharge(topic, partition)",
       "spec": "src/consumer/__tests__/offsetReset.spec.js",
       "title": "offset reset recreation resolution stays owed until a successful concrete commit",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "d1438b02eaf3ff1de853e3b76a677364d07e7b671f896af678dee765071ee0ba"
     },
     {
       "id": "G/I14",
@@ -2891,27 +2891,27 @@
       "id": "H/H-M18",
       "area": "H",
       "target": "src/consumer/rebalanceCoordinator.js",
-      "line": 332,
+      "line": 352,
       "operator": "patch",
       "original": "            ...(additionHold && { additionHold }),",
-      "mutated": "",
+      "mutated": "          })",
       "spec": "src/consumer/__tests__/rebalanceListener.spec.js",
       "title": "awaited rebalance callbacks in a round added partitions stay held from admission until the assigned callback returns",
       "commandClass": "unit",
-      "patchSha": "bad8c373ddf917a3da9c484d3628ea94341822d494dd50a92057b03396039e74"
+      "patchSha": "728f67a95bcb443b8865ffda2046d793debe49bd3d8892017f6d479183552172"
     },
     {
       "id": "H/H-M19",
       "area": "H",
       "target": "src/consumer/rebalanceCoordinator.js",
-      "line": 292,
+      "line": 311,
       "operator": "patch",
       "original": "",
       "mutated": "      let ordinaryThrow = false",
       "spec": "src/consumer/__tests__/rebalanceListener.spec.js",
       "title": "awaited rebalance callbacks in a round ordinary failure finishes the live round and ends the chain with the exact first error (string)",
       "commandClass": "unit",
-      "patchSha": "5aa6b647eaf96efe81e7570a7784e5416f0d98a80403a7736f3be0013d3ed28b"
+      "patchSha": "bef761f2c17bc54f155d43226104d389f5145bb6411cc15d6146ba9b66caff35"
     },
     {
       "id": "H/H-M20",
@@ -3112,14 +3112,14 @@
       "id": "I/I11",
       "area": "I",
       "target": "src/consumer/groupProtocol/interface.js",
-      "line": 341,
+      "line": 347,
       "operator": "patch",
       "original": "          unown = this.register(() => clearTimeout(timer))",
       "mutated": "          unown = () => {}",
       "spec": "src/consumer/__tests__/boundedClose.spec.js",
       "title": "consumer control operation lifetime retirement clears an owned backoff timer and settles its caller",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "a53312b606e290bcb4224641f1c4b34331c63118db69cab13f8305e650a1624e"
     },
     {
       "id": "I/I12",
@@ -3281,27 +3281,27 @@
       "id": "I/IA",
       "area": "I",
       "target": "src/consumer/runner.js",
-      "line": 732,
+      "line": 862,
       "operator": "patch",
       "original": "      await this.commitFinalOffsetsContained(scope)",
-      "mutated": "",
+      "mutated": "      this.consumerGroup.clearAssignerState()",
       "spec": "src/consumer/__tests__/boundedClose.spec.js",
       "title": "a consumer close over a scripted broker classic stop attempts the eligible final prefix once",
       "commandClass": "unit",
-      "patchSha": "146f42fc0cc51d7120e0d04cd6900d3b40e4c56614bc69e7bb37ea1f5eac5f31"
+      "patchSha": "1e1386fec1b1289e3c66341b680a9004f6852d78128f19cee38e88bb6f670c1c"
     },
     {
       "id": "I/IC",
       "area": "I",
       "target": "src/network/requestQueue/index.js",
-      "line": 209,
+      "line": 312,
       "operator": "patch",
       "original": "    const refusal = socketRequest.refusal()",
       "mutated": "    const refusal = null",
       "spec": "src/consumer/__tests__/consumerApiDeadlines.spec.js",
       "title": "a real connection under an API operation with request timeout enforcement true a queued unsent request is refused at transmission without a frame or an in-flight slot",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "f4c5a753f5b57229b65d4059d3ddf810e40c57adcde88799519ec03c032308ec"
     },
     {
       "id": "I/ID",
@@ -3333,14 +3333,14 @@
       "id": "I/IF",
       "area": "I",
       "target": "src/consumer/offsetManager/index.js",
-      "line": 1141,
+      "line": 1607,
       "operator": "patch",
       "original": "        written.forEach((partition) =>",
       "mutated": "        written.forEach((partition) => this.operations.apply(ticket, topic, partition))",
       "spec": "src/consumer/offsetManager/__tests__/resetSchedules.spec.js",
       "title": "Consumer > OffsetManager > reset schedules a mutation applied by another participant settles the reset C13 a mutation made under an unknown topic id settles nothing, and neither does one made under an older incarnation",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "0291032ce543bd067100fe79b816d1a2ce47b00121d60655c1232a1eb970fb18"
     },
     {
       "id": "J/J01",
@@ -4191,14 +4191,14 @@
       "id": "K/KI12.b",
       "area": "K",
       "target": "src/index.js",
-      "line": 573,
+      "line": 773,
       "operator": "patch",
-      "original": "    fetchSessions = false,",
-      "mutated": "    fetchSessions = true,",
+      "original": "      fetchSessions = false,",
+      "mutated": "      fetchSessions = true,",
       "spec": "src/consumer/__tests__/consumerDefaults.spec.js",
       "title": "consumer configuration defaults the public factory passes the session option and the client request timeout on",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "bbbcd0aac5a2c9d190fb590543e466bee2f0ebde8234f393f0fb0c075c5ee0a3"
     },
     {
       "id": "L/M01",
@@ -4230,14 +4230,14 @@
       "id": "L/M03.r1",
       "area": "L",
       "target": "testHelpers/lifecycle.js",
-      "line": 86,
+      "line": 87,
       "operator": "patch",
       "original": "  return [...cells, ...manualCells()]",
       "mutated": "  return cells",
       "spec": "src/consumer/__tests__/consumerSchedules.spec.js",
       "title": "Consumer schedule contracts generates manual and all callback boundaries without impossible membership cells",
       "commandClass": "unit",
-      "stale": "stale hunk: 1 out of 1 hunk FAILED"
+      "patchSha": "13497410c2c9d27cd56086c06bcae80e2bb3151e996f95652ac255d7432c841c"
     },
     {
       "id": "L/M04",

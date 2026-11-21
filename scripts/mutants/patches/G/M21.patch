@@ -1,11 +1,11 @@
 --- a/src/consumer/consumerGroup.js
 +++ b/src/consumer/consumerGroup.js
-@@ -3364,7 +3364,7 @@
-     }
+@@ -3708,7 +3708,7 @@
      check()
-     for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass++) {
--      await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
-+      this.seekOffsets([{ topic, partitions: [partition] }], preparation)
+     const quiescent = invocation !== undefined && this.isStopping()
+     for (let pass = 0; pass < MAX_RESOLUTION_PASSES;) {
+-      if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
++      if (!quiescent) this.seekOffsets([{ topic, partitions: [partition] }], preparation)
        check()
-       const halted = this.haltedPartitions.get(key)
-       if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
+       if (!quiescent && this.isSeekGated(topic, partition)) {
+         const held = this.operations.reservation(topic, partition)

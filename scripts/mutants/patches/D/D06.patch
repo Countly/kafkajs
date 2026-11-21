@@ -1,10 +1,10 @@
 --- a/src/consumer/groupProtocol/consumer.js
 +++ b/src/consumer/groupProtocol/consumer.js
-@@ -883,7 +883,6 @@
-       if (!isCurrent()) return
-       try {
-         const outcome = await this.cluster.refreshMetadataForTopicIds(askable, { isCurrent })
+@@ -933,7 +933,6 @@
+           isCurrent,
+           surface: true,
+         })
 -        if (!isCurrent()) return
+         const stalled = []
          for (const topicId of outcome?.unresolved || []) {
-           this.unresolvedAttempts.set(
-             topicId,
+           const attempts = (this.unresolvedAttempts.get(topicId) || 0) + 1
