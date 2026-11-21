@@ -22608,7 +22608,19 @@
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv1) a stale handler call is refused at admission while an earlier offset call is in flight",
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv1) a stale input refuses the commit before its coordinator is looked up",
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale handler call is refused at admission while an earlier offset call is in flight",
-        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale input refuses the commit before its coordinator is looked up"
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale input refuses the commit before its coordinator is looked up",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check decides as the per-topic scan did for generated answers and targets",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows a plain refresh that replaces the answer",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows a producer refresh that merges the accepted topics into the retained answer",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows a consumer refresh that isolates an established topic",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows a forgotten topic",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows a rebootstrap that drops the answer",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows a disconnect that drops the answer",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check follows an answer assigned directly",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes the freshness check reads each row name a bounded number of times however often a warm client checks",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes findLeaderForPartitions groups as the per-partition search did for generated partitions and requests",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes findLeaderForPartitions follows a leader written onto the installed partition and a new answer",
+        "src/cluster/__tests__/metadataIndexes.spec.js \u203a Cluster > metadata indexes findLeaderForPartitions reads each partition id a bounded number of times however often a route is looked up"
       ],
       "capMinutes": 85,
       "allowedSkips": [
