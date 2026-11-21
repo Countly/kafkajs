@@ -1233,11 +1233,15 @@ module.exports = class BrokerPool {
    * Overlapping admin calls share one target set, but any answer (another call's named read, a
    * fenced refresh, a retry, a late answer of an older request, an older all-topics answer, or one
    * sent after the admin's own `deleteTopics` pruned the name) may lack a topic a running call still
-   * routes. A topic no call holds is not retained, so the next answer that lacks it drops it; a
-   * held topic that was deleted keeps its old routing until its holder asks for it by name and
+   * routes. A retained row keeps the installed broker entry of each leader it names that the answer
+   * does not list, so the broker reconciliation that follows does not retire a broker a held route
+   * still uses (an older answer can predate that broker). Such a broker stays only while a held row
+   * names it: the next answer that carries the topic, or lacks it after the last hold ended,
+   * replaces both. A topic no call holds is not retained, so the next answer that lacks it drops it;
+   * a held topic that was deleted keeps its old routing until its holder asks for it by name and
    * gets `UNKNOWN_TOPIC_OR_PARTITION`.
    * @param {object} response the decoded answer
-   * @returns {object} `response`, or a copy whose topics include the retained ones
+   * @returns {object} `response`, or a copy whose topics and brokers include the retained ones
    */
   withRetainedTopics(response) {
     if (!this.retainTopic || !this.metadata) return response
@@ -1246,7 +1250,18 @@ module.exports = class BrokerPool {
       ({ topic }) => !answered.has(topic) && this.retainTopic(topic)
     )
     if (retained.length === 0) return response
-    return { ...response, topicMetadata: [...retained, ...response.topicMetadata] }
+    const listed = new Set(response.brokers.map(({ nodeId }) => nodeId))
+    const leaders = new Set(
+      retained.flatMap(({ partitionMetadata }) => partitionMetadata.map(({ leader }) => leader))
+    )
+    const kept = this.metadata.brokers.filter(
+      ({ nodeId }) => leaders.has(nodeId) && !listed.has(nodeId)
+    )
+    return {
+      ...response,
+      brokers: kept.length > 0 ? [...response.brokers, ...kept] : response.brokers,
+      topicMetadata: [...retained, ...response.topicMetadata],
+    }
   }
 
   /**

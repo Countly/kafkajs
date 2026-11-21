@@ -290,38 +290,49 @@ module.exports = class Cluster {
     // A refresh joins only calls of its own scope: a producer's fence, else the consumer's
     // subscription key (it moves with the generation and the declaration revision), else the
     // registration generation, so nothing joins a refresh begun before a mode change. While admin
-    // calls hold targets, an unfenced refresh is joined only by calls that see the target set it
-    // reads when it starts, so a call never waits on an answer that lacks its own topics.
-    const shareScopeOf = ({ fence, metadataScope } = {}) =>
-      fence ??
-      (metadataScope ?? this.brokerPool.consumerMetadataScope)?.shareKey() ??
-      (this.targetHolds.size > 0 ? `held:${[...this.targetTopics].join('\0')}` : null) ??
+    // calls hold targets, an unfenced refresh captures the target names once, when a call enrolls,
+    // and is keyed on and sends exactly those names, so a call never joins an answer that lacks its
+    // own topics.
+    const scopeKeyOf = ({ fence, metadataScope } = {}) =>
+      fence ?? (metadataScope ?? this.brokerPool.consumerMetadataScope)?.shareKey()
+    const shareScopeOf = ({ heldTopics, ...scope } = {}) =>
+      scopeKeyOf(scope) ??
+      (heldTopics && `held:${JSON.stringify(heldTopics)}`) ??
       this.brokerPool.consumerMetadataGeneration ??
       0
+    const shareRefresh = (work) => {
+      const shared = shareMetadata(work, shareScopeOf)
+      return (options = {}) =>
+        shared.call(
+          this,
+          retainTargets && this.targetHolds.size > 0 && scopeKeyOf(options) == null
+            ? { ...options, heldTopics: [...this.targetTopics] }
+            : options
+        )
+    }
 
-    this[PRIVATE.REFRESH_METADATA] = shareMetadata(async ({ fence, ...scope } = {}) => {
+    this[PRIVATE.REFRESH_METADATA] = shareRefresh(async ({ fence, heldTopics, ...scope } = {}) => {
       fence?.check()
       checked(null)
       this.pruneTargetTopics()
       if (this.targetTopicState !== null && this.targetTopics.size === 0) return
       return await this.brokerPool.refreshMetadata(
-        Array.from(this.targetTopics),
+        heldTopics ?? Array.from(this.targetTopics),
         ...refreshArgs({ fence, ...scope })
       )
-    }, shareScopeOf)
+    })
 
-    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareMetadata(
-      async ({ fence, ...scope } = {}) => {
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareRefresh(
+      async ({ fence, heldTopics, ...scope } = {}) => {
         fence?.check()
         checked(null)
         this.pruneTargetTopics()
         if (this.targetTopicState !== null && this.targetTopics.size === 0) return
         return await this.brokerPool.refreshMetadataIfNecessary(
-          Array.from(this.targetTopics),
+          heldTopics ?? Array.from(this.targetTopics),
           ...refreshArgs({ fence, ...scope })
         )
-      },
-      shareScopeOf
+      }
     )
 
     this[PRIVATE.FIND_CONTROLLER_BROKER] = shareMetadata(async () => {
