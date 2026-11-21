@@ -22608,7 +22608,18 @@
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv1) a stale handler call is refused at admission while an earlier offset call is in flight",
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv1) a stale input refuses the commit before its coordinator is looked up",
         "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale handler call is refused at admission while an earlier offset call is in flight",
-        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale input refuses the commit before its coordinator is looked up"
+        "src/producer/__tests__/transactionSeekFence.spec.js \u203a Producer > transactional seek fence (tv2) a stale input refuses the commit before its coordinator is looked up",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign installs exactly what the previous install did for 0 generated entries",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign installs exactly what the previous install did for 1 generated entries",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign installs exactly what the previous install did for 7 generated entries",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign installs exactly what the previous install did for 60 generated entries",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign installs exactly what the previous install did for 400 generated entries",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign keeps the first position and the last partitions of a repeated topic",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > SubscriptionState > assign writes the assignment table a number of times linear in the topic count",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > ConsumerGroup > applying an assignment produces the pinned tables, events and GROUP_JOIN payload in the eager protocol",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > ConsumerGroup > applying an assignment produces the pinned tables, events and GROUP_JOIN payload in the cooperative protocol",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > ConsumerGroup > applying an assignment writes its name tables a number of times linear in the topic count",
+        "src/consumer/__tests__/assignmentApplyLinear.spec.js \u203a Consumer > ConsumerGroup > applying an assignment reads each topic's known partitions a number of times linear in their count"
       ],
       "capMinutes": 85,
       "allowedSkips": [
