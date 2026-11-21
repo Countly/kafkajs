@@ -33,6 +33,8 @@ const { keys } = Object
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const LEADER_NOT_AVAILABLE = 5
+/** Least ms between two failed background refreshes, see `serveFromCache`. */
+const MIN_BACKGROUND_BACKOFF_MS = 10
 
 const mergeTopics = (obj, { topic, partitions }) =>
   Object.assign(dictionary(), obj, { [topic]: [...(obj[topic] || []), ...partitions] })
@@ -237,7 +239,10 @@ module.exports = class Cluster {
     })
 
     this.targetTopics = new Set()
-    /** @type {?{ fence: object, running: boolean, retryAt: number, backoff: number }} see `serveFromCache` */
+    /**
+     * See `serveFromCache`; `retryAt` is on the `performance.now()` clock.
+     * @type {?{ fence: object, running: boolean, retryAt: number, backoff: number }}
+     */
     this.backgroundRefresh = null
     this.metadataMaxIdle = metadataMaxIdle
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
@@ -298,10 +303,16 @@ module.exports = class Cluster {
 
     // A producer lifecycle's call shares nothing with another lifecycle's: each is scoped by its fence.
     const fenceOf = ({ fence } = {}) => fence
+    // Nor does a call join one started before the pool's last disconnect, which installs nothing.
+    const disconnectsOf = () => this.brokerPool.disconnects
 
-    this[PRIVATE.CONNECT] = shareMetadata(async ({ fence } = {}) => {
-      return await this.brokerPool.connect(...fenceArgs(fence))
-    }, fenceOf)
+    this[PRIVATE.CONNECT] = shareMetadata(
+      async ({ fence } = {}) => {
+        return await this.brokerPool.connect(...fenceArgs(fence))
+      },
+      fenceOf,
+      disconnectsOf
+    )
 
     // A refresh joins only calls of its own scope: a producer's fence, else the consumer's
     // subscription key (it moves with the generation and the declaration revision), else the
@@ -312,16 +323,20 @@ module.exports = class Cluster {
       this.brokerPool.consumerMetadataGeneration ??
       0
 
-    this[PRIVATE.REFRESH_METADATA] = shareMetadata(async ({ fence, ...scope } = {}) => {
-      fence?.check()
-      checked(null)
-      this.pruneTargetTopics()
-      if (this.targetTopicState !== null && this.targetTopics.size === 0) return
-      return await this.brokerPool.refreshMetadata(
-        Array.from(this.targetTopics),
-        ...refreshArgs({ fence, ...scope })
-      )
-    }, shareScopeOf)
+    this[PRIVATE.REFRESH_METADATA] = shareMetadata(
+      async ({ fence, ...scope } = {}) => {
+        fence?.check()
+        checked(null)
+        this.pruneTargetTopics()
+        if (this.targetTopicState !== null && this.targetTopics.size === 0) return
+        return await this.brokerPool.refreshMetadata(
+          Array.from(this.targetTopics),
+          ...refreshArgs({ fence, ...scope })
+        )
+      },
+      shareScopeOf,
+      disconnectsOf
+    )
 
     this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareMetadata(
       async ({ fence, ...scope } = {}) => {
@@ -334,7 +349,8 @@ module.exports = class Cluster {
           ...refreshArgs({ fence, ...scope })
         )
       },
-      shareScopeOf
+      shareScopeOf,
+      disconnectsOf
     )
 
     this[PRIVATE.FIND_CONTROLLER_BROKER] = shareMetadata(async () => {
@@ -594,11 +610,15 @@ module.exports = class Cluster {
    * Serves a call from the cached metadata when it names every target: at once when it is fresh,
    * and when it is only aged, after starting the shared conditional refresh without waiting for
    * it. At most one is started per lifecycle at a time; a call while it runs starts nothing and
-   * waits for nothing. Its failure is logged at debug level and delays the next start by a backoff: `initialRetryTime`, doubling on each failure up to ten times
-   * `initialRetryTime` (the ratio of the Java client's `retry.backoff.ms` to `retry.backoff.max.ms`)
-   * or `maxRetryTime` when lower; a success clears it. A refresh fenced by its lifecycle's close
-   * installs nothing, as any fenced refresh. The state is one object, replaced when the lifecycle
-   * changes, and holds no timer.
+   * waits for nothing. Its failure is logged at debug level and delays the next start by a
+   * backoff: `initialRetryTime`, doubling on each failure up to ten times `initialRetryTime` (the
+   * ratio of the Java client's `retry.backoff.ms` to `retry.backoff.max.ms`) or `maxRetryTime` when
+   * lower, and never under `MIN_BACKGROUND_BACKOFF_MS` (10 ms), so an `initialRetryTime` of 0 does
+   * not ask a failing broker back to back; a success clears it. The backoff runs on the monotonic
+   * clock (`performance.now()`), so a wall clock stepped back does not stall it. A refresh fenced
+   * by its lifecycle's close, or begun before the pool's last disconnect, installs nothing, as any
+   * fenced refresh. The state is one object, replaced when the lifecycle changes, and holds no
+   * timer.
    * @private
    * @param {import('../producer/generation')} [fence] the sending lifecycle
    * @returns {boolean} whether the call was served from the cache; false sends it the awaited way
@@ -612,7 +632,7 @@ module.exports = class Cluster {
     if (!state || state.fence !== fence) {
       state = this.backgroundRefresh = { fence, running: false, retryAt: 0, backoff: 0 }
     }
-    if (state.running || Date.now() < state.retryAt) return true
+    if (state.running || performance.now() < state.retryAt) return true
     state.running = true
     this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence }).then(
       () => {
@@ -625,13 +645,13 @@ module.exports = class Cluster {
           initialRetryTime = createRetry.defaults.initialRetryTime,
           maxRetryTime = createRetry.defaults.maxRetryTime,
         } = this.retryOptions
+        const initial = Math.max(initialRetryTime, MIN_BACKGROUND_BACKOFF_MS)
         state.running = false
-        state.backoff = Math.min(
-          state.backoff * 2 || initialRetryTime,
-          initialRetryTime * 10,
-          maxRetryTime
+        state.backoff = Math.max(
+          Math.min(state.backoff * 2 || initial, initial * 10, maxRetryTime),
+          MIN_BACKGROUND_BACKOFF_MS
         )
-        state.retryAt = Date.now() + state.backoff
+        state.retryAt = performance.now() + state.backoff
         try {
           this.logger.debug('Background metadata refresh failed', {
             error: describeThrown(error),

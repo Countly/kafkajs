@@ -1890,8 +1890,8 @@ const createSendMessages = ({
    * while the metadata cannot be loaded, within the send's delivery budget. The records are read
    * from `send` after each await: a send that settled meanwhile has none, and the wait ends without
    * enqueuing anything. A failure that arrives after the send settled is ignored: it refreshes no
-   * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure arms the
-   * transaction as `inTransaction` says.
+   * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure
+   * arms the transaction as `inTransaction` says.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline

@@ -201,12 +201,14 @@ class MetadataDiscovery extends AdminDeadline {
   /**
    * @param {() => Promise<any>} work one metadata refresh
    * @param {() => void} remove deletes only this episode from its owning map
+   * @param {any} [epoch] the epoch it started in, see `shareMetadata`
    * @returns {MetadataDiscovery} not started until its first caller is enrolled
    */
-  constructor(work, remove) {
+  constructor(work, remove, epoch) {
     super('metadata discovery', null)
     this.work = work
     this.remove = remove
+    this.epoch = epoch
     this.callers = new Set()
     this.running = null
     this.settled = false
@@ -305,19 +307,22 @@ const runWithDeadline = async (
  * Creates a metadata-only coalescer. Key identity preserves existing producer/consumer scoping.
  * @param {Function} work original refresh implementation
  * @param {Function} [keyOf] existing scope key selector
+ * @param {() => any} [epochOf] a call never joins an episode started in another epoch
  * @returns {Function} enrollment wrapper; each argument list is captured once per episode
  */
-const shareMetadata = (work, keyOf = () => undefined) => {
+const shareMetadata = (work, keyOf = () => undefined, epochOf = () => undefined) => {
   const entries = new Map()
   return function (...args) {
     const key = keyOf(...args)
+    const epoch = epochOf()
     let episode = entries.get(key)
-    if (!episode || episode.refusal()) {
+    if (!episode || episode.epoch !== epoch || episode.refusal()) {
       episode = new MetadataDiscovery(
         () => work.apply(this, args),
         () => {
           if (entries.get(key) === episode) entries.delete(key)
-        }
+        },
+        epoch
       )
       entries.set(key, episode)
     }

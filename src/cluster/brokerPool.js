@@ -260,6 +260,8 @@ module.exports = class BrokerPool {
     /** @type {import("../../types").BrokerMetadata | null} */
     this.metadata = null
     this.metadataExpireAt = null
+    /** Counts `disconnect()` calls: a refresh started before one installs nothing after it. */
+    this.disconnects = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
@@ -895,6 +897,7 @@ module.exports = class BrokerPool {
     this.retainSetupEndpoints()
     const brokers = new Set([...values(this.brokers), ...this.draining.keys()])
     if (this.seedBroker) brokers.add(this.seedBroker)
+    this.disconnects++
     this.brokers = {}
     this.metadata = null
     this.versions = null
@@ -1007,7 +1010,8 @@ module.exports = class BrokerPool {
               this.consumerMetadataGeneration ?? 0,
               this.consumerMetadataScope?.shareKey() ?? null,
               names || [],
-            ])
+            ]),
+      () => this.disconnects
     )
     return this.metadataDiscovery(topics, options)
   }
@@ -1040,8 +1044,10 @@ module.exports = class BrokerPool {
     }
     if (!isCurrent()) return
     const modeGeneration = this.consumerMetadataGeneration ?? 0
+    const disconnects = this.disconnects
     const ticket = metadataScope?.captureMetadata()
     const applicable = () =>
+      this.disconnects === disconnects &&
       !fence?.closed &&
       !guard?.() &&
       (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
