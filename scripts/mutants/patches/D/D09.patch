@@ -1,10 +1,10 @@
 --- a/src/consumer/groupProtocol/consumer.js
 +++ b/src/consumer/groupProtocol/consumer.js
-@@ -1466,7 +1466,6 @@
+@@ -1627,7 +1627,6 @@
  
      if (code === UNSUPPORTED_VERSION || this.isUnsupportedApi(error)) {
        const unsupported = unsupportedConsumerProtocolError(error)
 -      learnOwnershipLoss(this.ownership, unsupported, REBALANCE_PATHS.HEARTBEAT, 'consumer')
-       return this.transitionToFatal(unsupported)
+       return this.transitionToFatal(unsupported, true)
      }
  

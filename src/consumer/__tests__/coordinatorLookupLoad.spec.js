@@ -9,7 +9,12 @@ const GroupOwnership = require('../groupOwnership')
 const OffsetManager = require('../offsetManager')
 const Generation = require('../../producer/generation')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
-const { KafkaJSDeliveryTimeout } = require('../../errors')
+const {
+  KafkaJSCommitFailedError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSGroupCoordinatorNotFound,
+  KafkaJSNonRetriableError,
+} = require('../../errors')
 const { createPatternGroup } = require('./fixtures/patternGroup')
 const { newLogger } = require('testHelpers')
 
@@ -426,6 +431,13 @@ const settle = (work) =>
   )
 
 const COMMIT = [{ topic: TOPIC, partition: 0, offset: '2' }]
+const UNKNOWN_MEMBER_ID = 25
+
+/** @returns {object} an OffsetCommit answer refusing the committed partition as a departed member */
+const unknownMemberAnswer = () => ({
+  throttleTime: 0,
+  topics: [{ topic: TOPIC, partitions: [{ partition: 0, errorCode: UNKNOWN_MEMBER_ID }] }],
+})
 const HEARTBEAT = { classic: 'Heartbeat', consumer: 'ConsumerGroupHeartbeat' }
 
 /**
@@ -516,6 +528,17 @@ class HeldLookup {
     if (this.released) return
     this.released = true
     this.lookup.release()
+  }
+
+  /**
+   * Fails the held lookup, once, with `error` on the wire.
+   * @param {Error} error
+   * @returns {void}
+   */
+  fail(error) {
+    if (this.released) return
+    this.released = true
+    this.lookup.fail(error)
   }
 
   /** @returns {Promise<void>} releases the lookup and disposes the rig */
@@ -649,7 +672,9 @@ describe.each(['classic', 'consumer'])(
       await held.consumer.disconnect({ timeout: 0 })
       const framesAtClose = held.rig.cluster.requests().length
 
-      expect((await commit).type).toBe('CONSUMER_STOPPING')
+      const error = await commit
+      expect(error.type).toBe('CONSUMER_STOPPING')
+      expect(error.cause).toBeUndefined()
       held.release()
       await held.answered()
       await pause(250)
@@ -681,5 +706,157 @@ describe.each(['classic', 'consumer'])(
         after.filter((api) => ['OffsetCommit', 'Fetch', HEARTBEAT[protocol]].includes(api))
       ).toEqual([])
     })
+
+    test('an outside commit admitted before a graceful stop rejects with CONSUMER_STOPPING when its lookup then fails', async () => {
+      held = await HeldLookup.open(protocol)
+      const outside = held.consumer.commitOffsets(COMMIT).then(
+        () => 'committed',
+        (error) => error
+      )
+      await until(() => held.joined() >= 1, 'the commit joining the held lookup')
+      let stopped = false
+      const stopping = held.consumer.stop().then(() => (stopped = true))
+
+      held.fail(new Error('The scripted lookup failed'))
+      const error = await outside
+      await stopping
+
+      expect(error.type).toBe('CONSUMER_STOPPING')
+      expect(error.cause).toBeInstanceOf(KafkaJSGroupCoordinatorNotFound)
+      expect(stopped).toBe(true)
+      expect(held.rig.frames('OffsetCommit')).toHaveLength(0)
+    })
+
+    test('an outside commit admitted before a graceful stop resolves when its lookup is answered while the member is still in the group', async () => {
+      const entered = gate()
+      const proceed = gate()
+      held = await HeldLookup.open(
+        protocol,
+        {},
+        {
+          delivered: 0,
+          run: {
+            eachMessage: async () => {
+              entered.resolve()
+              await proceed.promise
+            },
+          },
+        },
+        entered.promise
+      )
+      const outside = settle(held.consumer.commitOffsets(COMMIT))
+      await until(() => held.joined() >= 1, 'the commit joining the held lookup')
+      const stopping = held.consumer.stop()
+
+      held.release()
+      const outcome = await outside
+      proceed.resolve()
+      await stopping
+
+      expect(outcome).toBe('committed')
+      const [commit, ...others] = held.rig.frames('OffsetCommit')
+      expect(others).toEqual([])
+      expect(commit.answeredOrder).toBeGreaterThan(commit.order)
+    })
+
+    test('an outside commit whose answer ends the membership during a graceful stop keeps that error, not the stopping one', async () => {
+      held = await HeldLookup.open(protocol)
+      const outside = held.consumer.commitOffsets(COMMIT).catch((error) => error)
+      await until(() => held.joined() >= 1, 'the commit joining the held lookup')
+      const stopping = held.consumer.stop()
+      held.rig.cluster.schedule.once({ api: 'OffsetCommit' }, unknownMemberAnswer())
+
+      held.release()
+      const error = await outside
+      await stopping
+
+      expect(error).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(error.type).toBe('UNKNOWN_MEMBER_ID')
+      expect(error.cause.type).toBe('UNKNOWN_MEMBER_ID')
+      expect(held.rig.frames('OffsetCommit')).toHaveLength(1)
+    })
+
+    test('a commit that enters after a graceful stop began resolves and writes nothing', async () => {
+      held = await HeldLookup.open(protocol)
+      const stopping = held.consumer.stop()
+      const late = settle(held.consumer.commitOffsets(COMMIT))
+
+      expect(await late).toBe('committed')
+      held.release()
+      await stopping
+      await held.answered()
+      await pause(250)
+      expect(held.rig.frames('OffsetCommit')).toHaveLength(0)
+    })
+
+    test('a commit after an awaited stop rejects because the run is gone and writes nothing', async () => {
+      held = await HeldLookup.open(protocol)
+      await held.consumer.stop()
+
+      const error = await held.consumer.commitOffsets(COMMIT).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(error.message).toBe(
+        'Consumer group was not initialized, consumer#run must be called first'
+      )
+      held.release()
+      await held.answered()
+      await pause(250)
+      expect(held.rig.frames('OffsetCommit')).toHaveLength(0)
+    })
   }
 )
+
+describe('Consumer > an outside commit written after a graceful stop, consumer protocol', () => {
+  /** @type {HeldLookup} */
+  let held
+  afterEach(async () => {
+    await held?.dispose()
+    held = null
+  })
+
+  /**
+   * Starts the schedule: a commit joins the held lookup and the stop completes without a leave,
+   * since a leave never looks for a coordinator.
+   * @returns {Promise<{ outside: Promise<unknown> }>} the commit's outcome, 'committed' or the error
+   */
+  const stoppedWithCommitPending = async () => {
+    held = await HeldLookup.open('consumer')
+    const outside = held.consumer.commitOffsets(COMMIT).then(
+      () => 'committed',
+      (error) => error
+    )
+    await until(() => held.joined() >= 1, 'the commit joining the held lookup')
+    await held.consumer.stop()
+    return { outside }
+  }
+
+  /** @returns {object[]} the leave heartbeats written, memberEpoch -1 */
+  const leaves = () =>
+    held.rig.frames('ConsumerGroupHeartbeat').filter(({ fields }) => fields?.memberEpoch === -1)
+
+  test('is acknowledged and resolves while the coordinator still holds the member, no leave having reached it', async () => {
+    const { outside } = await stoppedWithCommitPending()
+
+    held.release()
+
+    expect(await outside).toBe('committed')
+    expect(leaves()).toEqual([])
+    const [commit, ...others] = held.rig.frames('OffsetCommit')
+    expect(others).toEqual([])
+    expect(commit.answeredOrder).toBeGreaterThan(commit.order)
+  })
+
+  test('rejects with the membership loss once the coordinator has expired the member and refuses it with UNKNOWN_MEMBER_ID', async () => {
+    const { outside } = await stoppedWithCommitPending()
+    held.rig.cluster.schedule.once({ api: 'OffsetCommit' }, unknownMemberAnswer())
+
+    held.release()
+    const error = await outside
+
+    expect(error).toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(error.cause.type).toBe('UNKNOWN_MEMBER_ID')
+    expect(leaves()).toEqual([])
+    expect(held.rig.frames('OffsetCommit')).toHaveLength(1)
+  })
+})

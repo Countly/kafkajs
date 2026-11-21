@@ -511,7 +511,29 @@ const runLifecycleCell = async (cell) => {
     }
     if (operation) {
       await pump(() => operation.done, 'held operation completion')
-      if (cell.event === 'force' && cell.boundary.startsWith('commit:')) {
+      const offsetCommits = () =>
+        scripted.requests().filter((record) => record.api === 'OffsetCommit')
+      const runStopped =
+        ['stop', 'disconnect', 'crash'].includes(cell.event) && cell.boundary.startsWith('commit:')
+      // A static classic member forgets its generation locally when the run stops, so the held
+      // lookup's answer is installed for no one and the admitted commit fails before any frame.
+      const lookupRetired =
+        runStopped &&
+        cell.boundary === 'commit:coordinator-lookup' &&
+        cell.membership === 'static' &&
+        cell.protocol !== 'consumer'
+      if (lookupRetired) {
+        expect(operation.error).toMatchObject({
+          type: 'CONSUMER_STOPPING',
+          cause: { type: 'JOIN_DEADLINE_EXCEEDED' },
+        })
+        expect(manager.lastCommit).toBe(lastCommit)
+        expect(offsetCommits()).toHaveLength(framesBefore)
+      } else if (runStopped) {
+        // Any other admitted commit still completes, and only after its frame was answered.
+        expect(operation.error).toBeNull()
+        expect(offsetCommits().length).toBeGreaterThan(0)
+      } else if (cell.event === 'force' && cell.boundary.startsWith('commit:')) {
         expect(operation.error).toMatchObject({ type: 'CONSUMER_STOPPING' })
         expect(manager.lastCommit).toBe(lastCommit)
         expect(writes.slice(writeCount)).toEqual([])

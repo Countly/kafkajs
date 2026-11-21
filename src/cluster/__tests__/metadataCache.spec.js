@@ -500,6 +500,53 @@ describe('Cluster > MetadataCache', () => {
         expect(owned.topicName(ID_A)).toEqual('test-topic')
       })
 
+      test('an id lookup keeps a name an earlier full refresh carried until its owner registers it', () => {
+        owned.update(named('test-topic', ID_A), { full: true })
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+      })
+
+      test('a registered name is no longer pending: once unwanted, a scoped refresh drops it', () => {
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        wanted.add('test-topic')
+        owned.update(otherTopic({ topicId: ID_B }))
+        wanted.delete('test-topic')
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toBeUndefined()
+      })
+
+      test('releasing pending names drops every unwanted one not kept and keeps the kept ones', () => {
+        const ID_K = '21222324-2526-2728-292a-2b2c2d2e2f30'
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.updateTopicsById(named('kept-topic', ID_K))
+        owned.releasePending(['kept-topic'])
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toBeUndefined()
+        expect(owned.topicName(ID_K)).toEqual('kept-topic')
+        owned.releasePending([])
+        expect(owned.topicName(ID_K)).toBeUndefined()
+      })
+
+      test('Cluster#retireFirstAddTopics releases the pending names its owner no longer keeps', () => {
+        const cluster = new Cluster({
+          logger: newLogger(),
+          brokers: ['localhost:9092'],
+          socketFactory: () => {},
+          retry: { retries: 0 },
+        })
+        const ID_K = '21222324-2526-2728-292a-2b2c2d2e2f30'
+        cluster.metadataCache.updateTopicsById(response({ topicId: ID_A }))
+        cluster.metadataCache.updateTopicsById(named('kept-topic', ID_K))
+        cluster.retireFirstAddTopics(['kept-topic'])
+
+        expect(cluster.topicName(ID_A)).toBeUndefined()
+        expect(cluster.topicName(ID_K)).toEqual('kept-topic')
+      })
+
       test('a full-cluster refresh still prunes a wanted topic it does not carry', () => {
         wanted.add('test-topic')
         owned.update(response({ topicId: ID_A }))

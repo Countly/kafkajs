@@ -49,8 +49,8 @@ module.exports = class MetadataCache {
      * its id and epochs but releases `decoded` (set to `null`), because that object belongs to a
      * response nothing reads any more and holding it would pin the whole partition record.
      *
-     * `seenAt` is the refresh generation that last carried the topic; it is what the release and
-     * prune pass at the end of `update()` compares against.
+     * `seenAt` is the refresh generation that last carried the topic (0 when only an id lookup
+     * has); it is what the release and prune pass at the end of `update()` compares against.
      *
      * Entries are mutated in place and reused across refreshes - only a first sighting, a topic
      * recreation or `clear()` allocates.
@@ -60,6 +60,13 @@ module.exports = class MetadataCache {
     this.topics = new Map()
     /** @type {Map<string, string>} topic id -> topic name */
     this.topicIds = new Map()
+    /**
+     * Names an id lookup resolved that the client does not target yet: a scoped refresh keeps
+     * them until their owner registers them (they become wanted) or retires them
+     * (`releasePending`, `forget`). A full refresh that does not carry one still prunes it.
+     * @type {Set<string>}
+     */
+    this.pendingTopics = new Set()
     /** Incremented once per `update()`; stamped onto every topic that response carried. */
     this.generation = 0
     /** @type {Set<() => void>} synchronous internal listeners, independent of instrumentation */
@@ -214,15 +221,32 @@ module.exports = class MetadataCache {
     const entry = this.topics.get(topic)
     if (entry?.topicId != null) this.topicIds.delete(entry.topicId)
     this.topics.delete(topic)
+    this.pendingTopics.delete(topic)
     if (entry) this.publishRoutingChange()
+  }
+
+  /**
+   * Ends every pending id resolution not in `keep`: a name the client now targets only stops
+   * being pending, any other is forgotten. The owner of the id lookups calls it with the names it
+   * still holds whenever its assignment changes, so no name stays pending beyond its assignment.
+   * @param {Iterable<string>} [keep] names the owner still holds
+   * @returns {void}
+   */
+  releasePending(keep = []) {
+    const kept = new Set(keep)
+    for (const topic of this.pendingTopics) {
+      if (kept.has(topic)) continue
+      if (this.isWanted(topic)) this.pendingTopics.delete(topic)
+      else this.forget(topic)
+    }
   }
 
   /**
    * Second pass of `update()`: every cached topic the response did not carry either loses its
    * `decoded` references (a scoped response says nothing about it) or is dropped entirely (a
-   * full-cluster response says it no longer exists, or nothing wants it any more). A topic that
-   * only `updateTopicsById` recorded (`seenAt` 0) is kept: it is a pending id resolution its
-   * owner registers as a target or retires. Bounded by the number of cached topics.
+   * full-cluster response says it no longer exists, or nothing wants it any more). A pending id
+   * resolution (`pendingTopics`) is kept until its owner registers or retires it; one the client
+   * now wants stops being pending here. Bounded by the number of cached topics.
    *
    * @private
    * @param {boolean} full true when the response described the whole cluster
@@ -230,12 +254,15 @@ module.exports = class MetadataCache {
    */
   releaseTopicsAbsentFrom(full) {
     for (const [name, entry] of this.topics) {
+      if (this.pendingTopics.has(name) && this.isWanted(name)) this.pendingTopics.delete(name)
+
       if (entry.seenAt === this.generation) {
         continue
       }
 
-      if (full || (entry.seenAt > 0 && !this.isWanted(name))) {
+      if (full || (!this.pendingTopics.has(name) && !this.isWanted(name))) {
         this.topics.delete(name)
+        this.pendingTopics.delete(name)
         entry.topicId != null && this.topicIds.delete(entry.topicId)
         continue
       }
@@ -264,7 +291,9 @@ module.exports = class MetadataCache {
    * `update()` applies. It never seats a `decoded` reference - the response's partition objects
    * are not the ones the routing path reads - and never releases, prunes or re-stamps another
    * entry. A pair it accepts *is* written through to an existing `decoded`, exactly as
-   * `applyLeaderHint` does, so the cached view and the routing view cannot diverge.
+   * `applyLeaderHint` does, so the cached view and the routing view cannot diverge. Every name it
+   * records that the client does not target is marked pending, whether this call created its entry
+   * or an earlier refresh did, so a scoped refresh cannot drop it before its owner registers it.
    *
    * @param {{ brokers: Array<{ nodeId: number }>, topicMetadata: Array<{ topic: string, topicId?: string|null, partitionMetadata: Array<{ partitionId: number, leader: number, leaderEpoch: number }> }> }} metadata decoded response; not mutated
    * @param {{isCurrent?: () => boolean}} [options] composed scope and target installation guard
@@ -290,6 +319,8 @@ module.exports = class MetadataCache {
         recreations = recreations || []
         recreations.push(recreation)
       }
+
+      if (!this.isWanted(name)) this.pendingTopics.add(name)
 
       const usableId = this.usableTopicId(topicMetadata.topicId)
       changed = changed || (usableId != null && usableId !== entry.topicId)
@@ -534,6 +565,7 @@ module.exports = class MetadataCache {
   clear() {
     this.topics.clear()
     this.topicIds.clear()
+    this.pendingTopics.clear()
     this.publishRoutingChange()
   }
 

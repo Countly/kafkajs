@@ -1,14 +1,14 @@
 --- a/src/consumer/rebalanceCoordinator.js
 +++ b/src/consumer/rebalanceCoordinator.js
-@@ -329,7 +329,6 @@
-           this.consumerGroup.applyRebalanceResult(result, {
+@@ -349,7 +349,6 @@
              rebuildOffsets,
+             lost: kind === 'lost',
              round,
 -            ...(additionHold && { additionHold }),
            })
          // A listener's apply awaits user callbacks that carry their own deadline and retirement,
          // so their typed outcome is not raced against the round's wait.
-@@ -361,6 +360,7 @@
+@@ -381,6 +380,7 @@
              tookOn,
              group.hookIdentity(round, tookOn)
            )

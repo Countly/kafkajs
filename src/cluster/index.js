@@ -1069,7 +1069,8 @@ module.exports = class Cluster {
   /**
    * Ends every first-add row not in `keep`, synchronously and without the target lock: the name
    * stops being a target, its pending status is dropped without a report, and a late answer that
-   * names it installs and reports nothing.
+   * names it installs and reports nothing. Releases the cache's pending id resolutions not in
+   * `keep` too (`MetadataCache#releasePending`).
    * @param {Iterable<string>} [keep] names still assigned
    * @returns {void}
    */
@@ -1082,6 +1083,7 @@ module.exports = class Cluster {
       this.metadataCache.forget(topic)
       this.brokerPool.forgetTopic(topic)
     }
+    this.metadataCache.releasePending(kept)
   }
 
   /**

@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -344,7 +344,7 @@
+             },
+             Math.max(0, delay)
+           )
+-          unown = this.register(() => clearTimeout(timer))
++          unown = () => {}
+         })
+     )
+   }

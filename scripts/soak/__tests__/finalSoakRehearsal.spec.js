@@ -28,8 +28,11 @@ const WARP = 60
  * cores.
  */
 const RUN_WARP = 10
-/** A sped-up periodic sample is late by the real cost of two collections, which no warp shortens. */
-const EXPECTED_PROBLEM = /^step \S+ late$/
+/**
+ * A sped-up periodic sample (step `k<n>`) is late by the real cost of two collections, which no warp
+ * shortens. Any other late step is a problem.
+ */
+const EXPECTED_PROBLEM = /^step k\d+ late$/
 
 /**
  * A rehearsal workspace: the artifact directory with the reporter receipt the runbook's preparation
@@ -458,6 +461,16 @@ describe('final soak rehearsal heap snapshots', () => {
   })
 
   test('every sample is followed by its own heap record of V8 space and code statistics, and the stream stays valid', () => {
+    const samples = run.records.filter((r) => r.kind === 'sample')
+    for (const { slot } of run.config.processes) {
+      const roles = new Set(samples.filter((r) => r.process === slot).map((r) => r.role))
+      expect([slot, ...['baseline', 'periodic', 'final'].filter((r) => roles.has(r))]).toEqual([
+        slot,
+        'baseline',
+        'periodic',
+        'final',
+      ])
+    }
     const next = new Map()
     const unmatched = []
     for (const r of run.records) {
@@ -467,7 +480,7 @@ describe('final soak rehearsal heap snapshots', () => {
     }
     expect(unmatched).toEqual([])
     const heaps = run.records.filter((r) => r.kind === 'heap')
-    expect(heaps).toHaveLength(run.records.filter((r) => r.kind === 'sample').length)
+    expect(heaps).toHaveLength(samples.length)
     for (const h of heaps)
       expect([h.sample, h.spaces.old > 0, h.code.bytecode > 0]).toEqual([h.sample, true, true])
     const validator = new StreamValidator({

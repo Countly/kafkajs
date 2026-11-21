@@ -1,0 +1,15 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -1604,11 +1604,7 @@
+           delete this.resetPositions[topic]?.[partition]
+         }
+         const confirmed = this.isConfirmedIncarnation(topic, requestedIds.get(topic))
+-        written.forEach((partition) =>
+-          confirmed
+-            ? this.operations.apply(ticket, topic, partition)
+-            : this.operations.fence(ticket, topic, partition)
+-        )
++        written.forEach((partition) => this.operations.apply(ticket, topic, partition))
+       }
+     }
+   }
