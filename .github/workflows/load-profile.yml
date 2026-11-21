@@ -3,7 +3,9 @@ name: Load profile (diagnostic)
 # Compose cluster on a hosted 4-core runner, within 30 minutes, and uploads its sealed artifact
 # (header.json binds every file by SHA-256). The step exits with the profile's verdict: 0 pass,
 # 1 product failure (the sequence oracle found loss, a duplicate, a reordering or a skipped commit),
-# 2 inconclusive, 3 rate not reached (the runner could not offer the load: no claim either way).
+# 2 inconclusive, 3 rate not reached (the runner could not offer the load: no claim either way),
+# 4 flow stalled (slow-broker only: the other brokers' partitions stopped while one broker was slow
+# or frozen, or the slow broker's partitions did not flow again after it).
 # Diagnostic only: it gates nothing. A push to a branch named p12/load-profile* runs it with every
 # default, since a dispatch-only workflow must first exist on the default branch.
 on:
@@ -12,7 +14,7 @@ on:
       rate:
         description: Target records per second, all producers together
         type: choice
-        options: ['5000', '10000', '20000', '30000', '50000']
+        options: ['2000', '5000', '10000', '20000', '30000', '50000']
         default: '10000'
       record_bytes:
         description: Record value size in bytes
@@ -22,7 +24,7 @@ on:
       topics:
         description: Topics
         type: choice
-        options: ['1', '4', '12', '48']
+        options: ['1', '4', '12', '48', '2000']
         default: '12'
       partitions:
         description: Partitions per topic
@@ -42,8 +44,18 @@ on:
       faults:
         description: Fault schedule
         type: choice
-        options: ['rolling-restarts', 'none']
+        options: ['rolling-restarts', 'none', 'slow-broker', 'many-topics']
         default: 'rolling-restarts'
+      replication_factor:
+        description: Replication factor of the load topics
+        type: choice
+        options: ['3', '1']
+        default: '3'
+      producer_processes:
+        description: Processes the three producers are spread over
+        type: choice
+        options: ['1', '2', '3']
+        default: '1'
       node:
         description: Node.js major version
         type: choice
@@ -72,6 +84,8 @@ jobs:
       LOAD_DURATION: ${{ inputs.duration || '600' }}
       LOAD_COMPRESSION: ${{ inputs.compression || 'none' }}
       LOAD_FAULTS: ${{ inputs.faults || 'rolling-restarts' }}
+      LOAD_REPLICATION_FACTOR: ${{ inputs.replication_factor || '3' }}
+      LOAD_PRODUCER_PROCESSES: ${{ inputs.producer_processes || '1' }}
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 2
@@ -94,13 +108,13 @@ jobs:
         # The command string is evaluated by testWithKafka.sh; it names environment variables only,
         # each set from a choice input, so no input text reaches the shell.
         run: |
-          timeout -k 30s 1410s ./scripts/testWithKafka.sh 'node scripts/soak/loadRun.js --out "$LOAD_OUT" --rate "$LOAD_RATE" --record-bytes "$LOAD_RECORD_BYTES" --topics "$LOAD_TOPICS" --partitions "$LOAD_PARTITIONS" --duration "$LOAD_DURATION" --compression "$LOAD_COMPRESSION" --faults "$LOAD_FAULTS"'
+          timeout -k 30s 1410s ./scripts/testWithKafka.sh 'node scripts/soak/loadRun.js --out "$LOAD_OUT" --rate "$LOAD_RATE" --record-bytes "$LOAD_RECORD_BYTES" --topics "$LOAD_TOPICS" --partitions "$LOAD_PARTITIONS" --duration "$LOAD_DURATION" --compression "$LOAD_COMPRESSION" --faults "$LOAD_FAULTS" --replication-factor "$LOAD_REPLICATION_FACTOR" --producer-processes "$LOAD_PRODUCER_PROCESSES"'
       - name: Print the report
         if: always()
         timeout-minutes: 1
         run: |
           if [ -f "$LOAD_OUT/report.json" ]; then
-            node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ verdict: r.verdict, rate: r.rate, latencyMs: r.latencyMs, eventLoopDelayMs: r.eventLoopDelayMs, findings: r.oracle && Object.fromEntries(Object.entries(r.oracle.findings).map(([k, f]) => [k, f.count])), reads: r.oracle && r.oracle.reads, faults: r.faults, errors: r.errors }, null, 2))' "$LOAD_OUT/report.json"
+            node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ verdict: r.verdict, rate: r.rate, flow: r.flow, memory: r.memory, cpu: r.cpu, cluster: r.cluster, latencyMs: r.latencyMs, eventLoopDelayMs: r.eventLoopDelayMs, findings: r.oracle && Object.fromEntries(Object.entries(r.oracle.findings).map(([k, f]) => [k, f.count])), reads: r.oracle && r.oracle.reads, faults: r.faults, errors: r.errors }, null, 2))' "$LOAD_OUT/report.json"
           else
             echo "no report: the driver stopped before writing it"
           fi

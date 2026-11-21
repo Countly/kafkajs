@@ -2,7 +2,13 @@ const fs = require('fs')
 const path = require('path')
 const Accumulator = require('../accumulator')
 const JoinOrder = require('../joinOrder')
-const { KafkaJSDeliveryTimeout, KafkaJSProducerClosedError } = require('../../../errors')
+const { Admission } = require('../admission')
+const { Deadline } = require('../../deadline')
+const {
+  KafkaJSBufferExhaustedError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
+} = require('../../../errors')
 
 const TOPIC = 'topic-a'
 const OTHER_TOPIC = 'topic-b'
@@ -33,7 +39,7 @@ const byMessage = ({ records }) =>
  * partitioning of the send whose first record has that value, `fail(value, error)` rejects it.
  * Every hand-off is recorded and answered at once.
  */
-const createGated = ({ deadline, linger = 0 } = {}) => {
+const createGated = ({ deadline, linger = 0, admission } = {}) => {
   const gates = new Map()
   const gateOf = (value) => {
     if (!gates.has(value)) gates.set(value, deferred())
@@ -44,6 +50,7 @@ const createGated = ({ deadline, linger = 0 } = {}) => {
     linger,
     batchSize: 16384,
     deadline,
+    admission,
     partition: async (send) => {
       const value = send.records[0].messages[0].value
       await gateOf(value).promise
@@ -213,6 +220,65 @@ describe('Producer > the accumulator joins sends to their batches in call order'
     } finally {
       jest.useRealTimers()
     }
+  })
+
+  describe('a send that waits for buffer room', () => {
+    const CAPACITY = 200000
+
+    /** Holds all of the buffer but `free` bytes, too few for any one-record send. */
+    const fill = (admission, free = 1000) =>
+      admission.acquire(CAPACITY - free, new Deadline(Date.now(), 30000))
+
+    test('keeps its call order against a later send admitted at once when room comes back', async () => {
+      const admission = new Admission({ capacity: CAPACITY, maxBlockMs: 10000 })
+      const { accumulator, written, assign } = createGated({ admission })
+      const blocker = fill(admission)
+      const first = sendOne(accumulator, 'first')
+      await flushJobs()
+
+      blocker.releaseAll()
+      const second = sendOne(accumulator, 'second')
+      assign('second')
+      assign('first')
+      await Promise.all([first, second])
+      expect(written()).toEqual(['first', 'second'])
+    })
+
+    test('refused at once, leaves the order and the later sends of its topic join', async () => {
+      const admission = new Admission({ capacity: CAPACITY, maxBlockMs: 0 })
+      const { accumulator, written, assign } = createGated({ admission })
+      const blocker = fill(admission)
+      const refused = sendOne(accumulator, 'refused')
+      await expect(refused).rejects.toBeInstanceOf(KafkaJSBufferExhaustedError)
+
+      blocker.releaseAll()
+      const later = sendOne(accumulator, 'later')
+      assign('later')
+      await later
+      expect(written()).toEqual(['later'])
+    })
+
+    test('refused when its wait runs out, leaves the order and the later sends of its topic join', async () => {
+      jest.useFakeTimers({ now: 0 })
+      try {
+        const admission = new Admission({ capacity: CAPACITY, maxBlockMs: 50 })
+        const { accumulator, written, assign } = createGated({ admission })
+        const blocker = fill(admission)
+        const refused = sendOne(accumulator, 'refused')
+        refused.catch(() => {})
+        await jest.advanceTimersByTimeAsync(50)
+        await expect(refused).rejects.toBeInstanceOf(KafkaJSBufferExhaustedError)
+
+        blocker.releaseAll()
+        const later = sendOne(accumulator, 'later')
+        assign('later')
+        await jest.advanceTimersByTimeAsync(0)
+        await later
+        expect(written()).toEqual(['later'])
+      } finally {
+        jest.useRealTimers()
+      }
+    })
   })
 
   describe('the order itself', () => {

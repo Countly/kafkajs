@@ -21,6 +21,7 @@ const Fifo = require('../../utils/fifo')
 class JoinOrder {
   /** @type {Map<string, OrderedSend|Fifo<OrderedSend>>} a lone send is kept as itself, not in a Fifo */
   #lanes = new Map()
+  /** @type {(send: OrderedSend) => void} */
   #join
 
   /**
@@ -176,7 +177,7 @@ class JoinOrder {
     return lane.peek()
   }
 
-  /** @returns {number} how many topics have a lane, for tests */
+  /** @returns {number} how many topics have a lane; only the tests read it, to prove no lane is left */
   get size() {
     return this.#lanes.size
   }

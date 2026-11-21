@@ -1127,8 +1127,9 @@ module.exports = class ConsumerGroup {
     for (const assignment of currentMemberAssignment) {
       const { topic, partitions: assignedPartitions } = assignment
       const knownPartitions = this.partitionsPerSubscribedTopic.get(topic)
+      const known = knownPartitions && new Set(knownPartitions)
       const isAwareOfAllAssignedPartitions = assignedPartitions.every((partition) =>
-        knownPartitions.includes(partition)
+        known.has(partition)
       )
 
       if (!isAwareOfAllAssignedPartitions) {
@@ -1171,10 +1172,8 @@ module.exports = class ConsumerGroup {
     this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.groupMembership.narrowOwned(currentMemberAssignment)
 
-    const memberAssignment = currentMemberAssignment.reduce(
-      (partitionsByTopic, { topic, partitions }) =>
-        Object.assign(dictionary(), partitionsByTopic, { [topic]: partitions }),
-      dictionary()
+    const memberAssignment = dictionary(
+      currentMemberAssignment.map(({ topic, partitions }) => [topic, partitions])
     )
 
     if (rebuildOffsets || !this.offsetManager) {

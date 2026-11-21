@@ -29,16 +29,14 @@ module.exports = class SubscriptionState {
   }
 
   /**
-   * Replace the current assignment with a new set of assignments
+   * Replace the current assignment with a new set of assignments. One pass over the entries; a
+   * repeated topic keeps its first position and its last partition list.
    *
    * @param {Array<TopicPartitions>} topicPartitions Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   assign(topicPartitions = []) {
-    this.assignedPartitionsByTopic = topicPartitions.reduce(
-      (assigned, { topic, partitions = [] }) => {
-        return Object.assign(dictionary(), assigned, { [topic]: { topic, partitions } })
-      },
-      dictionary()
+    this.assignedPartitionsByTopic = dictionary(
+      topicPartitions.map(({ topic, partitions = [] }) => [topic, { topic, partitions }])
     )
 
     this.assignedPartitionSetsByTopic = new Map(

@@ -390,12 +390,8 @@ module.exports = class RebalanceCoordinator {
           memberId: this.consumerGroup.memberId,
           leaderId: this.consumerGroup.leaderId,
           isLeader: this.consumerGroup.isLeader(),
-          memberAssignment: assignment.reduce(
-            (byTopic, { topic, partitions }) => ({
-              ...byTopic,
-              [topic]: partitions,
-            }),
-            {}
+          memberAssignment: Object.fromEntries(
+            assignment.map(({ topic, partitions }) => [topic, partitions])
           ),
           groupProtocol: this.consumerGroup.groupProtocol,
           membershipProtocol: this.consumerGroup.kind || 'classic',

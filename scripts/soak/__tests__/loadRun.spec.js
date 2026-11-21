@@ -1,34 +1,68 @@
 const crypto = require('node:crypto')
+const { EventEmitter } = require('node:events')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
 const { fakeTime } = require('./churnFakes')
-const { parseLoadArgs } = require('../loadProfile')
-const { LoadRun, parseDescribe, recheck } = require('../loadRun')
+const { LatencyHistogram, parseLoadArgs } = require('../loadProfile')
+const {
+  LoadProducer,
+  LoadRun,
+  ProducerProcess,
+  forkProducerChild,
+  parseDescribe,
+  realSleep,
+  recheck,
+} = require('../loadRun')
+const { ProducerHost } = require('../loadProducerChild')
 
 /**
  * A scripted cluster: partition logs with transaction state, sends acknowledged `ackDelayMs` after
  * they were made (on the fake clock), one consumer member that is delivered every visible record,
- * and Apache's reader and group describe over the same logs.
+ * and Apache's reader and group describe over the same logs. Partition p is led by node p % 3 + 1;
+ * `delayed` (a node) adds 300 ms to every send touching its partitions, and a send whose cells
+ * `stalled` names is not acknowledged until it no longer does. Clients emit the instrumentation
+ * events the load run measures.
  */
 class FakeCluster {
-  /** @param {{ ackDelayMs?: number, dropLine?: (topic: string, line: string) => boolean }} [options] */
-  constructor({ ackDelayMs = 0, dropLine = () => false } = {}) {
-    Object.assign(this, { ackDelayMs, dropLine })
+  /**
+   * @param {{ ackDelayMs?: number, dropLine?: (topic: string, line: string) => boolean,
+   *   stalled?: (cells: string[]) => boolean }} [options]
+   */
+  constructor({ ackDelayMs = 0, dropLine = () => false, stalled = () => false } = {}) {
+    Object.assign(this, { ackDelayMs, dropLine, stalled })
     this.logs = new Map()
     this.pending = []
     this.members = []
     this.committed = new Map()
     this.now = 0
+    this.clock = null
+    this.delayed = null
+    this.createCalls = []
+    this.readTopicCalls = 0
+    this.readAllPatterns = []
     this.kafka = {
       admin: () => ({
         connect: async () => {},
         disconnect: async () => {},
         createTopics: async ({ topics }) => {
+          this.createCalls.push(topics.length)
+          if (this.clock) this.clock.t += 1500
           for (const { topic, numPartitions } of topics)
             for (let p = 0; p < numPartitions; p++) this.logs.set(`${topic}/${p}`, [])
         },
+        fetchTopicMetadata: async ({ topics }) => ({
+          topics: topics.map((name) => ({
+            name,
+            partitions: [...this.logs.keys()]
+              .filter((cell) => cell.startsWith(`${name}/`))
+              .map((cell) => {
+                const partitionId = Number(cell.split('/')[1])
+                return { partitionId, leader: FakeCluster.leaderOf(cell) }
+              }),
+          })),
+        }),
         deleteTopics: async () => {},
       }),
       producer: () => this.#producer(),
@@ -53,7 +87,24 @@ class FakeCluster {
           ].join('\n'),
         }
       },
+      readAll: async (pattern, onLine) => {
+        this.readAllPatterns.push(pattern)
+        const match = new RegExp(pattern)
+        let lines = 0
+        for (const [cell, log] of this.logs) {
+          if (!match.test(cell.split('/')[0])) continue
+          for (const entry of log) {
+            if (entry.state !== 'visible') continue
+            onLine(
+              `Partition:${cell.split('/')[1]}\tOffset:${entry.offset}\ttopic:${entry.header}\t${entry.key}`
+            )
+            lines++
+          }
+        }
+        return { exit: 0, lines, processed: lines, stderr: '' }
+      },
       readTopic: async (topic, onLine) => {
+        this.readTopicCalls++
         let lines = 0
         for (const [cell, log] of this.logs) {
           if (!cell.startsWith(`${topic}/`)) continue
@@ -70,12 +121,19 @@ class FakeCluster {
     }
   }
 
+  /** @param {string} cell `topic/partition` @returns {number} its leader */
+  static leaderOf(cell) {
+    return (Number(cell.split('/')[1]) % 3) + 1
+  }
+
   /** Called on every fake sleep: acknowledges due sends and delivers visible records. */
   tick(now) {
     this.now = now
-    const due = this.pending.filter((p) => p.at <= now)
-    this.pending = this.pending.filter((p) => p.at > now)
+    const ready = (p) => p.at <= now && !this.stalled(p.cells)
+    const due = this.pending.filter(ready)
+    this.pending = this.pending.filter((p) => !ready(p))
     due.forEach((p) => p.resolve())
+    for (const member of this.members) member.emit('consumer.fetch', { duration: 5 })
     for (const member of this.members.slice(0, 1)) {
       for (const [cell, log] of this.logs) {
         const key = `${member.group}|${cell}`
@@ -98,10 +156,10 @@ class FakeCluster {
     const touched = []
     for (const { topic, messages } of topicMessages) {
       const first = new Map()
-      for (const { partition, key } of messages) {
+      for (const { partition, key, headers } of messages) {
         const log = this.logs.get(`${topic}/${partition}`)
         if (!first.has(partition)) first.set(partition, log.length)
-        log.push({ offset: log.length, key, state })
+        log.push({ offset: log.length, key, state, header: headers?.topic })
         touched.push(log[log.length - 1])
       }
       for (const [partition, baseOffset] of first)
@@ -110,11 +168,26 @@ class FakeCluster {
     return { metadata, touched }
   }
 
-  #acknowledged(value) {
-    if (this.ackDelayMs === 0) return Promise.resolve(value)
+  #acknowledged(metadata) {
+    const cells = metadata.map((m) => `${m.topicName}/${m.partition}`)
+    const slow = this.delayed && cells.some((c) => FakeCluster.leaderOf(c) === this.delayed)
+    const delay = this.ackDelayMs + (slow ? 300 : 0)
+    if (delay === 0 && !this.stalled(cells)) return Promise.resolve(metadata)
     return new Promise((resolve) =>
-      this.pending.push({ at: this.now + this.ackDelayMs, resolve: () => resolve(value) })
+      this.pending.push({ at: this.now + delay, cells, resolve: () => resolve(metadata) })
     )
+  }
+
+  /** @returns {{ on: Function, emit: Function }} an instrumentation emitter of one client */
+  static emitter() {
+    const listeners = new Map()
+    return {
+      on: (event, listener) => {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener])
+        return () => {}
+      },
+      emit: (event, payload) => (listeners.get(event) ?? []).forEach((l) => l({ payload })),
+    }
   }
 
   #producer() {
@@ -127,8 +200,14 @@ class FakeCluster {
         log.push({ offset: log.length, key: null, state: 'marker' })
       }
     }
+    const { on, emit } = FakeCluster.emitter()
     return {
-      connect: async () => {},
+      events: { REQUEST: 'producer.network.request' },
+      on,
+      connect: async () => {
+        emit('producer.network.request', { apiName: 'ApiVersions', size: 99 })
+        emit('producer.network.request', { apiName: 'Metadata', size: 1024 })
+      },
       disconnect: async () => {},
       sendBatch: ({ topicMessages }) =>
         this.#acknowledged(this.#append(topicMessages, 'visible').metadata),
@@ -148,15 +227,28 @@ class FakeCluster {
   }
 
   #consumer(group) {
-    const member = { group, positions: new Map(), eachBatch: null }
+    const { on, emit } = FakeCluster.emitter()
+    const member = { group, positions: new Map(), eachBatch: null, emit }
     return {
-      events: { CRASH: 'consumer.crash' },
-      on: () => () => {},
-      connect: async () => {},
+      events: {
+        CRASH: 'consumer.crash',
+        GROUP_JOIN: 'consumer.group_join',
+        FETCH: 'consumer.fetch',
+        REQUEST: 'consumer.network.request',
+      },
+      on,
+      connect: async () => emit('consumer.network.request', { apiName: 'Metadata', size: 2048 }),
       subscribe: async () => {},
       run: async ({ eachBatch }) => {
         member.eachBatch = eachBatch
         this.members.push(member)
+        if (this.clock) this.clock.t += 400
+        const memberAssignment = {}
+        for (const cell of this.logs.keys()) {
+          const [topic, partition] = cell.split('/')
+          ;(memberAssignment[topic] ??= []).push(Number(partition))
+        }
+        emit('consumer.group_join', { duration: 250, memberAssignment })
       },
       disconnect: async () => {
         for (const [key, position] of member.positions) this.committed.set(key, position)
@@ -166,8 +258,33 @@ class FakeCluster {
   }
 }
 
-/** A small run: 2000 records a second for 3 s over 2 topics × 3 partitions, all three kinds. */
-const runWith = async (cluster, overrides = {}) => {
+/**
+ * Time that moves 50 ms at a time while anyone sleeps, so concurrent sleepers (the offer loop and
+ * a fault schedule) each wake when the clock reaches their own deadline.
+ */
+const steppedTime = (onStep) => {
+  const clock = {
+    t: 0,
+    now() {
+      return this.t
+    },
+  }
+  const sleep = async (ms, signal) => {
+    const target = clock.t + ms
+    while (clock.t < target && !signal?.aborted) {
+      clock.t = Math.min(target, clock.t + 50)
+      onStep(clock)
+      await new Promise(setImmediate)
+    }
+  }
+  return { clock, sleep }
+}
+
+/**
+ * A small run: 2000 records a second for 3 s over 2 topics × 3 partitions, all three kinds.
+ * `args` are further flags; `tools` builds the run's fault tools and probes from its time.
+ */
+const runWith = async (cluster, overrides = {}, { args = [], tools, stepped = false } = {}) => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'load-run-'))
   const profile = {
     ...parseLoadArgs([
@@ -183,6 +300,7 @@ const runWith = async (cluster, overrides = {}) => {
       '3',
       '--consumers',
       '1',
+      ...args,
     ]),
     ticksPerSecond: 50,
     drainQuietSeconds: 2,
@@ -193,7 +311,8 @@ const runWith = async (cluster, overrides = {}) => {
     recordBytes: 16,
     ...overrides,
   }
-  const { clock, sleep } = fakeTime((c) => cluster.tick(c.now()))
+  const { clock, sleep } = (stepped ? steppedTime : fakeTime)((c) => cluster.tick(c.now()))
+  cluster.clock = clock
   const report = await new LoadRun({
     profile,
     kafka: cluster.kafka,
@@ -202,6 +321,7 @@ const runWith = async (cluster, overrides = {}) => {
     sleep,
     log: () => {},
     treeSha: 'abc123',
+    ...tools?.({ clock, sleep }),
   }).run()
   return { report, out }
 }
@@ -282,6 +402,45 @@ describe('load run', () => {
     })
   })
 
+  it('names the client CPU as the limit when a run that missed its rate kept the load process at one core', async () => {
+    const tools = ({ clock }) => ({
+      host: {
+        cpus: 4,
+        read: () => ({
+          processUs: clock.now() * 1000,
+          machineBusyMs: clock.now(),
+          machineTotalMs: clock.now() * 4,
+          load1: 1.5,
+        }),
+      },
+    })
+    const { report, out } = await runWith(
+      new FakeCluster({ ackDelayMs: 1500 }),
+      { unsettledSeconds: 0.1 },
+      { tools }
+    )
+    dirs.push(out)
+    expect(report.rate.reached).toBe(false)
+    expect(report.rate.limitedBy).toBe('client-cpu')
+    expect(report.cpu).toMatchObject({
+      cpus: 4,
+      loadAverage1m: { max: 1.5, end: 1.5 },
+      stages: {
+        offer: { coreShare: 1, machineBusyShare: 0.25 },
+        join: { coreShare: 1, machineBusyShare: 0.25 },
+      },
+      phases: [
+        { phase: 'baseline', coreShare: 1, machineBusyShare: 0.25 },
+        { phase: 'after', coreShare: null, machineBusyShare: null },
+      ],
+      brokers: null,
+    })
+
+    const reached = await runWith(new FakeCluster(), {}, { tools })
+    dirs.push(reached.out)
+    expect(reached.report.rate).toMatchObject({ reached: true, limitedBy: null })
+  })
+
   it('fails the product when the independent read misses one acknowledged record', async () => {
     let dropped = false
     const cluster = new FakeCluster({
@@ -296,6 +455,348 @@ describe('load run', () => {
     expect(dropped).toBe(true)
     expect(findingCounts(report.oracle)).toEqual({ loss: 1 })
     expect(report.verdict).toMatchObject({ product: 'FAIL', exitCode: 1 })
+  })
+})
+
+describe('load run producer processes', () => {
+  const dirs = []
+  afterAll(() => dirs.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })))
+
+  /**
+   * Producer processes in this process: each message is copied as the IPC channel would, and
+   * handed over on a later turn. `hosts` collects each child's producer host.
+   */
+  const inProcessFork =
+    (cluster, hosts) =>
+    ({ clock, sleep }) => ({
+      fork: () => {
+        const child = new EventEmitter()
+        const deliver = (fn) => setImmediate(fn)
+        const host = new ProducerHost({
+          kafka: cluster.kafka,
+          clock,
+          sleep,
+          LoadProducer,
+          host: { read: () => ({ processUs: 0, machineBusyMs: 0, machineTotalMs: 0, load1: 0 }) },
+          send: (message) => deliver(() => child.emit('message', structuredClone(message))),
+        })
+        hosts.push(host)
+        child.send = (message) => {
+          const copy = structuredClone(message)
+          deliver(() =>
+            host.handle(copy).then(() => {
+              if (copy.type === 'close') child.emit('exit', 0)
+            })
+          )
+        }
+        child.kill = () => child.emit('exit', null)
+        return child
+      },
+    })
+
+  it('spreads the producers over child processes, each producer in exactly one, and judges the run as in one process', async () => {
+    const hosts = []
+    const cluster = new FakeCluster()
+    const { report, out } = await runWith(
+      cluster,
+      {},
+      {
+        args: ['--producer-processes', '2'],
+        tools: inProcessFork(cluster, hosts),
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(hosts.map((h) => h.producers.map((p) => `${p.id} ${p.kind}`))).toEqual([
+      ['p0 idempotent', 'p2 transactional'],
+      ['p1 plain'],
+    ])
+    expect(report.errors).toEqual([])
+    expect(findingCounts(report.oracle)).toEqual({})
+    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+    expect(report.totals.offered).toBe(6000)
+    expect(report.producers.map((p) => p.id)).toEqual(['p0', 'p1', 'p2'])
+    expect(report.producers[2].stats.aborted).toBeGreaterThan(0)
+    expect(report.latencyMs.samples).toBe(report.producers.reduce((n, p) => n + p.stats.acked, 0))
+    expect(report.cpu.producerProcesses.map((p) => [p.id, p.producers.join(',')])).toEqual([
+      ['process-0', 'p0,p2'],
+      ['process-1', 'p1'],
+    ])
+    const ledgers = JSON.parse(fs.readFileSync(path.join(out, 'producers.json'), 'utf8'))
+    expect(ledgers.map((l) => l.producer).sort()).toEqual(['p0', 'p1', 'p2'])
+    expect(report.oracle.counts.records).toBeGreaterThan(5000)
+    const replayed = await recheck(out)
+    expect(replayed.counts.records).toBe(report.oracle.counts.records)
+  })
+
+  it('runs a real producer process through setup, its window, its report and close over IPC', async () => {
+    const profile = { ...parseLoadArgs(['--out', 'o', '--duration', '1']), ticksPerSecond: 10 }
+    const latency = new LatencyHistogram()
+    const child = new ProducerProcess({
+      id: 'process-0',
+      producers: [],
+      profile,
+      runId: 'smoke',
+      topics: ['smoke-0'],
+      latency,
+      clock: performance,
+      sleep: realSleep,
+      fork: forkProducerChild,
+    })
+    await child.connect()
+    child.begin(performance.now())
+    expect(await child.join(5000)).toBe(true)
+    expect(child.cpu.offer.coreShare).toEqual(expect.any(Number))
+    await child.close()
+    expect({ closed: child.closed, failure: child.failure }).toEqual({
+      closed: true,
+      failure: null,
+    })
+  })
+
+  it('does not judge a run whose producer process failed before it sent its ledgers', async () => {
+    const cluster = new FakeCluster()
+    const { report, out } = await runWith(
+      cluster,
+      {},
+      {
+        args: ['--producer-processes', '3'],
+        tools: ({ clock, sleep }) => {
+          const { fork } = inProcessFork(cluster, [])({ clock, sleep })
+          let n = 0
+          return {
+            fork: () => {
+              const child = fork()
+              if (n++ !== 1) return child
+              const send = child.send
+              child.send = (message) => {
+                if (message.type !== 'begin') return send(message)
+                setImmediate(() => child.emit('exit', 1))
+              }
+              return child
+            },
+          }
+        },
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(report.oracle).toBe(null)
+    expect(report.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^driver: Error: process-1: exited with code 1/),
+        'read: not judged, no send ledgers from process-1',
+      ])
+    )
+    expect(report.verdict).toMatchObject({ product: 'INCONCLUSIVE', exitCode: 2 })
+  })
+})
+
+describe('load run fault schedules', () => {
+  const dirs = []
+  afterAll(() => dirs.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })))
+
+  /** The slow-broker tools over a fake cluster: the delay slows node 2, the pause freezes `frozen`. */
+  const slowTools =
+    (cluster, calls = []) =>
+    ({ sleep }) => ({
+      netem: {
+        check: async () => calls.push('check'),
+        apply: async () => {
+          calls.push('delay')
+          cluster.delayed = 2
+        },
+        clear: async () => {
+          calls.push('clear')
+          cluster.delayed = null
+        },
+      },
+      bouncer: {
+        step: async ({ service, kind, holdMs }) => {
+          calls.push(`${kind} ${service}`)
+          cluster.frozen = true
+          await sleep(holdMs)
+          cluster.frozen = false
+          calls.push(`un${kind} ${service}`)
+          return { service, kind, outageMs: holdMs }
+        },
+      },
+    })
+  const slowRun = (cluster, calls) =>
+    runWith(
+      cluster,
+      { recordBytes: 16 },
+      {
+        args: ['--faults', 'slow-broker', '--duration', '195', '--rate', '300'],
+        tools: slowTools(cluster, calls),
+        stepped: true,
+      }
+    )
+  const onNode2 = (cells) => cells.some((c) => FakeCluster.leaderOf(c) === 2)
+
+  it('fails at start, before creating a topic, when the fault mechanism is unavailable', async () => {
+    const cluster = new FakeCluster()
+    const tools = () => ({
+      netem: {
+        check: async () => {
+          throw new Error(
+            'slow-broker needs sudo, nsenter, tc and the netem qdisc: sudo: a password is required'
+          )
+        },
+      },
+      bouncer: {},
+    })
+    await expect(
+      runWith(cluster, {}, { args: ['--faults', 'slow-broker', '--duration', '195'], tools })
+    ).rejects.toThrow('slow-broker needs sudo, nsenter, tc and the netem qdisc')
+    expect(cluster.createCalls).toEqual([])
+  })
+
+  it('runs slow-broker with one send lane per leader, its phases in order, and keeps the other leaders flowing', async () => {
+    const calls = []
+    const cluster = new FakeCluster({ stalled: (cells) => cluster.frozen && onNode2(cells) })
+    const { report, out } = await slowRun(cluster, calls)
+    dirs.push(out)
+    expect(calls).toEqual(['check', 'delay', 'clear', 'pause kafka2', 'unpause kafka2'])
+    expect(report.faults.map((f) => f.phase)).toEqual(['slow', 'frozen', 'recovery'])
+    const [slow, frozen, recovery] = report.faults
+    expect(slow.startMs).toBeGreaterThanOrEqual(65000)
+    expect(slow.startMs).toBeLessThanOrEqual(65100)
+    expect(frozen.endMs - frozen.startMs).toBe(45000)
+    expect(recovery.endMs).toBeLessThanOrEqual(130100)
+    expect(report.flow.verdict).toBe('KEPT_FLOWING')
+    expect(report.flow.reasons).toEqual([])
+    const row = (phase, leader) =>
+      report.flow.table.find((r) => r.phase === phase && r.leader === leader)
+    expect(row('frozen', '2').ackedRate).toBe(0)
+    expect(row('frozen', '1').ackedRate).toBeGreaterThan(0.9 * row('frozen', '1').offeredRate)
+    expect(row('recovery', '2').ackedRate).toBeGreaterThan(0.9 * row('recovery', '2').offeredRate)
+    expect(report.memory.map((m) => m.phase)).toEqual([
+      'baseline',
+      'slow',
+      'frozen',
+      'recovery',
+      'after',
+    ])
+    expect(report.memory.every((m) => m.peakHeapUsed > 0 && m.endRss > 0)).toBe(true)
+    expect(findingCounts(report.oracle)).toEqual({})
+    expect(report.verdict).toEqual({
+      ok: true,
+      product: 'PASS',
+      profile: 'REACHED',
+      flow: 'KEPT_FLOWING',
+      exitCode: 0,
+    })
+  })
+
+  it("reports a stalled flow, exit 4, when the freeze holds back every leader's sends", async () => {
+    const cluster = new FakeCluster({ stalled: () => cluster.frozen })
+    const { report, out } = await slowRun(cluster)
+    dirs.push(out)
+    expect(report.flow.verdict).toBe('STALLED')
+    expect(report.flow.reasons).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^frozen: leader 1 stalled 4\d s \(most 20 s\)$/),
+      ])
+    )
+    expect(findingCounts(report.oracle)).toEqual({})
+    expect(report.verdict).toMatchObject({ product: 'PASS', flow: 'STALLED', exitCode: 4 })
+  })
+
+  it('reports rolling restarts cut short by the window end as restarts not run, not as a driver error', async () => {
+    const steps = []
+    const { report, out } = await runWith(
+      new FakeCluster(),
+      {},
+      {
+        args: ['--faults', 'rolling-restarts', '--duration', '6'],
+        tools: ({ sleep }) => ({
+          bouncer: {
+            async rollingBounce({ hard = false, between = 0, services, signal }) {
+              const outages = []
+              for (const service of services ?? ['kafka1', 'kafka2', 'kafka3']) {
+                if (outages.length && between) await sleep(between)
+                signal?.throwIfAborted()
+                steps.push(service)
+                await sleep(500)
+                outages.push({ service, kind: hard ? 'kill' : 'stop', outageMs: 500 })
+              }
+              return outages
+            },
+          },
+        }),
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(steps).toEqual(['kafka1'])
+    expect(report.errors).toEqual([])
+    expect(report.faults.map((f) => [f.kind, f.service, f.outageMs ?? f.skipped])).toEqual([
+      ['stop', 'kafka1', 500],
+      ['stop', 'kafka2', 'window ended'],
+      ['stop', 'kafka3', 'window ended'],
+      ['kill', 'kafka1', 'window ended'],
+      ['kill', 'kafka2', 'window ended'],
+      ['kill', 'kafka3', 'window ended'],
+    ])
+    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+  })
+
+  it('reports the many-topics measurements: topic creation, first assignment, rebalances, metadata requests and fetch rounds', async () => {
+    const cluster = new FakeCluster()
+    const bounces = []
+    const { report, out } = await runWith(
+      cluster,
+      {},
+      {
+        args: ['--faults', 'many-topics', '--topics', '1000', '--partitions', '1'],
+        tools: () => ({
+          bouncer: {
+            rollingBounce: async ({ topics }) => {
+              bounces.push(topics.length)
+              return [{ service: 'kafka1', kind: 'stop', outageMs: 1 }]
+            },
+          },
+          lagProbe: { start() {}, stop() {}, maxBetween: () => 42 },
+        }),
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(bounces).toEqual([1000])
+    expect(cluster.createCalls).toEqual([250, 250, 250, 250])
+    expect(report.cluster.createTopicsMs).toBe(6000)
+    expect(report.cluster.firstAssignmentMs).toEqual({ c0: 400 })
+    expect(report.cluster.rebalances).toEqual([
+      { member: 'c0', atMs: expect.any(Number), joinMs: 250, partitions: 1000, loopDelayMaxMs: 42 },
+    ])
+    expect(report.cluster.metadata).toEqual({
+      requests: 4,
+      perMinute: [4],
+      maxPerMinute: 4,
+      meanBytes: 1280,
+      maxBytes: 2048,
+    })
+    expect(report.cluster.fetchRoundMs.samples).toBeGreaterThan(10)
+    expect(report.cluster.fetchRoundMs.max).toBe(5)
+    expect(report.faults.map((f) => f.phase ?? `${f.kind} ${f.skipped ?? f.outageMs}`)).toEqual([
+      'rolling-restart',
+      'stop 1',
+      'stop window ended',
+      'stop window ended',
+    ])
+
+    expect(cluster.readTopicCalls).toBe(0)
+    expect(cluster.readAllPatterns).toHaveLength(1)
+    expect(report.oracle.reads).toEqual([
+      expect.objectContaining({ topic: '*', exit: 0, lines: report.oracle.counts.records }),
+    ])
+    expect(findingCounts(report.oracle)).toEqual({})
+    expect(report.oracle.counts.records).toBeGreaterThan(5000)
+    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+    const replayed = await recheck(out)
+    expect(replayed.findings).toEqual(report.oracle.findings)
+    expect(replayed.counts).toEqual(report.oracle.counts)
   })
 })
 
