@@ -12,8 +12,9 @@
  * from `verdictOf`: 0 pass, 1 product failure, 2 inconclusive, 3 rate not reached.
  *
  * Artifact: `profile.json`, `producers.json`, `consumers.json`, `committed.json`, `faults.json`,
- * `apache/<topic>.dump.gz` with `.end`, `apache/<group>.describe`, `report.json`, and `header.json`,
- * written last, which binds every other file by SHA-256 (the seal).
+ * `apache/<topic>.dump.gz` with `.end` (or one `apache/all.dump.gz` for a profile with topic
+ * headers), `apache/<group>.describe`, `report.json`, and `header.json`, written last, which binds
+ * every other file by SHA-256 (the seal).
  */
 
 const crypto = require('node:crypto')
@@ -29,9 +30,13 @@ const {
   LatencyHistogram,
   OfferSchedule,
   parseLoadArgs,
+  flowVerdict,
+  phaseList,
+  phaseMemory,
   rateReport,
   verdictOf,
 } = require('./loadProfile')
+const { ClientMeter, FlowMeter, LagProbe } = require('./loadMeters')
 const { DeliveryLedger, SendLedger, SequenceChecker, parseDumpLine } = require('./sequenceOracle')
 
 const BROKERS = Object.freeze(['localhost:9092', 'localhost:9095', 'localhost:9098'])
@@ -39,9 +44,14 @@ const BOOTSTRAP = 'kafka1:29092,kafka2:29095,kafka3:29098'
 const TOOLS = '/opt/kafka/bin'
 /** How long Apache's console consumer may see no record before it ends a topic's read. */
 const READ_IDLE_MS = 10000
+/** The idle end of the one read of every topic: a fetch across thousands of partitions starts slower. */
+const READ_ALL_IDLE_MS = 30000
 /** Topics read at once: each read is one JVM in the broker container. */
 const READ_CONCURRENCY = 3
-const SAMPLE_MS = 10000
+/** Topics per CreateTopics request: keeps each controller operation small with thousands of topics. */
+const CREATE_CHUNK = 250
+const ADMIN_TIMEOUT_MS = 60000
+const SAMPLE_MS = 2000
 const COMPRESSION = Object.freeze({ none: 0, gzip: 1, snappy: 2, lz4: 3, zstd: 4 })
 
 /** @param {number} ms @param {AbortSignal} [signal] @returns {Promise<void>} */
@@ -74,26 +84,38 @@ class ApacheReader {
    *   `processed` is the count the tool printed on stderr
    */
   readTopic(topic, onLine) {
+    return this.#consume(['--topic', topic], READ_IDLE_MS, false, onLine)
+  }
+
+  /**
+   * Reads every topic matching `pattern` in one console consumer, printing each record's headers
+   * (the load producer's `topic` header names its topic, which the formatter cannot print).
+   * @param {string} pattern a Java regular expression over topic names
+   * @param {(line: string) => void} onLine
+   * @returns {Promise<{ exit: number, lines: number, processed: number|null, stderr: string }>}
+   */
+  readAll(pattern, onLine) {
+    return this.#consume(['--include', pattern], READ_ALL_IDLE_MS, true, onLine)
+  }
+
+  #consume(select, idleMs, headers, onLine) {
+    const property = (name) => ['--formatter-property', name]
     return this.#run(
       [
         `${TOOLS}/kafka-console-consumer.sh`,
         '--bootstrap-server',
         BOOTSTRAP,
-        '--topic',
-        topic,
+        ...select,
         '--from-beginning',
         '--isolation-level',
         'read_committed',
         '--timeout-ms',
-        String(READ_IDLE_MS),
-        '--formatter-property',
-        'print.partition=true',
-        '--formatter-property',
-        'print.offset=true',
-        '--formatter-property',
-        'print.key=true',
-        '--formatter-property',
-        'print.value=false',
+        String(idleMs),
+        ...property('print.partition=true'),
+        ...property('print.offset=true'),
+        ...(headers ? property('print.headers=true') : []),
+        ...property('print.key=true'),
+        ...property('print.value=false'),
       ],
       onLine
     ).then((result) => {
@@ -185,11 +207,28 @@ const parseDescribe = (text, group) => {
   return { committed, logEnds }
 }
 
+const TOPIC_LINE = /^Partition:(\d{1,9})\tOffset:(\d{1,15})\ttopic:([^\t]+)\t(.*)$/
+
+/**
+ * Parses one line of the read of every topic: `parseDumpLine` with the `topic` header between the
+ * offset and the key.
+ * @param {string} line
+ * @returns {{ topic: string, partition: number, offset: number, key: string }|null}
+ */
+const parseTopicLine = (line) => {
+  const m = TOPIC_LINE.exec(line)
+  return m && { topic: m[3], partition: Number(m[1]), offset: Number(m[2]), key: m[4] }
+}
+
 /**
  * One load producer: a client producer of one kind with its offer schedule. A transactional
  * producer sends into the open transaction and ends it every `transactionMs`, aborting every
  * `abortEvery`-th and any whose send failed; a transaction that cannot end recreates the producer
  * as a new incarnation.
+ *
+ * Its partitions are split into lanes (one, unless `laneOf` names a lane per partition leader);
+ * each lane has its share of the rate, its own offer schedule and unsettled cap, and its own send
+ * per tick, so a lane whose broker is slow holds back no other lane's records.
  */
 class LoadProducer {
   /**
@@ -203,15 +242,43 @@ class LoadProducer {
    * @param {LatencyHistogram} options.latency
    * @param {{ now: () => number }} options.clock
    * @param {(ms: number) => Promise<void>} options.sleep
+   * @param {(cell: { topic: string, partition: number }) => string} [options.laneOf]
+   * @param {FlowMeter|null} [options.flow] counts acknowledged records per lane (not for a
+   *   transactional producer)
+   * @param {ClientMeter|null} [options.meter] listens to every incarnation's client
    */
-  constructor({ kafka, id, kind, profile, topics, runId, latency, clock, sleep }) {
-    Object.assign(this, { kafka, id, kind, profile, topics, runId, latency, clock, sleep })
+  constructor({
+    kafka,
+    id,
+    kind,
+    profile,
+    topics,
+    runId,
+    latency,
+    clock,
+    sleep,
+    laneOf = () => 'all',
+    flow = null,
+    meter = null,
+  }) {
+    Object.assign(this, { kafka, id, kind, profile, topics, runId, latency, clock, sleep, meter })
+    this.flow = kind === 'transactional' ? null : flow
     this.rate = profile.rate / profile.producers
-    this.cap = Math.max(1, Math.ceil(this.rate * profile.unsettledSeconds))
-    this.cells = topics.flatMap((topic) =>
+    const cells = topics.flatMap((topic) =>
       Array.from({ length: profile.partitions }, (_, partition) => ({ topic, partition }))
     )
-    this.cursor = 0
+    const byLane = new Map()
+    for (const cell of cells) {
+      const key = laneOf(cell)
+      if (!byLane.has(key)) byLane.set(key, [])
+      byLane.get(key).push(cell)
+    }
+    this.lanes = [...byLane].map(([key, laneCells]) => {
+      const rate = (this.rate * laneCells.length) / cells.length
+      const cap = Math.max(1, Math.ceil(rate * profile.unsettledSeconds))
+      return { key, cells: laneCells, rate, cap, cursor: 0, unsettled: 0, schedule: null }
+    })
+    this.headers = profile.topicHeader ? new Map(topics.map((t) => [t, { topic: t }])) : null
     this.unsettled = 0
     /** @type {SendLedger[]} */
     this.ledgers = []
@@ -242,6 +309,7 @@ class LoadProducer {
       }),
     }
     this.producer = this.kafka.producer(options)
+    this.meter?.observe(this.producer)
     this.ledger = new SendLedger({
       producer: this.id,
       incarnation: this.stats.incarnations++,
@@ -254,26 +322,32 @@ class LoadProducer {
 
   /** @param {number} start the offer window's start @returns {void} */
   begin(start) {
-    this.schedule = new OfferSchedule({ rate: this.rate, start })
+    for (const lane of this.lanes) lane.schedule = new OfferSchedule({ rate: lane.rate, start })
     this.lastTxAt = start
   }
 
   /**
-   * Sends what the schedule made due, as far as the unsettled cap allows.
+   * Sends what each lane's schedule made due, as far as its unsettled cap allows.
    * @param {number} now
    * @returns {void}
    */
   tick(now) {
     if (this.kind === 'transactional' && !this.#transactionReady(now)) return
-    const n = Math.min(this.schedule.due(now), this.cap - this.unsettled)
+    for (const lane of this.lanes) this.#tickLane(lane, now)
+  }
+
+  /** @param {object} lane @param {number} now @returns {void} */
+  #tickLane(lane, now) {
+    const { cells } = lane
+    const n = Math.min(lane.schedule.due(now), lane.cap - lane.unsettled)
     if (n <= 0) return
-    const { dueAt } = this.schedule.take(n)
+    const { dueAt } = lane.schedule.take(n)
     const byTopic = new Map()
     const issued = []
-    const per = Math.floor(n / this.cells.length)
-    let extra = n % this.cells.length
-    for (let k = 0; k < this.cells.length; k++) {
-      const cell = this.cells[(this.cursor + k) % this.cells.length]
+    const per = Math.floor(n / cells.length)
+    let extra = n % cells.length
+    for (let k = 0; k < cells.length; k++) {
+      const cell = cells[(lane.cursor + k) % cells.length]
       const count = per + (extra > 0 ? 1 : 0)
       if (extra > 0) extra--
       if (count === 0) break
@@ -281,14 +355,17 @@ class LoadProducer {
       issued.push({ ...cell, first, count })
       if (!byTopic.has(cell.topic)) byTopic.set(cell.topic, [])
       const messages = byTopic.get(cell.topic)
+      const headers = this.headers?.get(cell.topic)
       for (let i = 0; i < count; i++)
         messages.push({
           partition: cell.partition,
           key: key(i),
           value: this.values[(first + i) & 63],
+          ...(headers && { headers }),
         })
     }
-    this.cursor = (this.cursor + (n % this.cells.length)) % this.cells.length
+    lane.cursor = (lane.cursor + (n % cells.length)) % cells.length
+    lane.unsettled += n
     this.unsettled += n
     this.stats.sent += n
     const batch = {
@@ -302,7 +379,7 @@ class LoadProducer {
       (metadata) => ({ ok: true, metadata }),
       (error) => ({ ok: false, error })
     )
-    const entry = { send, issued, ledger, n, dueAt }
+    const entry = { send, issued, ledger, n, dueAt, lane }
     if (this.kind === 'transactional') {
       this.txSends.push(entry)
       return
@@ -402,7 +479,7 @@ class LoadProducer {
   }
 
   /**
-   * @param {{ issued: object[], ledger: SendLedger, n: number, dueAt: (i: number) => number }} entry
+   * @param {{ issued: object[], ledger: SendLedger, n: number, dueAt: (i: number) => number, lane: object }} entry
    * @param {'acked'|'failed'|'aborted'} status
    * @param {{ ok: boolean, metadata?: object[], error?: Error }} result the send's own result
    * @returns {void}
@@ -413,10 +490,12 @@ class LoadProducer {
       offsets.set(`${m.topicName}/${m.partition}`, Number(m.baseOffset))
     for (const { topic, partition, first } of entry.issued)
       entry.ledger.settle(topic, partition, first, status, offsets.get(`${topic}/${partition}`))
+    entry.lane.unsettled -= entry.n
     this.unsettled -= entry.n
     this.stats[status] += entry.n
     if (status === 'acked') {
       const now = this.clock.now()
+      this.flow?.add('acked', entry.lane.key, entry.n, now)
       for (let i = 0; i < entry.n; i++) this.latency.record(now - entry.dueAt(i))
     } else if (!result.ok) this.#recordError('send', result.error)
   }
@@ -433,10 +512,15 @@ class LoadProducer {
  */
 class LoadConsumer {
   /**
-   * @param {{ kafka: object, groupId: string, member: string, topics: string[], clock: { now: () => number } }} options
+   * @param {object} options
+   * @param {object} options.kafka @param {string} options.groupId @param {string} options.member
+   * @param {string[]} options.topics @param {{ now: () => number }} options.clock
+   * @param {((cell: { topic: string, partition: number }) => string)|null} [options.laneOf]
+   * @param {FlowMeter|null} [options.flow] counts delivered records per lane, with `laneOf`
+   * @param {ClientMeter|null} [options.meter]
    */
-  constructor({ kafka, groupId, member, topics, clock }) {
-    Object.assign(this, { kafka, groupId, topics, clock })
+  constructor({ kafka, groupId, member, topics, clock, laneOf = null, flow = null, meter = null }) {
+    Object.assign(this, { kafka, groupId, member, topics, clock, laneOf, flow, meter })
     this.ledger = new DeliveryLedger({ group: groupId, member })
     this.delivered = 0
     this.lastDeliveryAt = clock.now()
@@ -449,7 +533,9 @@ class LoadConsumer {
     this.consumer.on(this.consumer.events.CRASH, () => {
       this.crashes++
     })
+    this.meter?.observe(this.consumer, this.member)
     await this.consumer.connect()
+    this.meter?.subscribing(this.member)
     await this.consumer.subscribe({ topics: this.topics, fromBeginning: true })
     await this.consumer.run({
       eachBatch: async ({ batch }) => {
@@ -457,6 +543,8 @@ class LoadConsumer {
           this.ledger.deliver(batch.topic, batch.partition, Number(message.offset))
         this.delivered += batch.messages.length
         this.lastDeliveryAt = this.clock.now()
+        if (this.laneOf && this.flow)
+          this.flow.add('delivered', this.laneOf(batch), batch.messages.length, this.lastDeliveryAt)
       },
     })
   }
@@ -476,8 +564,12 @@ class LoadRun {
    * @param {object} options.profile `parseLoadArgs`
    * @param {object} options.kafka a `Kafka` for the clients under test
    * @param {{ readTopic: Function, describeGroup: Function }} options.reader an `ApacheReader`
-   * @param {{ rollingBounce: Function }|null} [options.bouncer] a `BrokerBouncer`, for a restart
-   *   schedule
+   * @param {{ rollingBounce: Function, step: Function }|null} [options.bouncer] a
+   *   `BrokerBouncer`, for a schedule that restarts or pauses brokers
+   * @param {{ check: Function, apply: Function, clear: Function }|null} [options.netem] a
+   *   `NetemDelay`, for the slow-broker schedule
+   * @param {{ start: Function, stop: Function, maxBetween: Function }|null} [options.lagProbe] a
+   *   `LagProbe`; one on the run's clock by default
    * @param {{ now: () => number }} [options.clock]
    * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
    * @param {(line: string) => void} [options.log]
@@ -488,12 +580,15 @@ class LoadRun {
     kafka,
     reader,
     bouncer = null,
+    netem = null,
+    lagProbe = null,
     clock = performance,
     sleep = realSleep,
     log = (line) => console.log(line),
     treeSha = null,
   }) {
-    Object.assign(this, { profile, kafka, reader, bouncer, clock, sleep, log, treeSha })
+    Object.assign(this, { profile, kafka, reader, bouncer, netem, clock, sleep, log, treeSha })
+    this.lagProbe = lagProbe ?? new LagProbe({ clock })
     this.runId = `load-${Date.now()}`
     this.topics = Array.from({ length: profile.topics }, (_, i) => `${this.runId}-${i}`)
     this.groupId = `${this.runId}-group`
@@ -502,40 +597,24 @@ class LoadRun {
   }
 
   /**
-   * Sets up, offers, drains, reads and judges; writes and seals the artifact.
+   * Checks the fault mechanism, then sets up, offers, drains, reads and judges; writes and seals
+   * the artifact.
    * @returns {Promise<object>} the report, with `verdict`
+   * @throws {Error} the fault schedule's `check`, before anything is created
    */
   async run() {
     const { profile } = this
+    const schedule = FAULT_SCHEDULES[profile.faults]
+    await schedule.check?.({ netem: this.netem, bouncer: this.bouncer })
     fs.mkdirSync(path.join(profile.out, 'apache'), { recursive: true })
     this.#write('profile.json', { ...profile, runId: this.runId, topics: this.topics })
     const admin = this.kafka.admin()
-    const producers = Array.from(
-      { length: profile.producers },
-      (_, i) =>
-        new LoadProducer({
-          kafka: this.kafka,
-          id: `p${i}`,
-          kind: profile.producerKinds[i % profile.producerKinds.length],
-          profile,
-          topics: this.topics,
-          runId: this.runId,
-          latency: this.latency,
-          clock: this.clock,
-          sleep: this.sleep,
-        })
-    )
-    const consumers = Array.from(
-      { length: profile.consumers },
-      (_, i) =>
-        new LoadConsumer({
-          kafka: this.kafka,
-          groupId: this.groupId,
-          member: `c${i}`,
-          topics: this.topics,
-          clock: this.clock,
-        })
-    )
+    const meter = new ClientMeter({ clock: this.clock, lag: this.lagProbe })
+    this.lagProbe.start(meter.origin)
+    this.flow = profile.leaderLanes ? new FlowMeter() : null
+    const setup = { createTopicsMs: null, leaders: null }
+    let producers = []
+    let consumers = []
     const resources = { samples: [], maxHeapUsed: 0, maxRss: 0 }
     const loop = monitorEventLoopDelay({ resolution: 20 })
     let totals = { offered: 0, sent: 0, acked: 0, failed: 0 }
@@ -544,17 +623,46 @@ class LoadRun {
     let windowMs = profile.durationSeconds * 1000
     try {
       await admin.connect()
-      await admin.createTopics({
-        waitForLeaders: true,
-        topics: this.topics.map((topic) => ({
-          topic,
-          numPartitions: profile.partitions,
-          replicationFactor: profile.replicationFactor,
-          configEntries: [
-            { name: 'min.insync.replicas', value: String(profile.minInsyncReplicas) },
-          ],
-        })),
-      })
+      setup.createTopicsMs = await this.#createTopics(admin)
+      let laneOf
+      if (profile.leaderLanes) {
+        const leaders = await this.#leaders(admin)
+        laneOf = ({ topic, partition }) => leaders.get(`${topic}/${partition}`) ?? 'unknown'
+        setup.leaders = {}
+        for (const node of leaders.values()) setup.leaders[node] = (setup.leaders[node] ?? 0) + 1
+      }
+      producers = Array.from(
+        { length: profile.producers },
+        (_, i) =>
+          new LoadProducer({
+            kafka: this.kafka,
+            id: `p${i}`,
+            kind: profile.producerKinds[i % profile.producerKinds.length],
+            profile,
+            topics: this.topics,
+            runId: this.runId,
+            latency: this.latency,
+            clock: this.clock,
+            sleep: this.sleep,
+            laneOf,
+            flow: this.flow,
+            meter,
+          })
+      )
+      consumers = Array.from(
+        { length: profile.consumers },
+        (_, i) =>
+          new LoadConsumer({
+            kafka: this.kafka,
+            groupId: this.groupId,
+            member: `c${i}`,
+            topics: this.topics,
+            clock: this.clock,
+            laneOf,
+            flow: this.flow,
+            meter,
+          })
+      )
       for (const consumer of consumers) await consumer.start()
       for (const producer of producers) await producer.connect()
       loop.enable()
@@ -573,6 +681,7 @@ class LoadRun {
       this.errors.push(`driver: ${error?.stack ?? error}`)
     } finally {
       loop.disable()
+      this.lagProbe.stop()
       for (const client of [...producers, ...consumers]) {
         try {
           await (client.close?.() ?? client.stop())
@@ -593,7 +702,7 @@ class LoadRun {
       this.errors.push(`read: ${error?.message}`)
     }
     try {
-      await admin.deleteTopics({ topics: this.topics })
+      await admin.deleteTopics({ topics: this.topics, timeout: ADMIN_TIMEOUT_MS })
     } catch (error) {
       this.log(`topic cleanup failed: ${error?.message}`)
     }
@@ -604,11 +713,19 @@ class LoadRun {
       targetFraction: profile.targetFraction,
       ...totals,
     })
-    const verdict = verdictOf({ oracle, rate, error: this.errors[0] ?? null })
+    const phases = phaseList(faults, windowMs)
+    const flow = this.flow && this.#flowVerdict(producers, phases)
+    const verdict = verdictOf({
+      oracle,
+      rate,
+      error: this.errors[0] ?? null,
+      flow: flow?.verdict ?? null,
+    })
     const report = {
       verdict,
       rate,
       totals,
+      ...(flow && { flow }),
       latencyMs: this.latency.toJSON(),
       eventLoopDelayMs: {
         p50: loop.percentile(50) / 1e6,
@@ -616,6 +733,8 @@ class LoadRun {
         max: loop.max / 1e6,
       },
       resources,
+      memory: phaseMemory(resources.samples, phases),
+      cluster: { ...setup, ...meter.toJSON() },
       oracle,
       producers: producers.map((p) => ({
         id: p.id,
@@ -628,7 +747,14 @@ class LoadRun {
         delivered: c.delivered,
         crashes: c.crashes,
       })),
-      faults: faults.map(({ service, kind, outageMs }) => ({ service, kind, outageMs })),
+      faults: faults.map(({ phase, service, kind, startMs, endMs, outageMs }) => ({
+        phase,
+        service,
+        kind,
+        startMs,
+        endMs,
+        outageMs,
+      })),
       errors: this.errors,
     }
     this.#write('report.json', report)
@@ -648,13 +774,17 @@ class LoadRun {
     const end = start + windowMs
     const tickMs = 1000 / profile.ticksPerSecond
     for (const producer of producers) producer.begin(start)
+    this.flow?.begin(start)
     const window = new AbortController()
     const fault = FAULT_SCHEDULES[profile.faults]
       .start({
         bouncer: this.bouncer,
+        netem: this.netem,
         admin,
         topics: this.topics,
         windowMs,
+        windowStart: start,
+        clock: this.clock,
         signal: window.signal,
         sleep: this.sleep,
       })
@@ -682,6 +812,56 @@ class LoadRun {
     const offered = producers.reduce((s, p) => s + Math.floor((windowMs * p.rate) / 1000), 0)
     const sent = producers.reduce((s, p) => s + p.stats.sent, 0)
     return { totals: { offered, sent, acked: 0, failed: 0 }, faults, windowMs }
+  }
+
+  /**
+   * Creates the topics, `CREATE_CHUNK` per request, each waiting for its leaders.
+   * @param {object} admin
+   * @returns {Promise<number>} how long it took, ms
+   */
+  async #createTopics(admin) {
+    const { profile } = this
+    const began = this.clock.now()
+    for (let i = 0; i < this.topics.length; i += CREATE_CHUNK)
+      await admin.createTopics({
+        waitForLeaders: true,
+        timeout: ADMIN_TIMEOUT_MS,
+        topics: this.topics.slice(i, i + CREATE_CHUNK).map((topic) => ({
+          topic,
+          numPartitions: profile.partitions,
+          replicationFactor: profile.replicationFactor,
+          configEntries: [
+            { name: 'min.insync.replicas', value: String(profile.minInsyncReplicas) },
+          ],
+        })),
+      })
+    return this.clock.now() - began
+  }
+
+  /**
+   * @param {object} admin
+   * @returns {Promise<Map<string, string>>} each `topic/partition`'s leader node id before the window
+   */
+  async #leaders(admin) {
+    const { topics } = await admin.fetchTopicMetadata({ topics: this.topics })
+    return new Map(
+      topics.flatMap(({ name, partitions }) =>
+        partitions.map(({ partitionId, leader }) => [`${name}/${partitionId}`, String(leader)])
+      )
+    )
+  }
+
+  /**
+   * @param {LoadProducer[]} producers @param {object[]} phases `phaseList`
+   * @returns {object} `flowVerdict` over the idempotent and plain producers' lanes
+   */
+  #flowVerdict(producers, phases) {
+    const rates = {}
+    for (const producer of producers)
+      if (producer.kind !== 'transactional')
+        for (const lane of producer.lanes) rates[lane.key] = (rates[lane.key] ?? 0) + lane.rate
+    const slowNode = String(FAULT_SCHEDULES[this.profile.faults].nodeId)
+    return flowVerdict({ phases, flow: this.flow, rates, slowNode })
   }
 
   /**
@@ -728,6 +908,13 @@ class LoadRun {
     })
     const reads = []
     const failures = []
+    if (this.profile.topicHeader) {
+      await this.#readAll(checker, reads, failures)
+      const verdict = { ...checker.finish(), size: checker.size(), reads }
+      if (failures.length)
+        throw Object.assign(new Error(`read failed: ${failures.join('; ')}`), { verdict })
+      return verdict
+    }
     const queue = [...this.topics]
     const worker = async () => {
       for (let topic = queue.shift(); topic; topic = queue.shift()) {
@@ -756,6 +943,30 @@ class LoadRun {
     if (failures.length)
       throw Object.assign(new Error(`read failed: ${failures.join('; ')}`), { verdict })
     return verdict
+  }
+
+  /**
+   * Reads every topic of the run in one console consumer into `apache/all.dump.gz`.
+   * @param {SequenceChecker} checker @param {object[]} reads @param {string[]} failures
+   * @returns {Promise<void>}
+   */
+  async #readAll(checker, reads, failures) {
+    const began = this.clock.now()
+    const file = path.join(this.profile.out, 'apache/all.dump.gz')
+    const gzip = zlib.createGzip()
+    const sink = fs.createWriteStream(file)
+    gzip.pipe(sink)
+    const result = await this.reader.readAll(`^${this.runId}-\\d+$`, (line) => {
+      gzip.write(line + '\n')
+      observeTopicLine(checker, line)
+    })
+    gzip.end()
+    await finished(sink)
+    const { exit, lines, processed } = result
+    fs.writeFileSync(`${file}.end`, `exit=${exit} lines=${lines} processed=${processed}\n`)
+    reads.push({ topic: '*', exit, lines, processed, seconds: (this.clock.now() - began) / 1000 })
+    if (exit !== 0 || processed !== lines)
+      failures.push(`all topics: exit ${exit}, ${lines} lines, tool counted ${processed}`)
   }
 
   /** @param {string} name @param {*} value @returns {void} */
@@ -795,6 +1006,17 @@ class LoadRun {
 }
 
 /**
+ * Hands one line of the read of every topic to the checker.
+ * @param {SequenceChecker} checker @param {string} line
+ * @returns {void}
+ */
+const observeTopicLine = (checker, line) => {
+  const parsed = parseTopicLine(line)
+  if (parsed) checker.observe(parsed.topic, parsed.partition, parsed.offset, parsed.key)
+  else checker.unparseable('*', line)
+}
+
+/**
  * Judges a sealed artifact again from its files alone: checks every file against `header.json`,
  * then replays the gzipped Apache dumps through a fresh `SequenceChecker` with the sealed ledgers.
  * @param {string} dir the artifact
@@ -819,26 +1041,31 @@ const recheck = async (dir) => {
     committed,
     logEnds,
   })
-  for (const topic of topics) {
-    const name = `apache/${topic}.dump.gz`
+  const replay = async (name, onLine) => {
     if (!header.files[name]) throw new Error(`${name} is not sealed`)
     const lines = readline.createInterface({
       input: fs.createReadStream(path.join(dir, name)).pipe(zlib.createGunzip()),
       crlfDelay: Infinity,
     })
-    for await (const line of lines) {
-      const parsed = parseDumpLine(line)
-      if (parsed) checker.observe(topic, parsed.partition, parsed.offset, parsed.key)
-      else checker.unparseable(topic, line)
-    }
+    for await (const line of lines) onLine(line)
   }
+  if (header.files['apache/all.dump.gz'])
+    await replay('apache/all.dump.gz', (line) => observeTopicLine(checker, line))
+  else
+    for (const topic of topics)
+      await replay(`apache/${topic}.dump.gz`, (line) => {
+        const parsed = parseDumpLine(line)
+        if (parsed) checker.observe(topic, parsed.partition, parsed.offset, parsed.key)
+        else checker.unparseable(topic, line)
+      })
   return { ...checker.finish(), size: checker.size() }
 }
 
 /**
  * The CLI: `--recheck <artifact>` replays a sealed artifact (exit 0 when the oracle passes it, 1
  * otherwise); any other arguments run a profile, building the client, the Apache reader and, for a
- * restart schedule, the bouncer.
+ * fault schedule, the bouncer and (slow-broker) the netem delay. With thousands of partitions a
+ * restart may wait up to 5 minutes for the full ISR.
  * @param {string[]} argv
  * @returns {Promise<number>} the exit code
  */
@@ -856,21 +1083,44 @@ const main = async (argv) => {
     '../..',
     process.env.COMPOSE_FILE || 'docker-compose.yml'
   )
-  const bouncer =
-    profile.faults === 'rolling-restarts'
-      ? new (require('../../testHelpers/leaderElection').BrokerBouncer)()
-      : null
+  const schedule = FAULT_SCHEDULES[profile.faults]
+  let bouncer = null
+  let netem = null
+  if (profile.faults !== 'none') {
+    const { BrokerBouncer, NODES, waitForFullIsr } = require('../../testHelpers/leaderElection')
+    bouncer = new BrokerBouncer(
+      profile.faults === 'many-topics'
+        ? {
+            waitForFullIsr: (admin, t) =>
+              waitForFullIsr(admin, t, { budgetMs: 300000, delayMs: 2000 }),
+          }
+        : {}
+    )
+    if (profile.faults === 'slow-broker') {
+      const { NetemDelay } = require('./netemDelay')
+      const { port } = NODES[schedule.service]
+      netem = new NetemDelay({ container: schedule.service, port, delayMs: schedule.delayMs })
+    }
+  }
   const report = await new LoadRun({
     profile,
     kafka,
     reader: new ApacheReader({ composeFile }),
     bouncer,
+    netem,
     treeSha: process.env.LOAD_TREE_SHA ?? null,
   }).run()
   const { verdict, rate, latencyMs } = report
   console.log(
     JSON.stringify(
-      { verdict, rate, latencyMs, findings: report.oracle?.findings, errors: report.errors },
+      {
+        verdict,
+        rate,
+        latencyMs,
+        flow: report.flow && { verdict: report.flow.verdict, reasons: report.flow.reasons },
+        findings: report.oracle?.findings,
+        errors: report.errors,
+      },
       null,
       2
     )
@@ -878,7 +1128,16 @@ const main = async (argv) => {
   return verdict.exitCode
 }
 
-module.exports = { ApacheReader, LoadConsumer, LoadProducer, LoadRun, main, parseDescribe, recheck }
+module.exports = {
+  ApacheReader,
+  LoadConsumer,
+  LoadProducer,
+  LoadRun,
+  main,
+  parseDescribe,
+  parseTopicLine,
+  recheck,
+}
 
 if (require.main === module) {
   main(process.argv.slice(2)).then(

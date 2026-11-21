@@ -347,7 +347,8 @@ node scripts/soak/loadRun.js --recheck .tmp/load-profile   # replay the sealed a
 
 Every flag has a default (`LOAD_DEFAULTS` in `scripts/soak/loadProfile.js`). On a hosted runner, dispatch the
 `Load profile (diagnostic)` workflow (`.github/workflows/load-profile.yml`): choice inputs for rate, record size, topics,
-partitions, duration, codec, fault schedule and Node; a push to a branch named `p12/load-profile*` runs it with the defaults.
+partitions, duration, codec, fault schedule, replication factor and Node; a push to a branch named `p12/load-profile*` runs
+it with the defaults.
 The job is limited to 30 minutes; the 600 s default window leaves about 10 minutes of slack, 900 s leaves little.
 
 ### 7.2 The oracle
@@ -375,7 +376,8 @@ the structures are the same size at 120,000 and 600,000 records.
 
 ### 7.3 The independent read
 
-Apache's `kafka-console-consumer.sh` in the kafka1 container, one JVM per topic, three topics at a time, `read_committed`,
+Apache's `kafka-console-consumer.sh` in the kafka1 container, one JVM per topic, three topics at a time (the `many-topics`
+schedule instead reads every topic in one JVM: see 7.5), `read_committed`,
 from the beginning, with `print.partition`, `print.offset` and `print.key` on and `print.value` off. Kafka 4.4's
 `DefaultMessageFormatter` ends the line after the key when the value is not printed, so each record costs about 30 bytes
 of output however large it is. It shares no code with the client under test. The tool ends after 10 s without a record;
@@ -389,8 +391,11 @@ records a second (measured with plain Node on the development host), so the tool
 `profile.json`, `producers.json`, `consumers.json`, `committed.json`, `faults.json`, `apache/<topic>.dump.gz` with
 `.end`, `apache/<group>.describe`, `report.json`, and `header.json`, written last, which binds every other file by SHA-256
 (the seal; `--recheck` refuses an artifact that differs from it). `report.json` holds the verdict, offered against sent
-and acknowledged rates, latency percentiles, event-loop delay, heap and RSS samples every 10 s, per-producer and
-per-member counts, the fault schedule's outages and the oracle's findings with examples.
+and acknowledged rates, latency percentiles, event-loop delay, heap and RSS samples every 2 s with each phase's peak and
+end level (`memory`), the client measurements (`cluster`: topic creation time, each member's time from `subscribe` to its
+first assignment, each rebalance with the worst event-loop lag around it, Metadata requests per minute and their response
+sizes, fetch round durations), per-producer and per-member counts, the fault schedule's phases and outages, the flow
+verdict of `slow-broker`, and the oracle's findings with examples.
 
 Latency is measured from each record's due time on the offer schedule (record n of a producer is due n / rate after the
 start), not from when the client accepted it, so a client that falls behind shows its backlog in the percentiles (no
@@ -402,6 +407,7 @@ coordinated omission). Transactional records are timed to their commit.
 | 1 | FAIL | either | loss, duplicate or reordering beyond the kind's guarantee, an aborted record visible, a foreign or malformed key, a skipped commit, a commit past the log end |
 | 2 | INCONCLUSIVE | either | the read was incomplete or failed, or the driver failed, with no product finding |
 | 3 | PASS | RATE_NOT_REACHED | the runner did not send, or the client did not acknowledge, 95 % of the offered records: no claim about the product at that rate |
+| 4 | PASS | either | `slow-broker` only, `flow` STALLED: a flow rule of 7.5 was broken (an inconclusive flow exits 2) |
 
 A shortfall names whether records were not sent (the runner or the unsettled cap) or not acknowledged, and how many sends
 the client rejected; rejections are the client refusing, so read them before blaming the runner.
@@ -410,9 +416,54 @@ the client rejected; rejections are the client refusing, so read them before bla
 
 `FAULT_SCHEDULES` in `loadProfile.js`. `none` is the plain profile. `rolling-restarts`: from a third of the window, every
 broker stopped and restarted in turn, then every broker killed and restarted in turn, 20 s apart, through `BrokerBouncer`
-(each step waits for the node to answer and the ISR to be full). `slow-broker` (a delayed broker, then `pauseBroker`, under
-load) and `many-topics` (thousands of topics with a trickle on each) are named extension points: the CLI refuses them until
-they are implemented.
+(each step waits for the node to answer and the ISR to be full).
+
+**`slow-broker`** (needs `--duration` ≥ 195). In the middle third of the window, kafka2 (node 2) is:
+
+| Phase | What | Length (600 s window) |
+|---|---|---|
+| slow | kafka2's answers to clients delayed 300 ms | (third − 45 s) / 2 = 77.5 s |
+| frozen | `docker compose pause kafka2` (a `BrokerBouncer` pause step), then unpause; the step waits until kafka2 answers | 45 s, above the 30 s client request timeout |
+| recovery | nothing; flow is judged | to two thirds of the window |
+
+The delay is `tc netem` run from the host inside kafka2's network namespace (`sudo nsenter --target <pid> --net tc ...`), on
+egress from the client port 9095 only: a hosted Ubuntu runner has passwordless `sudo`, `nsenter` and `tc`, so neither a new
+image nor `NET_ADMIN` on the broker container is needed, and replication stays fast (with RF 3 on three brokers every
+partition has a replica on kafka2, so delaying all its traffic would slow every partition through its follower and leave
+no healthy partition to compare). The run applies and removes a 1 ms rule before it creates anything and stops with exit 2
+and `slow-broker needs sudo, nsenter, tc and the netem qdisc ...` when that fails; it is never a silent no-op. The delay is
+always removed when the phase ends, and the pause step always unpauses.
+
+The schedule offers 10 ticks a second (one request per broker per producer every 100 ms, under the 5 in flight / 300 ms
+that one connection to the delayed broker can complete) and sends each tick's records as one batch per partition
+leader (taken before the window), so a slow partition's acknowledgement never holds back another leader's batch inside the
+harness. The flow verdict judges the idempotent and plain producers' acknowledgements per original leader in one-second
+buckets (a transaction waits for every partition it wrote, so the transactional producer is left out):
+
+| Phase | Leaders judged | Rule | Why this number |
+|---|---|---|---|
+| slow | not node 2 | acknowledged ≥ 90 % of offered | their brokers are untouched, so only the client can slow them; 10 % covers the 100 ms tick and the cap's ramp |
+| frozen | not node 2 | longest stall ≤ 20 s and acknowledged ≥ 50 % | the broker holds them about 11 s (kafka2 stays in their ISR until the controller fences it: `broker.session.timeout.ms` 9 s plus a 2 s heartbeat); a client waiting on kafka2's requests holds them a full 30 s request timeout; 20 s separates the two; 25 of 45 s flowing is above 50 % |
+| recovery | every leader | acknowledged ≥ 90 % of offered | the client recovered without a restart |
+
+A phase with fewer than 5 whole seconds, or a kafka2 that led nothing, makes the flow INCONCLUSIVE. `flow.table` gives each
+phase's offered, acknowledged and delivered rate and longest stall per leader (`baseline` and `after` included, not
+judged); `memory` gives each phase's heap and RSS peak and end level, to read the frozen phase's growth and the level after
+recovery. kafka2's partitions fail over during the freeze and stay on the other brokers until a preferred-leader election
+(`leader.imbalance.check.interval.seconds`, 300 s by default), so the recovery rule proves the client resumed those
+partitions, not that it reconnected to kafka2.
+
+**`many-topics`** (needs `--topics × --partitions` ≥ 1000; dispatch with topics 2000, partitions 1, rate 2000, duration
+300). Topics are created 250 per request, each record carries a `topic` header, and Apache's console consumer reads every
+topic in one JVM (`--include`, `print.headers`, 30 s idle end) into `apache/all.dump.gz`: one JVM per topic would cost
+2,000 JVM starts and idle timeouts. One clean rolling restart from a third of the window (each step waits up to 5 minutes
+for the full ISR). `cluster` reports the measurements; nothing in them is judged.
+
+What a hosted runner (4 vCPU, 16 GB, three brokers with the image's 1 GB heap each) can hold, unverified until the first
+run: 2,000 single-partition topics at RF 3 are 2,000 replicas on every broker, within Kafka's usual few thousand per broker;
+every broker holds about 6,000 open segment files and 4,000 index maps, below Docker's default open-file limit and
+`vm.max_map_count` 65,530. The first run reports the creation time and restart outages; if creation or a restart does not
+finish, dispatch again with replication factor 1 (2,000 replicas in all), and record that the RF 3 claim is not proven.
 
 ### 7.6 Expected rates and the first CI run
 
@@ -432,3 +483,25 @@ What the first run must show, and how to read it (the `Print the report` step, o
 - `consumers[].crashes` and `producers[].errors`: expected few, all inside the restart window.
 - `latencyMs.p99` and `eventLoopDelayMs.p99`: recorded, not judged.
 - the artifact replays: `node scripts/soak/loadRun.js --recheck <artifact>` exits 0 with the same findings.
+
+What the first `slow-broker` run (rate 10000, duration 600) must show:
+
+- no `slow-broker needs ...` error: if it appears, the runner lacks the mechanism and nothing was run.
+- `faults`: `slow` from about 200,000 ms to 277,500 ms with `delayMs` 300, `frozen` about 45,000 ms long with `outageMs`,
+  `recovery` ending at about 400,000 ms.
+- `cluster.leaders`: node 2 leads about a third of the partitions.
+- `flow.verdict` KEPT_FLOWING and `verdict.exitCode` 0; STALLED names the phase and leader in `flow.reasons`: a stall of
+  about 30 s on leader 1 or 3 in `frozen` is the client waiting on kafka2 (head-of-line), the finding this schedule exists for.
+- `flow.table`: node 2's `ackedRate` falls in `slow` and is near 0 in the first part of `frozen`; nodes 1 and 3 stay near their
+  `offeredRate` in `slow`.
+- `memory`: the `frozen` peak and the `after` end level, with every oracle count 0 as in the plain run.
+
+What the first `many-topics` run (topics 2000, partitions 1, rate 2000, duration 300, RF 3) must show:
+
+- `cluster.createTopicsMs` (expected under 2 minutes) and `cluster.firstAssignmentMs` per member.
+- `cluster.rebalances`: one per member at the start and more around the restart, each with `partitions` (about 667 for three
+  members), `joinMs` and `loopDelayMaxMs`, the event loop's worst lag around applying the assignment.
+- `cluster.metadata.perMinute`, `meanBytes` and `maxBytes` (an estimate: a full answer for 2,000 topics is about 100 to 200 KB) and
+  `cluster.fetchRoundMs`.
+- `faults`: one `rolling-restart` phase then three `stop` outages; `oracle.reads` one entry, topic `*`, `exit` 0, `lines`
+  equal to `processed`; every oracle count 0; exit 0.

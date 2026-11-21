@@ -7,7 +7,10 @@
  * The verdict keeps two questions apart. The product verdict is the sequence oracle's: no loss, no
  * duplicate or reordering beyond the producer kind's guarantee, no skipped commit. The profile
  * verdict says whether the run offered the load it was asked for: a run that did not reach its
- * target rate fails as a profile, and says so, but proves nothing against the product.
+ * target rate fails as a profile, and says so, but proves nothing against the product. The
+ * slow-broker schedule adds a flow verdict: whether the partitions led by the other brokers kept
+ * flowing while one broker was slow, then frozen, and whether the slow broker's own partitions
+ * flowed again after it (`flowVerdict`).
  */
 
 const CODECS = Object.freeze(['none', 'gzip', 'snappy', 'lz4', 'zstd'])
@@ -43,6 +46,10 @@ const LOAD_DEFAULTS = Object.freeze({
   unsettledSeconds: 2,
   transactionMs: 500,
   abortEvery: 10,
+  /** Send each tick's records as one batch per partition leader (`slow-broker` sets it). */
+  leaderLanes: false,
+  /** Give every record a `topic` header, so one read of all topics can tell them apart. */
+  topicHeader: false,
 })
 
 const INTEGER_FLAGS = Object.freeze({
@@ -64,11 +71,29 @@ const INTEGER_FLAGS = Object.freeze({
  *   none              the plain profile
  *   rolling-restarts  from a third of the window: every broker stopped and restarted in turn, then
  *                     every broker killed and restarted in turn, `betweenMs` apart (BrokerBouncer)
- *   slow-broker       extension point: one broker delayed (`chaosSocket`) and then frozen
- *                     (`pauseBroker`) under load, for producers and consumers
- *   many-topics       extension point: thousands of topics with a trickle on each, a rolling
- *                     restart and a regex subscriber over all of them
+ *   slow-broker       in the middle third of the window: kafka2's answers to clients delayed
+ *                     `delayMs` (`NetemDelay`), then kafka2 paused `freezeMs` (a `BrokerBouncer`
+ *                     pause step), then a recovery phase; judged by `flowVerdict`
+ *   many-topics       thousands of single-partition topics at a modest rate, one clean rolling
+ *                     restart from a third of the window, read back in one pass
+ *
+ * A schedule may also carry `profile` (parameters it sets), `validate` (refuses a profile it
+ * cannot run) and `check` (proves its fault mechanism before anything is created). Every `start`
+ * gets `{ bouncer, netem, admin, topics, windowMs, windowStart, clock, signal, sleep }`; a record
+ * with `phase` has `startMs` and `endMs` in ms from the window's start.
  */
+/**
+ * Waits on the run's clock until `ms` after the window started.
+ * @param {{ clock: { now: () => number }, windowStart: number, sleep: Function, signal: AbortSignal }} context
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+const untilWindowMs = ({ clock, windowStart, sleep, signal }, ms) =>
+  sleep(Math.max(0, ms - (clock.now() - windowStart)), signal)
+
+/** @param {{ clock: { now: () => number }, windowStart: number }} context @returns {number} */
+const windowMsOf = ({ clock, windowStart }) => Math.round(clock.now() - windowStart)
+
 const FAULT_SCHEDULES = Object.freeze({
   none: Object.freeze({ start: async () => [] }),
   'rolling-restarts': Object.freeze({
@@ -92,20 +117,114 @@ const FAULT_SCHEDULES = Object.freeze({
       return [...clean, ...hard]
     },
   }),
-  'slow-broker': Object.freeze({ extensionPoint: true }),
-  'many-topics': Object.freeze({ extensionPoint: true }),
+  'slow-broker': Object.freeze({
+    service: 'kafka2',
+    nodeId: 2,
+    /** A slow broker, not a dead one: well below the 30 s request timeout. */
+    delayMs: 300,
+    /** Longer than the client's 30 s default request timeout, so in-flight requests time out. */
+    freezeMs: 45000,
+    /** Each phase needs at least 20 s around the freeze: the middle third holds 45 + 20 s. */
+    minWindowMs: 3 * 65000,
+    /**
+     * 10 ticks a second keeps each producer at 10 requests a second per broker, under the 5 in
+     * flight / 300 ms ≈ 16 a second that one connection to the delayed broker can complete, so
+     * the slow lane is limited by the delay and not by a request queue the harness overfills.
+     * One lane per leader keeps a slow partition's acknowledgement out of another leader's send:
+     * the flow verdict then sees the client, not the harness's batching.
+     */
+    profile: Object.freeze({ ticksPerSecond: 10, leaderLanes: true }),
+    /** @param {object} profile @returns {string|null} why the profile cannot run it */
+    validate: (profile) =>
+      profile.durationSeconds * 1000 >= FAULT_SCHEDULES['slow-broker'].minWindowMs
+        ? null
+        : `fault schedule slow-broker needs --duration of at least ${FAULT_SCHEDULES['slow-broker'].minWindowMs / 1000}`,
+    /**
+     * @param {{ netem: { check: () => Promise<void> }|null }} context
+     * @returns {Promise<void>}
+     * @throws {Error} when there is no delay tool or it does not work on this host
+     */
+    async check({ netem }) {
+      if (!netem) throw new Error('slow-broker needs a network delay tool')
+      await netem.check()
+    },
+    /**
+     * @param {object} context see `FAULT_SCHEDULES`
+     * @returns {Promise<object[]>} the slow, frozen and recovery phases as they ran; the delay is
+     *   always removed, and `BrokerBouncer#step` always unpauses
+     */
+    async start(context) {
+      const { netem, bouncer, admin, topics, windowMs, signal } = context
+      const { service, delayMs, freezeMs } = FAULT_SCHEDULES['slow-broker']
+      const third = windowMs / 3
+      const records = []
+      await untilWindowMs(context, third)
+      if (signal.aborted) return records
+      const slow = { phase: 'slow', service, kind: 'delay', delayMs, startMs: windowMsOf(context) }
+      records.push(slow)
+      await netem.apply()
+      try {
+        await untilWindowMs(context, third + (third - freezeMs) / 2)
+      } finally {
+        await netem.clear()
+        slow.endMs = windowMsOf(context)
+      }
+      if (signal.aborted) return records
+      const frozen = { phase: 'frozen', service, kind: 'pause', requestedMs: windowMsOf(context) }
+      records.push(frozen)
+      const outage = await bouncer.step(
+        { service, kind: 'pause', holdMs: freezeMs },
+        { admin, topics, signal }
+      )
+      frozen.endMs = windowMsOf(context)
+      frozen.startMs = frozen.endMs - outage.outageMs
+      frozen.outageMs = outage.outageMs
+      const recovery = { phase: 'recovery', service, kind: 'none', startMs: frozen.endMs }
+      records.push(recovery)
+      await untilWindowMs(context, 2 * third)
+      recovery.endMs = windowMsOf(context)
+      return records
+    },
+  }),
+  'many-topics': Object.freeze({
+    betweenMs: 20000,
+    /** Below this many partitions in total the run is not a many-topics run. */
+    minPartitions: 1000,
+    /** One console consumer reads every topic; per-topic reads cost a JVM and an idle timeout each. */
+    profile: Object.freeze({ topicHeader: true }),
+    /** @param {object} profile @returns {string|null} why the profile cannot run it */
+    validate: (profile) =>
+      profile.topics * profile.partitions >= FAULT_SCHEDULES['many-topics'].minPartitions
+        ? null
+        : `fault schedule many-topics needs at least ${FAULT_SCHEDULES['many-topics'].minPartitions} partitions (--topics × --partitions)`,
+    /**
+     * @param {object} context see `FAULT_SCHEDULES`
+     * @returns {Promise<object[]>} the rolling restart's phase, then each step's outage
+     */
+    async start(context) {
+      const { bouncer, admin, topics, windowMs, signal } = context
+      await untilWindowMs(context, windowMs / 3)
+      if (signal.aborted) return []
+      const phase = { phase: 'rolling-restart', kind: 'stop', startMs: windowMsOf(context) }
+      const between = FAULT_SCHEDULES['many-topics'].betweenMs
+      const outages = await bouncer.rollingBounce({ between, admin, topics, signal })
+      phase.endMs = windowMsOf(context)
+      return [phase, ...outages]
+    },
+  }),
 })
 
 const USAGE = `usage: node scripts/soak/loadRun.js --out <dir> [--rate <n>] [--record-bytes <n>]
   [--topics <n>] [--partitions <n>] [--producers <n>] [--producer-kinds <${KINDS.join('|')},...>]
   [--consumers <n>] [--duration <seconds>] [--compression <${CODECS.join('|')}>]
-  [--faults <${Object.keys(FAULT_SCHEDULES).join('|')}>] [--replication-factor <n>]`
+  [--faults <${Object.keys(FAULT_SCHEDULES).join('|')}>] [--replication-factor <n>]
+  slow-broker needs --duration of at least 195; many-topics needs at least 1000 partitions`
 
 /**
  * @param {string[]} argv arguments after the script name
  * @returns {object} `LOAD_DEFAULTS` with the given flags applied, plus `out`
- * @throws {Error} the usage line, with the reason, for an unknown flag, a value out of range, an
- *   extension-point fault schedule or a missing `--out`
+ * @throws {Error} the usage line, with the reason, for an unknown flag, a value out of range, a
+ *   fault schedule the profile cannot hold or a missing `--out`
  */
 const parseLoadArgs = (argv) => {
   const profile = { ...LOAD_DEFAULTS, out: null }
@@ -126,7 +245,6 @@ const parseLoadArgs = (argv) => {
     } else if (flag === '--faults') {
       const schedule = FAULT_SCHEDULES[value]
       if (!schedule) fail(`unknown fault schedule ${value}`)
-      if (schedule.extensionPoint) fail(`fault schedule ${value} is not implemented yet`)
       profile.faults = value
     } else if (flag === '--producer-kinds') {
       const kinds = value.split(',')
@@ -135,6 +253,10 @@ const parseLoadArgs = (argv) => {
     } else fail(`unknown flag ${flag}`)
   }
   if (!profile.out) fail('--out is required')
+  const schedule = FAULT_SCHEDULES[profile.faults]
+  Object.assign(profile, schedule.profile)
+  const refusal = schedule.validate?.(profile)
+  if (refusal) fail(refusal)
   if (profile.minInsyncReplicas > profile.replicationFactor)
     profile.minInsyncReplicas = profile.replicationFactor
   return profile
@@ -257,7 +379,13 @@ const rateReport = ({ rate, windowMs, offered, sent, acked, failed = 0, targetFr
 }
 
 /** Exit codes of a run. */
-const EXIT = Object.freeze({ pass: 0, product: 1, inconclusive: 2, rateNotReached: 3 })
+const EXIT = Object.freeze({
+  pass: 0,
+  product: 1,
+  inconclusive: 2,
+  rateNotReached: 3,
+  flowStalled: 4,
+})
 
 /** Oracle findings that say the read, not the product, went wrong. */
 const READ_FINDINGS = Object.freeze(['incompleteRead', 'offsetOrder', 'unparseable'])
@@ -269,12 +397,14 @@ const READ_FINDINGS = Object.freeze(['incompleteRead', 'offsetOrder', 'unparseab
  *   `SequenceChecker#finish`, null when the read never happened
  * @param {{ reached: boolean }} result.rate `rateReport`
  * @param {string|null} [result.error] a driver failure
- * @returns {{ ok: boolean, product: 'PASS'|'FAIL'|'INCONCLUSIVE', profile: 'REACHED'|'RATE_NOT_REACHED', exitCode: number }}
+ * @param {'KEPT_FLOWING'|'STALLED'|'INCONCLUSIVE'|null} [result.flow] `flowVerdict`, for a
+ *   schedule that has one; the verdict carries it only then
+ * @returns {{ ok: boolean, product: 'PASS'|'FAIL'|'INCONCLUSIVE', profile: 'REACHED'|'RATE_NOT_REACHED', flow?: string, exitCode: number }}
  *   any product finding fails the product, except a loss seen by an incomplete read; a read
- *   finding or a driver error without a product finding is inconclusive; a product pass with the
- *   rate not reached exits 3, never 0
+ *   finding or a driver error without a product finding is inconclusive; with the product passing,
+ *   a stalled flow exits 4, an inconclusive flow 2, and the rate not reached 3, never 0
  */
-const verdictOf = ({ oracle, rate, error = null }) => {
+const verdictOf = ({ oracle, rate, error = null, flow = null }) => {
   const counts = oracle ? oracle.findings : {}
   const productFinding = Object.entries(counts).some(
     ([kind, { count }]) =>
@@ -290,24 +420,155 @@ const verdictOf = ({ oracle, rate, error = null }) => {
   const exitCode =
     product === 'FAIL'
       ? EXIT.product
-      : product === 'INCONCLUSIVE'
+      : product === 'INCONCLUSIVE' || flow === 'INCONCLUSIVE'
         ? EXIT.inconclusive
-        : profile === 'RATE_NOT_REACHED'
-          ? EXIT.rateNotReached
-          : EXIT.pass
-  return { ok: exitCode === EXIT.pass, product, profile, exitCode }
+        : flow === 'STALLED'
+          ? EXIT.flowStalled
+          : profile === 'RATE_NOT_REACHED'
+            ? EXIT.rateNotReached
+            : EXIT.pass
+  return { ok: exitCode === EXIT.pass, product, profile, ...(flow && { flow }), exitCode }
+}
+
+/**
+ * The phases of a window: `baseline` before the first recorded phase, each record that has a
+ * `phase` in start order, and `after` from the last one's end to the window's end.
+ * @param {object[]} records a fault schedule's records
+ * @param {number} windowMs
+ * @returns {{ phase: string, startMs: number, endMs: number }[]}
+ */
+const phaseList = (records, windowMs) => {
+  const phases = records
+    .filter((r) => r.phase && Number.isFinite(r.startMs) && Number.isFinite(r.endMs))
+    .map(({ phase, startMs, endMs }) => ({ phase, startMs, endMs }))
+    .sort((a, b) => a.startMs - b.startMs)
+  const first = phases[0]?.startMs ?? windowMs
+  const last = phases[phases.length - 1]?.endMs ?? windowMs
+  return [
+    { phase: 'baseline', startMs: 0, endMs: first },
+    ...phases,
+    { phase: 'after', startMs: last, endMs: windowMs },
+  ]
+}
+
+/**
+ * Memory per phase, from the run's samples: the peak and the last sample in each phase (a sample
+ * at `startMs < atMs ≤ endMs` belongs to it).
+ * @param {{ atMs: number, heapUsed: number, rss: number }[]} samples
+ * @param {{ phase: string, startMs: number, endMs: number }[]} phases `phaseList`
+ * @returns {object[]} per phase `peakHeapUsed`, `peakRss`, `endHeapUsed`, `endRss`; null with no sample
+ */
+const phaseMemory = (samples, phases) =>
+  phases.map(({ phase, startMs, endMs }) => {
+    const inside = samples.filter((s) => s.atMs > startMs && s.atMs <= endMs)
+    const last = inside[inside.length - 1]
+    return {
+      phase,
+      startMs,
+      endMs,
+      peakHeapUsed: inside.length ? Math.max(...inside.map((s) => s.heapUsed)) : null,
+      peakRss: inside.length ? Math.max(...inside.map((s) => s.rss)) : null,
+      endHeapUsed: last?.heapUsed ?? null,
+      endRss: last?.rss ?? null,
+    }
+  })
+
+/**
+ * The flow rules of the slow-broker schedule, applied to the idempotent and plain producers'
+ * acknowledgements per partition leader (a transaction waits for every partition it wrote, so a
+ * transactional producer stalls with the slowest one by design and is left out).
+ *
+ *   slow      the other leaders acknowledge at least 90 % of what they were offered: their brokers
+ *             are untouched, so only the client can slow them; 10 % covers the 100 ms offer tick
+ *             and the unsettled cap's ramp
+ *   frozen    the other leaders stall at most 20 s and acknowledge at least 50 %: the broker side
+ *             holds them about 11 s (the frozen broker stays in their ISR until the controller
+ *             fences it after broker.session.timeout.ms, 9 s, plus a 2 s heartbeat), while a client
+ *             that waits on the frozen broker's requests holds them a full 30 s request timeout, so
+ *             20 s separates the two; flowing at the offered rate after a 20 s stall is 25 of 45 s,
+ *             above 50 %
+ *   recovery  every leader, the slow broker's too, acknowledges at least 90 %: the client
+ *             recovered without a restart
+ */
+const FLOW_RULES = Object.freeze({
+  slow: Object.freeze({ minRatio: 0.9, maxStallSeconds: null, slowLeaderToo: false }),
+  frozen: Object.freeze({ minRatio: 0.5, maxStallSeconds: 20, slowLeaderToo: false }),
+  recovery: Object.freeze({ minRatio: 0.9, maxStallSeconds: null, slowLeaderToo: true }),
+})
+
+/** A judged phase shorter than this many whole seconds is too short to give a rate. */
+const MIN_JUDGED_SECONDS = 5
+
+/**
+ * The per-leader flow verdict of the slow-broker schedule.
+ * @param {object} input
+ * @param {{ phase: string, startMs: number, endMs: number }[]} input.phases `phaseList`
+ * @param {{ sum: Function, longestStall: Function, wholeSeconds: Function }} input.flow a
+ *   `FlowMeter` with the `acked` series per leader (and `delivered`, reported only)
+ * @param {Record<string, number>} input.rates per leader, records a second offered by the producers
+ *   the rules judge; its keys are the leaders
+ * @param {string} input.slowNode the slowed broker's node id
+ * @returns {{ verdict: 'KEPT_FLOWING'|'STALLED'|'INCONCLUSIVE', reasons: string[], table: object[] }}
+ *   one table row per phase and leader; STALLED when a rule is broken, else INCONCLUSIVE when a
+ *   judged phase was too short or the slowed broker led nothing
+ */
+const flowVerdict = ({ phases, flow, rates, slowNode }) => {
+  const stalled = []
+  const unjudged = []
+  const table = []
+  const leaders = Object.keys(rates).sort()
+  if (!leaders.includes(slowNode))
+    unjudged.push(`leader ${slowNode} led no partition: nothing was slowed`)
+  for (const { phase, startMs, endMs } of phases) {
+    const seconds = flow.wholeSeconds(startMs, endMs)
+    const rule = FLOW_RULES[phase]
+    if (rule && seconds < MIN_JUDGED_SECONDS)
+      unjudged.push(
+        `${phase}: ${seconds} whole seconds, too short to judge (least ${MIN_JUDGED_SECONDS})`
+      )
+    for (const leader of leaders) {
+      const perSecond = (series) =>
+        seconds ? Math.round(flow.sum(series, leader, startMs, endMs) / seconds) : null
+      const row = {
+        phase,
+        leader,
+        offeredRate: Math.round(rates[leader]),
+        ackedRate: perSecond('acked'),
+        deliveredRate: perSecond('delivered'),
+        longestStallSeconds: flow.longestStall('acked', leader, startMs, endMs),
+      }
+      table.push(row)
+      if (!rule || seconds < MIN_JUDGED_SECONDS) continue
+      if (leader === slowNode && !rule.slowLeaderToo) continue
+      if (rule.maxStallSeconds !== null && row.longestStallSeconds > rule.maxStallSeconds)
+        stalled.push(
+          `${phase}: leader ${leader} stalled ${row.longestStallSeconds} s (most ${rule.maxStallSeconds} s)`
+        )
+      const ratio = flow.sum('acked', leader, startMs, endMs) / (rates[leader] * seconds)
+      if (ratio < rule.minRatio)
+        stalled.push(
+          `${phase}: leader ${leader} acknowledged ${Math.round(ratio * 100)} % of its offered rate (least ${rule.minRatio * 100} %)`
+        )
+    }
+  }
+  const verdict = stalled.length ? 'STALLED' : unjudged.length ? 'INCONCLUSIVE' : 'KEPT_FLOWING'
+  return { verdict, reasons: [...stalled, ...unjudged], table }
 }
 
 module.exports = {
   CODECS,
   EXIT,
   FAULT_SCHEDULES,
+  FLOW_RULES,
   KINDS,
   LOAD_DEFAULTS,
   LatencyHistogram,
   OfferSchedule,
   USAGE,
+  flowVerdict,
   parseLoadArgs,
+  phaseList,
+  phaseMemory,
   rateReport,
   verdictOf,
 }
