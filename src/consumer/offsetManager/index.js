@@ -91,6 +91,18 @@ const acceptedCells = (topics, decoded) => {
     .filter(({ partitions }) => partitions.length > 0)
 }
 
+/**
+ * How far a partition resolved beyond its committed offset, as `countResolvedOffsets` adds it up.
+ * @param {string|undefined} resolved the resolved offset; a key with no value counts as nothing
+ * @param {string|undefined} committed the held committed offset; an invalid one counts as 0
+ * @returns {Long}
+ */
+const resolvedProgress = (resolved, committed) => {
+  if (resolved == null) return Long.fromValue(0)
+  const value = Long.fromValue(resolved)
+  return isInvalidOffset(committed) ? value : value.subtract(Long.fromValue(committed))
+}
+
 /** Used when no logger is injected, so a manager built without one still runs and logs nothing. */
 const SILENT_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }
 
@@ -334,6 +346,7 @@ module.exports = class OffsetManager {
 
     if (!resolved[partition] && committedOffset != null) {
       resolved[partition] = committedOffset
+      this.resolvedCount = null
     }
 
     let offset = resolved[partition]
@@ -562,6 +575,7 @@ module.exports = class OffsetManager {
   resetOffset({ topic, partition }) {
     if (!this.resolvedOffsets[topic]) return
     this.resolvedOffsets[topic][partition] = this.heldOffsetAt(topic, partition)
+    this.resolvedCount = null
     this.resolvedEpochs[topic][partition] = -1
   }
 
@@ -581,6 +595,7 @@ module.exports = class OffsetManager {
     this.resetPositions[topic] = {}
     this.resolvedOffsets[topic] = {}
     this.resolvedEpochs[topic] = {}
+    this.resolvedCount = null
   }
 
   /**
@@ -598,8 +613,18 @@ module.exports = class OffsetManager {
       return
     }
 
-    this.resolvedOffsets[topic][partition] = Long.fromValue(offset).add(1).toString()
+    const offsets = this.resolvedOffsets[topic]
+    const previous = offsets[partition]
+    offsets[partition] = Long.fromValue(offset).add(1).toString()
     this.resolvedEpochs[topic][partition] = leaderEpoch
+
+    const count = this.resolvedCount
+    if (count && count.stamp === this.committedRevision()) {
+      const committed = this.heldOffsetAt(topic, partition)
+      count.sum = count.sum
+        .add(resolvedProgress(offsets[partition], committed))
+        .subtract(resolvedProgress(previous, committed))
+    }
   }
 
   /**
@@ -636,6 +661,7 @@ module.exports = class OffsetManager {
     this.assignedPartitions = OffsetManager.indexAssignment(memberAssignment)
     this.topics = keys(memberAssignment)
     this.obligations.claimAssignment(this.topics)
+    this.resolvedCount = null
     this.generationId = generationId
     this.memberId = memberId
     this.coordinator = coordinator
@@ -740,28 +766,45 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * The sum, over every resolved partition of the assignment, of how far it resolved beyond its
+   * held committed offset: what `autoCommitThreshold` is compared with after every message.
+   *
+   * The sum is kept between calls, so the per-message check is O(1) instead of a walk of the whole
+   * assignment. `resolveOffset` adds its own change to it. Anything else that changes a resolved
+   * offset, the held baselines or the assignment drops it, and the next call walks again: every
+   * write to the group's shared cache (it advances the cache's revision, `committedRevision`), and
+   * this manager's own `nextOffset` seeding, `resetOffset`, `resetOffsetsForTopic`,
+   * `forgetResolved`, `installSeekPosition`, `holdResetPosition`, `updateAssignment`,
+   * `clearAllOffsets` and an automatic commit. Its size is one number and one `Long`.
    * @returns {Long}
    */
   countResolvedOffsets() {
-    const subtractOffsets = (resolvedOffset, committedOffset) => {
-      // A key with no value is "nothing resolved", not an offset: `Long.fromValue` would throw.
-      if (resolvedOffset == null) {
-        return Long.fromValue(0)
+    const stamp = this.committedRevision()
+    if (this.resolvedCount?.stamp !== stamp || stamp === null) {
+      let sum = Long.fromValue(0)
+      for (const topic of this.topics) {
+        for (const partition of keys(this.resolvedOffsets[topic])) {
+          sum = sum.add(
+            resolvedProgress(
+              this.resolvedOffsets[topic][partition],
+              this.heldOffsetAt(topic, partition)
+            )
+          )
+        }
       }
-
-      const resolvedOffsetLong = Long.fromValue(resolvedOffset)
-      return isInvalidOffset(committedOffset)
-        ? resolvedOffsetLong
-        : resolvedOffsetLong.subtract(Long.fromValue(committedOffset))
+      this.resolvedCount = { stamp, sum }
     }
+    return this.resolvedCount.sum
+  }
 
-    const subtractTopicOffsets = (topic) =>
-      keys(this.resolvedOffsets[topic]).map((partition) =>
-        subtractOffsets(this.resolvedOffsets[topic][partition], this.heldOffsetAt(topic, partition))
-      )
-
-    const offsetsDiff = this.topics.flatMap(subtractTopicOffsets)
-    return offsetsDiff.reduce((sum, offset) => sum.add(offset), Long.fromValue(0))
+  /**
+   * The revision counter of the group's shared committed cache, which every write to it advances.
+   * @private
+   * @returns {number|null} null once the counter stopped advancing, so no kept sum is trusted
+   */
+  committedRevision() {
+    const seq = CommittedOffsetRevisions.peek(this.committedOffsets())?.seq ?? 0
+    return seq < Number.MAX_SAFE_INTEGER ? seq : null
   }
 
   /**
@@ -1122,6 +1165,7 @@ module.exports = class OffsetManager {
     const positions = this.resetPositions[topic]
     if (positions && this.owns(topic, partition)) {
       positions[partition] = local ? { offset, seek: true, local } : { offset, seek: true }
+      this.resolvedCount = null
     }
   }
 
@@ -1208,6 +1252,7 @@ module.exports = class OffsetManager {
   forgetResolved(topic, partition) {
     if (this.resolvedOffsets[topic]) delete this.resolvedOffsets[topic][partition]
     if (this.resolvedEpochs[topic]) delete this.resolvedEpochs[topic][partition]
+    this.resolvedCount = null
   }
 
   /**
@@ -1250,6 +1295,7 @@ module.exports = class OffsetManager {
       this.countResolvedOffsets().gte(Long.fromValue(this.autoCommitThreshold))
 
     if (timeoutReached || thresholdReached) {
+      this.resolvedCount = null
       return this.commitOffsets({}, { ...options, auto: true })
     }
   }
@@ -2344,6 +2390,13 @@ module.exports = class OffsetManager {
     this.resolvedOffsets = indexTopics(this.topics)
 
     /**
+     * The kept `countResolvedOffsets` sum with the cache revision it was walked at, or null when
+     * the next call must walk.
+     * @type {{stamp: number|null, sum: Long}|null}
+     */
+    this.resolvedCount = null
+
+    /**
      * The positions this member's own reset policy, sentinel seek or local seek gave a cell, which
      * no other consumer of the group may read, and a seek's fallback. See `holdResetPosition` and
      * `installSeekPosition`.
@@ -2440,6 +2493,7 @@ module.exports = class OffsetManager {
   holdResetPosition(topic, partition, offset) {
     const positions = this.resetPositions[topic]
     if (!positions) return
+    this.resolvedCount = null
     positions[partition] = {
       offset,
       revision: CommittedOffsetRevisions.forCache(this.committedOffsets()).capture(
