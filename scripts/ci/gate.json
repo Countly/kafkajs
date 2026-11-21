@@ -9928,6 +9928,7 @@
         "src/consumer/offsetManager/__tests__/localOffsets.spec.js \u203a OffsetManager without a group answers every committed read locally with the no-offset marker",
         "src/consumer/offsetManager/__tests__/localOffsets.spec.js \u203a OffsetManager without a group commits nothing explicitly or automatically",
         "src/consumer/offsetManager/__tests__/localOffsets.spec.js \u203a OffsetManager without a group keeps its offsets in the private dictionary and never asks the cluster for a group entry",
+        "src/consumer/offsetManager/__tests__/localOffsets.spec.js \u203a OffsetManager without a group resolves the one assigned topic from its reset policy",
         "src/consumer/offsetManager/__tests__/memberEpoch.spec.js \u203a Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site abandons the retry within one sleep when the consumer is stopping",
         "src/consumer/offsetManager/__tests__/memberEpoch.spec.js \u203a Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site consults no accessor on the classic path",
         "src/consumer/offsetManager/__tests__/memberEpoch.spec.js \u203a Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site does not retry an OffsetFetch 113 once the member has no epoch",
