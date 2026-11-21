@@ -1,5 +1,6 @@
 const createRetry = require('../../retry')
 const {
+  KafkaJSApplicationRecoverableError,
   KafkaJSDeliveryTimeout,
   KafkaJSInvariantViolation,
   KafkaJSTransactionAbortableError,
@@ -23,6 +24,7 @@ const {
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
 const INVALID_PRODUCER_ID_MAPPING = 49
 const UNKNOWN_PRODUCER_ID = 59
+const PRODUCER_FENCED = 90
 
 /**
  * Java's message for a transaction whose expired batches left a gap the producer cannot close.
@@ -61,6 +63,8 @@ const ignore = () => {}
 class ProducerStateManager {
   #logger
   #transactional
+  /** @type {string|null} */
+  #transactionalId
   #retries
   #retry
   #retrier
@@ -122,6 +126,7 @@ class ProducerStateManager {
   }) {
     this.#logger = logger
     this.#transactional = transactional
+    this.#transactionalId = transactionalId
     this.#retries = deliveryRetries ?? createRetry.defaults.retries
     this.#retry = retry
     this.#retrier = createRetry(retry)
@@ -304,7 +309,7 @@ class ProducerStateManager {
   arm(error) {
     const state = this.transaction.state()
     if (transactionStateFor(error) === FATAL_ERROR) {
-      this.transaction.armFatal(error)
+      this.transaction.armFatal(this.#transactional ? this.#explainFencing(error) : error)
     } else if (this.#transactional && (state === IN_TRANSACTION || state === COMMITTING)) {
       this.transaction.armAbortable(error)
     }
@@ -319,6 +324,23 @@ class ProducerStateManager {
       error: armed.message,
     })
     this.sequencer.abortQueued(armed)
+  }
+
+  /**
+   * A transactional producer's PRODUCER_FENCED (90) or INVALID_PRODUCER_ID_MAPPING (49): the
+   * coordinator no longer holds this producer id and epoch, so the fatal error says why.
+   * @param {Error} error
+   * @returns {Error} the error to arm: `error` itself for any other code
+   */
+  #explainFencing(error) {
+    if (error.code !== PRODUCER_FENCED && error.code !== INVALID_PRODUCER_ID_MAPPING) {
+      return error
+    }
+
+    return new KafkaJSApplicationRecoverableError(
+      `Another producer took over transactional id ${this.#transactionalId}, or the transaction coordinator aborted its transaction on the transaction timeout (${error.message}); create a new producer`,
+      { cause: error }
+    )
   }
 
   /**

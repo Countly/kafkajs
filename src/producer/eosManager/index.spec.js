@@ -1657,7 +1657,23 @@ describe('Transaction coordinator discovery that runs out', () => {
       expect(manager.stateManager.transaction.commitPending()).toBe(true)
     })
 
-    test('abort with a successful immediate bump resolves READY with no bump owed', async () => {
+    /**
+     * @param {object} broker
+     * @returns {{ endTxn: Array, initProducerId: Array }} the pairs each request carried
+     */
+    const pairsSent = (broker) => ({
+      endTxn: broker.endTxn.mock.calls.map(([r]) => [
+        r.producerId,
+        r.producerEpoch,
+        r.transactionResult,
+      ]),
+      initProducerId: broker.initProducerId.mock.calls.map(([r]) => [
+        r.producerId,
+        r.producerEpoch,
+      ]),
+    })
+
+    test('an abort whose EndTxn finds no coordinator resolves READY and owes the EndTxn, which the next start sends with the pair held', async () => {
       const { manager, cluster, broker } = await build({ level })
       manager.stateManager.markOffsetsAdded()
       const epoch = manager.getProducerEpoch()
@@ -1666,54 +1682,59 @@ describe('Transaction coordinator discovery that runs out', () => {
       await expect(manager.abort()).resolves.toBeUndefined()
 
       expect(manager.stateManager.state()).toBe('READY')
-      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
-      expect(broker.initProducerId).toHaveBeenCalledWith(
-        expect.objectContaining({ producerId: '1000', producerEpoch: epoch })
-      )
-      expect(manager.getProducerEpoch()).toBe(epoch + 1)
+      expect(pairsSent(broker)).toEqual({ endTxn: [], initProducerId: [] })
       await manager.beginTransaction()
-      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+      expect(pairsSent(broker)).toEqual({
+        endTxn: [['1000', epoch, false]],
+        initProducerId: level === 1 ? [['1000', epoch]] : [],
+      })
+      expect(manager.getProducerEpoch()).toBe(epoch + 1)
+      await manager.abort()
+      await manager.beginTransaction()
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
     })
 
-    test('abort whose bump finds no coordinator resolves READY with the bump owed', async () => {
+    test('an owed EndTxn whose lookup runs out at the next start rejects it and stays owed, and the start after sends it', async () => {
       const { manager, cluster, broker } = await build({ level })
       manager.stateManager.markOffsetsAdded()
       const epoch = manager.getProducerEpoch()
-      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound()).mockRejectedValueOnce(spent())
-
-      await expect(manager.abort()).resolves.toBeUndefined()
-
-      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
-      expect(broker.endTxn).not.toHaveBeenCalled()
-      expect(broker.initProducerId).not.toHaveBeenCalled()
-      expect(manager.stateManager.state()).toBe('READY')
-      await manager.beginTransaction()
-      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
-      expect(manager.getProducerEpoch()).toBe(epoch + 1)
-    })
-
-    test('a failed owed bump is retried and succeeds at the next transaction start', async () => {
-      const { manager, cluster, broker } = await build({ level })
-      manager.stateManager.markOffsetsAdded()
-      const epoch = manager.getProducerEpoch()
-      cluster.findGroupCoordinator
-        .mockRejectedValueOnce(notFound())
-        .mockRejectedValueOnce(notFound())
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
       await manager.abort()
       const lost = spent()
       cluster.findGroupCoordinator.mockResolvedValueOnce(broker).mockRejectedValueOnce(lost)
 
       const error = await manager.beginTransaction().catch((e) => e)
 
-      expect(error).toBeInstanceOf(KafkaJSError)
-      expect(error.retriable).toBe(true)
-      expect(error.cause).toBe(lost)
+      expect(error).toBe(lost)
       expect(manager.stateManager.state()).toBe('READY')
-      expect(broker.initProducerId).not.toHaveBeenCalled()
+      expect(pairsSent(broker)).toEqual({ endTxn: [], initProducerId: [] })
       await manager.beginTransaction()
-      expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+      expect(pairsSent(broker)).toEqual({
+        endTxn: [['1000', epoch, false]],
+        initProducerId: level === 1 ? [['1000', epoch]] : [],
+      })
       expect(manager.getProducerEpoch()).toBe(epoch + 1)
       expect(manager.stateManager.state()).toBe('IN_TRANSACTION')
+    })
+
+    test('a fatal error armed while the owed EndTxn looked for the coordinator rejects the start with it', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+      await manager.abort()
+      const fenced = new KafkaJSApplicationRecoverableError('fenced', {
+        cause: createErrorFromCode(90),
+      })
+      cluster.findGroupCoordinator
+        .mockResolvedValueOnce(broker)
+        .mockImplementationOnce(async () => {
+          manager.stateManager.arm(fenced)
+          throw spent()
+        })
+
+      await expect(manager.beginTransaction()).rejects.toBe(fenced)
+      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+      expect(pairsSent(broker)).toEqual({ endTxn: [], initProducerId: [] })
     })
 
     test('a TxnOffsetCommit retry whose group lookup fails arms ABORTABLE_ERROR', async () => {
@@ -1765,34 +1786,34 @@ describe('Transaction coordinator discovery that runs out', () => {
       expect(other.broker.endTxn).not.toHaveBeenCalled()
     })
 
-    test.each([
-      ['while its EndTxn looked for the coordinator', 1],
-      ['while its epoch bump looked for the coordinator', 2],
-    ])('abort rejects with a fatal error armed %s', async (_when, lookup) => {
-      const generation = new Generation()
-      const { manager, cluster, broker } = await build({ level, generation })
-      manager.stateManager.markOffsetsAdded()
-      const fenced = new KafkaJSApplicationRecoverableError('fenced', {
-        cause: createErrorFromCode(90),
-      })
-      cluster.findGroupCoordinator.mockImplementation(async () => {
-        if (cluster.findGroupCoordinator.mock.calls.length === lookup) {
-          manager.stateManager.arm(fenced)
-        }
-        throw lookup === 1 ? notFound() : spent()
-      })
+    test.each([['while its EndTxn looked for the coordinator', 1]])(
+      'abort rejects with a fatal error armed %s',
+      async (_when, lookup) => {
+        const generation = new Generation()
+        const { manager, cluster, broker } = await build({ level, generation })
+        manager.stateManager.markOffsetsAdded()
+        const fenced = new KafkaJSApplicationRecoverableError('fenced', {
+          cause: createErrorFromCode(90),
+        })
+        cluster.findGroupCoordinator.mockImplementation(async () => {
+          if (cluster.findGroupCoordinator.mock.calls.length === lookup) {
+            manager.stateManager.arm(fenced)
+          }
+          throw lookup === 1 ? notFound() : spent()
+        })
 
-      await expect(manager.abort()).rejects.toBe(fenced)
+        await expect(manager.abort()).rejects.toBe(fenced)
 
-      expect(generation.closed).toBe(false)
-      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
-      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(lookup)
-      expect(broker.endTxn).not.toHaveBeenCalled()
-      expect(broker.initProducerId).not.toHaveBeenCalled()
-      await expect(manager.beginTransaction()).rejects.toBe(fenced)
-      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(lookup)
-      expect(broker.initProducerId).not.toHaveBeenCalled()
-    })
+        expect(generation.closed).toBe(false)
+        expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(lookup)
+        expect(broker.endTxn).not.toHaveBeenCalled()
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+        await expect(manager.beginTransaction()).rejects.toBe(fenced)
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(lookup)
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+      }
+    )
 
     test('TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53) stays fatal', async () => {
       const { manager, broker } = await build({ level })

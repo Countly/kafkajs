@@ -409,6 +409,48 @@ describe('Producer > state > ProducerStateManager', () => {
     })
   })
 
+  describe('the fatal error of a coordinator that no longer holds the producer id and epoch', () => {
+    const TAKEN_OVER =
+      /^Another producer took over transactional id test-transactional-id, or the transaction coordinator aborted its transaction on the transaction timeout \(.+\); create a new producer$/
+
+    test.each([PRODUCER_FENCED, INVALID_PRODUCER_ID_MAPPING])(
+      'a transactional producer arms code %i as an error saying another producer took over or the coordinator timed the transaction out',
+      async (code) => {
+        const manager = await transactionalManager()
+        const error = failure(code)
+        manager.classify(error, 'txn')
+
+        manager.arm(error)
+
+        const armed = manager.transaction.armedError()
+        expect(armed).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+        expect({ message: armed.message, cause: armed.cause }).toEqual({
+          message: expect.stringMatching(TAKEN_OVER),
+          cause: error,
+        })
+      }
+    )
+
+    test.each([
+      [
+        'a transactional producer, another fatal code',
+        transactionalManager,
+        INVALID_PRODUCER_EPOCH,
+      ],
+      ['an idempotent-only producer', idempotentManager, INVALID_PRODUCER_ID_MAPPING],
+    ])('%s keeps the generic fatal message', async (_, build, code) => {
+      const manager = await build()
+      const error = failure(code)
+      manager.classify(error, 'txn')
+
+      manager.arm(error)
+
+      expect(manager.transaction.armedError().message).toBe(
+        `The producer can no longer be used (${error.message}); create a new producer`
+      )
+    })
+  })
+
   describe('UNKNOWN_PRODUCER_ID after the log start moved past the last acknowledged offset', () => {
     /**
      * A batch of 3 records acknowledged at base offset 10 - so the last acknowledged offset is 12 -
