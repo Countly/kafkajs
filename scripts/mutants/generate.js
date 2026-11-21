@@ -57,6 +57,10 @@ const AREAS = [
     ],
     witnesses: {
       'src/producer/eosManager/index.js': {
+        createEosManager: [
+          'src/producer/eosManager/index.spec.js',
+          `${PRODUCER_TESTS}/sendOffsetsPublication.spec.js`,
+        ],
         hasPartitions: [
           `${PRODUCER_TESTS}/sendOffsets.spec.js`,
           `${PRODUCER_TESTS}/sendOffsetsPublication.spec.js`,
@@ -88,12 +92,19 @@ const AREAS = [
     witnesses: {
       'src/cluster/committedOffsetRevisions.js': {
         forCache: [`${OFFSET_TESTS}/privateResetPositions.spec.js`],
+        peek: ['src/cluster/__tests__/committedOffsetRetirement.spec.js'],
       },
       'src/consumer/offsetManager/index.js': {
         commitWithOwnership: ['src/consumer/__tests__/lostMeansNoCommit.spec.js'],
+        holdResetRefusals: ['src/consumer/__tests__/offsetResetHalt.spec.js'],
+        reposition: ['src/consumer/__tests__/logTruncation.spec.js'],
+        seek: [`${OFFSET_TESTS}/groupInstanceId.spec.js`],
         resetByDuration: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
         commitAndClear: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
-        resolveOffsets: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
+        resolveOffsets: [
+          `${OFFSET_TESTS}/resetSchedules.spec.js`,
+          `${OFFSET_TESTS}/resolveOffsetsEpoch.spec.js`,
+        ],
         applyResolution: [
           `${OFFSET_TESTS}/initializeConsumerOffsets.spec.js`,
           `${OFFSET_TESTS}/resetSchedules.spec.js`,
@@ -101,14 +112,17 @@ const AREAS = [
         seedConsumedEpochs: [`${OFFSET_TESTS}/resolveOffsetsEpoch.spec.js`],
       },
       'src/consumer/offsetManager/offsetOperations.js': {
+        bind: ['src/cluster/__tests__/groupRegistry.spec.js'],
         end: ['src/cluster/__tests__/groupRegistry.spec.js'],
         notifyIdle: ['src/cluster/__tests__/groupRegistry.spec.js'],
       },
       'src/consumer/offsetManager/resetObligations.js': {
+        claimSubscription: ['src/cluster/__tests__/committedOffsetRetirement.spec.js'],
         clear: [
           'src/cluster/__tests__/groupRegistry.spec.js',
           `${OFFSET_TESTS}/resetSchedules.spec.js`,
         ],
+        retain: ['src/cluster/__tests__/committedOffsetRetirement.spec.js'],
       },
     },
   },
@@ -133,6 +147,10 @@ const AREAS = [
       'src/consumer/groupTimeouts.js': {
         resolveGroupTimeouts: ['src/consumer/__tests__/consumerDefaults.spec.js'],
       },
+      [`${SYNC_GROUP}/index.js`]: [
+        `${SYNC_GROUP}/index.spec.js`,
+        'scripts/compat/__tests__/forkVersions.spec.js',
+      ],
       [`${SYNC_GROUP}/v0/request.js`]: [
         `${REQUESTS}/index.spec.js`,
         `${SYNC_GROUP}/v0/request.spec.js`,
@@ -174,6 +192,7 @@ const AREAS = [
           `${SHARE_TESTS}/shareConsumerEvents.spec.js`,
           `${SHARE_TESTS}/shareConsumerEventMatrix.spec.js`,
         ],
+        captureCloseCoordinator: [`${SHARE_TESTS}/shareConsumerCoordinatorClose.spec.js`],
         close: [
           `${SHARE_TESTS}/shareConsumerShutdown.spec.js`,
           `${SHARE_TESTS}/shareConsumerCloseRevocation.spec.js`,
@@ -184,6 +203,8 @@ const AREAS = [
           `${SHARE_TESTS}/shareConsumerDialRelease.spec.js`,
           `${SHARE_TESTS}/shareConsumerEvents.spec.js`,
         ],
+        leave: [`${SHARE_TESTS}/shareConsumerCoordinatorClose.spec.js`],
+        onMove: [`${SHARE_TESTS}/shareSessionFaults.spec.js`],
         publishCommitted: [
           `${SHARE_TESTS}/shareConsumerConnect.spec.js`,
           `${SHARE_TESTS}/shareConsumerEvents.spec.js`,
@@ -194,6 +215,7 @@ const AREAS = [
       'src/consumer/share/shareRunner.js': {
         connect: [`${SHARE_TESTS}/shareConsumerConnect.spec.js`],
         disconnect: ['src/telemetry/__tests__/close.spec.js'],
+        parseDisconnectTimeout: [`${SHARE_TESTS}/shareConsumerOptions.spec.js`],
         readTelemetryResources: ['src/telemetry/__tests__/factories.spec.js'],
         run: [`${SHARE_TESTS}/shareConsumerConnect.spec.js`],
         superviseCrash: [
