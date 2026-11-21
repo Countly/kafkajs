@@ -6,8 +6,10 @@ const {
   OfferSchedule,
   parseLoadArgs,
   flowVerdict,
+  phaseCpu,
   phaseList,
   phaseMemory,
+  rateLimitedBy,
   rateReport,
   verdictOf,
 } = require('../loadProfile')
@@ -714,6 +716,44 @@ describe('load profile per-leader flow verdict', () => {
         endHeapUsed: 11,
         endRss: 110,
       },
+    ])
+  })
+})
+
+describe('load profile rate attribution', () => {
+  it('puts a shortfall down to the client at 90 % of one core, else to the machine at 90 % busy, else to nothing known', () => {
+    const at = (coreShares, machineBusyShare, reached = false) =>
+      rateLimitedBy({ reached, coreShares, machineBusyShare })
+    expect(at([0.99], 0.99, true)).toBe(null)
+    expect(at([0.9], 0.2)).toBe('client-cpu')
+    expect(at([0.3, 1.2], 0.95)).toBe('client-cpu')
+    expect(at([0.89], 0.9)).toBe('machine')
+    expect(at([0.89], 0.89)).toBe('unknown')
+    expect(at([null], null)).toBe('unknown')
+  })
+
+  it("gives each phase this process's core share and the machine's busy share between the samples that bound it", () => {
+    const sample = (atMs, processUs, machineBusyMs, machineTotalMs) => ({
+      atMs,
+      processUs,
+      machineBusyMs,
+      machineTotalMs,
+    })
+    const samples = [
+      sample(0, 0, 0, 0),
+      sample(2000, 1000000, 4000, 8000),
+      sample(4000, 3000000, 11200, 16000),
+      sample(6000, 3400000, 12000, 24000),
+    ]
+    const phases = [
+      { phase: 'baseline', startMs: 0, endMs: 2000 },
+      { phase: 'rolling-restart', startMs: 2000, endMs: 5000 },
+      { phase: 'after', startMs: 5000, endMs: 5500 },
+    ]
+    expect(phaseCpu(samples, phases)).toEqual([
+      { ...phases[0], coreShare: 0.5, machineBusyShare: 0.5 },
+      { ...phases[1], coreShare: 1, machineBusyShare: 0.9 },
+      { ...phases[2], coreShare: null, machineBusyShare: null },
     ])
   })
 })

@@ -392,6 +392,45 @@ describe('load run', () => {
     })
   })
 
+  it('names the client CPU as the limit when a run that missed its rate kept the load process at one core', async () => {
+    const tools = ({ clock }) => ({
+      host: {
+        cpus: 4,
+        read: () => ({
+          processUs: clock.now() * 1000,
+          machineBusyMs: clock.now(),
+          machineTotalMs: clock.now() * 4,
+          load1: 1.5,
+        }),
+      },
+    })
+    const { report, out } = await runWith(
+      new FakeCluster({ ackDelayMs: 1500 }),
+      { unsettledSeconds: 0.1 },
+      { tools }
+    )
+    dirs.push(out)
+    expect(report.rate.reached).toBe(false)
+    expect(report.rate.limitedBy).toBe('client-cpu')
+    expect(report.cpu).toMatchObject({
+      cpus: 4,
+      loadAverage1m: { max: 1.5, end: 1.5 },
+      stages: {
+        offer: { coreShare: 1, machineBusyShare: 0.25 },
+        join: { coreShare: 1, machineBusyShare: 0.25 },
+      },
+      phases: [
+        { phase: 'baseline', coreShare: 1, machineBusyShare: 0.25 },
+        { phase: 'after', coreShare: null, machineBusyShare: null },
+      ],
+      brokers: null,
+    })
+
+    const reached = await runWith(new FakeCluster(), {}, { tools })
+    dirs.push(reached.out)
+    expect(reached.report.rate).toMatchObject({ reached: true, limitedBy: null })
+  })
+
   it('fails the product when the independent read misses one acknowledged record', async () => {
     let dropped = false
     const cluster = new FakeCluster({
