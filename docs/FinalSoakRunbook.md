@@ -328,3 +328,107 @@ minutes, inside the runner's six hours. Read K5 with section 6a before the day: 
 hour of each subject (about 21 hours separate the day's endpoint medians). Rehearsal 3afda68743d9 snapshotted only two
 subjects (p03 and p09, forecast 0.60 and 0.22 MB for the day); a forecast for the other ten from it is an extrapolation
 from their `heapUsed`, not a measurement, until a rehearsal of this tree snapshots every subject.
+
+## 7. The load profile (separate from the day plan)
+
+`scripts/soak/loadRun.js` measures the client at a target record rate with a loss and duplicate oracle that does not grow
+with the record count. It shares no code path with the day plan: `finalSoakMatrix.json`, the scheduler and the checker above
+are unchanged by it, and nothing here judges a final soak.
+
+### 7.1 Running it
+
+```bash
+# 3-broker Compose cluster (docker-compose.yml) up, then:
+node scripts/soak/loadRun.js --out .tmp/load-profile --rate 10000 --record-bytes 1024 --topics 12 --partitions 16 \
+  --producers 3 --producer-kinds idempotent,plain,transactional --consumers 3 --duration 600 \
+  --compression none --faults rolling-restarts
+node scripts/soak/loadRun.js --recheck .tmp/load-profile   # replay the sealed artifact offline
+```
+
+Every flag has a default (`LOAD_DEFAULTS` in `scripts/soak/loadProfile.js`). On a hosted runner, dispatch the
+`Load profile (diagnostic)` workflow (`.github/workflows/load-profile.yml`): choice inputs for rate, record size, topics,
+partitions, duration, codec, fault schedule and Node; a push to a branch named `p12/load-profile*` runs it with the defaults.
+The job is limited to 30 minutes; the 600 s default window leaves about 10 minutes of slack, 900 s leaves little.
+
+### 7.2 The oracle
+
+Each record's key is `<producer>.<incarnation>.<sequence>`: the sequence rises by one per record per partition per producer
+incarnation (a recreated producer is a new incarnation). Producers record what they issued and which sequences were not
+acknowledged; the one consumer group records the offset ranges each member was delivered. After the run every partition is
+read once and judged (`scripts/soak/sequenceOracle.js`):
+
+| Producer kind | An acknowledged record | A rejected send's record | Order (same incarnation, partition) |
+|---|---|---|---|
+| idempotent (default producer) | exactly once | absent or once | strictly increasing |
+| transactional (read_committed) | exactly once if its transaction committed; never if it aborted | absent or once | strictly increasing |
+| plain (`idempotent: false`, 5 in flight) | at least once (a retry after a lost answer repeats it) | absent or any number | may reorder with more than one request in flight; counted, not failed |
+
+These follow `docs/Producing.md` (idempotence: every message exactly once per partition, in order; a rejected send has an
+unknown outcome) and `docs/Transactions.md`. The rejected-send column is why the oracle never counts an unacknowledged
+record as lost. Consumer rule: every record of the read below the group's committed offset was delivered to some member
+(`skippedCommit`), and no committed offset is past the log end (`commitBeyondLog`); both come from Apache's
+`kafka-consumer-groups.sh --describe`, not from the client.
+
+Memory: one cell per producer incarnation and partition, plus one range per discontinuity (a rejected or aborted send on the
+producer side; a re-delivery or a transaction marker on the consumer side). It holds no entry per record; the spec asserts
+the structures are the same size at 120,000 and 600,000 records.
+
+### 7.3 The independent read
+
+Apache's `kafka-console-consumer.sh` in the kafka1 container, one JVM per topic, three topics at a time, `read_committed`,
+from the beginning, with `print.partition`, `print.offset` and `print.key` on and `print.value` off. Kafka 4.4's
+`DefaultMessageFormatter` ends the line after the key when the value is not printed, so each record costs about 30 bytes
+of output however large it is. It shares no code with the client under test. The tool ends after 10 s without a record;
+the read is complete when every partition reaches the last offset an acknowledgement returned, and each topic's line count
+must equal the tool's own `Processed a total of` count. Estimate for a hosted runner (unverified until the first run): a
+600 s window at 10,000 records/s is 6,000,000 lines, about 1 to 2 minutes of reading; the checker takes about 1.3 million
+records a second (measured with plain Node on the development host), so the tool, not the checker, sets the pace.
+
+### 7.4 The artifact and the verdict
+
+`profile.json`, `producers.json`, `consumers.json`, `committed.json`, `faults.json`, `apache/<topic>.dump.gz` with
+`.end`, `apache/<group>.describe`, `report.json`, and `header.json`, written last, which binds every other file by SHA-256
+(the seal; `--recheck` refuses an artifact that differs from it). `report.json` holds the verdict, offered against sent
+and acknowledged rates, latency percentiles, event-loop delay, heap and RSS samples every 10 s, per-producer and
+per-member counts, the fault schedule's outages and the oracle's findings with examples.
+
+Latency is measured from each record's due time on the offer schedule (record n of a producer is due n / rate after the
+start), not from when the client accepted it, so a client that falls behind shows its backlog in the percentiles (no
+coordinated omission). Transactional records are timed to their commit.
+
+| Exit | Product | Profile | Meaning |
+|---|---|---|---|
+| 0 | PASS | REACHED | no oracle finding, the offered rate was met |
+| 1 | FAIL | either | loss, duplicate or reordering beyond the kind's guarantee, an aborted record visible, a foreign or malformed key, a skipped commit, a commit past the log end |
+| 2 | INCONCLUSIVE | either | the read was incomplete or failed, or the driver failed, with no product finding |
+| 3 | PASS | RATE_NOT_REACHED | the runner did not send, or the client did not acknowledge, 95 % of the offered records: no claim about the product at that rate |
+
+A shortfall names whether records were not sent (the runner or the unsettled cap) or not acknowledged, and how many sends
+the client rejected; rejections are the client refusing, so read them before blaming the runner.
+
+### 7.5 Fault schedules
+
+`FAULT_SCHEDULES` in `loadProfile.js`. `none` is the plain profile. `rolling-restarts`: from a third of the window, every
+broker stopped and restarted in turn, then every broker killed and restarted in turn, 20 s apart, through `BrokerBouncer`
+(each step waits for the node to answer and the ISR to be full). `slow-broker` (a delayed broker, then `pauseBroker`, under
+load) and `many-topics` (thousands of topics with a trickle on each) are named extension points: the CLI refuses them until
+they are implemented.
+
+### 7.6 Expected rates and the first CI run
+
+Expected on a hosted 4-core runner with three brokers, RF 3, 1 KiB records and every client in one Node process: about
+10,000 to 20,000 records/s sustained (an estimate from the 2,000/s producer-churn soak and the short benchmark rows, not a
+measurement). The workflow offers 10,000/s by default; above about 20,000/s expect exit 3.
+
+What the first run must show, and how to read it (the `Print the report` step, or `report.json` in the artifact):
+
+- `verdict` `{ product: 'PASS', profile: 'REACHED', exitCode: 0 }`; any other value is the finding.
+- `rate.offeredRate` 10000, `sentRate` and `ackedRate` at least 9500, `shortfall` null.
+- every `oracle.findings.*.count` 0; `oracle.counts.records` about 6,000,000 minus the deliberately aborted tenth of the
+  transactional producer's records; `oracle.size.gapRanges` small (one per rejected send).
+- `oracle.reads`: one entry per topic with `exit` 0 and `lines` equal to `processed`; their `seconds` say whether the read
+  fits the time limit at higher rates.
+- `faults`: six outages, three `stop` then three `kill`, each with `outageMs`.
+- `consumers[].crashes` and `producers[].errors`: expected few, all inside the restart window.
+- `latencyMs.p99` and `eventLoopDelayMs.p99`: recorded, not judged.
+- the artifact replays: `node scripts/soak/loadRun.js --recheck <artifact>` exits 0 with the same findings.
