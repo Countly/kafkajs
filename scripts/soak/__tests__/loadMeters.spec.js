@@ -64,7 +64,12 @@ describe('load CPU meters', () => {
       { user: 400, nice: 100, sys: 0, irq: 0, idle: 1500 },
     ]
     const to = host.read()
-    expect(to).toEqual({ processUs: 1800000, machineBusyMs: 2300, machineTotalMs: 4000, load1: 3.5 })
+    expect(to).toEqual({
+      processUs: 1800000,
+      machineBusyMs: 2300,
+      machineTotalMs: 4000,
+      load1: 3.5,
+    })
     expect(HostMeter.between(from, to, 2000)).toEqual({ coreShare: 0.9, machineBusyShare: 0.575 })
     expect(HostMeter.between(to, to, 0)).toEqual({ coreShare: null, machineBusyShare: null })
   })

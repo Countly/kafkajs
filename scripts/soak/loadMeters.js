@@ -7,6 +7,7 @@
  * the run, or a fixed-size histogram, never one entry per record.
  */
 
+const os = require('node:os')
 const { LatencyHistogram } = require('./loadProfile')
 
 /**
@@ -205,4 +206,141 @@ class ClientMeter {
   }
 }
 
-module.exports = { ClientMeter, FlowMeter, LagProbe }
+/**
+ * Reads the load process's CPU and the machine's, cumulative, so two reads give the share of a
+ * span. The machine's share counts every core, so the brokers sharing the machine count too.
+ */
+class HostMeter {
+  /**
+   * @param {object} [sources] the outside world; a unit spec replaces it
+   * @param {() => { user: number, system: number }} [sources.cpuUsage] this process, µs
+   * @param {() => { user: number, nice: number, sys: number, irq: number, idle: number }[]} [sources.cpuTimes]
+   *   per core, ms
+   * @param {() => number[]} [sources.loadavg] 1, 5 and 15 minute load averages
+   * @param {number} [sources.cpus] cores the process may use
+   */
+  constructor({
+    cpuUsage = () => process.cpuUsage(),
+    cpuTimes = () => os.cpus().map((c) => c.times),
+    loadavg = () => os.loadavg(),
+    cpus = os.availableParallelism(),
+  } = {}) {
+    Object.assign(this, { cpuUsage, cpuTimes, loadavg, cpus })
+  }
+
+  /** @returns {{ processUs: number, machineBusyMs: number, machineTotalMs: number, load1: number }} */
+  read() {
+    const { user, system } = this.cpuUsage()
+    let busy = 0
+    let total = 0
+    for (const t of this.cpuTimes()) {
+      const all = t.user + t.nice + t.sys + t.irq + t.idle
+      total += all
+      busy += all - t.idle
+    }
+    return {
+      processUs: user + system,
+      machineBusyMs: busy,
+      machineTotalMs: total,
+      load1: this.loadavg()[0],
+    }
+  }
+
+  /**
+   * @param {object} from a `read` @param {object} to a later `read` @param {number} elapsedMs
+   * @returns {{ coreShare: number|null, machineBusyShare: number|null }} this process's CPU as a
+   *   share of one core, and the machine's busy share of all its cores; null over an empty span
+   */
+  static between(from, to, elapsedMs) {
+    const total = to.machineTotalMs - from.machineTotalMs
+    return {
+      coreShare:
+        elapsedMs > 0 ? round3((to.processUs - from.processUs) / (elapsedMs * 1000)) : null,
+      machineBusyShare: total > 0 ? round3((to.machineBusyMs - from.machineBusyMs) / total) : null,
+    }
+  }
+}
+
+/** @param {number} n @returns {number} */
+const round3 = (n) => Math.round(n * 1000) / 1000
+
+/**
+ * The broker containers' CPU while the window is open: `docker stats --no-stream` every
+ * `intervalMs`, one call at a time. Keeps a count, sum and maximum per container, never the
+ * samples. A failed call is counted and the probe goes on.
+ */
+class BrokerCpuProbe {
+  /**
+   * @param {object} options
+   * @param {() => Promise<string>} options.stats the output of `docker stats --no-stream --format
+   *   '{{.Name}}\t{{.CPUPerc}}'`
+   * @param {(ms: number, signal?: AbortSignal) => Promise<void>} options.sleep
+   * @param {number} [options.intervalMs=10000]
+   */
+  constructor({ stats, sleep, intervalMs = 10000 }) {
+    Object.assign(this, { stats, sleep, intervalMs })
+    /** @type {Map<string, { samples: number, sum: number, max: number }>} */
+    this.containers = new Map()
+    this.failures = 0
+    this.lastFailure = null
+    this.done = null
+  }
+
+  /**
+   * Parses `docker stats` lines of `<name>\t<percent>%`, where the percent is of one core.
+   * @param {string} text
+   * @returns {{ name: string, percent: number }[]} lines that are not one are left out
+   */
+  static parse(text) {
+    const rows = []
+    for (const line of text.split('\n')) {
+      const m = /^(\S+)\t(\d+(?:\.\d+)?)%$/.exec(line.trim())
+      if (m) rows.push({ name: m[1], percent: Number(m[2]) })
+    }
+    return rows
+  }
+
+  /** @param {AbortSignal} signal the window; the probe stops when it aborts @returns {void} */
+  start(signal) {
+    this.done = this.#loop(signal)
+  }
+
+  /** @returns {Promise<void>} once the call under way, if any, has returned */
+  async stop() {
+    await this.done
+  }
+
+  async #loop(signal) {
+    while (!signal.aborted) {
+      try {
+        for (const { name, percent } of BrokerCpuProbe.parse(await this.stats())) {
+          const c = this.containers.get(name) ?? { samples: 0, sum: 0, max: 0 }
+          c.samples++
+          c.sum += percent
+          c.max = Math.max(c.max, percent)
+          this.containers.set(name, c)
+        }
+      } catch (error) {
+        this.failures++
+        this.lastFailure = String(error?.message ?? error).slice(0, 200)
+      }
+      await this.sleep(this.intervalMs, signal)
+    }
+  }
+
+  /**
+   * @returns {{ containers: Record<string, { samples: number, meanPercent: number, maxPercent: number }>,
+   *   failures: number, lastFailure: string|null }} percents of one core
+   */
+  toJSON() {
+    const containers = {}
+    for (const [name, { samples, sum, max }] of [...this.containers].sort(([a], [b]) =>
+      a < b ? -1 : 1
+    )) {
+      containers[name] = { samples, meanPercent: Math.round(sum / samples), maxPercent: max }
+    }
+    return { containers, failures: this.failures, lastFailure: this.lastFailure }
+  }
+}
+
+module.exports = { BrokerCpuProbe, ClientMeter, FlowMeter, HostMeter, LagProbe }

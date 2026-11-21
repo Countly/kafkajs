@@ -22,21 +22,25 @@ const fs = require('node:fs')
 const path = require('node:path')
 const readline = require('node:readline')
 const zlib = require('node:zlib')
-const { spawn } = require('node:child_process')
+const { execFile, spawn } = require('node:child_process')
+const { promisify } = require('node:util')
 const { monitorEventLoopDelay } = require('node:perf_hooks')
 const { finished } = require('node:stream/promises')
 const {
+  BROKER_SERVICES,
   FAULT_SCHEDULES,
   LatencyHistogram,
   OfferSchedule,
   parseLoadArgs,
   flowVerdict,
+  phaseCpu,
   phaseList,
   phaseMemory,
+  rateLimitedBy,
   rateReport,
   verdictOf,
 } = require('./loadProfile')
-const { ClientMeter, FlowMeter, LagProbe } = require('./loadMeters')
+const { BrokerCpuProbe, ClientMeter, FlowMeter, HostMeter, LagProbe } = require('./loadMeters')
 const { DeliveryLedger, SendLedger, SequenceChecker, parseDumpLine } = require('./sequenceOracle')
 
 const BROKERS = Object.freeze(['localhost:9092', 'localhost:9095', 'localhost:9098'])
@@ -53,6 +57,7 @@ const CREATE_CHUNK = 250
 const ADMIN_TIMEOUT_MS = 60000
 const SAMPLE_MS = 2000
 const COMPRESSION = Object.freeze({ none: 0, gzip: 1, snappy: 2, lz4: 3, zstd: 4 })
+const execFileAsync = promisify(execFile)
 
 /** @param {number} ms @param {AbortSignal} [signal] @returns {Promise<void>} */
 const realSleep = (ms, signal) =>
@@ -574,6 +579,9 @@ class LoadRun {
    * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
    * @param {(line: string) => void} [options.log]
    * @param {string|null} [options.treeSha] the commit the run is of, for the seal
+   * @param {HostMeter} [options.host] this process's and the machine's CPU
+   * @param {{ start: Function, stop: Function, toJSON: Function }|null} [options.brokerCpu] a
+   *   `BrokerCpuProbe`, run while the window is open
    */
   constructor({
     profile,
@@ -586,8 +594,11 @@ class LoadRun {
     sleep = realSleep,
     log = (line) => console.log(line),
     treeSha = null,
+    host = new HostMeter(),
+    brokerCpu = null,
   }) {
     Object.assign(this, { profile, kafka, reader, bouncer, netem, clock, sleep, log, treeSha })
+    Object.assign(this, { host, brokerCpu })
     this.lagProbe = lagProbe ?? new LagProbe({ clock })
     this.runId = `load-${Date.now()}`
     this.topics = Array.from({ length: profile.topics }, (_, i) => `${this.runId}-${i}`)
@@ -621,6 +632,11 @@ class LoadRun {
     let faults = []
     let oracle = null
     let windowMs = profile.durationSeconds * 1000
+    /** Host reads at the end of each stage, with the clock: the offer window, the join, the drain. */
+    const stages = {}
+    const mark = (name) => {
+      stages[name] = { at: this.clock.now(), ...this.host.read() }
+    }
     try {
       await admin.connect()
       setup.createTopicsMs = await this.#createTopics(admin)
@@ -666,17 +682,21 @@ class LoadRun {
       for (const consumer of consumers) await consumer.start()
       for (const producer of producers) await producer.connect()
       loop.enable()
+      mark('start')
       const result = await this.#offer(producers, admin, resources)
+      mark('offer')
       ;({ faults, windowMs } = result)
       totals = result.totals
       for (const producer of producers)
         if (!(await producer.join(profile.joinSeconds * 1000)))
           this.errors.push(`${producer.id}: sends still unsettled after ${profile.joinSeconds} s`)
+      mark('join')
       for (const producer of producers) {
         totals.acked += producer.stats.acked + producer.stats.aborted
         totals.failed += producer.stats.failed
       }
       await this.#drain(consumers)
+      mark('drain')
     } catch (error) {
       this.errors.push(`driver: ${error?.stack ?? error}`)
     } finally {
@@ -707,13 +727,19 @@ class LoadRun {
       this.log(`topic cleanup failed: ${error?.message}`)
     }
     await admin.disconnect().catch(() => {})
+    const phases = phaseList(faults, windowMs)
+    const cpu = this.#cpuReport(stages, resources.samples, phases)
     const rate = rateReport({
       rate: profile.rate,
       windowMs,
       targetFraction: profile.targetFraction,
       ...totals,
     })
-    const phases = phaseList(faults, windowMs)
+    rate.limitedBy = rateLimitedBy({
+      reached: rate.reached,
+      coreShares: [cpu.stages.offer?.coreShare ?? null],
+      machineBusyShare: cpu.stages.offer?.machineBusyShare ?? null,
+    })
     const flow = this.flow && this.#flowVerdict(producers, phases)
     const verdict = verdictOf({
       oracle,
@@ -734,6 +760,7 @@ class LoadRun {
       },
       resources,
       memory: phaseMemory(resources.samples, phases),
+      cpu,
       cluster: { ...setup, ...meter.toJSON() },
       oracle,
       producers: producers.map((p) => ({
@@ -777,6 +804,7 @@ class LoadRun {
     for (const producer of producers) producer.begin(start)
     this.flow?.begin(start)
     const window = new AbortController()
+    this.brokerCpu?.start(window.signal)
     const fault = FAULT_SCHEDULES[profile.faults]
       .start({
         bouncer: this.bouncer,
@@ -793,26 +821,61 @@ class LoadRun {
         this.errors.push(`fault schedule: ${error?.message}`)
         return []
       })
+    const sample = (now) => {
+      const { heapUsed, rss } = process.memoryUsage()
+      resources.maxHeapUsed = Math.max(resources.maxHeapUsed, heapUsed)
+      resources.maxRss = Math.max(resources.maxRss, rss)
+      const sent = producers.reduce((s, p) => s + p.stats.sent, 0)
+      const atMs = Math.round(now - start)
+      resources.samples.push({ atMs, heapUsed, rss, sent, ...this.host.read() })
+    }
+    sample(start)
     let nextSample = start + SAMPLE_MS
     for (let n = 1; ; n++) {
       const now = Math.min(this.clock.now(), end)
       for (const producer of producers) producer.tick(now)
       if (now >= nextSample) {
         nextSample += SAMPLE_MS
-        const { heapUsed, rss } = process.memoryUsage()
-        resources.maxHeapUsed = Math.max(resources.maxHeapUsed, heapUsed)
-        resources.maxRss = Math.max(resources.maxRss, rss)
-        const sent = producers.reduce((s, p) => s + p.stats.sent, 0)
-        resources.samples.push({ atMs: Math.round(now - start), heapUsed, rss, sent })
+        sample(now)
       }
       if (now >= end) break
       await this.sleep(Math.max(0, Math.min(end, start + n * tickMs) - this.clock.now()))
     }
     window.abort()
+    await this.brokerCpu?.stop()
     const faults = await fault
     const offered = producers.reduce((s, p) => s + Math.floor((windowMs * p.rate) / 1000), 0)
     const sent = producers.reduce((s, p) => s + p.stats.sent, 0)
     return { totals: { offered, sent, acked: 0, failed: 0 }, faults, windowMs }
+  }
+
+  /**
+   * What the CPU did: this process per stage (the offer window, the join, the drain; producers and
+   * consumers share the process, and the drain is the consumers' alone) and per fault phase, the
+   * machine's cores and load average, and the broker containers when they were probed.
+   * @param {Record<string, object>} stages `HostMeter#read` with `at`, at the end of each stage
+   * @param {object[]} samples the window's samples @param {object[]} phases `phaseList`
+   * @returns {object}
+   */
+  #cpuReport(stages, samples, phases) {
+    const order = ['start', 'offer', 'join', 'drain']
+    const spans = {}
+    for (let i = 1; i < order.length; i++) {
+      const [from, to] = [stages[order[i - 1]], stages[order[i]]]
+      spans[order[i]] = from && to ? HostMeter.between(from, to, to.at - from.at) : null
+    }
+    const loads = samples.map((s) => s.load1).filter(Number.isFinite)
+    return {
+      cpus: this.host.cpus,
+      loadAverage1m: { max: loads.length ? Math.max(...loads) : null, end: loads.at(-1) ?? null },
+      stages: spans,
+      phases: phaseCpu(samples, phases).map(({ phase, coreShare, machineBusyShare }) => ({
+        phase,
+        coreShare,
+        machineBusyShare,
+      })),
+      brokers: this.brokerCpu?.toJSON() ?? null,
+    }
   }
 
   /**
@@ -1103,12 +1166,24 @@ const main = async (argv) => {
       netem = new NetemDelay({ container: schedule.service, port, delayMs: schedule.delayMs })
     }
   }
+  const brokerCpu = new BrokerCpuProbe({
+    stats: async () =>
+      (
+        await execFileAsync(
+          'docker',
+          ['stats', '--no-stream', '--format', '{{.Name}}\t{{.CPUPerc}}', ...BROKER_SERVICES],
+          { timeout: 15000 }
+        )
+      ).stdout,
+    sleep: realSleep,
+  })
   const report = await new LoadRun({
     profile,
     kafka,
     reader: new ApacheReader({ composeFile }),
     bouncer,
     netem,
+    brokerCpu,
     treeSha: process.env.LOAD_TREE_SHA ?? null,
   }).run()
   const { verdict, rate, latencyMs } = report
@@ -1118,6 +1193,7 @@ const main = async (argv) => {
         verdict,
         rate,
         latencyMs,
+        cpu: report.cpu,
         flow: report.flow && { verdict: report.flow.verdict, reasons: report.flow.reasons },
         findings: report.oracle?.findings,
         errors: report.errors,

@@ -537,6 +537,63 @@ const phaseMemory = (samples, phases) =>
   })
 
 /**
+ * CPU per phase, from the run's samples: this process's CPU as a share of one core and the
+ * machine's busy share of all its cores, between the last sample at or before the phase's start
+ * and the last one at or before its end.
+ * @param {{ atMs: number, processUs: number, machineBusyMs: number, machineTotalMs: number }[]} samples
+ *   in time order, the first at the window's start
+ * @param {{ phase: string, startMs: number, endMs: number }[]} phases `phaseList`
+ * @returns {{ phase: string, startMs: number, endMs: number, coreShare: number|null, machineBusyShare: number|null }[]}
+ *   null where no two samples bound the phase
+ */
+const phaseCpu = (samples, phases) =>
+  phases.map(({ phase, startMs, endMs }) => {
+    const lastAt = (ms) => samples.findLast((s) => s.atMs <= ms)
+    const from = lastAt(startMs)
+    const to = lastAt(endMs)
+    const spanned = from && to && to.atMs > from.atMs
+    const share = (n, d) => (spanned && d > 0 ? Math.round((n / d) * 1000) / 1000 : null)
+    return {
+      phase,
+      startMs,
+      endMs,
+      coreShare: share(to?.processUs - from?.processUs, (to?.atMs - from?.atMs) * 1000),
+      machineBusyShare: share(
+        to?.machineBusyMs - from?.machineBusyMs,
+        to?.machineTotalMs - from?.machineTotalMs
+      ),
+    }
+  })
+
+/**
+ * When a rate shortfall is put down to the CPU, from the offer window's measurements.
+ *
+ *   clientCoreShare   a load process at 90 % of one core or more is limited by the client: its
+ *                     JavaScript runs on one thread, so the rest of a core is all it can gain
+ *   machineBusyShare  every core of the machine 90 % busy or more: the brokers, the clients and
+ *                     the console reads share the machine, and none of them can go faster
+ */
+const LIMIT_RULES = Object.freeze({ clientCoreShare: 0.9, machineBusyShare: 0.9 })
+
+/**
+ * What limited a run that did not reach its rate. A client at one core is named first: when the
+ * machine is saturated too, the client is still the part that cannot use another core.
+ * @param {object} input
+ * @param {boolean} input.reached `rateReport`
+ * @param {(number|null)[]} input.coreShares each load process's CPU over the offer window, as a
+ *   share of one core
+ * @param {number|null} input.machineBusyShare the machine's busy share over the offer window
+ * @returns {'client-cpu'|'machine'|'unknown'|null} null when the rate was reached; `unknown` when
+ *   neither rule holds: look at the brokers, the unsettled cap and the rejected sends
+ */
+const rateLimitedBy = ({ reached, coreShares, machineBusyShare }) => {
+  if (reached) return null
+  if (coreShares.some((share) => (share ?? 0) >= LIMIT_RULES.clientCoreShare)) return 'client-cpu'
+  if ((machineBusyShare ?? 0) >= LIMIT_RULES.machineBusyShare) return 'machine'
+  return 'unknown'
+}
+
+/**
  * The flow rules of the slow-broker schedule, applied to the idempotent and plain producers'
  * acknowledgements per partition leader (a transaction waits for every partition it wrote, so a
  * transactional producer stalls with the slowest one by design and is left out).
@@ -619,19 +676,23 @@ const flowVerdict = ({ phases, flow, rates, slowNode }) => {
 }
 
 module.exports = {
+  BROKER_SERVICES,
   CODECS,
   EXIT,
   FAULT_SCHEDULES,
   FLOW_RULES,
   KINDS,
+  LIMIT_RULES,
   LOAD_DEFAULTS,
   LatencyHistogram,
   OfferSchedule,
   USAGE,
   flowVerdict,
   parseLoadArgs,
+  phaseCpu,
   phaseList,
   phaseMemory,
+  rateLimitedBy,
   rateReport,
   verdictOf,
 }
