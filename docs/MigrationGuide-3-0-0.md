@@ -125,6 +125,13 @@ notice and what, if anything, to do.
   id and the sequence numbers; it does not restore 2.2.4's send path, which every producer shares
   (the accumulator and per-partition retry items below). If you check `producer.isIdempotent()`,
   read it after `connect()`.
+  An idempotent producer keeps one batch of each partition in flight at a time. 2.2.4's default,
+  non-idempotent producer sent every `send()` as its own request, so concurrent sends to one
+  partition could all be in flight together; now one busy partition carries at most one batch,
+  up to `batchSize` (16384 bytes by default), per round trip, and a backlog above that fills
+  `bufferMemory` until sends reject with `KafkaJSBufferExhaustedError`. If one hot partition
+  needs more, raise `batchSize` (and `bufferMemory`), pass arrays of messages per `send()`, or
+  spread the records over more partitions: see "Running at high throughput" in the producing guide.
   At `linger: 0`, an awaited single `send()` of an idempotent producer takes about 2 % longer
   (about 30 µs on a 1.5 ms send) than with `idempotent: false`, which removes that cost and gives
   up the protection against duplicates and reordering on retry.
