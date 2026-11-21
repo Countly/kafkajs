@@ -240,6 +240,38 @@ describe('Admin > describeGroups > routing', () => {
     expect(groups[0].errorMessage).toBe('Group g1 is not a new consumer group')
   })
 
+  test.each([
+    ['DescribeGroups v6', { errorCode: GROUP_ID_NOT_FOUND, errorMessage: 'not found' }],
+    ['an older DescribeGroups', { errorCode: 0, errorMessage: null }],
+  ])(
+    'reports the %s answer, not UNSUPPORTED_VERSION, for a missing group on a cluster without the consumer protocol',
+    async (_name, answer) => {
+      const cluster = stubCluster({
+        consumerGroupDescribe: async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => ({ groupId, errorCode: UNSUPPORTED_VERSION })),
+        }),
+        describeGroups: async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => ({
+            groupId,
+            state: 'Dead',
+            protocolType: '',
+            protocol: '',
+            members: [],
+            authorizedOperations: -2147483648,
+            ...answer,
+          })),
+        }),
+      })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['g1'])
+
+      expect(groups).toEqual([
+        expect.objectContaining({ groupId: 'g1', state: 'Dead', groupType: 'classic', ...answer }),
+      ])
+    }
+  )
+
   it('fails the id with no fallback on a 69 GROUP_AUTHORIZATION_FAILED', async () => {
     const describeGroups = jest.fn()
     const cluster = stubCluster({
