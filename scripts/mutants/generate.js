@@ -102,8 +102,9 @@ const AREAS = [
         resetByDuration: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
         commitAndClear: [`${OFFSET_TESTS}/resetSchedules.spec.js`],
         resolveOffsets: [
-          `${OFFSET_TESTS}/resetSchedules.spec.js`,
+          `${OFFSET_TESTS}/localOffsets.spec.js`,
           `${OFFSET_TESTS}/resolveOffsetsEpoch.spec.js`,
+          `${OFFSET_TESTS}/resetSchedules.spec.js`,
         ],
         applyResolution: [
           `${OFFSET_TESTS}/initializeConsumerOffsets.spec.js`,
