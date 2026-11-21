@@ -65,13 +65,13 @@ jobs:
       COMPOSE_FILE: docker-compose.yml
       LOAD_OUT: ${{ github.workspace }}/.tmp/load-profile
       LOAD_TREE_SHA: ${{ github.sha }}
-      LOAD_RATE: ${{ inputs.rate || '10000' }}
+      LOAD_RATE: ${{ inputs.rate || '30000' }}
       LOAD_RECORD_BYTES: ${{ inputs.record_bytes || '1024' }}
       LOAD_TOPICS: ${{ inputs.topics || '12' }}
       LOAD_PARTITIONS: ${{ inputs.partitions || '16' }}
       LOAD_DURATION: ${{ inputs.duration || '600' }}
-      LOAD_COMPRESSION: ${{ inputs.compression || 'none' }}
-      LOAD_FAULTS: ${{ inputs.faults || 'rolling-restarts' }}
+      LOAD_COMPRESSION: ${{ inputs.compression || 'lz4' }}
+      LOAD_FAULTS: ${{ inputs.faults || 'none' }}
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 2
