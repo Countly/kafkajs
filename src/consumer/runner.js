@@ -2201,9 +2201,11 @@ module.exports = class Runner extends EventEmitter {
    * retired, and retirement removes a pending backoff timer and settles the call.
    * A commit made from a close callback runs while the stop is in progress; any other call that
    * starts once the runner is no longer running resolves at once, committing nothing, as in 2.2.4.
-   * A call admitted while the runner was running that then fails after the stop began rejects with
-   * `CONSUMER_STOPPING`, the failure as its `cause`, and is not retried; a `KafkaJSCommitFailedError`
-   * (the membership was lost) still rejects as itself.
+   * A call admitted while the runner was running that then fails after the run stopped, whether by
+   * `stop()`, `disconnect()` or a crash, rejects with `CONSUMER_STOPPING`, the failure as its
+   * `cause`, and is not retried: a crash stops the run the same way, and a restart is a new run
+   * that does not take the call over. A `KafkaJSCommitFailedError` (the membership was lost) still
+   * rejects as itself.
    * A commit answered with a rebalance in progress still rejects with that answer, and also asks
    * the group to rejoin, as the same answer to a heartbeat does.
    * @param {Object} offsets the offsets to commit
@@ -2212,7 +2214,7 @@ module.exports = class Runner extends EventEmitter {
    *   public call's private deadline scope
    * @returns {Promise<void>} resolves at once, committing nothing, when the runner is not running
    * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|import('../errors').KafkaJSCommitFailedError|Error}
-   *   `CONSUMER_STOPPING` when an admitted call fails after the stop began
+   *   `CONSUMER_STOPPING` when an admitted call fails after the run stopped
    */
   commitOffsets(offsets, batch = handlerContext.current() ?? null, { operation } = {}) {
     const ownership = this.consumerGroup.ownership
