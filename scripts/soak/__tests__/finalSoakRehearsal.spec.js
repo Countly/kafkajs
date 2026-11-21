@@ -18,9 +18,17 @@ const matrix = JSON.parse(fs.readFileSync(path.join(ROOT, MATRIX_FILE), 'utf8'))
 const TREE = 'b'.repeat(40)
 const JAR = 'c'.repeat(64)
 const BROKERS = 'kafka1:9092,kafka2:9092,kafka3:9092'
-/** The clock speed-up: the 30 min smoke schedule runs in about 30 s. */
+/** The clock speed-up of the clock tests' short scripts. */
 const WARP = 60
-/** Sixty-fold sampling is late by the real cost of two collections, which no broker-free run avoids. */
+/**
+ * The clock speed-up of the smoke run: the 30 min schedule runs in 3 min. Plan-paced work grows
+ * denser with the speed-up (the run spends about 140 CPU seconds at any rate), and a work step's
+ * deadline shrinks with it, so a sixty-fold run on a loaded four-core host misses step deadlines and
+ * aborts. Tenfold keeps the busiest step at about a third of its budget under 48 busy loops on 12
+ * cores.
+ */
+const RUN_WARP = 10
+/** A sped-up periodic sample is late by the real cost of two collections, which no warp shortens. */
 const EXPECTED_PROBLEM = /^step \S+ late$/
 
 /**
@@ -102,175 +110,184 @@ const recordsOf = (out) =>
     .filter(Boolean)
     .map((line) => JSON.parse(line))
 
+const smoke = { ws: null, run: null }
+
+/**
+ * The one smoke run every run-reading test checks, started by the first that needs it: preflight,
+ * the sixteen-process driver on the reviewed matrix with the decoder's heap snapshot path made a
+ * directory (so its snapshot fails and the others do not), the outer observer's finalize on the
+ * same run clock, and the summary.
+ * @returns {Promise<object>} the workspace, each step's result, the stream as the driver left it
+ *   (`driverRecords`, before finalize appends the supervisor's exit) and `read(file)` of an artifact
+ */
+const smokeRun = () => (smoke.run ??= runSmoke())
+
+/** @returns {Promise<object>} see `smokeRun` */
+async function runSmoke() {
+  const ws = (smoke.ws = workspace())
+  const preflight = spawnSync(
+    process.execPath,
+    [
+      'scripts/soak/finalSoakPreflight.js',
+      '--expect-sha',
+      TREE,
+      '--mode',
+      'smoke',
+      '--out',
+      ws.out,
+      '--diagnostic',
+    ],
+    { cwd: ROOT, env: { ...ws.env, FINAL_SOAK_REHEARSAL_PUSH: '1' }, encoding: 'utf8' }
+  )
+  fs.mkdirSync(path.join(ws.out, 'heap/p16.h00.heapsnapshot'), { recursive: true })
+  const warped = {
+    ...ws.env,
+    FINAL_SOAK_REHEARSAL_WARP: String(RUN_WARP),
+    FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
+    FINAL_SOAK_REHEARSAL_HOLDS: path.join(ws.dir, 'holds'),
+  }
+  const driver = await runDriver(
+    [
+      '--expose-gc',
+      '--no-flush-bytecode',
+      'scripts/soak/finalSoak.js',
+      '--mode',
+      'smoke',
+      '--expect-sha',
+      TREE,
+      '--matrix',
+      MATRIX_FILE,
+      '--out',
+      ws.out,
+      '--diagnostic',
+    ],
+    warped
+  )
+  const driverRecords = recordsOf(ws.out)
+  const finalize = spawnSync(
+    process.execPath,
+    ['scripts/soak/finalSoak.js', '--finalize', '--out', ws.out, '--status', String(driver.code)],
+    { cwd: ROOT, env: warped, encoding: 'utf8' }
+  )
+  const summary = spawnSync(
+    process.execPath,
+    ['scripts/soak/finalSoak.js', '--summary', '--out', ws.out],
+    { cwd: ROOT, env: ws.env, encoding: 'utf8' }
+  )
+  const read = (file) => JSON.parse(fs.readFileSync(path.join(ws.out, file), 'utf8'))
+  return { ws, preflight, driver, driverRecords, finalize, summary, read }
+}
+
+afterAll(() => smoke.ws?.remove())
+
 describe('final soak rehearsal', () => {
   test('preflight and the sixteen-process smoke run start, connect, run every schedule step, sample and exit naturally without a broker', async () => {
-    const ws = workspace()
-    try {
-      const preflight = spawnSync(
-        process.execPath,
-        [
-          'scripts/soak/finalSoakPreflight.js',
-          '--expect-sha',
-          TREE,
-          '--mode',
-          'smoke',
-          '--out',
-          ws.out,
-          '--diagnostic',
-        ],
-        { cwd: ROOT, env: { ...ws.env, FINAL_SOAK_REHEARSAL_PUSH: '1' }, encoding: 'utf8' }
-      )
-      const record = JSON.parse(fs.readFileSync(path.join(ws.out, 'preflight.json'), 'utf8'))
-      expect(record.error).toBeUndefined()
-      expect(preflight.status).toBe(0)
-      const blocking = record.checks.filter((c) => c.required && !c.ok).map((c) => c.name)
-      expect(blocking).toEqual([])
-      expect(record.checks.filter((c) => !c.required).map((c) => c.name)).toEqual([
-        'quiet-host',
-        'memory',
-        'disk',
-        'load',
+    const {
+      ws,
+      preflight,
+      driver,
+      finalize,
+      summary,
+      read,
+      driverRecords: records,
+    } = await smokeRun()
+    const record = read('preflight.json')
+    expect(record.error).toBeUndefined()
+    expect(preflight.status).toBe(0)
+    const blocking = record.checks.filter((c) => c.required && !c.ok).map((c) => c.name)
+    expect(blocking).toEqual([])
+    expect(record.checks.filter((c) => !c.required).map((c) => c.name)).toEqual([
+      'quiet-host',
+      'memory',
+      'disk',
+      'load',
+    ])
+    const capabilities = read('broker/capabilities.json')
+    expect(validateCapabilities(capabilities)).toEqual([])
+    expect(capabilities.nodes.map((n) => n.node)).toEqual([1, 2, 3])
+    expect(validateProvenance(read('broker/provenance.json'), 'supplied')).toEqual([])
+    expect(record.telemetry.pushes.map((p) => p.probe).sort()).toEqual(['consumer', 'producer'])
+
+    expect(driver.output).not.toMatch(/Error/)
+    expect(driver).toMatchObject({ code: 0, signal: null })
+
+    const config = read('config.json')
+    expect(validateConfig(config, matrix)).toEqual([])
+    const supervisor = read('supervisor.json')
+    expect(supervisor).toMatchObject({
+      aborted: null,
+      incomplete: null,
+      failures: [],
+      forced: [],
+    })
+    expect(supervisor.problems.filter((p) => !EXPECTED_PROBLEM.test(p))).toEqual([])
+    const slots = config.processes.map((p) => p.slot)
+    expect(slots).toHaveLength(16)
+    const of = (kind, test = () => true) => records.filter((r) => r.kind === kind && test(r))
+    expect(new Set(of('process', (r) => r.event === 'start').map((r) => r.process))).toEqual(
+      new Set(slots)
+    )
+    const exits = of('process', (r) => r.event === 'exit')
+    expect(exits.map((r) => r.process).sort()).toEqual(slots.filter((s) => s !== 'p15').sort())
+    expect(exits.every((r) => r.code === 0 && r.signal === null)).toBe(true)
+    for (const slot of slots) {
+      const roles = new Set(of('sample', (r) => r.process === slot).map((r) => r.role))
+      expect([slot, ...['baseline', 'periodic', 'final'].filter((r) => roles.has(r))]).toEqual([
+        slot,
+        'baseline',
+        'periodic',
+        'final',
       ])
-      const read = (file) => JSON.parse(fs.readFileSync(path.join(ws.out, file), 'utf8'))
-      const capabilities = read('broker/capabilities.json')
-      expect(validateCapabilities(capabilities)).toEqual([])
-      expect(capabilities.nodes.map((n) => n.node)).toEqual([1, 2, 3])
-      expect(validateProvenance(read('broker/provenance.json'), 'supplied')).toEqual([])
-      expect(record.telemetry.pushes.map((p) => p.probe).sort()).toEqual(['consumer', 'producer'])
-
-      // The outer observer's finalize witnesses the exit on the same (warped) run clock.
-      const warped = {
-        ...ws.env,
-        FINAL_SOAK_REHEARSAL_WARP: String(WARP),
-        FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
-        FINAL_SOAK_REHEARSAL_HOLDS: path.join(ws.dir, 'holds'),
-      }
-      const driver = await runDriver(
-        [
-          '--expose-gc',
-          '--no-flush-bytecode',
-          'scripts/soak/finalSoak.js',
-          '--mode',
-          'smoke',
-          '--expect-sha',
-          TREE,
-          '--matrix',
-          MATRIX_FILE,
-          '--out',
-          ws.out,
-          '--diagnostic',
-        ],
-        warped
-      )
-      expect(driver.output).not.toMatch(/Error/)
-      expect(driver).toMatchObject({ code: 0, signal: null })
-
-      const config = read('config.json')
-      expect(validateConfig(config, matrix)).toEqual([])
-      const supervisor = read('supervisor.json')
-      expect(supervisor).toMatchObject({
-        aborted: null,
-        incomplete: null,
-        failures: [],
-        forced: [],
-      })
-      expect(supervisor.problems.filter((p) => !EXPECTED_PROBLEM.test(p))).toEqual([])
-      const records = recordsOf(ws.out)
-      const slots = config.processes.map((p) => p.slot)
-      expect(slots).toHaveLength(16)
-      const of = (kind, test = () => true) => records.filter((r) => r.kind === kind && test(r))
-      expect(new Set(of('process', (r) => r.event === 'start').map((r) => r.process))).toEqual(
-        new Set(slots)
-      )
-      const exits = of('process', (r) => r.event === 'exit')
-      expect(exits.map((r) => r.process).sort()).toEqual(slots.filter((s) => s !== 'p15').sort())
-      expect(exits.every((r) => r.code === 0 && r.signal === null)).toBe(true)
-      for (const slot of slots) {
-        const roles = new Set(of('sample', (r) => r.process === slot).map((r) => r.role))
-        expect([slot, ...['baseline', 'periodic', 'final'].filter((r) => roles.has(r))]).toEqual([
-          slot,
-          'baseline',
-          'periodic',
-          'final',
-        ])
-      }
-      for (const slot of config.clients.filter((c) => c.standing)) {
-        const client = `${slot.slot}.1`
-        expect([
-          client,
-          of('client', (r) => r.event === 'construct' && r.client === client),
-        ]).toEqual([
-          client,
-          [expect.objectContaining({ process: slot.process, clientKind: slot.clientKind })],
-        ])
-        expect([
-          client,
-          of(
-            'client',
-            (r) => r.event === 'connect' && r.client === client && r.phase === 'end'
-          ).map((r) => r.result),
-        ]).toEqual([client, ['ok']])
-      }
-      const notes = of('diagnostic').map((r) => r.message)
-      const plan = planSchedule(matrix, 'smoke').steps
-      for (const step of plan)
-        expect([step.id, notes.some((n) => new RegExp(`^step ${step.id} \\w+$`).test(n))]).toEqual([
-          step.id,
-          true,
-        ])
-      expect(notes.filter((n) => /^step \S+ (failed|error)/.test(n))).toEqual([])
-      const scans = of('scan')
-      expect(scans.length).toBeGreaterThan(0)
-      for (const scan of scans)
-        expect([scan.scan, fs.existsSync(path.join(ws.out, scan.rawFile))]).toEqual([
-          scan.scan,
-          true,
-        ])
-      expect(notes.filter((n) => /^producer loop failed/.test(n))).toEqual([])
-      const shareGroup = config.clients.find((c) => c.clientKind === 'share').group
-      const configured = records.findIndex(
-        (r) =>
-          r.kind === 'diagnostic' &&
-          r.message === `share group ${shareGroup} reads back share.auto.offset.reset=earliest`
-      )
-      const shareStart = records.findIndex(
-        (r) => r.kind === 'client' && r.event === 'construct' && r.process === 'p07'
-      )
-      expect(configured).toBeGreaterThan(-1)
-      expect(configured).toBeLessThan(shareStart)
-
-      const finalize = spawnSync(
-        process.execPath,
-        [
-          'scripts/soak/finalSoak.js',
-          '--finalize',
-          '--out',
-          ws.out,
-          '--status',
-          String(driver.code),
-        ],
-        { cwd: ROOT, env: warped, encoding: 'utf8' }
-      )
-      expect(finalize.stderr).toBe('')
-      expect(finalize.status).toBe(0)
-      const header = read('header.json')
-      expect(header.exit).toMatchObject({ supervisorProcess: 'p15', code: 0, signal: null })
-      expect(validateHeader(header, matrix)).toEqual([])
-      const validator = new StreamValidator({ matrix, config, header })
-      for (const line of fs.readFileSync(path.join(ws.out, 'stream.ndjson'), 'utf8').split('\n'))
-        if (line) validator.push(line)
-      expect(validator.finish().slice(0, 30)).toEqual([])
-      const summary = spawnSync(
-        process.execPath,
-        ['scripts/soak/finalSoak.js', '--summary', '--out', ws.out],
-        { cwd: ROOT, env: ws.env, encoding: 'utf8' }
-      )
-      expect(summary.status).toBe(0)
-      expect(JSON.parse(summary.stdout).exit).toMatchObject({ code: 0 })
-    } finally {
-      ws.remove()
     }
-  }, 240000)
+    for (const slot of config.clients.filter((c) => c.standing)) {
+      const client = `${slot.slot}.1`
+      expect([client, of('client', (r) => r.event === 'construct' && r.client === client)]).toEqual(
+        [client, [expect.objectContaining({ process: slot.process, clientKind: slot.clientKind })]]
+      )
+      expect([
+        client,
+        of('client', (r) => r.event === 'connect' && r.client === client && r.phase === 'end').map(
+          (r) => r.result
+        ),
+      ]).toEqual([client, ['ok']])
+    }
+    const notes = of('diagnostic').map((r) => r.message)
+    const plan = planSchedule(matrix, 'smoke').steps
+    for (const step of plan)
+      expect([step.id, notes.some((n) => new RegExp(`^step ${step.id} \\w+$`).test(n))]).toEqual([
+        step.id,
+        true,
+      ])
+    expect(notes.filter((n) => /^step \S+ (failed|error)/.test(n))).toEqual([])
+    const scans = of('scan')
+    expect(scans.length).toBeGreaterThan(0)
+    for (const scan of scans)
+      expect([scan.scan, fs.existsSync(path.join(ws.out, scan.rawFile))]).toEqual([scan.scan, true])
+    expect(notes.filter((n) => /^producer loop failed/.test(n))).toEqual([])
+    const shareGroup = config.clients.find((c) => c.clientKind === 'share').group
+    const configured = records.findIndex(
+      (r) =>
+        r.kind === 'diagnostic' &&
+        r.message === `share group ${shareGroup} reads back share.auto.offset.reset=earliest`
+    )
+    const shareStart = records.findIndex(
+      (r) => r.kind === 'client' && r.event === 'construct' && r.process === 'p07'
+    )
+    expect(configured).toBeGreaterThan(-1)
+    expect(configured).toBeLessThan(shareStart)
+
+    expect(finalize.stderr).toBe('')
+    expect(finalize.status).toBe(0)
+    const header = read('header.json')
+    expect(header.exit).toMatchObject({ supervisorProcess: 'p15', code: 0, signal: null })
+    expect(validateHeader(header, matrix)).toEqual([])
+    const validator = new StreamValidator({ matrix, config, header })
+    for (const line of fs.readFileSync(path.join(ws.out, 'stream.ndjson'), 'utf8').split('\n'))
+      if (line) validator.push(line)
+    expect(validator.finish().slice(0, 30)).toEqual([])
+    expect(summary.status).toBe(0)
+    expect(JSON.parse(summary.stdout).exit).toMatchObject({ code: 0 })
+  }, 480000)
 
   test('the warp speeds the harness clock only: a raw reader connection outlives a 200 ms CPU stall in its setup', () => {
     // A stall the host can impose at any moment (a collection, a busy CPU) during the reader's
@@ -359,67 +376,15 @@ describe('final soak rehearsal', () => {
 
 describe('final soak rehearsal heap snapshots', () => {
   const run = {}
-  /**
-   * The reviewed matrix with the smoke quiet readings moved from the idle window's last minute to
-   * its middle, with the deadline at the window's end. A sixty-fold run pays the real cost of each
-   * reading's collections sixty times over, about twenty harness seconds, so on a loaded host the
-   * reviewed triplet's last reading would start past its fifty-second deadline or the window's end
-   * and be skipped. These tests are about the snapshots; the supervisor's unit tests cover a
-   * boundary whose last reading is skipped.
-   */
-  const snapshotMatrix = (() => {
-    const { schedule } = matrix
-    const idle = schedule.smoke.idleMs
-    const first = (idle.from + idle.to) / 2
-    const quietAtMs = schedule.smoke.quietAtMs.map((q) => q - schedule.smoke.quietAtMs[0] + first)
-    const quietDeadlineMs = schedule.quietAtMs[0] + (idle.to - first)
-    return {
-      ...matrix,
-      schedule: { ...schedule, quietDeadlineMs, smoke: { ...schedule.smoke, quietAtMs } },
-    }
-  })()
 
   beforeAll(async () => {
-    run.ws = workspace()
-    run.matrixFile = path.join(run.ws.dir, 'matrix.json')
-    fs.writeFileSync(run.matrixFile, JSON.stringify(snapshotMatrix))
-    // The decoder's snapshot path is a directory, so its snapshot fails and the others do not.
-    fs.mkdirSync(path.join(run.ws.out, 'heap/p16.h00.heapsnapshot'), { recursive: true })
-    const env = {
-      ...run.ws.env,
-      FINAL_SOAK_REHEARSAL_WARP: String(WARP),
-      FINAL_SOAK_REHEARSAL_ANCHOR: String(process.hrtime.bigint()),
-      FINAL_SOAK_REHEARSAL_HOLDS: path.join(run.ws.dir, 'holds'),
-    }
-    run.driver = await runDriver(
-      [
-        '--expose-gc',
-        '--no-flush-bytecode',
-        'scripts/soak/finalSoak.js',
-        '--mode',
-        'smoke',
-        '--expect-sha',
-        TREE,
-        '--matrix',
-        run.matrixFile,
-        '--out',
-        run.ws.out,
-        '--diagnostic',
-      ],
-      env
-    )
-    run.finalize = spawnSync(
-      process.execPath,
-      ['scripts/soak/finalSoak.js', '--finalize', '--out', run.ws.out, '--status', '0'],
-      { cwd: ROOT, env, encoding: 'utf8' }
-    )
-    const read = (file) => JSON.parse(fs.readFileSync(path.join(run.ws.out, file), 'utf8'))
+    const { ws, driver, finalize, read } = await smokeRun()
+    Object.assign(run, { ws, driver, finalize })
     run.config = read('config.json')
     run.supervisor = read('supervisor.json')
     run.header = read('header.json')
-    run.records = recordsOf(run.ws.out)
-  }, 240000)
-
+    run.records = recordsOf(ws.out)
+  }, 480000)
   afterAll(() => run.ws?.remove())
 
   test('each selected process writes its heap snapshot into the run directory only after every quiet reading of the boundary, and the sealed header binds the file', () => {
@@ -506,7 +471,7 @@ describe('final soak rehearsal heap snapshots', () => {
     for (const h of heaps)
       expect([h.sample, h.spaces.old > 0, h.code.bytecode > 0]).toEqual([h.sample, true, true])
     const validator = new StreamValidator({
-      matrix: snapshotMatrix,
+      matrix,
       config: run.config,
       header: run.header,
     })
