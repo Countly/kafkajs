@@ -46,7 +46,7 @@ describe('Admin', () => {
       ).rejects.toHaveProperty('message', 'Invalid partitions')
     })
 
-    test('set the consumer group to any offsets', async () => {
+    test('set the consumer group to any offsets, pre-seeding a group that does not exist yet', async () => {
       const cluster = createCluster()
       admin = createAdmin({ cluster, logger: newLogger() })
 
@@ -75,6 +75,7 @@ describe('Admin', () => {
       admin = createAdmin({ cluster: createCluster(), logger: newLogger() })
 
       await admin.connect()
+      const before = await admin.fetchOffsets({ groupId, topics: [topicName] })
       await expect(
         admin.setOffsets({
           groupId,
@@ -85,6 +86,47 @@ describe('Admin', () => {
         'message',
         'The consumer group must have no running instances, current state: Stable'
       )
+      expect(await admin.fetchOffsets({ groupId, topics: [topicName] })).toEqual(before)
+    })
+
+    test('setOffsets on an empty consumer-protocol group commits without joining or converting it', async () => {
+      consumer = createConsumer({
+        groupId,
+        groupProtocol: 'consumer',
+        cluster: createCluster(),
+        logger: newLogger(),
+      })
+      await consumer.connect()
+      await consumer.subscribe({ topic: topicName, fromBeginning: true })
+      let joined
+      const join = new Promise((resolve) => (joined = resolve))
+      consumer.on(consumer.events.GROUP_JOIN, () => joined())
+      await consumer.run({ eachMessage: async () => {} })
+      await join
+      await consumer.disconnect()
+      consumer = null
+
+      admin = createAdmin({ cluster: createCluster(), logger: newLogger() })
+      await admin.connect()
+      const describe = async () => (await admin.describeGroups([groupId])).groups[0]
+      const before = await describe()
+      expect(before).toMatchObject({ groupType: 'consumer', state: 'Empty', members: [] })
+
+      await admin.setOffsets({
+        groupId,
+        topic: topicName,
+        partitions: [{ partition: 0, offset: '7' }],
+      })
+
+      expect(await admin.fetchOffsets({ groupId, topics: [topicName] })).toEqual([
+        { topic: topicName, partitions: [{ partition: 0, offset: '7', metadata: null }] },
+      ])
+      expect(await describe()).toMatchObject({
+        groupType: 'consumer',
+        state: 'Empty',
+        members: [],
+        groupEpoch: before.groupEpoch,
+      })
     })
   })
 })
