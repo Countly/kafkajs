@@ -248,6 +248,168 @@ describe('load profile fault schedules', () => {
   })
 })
 
+describe('load profile fault schedules at the window end', () => {
+  /**
+   * A bouncer like `BrokerBouncer#rollingBounce`: each step takes its node down for `stepMs` and
+   * restores it, and a step asked for once the signal aborted rejects with the signal's reason.
+   */
+  const bouncing = ({ time, stepMs = 1000, fail = null }) => {
+    const calls = []
+    return {
+      calls,
+      rollingBounce: async ({ hard = false, services, signal }) => {
+        const outages = []
+        for (const service of services) {
+          signal?.throwIfAborted()
+          calls.push({ service, hard, at: time.t })
+          if (fail?.(service, hard)) throw new Error(`stopping ${service} failed`)
+          time.t += stepMs
+          outages.push({ service, kind: hard ? 'kill' : 'stop', outageMs: stepMs })
+        }
+        return outages
+      },
+    }
+  }
+  /** Fake time; the window ends (its signal aborts) once a sleep reaches `endAt`. */
+  const windowOf = (endAt) => {
+    const time = { t: 0 }
+    const window = new AbortController()
+    const sleep = async (ms, signal) => {
+      if (signal?.aborted) return
+      if (time.t + ms >= endAt) {
+        time.t = endAt
+        window.abort()
+        return
+      }
+      time.t += ms
+    }
+    return { time, window, sleep }
+  }
+
+  it('rolling-restarts stops at the window end, keeping the restarts done and recording each one not run; a failed restart still fails it', async () => {
+    const { time, window, sleep } = windowOf(230000)
+    const bouncer = bouncing({ time })
+    const records = await FAULT_SCHEDULES['rolling-restarts'].start({
+      bouncer,
+      admin: {},
+      topics: ['t'],
+      windowMs: 600000,
+      signal: window.signal,
+      sleep,
+    })
+    expect(bouncer.calls).toEqual([
+      { service: 'kafka1', hard: false, at: 200000 },
+      { service: 'kafka2', hard: false, at: 221000 },
+    ])
+    expect(records).toEqual([
+      { service: 'kafka1', kind: 'stop', outageMs: 1000 },
+      { service: 'kafka2', kind: 'stop', outageMs: 1000 },
+      { service: 'kafka3', kind: 'stop', skipped: 'window ended' },
+      { service: 'kafka1', kind: 'kill', skipped: 'window ended' },
+      { service: 'kafka2', kind: 'kill', skipped: 'window ended' },
+      { service: 'kafka3', kind: 'kill', skipped: 'window ended' },
+    ])
+
+    const failing = windowOf(600000)
+    await expect(
+      FAULT_SCHEDULES['rolling-restarts'].start({
+        bouncer: bouncing({ time: failing.time, fail: (service) => service === 'kafka2' }),
+        admin: {},
+        topics: ['t'],
+        windowMs: 600000,
+        signal: failing.window.signal,
+        sleep: failing.sleep,
+      })
+    ).rejects.toThrow('stopping kafka2 failed')
+  })
+
+  it('rolling-restarts does not fail when the window ends while a restart is being asked for', async () => {
+    const time = { t: 0 }
+    const window = new AbortController()
+    const sleep = async (ms, signal) => {
+      if (!signal?.aborted) time.t += ms
+    }
+    const bouncer = {
+      rollingBounce: async ({ services, signal }) => {
+        if (services?.[0] === 'kafka1' || !services) {
+          window.abort()
+          signal.throwIfAborted()
+        }
+        return []
+      },
+    }
+    const records = await FAULT_SCHEDULES['rolling-restarts'].start({
+      bouncer,
+      admin: {},
+      topics: ['t'],
+      windowMs: 600000,
+      signal: window.signal,
+      sleep,
+    })
+    expect(records.map((r) => `${r.kind} ${r.service} ${r.skipped}`)).toEqual([
+      'stop kafka1 window ended',
+      'stop kafka2 window ended',
+      'stop kafka3 window ended',
+      'kill kafka1 window ended',
+      'kill kafka2 window ended',
+      'kill kafka3 window ended',
+    ])
+  })
+
+  it('many-topics ends its restart phase at the window end and records the restarts not run', async () => {
+    const { time, window, sleep } = windowOf(121000)
+    const records = await FAULT_SCHEDULES['many-topics'].start({
+      bouncer: bouncing({ time }),
+      admin: {},
+      topics: ['t'],
+      windowMs: 300000,
+      windowStart: 0,
+      clock: { now: () => time.t },
+      signal: window.signal,
+      sleep,
+    })
+    expect(records).toEqual([
+      { phase: 'rolling-restart', kind: 'stop', startMs: 100000, endMs: 121000 },
+      { service: 'kafka1', kind: 'stop', outageMs: 1000 },
+      { service: 'kafka2', kind: 'stop', skipped: 'window ended' },
+      { service: 'kafka3', kind: 'stop', skipped: 'window ended' },
+    ])
+  })
+
+  it('slow-broker records the freeze as not run when the window ends while it is asked for', async () => {
+    const clock = {
+      t: 0,
+      now() {
+        return this.t
+      },
+    }
+    const window = new AbortController()
+    const sleep = async (ms, signal) => {
+      if (!signal?.aborted) clock.t += ms
+    }
+    const records = await FAULT_SCHEDULES['slow-broker'].start({
+      netem: { apply: async () => {}, clear: async () => {} },
+      bouncer: {
+        step: async (step, { signal }) => {
+          window.abort()
+          signal.throwIfAborted()
+        },
+      },
+      admin: {},
+      topics: ['t'],
+      windowMs: 600000,
+      windowStart: 0,
+      clock,
+      signal: window.signal,
+      sleep,
+    })
+    expect(records.map((r) => [r.phase, r.skipped])).toEqual([
+      ['slow', undefined],
+      ['frozen', 'window ended'],
+    ])
+  })
+})
+
 describe('load profile slow-broker and many-topics schedules', () => {
   /** A fake clock and the scripted fault tools, each logging what it was asked and when. */
   const scripted = () => {

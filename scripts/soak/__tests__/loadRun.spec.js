@@ -520,6 +520,45 @@ describe('load run fault schedules', () => {
     expect(report.verdict).toMatchObject({ product: 'PASS', flow: 'STALLED', exitCode: 4 })
   })
 
+  it('reports rolling restarts cut short by the window end as restarts not run, not as a driver error', async () => {
+    const steps = []
+    const { report, out } = await runWith(
+      new FakeCluster(),
+      {},
+      {
+        args: ['--faults', 'rolling-restarts', '--duration', '6'],
+        tools: ({ sleep }) => ({
+          bouncer: {
+            async rollingBounce({ hard = false, between = 0, services, signal }) {
+              const outages = []
+              for (const service of services ?? ['kafka1', 'kafka2', 'kafka3']) {
+                if (outages.length && between) await sleep(between)
+                signal?.throwIfAborted()
+                steps.push(service)
+                await sleep(500)
+                outages.push({ service, kind: hard ? 'kill' : 'stop', outageMs: 500 })
+              }
+              return outages
+            },
+          },
+        }),
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(steps).toEqual(['kafka1'])
+    expect(report.errors).toEqual([])
+    expect(report.faults.map((f) => [f.kind, f.service, f.outageMs ?? f.skipped])).toEqual([
+      ['stop', 'kafka1', 500],
+      ['stop', 'kafka2', 'window ended'],
+      ['stop', 'kafka3', 'window ended'],
+      ['kill', 'kafka1', 'window ended'],
+      ['kill', 'kafka2', 'window ended'],
+      ['kill', 'kafka3', 'window ended'],
+    ])
+    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+  })
+
   it('reports the many-topics measurements: topic creation, first assignment, rebalances, metadata requests and fetch rounds', async () => {
     const cluster = new FakeCluster()
     const bounces = []
