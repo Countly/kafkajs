@@ -29,8 +29,10 @@ const part = (leader, partitionId) => ({
  * The admin's cluster, built as `kafka.admin()` builds it, over two broker doubles whose Metadata
  * answers go through the real v13 parse. `live` maps each existing topic to its partition leaders,
  * `ids` to its topic id and `refused` to the topic error code a named request gets for it. A
- * Metadata answer waits for `gate(topics, n)` when one is set; `n` counts the Metadata requests.
- * A ListOffsets request waits for `listHook(n)` when one is set; `n` counts those requests.
+ * Metadata answer waits for `gate(topics, n)` when one is set; `n` counts the Metadata requests;
+ * a Map the gate returns replaces `live` for that answer. Its broker list is `nodes` as it was when the request was sent; its topics are read after the
+ * gate. A ListOffsets request waits for `listHook(n, topics)` when one is set; `n` counts those
+ * requests. Building a connection pool waits for `poolHook(host)` when one is set.
  * @param {object} [options] retry and apiTimeout of the admin
  * @returns {object} the cluster, the admin, the controls and the request log
  */
@@ -49,6 +51,8 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
   let sent = 0
   let listHook = null
   let listed = 0
+  let poolHook = null
+  const nodes = [...NODES]
   const emitter = new InstrumentationEventEmitter()
   const recreated = []
   emitter.addListener(CLUSTER_TOPIC_RECREATED, ({ payload }) => recreated.push(payload))
@@ -61,12 +65,10 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
     orderedMetadata: true,
   })
   const pool = cluster.brokerPool
-  pool.buildConnectionPool = async ({ host = 'kafka1', port = 9092, rack = null } = {}) => ({
-    host,
-    port,
-    rack,
-    destroy: async () => {},
-  })
+  pool.buildConnectionPool = async ({ host = 'kafka1', port = 9092, rack = null } = {}) => {
+    if (poolHook) await poolHook(host)
+    return { host, port, rack, retire: () => {}, destroy: async () => {} }
+  }
   pool.createBroker = ({ connectionPool, nodeId }) => {
     let connected = false
     return {
@@ -85,22 +87,23 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
       metadata: async (topics = []) => {
         calls.push({ api: 'Metadata', topics: [...topics].sort() })
         const n = ++sent
-        if (gate) await gate(topics, n)
-        const named = topics.length > 0 ? topics : [...live.keys()]
+        const brokers = [...nodes]
+        const view = (gate && (await gate(topics, n))) || live
+        const named = topics.length > 0 ? topics : [...view.keys()]
         const { response } = requests.Metadata.protocol({ version: 13 })({ topics })
         return response.parse({
           throttleTime: 0,
           clientSideThrottleTime: 0,
           errorCode: 0,
-          brokers: NODES,
+          brokers,
           clusterId: 'c',
           controllerId: 1,
           topicMetadata: named.map((topic) => ({
-            topicErrorCode: refused.get(topic) ?? (live.has(topic) ? 0 : 3),
+            topicErrorCode: refused.get(topic) ?? (view.has(topic) ? 0 : 3),
             topic,
-            topicId: live.has(topic) && !refused.has(topic) ? ids.get(topic) : null,
+            topicId: view.has(topic) && !refused.has(topic) ? ids.get(topic) : null,
             isInternal: false,
-            partitionMetadata: refused.has(topic) ? [] : (live.get(topic) ?? []).map(part),
+            partitionMetadata: refused.has(topic) ? [] : (view.get(topic) ?? []).map(part),
           })),
         })
       },
@@ -112,7 +115,7 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
           live.delete(topic)
       },
       listOffsets: async ({ topics }) => {
-        if (listHook) await listHook(++listed)
+        if (listHook) await listHook(++listed, topics)
         calls.push({ api: 'ListOffsets', nodeId, topics: topics.map(({ topic }) => topic) })
         return {
           responses: topics.map(({ topic, partitions }) => ({
@@ -170,6 +173,8 @@ const build = ({ retry = RETRY, apiTimeout } = {}) => {
     recreated,
     setGate: (g) => (gate = g),
     setListHook: (hook) => (listHook = hook),
+    setPoolHook: (hook) => (poolHook = hook),
+    nodes,
   }
 }
 
@@ -195,6 +200,10 @@ const latch = () => {
 const alwaysStale = (cluster) => {
   cluster.brokerPool.metadataMaxAge = -1
 }
+/** @param {Cluster} cluster @returns {string[]} the topics the installed metadata routes */
+const routed = (cluster) => cluster.brokerPool.metadata.topicMetadata.map(({ topic }) => topic)
+/** A producer-style lifecycle that never closes, as a fenced refresh carries one. */
+const OPEN_FENCE = { closed: false, check: () => {}, guard: () => null, register: () => () => {} }
 const T_OFFSETS = [
   { partition: 0, offset: '5', high: '5', low: '5' },
   { partition: 1, offset: '5', high: '5', low: '5' },
@@ -368,23 +377,25 @@ describe('Admin > each call targets its topics only while it runs', () => {
     test('while a read holds a topic another client deleted, a cluster-level call fails with code 3, and resolves once the read has ended', async () => {
       h = build()
       await h.admin.connect()
-      await h.admin.createTopics(CREATE('N'))
-      alwaysStale(h.cluster)
-      const held = latch()
-      let seen = 0
-      h.setGate(async (topics) => {
-        if (topics.includes('T') && ++seen === 2) {
-          h.live.delete('T')
-          await held.promise
+      const paused = latch()
+      const resume = latch()
+      h.setListHook(async (n, topics) => {
+        if (n === 1) {
+          paused.release()
+          await resume.promise
         }
+        if (topics.some(({ topic }) => !h.live.has(topic))) throw createErrorFromCode(3)
       })
-      const x = outcome(h.admin.fetchTopicOffsets('T'))
-      await tick()
-      held.release()
-      await tick()
+      let ended = false
+      const x = outcome(h.admin.fetchTopicOffsets('T')).finally(() => (ended = true))
+      await paused.promise
+      h.live.delete('T')
 
       const during = await outcome(h.admin.createTopics(CREATE('N2')))
+      expect(ended).toBe(false)
+      expect(h.cluster.targetHolds.get('T')).toBe(1)
       expect(during.error).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION', code: 3 })
+      resume.release()
       expect((await x).error).toMatchObject({
         name: 'KafkaJSNumberOfRetriesExceeded',
         cause: { type: 'UNKNOWN_TOPIC_OR_PARTITION' },
@@ -394,24 +405,33 @@ describe('Admin > each call targets its topics only while it runs', () => {
     })
 
     test('an offset read overlapping a read of a deleted topic retries and resolves after that read released it', async () => {
-      h = build({ retry: { retries: 6, initialRetryTime: 1, maxRetryTime: 2 } })
+      h = build()
       await h.admin.connect()
-      await h.admin.createTopics(CREATE('N'))
-      alwaysStale(h.cluster)
-      const held = latch()
-      let seen = 0
-      h.setGate(async (topics) => {
-        if (topics.includes('T') && ++seen === 2) {
-          h.live.delete('T')
-          await held.promise
+      const paused = latch()
+      const resume = latch()
+      h.setListHook(async (n) => {
+        if (n === 1) {
+          paused.release()
+          await resume.promise
+          throw createErrorFromCode(29)
         }
       })
-      const x = outcome(h.admin.fetchTopicOffsets('T'))
-      await tick()
-      held.release()
+      let ended = false
+      const x = outcome(h.admin.fetchTopicOffsets('T')).finally(() => (ended = true))
+      await paused.promise
+      h.live.delete('T')
+      const whileHeld = []
+      h.setGate(async (topics) => {
+        if (topics.includes('U'))
+          whileHeld.push([[...topics].sort(), ended, h.cluster.targetHolds.get('T')])
+        if (whileHeld.length === 1) resume.release()
+      })
 
       expect(await outcome(h.admin.fetchTopicOffsets('U'))).toEqual({ ok: U_OFFSETS })
-      expect((await x).error).toMatchObject({ cause: { type: 'UNKNOWN_TOPIC_OR_PARTITION' } })
+      expect(whileHeld[0]).toEqual([['T', 'U'], false, 1])
+      expect(whileHeld.slice(-1)[0][0]).toEqual(['U'])
+      expect((await x).error).toMatchObject({ type: 'TOPIC_AUTHORIZATION_FAILED' })
+      expect([...h.cluster.targetTopics]).toEqual([])
     })
 
     test('two reads of one topic keep it a target until the second ends', async () => {
@@ -483,6 +503,8 @@ describe('Admin > each call targets its topics only while it runs', () => {
         expect([...h.cluster.targetTopics]).toEqual(['T'])
 
         await expect(h.admin.deleteTopics(selection)).resolves.toBeUndefined()
+        expect([...h.cluster.targetTopics]).toEqual([])
+        expect(h.cluster.targetHolds.get('T')).toBe(1)
         held.release()
 
         expect((await reader).error).toMatchObject({
@@ -493,6 +515,226 @@ describe('Admin > each call targets its topics only while it runs', () => {
         expect([...h.cluster.targetHolds]).toEqual([])
         await h.cluster.disconnect()
       }
+    })
+  })
+
+  describe('every metadata answer keeps the routing of the topics calls hold', () => {
+    test.each([
+      [
+        'a named fetchTopicMetadata of another topic',
+        (h) => h.admin.fetchTopicMetadata({ topics: ['U'] }),
+      ],
+      [
+        'a named fetchTopicMetadata of the same topic',
+        (h) => h.admin.fetchTopicMetadata({ topics: ['T'] }),
+      ],
+      [
+        'a fenced refresh of another topic',
+        (h) => h.cluster.brokerPool.refreshMetadata(['U'], { fence: OPEN_FENCE }),
+      ],
+    ])(
+      '%s answered while a read routes its topic leaves that read its offsets',
+      async (_, publish) => {
+        h = build()
+        await h.admin.connect()
+        alwaysStale(h.cluster)
+        const paused = latch()
+        const resume = latch()
+        h.setListHook(async (n) => {
+          if (n === 1) {
+            paused.release()
+            await resume.promise
+          }
+        })
+        const read = outcome(h.admin.fetchTopicOffsets('T'))
+        await paused.promise
+
+        await publish(h)
+        expect(routed(h.cluster)).toContain('T')
+        resume.release()
+
+        expect(await read).toEqual({ ok: T_OFFSETS })
+        expect([...h.cluster.targetTopics]).toEqual([])
+      }
+    )
+
+    test('an older refresh of another topic that retries after a newer answer leaves a routing read its offsets', async () => {
+      h = build()
+      await h.admin.connect()
+      alwaysStale(h.cluster)
+      const narrow = latch()
+      const failNarrow = latch()
+      const paused = latch()
+      const resume = latch()
+      let narrowSeen = 0
+      h.setGate(async (topics) => {
+        if (topics.length === 1 && topics[0] === 'U' && ++narrowSeen === 2) {
+          narrow.release()
+          await failNarrow.promise
+          throw createErrorFromCode(5)
+        }
+      })
+      let pausedOnce = false
+      h.setListHook(async (n, topics) => {
+        if (topics[0].topic === 'T' && !pausedOnce) {
+          pausedOnce = true
+          paused.release()
+          await resume.promise
+        }
+      })
+      const u = outcome(h.admin.fetchTopicOffsets('U'))
+      await narrow.promise
+      const t = outcome(h.admin.fetchTopicOffsets('T'))
+      await paused.promise
+      expect(routed(h.cluster).sort()).toEqual(['T', 'U'])
+
+      failNarrow.release()
+      expect(await u).toEqual({ ok: U_OFFSETS })
+      expect(narrowSeen).toBe(3)
+      expect(routed(h.cluster)).toContain('T')
+      resume.release()
+
+      expect(await t).toEqual({ ok: T_OFFSETS })
+    })
+
+    test('reads joined to a refresh still get their offsets when a rebootstrap cleared a newer answer before theirs landed', async () => {
+      h = build()
+      await h.admin.connect()
+      alwaysStale(h.cluster)
+      const narrow = latch()
+      const resume = latch()
+      let narrowSeen = 0
+      h.setGate(async (topics) => {
+        if (topics.length === 1 && topics[0] === 'U' && ++narrowSeen === 2) {
+          narrow.release()
+          await resume.promise
+        }
+      })
+      const first = outcome(h.admin.fetchTopicOffsets('U'))
+      await narrow.promise
+      const second = outcome(h.admin.fetchTopicOffsets('U'))
+      await tick()
+      expect(narrowSeen).toBe(2)
+      await h.admin.fetchTopicMetadata({ topics: ['T'] })
+      await h.cluster.brokerPool.rebootstrap('required')
+      expect(h.cluster.brokerPool.metadata).toBeNull()
+
+      resume.release()
+
+      expect(await first).toEqual({ ok: U_OFFSETS })
+      expect(await second).toEqual({ ok: U_OFFSETS })
+      expect([...h.cluster.targetTopics]).toEqual([])
+    })
+
+    test('a read whose older answer lands while a newer answer is still building the broker of a moved leader gets its offsets', async () => {
+      h = build()
+      await h.admin.connect()
+      await h.admin.fetchTopicOffsets('U')
+      alwaysStale(h.cluster)
+      const older = latch()
+      const building = latch()
+      const built = latch()
+      const sent = latch()
+      let tSeen = 0
+      h.setGate(async (topics) => {
+        if (topics.length === 1 && topics[0] === 'T' && ++tSeen === 2) {
+          const before = new Map(h.live)
+          sent.release()
+          await older.promise
+          return before
+        }
+      })
+      const read = outcome(h.admin.fetchTopicOffsets('T'))
+      await sent.promise
+
+      h.nodes.push({ nodeId: 3, host: 'kafka3', port: 9092, rack: null })
+      h.live.set('T', [3, 3])
+      h.setPoolHook(async (host) => {
+        if (host === 'kafka3') {
+          building.release()
+          await built.promise
+        }
+      })
+      const newer = h.cluster.brokerPool.refreshMetadata(['T', 'U'])
+      await building.promise
+      older.release()
+      await tick()
+      built.release()
+
+      expect(await read).toEqual({ ok: T_OFFSETS })
+      await newer
+      expect(h.calls.filter(({ api }) => api === 'ListOffsets').length).toBeGreaterThan(0)
+    })
+  })
+
+  describe('a hold is released however its call ends', () => {
+    test('a group-offset batch that fails fast keeps each started row its own hold until that row ends', async () => {
+      h = build()
+      await h.admin.connect()
+      const queued = latch()
+      const lock = h.cluster.mutatingTargetTopics
+      const acquire = lock.acquire.bind(lock)
+      let acquires = 0
+      lock.acquire = () => (++acquires === 2 ? queued.promise.then(acquire) : acquire())
+
+      const call = await outcome(
+        h.admin.fetchOffsetsForGroups({
+          groups: [{ groupId: 'g', topics: [{ topic: 'absent' }, { topic: 'U' }] }],
+        })
+      )
+      expect(call.error).toMatchObject({ type: 'UNKNOWN_TOPIC_OR_PARTITION', code: 3 })
+      expect(acquires).toBe(2)
+      queued.release()
+      for (let n = 0; n < 50 && h.md().every(({ topics }) => !topics.includes('U')); n++) {
+        await tick(1)
+      }
+      await tick()
+
+      expect(h.md().some(({ topics }) => topics.includes('U'))).toBe(true)
+      expect([...h.cluster.targetTopics]).toEqual([])
+      expect([...h.cluster.targetHolds]).toEqual([])
+    })
+
+    test.each([
+      [
+        'fetchTopicOffsetsByTimestamp with a named spec',
+        (a) => a.fetchTopicOffsetsByTimestamp('T', 'maxTimestamp'),
+      ],
+      [
+        'fetchTopicOffsetsByTimestamp with a timestamp',
+        (a) => a.fetchTopicOffsetsByTimestamp('T', 0),
+      ],
+      ['fetchTopicOffsets', (a) => a.fetchTopicOffsets('T')],
+      [
+        'abortTransaction',
+        (a) =>
+          a.abortTransaction({
+            topic: 'T',
+            partition: 0,
+            producerId: '7',
+            producerEpoch: 1,
+            coordinatorEpoch: 1,
+          }),
+      ],
+      [
+        'deleteTopicRecords',
+        (a) => a.deleteTopicRecords({ topic: 'T', partitions: [{ partition: 0, offset: '1' }] }),
+      ],
+    ])('%s with a retry setting its retrier refuses takes no hold', async (_, call) => {
+      h = build()
+      await h.admin.connect()
+      const admin = createAdmin({
+        cluster: h.cluster,
+        logger: newLogger(),
+        retry: { ...RETRY, maxTotalTime: 0 },
+      })
+
+      await expect(call(admin)).rejects.toMatchObject({
+        name: 'KafkaJSInvalidConfigurationError',
+        message: expect.stringContaining('retry.maxTotalTime'),
+      })
+      expect([...h.cluster.targetHolds]).toEqual([])
+      expect([...h.cluster.targetTopics]).toEqual([])
     })
   })
 

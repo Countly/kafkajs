@@ -243,8 +243,14 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
 
     test('after success, a running group and a crashed member', async () => {
       const gate = scripted.schedule.hold({ api: 'OffsetCommit' })
-      const reset = admin.resetOffsets({ groupId: 'reset-group', topic: TOPIC })
+      let settled = false
+      const reset = admin
+        .resetOffsets({ groupId: 'reset-group', topic: TOPIC })
+        .finally(() => (settled = true))
       await gate.arrived()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(settled).toBe(false)
+      expect([...adminCluster().targetHolds]).toEqual([[TOPIC, 1]])
       expect([...adminCluster().targetTopics]).toEqual([TOPIC])
       gate.release()
       await reset
@@ -267,6 +273,32 @@ describe('Admin > setOffsets > the internal consumer is released on every exit',
       ).rejects.toMatchObject({ type: 'GROUP_AUTHORIZATION_FAILED' })
       expect([...adminCluster().targetTopics]).toEqual([])
       expect([...adminCluster().targetHolds]).toEqual([])
+    })
+
+    test('a seek commit that never gets an answer holds the call and the topic until the client request timeout, then the call resolves without surfacing that commit failure', async () => {
+      await admin.disconnect()
+      admin = new Kafka(scripted.kafkaOptions({ requestTimeout: 300 })).admin()
+      await admin.connect()
+      const gate = scripted.schedule.hold({ api: 'OffsetCommit' })
+      let settled = false
+      const set = admin
+        .setOffsets({
+          groupId: 'set-group',
+          topic: TOPIC,
+          partitions: [{ partition: 0, offset: '3' }],
+        })
+        .finally(() => (settled = true))
+      await gate.arrived()
+      const arrivedAt = Date.now()
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      expect(settled).toBe(false)
+      expect([...adminCluster().targetHolds]).toEqual([[TOPIC, 1]])
+
+      await expect(set).resolves.toBeUndefined()
+      expect(Date.now() - arrivedAt).toBeGreaterThanOrEqual(300)
+      expect([...adminCluster().targetHolds]).toEqual([])
+      expect([...adminCluster().targetTopics]).toEqual([])
+      gate.release()
     })
 
     test('a member that cannot be built takes no hold', async () => {

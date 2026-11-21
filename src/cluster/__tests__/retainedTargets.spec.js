@@ -99,7 +99,7 @@ const olderAnswersLast = async (cluster, older, newer) => {
   return { observed, requests }
 }
 
-describe('Cluster > ordered metadata', () => {
+describe('Cluster > a scoped answer keeps the routing of current targets', () => {
   let cluster
   beforeEach(() => {
     mockClusters.length = 0
@@ -109,20 +109,38 @@ describe('Cluster > ordered metadata', () => {
     cluster = null
   })
 
-  test('with orderedMetadata, an answer that lands after the answer of a later request is not installed, and its caller resolves', async () => {
-    cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), orderedMetadata: true })
+  test('with retainTargets, a scoped answer that lands last keeps the routing of every topic still a target, and drops the others', async () => {
+    cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retainTargets: true })
+    cluster.targetTopics.add('a')
+    cluster.targetTopics.add('b')
 
     const { observed, requests } = await olderAnswersLast(cluster, ['a'], ['a', 'b'])
 
     expect(requests).toEqual([['a'], ['a', 'b']])
-    expect(routed(cluster)).toEqual(['a', 'b'])
+    expect(routed(cluster).sort()).toEqual(['a', 'b'])
+    expect(observed.map((topics) => topics.sort())).toEqual([['a', 'b']])
     expect(cluster.metadataCache.leader('b', 0)).toBe(0)
-    expect(Object.keys(cluster.brokerPool.brokers)).toEqual(['0'])
-    expect(observed).toEqual([])
+
+    cluster.targetTopics.delete('b')
+    await cluster.brokerPool.refreshMetadata(['a'])
+    expect(routed(cluster)).toEqual(['a'])
   })
 
-  test('without orderedMetadata, the answer that lands last is installed and observed, as before', async () => {
+  test('with retainTargets, an answer for every topic is installed as it is', async () => {
+    cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retainTargets: true })
+    front(cluster, ['b'])
+    cluster.targetTopics.add('a')
+    await cluster.brokerPool.refreshMetadata(['a'])
+
+    await cluster.brokerPool.refreshMetadata([])
+
+    expect(routed(cluster)).toEqual(['b'])
+  })
+
+  test('without retainTargets, the answer that lands last is installed and observed, as before', async () => {
     cluster = new Cluster({ ...connectionOpts(), logger: newLogger() })
+    cluster.targetTopics.add('a')
+    cluster.targetTopics.add('b')
 
     const { observed } = await olderAnswersLast(cluster, ['a'], ['a', 'b'])
 
@@ -143,6 +161,19 @@ describe('Cluster > ordered metadata', () => {
     expect(routed(cluster).sort()).toEqual(['a', 'b'])
   })
 
+  test('a consumer installs the scoped answer that lands last as it is', async () => {
+    new Kafka({ ...connectionOpts(), logLevel: 0 }).consumer({ groupId: 'g' })
+    ;[cluster] = mockClusters
+    cluster.targetTopics.add('a')
+    cluster.targetTopics.add('b')
+
+    const { observed } = await olderAnswersLast(cluster, ['a'], ['a', 'b'])
+
+    expect(mockClusters).toHaveLength(1)
+    expect(observed).toEqual([['a']])
+    expect(routed(cluster)).toEqual(['a'])
+  })
+
   test('a pattern consumer keeps installing and evaluating the answer that lands last', async () => {
     new Kafka({ ...connectionOpts(), logLevel: 0 }).consumer({ groupId: 'g' })
     ;[cluster] = mockClusters
@@ -154,19 +185,21 @@ describe('Cluster > ordered metadata', () => {
     expect(routed(cluster)).toEqual(['a', 'b'])
   })
 
-  test('an admin client orders its metadata answers', async () => {
+  test('an admin client keeps the routing of its targets', async () => {
     new Kafka({ ...connectionOpts(), logLevel: 0 }).admin()
     ;[cluster] = mockClusters
+    cluster.targetTopics.add('a')
+    cluster.targetTopics.add('b')
 
-    const { observed } = await olderAnswersLast(cluster, [], ['a'])
+    await olderAnswersLast(cluster, ['a'], ['a', 'b'])
 
-    expect(routed(cluster)).toEqual(['a'])
-    expect(observed).toEqual([])
+    expect(mockClusters).toHaveLength(1)
+    expect(routed(cluster).sort()).toEqual(['a', 'b'])
   })
 
   describe('joining a refresh while admin calls hold targets', () => {
     test('a refresh begun before a topic was added is not joined by a call that needs that topic', async () => {
-      cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), orderedMetadata: true })
+      cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retainTargets: true })
       const { requests, gates } = front(cluster)
       cluster.holdTargetTopics(['a'])
       cluster.targetTopics.add('a')
@@ -182,11 +215,11 @@ describe('Cluster > ordered metadata', () => {
       await older
 
       expect(requests).toEqual([['a'], ['a', 'b']])
-      expect(routed(cluster)).toEqual(['a', 'b'])
+      expect(routed(cluster).sort()).toEqual(['a', 'b'])
     })
 
     test('with no hold, a refresh is joined as before', async () => {
-      cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), orderedMetadata: true })
+      cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retainTargets: true })
       const { requests, gates } = front(cluster)
       cluster.targetTopics.add('a')
       const held = latch()
