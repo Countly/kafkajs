@@ -237,6 +237,8 @@ module.exports = class Cluster {
     })
 
     this.targetTopics = new Set()
+    /** @type {?{ fence: object, running: boolean, retryAt: number, backoff: number }} see `serveFromCache` */
+    this.backgroundRefresh = null
     this.metadataMaxIdle = metadataMaxIdle
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
     this.topicPins = metadataMaxIdle === undefined ? null : new Map()
@@ -577,11 +579,68 @@ module.exports = class Cluster {
    * @param {() => boolean} [options.isCurrent] see `refreshMetadata`
    * @param {boolean} [options.allowAutoTopicCreation] see `refreshMetadata`
    * @param {(metadata: object) => void} [options.onMetadata] see `refreshMetadata`
+   * @param {boolean} [options.background] producer sends only: when every target is in the cached
+   *   metadata, return at once, and when that metadata is only past `metadataMaxAge`, refresh it in
+   *   the background, as the Java producer's `waitOnMetadata` does; see `serveFromCache`
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
-  async refreshMetadataIfNecessary({ fence, ...scope } = {}) {
+  async refreshMetadataIfNecessary({ fence, background = false, ...scope } = {}) {
+    if (background && this.serveFromCache(fence)) return
     await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence, ...scope })
+  }
+
+  /**
+   * Serves a call from the cached metadata when it names every target: at once when it is fresh,
+   * and when it is only aged, after starting the shared conditional refresh without waiting for
+   * it. At most one is started per lifecycle at a time; a call while it runs starts nothing and
+   * waits for nothing. Its failure is logged at debug level and delays the next start by a backoff: `initialRetryTime`, doubling on each failure up to ten times
+   * `initialRetryTime` (the ratio of the Java client's `retry.backoff.ms` to `retry.backoff.max.ms`)
+   * or `maxRetryTime` when lower; a success clears it. A refresh fenced by its lifecycle's close
+   * installs nothing, as any fenced refresh. The state is one object, replaced when the lifecycle
+   * changes, and holds no timer.
+   * @private
+   * @param {import('../producer/generation')} [fence] the sending lifecycle
+   * @returns {boolean} whether the call was served from the cache; false sends it the awaited way
+   */
+  serveFromCache(fence) {
+    fence?.check()
+    this.pruneTargetTopics()
+    const cached = this.brokerPool.metadataState(Array.from(this.targetTopics))
+    if (cached !== 'aged') return cached === 'fresh'
+    let state = this.backgroundRefresh
+    if (!state || state.fence !== fence) {
+      state = this.backgroundRefresh = { fence, running: false, retryAt: 0, backoff: 0 }
+    }
+    if (state.running || Date.now() < state.retryAt) return true
+    state.running = true
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence }).then(
+      () => {
+        state.running = false
+        state.backoff = 0
+        state.retryAt = 0
+      },
+      (error) => {
+        const {
+          initialRetryTime = createRetry.defaults.initialRetryTime,
+          maxRetryTime = createRetry.defaults.maxRetryTime,
+        } = this.retryOptions
+        state.running = false
+        state.backoff = Math.min(
+          state.backoff * 2 || initialRetryTime,
+          initialRetryTime * 10,
+          maxRetryTime
+        )
+        state.retryAt = Date.now() + state.backoff
+        try {
+          this.logger.debug('Background metadata refresh failed', {
+            error: describeThrown(error),
+            retryInMs: state.backoff,
+          })
+        } catch {}
+      }
+    )
+    return true
   }
 
   /**
