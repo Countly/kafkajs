@@ -114,6 +114,9 @@ const isAuthenticationFailure = (error) => {
   return false
 }
 
+/** @type {WeakMap<object[], Map<string, object>>} see `BrokerPool.topicRowsByName` */
+const topicRowIndexes = new WeakMap()
+
 const PRIVATE = {
   REBOOTSTRAP: Symbol('private:BrokerPool:rebootstrap'),
 }
@@ -1478,7 +1481,7 @@ module.exports = class BrokerPool {
       !topics.every(
         (topic) =>
           (this.unavailableTopics?.has(topic) && Date.now() <= this.isolatedRecheckAt) ||
-          this.metadata.topicMetadata.some((topicMetadata) => topicMetadata.topic === topic)
+          BrokerPool.topicRowsByName(this.metadata).has(topic)
       )
 
     if (shouldRefresh) {
@@ -1487,6 +1490,29 @@ module.exports = class BrokerPool {
         ? this.refreshMetadata(topics, context)
         : this.refreshMetadata(topics)
     }
+  }
+
+  /**
+   * An answer's rows by topic name; of two rows with one name, the first wins, as a search of the
+   * array would find it. Cached per `topicMetadata` array: every writer of `metadata` installs a
+   * new array and none renames, adds or removes rows in place, so a new array is the one
+   * invalidation point. Held weakly by that array, so it lives as long as the answer it indexes.
+   * @param {{ topicMetadata?: object[] } | null} metadata
+   * @returns {Map<string, object>} empty for no answer
+   */
+  static topicRowsByName(metadata) {
+    const rows = metadata?.topicMetadata
+    if (!rows) return new Map()
+    let byName = topicRowIndexes.get(rows)
+    if (!byName) {
+      byName = new Map()
+      for (const row of rows) {
+        const { topic } = row
+        if (!byName.has(topic)) byName.set(topic, row)
+      }
+      topicRowIndexes.set(rows, byName)
+    }
+    return byName
   }
 
   /** @type {() => string[]} */

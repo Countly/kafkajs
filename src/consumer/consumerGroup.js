@@ -34,6 +34,24 @@ const RETIRED_ACQUISITION = Object.freeze({
  *   `clock`
  */
 const isChangedSince = (acquired, clock) => acquired.changedAt > clock || acquired.soughtAt > clock
+
+/**
+ * Indexes items by one field, keeping the first item for a repeated key, so a lookup answers
+ * exactly what `Array#find` on the same field would.
+ * @template T
+ * @param {T[]} items
+ * @param {string} field
+ * @returns {Map<*, T>}
+ */
+const indexFirstBy = (items, field) => {
+  const index = new Map()
+  for (const item of items) if (!index.has(item[field])) index.set(item[field], item)
+  return index
+}
+
+/** Metadata arrays up to this length are searched; longer ones are indexed. */
+const SHORT_METADATA = 8
+
 const { FetchSessions } = require('./fetchSession')
 const PositionValidator = require('./positionValidator')
 const Outage = require('./outage')
@@ -2538,6 +2556,7 @@ module.exports = class ConsumerGroup {
       // Hoisted out of the per-partition loop: the response row below is the hot path, and its
       // payload must not be built once per partition per round only to be discarded.
       const debug = this.logger.debugEnabled()
+      const requestsByTopic = indexFirstBy(requests, 'topic')
 
       for (const { topicName, topicId, partitions } of responses) {
         if (topicName == null) {
@@ -2553,7 +2572,7 @@ module.exports = class ConsumerGroup {
           continue
         }
 
-        const topicRequestData = requests.find(({ topic }) => topic === topicName)
+        const topicRequestData = requestsByTopic.get(topicName)
 
         let preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topicName]
         if (!preferredReadReplicas) {
@@ -2564,7 +2583,8 @@ module.exports = class ConsumerGroup {
         const context = {
           topicName,
           topicId: topicId ?? topicIds?.get(topicName),
-          topicRequestData,
+          requestedPartitions:
+            topicRequestData && indexFirstBy(topicRequestData.partitions, 'partition'),
           preferredReadReplicas,
           nodeEndpoints,
           batches,
@@ -2838,6 +2858,9 @@ module.exports = class ConsumerGroup {
    * client is not yet sure still exists. A halted partition is left out until its halt is cleared;
    * the check is skipped while nothing is halted, which is the steady state.
    *
+   * Pause and hold state is checked per requested partition, so the cost follows the node's
+   * partitions, not the whole assignment.
+   *
    * @private
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
    * @returns {{topic: string, partitions: {partition: number, fetchOffset: string,
@@ -2846,7 +2869,7 @@ module.exports = class ConsumerGroup {
    */
   buildFetchRequests(topicPartitions) {
     const manager = this.offsetManager
-    const activeTopicPartitions = this.getActiveTopicPartitions()
+    const state = this.subscriptionState
 
     return topicPartitions
       .filter(({ topic }) => this.obligations.current(topic) !== null)
@@ -2856,7 +2879,9 @@ module.exports = class ConsumerGroup {
           const baseline = manager.heldOffsetAt(topic, partition)
           if (
             baseline != null &&
-            activeTopicPartitions[topic].has(partition) &&
+            state.isAssigned(topic, partition) &&
+            !state.isPaused(topic, partition) &&
+            !state.isHeld(topic, partition) &&
             !this.positionValidator.isAwaiting(topic, partition) &&
             (this.haltedPartitions.size === 0 ||
               !this.haltedPartitions.has(`${topic}|${partition}`)) &&
@@ -2964,7 +2989,8 @@ module.exports = class ConsumerGroup {
    * @param {object} context this topic's state for the round
    * @param {string} context.topicName
    * @param {string} [context.topicId] the id the answer or the request keyed the topic with
-   * @param {object} context.topicRequestData the request entry this topic was fetched with
+   * @param {Map<number, {fetchOffset: string}>} context.requestedPartitions this topic's request
+   *   entries by partition
    * @param {object} context.preferredReadReplicas this topic's preferred-replica map, written here
    * @param {object[]} [context.nodeEndpoints] the response's KIP-951 endpoints, if any
    * @param {import('./batch')[]} context.batches the round's batches, appended to
@@ -2979,7 +3005,7 @@ module.exports = class ConsumerGroup {
    * @throws {Error} the error an unclassified partition code maps to, or the fence's close error
    */
   async handleFetchedPartition(partitionData, context) {
-    const { topicName, topicRequestData, preferredReadReplicas, nodeEndpoints, batches, debug } =
+    const { topicName, requestedPartitions, preferredReadReplicas, nodeEndpoints, batches, debug } =
       context
     const { partition, errorCode, preferredReadReplica } = partitionData
 
@@ -3005,7 +3031,7 @@ module.exports = class ConsumerGroup {
       if (action === 'offset-out-of-range') {
         // The existing recovery, for this partition only: drop the preferred replica if one is
         // set, otherwise reset per the topic's own fromBeginning.
-        const requested = topicRequestData.partitions.find((p) => p.partition === partition)
+        const requested = requestedPartitions.get(partition)
         await this.recoverFromOffsetOutOfRange(
           { topic: topicName, partition, offset: requested && String(requested.fetchOffset) },
           context.fence,
@@ -3088,9 +3114,7 @@ module.exports = class ConsumerGroup {
     const { corruption } = partitionData
     const halted = corruption != null && this.acceptHalt(topicName, partition, corruption, context)
 
-    const partitionRequestData = topicRequestData.partitions.find(
-      (requested) => requested.partition === partition
-    )
+    const partitionRequestData = requestedPartitions.get(partition)
 
     batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
     if (halted) this.reportHalt(topicName, partition, corruption)
@@ -4407,6 +4431,9 @@ module.exports = class ConsumerGroup {
    * in the partition's `offlineReplicas`; otherwise the leader is. Only the preferred replica's
    * state matters: a leader listed as offline does not exclude an online preferred follower.
    *
+   * The metadata rows are indexed by id for this call only, so the cost is linear in the topic's
+   * partitions and nothing outlives the call: the next call reads the metadata as it is then.
+   *
    * @param {string} topic
    * @param {number[]} partitions
    * @param {{expiresAt?: number, leaderless?: boolean}} [routing] an optional observation:
@@ -4421,12 +4448,20 @@ module.exports = class ConsumerGroup {
   // Invariant: The resulting object has each partition referenced exactly once
   findReadReplicaForPartitions(topic, partitions, routing) {
     const partitionMetadata = this.cluster.findTopicPartitionMetadata(topic)
+    // A short array is searched faster than it is indexed.
+    const rows =
+      partitionMetadata.length > SHORT_METADATA
+        ? indexFirstBy(partitionMetadata, 'partitionId')
+        : null
     const preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topic]
-    return partitions.reduce((result, id) => {
+    const result = {}
+    for (const id of partitions) {
       const partitionId = parseInt(id, 10)
-      const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
+      const metadata = rows
+        ? rows.get(partitionId)
+        : partitionMetadata.find((p) => p.partitionId === partitionId)
       if (!metadata) {
-        return result
+        continue
       }
 
       if (metadata.leader == null) {
@@ -4435,7 +4470,7 @@ module.exports = class ConsumerGroup {
 
       if (metadata.leader < 0) {
         if (routing) routing.leaderless = true
-        return result
+        continue
       }
 
       // Pick the preferred replica if there is one, and it isn't known to be offline, otherwise the leader.
@@ -4473,9 +4508,9 @@ module.exports = class ConsumerGroup {
           }
         }
       }
-      const current = result[nodeId] || []
-      return { ...result, [nodeId]: [...current, partitionId] }
-    }, {})
+      ;(result[nodeId] ||= []).push(partitionId)
+    }
+    return result
   }
 
   /**
@@ -4541,16 +4576,5 @@ module.exports = class ConsumerGroup {
       this.leaderlessRefresh = attempt
     }
     await run.fence.wait(attempt.promise).catch(() => {})
-  }
-
-  getActiveTopicPartitions() {
-    const activeSubscriptionState = this.subscriptionState.active()
-
-    const activeTopicPartitions = dictionary()
-    activeSubscriptionState.forEach(({ topic, partitions }) => {
-      activeTopicPartitions[topic] = new Set(partitions)
-    })
-
-    return activeTopicPartitions
   }
 }

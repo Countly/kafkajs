@@ -77,6 +77,30 @@ const FAILED = 'failed'
  */
 const fenceArgs = (fence) => (fence ? [{ fence }] : [])
 
+/** @type {WeakMap<object[], Map<number, object>>} see `partitionsById` */
+const partitionIndexes = new WeakMap()
+
+/**
+ * A topic's partitions by id; of two with one id, the first wins, as a search would find it.
+ * Cached per `partitionMetadata` array: an answer installs new arrays, and what is written onto an
+ * installed partition in place (a leader hint, a kept leader) is read through the indexed object,
+ * so a new array is the one invalidation point. Held weakly by that array.
+ * @param {object[]} partitionMetadata
+ * @returns {Map<number, object>}
+ */
+const partitionsById = (partitionMetadata) => {
+  let byId = partitionIndexes.get(partitionMetadata)
+  if (!byId) {
+    byId = new Map()
+    for (const partition of partitionMetadata) {
+      const { partitionId } = partition
+      if (!byId.has(partitionId)) byId.set(partitionId, partition)
+    }
+    partitionIndexes.set(partitionMetadata, byId)
+  }
+  return byId
+}
+
 /**
  * A refresh's context as the trailing argument of a broker-pool call, or no argument at all: only
  * the fields the caller set are forwarded, so an ordinary call keeps the shape it always had.
@@ -225,8 +249,6 @@ module.exports = class Cluster {
     this.firstAddTopics = new Set()
     /** Counts the removals of targets, so an answer to an earlier declaration establishes nothing. */
     this.targetRevision = 0
-    /** @type {WeakMap<object, {topics: object[], byName: Map<string, object>}>} lookup index per accepted metadata object */
-    this.topicMetadataIndexes = new WeakMap()
     this.mutatingTargetTopics = new Lock({
       description: `updating target topics`,
       timeout: requestTimeout,
@@ -934,15 +956,13 @@ module.exports = class Cluster {
       checked(null)
       fence?.check()
       checked(null)
-      const previousSize = this.targetTopics.size
-      const previousTopics = new Set(this.targetTopics)
-      this.addingTopics = new Set(topics.filter((topic) => !previousTopics.has(topic)))
+      this.addingTopics = new Set(topics.filter((topic) => !this.targetTopics.has(topic)))
+      const hasChanged = this.addingTopics.size > 0 || !this.brokerPool.metadata
+      const previousTopics = hasChanged ? new Set(this.targetTopics) : null
       for (const topic of topics) {
         this.targetTopics.add(topic)
         this.touchTargetTopic(topic)
       }
-
-      const hasChanged = previousSize !== this.targetTopics.size || !this.brokerPool.metadata
 
       if (hasChanged) {
         try {
@@ -1242,7 +1262,6 @@ module.exports = class Cluster {
       }
       this.targetTopics = next
       this.targetRevision++
-      this.topicMetadataIndexes = new WeakMap()
       publish?.()
       if (accepted) {
         const topicMetadata = accepted.topicMetadata.filter(({ topic }) => next.has(topic))
@@ -1389,17 +1408,7 @@ module.exports = class Cluster {
       })
     }
 
-    this.topicMetadataIndexes ??= new WeakMap()
-    let index = this.topicMetadataIndexes.get(metadata)
-    if (!index || index.topics !== metadata.topicMetadata) {
-      const byName = new Map()
-      for (const entry of metadata.topicMetadata) {
-        if (!byName.has(entry.topic)) byName.set(entry.topic, entry)
-      }
-      index = { topics: metadata.topicMetadata, byName }
-      this.topicMetadataIndexes.set(metadata, index)
-    }
-    return index.byName.get(topic)?.partitionMetadata ?? []
+    return BrokerPool.topicRowsByName(metadata).get(topic)?.partitionMetadata ?? []
   }
 
   /**
@@ -1587,14 +1596,13 @@ module.exports = class Cluster {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    */
   findLeaderForPartitions(topic, partitions) {
-    const partitionMetadata = this.findTopicPartitionMetadata(topic)
-    return partitions.reduce((result, id) => {
+    const byId = partitionsById(this.findTopicPartitionMetadata(topic))
+    const result = {}
+    for (const id of partitions) {
       const partitionId = parseInt(id, 10)
-      const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
+      const metadata = byId.get(partitionId)
 
-      if (!metadata) {
-        return result
-      }
+      if (!metadata) continue
 
       if (metadata.leader === null || metadata.leader === undefined) {
         throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
@@ -1604,10 +1612,9 @@ module.exports = class Cluster {
         throw createErrorFromCode(LEADER_NOT_AVAILABLE)
       }
 
-      const { leader } = metadata
-      const current = result[leader] || []
-      return { ...result, [leader]: [...current, partitionId] }
-    }, {})
+      ;(result[metadata.leader] ??= []).push(partitionId)
+    }
+    return result
   }
 
   /**
