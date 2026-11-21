@@ -241,10 +241,10 @@ describe('Admin > describeGroups > routing', () => {
   })
 
   test.each([
-    ['DescribeGroups v6', { errorCode: GROUP_ID_NOT_FOUND, errorMessage: 'not found' }],
-    ['an older DescribeGroups', { errorCode: 0, errorMessage: null }],
+    ['the DescribeGroups v6 answer', { errorCode: GROUP_ID_NOT_FOUND, errorMessage: 'not found' }],
+    ['an older DescribeGroups answer', { errorCode: 0, errorMessage: null }],
   ])(
-    'reports the %s answer, not UNSUPPORTED_VERSION, for a missing group on a cluster without the consumer protocol',
+    'reports %s, not UNSUPPORTED_VERSION, for a missing group on a cluster without the consumer protocol',
     async (_name, answer) => {
       const cluster = stubCluster({
         consumerGroupDescribe: async ({ groupIds }) => ({

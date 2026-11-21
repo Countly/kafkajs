@@ -3385,7 +3385,7 @@
         "src/admin/__tests__/describeGroupsRouting.spec.js \u203a Admin > describeGroups > routing synthesises a decodable memberAssignment buffer and an empty memberMetadata",
         "src/admin/__tests__/describeGroupsRouting.spec.js \u203a does not duplicate an in-flight successful split classic batch",
         "src/admin/__tests__/describeGroupsRouting.spec.js \u203a Admin > describeGroups > routing reports the DescribeGroups v6 answer, not UNSUPPORTED_VERSION, for a missing group on a cluster without the consumer protocol",
-        "src/admin/__tests__/describeGroupsRouting.spec.js \u203a Admin > describeGroups > routing reports the an older DescribeGroups answer, not UNSUPPORTED_VERSION, for a missing group on a cluster without the consumer protocol",
+        "src/admin/__tests__/describeGroupsRouting.spec.js \u203a Admin > describeGroups > routing reports an older DescribeGroups answer, not UNSUPPORTED_VERSION, for a missing group on a cluster without the consumer protocol",
         "src/admin/__tests__/describeTopicPartitionsAdmin.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions on the wire a real broker answers the page and the admin keeps the eligible leader replicas as sent",
         "src/admin/__tests__/describeTopicPartitionsAdmin.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions paging asks for no cursor when the one a page names belongs to a topic that failed",
         "src/admin/__tests__/describeTopicPartitionsAdmin.spec.js \u203a Admin > fetchTopicMetadata > DescribeTopicPartitions paging ends on a null cursor and never on a count",
