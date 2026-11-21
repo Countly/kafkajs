@@ -1468,13 +1468,18 @@ describe('Transaction coordinator discovery that runs out', () => {
       addOffsetsToTxn: jest.fn(async () => ({})),
       txnOffsetCommit: jest.fn(async () => ({})),
     })
-    broker.initProducerId.mockImplementation(async ({ producerEpoch }) => ({
-      producerId: '1000',
-      producerEpoch: producerEpoch + 1,
-    }))
-    broker.endTxn.mockImplementation(async ({ producerEpoch }) =>
-      level === 2 ? { producerId: '1000', producerEpoch: producerEpoch + 1 } : {}
-    )
+    // The coordinator's epoch: every transactional InitProducerId bumps it, a fresh one (-1/-1) too.
+    let coordinatorEpoch = -1
+    broker.initProducerId.mockImplementation(async ({ transactionalId, producerEpoch = -1 }) => {
+      if (transactionalId == null) return { producerId: '1000', producerEpoch: producerEpoch + 1 }
+      coordinatorEpoch = Math.max(coordinatorEpoch, producerEpoch) + 1
+      return { producerId: '1000', producerEpoch: coordinatorEpoch }
+    })
+    broker.endTxn.mockImplementation(async ({ producerEpoch }) => {
+      if (level !== 2) return {}
+      coordinatorEpoch = Math.max(coordinatorEpoch, producerEpoch + 1)
+      return { producerId: '1000', producerEpoch: producerEpoch + 1 }
+    })
     const manager = createEosManager({
       cluster,
       logger: newLogger(),
@@ -1668,7 +1673,7 @@ describe('Transaction coordinator discovery that runs out', () => {
       expect(manager.stateManager.state()).toBe('READY')
       expect(broker.initProducerId).toHaveBeenCalledTimes(1)
       expect(broker.initProducerId).toHaveBeenCalledWith(
-        expect.objectContaining({ producerId: '1000', producerEpoch: epoch })
+        expect.objectContaining({ producerId: -1, producerEpoch: -1 })
       )
       expect(manager.getProducerEpoch()).toBe(epoch + 1)
       await manager.beginTransaction()

@@ -586,8 +586,8 @@ describe('Producer > a transaction coordinator that cannot be found while a tran
     const next = await producer.transaction()
     expect(broker.initProducerId.mock.calls.at(-1)[0]).toMatchObject({
       transactionalId: TRANSACTIONAL_ID,
-      producerId: '1000',
-      producerEpoch: 0,
+      producerId: -1,
+      producerEpoch: -1,
     })
     await next.abort()
   })

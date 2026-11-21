@@ -87,14 +87,17 @@ const createTransactionalProducer = ({
     finalizedFeaturesEpoch: 1,
     negotiatedVersion: () => 5,
   })
-  broker.initProducerId.mockImplementation(async ({ producerEpoch = -1 }) => ({
-    producerId: '1000',
-    producerEpoch: producerEpoch + 1,
-  }))
-  broker.endTxn.mockImplementation(async ({ producerEpoch }) => ({
-    producerId: '1000',
-    producerEpoch: producerEpoch + 1,
-  }))
+  // The coordinator's epoch: every transactional InitProducerId bumps it, a fresh one (-1/-1) too.
+  let coordinatorEpoch = -1
+  broker.initProducerId.mockImplementation(async ({ transactionalId, producerEpoch = -1 }) => {
+    if (transactionalId == null) return { producerId: '1000', producerEpoch: producerEpoch + 1 }
+    coordinatorEpoch = Math.max(coordinatorEpoch, producerEpoch) + 1
+    return { producerId: '1000', producerEpoch: coordinatorEpoch }
+  })
+  broker.endTxn.mockImplementation(async ({ producerEpoch }) => {
+    if (level === 2) coordinatorEpoch = Math.max(coordinatorEpoch, producerEpoch + 1)
+    return { producerId: '1000', producerEpoch: producerEpoch + 1 }
+  })
   const producer = createProducer({
     cluster,
     logger: newLogger(),
@@ -917,7 +920,7 @@ describe('Producer > the transaction wrapper', () => {
         await second.send({ topic: TOPIC, messages: ONE })
 
         const reinitialized = broker.initProducerId.mock.calls.at(-1)[0]
-        expect(reinitialized).toMatchObject({ producerId: '1000', producerEpoch: 0 })
+        expect(reinitialized).toMatchObject({ producerId: -1, producerEpoch: -1 })
         expect(broker.produce.mock.calls.map(([{ producerEpoch }]) => producerEpoch)).toEqual([
           0, 1,
         ])

@@ -325,8 +325,14 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
       endTxn: 'applied with its markers pending',
       mode: 'unanswered',
       markerRounds: 1,
-      expected: afterFence(1),
-      epoch: 2,
+      expected: [
+        'initProducerId:-1',
+        'initProducerId:-1',
+        'addPartitionsToTxn:1',
+        'produce:1',
+        'endTxn:commit:1',
+      ],
+      epoch: 1,
     },
     {
       version: 2,

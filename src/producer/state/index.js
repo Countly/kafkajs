@@ -228,20 +228,23 @@ class ProducerStateManager {
   }
 
   /**
-   * Bumps the epoch of the producer id held (KIP-360), at a transaction boundary.
+   * Bumps the epoch of the producer id held (KIP-360), at a transaction boundary; `fresh` sends
+   * -1/-1 instead, accepting whatever pair the coordinator answers.
+   * @param {object} [options]
+   * @param {boolean} [options.fresh=false]
    * @returns {Promise<void>}
    * @throws {KafkaJSInvariantViolation} while a batch is in flight
    * @throws {import('../../errors').KafkaJSApplicationRecoverableError} when the coordinator did
    *   not bump; the producer is then in `FATAL_ERROR`, as after any fatal error of the request
    * @throws {Error} a retriable error, unchanged, for the caller to retry
    */
-  async reinitialize() {
+  async reinitialize({ fresh = false } = {}) {
     if (this.sequencer.hasInFlight()) {
       throw new KafkaJSInvariantViolation('Producer id re-initialized with a batch in flight')
     }
 
     try {
-      await this.#identity.reinitialize()
+      await (fresh ? this.#identity.initialize() : this.#identity.reinitialize())
     } catch (error) {
       this.classify(error, 'txn')
       if (transactionStateFor(error) === FATAL_ERROR) {

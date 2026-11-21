@@ -208,6 +208,23 @@ describe('Producer > state > ProducerStateManager', () => {
       expect(manager.sequencer.entry(TOPIC, 1)).toBeNull()
     })
 
+    test('reinitialize({ fresh: true }) sends -1/-1, takes the answer and resets every partition', async () => {
+      const coordinator = createCoordinator()
+      const manager = await transactionalManager({ coordinator })
+      await withAcknowledgedPartitions(manager)
+      coordinator.initProducerId.mockClear()
+      coordinator.initProducerId.mockResolvedValueOnce({ producerId: '1000', producerEpoch: 7 })
+
+      await manager.reinitialize({ fresh: true })
+
+      expect(coordinator.initProducerId.mock.calls).toEqual([
+        [expect.objectContaining({ producerId: -1, producerEpoch: -1 })],
+      ])
+      expect([manager.producerId, manager.producerEpoch]).toEqual(['1000', 7])
+      expect(manager.sequencer.entry(TOPIC, 0)).toBeNull()
+      expect(manager.sequencer.entry(TOPIC, 1)).toBeNull()
+    })
+
     test('adopt() takes the pair and resets every partition', async () => {
       const manager = await transactionalManager()
       await withAcknowledgedPartitions(manager)

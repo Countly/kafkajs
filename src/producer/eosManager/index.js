@@ -497,28 +497,49 @@ const createEosManager = ({
       }
     })
 
-  /** Whether a KIP-360 epoch bump is owed before the next transaction; kept until one succeeds. */
-  let bumpOwed = false
+  /**
+   * The epoch bump owed before the next transaction, kept until one succeeds: null, `'bump'` for a
+   * KIP-360 bump of the pair held, or `'fresh'` for an InitProducerId with -1/-1 after an abort
+   * whose outcome is unknown. A coordinator that still holds that transaction fences it on either
+   * request; under transaction version 1 it then forgets the epoch it fenced, so only a fresh
+   * request's retry is answered.
+   * @type {?('bump'|'fresh')}
+   */
+  let owed = null
+
+  /**
+   * Owes a bump of `kind`; a fresh one owed stays fresh.
+   * @param {'bump'|'fresh'} kind
+   * @returns {void}
+   */
+  const owe = (kind) => {
+    if (owed !== 'fresh') owed = kind
+  }
   /** @type {?{ generation: ?import('../generation'), promise: Promise<void> }} */
   let bumping = null
 
   /**
    * Performs the epoch bump owed, if any: one re-initialization shared by the concurrent callers
-   * of one producer lifecycle. A failure keeps the bump owed, so the next transaction tries it
-   * again, and so does a bump whose lifecycle closed before it answered.
+   * of one producer lifecycle, fresh when a fresh one is owed. A failure keeps the bump owed, so
+   * the next transaction tries it again, and so does a bump whose lifecycle closed before it
+   * answered.
    * @param {import('../generation')} [generation] the lifecycle the caller captured
    * @returns {Promise<void>}
    */
   const bumpIfOwed = (generation) => {
-    if (!bumpOwed) {
+    if (owed === null) {
       return Promise.resolve()
     }
 
     if (bumping === null || bumping.generation !== generation) {
       const current = { generation, promise: null }
-      current.promise = retryingInitProducerId(() => stateManager.reinitialize(), generation)
+      const fresh = owed === 'fresh'
+      current.promise = retryingInitProducerId(
+        () => stateManager.reinitialize({ fresh }),
+        generation
+      )
         .then(() => {
-          if (!generation?.closed) bumpOwed = false
+          if (!generation?.closed && (fresh || owed === 'bump')) owed = null
         })
         .finally(() => {
           if (bumping === current) bumping = null
@@ -768,7 +789,7 @@ const createEosManager = ({
       }
       generation?.check()
       if (stateManager.version.begin(coordinator).bumpRequired) {
-        bumpOwed = true
+        owe('bump')
       }
       await bumpIfOwed(generation)
       generation?.check()
@@ -895,15 +916,19 @@ const createEosManager = ({
      * already carried a sequence, then bumps the producer epoch (KIP-360), so the next transaction
      * starts with no sequence left over from this one - unless its EndTxn handed back a new epoch
      * (transaction version 2), which restarts every sequence already. An abort whose EndTxn failed
-     * bumps the epoch under either version: the coordinator
-     * may still hold the transaction, or have fenced its epoch, and an InitProducerId with the
-     * current id and epoch aborts what is left of it. A bump that fails is owed to the next
+     * initializes afresh under either version - an InitProducerId with -1/-1, as a restarting
+     * producer sends: the coordinator may still hold the transaction, and fences and aborts it
+     * answering CONCURRENT_TRANSACTIONS; the retry then gets a new epoch. A bump with the current
+     * id and epoch would be refused with PRODUCER_FENCED under transaction version 1, whose fence
+     * forgets that epoch. A fresh InitProducerId fences any other producer that took over the
+     * transactional id meanwhile instead of being fenced by it. A bump that fails is owed to the next
      * transaction, and the abort resolves with the producer `READY`; only a bump that fails fatally
      * rejects it, after a successful EndTxn, with the producer in `FATAL_ERROR`. A transaction
      * coordinator that could not be found is never fatal here, for the EndTxn or for the bump.
      * A producer closed while the abort runs rejects it with the close error, and leaves the
-     * producer `READY` with the epoch bump owed, as a failed EndTxn does: after a reconnect the next
-     * transaction bumps the epoch first, which aborts whatever the coordinator still holds.
+     * producer `READY` with the fresh initialization owed, as a failed EndTxn does: after a
+     * reconnect the next transaction initializes first, which aborts whatever the coordinator still
+     * holds, under both transaction versions.
      * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
      * @param {object} [options]
      * @param {boolean} [options.droppedSequences=false] whether the caller dropped queued batches
@@ -944,14 +969,14 @@ const createEosManager = ({
         // A close leaves the outcome unknown, as a failed EndTxn does: end locally, owe the bump.
         if (generation?.closed && stateManager.state() === STATES.ABORTING) {
           stateManager.transitionTo(STATES.READY)
-          bumpOwed = true
+          owe('fresh')
         }
         throw error
       }
       stateManager.transitionTo(STATES.READY)
 
       if (!ended || (bump && !adopted)) {
-        bumpOwed = true
+        owe(ended ? 'bump' : 'fresh')
         await bumpIfOwed(generation).catch((error) => {
           generation?.check()
           swallowUnlessFatal(error)
