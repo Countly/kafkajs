@@ -84,7 +84,10 @@ describe('transaction facade after a forced close', () => {
 describe('reconnecting after a close that forced an abort or a commit', () => {
   const { flushAll } = require('./fixtures/bufferHarness')
   const { TransactionCoordinatorModel } = require('./fixtures/transactionCoordinator')
+  const { KafkaJSApplicationRecoverableError } = require('../../errors')
   const TOPIC = 'forced-close'
+  const TAKEN_OVER =
+    /^Another producer took over transactional id forced-close, or the transaction coordinator aborted its transaction on the transaction timeout \(.+\); create a new producer$/
 
   /**
    * A transactional producer on transaction version `version` over a coordinator that follows the
@@ -133,13 +136,61 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
   }
 
   /**
-   * After a reconnect, runs a whole transaction and returns the requests it sent, in order.
+   * Opens a transaction at epoch 0 and leaves its abort's outcome unknown, then reconnects:
+   * `'close'` closes the producer while `abort()` waits for an EndTxn handled as `mode`;
+   * `'disconnect'` lets a `disconnect({ timeout })` end the abort it runs for the open
+   * transaction; `'refused'` has every EndTxn of `abort()` refused until its retries run out.
+   * @param {ReturnType<typeof setUp>} setup
+   * @param {object} options
+   * @param {'close'|'disconnect'|'refused'} [options.via='close']
+   * @param {string} [options.mode='lost'] the EndTxn mode while the abort runs
+   * @param {number} [options.markerRounds=0]
+   * @returns {Promise<?Error>} what the abort rejected with
+   */
+  const abortUnknown = async (
+    { producer, coordinator, log, setEndTxn },
+    { via = 'close', mode = 'lost', markerRounds = 0 } = {}
+  ) => {
+    await producer.connect()
+    const transaction = await openTransaction(producer)
+    coordinator.markerRounds = markerRounds
+    let abortError = null
+    if (via === 'refused') {
+      setEndTxn('refuse')
+      await transaction.abort()
+    } else if (via === 'disconnect') {
+      setEndTxn(mode)
+      jest.useFakeTimers({ doNotFake: ['Date', 'nextTick', 'setImmediate', 'queueMicrotask'] })
+      try {
+        const closing = producer.disconnect({ timeout: 1000 })
+        await untilEndTxn(log)
+        await jest.advanceTimersByTimeAsync(1000)
+        await closing
+      } finally {
+        jest.useRealTimers()
+      }
+    } else {
+      setEndTxn(mode)
+      const aborted = transaction.abort().then(
+        () => null,
+        (error) => error
+      )
+      await untilEndTxn(log)
+      await producer.disconnect({ timeout: 0 })
+      abortError = await aborted
+    }
+    setEndTxn('answer')
+    await producer.connect()
+    return abortError
+  }
+
+  /**
+   * Runs a whole transaction and returns the requests it sent, in order.
    * @param {object} producer
    * @param {string[]} log
    * @returns {Promise<string[]>}
    */
   const runTransaction = async (producer, log) => {
-    await producer.connect()
     const from = log.length
     const transaction = await openTransaction(producer)
     await transaction.commit()
@@ -147,51 +198,290 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
   }
 
   /**
-   * The requests of the next transaction after a close left the coordinator holding the
-   * transaction at epoch 0: a fresh InitProducerId fences and aborts it (CONCURRENT_TRANSACTIONS),
-   * its retry gets epoch 2, and the transaction commits at that epoch.
+   * The requests of the next transaction after an abort at epoch 0 whose outcome was unknown: the
+   * abort sent again with the pair held (`resends` times), then under version 1 the epoch bump
+   * with that pair, under version 2 the epoch the EndTxn answer carries, and the transaction.
    * @param {number} version
+   * @param {number} [resends=1]
    * @returns {string[]}
    */
-  const afterFence = (version) =>
-    version === 1
-      ? [
-          'initProducerId:-1',
-          'initProducerId:-1',
-          'addPartitionsToTxn:2',
-          'produce:2',
-          'endTxn:commit:2',
-        ]
-      : ['initProducerId:-1', 'initProducerId:-1', 'produce:2', 'endTxn:commit:2']
+  const afterResend = (version, resends = 1) => [
+    ...Array(resends).fill('endTxn:abort:1000/0'),
+    ...(version === 1 ? ['initProducerId:1000/0', 'addPartitionsToTxn:1'] : []),
+    'produce:1',
+    'endTxn:commit:1000/1',
+  ]
 
-  /**
-   * @param {TransactionCoordinatorModel} coordinator
-   * @returns {{ state: string, epoch: number }}
-   */
+  /** @returns {{ state: string, epoch: number }} the coordinator's state and epoch */
   const coordinatorAt = ({ state, epoch }) => ({ state, epoch })
 
-  test.each([1, 2])(
-    'a close forced while abort() waits for its EndTxn leaves a producer whose next transaction bumps the epoch first and commits, transaction version %i',
-    async (version) => {
-      const { producer, coordinator, log, setEndTxn } = setUp(version)
+  /**
+   * @param {string[]} log
+   * @returns {string[]} the requests that carried no producer id and epoch
+   */
+  const fresh = (log) => log.filter((entry) => entry.includes('-1/-1'))
+
+  /**
+   * A rival producer initializing the same transactional id with -1/-1, retrying
+   * CONCURRENT_TRANSACTIONS as a client does.
+   * @param {TransactionCoordinatorModel} coordinator
+   * @returns {{ producerId: string, producerEpoch: number }}
+   */
+  const rivalInit = (coordinator) => {
+    for (;;) {
       try {
-        await producer.connect()
-        const transaction = await openTransaction(producer)
-        setEndTxn('lost')
-        const aborted = transaction.abort().then(
+        return coordinator.initProducerId({})
+      } catch (error) {
+        if (error.type !== 'CONCURRENT_TRANSACTIONS') throw error
+      }
+    }
+  }
+
+  /**
+   * The next transaction() after a takeover, and the one after it.
+   * @param {object} producer
+   * @returns {Promise<{ first: Error, second: Error }>}
+   */
+  const twoRefusedStarts = async (producer) => {
+    const first = await producer.transaction().then(
+      () => null,
+      (error) => error
+    )
+    const second = await producer.transaction().then(
+      () => null,
+      (error) => error
+    )
+    return { first, second }
+  }
+
+  describe.each([1, 2])('transaction version %i', (version) => {
+    test.each(['close', 'disconnect', 'refused'])(
+      'an abort that never reached the coordinator (%s) is sent again with the pair held before the next transaction, which commits',
+      async (via) => {
+        const setup = setUp(version)
+        const { producer, coordinator, log } = setup
+        try {
+          const abortError = await abortUnknown(setup, { via })
+          const atAbort = coordinatorAt(coordinator)
+          const requests = await runTransaction(producer, log)
+          expect({
+            abortError: abortError?.name ?? null,
+            atAbort,
+            requests,
+            fresh: fresh(log),
+            at: coordinatorAt(coordinator),
+          }).toEqual({
+            abortError: via === 'close' ? 'KafkaJSProducerClosedError' : null,
+            atAbort: { state: 'ONGOING', epoch: 0 },
+            requests: afterResend(version),
+            fresh: ['initProducerId:-1/-1'],
+            at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 1 : 2 },
+          })
+        } finally {
+          await producer.disconnect({ timeout: 0 })
+        }
+      }
+    )
+
+    test('an abort the coordinator applied whose answer was lost is answered with success when sent again, with no second bump, and the next transaction commits', async () => {
+      const setup = setUp(version)
+      const { producer, coordinator, log } = setup
+      try {
+        await abortUnknown(setup, { mode: 'unanswered' })
+        const atAbort = coordinatorAt(coordinator)
+        const requests = await runTransaction(producer, log)
+        expect({ atAbort, requests, at: coordinatorAt(coordinator) }).toEqual({
+          atAbort: { state: 'COMPLETE_ABORT', epoch: version === 1 ? 0 : 1 },
+          requests: afterResend(version),
+          at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 1 : 2 },
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
+
+    test('an abort sent again while the coordinator writes its markers retries CONCURRENT_TRANSACTIONS, then the next transaction commits', async () => {
+      const setup = setUp(version)
+      const { producer, coordinator, log } = setup
+      try {
+        await abortUnknown(setup, { mode: 'unanswered', markerRounds: 2 })
+        const atAbort = coordinatorAt(coordinator)
+        const requests = await runTransaction(producer, log)
+        expect({ atAbort, requests, at: coordinatorAt(coordinator) }).toEqual({
+          atAbort: { state: 'PREPARE_ABORT', epoch: version === 1 ? 0 : 1 },
+          requests: afterResend(version, 3),
+          at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 1 : 2 },
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
+
+    test.each([
+      { rival: 'idle', state: 'EMPTY' },
+      { rival: 'in a transaction', state: 'ONGOING' },
+    ])(
+      'a rival that took over the transactional id ($rival) makes the old producer fatal on the abort sent again, and is left untouched',
+      async ({ rival, state }) => {
+        const setup = setUp(version)
+        const { producer, coordinator, log } = setup
+        try {
+          await abortUnknown(setup)
+          const { producerEpoch } = rivalInit(coordinator)
+          if (rival !== 'idle') coordinator.addPartitions({ producerEpoch })
+          const from = log.length
+
+          const { first, second } = await twoRefusedStarts(producer)
+          expect(first).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+          expect({
+            message: first.message,
+            cause: first.cause?.type,
+            second,
+            sent: log.slice(from),
+            inits: log.filter((entry) => entry.startsWith('initProducerId')),
+            at: coordinatorAt(coordinator),
+          }).toEqual({
+            message: expect.stringMatching(TAKEN_OVER),
+            cause: 'PRODUCER_FENCED',
+            second: first,
+            sent: ['endTxn:abort:1000/0'],
+            inits: ['initProducerId:-1/-1'],
+            at: { state, epoch: 2 },
+          })
+        } finally {
+          await producer.disconnect({ timeout: 0 })
+        }
+      }
+    )
+  })
+
+  test('a transaction the coordinator aborted on its timeout makes the producer fatal on the abort sent again, transaction version 1', async () => {
+    const setup = setUp(1)
+    const { producer, coordinator, log } = setup
+    try {
+      await abortUnknown(setup)
+      coordinator.timeout()
+      const from = log.length
+
+      const { first, second } = await twoRefusedStarts(producer)
+      expect(first).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+      expect({
+        message: first.message,
+        cause: first.cause?.type,
+        second,
+        sent: log.slice(from),
+        at: coordinatorAt(coordinator),
+      }).toEqual({
+        message: expect.stringMatching(TAKEN_OVER),
+        cause: 'PRODUCER_FENCED',
+        second: first,
+        sent: ['endTxn:abort:1000/0'],
+        at: { state: 'COMPLETE_ABORT', epoch: 1 },
+      })
+    } finally {
+      await producer.disconnect({ timeout: 0 })
+    }
+  })
+
+  test('a transaction the coordinator aborted on its timeout accepts the abort sent again as a retry, and the next transaction commits, transaction version 2', async () => {
+    const setup = setUp(2)
+    const { producer, coordinator, log } = setup
+    try {
+      await abortUnknown(setup)
+      coordinator.timeout()
+      const atTimeout = coordinatorAt(coordinator)
+      const requests = await runTransaction(producer, log)
+      expect({ atTimeout, requests, at: coordinatorAt(coordinator) }).toEqual({
+        atTimeout: { state: 'COMPLETE_ABORT', epoch: 1 },
+        requests: afterResend(2),
+        at: { state: 'COMPLETE_COMMIT', epoch: 2 },
+      })
+    } finally {
+      await producer.disconnect({ timeout: 0 })
+    }
+  })
+
+  test("an abort sent again between a rival's fence and the rival's retry is accepted, the rival then gets the next epoch untouched, and the old producer is fatal on its next request, transaction version 2", async () => {
+    const setup = setUp(2)
+    const { producer, coordinator, log } = setup
+    try {
+      await abortUnknown(setup)
+      expect(() => coordinator.initProducerId({})).toThrow(
+        expect.objectContaining({ type: 'CONCURRENT_TRANSACTIONS' })
+      )
+      const transaction = await producer.transaction()
+      const fenced = coordinatorAt(coordinator)
+      const rival = rivalInit(coordinator)
+      const from = log.length
+      const sent = await transaction.send({ topic: TOPIC, messages: [{ value: 'v' }] }).then(
+        () => null,
+        (error) => error
+      )
+      const next = await producer.transaction().then(
+        () => null,
+        (error) => error
+      )
+      expect({
+        fenced,
+        rival,
+        sentCode: sent?.type,
+        requests: log.slice(from),
+        next: next?.message,
+        nextCause: next?.cause?.type,
+        at: coordinatorAt(coordinator),
+      }).toEqual({
+        fenced: { state: 'COMPLETE_ABORT', epoch: 1 },
+        rival: { producerId: '1000', producerEpoch: 2 },
+        sentCode: 'PRODUCER_FENCED',
+        requests: ['produce:1'],
+        next: expect.stringMatching(TAKEN_OVER),
+        nextCause: 'PRODUCER_FENCED',
+        at: { state: 'EMPTY', epoch: 2 },
+      })
+      expect(log.filter((entry) => entry.startsWith('endTxn'))).toEqual([
+        'endTxn:abort:1000/0',
+        'endTxn:abort:1000/0',
+      ])
+    } finally {
+      await producer.disconnect({ timeout: 0 })
+    }
+  })
+
+  test.each([1, 2])(
+    'an abort that failed to be sent again stays owed: the next transaction() sends it again, and concurrent calls share one, transaction version %i',
+    async (version) => {
+      const setup = setUp(version)
+      const { producer, coordinator, log, setEndTxn } = setup
+      try {
+        await abortUnknown(setup)
+        setEndTxn('refuse')
+        const before = log.length
+        const failed = await producer.transaction().then(
           () => null,
           (error) => error
         )
-        await untilEndTxn(log)
-        await producer.disconnect({ timeout: 0 })
-        const abortError = await aborted
+        const refused = log.slice(before)
+        const atFailure = coordinatorAt(coordinator)
         setEndTxn('answer')
-
-        const requests = await runTransaction(producer, log)
-        expect({ abortError: abortError?.name, requests, at: coordinatorAt(coordinator) }).toEqual({
-          abortError: 'KafkaJSProducerClosedError',
-          requests: afterFence(version),
-          at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 2 : 3 },
+        const from = log.length
+        const starts = await Promise.allSettled([producer.transaction(), producer.transaction()])
+        const resent = log.slice(from).filter((entry) => entry.startsWith('endTxn'))
+        const begun = starts.filter(({ status }) => status === 'fulfilled')
+        await begun[0].value.abort()
+        expect({
+          failed: failed?.name,
+          refused: [...new Set(refused)],
+          attempts: refused.length > 1,
+          atFailure,
+          resent,
+          begun: begun.length > 0,
+        }).toEqual({
+          failed: 'KafkaJSNumberOfRetriesExceeded',
+          refused: ['endTxn:abort:1000/0'],
+          attempts: true,
+          atFailure: { state: 'ONGOING', epoch: 0 },
+          resent: ['endTxn:abort:1000/0'],
+          begun: true,
         })
       } finally {
         await producer.disconnect({ timeout: 0 })
@@ -200,51 +490,49 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
   )
 
   test.each([1, 2])(
-    'a disconnect whose timeout ends the abort of an open transaction leaves a producer whose next transaction bumps the epoch first and commits, transaction version %i',
-    async (version) => {
-      const { producer, coordinator, log, setEndTxn } = setUp(version)
-      try {
-        await producer.connect()
-        await openTransaction(producer)
-        setEndTxn('lost')
-        jest.useFakeTimers({ doNotFake: ['Date', 'nextTick', 'setImmediate', 'queueMicrotask'] })
-        const closing = producer.disconnect({ timeout: 1000 })
-        await untilEndTxn(log)
-        expect(log.at(-1)).toBe('endTxn:abort:0')
-        await jest.advanceTimersByTimeAsync(1000)
-        await closing
-        jest.useRealTimers()
-        setEndTxn('answer')
-
-        const requests = await runTransaction(producer, log)
-        expect({ requests, at: coordinatorAt(coordinator) }).toEqual({
-          requests: afterFence(version),
-          at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 2 : 3 },
-        })
-      } finally {
-        jest.useRealTimers()
-        await producer.disconnect({ timeout: 0 })
-      }
-    }
-  )
-
-  test.each([1, 2])(
-    'a disconnect that completes the abort of an open transaction owes no epoch bump, transaction version %i',
+    'a disconnect that completes the abort of an open transaction owes nothing, transaction version %i',
     async (version) => {
       const { producer, coordinator, log } = setUp(version)
       try {
         await producer.connect()
         await openTransaction(producer)
         await producer.disconnect()
-        expect(log.at(-1)).toBe('endTxn:abort:0')
+        expect(log.at(-1)).toBe('endTxn:abort:1000/0')
 
+        await producer.connect()
         const requests = await runTransaction(producer, log)
         expect({ requests, at: coordinatorAt(coordinator) }).toEqual({
           requests:
             version === 1
-              ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:0']
-              : ['produce:1', 'endTxn:commit:1'],
+              ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:1000/0']
+              : ['produce:1', 'endTxn:commit:1000/1'],
           at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 0 : 2 },
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    }
+  )
+
+  test.each([1, 2])(
+    'a plain disconnect and connect with nothing owed sends no InitProducerId, transaction version %i',
+    async (version) => {
+      const { producer, log } = setUp(version)
+      try {
+        await producer.connect()
+        await runTransaction(producer, log)
+        await producer.disconnect()
+        await producer.connect()
+        const requests = await runTransaction(producer, log)
+        expect({
+          inits: log.filter((entry) => entry.startsWith('initProducerId')),
+          requests,
+        }).toEqual({
+          inits: ['initProducerId:-1/-1'],
+          requests:
+            version === 1
+              ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:1000/0']
+              : ['produce:1', 'endTxn:commit:1000/1'],
         })
       } finally {
         await producer.disconnect({ timeout: 0 })
@@ -290,11 +578,11 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
           outcome: 'unknown',
           begin:
             'Transaction state exception: Cannot call "beginTransaction" while a commit is pending: commit() did not complete; call commit() again',
-          retried: ['endTxn:commit:0'],
+          retried: ['endTxn:commit:1000/0'],
           requests:
             version === 1
-              ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:0']
-              : ['produce:1', 'endTxn:commit:1'],
+              ? ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:1000/0']
+              : ['produce:1', 'endTxn:commit:1000/1'],
           at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 0 : 2 },
         })
       } finally {
@@ -303,76 +591,7 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
     }
   )
 
-  test.each([
-    {
-      version: 1,
-      endTxn: 'applied, its answer lost',
-      mode: 'unanswered',
-      markerRounds: 0,
-      expected: ['initProducerId:-1', 'addPartitionsToTxn:1', 'produce:1', 'endTxn:commit:1'],
-      epoch: 1,
-    },
-    {
-      version: 2,
-      endTxn: 'applied, its answer lost',
-      mode: 'unanswered',
-      markerRounds: 0,
-      expected: ['initProducerId:-1', 'produce:2', 'endTxn:commit:2'],
-      epoch: 3,
-    },
-    {
-      version: 1,
-      endTxn: 'applied with its markers pending',
-      mode: 'unanswered',
-      markerRounds: 1,
-      expected: [
-        'initProducerId:-1',
-        'initProducerId:-1',
-        'addPartitionsToTxn:1',
-        'produce:1',
-        'endTxn:commit:1',
-      ],
-      epoch: 1,
-    },
-    {
-      version: 2,
-      endTxn: 'applied with its markers pending',
-      mode: 'unanswered',
-      markerRounds: 1,
-      expected: afterFence(2),
-      epoch: 3,
-    },
-  ])(
-    'a close forced while abort() waits for an EndTxn the coordinator $endTxn leaves a producer whose next transaction starts fresh and commits, transaction version $version',
-    async ({ version, mode, markerRounds, expected, epoch }) => {
-      const { producer, coordinator, log, setEndTxn } = setUp(version)
-      try {
-        await producer.connect()
-        const transaction = await openTransaction(producer)
-        coordinator.markerRounds = markerRounds
-        setEndTxn(mode)
-        const aborted = transaction.abort().then(
-          () => null,
-          (error) => error
-        )
-        await untilEndTxn(log)
-        await producer.disconnect({ timeout: 0 })
-        const abortError = await aborted
-        setEndTxn('answer')
-
-        const requests = await runTransaction(producer, log)
-        expect({ abortError: abortError?.name, requests, at: coordinatorAt(coordinator) }).toEqual({
-          abortError: 'KafkaJSProducerClosedError',
-          requests: expected,
-          at: { state: 'COMPLETE_COMMIT', epoch },
-        })
-      } finally {
-        await producer.disconnect({ timeout: 0 })
-      }
-    }
-  )
-
-  test('a close forced while abort() waits for an AddPartitionsToTxn the coordinator applied leaves a producer whose next transaction starts fresh and commits, transaction version 1', async () => {
+  test('a close forced while abort() waits for an AddPartitionsToTxn of an otherwise empty transaction owes no EndTxn, and the next transaction commits, transaction version 1', async () => {
     const { producer, coordinator, log, holdAddPartitions } = setUp(1)
     try {
       await producer.connect()
@@ -395,51 +614,39 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
       await sent
       holdAddPartitions(false)
 
-      const before = log.length
+      await producer.connect()
       const requests = await runTransaction(producer, log)
       expect({
-        added: log.slice(0, before).filter((entry) => !entry.startsWith('initProducerId')),
         abortError: abortError?.name,
+        endTxn: log.filter((entry) => entry.startsWith('endTxn')),
         requests,
         at: coordinatorAt(coordinator),
       }).toEqual({
-        added: ['addPartitionsToTxn:0'],
         abortError: 'KafkaJSProducerClosedError',
-        requests: afterFence(1),
-        at: { state: 'COMPLETE_COMMIT', epoch: 2 },
+        endTxn: ['endTxn:commit:1000/0'],
+        requests: ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:1000/0'],
+        at: { state: 'COMPLETE_COMMIT', epoch: 0 },
       })
     } finally {
       await producer.disconnect({ timeout: 0 })
     }
   })
 
-  test.each([1, 2])(
-    "an abort whose EndTxn is refused until its retries run out ends the coordinator's transaction with a fresh InitProducerId, transaction version %i",
-    async (version) => {
-      const { producer, coordinator, log, setEndTxn } = setUp(version)
-      try {
-        await producer.connect()
-        const transaction = await openTransaction(producer)
-        setEndTxn('refuse')
-        const from = log.length
-        await transaction.abort()
-        const abort = log.slice(from).filter((entry) => !entry.startsWith('endTxn'))
-        const atAbort = coordinatorAt(coordinator)
-        setEndTxn('answer')
-
-        const requests = await runTransaction(producer, log)
-        expect({ abort, atAbort, requests, at: coordinatorAt(coordinator) }).toEqual({
-          abort: ['initProducerId:-1', 'initProducerId:-1'],
-          atAbort: { state: 'EMPTY', epoch: 2 },
-          requests:
-            version === 1
-              ? ['addPartitionsToTxn:2', 'produce:2', 'endTxn:commit:2']
-              : ['produce:2', 'endTxn:commit:2'],
-          at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 2 : 3 },
-        })
-      } finally {
-        await producer.disconnect({ timeout: 0 })
-      }
+  test('an abort of a transaction with nothing in it sends no EndTxn, then or before the next transaction, transaction version 1', async () => {
+    const { producer, log, setEndTxn } = setUp(1)
+    try {
+      await producer.connect()
+      const transaction = await producer.transaction()
+      setEndTxn('refuse')
+      await transaction.abort()
+      setEndTxn('answer')
+      const requests = await runTransaction(producer, log)
+      expect({ endTxn: log.filter((entry) => entry.startsWith('endTxn')), requests }).toEqual({
+        endTxn: ['endTxn:commit:1000/0'],
+        requests: ['addPartitionsToTxn:0', 'produce:0', 'endTxn:commit:1000/0'],
+      })
+    } finally {
+      await producer.disconnect({ timeout: 0 })
     }
-  )
+  })
 })

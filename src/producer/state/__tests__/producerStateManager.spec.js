@@ -208,23 +208,6 @@ describe('Producer > state > ProducerStateManager', () => {
       expect(manager.sequencer.entry(TOPIC, 1)).toBeNull()
     })
 
-    test('reinitialize({ fresh: true }) sends -1/-1, takes the answer and resets every partition', async () => {
-      const coordinator = createCoordinator()
-      const manager = await transactionalManager({ coordinator })
-      await withAcknowledgedPartitions(manager)
-      coordinator.initProducerId.mockClear()
-      coordinator.initProducerId.mockResolvedValueOnce({ producerId: '1000', producerEpoch: 7 })
-
-      await manager.reinitialize({ fresh: true })
-
-      expect(coordinator.initProducerId.mock.calls).toEqual([
-        [expect.objectContaining({ producerId: -1, producerEpoch: -1 })],
-      ])
-      expect([manager.producerId, manager.producerEpoch]).toEqual(['1000', 7])
-      expect(manager.sequencer.entry(TOPIC, 0)).toBeNull()
-      expect(manager.sequencer.entry(TOPIC, 1)).toBeNull()
-    })
-
     test('adopt() takes the pair and resets every partition', async () => {
       const manager = await transactionalManager()
       await withAcknowledgedPartitions(manager)
@@ -423,6 +406,48 @@ describe('Producer > state > ProducerStateManager', () => {
       ]) {
         expect(() => manager.transaction.guard(method)).toThrow(KafkaJSApplicationRecoverableError)
       }
+    })
+  })
+
+  describe('the fatal error of a coordinator that no longer holds the producer id and epoch', () => {
+    const TAKEN_OVER =
+      /^Another producer took over transactional id test-transactional-id, or the transaction coordinator aborted its transaction on the transaction timeout \(.+\); create a new producer$/
+
+    test.each([PRODUCER_FENCED, INVALID_PRODUCER_ID_MAPPING])(
+      'a transactional producer arms code %i as an error saying another producer took over or the coordinator timed the transaction out',
+      async (code) => {
+        const manager = await transactionalManager()
+        const error = failure(code)
+        manager.classify(error, 'txn')
+
+        manager.arm(error)
+
+        const armed = manager.transaction.armedError()
+        expect(armed).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+        expect({ message: armed.message, cause: armed.cause }).toEqual({
+          message: expect.stringMatching(TAKEN_OVER),
+          cause: error,
+        })
+      }
+    )
+
+    test.each([
+      [
+        'a transactional producer, another fatal code',
+        transactionalManager,
+        INVALID_PRODUCER_EPOCH,
+      ],
+      ['an idempotent-only producer', idempotentManager, INVALID_PRODUCER_ID_MAPPING],
+    ])('%s keeps the generic fatal message', async (_, build, code) => {
+      const manager = await build()
+      const error = failure(code)
+      manager.classify(error, 'txn')
+
+      manager.arm(error)
+
+      expect(manager.transaction.armedError().message).toBe(
+        `The producer can no longer be used (${error.message}); create a new producer`
+      )
     })
   })
 
