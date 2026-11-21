@@ -83,7 +83,7 @@ jobs:
       LOAD_PARTITIONS: ${{ inputs.partitions || '16' }}
       LOAD_DURATION: ${{ inputs.duration || '600' }}
       LOAD_COMPRESSION: ${{ inputs.compression || 'none' }}
-      LOAD_FAULTS: ${{ inputs.faults || 'rolling-restarts' }}
+      LOAD_FAULTS: ${{ inputs.faults || 'slow-broker' }}
       LOAD_REPLICATION_FACTOR: ${{ inputs.replication_factor || '3' }}
       LOAD_PRODUCER_PROCESSES: ${{ inputs.producer_processes || '1' }}
     steps:
