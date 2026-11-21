@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -344,7 +344,7 @@
+   async connect(round) {
+     const { membershipRevision } = this
+     const ownershipToken = this.ownership?.token()
+-    const coordinator = await this.coordinatorLookup.find(round?.fence)
++    const coordinator = await this.coordinatorLookup.find()
+     round?.fence?.check()
+     const refusal = round?.guard?.()
+     if (refusal) throw refusal

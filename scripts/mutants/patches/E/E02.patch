@@ -1,11 +1,10 @@
 --- a/src/consumer/offsetManager/index.js
 +++ b/src/consumer/offsetManager/index.js
-@@ -780,7 +780,7 @@
-           // A seek names a position, not a record: nothing has been consumed at it yet.
-           leaderEpoch: -1,
-         })
--        this.operations.fence(ticket, topic, partition)
-+        this.operations.apply(ticket, topic, partition)
-       } finally {
-         this.operations.end(ticket)
-       }
+@@ -978,6 +978,7 @@
+     this.clearPendingSeek(topic, partition)
+     this.installSeekPosition(topic, partition, offset, { local: true })
+     this.operations.touchOwned(this, topic, partition)
++    this.operations.discharge(topic, partition)
+     this.retireResetRefusals(topic, partition)
+     return true
+   }

@@ -1,7 +1,7 @@
 --- a/src/consumer/index.js
 +++ b/src/consumer/index.js
-@@ -360,7 +360,7 @@
-     : { offsets: dictionary(), operations: new OffsetOperations() }
+@@ -402,7 +402,7 @@
+     : { offsets: privateOffsets, operations: new OffsetOperations(privateOffsets) }
    /** @returns {OffsetOperations} the private ledger, or the group's shared one */
    const offsetOperations = () =>
 -    privateState ? privateState.operations : cluster.offsetOperations({ groupId })

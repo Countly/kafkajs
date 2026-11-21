@@ -1,0 +1,11 @@
+--- a/src/index.js
++++ b/src/index.js
+@@ -770,7 +770,7 @@
+       groupProtocol,
+       groupRemoteAssignor,
+       maxPrefetchBatches,
+-      fetchSessions = false,
++      fetchSessions = true,
+     } = options
+     if (typeof fetchSessions !== 'boolean') {
+       throw new KafkaJSNonRetriableError('fetchSessions must be a boolean')

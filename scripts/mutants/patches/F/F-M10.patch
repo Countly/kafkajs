@@ -1,11 +1,11 @@
 --- a/src/cluster/brokerPool.js
 +++ b/src/cluster/brokerPool.js
-@@ -670,7 +670,7 @@
+@@ -1046,7 +1046,7 @@
        (!ticket || ticket.isCurrent())
-     if (metadataScope?.hasPatterns()) {
-       topics = []
--      allowAutoTopicCreation = false
-+      allowAutoTopicCreation = true
-     }
+     const clientPattern = metadataScope?.hasPatterns()
+     if (clientPattern) topics = []
+-    if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = false
++    if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = true
      const accept = this.captureTopics?.(topics || [])
-     const requestOptions = {
+     const establishment =
+       this.unavailableTopics !== null && topics?.length > 0 ? this.captureEstablishment() : null

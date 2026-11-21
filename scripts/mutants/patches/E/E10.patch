@@ -1,11 +1,11 @@
 --- a/src/consumer/offsetManager/index.js
 +++ b/src/consumer/offsetManager/index.js
-@@ -681,7 +681,7 @@
+@@ -836,7 +836,7 @@
            memberId: this.memberId,
            groupGenerationId: this.generationId,
            groupInstanceId: this.groupInstanceId,
 -          topics: [{ topic, partitions: [{ partition, offset: actualOffset }] }],
 +          topics: [{ topic, partitions: [{ partition, offset: '-1' }] }],
          }
-         await this.sendOffsetCommit(payload, {
-           guard,
+         try {
+           await this.sendOffsetCommit(payload, {

@@ -1,7 +1,7 @@
 --- a/src/consumer/runner.js
 +++ b/src/consumer/runner.js
-@@ -729,8 +729,6 @@
-       await scope.wait(() => this.waitForConsumer(scope))
+@@ -859,8 +859,6 @@
+       this.disarmFatal()
        if (closing) await scope.wait(() => this.invokeCloseHook(closing, scope))
  
 -      await this.commitFinalOffsetsContained(scope)

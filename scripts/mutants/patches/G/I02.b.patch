@@ -1,13 +1,11 @@
---- a/src/consumer/offsetManager/index.js
-+++ b/src/consumer/offsetManager/index.js
-@@ -1905,9 +1905,7 @@
-   committedOffsets() {
-     if (!this[PRIVATE.COMMITTED_OFFSETS]) {
-       this[PRIVATE.COMMITTED_OFFSETS] =
--        this.groupId === undefined
--          ? this.privateOffsets || dictionary()
--          : this.cluster.committedOffsets({ groupId: this.groupId })
-+        this.cluster.committedOffsets({ groupId: this.groupId })
-     }
- 
-     return this[PRIVATE.COMMITTED_OFFSETS]
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -399,7 +399,7 @@
+   const privateOffsets = hasGroup ? null : dictionary()
+   const privateState = hasGroup
+     ? null
+-    : { offsets: privateOffsets, operations: new OffsetOperations(privateOffsets) }
++    : { offsets: privateOffsets, operations: new OffsetOperations(cluster.committedOffsets({ groupId })) }
+   /** @returns {OffsetOperations} the private ledger, or the group's shared one */
+   const offsetOperations = () =>
+     privateState ? privateState.operations : cluster.offsetOperations({ groupId })
