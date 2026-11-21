@@ -1604,6 +1604,8 @@ describe('scripts/evidence/finalSoakCore', () => {
   describe('K5 on real heap snapshots', () => {
     const FIXTURE = path.join(__dirname, '../../soak/__tests__/fixtures/heapJudged.js')
     const MIB = 1024 * 1024
+    // Writing and reading real snapshots is CPU work whose length follows the host load.
+    const REAL_SNAPSHOT_MS = 240000
     const snapshots = {}
     beforeAll(() => {
       for (const kind of ['code', 'map', 'array', 'strings', 'seed']) {
@@ -1632,15 +1634,19 @@ describe('scripts/evidence/finalSoakCore', () => {
       return { report, first, last }
     }
 
-    it('passes a run whose whole-process heap grows 6 MiB of excluded V8 code', async () => {
-      const { report, first, last } = await judgeReal('code')
-      expect(last.totalBytes - first.totalBytes).toBeGreaterThan(6 * MIB)
-      expect(last.excluded['system / BytecodeArray']).toBeGreaterThan(
-        first.excluded['system / BytecodeArray'] + MIB
-      )
-      expectRow(report, 'K5', 'PASS')
-      expect(row(report, 'K5').numbers.p04.endpoint).toBeLessThan(64 * 1024)
-    }, 60000)
+    it(
+      'passes a run whose whole-process heap grows 6 MiB of excluded V8 code',
+      async () => {
+        const { report, first, last } = await judgeReal('code')
+        expect(last.totalBytes - first.totalBytes).toBeGreaterThan(6 * MIB)
+        expect(last.excluded['system / BytecodeArray']).toBeGreaterThan(
+          first.excluded['system / BytecodeArray'] + MIB
+        )
+        expectRow(report, 'K5', 'PASS')
+        expect(row(report, 'K5').numbers.p04.endpoint).toBeLessThan(64 * 1024)
+      },
+      REAL_SNAPSHOT_MS
+    )
 
     it.each([
       ['a product Map', 'map', 'product'],
@@ -1654,14 +1660,18 @@ describe('scripts/evidence/finalSoakCore', () => {
         expect(last.judgedByOwner[owner] - first.judgedByOwner[owner]).toBeGreaterThan(2 * MIB)
         expectRow(report, 'K5', 'FAIL', /p04 judged heap endpoint \d+ bytes exceeds 2097152/)
       },
-      60000
+      REAL_SNAPSHOT_MS
     )
 
-    it('judges what the seed retains: real snapshots of its offset map show the leak to the control', async () => {
-      const { report } = await judgeReal('code', 'seed')
-      expectRow(report, 'K5', 'PASS')
-      expect(report.information.heap.control.p13.endpoint).toBeGreaterThan(2 * MIB)
-    }, 60000)
+    it(
+      'judges what the seed retains: real snapshots of its offset map show the leak to the control',
+      async () => {
+        const { report } = await judgeReal('code', 'seed')
+        expectRow(report, 'K5', 'PASS')
+        expect(report.information.heap.control.p13.endpoint).toBeGreaterThan(2 * MIB)
+      },
+      REAL_SNAPSHOT_MS
+    )
   })
 
   describe('K6 resources', () => {
