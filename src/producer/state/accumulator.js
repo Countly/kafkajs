@@ -1340,9 +1340,7 @@ class Accumulator {
    */
   #joinHeld(send) {
     const { entries, resolve, reject, options } = send
-    if (!this.#leave(send)) {
-      return
-    }
+    this.#leave(send)
     try {
       resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
     } catch (error) {
