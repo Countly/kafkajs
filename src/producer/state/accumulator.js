@@ -1115,7 +1115,10 @@ class Accumulator {
    * admitted: at once when it fits and no send waits, else after the sends ahead of it, within
    * `maxBlockMs` and its deadline. Its records are the caller's owned copy (`Accumulator.snapshot`),
    * held by the send while it waits; a refusal drops them. A refusal goes through `expired`, so it
-   * arms a transaction and the send rejects with the refusal itself.
+   * arms a transaction and the send rejects with the refusal itself. It takes its place in its
+   * topics' call order there too (see `JoinOrder`), so a send admitted after a wait still joins
+   * before every later send of its topics; a refusal gives the place up. Admission is FIFO, so no
+   * later send holds buffer room while it waits for this one to be admitted.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} [request.timeout]
@@ -1152,6 +1155,8 @@ class Accumulator {
 
     this.#appending += 1
     send.holdTopics()
+    send.lanes = send.topics
+    this.#order.enter(send)
     this.track(send)
     try {
       this.#assertFits(topicMessages, compression)
@@ -1160,9 +1165,11 @@ class Accumulator {
       send.admit(granted instanceof Promise ? this.#granted(await granted) : granted, charge)
     } catch (error) {
       send.records = null
+      send.settled = true
       send.releaseTopics()
       send.untrack()
       this.#end()
+      this.#order.passed(send)
       throw this.#expired(error)
     }
     return this.#hold(send, { acks, timeout, compression })
@@ -1295,9 +1302,7 @@ class Accumulator {
       send.reject = reject
       send.resolve = resolve
       send.options = options
-      send.lanes = send.topics
       this.#register(send)
-      this.#order.enter(send)
 
       send.pin()
       let assigned
@@ -1335,7 +1340,9 @@ class Accumulator {
    */
   #joinHeld(send) {
     const { entries, resolve, reject, options } = send
-    this.#leave(send)
+    if (!this.#leave(send)) {
+      return
+    }
     try {
       resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
     } catch (error) {
