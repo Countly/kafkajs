@@ -70,6 +70,17 @@ describe('load profile arguments', () => {
     expect(() => parseLoadArgs(['--out', 'o', '--bogus', '1'])).toThrow('unknown flag --bogus')
   })
 
+  it('spreads the producers over at most one process each, and keeps slow-broker in one process', () => {
+    expect(parseLoadArgs(['--out', 'o']).producerProcesses).toBe(1)
+    expect(parseLoadArgs(['--out', 'o', '--producer-processes', '3']).producerProcesses).toBe(3)
+    expect(() => parseLoadArgs(['--out', 'o', '--producer-processes', '4'])).toThrow(
+      '--producer-processes must be at most --producers'
+    )
+    expect(() =>
+      parseLoadArgs(['--out', 'o', '--faults', 'slow-broker', '--producer-processes', '2'])
+    ).toThrow('fault schedule slow-broker needs --producer-processes 1')
+  })
+
   it('applies the overrides of the slow-broker and many-topics schedules', () => {
     expect(parseLoadArgs(['--out', 'o', '--faults', 'slow-broker'])).toMatchObject({
       faults: 'slow-broker',
@@ -755,5 +766,19 @@ describe('load profile rate attribution', () => {
       { ...phases[1], coreShare: 1, machineBusyShare: 0.9 },
       { ...phases[2], coreShare: null, machineBusyShare: null },
     ])
+  })
+})
+
+describe('load profile latency histogram across processes', () => {
+  it('merges a latency histogram sent from another process', () => {
+    const here = new LatencyHistogram()
+    const there = new LatencyHistogram()
+    for (const ms of [1, 2, 3]) here.record(ms)
+    for (const ms of [50, 400]) there.record(ms)
+    const snapshot = there.snapshot()
+    here.merge(JSON.parse(JSON.stringify(snapshot)))
+    expect(here.toJSON()).toMatchObject({ samples: 5, max: 400 })
+    expect(here.percentile(80)).toBeGreaterThanOrEqual(50)
+    expect(here.percentile(80)).toBeLessThan(51.1)
   })
 })

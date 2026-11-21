@@ -1,11 +1,13 @@
 const crypto = require('node:crypto')
+const { EventEmitter } = require('node:events')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
 const { fakeTime } = require('./churnFakes')
 const { parseLoadArgs } = require('../loadProfile')
-const { LoadRun, parseDescribe, recheck } = require('../loadRun')
+const { LoadProducer, LoadRun, parseDescribe, recheck } = require('../loadRun')
+const { ProducerHost } = require('../loadProducerChild')
 
 /**
  * A scripted cluster: partition logs with transaction state, sends acknowledged `ackDelayMs` after
@@ -445,6 +447,115 @@ describe('load run', () => {
     expect(dropped).toBe(true)
     expect(findingCounts(report.oracle)).toEqual({ loss: 1 })
     expect(report.verdict).toMatchObject({ product: 'FAIL', exitCode: 1 })
+  })
+})
+
+describe('load run producer processes', () => {
+  const dirs = []
+  afterAll(() => dirs.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })))
+
+  /**
+   * Producer processes in this process: each message is copied as the IPC channel would, and
+   * handed over on a later turn. `hosts` collects each child's producer host.
+   */
+  const inProcessFork =
+    (cluster, hosts) =>
+    ({ clock, sleep }) => ({
+      fork: () => {
+        const child = new EventEmitter()
+        const deliver = (fn) => setImmediate(fn)
+        const host = new ProducerHost({
+          kafka: cluster.kafka,
+          clock,
+          sleep,
+          LoadProducer,
+          host: { read: () => ({ processUs: 0, machineBusyMs: 0, machineTotalMs: 0, load1: 0 }) },
+          send: (message) => deliver(() => child.emit('message', structuredClone(message))),
+        })
+        hosts.push(host)
+        child.send = (message) => {
+          const copy = structuredClone(message)
+          deliver(() =>
+            host.handle(copy).then(() => {
+              if (copy.type === 'close') child.emit('exit', 0)
+            })
+          )
+        }
+        child.kill = () => child.emit('exit', null)
+        return child
+      },
+    })
+
+  it('spreads the producers over child processes, each producer in exactly one, and judges the run as in one process', async () => {
+    const hosts = []
+    const cluster = new FakeCluster()
+    const { report, out } = await runWith(
+      cluster,
+      {},
+      {
+        args: ['--producer-processes', '2'],
+        tools: inProcessFork(cluster, hosts),
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(hosts.map((h) => h.producers.map((p) => `${p.id} ${p.kind}`))).toEqual([
+      ['p0 idempotent', 'p2 transactional'],
+      ['p1 plain'],
+    ])
+    expect(report.errors).toEqual([])
+    expect(findingCounts(report.oracle)).toEqual({})
+    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+    expect(report.totals.offered).toBe(6000)
+    expect(report.producers.map((p) => p.id)).toEqual(['p0', 'p1', 'p2'])
+    expect(report.producers[2].stats.aborted).toBeGreaterThan(0)
+    expect(report.latencyMs.samples).toBe(report.producers.reduce((n, p) => n + p.stats.acked, 0))
+    expect(report.cpu.producerProcesses.map((p) => [p.id, p.producers.join(',')])).toEqual([
+      ['process-0', 'p0,p2'],
+      ['process-1', 'p1'],
+    ])
+    const ledgers = JSON.parse(fs.readFileSync(path.join(out, 'producers.json'), 'utf8'))
+    expect(ledgers.map((l) => l.producer).sort()).toEqual(['p0', 'p1', 'p2'])
+    expect(report.oracle.counts.records).toBeGreaterThan(5000)
+    const replayed = await recheck(out)
+    expect(replayed.counts.records).toBe(report.oracle.counts.records)
+  })
+
+  it('does not judge a run whose producer process failed before it sent its ledgers', async () => {
+    const cluster = new FakeCluster()
+    const { report, out } = await runWith(
+      cluster,
+      {},
+      {
+        args: ['--producer-processes', '3'],
+        tools: ({ clock, sleep }) => {
+          const { fork } = inProcessFork(cluster, [])({ clock, sleep })
+          let n = 0
+          return {
+            fork: () => {
+              const child = fork()
+              if (n++ !== 1) return child
+              const send = child.send
+              child.send = (message) => {
+                if (message.type !== 'begin') return send(message)
+                setImmediate(() => child.emit('exit', 1))
+              }
+              return child
+            },
+          }
+        },
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(report.oracle).toBe(null)
+    expect(report.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^driver: Error: process-1: exited with code 1/),
+        'read: not judged, no send ledgers from process-1',
+      ])
+    )
+    expect(report.verdict).toMatchObject({ product: 'INCONCLUSIVE', exitCode: 2 })
   })
 })
 
