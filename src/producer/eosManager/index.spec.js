@@ -840,11 +840,11 @@ describe('Producer > eosManager', () => {
     })
 
     test.each([
-      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', 53],
-      ['GROUP_AUTHORIZATION_FAILED', 30],
+      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', 'none: the producer is fatal', 53, 0],
+      ['GROUP_AUTHORIZATION_FAILED', 'one, since the AddOffsetsToTxn was sent', 30, 1],
     ])(
-      'an AddOffsetsToTxn refused with %s leaves the transaction unstarted: abort() sends no EndTxn',
-      async (_, code) => {
+      'an AddOffsetsToTxn refused with %s leaves the transaction unconfirmed and sends no TxnOffsetCommit; the EndTxn abort() sends: %s',
+      async (_, __, code, endTxns) => {
         broker.negotiatedVersion = jest.fn(() => 5)
         broker.initProducerId.mockImplementation(
           async ({ producerId: id, producerEpoch: epoch }) =>
@@ -865,7 +865,7 @@ describe('Producer > eosManager', () => {
         await eosManager.abort().catch(() => {})
 
         expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
-        expect(broker.endTxn).not.toHaveBeenCalled()
+        expect(broker.endTxn).toHaveBeenCalledTimes(endTxns)
       }
     )
 

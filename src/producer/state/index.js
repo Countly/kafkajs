@@ -81,6 +81,8 @@ class ProducerStateManager {
   /** @type {Set<Promise<void>>} every AddPartitionsToTxn not yet settled, never rejecting */
   #adds = new Set()
   #started = false
+  /** Whether an add request of the current transaction was sent, answered or not. */
+  #addSent = false
   /** Moves on every return to READY, so a late answer cannot touch the next transaction. */
   #generation = 0
   /** @type {?{ lifecycle: ?import('../generation'), promise: Promise<void> }} */
@@ -328,7 +330,8 @@ class ProducerStateManager {
 
   /**
    * A transactional producer's PRODUCER_FENCED (90) or INVALID_PRODUCER_ID_MAPPING (49): the
-   * coordinator no longer holds this producer id and epoch, so the fatal error says why.
+   * coordinator no longer accepts this producer id and epoch, so the fatal error says why it may
+   * not: a takeover, a timed-out transaction, or a transactional id that expired.
    * @param {Error} error
    * @returns {Error} the error to arm: `error` itself for any other code
    */
@@ -338,7 +341,7 @@ class ProducerStateManager {
     }
 
     return new KafkaJSApplicationRecoverableError(
-      `Another producer took over transactional id ${this.#transactionalId}, or the transaction coordinator aborted its transaction on the transaction timeout (${error.message}); create a new producer`,
+      `The transaction coordinator no longer accepts this producer's id and epoch: another producer took over transactional id ${this.#transactionalId}, its transaction timed out, or the transactional id expired (${error.message}); create a new producer`,
       { cause: error }
     )
   }
@@ -362,6 +365,7 @@ class ProducerStateManager {
       this.#nextAdd = null
       this.#partitions.clear()
       this.#started = false
+      this.#addSent = false
       this.#generation += 1
     }
   }
@@ -596,9 +600,22 @@ class ProducerStateManager {
     return this.#started
   }
 
+  /**
+   * @returns {boolean} whether the coordinator may hold the current transaction: something joined
+   *   it, or an AddPartitionsToTxn or AddOffsetsToTxn of it was sent, answered or not
+   */
+  transactionReached() {
+    return this.#started || this.#addSent
+  }
+
   /** Records that offsets joined the current transaction. @returns {void} */
   markOffsetsAdded() {
     this.#started = true
+  }
+
+  /** Records that an AddOffsetsToTxn of the current transaction is being sent. @returns {void} */
+  markAddSent() {
+    this.#addSent = true
   }
 
   /**
@@ -794,6 +811,7 @@ class ProducerStateManager {
       return
     }
 
+    this.#addSent = true
     const request = [...topics].map(([topic, partitions]) => ({ topic, partitions }))
 
     try {

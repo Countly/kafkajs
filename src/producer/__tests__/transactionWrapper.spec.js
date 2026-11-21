@@ -743,7 +743,7 @@ describe('Producer > the transaction wrapper', () => {
       )
     })
 
-    test('under transaction version 1, an AddPartitionsToTxn that runs out of retries leaves the transaction abort-only; abort() ends it and the next transaction commits', async () => {
+    test('under transaction version 1, an AddPartitionsToTxn that runs out of retries leaves the transaction abort-only; abort() sends its EndTxn and the next transaction commits', async () => {
       const { broker, producer } = createTransactionalProducer({ level: 1 })
       await producer.connect()
       broker.addPartitionsToTxn.mockRejectedValue(
@@ -765,6 +765,7 @@ describe('Producer > the transaction wrapper', () => {
 
       expect(broker.produce).toHaveBeenCalledTimes(1)
       expect(broker.endTxn.mock.calls.map(([request]) => request)).toEqual([
+        expect.objectContaining({ transactionResult: false, transactionVersion: 1 }),
         expect.objectContaining({ transactionResult: true, transactionVersion: 1 }),
       ])
     })
