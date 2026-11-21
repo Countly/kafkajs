@@ -188,13 +188,17 @@ const toRemoveMemberResult = (sent, answered) => {
 }
 
 const findTopicPartitions = async (cluster, topic) => {
-  checked(await waitOf(async () => cluster.addTargetTopic(topic)))
-  checked(await waitOf(async () => cluster.refreshMetadataIfNecessary()))
-
-  return cluster
-    .findTopicPartitionMetadata(topic)
-    .map(({ partitionId }) => partitionId)
-    .sort()
+  const release = cluster.holdTargetTopics([topic])
+  try {
+    checked(await waitOf(async () => cluster.addTargetTopic(topic)))
+    checked(await waitOf(async () => cluster.refreshMetadataIfNecessary()))
+    return cluster
+      .findTopicPartitionMetadata(topic)
+      .map(({ partitionId }) => partitionId)
+      .sort()
+  } finally {
+    release()
+  }
 }
 const indexByPartition = (array) =>
   array.reduce(
@@ -836,7 +840,8 @@ module.exports = ({
   }
 
   /**
-   * Reads low and high offsets at the selected isolation; the default remains committed.
+   * Reads low and high offsets at the selected isolation; the default remains committed. The topic
+   * is a target of the admin's metadata refreshes only until the call, retries included, ends.
    * @param {string} topic topic name
    * @param {object} [options] isolationLevel and apiTimeout
    * @returns {Promise<object[]>} partition low/high decimal offsets
@@ -850,6 +855,7 @@ module.exports = ({
     }
 
     const retrier = retrierOf(retry)
+    const release = cluster.holdTargetTopics([topic])
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
@@ -906,7 +912,7 @@ module.exports = ({
 
         bail(e)
       }
-    })
+    }).finally(release)
   }
 
   /**
@@ -931,6 +937,7 @@ module.exports = ({
       if (!topic || typeof topic !== 'string')
         throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
       const [fromTimestamp, minVersion] = specs[timestamp]
+      const release = cluster.holdTargetTopics([topic])
       return retrierOf(retry)(async (bail) => {
         try {
           checked(await waitOf(() => cluster.addTargetTopic(topic)))
@@ -956,13 +963,14 @@ module.exports = ({
           }
           bail(error)
         }
-      })
+      }).finally(release)
     }
     if (!topic || typeof topic !== 'string') {
       throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
     }
 
     const retrier = retrierOf(retry)
+    const release = cluster.holdTargetTopics([topic])
 
     return retrier(async (bail, retryCount, retryTime) => {
       try {
@@ -1022,7 +1030,7 @@ module.exports = ({
 
         bail(e)
       }
-    })
+    }).finally(release)
   }
 
   /**
@@ -1207,7 +1215,8 @@ module.exports = ({
    * `resolveOffsets` does so); any other offset is committed by a seek of the member. On every
    * exit the call awaits disposal of the member, which releases its cluster subscriptions even if
    * stopping fails. A disposal failure does not replace the call's outcome. Disposal itself does
-   * not disconnect the admin's shared cluster.
+   * not disconnect the admin's shared cluster. The topic is a target of the admin's metadata
+   * refreshes until the member is disposed, and no longer.
    * @param {object} request
    * @param {string} request.groupId
    * @param {string} request.topic
@@ -1249,6 +1258,7 @@ module.exports = ({
       const unown = round.own(() => {
         dispose().catch(() => {})
       })
+      const release = cluster.holdTargetTopics([topic])
 
       try {
         checked(await waitOf(async () => consumer.subscribe({ topic, fromBeginning: true })))
@@ -1301,6 +1311,7 @@ module.exports = ({
         // stop is already logged by the consumer and must not replace the call's own outcome.
         unown()
         await dispose()
+        release()
       }
     })
   }
@@ -2068,7 +2079,8 @@ module.exports = ({
    * round again, as the Java `Admin#deleteRecords` retries its leader lookup, and so does any
    * retriable failure. The request to each leader is built on the first attempt that finds them all
    * and kept: a broker that already answered is not asked again, and a retry goes to the node it
-   * was built for, after a stale-metadata answer too.
+   * was built for, after a stale-metadata answer too. The topic is a target of the admin's metadata
+   * refreshes from the offsets read until the call ends, and no longer.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    *
    * @param {string} topic
@@ -2096,7 +2108,14 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
 
-    const topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
+    const release = cluster.holdTargetTopics([topic])
+    let topicOffsets
+    try {
+      topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
+    } catch (error) {
+      release()
+      throw error
+    }
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
 
@@ -2212,7 +2231,7 @@ module.exports = ({
         }
         throw e
       }
-    })
+    }).finally(release)
   }
 
   /**

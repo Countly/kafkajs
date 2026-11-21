@@ -432,6 +432,7 @@ describe('admin invocation deadlines', () => {
         refreshMetadata: async () => {},
         refreshMetadataIfNecessary: async () => {},
         addTargetTopic: async () => {},
+        holdTargetTopics: () => () => {},
         findControllerBroker: async () => broker,
         findConnectedBroker: async () => broker,
         findBroker: async () => broker,

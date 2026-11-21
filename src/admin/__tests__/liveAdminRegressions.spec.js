@@ -40,6 +40,7 @@ describe('legacy admin call patterns', () => {
       const reads = []
       const cluster = {
         addTargetTopic: async () => {},
+        holdTargetTopics: () => () => {},
         refreshMetadataIfNecessary: async () => {},
         findTopicPartitionMetadata: () => [{ partitionId: 0 }],
         fetchTopicsOffset: async (topics, options) => {
@@ -93,6 +94,7 @@ describe('delete-records partial broker retries', () => {
     }))
     const cluster = {
       addTargetTopic: async () => {},
+      holdTargetTopics: () => () => {},
       refreshMetadataIfNecessary: async () => {},
       refreshMetadata: jest.fn(async () => {}),
       findTopicPartitionMetadata: () => [{ partitionId: 0 }, { partitionId: 1 }],

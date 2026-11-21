@@ -30,6 +30,7 @@ const fixture = () => {
     findBroker: async () => broker,
     defaultOffset: ({ fromBeginning }) => (fromBeginning ? -2 : -1),
     addTargetTopic: async () => {},
+    holdTargetTopics: () => () => {},
     refreshMetadataIfNecessary: async () => {},
     findTopicPartitionMetadata: () => [{ partitionId: 0 }],
     fetchTopicsOffset: Cluster.prototype.fetchTopicsOffset,

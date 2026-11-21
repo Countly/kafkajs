@@ -17,6 +17,16 @@ An old lookup, authentication, encoder, queued write, response or temporary cons
 send, reconnect or clear the replacement lifecycle. A forced close reports an unknown outcome;
 a mutation already sent may have been applied. Inspect the broker state before repeating it.
 
+A call that reads offsets or partitions of named topics (`fetchTopicOffsets`,
+`fetchTopicOffsetsByTimestamp`, `fetchOffsets` with `topics`, `fetchOffsetsForGroups`,
+`resetOffsets`, `setOffsets`, `deleteTopicRecords`, `describeProducers`, `abortTransaction`) asks
+for its topics in the admin client's metadata requests only while it runs. A topic another client
+deletes therefore fails only the calls that name it. While such a call is running, other calls on
+the same admin client that refresh metadata ask for its topics too, so they can fail with
+`UNKNOWN_TOPIC_OR_PARTITION` if that topic was deleted, until the call ends. When no such call is
+running, the metadata request before a cluster-level call (`createTopics`, `describeConfigs`, …)
+asks for every topic, as a new admin client does.
+
 ## Admin API ledger
 
 The following rows cover the complete public Admin method surface and its direct options.

@@ -15,6 +15,7 @@ const TOPIC_AUTHORIZATION_FAILED = 29
  */
 const stubCluster = (fetchTopicsOffset) => ({
   addTargetTopic: async () => {},
+  holdTargetTopics: () => () => {},
   refreshMetadataIfNecessary: async () => {},
   refreshMetadata: async () => {},
   findTopicPartitionMetadata: () => [{ partitionId: 0 }],

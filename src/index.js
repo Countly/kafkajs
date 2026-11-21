@@ -536,6 +536,7 @@ module.exports = class Client {
       instrumentationEmitter = null,
       isolationLevel,
       onTopicMetadataStatus,
+      orderedMetadata,
     }) =>
       new Cluster({
         telemetryMetrics,
@@ -570,6 +571,7 @@ module.exports = class Client {
         metadataRecoveryRebootstrapTriggerMs: validatedMetadataRecoveryRebootstrapTriggerMs,
         bootstrapResolveTimeout: validatedBootstrapResolveTimeout,
         onTopicMetadataStatus,
+        orderedMetadata,
       })
   }
 
@@ -941,6 +943,7 @@ module.exports = class Client {
       telemetryMetrics: telemetry.metrics,
       allowAutoTopicCreation: false,
       instrumentationEmitter,
+      orderedMetadata: true,
     })
 
     telemetry.bind(cluster)

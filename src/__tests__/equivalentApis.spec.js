@@ -1133,6 +1133,7 @@ describe('admin detail and lag equivalents', () => {
     const cluster = {
       findGroupCoordinator: async () => coordinator,
       addTargetTopic: async () => {},
+      holdTargetTopics: () => () => {},
       refreshMetadataIfNecessary: async () => {},
       findTopicPartitionMetadata: () => [{ partitionId: 0 }],
       fetchTopicsOffset: jest.fn(async (topics, options) => {
@@ -1353,6 +1354,7 @@ const resetRig = async ({
     findGroupCoordinator: async () => broker,
     refreshMetadata: async () => {},
     addTargetTopic: async () => {},
+    holdTargetTopics: () => () => {},
     refreshMetadataIfNecessary: async () => {},
     findTopicPartitionMetadata: () => partitions.map((partitionId) => ({ partitionId })),
     fetchTopicsOffset: async ([request]) => {

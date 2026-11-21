@@ -15,6 +15,7 @@ const fixture = () => {
   )
   const cluster = {
     addTargetTopic: jest.fn(async () => {}),
+    holdTargetTopics: jest.fn(() => () => {}),
     refreshMetadataIfNecessary: async () => {},
     findTopicPartitionMetadata: () => [{ partitionId: 0 }],
     fetchTopicsOffset: read,

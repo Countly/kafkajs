@@ -32,6 +32,7 @@ const rejection = (promise) =>
 /** A cluster whose every seam records a call, so a test can prove none was made. */
 const idleCluster = () => ({
   addTargetTopic: jest.fn(async () => {}),
+  holdTargetTopics: jest.fn(() => () => {}),
   refreshMetadata: jest.fn(async () => {}),
   refreshMetadataIfNecessary: jest.fn(async () => {}),
   findControllerBroker: jest.fn(),

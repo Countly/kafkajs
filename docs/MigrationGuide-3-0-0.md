@@ -1146,10 +1146,27 @@ Group visibility and the admin client.
   resolve one result per item and do not throw for an item's own error, so check each result's
   `errorCode` (or its `error`). Prefer `incrementalAlterConfigs` over `alterConfigs`, which replaces
   a resource's whole dynamic config.
+- **An admin client no longer remembers the topics it has read.** In 2.2.4, every topic an admin
+  client read offsets of stayed in all its later metadata requests until its own `deleteTopics`
+  removed it, so a topic deleted by another client made every later call that refreshes metadata
+  fail with `UNKNOWN_TOPIC_OR_PARTITION` (or `TOPIC_AUTHORIZATION_FAILED` for a topic that became
+  unauthorized). Now a call holds its topics only while it runs. A call that names the missing topic
+  still fails as before: `fetchTopicOffsets`, `fetchTopicOffsetsByTimestamp` and
+  `deleteTopicRecords` with `KafkaJSNumberOfRetriesExceeded` whose `cause` is
+  `UNKNOWN_TOPIC_OR_PARTITION`, the others with `UNKNOWN_TOPIC_OR_PARTITION` at once. One window
+  remains: while one call on an admin client is running for a topic that another client deletes,
+  other calls on the same client that refresh metadata can fail with that error until the first
+  call ends (with default retry settings, about 10 seconds at most). When no call is running, the
+  metadata request before cluster-level calls (`createTopics`, `describeConfigs`, …) asks for every
+  topic, as on a new admin client; on a cluster with many topics that request is larger than
+  before. *What to do:* an application that recreated its admin client to recover from these
+  failures no longer needs to; retry a cluster-level call that fails with
+  `UNKNOWN_TOPIC_OR_PARTITION` while another call on the same client is reading a topic that may
+  be deleted.
 - **`describeCluster`, `listTopics` and `fetchTopicMetadata()` no longer fail while a partition
   has no leader.** Neither do the admin calls that refresh the metadata first, such as
-  `createTopics` and `describeConfigs`, unless one of the admin's target topics (a topic it has read
-  or reset offsets of, or deleted records from) has a partition without a leader. They used to fail
+  `createTopics` and `describeConfigs`, unless another call on the same admin client is reading
+  offsets of, or setting offsets for, a topic that has a partition without a leader. They used to fail
   with `LEADER_NOT_AVAILABLE`, after retries, whenever any partition in the cluster had no leader.
   `fetchTopicMetadata()` with no topics now returns such a partition with its `partitionErrorCode`
   and `leader: -1` instead of waiting. *What to do:* code that used `fetchTopicMetadata()` to wait

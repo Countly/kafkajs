@@ -16,6 +16,7 @@ const fixture = () => {
   }
   const cluster = {
     addTargetTopic: jest.fn(async () => {}),
+    holdTargetTopics: jest.fn(() => () => {}),
     refreshMetadata: jest.fn(async () => {}),
     findLeaderForPartitions: jest.fn((_topic, parts) => ({ 1: parts })),
     findBroker: jest.fn(async () => broker),

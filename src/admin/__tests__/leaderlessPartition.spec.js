@@ -505,6 +505,7 @@ describe('Admin > deleteTopicRecords at DeleteRecords v2', () => {
       retry: { retries: 0 },
       cluster: {
         addTargetTopic: async () => {},
+        holdTargetTopics: () => () => {},
         refreshMetadataIfNecessary: async () => {},
         refreshMetadata: async () => {},
         findTopicPartitionMetadata: () => [{ partitionId: 0 }, { partitionId: 2 }],

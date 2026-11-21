@@ -143,6 +143,7 @@ module.exports = class Cluster {
    *   established target the broker answers `UNKNOWN_TOPIC_OR_PARTITION`, instead of failing for
    *   every topic, and reports each change of that topic's status here (see
    *   `BrokerPool#isolateUnknownTopics`). Producer and admin clusters do not pass it.
+   * @param {boolean} [options.orderedMetadata] see `BrokerPool`; the admin cluster passes true
    */
   constructor({
     logger: rootLogger,
@@ -177,6 +178,7 @@ module.exports = class Cluster {
     metadataRecoveryRebootstrapTriggerMs,
     bootstrapResolveTimeout = 0,
     onTopicMetadataStatus,
+    orderedMetadata = false,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -213,6 +215,8 @@ module.exports = class Cluster {
     })
 
     this.targetTopics = new Set()
+    /** @type {Map<string, number>} per target topic, the admin calls in flight that hold it */
+    this.targetHolds = new Map()
     this.metadataMaxIdle = metadataMaxIdle
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
     this.topicPins = metadataMaxIdle === undefined ? null : new Map()
@@ -261,6 +265,7 @@ module.exports = class Cluster {
       allowAutoTopicCreation,
       authenticationTimeout,
       metadataMaxAge,
+      orderedMetadata,
       metadataRecoveryStrategy,
       metadataClusterCheck,
       metadataRecoveryRebootstrapTriggerMs,
@@ -281,10 +286,12 @@ module.exports = class Cluster {
 
     // A refresh joins only calls of its own scope: a producer's fence, else the consumer's
     // subscription key (it moves with the generation and the declaration revision), else the
-    // registration generation, so nothing joins a refresh begun before a mode change.
+    // registration generation, so nothing joins a refresh begun before a mode change. While admin
+    // calls hold targets, a refresh is joined only by calls whose targets it asks for.
     const shareScopeOf = ({ fence, metadataScope } = {}) =>
       fence ??
       (metadataScope ?? this.brokerPool.consumerMetadataScope)?.shareKey() ??
+      (this.targetHolds.size > 0 ? `held:${[...this.targetTopics].join('\0')}` : null) ??
       this.brokerPool.consumerMetadataGeneration ??
       0
 
@@ -491,6 +498,8 @@ module.exports = class Cluster {
     } finally {
       for (const groupId of this.groupEntries.keys()) this.groupRegistry.release(groupId, this)
       this.groupEntries.clear()
+      for (const topic of this.targetHolds.keys()) this.releaseTargetTopic(topic)
+      this.targetHolds = new Map()
     }
   }
 
@@ -904,6 +913,44 @@ module.exports = class Cluster {
   }
 
   /**
+   * Holds topics as targets for one admin call, which adds them itself with `addTargetTopic`.
+   * Counted per topic, so overlapping calls keep a topic until the last one releases it; a topic
+   * whose count reaches zero stops being a target. `disconnect` releases every hold, and a release
+   * taken before it does nothing.
+   * @param {string[]} topics the names the call reads
+   * @returns {() => void} idempotent release
+   */
+  holdTargetTopics(topics) {
+    const holds = this.targetHolds
+    const names = [...new Set(topics)]
+    for (const name of names) holds.set(name, (holds.get(name) ?? 0) + 1)
+    let held = true
+    return () => {
+      if (!held || holds !== this.targetHolds) return
+      held = false
+      for (const name of names) {
+        const left = holds.get(name) - 1
+        if (left > 0) holds.set(name, left)
+        else {
+          holds.delete(name)
+          this.releaseTargetTopic(name)
+        }
+      }
+    }
+  }
+
+  /**
+   * Stops targeting a topic without a request; the cache drops it at the next scoped refresh.
+   * @param {string} topic target name
+   * @returns {void}
+   */
+  releaseTargetTopic(topic) {
+    this.targetTopics.delete(topic)
+    this.establishedTopics.delete(topic)
+    this.targetRevision++
+  }
+
+  /**
    * @public
    * @param {string} topic
    * @return {Promise}
@@ -956,11 +1003,7 @@ module.exports = class Cluster {
             e.type === 'TOPIC_AUTHORIZATION_FAILED'
           ) {
             if (this.targetTopicState === null) {
-              for (const topic of this.addingTopics) {
-                this.targetTopics.delete(topic)
-                this.establishedTopics.delete(topic)
-              }
-              this.targetRevision++
+              for (const topic of this.addingTopics) this.releaseTargetTopic(topic)
             } else {
               for (const topic of this.targetTopics) {
                 if (!previousTopics.has(topic)) this.forgetTargetTopic(topic)

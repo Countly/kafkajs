@@ -14,6 +14,7 @@ const fixture = (overrides = {}, retryOptions = retry) => {
   const broker = { nodeId: 1 }
   const cluster = {
     addTargetTopic: jest.fn(async () => {}),
+    holdTargetTopics: jest.fn(() => () => {}),
     refreshMetadata: jest.fn(async () => {}),
     findBroker: jest.fn(async () => broker),
     findLeaderForPartitions: jest.fn((_topic, parts) => ({ 1: parts })),

@@ -152,6 +152,8 @@ module.exports = class BrokerPool {
    * @param {boolean} [options.allowAutoTopicCreation]
    * @param {number} [options.authenticationTimeout]
    * @param {number} [options.metadataMaxAge]
+   * @param {boolean} [options.orderedMetadata] an answer never replaces the installed answer of a
+   *   request sent after it (the admin cluster, whose calls hold their topics as targets)
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
    *   `'rebootstrap'` enables all three triggers in `refreshMetadata`/`findConnectedBroker`, and
    *   the same recovery on a `REBOOTSTRAP_REQUIRED` answer to ApiVersions (KIP-1242);
@@ -178,6 +180,7 @@ module.exports = class BrokerPool {
     allowAutoTopicCreation,
     authenticationTimeout,
     metadataMaxAge,
+    orderedMetadata = false,
     metadataRecoveryStrategy,
     metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
@@ -206,6 +209,9 @@ module.exports = class BrokerPool {
     this.connectionPoolBuilder = connectionPoolBuilder
     this.bootstrapResolution = bootstrapResolution
     this.metadataMaxAge = metadataMaxAge || 0
+    this.metadataRequests = 0
+    /** @type {number|null} when ordered, the number of the request whose answer is installed */
+    this.installedRequest = orderedMetadata ? 0 : null
     this.logger = logger.namespace('BrokerPool')
     this.retryOptions = assign({}, retry)
     this.retrier = (action) => retrierOf(this.retryOptions)(action)
@@ -1082,10 +1088,15 @@ module.exports = class BrokerPool {
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
+          const request = ++this.metadataRequests
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
           if (!applicable()) return
+          if (this.installedRequest !== null) {
+            if (request < this.installedRequest) return
+            this.installedRequest = request
+          }
           if (accept) {
             const settled = this.settleTopicErrors(response.topicMetadata, accept)
             checkPartitions(settled, { allowLeaderless })

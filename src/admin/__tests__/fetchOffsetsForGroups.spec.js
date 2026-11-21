@@ -795,6 +795,7 @@ describe('multi-group validation and exhaustion', () => {
     const cluster = {
       findGroupCoordinator: jest.fn(async () => target),
       addTargetTopic: jest.fn(),
+      holdTargetTopics: jest.fn(() => () => {}),
       refreshMetadataIfNecessary: jest.fn(),
       findTopicPartitionMetadata: () => [{ partitionId: 0 }],
     }

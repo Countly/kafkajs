@@ -274,6 +274,21 @@ class TransactionAdmin {
     const { topicPartitions, brokerId } = this.options(options)
     const items = this.partitions(topicPartitions)
     if (brokerId !== undefined) this.integer(brokerId, 2147483647, 'brokerId')
+    const release = this.cluster.holdTargetTopics(
+      brokerId === undefined ? this.topics(items).map(({ topic }) => topic) : []
+    )
+    try {
+      return await this.describeProducerItems(items, brokerId)
+    } finally {
+      release()
+    }
+  }
+
+  /** Describes the validated partitions, routed by leader unless a broker is given.
+   * @param {object[]} items validated partitions @param {number} [brokerId] fixed replica
+   * @returns {Promise<object[]>} topic/partition results @throws {Error} as `describeProducers`
+   */
+  async describeProducerItems(items, brokerId) {
     let refresh = brokerId === undefined
     if (brokerId === undefined) {
       for (const { topic } of this.topics(items))
@@ -435,7 +450,13 @@ class TransactionAdmin {
     const producerId = this.producerId(input.producerId)
     const producerEpoch = this.integer(input.producerEpoch, 32767, 'producerEpoch')
     const coordinatorEpoch = this.integer(input.coordinatorEpoch, 2147483647, 'coordinatorEpoch')
-    checked(await waitOf(() => this.cluster.addTargetTopic(topic)))
+    const release = this.cluster.holdTargetTopics([topic])
+    try {
+      checked(await waitOf(() => this.cluster.addTargetTopic(topic)))
+    } catch (error) {
+      release()
+      throw error
+    }
     let refresh = true
     await retrierOf(this.retry)(async (bail) => {
       try {
@@ -482,7 +503,7 @@ class TransactionAdmin {
         if (error.code === 7 || (error.code === undefined && error.retriable === true)) throw error
         bail(error)
       }
-    })
+    }).finally(release)
   }
 
   /** Fences each id through the existing InitProducerId sentinel request.
