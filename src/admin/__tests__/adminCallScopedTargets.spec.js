@@ -668,35 +668,6 @@ describe('Admin > each call targets its topics only while it runs', () => {
       expect(await t).toEqual({ ok: T_OFFSETS })
     })
 
-    test('reads joined to a refresh still get their offsets when a rebootstrap cleared a newer answer before theirs landed', async () => {
-      h = build()
-      await h.admin.connect()
-      alwaysStale(h.cluster)
-      const narrow = latch()
-      const resume = latch()
-      let narrowSeen = 0
-      h.setGate(async (topics) => {
-        if (topics.length === 1 && topics[0] === 'U' && ++narrowSeen === 2) {
-          narrow.release()
-          await resume.promise
-        }
-      })
-      const first = outcome(h.admin.fetchTopicOffsets('U'))
-      await narrow.promise
-      const second = outcome(h.admin.fetchTopicOffsets('U'))
-      await tick()
-      expect(narrowSeen).toBe(2)
-      await h.admin.fetchTopicMetadata({ topics: ['T'] })
-      await h.cluster.brokerPool.rebootstrap('required')
-      expect(h.cluster.brokerPool.metadata).toBeNull()
-
-      resume.release()
-
-      expect(await first).toEqual({ ok: U_OFFSETS })
-      expect(await second).toEqual({ ok: U_OFFSETS })
-      expect([...h.cluster.targetTopics]).toEqual([])
-    })
-
     test('a read whose older answer lands while a newer answer is still building the broker of a moved leader gets its offsets', async () => {
       h = build()
       await h.admin.connect()

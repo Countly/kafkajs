@@ -972,10 +972,7 @@ module.exports = class BrokerPool {
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
    * and rebuilds the seed, so re-resolving both on every iteration is what keeps a later attempt
    * from calling a disconnected object or building a duplicate `Broker` for the seed's own node
-   * id via a stale `seedHost`/`seedPort` pair. An answer that arrives after a rebootstrap (or a
-   * removed seed) replaced the seed is not installed: the attempt is retried on the new seed, within the same retry
-   * budget, so no caller is handed routing whose brokers were never reconciled.
-   * `findConnectedBroker()`'s own throw is `bail()`ed
+   * id via a stale `seedHost`/`seedPort` pair. `findConnectedBroker()`'s own throw is `bail()`ed
    * immediately rather than left for the retrier to reclassify - the retrier's generic
    * catch-and-wrap would otherwise turn e.g. a `KafkaJSSASLAuthenticationError` into a
    * `KafkaJSNonRetriableError` and replace its `retryCount`/`retryTime`, breaking callers (the
@@ -1088,18 +1085,12 @@ module.exports = class BrokerPool {
         if (!applicable()) return
         const seedBroker = this.seedBroker
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
-        let superseded = null
 
         try {
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
           if (!applicable()) return
-          // A seed replaced while the request was out (a rebootstrap, a removed seed) leaves an
-          // answer that could not reconcile the broker table it routes to: ask the new seed.
-          if (this.seedBroker !== seedBroker) {
-            throw (superseded = new KafkaJSConnectionError('A rebootstrap superseded the request'))
-          }
           if (accept) {
             const settled = this.settleTopicErrors(response.topicMetadata, accept)
             checkPartitions(settled, { allowLeaderless })
@@ -1215,7 +1206,6 @@ module.exports = class BrokerPool {
           if (guard?.()) return bail(e)
           if (!applicable()) return
           if (
-            e === superseded ||
             e.type === 'LEADER_NOT_AVAILABLE' ||
             ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
               e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
