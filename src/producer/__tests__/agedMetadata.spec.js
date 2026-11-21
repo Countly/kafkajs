@@ -524,6 +524,38 @@ describe('Cluster > a refresh across a disconnect', () => {
       await old
     }
   })
+
+  it('sends and installs nothing for a refresh requested in the same tick as a disconnect', async () => {
+    const scripted = producerScript(createScriptedCluster({ nodes: NODES }))
+    scripted.answer('Metadata', () => metadataAnswer())
+    const clusterOf = captureCluster()
+    const admin = new Kafka(
+      scripted.kafkaOptions({
+        metadataRecoveryStrategy: 'none',
+        retry: { initialRetryTime: 100, retries: 1 },
+      })
+    ).admin()
+    await admin.connect()
+    const cluster = clusterOf()
+    const pool = cluster.brokerPool
+    cluster.targetTopics.add(TOPIC)
+    scripted.answer('Metadata', () => metadataAnswer({ partitions: 3 }))
+    const sent = scripted.tally('Metadata')
+
+    const refresh = within(cluster.refreshMetadata(), 'the same-tick refresh')
+    try {
+      await cluster.disconnect()
+      await refresh
+      await turns()
+
+      expect(scripted.tally('Metadata')).toBe(sent)
+      expect(pool.metadata).toBeNull()
+      expect(Object.keys(pool.brokers)).toEqual([])
+      expect(scripted.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+    } finally {
+      await admin.disconnect()
+    }
+  })
 })
 
 describe('Cluster > refreshMetadataIfNecessary without the producer option', () => {
