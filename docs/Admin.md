@@ -17,6 +17,11 @@ An old lookup, authentication, encoder, queued write or response cannot
 send, reconnect or clear the replacement lifecycle. A forced close reports an unknown outcome;
 a mutation already sent may have been applied. Inspect the broker state before repeating it.
 
+An admin client keeps every topic it has read offsets of as a metadata target, until its own
+`deleteTopics` removes it. If another client deletes such a topic, later calls of this admin
+client that refresh metadata fail with `UNKNOWN_TOPIC_OR_PARTITION`, until you create a new admin
+client. See [Known issues](MigrationGuide-3-0-0.md#known-issues).
+
 ## Admin API ledger
 
 The following rows cover the complete public Admin method surface and its direct options.
@@ -449,6 +454,8 @@ await admin.fetchTopicOffsets(topic)
 ```
 
 `fetchTopicOffsets` and consumer offset resolution keep their existing behavior. Named offset specifications are selected through `fetchTopicOffsetsByTimestamp`.
+
+Parallel `fetchTopicOffsets` calls on one admin client can fail with `TypeError: Cannot destructure property 'partitions'…` when one of them reads a topic this client has not read before; read each topic once, awaited, before reading in parallel. The topic stays a metadata target of the admin client, so another client deleting it breaks later admin calls. See [Known issues](MigrationGuide-3-0-0.md#known-issues).
 
 ## <a name="fetch-topic-offsets-by-timestamp"></a> Fetch topic offsets by timestamp
 
