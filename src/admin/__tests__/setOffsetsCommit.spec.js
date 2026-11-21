@@ -1,4 +1,5 @@
 const { Kafka } = require('../../../index')
+const Long = require('../../utils/long')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const { describeGroupAs } = require('./fixtures/describeGroupAs')
@@ -570,6 +571,18 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
         [1, '-2'],
       ],
     ])
+  })
+
+  test.each([
+    ['a signed string', '+5', '5'],
+    ['a bigint', 10n, '10'],
+    ['a Long', Long.fromValue('7'), '7'],
+  ])('%s offset is sent in decimal', async (_, offset, sent) => {
+    await connect()
+
+    await set([{ partition: 0, offset }])
+
+    expect(cells()).toEqual([[[0, sent]]])
   })
 
   test('the largest int64 offset is sent as given', async () => {

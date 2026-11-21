@@ -20,6 +20,7 @@ const {
 const { createOffsets, OffsetAdmin } = require('./offsets')
 const createLogDirs = require('./logDirs')
 const groupBy = require('../utils/groupBy')
+const Long = require('../utils/long')
 const { assertPartitionId } = require('../utils/partitionId')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
@@ -132,18 +133,19 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
 const isConsumerGroupRunning = (description) => ['Empty', 'Dead'].includes(description.state)
 
 /**
- * An offset as a commit carries it. Only a decimal integer string (an optional `-` and digits) or a
- * safe integer number is read; anything else, `'NaN'`, a blank or prefixed string, a boolean or an
- * array say, is refused rather than read as 0 the way `Long.fromValue` would.
- * @param {string|number} offset a long of at least 0, or `-1` (latest) or `-2` (earliest)
+ * An offset as a commit carries it. Only a decimal integer string (an optional sign and digits), a
+ * safe integer number, a bigint or a `Long` is read; anything else, `'NaN'`, a blank or prefixed
+ * string, a boolean or an array say, is refused rather than read as 0 the way `Long.fromValue` would.
+ * @param {string|number|bigint|Long} offset a long of at least 0, or `-1` (latest) or `-2` (earliest)
  * @returns {string} the offset in decimal
  * @throws {KafkaJSNonRetriableError} for anything else, a value above the signed int64 range
  *   included
  */
 const commitOffsetOf = (offset) => {
+  const text = typeof offset === 'bigint' || offset instanceof Long ? offset.toString() : offset
   const value =
-    (typeof offset === 'string' && /^-?\d+$/.test(offset)) || Number.isSafeInteger(offset)
-      ? BigInt(offset)
+    (typeof text === 'string' && /^[+-]?\d+$/.test(text)) || Number.isSafeInteger(text)
+      ? BigInt(text)
       : null
   if (value === null || value > MAX_OFFSET) {
     throw new KafkaJSNonRetriableError(`Invalid offset, expected a long received ${String(offset)}`)
