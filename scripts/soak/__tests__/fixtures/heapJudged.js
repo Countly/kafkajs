@@ -3,7 +3,7 @@
  * Writes three real heap snapshots of this process, `<dir>/<slot>.h00`, `.h01` and `.h02`, and
  * between the last two grows one thing:
  *
- *   code     about 7 MiB of bytecode and feedback, by calling functions whose source was loaded
+ *   code     at least 7 MiB of bytecode and feedback, by calling functions whose source was loaded
  *            before the first snapshot
  *   map      3 MiB of entries in the `topics` Map of a product `MetadataCache`
  *   array    3 MiB of objects in an array of this harness file
@@ -21,7 +21,7 @@ const MetadataCache = require('../../../../src/cluster/metadataCache')
 
 const [dir, slot, kind] = process.argv.slice(2)
 const MIB = 1024 * 1024
-const FUNCTIONS = 800
+const FUNCTIONS = 1400
 
 /** @param {number} i @returns {string} the source of one function with a long body */
 const body = (i) => {
