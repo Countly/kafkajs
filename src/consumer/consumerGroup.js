@@ -940,9 +940,15 @@ module.exports = class ConsumerGroup {
    * inside its install and the newest desired revision is handed on afterwards. Every refresh lets
    * a partition without a leader through as leader -1, so routing skips it; a strict refresh would
    * fail until its retries end and take the fetch loop down with it.
+   *
+   * With `ifNecessary`, metadata that names every subscribed topic and is only past
+   * `metadataMaxAge` is used as it is and refreshed in the background, so a broker that does not
+   * answer that refresh delays no fetch; as in the Java consumer, a fetch never waits for a
+   * periodic refresh. What that refresh discovers is acted on from the next round on.
    * @param {object} [options]
    * @param {Generation} [options.fence] the run's terminal fence, binding the refresh to the run
-   * @param {boolean} [options.ifNecessary=false] refresh only when the cache is missing or expired
+   * @param {boolean} [options.ifNecessary=false] wait for a refresh only when the cache is missing
+   *   a subscribed topic; refresh in the background when it is only expired
    * @returns {Promise<void>}
    * @throws {Error} the refresh's failure or the fence's close error
    */
@@ -950,7 +956,7 @@ module.exports = class ConsumerGroup {
     if (!this.subscription) {
       const options = { ...(fence && { fence }), allowLeaderless: true }
       await (ifNecessary
-        ? this.cluster.refreshMetadataIfNecessary(options)
+        ? this.cluster.refreshMetadataIfNecessary({ ...options, background: true })
         : this.cluster.refreshMetadata(options))
       return
     }
@@ -966,7 +972,7 @@ module.exports = class ConsumerGroup {
     }
 
     await (ifNecessary
-      ? this.cluster.refreshMetadataIfNecessary(options)
+      ? this.cluster.refreshMetadataIfNecessary({ ...options, background: true })
       : this.cluster.refreshMetadata(options))
 
     if (this.discovered) {

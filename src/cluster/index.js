@@ -595,14 +595,15 @@ module.exports = class Cluster {
    * @param {() => boolean} [options.isCurrent] see `refreshMetadata`
    * @param {boolean} [options.allowAutoTopicCreation] see `refreshMetadata`
    * @param {(metadata: object) => void} [options.onMetadata] see `refreshMetadata`
-   * @param {boolean} [options.background] producer sends only: when every target is in the cached
-   *   metadata, return at once, and when that metadata is only past `metadataMaxAge`, refresh it in
-   *   the background, as the Java producer's `waitOnMetadata` does; see `serveFromCache`
+   * @param {boolean} [options.background] producer sends and consumer fetch rounds: when every
+   *   target is in the cached metadata, return at once, and when that metadata is only past
+   *   `metadataMaxAge`, refresh it in the background with the same scope, as the Java clients do
+   *   (the producer's `waitOnMetadata`, the consumer's fetch); see `serveFromCache`
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
   async refreshMetadataIfNecessary({ fence, background = false, ...scope } = {}) {
-    if (background && this.serveFromCache(fence)) return
+    if (background && this.serveFromCache({ fence, ...scope })) return
     await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence, ...scope })
   }
 
@@ -619,14 +620,20 @@ module.exports = class Cluster {
    * by its lifecycle's close, or begun before the pool's last disconnect, installs nothing, as any
    * fenced refresh. The state is one object, replaced when the lifecycle changes, and holds no
    * timer.
+   * The caller's scope (a consumer's subscription, run check and observer) both judges the cache
+   * and goes with the background refresh, so a pattern consumer's discovery is observed when that
+   * refresh installs.
    * @private
-   * @param {import('../producer/generation')} [fence] the sending lifecycle
+   * @param {object} options
+   * @param {import('../producer/generation')} [options.fence] the sending or fetching lifecycle
+   * @param {object} [options.metadataScope] see `refreshMetadata`; the rest of the scope is only
+   *   handed on
    * @returns {boolean} whether the call was served from the cache; false sends it the awaited way
    */
-  serveFromCache(fence) {
+  serveFromCache({ fence, ...scope }) {
     fence?.check()
     this.pruneTargetTopics()
-    const cached = this.brokerPool.metadataState(Array.from(this.targetTopics))
+    const cached = this.brokerPool.metadataState(Array.from(this.targetTopics), scope.metadataScope)
     if (cached !== 'aged') return cached === 'fresh'
     let state = this.backgroundRefresh
     if (!state || state.fence !== fence) {
@@ -634,7 +641,7 @@ module.exports = class Cluster {
     }
     if (state.running || performance.now() < state.retryAt) return true
     state.running = true
-    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence }).then(
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence, ...scope }).then(
       () => {
         state.running = false
         state.backoff = 0
