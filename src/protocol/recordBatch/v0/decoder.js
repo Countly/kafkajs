@@ -286,13 +286,15 @@ module.exports = async (
   // recordContext: that object is attached to every message as `batchContext`, and its shape is
   // part of the public message.
   const firstOffsetNumber = Number(firstOffset)
+  const firstTimestampNumber = Number(firstTimestamp)
 
   try {
     const records = await decodeRecords(
       { codec, attributes, count, limit: maxDecompressedBatchBytes },
       decoder,
       { ...recordContext, magicByte },
-      firstOffsetNumber
+      firstOffsetNumber,
+      firstTimestampNumber
     )
 
     if (isControlBatch) {
@@ -336,6 +338,7 @@ module.exports = async (
  * @param {Decoder} recordsDecoder positioned at the start of the records section
  * @param {object} recordContext the batch-level values shared by every record in the batch
  * @param {number} firstOffsetNumber `Number(firstOffset)`, computed once per batch
+ * @param {number} firstTimestampNumber `Number(firstTimestamp)`, computed once per batch
  * @returns {Promise<object[]>} the decoded records, in wire order
  * @throws {KafkaJSCorruptRecordError} with reason `count` for a negative count, one above the
  *         record ceiling or one the bytes cannot hold, and for a compressed body `decompressed-size`
@@ -345,7 +348,8 @@ const decodeRecords = async (
   { codec, attributes, count, limit },
   recordsDecoder,
   recordContext,
-  firstOffsetNumber
+  firstOffsetNumber,
+  firstTimestampNumber
 ) => {
   if (count < 0) {
     throw corrupt(`Record count ${count} is negative`, 'count', recordContext.firstOffset)
@@ -383,7 +387,7 @@ const decodeRecords = async (
   const records = new Array(count)
 
   for (let i = 0; i < count; i++) {
-    records[i] = decodeRecord(decoder, recordContext, firstOffsetNumber)
+    records[i] = decodeRecord(decoder, recordContext, firstOffsetNumber, firstTimestampNumber)
   }
 
   return records
@@ -394,16 +398,22 @@ const decodeRecords = async (
  * @param {Decoder} decoder positioned at the record's length varint
  * @param {object} recordContext the batch-level values shared by every record in the batch
  * @param {number} firstOffsetNumber `Number(firstOffset)`, computed once per batch
+ * @param {number} firstTimestampNumber `Number(firstTimestamp)`, computed once per batch
  * @returns {object} the decoded record
  * @throws {KafkaJSCorruptRecordError} with reason `length` for a record whose length is -1, the
  *         null of a varint length, which no record can have
  */
-const decodeRecord = (decoder, recordContext, firstOffsetNumber) => {
+const decodeRecord = (decoder, recordContext, firstOffsetNumber, firstTimestampNumber) => {
   const recordBuffer = decoder.readVarIntBytes()
 
   if (recordBuffer === null) {
     throw corrupt('Record length is -1', 'length', recordContext.firstOffset)
   }
 
-  return RecordDecoder(new Decoder(recordBuffer), recordContext, firstOffsetNumber)
+  return RecordDecoder(
+    new Decoder(recordBuffer),
+    recordContext,
+    firstOffsetNumber,
+    firstTimestampNumber
+  )
 }
