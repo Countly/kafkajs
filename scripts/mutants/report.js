@@ -31,6 +31,11 @@ const SEVERITY = {
   'group-timing': 'P1',
   share: 'P1',
   protocol: 'P1',
+  'producer-send': 'P1',
+  network: 'P1',
+  'fetch-loop': 'P1',
+  compression: 'P1',
+  'aged-metadata': 'P2',
   cluster: 'P2',
   admin: 'P2',
 }
