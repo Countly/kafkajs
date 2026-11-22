@@ -1261,6 +1261,26 @@ const interruptsAcquisition = (kind, event, entry) =>
     })
   )
 
+/**
+ * Optional work meter for the cooperative audits, set by tests: every bounded audit loop counts
+ * each record, row or member it visits here, so a test can bound the visits between two yields
+ * and their growth with the run without reading real time. Work done inside one visit is not
+ * counted and stays one step: encoding or decoding one archive row (its size follows the row),
+ * `historyAccounting` for one cut and `epochAdvance` for one replay.
+ * @type {{ visits: number } | null}
+ */
+let auditMeter = null
+
+/**
+ * Counts one audit visit and tells its loop when to yield.
+ * @param {number} visited Visits this loop made before this one.
+ * @returns {boolean} Whether to yield first: before every 100th visit.
+ */
+const auditVisit = (visited) => {
+  if (auditMeter) auditMeter.visits++
+  return visited % 100 === 0
+}
+
 /** @param {Map} index Join index. @param {*} key Key. @param {*} value Member. @returns {void} */
 const indexMember = (index, key, value) => {
   if (!index.has(key)) index.set(key, [])
@@ -1272,7 +1292,7 @@ const mappedAuditWork = function* (values, project) {
   const rows = []
   let visited = 0
   for (const value of values) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     rows.push(project(value))
   }
   return rows
@@ -1290,7 +1310,7 @@ const sortedAuditWork = function* (values, compare) {
       const middle = right
       const end = Math.min(base + 2 * width, source.length)
       for (let at = base; at < end; at++) {
-        if (comparisons++ % 100 === 0) yield
+        if (auditVisit(comparisons++)) yield
         target[at] =
           left < middle && (right >= end || compare(source[left], source[right]) <= 0)
             ? source[left++]
@@ -1371,7 +1391,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   evidence.outcomesByCohort = new Map()
   let visited = 0
   for (const [cohort, outcomes] of cohortOutcomes) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     evidence.outcomesByCohort.set(cohort, outcomes)
   }
   entries = yield* mappedAuditWork(originalEntries, (entry) => ({
@@ -1394,14 +1414,14 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     evidence.auditIndex.obligations.set(bounce, effectiveObligations(bounce))
   }
   for (const exchange of evidence.exchanges) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     const cohorts = new Set(exchange.tickets.map(({ cohort }) => cohort))
     for (const cohort of cohorts) indexMember(evidence.exchangesByCohort, cohort, exchange)
   }
   // Preserve cohort membership even for scripted empty-ticket acquisitions.
   for (const [cohort, exchanges] of cohortExchanges)
     for (const exchange of exchanges) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!originalExchanges.has(exchange)) continue
       const copied = exchangeCopy(exchange)
       if (!(evidence.exchangesByCohort.get(cohort) ?? []).includes(copied))
@@ -1416,11 +1436,11 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }))
   const seenAcquisitions = new Set()
   for (const { acquisition } of originals) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     seenAcquisitions.add(acquisition)
   }
   for (const entry of entries) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     if (!seenAcquisitions.has(entry.acquisition)) {
       seenAcquisitions.add(entry.acquisition)
       originals.push(entry)
@@ -1428,7 +1448,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   const authorities = new Map()
   for (const entry of originals) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     if (!entry.acquisition?.source?.frames[0]) continue
     const scope = authority(entry)
     const key = JSON.stringify(scope)
@@ -1446,7 +1466,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   const journal = interruptionJournal(evidence)
   for (const item of journal) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     const key =
       item.kind === 'socket'
         ? `socket:${item.event.socket}`
@@ -1464,7 +1484,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     }
   )
   for (const { kind, event } of primitives) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     const cut = interruptionEvent(kind, event)
     if (kind === 'command') {
       episodes.push({
@@ -1491,7 +1511,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   const timeline = []
   for (const entry of entries) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     indexMember(evidence.auditIndex.deliveries, entry.identity, entry)
     timeline.push({ kind: 'handler', event: entry })
     const outcomes = entry.acquisition ? evidence.successfulReceipts(entry) : []
@@ -1513,7 +1533,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     const successes = []
     const cuts = []
     while (position < orderedTimeline.length && orderedTimeline[position].event.at === at) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const item = orderedTimeline[position++]
       if (item.kind === 'handler') indexMember(active, item.event.identity, item.event)
       else if (item.kind === 'success') successes.push(item)
@@ -1525,7 +1545,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
       if (evidence.auditIndex.history.has(key)) continue
       const lastSuccess = new Map()
       for (const { entry, event } of successes) {
-        if (visited++ % 100 === 0) yield
+        if (auditVisit(visited++)) yield
         if (!precedes(entry, cut) || !precedes(event, cut)) continue
         const prior = lastSuccess.get(entry.identity)
         if (!prior || entryPosition.get(prior) < entryPosition.get(entry))
@@ -1535,7 +1555,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
       for (const [identity, group] of active) {
         const success = lastSuccess.get(identity)
         for (const entry of group) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           if (precedes(entry, cut) && (!success || precedes(success, entry))) history.push(entry)
         }
       }
@@ -1546,7 +1566,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     }
     // Every later clock strictly follows these receipts, even when their sequence is unavailable.
     for (const { entry } of successes) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const remaining = (active.get(entry.identity) ?? []).filter((later) => precedes(entry, later))
       if (remaining.length) active.set(entry.identity, remaining)
       else active.delete(entry.identity)
@@ -1956,14 +1976,14 @@ const reconstructFreezes = function* (entries, bounces, evidence) {
   )
   let primitiveCount = 0
   for (const { kind, event } of journal) {
-    if (primitiveCount++ % 100 === 0) yield
+    if (auditVisit(primitiveCount++)) yield
     const cut = interruptionEvent(kind, event)
     if (kind === 'command') {
       origins = new Map()
       for (const prior of reconstructed)
         if (prior.index < event.index)
           for (const held of newObligations(prior)) {
-            if (primitiveCount++ % 100 === 0) yield
+            if (auditVisit(primitiveCount++)) yield
             if (!origins.has(held.entry)) origins.set(held.entry, prior.index)
           }
       const history = unresolvedAt(entries, evidence, cut)
@@ -2133,7 +2153,7 @@ const epochSampleIndexWork = function* (samples) {
     cached = { length: samples.length, rows: new Map() }
     let visited = 0
     for (const sample of samples) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (sample.frames.length !== 1) continue
       const frame = sample.frames[0]
       if (frame.apiKey !== 3 || frame.apiVersion < 7) continue
@@ -2720,7 +2740,7 @@ const auditReplayWork = function* (entries, bounces, corpus, evidence) {
   const problems = [...uncertainty.problems]
   const extras = []
   for (const [index, entry] of entries.entries()) {
-    if (index % 100 === 0) yield
+    if (auditVisit(index)) yield
     const old = previous.get(entry.identity)
     const key = `${entry.acquisition?.source?.frames[0]?.id}:${entry.topicId}:${entry.partition}:${entry.offset}`
     if (!corpus.has(entry.identity)) problems.push(`${entry.identity} is outside the corpus`)
@@ -2810,7 +2830,7 @@ const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, 
   const successful = new Set()
   const last = new Map()
   for (const [index, entry] of entries.entries()) {
-    if (index % 100 === 0) yield
+    if (auditVisit(index)) yield
     last.set(entry.identity, entry)
     if (
       entry.acquisition &&
@@ -2820,7 +2840,7 @@ const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, 
   }
   let checked = 0
   for (const entry of last.values()) {
-    if (checked++ % 100 === 0) yield
+    if (auditVisit(checked++)) yield
     if (corpus.has(entry.identity) && validAcquisition(entry) && evidence.successful(entry))
       successful.add(entry.identity)
   }
@@ -2829,7 +2849,7 @@ const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, 
   const unresolved = []
   let visited = 0
   for (const identity of corpus) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     if (successful.has(identity)) continue
     const entry = last.get(identity)
     let candidate = null
@@ -2977,7 +2997,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
   }
   let visited = 0
   for (const [occurrence, exchange] of exchanges.entries()) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     for (const frame of exchange.frames) {
       if (
         frame.request?.topics.some(({ partitions }) =>
@@ -3007,7 +3027,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
         const state = requested.has(key) && partitions.get(key)
         if (!state) continue
         for (const range of partition.acquiredRecords ?? []) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           const bad =
             !Number.isInteger(range.deliveryCount) ||
             range.deliveryCount < 1 ||
@@ -3032,7 +3052,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
     let position = 0
     for (const { at, entry } of identities) {
       while (position < events.length && events[position].at <= at) {
-        if (visited++ % 100 === 0) yield
+        if (auditVisit(visited++)) yield
         const event = events[position++]
         const count = (active.get(event.occurrence) ?? 0) + event.delta
         if (count) active.set(event.occurrence, count)
@@ -3514,6 +3534,7 @@ const boundedEvidence = (value, limit) => {
 /**
  * Compresses complete JSON losslessly; chunks split encoded bytes, never nested membership.
  * Manifest counts and the digest let readers reject missing, reordered or changed chunks.
+ * Synchronous: one call is one audit step, so the step's work grows with the row's size.
  * @param {string} event Original row kind.
  * @param {string} id Stable object ID.
  * @param {object} fields Complete original facts.
@@ -3548,6 +3569,7 @@ const evidenceRows = (event, id, fields) => {
 
 /**
  * Reconstructs a chunked object, rejecting missing, reordered or damaged members.
+ * Synchronous, like `evidenceRows`: one row's decode is one audit step.
  * @param {object[]} rows Manifest followed by original chunks.
  * @returns {object} Complete original object.
  * @throws {Error} The specific incomplete evidence component.
@@ -5757,7 +5779,7 @@ class ShareBounceCase {
     const bulkFrames = []
     let planned = 0
     for (const frame of this.tap.allFrames) {
-      if (planned++ % 100 === 0) yield
+      if (auditVisit(planned++)) yield
       const producerFrame = [0, 22].includes(frame.apiKey)
       if (failed && !producerFrame && !frameIds.has(frame.id)) continue
       const { bytes, responseBytes, ...fact } = frame
@@ -5887,7 +5909,7 @@ class ShareBounceCase {
     // Use the existing lossless history schema to avoid thousands of duplicate row envelopes.
     const counts = new Map()
     for (const row of rows) {
-      if (planned++ % 100 === 0) yield
+      if (auditVisit(planned++)) yield
       indexMember(counts, `${row.event}:${priority(row)}`, row)
     }
     const packed = []
@@ -5917,7 +5939,7 @@ class ShareBounceCase {
     }
     const manifest = []
     for (const [index, fact] of orderedRows.entries()) {
-      if (index % 100 === 0) yield
+      if (auditVisit(index)) yield
       manifest.push({
         index,
         event: fact.event,
@@ -5972,11 +5994,11 @@ class ShareBounceCase {
     const byEvent = new Map()
     let visited = 0
     for (const { event, fields } of rows) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const history = ARCHIVE_HISTORY_MEMBERS.get(event)
       if (history) {
         for (const member of fields[history.key]) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           indexMember(byEvent, history.event, member)
         }
       } else indexMember(byEvent, event, fields)
@@ -5989,7 +6011,7 @@ class ShareBounceCase {
         ...(byEvent.get(bulk) ?? []).map((row) => row[key]),
       ])
         for (const row of group) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           index.set(row.id, row)
         }
       return index
@@ -6003,7 +6025,7 @@ class ShareBounceCase {
       ...(byEvent.get('exchange-history') ?? []).flatMap(({ exchanges }) => exchanges),
     ]
     for (const row of referenced) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       for (const id of row.frames ?? []) frameIds.add(id)
     }
     problems.push(...this.archiveLifecycleProblems(byEvent))
@@ -6011,7 +6033,7 @@ class ShareBounceCase {
       (byEvent.get('bounce-control') ?? []).map((control) => [control.id, control])
     )
     for (const extra of byEvent.get('replay-entry') ?? []) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const witness = extra.incarnationWitness
       if (!witness) continue
       for (const key of [
@@ -6036,11 +6058,11 @@ class ShareBounceCase {
       ...this.evidence.epochs,
       ...this.evidence.brokerStates,
     ]) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (source.response) for (const { id } of source.frames) completed.add(id)
     }
     for (const id of frameIds) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const frame = frames.get(id)
       if (!frame) problems.push(`frame: missing required original ${id}`)
       else {
@@ -6053,14 +6075,14 @@ class ShareBounceCase {
     const acquisitions = yield* originals('acquisition', 'acquisition-history', 'acquisitions')
     const exchanges = yield* originals('share-exchange', 'exchange-history', 'exchanges')
     for (const entry of entries.values()) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const acquisition = acquisitions.get(entry.acquisition)
       if (!acquisition || !exchanges.has(acquisition.exchange))
         problems.push(`acquisition-reference: missing original for ${entry.id}`)
     }
     for (const bounce of byEvent.get('frozen-bounce') ?? []) {
       for (const held of [...bounce.obligations, ...bounce.carried]) {
-        if (visited++ % 100 === 0) yield
+        if (auditVisit(visited++)) yield
         if (!entries.has(held.entry))
           problems.push(`interruption-member: missing original ${held.entry}`)
       }
@@ -6071,7 +6093,7 @@ class ShareBounceCase {
           ...cut.obligations.map(({ entry }) => entry),
           ...cut.carried.map(({ entry }) => entry),
         ]) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           if (!entries.has(id)) problems.push(`interruption-member: missing original ${id}`)
         }
         const event =
@@ -6227,7 +6249,7 @@ class ShareBounceCase {
     const groups = new Map()
     let visited = 0
     for (const original of typeof stored === 'string' ? stored.split('\n') : stored) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!original) continue
       const row = typeof original === 'string' ? JSON.parse(original) : original
       rows.push(row)
@@ -6286,7 +6308,7 @@ class ShareBounceCase {
     const cohorts = new Set()
     const exchanges = new Set()
     for (const { acquisition, ...entry } of this.entries) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!identities.has(entry.identity)) continue
       cohorts.add(acquisition?.id)
       exchanges.add(acquisition?.exchange)
@@ -6317,7 +6339,7 @@ class ShareBounceCase {
       }
     }
     for (const { frames, response, ...exchange } of this.evidence.exchanges) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (
         !exchange.tickets.some(({ cohort }) => cohorts.has(cohort)) &&
         !exchanges.has(exchange.id)
@@ -6373,7 +6395,7 @@ class ShareBounceCase {
         ])
     )
     for (const entry of involvedSources.values()) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const frame = entry.acquisition?.source?.frames[0]
       if (!frame) continue
       const samples = sourceEpochSamples(entry, this.evidence.epochs, false)
@@ -6398,7 +6420,7 @@ class ShareBounceCase {
           chosen.add(sample.frame.id)
     }
     for (const { frames, ...source } of this.evidence.epochs) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!frames.some(({ id }) => chosen.has(id))) continue
       for (const { id } of frames) frameIds.add(id)
       emit('epoch-source', { ...source, frames: frames.map(({ id }) => id) })
@@ -6412,7 +6434,7 @@ class ShareBounceCase {
     for (const frame of this.tap.allFrames) if (frameIds.has(frame.id)) sockets.add(frame.socket)
     const omittedEvents = []
     for (const event of this.tap.socketEvents) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!sockets.has(event.socket)) {
         omittedEvents.push(event)
         continue
@@ -9073,7 +9095,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
   /**
    * Runs the synthetic drain, terminal, archive and completion audit on one corpus size, metering
    * the visits the cooperative audit loops count (`auditMeter`) and the steps between yields.
-   * Real time is never read: the case has no deadline, so only the audit's work is measured.
+   * No real-time bound decides the outcome: the case has no deadline and only work is asserted.
    * @param {number} records Corpus size.
    * @returns {Promise<{ visits: number, turns: number, maxVisits: number, archiveBytes: number }>}
    *   Total visits and steps, the most visits in one step and the archive's size.
