@@ -1,4 +1,4 @@
-const { KafkaJSRecordTooLargeError } = require('../../errors')
+const { KafkaJSNonRetriableError, KafkaJSRecordTooLargeError } = require('../../errors')
 const { Codecs, Types } = require('../../protocol/message/compression')
 const snappy = require('../../protocol/message/compression/snappy')
 
@@ -364,6 +364,9 @@ const ownBuffers = (topicMessages) => {
     const length = lengths[next++]
     if (length < 0) {
       return view
+    }
+    if (lengthOf.call(view) !== length) {
+      throw new KafkaJSNonRetriableError('A Buffer changed size while its send was being read')
     }
     store.set(view, offset)
     offset += length
