@@ -3,6 +3,7 @@
   "entries": [
     {
       "name": "compare-produce-latency",
+      "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
         "--client",
@@ -10,19 +11,23 @@
         "--package",
         "{package}",
         "--workload",
-        "produce-latency"
+        "produce-latency",
+        "--duration-ms",
+        "30000"
       ],
       "broker": true,
       "metrics": [
         { "key": "p50", "unit": "ms" },
         { "key": "p90", "unit": "ms" },
         { "key": "p99", "unit": "ms" },
-        { "key": "messagesPerSecond", "unit": "msg/s" }
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "elapsedMs", "unit": "ms" }
       ],
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
       "name": "compare-produce-throughput",
+      "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
         "--client",
@@ -30,14 +35,93 @@
         "--package",
         "{package}",
         "--workload",
-        "produce-throughput"
+        "produce-throughput",
+        "--duration-ms",
+        "30000"
       ],
       "broker": true,
-      "metrics": [{ "key": "messagesPerSecond", "unit": "msg/s" }],
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-1k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "1024"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-12p",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "12"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
       "name": "compare-consume-throughput",
+      "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
         "--client",
@@ -45,10 +129,142 @@
         "--package",
         "{package}",
         "--workload",
-        "consume-throughput"
+        "consume-throughput",
+        "--messages",
+        "12000000"
       ],
       "broker": true,
-      "metrics": [{ "key": "messagesPerSecond", "unit": "msg/s" }],
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "12000000",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput-1k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "4000000",
+        "--size",
+        "1024"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "10000000",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput-12p",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "12000000",
+        "--partitions",
+        "12"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {

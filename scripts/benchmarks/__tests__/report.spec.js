@@ -221,7 +221,7 @@ describe('Benchmarks > report', () => {
           : json({ ...identityOf(args), a: n, elapsedMs: 30000 })
       )
 
-      const { rows } = runEntry(compared({ adapter: 'clientCompare' }), options(spawn, 1))
+      const { rows, details } = runEntry(compared({ adapter: 'clientCompare' }), options(spawn, 1))
 
       expect(calls.map(({ args }) => valueAfter(args, '--package'))).toEqual([
         '@countly/kafkajs',
@@ -239,6 +239,10 @@ describe('Benchmarks > report', () => {
         { arm: 'kafkajs@2.2.4', metric: 'a', status: 'valid', runs: 5, median: 5 },
       ])
       expect(rows[0].reason).toBe('run 2 of 5: exit 1: boom')
+      expect(details.map(({ benchmark, status }) => [benchmark, status])).toEqual([
+        ['compared', 'error'],
+        ['compared', 'valid'],
+      ])
       const evidence = JSON.parse(
         fs.readFileSync(path.join(rawDir, 'compared', 'kafkajs@2.2.4.json'), 'utf8')
       )

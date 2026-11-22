@@ -49,12 +49,12 @@ const USAGE =
  *   what an adapter shows beside its rows: controls, notes and an optional table of text cells,
  *   shown whatever the row's status
  * @typedef {{ outputs: object[], error?: string }} Outcome what the runs of one arm gave
- * @typedef {{ runs?: number, timeoutMs?: number,
+ * @typedef {{ runs?: number, timeoutMs?: number, interleave?: boolean,
  *   read: (result: object, entry: ManifestEntry, arm: string) => object,
  *   rows: (entry: ManifestEntry, arm: string, outcome: Outcome, runs: number) =>
  *     { rows: Row[], detail?: Detail } }} Adapter `read` turns one spawn result into an output
  *   or throws; `rows` turns an arm's outputs into rows; `runs` and `timeoutMs` override the
- *   report's for every arm
+ *   report's for every arm; `interleave` alternates the arms run by run
  * @typedef {{ name: string, command: string[], broker: boolean,
  *   metrics: { key: string, unit: string }[], arms: ('fork'|'kafkajs@2.2.4')[],
  *   adapter?: string, omitted?: { reason: string, decision: string, evidenceRun: string } }}
@@ -157,19 +157,28 @@ const readRun = (result, entry, arm) => {
 }
 
 /**
- * Runs `entry` for one arm, `runs` times in a row, and stops at the first run that fails. After
- * each run, every run so far (arguments, exit, stdout, stderr) is rewritten to `<rawDir>/<arm>.json`.
+ * Runs `entry` on each of its arms `runs` times: every run of one arm before the next arm, or, for
+ * an adapter with `interleave`, one run of each arm in turn (fork, 2.2.4, fork, ...) so drift on
+ * the runner reaches both arms alike. An arm stops at its first failed run; the others go on.
+ * After each run, every run of that arm so far (arguments, exit, stdout, stderr) is rewritten to
+ * `<rawDir>/<arm>.json`.
  * @param {ManifestEntry} entry
- * @param {string} arm
  * @param {Adapter} adapter reads each run's result
  * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function,
  *   rawDir: string }} options `rawDir` is the entry's evidence directory
- * @returns {Outcome} what the runs that succeeded gave
+ * @returns {Map<string, Outcome>} by arm, what the runs that succeeded gave
  */
-const runArm = (entry, arm, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) => {
-  const evidence = { arm, runs: [] }
-  const outputs = []
-  for (let n = 1; n <= runs; n++) {
+const runArms = (entry, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) => {
+  const state = new Map(
+    entry.arms.map((arm) => [arm, { evidence: { arm, runs: [] }, outputs: [] }])
+  )
+  const numbers = Array.from({ length: runs }, (_, i) => i + 1)
+  const schedule = adapter.interleave
+    ? numbers.flatMap((n) => entry.arms.map((arm) => [arm, n]))
+    : entry.arms.flatMap((arm) => numbers.map((n) => [arm, n]))
+  for (const [arm, n] of schedule) {
+    const { evidence, outputs, error } = state.get(arm)
+    if (error) continue
     const args = fill(entry.command, {
       client: arm === 'fork' ? forkDir : baselineDir,
       package: PACKAGES[arm],
@@ -191,11 +200,13 @@ const runArm = (entry, arm, adapter, { runs, forkDir, baselineDir, spawn, rawDir
     writeJson(path.join(rawDir, `${arm}.json`), evidence)
     try {
       outputs.push(adapter.read(result, entry, arm))
-    } catch (error) {
-      return { outputs, error: `run ${n} of ${runs}: ${error.message}` }
+    } catch (err) {
+      state.get(arm).error = `run ${n} of ${runs}: ${err.message}`
     }
   }
-  return { outputs }
+  return new Map(
+    [...state].map(([arm, { outputs, error }]) => [arm, error ? { outputs, error } : { outputs }])
+  )
 }
 
 /**
@@ -333,10 +344,10 @@ const runEntry = (entry, options) => {
     return { rows: [entryRow(entry, 'error', error.message)], details: [] }
   }
   const runs = adapter.runs ?? options.runs
+  const outcomes = runArms(entry, adapter, { ...options, runs, rawDir })
   const results = entry.arms.map((arm) => {
-    const outcome = runArm(entry, arm, adapter, { ...options, runs, rawDir })
     try {
-      return adapter.rows(entry, arm, outcome, runs)
+      return adapter.rows(entry, arm, outcomes.get(arm), runs)
     } catch (error) {
       return { rows: [entryRow(entry, 'error', `the ${arm} rows failed: ${error.message}`)] }
     }
@@ -534,7 +545,7 @@ const main = (
   return 0
 }
 
-module.exports = { lastJsonLine, pick, tail, runEntry, renderMarkdown, main }
+module.exports = { lastJsonLine, pick, tail, readRun, rowsOf, runEntry, renderMarkdown, main }
 
 if (require.main === module) {
   process.exitCode = main(process.argv.slice(2))

@@ -161,7 +161,6 @@ describe('Benchmark report clientCompare adapter', () => {
 
       expect(rows.map(({ status }) => status)).toEqual(['valid', 'valid'])
       expect(detail).toEqual({
-        benchmark: 'compare-x / kafkajs@2.2.4',
         status: 'valid',
         controls: [
           {
@@ -172,7 +171,7 @@ describe('Benchmark report clientCompare adapter', () => {
           },
         ],
         notes: [
-          "3 of 3 runs, interleaved with the other arm; each run's warm-up is not measured",
+          "kafkajs@2.2.4: 3 of 3 runs, interleaved with the other arm; each run's warm-up is not measured",
           "consumer settings in force (this package's defaults): checkCrcs=true, maxInFlightRequests=5",
           'lz4: lz4-napi@2.10.0, a frame codec this benchmark registers through CompressionCodecs (2.2.4 has no built-in LZ4)',
           'Fetch version: 11',
