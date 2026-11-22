@@ -183,6 +183,9 @@ const rollingRestart = async (context, between, hards) => {
   return [phase, ...records]
 }
 
+/** The fault kind of each slow-broker phase. */
+const SLOW_KINDS = Object.freeze({ slow: 'delay', frozen: 'pause', recovery: 'none' })
+
 const FAULT_SCHEDULES = Object.freeze({
   none: Object.freeze({ start: async () => [] }),
   'rolling-restarts': Object.freeze({
@@ -236,16 +239,21 @@ const FAULT_SCHEDULES = Object.freeze({
     /**
      * @param {object} context see `FAULT_SCHEDULES`
      * @returns {Promise<object[]>} the slow, frozen and recovery phases as they ran; the delay is
-     *   always removed, and `BrokerBouncer#step` always unpauses; a freeze the window's end
-     *   stopped is recorded with `skipped`
+     *   always removed, and `BrokerBouncer#step` always unpauses; each phase the window's end
+     *   stopped is recorded with `skipped`, so a run that did not hold all three is incomplete
      */
     async start(context) {
       const { netem, bouncer, admin, topics, windowMs, signal } = context
       const { service, delayMs, freezeMs } = FAULT_SCHEDULES['slow-broker']
       const third = windowMs / 3
       const records = []
+      const notRun = (...phases) => {
+        for (const phase of phases)
+          records.push({ phase, service, kind: SLOW_KINDS[phase], skipped: WINDOW_ENDED })
+        return records
+      }
       await untilWindowMs(context, third)
-      if (signal.aborted) return records
+      if (signal.aborted) return notRun('slow', 'frozen', 'recovery')
       const slow = { phase: 'slow', service, kind: 'delay', delayMs, startMs: windowMsOf(context) }
       records.push(slow)
       await netem.apply()
@@ -255,7 +263,7 @@ const FAULT_SCHEDULES = Object.freeze({
         await netem.clear()
         slow.endMs = windowMsOf(context)
       }
-      if (signal.aborted) return records
+      if (signal.aborted) return notRun('frozen', 'recovery')
       const frozen = { phase: 'frozen', service, kind: 'pause', requestedMs: windowMsOf(context) }
       records.push(frozen)
       let outage
@@ -267,7 +275,7 @@ const FAULT_SCHEDULES = Object.freeze({
       } catch (error) {
         if (!windowEnded(error, signal)) throw error
         frozen.skipped = WINDOW_ENDED
-        return records
+        return notRun('recovery')
       }
       frozen.endMs = windowMsOf(context)
       frozen.startMs = frozen.endMs - outage.outageMs
