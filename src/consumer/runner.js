@@ -2126,12 +2126,14 @@ module.exports = class Runner extends EventEmitter {
    * Commits the resolved offsets when the interval or threshold is due, unless autoCommit is off
    * or the batch no longer owns the commit. The guard keeps the batch it was created for, so a
    * transport that evaluates it later, in another async context, still checks the same batch.
+   * Runs once per message, so a commit that is not due returns before the ownership checks.
    * @param {object|null} [batch] the batch committing; defaults to the calling handler's, `null`
    *   for none
    * @returns {Promise<void>|undefined} undefined when nothing is attempted
    */
   autoCommitOffsetsIfNecessary(batch = handlerContext.current() ?? null) {
-    if (this.autoCommit && !this.commitRefusal(undefined, batch)) {
+    if (!this.autoCommit || this.consumerGroup.offsetManager?.autoCommitIdle()) return
+    if (!this.commitRefusal(undefined, batch)) {
       return this.consumerGroup.commitOffsetsIfNecessary({
         guard: () => this.commitRefusal(undefined, batch),
       })

@@ -1269,6 +1269,19 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Whether `commitOffsetsIfNecessary` would do nothing now, decided without side effects. A
+   * configured threshold always answers false: counting resolved offsets fills a cache, so that
+   * decision stays with `commitOffsetsIfNecessary`.
+   * @returns {boolean} true when no threshold is set and the interval is unset or not yet elapsed
+   */
+  autoCommitIdle() {
+    return (
+      this.autoCommitThreshold == null &&
+      (this.autoCommitInterval == null || Date.now() < this.lastCommit + this.autoCommitInterval)
+    )
+  }
+
+  /**
    * Auto-commits the resolved offsets when the interval has elapsed or the offsets resolved beyond
    * the committed ones add up to the threshold, and does nothing otherwise. Either trigger is
    * optional (a null or undefined interval or threshold never fires) and one is enough.
