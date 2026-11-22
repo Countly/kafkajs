@@ -133,6 +133,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The final soak rehearsal and original share priming specs leave the whole-suite unit run and run one at a time in their own CI job, `unit-heavy` (`npm run test:unit:heavy`), on Node 22, 24 and 26, and in the exit gate's `unit-heavy` check; the frozen coverage run no longer runs the rehearsal, and the CI unit job's limit drops from 50 to 40 minutes. The memory-gates unit job runs them as a separate step.
 - Load profile (`scripts/soak/loadRun.js`): a target-rate run with a per-partition sequence oracle (loss, duplicates, reordering, skipped commits; memory independent of the record count), read back by Apache's console consumer, with a rolling-restart schedule, a sealed artifact and a dispatch-only `load-profile.yml` job; report only.
 - The benchmark report's comparison with kafkajs 2.2.4 now measures at least 30 s per run after an unmeasured warm-up, five interleaved runs per arm with the spread of each metric, and adds 1 KiB records, LZ4, 12 partitions and a consume row with the same explicit settings on both arms; consume rows report CPU per message, event-loop delay, Fetch requests and bytes per Fetch and the consumer settings in force.
+- The share bounce live case archives the socket event of every socket interruption, including one whose partitions hold no unresolved work, so a kill of an idle node no longer fails the evidence check with `interruption-reference: missing socket <id>`.
 
 #### Docs
 
