@@ -384,7 +384,13 @@ describe('Producer > the buffer > small views of large stores', () => {
       { value: slab.subarray(10, 30), headers: { h: slab.subarray(30, 31) } },
     ])
     const heldBytes = held(messages[0]) + held(messages[1])
+    const { key, value } = messages[0]
 
+    expect(
+      new Set([key, value, messages[1].value, messages[1].headers.h].map((field) => field.buffer))
+        .size
+    ).toBe(1)
+    expect(key.buffer.byteLength).toBe(31)
     expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
       total: 1536 + heldBytes,
       shell: 1536 + 31,
@@ -467,8 +473,91 @@ describe('Producer > the buffer > small views of large stores', () => {
       const values = texts.map((text) => Buffer.from(text))
       expect(values.every((value) => value.buffer.byteLength <= 16384)).toBe(true)
       const messages = snapshotOf(values.map((value) => ({ value })))
+      const heldBytes = messages.reduce((sum, message) => sum + held(message), 0)
+      const pool = values[0].buffer
 
       messages.forEach((message, i) => expect(message.value).toBe(values[i]))
+      expect(values.every((value) => value.buffer === pool)).toBe(true)
+      expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+        total: 1536 + heldBytes + pool.byteLength - (7 + 8 + 300),
+        shell: 1536 + pool.byteLength,
+      })
+    })
+  })
+
+  test('a Buffer whose own copy method is replaced is copied without calling it, at its own bytes', () => {
+    const slab = Buffer.alloc(1048576, 'a')
+    slab.write('xyz', 5)
+    const key = slab.subarray(5, 8)
+    const calls = []
+    key.copy = (...args) => {
+      calls.push(args)
+      return 1000
+    }
+
+    const [record] = snapshotOf([{ key, value: slab.subarray(8, 10) }])
+
+    expect(calls).toEqual([])
+    expect(String(record.key)).toBe('xyz')
+    expect(String(record.value)).toBe('aa')
+    expect(record.value.buffer).toBe(record.key.buffer)
+    expect(record.key.buffer.byteLength).toBe(5)
+  })
+
+  test("a header-value array whose own slice returns itself is copied without it: the caller's array keeps its views and its holes", () => {
+    const slab = Buffer.alloc(65536)
+    slab.write('ab', 0)
+    const first = slab.subarray(0, 1)
+    const second = slab.subarray(1, 2)
+    const list = [first]
+    list[2] = second
+    list.slice = () => list
+
+    const [record] = snapshotOf([{ headers: { list } }])
+    const copy = record.headers.list
+
+    expect(list[0]).toBe(first)
+    expect(list[2]).toBe(second)
+    expect(1 in list).toBe(false)
+    expect(copy).not.toBe(list)
+    expect(copy).toHaveLength(3)
+    expect(1 in copy).toBe(false)
+    expect(String(copy[0]) + String(copy[2])).toBe('ab')
+    expect(copy[2].buffer).toBe(copy[0].buffer)
+    expect(copy[0].buffer.byteLength).toBe(2)
+  })
+
+  test('a send that cannot fit is refused with the error it had when each view was copied into a store of its own', () => {
+    const slab = Buffer.alloc(1048576)
+    const messages = snapshotOf([{ value: slab.subarray(0, 1) }, { value: slab.subarray(1, 2001) }])
+    const run = () => chargeOf([{ topic: TOPIC, messages }], 2000)
+
+    expect(messages[1].value.buffer).toBe(messages[0].value.buffer)
+    // 21 + 64 + 1 + (2 + 2000) + 1
+    expect(run).toThrow(
+      expect.objectContaining({
+        reason: 'bufferMemory',
+        scope: 'record',
+        size: 2089,
+        limit: 2000,
+        topic: TOPIC,
+      })
+    )
+  })
+
+  test("a slice of another send's copy store that is kept as it is is charged the bytes of that store it does not show", () => {
+    const slab = Buffer.alloc(1048576)
+    const [kept] = snapshotOf([
+      { value: slab.subarray(0, 100) },
+      { value: slab.subarray(100, 200) },
+    ])
+
+    const messages = snapshotOf([{ value: kept.value }])
+
+    expect(messages[0].value).toBe(kept.value)
+    expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+      total: 1536 + held(messages[0]) + 100,
+      shell: 1536 + 200,
     })
   })
 
