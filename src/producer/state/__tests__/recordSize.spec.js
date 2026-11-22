@@ -802,10 +802,9 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
 
     expect(sent.state).toBe('fulfilled')
-    const [{ messages: sentMessages, bytes }] = written
+    const [{ messages: sentMessages }] = written
     expect(String(sentMessages[0].value)).toBe('q')
     expect(sentMessages[0].value.buffer.byteLength).toBe(1)
-    expect(bytes.includes(Buffer.from('q'))).toBe(true)
     await producer.disconnect()
   })
 

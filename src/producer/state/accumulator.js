@@ -343,6 +343,25 @@ const ownedHeaders = (headers, copies) => {
 }
 
 /**
+ * A plain array of `own(element)` for each element of `list`, holes kept. Built by index, so the
+ * result is the producer's own array whatever class, iterator or `map` the caller's list has.
+ * @template T, U
+ * @param {T[]} list
+ * @param {(element: T) => U} own
+ * @returns {U[]}
+ */
+const ownedList = (list, own) => {
+  const { length } = list
+  const copy = new Array(length)
+  for (let i = 0; i < length; i++) {
+    if (i in list) {
+      copy[i] = own(list[i])
+    }
+  }
+  return copy
+}
+
+/**
  * The producer's own copy of a record, each field read once: its own enumerable fields, so a
  * custom partitioner still sees them, and the fields the producer reads, also when they come from
  * a prototype. A header container, a header-value array, a `Date` and a `Long` are copied, so
@@ -1057,7 +1076,7 @@ class Accumulator {
    */
   static snapshot(topicMessages) {
     const copies = new SendCopy()
-    const snapshot = topicMessages.map((entry) => {
+    const snapshot = ownedList(topicMessages, (entry) => {
       if (entry === null || typeof entry !== 'object') {
         return entry
       }
@@ -1065,7 +1084,7 @@ class Accumulator {
       return {
         topic,
         messages: Array.isArray(messages)
-          ? messages.map((message) => ownedRecord(message, copies))
+          ? ownedList(messages, (message) => ownedRecord(message, copies))
           : messages,
       }
     })

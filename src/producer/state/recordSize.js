@@ -271,7 +271,7 @@ const chargeOf = (topicMessages, limit) => {
  */
 const pinsStore = (view) => {
   const { byteLength } = view.buffer
-  return byteLength > COPY_STORES_ABOVE && byteLength > COPY_STORES_TIMES * view.length
+  return byteLength > COPY_STORES_ABOVE && byteLength > COPY_STORES_TIMES * lengthOf.call(view)
 }
 
 /**
@@ -287,7 +287,7 @@ const pinsStore = (view) => {
  * `chargeOf` charges it no excess; it may be collected before the send's charge is released when
  * the records still held carry no slice of it. Keeping any slice (a record kept by a custom
  * partitioner or from a delivery error, or the slice passed again in another send) keeps the whole
- * store alive; a later send that carries such a slice as it is is charged the bytes of the store
+ * store alive; a later send that carries such a slice unchanged is charged the bytes of the store
  * it does not show. A send that cannot fit is still refused, but which record the error names and
  * the size it reports can differ from a copy per view.
  */
