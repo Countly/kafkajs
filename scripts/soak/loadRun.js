@@ -9,12 +9,13 @@
  * Usage: see `loadProfile.USAGE`; `--recheck <artifact>` judges a sealed artifact again offline.
  * A run needs the repository's three-broker Compose cluster
  * (`docker-compose.yml`, or `COMPOSE_FILE`). Writes the artifact to `--out` and sets the exit code
- * from `verdictOf`: 0 pass, 1 product failure, 2 inconclusive, 3 rate not reached.
+ * from `verdictOf`: 0 pass, 1 product failure, 2 inconclusive (also when a scheduled fault did not
+ * run), 3 rate not reached, 4 flow stalled.
  *
  * Artifact: `profile.json`, `producers.json`, `consumers.json`, `committed.json`, `faults.json`,
  * `apache/<topic>.dump.gz` with `.end` (or one `apache/all.dump.gz` for a profile with topic
- * headers), `apache/<group>.describe`, `report.json`, and `header.json`, written last, which binds
- * every other file by SHA-256 (the seal).
+ * headers), `apache/<group>.describe`, `throughput.json` (the per-interval series), `report.json`,
+ * and `header.json`, written last, which binds every other file by SHA-256 (the seal).
  */
 
 const crypto = require('node:crypto')
@@ -38,9 +39,17 @@ const {
   phaseMemory,
   rateLimitedBy,
   rateReport,
+  throughputReport,
   verdictOf,
 } = require('./loadProfile')
-const { BrokerCpuProbe, ClientMeter, FlowMeter, HostMeter, LagProbe } = require('./loadMeters')
+const {
+  BrokerCpuProbe,
+  ClientMeter,
+  FlowMeter,
+  HostMeter,
+  LagProbe,
+  ThroughputSeries,
+} = require('./loadMeters')
 const { DeliveryLedger, SendLedger, SequenceChecker, parseDumpLine } = require('./sequenceOracle')
 
 const BROKERS = Object.freeze(['localhost:9092', 'localhost:9095', 'localhost:9098'])
@@ -251,6 +260,8 @@ class LoadProducer {
    * @param {FlowMeter|null} [options.flow] counts acknowledged records per lane (not for a
    *   transactional producer)
    * @param {ClientMeter|null} [options.meter] listens to every incarnation's client
+   * @param {ThroughputSeries|null} [options.series] counts sent, acknowledged (or aborted) and
+   *   failed records per interval; per lane too, except for a transactional producer
    */
   constructor({
     kafka,
@@ -265,8 +276,10 @@ class LoadProducer {
     laneOf = () => 'all',
     flow = null,
     meter = null,
+    series = null,
   }) {
     Object.assign(this, { kafka, id, kind, profile, topics, runId, latency, clock, sleep, meter })
+    this.series = series
     this.flow = kind === 'transactional' ? null : flow
     this.rate = profile.rate / profile.producers
     const cells = topics.flatMap((topic) =>
@@ -373,6 +386,7 @@ class LoadProducer {
     lane.unsettled += n
     this.unsettled += n
     this.stats.sent += n
+    this.series?.count('sent', n, now, this.#seriesGroup(lane))
     const batch = {
       topicMessages: [...byTopic].map(([topic, messages]) => ({ topic, messages })),
       acks: -1,
@@ -503,11 +517,25 @@ class LoadProducer {
     entry.lane.unsettled -= entry.n
     this.unsettled -= entry.n
     this.stats[status] += entry.n
+    const now = this.clock.now()
+    this.series?.count(
+      status === 'failed' ? 'failed' : 'acked',
+      entry.n,
+      now,
+      this.#seriesGroup(entry.lane)
+    )
     if (status === 'acked') {
-      const now = this.clock.now()
       this.flow?.add('acked', entry.lane.key, entry.n, now)
       for (let i = 0; i < entry.n; i++) this.latency.record(now - entry.dueAt(i))
     } else if (!result.ok) this.#recordError('send', result.error)
+  }
+
+  /**
+   * A transaction waits for every partition it wrote, so its records count in `all` only.
+   * @param {{ key: string }} lane @returns {string} the series group of the lane's records
+   */
+  #seriesGroup(lane) {
+    return this.kind === 'transactional' ? 'all' : lane.key
   }
 
   /** @param {string} where @param {Error} error @returns {void} */
@@ -539,9 +567,23 @@ class ProducerProcess {
    * @param {{ now: () => number, timeOrigin?: number }} options.clock
    * @param {(ms: number) => Promise<void>} options.sleep
    * @param {() => object} options.fork starts the child: an object with `send`, `on` and `kill`
+   * @param {ThroughputSeries|null} [options.series] the run's, which the child's series is merged
+   *   into; the child's own is kept as `seriesSnapshot`
    */
-  constructor({ id, producers, profile, runId, topics, latency, clock, sleep, fork: start }) {
-    Object.assign(this, { id, profile, runId, topics, latency, clock, sleep, start })
+  constructor({
+    id,
+    producers,
+    profile,
+    runId,
+    topics,
+    latency,
+    clock,
+    sleep,
+    fork: start,
+    series = null,
+  }) {
+    Object.assign(this, { id, profile, runId, topics, latency, clock, sleep, start, series })
+    this.seriesSnapshot = null
     this.hosted = producers
     this.views = producers.map(({ id: producerId, kind }) => ({
       id: producerId,
@@ -623,6 +665,8 @@ class ProducerProcess {
         Object.assign(this.views[i], { stats, errors, ledgers, settled })
       )
       this.latency.merge(message.latency)
+      this.seriesSnapshot = message.series
+      this.series?.merge(message.series)
       this.cpu = message.cpu
       this.reported = true
     } else if (message.type === 'closed') this.closed = true
@@ -654,9 +698,21 @@ class LoadConsumer {
    * @param {((cell: { topic: string, partition: number }) => string)|null} [options.laneOf]
    * @param {FlowMeter|null} [options.flow] counts delivered records per lane, with `laneOf`
    * @param {ClientMeter|null} [options.meter]
+   * @param {ThroughputSeries|null} [options.series] counts consumed records per interval, per lane
+   *   with `laneOf`
    */
-  constructor({ kafka, groupId, member, topics, clock, laneOf = null, flow = null, meter = null }) {
-    Object.assign(this, { kafka, groupId, member, topics, clock, laneOf, flow, meter })
+  constructor({
+    kafka,
+    groupId,
+    member,
+    topics,
+    clock,
+    laneOf = null,
+    flow = null,
+    meter = null,
+    series = null,
+  }) {
+    Object.assign(this, { kafka, groupId, member, topics, clock, laneOf, flow, meter, series })
     this.ledger = new DeliveryLedger({ group: groupId, member })
     this.delivered = 0
     this.lastDeliveryAt = clock.now()
@@ -679,8 +735,9 @@ class LoadConsumer {
           this.ledger.deliver(batch.topic, batch.partition, Number(message.offset))
         this.delivered += batch.messages.length
         this.lastDeliveryAt = this.clock.now()
-        if (this.laneOf && this.flow)
-          this.flow.add('delivered', this.laneOf(batch), batch.messages.length, this.lastDeliveryAt)
+        const lane = this.laneOf?.(batch) ?? 'all'
+        this.flow?.add('delivered', lane, batch.messages.length, this.lastDeliveryAt)
+        this.series?.count('consumed', batch.messages.length, this.lastDeliveryAt, lane)
       },
     })
   }
@@ -756,6 +813,7 @@ class LoadRun {
     const meter = new ClientMeter({ clock: this.clock, lag: this.lagProbe })
     this.lagProbe.start(meter.origin)
     this.flow = profile.leaderLanes ? new FlowMeter() : null
+    this.series = ThroughputSeries.forProfile(profile)
     const setup = { createTopicsMs: null, leaders: null }
     let producers = []
     let units = []
@@ -795,6 +853,7 @@ class LoadRun {
             laneOf,
             flow: this.flow,
             meter,
+            series: this.series,
           })
       )
       for (const consumer of consumers) await consumer.start()
@@ -874,17 +933,29 @@ class LoadRun {
         join: p.cpu?.join ?? null,
       }))
     const flow = this.flow && this.#flowVerdict(producers, phases)
+    const throughput = throughputReport({
+      series: this.series.snapshot(),
+      rates: this.#seriesRates(producers),
+      windowMs,
+      faults,
+    })
+    this.#write('throughput.json', {
+      ...throughput.series,
+      processes: Object.fromEntries(processes.map((p) => [p.id, p.seriesSnapshot])),
+    })
     const verdict = verdictOf({
       oracle,
       rate,
       error: this.errors[0] ?? null,
       flow: flow?.verdict ?? null,
+      faults,
     })
     const report = {
       verdict,
       rate,
       totals,
       ...(flow && { flow }),
+      throughput: throughput.summary,
       latencyMs: this.latency.toJSON(),
       eventLoopDelayMs: {
         p50: loop.percentile(50) / 1e6,
@@ -953,6 +1024,7 @@ class LoadRun {
             laneOf,
             flow: this.flow,
             meter,
+            series: this.series,
           })
       )
       return { producers, units: producers, processes: [] }
@@ -970,6 +1042,7 @@ class LoadRun {
           clock: this.clock,
           sleep: this.sleep,
           fork: this.fork,
+          series: this.series,
         })
     )
     const byId = new Map(processes.flatMap((p) => p.views.map((v) => [v.id, v])))
@@ -992,6 +1065,7 @@ class LoadRun {
     const tickMs = 1000 / profile.ticksPerSecond
     for (const unit of units) unit.begin(start)
     this.flow?.begin(start)
+    this.series.begin(start)
     const window = new AbortController()
     this.brokerCpu?.start(window.signal)
     const fault = FAULT_SCHEDULES[profile.faults]
@@ -1109,12 +1183,19 @@ class LoadRun {
    * @returns {object} `flowVerdict` over the idempotent and plain producers' lanes
    */
   #flowVerdict(producers, phases) {
-    const rates = {}
-    for (const producer of producers)
-      if (producer.kind !== 'transactional')
-        for (const lane of producer.lanes) rates[lane.key] = (rates[lane.key] ?? 0) + lane.rate
     const slowNode = String(FAULT_SCHEDULES[this.profile.faults].nodeId)
-    return flowVerdict({ phases, flow: this.flow, rates, slowNode })
+    return flowVerdict({ phases, flow: this.flow, rates: laneRates(producers), slowNode })
+  }
+
+  /**
+   * @param {object[]} producers see `#producers`
+   * @returns {Record<string, number>} records a second offered per series group: every producer's
+   *   in `all`, the idempotent and plain producers' per leader lane
+   */
+  #seriesRates(producers) {
+    const all = producers.reduce((n, p) => n + p.rate, 0)
+    const lanes = this.profile.leaderLanes ? laneRates(producers) : {}
+    return { ...lanes, all }
   }
 
   /**
@@ -1258,6 +1339,19 @@ class LoadRun {
   }
 }
 
+/**
+ * @param {object[]} producers the run's in-process load producers
+ * @returns {Record<string, number>} records a second the idempotent and plain producers offer per
+ *   lane (a transactional producer stalls with its slowest partition by design)
+ */
+const laneRates = (producers) => {
+  const rates = {}
+  for (const producer of producers)
+    if (producer.kind !== 'transactional')
+      for (const lane of producer.lanes) rates[lane.key] = (rates[lane.key] ?? 0) + lane.rate
+  return rates
+}
+
 /** @returns {object} the client under test, as every process of a run builds it */
 const loadKafka = () => {
   const { Kafka, logLevel } = require('../../index')
@@ -1396,6 +1490,7 @@ const main = async (argv) => {
         latencyMs,
         cpu: report.cpu,
         flow: report.flow && { verdict: report.flow.verdict, reasons: report.flow.reasons },
+        throughput: report.throughput,
         findings: report.oracle?.findings,
         errors: report.errors,
       },
