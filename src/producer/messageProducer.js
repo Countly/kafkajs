@@ -233,7 +233,8 @@ module.exports = ({
    *
    * The records are read once, at this call (`Accumulator.snapshot`): changing a record, its
    * headers or a `Date` or `Long` timestamp afterwards changes neither what is sent nor what is
-   * charged against `bufferMemory`; the bytes of a Buffer are not copied.
+   * charged against `bufferMemory`. The bytes of a Buffer are not copied, except a small view of a
+   * large backing store: all of those in the send are copied into one store (`SendCopy`).
    * @param {SendBatchRequest}
    * @returns {Promise}
    */
