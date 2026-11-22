@@ -149,9 +149,8 @@ module.exports = class ClassicGroupProtocol {
       const { groupId, generationId, memberId } = this
       const token = this.ownership?.token()
       const { membershipRevision } = this
-      const now = Date.now()
 
-      if (memberId && now >= this.lastRequest + interval) {
+      if (this.heartbeatDue(interval)) {
         const payload = {
           groupId,
           memberId,
@@ -775,6 +774,27 @@ module.exports = class ClassicGroupProtocol {
    */
   async heartbeat({ interval, guard }) {
     return this.sharedHeartbeat({ interval, guard })
+  }
+
+  /**
+   * Whether a joined member's interval has passed, so a heartbeat call would send one.
+   * @private
+   * @param {number} interval milliseconds since the last request
+   * @returns {boolean}
+   */
+  heartbeatDue(interval) {
+    return Boolean(this.memberId) && Date.now() >= this.lastRequest + interval
+  }
+
+  /**
+   * Whether {@link ClassicGroupProtocol#heartbeat} would do nothing now: no heartbeat is in flight
+   * to join and none is due. Side-effect free, so a caller that checks it once per message can skip
+   * the call; whenever it is false the call must be made.
+   * @param {number} interval the interval the call would pass
+   * @returns {boolean}
+   */
+  heartbeatIdle(interval) {
+    return !this.sharedHeartbeat.isRunning() && !this.heartbeatDue(interval)
   }
 
   /**

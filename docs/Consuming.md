@@ -400,7 +400,7 @@ A classic static member that leaves with `true` sends its member id and its `gro
 
 ## <a name="pause-resume"></a> Pause & Resume
 
-In order to pause and resume consuming from one or more topics, the `Consumer` provides the methods `pause` and `resume`. It also provides the `paused` method to get the list of all paused topics. Note that pausing a topic means that it won't be fetched in the next cycle and subsequent messages within the current batch won't be passed to an `eachMessage` handler.
+In order to pause and resume consuming from one or more topics, the `Consumer` provides the methods `pause` and `resume`. It also provides the `paused` method to get the list of all paused topics. Note that pausing a topic means that it won't be fetched in the next cycle and subsequent messages within the current batch won't be passed to an `eachMessage` handler. The consumer checks for a pause after each `eachMessage` call settles: a handler that needs the next message to wait must call `pause()` before its returned promise settles, either directly or after an operation it awaits. Work the handler starts but does not await is not ordered against the delivery of the next message.
 
 A pause for a topic outside the subscription is retained until the next subscription lifecycle point. paused() lists only assigned partitions. Pause state survives ordinary eager, cooperative and consumer-protocol rebalances, and is retired when the topic leaves the subscription, the run ends or the topic is recreated. Calling `resume` with a topic that is not paused is also a no-op.
 

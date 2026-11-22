@@ -681,6 +681,16 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Whether a heartbeat call would do nothing now: none in flight to join and none due. Only the
+   * classic membership answers; any other is never idle, so its callers always make the call.
+   * @param {number} interval the interval the call would pass
+   * @returns {boolean}
+   */
+  heartbeatIdle(interval) {
+    return this.groupMembership.heartbeatIdle?.(interval) ?? false
+  }
+
+  /**
    * Whether the membership holds a target assignment that still differs from what this member
    * owns, counting only what a round's apply would keep. Always false under classic. Unresolved
    * topic ids and assigned topics outside a client-pattern subscription deliberately do NOT make it
