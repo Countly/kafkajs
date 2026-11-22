@@ -314,8 +314,8 @@ const ownedTimestamp = (timestamp) => {
 }
 
 /**
- * A copy of a record's headers, each own key read once: an array value is copied too. Buffers are
- * kept here; `ownBuffers` copies those that pin a large store once the whole send is read.
+ * A copy of a record's headers, each own key read once: an array value is copied too, element by
+ * element with its holes, without calling its methods. Buffers are kept here; `ownBuffers` copies those that pin a large store once the whole send is read.
  * @param {*} headers
  * @returns {object}
  */
@@ -324,7 +324,13 @@ const ownedHeaders = (headers) => {
   for (const name of Object.keys(copy)) {
     const header = copy[name]
     if (Array.isArray(header)) {
-      copy[name] = header.slice()
+      const list = new Array(header.length)
+      for (let i = 0; i < header.length; i++) {
+        if (i in header) {
+          list[i] = header[i]
+        }
+      }
+      copy[name] = list
     }
   }
   return copy
