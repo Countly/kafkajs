@@ -4048,14 +4048,14 @@
       "id": "K/KI01",
       "area": "K",
       "target": "src/consumer/consumerGroup.js",
-      "line": 2266,
+      "line": 2558,
       "operator": "patch",
-      "original": "        const topicRequestData = requests.find(({ topic }) => topic === topicName)",
-      "mutated": "        const topicRequestData = (tracked ? tracked.wire.topics : requests).find(({ topic }) => topic === topicName)",
+      "original": "      const requestsByTopic = indexFirstBy(requests, 'topic')",
+      "mutated": "      const requestsByTopic = indexFirstBy(tracked ? tracked.wire.topics : requests, 'topic')",
       "spec": "src/consumer/__tests__/fetchSessionsSeam.spec.js",
       "title": "Fetch sessions through the consumer group decodes sparse topic-ID replies with the complete request map",
       "commandClass": "unit",
-      "patchSha": "2ff251e496e59f4f6503e7a680ad7d00af6388acad498c030140f5de2e6fb988"
+      "patchSha": "ef3b18d88fb54192a59e68ff86813ac62126a59aec6cab65a072a7f1f63b57b1"
     },
     {
       "id": "K/KI02",

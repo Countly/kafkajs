@@ -12,7 +12,7 @@ on:
       shards:
         description: Unit shards, 1-32
         required: false
-        default: '8'
+        default: '16'
       time-cap-minutes:
         description: Minutes after which a shard starts no new record, 1-300
         required: false
