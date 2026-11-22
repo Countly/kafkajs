@@ -195,6 +195,14 @@ describe('Protocol > Requests > Fetch > record envelope', () => {
         expect(corruption).toMatchObject({ reason: 'magic', offset: '2' })
       })
 
+      test('a tail that ends on a bad magic byte is corrupt, as in Java: 17 bytes are enough to judge it', async () => {
+        const forged = batch({ baseOffset: 2n, magic: 3, records: [record()] })
+        const { messages, corruption } = await corrupt(forged.subarray(0, 17))
+
+        expect(messages.map(asLiteral)).toEqual(firstMessages)
+        expect(corruption).toMatchObject({ reason: 'magic', offset: '2' })
+      })
+
       test('a corrupt first batch is carried at once with no records', async () => {
         const { messages, corruption } = await corrupt(
           batch({ baseOffset: 0n, length: -1, records: [record()] }),
