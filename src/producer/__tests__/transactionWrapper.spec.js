@@ -743,7 +743,7 @@ describe('Producer > the transaction wrapper', () => {
       )
     })
 
-    test('under transaction version 1, an AddPartitionsToTxn that runs out of retries leaves the transaction abort-only; abort() ends it and the next transaction commits', async () => {
+    test('under transaction version 1, an AddPartitionsToTxn that runs out of retries leaves the transaction abort-only; abort() sends its EndTxn and the next transaction commits', async () => {
       const { broker, producer } = createTransactionalProducer({ level: 1 })
       await producer.connect()
       broker.addPartitionsToTxn.mockRejectedValue(
@@ -765,6 +765,7 @@ describe('Producer > the transaction wrapper', () => {
 
       expect(broker.produce).toHaveBeenCalledTimes(1)
       expect(broker.endTxn.mock.calls.map(([request]) => request)).toEqual([
+        expect.objectContaining({ transactionResult: false, transactionVersion: 1 }),
         expect.objectContaining({ transactionResult: true, transactionVersion: 1 }),
       ])
     })
@@ -902,7 +903,7 @@ describe('Producer > the transaction wrapper', () => {
     })
 
     test.each([1, 2])(
-      'under transaction version %p, an abort whose EndTxn failed moves the next transaction to a new epoch',
+      'under transaction version %p, an abort whose EndTxn failed sends it again with the pair held before the next transaction, which moves to a new epoch',
       async (level) => {
         const { broker, producer } = createTransactionalProducer({ level })
         await producer.connect()
@@ -912,12 +913,28 @@ describe('Producer > the transaction wrapper', () => {
           new KafkaJSProtocolError(createErrorFromCode(TRANSACTION_ABORTABLE))
         )
 
+        const inits = broker.initProducerId.mock.calls.length
         await first.abort()
         const second = await producer.transaction()
         await second.send({ topic: TOPIC, messages: ONE })
 
-        const reinitialized = broker.initProducerId.mock.calls.at(-1)[0]
-        expect(reinitialized).toMatchObject({ producerId: '1000', producerEpoch: 0 })
+        expect(broker.endTxn.mock.calls.map(([request]) => request)).toEqual([
+          expect.objectContaining({
+            producerId: '1000',
+            producerEpoch: 0,
+            transactionResult: false,
+          }),
+          expect.objectContaining({
+            producerId: '1000',
+            producerEpoch: 0,
+            transactionResult: false,
+          }),
+        ])
+        expect(
+          broker.initProducerId.mock.calls
+            .slice(inits)
+            .map(([request]) => [request.producerId, request.producerEpoch])
+        ).toEqual(level === 1 ? [['1000', 0]] : [])
         expect(broker.produce.mock.calls.map(([{ producerEpoch }]) => producerEpoch)).toEqual([
           0, 1,
         ])
