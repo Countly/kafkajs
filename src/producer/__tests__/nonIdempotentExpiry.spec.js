@@ -345,6 +345,39 @@ describe('a plain request with different delivery deadlines', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
+  it('refuses unsent, at the hand-off itself, a batch whose deadline is exactly now, and writes only its sibling', async () => {
+    const writes = []
+    const harness = setup(
+      async (request) => {
+        const refused = request.guard?.(100)
+        if (refused) throw refused
+        writes.push(
+          request.topicData.flatMap(({ partitions }) =>
+            partitions.map(({ partition }) => partition)
+          )
+        )
+        return success(request)
+      },
+      3,
+      [-500, 500]
+    )
+
+    expect(harness.settlers[0].reject).toHaveBeenCalledTimes(1)
+    expect(harness.settlers[0].reject.mock.calls[0][0]).toMatchObject({
+      name: 'KafkaJSDeliveryTimeout',
+      outcome: 'unsent',
+    })
+    await jest.advanceTimersByTimeAsync(0)
+    await work
+    expect(writes).toEqual([[1]])
+    expect(harness.cluster.broker.produce).toHaveBeenCalledTimes(1)
+    expect(harness.settlers[0].resolve).not.toHaveBeenCalled()
+    expect(harness.settlers[1].resolve).toHaveBeenCalledTimes(1)
+    expect(harness.settlers[1].reject).not.toHaveBeenCalled()
+    expect(harness.error()).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
   it('expires all equal-deadline members in one callback', async () => {
     const harness = setup(
       async (request) => {

@@ -1,5 +1,6 @@
 const { Kafka } = require('../../../index')
 const Cluster = require('../../cluster')
+const Generation = require('../generation')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { newLogger, connectionOpts } = require('testHelpers')
 const { TOPIC, TOPIC_ID } = require('../../consumer/__tests__/fixtures/fetchHarness')
@@ -593,4 +594,24 @@ describe('Cluster > refreshMetadataIfNecessary without the producer option', () 
     await pending
     expect(settled).toBe(true)
   })
+
+  it.each([
+    ['fresh', MAX_AGE],
+    ['aged', -1],
+  ])(
+    'a closed producer lifecycle is refused with its close error on %s cached metadata, and nothing refreshes',
+    async (_name, expiresIn) => {
+      const { cluster } = agedCluster()
+      cluster.brokerPool.metadataExpireAt = Date.now() + expiresIn
+      const fence = new Generation()
+      const closed = new Error('The producer was closed')
+      fence.close(closed)
+
+      await expect(cluster.refreshMetadataIfNecessary({ fence, background: true })).rejects.toBe(
+        closed
+      )
+      await turns(5)
+      expect(cluster.brokerPool.refreshMetadata).not.toHaveBeenCalled()
+    }
+  )
 })

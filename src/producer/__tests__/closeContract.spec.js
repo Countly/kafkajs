@@ -279,6 +279,38 @@ describe('producer close contract', () => {
     }
   })
 
+  test('a forced close ends the written send of a producer that turned idempotence off for acks 1', async () => {
+    const { producer, cluster } = bufferedProducer({ deliveryTimeout: 60000 })
+    const held = deferred()
+    cluster.broker.produce.mockImplementationOnce(async (request) => {
+      const refusal = request.guard?.(100)
+      if (refusal) throw refusal
+      await held.promise
+      return succeeded(request)
+    })
+    await producer.connect()
+    expect(cluster.broker.initProducerId).toHaveBeenCalledTimes(1)
+    const send = watch(producer.send({ acks: 1, topic: 'topic', messages: [{ value: 'a' }] }))
+    try {
+      await pump()
+      expect(producer.isIdempotent()).toBe(false)
+      expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+      expect(cluster.broker.produce.mock.calls[0][0]).toMatchObject({ producerId: -1 })
+
+      const closed = watch(producer.disconnect({ timeout: 0 }))
+      await pump()
+
+      expect(closed.state).toBe('fulfilled')
+      expect(send).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
+      })
+    } finally {
+      held.resolve()
+      await pump()
+    }
+  })
+
   test('a send while a close waits for a held answer, and one after it ended, are refused untouched', async () => {
     const { producer, cluster, send, held } = await writing({ linger: 0, deliveryTimeout: 60000 })
     const produced = cluster.broker.produce.mock.calls.length
