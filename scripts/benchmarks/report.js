@@ -48,7 +48,8 @@ const USAGE =
  *   notes: string[], table?: { caption: string, header: string[], rows: string[][] } }} Detail
  *   what an adapter shows beside its rows: controls, notes and an optional table of text cells,
  *   shown whatever the row's status
- * @typedef {{ outputs: object[], error?: string }} Outcome what the runs of one arm gave
+ * @typedef {{ outputs: object[], error?: string, profile?: string }} Outcome what the runs of
+ *   one arm gave; `profile` is where its CPU profile is, or why it failed
  * @typedef {{ runs?: number, timeoutMs?: number, interleave?: boolean,
  *   read: (result: object, entry: ManifestEntry, arm: string) => object,
  *   rows: (entry: ManifestEntry, arm: string, outcome: Outcome, runs: number) =>
@@ -57,8 +58,9 @@ const USAGE =
  *   report's for every arm; `interleave` alternates the arms run by run
  * @typedef {{ name: string, command: string[], broker: boolean,
  *   metrics: { key: string, unit: string }[], arms: ('fork'|'kafkajs@2.2.4')[],
- *   adapter?: string, omitted?: { reason: string, decision: string, evidenceRun: string } }}
- *   ManifestEntry
+ *   adapter?: string, profile?: boolean,
+ *   omitted?: { reason: string, decision: string, evidenceRun: string } }} ManifestEntry
+ *   `profile` adds one CPU-profiled run per arm
  */
 
 /**
@@ -161,7 +163,9 @@ const readRun = (result, entry, arm) => {
  * an adapter with `interleave`, one run of each arm in turn (fork, 2.2.4, fork, ...) so drift on
  * the runner reaches both arms alike. An arm stops at its first failed run; the others go on.
  * After each run, every run of that arm so far (arguments, exit, stdout, stderr) is rewritten to
- * `<rawDir>/<arm>.json`.
+ * `<rawDir>/<arm>.json`. An entry with `profile` then runs each arm that did not fail once more
+ * under `node --cpu-prof`, writing the profile to `<rawDir>/<arm>-cpu-profile/`; that run's
+ * output is checked but never joins the outputs, since profiling changes the timing.
  * @param {ManifestEntry} entry
  * @param {Adapter} adapter reads each run's result
  * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function,
@@ -176,21 +180,20 @@ const runArms = (entry, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) 
   const schedule = adapter.interleave
     ? numbers.flatMap((n) => entry.arms.map((arm) => [arm, n]))
     : entry.arms.flatMap((arm) => numbers.map((n) => [arm, n]))
-  for (const [arm, n] of schedule) {
-    const { evidence, outputs, error } = state.get(arm)
-    if (error) continue
+  const timeout = adapter.timeoutMs ?? RUN_TIMEOUT_MS
+  const options = { cwd: ROOT, encoding: 'utf8', timeout, maxBuffer: MAX_BUFFER }
+  const run = (arm, n, nodeArgs = []) => {
     const args = fill(entry.command, {
       client: arm === 'fork' ? forkDir : baselineDir,
       package: PACKAGES[arm],
       baselinePackageDir: path.join(baselineDir, 'node_modules', 'kafkajs'),
       raw: path.join(rawDir, `${arm}-run-${n}.jsonl`),
     })
-    const timeout = adapter.timeoutMs ?? RUN_TIMEOUT_MS
-    const options = { cwd: ROOT, encoding: 'utf8', timeout, maxBuffer: MAX_BUFFER }
-    const result = spawn(process.execPath, args, options)
+    const result = spawn(process.execPath, [...nodeArgs, ...args], options)
+    const { evidence } = state.get(arm)
     evidence.runs.push({
       run: n,
-      args,
+      args: [...nodeArgs, ...args],
       status: result.status,
       signal: result.signal ?? null,
       error: result.error?.message ?? null,
@@ -198,14 +201,32 @@ const runArms = (entry, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) 
       stderr: result.stderr ?? '',
     })
     writeJson(path.join(rawDir, `${arm}.json`), evidence)
+    return adapter.read(result, entry, arm)
+  }
+  for (const [arm, n] of schedule) {
+    const arms = state.get(arm)
+    if (arms.error) continue
     try {
-      outputs.push(adapter.read(result, entry, arm))
+      arms.outputs.push(run(arm, n))
     } catch (err) {
-      state.get(arm).error = `run ${n} of ${runs}: ${err.message}`
+      arms.error = `run ${n} of ${runs}: ${err.message}`
+    }
+  }
+  for (const [arm, arms] of entry.profile ? state : []) {
+    if (arms.error) continue
+    const dir = `${arm}-cpu-profile`
+    try {
+      run(arm, 'profile', ['--cpu-prof', '--cpu-prof-dir', path.join(rawDir, dir)])
+      arms.profile = `bench-raw/${entry.name}/${dir}/`
+    } catch (err) {
+      arms.profile = `failed: ${err.message}`
     }
   }
   return new Map(
-    [...state].map(([arm, { outputs, error }]) => [arm, error ? { outputs, error } : { outputs }])
+    [...state].map(([arm, { outputs, error, profile }]) => [
+      arm,
+      { outputs, ...(error && { error }), ...(profile && { profile }) },
+    ])
   )
 }
 

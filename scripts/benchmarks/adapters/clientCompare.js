@@ -4,8 +4,9 @@
  * alike. Each run excludes its own warm-up. An arm with a run whose measured window is shorter
  * than 30 seconds is `inconclusive`: a shorter window does not mean anything in either direction.
  * Beside the rows, each arm shows the median, minimum, maximum and spread of every metric, and,
- * from its first run, the consumer settings in force, the LZ4 codec and the Fetch version, so a
- * consume ratio can be read from the report alone.
+ * from its first run, the producer or consumer settings in force, the LZ4 codec, the Fetch
+ * version and the consume passes, so a ratio can be read from the report alone. A row with
+ * `profile` names each arm's CPU profile, taken in one extra run outside the medians.
  */
 const { readRun, rowsOf } = require('../report')
 
@@ -13,18 +14,21 @@ const RUNS = 5
 const MIN_WINDOW_MS = 30000
 
 /**
- * Seconds one run spends outside its measured window: process start, topic creation and deletion,
- * connecting, and for a consume run joining the group.
+ * Seconds one run spends outside its warm-up and measured window: process start, topic creation
+ * and deletion, connecting, and for a consume run joining the group. Benchmark run 45023473404
+ * (hosted runner, Kafka 4.4.0) took 35.6 s per 30-second produce run, and about 2 s besides the
+ * corpus and its consumption per consume run.
  */
-const RUN_OVERHEAD_S = 15
+const RUN_OVERHEAD_S = 2
 /** Produce warm-up seconds before the measured window (`clientCompare.js` `WARMUP_MS`). */
 const WARMUP_S = 5
 /**
- * Planning rates for a consume run, in bytes per second, below what the recorded comparison saw on
- * a hosted runner (about 26 MB/s produced and 45 MB/s consumed at 200 bytes a record).
+ * Microseconds per record and per byte to produce a consume corpus, and to consume it at the slower
+ * arm's rate, fitted to run 45023473404: corpora of 200-byte records were produced at about
+ * 205,000 records/s and 1 KiB ones at 91,000; the fork consumed about 385,000 and 215,000 records/s.
  */
-const CORPUS_BYTES_PER_S = 25e6
-const CONSUME_BYTES_PER_S = 35e6
+const CORPUS_US = { record: 3.4, byte: 0.0074 }
+const CONSUME_US = { record: 2.1, byte: 0.0025 }
 
 /**
  * @param {string[]} command
@@ -44,40 +48,46 @@ const spreadOf = ({ median, min, max }) => (median ? ((max - min) / median) * 10
 
 /**
  * The wall-clock seconds a compare row is planned to take with both arms: a produce row by its
- * `--duration-ms`, a consume row by its corpus (`--messages` times `--size`) at the planning rates.
- * @param {{ command: string[], arms: string[] }} entry
+ * `--duration-ms`, a consume row by producing its corpus once and reading it `--passes` times at
+ * the planning costs. A row with `profile` has one more run per arm.
+ * @param {{ command: string[], arms: string[], profile?: boolean }} entry
  * @param {number} [runs]
  * @returns {number}
  */
-const plannedSeconds = ({ command, arms }, runs = RUNS) => {
+const plannedSeconds = ({ command, arms, profile }, runs = RUNS) => {
   const duration = Number(valueOf(command, '--duration-ms') ?? 0) / 1000
-  const bytes =
-    Number(valueOf(command, '--messages') ?? 0) * Number(valueOf(command, '--size') ?? 200)
+  const records = Number(valueOf(command, '--messages') ?? 0)
+  const size = Number(valueOf(command, '--size') ?? 200)
+  const passes = Number(valueOf(command, '--passes') ?? 1)
+  const seconds = ({ record, byte }, n) => (n * (record + size * byte)) / 1e6
   const perRun =
     valueOf(command, '--workload') === 'consume-throughput'
-      ? RUN_OVERHEAD_S + bytes / CORPUS_BYTES_PER_S + bytes / CONSUME_BYTES_PER_S
+      ? RUN_OVERHEAD_S + seconds(CORPUS_US, records) + seconds(CONSUME_US, records * passes)
       : RUN_OVERHEAD_S + WARMUP_S + duration
-  return perRun * runs * arms.length
+  return perRun * (runs + (profile ? 1 : 0)) * arms.length
 }
 
 /**
  * @param {object} output one run's JSON line
- * @returns {string[]} what the arm ran with: consumer settings, LZ4 codec and Fetch version
+ * @param {string} workload the row's `--workload`
+ * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 codec, Fetch
+ *   version and passes
  */
-const notesOf = (output) => {
+const notesOf = (output, workload) => {
   const pairs = (settings) =>
     Object.entries(settings)
-      .map(([key, value]) => `${key}=${value}`)
+      .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
       .join(', ')
   const notes = []
+  const client = workload === 'consume-throughput' ? 'consumer' : 'producer'
   if (output.settings?.same) {
     notes.push(
-      `consumer settings in force (the same explicit settings on both arms): ${pairs(output.settings.same)}`
+      `${client} settings in force (the same explicit settings on both arms): ${pairs(output.settings.same)}`
     )
   } else if (output.settings) {
     const defaults = output.settings.defaults
     notes.push(
-      `consumer settings in force (this package's defaults): ${defaults ? pairs(defaults) : 'unknown package'}`
+      `${client} settings in force (this package's defaults): ${defaults ? pairs(defaults) : 'unknown package'}`
     )
   }
   if (output.codec) {
@@ -88,6 +98,11 @@ const notesOf = (output) => {
     notes.push(`lz4: ${output.codec.package}@${output.codec.version}, ${how}`)
   }
   if (output.fetchVersion !== undefined) notes.push(`Fetch version: ${output.fetchVersion}`)
+  if (output.passes > 1) {
+    notes.push(
+      `the corpus is read ${output.passes} times: each partition is sought back to its first offset after its last record`
+    )
+  }
   return notes
 }
 
@@ -125,7 +140,12 @@ const rows = (entry, arm, outcome, runs) => {
     controls: [window],
     notes: [
       `${arm}: ${outcome.outputs.length} of ${runs} runs, interleaved with the other arm; each run's warm-up is not measured`,
-      ...(outcome.outputs.length ? notesOf(outcome.outputs[0]) : []),
+      ...(outcome.outputs.length
+        ? notesOf(outcome.outputs[0], valueOf(entry.command, '--workload'))
+        : []),
+      ...(outcome.profile
+        ? [`CPU profile (one extra run, not in the medians): ${outcome.profile}`]
+        : []),
     ],
     ...(numbered.length && {
       table: {

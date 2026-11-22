@@ -26,6 +26,32 @@
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
+      "name": "compare-produce-latency-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-latency",
+        "--duration-ms",
+        "30000",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "p50", "unit": "ms" },
+        { "key": "p90", "unit": "ms" },
+        { "key": "p99", "unit": "ms" },
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
       "name": "compare-produce-throughput",
       "adapter": "clientCompare",
       "command": [
@@ -46,6 +72,31 @@
         { "key": "elapsedMs", "unit": "ms" }
       ],
       "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
     },
     {
       "name": "compare-produce-throughput-1k",
@@ -131,7 +182,7 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "12000000"
+        "22000000"
       ],
       "broker": true,
       "metrics": [
@@ -159,7 +210,7 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "12000000",
+        "22000000",
         "--settings",
         "same"
       ],
@@ -175,7 +226,8 @@
         { "key": "messagesPerFetch", "unit": "messages" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
-      "arms": ["fork", "kafkajs@2.2.4"]
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
     },
     {
       "name": "compare-consume-throughput-1k",
@@ -191,7 +243,9 @@
         "--messages",
         "4000000",
         "--size",
-        "1024"
+        "1024",
+        "--passes",
+        "5"
       ],
       "broker": true,
       "metrics": [
@@ -219,7 +273,7 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "10000000",
+        "22000000",
         "--compression",
         "lz4"
       ],
@@ -249,7 +303,7 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "12000000",
+        "22000000",
         "--partitions",
         "12"
       ],
