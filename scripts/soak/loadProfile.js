@@ -52,6 +52,8 @@ const LOAD_DEFAULTS = Object.freeze({
   leaderLanes: false,
   /** Give every record a `topic` header, so one read of all topics can tell them apart. */
   topicHeader: false,
+  /** The interval of the throughput series (`ThroughputSeries`). */
+  seriesIntervalMs: 5000,
 })
 
 const INTEGER_FLAGS = Object.freeze({
@@ -83,9 +85,10 @@ const INTEGER_FLAGS = Object.freeze({
  * A schedule may also carry `profile` (parameters it sets), `validate` (refuses a profile it
  * cannot run) and `check` (proves its fault mechanism before anything is created). Every `start`
  * gets `{ bouncer, netem, admin, topics, windowMs, windowStart, clock, signal, sleep }`; a record
- * with `phase` has `startMs` and `endMs` in ms from the window's start. The window's end aborts
- * `signal` and stops a schedule without failing it: a fault it stopped is recorded with
- * `skipped: 'window ended'`, so only a fault mechanism's own failure is a schedule error.
+ * with `phase`, and a broker outage that ran, has `startMs` and `endMs` in ms from the window's
+ * start. The window's end aborts `signal` and stops a schedule without failing it: a fault it
+ * stopped is recorded with `skipped: 'window ended'`, so only a fault mechanism's own failure is a
+ * schedule error; `verdictOf` makes such a run inconclusive.
  */
 /**
  * Waits on the run's clock until `ms` after the window started.
@@ -118,21 +121,24 @@ const windowEnded = (error, signal) => signal.aborted && error === signal.reason
  * stops it without failing it: a node already down is restored by its own step, no later node is
  * taken down, and each restart not run is recorded with `skipped`, so a schedule longer than its
  * window says so in the report.
- * @param {object} context
+ * @param {object} context see `FAULT_SCHEDULES`
  * @param {{ rollingBounce: Function }} context.bouncer
  * @param {boolean} [context.hard=false] kill rather than stop
  * @param {number} context.between @param {object} context.admin @param {string[]} context.topics
  * @param {AbortSignal} context.signal the window
  * @param {(ms: number, signal?: AbortSignal) => Promise<void>} context.sleep
- * @returns {Promise<object[]>} per broker in order, its outage or `{ service, kind, skipped }`
+ * @returns {Promise<object[]>} per broker in order, its outage with `startMs` and `endMs` (the
+ *   step's span in ms from the window's start, on the run's clock), or `{ service, kind, skipped }`
  * @throws {Error} a restart's own failure, after its node was restored
  */
-const restartEach = async ({ bouncer, hard = false, between, admin, topics, signal, sleep }) => {
+const restartEach = async (context) => {
+  const { bouncer, hard = false, between, admin, topics, signal, sleep } = context
   const records = []
   for (const [i, service] of BROKER_SERVICES.entries()) {
     if (i > 0) await sleep(between, signal)
     if (!signal.aborted) {
       try {
+        const startMs = windowMsOf(context)
         const outages = await bouncer.rollingBounce({
           hard,
           admin,
@@ -140,7 +146,8 @@ const restartEach = async ({ bouncer, hard = false, between, admin, topics, sign
           services: [service],
           signal,
         })
-        records.push(...outages)
+        const endMs = windowMsOf(context)
+        records.push(...outages.map((outage) => ({ ...outage, startMs, endMs })))
         continue
       } catch (error) {
         if (!windowEnded(error, signal)) throw error
@@ -149,6 +156,31 @@ const restartEach = async ({ bouncer, hard = false, between, admin, topics, sign
     records.push({ service, kind: hard ? 'kill' : 'stop', skipped: WINDOW_ENDED })
   }
   return records
+}
+
+/**
+ * A rolling restart phase: one `restartEach` round per entry of `hards` (kill when true), `between`
+ * ms apart. The phase record, first, spans the rounds; it is left out when the window had already
+ * ended, and every restart is then recorded as not run.
+ * @param {object} context see `FAULT_SCHEDULES` @param {number} between
+ * @param {boolean[]} hards
+ * @returns {Promise<object[]>} the phase, then each restart's record in order
+ * @throws {Error} a restart's own failure (`restartEach`)
+ */
+const rollingRestart = async (context, between, hards) => {
+  const { signal, sleep } = context
+  const kind = hards.map((hard) => (hard ? 'kill' : 'stop')).join('+')
+  const phase = signal.aborted
+    ? null
+    : { phase: 'rolling-restart', kind, startMs: windowMsOf(context) }
+  const records = []
+  for (const [i, hard] of hards.entries()) {
+    if (i > 0) await sleep(between, signal)
+    records.push(...(await restartEach({ ...context, hard, between })))
+  }
+  if (!phase) return records
+  phase.endMs = windowMsOf(context)
+  return [phase, ...records]
 }
 
 const FAULT_SCHEDULES = Object.freeze({
@@ -161,17 +193,13 @@ const FAULT_SCHEDULES = Object.freeze({
      * @param {object} context.admin @param {string[]} context.topics
      * @param {number} context.windowMs @param {AbortSignal} context.signal
      * @param {(ms: number, signal?: AbortSignal) => Promise<void>} context.sleep
-     * @returns {Promise<object[]>} every restart's outage, clean ones first; a restart the
-     *   window's end stopped is recorded with `skipped` (`restartEach`)
+     * @returns {Promise<object[]>} the `rolling-restart` phase, then every restart's outage, clean
+     *   ones first; a restart the window's end stopped is recorded with `skipped` (`rollingRestart`)
      */
     async start(context) {
       const { windowMs, signal, sleep } = context
-      const between = FAULT_SCHEDULES['rolling-restarts'].betweenMs
       await sleep(Math.floor(windowMs / 3), signal)
-      const clean = await restartEach({ ...context, between })
-      await sleep(between, signal)
-      const hard = await restartEach({ ...context, hard: true, between })
-      return [...clean, ...hard]
+      return rollingRestart(context, FAULT_SCHEDULES['rolling-restarts'].betweenMs, [false, true])
     },
   }),
   'slow-broker': Object.freeze({
@@ -268,14 +296,8 @@ const FAULT_SCHEDULES = Object.freeze({
      *   when the window's end stopped it, `skipped` (`restartEach`)
      */
     async start(context) {
-      const { windowMs, signal } = context
-      await untilWindowMs(context, windowMs / 3)
-      if (signal.aborted) return []
-      const phase = { phase: 'rolling-restart', kind: 'stop', startMs: windowMsOf(context) }
-      const between = FAULT_SCHEDULES['many-topics'].betweenMs
-      const outages = await restartEach({ ...context, between })
-      phase.endMs = windowMsOf(context)
-      return [phase, ...outages]
+      await untilWindowMs(context, context.windowMs / 3)
+      return rollingRestart(context, FAULT_SCHEDULES['many-topics'].betweenMs, [false])
     },
   }),
 })
@@ -483,12 +505,16 @@ const READ_FINDINGS = Object.freeze(['incompleteRead', 'offsetOrder', 'unparseab
  * @param {string|null} [result.error] a driver failure
  * @param {'KEPT_FLOWING'|'STALLED'|'INCONCLUSIVE'|null} [result.flow] `flowVerdict`, for a
  *   schedule that has one; the verdict carries it only then
- * @returns {{ ok: boolean, product: 'PASS'|'FAIL'|'INCONCLUSIVE', profile: 'REACHED'|'RATE_NOT_REACHED', flow?: string, exitCode: number }}
+ * @param {object[]} [result.faults] the fault schedule's records: one with `skipped` is a fault
+ *   that did not run
+ * @returns {{ ok: boolean, product: 'PASS'|'FAIL'|'INCONCLUSIVE', profile: 'REACHED'|'RATE_NOT_REACHED',
+ *   flow?: string, faults?: 'INCOMPLETE', reasons?: string[], exitCode: number }}
  *   any product finding fails the product, except a loss seen by an incomplete read; a read
  *   finding or a driver error without a product finding is inconclusive; with the product passing,
- *   a stalled flow exits 4, an inconclusive flow 2, and the rate not reached 3, never 0
+ *   faults not run (`faults` INCOMPLETE, each named in `reasons`) or an inconclusive flow exit 2, a
+ *   stalled flow 4, and the rate not reached 3, never 0
  */
-const verdictOf = ({ oracle, rate, error = null, flow = null }) => {
+const verdictOf = ({ oracle, rate, error = null, flow = null, faults = [] }) => {
   const counts = oracle ? oracle.findings : {}
   const productFinding = Object.entries(counts).some(
     ([kind, { count }]) =>
@@ -501,17 +527,27 @@ const verdictOf = ({ oracle, rate, error = null, flow = null }) => {
       ? 'INCONCLUSIVE'
       : 'PASS'
   const profile = rate.reached ? 'REACHED' : 'RATE_NOT_REACHED'
+  const notRun = faults
+    .filter((f) => f.skipped)
+    .map((f) => `${f.phase ?? f.kind} ${f.service}: ${f.skipped}`)
   const exitCode =
     product === 'FAIL'
       ? EXIT.product
-      : product === 'INCONCLUSIVE' || flow === 'INCONCLUSIVE'
+      : product === 'INCONCLUSIVE' || flow === 'INCONCLUSIVE' || notRun.length
         ? EXIT.inconclusive
         : flow === 'STALLED'
           ? EXIT.flowStalled
           : profile === 'RATE_NOT_REACHED'
             ? EXIT.rateNotReached
             : EXIT.pass
-  return { ok: exitCode === EXIT.pass, product, profile, ...(flow && { flow }), exitCode }
+  return {
+    ok: exitCode === EXIT.pass,
+    product,
+    profile,
+    ...(flow && { flow }),
+    ...(notRun.length && { faults: 'INCOMPLETE', reasons: notRun }),
+    exitCode,
+  }
 }
 
 /**
@@ -696,6 +732,128 @@ const flowVerdict = ({ phases, flow, rates, slowNode }) => {
   return { verdict, reasons: [...stalled, ...unjudged], table }
 }
 
+/**
+ * The stall rule of the throughput series: a stretch longer than `maxSilentMs` with no
+ * acknowledgement while records were offered, outside every fault on the group's brokers, is
+ * flagged. 20 s is the frozen-phase bound of `FLOW_RULES` and for the same reason: a broker that
+ * stops answering holds its partitions about 11 s before the controller fences it, while a client
+ * that waits on a refresh or a request holds them for a 30 s request timeout or longer. It must
+ * stay above the series interval, since a silence shorter than one interval is not a candidate.
+ */
+const STALL_RULE = Object.freeze({ maxSilentMs: 20000 })
+
+/**
+ * Records offered in each interval by a deadline schedule of `rate` a second: the schedule's own
+ * count, `floor(t * rate / 1000)`, at the interval's ends, none after the window.
+ * @param {number} rate @param {number} intervalMs @param {number} intervals @param {number} windowMs
+ * @returns {number[]}
+ */
+const offeredPerInterval = (rate, intervalMs, intervals, windowMs) =>
+  Array.from({ length: intervals }, (_, i) => {
+    const due = (ms) => Math.floor((Math.min(ms, windowMs) * rate) / 1000)
+    return due((i + 1) * intervalMs) - due(i * intervalMs)
+  })
+
+/**
+ * The longest piece of `[from, to]` outside every one of `windows`.
+ * @param {number} from @param {number} to @param {{ startMs: number, endMs: number }[]} windows
+ * @returns {{ startMs: number, lengthMs: number }|null} null when the windows cover it
+ */
+const longestOutside = (from, to, windows) => {
+  let pieces = [[from, to]]
+  for (const { startMs, endMs } of windows)
+    pieces = pieces.flatMap(([a, b]) =>
+      [
+        [a, Math.min(b, startMs)],
+        [Math.max(a, endMs), b],
+      ].filter(([x, y]) => y > x)
+    )
+  const best = pieces.reduce((m, p) => (!m || p[1] - p[0] > m[1] - m[0] ? p : m), null)
+  return best && { startMs: best[0], lengthMs: best[1] - best[0] }
+}
+
+/**
+ * The throughput series with the records offered in each interval, and its stall finding.
+ *
+ * Per group with a rate (`all`, and each original partition leader when the run has leader lanes)
+ * the silences are the stretches between consecutive acknowledgements inside the offer window,
+ * from its start to its end, taken from each interval's first and last acknowledgement. Only a
+ * silence of at least one interval is a candidate: a shorter one can stay inside an interval,
+ * where only its length (`maxGapMs`) is kept, so it is not measured everywhere.
+ * A silence is excused where it overlaps a fault on the group's brokers: an outage, delay or pause
+ * record (with `service`, `startMs` and `endMs`) of that leader's broker, and for `all` any such
+ * record. A phase record without a service, and `recovery`, excuse nothing. The group is flagged
+ * when the longest piece of a silence outside its excuses is longer than the rule.
+ *
+ * What it cannot tell: without leader lanes (every schedule but slow-broker) only `all` exists, so
+ * one stopped leader whose partitions others outweigh is not a silence, and any outage excuses the
+ * whole run; leaders are taken before the window, so after a failover a partition counts under its
+ * first leader. It is a report, not part of the verdict.
+ * @param {object} input
+ * @param {object} input.series `ThroughputSeries#snapshot`, merged across processes
+ * @param {Record<string, number>} input.rates records a second offered per group; a group without
+ *   one is not judged
+ * @param {number} input.windowMs @param {object[]} input.faults the fault schedule's records
+ * @returns {{ series: object, summary: object }} `series` with `offered` per group; `summary`
+ *   per judged group its longest silence, its longest piece outside the excuses (`unexcused`),
+ *   each null with no silence of an interval or more, and `flagged`, then `stalled` and `reasons`
+ */
+const throughputReport = ({ series, rates, windowMs, faults }) => {
+  const { intervalMs, intervals } = series
+  const excuses = faults.filter(
+    (f) => f.service && f.kind !== 'none' && Number.isFinite(f.startMs) && Number.isFinite(f.endMs)
+  )
+  const nodeOf = (service) => String(BROKER_SERVICES.indexOf(service) + 1)
+  const groups = {}
+  const summary = {}
+  const reasons = []
+  const seconds = (ms) => (ms / 1000).toFixed(1)
+  for (const [name, cells] of Object.entries(series.groups)) {
+    const rate = rates[name]
+    groups[name] = {
+      ...cells,
+      offered:
+        rate === undefined ? null : offeredPerInterval(rate, intervalMs, intervals, windowMs),
+    }
+    if (rate === undefined) continue
+    const windows = excuses.filter((f) => name === 'all' || nodeOf(f.service) === name)
+    let longestSilence = null
+    let unexcused = null
+    const silence = (from, to) => {
+      if (to - from < intervalMs) return
+      if (to - from > (longestSilence?.lengthMs ?? 0))
+        longestSilence = { startMs: from, lengthMs: to - from }
+      const piece = longestOutside(from, to, windows)
+      if (piece && piece.lengthMs > (unexcused?.lengthMs ?? 0)) unexcused = piece
+    }
+    let last = 0
+    for (let i = 0; i < intervals && i * intervalMs < windowMs; i++) {
+      if (cells.firstAckMs[i] === null) continue
+      silence(last, Math.min(cells.firstAckMs[i], windowMs))
+      last = cells.lastAckMs[i]
+    }
+    if (last < windowMs) silence(last, windowMs)
+    const flagged = (unexcused?.lengthMs ?? 0) > STALL_RULE.maxSilentMs
+    summary[name] = { longestSilence, unexcused, flagged }
+    if (flagged)
+      reasons.push(
+        `${name === 'all' ? 'all' : `leader ${name}`}: no acknowledgement for ${seconds(unexcused.lengthMs)} s from ${seconds(unexcused.startMs)} s, outside any fault on its brokers (most ${STALL_RULE.maxSilentMs / 1000} s)`
+      )
+  }
+  return {
+    series: { ...series, groups },
+    summary: {
+      intervalMs,
+      intervals,
+      beyond: series.beyond,
+      stallThresholdMs: STALL_RULE.maxSilentMs,
+      groups: summary,
+      stalled: reasons.length > 0,
+      reasons,
+    },
+  }
+}
+
 module.exports = {
   BROKER_SERVICES,
   CODECS,
@@ -715,5 +873,7 @@ module.exports = {
   phaseMemory,
   rateLimitedBy,
   rateReport,
+  STALL_RULE,
+  throughputReport,
   verdictOf,
 }

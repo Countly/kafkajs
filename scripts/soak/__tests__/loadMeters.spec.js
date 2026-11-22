@@ -1,4 +1,10 @@
-const { BrokerCpuProbe, FlowMeter, HostMeter, LagProbe } = require('../loadMeters')
+const {
+  BrokerCpuProbe,
+  FlowMeter,
+  HostMeter,
+  LagProbe,
+  ThroughputSeries,
+} = require('../loadMeters')
 
 describe('load meters', () => {
   it('counts a series per key in whole seconds from its origin and finds the longest silence', () => {
@@ -103,5 +109,71 @@ describe('load CPU meters', () => {
       failures: 1,
       lastFailure: 'docker: daemon not answering',
     })
+  })
+})
+
+describe('load throughput series', () => {
+  it('counts each interval per group and keeps the longest stretch inside it with no acknowledgement', () => {
+    const series = new ThroughputSeries({ intervalMs: 5000, spanMs: 20000 })
+    series.count('sent', 5, 100)
+    series.begin(1000)
+    series.count('sent', 10, 1000, '1')
+    series.count('acked', 4, 2000, '1')
+    series.count('acked', 6, 3000, '2')
+    series.count('failed', 1, 4000)
+    series.count('consumed', 9, 6500, '1')
+    series.count('acked', 3, 17000, '1')
+    const { intervalMs, intervals, beyond, groups } = series.snapshot()
+    expect({ intervalMs, intervals, beyond }).toEqual({ intervalMs: 5000, intervals: 4, beyond: 0 })
+    expect(groups.all).toEqual({
+      sent: [10, 0, 0, 0],
+      acked: [10, 0, 0, 3],
+      failed: [1, 0, 0, 0],
+      consumed: [0, 9, 0, 0],
+      firstAckMs: [1000, null, null, 16000],
+      lastAckMs: [2000, null, null, 16000],
+      maxGapMs: [3000, 5000, 5000, 4000],
+    })
+    expect(groups['1'].acked).toEqual([4, 0, 0, 3])
+    expect(groups['1'].maxGapMs).toEqual([4000, 5000, 5000, 4000])
+    expect(groups['2']).toMatchObject({ acked: [6, 0, 0, 0], sent: [0, 0, 0, 0] })
+  })
+
+  it('is sized for its span when created and only counts what falls past it', () => {
+    const series = new ThroughputSeries({ intervalMs: 5000, spanMs: 12000 })
+    series.begin(0)
+    series.count('acked', 1, 1000)
+    const cells = series.snapshot().groups.all.acked
+    for (let at = 0; at < 1e6; at += 997) series.count('acked', 1, at)
+    expect(series.snapshot().groups.all.acked).toHaveLength(cells.length)
+    expect(cells).toHaveLength(3)
+    expect(series.beyond).toBe(Math.ceil((1e6 - 15000) / 997))
+  })
+
+  it("merges another process's series: counts add, acknowledgement times widen, an interval's gap is the shortest any process saw", () => {
+    const parent = new ThroughputSeries({ intervalMs: 5000, spanMs: 10000 })
+    parent.begin(0)
+    parent.count('consumed', 7, 6000)
+    const child = (acks) => {
+      const s = new ThroughputSeries({ intervalMs: 5000, spanMs: 10000 })
+      s.begin(50000)
+      for (const at of acks) s.count('acked', 1, 50000 + at)
+      s.count('sent', acks.length, 50000)
+      return s.snapshot()
+    }
+    parent.merge(child([500, 4500]))
+    parent.merge(child([2500, 7000]))
+    expect(parent.snapshot().groups.all).toEqual({
+      sent: [4, 0],
+      acked: [3, 1],
+      failed: [0, 0],
+      consumed: [0, 7],
+      firstAckMs: [500, 7000],
+      lastAckMs: [4500, 7000],
+      maxGapMs: [2500, 3000],
+    })
+    expect(() =>
+      parent.merge(new ThroughputSeries({ intervalMs: 1000, spanMs: 10000 }).snapshot())
+    ).toThrow('a series of 10 intervals of 1000 ms cannot merge into 2 of 5000 ms')
   })
 })

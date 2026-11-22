@@ -397,13 +397,14 @@ records a second (measured with plain Node on the development host), so the tool
 ### 7.4 The artifact and the verdict
 
 `profile.json`, `producers.json`, `consumers.json`, `committed.json`, `faults.json`, `apache/<topic>.dump.gz` with
-`.end`, `apache/<group>.describe`, `report.json`, and `header.json`, written last, which binds every other file by SHA-256
+`.end`, `apache/<group>.describe`, `throughput.json` (the series of 7.4a), `report.json`, and `header.json`, written last, which binds every other file by SHA-256
 (the seal; `--recheck` refuses an artifact that differs from it). `report.json` holds the verdict, offered against sent
 and acknowledged rates, latency percentiles, event-loop delay, heap and RSS samples every 2 s with each phase's peak and
 end level (`memory`), the client measurements (`cluster`: topic creation time, each member's time from `subscribe` to its
 first assignment, each rebalance with the worst event-loop lag around it, Metadata requests per minute and their response
-sizes, fetch round durations), per-producer and per-member counts, the fault schedule's phases and outages, the flow
-verdict of `slow-broker`, and the oracle's findings with examples.
+sizes, fetch round durations), per-producer and per-member counts, the fault schedule's phases and outages (each
+outage that ran with its `startMs` and `endMs` in the window), the flow verdict of `slow-broker`, the throughput summary
+(`throughput`, 7.4a), and the oracle's findings with examples.
 
 Latency is measured from each record's due time on the offer schedule (record n of a producer is due n / rate after the
 start), not from when the client accepted it, so a client that falls behind shows its backlog in the percentiles (no
@@ -414,6 +415,7 @@ coordinated omission). Transactional records are timed to their commit.
 | 0 | PASS | REACHED | no oracle finding, the offered rate was met |
 | 1 | FAIL | either | loss, duplicate or reordering beyond the kind's guarantee, an aborted record visible, a foreign or malformed key, a skipped commit, a commit past the log end |
 | 2 | INCONCLUSIVE | either | the read was incomplete or failed, or the driver failed, with no product finding |
+| 2 | PASS | either | `faults` INCOMPLETE: a scheduled fault did not run; `verdict.reasons` names each one (for example `kill kafka3: window ended`) |
 | 3 | PASS | RATE_NOT_REACHED | the runner did not send, or the client did not acknowledge, 95 % of the offered records: no claim about the product at that rate |
 | 4 | PASS | either | `slow-broker` only, `flow` STALLED: a flow rule of 7.5 was broken (an inconclusive flow exits 2) |
 
@@ -435,6 +437,31 @@ container; a failed call is counted). `rate.limitedBy` (null when the rate was r
 | `machine` | every core of the machine 90 % busy or more | brokers, clients and reads share the runner: the runner, not the client, set the rate |
 | `unknown` | neither | look at the brokers' CPU, the unsettled cap, rejected sends and latency |
 
+### 7.4a Throughput over time
+
+Totals and percentiles over the whole window hide a producer that stops for a while and then catches up.
+`throughput.json` holds a series of fixed 5 s intervals (`seriesIntervalMs` in `LOAD_DEFAULTS`) from the window's
+start through the join and the drain: per interval the records `offered` (the deadline schedule's own count), `sent`,
+`acked` (acknowledged, or aborted in a transaction), `failed` and `consumed`, the first and last acknowledgement
+(`firstAckMs`, `lastAckMs`, ms from the window's start) and the longest stretch inside the interval with none
+(`maxGapMs`). Groups: `all`, and with leader lanes (`slow-broker`) each original partition leader, whose sent,
+acknowledged and failed counts are the idempotent and plain producers' (a transaction waits for its slowest partition, so
+transactional sends count in `all` only) and whose consumed count is every record delivered from its partitions. The arrays are sized for the planned span when a group first counts, one cell per interval and field, never
+one entry per record; a record past the span is only counted in `beyond`. With `--producer-processes` above 1 each process
+keeps its own series (`processes.<id>`) and the run merges them into the groups: counts add, first and last
+acknowledgements widen, and an interval's `maxGapMs` becomes the shortest any process saw (an upper bound).
+
+`report.throughput` is the summary: per group the longest silence (no acknowledgement between two consecutive ones, from
+the window's start to its end, at least one interval long) and its longest piece outside the faults on the group's brokers
+(`unexcused`). A group is `flagged` when that piece is longer than 20 s (`STALL_RULE` in `loadProfile.js`, the frozen-phase
+bound of 7.5 for the same reason); `stalled` and `reasons` list the flagged groups. A fault excuses `all` and the leader
+of its broker: an outage, delay or pause record with its window times; a phase record without a broker, and `recovery`,
+excuse nothing. The flag is a report, not part of the exit code.
+
+What it can and cannot tell: per-leader groups exist only with leader lanes, so in every other schedule a leader whose
+partitions stopped while the others flowed is not a silence of `all`, and any restart outage excuses `all`. Leaders are
+taken before the window: after a failover a partition still counts under its first leader.
+
 ### 7.5 Fault schedules
 
 `FAULT_SCHEDULES` in `loadProfile.js`. `none` is the plain profile. `rolling-restarts`: from a third of the window, every
@@ -442,10 +469,12 @@ broker stopped and restarted in turn, then every broker killed and restarted in 
 (each step waits for the node to answer and the ISR to be full).
 
 A schedule never runs past the offer window. When the window ends, a broker already down is restarted by its own step, no
-later broker is taken down, and each fault not run is in `faults` with `skipped: "window ended"`; that is not an error and
-does not make the run inconclusive. Only a fault mechanism's own failure is reported as `fault schedule: ...`. With
-thousands of partitions each restart waits much longer for the full ISR, so a 600 s window may hold only part of the
-`rolling-restarts` schedule: read `faults` to see which restarts ran.
+later broker is taken down, and each fault not run is in `faults` with `skipped: "window ended"`; that is not an error, but
+the run did not test what it was dispatched for, so the verdict is inconclusive (exit 2, `faults` INCOMPLETE, the faults not
+run in `verdict.reasons`). Only a fault mechanism's own failure is reported as `fault schedule: ...`. With thousands of
+partitions each restart waits much longer for the full ISR: at 48 topics × 64 partitions, 30,000 records/s and a 600 s
+window, the restarts took 38 to 70 s each and the last kill did not fit; dispatch 900 s for that size (it leaves little of the 30-minute limit). The
+`rolling-restart` phase spans both rounds, so `memory` and `cpu.phases` show it.
 
 **`slow-broker`** (needs `--duration` ≥ 195). In the middle third of the window, kafka2 (node 2) is:
 
@@ -508,7 +537,9 @@ What the first run must show, and how to read it (the `Print the report` step, o
   transactional producer's records; `oracle.size.gapRanges` small (one per rejected send).
 - `oracle.reads`: one entry per topic with `exit` 0 and `lines` equal to `processed`; their `seconds` say whether the read
   fits the time limit at higher rates.
-- `faults`: six outages, three `stop` then three `kill`, each with `outageMs`.
+- `faults`: the `rolling-restart` phase, then six outages, three `stop` then three `kill`, each with `outageMs`,
+  `startMs` and `endMs`.
+- `throughput.stalled` false; `throughput.groups.all.longestSilence`, if any, inside a restart outage.
 - `consumers[].crashes` and `producers[].errors`: expected few, all inside the restart window.
 - `latencyMs.p99` and `eventLoopDelayMs.p99`: recorded, not judged.
 - the artifact replays: `node scripts/soak/loadRun.js --recheck <artifact>` exits 0 with the same findings.
@@ -524,6 +555,10 @@ What the first `slow-broker` run (rate 10000, duration 600) must show:
 - `flow.table`: node 2's `ackedRate` falls in `slow` and is near 0 in the first part of `frozen`; nodes 1 and 3 stay near their
   `offeredRate` in `slow`.
 - `memory`: the `frozen` peak and the `after` end level, with every oracle count 0 as in the plain run.
+- `throughput`: leader 2's longest silence inside `frozen`, not flagged; leaders 1 and 3 not flagged. A producer that
+  waits on its metadata refresh once the cached metadata passes its maximum age (5 minutes after the producers
+  connected, inside `frozen` in a 600 s window) shows as a flagged silence of leaders 1 and 3 there, and in
+  `throughput.json` as intervals with `acked` 0 while `offered` stays at the leader's rate.
 
 What the first `many-topics` run (topics 2000, partitions 1, rate 2000, duration 300, RF 3) must show:
 
