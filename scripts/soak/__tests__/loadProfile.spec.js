@@ -11,9 +11,11 @@ const {
   phaseMemory,
   rateLimitedBy,
   rateReport,
+  STALL_RULE,
+  throughputReport,
   verdictOf,
 } = require('../loadProfile')
-const { FlowMeter } = require('../loadMeters')
+const { FlowMeter, ThroughputSeries } = require('../loadMeters')
 
 const clean = () => ({ complete: true, findings: { loss: { count: 0 }, duplicate: { count: 0 } } })
 const reached = { reached: true }
@@ -204,6 +206,39 @@ describe('load profile rate report and verdict', () => {
       'INCONCLUSIVE'
     )
   })
+
+  it('makes a run whose scheduled faults did not all run inconclusive, naming each fault not run', () => {
+    const faults = [
+      { phase: 'rolling-restart', kind: 'stop+kill', startMs: 200000, endMs: 600000 },
+      { service: 'kafka1', kind: 'stop', outageMs: 56218, startMs: 200000, endMs: 260000 },
+      { service: 'kafka3', kind: 'kill', skipped: 'window ended' },
+      { phase: 'frozen', service: 'kafka2', kind: 'pause', skipped: 'window ended' },
+    ]
+    expect(verdictOf({ oracle: clean(), rate: reached, faults })).toEqual({
+      ok: false,
+      product: 'PASS',
+      profile: 'REACHED',
+      faults: 'INCOMPLETE',
+      reasons: ['kill kafka3: window ended', 'frozen kafka2: window ended'],
+      exitCode: EXIT.inconclusive,
+    })
+    expect(verdictOf({ oracle: clean(), rate: notReached, faults }).exitCode).toBe(
+      EXIT.inconclusive
+    )
+    const lossy = clean()
+    lossy.findings.loss.count = 1
+    expect(verdictOf({ oracle: lossy, rate: reached, faults })).toMatchObject({
+      product: 'FAIL',
+      faults: 'INCOMPLETE',
+      exitCode: EXIT.product,
+    })
+    expect(verdictOf({ oracle: clean(), rate: reached, faults: faults.slice(0, 2) })).toEqual({
+      ok: true,
+      product: 'PASS',
+      profile: 'REACHED',
+      exitCode: EXIT.pass,
+    })
+  })
 })
 
 describe('load profile fault schedules', () => {
@@ -214,6 +249,7 @@ describe('load profile fault schedules', () => {
     return {
       time,
       calls,
+      clock: { now: () => time.t },
       sleep: async (ms, signal) => {
         if (!signal?.aborted) time.t += ms
       },
@@ -227,14 +263,22 @@ describe('load profile fault schedules', () => {
   }
 
   it('rolls clean restarts from a third of the window, then hard restarts', async () => {
-    const { time, calls, sleep, bouncer } = scripted()
-    const outages = await FAULT_SCHEDULES['rolling-restarts'].start({
+    const { time, calls, clock, sleep, bouncer } = scripted()
+    const [phase, ...outages] = await FAULT_SCHEDULES['rolling-restarts'].start({
       bouncer,
       admin: {},
       topics: ['t'],
       windowMs: 600000,
+      windowStart: 0,
+      clock,
       signal: new AbortController().signal,
       sleep,
+    })
+    expect(phase).toEqual({
+      phase: 'rolling-restart',
+      kind: 'stop+kill',
+      startMs: 200000,
+      endMs: 300000,
     })
     expect(calls).toEqual([
       { at: 200000, hard: false, service: 'kafka1', topics: ['t'] },
@@ -252,6 +296,7 @@ describe('load profile fault schedules', () => {
       'kill kafka2',
       'kill kafka3',
     ])
+    expect(outages.map((o) => [o.startMs, o.endMs])).toEqual(calls.map((c) => [c.at, c.at]))
     expect(time.t).toBe(300000)
   })
 
@@ -311,7 +356,7 @@ describe('load profile fault schedules at the window end', () => {
     return { time, window, sleep }
   }
 
-  it('rolling-restarts stops at the window end, keeping the restarts done and recording each one not run; a failed restart still fails it', async () => {
+  it('rolling-restarts stops at the window end, keeping the restarts done with their window times and recording each one not run; a failed restart still fails it', async () => {
     const { time, window, sleep } = windowOf(230000)
     const bouncer = bouncing({ time })
     const records = await FAULT_SCHEDULES['rolling-restarts'].start({
@@ -319,6 +364,8 @@ describe('load profile fault schedules at the window end', () => {
       admin: {},
       topics: ['t'],
       windowMs: 600000,
+      windowStart: 0,
+      clock: { now: () => time.t },
       signal: window.signal,
       sleep,
     })
@@ -327,8 +374,9 @@ describe('load profile fault schedules at the window end', () => {
       { service: 'kafka2', hard: false, at: 221000 },
     ])
     expect(records).toEqual([
-      { service: 'kafka1', kind: 'stop', outageMs: 1000 },
-      { service: 'kafka2', kind: 'stop', outageMs: 1000 },
+      { phase: 'rolling-restart', kind: 'stop+kill', startMs: 200000, endMs: 230000 },
+      { service: 'kafka1', kind: 'stop', outageMs: 1000, startMs: 200000, endMs: 201000 },
+      { service: 'kafka2', kind: 'stop', outageMs: 1000, startMs: 221000, endMs: 222000 },
       { service: 'kafka3', kind: 'stop', skipped: 'window ended' },
       { service: 'kafka1', kind: 'kill', skipped: 'window ended' },
       { service: 'kafka2', kind: 'kill', skipped: 'window ended' },
@@ -342,6 +390,8 @@ describe('load profile fault schedules at the window end', () => {
         admin: {},
         topics: ['t'],
         windowMs: 600000,
+        windowStart: 0,
+        clock: { now: () => failing.time.t },
         signal: failing.window.signal,
         sleep: failing.sleep,
       })
@@ -368,10 +418,14 @@ describe('load profile fault schedules at the window end', () => {
       admin: {},
       topics: ['t'],
       windowMs: 600000,
+      windowStart: 0,
+      clock: { now: () => time.t },
       signal: window.signal,
       sleep,
     })
-    expect(records.map((r) => `${r.kind} ${r.service} ${r.skipped}`)).toEqual([
+    expect(
+      records.filter((r) => r.service).map((r) => `${r.kind} ${r.service} ${r.skipped}`)
+    ).toEqual([
       'stop kafka1 window ended',
       'stop kafka2 window ended',
       'stop kafka3 window ended',
@@ -395,7 +449,7 @@ describe('load profile fault schedules at the window end', () => {
     })
     expect(records).toEqual([
       { phase: 'rolling-restart', kind: 'stop', startMs: 100000, endMs: 121000 },
-      { service: 'kafka1', kind: 'stop', outageMs: 1000 },
+      { service: 'kafka1', kind: 'stop', outageMs: 1000, startMs: 100000, endMs: 101000 },
       { service: 'kafka2', kind: 'stop', skipped: 'window ended' },
       { service: 'kafka3', kind: 'stop', skipped: 'window ended' },
     ])
@@ -780,5 +834,96 @@ describe('load profile latency histogram across processes', () => {
     expect(here.toJSON()).toMatchObject({ samples: 5, max: 400 })
     expect(here.percentile(80)).toBeGreaterThanOrEqual(50)
     expect(here.percentile(80)).toBeLessThan(51.1)
+  })
+})
+
+describe('load profile throughput series and stall finding', () => {
+  const WINDOW_MS = 600000
+  const RATES = { all: 300, 1: 100, 2: 100, 3: 100 }
+
+  /**
+   * Acknowledges each leader's records every 500 ms of a 600 s window, except where `silent` says;
+   * with `leaders` `['all']` the series has no per-leader groups, as in a run without leader lanes.
+   */
+  const seriesOf = (silent = () => false, leaders = ['1', '2', '3']) => {
+    const series = new ThroughputSeries({ intervalMs: 5000, spanMs: WINDOW_MS + 30000 })
+    series.begin(0)
+    for (let t = 0; t < WINDOW_MS; t += 500)
+      for (const leader of leaders) {
+        series.count('sent', 50, t, leader)
+        if (!silent(leader, t)) series.count('acked', 50, t, leader)
+      }
+    return series.snapshot()
+  }
+  const judge = (series, faults = []) =>
+    throughputReport({ series, rates: RATES, windowMs: WINDOW_MS, faults })
+
+  it('flags a stretch with no acknowledgement at the 300 s mark of a run with no fault', () => {
+    const { summary, series } = judge(seriesOf((_, t) => t >= 300000 && t < 330000))
+    expect(STALL_RULE.maxSilentMs).toBe(20000)
+    expect(summary.groups.all).toEqual({
+      longestSilence: { startMs: 299500, lengthMs: 30500 },
+      unexcused: { startMs: 299500, lengthMs: 30500 },
+      flagged: true,
+    })
+    expect(summary.stalled).toBe(true)
+    expect(summary.reasons).toEqual(
+      expect.arrayContaining([
+        'all: no acknowledgement for 30.5 s from 299.5 s, outside any fault on its brokers (most 20 s)',
+        'leader 1: no acknowledgement for 30.5 s from 299.5 s, outside any fault on its brokers (most 20 s)',
+      ])
+    )
+    expect(series.groups.all.offered.slice(0, 2)).toEqual([1500, 1500])
+    expect(series.groups.all.offered.slice(120)).toEqual(Array(6).fill(0))
+    expect(series.groups['2'].offered[0]).toBe(500)
+  })
+
+  it('does not flag the same stretch inside a scheduled restart outage, and still reports it', () => {
+    const outage = {
+      service: 'kafka1',
+      kind: 'stop',
+      outageMs: 30000,
+      startMs: 295000,
+      endMs: 335000,
+    }
+    const phase = { phase: 'rolling-restart', kind: 'stop+kill', startMs: 200000, endMs: 400000 }
+    const silent = seriesOf((_, t) => t >= 300000 && t < 330000, ['all'])
+    const { summary } = judge(silent, [phase, outage])
+    expect(summary.groups).toEqual({
+      all: {
+        longestSilence: { startMs: 299500, lengthMs: 30500 },
+        unexcused: null,
+        flagged: false,
+      },
+    })
+    expect(summary.stalled).toBe(false)
+    expect(summary.reasons).toEqual([])
+    expect(judge(silent, [phase]).summary.groups.all.flagged).toBe(true)
+  })
+
+  it("does not flag a frozen broker's partitions in a slow-broker run, and flags the healthy leaders' stop inside its freeze", () => {
+    const faults = [
+      { phase: 'slow', service: 'kafka2', kind: 'delay', startMs: 200000, endMs: 277500 },
+      { phase: 'frozen', service: 'kafka2', kind: 'pause', startMs: 277500, endMs: 322500 },
+      { phase: 'recovery', service: 'kafka2', kind: 'none', startMs: 322500, endMs: 400000 },
+    ]
+    const frozen = (leader, t) => leader === '2' && t >= 277500 && t < 322500
+    const healthy = judge(seriesOf(frozen), faults).summary
+    expect(healthy.groups['2'].longestSilence.lengthMs).toBe(45500)
+    expect(healthy.groups['2'].flagged).toBe(false)
+    expect(healthy.stalled).toBe(false)
+
+    const stopped = judge(
+      seriesOf((leader, t) => frozen(leader, t) || (leader !== '2' && t >= 300000 && t < 330000)),
+      faults
+    ).summary
+    expect(Object.entries(stopped.groups).map(([g, r]) => [g, r.flagged])).toEqual([
+      ['1', true],
+      ['2', false],
+      ['3', true],
+      ['all', false],
+    ])
+    expect(stopped.groups['1'].unexcused).toEqual({ startMs: 299500, lengthMs: 30500 })
+    expect(stopped.groups.all.longestSilence).toEqual({ startMs: 299500, lengthMs: 23000 })
   })
 })
