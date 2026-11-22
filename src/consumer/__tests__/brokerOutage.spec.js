@@ -3,6 +3,7 @@ const { KafkaJSConnectionError } = require('../../errors')
 const createConsumer = require('../index')
 const Runner = require('../runner')
 const ClassicMembership = require('../groupProtocol/classic')
+const Cluster = require('../../cluster')
 const { createCluster, newLogger } = require('testHelpers')
 const {
   createScriptedCluster,
@@ -1542,5 +1543,121 @@ describe('Consumer > broker outages', () => {
 
     expect(scripted.sockets().filter((socket) => !socket.destroyed)).toEqual([])
     expect(scripted.requests().slice(disconnectedAt)).toEqual([])
+  })
+
+  describe('metadata that is only past metadataMaxAge', () => {
+    const MAX_AGE = 300
+    const unhandled = []
+    const onUnhandled = (reason) => unhandled.push(reason)
+
+    beforeEach(() => {
+      unhandled.length = 0
+      process.on('unhandledRejection', onUnhandled)
+    })
+
+    afterEach(() => {
+      process.off('unhandledRejection', onUnhandled)
+    })
+
+    /**
+     * Starts a consumer whose metadata ages within the case and whose every Fetch carries a record.
+     * @returns {Promise<{ cluster: object, events: object }>} once the first record is delivered
+     */
+    const agedConsumer = async () => {
+      const rig = scenario({ metadataMaxAge: MAX_AGE })
+      endlessRecords(rig.cluster)
+      await start(rig.events)
+      await until(() => rig.events.records.length > 0, 'the first record')
+      return rig
+    }
+
+    /**
+     * Holds the next Metadata request, as a broker that keeps its connection but never answers.
+     * @param {object} cluster
+     * @returns {Promise<object>} the gate, once the request has arrived
+     */
+    const holdRefresh = async (cluster) => {
+      const gate = cluster.schedule.hold({ api: 'Metadata' })
+      let arrived = false
+      gate.arrived().then(() => (arrived = true))
+      await until(() => arrived, 'a refresh of the aged metadata')
+      return gate
+    }
+
+    /**
+     * Captures the Cluster the next client connects with, so a case can read its broker pool.
+     * @returns {() => Cluster} the captured cluster
+     */
+    const captureCluster = () => {
+      let captured
+      const connect = Cluster.prototype.connect
+      jest.spyOn(Cluster.prototype, 'connect').mockImplementation(function (...args) {
+        captured ??= this
+        return connect.apply(this, args)
+      })
+      return () => captured
+    }
+
+    it('keeps delivering from the cached leader while the refresh is never answered, and starts no second refresh', async () => {
+      const { cluster, events } = await agedConsumer()
+      const gate = await holdRefresh(cluster)
+      try {
+        const asked = cluster.tally('Metadata')
+        const delivered = events.records.length
+        await until(
+          () => events.records.length >= delivered + 10,
+          'ten records while the refresh is held'
+        )
+        await sleep(MAX_AGE)
+
+        expect(cluster.tally('Metadata')).toBe(asked)
+        expect(events.crashes).toEqual([])
+        expect(unhandled).toEqual([])
+      } finally {
+        gate.release()
+      }
+    })
+
+    it('keeps delivering when the refresh fails, reports no unhandled rejection and refreshes again on a later round', async () => {
+      const { cluster, events } = await agedConsumer()
+      const asked = cluster.tally('Metadata')
+      cluster.outage('Metadata', { errorCode: 7 })
+      try {
+        // RETRY spends two requests on one refresh, so a third is a later refresh.
+        await until(() => cluster.tally('Metadata') >= asked + 3, 'a refresh after a failed one')
+        const delivered = events.records.length
+        await until(
+          () => events.records.length >= delivered + 10,
+          'ten records while the refreshes fail'
+        )
+
+        expect(events.crashes).toEqual([])
+        expect(unhandled).toEqual([])
+      } finally {
+        cluster.recover('Metadata')
+      }
+    })
+
+    it('stops and disconnects while the refresh is never answered, leaving no connection and installing nothing after it', async () => {
+      const clusterOf = captureCluster()
+      const { cluster, events } = await agedConsumer()
+      const pool = clusterOf().brokerPool
+      const gate = await holdRefresh(cluster)
+
+      let stopped = false
+      const stopping = consumer.stop().finally(() => (stopped = true))
+      await until(() => stopped, 'the stop')
+      await stopping
+      await consumer.disconnect()
+      consumer = undefined
+      gate.release()
+      await sleep(20)
+
+      expect(cluster.tally('Metadata', 'cancelled')).toBe(1)
+      expect(cluster.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      expect(pool.metadata).toBeNull()
+      expect(events.crashes).toEqual([])
+      expect(unhandled).toEqual([])
+    })
   })
 })

@@ -5,6 +5,7 @@ const { buildRequest } = require('../groupProtocol/heartbeatState')
 const ConsumerGroupProtocol = require('../groupProtocol/consumer')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { createPatternGroup } = require('./fixtures/patternGroup')
+const { TOPIC, TOPIC_ID, prepareRecordBatches } = require('./fixtures/fetchHarness')
 const { Kafka, logLevel } = require('../../../index')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const { metadataV13 } = require('../../../testHelpers/wire/expected')
@@ -362,6 +363,57 @@ describe('discovery refreshes and their scope', () => {
     expect(broker.metadata).toHaveBeenCalledTimes(1)
   })
 
+  test('a background refresh of aged metadata returns at once and observes the answer for its scope when it lands', async () => {
+    const held = gate()
+    const { cluster, broker } = clusterWith([metadata(['orders-1']), held.promise])
+    const scope = new Subscription()
+    scope.add({ topics: [/^orders-/], policy: { kind: 'earliest' } })
+    const onMetadata = jest.fn()
+    const options = { metadataScope: scope, isCurrent: () => true, onMetadata }
+    try {
+      await cluster.refreshMetadata(options)
+      cluster.brokerPool.metadataExpireAt = Date.now() - 1
+
+      await cluster.refreshMetadataIfNecessary({ ...options, background: true })
+      for (let i = 0; i < 10; i++) await new Promise(setImmediate)
+      expect(broker.metadata).toHaveBeenCalledTimes(2)
+      expect(onMetadata).toHaveBeenCalledTimes(1)
+
+      held.release(metadata(['orders-1', 'orders-2']))
+      for (let i = 0; i < 10; i++) await new Promise(setImmediate)
+      expect(onMetadata).toHaveBeenCalledTimes(2)
+      expect(onMetadata.mock.calls[1][0].topicMetadata.map(({ topic }) => topic)).toEqual([
+        'orders-1',
+        'orders-2',
+      ])
+    } finally {
+      held.release(metadata([]))
+    }
+  })
+
+  test('a refresh asked for in the background still waits when a subscribed topic is missing from the cached metadata', async () => {
+    const held = gate()
+    const { cluster, broker } = clusterWith([metadata(['keep']), held.promise])
+    await cluster.brokerPool.refreshMetadata(['keep'])
+    cluster.targetTopics = new Set(['keep', 'new'])
+    let settled = false
+    const pending = cluster
+      .refreshMetadataIfNecessary({ allowLeaderless: true, background: true })
+      .finally(() => (settled = true))
+    try {
+      for (let i = 0; i < 10; i++) await new Promise(setImmediate)
+      expect(broker.metadata).toHaveBeenCalledTimes(2)
+      expect(settled).toBe(false)
+
+      held.release(metadata(['keep', 'new']))
+      await pending
+      expect(cluster.brokerPool.metadataState(['keep', 'new'])).toBe('fresh')
+    } finally {
+      held.release(metadata([]))
+      await pending
+    }
+  })
+
   describe('concurrent refreshes join only within one subscription key', () => {
     const closures = [
       ['refreshMetadata', 'refreshMetadataIfNecessary'],
@@ -606,6 +658,83 @@ const scriptedDiscovery = async () => {
 }
 
 /**
+ * A pattern consumer assigned the harness topic, whose metadata ages within the case: the refresh
+ * that finds a second matching topic is held unanswered, as by a broker that keeps its connection
+ * but answers nothing. Fetches go on meanwhile, and the rejoin with both names follows once that
+ * refresh lands.
+ * @returns {Promise<void>}
+ */
+const heldDiscovery = async () => {
+  await prepareRecordBatches()
+  const later = `${TOPIC}-later`
+  const names = [TOPIC]
+  const seam = groupScript(createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }] }))
+  seam.answer('Metadata', () => ({
+    ...metadataV13.response,
+    brokers: [{ nodeId: 0, host: 'node0', port: 9092, rack: null }],
+    controllerId: 0,
+    topics: names.map((name) => ({
+      ...metadataV13.response.topics[0],
+      name,
+      topicId: name === TOPIC ? TOPIC_ID : '01020304-0506-0708-090a-0b0c0d0e0f19',
+      partitions:
+        name === TOPIC
+          ? [
+              {
+                errorCode: 0,
+                partitionIndex: 0,
+                leaderId: 0,
+                leaderEpoch: 5,
+                replicas: [0],
+                isr: [0],
+                offlineReplicas: [],
+              },
+            ]
+          : [],
+    })),
+  }))
+  const consumer = new Kafka(seam.kafkaOptions()).consumer({
+    groupId: 'held-discovery',
+    metadataMaxAge: 300,
+    maxWaitTimeInMs: 20,
+  })
+  const reached = (condition) =>
+    waitFor(condition, { maxWait: 5000 }).then(
+      () => true,
+      () => false
+    )
+  const sent = (api) => seam.requests().filter((request) => request.api === api)
+  const joined = (join) =>
+    MemberMetadata.decode(Buffer.from(join.fields.groupProtocols[0].metadata, 'hex')).topics.sort()
+  let held = null
+  try {
+    await consumer.connect()
+    await consumer.subscribe({ topics: [/^test-topic/] })
+    await consumer.run({ autoCommit: false, eachMessage: async () => {} })
+    expect(await reached(() => sent('JoinGroup').length === 1)).toBe(true)
+    expect(joined(sent('JoinGroup')[0])).toEqual([TOPIC])
+
+    held = seam.schedule.hold({ api: 'Metadata' })
+    let arrived = false
+    held.arrived().then(() => (arrived = true))
+    names.push(later)
+    expect(await reached(() => arrived)).toBe(true)
+    const fetched = sent('Fetch').length
+    expect(await reached(() => sent('Fetch').length >= fetched + 3)).toBe(true)
+    expect(sent('JoinGroup')).toHaveLength(1)
+
+    held.release()
+    held = null
+    expect(await reached(() => sent('JoinGroup').length === 2)).toBe(true)
+    expect(joined(sent('JoinGroup')[1])).toEqual([TOPIC, later])
+    seam.assertClean()
+  } finally {
+    held?.release()
+    await consumer.disconnect()
+  }
+}
+
+/**
  * The same scenario on a real cluster, through the public clients: a topic created after the
  * subscription is joined and delivered within the unblocked-fixture bound.
  * @param {AbortSignal} scope the case scope
@@ -656,6 +785,10 @@ describe.each(lanes())('a topic created after a pattern subscription on the %s l
 
   if (lane === 'fake') {
     test('joins again with both names at the next metadata refresh', scriptedDiscovery)
+    test(
+      'keeps fetching while the refresh of aged metadata is unanswered, and joins again with both names once it lands',
+      heldDiscovery
+    )
   } else {
     test(
       'is joined and delivered within the discovery bound',
