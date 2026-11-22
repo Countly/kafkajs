@@ -117,6 +117,11 @@ describe('scripts/mutants/generate.js', () => {
       'group-timing',
       'share',
       'protocol',
+      'producer-send',
+      'network',
+      'fetch-loop',
+      'compression',
+      'aged-metadata',
       'cluster',
       'admin',
     ])
@@ -150,6 +155,46 @@ describe('scripts/mutants/generate.js', () => {
     expect(specsOf(`${dir}/syncGroup/v5/response.js`)).toEqual([`${dir}/groupResponses.spec.js`])
     expect(specsOf(`${dir}/syncGroup/index.js`)).toEqual([`${dir}/syncGroup/index.spec.js`])
   })
+  test('every witness spec an area names runs in the broker-free unit lane', () => {
+    const script = require('../../../package.json').scripts['test:unit']
+    const selected = script.slice(script.indexOf('--testPathPatterns'))
+    const patterns = [...selected.matchAll(/'([^']+)'/g)].map(([, p]) => new RegExp(p))
+    const named = AREAS.flatMap(({ specs, witnesses = {} }) => [
+      ...specs,
+      ...Object.values(witnesses).flatMap((entry) =>
+        typeof entry === 'object' && !Array.isArray(entry) ? Object.values(entry).flat() : entry
+      ),
+    ])
+    expect(named.length).toBeGreaterThan(100)
+    expect([...new Set(named)].filter((spec) => !patterns.some((p) => p.test(spec)))).toEqual([])
+  })
+
+  test('aged-metadata mutates only the metadata-age and disconnect-fence methods of the cluster and pool', () => {
+    const area = AREAS.find((a) => a.name === 'aged-metadata')
+    const records = generate(REPO, AREAS).filter((r) => r.area === 'aged-metadata')
+    const lines = new Map()
+    const methods = new Set()
+    for (const r of records) {
+      if (!lines.has(r.target))
+        lines.set(r.target, fs.readFileSync(path.join(REPO, r.target), 'utf8').split('\n'))
+      const text = lines.get(r.target)
+      let at = r.line - 1
+      while (at >= 0 && !/^ {2}(?:async )?[\w#]+\(/.test(text[at])) at--
+      const method = /^ {2}(?:async )?([\w#]+)\(/.exec(text[at])[1]
+      expect(Object.keys(area.witnesses[r.target])).toContain(method)
+      methods.add(`${r.target}#${method}`)
+    }
+    expect([...methods].sort()).toEqual([
+      'src/cluster/brokerPool.js#disconnect',
+      'src/cluster/brokerPool.js#metadataState',
+      'src/cluster/brokerPool.js#refreshMetadata',
+      'src/cluster/brokerPool.js#refreshMetadataIfNecessary',
+      'src/cluster/brokerPool.js#refreshMetadataUnshared',
+      'src/cluster/index.js#refreshMetadataIfNecessary',
+      'src/cluster/index.js#serveFromCache',
+    ])
+  })
+
   describe('method-specific witnesses', () => {
     const lib = 'src/a/lib.spec.js'
     const other = 'src/a/other.spec.js'
@@ -257,6 +302,40 @@ describe('scripts/mutants/generate.js', () => {
         witnesses: [other, lib],
       })
     })
+    test('a methodsOnly area mutates only the methods its rules name and keeps its unruled targets whole', () => {
+      const area = {
+        name: 'theta',
+        targets: ['src/a/lib.js', 'src/b/two.js'],
+        specs: [lib],
+        methodsOnly: true,
+        witnesses: { 'src/b/two.js': { first: [other], third: [other] } },
+      }
+      const records = generate(root, [area])
+      const ruled = records.filter((r) => r.target === 'src/b/two.js')
+      expect(ruled.map((r) => [r.line, r.operator])).toEqual([
+        [6, 'early-return'],
+        [7, 'boundary'],
+        [7, 'negated-condition'],
+        [7, 'constant'],
+        [8, 'constant'],
+        [18, 'early-return'],
+        [19, 'early-return'],
+        [20, 'boundary'],
+        [20, 'negated-condition'],
+        [20, 'constant'],
+        [21, 'constant'],
+      ])
+      for (const r of ruled) expect(r).toMatchObject({ spec: other, witnesses: [other, lib] })
+      const whole = generate(root, [{ ...area, methodsOnly: undefined }])
+      expect(records.filter((r) => r.target === 'src/a/lib.js')).toEqual(
+        whole.filter((r) => r.target === 'src/a/lib.js')
+      )
+      expect(whole.filter((r) => r.target === 'src/b/two.js').length).toBeGreaterThan(ruled.length)
+      expect(() =>
+        generate(root, [{ ...area, witnesses: { 'src/b/two.js': { gone: [other] } } }])
+      ).toThrow('mutants: the witness rule gone of src/b/two.js matches no method')
+    })
+
     test('a rule for a file the area does not generate fails generation and names the file', () => {
       const area = (witnesses) => ({ name: 'eta', targets: ['src/b/'], specs: [lib], witnesses })
       expect(() => generate(root, [area({ 'src/b/moved.js': { first: [other] } })])).toThrow(
@@ -926,6 +1005,75 @@ describe('scripts/mutants/generate.js', () => {
         'boundary',
         [`${SHARE}/shareConsumerOptions.spec.js`, `${SHARE}/shareConsumerClose.spec.js`],
       ],
+      [
+        'aged metadata: an aged cache is served while the refresh runs',
+        'src/cluster/index.js',
+        'serveFromCache(',
+        "    if (cached !== 'aged') return cached === 'fresh'",
+        'negated-condition',
+        [`${PRODUCER}/__tests__/agedMetadata.spec.js`],
+      ],
+      [
+        'aged metadata: a disconnect clears what the pool installed',
+        'src/cluster/brokerPool.js',
+        'async disconnect(',
+        '    this.authenticationBlackout.clear()',
+        'removed-call',
+        [
+          `${PRODUCER}/__tests__/agedMetadata.spec.js`,
+          'src/cluster/__tests__/disconnectDrains.spec.js',
+        ],
+      ],
+      [
+        'aged metadata: a refresh begun before a disconnect installs nothing',
+        'src/cluster/brokerPool.js',
+        'async refreshMetadataUnshared(',
+        '        if (!applicable()) return',
+        'negated-condition',
+        [
+          `${PRODUCER}/__tests__/agedMetadata.spec.js`,
+          'src/cluster/__tests__/metadataCacheWiring.spec.js',
+          'src/cluster/__tests__/obsoleteDrain.spec.js',
+          'src/cluster/__tests__/consumerTopicIsolation.spec.js',
+        ],
+      ],
+      [
+        'network: the frame buffer refuses a non-Kafka reply',
+        'src/network/frameBuffer.js',
+        'const looksLike',
+        '  if (prefix.readInt32BE(0) === HTTP_AS_SIZE) {',
+        'negated-condition',
+        [
+          'src/network/__tests__/frameValidation.spec.js',
+          'src/network/__tests__/flexibleFraming.spec.js',
+        ],
+      ],
+      [
+        'producer send: record errors pick the failing records',
+        'src/producer/sendMessages.js',
+        'const resolveFailingRecords',
+        '  if (!Array.isArray(e.recordErrors) || e.recordErrors.length === 0) {',
+        'negated-condition',
+        [
+          `${PRODUCER}/sendMessages.spec.js`,
+          `${PRODUCER}/__tests__/drainLoop.spec.js`,
+          `${PRODUCER}/__tests__/splitSend.spec.js`,
+          `${PRODUCER}/__tests__/leaderHint.spec.js`,
+        ],
+      ],
+      [
+        'fetch loop: the fetcher set is rebuilt when its nodes differ',
+        'src/consumer/fetchManager.js',
+        'const differs',
+        '  if (current.length !== wanted.size) return true',
+        'negated-condition',
+        [
+          'src/consumer/fetchManager.spec.js',
+          'src/consumer/__tests__/fetchManagerReconcile.spec.js',
+          'src/consumer/__tests__/fetchManagerStop.spec.js',
+          'src/consumer/__tests__/fetchManagerErrorIsolation.spec.js',
+        ],
+      ],
     ]
 
     test.each(GUARDED)(
@@ -1016,6 +1164,27 @@ describe('scripts/mutants/generate.js', () => {
           "    const where = hosts.length > 0 ? hosts.join(', ') : 'the bootstrap list'",
           'boundary',
           'src/cluster/__tests__/bootstrapResolution.spec.js',
+        ],
+        [
+          'src/producer/state/joinOrder.js',
+          'enter(send)',
+          "    if (typeof lanes === 'string') {",
+          'negated-condition',
+          'src/producer/state/__tests__/joinOrder.spec.js',
+        ],
+        [
+          'src/protocol/message/compression/lz4.js',
+          'const unavailable',
+          'const unavailable = () => {',
+          'early-return',
+          'src/protocol/message/compression/lz4.spec.js',
+        ],
+        [
+          'src/consumer/batch.js',
+          'leaderEpochAt(offset)',
+          '  leaderEpochAt(offset) {',
+          'early-return',
+          'src/consumer/__tests__/batch.spec.js',
         ],
         [
           'src/producer/state/transactionOffsets.js',

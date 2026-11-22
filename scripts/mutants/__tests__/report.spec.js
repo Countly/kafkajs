@@ -188,6 +188,27 @@ describe('scripts/mutants/report.js', () => {
     expect(notRun).toContain('- 1 × sampling')
   })
 
+  test('the hot paths every record passes through are P1 areas; aged metadata ranks with cluster', () => {
+    const { AREAS } = require('../generate')
+    const severities = Object.fromEntries(
+      AREAS.map(({ name }) => [name, MutationReport.severity(name)])
+    )
+    expect(severities).toEqual({
+      transactions: 'P1',
+      offsets: 'P1',
+      'group-timing': 'P1',
+      share: 'P1',
+      protocol: 'P1',
+      'producer-send': 'P1',
+      network: 'P1',
+      'fetch-loop': 'P1',
+      compression: 'P1',
+      'aged-metadata': 'P2',
+      cluster: 'P2',
+      admin: 'P2',
+    })
+  })
+
   test('survivors are ranked by area severity then operator class', () => {
     const records = [
       rec({ id: 'p2-removed', area: 'cluster', operator: 'removed-call', mutated: '' }),
