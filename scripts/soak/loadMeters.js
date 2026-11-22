@@ -343,4 +343,141 @@ class BrokerCpuProbe {
   }
 }
 
-module.exports = { BrokerCpuProbe, ClientMeter, FlowMeter, HostMeter, LagProbe }
+/** The counts a `ThroughputSeries` keeps per interval. */
+const SERIES_COUNTS = Object.freeze(['sent', 'acked', 'failed', 'consumed'])
+
+/**
+ * Records per fixed interval over a run's planned span (offer window, join and drain): sent,
+ * acknowledged, failed and consumed, and per interval the first and last acknowledgement and the
+ * longest stretch inside it with none. Kept for `all` and for each named group (a partition
+ * leader). Its memory is fixed when a group first counts: one typed-array cell per interval and
+ * field, never one entry per record; a record past the span is only counted in `beyond`. Counting
+ * is an array increment per group, plus two comparisons for an acknowledgement.
+ */
+class ThroughputSeries {
+  /** @param {{ intervalMs?: number, spanMs: number }} options the span is rounded up to whole intervals */
+  constructor({ intervalMs = 5000, spanMs }) {
+    this.intervalMs = intervalMs
+    this.intervals = Math.max(1, Math.ceil(spanMs / intervalMs))
+    this.origin = null
+    this.beyond = 0
+    /** @type {Map<string, object>} */
+    this.groups = new Map()
+  }
+
+  /**
+   * @param {{ seriesIntervalMs: number, durationSeconds: number, joinSeconds: number, drainSeconds: number }} profile
+   * @returns {ThroughputSeries} sized for the profile's window, join and drain
+   */
+  static forProfile({ seriesIntervalMs, durationSeconds, joinSeconds, drainSeconds }) {
+    const spanMs = (durationSeconds + joinSeconds + drainSeconds) * 1000
+    return new ThroughputSeries({ intervalMs: seriesIntervalMs, spanMs })
+  }
+
+  /** @param {number} origin the clock time the first interval starts at @returns {void} */
+  begin(origin) {
+    this.origin = origin
+  }
+
+  /**
+   * Counts `n` records in `all` and, when it is another name, in `group`. Nothing is counted
+   * before `begin`.
+   * @param {'sent'|'acked'|'failed'|'consumed'} kind
+   * @param {number} n @param {number} now clock time @param {string} [group='all']
+   * @returns {void}
+   */
+  count(kind, n, now, group = 'all') {
+    if (this.origin === null) return
+    const at = now - this.origin
+    const i = Math.floor(at / this.intervalMs)
+    if (i < 0 || i >= this.intervals) {
+      this.beyond += n
+      return
+    }
+    this.#record(this.#group('all'), kind, n, at, i)
+    if (group !== 'all') this.#record(this.#group(group), kind, n, at, i)
+  }
+
+  /**
+   * Adds another process's series, taken from the same profile, after its window and join. Counts
+   * add; first and last acknowledgement times widen. An interval's longest stretch without an
+   * acknowledgement becomes the shortest any process saw: an upper bound on the merged one, since
+   * one process's acknowledgements may fall inside another's stretch.
+   * @param {object} other a `snapshot`
+   * @returns {void}
+   * @throws {Error} when the intervals differ
+   */
+  merge(other) {
+    if (other.intervalMs !== this.intervalMs || other.intervals !== this.intervals)
+      throw new Error(
+        `a series of ${other.intervals} intervals of ${other.intervalMs} ms cannot merge into ${this.intervals} of ${this.intervalMs} ms`
+      )
+    this.beyond += other.beyond
+    for (const [name, cells] of Object.entries(other.groups)) {
+      const g = this.#group(name)
+      g.gaps ??= this.#gaps(g)
+      for (let i = 0; i < this.intervals; i++) {
+        for (const kind of SERIES_COUNTS) g[kind][i] += cells[kind][i]
+        if (cells.firstAckMs[i] !== null) {
+          if (!(g.firstAt[i] <= cells.firstAckMs[i])) g.firstAt[i] = cells.firstAckMs[i]
+          if (!(g.lastAt[i] >= cells.lastAckMs[i])) g.lastAt[i] = cells.lastAckMs[i]
+        }
+        g.gaps[i] = Math.min(g.gaps[i], cells.maxGapMs[i])
+      }
+    }
+  }
+
+  /**
+   * @returns {{ intervalMs: number, intervals: number, beyond: number, groups: Record<string, object> }}
+   *   per group arrays of one cell per interval: the counts, `firstAckMs` and `lastAckMs` (ms from
+   *   the origin, null with none) and `maxGapMs` (an interval with no acknowledgement has its whole
+   *   length); safe to send to another process
+   */
+  snapshot() {
+    const groups = {}
+    for (const [name, g] of this.groups) {
+      const cells = {}
+      for (const kind of SERIES_COUNTS) cells[kind] = Array.from(g[kind])
+      const orNull = (t) => (Number.isNaN(t) ? null : t)
+      cells.firstAckMs = Array.from(g.firstAt, orNull)
+      cells.lastAckMs = Array.from(g.lastAt, orNull)
+      cells.maxGapMs = Array.from(g.gaps ?? this.#gaps(g))
+      groups[name] = cells
+    }
+    const { intervalMs, intervals, beyond } = this
+    return { intervalMs, intervals, beyond, groups }
+  }
+
+  #group(name) {
+    let g = this.groups.get(name)
+    if (!g) {
+      const cells = () => new Float64Array(this.intervals)
+      g = { firstAt: cells().fill(NaN), lastAt: cells().fill(NaN), maxGap: cells(), lastAckMs: 0 }
+      for (const kind of SERIES_COUNTS) g[kind] = cells()
+      g.gaps = null
+      this.groups.set(name, g)
+    }
+    return g
+  }
+
+  #record(g, kind, n, at, i) {
+    g[kind][i] += n
+    if (kind !== 'acked') return
+    const gap = at - Math.max(g.lastAckMs, i * this.intervalMs)
+    if (gap > g.maxGap[i]) g.maxGap[i] = gap
+    if (Number.isNaN(g.firstAt[i])) g.firstAt[i] = at
+    g.lastAt[i] = at
+    g.lastAckMs = at
+  }
+
+  /** Each interval's longest stretch without an acknowledgement, its tail after the last one included. */
+  #gaps(g) {
+    return Float64Array.from(g.maxGap, (inner, i) => {
+      const end = (i + 1) * this.intervalMs
+      if (Number.isNaN(g.lastAt[i])) return this.intervalMs
+      return Math.max(inner, end - g.lastAt[i])
+    })
+  }
+}
+
+module.exports = { BrokerCpuProbe, ClientMeter, FlowMeter, HostMeter, LagProbe, ThroughputSeries }

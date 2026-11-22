@@ -4,17 +4,17 @@
  * One producer process of a load run with `--producer-processes` above 1: it hosts the load
  * producers the parent hands it, offers their share of the rate on its own deadline schedule from
  * the window's start, joins them, and sends back what the oracle and the report need (each
- * incarnation's send ledger, the stats, the latency histogram and its own CPU). A producer lives in
- * exactly one process, so every record key stays single-writer per producer, incarnation and
- * partition, as in one process.
+ * incarnation's send ledger, the stats, the latency histogram, the throughput series and its own
+ * CPU). A producer lives in exactly one process, so every record key stays single-writer per
+ * producer, incarnation and partition, as in one process.
  *
  * Messages from the parent: `setup` `{ profile, runId, topics, producers: [{ id, kind }] }`,
  * `begin` `{ startEpochMs }`, `close`. To the parent: `ready`, `progress` `{ sent }` per
- * producer, `done` `{ producers, latency, cpu }`, `closed`, or `failed` `{ error }`.
+ * producer, `done` `{ producers, latency, series, cpu }`, `closed`, or `failed` `{ error }`.
  */
 
 const { LatencyHistogram } = require('./loadProfile')
-const { HostMeter } = require('./loadMeters')
+const { HostMeter, ThroughputSeries } = require('./loadMeters')
 
 /** How often the window's progress (records sent) goes to the parent. */
 const PROGRESS_MS = 2000
@@ -56,6 +56,7 @@ class ProducerHost {
 
   async #setup({ profile, runId, topics, producers }) {
     this.profile = profile
+    this.series = ThroughputSeries.forProfile(profile)
     this.producers = producers.map(
       ({ id, kind }) =>
         new this.LoadProducer({
@@ -68,6 +69,7 @@ class ProducerHost {
           latency: this.latency,
           clock: this.clock,
           sleep: this.sleep,
+          series: this.series,
         })
     )
     for (const producer of this.producers) await producer.connect()
@@ -83,6 +85,7 @@ class ProducerHost {
     const read = () => ({ at: this.clock.now(), ...this.host.read() })
     const marks = [read()]
     for (const producer of producers) producer.begin(start)
+    this.series.begin(start)
     let nextProgress = start + PROGRESS_MS
     for (let n = 1; ; n++) {
       const now = Math.min(this.clock.now(), end)
@@ -109,6 +112,7 @@ class ProducerHost {
         settled: settled[i],
       })),
       latency: this.latency.snapshot(),
+      series: this.series.snapshot(),
       cpu: { offer: span(marks[0], marks[1]), join: span(marks[1], marks[2]) },
     })
   }

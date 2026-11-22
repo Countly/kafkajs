@@ -412,7 +412,8 @@ describe('load run', () => {
   })
 
   it('shows a stretch with no acknowledgement in the throughput series and flags it outside any fault', async () => {
-    const cluster = new FakeCluster({ stalled: () => cluster.now >= 20000 && cluster.now < 50000 })
+    // The window opens 1.9 s into the fake clock (topic creation 1.5 s, the group join 0.4 s).
+    const cluster = new FakeCluster({ stalled: () => cluster.now >= 22400 && cluster.now < 52400 })
     const { report, out } = await runWith(
       cluster,
       {},
@@ -421,17 +422,17 @@ describe('load run', () => {
     dirs.push(out)
     const { all } = report.throughput.groups
     expect(all.flagged).toBe(true)
-    expect(all.unexcused.startMs).toBeGreaterThan(19900)
-    expect(all.unexcused.startMs).toBeLessThan(20000)
+    expect(all.unexcused.startMs).toBeGreaterThan(20400)
+    expect(all.unexcused.startMs).toBeLessThanOrEqual(20500)
     expect(all.unexcused.lengthMs).toBeGreaterThanOrEqual(30000)
     expect(all.unexcused.lengthMs).toBeLessThan(30100)
     expect(report.throughput.reasons[0]).toMatch(
-      /^all: no acknowledgement for 30\.\d s from 19\.9\d* s/
+      /^all: no acknowledgement for 30\.\d s from 20\.[45] s/
     )
     const series = JSON.parse(fs.readFileSync(path.join(out, 'throughput.json'), 'utf8'))
-    expect(series.groups.all.acked.slice(4, 10)).toEqual([0, 0, 0, 0, 0, 0])
+    expect(series.groups.all.acked.slice(5, 10)).toEqual([0, 0, 0, 0, 0])
     expect(series.groups.all.acked[10]).toBeGreaterThan(0)
-    expect(series.groups.all.offered.slice(4, 10)).toEqual(Array(6).fill(1500))
+    expect(series.groups.all.offered.slice(5, 10)).toEqual(Array(5).fill(1500))
     expect(findingCounts(report.oracle)).toEqual({})
   })
 
