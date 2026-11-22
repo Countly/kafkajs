@@ -1008,7 +1008,7 @@ const createEosManager = ({
       const bump = droppedSequences || stateManager.state() === STATES.ABORTABLE_ERROR
       stateManager.transitionTo(STATES.ABORTING)
 
-      /** Ends the transaction locally, owing its EndTxn when it reached the coordinator. */
+      /** Ends the transaction locally, owing its EndTxn when it may have reached the coordinator. */
       const endUnknown = () => {
         if (stateManager.transactionReached()) {
           abortOwed = {
