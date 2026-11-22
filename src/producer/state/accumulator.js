@@ -13,7 +13,7 @@ const JoinOrder = require('./joinOrder')
 const {
   chargeOf,
   share,
-  ownedBuffer,
+  ownBuffers,
   wire,
   recordsBytes,
   RequestBudget,
@@ -314,8 +314,8 @@ const ownedTimestamp = (timestamp) => {
 }
 
 /**
- * A copy of a record's headers, each own key read once: an array value is copied too, and every
- * Buffer is kept as `ownedBuffer` keeps it.
+ * A copy of a record's headers, each own key read once: an array value is copied too. Buffers are
+ * kept here; `ownBuffers` copies those that pin a large store once the whole send is read.
  * @param {*} headers
  * @returns {object}
  */
@@ -323,7 +323,9 @@ const ownedHeaders = (headers) => {
   const copy = { ...headers }
   for (const name of Object.keys(copy)) {
     const header = copy[name]
-    copy[name] = Array.isArray(header) ? header.map(ownedBuffer) : ownedBuffer(header)
+    if (Array.isArray(header)) {
+      copy[name] = header.slice()
+    }
   }
   return copy
 }
@@ -332,8 +334,8 @@ const ownedHeaders = (headers) => {
  * The producer's own copy of a record, each field read once: its own enumerable fields, so a
  * custom partitioner still sees them, and the fields the producer reads, also when they come from
  * a prototype. A header container, a header-value array, a `Date` and a `Long` are copied, so
- * changing them after the call changes nothing; the bytes of a Buffer are shared, unless it is a
- * small view of a large backing store (`ownedBuffer`). Anything that is not an object is kept, so
+ * changing them after the call changes nothing; the bytes of a Buffer are shared here (see
+ * `ownBuffers` for those the send copies). Anything that is not an object is kept, so
  * validation fails it as before.
  * @param {*} message
  * @returns {*}
@@ -351,12 +353,6 @@ const ownedRecord = (message) => {
         record[field] = value
       }
     }
-  }
-  if (Buffer.isBuffer(record.key)) {
-    record.key = ownedBuffer(record.key)
-  }
-  if (Buffer.isBuffer(record.value)) {
-    record.value = ownedBuffer(record.value)
   }
   if (record.headers != null) {
     record.headers = ownedHeaders(record.headers)
@@ -1038,19 +1034,22 @@ class Accumulator {
    * a record, its headers, a header-value array or a `Date` or `Long` timestamp after the call
    * changes nothing. A record's own enumerable fields are kept beside the fields the producer
    * reads; the bytes of its Buffers are shared, as in 2.2.4, except a small view of a large backing
-   * store, which is copied. Entries and records that are not objects are kept as they are, and so
-   * is a `messages` that is not an array, so validation refuses them as before.
+   * store: all of those in the send are copied into one store of their own (`ownBuffers`). Entries
+   * and records that are not objects are kept as they are, and so is a `messages` that is not an
+   * array, so validation refuses them as before.
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @returns {{ topic: string, messages: object[] }[]}
    */
   static snapshot(topicMessages) {
-    return topicMessages.map((entry) => {
+    const snapshot = topicMessages.map((entry) => {
       if (entry === null || typeof entry !== 'object') {
         return entry
       }
       const { topic, messages } = entry
       return { topic, messages: Array.isArray(messages) ? messages.map(ownedRecord) : messages }
     })
+    ownBuffers(snapshot)
+    return snapshot
   }
 
   /**

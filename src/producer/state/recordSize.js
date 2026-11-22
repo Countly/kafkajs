@@ -260,24 +260,96 @@ const chargeOf = (topicMessages, limit) => {
 }
 
 /**
- * The Buffer a send keeps for a key, value or header value: the caller's own, as in 2.2.4, so its
- * bytes still reach the wire if the caller changes them, unless it is a small view over a large
- * backing store (above 16 KiB and above 16 times the view), which is copied into a store of its
- * own size so the send does not keep the large one alive. Anything else is returned as it is.
- * @param {*} field
- * @returns {*}
+ * Calls `visit` with each Buffer among a record's key, value and header values, as the encoder
+ * writes them, and keeps what it returns in that place. The record and its headers must be the
+ * producer's own copies.
+ * @param {object} record
+ * @param {(view: Buffer) => Buffer} visit
+ * @returns {void}
  */
-const ownedBuffer = (field) => {
-  if (!Buffer.isBuffer(field)) {
-    return field
+const replaceBuffers = (record, visit) => {
+  if (Buffer.isBuffer(record.key)) {
+    record.key = visit(record.key)
   }
-  const { byteLength } = field.buffer
-  if (byteLength <= COPY_STORES_ABOVE || byteLength <= COPY_STORES_TIMES * field.length) {
-    return field
+  if (Buffer.isBuffer(record.value)) {
+    record.value = visit(record.value)
   }
-  const copy = Buffer.allocUnsafeSlow(field.length)
-  field.copy(copy)
-  return copy
+  const { headers } = record
+  if (headers != null) {
+    for (const name of Object.keys(headers)) {
+      const header = headers[name]
+      if (!Array.isArray(header)) {
+        if (Buffer.isBuffer(header)) {
+          headers[name] = visit(header)
+        }
+        continue
+      }
+      for (let i = 0; i < header.length; i++) {
+        if (i in header && Buffer.isBuffer(header[i])) {
+          header[i] = visit(header[i])
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @param {Buffer} view
+ * @returns {boolean} whether it is a small view over a large backing store: one above 16 KiB and
+ *   above 16 times the view, which a send copies so as not to keep the store alive
+ */
+const pinsStore = (view) => {
+  const { byteLength } = view.buffer
+  return byteLength > COPY_STORES_ABOVE && byteLength > COPY_STORES_TIMES * view.length
+}
+
+/**
+ * Makes the Buffers a send keeps for its keys, values and header values its own where they would
+ * pin a large store (`pinsStore`): all such Buffers of the send are copied into one store of the
+ * sum of their lengths, each replaced by its own slice of it, so the send neither keeps a large
+ * store alive nor allocates once per field. Every other Buffer stays the caller's own, as in 2.2.4,
+ * so its bytes still reach the wire if the caller changes them; a send with nothing to copy
+ * allocates nothing. The store is held by the send's records alone, so it lives until the last
+ * batch carrying one retires, as the send's charge does, and is charged as fully used.
+ * @param {{ topic: string, messages: object[] }[]} topicMessages the send's own copy
+ *   (`Accumulator.snapshot`); entries and records that are not objects are skipped
+ * @returns {void}
+ */
+const ownBuffers = (topicMessages) => {
+  const eachRecord = (visit) => {
+    for (const entry of topicMessages) {
+      if (entry === null || typeof entry !== 'object' || !Array.isArray(entry.messages)) {
+        continue
+      }
+      for (const record of entry.messages) {
+        if (record !== null && typeof record === 'object') {
+          replaceBuffers(record, visit)
+        }
+      }
+    }
+  }
+  let bytes = 0
+  let copies = 0
+  eachRecord((view) => {
+    if (pinsStore(view)) {
+      bytes += view.length
+      copies += 1
+    }
+    return view
+  })
+  if (copies === 0) {
+    return
+  }
+  const store = Buffer.allocUnsafeSlow(bytes)
+  let offset = 0
+  eachRecord((view) => {
+    if (!pinsStore(view)) {
+      return view
+    }
+    const start = offset
+    offset += view.copy(store, start)
+    return store.subarray(start, offset)
+  })
 }
 
 /** `DefaultRecordBatch.RECORD_BATCH_OVERHEAD`: the header of a v2 record batch. */
@@ -455,7 +527,7 @@ module.exports = {
   held,
   share,
   chargeOf,
-  ownedBuffer,
+  ownBuffers,
   varintSize,
   framing,
   topicFraming,
