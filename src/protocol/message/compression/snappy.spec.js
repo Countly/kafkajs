@@ -167,6 +167,17 @@ describe('Snappy raw and xerial codec', () => {
     expect(() => snappy.encodedBound(Number.MAX_SAFE_INTEGER)).toThrow(RangeError)
   })
 
+  test('a bound exactly at the Buffer limit is allowed, one input byte more is refused', () => {
+    const { MAX_LENGTH } = require('buffer').constants
+    const formula = (n) => 16 + n + 12 * Math.ceil(n / 32768) + Math.floor(n / 32)
+    let n = Math.floor((MAX_LENGTH - 16) / (1 + 12 / 32768 + 1 / 32)) - 4096
+    while (formula(n + 1) <= MAX_LENGTH) n += 1
+    expect(formula(n)).toBe(MAX_LENGTH)
+
+    expect(snappy.encodedBound(n)).toBe(MAX_LENGTH)
+    expect(() => snappy.encodedBound(n + 1)).toThrow('Snappy output exceeds Buffer limit')
+  })
+
   test('adversarial literal and short-copy runs stay within the bound', async () => {
     const inputs = [
       Buffer.concat(
