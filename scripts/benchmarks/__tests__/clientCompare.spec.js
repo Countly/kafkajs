@@ -50,7 +50,8 @@ const legacyPartitioner = () => () => 0
  * An in-memory Kafka that keeps what it was asked to do in `state`. Its admin throws, as kafkajs
  * 2.2.4's does, when `createTopics` is asked to wait for leaders the broker does not know yet;
  * `metadata` lists what each `fetchTopicMetadata` answers in turn (`'unknown'`, `'no leader'`,
- * leaders for every partition when absent).
+ * leaders for every partition when absent). `offsets` replaces what `fetchTopicOffsets` answers
+ * (one partition 0 holding the corpus when absent); `state.eachMessage` is the consumer's handler.
  */
 const fakeKafka = ({
   failSend = false,
@@ -59,6 +60,7 @@ const fakeKafka = ({
   manualDelivery = false,
   sendMs,
   metadata = [],
+  offsets,
 } = {}) => {
   const state = {
     topics: new Map(),
@@ -146,14 +148,15 @@ const fakeKafka = ({
             }),
           }
         },
-        fetchTopicOffsets: async (topic) => [
-          {
-            partition: 0,
-            offset: String(state.topics.get(topic).length),
-            high: String(state.topics.get(topic).length),
-            low: '0',
-          },
-        ],
+        fetchTopicOffsets: async (topic) =>
+          offsets ?? [
+            {
+              partition: 0,
+              offset: String(state.topics.get(topic).length),
+              high: String(state.topics.get(topic).length),
+              low: '0',
+            },
+          ],
         deleteTopics: async ({ topics }) => {
           for (const topic of topics) state.deleted.push(topic)
           state.events.push('delete topics')
@@ -203,6 +206,7 @@ const fakeKafka = ({
           index = Number(offset)
         },
         run: async ({ eachMessage }) => {
+          state.eachMessage = eachMessage
           const records = state.topics.get(topic)
           state.deliverable = records.length
           state.deliver = async (count = Infinity) => {
@@ -814,6 +818,63 @@ describe('Benchmarks > clientCompare', () => {
       ])
       expect(state.callbacks).toBe(150)
       expect(metrics).toMatchObject({ measuredMessages: 145, elapsedMs: 1450, passes: 3 })
+    })
+
+    describe('consume-throughput replay completion', () => {
+      const twoPartitions = [
+        { partition: 0, offset: '3', high: '3', low: '0' },
+        { partition: 1, offset: '3', high: '3', low: '0' },
+      ]
+      /** Starts a 6-record, two-pass replay over two partitions of three records each. */
+      const replay = async () => {
+        const kafka = fakeKafka({ manualDelivery: true, offsets: twoPartitions })
+        let completed = false
+        const pending = runWith('consume-throughput', { messages: 6, passes: 2 }, kafka).then(
+          (result) => {
+            completed = true
+            return result
+          },
+          (error) => error
+        )
+        await kafka.state.ready
+        const deliver = async (partition, offsets) => {
+          for (const offset of offsets)
+            await kafka.state.eachMessage({
+              topic: kafka.state.subscription.topic,
+              partition,
+              message: { offset: String(offset) },
+            })
+          await new Promise(setImmediate)
+        }
+        return { kafka, pending, deliver, isCompleted: () => completed }
+      }
+
+      test('a duplicate delivery does not complete a pass: the run ends only when every partition delivered each pass in order', async () => {
+        const { kafka, pending, deliver, isCompleted } = await replay()
+        await deliver(0, [0, 1, 2, 0, 1, 2])
+        await deliver(1, [0, 1, 2, 0, 0, 1])
+        expect(isCompleted()).toBe(false)
+        expect(kafka.state.seeks.map(({ partition, offset }) => [partition, offset])).toEqual([
+          [0, '0'],
+          [1, '0'],
+        ])
+        await deliver(1, [2])
+        const { metrics } = await pending
+        expect(isCompleted()).toBe(true)
+        expect(metrics).toMatchObject({ measuredMessages: 11, passes: 2 })
+        expect(kafka.state.seeks).toHaveLength(2)
+      })
+
+      test('a missing offset is never counted past: the replay times out with the deliveries in order', async () => {
+        const { kafka, pending, deliver, isCompleted } = await replay()
+        await deliver(0, [0, 1, 2, 0, 1, 2])
+        await deliver(1, [0, 2])
+        expect(isCompleted()).toBe(false)
+        expect(kafka.state.seeks.map(({ partition }) => partition)).toEqual([0])
+        const [{ callback }] = kafka.state.timers.values()
+        callback()
+        expect(await pending).toEqual(new Error('received 7 of 12 messages in time'))
+      })
     })
 
     test('produce workloads with --settings same give the producer one explicit configuration and report it; defaults report the package defaults', async () => {
