@@ -6273,7 +6273,8 @@ class ShareBounceCase {
   }
 
   /**
-   * Retains original acquisition/receipt provenance only for involved identities, with raw frame links.
+   * Retains original acquisition/receipt provenance only for involved identities, with raw frame links,
+   * and archives individually every event an interruption cut references.
    * @param {Set<string>} identities Failure identities and their matching public receipts.
    * @param {Set<number>} frameIds Relevant frames, extended with acquisition/receipt/epoch sources.
    * @param {Function} emit Collects rows for closure ordering.
@@ -6297,8 +6298,14 @@ class ShareBounceCase {
         emit('acquisition', acquisition)
         for (const frame of source.frames) frameIds.add(frame.id)
       }
+    // Every cut's referenced event is archived individually: retirements always are; failures and
+    // sockets are selected here even when the cut holds no unresolved work.
+    const cutSockets = new Set()
     for (const bounce of this.snapshots)
-      for (const cut of bounce.interruptions) if (cut.kind === 'failure') exchanges.add(cut.event)
+      for (const cut of bounce.interruptions) {
+        if (cut.kind === 'failure') exchanges.add(cut.event)
+        if (cut.kind === 'socket') cutSockets.add(cut.scope.socket)
+      }
     for (const extra of this.replay?.extras ?? []) {
       const witness = extra.incarnationWitness
       if (witness?.kind !== 'partition-transition') continue
@@ -6401,6 +6408,7 @@ class ShareBounceCase {
         .filter(({ identity }) => identities.has(identity))
         .map((entry) => entry.acquisition?.source?.frames[0]?.socket)
     )
+    for (const socket of cutSockets) sockets.add(socket)
     for (const frame of this.tap.allFrames) if (frameIds.has(frame.id)) sockets.add(frame.socket)
     const omittedEvents = []
     for (const event of this.tap.socketEvents) {
