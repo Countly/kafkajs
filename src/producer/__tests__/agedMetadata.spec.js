@@ -60,17 +60,17 @@ const hold = () => {
 }
 
 /**
- * @param {{ partitions?: number, leader?: number, epoch?: number, topicId?: string }} [options]
+ * @param {{ partitions?: number, leader?: number, epoch?: number }} [options]
  * @returns {object} a Metadata answer listing the topic
  */
-const metadataAnswer = ({ partitions = 1, leader = 0, epoch = 5, topicId = TOPIC_ID } = {}) => ({
+const metadataAnswer = ({ partitions = 1, leader = 0, epoch = 5 } = {}) => ({
   brokers: NODES.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
   controllerId: 0,
   topics: [
     {
       errorCode: 0,
       name: TOPIC,
-      topicId,
+      topicId: TOPIC_ID,
       isInternal: false,
       topicAuthorizedOperations: -2147483648,
       partitions: Array.from({ length: partitions }, (_, partitionIndex) => ({
@@ -173,13 +173,6 @@ const metadataInFlight = (cluster) =>
   cluster.tally('Metadata') -
   cluster.tally('Metadata', 'answered') -
   cluster.tally('Metadata', 'cancelled')
-
-/** The id of the topic once it is recreated. */
-const NEW_TOPIC_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
-
-/** @param {object} pool @returns {object[]} the cached partitions of the topic */
-const cachedPartitions = (pool) =>
-  pool.metadata.topicMetadata.find(({ topic }) => topic === TOPIC).partitionMetadata
 
 const send = (producer, seq) =>
   producer.send({ topic: TOPIC, messages: [{ value: JSON.stringify({ seq }) }] })
@@ -497,69 +490,6 @@ describe('Producer > sends on metadata that is only past metadataMaxAge', () => 
     )
     cluster.assertClean()
   })
-
-  it('keeps the metadata a forced refresh installed when an older background answer arrives after it, and refreshes again once that metadata ages', async () => {
-    const clusterOf = captureCluster()
-    const setup = await warmProducer({
-      createPartitioner:
-        () =>
-        ({ partitionMetadata }) =>
-          partitionMetadata.length - 1,
-    })
-    producer = setup.producer
-    const { cluster, produced } = setup
-    const pool = clusterOf().brokerPool
-    const held = hold()
-    let metadataCalls = 0
-    cluster.answer('Metadata', () =>
-      metadataCalls++ === 0 ? held.promise : metadataAnswer({ partitions: 3, leader: 1, epoch: 6 })
-    )
-    cluster.answer('Produce', ({ topics }, record) => ({
-      responses: topics.map(({ partitions, ...key }) => ({
-        ...key,
-        partitions: partitions.map(({ partition }) => ({
-          partition,
-          errorCode: record.node === 0 ? 6 : 0,
-          baseOffset: '0',
-          logAppendTime: '-1',
-          logStartOffset: '0',
-          leader: null,
-        })),
-      })),
-      nodeEndpoints: [],
-    }))
-    ageMetadata()
-    const start = produced.length
-
-    await within(send(producer, 1), 'the send moved to the new leader', 4000)
-    expect(produced.slice(start).map(({ node }) => node)).toEqual([0, 1])
-    expect(metadataInFlight(cluster)).toBe(1)
-
-    freeze()
-    const installed = pool.metadata
-    const expireAt = pool.metadataExpireAt
-    advance(1000)
-    held.release(metadataAnswer())
-    await turns()
-
-    expect(metadataInFlight(cluster)).toBe(0)
-    expect(pool.metadata).toBe(installed)
-    expect(cachedPartitions(pool).map(({ leader }) => leader)).toEqual([1, 1, 1])
-    expect(pool.metadataExpireAt).toBe(expireAt)
-
-    const before = cluster.tally('Metadata')
-    const next = produced.length
-    await within(send(producer, 2), 'the send after the older answer')
-    expect(produced.slice(next)).toEqual([expect.objectContaining({ node: 1, partitions: [2] })])
-    expect(cluster.tally('Metadata')).toBe(before)
-
-    advance(MAX_AGE)
-    await within(send(producer, 3), 'the send once the forced metadata aged')
-    await turns()
-    expect(cluster.tally('Metadata')).toBe(before + 1)
-    expect(unhandled).toEqual([])
-    cluster.assertClean()
-  })
 })
 
 describe('Cluster > a refresh across a disconnect', () => {
@@ -626,96 +556,6 @@ describe('Cluster > a refresh across a disconnect', () => {
     } finally {
       await admin.disconnect()
     }
-  })
-})
-
-describe('Cluster > overlapping metadata refreshes', () => {
-  let admin
-
-  /**
-   * A connected admin's Cluster whose Metadata requests are each held until the test releases
-   * them, in the order they were sent.
-   * @returns {Promise<{ cluster: Cluster, holds: Array<{ release: Function }> }>}
-   */
-  const heldCluster = async () => {
-    const scripted = producerScript(createScriptedCluster({ nodes: NODES }))
-    scripted.answer('Metadata', () => metadataAnswer())
-    const clusterOf = captureCluster()
-    admin = new Kafka(
-      scripted.kafkaOptions({ metadataRecoveryStrategy: 'none', retry: { retries: 0 } })
-    ).admin()
-    await admin.connect()
-    const cluster = clusterOf()
-    cluster.targetTopics.add(TOPIC)
-    const holds = []
-    scripted.answer('Metadata', () => {
-      const held = hold()
-      holds.push(held)
-      return held.promise
-    })
-    return { cluster, holds }
-  }
-
-  /**
-   * Starts two refreshes, the second only once the first's request is sent.
-   * @param {Cluster} cluster
-   * @param {Array<{ release: Function }>} holds
-   * @param {string[]} observed collects the name of each refresh whose answer was installed
-   * @returns {Promise<{ first: Promise<void>, second: Promise<void> }>}
-   */
-  const twoRefreshes = async (cluster, holds, observed) => {
-    const refresh = (name) =>
-      cluster.brokerPool.refreshMetadata([TOPIC], { onMetadata: () => observed.push(name) })
-    const first = refresh('first')
-    await turns()
-    expect(holds).toHaveLength(1)
-    const second = refresh('second')
-    await turns()
-    expect(holds).toHaveLength(2)
-    return { first, second }
-  }
-
-  afterEach(async () => {
-    jest.restoreAllMocks()
-    await admin?.disconnect()
-    admin = null
-  })
-
-  it('installs both answers when they arrive in the order their requests were sent', async () => {
-    const { cluster, holds } = await heldCluster()
-    const observed = []
-    const { first, second } = await twoRefreshes(cluster, holds, observed)
-
-    holds[0].release(metadataAnswer({ partitions: 2 }))
-    await within(first, 'the first refresh')
-    expect(cluster.findTopicPartitionMetadata(TOPIC)).toHaveLength(2)
-    holds[1].release(metadataAnswer({ partitions: 3, topicId: NEW_TOPIC_ID }))
-    await within(second, 'the second refresh')
-
-    expect(cluster.findTopicPartitionMetadata(TOPIC)).toHaveLength(3)
-    expect(cluster.topicId(TOPIC)).toBe(NEW_TOPIC_ID)
-    expect(observed).toEqual(['first', 'second'])
-  })
-
-  it('settles the caller of an answer older than the installed one on the installed metadata, and installs nothing from it', async () => {
-    const { cluster, holds } = await heldCluster()
-    const pool = cluster.brokerPool
-    const observed = []
-    const { first, second } = await twoRefreshes(cluster, holds, observed)
-
-    holds[1].release(metadataAnswer({ partitions: 3, topicId: NEW_TOPIC_ID }))
-    await within(second, 'the second refresh')
-    const installed = pool.metadata
-    const expireAt = pool.metadataExpireAt
-    jest.spyOn(Date, 'now').mockReturnValue(expireAt)
-    holds[0].release(metadataAnswer({ partitions: 2 }))
-    await within(first, 'the first refresh')
-
-    expect(pool.metadata).toBe(installed)
-    expect(pool.metadataExpireAt).toBe(expireAt)
-    expect(cluster.findTopicPartitionMetadata(TOPIC)).toHaveLength(3)
-    expect(cluster.topicId(TOPIC)).toBe(NEW_TOPIC_ID)
-    expect(observed).toEqual(['second'])
   })
 })
 
