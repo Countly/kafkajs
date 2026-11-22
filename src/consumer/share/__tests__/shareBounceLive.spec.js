@@ -4076,10 +4076,7 @@ class ShareBounceCase {
       )
       return false
     }
-    if (
-      event === 'case-complete' &&
-      performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity)
-    ) {
+    if (event === 'case-complete' && this.deadlinePassed()) {
       storage.truncate(before)
       throw new Error('deadline: finalization overrun')
     }
@@ -4112,6 +4109,23 @@ class ShareBounceCase {
       captureProblems: this.captureProblems,
       bounces: this.snapshots.map(({ held, ...rest }) => ({ ...rest, held: held.size })),
     }
+  }
+
+  /**
+   * The case's deadline owns every real-time bound of completion. A case without one
+   * (`deadline: Infinity`, as the broker-free fixtures set) has no real-time bound at all.
+   * @returns {boolean} whether the selection deadline or the final window has passed
+   */
+  deadlinePassed() {
+    return performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity)
+  }
+
+  /**
+   * @param {number} ms a completion step's bound in a case with a deadline
+   * @returns {number} `ms`, or `Infinity` for a case without a deadline
+   */
+  stepBound(ms) {
+    return this.deadline === Infinity ? Infinity : ms
   }
 
   /**
@@ -6611,23 +6625,21 @@ class ShareBounceCase {
     if (!this.cleanupProof?.completed) throw new Error('cleanup: missing completed evidence')
     if (this.cleanupProof.tainted !== false)
       throw new Error('taint: missing or failed cleanup evidence')
-    if (performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity))
-      throw new Error('deadline: selection deadline passed')
+    if (this.deadlinePassed()) throw new Error('deadline: selection deadline passed')
     expect(this.terminalVerified).toBe(true)
     expect([...this.tap.problems, ...this.producerEvidence.problems]).toEqual([])
     await pollUntil(
       scope,
-      5000,
+      this.stepBound(5000),
       async () => (await this.probe.snapshot()).sockets.open === this.beforeAdmin.sockets.open,
       { delayMs: 50, label: 'The admin sockets closing' }
     )
-    const final = await bounded(scope, 10000, () => this.probe.snapshot())
+    const final = await bounded(scope, this.stepBound(10000), () => this.probe.snapshot())
     if (!this.row('cleanup', { snapshot: final, ...this.cleanupProof }))
       throw new Error('cleanup: evidence omitted')
     const { extras, perBounce } = this.replay
     scope.throwIfAborted()
-    if (performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity))
-      throw new Error('deadline: selection deadline passed')
+    if (this.deadlinePassed()) throw new Error('deadline: selection deadline passed')
     if (
       !this.row('case-complete', {
         status: 'passed',
