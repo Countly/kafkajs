@@ -14413,6 +14413,7 @@
         "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > small views of large stores a slice of another send's copy store that is kept as it is is charged the bytes of that store it does not show",
         "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > small views of large stores a header-value array is copied up to the length it had when the copy began: an element getter that appends adds nothing",
         "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > the producer's own copy of a send a send whose copied views cannot fit in bufferMemory is refused, and nothing is admitted or charged",
+        "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > small views of large stores a view that shrinks while its send is read refuses the send instead of sending unwritten bytes",
         "src/producer/state/__tests__/retiredOwnership.spec.js \u203a retired payload ownership idempotent: a successful partition releases its snapshotted record while another broker is held",
         "src/producer/state/__tests__/retiredOwnership.spec.js \u203a retired payload ownership plain: a successful partition releases its snapshotted record while another broker is held",
         "src/producer/state/__tests__/subdivision.spec.js \u203a Producer > Accumulator.cut a batch of several sends a settler made without an origin reports the send\u2019s first record at its own position",

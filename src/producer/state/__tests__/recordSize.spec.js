@@ -4,7 +4,7 @@ const buildRecordBatch = require('../../../protocol/requests/produce/buildRecord
 const Long = require('../../../utils/long')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { mulberry32 } = require('../../../../testHelpers/schedule')
-const { wire, held, share, chargeOf, varintSize } = require('../recordSize')
+const { wire, held, share, chargeOf, varintSize, ownBuffers } = require('../recordSize')
 const Accumulator = require('../accumulator')
 const {
   KafkaJSInvalidConfigurationError,
@@ -502,6 +502,25 @@ describe('Producer > the buffer > small views of large stores', () => {
     expect(String(record.value)).toBe('aa')
     expect(record.value.buffer).toBe(record.key.buffer)
     expect(record.key.buffer.byteLength).toBe(5)
+  })
+
+  test('a view that shrinks while its send is read refuses the send instead of sending unwritten bytes', () => {
+    const backing = new ArrayBuffer(1048576, { maxByteLength: 1048576 })
+    const view = new Uint8Array(backing, 1048576 - 10)
+    Object.setPrototypeOf(view, Buffer.prototype)
+    let reads = 0
+    const later = {
+      get value() {
+        if (++reads === 1) {
+          backing.resize(1048576 - 5)
+        }
+        return 'x'
+      },
+    }
+
+    expect(() => ownBuffers([{ topic: 'topic', messages: [{ value: view }, later] }])).toThrow(
+      new KafkaJSNonRetriableError('A Buffer changed size while its send was being read')
+    )
   })
 
   test("a header-value array whose own slice returns itself is copied without it: the caller's array keeps its views and its holes", () => {
