@@ -2938,10 +2938,7 @@ describe.each(['classic', 'consumer'])('commit edges on %s', (kind) => {
       'an interval commit',
       'commitOffsetsIfNecessary',
       0,
-      (runner) => {
-        runner.consumerGroup.offsetManager.autoCommitInterval = 0
-        return runner.autoCommitOffsetsIfNecessary()
-      },
+      (runner) => runner.autoCommitOffsetsIfNecessary(),
     ],
   ])(
     'keeps %s made outside any handler when its guard runs in a stale batch context',
@@ -2961,7 +2958,6 @@ describe.each(['classic', 'consumer'])('commit edges on %s', (kind) => {
   it('commits a filtered batch whatever handler store the runner inherited', async () => {
     const fixture = ownershipFixture({ kind, eachMessage: async () => {} })
     const due = jest.spyOn(fixture.group, 'commitOffsetsIfNecessary').mockResolvedValue()
-    fixture.manager.autoCommitInterval = 0
     const batch = {
       ...fixture.batch(),
       ownershipKey: `${SCHEDULED_TOPIC}|0`,
