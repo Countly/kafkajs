@@ -798,9 +798,14 @@ describe('Consumer > classic group protocol > the idle heartbeat probe', () => {
   })
 
   it('is not idle while a heartbeat is in flight, and a not-due call joins it and rejects with its error', async () => {
-    let fail
+    let fail, onWire
+    const written = new Promise((resolve) => (onWire = resolve))
     const { protocol, coordinator } = joinedProtocol(
-      () => new Promise((_resolve, reject) => (fail = reject))
+      () =>
+        new Promise((_resolve, reject) => {
+          fail = reject
+          onWire()
+        })
     )
     const failure = createErrorFromCode(27)
 
@@ -808,12 +813,20 @@ describe('Consumer > classic group protocol > the idle heartbeat probe', () => {
     const sent = protocol.heartbeat({ interval: INTERVAL })
     expect(protocol.heartbeatIdle(Infinity)).toBe(false)
     const joined = protocol.heartbeat({ interval: Infinity })
-    await sleep(0)
+    await written
     expect(coordinator.heartbeat).toHaveBeenCalledTimes(1)
+    const sentOutcome = sent.then(
+      () => 'resolved',
+      (e) => e
+    )
+    const joinedOutcome = joined.then(
+      () => 'resolved',
+      (e) => e
+    )
     fail(failure)
 
-    await expect(sent).rejects.toBe(failure)
-    await expect(joined).rejects.toBe(failure)
+    expect(await sentOutcome).toBe(failure)
+    expect(await joinedOutcome).toBe(failure)
     expect(coordinator.heartbeat).toHaveBeenCalledTimes(1)
     expect(protocol.heartbeatIdle(Infinity)).toBe(true)
   })
