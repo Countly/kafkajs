@@ -455,7 +455,7 @@ describe('load profile fault schedules at the window end', () => {
     ])
   })
 
-  it('slow-broker records the freeze as not run when the window ends while it is asked for', async () => {
+  it('slow-broker records the freeze and the recovery as not run when the window ends while the freeze is asked for', async () => {
     const clock = {
       t: 0,
       now() {
@@ -485,7 +485,48 @@ describe('load profile fault schedules at the window end', () => {
     expect(records.map((r) => [r.phase, r.skipped])).toEqual([
       ['slow', undefined],
       ['frozen', 'window ended'],
+      ['recovery', 'window ended'],
     ])
+  })
+
+  it('slow-broker records every phase as not run when the window ends before the slow phase starts', async () => {
+    const clock = {
+      t: 0,
+      now() {
+        return this.t
+      },
+    }
+    const window = new AbortController()
+    const apply = jest.fn(async () => {})
+    const records = await FAULT_SCHEDULES['slow-broker'].start({
+      netem: { apply, clear: async () => {} },
+      bouncer: { step: jest.fn() },
+      admin: {},
+      topics: ['t'],
+      windowMs: 600000,
+      windowStart: 0,
+      clock,
+      signal: window.signal,
+      sleep: async () => window.abort(),
+    })
+    expect(apply).not.toHaveBeenCalled()
+    expect(records).toEqual([
+      { phase: 'slow', service: 'kafka2', kind: 'delay', skipped: 'window ended' },
+      { phase: 'frozen', service: 'kafka2', kind: 'pause', skipped: 'window ended' },
+      { phase: 'recovery', service: 'kafka2', kind: 'none', skipped: 'window ended' },
+    ])
+    expect(verdictOf({ oracle: clean(), rate: reached, faults: records })).toEqual({
+      ok: false,
+      product: 'PASS',
+      profile: 'REACHED',
+      faults: 'INCOMPLETE',
+      reasons: [
+        'slow kafka2: window ended',
+        'frozen kafka2: window ended',
+        'recovery kafka2: window ended',
+      ],
+      exitCode: EXIT.inconclusive,
+    })
   })
 })
 
@@ -569,7 +610,7 @@ describe('load profile slow-broker and many-topics schedules', () => {
     expect(clock.t - 1000).toBe(400000)
   })
 
-  it('slow-broker clears the delay and freezes nothing when the window ends during the slow phase', async () => {
+  it('slow-broker clears the delay, freezes nothing and records the freeze and the recovery as not run when the window ends during the slow phase', async () => {
     const { clock, log, netem, bouncer } = scripted()
     const window = new AbortController()
     let slept = 0
@@ -596,7 +637,11 @@ describe('load profile slow-broker and many-topics schedules', () => {
       ['delay', 200000],
       ['clear', 200000],
     ])
-    expect(records.map((r) => r.phase)).toEqual(['slow'])
+    expect(records.map((r) => [r.phase, r.skipped])).toEqual([
+      ['slow', undefined],
+      ['frozen', 'window ended'],
+      ['recovery', 'window ended'],
+    ])
   })
 
   it('many-topics rolls one clean restart from a third of the window and records its phase', async () => {

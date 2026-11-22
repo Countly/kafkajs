@@ -732,6 +732,42 @@ describe('load run fault schedules', () => {
     })
   })
 
+  it('reports a slow-broker run whose delay cleanup outlasted the window as inconclusive, its freeze and recovery not run', async () => {
+    const calls = []
+    const cluster = new FakeCluster()
+    const tools = (time) => {
+      const built = slowTools(cluster, calls)(time)
+      const clear = built.netem.clear
+      built.netem.clear = async () => {
+        await time.sleep(130000)
+        await clear()
+      }
+      return built
+    }
+    const { report, out } = await runWith(
+      cluster,
+      { recordBytes: 16 },
+      {
+        args: ['--faults', 'slow-broker', '--duration', '195', '--rate', '300'],
+        tools,
+        stepped: true,
+      }
+    )
+    dirs.push(out)
+    expect(calls).toEqual(['check', 'delay', 'clear'])
+    expect(report.faults.map((f) => [f.phase, f.skipped])).toEqual([
+      ['slow', undefined],
+      ['frozen', 'window ended'],
+      ['recovery', 'window ended'],
+    ])
+    expect(report.verdict).toMatchObject({
+      ok: false,
+      faults: 'INCOMPLETE',
+      reasons: ['frozen kafka2: window ended', 'recovery kafka2: window ended'],
+      exitCode: 2,
+    })
+  })
+
   it("reports a stalled flow, exit 4, when the freeze holds back every leader's sends", async () => {
     const cluster = new FakeCluster({ stalled: () => cluster.frozen })
     const { report, out } = await slowRun(cluster)
