@@ -214,6 +214,37 @@ describe('Benchmarks > report', () => {
       ])
     })
 
+    test('an interleaving adapter alternates the arms run by run and stops only the arm that failed', () => {
+      const { spawn, calls } = stub((args, n) =>
+        n === 3
+          ? { status: 1, stdout: '', stderr: 'boom' }
+          : json({ ...identityOf(args), a: n, elapsedMs: 30000 })
+      )
+
+      const { rows } = runEntry(compared({ adapter: 'clientCompare' }), options(spawn, 1))
+
+      expect(calls.map(({ args }) => valueAfter(args, '--package'))).toEqual([
+        '@countly/kafkajs',
+        'kafkajs',
+        '@countly/kafkajs',
+        'kafkajs',
+        'kafkajs',
+        'kafkajs',
+        'kafkajs',
+      ])
+      expect(
+        rows.map(({ arm, metric, status, runs, median }) => ({ arm, metric, status, runs, median }))
+      ).toEqual([
+        { arm: 'fork', metric: 'a', status: 'error', runs: 1, median: undefined },
+        { arm: 'kafkajs@2.2.4', metric: 'a', status: 'valid', runs: 5, median: 5 },
+      ])
+      expect(rows[0].reason).toBe('run 2 of 5: exit 1: boom')
+      const evidence = JSON.parse(
+        fs.readFileSync(path.join(rawDir, 'compared', 'kafkajs@2.2.4.json'), 'utf8')
+      )
+      expect(evidence.runs.map(({ run }) => run)).toEqual([1, 2, 3, 4, 5])
+    })
+
     test('reports a missing, null, NaN or non-numeric metric as an error row', () => {
       const keys = ['good', 'missing', 'nothing', 'text', 'huge', 'nested']
       const entry = single({ metrics: keys.map((key) => ({ key, unit: 'ms' })) })
@@ -312,7 +343,9 @@ describe('Benchmarks > report', () => {
 
     test('replaces {client} and {package} per arm in the spawned arguments', () => {
       const entry = manifest.entries.find((candidate) => candidate.arms.length === 2)
-      const { spawn, calls } = stub((args) => json({ ...identityOf(args), ...outputFor(entry) }))
+      const { spawn, calls } = stub((args) =>
+        json({ ...identityOf(args), ...outputFor(entry, 30000) })
+      )
 
       const { rows } = runEntry(entry, options(spawn, 1))
 
@@ -330,7 +363,10 @@ describe('Benchmarks > report', () => {
 
         runEntry(entry, options(spawn, 1))
 
-        expect(calls).toHaveLength(entry.adapter ? 1 : entry.arms.length)
+        const adapter = entry.adapter && require(path.join(BENCHMARKS, 'adapters', entry.adapter))
+        expect(calls).toHaveLength(
+          entry.adapter ? (adapter.runs ?? 1) * entry.arms.length : entry.arms.length
+        )
         for (const { args } of calls) expect(args.filter((arg) => /[{}]/.test(arg))).toEqual([])
       }
     })
