@@ -86,6 +86,25 @@ describe('Network > DNS through the default socket factory', () => {
     }
   )
 
+  test('the default socket factory turns TCP keep-alive on, probing after 60 s of silence', async () => {
+    const keepAlive = jest.spyOn(net.Socket.prototype, 'setKeepAlive')
+    const port = await listen(net.createServer())
+    const connection = new Connection({
+      host: '127.0.0.1',
+      port,
+      logger,
+      socketFactory: defaultSocketFactory(),
+      connectionTimeout: 3000,
+      requestTimeout: 30000,
+    })
+    connections.push(connection)
+
+    await connection.connect()
+
+    expect(keepAlive).toHaveBeenCalledWith(true, 60000)
+    expect(keepAlive.mock.contexts).toContain(connection.socket)
+  })
+
   test('the documented canonical-names recipe resolves each bootstrap address to its name', async () => {
     const markdown = fs.readFileSync(path.join(__dirname, '../../../docs/Configuration.md'), 'utf8')
     const [fence] = [...markdown.matchAll(/^```javascript\n([\s\S]*?)^```$/gm)]

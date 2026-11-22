@@ -986,6 +986,78 @@ describe('Producer > retained request children at their delivery owner', () => {
     await flushAll()
   })
 
+  test('the first half of a batch cut on the plain path gives back its records when it expires unwritten', async () => {
+    const createSendMessages = require('../sendMessages')
+    const createEosManager = require('../eosManager')
+    const createRetry = require('../../retry')
+    const Idempotence = require('../idempotence')
+    const { createFakeCluster } = require('./fixtures/fakeCluster')
+    const { deferred, flushAll, watch } = require('./fixtures/bufferHarness')
+    const logger = { debug() {}, info() {}, warn() {}, error() {} }
+    const cluster = createFakeCluster({ partitions: 1 })
+    const eosManager = createEosManager({ logger, cluster, transactional: false, retry: RETRY })
+    const lookup = deferred()
+    let blocked = false
+    const broker = {
+      ...cluster.broker,
+      nodeId: 0,
+      produce: async (request) => {
+        blocked = true
+        const refusal = request.guard(4097)
+        if (refusal) throw refusal
+        throw new Error('written')
+      },
+    }
+    cluster.findBroker.mockImplementation(async () => {
+      if (blocked) await lookup.promise
+      return broker
+    })
+    cluster.findLeaderForPartitions = () => ({ 0: [0] })
+    const sender = createSendMessages({
+      logger,
+      cluster,
+      eosManager,
+      retrier: createRetry(RETRY),
+      retry: RETRY,
+      idempotence: new Idempotence({ enabled: false, explicit: true, logger }),
+      deliveryTimeout: 1000,
+      budget: new RequestBudget({ maxRequestSize: 4096 }),
+      getConnectionStatus: () => 'connected',
+    })
+    const settler = { resolve: jest.fn(), reject: jest.fn() }
+    const detach = jest.fn()
+    const retire = jest.fn()
+    const batch = {
+      topic: TOPIC,
+      partition: 0,
+      messages: [{ value: 'a' }, { value: 'b' }],
+      createdAt: 0,
+      settlers: [settler],
+      detach,
+      retire,
+    }
+    const sent = watch(
+      sender.sendPartitioned({ acks: 1, timeout: 30000, compression: 0, batches: [batch] })
+    )
+    await flushAll()
+    expect(blocked).toBe(true)
+    await jest.advanceTimersByTimeAsync(1100)
+    await flushAll()
+
+    expect(settler.reject).toHaveBeenCalledTimes(1)
+    expect(settler.reject.mock.calls[0][0]).toMatchObject({
+      name: 'KafkaJSDeliveryTimeout',
+      outcome: 'unsent',
+    })
+    expect(sent.state).toBe('rejected')
+    expect(detach).toHaveBeenCalledTimes(1)
+    expect(retire).not.toHaveBeenCalled()
+    lookup.resolve()
+    await flushAll()
+    expect(detach).toHaveBeenCalledTimes(1)
+    expect(retire).toHaveBeenCalledTimes(1)
+  })
+
   test('a written part ends at that write, so its members can share a request again', async () => {
     const createSendMessages = require('../sendMessages')
     const createEosManager = require('../eosManager')

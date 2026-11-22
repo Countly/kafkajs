@@ -30,9 +30,10 @@ describe('connection setup edges', () => {
     jest.useFakeTimers()
     const attempt = new Attempt({ address: 'a', policy, now: () => 100 })
 
-    await expect(attempt.wait()).resolves.toBeUndefined()
+    const waiting = attempt.wait()
 
     expect(jest.getTimerCount()).toBe(0)
+    await expect(waiting).resolves.toBeUndefined()
   })
 
   test('arming twice keeps the first budget and its expiry callback', () => {

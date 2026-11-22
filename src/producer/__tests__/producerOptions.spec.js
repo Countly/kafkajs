@@ -245,6 +245,13 @@ describe('Producer > options: the idempotent default and the settings that confl
         'Limiting retries for the idempotent producer may invalidate EoS guarantees'
       )
     })
+
+    test('retries of 5 log no "limiting retries" warning on an idempotent producer', () => {
+      const producer = createKafka().producer({ idempotent: true, retry: { retries: 5 } })
+
+      expect(producer.isIdempotent()).toBe(true)
+      expect(entries.filter(({ level }) => level === LEVELS.WARN)).toEqual([])
+    })
   })
 
   describe('a transactionalId counts as asking for idempotence', () => {
