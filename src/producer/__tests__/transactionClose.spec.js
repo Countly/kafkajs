@@ -254,6 +254,19 @@ const sendOne = async (transaction) => {
   await flushAll()
   await sent
 }
+/**
+ * Aborts `transaction` under fake timers, letting its EndTxn retries run out.
+ * @param {object} transaction
+ * @returns {Promise<void>}
+ */
+const abortSettled = async (transaction) => {
+  const aborted = watch(transaction.abort())
+  for (let i = 0; i < 20 && aborted.state === 'pending'; i += 1) {
+    await jest.advanceTimersByTimeAsync(5)
+    await flushAll()
+  }
+  expect(aborted.state).toBe('fulfilled')
+}
 const OFFSETS = {
   consumerGroupId: 'group',
   topics: [{ topic: 'input', partitions: [{ partition: 0, offset: '1' }] }],
@@ -326,26 +339,33 @@ const HELD_STEPS = [
     },
   ],
   [
-    'the reinitialization after an abort',
+    'the EndTxn an abort owes, sent again before the next transaction',
     [1, 2],
     async ({ cluster, producer }) => {
       const transaction = await producer.transaction()
       await sendOne(transaction)
-      const held = deferred()
       cluster.broker.endTxn.mockRejectedValue(new KafkaJSConnectionError('Connection error'))
-      let reinitializing = false
-      cluster.broker.initProducerId.mockImplementation(async () => {
-        reinitializing = true
-        return held.promise
-      })
-      const caller = watch(transaction.abort())
-      // eslint-disable-next-line no-unmodified-loop-condition -- the broker mock sets it while the loop awaits
-      for (let i = 0; i < 20 && !reinitializing; i += 1) {
-        await jest.advanceTimersByTimeAsync(5)
-        await flushAll()
-      }
-      expect(reinitializing).toBe(true)
-      return { held, caller }
+      await abortSettled(transaction)
+      const held = deferred()
+      cluster.broker.endTxn.mockImplementation(async () => held.promise)
+      return { held, caller: watch(producer.transaction()) }
+    },
+  ],
+  [
+    'the epoch bump after the EndTxn an abort owed',
+    [1],
+    async ({ cluster, producer }) => {
+      const transaction = await producer.transaction()
+      await sendOne(transaction)
+      cluster.broker.endTxn.mockRejectedValue(new KafkaJSConnectionError('Connection error'))
+      await abortSettled(transaction)
+      cluster.broker.endTxn.mockImplementation(async () => ({
+        producerId: '-1',
+        producerEpoch: -1,
+      }))
+      const held = deferred()
+      cluster.broker.initProducerId.mockImplementation(async () => held.promise)
+      return { held, caller: watch(producer.transaction()) }
     },
   ],
 ]
