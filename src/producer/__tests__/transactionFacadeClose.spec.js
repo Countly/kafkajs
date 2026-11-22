@@ -284,6 +284,30 @@ describe('reconnecting after a close that forced an abort or a commit', () => {
       }
     )
 
+    test('an abort that ran out of retries is not sent again by disconnect(): the coordinator holds the transaction until the next transaction() sends it', async () => {
+      const setup = setUp(version)
+      const { producer, coordinator, log, setEndTxn } = setup
+      try {
+        await producer.connect()
+        const transaction = await openTransaction(producer)
+        setEndTxn('refuse')
+        await transaction.abort()
+        setEndTxn('answer')
+        const from = log.length
+        await producer.disconnect()
+        const atDisconnect = { sent: log.slice(from), at: coordinatorAt(coordinator) }
+        await producer.connect()
+        const requests = await runTransaction(producer, log)
+        expect({ atDisconnect, requests, at: coordinatorAt(coordinator) }).toEqual({
+          atDisconnect: { sent: [], at: { state: 'ONGOING', epoch: 0 } },
+          requests: afterResend(version),
+          at: { state: 'COMPLETE_COMMIT', epoch: version === 1 ? 1 : 2 },
+        })
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
+
     test('an abort the coordinator applied whose answer was lost is answered with success when sent again, with no second bump, and the next transaction commits', async () => {
       const setup = setUp(version)
       const { producer, coordinator, log } = setup
