@@ -264,6 +264,10 @@ module.exports = class BrokerPool {
     this.disconnects = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
+    /** Numbers the Metadata requests in the order they are sent. */
+    this.metadataRequests = 0
+    /** The number of the request whose answer `this.metadata` holds. */
+    this.installedMetadataRequest = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
     this.consumerMetadataScope = null
     /** Advances when the default scope is registered or released, fencing earlier unscoped work. */
@@ -966,7 +970,10 @@ module.exports = class BrokerPool {
    * Refreshes may overlap, and their replies may arrive in one read. Each response takes a
    * publication number when it is assigned to `this.metadata`, and a refresh stops reconciling the
    * broker table as soon as a newer response has been published: the topology last published is
-   * the one installed, and a pool built for an older one is closed unused.
+   * the one installed, and a pool built for an older one is closed unused. An answer to a request
+   * sent before the one whose answer is installed is dropped, as the Java client applies a reply
+   * with the version captured when it was sent: it installs nothing, renews no age, calls no
+   * `onMetadata`, and its caller resolves on the newer installed metadata.
    *
    * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
@@ -1091,10 +1098,14 @@ module.exports = class BrokerPool {
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
+          const request = ++this.metadataRequests
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
           if (!applicable()) return
+          // An answer to a request sent before the installed one's is older: it installs nothing.
+          if (this.metadata && request < this.installedMetadataRequest) return
+          this.installedMetadataRequest = request
           if (accept) {
             const settled = this.settleTopicErrors(response.topicMetadata, accept)
             checkPartitions(settled, { allowLeaderless })
