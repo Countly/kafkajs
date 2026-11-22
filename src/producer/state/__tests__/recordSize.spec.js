@@ -4,7 +4,8 @@ const buildRecordBatch = require('../../../protocol/requests/produce/buildRecord
 const Long = require('../../../utils/long')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { mulberry32 } = require('../../../../testHelpers/schedule')
-const { wire, held, share, chargeOf, ownedBuffer, varintSize } = require('../recordSize')
+const { wire, held, share, chargeOf, varintSize } = require('../recordSize')
+const Accumulator = require('../accumulator')
 const {
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
@@ -36,6 +37,28 @@ const readVarint = (buffer, offset) => {
     if (byte < 0x80) break
   }
   return { value: raw % 2 === 0 ? raw / 2 : -(raw + 1) / 2, next }
+}
+
+/** Makes Node start a new small-Buffer pool, of `Buffer.poolSize` bytes. */
+const rebuildPool = () => {
+  const { buffer } = Buffer.allocUnsafe(1)
+  let probe
+  do {
+    probe = Buffer.allocUnsafe(1024)
+  } while (probe.buffer === buffer)
+}
+
+/** Runs `make` with Node's small-Buffer pool rebuilt at `size`, then rebuilds it at the old size. */
+const withPool = (size, make) => {
+  const before = Buffer.poolSize
+  try {
+    Buffer.poolSize = size
+    rebuildPool()
+    return make()
+  } finally {
+    Buffer.poolSize = before
+    rebuildPool()
+  }
 }
 
 describe('Producer > the buffer > record sizes', () => {
@@ -333,24 +356,132 @@ describe('Producer > the buffer > record sizes', () => {
       })
     )
   })
+})
 
-  test('a small view of a large store is copied into a store of its own size; any other Buffer is kept', () => {
+describe('Producer > the buffer > small views of large stores', () => {
+  /** The records of a one-topic send as the producer keeps them. */
+  const snapshotOf = (messages) => Accumulator.snapshot([{ topic: TOPIC, messages }])[0].messages
+
+  test('the small views of large stores in one send are copied into one store of the sum of their lengths', () => {
     const slab = Buffer.alloc(1048576, 'a')
-    const view = slab.subarray(10, 11)
-    const copy = ownedBuffer(view)
+    slab.write('bcdefg', 10)
+    const views = [slab.subarray(10, 11), slab.subarray(11, 13), slab.subarray(13, 16)]
 
-    expect(copy).not.toBe(view)
-    expect(copy.buffer.byteLength).toBe(1)
-    slab[10] = 'z'.charCodeAt(0)
-    expect(copy.toString()).toBe('a')
+    const copies = snapshotOf(views.map((value) => ({ value }))).map(({ value }) => value)
 
+    expect(copies.map(String)).toEqual(['b', 'cd', 'efg'])
+    copies.forEach((copy, i) => expect(copy).not.toBe(views[i]))
+    expect(new Set(copies.map((copy) => copy.buffer)).size).toBe(1)
+    expect(copies[0].buffer.byteLength).toBe(6)
+    slab.fill('z')
+    expect(copies.map(String)).toEqual(['b', 'cd', 'efg'])
+  })
+
+  test('the charge of a send whose views share one copy is its held bytes and its shell, with no store excess', () => {
+    const slab = Buffer.alloc(1048576, 'a')
+    const messages = snapshotOf([
+      { key: slab.subarray(0, 3), value: slab.subarray(3, 10) },
+      { value: slab.subarray(10, 30), headers: { h: slab.subarray(30, 31) } },
+    ])
+    const heldBytes = held(messages[0]) + held(messages[1])
+
+    expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+      total: 1536 + heldBytes,
+      shell: 1536 + 31,
+    })
+  })
+
+  test('two sends never share a copy store', () => {
+    const view = Buffer.alloc(1048576, 'a').subarray(0, 1)
+
+    const [first] = snapshotOf([{ value: view }])
+    const [second] = snapshotOf([{ value: view }])
+
+    expect(first.value.buffer).not.toBe(second.value.buffer)
+    expect(first.value.buffer.byteLength).toBe(1)
+    expect(second.value.buffer.byteLength).toBe(1)
+    first.value[0] = 'z'.charCodeAt(0)
+    expect(String(second.value)).toBe('a')
+  })
+
+  test('a view at or under the thresholds, a string and a null are kept as the same objects; a view just above them is copied', () => {
     const atSixteenKiB = Buffer.alloc(16384).subarray(0, 1)
-    expect(ownedBuffer(atSixteenKiB)).toBe(atSixteenKiB)
-    const aboveSixteenKiB = Buffer.alloc(16385).subarray(0, 1)
-    expect(ownedBuffer(aboveSixteenKiB).buffer.byteLength).toBe(1)
     const atSixteenTimes = Buffer.alloc(32768).subarray(0, 2048)
-    expect(ownedBuffer(atSixteenTimes)).toBe(atSixteenTimes)
-    expect(ownedBuffer('text')).toBe('text')
+    const headers = { text: 'text', none: null, list: [atSixteenKiB, 'item'] }
+
+    const [record] = snapshotOf([{ key: atSixteenKiB, value: atSixteenTimes, headers }])
+
+    expect(record.key).toBe(atSixteenKiB)
+    expect(record.value).toBe(atSixteenTimes)
+    expect(record.headers.text).toBe('text')
+    expect(record.headers.none).toBeNull()
+    expect(record.headers.list[0]).toBe(atSixteenKiB)
+    expect(record.headers.list[1]).toBe('item')
+
+    const aboveSixteenKiB = Buffer.alloc(16385).subarray(0, 1)
+    const [copied] = snapshotOf([{ value: aboveSixteenKiB }])
+    expect(copied.value).not.toBe(aboveSixteenKiB)
+    expect(copied.value.buffer.byteLength).toBe(1)
+  })
+
+  test("the keys, values and header values of one send, array elements included, land in one copy store; the caller's array keeps its views", () => {
+    const slab = Buffer.alloc(65536)
+    slab.write('kvhab', 0)
+    const [key, value, header, first, second] = [0, 1, 2, 3, 4].map((i) => slab.subarray(i, i + 1))
+    const list = [first, 'text', second]
+
+    const [record] = snapshotOf([{ key, value, headers: { h: header, list } }])
+    const fields = [
+      record.key,
+      record.value,
+      record.headers.h,
+      record.headers.list[0],
+      record.headers.list[2],
+    ]
+
+    expect(fields.map(String).join('')).toBe('kvhab')
+    expect(new Set(fields.map((field) => field.buffer)).size).toBe(1)
+    expect(fields[0].buffer.byteLength).toBe(5)
+    expect(record.headers.list[1]).toBe('text')
+    expect(list).toEqual([first, 'text', second])
+    expect(list[0]).toBe(first)
+  })
+
+  test("pooled Buffer values are charged by their own bytes under a 64 KiB pool, and kept as the caller's under an 8 KiB pool", () => {
+    const texts = ['{"a":1}', '{"b":22}', 'x'.repeat(300)]
+
+    withPool(65536, () => {
+      const values = texts.map((text) => Buffer.from(text))
+      expect(values.every((value) => value.buffer.byteLength >= 65536)).toBe(true)
+      const messages = snapshotOf(values.map((value) => ({ value })))
+      const heldBytes = messages.reduce((sum, message) => sum + held(message), 0)
+
+      expect(messages.map(({ value }) => String(value))).toEqual(texts)
+      expect(new Set(messages.map(({ value }) => value.buffer)).size).toBe(1)
+      expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+        total: 1536 + heldBytes,
+        shell: 1536 + 7 + 8 + 300,
+      })
+    })
+    withPool(8192, () => {
+      const values = texts.map((text) => Buffer.from(text))
+      expect(values.every((value) => value.buffer.byteLength <= 16384)).toBe(true)
+      const messages = snapshotOf(values.map((value) => ({ value })))
+
+      messages.forEach((message, i) => expect(message.value).toBe(values[i]))
+    })
+  })
+
+  test('5,000 references to one small view of a 1 MiB store are charged by their copied bytes, not the store', () => {
+    const view = Buffer.alloc(1048576).subarray(0, 10)
+
+    const messages = snapshotOf(Array.from({ length: 5000 }, () => ({ value: view })))
+
+    expect(messages[0].value.buffer.byteLength).toBe(50000)
+    expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+      total: 1536 + 5000 * held({ value: view }),
+      shell: 1536 + 50000,
+    })
   })
 })
 
@@ -506,6 +637,42 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     expect(written[0].messages[0].value).not.toBe(view)
     expect(written[0].bytes.includes(Buffer.alloc(16, 'a'))).toBe(true)
     expect(written[0].bytes.includes(Buffer.alloc(16, 'z'))).toBe(false)
+    await producer.disconnect()
+  })
+
+  test('small views of one large store in a send are admitted at their held bytes and the send shell exactly', async () => {
+    const { producer, admission, written, release } = await heldProducer()
+    const slab = Buffer.alloc(1048576, 'a')
+    const messages = [
+      { key: slab.subarray(0, 4), value: slab.subarray(4, 20) },
+      { value: slab.subarray(20, 52), headers: { h: slab.subarray(52, 53) } },
+    ]
+
+    const sent = producer.send({ topic: TOPIC, messages })
+    await flushAll()
+    expect(admission.reserved).toBe(held(messages[0]) + held(messages[1]) + 1536)
+    await release()
+    await sent
+
+    const [first, second] = written[0].messages
+    expect(first.value.buffer).toBe(first.key.buffer)
+    expect(second.value.buffer).toBe(first.key.buffer)
+    expect(second.headers.h.buffer).toBe(first.key.buffer)
+    expect(first.key.buffer.byteLength).toBe(53)
+    await producer.disconnect()
+  })
+
+  test('a one-byte Buffer from a 64 KiB pool fits a bufferMemory of 4096', async () => {
+    const { producer, admission, release } = await heldProducer({ capacity: 4096 })
+    const value = withPool(65536, () => Buffer.from('v'))
+    expect(value.buffer.byteLength).toBeGreaterThanOrEqual(65536)
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value }] }))
+    await flushAll()
+    expect(admission.reserved).toBe(held({ value }) + 1536)
+    await release()
+
+    expect(sent.state).toBe('fulfilled')
     await producer.disconnect()
   })
 
