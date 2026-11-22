@@ -425,6 +425,8 @@ new Kafka({
 })
 ```
 
+Without the timeout, a broker that stops answering while its connection stays open holds a Metadata request forever. A consumer whose metadata is older than `metadataMaxAge` then pauses its fetches, and a producer starts no further background metadata refresh, so it notices new partitions only when a send error forces a refresh. See [Consuming](Consuming.md#options) and [Producing](Producing.md#options).
+
 ## Max In Flight Requests
 
 `maxInFlightRequests`, available on `producer()` and `consumer()`, caps the number of
