@@ -16,7 +16,8 @@
  * broker provenance (image digests from `docker image inspect`, or operator evidence for a supplied
  * cluster); the prepared reporter's file cap, mounted jar digest and the cap each broker's load proof
  * reports; a quiet host (no agent or test
- * process other than this run's own broker containers), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
+ * process other than this run's own broker containers, judged only once every broker container root
+ * is visible to the census), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
  * or rehearsal, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
  * fail the preflight, and the record says so; such a run is never acceptance evidence.
  */
@@ -70,27 +71,34 @@ class Preflight {
   }
 
   /**
-   * @returns {Promise<{ checks: { name: string, ok: boolean, required: boolean }[],
-   *   failed: string[], exitCode: number, facts: object }>} every check, the names that failed and
-   *   the process exit code (only required checks fail it)
+   * @returns {Promise<{ checks: { name: string, ok: boolean, required: boolean, reason?: string }[],
+   *   failed: string[], exitCode: number, facts: object }>} every check (with the reason a check
+   *   gave for failing), the names that failed and the process exit code (only required checks
+   *   fail it)
    */
   async run() {
     const facts = await this.read()
     const checks = Object.entries(this.checks(facts)).map(([name, check]) => {
-      let ok = false
+      let result = false
       try {
-        ok = check() === true
+        result = check()
       } catch {
-        ok = false
+        result = false
       }
-      return { name, ok, required: !(this.diagnostic && HOST_CHECKS.includes(name)) }
+      const required = !(this.diagnostic && HOST_CHECKS.includes(name))
+      const reason = typeof result === 'string' ? { reason: result } : {}
+      return { name, ok: result === true, required, ...reason }
     })
     const failed = checks.filter((c) => !c.ok).map((c) => c.name)
     const blocking = checks.filter((c) => !c.ok && c.required)
     return { checks, failed, exitCode: blocking.length === 0 ? 0 : 1, facts }
   }
 
-  /** @param {object} f the gathered facts @returns {Record<string, () => boolean>} named checks */
+  /**
+   * @param {object} f the gathered facts
+   * @returns {Record<string, () => boolean|string>} named checks; a check passes only on `true`, and
+   *   a string is its reason for failing
+   */
   checks(f) {
     const host = this.matrix.host
     const share = f.share.finalized['share.version']
@@ -122,7 +130,14 @@ class Preflight {
         f.reporter.mounted === f.reporter.jarSha256 &&
         f.reporter.loadedCaps.length === NODES.length &&
         f.reporter.loadedCaps.every((cap) => cap === f.reporter.sinkBytes),
-      'quiet-host': () => f.host.census.every((p) => p.class !== 'agent' && p.class !== 'test'),
+      'quiet-host': () => {
+        if (f.host.view?.verified !== true)
+          return `the process census cannot see the host: ${f.host.view?.reason ?? 'no view'}`
+        const busy = f.host.census.filter((p) => p.class === 'agent' || p.class === 'test')
+        return (
+          busy.length === 0 || `busy: ${busy.map((p) => `${p.name} (pid ${p.pid})`).join(', ')}`
+        )
+      },
       memory: () => f.host.memAvailable >= host.minMemAvailableBytes.value,
       disk: () => f.host.freeDisk >= host.minFreeDiskBytes.value,
       load: () => f.host.load1m <= host.maxLoadAverage1m.value,
@@ -220,6 +235,36 @@ function brokerRoots(
     }
     return { node, container, pid, visible }
   })
+}
+
+/**
+ * Whether the census sees the host's processes rather than only its own pid namespace. With this
+ * run's Compose cluster that holds only when every broker container root is visible (`brokerRoots`):
+ * a census in another pid namespace sees neither the run's brokers nor foreign work, so an empty one
+ * proves nothing. A supplied cluster has no container to confirm the view with, so it is never
+ * verified.
+ * @param {{ kind: string }} provenance the captured broker provenance
+ * @param {{ node: number, pid: number, visible: boolean }[]} roots from `brokerRoots`
+ * @returns {{ verified: boolean, reason: string|null }} the reason names what could not be confirmed
+ */
+function censusView(provenance, roots) {
+  if (provenance.kind !== 'image')
+    return {
+      verified: false,
+      reason: 'a supplied cluster has no broker container to confirm the view with',
+    }
+  if (roots.length !== NODES.length)
+    return {
+      verified: false,
+      reason: `expected ${NODES.length} broker container roots, found ${roots.length}`,
+    }
+  const hidden = roots.filter((r) => r.visible !== true)
+  if (hidden.length > 0)
+    return {
+      verified: false,
+      reason: `${hidden.map((r) => `kafka${r.node} (pid ${r.pid})`).join(', ')} not visible in this pid namespace`,
+    }
+  return { verified: true, reason: null }
 }
 
 /** @returns {number} Linux MemAvailable in bytes */
@@ -529,6 +574,7 @@ async function gatherFacts({
         load1m: os.loadavg()[0],
         census: census({ roots }),
         roots,
+        view: censusView(provenance, roots),
       },
     }
   } finally {
@@ -710,6 +756,7 @@ async function main(argv, { kafkaOptions } = {}) {
         failed: result.failed,
         census: facts.host.census,
         ownBrokers: facts.host.roots,
+        censusView: facts.host.view,
         telemetry: facts.telemetry,
         broker: facts.broker,
         host: {
@@ -730,7 +777,9 @@ async function main(argv, { kafkaOptions } = {}) {
     ) + '\n'
   )
   for (const c of result.checks)
-    console.log(`${c.ok ? 'ok  ' : c.required ? 'FAIL' : 'miss'} ${c.name}`)
+    console.log(
+      `${c.ok ? 'ok  ' : c.required ? 'FAIL' : 'miss'} ${c.name}${c.reason ? `: ${c.reason}` : ''}`
+    )
   return result.exitCode
 }
 
@@ -755,5 +804,6 @@ module.exports = {
   census,
   classifyCensus,
   brokerRoots,
+  censusView,
   telemetrySubscription,
 }
