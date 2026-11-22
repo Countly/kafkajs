@@ -1025,14 +1025,16 @@ describe('Producer > retained request children at their delivery owner', () => {
       getConnectionStatus: () => 'connected',
     })
     const settler = { resolve: jest.fn(), reject: jest.fn() }
+    const detach = jest.fn()
+    const retire = jest.fn()
     const batch = {
       topic: TOPIC,
       partition: 0,
       messages: [{ value: 'a' }, { value: 'b' }],
       createdAt: 0,
       settlers: [settler],
-      detach: jest.fn(),
-      retire: jest.fn(),
+      detach,
+      retire,
     }
     const sent = watch(
       sender.sendPartitioned({ acks: 1, timeout: 30000, compression: 0, batches: [batch] })
@@ -1048,12 +1050,12 @@ describe('Producer > retained request children at their delivery owner', () => {
       outcome: 'unsent',
     })
     expect(sent.state).toBe('rejected')
-    expect(batch.detach).toHaveBeenCalledTimes(1)
-    expect(batch.retire).not.toHaveBeenCalled()
+    expect(detach).toHaveBeenCalledTimes(1)
+    expect(retire).not.toHaveBeenCalled()
     lookup.resolve()
     await flushAll()
-    expect(batch.detach).toHaveBeenCalledTimes(1)
-    expect(batch.retire).toHaveBeenCalledTimes(1)
+    expect(detach).toHaveBeenCalledTimes(1)
+    expect(retire).toHaveBeenCalledTimes(1)
   })
 
   test('a written part ends at that write, so its members can share a request again', async () => {
