@@ -58,15 +58,80 @@ describe('Fetcher', () => {
     expect(handler).toHaveBeenCalledTimes(0)
   })
 
-  it('makes no further fetch once stop() has resolved', async () => {
-    fetcher.start()
-    await waitFor(() => handler.mock.calls.length > 0, { maxWait: 2000 })
-    await fetcher.stop()
-    const fetchesAtStop = fetch.mock.calls.length
+  describe('once stop() has resolved', () => {
+    /** Lets `count` event-loop turns pass; setImmediate stays real under these fake timers. */
+    const turns = async (count) => {
+      for (let i = 0; i < count; i++) await new Promise((resolve) => setImmediate(resolve))
+    }
 
-    await sleep(50)
+    beforeEach(() => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+    })
 
-    expect(fetch).toHaveBeenCalledTimes(fetchesAtStop)
+    afterEach(() => {
+      jest.useRealTimers()
+    })
+
+    it('makes no further fetch after a stop() that waited for the worker holding its round', async () => {
+      let release
+      handler.mockImplementation(() => new Promise((resolve) => (release = resolve)))
+      const heldFetch = jest.fn(async () => [
+        new Batch('test-topic', 0, { partition: '0', highWatermark: '100', messages: [] }),
+      ])
+      const held = createFetcher({
+        nodeId: 2,
+        fetch: heldFetch,
+        workerQueue,
+        logger,
+        partitionAssignments: fetcherAssignments,
+      })
+
+      const started = held.start()
+      await turns(5)
+      expect(handler).toHaveBeenCalledTimes(1)
+      let stopped = false
+      const stopping = held.stop().then(() => (stopped = true))
+      await turns(5)
+      expect(stopped).toBe(false)
+
+      release()
+      await stopping
+      await started
+      await jest.advanceTimersByTimeAsync(60000)
+      await turns(5)
+
+      expect(heldFetch).toHaveBeenCalledTimes(1)
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    it('makes no further fetch after a stop() that cancelled a retry wait, and leaves no timer behind', async () => {
+      const failingFetch = jest.fn(async () => {
+        throw new Error('connection lost')
+      })
+      const retrying = createFetcher({
+        nodeId: 3,
+        fetch: failingFetch,
+        retryDelay: () => 100,
+        workerQueue,
+        logger,
+        partitionAssignments: fetcherAssignments,
+      })
+
+      const started = retrying.start()
+      await turns(5)
+      expect(failingFetch).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(1)
+
+      await retrying.stop()
+      await started
+      expect(jest.getTimerCount()).toBe(0)
+      await jest.advanceTimersByTimeAsync(60000)
+      await turns(5)
+
+      expect(failingFetch).toHaveBeenCalledTimes(1)
+      expect(handler).not.toHaveBeenCalled()
+    })
   })
 
   it('should utilize all workers', async () => {
