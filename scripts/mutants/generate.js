@@ -19,7 +19,8 @@
  * their listed order with the default appended when not listed, and every other method keeps the default alone. A method is the module-level
  * function or class method that holds the mutated line, so the table survives line moves. Every spec the
  * area names must exist, every file a table names must be a generated target and every method it names
- * must hold a mutated line, or generation fails.
+ * must hold a mutated line, or generation fails. An area with `methodsOnly` generates, for a target with
+ * method rules, only the lines of the methods those rules name; its other targets stay whole.
  *
  * Usage: node scripts/mutants/generate.js [--root <dir>] [--out <file>]   prints or writes `{ records }`
  */
@@ -33,10 +34,17 @@ const PROTOCOL = 'src/protocol'
 const REQUESTS = 'src/protocol/requests'
 const SYNC_GROUP = 'src/protocol/requests/syncGroup'
 const SCHEMA_SPEC = 'scripts/protocol/__tests__/schema.spec.js'
+const CLUSTER_TESTS = 'src/cluster/__tests__'
+const NETWORK_TESTS = 'src/network/__tests__'
+const CONSUMER_TESTS = 'src/consumer/__tests__'
+const COMPRESSION = 'src/protocol/message/compression'
+const RECORD_BATCH = 'src/protocol/recordBatch/v0'
+const AGED_METADATA_SPEC = `${PRODUCER_TESTS}/agedMetadata.spec.js`
 
 /**
  * The risk areas, their broker-free default witness specs, and the `witnesses` table that names, per
  * target, the specs that guard it where the default does not reach (see the file's description).
+ * `aged-metadata` is `methodsOnly`: the rest of the cluster and broker pool is not its subject.
  */
 const AREAS = [
   {
@@ -48,6 +56,7 @@ const AREAS = [
       'src/producer/state/__tests__/accumulator.spec.js',
       'src/producer/state/__tests__/admission.spec.js',
       'src/producer/state/__tests__/errorClassifier.spec.js',
+      'src/producer/state/__tests__/joinOrder.spec.js',
       'src/producer/state/__tests__/partitionSequencer.spec.js',
       'src/producer/state/__tests__/producerIdAndEpoch.spec.js',
       'src/producer/state/__tests__/recordSize.spec.js',
@@ -258,6 +267,180 @@ const AREAS = [
           `${PROTOCOL}/recordBatch/record/v0/decoderEquality.spec.js`,
           `${REQUESTS}/produce/produceFraming.spec.js`,
         ],
+      },
+    },
+  },
+  {
+    name: 'producer-send',
+    targets: [
+      'src/producer/index.js',
+      'src/producer/messageProducer.js',
+      'src/producer/sendMessages.js',
+    ],
+    specs: ['src/producer/sendMessages.spec.js', `${PRODUCER_TESTS}/messageProducer.spec.js`],
+    witnesses: {
+      'src/producer/index.js': [
+        `${PRODUCER_TESTS}/drainLoop.spec.js`,
+        `${PRODUCER_TESTS}/deliveryBudget.spec.js`,
+        `${PRODUCER_TESTS}/closeContract.spec.js`,
+        `${PRODUCER_TESTS}/producerOptions.spec.js`,
+      ],
+      'src/producer/messageProducer.js': [
+        `${PRODUCER_TESTS}/messageProducer.spec.js`,
+        `${PRODUCER_TESTS}/partitionerSeam.spec.js`,
+        `${PRODUCER_TESTS}/deliveryBudget.spec.js`,
+      ],
+      'src/producer/sendMessages.js': [
+        'src/producer/sendMessages.spec.js',
+        `${PRODUCER_TESTS}/drainLoop.spec.js`,
+        `${PRODUCER_TESTS}/splitSend.spec.js`,
+        `${PRODUCER_TESTS}/leaderHint.spec.js`,
+      ],
+    },
+  },
+  {
+    name: 'network',
+    targets: ['src/network/'],
+    specs: [
+      `${NETWORK_TESTS}/connectionLifecycle.spec.js`,
+      'src/network/connectionPool.spec.js',
+      `${NETWORK_TESTS}/connectionSetup.spec.js`,
+      'src/network/requestQueue/index.spec.js',
+      'src/network/requestQueue/socketRequest.spec.js',
+    ],
+    witnesses: {
+      'src/network/connection.js': [
+        `${NETWORK_TESTS}/connectionLifecycle.spec.js`,
+        `${NETWORK_TESTS}/connectionSendOrder.spec.js`,
+        `${NETWORK_TESTS}/connectionBranches.spec.js`,
+        `${NETWORK_TESTS}/requestTimeoutClose.spec.js`,
+      ],
+      'src/network/connectionFailure.js': [
+        `${NETWORK_TESTS}/connectionLifecycle.spec.js`,
+        `${NETWORK_TESTS}/thrownValues.spec.js`,
+      ],
+      'src/network/connectionPool.js': [
+        'src/network/connectionPool.spec.js',
+        `${NETWORK_TESTS}/idleReaping.spec.js`,
+        `${NETWORK_TESTS}/obsoleteConnectionBound.spec.js`,
+        `${NETWORK_TESTS}/shareConnectionPool.spec.js`,
+      ],
+      'src/network/connectionSetup.js': [
+        `${NETWORK_TESTS}/connectionSetup.spec.js`,
+        `${NETWORK_TESTS}/connectionSetupEdges.spec.js`,
+        `${NETWORK_TESTS}/connectionSetupPolicy.spec.js`,
+      ],
+      'src/network/describeThrown.js': [`${NETWORK_TESTS}/thrownValues.spec.js`],
+      'src/network/frameBuffer.js': [
+        `${NETWORK_TESTS}/frameValidation.spec.js`,
+        `${NETWORK_TESTS}/flexibleFraming.spec.js`,
+      ],
+      'src/network/requestQueue/index.js': [
+        'src/network/requestQueue/index.spec.js',
+        'src/network/requestQueue/ownership.spec.js',
+        'src/network/requestQueue/idleScheduling.spec.js',
+        'src/network/requestQueue/scopeRelease.spec.js',
+      ],
+      'src/network/requestQueue/socketRequest.js': [
+        'src/network/requestQueue/socketRequest.spec.js',
+        `${NETWORK_TESTS}/telemetryObservation.spec.js`,
+      ],
+      'src/network/socket.js': [
+        `${NETWORK_TESTS}/disconnectClosedSocket.spec.js`,
+        `${NETWORK_TESTS}/connectionLifecycle.spec.js`,
+      ],
+      'src/network/socketFactory.js': [
+        `${NETWORK_TESTS}/tlsNegative.spec.js`,
+        `${NETWORK_TESTS}/dnsAddresses.spec.js`,
+      ],
+    },
+  },
+  {
+    name: 'fetch-loop',
+    targets: [
+      'src/consumer/batch.js',
+      'src/consumer/fetchManager.js',
+      'src/consumer/fetcher.js',
+      'src/consumer/runner.js',
+    ],
+    specs: [
+      `${CONSUMER_TESTS}/batch.spec.js`,
+      'src/consumer/fetchManager.spec.js',
+      'src/consumer/fetcher.spec.js',
+      `${CONSUMER_TESTS}/runner.spec.js`,
+    ],
+    witnesses: {
+      'src/consumer/fetchManager.js': [
+        'src/consumer/fetchManager.spec.js',
+        `${CONSUMER_TESTS}/fetchManagerReconcile.spec.js`,
+        `${CONSUMER_TESTS}/fetchManagerStop.spec.js`,
+        `${CONSUMER_TESTS}/fetchManagerErrorIsolation.spec.js`,
+      ],
+      'src/consumer/fetcher.js': [
+        'src/consumer/fetcher.spec.js',
+        `${CONSUMER_TESTS}/fetcherPhases.spec.js`,
+        `${CONSUMER_TESTS}/fetcherRecreations.spec.js`,
+      ],
+      'src/consumer/runner.js': [
+        `${CONSUMER_TESTS}/runner.spec.js`,
+        `${CONSUMER_TESTS}/crash.spec.js`,
+        `${CONSUMER_TESTS}/boundedClose.spec.js`,
+      ],
+    },
+  },
+  {
+    name: 'compression',
+    targets: [`${COMPRESSION}/`, `${RECORD_BATCH}/decoder.js`, `${RECORD_BATCH}/index.js`],
+    specs: [
+      `${COMPRESSION}/compressionLevels.spec.js`,
+      `${COMPRESSION}/lz4.spec.js`,
+      `${COMPRESSION}/snappy.spec.js`,
+      `${COMPRESSION}/zstd.spec.js`,
+    ],
+    witnesses: {
+      [`${COMPRESSION}/index.js`]: [
+        `${COMPRESSION}/compressionLevels.spec.js`,
+        `${COMPRESSION}/customCodec.spec.js`,
+        `${COMPRESSION}/codecBombs.spec.js`,
+        `${COMPRESSION}/decompressionBound.spec.js`,
+      ],
+      [`${RECORD_BATCH}/decoder.js`]: [
+        `${COMPRESSION}/decompressionBound.spec.js`,
+        `${RECORD_BATCH}/compressedCount.spec.js`,
+        `${RECORD_BATCH}/recordBounds.spec.js`,
+        `${RECORD_BATCH}/crcValidation.spec.js`,
+      ],
+      [`${RECORD_BATCH}/index.js`]: [
+        `${COMPRESSION}/compressionLevels.spec.js`,
+        `${RECORD_BATCH}/compressedCount.spec.js`,
+        `${RECORD_BATCH}/crcValidation.spec.js`,
+      ],
+    },
+  },
+  {
+    name: 'aged-metadata',
+    targets: ['src/cluster/brokerPool.js', 'src/cluster/index.js'],
+    specs: [AGED_METADATA_SPEC],
+    methodsOnly: true,
+    witnesses: {
+      'src/cluster/brokerPool.js': {
+        disconnect: [AGED_METADATA_SPEC, `${CLUSTER_TESTS}/disconnectDrains.spec.js`],
+        metadataState: [AGED_METADATA_SPEC, `${CLUSTER_TESTS}/consumerTopicIsolation.spec.js`],
+        refreshMetadata: [AGED_METADATA_SPEC],
+        refreshMetadataIfNecessary: [
+          AGED_METADATA_SPEC,
+          `${CLUSTER_TESTS}/consumerTopicIsolation.spec.js`,
+        ],
+        refreshMetadataUnshared: [
+          AGED_METADATA_SPEC,
+          `${CLUSTER_TESTS}/metadataCacheWiring.spec.js`,
+          `${CLUSTER_TESTS}/obsoleteDrain.spec.js`,
+          `${CLUSTER_TESTS}/consumerTopicIsolation.spec.js`,
+        ],
+      },
+      'src/cluster/index.js': {
+        refreshMetadataIfNecessary: [AGED_METADATA_SPEC],
+        serveFromCache: [AGED_METADATA_SPEC],
       },
     },
   },
@@ -535,7 +718,7 @@ const specsNamed = ({ specs, witnesses = {} }) => [
 /**
  * Generates the mutants of every area's targets.
  * @param {string} root the tree
- * @param {{ name: string, targets: string[], specs: string[], witnesses?: object }[]} [areas]
+ * @param {{ name: string, targets: string[], specs: string[], witnesses?: object, methodsOnly?: boolean }[]} [areas]
  * @returns {object[]} runner records, ordered by area, file and line
  * @throws {Error} when an area names a witness spec that is not in the tree, a rule names a file that
  *   is not a generated target, or a method rule matches no method of its target
@@ -567,6 +750,7 @@ const generate = (root, areas = AREAS) => {
         const mutants = lineMutants(line, masked[i], neighbour(i, -1), neighbour(i, 1))
         if (mutants.length === 0) return
         const method = byMethod ? enclosingSymbol(masked, i) : ''
+        if (area.methodsOnly && byMethod && !Object.hasOwn(area.witnesses[target], method)) return
         symbols.add(method)
         const witnesses = witnessesFor(target, method, area)
         for (const m of mutants) {

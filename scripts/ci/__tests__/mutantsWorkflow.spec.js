@@ -22,7 +22,7 @@ describe('mutants workflow', () => {
     const config = workflow()
     expect(Object.keys(config.on)).toEqual(['workflow_dispatch'])
     const { inputs } = config.on.workflow_dispatch
-    expect(inputs.shards.default).toBe('8')
+    expect(inputs.shards.default).toBe('16')
     expect(inputs['time-cap-minutes'].default).toBe('40')
     expect(inputs.areas.default).toBe('all')
     expect(inputs['per-area'].default).toBe('40')
@@ -53,7 +53,7 @@ describe('mutants workflow', () => {
     expect(run.env).toMatchObject({ CAP: `\${{ needs.prepare.outputs.cap }}` })
     expect(run.run).toContain('--time-cap "$CAP"')
     expect(run.run).toContain('--shard "$SHARD/$SHARDS"')
-    expect(MutantSelection.plan({ shards: '8', capMinutes: '40' }).shardTimeout).toBe(40 + 36)
+    expect(MutantSelection.plan({ shards: '16', capMinutes: '40' }).shardTimeout).toBe(40 + 36)
   })
 
   test('every shard checks out the selected tree on its own runner', () => {
