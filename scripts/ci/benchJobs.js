@@ -11,8 +11,9 @@
  *
  * Usage: node scripts/ci/benchJobs.js plan                       (env ROWS; prints job outputs)
  *        node scripts/ci/benchJobs.js collect <reports> <out>    (env ROWS, NEEDS, DOWNLOAD)
- * `<reports>` holds one `report-<unit>/bench-report.json` per job that reported; `NEEDS` is the
- * workflow's `needs` context as JSON. Exit codes: 0 done, 2 a bad argument or an unknown row name.
+ * `<reports>` holds one `report-<unit>/bench-report.json` per job that reported (or, when only one
+ * job reported, that job's `bench-report.json` itself); `NEEDS` is the workflow's `needs` context
+ * as JSON. Exit codes: 0 done, 2 a bad argument or an unknown row name.
  */
 const fs = require('node:fs')
 const path = require('node:path')
@@ -152,11 +153,34 @@ const readReport = (file) => {
 }
 
 /**
+ * Reads each unit's report from the downloaded artifacts. The download action puts each artifact
+ * in a `report-<unit>` directory, except when exactly one artifact matched: then it extracts that
+ * one into `reports` itself. Such a lone report belongs to the one unit whose rows hold every row
+ * it ran; when no unit or more than one does, no unit gets it.
+ * @param {string} reports the download directory
+ * @param {Unit[]} units
+ * @returns {Map<string, object>} the parsed reports by unit key
+ */
+const readReports = (reports, units) => {
+  const found = new Map()
+  for (const unit of units) {
+    const report = readReport(path.join(reports, `report-${unit.key}`, 'bench-report.json'))
+    if (report) found.set(unit.key, report)
+  }
+  const lone = readReport(path.join(reports, 'bench-report.json'))
+  if (!Array.isArray(lone?.rows)) return found
+  const ran = lone.rows.filter((r) => r.status !== 'not selected').map((r) => r.benchmark)
+  const owners = units.filter((unit) => ran.every((row) => unit.rows.includes(row)))
+  if (owners.length === 1 && !found.has(owners[0].key)) found.set(owners[0].key, lone)
+  return found
+}
+
+/**
  * Joins the jobs' reports into one, by manifest row. Each unit's selected rows come from its own
  * report; a missing report, or one without the row, makes the row `error` with the job's result.
  * A row a report ran although its unit does not own it is an `error` row of that unit. Rows the
  * dispatch left out are `not selected`.
- * @param {string} reports the directory of downloaded `report-<unit>` artifacts
+ * @param {string} reports the directory of downloaded `report-<unit>` artifacts (`readReports`)
  * @param {{ input: string, needs?: Record<string, { result?: string }>, download?: string,
  *   manifest?: { entries: Entry[] }, meta?: object }} options
  * @returns {{ meta: object, units: object[], rows: object[], details: object[] }}
@@ -166,10 +190,11 @@ const collect = (
   { input, needs = {}, download, manifest = defaultManifest, meta = {} }
 ) => {
   const planned = plan(input, manifest)
+  const found = readReports(reports, planned.units)
   const rows = []
   const details = []
   const units = planned.units.map((unit) => {
-    const report = readReport(path.join(reports, `report-${unit.key}`, 'bench-report.json'))
+    const report = found.get(unit.key)
     const result = needs[unit.job]?.result ?? 'unknown'
     const named = (row) => (unit.label ? `${row} (${unit.label})` : row)
     const error = (benchmark, reason) => ({

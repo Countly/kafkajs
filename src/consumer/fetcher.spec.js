@@ -58,10 +58,21 @@ describe('Fetcher', () => {
     expect(handler).toHaveBeenCalledTimes(0)
   })
 
+  it('makes no further fetch once stop() has resolved', async () => {
+    fetcher.start()
+    await waitFor(() => handler.mock.calls.length > 0, { maxWait: 2000 })
+    await fetcher.stop()
+    const fetchesAtStop = fetch.mock.calls.length
+
+    await sleep(50)
+
+    expect(fetch).toHaveBeenCalledTimes(fetchesAtStop)
+  })
+
   it('should utilize all workers', async () => {
     fetcher.start()
 
-    await waitFor(() => handler.mock.calls.length > workerIds.length)
+    await waitFor(() => handler.mock.calls.length > workerIds.length, { maxWait: 2000 })
     await fetcher.stop()
 
     const calledWorkerIds = handler.mock.calls.map(([, { workerId }]) => workerId)
@@ -144,10 +155,42 @@ describe('Fetcher', () => {
 
       fetchers.forEach((fetcher) => fetcher.start())
 
-      await waitFor(() => handler.mock.calls.length >= 3)
+      await waitFor(() => handler.mock.calls.length >= 3, { maxWait: 2000 })
       await Promise.all(fetchers.map((fetcher) => fetcher.stop()))
 
       expect(handler).toHaveBeenCalledTimes(3)
+    })
+
+    it('lets another fetcher deliver a partition once the previous fetcher has handled it', async () => {
+      const movedBatch = () =>
+        new Batch('test-topic', 0, { partition: 'moved', highWatermark: '100', messages: [] })
+      let deliveredByOldLeader = false
+      const oldLeaderFetch = jest.fn(async () => {
+        await sleep(1)
+        if (deliveredByOldLeader) return []
+        deliveredByOldLeader = true
+        return [movedBatch()]
+      })
+      const newLeaderFetch = jest.fn(async () => {
+        await sleep(1)
+        return handler.mock.calls.length > 0 ? [movedBatch()] : []
+      })
+      fetchers = [oldLeaderFetch, newLeaderFetch].map((fetch, nodeId) =>
+        createFetcher({
+          nodeId,
+          fetch,
+          workerQueue,
+          logger,
+          partitionAssignments: fetcherAssignments,
+        })
+      )
+
+      fetchers.forEach((fetcher) => fetcher.start())
+      await waitFor(() => handler.mock.calls.length >= 2, { maxWait: 2000 })
+      await Promise.all(fetchers.map((fetcher) => fetcher.stop()))
+
+      expect(handler.mock.calls[0][0].partition).toBe('moved')
+      expect(handler.mock.calls[1][0].partition).toBe('moved')
     })
   })
 })

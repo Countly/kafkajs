@@ -237,6 +237,20 @@ describe('Network > RequestQueue', () => {
       expect(sentAt).toBeGreaterThanOrEqual(before + clientSideThrottleTime)
     })
 
+    it('rejects a request whose write hook throws with what it threw, writing nothing and taking no slot', () => {
+      const refusal = new Error('the commit lost its authority')
+      request.onWrite = () => {
+        throw refusal
+      }
+
+      requestQueue.push(request)
+
+      expect(request.entry.reject).toHaveBeenCalledWith(refusal)
+      expect(send).not.toHaveBeenCalled()
+      expect(requestQueue.inflight.size).toEqual(0)
+      expect(requestQueue.pending.length).toEqual(0)
+    })
+
     it('does not allow for a inflight correlation ids collision', async () => {
       requestQueue.inflight.set(request.entry.correlationId, 'already existing inflight')
       expect(() => {

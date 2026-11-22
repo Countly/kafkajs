@@ -49,6 +49,14 @@ describe('Consumer > committed leader epoch', () => {
       expect(batch.leaderEpochAt('999')).toEqual(-1)
     })
 
+    it('returns -1 for a record that carries no leader epoch, at the end of the batch and before it', () => {
+      const noEpoch = { batchContext: undefined }
+      const batch = buildBatch(10, [message(10, 0, noEpoch), message(11, 0, noEpoch)])
+
+      expect(batch.leaderEpochAt('11')).toBe(-1)
+      expect(batch.leaderEpochAt('10')).toBe(-1)
+    })
+
     it('returns -1 for a batch emptied by log compaction, which advances past no record', () => {
       // Every raw message sits below the requested offset, so messagesWithinOffset is empty and
       // lastOffset() falls back to the batch's own fetchedOffset - a position with nothing behind

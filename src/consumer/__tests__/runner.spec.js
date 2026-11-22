@@ -231,6 +231,31 @@ describe('Consumer > Runner', () => {
         guard: expect.any(Function),
       })
     })
+
+    it('pauses the partition of the batch through "pause", and resumes it through what it returns', async () => {
+      const batch = new Batch(topicName, 0, {
+        partition,
+        highWatermark: 5,
+        messages: [{ offset: 4, key: '1', value: '2' }],
+      })
+      consumerGroup.pause = jest.fn()
+      consumerGroup.resume = jest.fn()
+      let resume
+      eachBatch.mockImplementation(async ({ pause }) => {
+        resume = pause()
+      })
+
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batch)
+
+      const entry = [{ topic: topicName, partitions: [partition] }]
+      expect(consumerGroup.pause).toHaveBeenCalledWith(entry)
+      expect(consumerGroup.resume).not.toHaveBeenCalled()
+
+      resume()
+      expect(consumerGroup.resume).toHaveBeenCalledWith(entry)
+    })
   })
 
   describe('when eachBatchAutoResolve is set to false', () => {
@@ -1219,13 +1244,20 @@ describe('Consumer > Runner', () => {
       try {
         let busy = true
         const baseline = jest.getTimerCount()
-        const done = runner.awaitQuiescence(() => busy, {
-          deadlineAt: 20,
-          identity: { round: roundOf() },
-        })
+        let outcome = 'pending'
+        const done = runner
+          .awaitQuiescence(() => busy, {
+            deadlineAt: 20,
+            identity: { round: roundOf() },
+          })
+          .then(
+            () => (outcome = 'resolved'),
+            (error) => (outcome = error)
+          )
         busy = false
         await jest.advanceTimersByTimeAsync(20)
-        await expect(done).resolves.toBeUndefined()
+        expect(outcome).toBe('resolved')
+        await done
         expect(runner.hookWaiters.size).toBe(0)
         expect(jest.getTimerCount()).toBe(baseline)
       } finally {

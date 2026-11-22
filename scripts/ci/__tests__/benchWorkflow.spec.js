@@ -644,6 +644,48 @@ describe('bench.yml', () => {
     expect(markdown).toContain(`### ${each} (node 22): valid`)
   })
 
+  test('joins the lone report that the download extracts into the reports directory itself when one artifact matched', () => {
+    const reports = tmp()
+    const input = 'compare-produce-latency,compare-consume-throughput,compare-consume-throughput-1k'
+    const row = (benchmark, arm, status, extra = {}) => ({
+      benchmark,
+      arm,
+      metric: 'messagesPerSecond',
+      unit: 'msg/s',
+      runs: 5,
+      status,
+      median: 1,
+      min: 1,
+      max: 1,
+      ...extra,
+    })
+    const rows = [
+      row('compare-produce-latency', 'fork', 'valid', { ratio: 0.1 }),
+      row('compare-produce-latency', 'kafkajs@2.2.4', 'valid'),
+      row('compare-consume-throughput', 'fork', 'inconclusive', { reason: 'measured window' }),
+      row('compare-consume-throughput-1k', 'kafkajs@2.2.4', 'error', { runs: 0, reason: 'x' }),
+      { benchmark: 'murmur2', arm: '-', metric: '-', unit: '-', runs: 0, status: 'not selected' },
+    ]
+    const detail = { benchmark: 'compare-produce-latency', status: 'valid', raw: 'bench-raw/r/' }
+    const report = { meta: { only: input.split(',') }, rows, details: [detail] }
+    fs.writeFileSync(path.join(reports, 'bench-report.json'), JSON.stringify(report))
+    fs.writeFileSync(path.join(reports, 'bench-report.md'), '# Benchmark report\n')
+
+    const joined = benchJobs.collect(reports, {
+      input,
+      needs: { bench: { result: 'success' } },
+      download: 'success',
+    })
+
+    expect(joined.meta.jobs).toBe('1 of 1 reported')
+    expect(joined.rows.filter((r) => r.source === 'ordinary')).toEqual(
+      rows.slice(0, 4).map((r) => ({ ...r, source: 'ordinary' }))
+    )
+    expect(joined.details).toEqual([
+      { ...detail, raw: 'artifact bench-ordinary, bench-raw/r/', source: 'ordinary' },
+    ])
+  })
+
   test('the report job joins every job even after a failed one and uploads the joined report', () => {
     const job = workflow.jobs.report
     const join = stepIn(job, 'benchJobs.js collect')
