@@ -249,6 +249,37 @@ describe('Benchmarks > report', () => {
       expect(evidence.runs.map(({ run }) => run)).toEqual([1, 2, 3, 4, 5])
     })
 
+    test('an entry with profile runs each arm that did not fail once more under --cpu-prof, after its measured runs and outside its medians', () => {
+      const { spawn, calls } = stub((args, n) =>
+        valueAfter(args, '--package') === 'kafkajs'
+          ? { status: 1, stdout: '', stderr: 'boom' }
+          : json({
+              ...identityOf(args),
+              a: args.includes('--cpu-prof') ? 999 : n,
+              elapsedMs: 30000,
+            })
+      )
+
+      const { rows, details } = runEntry(
+        compared({ name: 'profiled', adapter: 'clientCompare', profile: true }),
+        options(spawn)
+      )
+
+      const profileDir = path.join(rawDir, 'profiled', 'fork-cpu-profile')
+      expect(calls).toHaveLength(7)
+      expect(calls[6].args.slice(0, 3)).toEqual(['--cpu-prof', '--cpu-prof-dir', profileDir])
+      expect(calls[6].args.slice(3)).toEqual(calls[0].args)
+      expect(calls.slice(0, 6).every(({ args }) => !args.includes('--cpu-prof'))).toBe(true)
+      expect(rows.find(({ arm }) => arm === 'fork')).toMatchObject({ runs: 5, median: 4 })
+      expect(details.find(({ notes }) => notes[0].startsWith('fork')).notes.at(-1)).toBe(
+        'CPU profile (one extra run, not in the medians): bench-raw/profiled/fork-cpu-profile/'
+      )
+      const evidence = JSON.parse(
+        fs.readFileSync(path.join(rawDir, 'profiled', 'fork.json'), 'utf8')
+      )
+      expect(evidence.runs.map(({ run }) => run)).toEqual([1, 2, 3, 4, 5, 'profile'])
+    })
+
     test('reports a missing, null, NaN or non-numeric metric as an error row', () => {
       const keys = ['good', 'missing', 'nothing', 'text', 'huge', 'nested']
       const entry = single({ metrics: keys.map((key) => ({ key, unit: 'ms' })) })
@@ -368,8 +399,9 @@ describe('Benchmarks > report', () => {
         runEntry(entry, options(spawn, 1))
 
         const adapter = entry.adapter && require(path.join(BENCHMARKS, 'adapters', entry.adapter))
+        const profiled = entry.profile ? 1 : 0
         expect(calls).toHaveLength(
-          entry.adapter ? (adapter.runs ?? 1) * entry.arms.length : entry.arms.length
+          entry.adapter ? ((adapter.runs ?? 1) + profiled) * entry.arms.length : entry.arms.length
         )
         for (const { args } of calls) expect(args.filter((arg) => /[{}]/.test(arg))).toEqual([])
       }

@@ -75,7 +75,9 @@ describe('Benchmark report clientCompare adapter', () => {
 
       expect(Object.fromEntries(compareRows.map((row) => [row.name, shape(row)]))).toEqual({
         'compare-produce-latency': ['produce-latency', '200', 'none', '3', 'defaults'],
+        'compare-produce-latency-same': ['produce-latency', '200', 'none', '3', 'same'],
         'compare-produce-throughput': ['produce-throughput', '200', 'none', '3', 'defaults'],
+        'compare-produce-throughput-same': ['produce-throughput', '200', 'none', '3', 'same'],
         'compare-produce-throughput-1k': ['produce-throughput', '1024', 'none', '3', 'defaults'],
         'compare-produce-throughput-lz4': ['produce-throughput', '200', 'lz4', '3', 'defaults'],
         'compare-produce-throughput-12p': ['produce-throughput', '200', 'none', '12', 'defaults'],
@@ -87,13 +89,49 @@ describe('Benchmark report clientCompare adapter', () => {
       })
     })
 
+    test('each consume corpus gives the faster arm at least 35 seconds of measured work at the fastest rate run 45023473404 saw', () => {
+      // Records per second of the fastest single run of either arm in benchmark run 45023473404
+      // (kafkajs 2.2.4 in each row); its 1 KiB 2.2.4 arm never ran, so that row allows 2.2.4
+      // twice the fork's fastest 1 KiB rate (226,457), against 1.32 times at 200 bytes.
+      const fastest = {
+        'compare-consume-throughput': 562872,
+        'compare-consume-throughput-same': 540005,
+        'compare-consume-throughput-1k': 2 * 226457,
+        'compare-consume-throughput-lz4': 538654,
+        'compare-consume-throughput-12p': 502499,
+      }
+      const consumeRows = compareRows.filter(
+        (row) => valueOf(row.command, '--workload') === 'consume-throughput'
+      )
+
+      expect(consumeRows.map(({ name }) => name).sort()).toEqual(Object.keys(fastest).sort())
+      for (const row of consumeRows) {
+        const records = Number(valueOf(row.command, '--messages'))
+        const passes = Number(valueOf(row.command, '--passes') ?? 1)
+        const measured = records * passes - Math.floor(records * 0.1)
+        expect([row.name, measured / fastest[row.name] >= 35]).toEqual([row.name, true])
+        expect([
+          row.name,
+          records * Number(valueOf(row.command, '--size') ?? 200) <= 4.5e9,
+        ]).toEqual([row.name, true])
+      }
+    })
+
+    test('the same-settings produce and consume rows take one CPU profile per arm, and no other row does', () => {
+      expect(compareRows.filter((row) => row.profile).map(({ name }) => name)).toEqual([
+        'compare-produce-throughput-same',
+        'compare-consume-throughput-same',
+      ])
+      expect(compareRows.filter((row) => 'profile' in row && row.profile !== true)).toEqual([])
+    })
+
     test('the planned compare minutes fit the bench job timeout with 20 minutes left for setup', () => {
       const workflow = yaml.load(
         fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'bench.yml'), 'utf8')
       )
       const minutes = compareRows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
 
-      expect(Math.round(minutes)).toBe(206)
+      expect(Math.round(minutes)).toBe(184)
       expect(minutes + 20).toBeLessThanOrEqual(workflow.jobs.bench['timeout-minutes'])
     })
   })
@@ -108,10 +146,26 @@ describe('Benchmark report clientCompare adapter', () => {
         command: ['--workload', 'consume-throughput', '--messages', '7000000', '--size', '1000'],
         arms: ARMS,
       }
+      const corpus = (7e6 * (3.4 + 1000 * 0.0074)) / 1e6
+      const read = (7e6 * (2.1 + 1000 * 0.0025)) / 1e6
 
-      expect(adapter.plannedSeconds(produce)).toBe((15 + 5 + 30) * 5 * 2)
-      expect(adapter.plannedSeconds(consume)).toBe((15 + 7e9 / 25e6 + 7e9 / 35e6) * 5 * 2)
-      expect(adapter.plannedSeconds({ ...produce, arms: ['fork'] }, 1)).toBe(50)
+      expect(adapter.plannedSeconds(produce)).toBe((2 + 5 + 30) * 5 * 2)
+      expect(adapter.plannedSeconds(consume)).toBeCloseTo((2 + corpus + read) * 5 * 2, 6)
+      expect(adapter.plannedSeconds({ ...produce, arms: ['fork'] }, 1)).toBe(37)
+    })
+
+    test('counts every pass over a corpus once it is produced, and one more run per arm for a profile', () => {
+      const command = ['--workload', 'consume-throughput', '--messages', '1000000', '--passes', '4']
+      const corpus = (1e6 * (3.4 + 200 * 0.0074)) / 1e6
+      const read = (4e6 * (2.1 + 200 * 0.0025)) / 1e6
+
+      expect(adapter.plannedSeconds({ command, arms: ARMS })).toBeCloseTo(
+        (2 + corpus + read) * 5 * 2,
+        6
+      )
+      expect(
+        adapter.plannedSeconds({ command: ['--duration-ms', '30000'], arms: ARMS, profile: true })
+      ).toBe(37 * 6 * 2)
     })
   })
 
@@ -199,6 +253,34 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(detail.notes.slice(1)).toEqual([
         'consumer settings in force (the same explicit settings on both arms): checkCrcs=false',
         "lz4: lz4-napi@2.10.0, the package's built-in codec",
+      ])
+    })
+
+    test('a produce arm notes its producer settings, a multi-pass corpus says so, and a profiled arm names its profile outside the medians', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const same = { same: { linger: 0, retry: { retries: 5 }, partitioner: 'DefaultPartitioner' } }
+      const outcome = {
+        outputs: [output(1, 30000, { settings: same })],
+        profile: 'bench-raw/compare-x/fork-cpu-profile/',
+      }
+
+      const produced = adapter.rows(produce, 'fork', outcome, 1).detail.notes.slice(1)
+      const consumed = adapter.rows(
+        entry,
+        'fork',
+        { outputs: [output(1, 30000, { passes: 4 })] },
+        1
+      )
+
+      expect(produced).toEqual([
+        'producer settings in force (the same explicit settings on both arms): linger=0, retry={"retries":5}, partitioner="DefaultPartitioner"',
+        'CPU profile (one extra run, not in the medians): bench-raw/compare-x/fork-cpu-profile/',
+      ])
+      expect(consumed.detail.notes.slice(1)).toEqual([
+        'the corpus is read 4 times: each partition is sought back to its first offset after its last record',
       ])
     })
 

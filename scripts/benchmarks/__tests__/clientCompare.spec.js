@@ -10,6 +10,8 @@ const {
   WORKLOADS,
   SAME_SETTINGS,
   PACKAGE_DEFAULTS,
+  SAME_PRODUCER_SETTINGS,
+  PRODUCER_DEFAULTS,
 } = require('../clientCompare')
 
 const SCRIPT = path.join(__dirname, '..', 'clientCompare.js')
@@ -36,13 +38,27 @@ const installStub = (prefix, name, version, origin) => {
   )
 }
 
-/** An in-memory Kafka that keeps what it was asked to do in `state`. */
+/** What kafkajs 2.2.4's admin throws while a broker does not know a topic yet. */
+const unknownTopic = () =>
+  Object.assign(new Error('This server does not host this topic-partition'), {
+    type: 'UNKNOWN_TOPIC_OR_PARTITION',
+  })
+/** Stands in for a package's `Partitioners.DefaultPartitioner`. */
+const legacyPartitioner = () => () => 0
+
+/**
+ * An in-memory Kafka that keeps what it was asked to do in `state`. Its admin throws, as kafkajs
+ * 2.2.4's does, when `createTopics` is asked to wait for leaders the broker does not know yet;
+ * `metadata` lists what each `fetchTopicMetadata` answers in turn (`'unknown'`, `'no leader'`,
+ * leaders for every partition when absent).
+ */
 const fakeKafka = ({
   failSend = false,
   failConnect,
   failRun = false,
   manualDelivery = false,
   sendMs,
+  metadata = [],
 } = {}) => {
   const state = {
     topics: new Map(),
@@ -57,6 +73,10 @@ const fakeKafka = ({
     timers: new Map(),
     createdTopics: [],
     consumerConfigs: [],
+    producerConfigs: [],
+    metadataReads: 0,
+    sleeps: [],
+    seeks: [],
     compressions: [],
     listeners: [],
     delay: { enabledAt: [], disabledAt: [] },
@@ -74,6 +94,10 @@ const fakeKafka = ({
       return timer
     },
     clearTimeout: (timer) => state.timers.delete(timer),
+    sleep: async (ms) => {
+      state.sleeps.push(ms)
+      elapsedNs += BigInt(ms) * 1000000n
+    },
     cpuUsage: (previous) =>
       previous ? { user: 600 * state.callbacks + 1200, system: 300 } : { user: 0, system: 0 },
     eventLoopDelay: () => ({
@@ -101,11 +125,35 @@ const fakeKafka = ({
     admin() {
       return {
         connect: () => connect('admin'),
-        createTopics: async ({ topics }) => {
+        createTopics: async ({ topics, waitForLeaders }) => {
+          if (waitForLeaders) throw unknownTopic()
           for (const { topic } of topics) state.topics.set(topic, [])
           state.createdTopics.push(...topics)
           return true
         },
+        fetchTopicMetadata: async ({ topics }) => {
+          const answer = metadata[state.metadataReads++]
+          if (answer === 'unknown') throw unknownTopic()
+          const leader = answer === 'no leader' ? -1 : 1
+          return {
+            topics: topics.map((name) => {
+              const { numPartitions } = state.createdTopics.find(({ topic }) => topic === name)
+              const partitions = Array.from({ length: numPartitions }, (_, partitionId) => ({
+                partitionId,
+                leader,
+              }))
+              return { name, partitions }
+            }),
+          }
+        },
+        fetchTopicOffsets: async (topic) => [
+          {
+            partition: 0,
+            offset: String(state.topics.get(topic).length),
+            high: String(state.topics.get(topic).length),
+            low: '0',
+          },
+        ],
         deleteTopics: async ({ topics }) => {
           for (const topic of topics) state.deleted.push(topic)
           state.events.push('delete topics')
@@ -118,7 +166,8 @@ const fakeKafka = ({
       }
     }
 
-    producer() {
+    producer(config) {
+      state.producerConfigs.push(config)
       return {
         connect: () => connect('producer'),
         send: async ({ topic, messages, compression }) => {
@@ -137,6 +186,7 @@ const fakeKafka = ({
       state.consumerGroups.push(config.groupId)
       state.consumerConfigs.push(config)
       let topic
+      let index = 0
       return {
         events: { REQUEST: 'consumer.network.request' },
         on: (event, listener) => {
@@ -148,12 +198,17 @@ const fakeKafka = ({
           topic = subscription.topic
           state.subscription = subscription
         },
+        seek: ({ topic: sought, partition, offset }) => {
+          state.seeks.push({ topic: sought, partition, offset })
+          index = Number(offset)
+        },
         run: async ({ eachMessage }) => {
-          state.deliverable = state.topics.get(topic).length
-          let index = 0
-          state.deliver = async (count) => {
-            for (let i = 0; i < count; i++) {
-              const message = state.topics.get(topic)[index++]
+          const records = state.topics.get(topic)
+          state.deliverable = records.length
+          state.deliver = async (count = Infinity) => {
+            for (let i = 0; i < count && index < records.length; i++) {
+              const offset = String(index)
+              const message = { ...records[index++], offset }
               elapsedNs += 10000000n
               state.callbacks += 1
               await eachMessage({ topic, partition: 0, message })
@@ -161,13 +216,18 @@ const fakeKafka = ({
           }
           ready()
           if (failRun) throw new Error('run failed')
-          if (!manualDelivery) await state.deliver(state.deliverable)
+          if (!manualDelivery) await state.deliver()
         },
         disconnect: () => disconnect('consumer'),
       }
     }
   }
-  const client = { Kafka, logLevel: { NOTHING: 0 }, CompressionTypes: { LZ4: 3 } }
+  const client = {
+    Kafka,
+    logLevel: { NOTHING: 0 },
+    CompressionTypes: { LZ4: 3 },
+    Partitioners: { DefaultPartitioner: legacyPartitioner },
+  }
   return { client, state, timing }
 }
 
@@ -309,6 +369,7 @@ describe('Benchmarks > clientCompare', () => {
         partitions: 3,
         compression: 'none',
         settings: 'defaults',
+        passes: 1,
         brokers: BROKERS,
       })
       expect(parse('produce-throughput').messages).toBe(200000)
@@ -351,6 +412,19 @@ describe('Benchmarks > clientCompare', () => {
         expect(() => parse(...bad)).toThrow(/usage/)
       }
     })
+
+    test('parseArgs reads --passes on the consume workload only and defaults it to one', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      expect(parse('--workload', 'consume-throughput', '--passes', '4').passes).toBe(4)
+      expect(parse('--workload', 'consume-throughput').passes).toBe(1)
+      for (const bad of [
+        ['--workload', 'produce-throughput', '--passes', '2'],
+        ['--workload', 'consume-throughput', '--passes', '0'],
+      ]) {
+        expect(() => parse(...bad)).toThrow(/usage/)
+      }
+    })
   })
 
   describe('module', () => {
@@ -386,6 +460,7 @@ describe('Benchmarks > clientCompare', () => {
         elapsedMs: 820,
         measuredMessages: 40,
         messagesPerSecond: (40 / 820) * 1000,
+        settings: { defaults: null },
       })
     })
 
@@ -398,6 +473,7 @@ describe('Benchmarks > clientCompare', () => {
         messagesPerSecond: 200000,
         measuredMessages: 1200,
         cpuMicrosPerMessage: 1500 / 1200,
+        settings: { defaults: null },
       })
     })
 
@@ -548,6 +624,7 @@ describe('Benchmarks > clientCompare', () => {
         measuredMessages: 150000,
         messagesPerSecond: 5000,
         cpuMicrosPerMessage: 1500 / 150000,
+        settings: { defaults: null },
       })
     })
 
@@ -566,6 +643,7 @@ describe('Benchmarks > clientCompare', () => {
         elapsedMs: 30000,
         measuredMessages: 300,
         messagesPerSecond: 10,
+        settings: { defaults: null },
       })
     })
 
@@ -600,6 +678,7 @@ describe('Benchmarks > clientCompare', () => {
         bytesPerFetch: 3000,
         messagesPerFetch: 45,
         fetchVersion: 17,
+        passes: 1,
         settings: { defaults: null },
       })
     })
@@ -702,6 +781,84 @@ describe('Benchmarks > clientCompare', () => {
       )
       expect(client).toMatch(/\n {6}readUncommitted = false,\n/)
       expect(timeouts).toMatch(new RegExp(`DEFAULT_MAX_POLL_INTERVAL = ${fork.pollTimeout}\\n`))
+    })
+
+    test('waits for the new topic through unknown-topic and leaderless answers instead of createTopics waitForLeaders, which kafkajs 2.2.4 gives up on', async () => {
+      const kafka = fakeKafka({ metadata: ['unknown', 'no leader', 'unknown'] })
+
+      const { metrics, state } = await runWith('produce-throughput', { messages: 5 }, kafka)
+
+      expect(metrics.measuredMessages).toBe(5)
+      expect(state.createdTopics).toHaveLength(1)
+      expect(state.metadataReads).toBe(4)
+      expect(state.sleeps).toEqual([100, 100, 100])
+    })
+
+    test('gives up on a topic without leaders after 30 seconds with the last answer', async () => {
+      const kafka = fakeKafka({ metadata: Array(400).fill('unknown') })
+
+      await expect(runWith('produce-throughput', { messages: 5 }, kafka)).rejects.toThrow(
+        'This server does not host this topic-partition'
+      )
+      expect(kafka.state.metadataReads).toBe(301)
+      expect(kafka.state.sends).toEqual([])
+      expect(kafka.state.deleted).toHaveLength(1)
+    })
+
+    test('consume-throughput with --passes reads the corpus that many times, seeking each partition back after its last record', async () => {
+      const { metrics, state } = await runWith('consume-throughput', { messages: 50, passes: 3 })
+
+      expect(state.seeks).toEqual([
+        { topic: state.subscription.topic, partition: 0, offset: '0' },
+        { topic: state.subscription.topic, partition: 0, offset: '0' },
+      ])
+      expect(state.callbacks).toBe(150)
+      expect(metrics).toMatchObject({ measuredMessages: 145, elapsedMs: 1450, passes: 3 })
+    })
+
+    test('produce workloads with --settings same give the producer one explicit configuration and report it; defaults report the package defaults', async () => {
+      const same = await runWith('produce-throughput', { messages: 5, settings: 'same' })
+      const fork = fakeKafka()
+      fork.client.name = '@countly/kafkajs'
+      const defaults = await runWith('produce-latency', { messages: 5 }, fork)
+
+      expect(same.state.producerConfigs).toEqual([
+        { ...SAME_PRODUCER_SETTINGS, createPartitioner: legacyPartitioner },
+      ])
+      expect(same.metrics.settings).toEqual({
+        same: { ...SAME_PRODUCER_SETTINGS, partitioner: 'DefaultPartitioner' },
+      })
+      expect(defaults.state.producerConfigs).toEqual([{}])
+      expect(defaults.metrics.settings).toEqual({ defaults: PRODUCER_DEFAULTS['@countly/kafkajs'] })
+      expect(SAME_PRODUCER_SETTINGS).toEqual({
+        idempotent: false,
+        maxInFlightRequests: null,
+        retry: { retries: 5 },
+        linger: 0,
+        batchSize: 1048576,
+      })
+    })
+
+    test('the fork producer defaults it reports are the ones its source sets', () => {
+      const producer = fs.readFileSync(path.join(ROOT, 'src', 'producer', 'index.js'), 'utf8')
+      const client = fs.readFileSync(path.join(ROOT, 'src', 'index.js'), 'utf8')
+      const fork = PRODUCER_DEFAULTS['@countly/kafkajs']
+
+      expect(producer).toMatch(
+        new RegExp(`\\n {2}linger: ${fork.linger},\\n {2}batchSize: ${fork.batchSize},`)
+      )
+      expect(producer).toMatch(new RegExp(`\\n {2}retries: ${fork.retries},\\n`))
+      expect(producer).toMatch(/\n {2}adaptive: true,\n/)
+      expect(producer).toMatch(/UniformStickyPartitioner\(\{ stickyBytes: batchSize/)
+      expect(client).toMatch(
+        new RegExp(`DEFAULT_MAX_IN_FLIGHT_REQUESTS = ${fork.maxInFlightRequests}\\n`)
+      )
+      expect(client).toMatch(/const requested = transactional \|\| idempotent == null \|\|/)
+      expect(fork).toMatchObject({
+        idempotent: true,
+        acks: -1,
+        partitioner: 'UniformStickyPartitioner (adaptive)',
+      })
     })
   })
 })
