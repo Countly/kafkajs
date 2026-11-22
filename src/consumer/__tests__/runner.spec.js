@@ -153,6 +153,64 @@ describe('Consumer > Runner', () => {
     )
   })
 
+  describe('a heartbeat the group reports idle', () => {
+    it('ends the heartbeat outage without calling the group heartbeat', async () => {
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+
+      await expect(runner.heartbeat()).resolves.toBeUndefined()
+
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalledWith(3000)
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      expect(runner.outages.heartbeat.since).toBeNull()
+    })
+
+    it('still calls the group heartbeat, with the same interval, and rejects with its error when the group reports it not idle', async () => {
+      const failure = new Error('the joined heartbeat failed')
+      consumerGroup.heartbeatIdle = jest.fn(() => false)
+      consumerGroup.heartbeat.mockRejectedValueOnce(failure)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+
+      await expect(runner.heartbeat()).rejects.toBe(failure)
+
+      expect(consumerGroup.heartbeat).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeat).toHaveBeenCalledWith(
+        expect.objectContaining({ interval: 3000 })
+      )
+      expect(runner.outages.heartbeat.since).toBe(5)
+    })
+
+    it('rejects with the retirement reason before asking the group whether it is idle', async () => {
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+      const reason = new Error('the run was retired')
+      runner.retire(reason)
+
+      await expect(runner.heartbeat()).rejects.toBe(reason)
+
+      expect(consumerGroup.heartbeatIdle).not.toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      expect(runner.outages.heartbeat.since).toBe(5)
+    })
+
+    it('does nothing once stop is latched, before asking the group whether it is idle', async () => {
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+      runner.latchStop()
+
+      await expect(runner.heartbeat()).resolves.toBeUndefined()
+
+      expect(consumerGroup.heartbeatIdle).not.toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      expect(runner.outages.heartbeat.since).toBe(5)
+    })
+  })
+
   describe('when the group is rebalancing before the new consumer has joined', () => {
     it('recovers from rebalance in progress and re-join the group', async () => {
       consumerGroup.sync

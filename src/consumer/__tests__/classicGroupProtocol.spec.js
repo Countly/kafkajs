@@ -748,3 +748,82 @@ describe('Consumer > classic group protocol > a heartbeat that loses its coordin
     expect(old.heartbeat).toHaveBeenCalledTimes(2)
   })
 })
+
+describe('Consumer > classic group protocol > the idle heartbeat probe', () => {
+  const ConsumerProtocol = require('../groupProtocol/consumer')
+  const INTERVAL = 3000
+  let now
+
+  /** A connected protocol whose coordinator answers every heartbeat with `answer()`. */
+  const joinedProtocol = (answer = async () => {}) => {
+    const coordinator = { heartbeat: jest.fn(answer), isConnected: () => true }
+    const protocol = buildProtocol()
+    protocol.coordinator = coordinator
+    Object.assign(protocol, { memberId: 'seam-member', generationId: 1 })
+    protocol.lastRequest = Date.now()
+    return { protocol, coordinator }
+  }
+
+  beforeEach(() => {
+    now = 1_000_000
+    jest.spyOn(Date, 'now').mockImplementation(() => now)
+  })
+
+  afterEach(() => jest.restoreAllMocks())
+
+  it('turns false exactly when heartbeat() sends, and true again once the heartbeat is answered', async () => {
+    const { protocol, coordinator } = joinedProtocol()
+
+    now += INTERVAL - 1
+    expect(protocol.heartbeatIdle(INTERVAL)).toBe(true)
+    await protocol.heartbeat({ interval: INTERVAL })
+    expect(coordinator.heartbeat).not.toHaveBeenCalled()
+
+    now += 1
+    expect(protocol.heartbeatIdle(INTERVAL)).toBe(false)
+    await protocol.heartbeat({ interval: INTERVAL })
+    expect(coordinator.heartbeat).toHaveBeenCalledTimes(1)
+    expect(protocol.lastRequest).toBe(now)
+    expect(protocol.heartbeatIdle(INTERVAL)).toBe(true)
+  })
+
+  it('is idle without a joined member, however long since the last request, as heartbeat() then sends nothing', async () => {
+    const { protocol, coordinator } = joinedProtocol()
+    protocol.memberId = null
+
+    now += 10 * INTERVAL
+    expect(protocol.heartbeatIdle(INTERVAL)).toBe(true)
+    await protocol.heartbeat({ interval: INTERVAL })
+    expect(coordinator.heartbeat).not.toHaveBeenCalled()
+  })
+
+  it('is not idle while a heartbeat is in flight, and a not-due call joins it and rejects with its error', async () => {
+    let fail
+    const { protocol, coordinator } = joinedProtocol(
+      () => new Promise((_resolve, reject) => (fail = reject))
+    )
+    const failure = createErrorFromCode(27)
+
+    now += INTERVAL
+    const sent = protocol.heartbeat({ interval: INTERVAL })
+    expect(protocol.heartbeatIdle(Infinity)).toBe(false)
+    const joined = protocol.heartbeat({ interval: Infinity })
+    await sleep(0)
+    expect(coordinator.heartbeat).toHaveBeenCalledTimes(1)
+    fail(failure)
+
+    await expect(sent).rejects.toBe(failure)
+    await expect(joined).rejects.toBe(failure)
+    expect(coordinator.heartbeat).toHaveBeenCalledTimes(1)
+    expect(protocol.heartbeatIdle(Infinity)).toBe(true)
+  })
+
+  it('leaves the consumer-protocol member out: its group is never idle, so every call reaches it', () => {
+    expect('heartbeatIdle' in ConsumerProtocol.prototype).toBe(false)
+    const forward = (groupMembership) =>
+      ConsumerGroup.prototype.heartbeatIdle.call({ groupMembership }, INTERVAL)
+
+    expect(forward(Object.create(ConsumerProtocol.prototype))).toBe(false)
+    expect(forward({ heartbeatIdle: (interval) => interval === INTERVAL })).toBe(true)
+  })
+})
