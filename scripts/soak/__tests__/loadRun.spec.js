@@ -359,6 +359,7 @@ describe('load run', () => {
         'producers.json',
         'profile.json',
         'report.json',
+        'throughput.json',
         ...topics.flatMap((t) => [`apache/${t}.dump.gz`, `apache/${t}.dump.gz.end`]),
         `apache/${topics[0].replace(/-0$/, '')}-group.describe`,
       ].sort()
@@ -372,6 +373,14 @@ describe('load run', () => {
       ).toBe(sha256)
     const dump = zlib.gunzipSync(fs.readFileSync(path.join(out, `apache/${topics[0]}.dump.gz`)))
     expect(dump.toString().split('\n')[0]).toMatch(/^Partition:\d\tOffset:\d+\tp\d\.0\.\d+$/)
+    const series = JSON.parse(fs.readFileSync(path.join(out, 'throughput.json'), 'utf8'))
+    const sum = (cells) => cells.reduce((n, c) => n + c, 0)
+    expect(series.intervalMs).toBe(5000)
+    expect(sum(series.groups.all.acked)).toBe(report.totals.acked)
+    expect(sum(series.groups.all.sent)).toBe(report.totals.sent)
+    expect(sum(series.groups.all.offered)).toBe(report.totals.offered)
+    expect(sum(series.groups.all.consumed)).toBe(report.consumers[0].delivered)
+    expect(report.throughput).toMatchObject({ intervalMs: 5000, stalled: false, reasons: [] })
 
     const replayed = await recheck(out)
     expect(replayed.findings).toEqual(report.oracle.findings)
@@ -400,6 +409,30 @@ describe('load run', () => {
       profile: 'RATE_NOT_REACHED',
       exitCode: 3,
     })
+  })
+
+  it('shows a stretch with no acknowledgement in the throughput series and flags it outside any fault', async () => {
+    const cluster = new FakeCluster({ stalled: () => cluster.now >= 20000 && cluster.now < 50000 })
+    const { report, out } = await runWith(
+      cluster,
+      {},
+      { args: ['--duration', '60', '--rate', '300'] }
+    )
+    dirs.push(out)
+    const { all } = report.throughput.groups
+    expect(all.flagged).toBe(true)
+    expect(all.unexcused.startMs).toBeGreaterThan(19900)
+    expect(all.unexcused.startMs).toBeLessThan(20000)
+    expect(all.unexcused.lengthMs).toBeGreaterThanOrEqual(30000)
+    expect(all.unexcused.lengthMs).toBeLessThan(30100)
+    expect(report.throughput.reasons[0]).toMatch(
+      /^all: no acknowledgement for 30\.\d s from 19\.9\d* s/
+    )
+    const series = JSON.parse(fs.readFileSync(path.join(out, 'throughput.json'), 'utf8'))
+    expect(series.groups.all.acked.slice(4, 10)).toEqual([0, 0, 0, 0, 0, 0])
+    expect(series.groups.all.acked[10]).toBeGreaterThan(0)
+    expect(series.groups.all.offered.slice(4, 10)).toEqual(Array(6).fill(1500))
+    expect(findingCounts(report.oracle)).toEqual({})
   })
 
   it('names the client CPU as the limit when a run that missed its rate kept the load process at one core', async () => {
@@ -524,6 +557,15 @@ describe('load run producer processes', () => {
     ])
     const ledgers = JSON.parse(fs.readFileSync(path.join(out, 'producers.json'), 'utf8'))
     expect(ledgers.map((l) => l.producer).sort()).toEqual(['p0', 'p1', 'p2'])
+    const series = JSON.parse(fs.readFileSync(path.join(out, 'throughput.json'), 'utf8'))
+    const sum = (cells) => cells.reduce((n, c) => n + c, 0)
+    expect(sum(series.groups.all.acked)).toBe(report.totals.acked)
+    expect(Object.keys(series.processes)).toEqual(['process-0', 'process-1'])
+    expect(
+      sum(series.processes['process-0'].groups.all.acked) +
+        sum(series.processes['process-1'].groups.all.acked)
+    ).toBe(report.totals.acked)
+    expect(report.throughput.stalled).toBe(false)
     expect(report.oracle.counts.records).toBeGreaterThan(5000)
     const replayed = await recheck(out)
     expect(replayed.counts.records).toBe(report.oracle.counts.records)
@@ -703,7 +745,7 @@ describe('load run fault schedules', () => {
     expect(report.verdict).toMatchObject({ product: 'PASS', flow: 'STALLED', exitCode: 4 })
   })
 
-  it('reports rolling restarts cut short by the window end as restarts not run, not as a driver error', async () => {
+  it('reports rolling restarts cut short by the window end as restarts not run and the run as inconclusive, not as a driver error', async () => {
     const steps = []
     const { report, out } = await runWith(
       new FakeCluster(),
@@ -731,15 +773,39 @@ describe('load run fault schedules', () => {
     dirs.push(out)
     expect(steps).toEqual(['kafka1'])
     expect(report.errors).toEqual([])
-    expect(report.faults.map((f) => [f.kind, f.service, f.outageMs ?? f.skipped])).toEqual([
-      ['stop', 'kafka1', 500],
-      ['stop', 'kafka2', 'window ended'],
-      ['stop', 'kafka3', 'window ended'],
-      ['kill', 'kafka1', 'window ended'],
-      ['kill', 'kafka2', 'window ended'],
-      ['kill', 'kafka3', 'window ended'],
+    const [phase, kafka1] = report.faults
+    expect(phase).toMatchObject({ phase: 'rolling-restart', kind: 'stop+kill' })
+    expect([phase.startMs, phase.endMs, kafka1.startMs, kafka1.endMs - kafka1.startMs]).toEqual([
+      expect.toBeWithin(2000, 2101),
+      expect.toBeWithin(6000, 6101),
+      phase.startMs,
+      expect.toBeWithin(500, 601),
     ])
-    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+    expect(report.memory.map((m) => m.phase)).toEqual(['baseline', 'rolling-restart', 'after'])
+    expect(report.faults.slice(1).map((f) => [f.kind, f.service, f.outageMs ?? f.skipped])).toEqual(
+      [
+        ['stop', 'kafka1', 500],
+        ['stop', 'kafka2', 'window ended'],
+        ['stop', 'kafka3', 'window ended'],
+        ['kill', 'kafka1', 'window ended'],
+        ['kill', 'kafka2', 'window ended'],
+        ['kill', 'kafka3', 'window ended'],
+      ]
+    )
+    expect(report.verdict).toEqual({
+      ok: false,
+      product: 'PASS',
+      profile: 'REACHED',
+      faults: 'INCOMPLETE',
+      reasons: [
+        'stop kafka2: window ended',
+        'stop kafka3: window ended',
+        'kill kafka1: window ended',
+        'kill kafka2: window ended',
+        'kill kafka3: window ended',
+      ],
+      exitCode: 2,
+    })
   })
 
   it('reports the many-topics measurements: topic creation, first assignment, rebalances, metadata requests and fetch rounds', async () => {
@@ -793,7 +859,14 @@ describe('load run fault schedules', () => {
     ])
     expect(findingCounts(report.oracle)).toEqual({})
     expect(report.oracle.counts.records).toBeGreaterThan(5000)
-    expect(report.verdict).toEqual({ ok: true, product: 'PASS', profile: 'REACHED', exitCode: 0 })
+    expect(report.verdict).toEqual({
+      ok: false,
+      product: 'PASS',
+      profile: 'REACHED',
+      faults: 'INCOMPLETE',
+      reasons: ['stop kafka2: window ended', 'stop kafka3: window ended'],
+      exitCode: 2,
+    })
     const replayed = await recheck(out)
     expect(replayed.findings).toEqual(report.oracle.findings)
     expect(replayed.counts).toEqual(report.oracle.counts)
