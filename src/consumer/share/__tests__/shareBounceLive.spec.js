@@ -8292,6 +8292,48 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(rows.find(({ event }) => event === 'witness-closure-end').complete).toBe(true)
   })
 
+  it('archives the socket event of a socket cut whose partition holds no unresolved work', async () => {
+    const { fixture, instance, rows } = archiveFixture()
+    const prior = fixture.bounces[0].interruptions[0]
+    const base = fixture.old.acquisition
+    const frame = { ...base.source.frames[0], id: 70, socket: 7, correlationId: 70 }
+    fixture.evidence.acquisitions.push({
+      ...base,
+      id: 'idle-partition-1',
+      partition: 1,
+      source: { ...base.source, frames: [frame], open: 1 },
+    })
+    instance.tap.allFrames.push(frame)
+    instance.tap.socketEvents.push({
+      id: 0,
+      socket: 7,
+      event: 'end',
+      at: prior.at - 0.5,
+      order: prior.order - 1,
+      label: 'member',
+      endpoint: 'node-1',
+      outstanding: [],
+      error: null,
+    })
+    captureFreezes(fixture)
+    instance.replay = audit(fixture)
+    expect(fixture.bounces[0].interruptions).toContainEqual(
+      expect.objectContaining({
+        kind: 'socket',
+        event: 0,
+        scope: expect.objectContaining({ socket: 7, partition: 1 }),
+        obligations: [],
+        carried: [],
+      })
+    )
+    instance.archive()
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
+    expect(instance.archiveClosure.problems).toEqual([])
+    expect(
+      rows.filter(({ event }) => event === 'socket-event').map(({ id, socket }) => [id, socket])
+    ).toEqual([[0, 7]])
+  })
+
   it.each([
     [
       'required frame',
