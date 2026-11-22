@@ -1,4 +1,5 @@
 const Runner = require('../runner')
+const ConsumerGroup = require('../consumerGroup')
 const Batch = require('../batch')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger, secureRandom, waitFor } = require('testHelpers')
@@ -208,6 +209,73 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.heartbeatIdle).not.toHaveBeenCalled()
       expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
       expect(runner.outages.heartbeat.since).toBe(5)
+    })
+  })
+
+  describe('pause from "eachMessage" while no heartbeat is due', () => {
+    const twoMessages = () =>
+      new Batch(topicName, 0, {
+        partition,
+        highWatermark: 5,
+        messages: [
+          { offset: '4', key: '1', value: '2' },
+          { offset: '5', key: '3', value: '4' },
+        ],
+      })
+
+    /** Runs one two-message batch through `eachMessage` and returns the offsets it was handed. */
+    const deliveredOffsets = async (eachMessage) => {
+      runner = createTestRunner({ eachBatch: undefined, eachMessage })
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(twoMessages())
+      return eachMessage.mock.calls.map(([{ message }]) => message.offset)
+    }
+
+    beforeEach(() => {
+      const paused = new Set()
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      consumerGroup.pause = jest.fn((topicPartitions) => {
+        for (const { topic, partitions } of topicPartitions) {
+          for (const p of partitions) paused.add(`${topic}|${p}`)
+        }
+      })
+      consumerGroup.isPaused = jest.fn((topic, p) => paused.has(`${topic}|${p}`))
+    })
+
+    it('delivers both messages when the handler does not pause', async () => {
+      const offsets = await deliveredOffsets(jest.fn(async () => {}))
+
+      expect(offsets).toEqual(['4', '5'])
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+
+    it('stops before the second message when the handler pauses synchronously', async () => {
+      const offsets = await deliveredOffsets(
+        jest.fn(async ({ pause }) => {
+          pause()
+        })
+      )
+
+      expect(offsets).toEqual(['4'])
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+
+    it('stops before the second message when the handler pauses after an awaited operation', async () => {
+      const offsets = await deliveredOffsets(
+        jest.fn(async ({ pause }) => {
+          await new Promise((resolve) => setImmediate(resolve))
+          pause()
+        })
+      )
+
+      expect(offsets).toEqual(['4'])
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
     })
   })
 
@@ -1341,5 +1409,185 @@ describe('Consumer > Runner', () => {
       expect(round.guard()).toMatchObject({ type: 'CONSUMER_STOPPING' })
       expect(consumerGroup.rebalanceHooks.retire).toHaveBeenCalledTimes(1)
     })
+  })
+})
+
+describe('Consumer > Runner > heartbeat through a real group membership', () => {
+  const INTERVAL = 3000
+  let now, wire, group, runner
+
+  /**
+   * A real `ConsumerGroup` and runner over a coordinator double whose heartbeat answers with
+   * `answer()`. A classic member is joined, its interval just restarted.
+   */
+  const build = ({ groupProtocol = 'classic', answer = async () => {} } = {}) => {
+    wire = {
+      nodeId: 0,
+      isConnected: () => true,
+      heartbeat: jest.fn(answer),
+      consumerGroupHeartbeat: jest.fn(async () => {
+        throw new Error('no consumer-protocol heartbeat is expected on the wire')
+      }),
+    }
+    group = new ConsumerGroup({
+      retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 2 },
+      cluster: {
+        connect: jest.fn(async () => {}),
+        refreshMetadata: jest.fn(async () => {}),
+        refreshMetadataIfNecessary: jest.fn(async () => {}),
+        committedOffsets: () => ({}),
+        topicName: () => undefined,
+        topicId: () => undefined,
+        findTopicPartitionMetadata: () => [],
+        findGroupCoordinator: jest.fn(async () => wire),
+        addMultipleTargetTopics: jest.fn(async () => {}),
+      },
+      groupId: 'heartbeat-group',
+      groupProtocol,
+      topics: ['topic-a'],
+      topicConfigurations: { 'topic-a': {} },
+      logger: newLogger(),
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      assigners: [],
+      sessionTimeout: 10000,
+      rebalanceTimeout: 60000,
+      heartbeatInterval: INTERVAL,
+      maxBytesPerPartition: 1048576,
+      minBytes: 1,
+      maxBytes: 1048576,
+      maxWaitTimeInMs: 1000,
+      autoCommit: true,
+      autoCommitInterval: null,
+      autoCommitThreshold: null,
+      isolationLevel: 0,
+      rackId: '',
+      checkCrcs: true,
+      metadataMaxAge: 300000,
+    })
+    group.coordinator = wire
+    if (groupProtocol === 'classic') {
+      group.memberId = 'member-1'
+      group.generationId = 1
+      group.lastRequest = now
+    }
+    runner = new Runner({
+      consumerGroup: group,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+      concurrency: 1,
+      heartbeatInterval: INTERVAL,
+      maxPollInterval: 300000,
+      autoCommit: true,
+      onCrash: jest.fn(),
+      eachMessage: async () => {},
+    })
+    runner.running = true
+  }
+
+  /** A heartbeat answer held until the test fails it, and a signal that it reached the wire. */
+  const heldAnswer = () => {
+    const held = {}
+    held.written = new Promise((resolve) => (held.onWire = resolve))
+    held.answer = () =>
+      new Promise((_resolve, reject) => {
+        held.fail = reject
+        held.onWire()
+      })
+    return held
+  }
+
+  /** @returns {Promise<unknown>} the call's rejection reason, or 'resolved' */
+  const outcome = (call) =>
+    call.then(
+      () => 'resolved',
+      (e) => e
+    )
+
+  beforeEach(() => {
+    now = 1_000_000
+    jest.spyOn(Date, 'now').mockImplementation(() => now)
+  })
+
+  afterEach(() => jest.restoreAllMocks())
+
+  it('sends the classic heartbeat exactly at the deadline, and ends the heartbeat outage on the calls before it', async () => {
+    build()
+    runner.outages.heartbeat.since = 5
+
+    now += INTERVAL - 1
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(wire.heartbeat).not.toHaveBeenCalled()
+    expect(runner.outages.heartbeat.since).toBeNull()
+
+    now += 1
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+    expect(wire.heartbeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        groupId: 'heartbeat-group',
+        memberId: 'member-1',
+        groupGenerationId: 1,
+      })
+    )
+    expect(group.lastRequest).toBe(now)
+
+    await runner.heartbeat()
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('joins a classic heartbeat in flight, even once the interval reads not due, and its rejection reaches both callers', async () => {
+    const held = heldAnswer()
+    build({ answer: held.answer })
+    const failure = new Error('the heartbeat connection broke')
+
+    now += INTERVAL
+    const first = runner.heartbeat()
+    await held.written
+    // Nothing else restarts the interval in production; this isolates the in-flight check.
+    group.lastRequest = now
+    const second = runner.heartbeat()
+    const firstOutcome = outcome(first)
+    const secondOutcome = outcome(second)
+    held.fail(failure)
+
+    expect(await firstOutcome).toBe(failure)
+    expect(await secondOutcome).toBe(failure)
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends one classic heartbeat for two calls in one turn that straddle the deadline, and a third caller joins it and sees its rejection', async () => {
+    const held = heldAnswer()
+    build({ answer: held.answer })
+    const failure = new Error('the heartbeat connection broke')
+
+    now += INTERVAL - 1
+    const before = runner.heartbeat()
+    now += 1
+    const due = runner.heartbeat()
+    await held.written
+    const joined = runner.heartbeat()
+    const dueOutcome = outcome(due)
+    const joinedOutcome = outcome(joined)
+    held.fail(failure)
+
+    await expect(before).resolves.toBeUndefined()
+    expect(await dueOutcome).toBe(failure)
+    expect(await joinedOutcome).toBe(failure)
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('makes the full group heartbeat call on every consumer-protocol heartbeat', async () => {
+    build({ groupProtocol: 'consumer' })
+    const membershipHeartbeat = jest
+      .spyOn(group.groupMembership, 'heartbeat')
+      .mockResolvedValue(undefined)
+    const interval = group.heartbeatInterval()
+
+    await runner.heartbeat()
+    await runner.heartbeat()
+
+    expect(group.heartbeatIdle(interval)).toBe(false)
+    expect(membershipHeartbeat).toHaveBeenCalledTimes(2)
+    expect(membershipHeartbeat).toHaveBeenCalledWith(expect.objectContaining({ interval }))
   })
 })
