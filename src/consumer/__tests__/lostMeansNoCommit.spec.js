@@ -300,6 +300,8 @@ const ownershipFixture = ({
   })
   runner.running = true
   group.heartbeat = jest.fn(async () => {})
+  // The membership underneath never joined, so it reports idle; cases drive the replaced heartbeat.
+  group.heartbeatIdle = () => false
   const batch = (partition = 0) => ({
     topic: SCHEDULED_TOPIC,
     partition,
