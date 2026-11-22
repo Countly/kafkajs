@@ -397,6 +397,21 @@ describe('Producer > the buffer > small views of large stores', () => {
     })
   })
 
+  test('a hole in a messages list stays a hole in the plain array the producer keeps', () => {
+    const slab = Buffer.alloc(1048576, 'a')
+    const messages = [{ value: slab.subarray(0, 1) }]
+    messages[2] = { value: slab.subarray(1, 2) }
+
+    const own = snapshotOf(messages)
+
+    expect(Object.getPrototypeOf(own)).toBe(Array.prototype)
+    expect(own).toHaveLength(3)
+    expect(1 in own).toBe(false)
+    expect(String(own[2].value)).toBe('a')
+    expect(own[2].value.buffer).toBe(own[0].value.buffer)
+    expect(own[0].value.buffer.byteLength).toBe(2)
+  })
+
   test('independent sends of the same source view get independent copies', () => {
     const view = Buffer.alloc(1048576, 'a').subarray(0, 1)
 

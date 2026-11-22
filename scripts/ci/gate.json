@@ -14415,6 +14415,7 @@
         "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > small views of large stores independent sends of the same source view get independent copies",
         "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > the producer's own copy of a send a view that shrinks while its send is read refuses the send instead of sending unwritten bytes",
         "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > the producer's own copy of a send a messages array whose iterator yields fresh copies still has its view copied: a one-byte view of a 1 MiB store fits a bufferMemory of 4096",
+        "src/producer/state/__tests__/recordSize.spec.js \u203a Producer > the buffer > small views of large stores a hole in a messages list stays a hole in the plain array the producer keeps",
         "src/producer/state/__tests__/retiredOwnership.spec.js \u203a retired payload ownership idempotent: a successful partition releases its snapshotted record while another broker is held",
         "src/producer/state/__tests__/retiredOwnership.spec.js \u203a retired payload ownership plain: a successful partition releases its snapshotted record while another broker is held",
         "src/producer/state/__tests__/subdivision.spec.js \u203a Producer > Accumulator.cut a batch of several sends a settler made without an origin reports the send\u2019s first record at its own position",
