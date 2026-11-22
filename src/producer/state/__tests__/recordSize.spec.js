@@ -4,7 +4,7 @@ const buildRecordBatch = require('../../../protocol/requests/produce/buildRecord
 const Long = require('../../../utils/long')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { mulberry32 } = require('../../../../testHelpers/schedule')
-const { wire, held, share, chargeOf, varintSize, ownBuffers } = require('../recordSize')
+const { wire, held, share, chargeOf, varintSize } = require('../recordSize')
 const Accumulator = require('../accumulator')
 const {
   KafkaJSInvalidConfigurationError,
@@ -397,7 +397,7 @@ describe('Producer > the buffer > small views of large stores', () => {
     })
   })
 
-  test('two sends never share a copy store', () => {
+  test('independent sends of the same source view get independent copies', () => {
     const view = Buffer.alloc(1048576, 'a').subarray(0, 1)
 
     const [first] = snapshotOf([{ value: view }])
@@ -425,9 +425,12 @@ describe('Producer > the buffer > small views of large stores', () => {
     expect(record.headers.list[1]).toBe('item')
 
     const aboveSixteenKiB = Buffer.alloc(16385).subarray(0, 1)
-    const [copied] = snapshotOf([{ value: aboveSixteenKiB }])
-    expect(copied.value).not.toBe(aboveSixteenKiB)
-    expect(copied.value.buffer.byteLength).toBe(1)
+    const underSixteenTimes = Buffer.alloc(32768).subarray(0, 2047)
+    const [copied] = snapshotOf([{ key: aboveSixteenKiB, value: underSixteenTimes }])
+    expect(copied.key).not.toBe(aboveSixteenKiB)
+    expect(copied.value).not.toBe(underSixteenTimes)
+    expect(copied.key.buffer).toBe(copied.value.buffer)
+    expect(copied.key.buffer.byteLength).toBe(1 + 2047)
   })
 
   test("the keys, values and header values of one send, array elements included, land in one copy store; the caller's array keeps its views", () => {
@@ -502,25 +505,6 @@ describe('Producer > the buffer > small views of large stores', () => {
     expect(String(record.value)).toBe('aa')
     expect(record.value.buffer).toBe(record.key.buffer)
     expect(record.key.buffer.byteLength).toBe(5)
-  })
-
-  test('a view that shrinks while its send is read refuses the send instead of sending unwritten bytes', () => {
-    const backing = new ArrayBuffer(1048576, { maxByteLength: 1048576 })
-    const view = new Uint8Array(backing, 1048576 - 10)
-    Object.setPrototypeOf(view, Buffer.prototype)
-    let reads = 0
-    const later = {
-      get value() {
-        if (++reads === 1) {
-          backing.resize(1048576 - 5)
-        }
-        return 'x'
-      },
-    }
-
-    expect(() => ownBuffers([{ topic: 'topic', messages: [{ value: view }, later] }])).toThrow(
-      new KafkaJSNonRetriableError('A Buffer changed size while its send was being read')
-    )
   })
 
   test("a header-value array whose own slice returns itself is copied without it: the caller's array keeps its views and its holes", () => {
@@ -794,6 +778,67 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     expect(countersOf(admission)).toEqual(quiescent(admission))
     await release()
     expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await producer.disconnect()
+  })
+
+  test('a messages array whose iterator yields fresh copies still has its view copied: a one-byte view of a 1 MiB store fits a bufferMemory of 4096', async () => {
+    const { producer, admission, written, release } = await heldProducer({ capacity: 4096 })
+    const slab = Buffer.alloc(1048576, 'a')
+    slab.write('q', 7)
+    class Messages extends Array {
+      *[Symbol.iterator]() {
+        for (let i = 0; i < this.length; i++) {
+          yield { ...this[i] }
+        }
+      }
+    }
+    const messages = new Messages()
+    messages.push({ value: slab.subarray(7, 8) })
+
+    const sent = watch(producer.send({ topic: TOPIC, messages }))
+    await flushAll()
+    expect(admission.reserved).toBe(held({ value: Buffer.alloc(1) }) + 1536)
+    await release()
+
+    expect(sent.state).toBe('fulfilled')
+    const [{ messages: sentMessages, bytes }] = written
+    expect(String(sentMessages[0].value)).toBe('q')
+    expect(sentMessages[0].value.buffer.byteLength).toBe(1)
+    expect(bytes.includes(Buffer.from('q'))).toBe(true)
+    await producer.disconnect()
+  })
+
+  test('a view that shrinks while its send is read refuses the send instead of sending unwritten bytes', async () => {
+    const { producer, admission, cluster, release } = await heldProducer()
+    const backing = new ArrayBuffer(1048576, { maxByteLength: 1048576 })
+    const view = new Uint8Array(backing, 1048576 - 10)
+    Object.setPrototypeOf(view, Buffer.prototype)
+    let reads = 0
+    const later = {
+      get value() {
+        if (++reads === 1) {
+          backing.resize(1048576 - 5)
+        }
+        return 'x'
+      },
+    }
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value: view }, later] }))
+    await flushAll()
+
+    expect(reads).toBe(1)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(sent.value.message).toBe('A Buffer changed size while its send was being read')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await release()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+
+    const next = watch(producer.send({ topic: TOPIC, messages: [{ value: 'ok' }] }))
+    await flushAll()
+    expect(next.state).toBe('fulfilled')
+    expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
     expect(countersOf(admission)).toEqual(quiescent(admission))
     await producer.disconnect()
   })
