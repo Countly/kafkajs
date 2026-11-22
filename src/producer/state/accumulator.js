@@ -13,7 +13,7 @@ const JoinOrder = require('./joinOrder')
 const {
   chargeOf,
   share,
-  ownedBuffer,
+  SendCopy,
   wire,
   recordsBytes,
   RequestBudget,
@@ -314,16 +314,49 @@ const ownedTimestamp = (timestamp) => {
 }
 
 /**
- * A copy of a record's headers, each own key read once: an array value is copied too, and every
- * Buffer is kept as `ownedBuffer` keeps it.
+ * A copy of a record's headers, each own key read once: an array value is copied too, element by
+ * element up to its length read once, with its holes, without calling its methods. Each Buffer is
+ * put in the copy as it is and noted in `copies`.
  * @param {*} headers
+ * @param {SendCopy} copies
  * @returns {object}
  */
-const ownedHeaders = (headers) => {
+const ownedHeaders = (headers, copies) => {
   const copy = { ...headers }
   for (const name of Object.keys(copy)) {
     const header = copy[name]
-    copy[name] = Array.isArray(header) ? header.map(ownedBuffer) : ownedBuffer(header)
+    if (!Array.isArray(header)) {
+      copies.note(copy, name)
+      continue
+    }
+    const { length } = header
+    const list = new Array(length)
+    for (let i = 0; i < length; i++) {
+      if (i in header) {
+        list[i] = header[i]
+        copies.note(list, i)
+      }
+    }
+    copy[name] = list
+  }
+  return copy
+}
+
+/**
+ * A plain array of `own(element)` for each element of `list`, holes kept. Built by index, so the
+ * result is the producer's own array whatever class, iterator or `map` the caller's list has.
+ * @template T, U
+ * @param {T[]} list
+ * @param {(element: T) => U} own
+ * @returns {U[]}
+ */
+const ownedList = (list, own) => {
+  const { length } = list
+  const copy = new Array(length)
+  for (let i = 0; i < length; i++) {
+    if (i in list) {
+      copy[i] = own(list[i])
+    }
   }
   return copy
 }
@@ -332,13 +365,14 @@ const ownedHeaders = (headers) => {
  * The producer's own copy of a record, each field read once: its own enumerable fields, so a
  * custom partitioner still sees them, and the fields the producer reads, also when they come from
  * a prototype. A header container, a header-value array, a `Date` and a `Long` are copied, so
- * changing them after the call changes nothing; the bytes of a Buffer are shared, unless it is a
- * small view of a large backing store (`ownedBuffer`). Anything that is not an object is kept, so
- * validation fails it as before.
+ * changing them after the call changes nothing; each Buffer is put in the copy as it is and noted
+ * in `copies`, which copies those that pin a large store. Anything that is not an object is kept,
+ * so validation fails it as before.
  * @param {*} message
+ * @param {SendCopy} copies
  * @returns {*}
  */
-const ownedRecord = (message) => {
+const ownedRecord = (message, copies) => {
   if (message === null || typeof message !== 'object') {
     return message
   }
@@ -352,14 +386,10 @@ const ownedRecord = (message) => {
       }
     }
   }
-  if (Buffer.isBuffer(record.key)) {
-    record.key = ownedBuffer(record.key)
-  }
-  if (Buffer.isBuffer(record.value)) {
-    record.value = ownedBuffer(record.value)
-  }
+  copies.note(record, 'key')
+  copies.note(record, 'value')
   if (record.headers != null) {
-    record.headers = ownedHeaders(record.headers)
+    record.headers = ownedHeaders(record.headers, copies)
   }
   if (record.timestamp != null) {
     record.timestamp = ownedTimestamp(record.timestamp)
@@ -1038,19 +1068,28 @@ class Accumulator {
    * a record, its headers, a header-value array or a `Date` or `Long` timestamp after the call
    * changes nothing. A record's own enumerable fields are kept beside the fields the producer
    * reads; the bytes of its Buffers are shared, as in 2.2.4, except a small view of a large backing
-   * store, which is copied. Entries and records that are not objects are kept as they are, and so
-   * is a `messages` that is not an array, so validation refuses them as before.
+   * store: all of those in the send are copied into one store of their own (`SendCopy`). Entries
+   * and records that are not objects are kept as they are, and so is a `messages` that is not an
+   * array, so validation refuses them as before.
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @returns {{ topic: string, messages: object[] }[]}
    */
   static snapshot(topicMessages) {
-    return topicMessages.map((entry) => {
+    const copies = new SendCopy()
+    const snapshot = ownedList(topicMessages, (entry) => {
       if (entry === null || typeof entry !== 'object') {
         return entry
       }
       const { topic, messages } = entry
-      return { topic, messages: Array.isArray(messages) ? messages.map(ownedRecord) : messages }
+      return {
+        topic,
+        messages: Array.isArray(messages)
+          ? ownedList(messages, (message) => ownedRecord(message, copies))
+          : messages,
+      }
     })
+    copies.copy()
+    return snapshot
   }
 
   /**
