@@ -548,6 +548,118 @@ describe('final soak driver', () => {
     ).toThrow('--diagnostic is accepted only in smoke mode')
   })
 
+  describe('preflight quiet-host census', () => {
+    const { classifyCensus, brokerRoots } = require('../finalSoakPreflight')
+    const id = (n) => String(n).repeat(64)
+    // pid ppid pcpu rss comm, as `ps -eo pid=,ppid=,pcpu=,rss=,comm=` prints them
+    const TABLE = [
+      '1 0 0.0 100 systemd',
+      '500 1 0.1 2000 containerd-shim',
+      '501 500 5.0 900000 java',
+      '510 1 0.1 2000 containerd-shim',
+      '511 510 0.0 100 tini',
+      '512 511 4.0 900000 java',
+      '520 1 0.1 2000 containerd-shim',
+      '521 520 5.0 900000 java',
+      '530 1 0.1 2000 containerd-shim',
+      '531 530 5.0 900000 java',
+      '600 1 3.0 500000 java',
+      '601 1 9.0 300000 jest',
+      '700 1 1.0 90000 node',
+      '701 700 0.0 1000 ps',
+    ].join('\n')
+    const ROOTS = [
+      { node: 1, container: id(1), pid: 501, visible: true },
+      { node: 2, container: id(2), pid: 511, visible: true },
+      { node: 3, container: id(3), pid: 521, visible: true },
+    ]
+    const quiet = (census) =>
+      new Preflight({ sha: TREE, mode: 'acceptance', matrix })
+        .checks({
+          share: { finalized: {} },
+          host: { census },
+        })
+        ['quiet-host']()
+
+    test("processes inside this run's three broker containers are named as the run's own and do not make the host busy", () => {
+      const census = classifyCensus(TABLE, { self: 700, roots: ROOTS })
+      const own = census.filter((p) => p.class === 'own-broker')
+      expect(own.map((p) => [p.pid, p.name, p.node, p.container])).toEqual([
+        [501, 'java', 1, id(1)],
+        [511, 'tini', 2, id(2)],
+        [512, 'java', 2, id(2)],
+        [521, 'java', 3, id(3)],
+      ])
+      expect(census.map((p) => p.pid)).not.toContain(700)
+      expect(census.map((p) => p.pid)).not.toContain(701)
+      expect(quiet(census.filter((p) => ![531, 600, 601].includes(p.pid)))).toBe(true)
+    })
+
+    test('a foreign java on the host, a java in a container of another project and a foreign test runner still make the host busy', () => {
+      const census = classifyCensus(TABLE, { self: 700, roots: ROOTS })
+      const byPid = (pid) => census.find((p) => p.pid === pid)
+      expect([531, 600, 601].map((pid) => [byPid(pid).name, byPid(pid).class])).toEqual([
+        ['java', 'test'],
+        ['java', 'test'],
+        ['jest', 'test'],
+      ])
+      for (const foreign of [531, 600, 601]) {
+        const own = census.filter((p) => p.class === 'own-broker')
+        expect(quiet([...own, byPid(foreign)])).toBe(false)
+      }
+    })
+
+    test('a broker container root whose pid is not that container in this pid namespace excludes nothing', () => {
+      const roots = ROOTS.map((r) => ({ ...r, visible: r.node !== 1 }))
+      const census = classifyCensus(TABLE, { self: 700, roots })
+      expect(census.find((p) => p.pid === 501).class).toBe('test')
+      expect(quiet(census.filter((p) => p.pid === 501))).toBe(false)
+    })
+
+    test('broker container roots come from docker inspect and the container cgroup, and Docker not answering fails closed', () => {
+      const provenance = {
+        kind: 'image',
+        nodes: [1, 2, 3].map((node) => ({ node, container: id(node) })),
+      }
+      const pids = { [id(1)]: '501', [id(2)]: '511', [id(3)]: '521' }
+      const cgroups = {
+        501: `0::/system.slice/docker-${id(1)}.scope\n`,
+        511: `0::/docker/${id(2)}\n`,
+        521: '0::/\n',
+      }
+      const docker = { inspect: (c) => pids[c], cgroup: (pid) => cgroups[pid] }
+      expect(brokerRoots(provenance, docker)).toEqual([
+        { node: 1, container: id(1), pid: 501, visible: true },
+        { node: 2, container: id(2), pid: 511, visible: true },
+        { node: 3, container: id(3), pid: 521, visible: false },
+      ])
+      const unreadable = {
+        ...docker,
+        cgroup: () => {
+          throw new Error('ENOENT')
+        },
+      }
+      expect(brokerRoots(provenance, unreadable).map((r) => r.visible)).toEqual([
+        false,
+        false,
+        false,
+      ])
+      const down = {
+        ...docker,
+        inspect: () => {
+          throw new Error('Cannot connect to the Docker daemon')
+        },
+      }
+      expect(() => brokerRoots(provenance, down)).toThrow(
+        `docker did not report the pid of kafka1 (${id(1)}): Cannot connect to the Docker daemon`
+      )
+      expect(() => brokerRoots(provenance, { ...docker, inspect: () => '0' })).toThrow(
+        `kafka1 (${id(1)}) has no running process`
+      )
+      expect(brokerRoots({ kind: 'supplied', nodes: [{ node: 1 }] }, down)).toEqual([])
+    })
+  })
+
   test('the final reporter source takes the Kafka line adaptation before its file cap', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-reporter-'))
     const fixture = path.join(ROOT, 'scripts/e2e/telemetry/CountingTelemetryReporter.java')
