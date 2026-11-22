@@ -511,11 +511,12 @@ describe('Producer > the buffer > small views of large stores', () => {
     const second = slab.subarray(1, 2)
     const list = [first]
     list[2] = second
-    list.slice = () => list
+    list.slice = jest.fn(() => list)
 
     const [record] = snapshotOf([{ headers: { list } }])
     const copy = record.headers.list
 
+    expect(list.slice).not.toHaveBeenCalled()
     expect(list[0]).toBe(first)
     expect(list[2]).toBe(second)
     expect(1 in list).toBe(false)
@@ -527,22 +528,27 @@ describe('Producer > the buffer > small views of large stores', () => {
     expect(copy[0].buffer.byteLength).toBe(2)
   })
 
-  test('a send that cannot fit is refused with the error it had when each view was copied into a store of its own', () => {
-    const slab = Buffer.alloc(1048576)
-    const messages = snapshotOf([{ value: slab.subarray(0, 1) }, { value: slab.subarray(1, 2001) }])
-    const run = () => chargeOf([{ topic: TOPIC, messages }], 2000)
+  test('a header-value array is copied up to the length it had when the copy began: an element getter that appends adds nothing', () => {
+    const slab = Buffer.alloc(65536)
+    slab.write('abc', 0)
+    const list = [slab.subarray(0, 1), slab.subarray(1, 2)]
+    const first = list[0]
+    Object.defineProperty(list, 0, {
+      get() {
+        list.push(slab.subarray(2, 3))
+        return first
+      },
+      enumerable: true,
+      configurable: true,
+    })
 
-    expect(messages[1].value.buffer).toBe(messages[0].value.buffer)
-    // 21 + 64 + 1 + (2 + 2000) + 1
-    expect(run).toThrow(
-      expect.objectContaining({
-        reason: 'bufferMemory',
-        scope: 'record',
-        size: 2089,
-        limit: 2000,
-        topic: TOPIC,
-      })
-    )
+    const [record] = snapshotOf([{ headers: { list } }])
+    const copy = record.headers.list
+
+    expect(list).toHaveLength(3)
+    expect(copy).toHaveLength(2)
+    expect(copy.map(String)).toEqual(['a', 'b'])
+    expect(copy[0].buffer.byteLength).toBe(2)
   })
 
   test("a slice of another send's copy store that is kept as it is is charged the bytes of that store it does not show", () => {
@@ -748,6 +754,28 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     expect(second.value.buffer).toBe(first.key.buffer)
     expect(second.headers.h.buffer).toBe(first.key.buffer)
     expect(first.key.buffer.byteLength).toBe(53)
+    await producer.disconnect()
+  })
+
+  test('a send whose copied views cannot fit in bufferMemory is refused, and nothing is admitted or charged', async () => {
+    const { producer, admission, cluster, release } = await heldProducer({ capacity: 2000 })
+    const slab = Buffer.alloc(1048576)
+
+    const sent = watch(
+      producer.send({
+        topic: TOPIC,
+        messages: [{ value: slab.subarray(0, 1) }, { value: slab.subarray(1, 2001) }],
+      })
+    )
+    await flushAll()
+
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSRecordTooLargeError)
+    expect(sent.value).toMatchObject({ reason: 'bufferMemory', limit: 2000 })
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await release()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
     await producer.disconnect()
   })
 
