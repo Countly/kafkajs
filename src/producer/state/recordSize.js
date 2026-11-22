@@ -29,8 +29,6 @@ const BATCH_DEBIT = 1024
 /** A Buffer is copied when its backing store is larger than this and than 16 times the Buffer. */
 const COPY_STORES_ABOVE = 16384
 const COPY_STORES_TIMES = 16
-/** The stores `ownBuffers` made: a send's own views of one cover it whole, so it adds no excess. */
-const copyStores = new WeakSet()
 /** The intrinsic length of a typed array, which an own `length` property cannot change. */
 const lengthOf = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
@@ -206,32 +204,11 @@ const storeCharge = (stores, view) => {
   const start = view.byteOffset
   const end = start + view.length
   const spans = stores.get(view.buffer)
-  const copied = copyStores.has(view.buffer)
   if (spans === undefined) {
     stores.set(view.buffer, [start, end])
-    return copied ? 0 : view.buffer.byteLength - view.length
+    return view.buffer.byteLength - view.length
   }
-  const added = cover(spans, start, end)
-  return copied ? 0 : -added
-}
-
-/**
- * The bytes of the stores `ownBuffers` made that a send's views do not cover: none for the send's
- * own store, the rest for a slice of another send's store that was kept as it is.
- * @param {Map<ArrayBufferLike, number[]>} stores by backing store, the bytes the send's views cover
- * @returns {number}
- */
-const uncoveredCopies = (stores) => {
-  let bytes = 0
-  for (const [store, spans] of stores) {
-    if (copyStores.has(store)) {
-      bytes += store.byteLength
-      for (let i = 0; i < spans.length; i += 2) {
-        bytes -= spans[i + 1] - spans[i]
-      }
-    }
-  }
-  return bytes
+  return -cover(spans, start, end)
 }
 
 /**
@@ -246,11 +223,7 @@ const uncoveredCopies = (stores) => {
  * checked against `limit` before the next record is read: a record never takes back more than its
  * own held size adds, so the charge only grows, and the first prefix above `limit` ends the pass and
  * is returned, for `acquire` to refuse as `scope: 'send'`. A total within `limit` is exact, and no
- * sum goes past `limit` by more than one record and its stores. A store `ownBuffers` made adds no
- * excess during the pass, so a send is refused as it was when each view had a store of its own:
- * the send's own store is covered whole by its views, already counted as held bytes, and the bytes
- * such a store keeps that the send's views do not show (a slice of another send's store) are added
- * at the end.
+ * sum goes past `limit` by more than one record and its stores.
  * @param {{ topic: string, messages: object[] }[]} topicMessages
  * @param {number} limit the producer's `bufferMemory`
  * @returns {{ total: number, shell: number }} `total` is above `limit` when the send cannot fit
@@ -288,8 +261,7 @@ const chargeOf = (topicMessages, limit) => {
       }
     }
   }
-  const uncovered = covered === null ? 0 : uncoveredCopies(covered)
-  return { total: total + uncovered, shell: SEND_CHARGE + stores + uncovered + buffered }
+  return { total, shell: SEND_CHARGE + stores + buffered }
 }
 
 /**
@@ -344,9 +316,14 @@ const pinsStore = (view) => {
  * so its bytes still reach the wire if the caller changes them; a send with nothing to copy
  * allocates nothing. The bytes are copied after every record of the send has been read, with
  * intrinsics only: no method of a caller's Buffer is called. The store is held only through the
- * slices in the send's records, and is charged as fully used until the send's charge is released:
- * whatever keeps one of those records (a custom partitioner, a delivery error) keeps the whole store,
- * and the store can be collected earlier when the records still held carry no slice of it.
+ * slices in the send's records, and the send's own slices cover it whole, so `chargeOf` charges it
+ * no excess once the send is walked; it may be collected before the send's charge is released when
+ * the records still held carry no slice of it. Keeping any slice (a record kept by a custom
+ * partitioner or from a delivery error, or the slice passed again in another send) keeps the whole
+ * store alive, and a later send carrying it is charged the bytes of the store it does not show. A
+ * send that cannot fit is still refused, but the first slice walked carries the store's uncovered
+ * bytes until later slices cover them, so which record the error names and the size it reports can
+ * differ from a copy per view.
  * @param {{ topic: string, messages: object[] }[]} topicMessages the send's own copy
  *   (`Accumulator.snapshot`); entries and records that are not objects are skipped
  * @returns {void}
@@ -381,7 +358,6 @@ const ownBuffers = (topicMessages) => {
     return
   }
   const store = Buffer.allocUnsafeSlow(bytes)
-  copyStores.add(store.buffer)
   let next = 0
   let offset = 0
   eachRecord((view) => {
