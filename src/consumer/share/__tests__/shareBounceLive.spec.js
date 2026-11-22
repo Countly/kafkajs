@@ -8240,6 +8240,41 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
   })
 
+  it('completes a case without a deadline however long its socket and snapshot reads take', async () => {
+    const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
+    instance.archive()
+    const { snapshot } = instance.probe
+    let reached
+    let release
+    const waiting = new Promise((resolve) => {
+      reached = resolve
+    })
+    const held = new Promise((resolve) => {
+      release = resolve
+    })
+    instance.probe = {
+      snapshot: async () => {
+        reached()
+        await held
+        return snapshot()
+      },
+    }
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+    try {
+      const completion = instance.complete(NEVER)
+      await waiting
+      jest.advanceTimersByTime(60000)
+      release()
+      await completion
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+      expect(liveRun.tainted).toBe(false)
+    } finally {
+      jest.useRealTimers()
+      liveRun.reset()
+    }
+  })
+
   it('stops completion when the final scope aborts between persisted validation steps', async () => {
     const baseline = archiveFixture()
     readyCompletion(baseline.instance)
@@ -9092,6 +9127,15 @@ describe('share bounce acquisition and settlement sensitivity', () => {
   /** Most metered visits one audit step may make: a 100-visit loop tail joined to the next loop's head. */
   const STEP_VISITS = 200
 
+  /** Most growth in visits and steps when the records double: linear work plus fixed work. */
+  const LINEAR_GROWTH = 2
+
+  /**
+   * Least growth in visits when the records double. It proves the metered visits are mostly
+   * record-sized work, so the `LINEAR_GROWTH` bound would see a loop that grows faster.
+   */
+  const RECORD_GROWTH = 1.5
+
   /**
    * Runs the synthetic drain, terminal, archive and completion audit on one corpus size, metering
    * the visits the cooperative audit loops count (`auditMeter`) and the steps between yields.
@@ -9283,10 +9327,9 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       expect(run.maxVisits).toBeGreaterThan(0)
       expect(run.maxVisits).toBeLessThanOrEqual(STEP_VISITS)
     }
-    // Twice the records is at most 2.5 times the visits and steps: linear, not quadratic.
-    expect(full.visits).toBeLessThan(2.5 * half.visits)
-    expect(full.turns).toBeLessThan(2.5 * half.turns)
-    expect(full.visits).toBeGreaterThan(1.5 * half.visits)
+    expect(full.visits).toBeLessThanOrEqual(LINEAR_GROWTH * half.visits)
+    expect(full.turns).toBeLessThanOrEqual(LINEAR_GROWTH * half.turns)
+    expect(full.visits).toBeGreaterThan(RECORD_GROWTH * half.visits)
     // The 1 MiB margin covers the run stamps evidence lines add beyond these envelope rows.
     expect(full.archiveBytes).toBeLessThanOrEqual(ARCHIVE_BYTES - 1024 * 1024)
   }, 300000)
