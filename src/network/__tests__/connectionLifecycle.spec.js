@@ -302,6 +302,22 @@ describe('Connection and Broker lifecycle on the scripted cluster', () => {
       expect((await pending).error).toBeInstanceOf(KafkaJSConnectionClosedError)
     })
 
+    it('leaves only its error handler on the socket it closed, so the old socket reaches nothing', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const broker = open(cluster)
+      await broker.connect()
+      const [socket] = cluster.sockets()
+      expect(socket.listenerCount('close')).toBe(1)
+
+      await within(broker.disconnect({ drainTimeout: 0 }), 1000, 'the close')
+
+      expect(socket.destroyed).toBe(true)
+      for (const event of ['data', 'end', 'close', 'timeout']) {
+        expect({ event, listeners: socket.listenerCount(event) }).toEqual({ event, listeners: 0 })
+      }
+      expect(socket.listenerCount('error')).toBe(1)
+    })
+
     it('stays reusable: the next connect opens a new socket', async () => {
       const cluster = createScriptedCluster({ nodes: NODES })
       const broker = open(cluster)
