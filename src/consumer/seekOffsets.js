@@ -8,7 +8,15 @@ module.exports = class SeekOffsets extends Map {
     super.set(key, offset)
   }
 
+  /**
+   * Whether a seek is pending for one partition. Runs once per consumed message, so an empty map
+   * answers without building the key.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean}
+   */
   has(topic, partition) {
+    if (this.size === 0) return false
     const key = this.getKey(topic, partition)
     return super.has(key)
   }

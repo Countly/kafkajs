@@ -28,4 +28,29 @@ describe('Protocol > RecordBatch > crc32C', () => {
   test('unicode null', () => {
     expect(crc32C(Buffer.from('\u0000'))).toEqual(1383945041)
   })
+
+  /** Deterministic bytes, so every length crosses the eight-byte fold differently. */
+  const bytes = (length) => Buffer.from(Array.from({ length }, (_, i) => (i * 31 + 7) & 0xff))
+
+  test('the standard check value of "123456789" is 0xE3069283', () => {
+    expect(crc32C(Buffer.from('123456789'))).toEqual(0xe3069283)
+  })
+
+  // Computed with a bit-at-a-time reference over the reflected Castagnoli polynomial 0x82F63B78.
+  const BY_LENGTH = [
+    0x00000000, 0x86b737ba, 0x8d10d7a1, 0x765a7c83, 0x65f1c5dc, 0x5d2e4463, 0x63c6d8d2, 0x5110a112,
+    0x40795c72, 0x6fe35da6, 0x6ade9a0a, 0xb63ea091, 0x2e6e07e6, 0x7fd38d92, 0xd8dbd813, 0x9b0c1517,
+    0xcf7845a4, 0x10c70233,
+  ]
+
+  test.each(BY_LENGTH.map((expected, length) => [length, expected]))(
+    'a buffer of %i bytes matches the bitwise reference',
+    (length, expected) => {
+      expect(crc32C(bytes(length))).toEqual(expected)
+    }
+  )
+
+  test('a 100003-byte buffer matches the bitwise reference', () => {
+    expect(crc32C(bytes(100003))).toEqual(0xd351be60)
+  })
 })

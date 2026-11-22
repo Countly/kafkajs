@@ -37,7 +37,8 @@ const buildTables = () => {
   return tables
 }
 
-const TABLES = buildTables()
+// Eight local bindings: indexing an array of tables in the loop costs a second lookup per byte.
+const [T0, T1, T2, T3, T4, T5, T6, T7] = buildTables()
 
 /**
  * Computes the CRC32C (Castagnoli) checksum of a buffer.
@@ -60,19 +61,19 @@ const crc32C = (buffer) => {
       0
 
     crc =
-      (TABLES[7][crc & 0xff] ^
-        TABLES[6][(crc >>> 8) & 0xff] ^
-        TABLES[5][(crc >>> 16) & 0xff] ^
-        TABLES[4][(crc >>> 24) & 0xff] ^
-        TABLES[3][buffer[offset + 4]] ^
-        TABLES[2][buffer[offset + 5]] ^
-        TABLES[1][buffer[offset + 6]] ^
-        TABLES[0][buffer[offset + 7]]) >>>
+      (T7[crc & 0xff] ^
+        T6[(crc >>> 8) & 0xff] ^
+        T5[(crc >>> 16) & 0xff] ^
+        T4[(crc >>> 24) & 0xff] ^
+        T3[buffer[offset + 4]] ^
+        T2[buffer[offset + 5]] ^
+        T1[buffer[offset + 6]] ^
+        T0[buffer[offset + 7]]) >>>
       0
   }
 
   for (; offset < length; offset++) {
-    crc = (TABLES[0][(crc ^ buffer[offset]) & 0xff] ^ (crc >>> 8)) >>> 0
+    crc = (T0[(crc ^ buffer[offset]) & 0xff] ^ (crc >>> 8)) >>> 0
   }
 
   return (crc ^ 0xffffffff) >>> 0

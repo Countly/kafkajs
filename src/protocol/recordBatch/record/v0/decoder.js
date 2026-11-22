@@ -41,6 +41,24 @@ const setHeader = (headers, key, value) => {
 }
 
 /**
+ * The record timestamp as a decimal string: a double sum when the base, the delta and the sum are
+ * all safe integers, else exact 64-bit arithmetic. Both render through `Long`, like offsets.
+ * @param {string} firstTimestamp the batch first timestamp
+ * @param {number} [firstTimestampNumber] `Number(firstTimestamp)`, or undefined
+ * @param {Long} timestampDelta the record delta
+ * @returns {string}
+ */
+const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
+  const delta = timestampDelta.toNumber()
+  const sum = firstTimestampNumber + delta
+  return Number.isSafeInteger(firstTimestampNumber) &&
+    Number.isSafeInteger(delta) &&
+    Number.isSafeInteger(sum)
+    ? Long.fromNumber(sum).toString()
+    : Long.fromValue(firstTimestamp).add(timestampDelta).toString()
+}
+
+/**
  * Decodes one record of a v0 record batch.
  * @param {Decoder} decoder positioned at the start of one record's body
  * @param {object} [batchContext] the batch-level values shared by every record in the batch; this
@@ -51,6 +69,9 @@ const setHeader = (headers, key, value) => {
  *   path is guarded on both the base and the sum being safe integers. Above that, or when the base
  *   is absent, the exact 64-bit arithmetic is used unchanged. Either way the resulting string comes
  *   from `Long`, never from `Number#toString`.
+ * @param {number} [firstTimestampNumber] `Number(batchContext.firstTimestamp)`, computed once per
+ *   batch, the timestamp counterpart of `firstOffsetNumber` with the same guards. The delta is a
+ *   varlong, so it is guarded too: an unsafe delta can still give a safe but inexact sum.
  * @returns {object} the decoded record: `{ magicByte, attributes, timestamp, offset, key, value,
  *   headers, isControlRecord, batchContext }`, with `timestamp` and `offset` as decimal strings
  * @throws {KafkaJSPartialMessageError} when the header count is negative (other than -1, an empty
@@ -59,7 +80,7 @@ const setHeader = (headers, key, value) => {
  *   protocol array readers. The header array grows as headers decode, without preallocation
  *   from the untrusted count.
  */
-module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
+module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampNumber) => {
   const {
     firstOffset,
     firstTimestamp,
@@ -74,7 +95,7 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   const timestamp =
     timestampType === TimestampTypes.LOG_APPEND_TIME && maxTimestamp
       ? maxTimestamp
-      : Long.fromValue(firstTimestamp).add(timestampDelta).toString()
+      : addTimestamp(firstTimestamp, firstTimestampNumber, timestampDelta)
 
   const offsetDelta = decoder.readVarInt()
   const offsetSum = firstOffsetNumber + offsetDelta

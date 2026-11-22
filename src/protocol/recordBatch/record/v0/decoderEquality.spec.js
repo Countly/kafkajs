@@ -4,6 +4,7 @@ const { RecordBatch } = require('../../v0')
 const RecordEncoder = require('../../record/v0')
 const { Types: CompressionTypes } = require('../../../message/compression')
 const reference = require('./decoderEquality.reference.json')
+const Long = require('../../../../utils/long')
 
 const TIMESTAMP_TYPE_FLAG_MASK = 0x8
 const CONTROL_FLAG_MASK = 0x20
@@ -281,6 +282,63 @@ describe('Protocol > RecordBatch > record decoder', () => {
     const { records } = await decodeCorpusBatch('a safe first offset with a sum that rounds')
 
     expect(records[0].offset).toEqual('9007199254740997')
+  })
+
+  // Each row: the batch first timestamp, the record deltas and the exact timestamps they decode to.
+  // The deltas are varlongs, so the strings carry values a double cannot hold exactly.
+  test.each([
+    ['-1', [0, 1, -5], ['-1', '0', '-6']],
+    ['0', [-1, 0], ['-1', '0']],
+    ['1700000000000', [0, 250, -250], ['1700000000000', '1700000000250', '1699999999750']],
+    ['9007199254740991', [0, 6, -1], ['9007199254740991', '9007199254740997', '9007199254740990']],
+    ['9007199254740993', [-10, 0], ['9007199254740983', '9007199254740993']],
+    ['-9007199254740991', ['9007199254740993', 0], ['2', '-9007199254740991']],
+    ['-9223372036854775808', [0, 1], ['-9223372036854775808', '-9223372036854775807']],
+    ['9223372036854775807', [0, -1], ['9223372036854775807', '9223372036854775806']],
+    ['1000', ['-9007199254740993'], ['-9007199254739993']],
+  ])(
+    'a first timestamp of %s with deltas %j decodes exact timestamps',
+    async (firstTimestamp, deltas, expected) => {
+      const buffer = await buildBatch({
+        firstOffset: '10',
+        firstTimestamp,
+        maxTimestamp: firstTimestamp,
+        records: deltas.map((timestampDelta, offsetDelta) =>
+          RecordEncoder({ value: Buffer.from('v'), offsetDelta, timestampDelta })
+        ),
+      })
+
+      const { records } = await RecordBatchDecoder(new Decoder(buffer), { checkCrcs: false })
+      expect(records.map(({ timestamp }) => timestamp)).toEqual(expected)
+    }
+  )
+
+  test('a safe first timestamp is not parsed from its string once per record', async () => {
+    const buffer = await buildBatch({
+      firstOffset: '10',
+      firstTimestamp: FIRST_TIMESTAMP,
+      maxTimestamp: FIRST_TIMESTAMP,
+      records: [0, 1, 2].map((offsetDelta) =>
+        RecordEncoder({ value: Buffer.from('v'), offsetDelta, timestampDelta: offsetDelta * 10 })
+      ),
+    })
+    const fromString = jest.spyOn(Long, 'fromString')
+
+    let records
+    let parsed
+    try {
+      ;({ records } = await RecordBatchDecoder(new Decoder(buffer), { checkCrcs: false }))
+      parsed = fromString.mock.calls.length
+    } finally {
+      fromString.mockRestore()
+    }
+
+    expect(records.map(({ timestamp }) => timestamp)).toEqual([
+      '1700000000000',
+      '1700000000010',
+      '1700000000020',
+    ])
+    expect(parsed).toBe(0)
   })
 
   test('duplicate header keys keep their exact semantics', async () => {
