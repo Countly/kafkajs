@@ -27,14 +27,16 @@ const {
 const { subscribeNamedTopic } = require('./subscribeNamedTopic')
 
 /**
- * Whether `commitOffsets()` refused at its start because the run was stopping or not yet running,
- * so nothing was sent. A stop error with a cause failed after the call was admitted, and its
- * outcome is unknown.
+ * Whether `commitOffsets()` ended because the run is stopping or not yet running. A call refused
+ * at its start sent nothing; a `CONSUMER_STOPPING` can also follow an attempt that may have been
+ * sent, with or without a `cause` (a forced close or a call deadline leaves none), so its outcome
+ * is unknown. Either way no commit is observed, the offset stays owed and the next commit sends it
+ * again; a broker that did store it shows up only in the next acquisition's position.
  * @param {any} error what the call rejected with
  * @returns {boolean}
  */
-const sentNothing = (error) =>
-  (error?.type === 'CONSUMER_STOPPING' && error.cause === undefined) ||
+const stillOwed = (error) =>
+  error?.type === 'CONSUMER_STOPPING' ||
   (error?.name === 'KafkaJSNonRetriableError' &&
     error.message.startsWith('Consumer is not running'))
 
@@ -291,8 +293,8 @@ class ChurnMember {
 
   /**
    * Commits every partition whose contiguous processed position moved, then reads the broker back.
-   * A commit the client refuses because ownership ended, or sends nothing for because the run is
-   * stopping or not yet running, is not an error and not an observation; it stays owed.
+   * A commit the client refuses because ownership ended, or ends because the run is stopping or
+   * not yet running (sent or not), is not an error and not an observation; it stays owed.
    * Calls run one at a time, so a commit in flight is journaled before a later boundary and is
    * never repeated by it.
    * @returns {Promise<void>}
@@ -313,7 +315,7 @@ class ChurnMember {
       try {
         await this.consumer.commitOffsets([{ topic, partition, offset: String(next) }])
       } catch (error) {
-        if (error instanceof KafkaJSCommitFailedError || sentNothing(error)) continue
+        if (error instanceof KafkaJSCommitFailedError || stillOwed(error)) continue
         throw error
       }
       const brokerNext = (await this.#positions(topic)).get(partition)

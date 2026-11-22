@@ -228,6 +228,30 @@ describe('Consumer > OffsetManager > resolved offset count', () => {
       expectWalk('7')
     })
 
+    it('a second reset position held on the same partition before any commit moves the baseline again', () => {
+      manager.holdResetPosition('t', 1, '1')
+      expectWalk('7')
+      manager.holdResetPosition('t', 1, '2')
+      expectWalk('6')
+    })
+
+    it('a seek applied without a commit counts from its private fallback without a forget first', () => {
+      expectWalk('8')
+      manager.seekLocally('t', 1, '9')
+      expectWalk('5')
+    })
+
+    it('a topic that leaves the assignment without a revoked entry stops counting', () => {
+      manager.updateAssignment({
+        revoked: [],
+        memberAssignment: { u: [0] },
+        generationId: 2,
+        memberId: 'member',
+        coordinator: {},
+      })
+      expectWalk('0')
+    })
+
     it('a revoked partition stops counting', () => {
       manager.updateAssignment({
         revoked: [{ topic: 't', partitions: [0] }],

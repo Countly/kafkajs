@@ -22,6 +22,7 @@ jest.mock('../../utils/dictionary', () =>
   })
 )
 
+const v8 = require('v8')
 const SubscriptionState = require('../subscriptionState')
 const ConsumerGroup = require('../consumerGroup')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
@@ -354,6 +355,31 @@ describe('Consumer > ConsumerGroup > applying an assignment', () => {
 
     expect(small).toBeGreaterThanOrEqual(2 * 200)
     expect(large).toBeLessThanOrEqual(2 * small + 10)
+  })
+
+  it('allocates for a round, GROUP_JOIN payload included, linearly in the topic count', async () => {
+    // V8's allocation counter is deterministic where a clock is not; Node 22 does not expose it.
+    const allocated = () => v8.getHeapStatistics().total_allocated_bytes
+    if (allocated() === undefined) return
+
+    const bytesPerTopic = async (count) => {
+      const topics = Array.from({ length: count }, (_, index) => `topic-${index}`)
+      const { emitted, round } = createRealRound({ topics, partitions: 1 })
+      const assignment = decoded(topics.map((topic) => [topic, [0]]))
+      const before = allocated()
+      await round(assignment)
+      const bytes = allocated() - before
+      const join = emitted.find(({ type }) => type === events.GROUP_JOIN)
+      expect(Object.keys(join.payload.memberAssignment)).toHaveLength(count)
+      return bytes / count
+    }
+
+    await bytesPerTopic(250)
+    const small = await bytesPerTopic(250)
+    const large = await bytesPerTopic(1000)
+
+    // Linear stays near 1.7x here; the copy-per-topic payload build measured above 10x.
+    expect(large).toBeLessThanOrEqual(4 * small)
   })
 
   it("reads each topic's known partitions a number of times linear in their count", async () => {
