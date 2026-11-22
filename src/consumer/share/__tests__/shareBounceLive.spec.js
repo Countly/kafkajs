@@ -7318,9 +7318,11 @@ const budgetFixture = (count, perEpisode, unknown) => {
 
 /**
  * Scripts six unknown pools and the remaining real Accepts against a fixed three-partition corpus.
- * @returns {object} Full terminal proof with 1800 unknown and 28200 successful identities.
+ * @param {number} [records] Corpus size: a multiple of 300 above the 1800 unknown identities.
+ * @returns {object} Full terminal proof with 1800 unknown and `records - 1800` successful identities.
  */
-const terminalBudgetFixture = () => {
+const terminalBudgetFixture = (records = RECORDS) => {
+  const perPartition = records / PARTITIONS
   const fixture = budgetFixture(MAX_REPLAY, MAX_HELD, true)
   const { evidence } = fixture
   evidence.acquisitions = fixture.entries.map(({ acquisition }) => acquisition)
@@ -7359,8 +7361,8 @@ const terminalBudgetFixture = () => {
       value: Buffer.from('v'),
     })
   }
-  const batchesPerPartition = (RECORDS - MAX_REPLAY) / PARTITIONS / BURST_SIZE
-  for (let batch = 0; batch < (RECORDS - MAX_REPLAY) / BURST_SIZE; batch++) {
+  const batchesPerPartition = (records - MAX_REPLAY) / PARTITIONS / BURST_SIZE
+  for (let batch = 0; batch < (records - MAX_REPLAY) / BURST_SIZE; batch++) {
     const partition = Math.floor(batch / batchesPerPartition)
     const first = MAX_REPLAY / PARTITIONS + (batch % batchesPerPartition) * BURST_SIZE
     const last = first + BURST_SIZE - 1
@@ -7411,11 +7413,11 @@ const terminalBudgetFixture = () => {
   }
   captureFreezes(fixture)
   const { topic, topicId, groupId } = fixture.entries[0]
-  const corpus = Array.from({ length: RECORDS }, (_value, index) =>
+  const corpus = Array.from({ length: records }, (_value, index) =>
     shareRecordIdentity({
       topic,
-      partition: Math.floor(index / 10000),
-      offset: String(index % 10000),
+      partition: Math.floor(index / perPartition),
+      offset: String(index % perPartition),
       key: Buffer.from('k'),
       value: Buffer.from('v'),
     })
@@ -7423,7 +7425,7 @@ const terminalBudgetFixture = () => {
   const partitions = Array.from({ length: PARTITIONS }, (_value, partition) => ({
     partition,
     floor: '0',
-    end: '10000',
+    end: String(perPartition),
   }))
   const rows = [
     {
@@ -7443,7 +7445,7 @@ const terminalBudgetFixture = () => {
     topicId,
     named: rows,
     all: JSON.parse(JSON.stringify(rows)),
-    ends: partitions.map(({ partition }) => ({ partition, high: '10000' })),
+    ends: partitions.map(({ partition }) => ({ partition, high: String(perPartition) })),
   }
   return {
     ...fixture,
@@ -8194,7 +8196,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
     Object.assign(instance, {
       cleanupProof: { completed: true, tainted: false },
-      deadline: performance.now() + FINAL_MS,
+      deadline: Infinity,
       terminalVerified: true,
       bounceFacts: [],
       beforeAdmin: snapshot,
@@ -9065,10 +9067,19 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(rows.at(-1).event).toBe('unresolved-settlement')
   })
 
-  it('audits 30000 records with Metadata and count resets through drain, terminal, archive and completion work', async () => {
-    // Coverage instrumentation slows the synthetic audit; the live finalization budget stays strict.
-    const AUDIT_MS = globalThis.__coverage__ ? 3 * FINAL_MS : FINAL_MS
-    const proof = terminalBudgetFixture()
+  /** Most metered visits one audit step may make: a 100-visit loop tail joined to the next loop's head. */
+  const STEP_VISITS = 200
+
+  /**
+   * Runs the synthetic drain, terminal, archive and completion audit on one corpus size, metering
+   * the visits the cooperative audit loops count (`auditMeter`) and the steps between yields.
+   * Real time is never read: the case has no deadline, so only the audit's work is measured.
+   * @param {number} records Corpus size.
+   * @returns {Promise<{ visits: number, turns: number, maxVisits: number, archiveBytes: number }>}
+   *   Total visits and steps, the most visits in one step and the archive's size.
+   */
+  const meteredAudit = async (records) => {
+    const proof = terminalBudgetFixture(records)
     const replay = replayFixture({ sameLeader: true })
     replay.next.acquisition.acquiredRecords[0].lastOffset = '99'
     for (let offset = 0; offset < 100; offset++) {
@@ -9141,98 +9152,122 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       })
     }
     captureFreezes(proof)
+    const meter = { visits: 0 }
     let turns = 0
-    let maxStepMs = 0
-    /** @param {Generator} work Actual audit. @returns {Generator} Identical steps with runtime observations. */
+    let maxVisits = 0
+    /** @param {Generator} work Actual audit. @returns {Generator} Identical steps with metered visits. */
     const measured = function* (work) {
       for (;;) {
-        const started = performance.now()
+        const before = meter.visits
         const step = work.next()
-        maxStepMs = Math.max(maxStepMs, performance.now() - started)
+        maxVisits = Math.max(maxVisits, meter.visits - before)
         if (step.done) return step.value
         turns++
         yield
       }
     }
-    const started = performance.now()
-    const candidates = await cooperativeAudit(
-      measured(
-        settlementCandidatesWork(
-          proof.entries,
-          new Set(proof.corpus),
-          proof.bounces,
-          proof.evidence
-        )
-      ),
-      NEVER
-    )
-    const terminal = await cooperativeAudit(measured(auditTerminalWork(proof)), NEVER)
-    expect(proof.corpus).toHaveLength(RECORDS)
-    expect(proof.evidence.epochs).toHaveLength(2000)
-    expect(candidates.problems).toEqual([])
-    expect(terminal.problems).toEqual([])
-    expect(terminal.replay.extras).toHaveLength(100)
-    expect(
-      terminal.replay.extras.every(
-        ({ incarnationWitness }) => incarnationWitness.kind === 'partition-transition'
+    auditMeter = meter
+    try {
+      const candidates = await cooperativeAudit(
+        measured(
+          settlementCandidatesWork(
+            proof.entries,
+            new Set(proof.corpus),
+            proof.bounces,
+            proof.evidence
+          )
+        ),
+        NEVER
       )
-    ).toBe(true)
-    expect(terminal.settlement.successful).toEqual(candidates.successful)
-    const { instance, rows } = archiveFixture()
-    readyCompletion(instance)
-    const socketEvents = proof.evidence.owner.tap.socketEvents
-    Object.assign(instance, {
-      entries: proof.entries,
-      snapshots: proof.bounces,
-      expected: proof.corpus,
-      evidence: proof.evidence,
-      replay: terminal.replay,
-      settlement: terminal.settlement,
-      lifecycle: proof.evidence.owner.lifecycle,
-      deadline: started + AUDIT_MS,
-      rawIdentities: proof.raw,
-      handled: tally(proof.entries.map(({ identity }) => identity)),
-      expectedHandled: tally([
-        ...proof.corpus,
-        ...terminal.replay.extras.map(({ identity }) => identity),
-      ]),
-      beforeTerminal: proof.before,
-      afterTerminal: proof.after,
-      quiet: proof.quiet,
-    })
-    instance.evidence.owner = instance
-    instance.tap.socketEvents = socketEvents
-    instance.tap.allFrames = [
-      ...new Map(
-        [...proof.evidence.exchanges, ...proof.evidence.epochs]
-          .flatMap(({ frames }) => frames)
-          .map((frame) => [frame.id, frame])
-      ).values(),
-    ]
-    for (const frame of instance.tap.allFrames) frame.bytes = 'original-request'
-    let validationRuns = 0
-    let validationTurns = 0
-    const read = instance.requireArchiveWork.bind(instance)
-    instance.requireArchiveWork = function* (...args) {
-      validationRuns++
-      const before = turns
-      const result = yield* measured(read(...args))
-      validationTurns += turns - before
-      return result
+      const terminal = await cooperativeAudit(measured(auditTerminalWork(proof)), NEVER)
+      expect(proof.corpus).toHaveLength(records)
+      expect(proof.evidence.epochs).toHaveLength(2000)
+      expect(candidates.problems).toEqual([])
+      expect(terminal.problems).toEqual([])
+      expect(terminal.replay.extras).toHaveLength(100)
+      expect(
+        terminal.replay.extras.every(
+          ({ incarnationWitness }) => incarnationWitness.kind === 'partition-transition'
+        )
+      ).toBe(true)
+      expect(terminal.settlement.successful).toEqual(candidates.successful)
+      const { instance, rows } = archiveFixture()
+      readyCompletion(instance)
+      const socketEvents = proof.evidence.owner.tap.socketEvents
+      Object.assign(instance, {
+        entries: proof.entries,
+        snapshots: proof.bounces,
+        expected: proof.corpus,
+        evidence: proof.evidence,
+        replay: terminal.replay,
+        settlement: terminal.settlement,
+        lifecycle: proof.evidence.owner.lifecycle,
+        rawIdentities: proof.raw,
+        handled: tally(proof.entries.map(({ identity }) => identity)),
+        expectedHandled: tally([
+          ...proof.corpus,
+          ...terminal.replay.extras.map(({ identity }) => identity),
+        ]),
+        beforeTerminal: proof.before,
+        afterTerminal: proof.after,
+        quiet: proof.quiet,
+      })
+      instance.evidence.owner = instance
+      instance.tap.socketEvents = socketEvents
+      instance.tap.allFrames = [
+        ...new Map(
+          [...proof.evidence.exchanges, ...proof.evidence.epochs]
+            .flatMap(({ frames }) => frames)
+            .map((frame) => [frame.id, frame])
+        ).values(),
+      ]
+      for (const frame of instance.tap.allFrames) frame.bytes = 'original-request'
+      let validationRuns = 0
+      let validationTurns = 0
+      const read = instance.requireArchiveWork.bind(instance)
+      instance.requireArchiveWork = function* (...args) {
+        validationRuns++
+        const before = turns
+        const result = yield* measured(read(...args))
+        validationTurns += turns - before
+        return result
+      }
+      await cooperativeAudit(measured(instance.archiveWork()), NEVER)
+      expect(instance.archiveClosure.problems).toEqual([])
+      expect(instance.captureProblems).toEqual([])
+      expect(instance.archiveIncomplete).not.toBe(true)
+      await instance.complete(NEVER)
+      expect(validationRuns).toBe(1)
+      expect(validationTurns).toBeGreaterThan(records / 100)
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+      expect(rows.some(({ event }) => event === 'witness-closure-end')).toBe(true)
+      expect(turns).toBeGreaterThan(records / 100)
+      return {
+        visits: meter.visits,
+        turns,
+        maxVisits,
+        archiveBytes: instance.archiveStorage.size(),
+      }
+    } finally {
+      auditMeter = null
     }
-    await cooperativeAudit(measured(instance.archiveWork()), NEVER)
-    expect(instance.archiveClosure.problems).toEqual([])
-    expect(instance.captureProblems).toEqual([])
-    expect(instance.archiveIncomplete).not.toBe(true)
-    await instance.complete(NEVER)
-    expect(validationRuns).toBe(1)
-    expect(validationTurns).toBeGreaterThan(RECORDS / 100)
-    expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
-    expect(rows.some(({ event }) => event === 'witness-closure-end')).toBe(true)
-    expect(turns).toBeGreaterThan(RECORDS / 100)
-    expect(maxStepMs).toBeLessThan(1000)
-    expect(performance.now() - started).toBeLessThan(AUDIT_MS)
-  })
+  }
+
+  it('audits 30000 records with Metadata and count resets through drain, terminal, archive and completion work', async () => {
+    const half = await meteredAudit(RECORDS / 2)
+    const full = await meteredAudit(RECORDS)
+    for (const run of [half, full]) {
+      expect(run.visits).toBeGreaterThan(run.turns)
+      expect(run.maxVisits).toBeGreaterThan(0)
+      expect(run.maxVisits).toBeLessThanOrEqual(STEP_VISITS)
+    }
+    // Twice the records is at most 2.5 times the visits and steps: linear, not quadratic.
+    expect(full.visits).toBeLessThan(2.5 * half.visits)
+    expect(full.turns).toBeLessThan(2.5 * half.turns)
+    expect(full.visits).toBeGreaterThan(1.5 * half.visits)
+    // The 1 MiB margin covers the run stamps evidence lines add beyond these envelope rows.
+    expect(full.archiveBytes).toBeLessThanOrEqual(ARCHIVE_BYTES - 1024 * 1024)
+  }, 300000)
 
   it.each([
     ['receipt before cut', 9, 10, false],
