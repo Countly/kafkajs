@@ -1072,6 +1072,10 @@ module.exports = class Runner extends EventEmitter {
    * go straight to the group and leave it alone. Under the consumer protocol the handler and the
    * timer share one exchange, which ends it through {@link Runner#heartbeatAccepted} once, on a
    * success the live run accepted.
+   *
+   * A call the group reports idle (classic, none in flight, none due) skips the group call and only
+   * ends the outage, as the group call would have: the eachMessage loop pays one check per message.
+   * A group without the probe always gets the call.
    * @returns {Promise<void>}
    */
   async heartbeat() {
@@ -1080,11 +1084,14 @@ module.exports = class Runner extends EventEmitter {
     if (!this.running) return
 
     try {
-      await this.consumerGroup.heartbeat({
-        interval: this.consumerGroup.heartbeatInterval(),
-        guard: () => this.retirement ?? null,
-        onAccepted: () => this.heartbeatAccepted(),
-      })
+      const interval = this.consumerGroup.heartbeatInterval()
+      if (!this.consumerGroup.heartbeatIdle?.(interval)) {
+        await this.consumerGroup.heartbeat({
+          interval,
+          guard: () => this.retirement ?? null,
+          onAccepted: () => this.heartbeatAccepted(),
+        })
+      }
       if (this.consumerGroup.kind !== 'consumer') this.outages.heartbeat.end()
     } catch (e) {
       const verdict = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.HEARTBEAT)
