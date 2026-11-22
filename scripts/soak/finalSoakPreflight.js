@@ -16,7 +16,7 @@
  * broker provenance (image digests from `docker image inspect`, or operator evidence for a supplied
  * cluster); the prepared reporter's file cap, mounted jar digest and the cap each broker's load proof
  * reports; a quiet host (no agent or test
- * process), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
+ * process other than this run's own broker containers), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
  * or rehearsal, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
  * fail the preflight, and the record says so; such a run is never acceptance evidence.
  */
@@ -135,22 +135,92 @@ const run = (command, args, options = {}) =>
   execFileSync(command, args, { cwd: ROOT, encoding: 'utf8', ...options }).trim()
 
 /**
- * The paused-work census: pid, executable name, CPU and RSS, and a class. No environment, credential
- * or command-line argument is read.
- * @returns {{ pid: number, name: string, cpu: number, rss: number, class: string }[]}
+ * Classes one `ps -eo pid=,ppid=,pcpu=,rss=,comm=` table for the paused-work census. A process whose
+ * ancestry reaches a visible root of this run's broker containers is `own-broker` and names its node
+ * and container; any other agent or test process, a foreign `java` included, keeps its class.
+ * @param {string} table the `ps` output
+ * @param {{ self?: number, roots?: { node: number, container: string, pid: number,
+ *   visible: boolean }[] }} [options] the preflight's own pid (it and its children are left out) and
+ *   the broker container roots from `brokerRoots`
+ * @returns {{ pid: number, name: string, cpu: number, rss: number, class: string, node?: number,
+ *   container?: string }[]}
  */
-const census = () =>
-  run('ps', ['-eo', 'pid=,ppid=,pcpu=,rss=,comm='])
+function classifyCensus(table, { self = process.pid, roots = [] } = {}) {
+  const rows = table
     .split('\n')
     .map((line) => line.trim().split(/\s+/))
-    .filter(([pid, ppid]) => Number(pid) !== process.pid && Number(ppid) !== process.pid)
-    .map(([pid, , cpu, rss, name]) => ({
+    .map(([pid, ppid, cpu, rss, name]) => ({
       pid: Number(pid),
+      ppid: Number(ppid),
+      cpu,
+      rss,
       name,
-      cpu: Number(cpu),
-      rss: Number(rss) * 1024,
-      class: /^(codex|claude)$/.test(name) ? 'agent' : BUSY.test(name) ? 'test' : 'other',
     }))
+  const parent = new Map(rows.map((r) => [r.pid, r.ppid]))
+  const rootOf = new Map(roots.filter((r) => r.visible).map((r) => [r.pid, r]))
+  const ownRoot = (pid) => {
+    for (let p = pid, hops = 0; p !== undefined && hops <= rows.length; p = parent.get(p), hops++)
+      if (rootOf.has(p)) return rootOf.get(p)
+    return undefined
+  }
+  return rows
+    .filter((r) => r.pid !== self && r.ppid !== self)
+    .map(({ pid, cpu, rss, name }) => {
+      const root = ownRoot(pid)
+      const entry = { pid, name, cpu: Number(cpu), rss: Number(rss) * 1024 }
+      if (root) return { ...entry, class: 'own-broker', node: root.node, container: root.container }
+      const cls = /^(codex|claude)$/.test(name) ? 'agent' : BUSY.test(name) ? 'test' : 'other'
+      return { ...entry, class: cls }
+    })
+}
+
+/**
+ * The paused-work census: pid, executable name, CPU and RSS, and a class. No environment, credential
+ * or command-line argument is read.
+ * @param {{ roots?: object[] }} [options] this run's broker container roots, from `brokerRoots`
+ * @returns {object[]} the classed processes, as `classifyCensus` returns them
+ */
+const census = ({ roots = [] } = {}) =>
+  classifyCensus(run('ps', ['-eo', 'pid=,ppid=,pcpu=,rss=,comm=']), { roots })
+
+/**
+ * The host pids of this run's broker containers (the containers `captureBroker` recorded), so the
+ * census can tell the run's own brokers from foreign processes by ancestry rather than by name. A
+ * root is `visible` only when that pid's cgroup names its container: in another pid namespace
+ * (Docker in a sidecar) the pid is some other process, so it excludes nothing. A supplied cluster
+ * has no containers here.
+ * @param {object} provenance the captured broker provenance
+ * @param {{ inspect?: (container: string) => string, cgroup?: (pid: number) => string }} [docker]
+ *   reads a container's host pid and a pid's cgroup file
+ * @returns {{ node: number, container: string, pid: number, visible: boolean }[]}
+ * @throws {Error} when Docker does not answer or a broker container has no running process
+ */
+function brokerRoots(
+  provenance,
+  {
+    inspect = (container) => run('docker', ['inspect', '--format', '{{.State.Pid}}', container]),
+    cgroup = (pid) => fs.readFileSync(`/proc/${pid}/cgroup`, 'utf8'),
+  } = {}
+) {
+  if (provenance.kind !== 'image') return []
+  return provenance.nodes.map(({ node, container }) => {
+    let pid
+    try {
+      pid = Number(inspect(container))
+    } catch (e) {
+      throw new Error(`docker did not report the pid of kafka${node} (${container}): ${e.message}`)
+    }
+    if (!Number.isInteger(pid) || pid <= 0)
+      throw new Error(`kafka${node} (${container}) has no running process`)
+    let visible = false
+    try {
+      visible = container.length > 0 && cgroup(pid).includes(container)
+    } catch {
+      visible = false
+    }
+    return { node, container, pid, visible }
+  })
+}
 
 /** @returns {number} Linux MemAvailable in bytes */
 const memAvailable = () =>
@@ -426,6 +496,7 @@ async function gatherFacts({
       return JSON.parse(fs.readFileSync(proof, 'utf8')).maxFileBytes
     })
     progress.stage = 'host'
+    const roots = brokerRoots(provenance)
     const statfs = fs.statfsSync(out)
     return {
       node: process.version,
@@ -456,7 +527,8 @@ async function gatherFacts({
         memAvailable: memAvailable(),
         freeDisk: statfs.bavail * statfs.bsize,
         load1m: os.loadavg()[0],
-        census: census(),
+        census: census({ roots }),
+        roots,
       },
     }
   } finally {
@@ -637,6 +709,7 @@ async function main(argv, { kafkaOptions } = {}) {
         checks: result.checks,
         failed: result.failed,
         census: facts.host.census,
+        ownBrokers: facts.host.roots,
         telemetry: facts.telemetry,
         broker: facts.broker,
         host: {
@@ -680,5 +753,7 @@ module.exports = {
   prepareReporter,
   reporterSource,
   census,
+  classifyCensus,
+  brokerRoots,
   telemetrySubscription,
 }
