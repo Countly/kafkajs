@@ -482,7 +482,13 @@ describe('final soak driver', () => {
         mounted: 'c'.repeat(64),
         loadedCaps: [1, 2, 3].map(() => matrix.host.brokerReporterFileBytes.value),
       },
-      host: { memAvailable: 20 * GIB, freeDisk: 300 * GIB, load1m: 1, census: [] },
+      host: {
+        memAvailable: 20 * GIB,
+        freeDisk: 300 * GIB,
+        load1m: 1,
+        census: [],
+        view: { verified: true, reason: null },
+      },
     })
     const run = (facts, diagnostic = false) =>
       new Preflight({
@@ -531,7 +537,13 @@ describe('final soak driver', () => {
 
     const hosted = healthy()
     hosted.mode = 'smoke'
-    hosted.host = { memAvailable: 9 * GIB, freeDisk: 20 * GIB, load1m: 4, census: [] }
+    hosted.host = {
+      memAvailable: 9 * GIB,
+      freeDisk: 20 * GIB,
+      load1m: 4,
+      census: [],
+      view: { verified: true, reason: null },
+    }
     const diagnostic = await run(hosted, true)
     expect(diagnostic.failed).toEqual(['memory', 'disk', 'load'])
     expect(diagnostic.exitCode).toBe(0)
@@ -549,7 +561,7 @@ describe('final soak driver', () => {
   })
 
   describe('preflight quiet-host census', () => {
-    const { classifyCensus, brokerRoots } = require('../finalSoakPreflight')
+    const { classifyCensus, brokerRoots, censusView } = require('../finalSoakPreflight')
     const id = (n) => String(n).repeat(64)
     // pid ppid pcpu rss comm, as `ps -eo pid=,ppid=,pcpu=,rss=,comm=` prints them
     const TABLE = [
@@ -577,9 +589,9 @@ describe('final soak driver', () => {
       new Preflight({ sha: TREE, mode: 'acceptance', matrix })
         .checks({
           share: { finalized: {} },
-          host: { census },
+          host: { census, view: { verified: true, reason: null } },
         })
-        ['quiet-host']()
+        ['quiet-host']() === true
 
     test("processes inside this run's three broker containers are named as the run's own and do not make the host busy", () => {
       const census = classifyCensus(TABLE, { self: 700, roots: ROOTS })
@@ -657,6 +669,88 @@ describe('final soak driver', () => {
         `kafka1 (${id(1)}) has no running process`
       )
       expect(brokerRoots({ kind: 'supplied', nodes: [{ node: 1 }] }, down)).toEqual([])
+    })
+
+    test('the census view is verified only when every broker container root is visible in this pid namespace', () => {
+      const image = { kind: 'image' }
+      expect(censusView(image, ROOTS)).toEqual({ verified: true, reason: null })
+      const hidden = ROOTS.map((r) => ({ ...r, visible: r.node === 2 }))
+      expect(censusView(image, hidden)).toEqual({
+        verified: false,
+        reason: 'kafka1 (pid 501), kafka3 (pid 521) not visible in this pid namespace',
+      })
+      expect(censusView(image, ROOTS.slice(0, 2))).toEqual({
+        verified: false,
+        reason: 'expected 3 broker container roots, found 2',
+      })
+      expect(censusView({ kind: 'supplied' }, [])).toEqual({
+        verified: false,
+        reason: 'a supplied cluster has no broker container to confirm the view with',
+      })
+    })
+
+    test('a census that cannot see the host fails acceptance as unverified, not busy, and a diagnostic smoke only records it', async () => {
+      const facts = {
+        node: 'v26.1.0',
+        git: { head: TREE, porcelain: '' },
+        deps: { installed: true, lockMatches: true },
+        cluster: { brokers: [1, 2, 3] },
+        share: { finalized: { 'share.version': { minVersionLevel: 1, maxVersionLevel: 1 } } },
+        telemetry: {
+          subscription: { metrics: '*', intervalMs: '30000' },
+          pushes: [
+            { probe: 'producer', metrics: 12, decoded: true },
+            { probe: 'consumer', metrics: 9, decoded: true },
+          ],
+        },
+        clock: { bootId: 'f'.repeat(36), platform: 'linux' },
+        provenance: {
+          kind: 'image',
+          nodes: [1, 2, 3].map((node) => ({ node, digest: `sha256:${'a'.repeat(64)}` })),
+        },
+        reporter: {
+          sinkBytes: matrix.host.brokerReporterFileBytes.value,
+          jarSha256: 'c'.repeat(64),
+          mounted: 'c'.repeat(64),
+          loadedCaps: [1, 2, 3].map(() => matrix.host.brokerReporterFileBytes.value),
+        },
+        host: {
+          memAvailable: 20 * GIB,
+          freeDisk: 300 * GIB,
+          load1m: 1,
+          census: [{ pid: 9, name: 'containerd-shim', cpu: 0, rss: 0, class: 'other' }],
+          view: censusView(
+            { kind: 'image' },
+            ROOTS.map((r) => ({ ...r, visible: false }))
+          ),
+        },
+      }
+      const run = (mode, diagnostic) =>
+        new Preflight({ sha: TREE, mode, matrix, diagnostic, read: async () => facts }).run()
+      const acceptance = await run('acceptance', false)
+      expect(acceptance.failed).toEqual(['quiet-host'])
+      expect(acceptance.exitCode).toBe(1)
+      expect(acceptance.checks.find((c) => c.name === 'quiet-host')).toEqual({
+        name: 'quiet-host',
+        ok: false,
+        required: true,
+        reason:
+          'the process census cannot see the host: kafka1 (pid 501), kafka2 (pid 511), kafka3 (pid 521) not visible in this pid namespace',
+      })
+      const smoke = await run('smoke', true)
+      expect(smoke.failed).toEqual(['quiet-host'])
+      expect(smoke.exitCode).toBe(0)
+      expect(smoke.checks.find((c) => c.name === 'quiet-host').required).toBe(false)
+
+      facts.host.view = censusView({ kind: 'image' }, ROOTS)
+      facts.host.census.push({ pid: 601, name: 'jest', cpu: 9, rss: 0, class: 'test' })
+      const busy = await run('acceptance', false)
+      expect(busy.checks.find((c) => c.name === 'quiet-host')).toEqual({
+        name: 'quiet-host',
+        ok: false,
+        required: true,
+        reason: 'busy: jest (pid 601)',
+      })
     })
   })
 
