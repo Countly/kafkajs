@@ -573,22 +573,30 @@ describe('Producer > disconnect() and the commit of a transaction', () => {
 })
 
 describe('Producer > a transaction coordinator that cannot be found while a transaction ends', () => {
-  test('abort() still ends the transaction, and the next one first bumps the epoch', async () => {
+  test('abort() still ends the transaction, and the next one first sends its EndTxn again with the pair held', async () => {
     const { broker, cluster, producer, transaction } = await createCommittingProducer()
     const lost = new KafkaJSConnectionError('Connection error')
     cluster.findGroupCoordinator.mockRejectedValue(
       new KafkaJSNumberOfRetriesExceeded(lost, { retryCount: 2, retryTime: 1 })
     )
+    const inits = broker.initProducerId.mock.calls.length
 
     await expect(transaction.abort()).resolves.toBeUndefined()
+    expect(broker.endTxn).not.toHaveBeenCalled()
 
     cluster.findGroupCoordinator.mockResolvedValue(broker)
     const next = await producer.transaction()
-    expect(broker.initProducerId.mock.calls.at(-1)[0]).toMatchObject({
-      transactionalId: TRANSACTIONAL_ID,
-      producerId: '1000',
-      producerEpoch: 0,
-    })
+    expect(broker.endTxn.mock.calls.map(([request]) => request)).toEqual([
+      expect.objectContaining({
+        transactionalId: TRANSACTIONAL_ID,
+        producerId: '1000',
+        producerEpoch: 0,
+        transactionResult: false,
+      }),
+    ])
+    expect(
+      broker.initProducerId.mock.calls.slice(inits).map(([request]) => request.producerEpoch)
+    ).not.toContain(-1)
     await next.abort()
   })
 })

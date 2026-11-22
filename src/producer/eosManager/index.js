@@ -133,6 +133,18 @@ const abortOnly = (cause) =>
   )
 
 /**
+ * Whether an abort's INVALID_TXN_STATE means there is nothing to abort: no add request of the
+ * transaction was confirmed, so the coordinator never started it (EMPTY, or the previous
+ * transaction's COMPLETE_COMMIT), as `endTransactionWithTV1` answers. For a confirmed transaction
+ * the answer stays a fatal error.
+ * @see https://github.com/apache/kafka/blob/4.4.0/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala
+ * @param {Error} error what the abort's EndTxn rejected with
+ * @param {boolean} confirmed whether the transaction was confirmed to have started
+ * @returns {boolean}
+ */
+const nothingToAbort = (error, confirmed) => !confirmed && error.type === 'INVALID_TXN_STATE'
+
+/**
  * @param {{ partitions: unknown[] }[]} topics offsets as given to `sendOffsets`
  * @returns {boolean} whether any topic holds a partition
  */
@@ -497,10 +509,29 @@ const createEosManager = ({
       }
     })
 
+  /**
+   * Runs one task at a time per producer lifecycle: concurrent callers of one lifecycle share it,
+   * a caller of another lifecycle starts its own.
+   * @returns {(generation: ?import('../generation'), task: () => Promise<void>) => Promise<void>}
+   */
+  const sharedPerLifecycle = () => {
+    /** @type {?{ generation: ?import('../generation'), promise: Promise<void> }} */
+    let running = null
+    return (generation, task) => {
+      if (running === null || running.generation !== generation) {
+        const current = { generation, promise: null }
+        current.promise = task().finally(() => {
+          if (running === current) running = null
+        })
+        running = current
+      }
+      return running.promise
+    }
+  }
+
   /** Whether a KIP-360 epoch bump is owed before the next transaction; kept until one succeeds. */
   let bumpOwed = false
-  /** @type {?{ generation: ?import('../generation'), promise: Promise<void> }} */
-  let bumping = null
+  const bumping = sharedPerLifecycle()
 
   /**
    * Performs the epoch bump owed, if any: one re-initialization shared by the concurrent callers
@@ -514,19 +545,56 @@ const createEosManager = ({
       return Promise.resolve()
     }
 
-    if (bumping === null || bumping.generation !== generation) {
-      const current = { generation, promise: null }
-      current.promise = retryingInitProducerId(() => stateManager.reinitialize(), generation)
-        .then(() => {
-          if (!generation?.closed) bumpOwed = false
-        })
-        .finally(() => {
-          if (bumping === current) bumping = null
-        })
-      bumping = current
-    }
-    return bumping.promise
+    return bumping(generation, () =>
+      retryingInitProducerId(() => stateManager.reinitialize(), generation).then(() => {
+        if (!generation?.closed) bumpOwed = false
+      })
+    )
   }
+
+  /**
+   * An abort whose outcome is unknown - its EndTxn failed, or a close cut it short - and whose
+   * EndTxn is sent again before the next transaction: its transaction version, and whether the
+   * transaction was confirmed to have started; null when none is owed. Kept until the coordinator
+   * answers that EndTxn.
+   * @type {?{ version: 1|2, confirmed: boolean }}
+   */
+  let abortOwed = null
+  const resending = sharedPerLifecycle()
+
+  /**
+   * Sends the owed abort again: EndTxn(ABORT) with the producer id and epoch held, shared
+   * by the concurrent callers of one producer lifecycle. A coordinator that still holds the
+   * transaction aborts it, and one that already aborted it answers success. Under transaction
+   * version 2 the producer adopts the epoch the answer carries; under version 1 an epoch bump is
+   * then owed. PRODUCER_FENCED or INVALID_PRODUCER_ID_MAPPING - another producer took over the
+   * transactional id, or (version 1) the coordinator aborted the transaction on its timeout -
+   * makes the producer fatal. INVALID_TXN_STATE for a transaction never confirmed to have started
+   * means nothing to abort (`nothingToAbort`), handled as success. Any other failure keeps the
+   * abort owed.
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
+   * @returns {Promise<void>}
+   * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed fatal error
+   * @throws {Error} the EndTxn's other error, as `endTransaction` throws it
+   */
+  const resendAbortOwed = (generation) =>
+    resending(generation, async () => {
+      let adopted = false
+      try {
+        adopted = await sendEndTxn(false, abortOwed.version, generation)
+      } catch (error) {
+        generation?.check()
+        if (!nothingToAbort(error, abortOwed.confirmed)) {
+          stateManager.arm(error)
+          if (stateManager.state() === STATES.FATAL_ERROR) {
+            throw stateManager.transaction.armedError()
+          }
+          throw error
+        }
+      }
+      abortOwed = null
+      bumpOwed = !adopted
+    })
 
   /**
    * Arms the state a failed transactional request leaves, from its already classified error, and
@@ -568,8 +636,10 @@ const createEosManager = ({
   /**
    * Ends the transaction with one EndTxn at the version the transaction began under, retried while
    * the coordinator moves or is busy, and under transaction version 2 adopts the producer id and
-   * epoch it returns (KIP-890), which restarts every sequence. A transaction that never produced
-   * and never sent offsets ends locally with no EndTxn, under either version. No EndTxn goes out
+   * epoch it returns (KIP-890), which restarts every sequence. A transaction that sent no add
+   * request and holds nothing ends locally with no EndTxn, under either version; one whose
+   * AddPartitionsToTxn or AddOffsetsToTxn went unanswered sends it, since the coordinator may
+   * have applied the add. No EndTxn goes out
    * while a batch is in flight, as the Java producer holds it until every batch completed: the
    * caller waited for the transaction's sends, so only a fault in the send loop leaves one. The
    * coordinator is looked up again on every attempt, and a lookup whose own retries ran out ends
@@ -584,7 +654,7 @@ const createEosManager = ({
    *   retries run out; the lifecycle's close error once it closed
    */
   const endTransaction = async (committed, generation) => {
-    if (!stateManager.transactionStarted()) {
+    if (!stateManager.transactionReached()) {
       logger.debug('No partitions or offsets registered, not sending EndTxn')
       return false
     }
@@ -593,7 +663,19 @@ const createEosManager = ({
       throw new KafkaJSInvariantViolation('EndTxn with a batch of the transaction in flight')
     }
 
-    const transactionVersion = stateManager.transactionVersion()
+    return sendEndTxn(committed, stateManager.transactionVersion(), generation)
+  }
+
+  /**
+   * Sends one EndTxn with the producer id and epoch held, as `endTransaction` describes, at
+   * `transactionVersion`.
+   * @param {boolean} committed
+   * @param {1|2} transactionVersion
+   * @param {import('../generation')} [generation]
+   * @returns {Promise<boolean>} whether a new producer id and epoch were adopted
+   * @throws {Error} as `endTransaction`
+   */
+  const sendEndTxn = async (committed, transactionVersion, generation) => {
     const ended = await retrierFor(generation)(async (bail) => {
       try {
         generation?.check()
@@ -740,12 +822,13 @@ const createEosManager = ({
 
     /**
      * Begin a transaction. Resolves the transaction coordinator and reads the transaction version
-     * it finalizes, fixed for this transaction. When that version moved from 1 to 2, or an epoch
-     * bump is still owed from an earlier abort, the producer id is re-initialized first (KIP-360);
-     * a failure there rejects the call, leaves the producer `READY` and keeps the bump owed for the
-     * next call. A lookup that fails retriably, a connection reset above all, is retried under the
-     * producer's `retry` settings; one that is not retriable, or whose retries ran out, rejects the
-     * call the same way.
+     * it finalizes, fixed for this transaction. An abort whose outcome was unknown has its EndTxn
+     * sent again first (`resendAbortOwed`). When the version moved from 1 to 2, or an epoch bump
+     * is still owed, the producer id is then re-initialized (KIP-360). A failure of either rejects
+     * the call, leaves the producer `READY` - `FATAL_ERROR` when it was fatal - and keeps what was
+     * owed for the next call. A lookup that fails retriably, a connection reset above all, is
+     * retried under the producer's `retry` settings; one that is not retriable, or whose retries
+     * ran out, rejects the call the same way.
      * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense
      * @returns {Promise<void>}
      * @throws {import('../../errors').KafkaJSNonRetriableError} outside `READY`, or on a producer
@@ -769,6 +852,10 @@ const createEosManager = ({
       generation?.check()
       if (stateManager.version.begin(coordinator).bumpRequired) {
         bumpOwed = true
+      }
+      if (abortOwed !== null) {
+        await resendAbortOwed(generation)
+        generation?.check()
       }
       await bumpIfOwed(generation)
       generation?.check()
@@ -894,16 +981,15 @@ const createEosManager = ({
      * (KIP-1050). An abort that ends `ABORTABLE_ERROR`, or whose caller dropped queued batches that
      * already carried a sequence, then bumps the producer epoch (KIP-360), so the next transaction
      * starts with no sequence left over from this one - unless its EndTxn handed back a new epoch
-     * (transaction version 2), which restarts every sequence already. An abort whose EndTxn failed
-     * bumps the epoch under either version: the coordinator
-     * may still hold the transaction, or have fenced its epoch, and an InitProducerId with the
-     * current id and epoch aborts what is left of it. A bump that fails is owed to the next
-     * transaction, and the abort resolves with the producer `READY`; only a bump that fails fatally
-     * rejects it, after a successful EndTxn, with the producer in `FATAL_ERROR`. A transaction
-     * coordinator that could not be found is never fatal here, for the EndTxn or for the bump.
-     * A producer closed while the abort runs rejects it with the close error, and leaves the
-     * producer `READY` with the epoch bump owed, as a failed EndTxn does: after a reconnect the next
-     * transaction bumps the epoch first, which aborts whatever the coordinator still holds.
+     * (transaction version 2), which restarts every sequence already. A bump that fails is owed to
+     * the next transaction, and the abort resolves with the producer `READY`; only a bump that
+     * fails fatally rejects it, after a successful EndTxn, with the producer in `FATAL_ERROR`. A
+     * transaction coordinator that could not be found is never fatal here, for the EndTxn or for
+     * the bump. An abort whose outcome is unknown - its EndTxn failed, or the producer was closed
+     * while the abort ran - ends the transaction locally and leaves the producer `READY` with the
+     * EndTxn owed when the transaction reached the coordinator: the next transaction sends it again
+     * with the producer id and epoch held, never a fresh InitProducerId, so it cannot fence another
+     * producer that took over the transactional id. A close rejects the abort with the close error.
      * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
      * @param {object} [options]
      * @param {boolean} [options.droppedSequences=false] whether the caller dropped queued batches
@@ -912,7 +998,7 @@ const createEosManager = ({
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} when the abort itself
      *   failed fatally, or a fatal answer armed `FATAL_ERROR` while it waited
      * @throws {import('../../errors').KafkaJSProducerClosedError} the lifecycle's close error once
-     *   the producer was closed; the producer is `READY`, the bump owed
+     *   the producer was closed; the producer is `READY`, the EndTxn owed
      */
     async abort({ droppedSequences = false } = {}) {
       const generation = getGeneration()
@@ -922,7 +1008,18 @@ const createEosManager = ({
       const bump = droppedSequences || stateManager.state() === STATES.ABORTABLE_ERROR
       stateManager.transitionTo(STATES.ABORTING)
 
-      let ended = true
+      /** Ends the transaction locally, owing its EndTxn when it reached the coordinator. */
+      const endUnknown = () => {
+        if (stateManager.transactionReached()) {
+          abortOwed = {
+            version: stateManager.transactionVersion(),
+            confirmed: stateManager.transactionStarted(),
+          }
+        }
+        if (bump) bumpOwed = true
+        stateManager.transitionTo(STATES.READY)
+      }
+
       let adopted = false
       try {
         await stateManager.whenPartitionsAdded()
@@ -935,22 +1032,21 @@ const createEosManager = ({
           adopted = await endTransaction(false, generation)
         } catch (error) {
           generation?.check()
-          swallowUnlessFatal(error)
-          ended = false
+          if (!nothingToAbort(error, stateManager.transactionStarted())) {
+            swallowUnlessFatal(error)
+            endUnknown()
+            return
+          }
         }
 
         generation?.check()
       } catch (error) {
-        // A close leaves the outcome unknown, as a failed EndTxn does: end locally, owe the bump.
-        if (generation?.closed && stateManager.state() === STATES.ABORTING) {
-          stateManager.transitionTo(STATES.READY)
-          bumpOwed = true
-        }
+        if (generation?.closed && stateManager.state() === STATES.ABORTING) endUnknown()
         throw error
       }
       stateManager.transitionTo(STATES.READY)
 
-      if (!ended || (bump && !adopted)) {
+      if (bump && !adopted) {
         bumpOwed = true
         await bumpIfOwed(generation).catch((error) => {
           generation?.check()
@@ -1071,6 +1167,7 @@ const createEosManager = ({
           }
 
           if (transactionVersion === 1) {
+            stateManager.markAddSent()
             await retrierFor(generation)(async (bail, retryCount, retryTime) => {
               generation?.check()
               const transactionCoordinator = await findTransactionCoordinator(generation)
