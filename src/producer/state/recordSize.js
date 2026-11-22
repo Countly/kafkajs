@@ -265,40 +265,6 @@ const chargeOf = (topicMessages, limit) => {
 }
 
 /**
- * Calls `visit` with each Buffer among a record's key, value and header values, as the encoder
- * writes them, and keeps what it returns in that place. The record and its headers must be the
- * producer's own copies.
- * @param {object} record
- * @param {(view: Buffer) => Buffer} visit
- * @returns {void}
- */
-const replaceBuffers = (record, visit) => {
-  if (Buffer.isBuffer(record.key)) {
-    record.key = visit(record.key)
-  }
-  if (Buffer.isBuffer(record.value)) {
-    record.value = visit(record.value)
-  }
-  const { headers } = record
-  if (headers != null) {
-    for (const name of Object.keys(headers)) {
-      const header = headers[name]
-      if (!Array.isArray(header)) {
-        if (Buffer.isBuffer(header)) {
-          headers[name] = visit(header)
-        }
-        continue
-      }
-      for (let i = 0; i < header.length; i++) {
-        if (i in header && Buffer.isBuffer(header[i])) {
-          header[i] = visit(header[i])
-        }
-      }
-    }
-  }
-}
-
-/**
  * @param {Buffer} view
  * @returns {boolean} whether it is a small view over a large backing store: one above 16 KiB and
  *   above 16 times the view, which a send copies so as not to keep the store alive
@@ -309,69 +275,67 @@ const pinsStore = (view) => {
 }
 
 /**
- * Makes the Buffers a send keeps for its keys, values and header values its own where they would
- * pin a large store (`pinsStore`): all such Buffers of the send are copied into one store of the
- * sum of their lengths, each replaced by its own slice of it, so the send neither keeps a large
- * store alive nor allocates once per field. Every other Buffer stays the caller's own, as in 2.2.4,
- * so its bytes still reach the wire if the caller changes them; a send with nothing to copy
- * allocates nothing. The bytes are copied after every record of the send has been read, with
- * intrinsics only: no method of a caller's Buffer is called. The store is held only through the
- * slices in the send's records, and the send's own slices cover it whole, so `chargeOf` charges it
- * no excess once the send is walked; it may be collected before the send's charge is released when
+ * The copy of one send's Buffers that would pin a large store (`pinsStore`). While the send's own
+ * records are built, `note` remembers each such Buffer by the own container and key it was put
+ * at, with its length read once; `copy` then copies them all into one store of the sum of those
+ * lengths and puts each one's slice in its place. Every other Buffer stays the caller's own, as in
+ * 2.2.4, so its bytes still reach the wire if the caller changes them; a send with nothing to copy
+ * allocates no store. The bytes are captured after every record of the send has been read, with
+ * intrinsics only: no method or iterator of the caller runs during the copy.
+ *
+ * The store is held only through the slices in the send's records, which cover it whole, so
+ * `chargeOf` charges it no excess; it may be collected before the send's charge is released when
  * the records still held carry no slice of it. Keeping any slice (a record kept by a custom
  * partitioner or from a delivery error, or the slice passed again in another send) keeps the whole
- * store alive, and a later send carrying it is charged the bytes of the store it does not show. A
- * send that cannot fit is still refused, but the first slice walked carries the store's uncovered
- * bytes until later slices cover them, so which record the error names and the size it reports can
- * differ from a copy per view.
- * @param {{ topic: string, messages: object[] }[]} topicMessages the send's own copy
- *   (`Accumulator.snapshot`); entries and records that are not objects are skipped
- * @returns {void}
+ * store alive; a later send that carries such a slice as it is is charged the bytes of the store
+ * it does not show. A send that cannot fit is still refused, but which record the error names and
+ * the size it reports can differ from a copy per view.
  */
-const ownBuffers = (topicMessages) => {
-  const eachRecord = (visit) => {
-    for (const entry of topicMessages) {
-      if (entry === null || typeof entry !== 'object' || !Array.isArray(entry.messages)) {
-        continue
+class SendCopy {
+  /** @type {Array<object|string|number|Buffer>|null} flat slots: container, key, view, length */
+  #slots = null
+  #bytes = 0
+
+  /**
+   * Remembers `container[key]` for the copy when it is a Buffer that pins a large store.
+   * @param {object} container the producer's own record, header object or header-value array
+   * @param {string|number} key
+   * @returns {void}
+   */
+  note(container, key) {
+    const view = container[key]
+    if (!Buffer.isBuffer(view) || !pinsStore(view)) {
+      return
+    }
+    const length = lengthOf.call(view)
+    this.#slots ??= []
+    this.#slots.push(container, key, view, length)
+    this.#bytes += length
+  }
+
+  /**
+   * Copies every remembered Buffer into one store and puts its slice in its place.
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} when a Buffer's length changed since it was remembered
+   */
+  copy() {
+    const slots = this.#slots
+    if (slots === null) {
+      return
+    }
+    const store = Buffer.allocUnsafeSlow(this.#bytes)
+    let offset = 0
+    for (let i = 0; i < slots.length; i += 4) {
+      const view = slots[i + 2]
+      const length = slots[i + 3]
+      if (lengthOf.call(view) !== length) {
+        throw new KafkaJSNonRetriableError('A Buffer changed size while its send was being read')
       }
-      for (const record of entry.messages) {
-        if (record !== null && typeof record === 'object') {
-          replaceBuffers(record, visit)
-        }
-      }
+      store.set(view, offset)
+      slots[i][slots[i + 1]] = store.subarray(offset, offset + length)
+      offset += length
     }
   }
-  /** @type {number[]} for each Buffer in visiting order, the bytes to copy, or -1 to keep it */
-  const lengths = []
-  let bytes = 0
-  let copies = 0
-  eachRecord((view) => {
-    const length = pinsStore(view) ? lengthOf.call(view) : -1
-    lengths.push(length)
-    if (length >= 0) {
-      bytes += length
-      copies += 1
-    }
-    return view
-  })
-  if (copies === 0) {
-    return
-  }
-  const store = Buffer.allocUnsafeSlow(bytes)
-  let next = 0
-  let offset = 0
-  eachRecord((view) => {
-    const length = lengths[next++]
-    if (length < 0) {
-      return view
-    }
-    if (lengthOf.call(view) !== length) {
-      throw new KafkaJSNonRetriableError('A Buffer changed size while its send was being read')
-    }
-    store.set(view, offset)
-    offset += length
-    return store.subarray(offset - length, offset)
-  })
 }
 
 /** `DefaultRecordBatch.RECORD_BATCH_OVERHEAD`: the header of a v2 record batch. */
@@ -549,7 +513,7 @@ module.exports = {
   held,
   share,
   chargeOf,
-  ownBuffers,
+  SendCopy,
   varintSize,
   framing,
   topicFraming,
