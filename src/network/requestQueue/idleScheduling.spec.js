@@ -33,6 +33,14 @@ describe('Network > RequestQueue > scheduleCheckPendingRequests', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
+  it('schedules nothing for an idle queue whose throttle ends at this very millisecond', () => {
+    requestQueue.throttledUntil = Date.now()
+    requestQueue.scheduleCheckPendingRequests()
+
+    expect(requestQueue.throttleCheckTimeoutId).toBeNull()
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
   it('does not re-arm itself after every fulfilled request (#1704, #1556)', () => {
     // fulfillRequest -> checkPendingRequests -> scheduleCheckPendingRequests
     requestQueue.fulfillRequest({ correlationId: 1, payload: null, size: 0 })
