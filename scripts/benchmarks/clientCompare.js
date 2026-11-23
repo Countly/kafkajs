@@ -18,10 +18,11 @@
  * partition back to its first offset once it delivered its last record, so a corpus the runner's
  * disk can hold still gives a long enough window. `--settings same` gives either package one
  * explicit consumer configuration (`SAME_SETTINGS`) and, on the produce workloads, one explicit
- * producer configuration (`SAME_PRODUCER_SETTINGS`) instead of its defaults. A run waits for its
- * new topic's leaders itself, through unknown-topic answers: kafkajs 2.2.4's `createTopics`
- * `waitForLeaders` gives up on the first one, which a KRaft broker can give right after the topic
- * is created. `--compression lz4` uses the fork's
+ * producer configuration (`SAME_PRODUCER_SETTINGS`) instead of its defaults. A run creates its
+ * topic with `waitForLeaders: false` and waits for the leaders itself, through unknown-topic
+ * answers: both packages wait by default, and kafkajs 2.2.4's wait gives up on the first error
+ * other than `LEADER_NOT_AVAILABLE`, which a KRaft broker can give right after the topic is
+ * created. `--compression lz4` uses the fork's
  * built-in codec; kafkajs 2.2.4 has none, so for it the run registers an `lz4-napi` frame codec,
  * loaded from this repository's install, through `CompressionCodecs`.
  * Prints one JSON line: { package, version, workload, messages, size, partitions, compression,
@@ -869,6 +870,7 @@ const runWorkload = async (client, workload, options, timing = {}) => {
             configEntries: [{ name: 'file.delete.delay.ms', value: '1000' }],
           },
         ],
+        waitForLeaders: false,
       })
       await waitForLeaders(admin, topic, partitions, clock)
       const values = valuePool(options.size)
