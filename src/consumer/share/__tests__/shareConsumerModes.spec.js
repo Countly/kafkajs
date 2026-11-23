@@ -255,6 +255,31 @@ describe('Share consumer handler decisions', () => {
     expect(c.call.complete()).toBeNull()
     expect(() => c.call.acknowledge(c.messages[1])).toThrow(KafkaJSNonRetriableError)
   })
+  test('freezing a call whose acquisition was retired closes it without touching the ledger', () => {
+    const c = setup({ offsets: ['0', '1', '2'] })
+    c.call.acknowledge(c.messages[0], 'accept')
+    const retired = c.ledger.invalidate('session-lost')
+    c.retire()
+    c.call.freeze()
+    expect(
+      retired.map(({ firstOffset, lastOffset, type }) => [firstOffset, lastOffset, type])
+    ).toEqual([
+      ['0', '0', 'accept'],
+      ['1', '2', 'release'],
+    ])
+    expect(c.call.open).toBe(false)
+    expect(c.ledger.size).toBe(0)
+    expect(c.call.complete()).toBeNull()
+    expect(() => c.call.acknowledge(c.messages[1])).toThrow(KafkaJSNonRetriableError)
+  })
+  test('freezing a call that lost its authority promotes none of its choices', () => {
+    const c = setup({ offsets: ['0', '1'] })
+    c.call.acknowledge(c.messages[0], 'reject')
+    c.retire()
+    c.call.freeze()
+    expect(c.call.open).toBe(false)
+    expect(c.ledger.prepare({ token: c.token }).ticket).toBeNull()
+  })
 })
 
 describe('public share handler contract', () => {

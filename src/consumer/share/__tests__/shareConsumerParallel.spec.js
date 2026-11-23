@@ -2,6 +2,7 @@ const HeartbeatManager = require('../../heartbeatManager')
 const { ShareRunner } = require('../shareRunner')
 const {
   A,
+  ackAnswer,
   acquire,
   deferred,
   echo,
@@ -297,6 +298,70 @@ describe('share handlers on parallel leader nodes', () => {
       expect(h.seen.stops).toEqual([true])
       expect(h.seen.crashes).toEqual([])
     })
+  })
+
+  test('a poll expiry over a handler whose renewal lost its session still finals the other node and leaves', async () => {
+    await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
+    const opened = [false, false]
+    h.cluster.answer('ShareFetch', (fields, call) => {
+      if (fields.shareSessionEpoch !== 0 || opened[call.node]) return echo('ShareFetch', fields)
+      opened[call.node] = true
+      return fetchAnswer([call.node === 0 ? acquire(0, 0, ['a']) : acquire(1, 0, ['b', 'c'])])
+    })
+    h.cluster.answer('ShareAcknowledge', (fields, call) =>
+      call.node === 0 && fields.isRenewAck
+        ? ackAnswer([], { errorCode: 122 })
+        : echo('ShareAcknowledge', fields)
+    )
+    const gate = deferred()
+    const completions = []
+    holds.push({ release: () => gate.resolve(), completions })
+    const started = []
+    const renewals = []
+    await run({
+      eachMessage: async ({ partition, message, acknowledge, renew }) => {
+        const completed = deferred()
+        completions.push(completed.promise)
+        try {
+          started.push(`${partition}:${message.offset}`)
+          acknowledge('accept')
+          if (partition === 0) await renew().catch((error) => renewals.push(error))
+          await gate.promise
+        } finally {
+          completed.resolve()
+        }
+      },
+    })
+    await until(
+      () => started.length === 2 && renewals.length === 1,
+      'both handlers and the renewal'
+    )
+    expect(renewals[0].reason).toBe('session-lost')
+    for (let count = 2; count <= 5; count++) await beat(count)
+    expect(leaves()).toHaveLength(0)
+    await advance(50)
+    await until(() => leaves().length === 1, 'the poll-expiry leave')
+    await flush()
+    const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+    expect(finals.map(({ node }) => node)).toEqual([1])
+    expect(finals[0].fields.topics).toEqual([
+      {
+        topicId: A,
+        partitions: [
+          {
+            partitionIndex: 1,
+            acknowledgementBatches: [
+              { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [1, 2] },
+            ],
+          },
+        ],
+      },
+    ])
+    expect(finals[0].order).toBeLessThan(leaves()[0].order)
+    const fromNode0 = h.frames(79).filter(({ node }) => node === 0)
+    expect(fromNode0.map(({ fields }) => fields.isRenewAck)).toEqual([true])
+    expect(started.sort()).toEqual(['0:0', '1:0'])
+    expect(h.seen.crashes).toEqual([])
   })
 
   test('uses one completion-rearmed heartbeat chain', async () => {
