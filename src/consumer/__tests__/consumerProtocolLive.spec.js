@@ -1,6 +1,6 @@
 const { Kafka, logLevel } = require('../../../index')
 const { secureRandom, plainTextBrokers, createTopic } = require('testHelpers')
-const { waitForCondition, withTimeout, createLedger } = require('./fixtures/liveScenario')
+const { sleep, waitForCondition, withTimeout, createLedger } = require('./fixtures/liveScenario')
 
 // Gated: this scenario runs a real KIP-848 group and would race the other consumer specs. Run it
 // alone: `npm run test:e2e:consumer-protocol`.
@@ -19,6 +19,34 @@ const LEAVE_RELEASE_BUDGET = { attempts: 20, delay: 200 } // 4 s, under the 6 s 
 const DELIVERY_BUDGET = { attempts: 120, delay: 500 } // 60 s
 const ASSIGNMENT_BUDGET = { attempts: 60, delay: 500 } // 30 s
 const DISCONNECT_BUDGET_MS = 15000
+const POLL_INTERVAL_MS = 500
+
+/**
+ * Polls `predicate` until it holds or `ms` has elapsed. Each call is bounded by the time left, and
+ * a call that rejects counts as not yet, so a slow or failing RPC ends the wait rather than the row.
+ * @param {() => boolean|Promise<boolean>} predicate
+ * @param {number} ms the wall-clock budget of the whole wait
+ * @returns {Promise<boolean>} whether `predicate` held within `ms`
+ */
+const waitWithin = async (predicate, ms) => {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    let timer
+    const expired = new Promise((resolve) => {
+      timer = setTimeout(resolve, deadline - Date.now(), false)
+    })
+    try {
+      const call = Promise.resolve()
+        .then(predicate)
+        .catch(() => false)
+      if (await Promise.race([call, expired])) return true
+    } finally {
+      clearTimeout(timer)
+    }
+    await sleep(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())))
+  }
+  return false
+}
 
 /**
  * Live proof that a member on the KIP-848 consumer group protocol joins, reconciles and
@@ -361,45 +389,65 @@ describeConsumerProtocol('Consumer > the consumer group protocol (live)', () => 
         const [{ baseOffset }] = await producer.send({ topic, messages: [{ value, partition: 0 }] })
         return String(Number(baseOffset) + 1)
       }
+      // Four waits of 25 + 30 + 30 + 40 s leave headroom under the row budget for the connects,
+      // produces and the admin disconnect.
+      let rebalances = 0
+      a.consumer.on(a.consumer.events.REBALANCING, () => (rebalances += 1))
+      /** @param {object} member a described member @returns {string[]} its `topic|partition` cells */
+      const cellsOf = (member) =>
+        member.assignment
+          .flatMap(({ topic: owned, partitions }) => partitions.map((p) => `${owned}|${p}`))
+          .sort()
       try {
         await admin.connect()
         await a.consumer.connect()
         await a.consumer.subscribe({ topic, fromBeginning: true })
         await a.consumer.run({ autoCommitThreshold: 1, eachMessage: async () => {} })
-        expect(
-          await waitForCondition(() => ownedBy(a.observed).length === PARTITIONS, ASSIGNMENT_BUDGET)
-        ).toBe(true)
+        expect(await waitWithin(() => ownedBy(a.observed).length === PARTITIONS, 25000)).toBe(true)
+        const originalCells = ownedBy(a.observed)
+          .map((partition) => `${topic}|${partition}`)
+          .sort()
 
         const first = await produceOne('before')
-        expect(
-          await waitForCondition(async () => (await committedAt()) === first, DELIVERY_BUDGET)
-        ).toBe(true)
+        expect(await waitWithin(async () => (await committedAt()) === first, 30000)).toBe(true)
         const before = a.consumer.groupMetadata()
         const joinsBefore = a.observed.groupJoins.length
+        const rebalancesBefore = rebalances
 
         await b.consumer.connect()
         await b.consumer.subscribe({ topic: otherTopic, fromBeginning: true })
         await b.consumer.run({ eachMessage: async () => {} })
+        let advancedEpoch = null
         expect(
-          await waitForCondition(async () => {
+          await waitWithin(async () => {
             const { members } = await a.consumer.describeGroup()
             const member = members.find(({ memberId }) => memberId === before.memberId)
-            return (
+            if (
               members.length === 2 &&
               member?.memberEpoch > before.generationId &&
-              a.consumer.groupMetadata().generationId === member.memberEpoch
-            )
-          }, ASSIGNMENT_BUDGET)
+              a.consumer.groupMetadata().generationId === member.memberEpoch &&
+              JSON.stringify(cellsOf(member)) === JSON.stringify(originalCells)
+            ) {
+              advancedEpoch = member.memberEpoch
+              return true
+            }
+            return false
+          }, 30000)
         ).toBe(true)
 
         expect(a.consumer.groupMetadata().memberId).toBe(before.memberId)
         expect(ownedBy(a.observed)).toEqual(allPartitions())
         expect(a.observed.groupJoins).toHaveLength(joinsBefore)
 
+        // Partition 0 held only the first record until now, so no commit before this produce,
+        // the B-join round's included, can store the offset the next wait asks for.
         const second = await produceOne('after')
-        expect(
-          await waitForCondition(async () => (await committedAt()) === second, DELIVERY_BUDGET)
-        ).toBe(true)
+        expect(Number(second)).toBeGreaterThan(Number(first))
+        expect(await waitWithin(async () => (await committedAt()) === second, 40000)).toBe(true)
+        // No later round committed it: none started, none completed and the epoch never moved.
+        expect(rebalances).toBe(rebalancesBefore)
+        expect(a.observed.groupJoins).toHaveLength(joinsBefore)
+        expect(a.consumer.groupMetadata().generationId).toBe(advancedEpoch)
         expect(a.observed.lost).toEqual([])
         expect(a.observed.crashes).toEqual([])
         expect(b.observed.crashes).toEqual([])

@@ -182,8 +182,14 @@ describe('Consumer > OffsetManager > the member epoch a commit carries', () => {
     'refuses a commit built under member epoch %i without a request',
     async (epoch) => {
       const offsetCommit = jest.fn(async () => {})
-      const { manager, coordinator } = build({ membershipProtocol: 'consumer', offsetCommit })
+      const { manager, coordinator, cluster } = build({
+        membershipProtocol: 'consumer',
+        offsetCommit,
+      })
+      // A disconnected coordinator makes any lookup reach discovery.
+      coordinator.isConnected = () => false
       manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+      const getCoordinator = jest.spyOn(manager, 'getCoordinator')
       manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
 
       await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
@@ -192,6 +198,8 @@ describe('Consumer > OffsetManager > the member epoch a commit carries', () => {
       expect(caught).toBeInstanceOf(KafkaJSCommitFailedError)
       expect(caught.message).toBe('The commit outlived its assignment')
       expect(caught.reason).toBe('stale-assignment')
+      expect(getCoordinator).not.toHaveBeenCalled()
+      expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
       expect(offsetCommit).not.toHaveBeenCalled()
       expect(manager.resolvedOffsetAt(TOPIC, 0)).toEqual('6')
     }
