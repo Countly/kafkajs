@@ -9,6 +9,7 @@ const {
   KafkaJSNotImplemented,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSDeliveryTimeout,
+  KafkaJSCommitFailedError,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { stampOffsetCommit, stampMembership } = require('../rebalanceErrorContract')
@@ -356,6 +357,42 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets, {
         guard: expect.any(Function),
       })
+    })
+
+    it('checks the guards of its commits against the batch identity, never the batch', async () => {
+      const batch = new Batch(topicName, 0, {
+        partition,
+        highWatermark: 5,
+        messages: [{ offset: 4, key: '1', value: '2' }],
+      })
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batch)
+      const { commitOffsetsIfNecessary } = eachBatch.mock.calls[0][0]
+      const commitRefusal = jest.spyOn(runner, 'commitRefusal')
+
+      await commitOffsetsIfNecessary()
+      expect(consumerGroup.commitOffsetsIfNecessary.mock.calls[0][0].guard()).toBeNull()
+      const offsets = {
+        topics: [{ topic: topicName, partitions: [{ offset: '1', partition: 0 }] }],
+      }
+      await commitOffsetsIfNecessary(offsets)
+      expect(consumerGroup.commitOffsets.mock.calls.at(-1)[1].guard()).toBeNull()
+
+      expect(commitRefusal).toHaveBeenCalledTimes(3)
+      for (const [, checked] of commitRefusal.mock.calls) {
+        expect(checked).not.toBeInstanceOf(Batch)
+        expect(checked).toEqual({
+          topic: topicName,
+          partition,
+          assignmentEpoch: null,
+          acquireClock: undefined,
+          ownershipKey: undefined,
+          acquisition: undefined,
+          groupId: 'test-group',
+          runIdentity: undefined,
+        })
+      }
     })
 
     it('pauses the partition of the batch through "pause", and resumes it through what it returns', async () => {
@@ -719,6 +756,59 @@ describe('Consumer > Runner', () => {
 
       expect(eachBatch).toHaveBeenCalled()
       expect(consumerGroup.commitOffsets).toHaveBeenCalled()
+    })
+
+    it('checks the guard of the per-batch commit against the batch identity, never the batch', async () => {
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+      const commitRefusal = jest.spyOn(runner, 'commitRefusal')
+
+      expect(consumerGroup.commitOffsets.mock.calls[0][1].guard()).toBeNull()
+
+      expect(commitRefusal).toHaveBeenCalledTimes(1)
+      const checked = commitRefusal.mock.calls[0][1]
+      expect(checked).not.toBeInstanceOf(Batch)
+      expect(checked).toEqual({
+        topic: topicName,
+        partition,
+        assignmentEpoch: 0,
+        acquireClock: undefined,
+        ownershipKey: undefined,
+        acquisition: undefined,
+        groupId: 'test-group',
+        runIdentity: undefined,
+      })
+    })
+
+    it('refuses the per-batch commit when the epoch moves while it is in flight', async () => {
+      let refusal = null
+      consumerGroup.commitOffsets.mockImplementation(async (offsets, { guard }) => {
+        consumerGroup.assignmentEpoch += 1
+        refusal = guard()
+      })
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.commitOffsets.mock.calls[0][1].auto).toBe(true)
+      expect(refusal).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(refusal.message).toBe('The handler outlived its assignment')
+    })
+
+    it('fences the per-batch commit by the membership once its ownership is lost', async () => {
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+      const lost = new Error('the membership was lost')
+      consumerGroup.ownership = { token: () => 7, refusal: (token) => (token === 7 ? lost : null) }
+
+      try {
+        expect(consumerGroup.commitOffsets.mock.calls[0][1].guard()).toBe(lost)
+      } finally {
+        delete consumerGroup.ownership
+      }
     })
 
     it('stops "eachMessage" after the message it was inside, resolving only that offset', async () => {

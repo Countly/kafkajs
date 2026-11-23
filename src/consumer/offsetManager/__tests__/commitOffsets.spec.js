@@ -2,7 +2,7 @@ const OffsetManager = require('../index')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { KafkaJSNumberOfRetriesExceeded } = require('../../../errors')
-const { ON_WRITE } = require('../../../broker/privateOptions')
+const { ON_WRITE, ON_DECODED } = require('../../../broker/privateOptions')
 const NOT_COORDINATOR_FOR_GROUP_CODE = 16
 
 describe('Consumer > OffsetMananger > commitOffsets', () => {
@@ -188,6 +188,77 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
     // own retrier needs to see `originalError` to know it can retry the commit.
     await expect(offsetManager.commitOffsets(offsets)).rejects.toBe(originalError)
     expect(mockCluster.refreshMetadata).toHaveBeenCalled()
+  })
+
+  describe('with a caller guard', () => {
+    const offsets = {
+      topics: [
+        {
+          topic: topic1,
+          partitions: [
+            { partition: '0', offset: '3' },
+            { partition: '1', offset: '3' },
+          ],
+        },
+      ],
+    }
+
+    /**
+     * A coordinator that decodes a reply with the given partition answers for topic-1.
+     * @param {{partition: number, errorCode: number}[]} partitions
+     * @returns {Function} an `offsetCommit` implementation
+     */
+    const answering = (partitions) => async (request, options) => {
+      options[ON_DECODED]({ responses: [{ topic: request.topics[0].topic, partitions }] })
+      return {}
+    }
+
+    it('hands the coordinator one options object whose private keys exist from its creation', async () => {
+      mockCoordinator.offsetCommit.mockImplementation(
+        answering([
+          { partition: 0, errorCode: 0 },
+          { partition: 1, errorCode: 0 },
+        ])
+      )
+
+      await offsetManager.commitOffsets(offsets, { guard: () => null })
+
+      const options = mockCoordinator.offsetCommit.mock.calls[0][1]
+      expect(Reflect.ownKeys(options)).toEqual(['guard', ON_WRITE, ON_DECODED])
+      expect(options[ON_WRITE]).toBeUndefined()
+      expect(options[ON_DECODED]).toEqual(expect.any(Function))
+    })
+
+    it('records only the cells the decoded reply accepted', async () => {
+      mockCoordinator.offsetCommit.mockImplementation(
+        answering([
+          { partition: 0, errorCode: 0 },
+          { partition: 1, errorCode: 22 },
+        ])
+      )
+
+      await offsetManager.commitOffsets(offsets, { guard: () => null })
+
+      expect(offsetManager.committedOffsets()[topic1]).toEqual({ 0: '3' })
+    })
+
+    it('rejects with the guard refusal learned during the write and records nothing', async () => {
+      const refusal = new Error('the batch no longer owns the commit')
+      let refused = null
+      mockCoordinator.offsetCommit.mockImplementation(async (request, options) => {
+        await answering([
+          { partition: 0, errorCode: 0 },
+          { partition: 1, errorCode: 0 },
+        ])(request, options)
+        refused = refusal
+        return {}
+      })
+
+      await expect(offsetManager.commitOffsets(offsets, { guard: () => refused })).rejects.toBe(
+        refusal
+      )
+      expect(offsetManager.committedOffsets()[topic1]?.[0]).toBeUndefined()
+    })
   })
 
   /**
