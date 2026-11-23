@@ -718,7 +718,9 @@ class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
  * An offset commit was refused because the consumer lost its group membership, or because a
  * handler or a retry outlived a rejoin. Reason `stale-assignment` also covers a handler commit of
  * offsets for a batch fetched before a `consumer.seek()` of its partition, with no rejoin, so it
- * does not by itself mean the group rebalanced. It is also the `cause` of the
+ * does not by itself mean the group rebalanced, and, under `groupProtocol: 'consumer'`, a commit
+ * built under a member epoch of 0 or below (a member joining, or one that left the group, such as
+ * a commit still retrying when the consumer stops). It is also the `cause` of the
  * `KafkaJSTransactionAbortableError` that refuses a transaction carrying offsets of such a batch
  * (message `A seek superseded the handler batch` or `The handler outlived its assignment`).
  * `cause` is the loss, absent for a stale handler and for a seek. For a loss the broker reported,

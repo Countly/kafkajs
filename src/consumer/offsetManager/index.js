@@ -18,6 +18,7 @@ const { isCallDeadline } = require('../groupProtocol/interface')
 const { ON_WRITE, ON_DECODED, acceptedIndex } = require('../../broker/privateOptions')
 const {
   stampGeneration,
+  sentGeneration,
   stampOffsetCommit,
   stampOwnership,
   stampMembership,
@@ -60,6 +61,22 @@ const SEEK_REFUSAL = Symbol('private:OffsetManager:seekRefusal')
  *   release?: () => void}} CommitAttempt
  */
 const UNSTABLE_RETRY_MAX_INTERVAL = 1000
+
+/**
+ * Refuses a consumer-protocol commit built under a member epoch of 0 or below. Such a member is not
+ * in the group: 0 is a member joining or rejoining, and -1 or -2 a dynamic or static member that
+ * left, whose epoch the coordinator can accept and so overwrite the final commit. Other protocols
+ * send the generation they hold.
+ * @param {'classic'|'consumer'|'manual'} membershipProtocol
+ * @param {{groupGenerationId: number}} payload the OffsetCommit payload
+ * @returns {KafkaJSCommitFailedError|null}
+ */
+const memberEpochRefusal = (membershipProtocol, { groupGenerationId }) =>
+  membershipProtocol === 'consumer' && !(groupGenerationId > 0)
+    ? new KafkaJSCommitFailedError('The commit outlived its assignment', {
+        reason: 'stale-assignment',
+      })
+    : null
 
 /**
  * @param {{topic: string, partitions: object[]}[]} topics the cells of an OffsetCommit
@@ -424,7 +441,8 @@ module.exports = class OffsetManager {
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
    *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
    *   original answer's ownership loss be learned for its own token. A retired run or a forced
-   *   close publishes nothing
+   *   close publishes nothing. `KafkaJSCommitFailedError` before any lookup or write for a
+   *   consumer-protocol payload whose member epoch is not positive (`memberEpochRefusal`)
    */
   async sendOffsetCommit(
     payload,
@@ -455,7 +473,7 @@ module.exports = class OffsetManager {
     }
 
     try {
-      let refusal = check()
+      let refusal = check() || memberEpochRefusal(this.membershipProtocol, payload)
       if (refusal) throw refusal
       const coordinator = await this.getCoordinator({ guard: check, fence })
       refusal = check()
@@ -1522,6 +1540,8 @@ module.exports = class OffsetManager {
         }
         throw e
       }
+      // A remainder rebuilt before its write was sent under a newer epoch (`sendAndRecordCommit`).
+      const sentEpoch = sentGeneration(e) ?? generationId
       // The coordinator has changed due to a restart or broker reassignment; refresh the
       // metadata *and* re-discover the coordinator so the next attempt targets the right broker.
       // Best-effort: if the retrier behind findGroupCoordinator exhausts, it rejects with a
@@ -1542,7 +1562,7 @@ module.exports = class OffsetManager {
       }
 
       if (e.type === STALE_MEMBER_EPOCH) {
-        stampGeneration(e, generationId)
+        stampGeneration(e, sentEpoch)
 
         if (auto) {
           // Java does not even back this off: the epoch is not retriable, and the next interval
@@ -1551,7 +1571,7 @@ module.exports = class OffsetManager {
           this.logger.error('Auto-commit rejected with a stale member epoch; skipping this one', {
             groupId,
             memberId,
-            memberEpoch: generationId,
+            memberEpoch: sentEpoch,
           })
 
           this.lastCommit = Date.now()
@@ -1570,13 +1590,13 @@ module.exports = class OffsetManager {
               { retriable: false, cause: e }
             )
           ),
-          generationId
+          sentEpoch
         )
       }
 
       // A commit issued before a rebalance and answered after it is answered about the generation
       // it was sent under, not the one this member holds by then.
-      throw stampGeneration(e, generationId)
+      throw stampGeneration(e, sentEpoch)
     }
   }
 
@@ -1596,8 +1616,10 @@ module.exports = class OffsetManager {
    *
    * A default selection (`since`) is sent once, under this one ticket, with only its cells that
    * are still authorized at the write: a cell sought or acquired again since the selection is
-   * removed and the request rebuilt from the rest. Every rebuild removes at least one cell, so it
-   * ends by itself; with no cell left nothing is sent and the commit completes.
+   * removed and the request rebuilt from the rest, under the consumer protocol with the member
+   * epoch current then. Only a request refused before its write is rebuilt. Every rebuild removes
+   * at least one cell, so it ends by itself; with no cell left nothing is sent and the commit
+   * completes.
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
@@ -1629,6 +1651,8 @@ module.exports = class OffsetManager {
           const cells = this.authorizedCells(sent.topics, options.since)
           if (cells.length === 0) return
           sent = { ...payload, topics: cells }
+          // Nothing was written, so the remainder is a new request: it takes the epoch current now.
+          if (this.membershipProtocol === 'consumer') sent.groupGenerationId = this.generationId
         }
       }
       if (this.instrumentationEmitter.hasListeners(COMMIT_OFFSETS)) {
