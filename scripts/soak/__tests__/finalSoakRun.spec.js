@@ -3151,16 +3151,23 @@ describe('final soak smoke schedule', () => {
       expect(work[i - 1].deadline).toBeLessThanOrEqual(work[i].at)
   })
 
-  test('the day orders its twelve outages two seconds, twelve seconds, two seconds, twelve seconds', () => {
+  test('the acceptance run orders its six outages two seconds, twelve seconds, two seconds, twelve seconds, each node stopped once clean and once hard', () => {
     const day = planSchedule(matrix, 'acceptance').steps.filter((s) => s.shape === 'broker-outage')
-    expect(day).toHaveLength(12)
+    expect(day).toHaveLength(6)
     expect(day.map((o) => o.downMs)).toEqual(
-      Array.from({ length: 12 }, (_, i) => (i % 2 === 0 ? 2000 : 12000))
+      Array.from({ length: 6 }, (_, i) => (i % 2 === 0 ? 2000 : 12000))
     )
-    expect(day.map((o) => o.node)).toEqual(Array.from({ length: 12 }, (_, i) => (i % 3) + 1))
+    expect(day.map((o) => o.node)).toEqual(Array.from({ length: 6 }, (_, i) => (i % 3) + 1))
     expect(day.map((o) => o.stop)).toEqual(
-      Array.from({ length: 12 }, (_, i) => (i % 2 === 0 ? 'clean' : 'hard'))
+      Array.from({ length: 6 }, (_, i) => (i % 2 === 0 ? 'clean' : 'hard'))
     )
+    for (const node of [1, 2, 3])
+      expect(
+        day
+          .filter((o) => o.node === node)
+          .map((o) => o.stop)
+          .sort()
+      ).toEqual(['clean', 'hard'])
   })
 })
 

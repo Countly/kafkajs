@@ -148,15 +148,15 @@ describe('final soak driver', () => {
     const ordinary = kindsWhere((k) => k.role === 'consumer' && k.churn)
     const statics = kindsWhere((k) => k.static)
     expect(totals).toEqual({
-      idleWindows: 24,
-      regexExecutions: 96,
-      recreations: 48,
-      membershipExecutions: 96,
-      outages: 12,
-      pauseSequences: Object.fromEntries(ordinary.map((k) => [k, 288])),
-      staticRestarts: Object.fromEntries(statics.map((k) => [k, 24])),
-      periodicSlots: 2881,
-      quietReadings: 72,
+      idleWindows: 12,
+      regexExecutions: 48,
+      recreations: 24,
+      membershipExecutions: 48,
+      outages: 6,
+      pauseSequences: Object.fromEntries(ordinary.map((k) => [k, 144])),
+      staticRestarts: Object.fromEntries(statics.map((k) => [k, 12])),
+      periodicSlots: 1441,
+      quietReadings: 36,
       shapes: sorted(SHAPES),
       kinds: sorted(CLIENT_KINDS),
     })
@@ -189,12 +189,64 @@ describe('final soak driver', () => {
     const outages = executions.filter((s) => s.shape === 'broker-outage')
     for (const node of [1, 2, 3]) {
       const mine = outages.filter((s) => s.node === node)
-      expect(mine).toHaveLength(4)
+      expect(mine).toHaveLength(2)
       expect(new Set(mine.map((s) => s.stop))).toEqual(new Set(['clean', 'hard']))
     }
     expect(outages.map((s) => s.downMs)).toEqual(
       outages.map((_, i) => (i % 2 === 0 ? 2000 : 12000))
     )
+  })
+
+  test('the acceptance plan lasts 12 hours and holds every scheduled event inside the run, each hour with its own events, matching every matrix total', () => {
+    const hourMs = matrix.schedule.hourMs
+    const plan = planSchedule(matrix, 'acceptance')
+    expect(plan.requestedMs).toBe(12 * hourMs)
+    expect(plan.requestedMs).toBe(matrix.acceptance.modes.acceptance.requestedMs.value)
+    for (const step of plan.steps) {
+      expect([step.id, step.at >= 0 && step.at <= plan.requestedMs]).toEqual([step.id, true])
+      if (step.type === 'execution' || step.type === 'idle' || step.type === 'quiet')
+        expect([step.id, (step.until ?? step.deadline) <= plan.requestedMs]).toEqual([
+          step.id,
+          true,
+        ])
+    }
+    const hourOf = (s) => Math.floor(s.at / hourMs)
+    const shapesIn = (h) =>
+      sorted(
+        new Set(
+          plan.steps
+            .filter((s) => SHAPES.includes(s.shape) && s.shape !== 'traffic' && hourOf(s) === h)
+            .map((s) => s.shape)
+        )
+      )
+    const every = sorted(SHAPES.filter((s) => s !== 'traffic'))
+    const odd = every.filter((s) => s !== 'broker-outage')
+    for (let h = 0; h < 12; h++) expect([h, shapesIn(h)]).toEqual([h, h % 2 === 0 ? every : odd])
+    const boundaries = plan.steps.filter((s) => s.type === 'quiet').map((s) => s.boundary)
+    expect([...new Set(boundaries)]).toEqual(
+      Array.from({ length: 12 }, (_, h) => `h${String(h).padStart(2, '0')}`)
+    )
+    const totals = scheduleTotals(plan)
+    const day = matrix.schedule.totals
+    expect({
+      idleWindows: totals.idleWindows,
+      regexExecutions: totals.regexExecutions,
+      recreations: totals.recreations,
+      membershipExecutions: totals.membershipExecutions,
+      pauseSequencesPerOrdinaryKind: [...new Set(Object.values(totals.pauseSequences))],
+      outages: totals.outages,
+      staticRestartsPerStaticKind: [...new Set(Object.values(totals.staticRestarts))],
+    }).toEqual({
+      ...day,
+      pauseSequencesPerOrdinaryKind: [day.pauseSequencesPerOrdinaryKind],
+      staticRestartsPerStaticKind: [day.staticRestartsPerStaticKind],
+    })
+    expect(totals.periodicSlots).toBe(matrix.sampling.periodicSlots.value)
+    const last = (type) => plan.steps.findLast((s) => s.type === type)
+    expect([last('seed-clear').at, last('disconnect').at]).toEqual([
+      plan.requestedMs,
+      plan.requestedMs,
+    ])
   })
 
   test('smoke mode keeps every shape in a shortened schedule', () => {
@@ -255,6 +307,7 @@ describe('final soak driver', () => {
     const hourMs = matrix.schedule.hourMs
     const plan = planSchedule(matrix, 'rehearsal')
     expect(plan.requestedMs).toBe(3 * hourMs)
+    expect(plan.requestedMs).toBeLessThan(planSchedule(matrix, 'acceptance').requestedMs)
     expect(scheduleTotals(plan)).toMatchObject({
       idleWindows: 3,
       regexExecutions: 12,
@@ -332,7 +385,7 @@ describe('final soak driver', () => {
     )
     expect(parseArgs(['--mode', 'acceptance', ...ARGS], ENV)).toMatchObject({
       mode: 'acceptance',
-      requestedMs: 86400000,
+      requestedMs: 43200000,
       brokers: ENV.KAFKA_BROKERS.split(','),
       expectSha: TREE,
       diagnostic: false,
@@ -2694,8 +2747,8 @@ describe('final soak driver', () => {
 
   test("a plan whose expected offers exceed 80% of the core checker's capacity refuses to start before it writes anything", async () => {
     const { Supervisor, offerPlan } = require('../finalSoak')
-    expect(offerPlan(matrix, 'acceptance')).toEqual({ expected: 1470745, capacity: 2000000 })
-    expect(1470745 / 2000000).toBeLessThanOrEqual(0.8)
+    expect(offerPlan(matrix, 'acceptance')).toEqual({ expected: 735373, capacity: 2000000 })
+    expect(735373 / 2000000).toBeLessThanOrEqual(0.8)
     expect(offerPlan(matrix, 'smoke')).toEqual({ expected: 24515, capacity: 2000000 })
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'final-soak-capacity-'))
     const options = {
@@ -2706,9 +2759,9 @@ describe('final soak driver', () => {
     }
     try {
       const day = new Supervisor({ ...options, mode: 'acceptance' })
-      day.matrix.traffic.maxOffers.value = 1600000
+      day.matrix.traffic.maxOffers.value = 900000
       await expect(day.run()).rejects.toThrow(
-        "the plan expects 1470745 offers, more than 80% of the core checker's capacity of 1600000 (traffic.maxOffers)"
+        "the plan expects 735373 offers, more than 80% of the core checker's capacity of 900000 (traffic.maxOffers)"
       )
       const smoke = new Supervisor({ ...options, mode: 'smoke' })
       smoke.matrix.traffic.maxOffers.value = 30000

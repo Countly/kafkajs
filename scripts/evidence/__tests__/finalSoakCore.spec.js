@@ -1246,29 +1246,29 @@ describe('scripts/evidence/finalSoakCore', () => {
     }
 
     it('fails a judged endpoint above the bound', async () => {
-      const world = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
+      const world = judged('p04', (h) => 9e6 + (h >= 9 ? 3 * MIB : 0))
       expectRow(await check(world), 'K5', 'FAIL', /p04 judged heap endpoint 3145728 bytes/)
     })
 
     it('fails a judged slope above the bound even when the endpoint is clean', async () => {
-      const world = judged('p05', (h) => 9e6 + (h >= 12 && h <= 20 ? 500 * MIB : 0))
+      const world = judged('p05', (h) => 9e6 + (h >= 6 && h <= 8 ? 500 * MIB : 0))
       const report = await check(world)
       expectRow(report, 'K5', 'FAIL', /p05 judged heap slope/)
       expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p05.*endpoint/)
     })
 
-    it('passes a day whose whole-process heap grows 69 MiB of excluded code and prints that growth as information', async () => {
+    it('passes a run whose whole-process heap grows 33 MiB of excluded code and prints that growth as information', async () => {
       const world = fx.healthy()
       const edit = quiet('p04', (h, r) => ({ heapUsed: r.heapUsed + h * 3 * MIB }))
       const report = await check(world, { edit })
       expectRow(report, 'K5', 'PASS')
       expect(row(report, 'K5').numbers.p04).toEqual({ endpoint: 0, slopePerMinute: 0 })
       expect(report.information.heap.heapUsed.p04).toEqual({
-        endpoint: 63 * MIB,
+        endpoint: 27 * MIB,
         slopePerMinute: Math.round((3 * MIB) / 60),
       })
       expect(formatReport(report)).toContain(
-        `  whole-process heapUsed p04: endpoint ${63 * MIB} bytes, slope ${Math.round((3 * MIB) / 60)} B/min`
+        `  whole-process heapUsed p04: endpoint ${27 * MIB} bytes, slope ${Math.round((3 * MIB) / 60)} B/min`
       )
     })
 
@@ -1296,7 +1296,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     ])('is inconclusive, never PASS, for a boundary with %s', async (_, fn, reason) => {
       const report = await check(receipt('p03', 'h10', fn))
       expectRow(report, 'K5', 'INCONCLUSIVE', reason)
-      expect(row(report, 'K5').reasons.join('\n')).toMatch(/p03 has 23 of 24 usable heap snapshots/)
+      expect(row(report, 'K5').reasons.join('\n')).toMatch(/p03 has 11 of 12 usable heap snapshots/)
       expect(report.overall).toBe('NOT ACCEPTED')
     })
 
@@ -1339,24 +1339,24 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('is inconclusive without a heap summary, and fails no process on one', async () => {
-      const world = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
+      const world = judged('p04', (h) => 9e6 + (h >= 9 ? 3 * MIB : 0))
       world.heap.edit = (dir) => fs.rmSync(path.join(dir, 'heap/summary.json'))
       const report = await check(world)
       expectRow(report, 'K5', 'INCONCLUSIVE', /heap\/summary\.json: missing/)
     })
 
     it('re-derives the endpoints from the kept snapshot files: a summary that disagrees with its kept snapshot, or a kept snapshot that is gone, leaves the process inconclusive', async () => {
-      const lied = judged('p04', (h) => 9e6 + (h >= 21 ? 3 * MIB : 0))
+      const lied = judged('p04', (h) => 9e6 + (h >= 9 ? 3 * MIB : 0))
       lied.heap.edit = (dir) =>
         resummarise(dir, (r) => {
-          if (r.slot === 'p04' && r.boundary === 'h23') r.judgedBytes = 9e6
+          if (r.slot === 'p04' && r.boundary === 'h11') r.judgedBytes = 9e6
         })
       const report = await check(lied)
       expectRow(
         report,
         'K5',
         'INCONCLUSIVE',
-        /p04 h23 snapshot does not confirm its summary: heap\/p04\.h23\.heapsnapshot has judgedBytes 12145728, its summary 9000000/
+        /p04 h11 snapshot does not confirm its summary: heap\/p04\.h11\.heapsnapshot has judgedBytes 12145728, its summary 9000000/
       )
       expect(row(report, 'K5').numbers.p04).toBeUndefined()
       const gone = fx.healthy()
@@ -1375,29 +1375,29 @@ describe('scripts/evidence/finalSoakCore', () => {
         const h = Number(r.boundary.slice(1))
         if (r.slot === slot && judgedOf(h) !== undefined) r.judgedBytes = judgedOf(h)
       })
-    const leak = (h) => 9e6 + (h >= 21 ? 3 * MIB : 0)
+    const leak = (h) => 9e6 + (h >= 9 ? 3 * MIB : 0)
 
     it.each([
       [
         'its files deleted',
         leak,
-        (h) => (h === 21 || h === 22 ? 9e6 : undefined),
-        ['h21', 'h22'],
-        /p04 h21 snapshot does not confirm its summary: heap\/p04\.h21\.heapsnapshot cannot be read/,
+        (h) => (h === 9 || h === 10 ? 9e6 : undefined),
+        ['h09', 'h10'],
+        /p04 h09 snapshot does not confirm its summary: heap\/p04\.h09\.heapsnapshot cannot be read/,
       ],
       [
         'its files still on disk',
         leak,
-        (h) => (h === 21 || h === 22 ? 9e6 : undefined),
+        (h) => (h === 9 || h === 10 ? 9e6 : undefined),
         [],
-        /p04 h21 snapshot does not confirm its summary: heap\/p04\.h21\.heapsnapshot has judgedBytes 12145728, its summary 9000000/,
+        /p04 h09 snapshot does not confirm its summary: heap\/p04\.h09\.heapsnapshot has judgedBytes 12145728, its summary 9000000/,
       ],
       [
         'a steady leak raised at the start and lowered at the end',
-        (h) => 9e6 + h * 150000,
-        (h) => ({ 1: 11e6, 2: 11e6, 21: 9e6, 22: 9e6 })[h],
+        (h) => 9e6 + h * 300000,
+        (h) => ({ 1: 11e6, 2: 11e6, 9: 9e6, 10: 9e6 })[h],
         [],
-        /p04 h01 snapshot does not confirm its summary: heap\/p04\.h01\.heapsnapshot has judgedBytes 9150000, its summary 11000000/,
+        /p04 h01 snapshot does not confirm its summary: heap\/p04\.h01\.heapsnapshot has judgedBytes 9300000, its summary 11000000/,
       ],
     ])(
       'never passes a day whose middle summary records lie about the endpoint inputs, %s: every snapshot is re-derived from its file',
@@ -1413,23 +1413,23 @@ describe('scripts/evidence/finalSoakCore', () => {
       }
     )
 
-    /** @returns {(dir: string) => void} an edit making p04's h23 record a copy of `slot`'s `boundary` record */
+    /** @returns {(dir: string) => void} an edit making p04's h11 record a copy of `slot`'s `boundary` record */
     const pointAt = (slot, boundary) => (dir) => {
       const summary = summaryOf(dir)
       const source = summary.records.find((r) => r.slot === slot && r.boundary === boundary)
-      const i = summary.records.findIndex((r) => r.slot === 'p04' && r.boundary === 'h23')
+      const i = summary.records.findIndex((r) => r.slot === 'p04' && r.boundary === 'h11')
       const { at, ms } = summary.records[i]
-      summary.records[i] = { ...source, slot: 'p04', boundary: 'h23', at, ms }
+      summary.records[i] = { ...source, slot: 'p04', boundary: 'h11', at, ms }
       fs.writeFileSync(path.join(dir, 'heap/summary.json'), JSON.stringify(summary))
     }
-    /** @returns {(dir: string) => void} an edit changing p04's h23 record by `fn` */
+    /** @returns {(dir: string) => void} an edit changing p04's h11 record by `fn` */
     const lastRecord = (fn) => (dir) =>
       resummarise(dir, (r) => {
-        if (r.slot === 'p04' && r.boundary === 'h23') fn(r)
+        if (r.slot === 'p04' && r.boundary === 'h11') fn(r)
       })
 
     it.each([
-      ['another process’s snapshot of the same boundary', pointAt('p05', 'h23'), {}],
+      ['another process’s snapshot of the same boundary', pointAt('p05', 'h11'), {}],
       ['its own process’s snapshot of another boundary', pointAt('p04', 'h00'), {}],
       [
         'a size other than the one the worker recorded',
@@ -1439,20 +1439,20 @@ describe('scripts/evidence/finalSoakCore', () => {
       ['a receipt whose size is not the file’s', () => {}, { bytes: (r) => r.bytes + 1 }],
       [
         'a receipt naming another process’s file',
-        lastRecord((r) => (r.file = 'heap/p05.h23.heapsnapshot')),
-        { file: () => 'heap/p05.h23.heapsnapshot' },
+        lastRecord((r) => (r.file = 'heap/p05.h11.heapsnapshot')),
+        { file: () => 'heap/p05.h11.heapsnapshot' },
       ],
     ])(
       'never passes a leaking process whose last record is bound to %s',
       async (_, edit, fields) => {
-        const world = judged('p04', (h) => 9e6 + (h >= 22 ? 3 * MIB : 0))
+        const world = judged('p04', (h) => 9e6 + (h >= 10 ? 3 * MIB : 0))
         world.heap.edit = edit
         const changed = (r) =>
           Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, value(r)]))
         const supervisor = (s) => ({
           ...s,
           heapSnapshots: s.heapSnapshots.map((r) =>
-            r.slot === 'p04' && r.boundary === 'h23' ? { ...r, ...changed(r) } : r
+            r.slot === 'p04' && r.boundary === 'h11' ? { ...r, ...changed(r) } : r
           ),
         })
         const report = await check(world, { supervisor })
@@ -1460,7 +1460,7 @@ describe('scripts/evidence/finalSoakCore', () => {
           report,
           'K5',
           'INCONCLUSIVE',
-          /p04 h23 has a heap snapshot summary that disagrees with the supervisor receipt/
+          /p04 h11 has a heap snapshot summary that disagrees with the supervisor receipt/
         )
         expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p04 judged heap endpoint/)
       }
@@ -1470,10 +1470,10 @@ describe('scripts/evidence/finalSoakCore', () => {
       const report = await check(fx.healthy())
       expectRow(report, 'K5', 'PASS')
       expect(report.information.heap.control).toEqual({
-        p13: { endpoint: 42 * MIB, slopePerMinute: Math.round((2 * MIB) / 60) },
+        p13: { endpoint: 18 * MIB, slopePerMinute: Math.round((2 * MIB) / 60) },
       })
       expect(formatReport(report)).toContain(
-        `  seed control p13 (judged heap, must exceed 2097152 bytes): endpoint ${42 * MIB} bytes, slope ${Math.round((2 * MIB) / 60)} B/min`
+        `  seed control p13 (judged heap, must exceed 2097152 bytes): endpoint ${18 * MIB} bytes, slope ${Math.round((2 * MIB) / 60)} B/min`
       )
     })
 
@@ -1485,7 +1485,7 @@ describe('scripts/evidence/finalSoakCore', () => {
       ],
       [
         'grows exactly the breach bound',
-        (h) => 9e6 + (h >= 21 ? 2 * MIB : 0),
+        (h) => 9e6 + (h >= 9 ? 2 * MIB : 0),
         /seed p13 does not show its leak: judged heap endpoint 2097152 bytes is not above 2097152/,
       ],
     ])('cannot pass the heap row when the seed %s', async (_, bytes, reason) => {
@@ -1556,7 +1556,7 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('leaves a boundary whose quiet readings completed after its hour out of the whole-process heapUsed information line', async () => {
-      const late = (h) => h === 21 || h === 22
+      const late = (h) => h === 9 || h === 10
       const edit = quiet('p04', (h, r) =>
         late(h) ? { heapUsed: r.heapUsed + 10 * MIB, completedAt: r.completedAt + 3600000 } : {}
       )
@@ -1581,11 +1581,11 @@ describe('scripts/evidence/finalSoakCore', () => {
       const report = await check(world)
       expectRow(report, 'K5', 'PASS')
       expect(report.information.heap.comparison).toEqual({
-        p14: { endpoint: 63 * MIB, slopePerMinute: Math.round((3 * MIB) / 60) },
+        p14: { endpoint: 27 * MIB, slopePerMinute: Math.round((3 * MIB) / 60) },
         p16: { endpoint: 0, slopePerMinute: 0 },
       })
       expect(formatReport(report)).toContain(
-        `  judged heap of harness-only p14: endpoint ${63 * MIB} bytes`
+        `  judged heap of harness-only p14: endpoint ${27 * MIB} bytes`
       )
     })
 
@@ -1729,7 +1729,7 @@ describe('scripts/evidence/finalSoakCore', () => {
 
     it('is inconclusive when another sample of the process completed after its final sample', async () => {
       const edit = mapRecords(
-        (r) => isSample('p02', 'periodic')(r) && r.slot === 2880,
+        (r) => isSample('p02', 'periodic')(r) && r.slot === 1440,
         (r) => ({ completedAt: r.completedAt + 200 })
       )
       expectRow(
@@ -1985,12 +1985,12 @@ describe('scripts/evidence/finalSoakCore', () => {
       }
     })
 
-    it('fails a run shorter than 24 hours in acceptance mode', async () => {
+    it('fails a run shorter than 12 hours in acceptance mode', async () => {
       const header = (h) => ({
         ...h,
         window: { ...h.window, requestedMs: 3600000, runEndAt: h.window.runStartAt + 3600000 },
       })
-      expectRow(await check(fx.healthy(), { header }), 'K7', 'FAIL', /3600000.*86400000/)
+      expectRow(await check(fx.healthy(), { header }), 'K7', 'FAIL', /3600000.*43200000/)
     })
 
     it('fails a run window that is not the requested time', async () => {
@@ -2379,21 +2379,21 @@ describe('scripts/evidence/finalSoakCore', () => {
     const outages = (n) =>
       Array.from({ length: n }, (_, k) => brokerState(k % 2 ? 'ready' : 'down', 4000 + k * 1000))
 
-    it('keeps and prints every down and ready record of the twelve scheduled outages of a day', async () => {
-      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(24)] })
+    it('keeps and prints every down and ready record of the six scheduled outages of the acceptance run', async () => {
+      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(12)] })
       expect(report.information.outages.map((o) => `${o.event}@${o.at}`)).toEqual(
-        outages(24).map((o) => `${o.event}@${o.at}`)
+        outages(12).map((o) => `${o.event}@${o.at}`)
       )
       expect(report.information.outagesNotShown).toBe(0)
       const info = formatReport(report).split('NOT JUDGED information')[1]
-      expect(info.match(/^ {2}broker 2 (down|ready) at/gm)).toHaveLength(24)
-      expect(info).toMatch(/broker 2 ready at 27000/)
+      expect(info.match(/^ {2}broker 2 (down|ready) at/gm)).toHaveLength(12)
+      expect(info).toMatch(/broker 2 ready at 15000/)
       expect(info).not.toMatch(/not shown/)
     })
 
     it('prints how many down and ready records beyond the schedule it did not keep', async () => {
-      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(27)] })
-      expect(report.information.outages).toHaveLength(24)
+      const report = await check(fx.healthy(), { edit: (records) => [...records, ...outages(15)] })
+      expect(report.information.outages).toHaveLength(12)
       expect(report.information.outagesNotShown).toBe(3)
       expect(formatReport(report)).toMatch(/3 more broker down or ready records not shown/)
     })

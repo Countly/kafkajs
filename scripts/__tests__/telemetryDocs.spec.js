@@ -509,8 +509,8 @@ describe('telemetry resource documentation', () => {
   })
 
   test('retains the long-run obligation and the changelog lines', () => {
-    expect(telemetry).toContain('final 24-hour idle/churn obligation')
-    expect(testing).toContain('never closes the final 24-hour idle/churn gate')
+    expect(telemetry).toContain('final 12-hour idle/churn obligation')
+    expect(testing).toContain('never closes the final 12-hour idle/churn gate')
     const changelog = read('CHANGELOG.md').replace(/\s+/g, ' ')
     expect(changelog).toContain(
       'Verify bounded telemetry resources, repeated reopen and natural shutdown under subscription and connection churn.'

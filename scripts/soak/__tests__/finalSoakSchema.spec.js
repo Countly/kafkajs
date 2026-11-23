@@ -937,14 +937,14 @@ describe('scripts/soak/finalSoakSchema', () => {
     expect(
       Object.fromEntries(matrix.rows.map((row) => [row.id, row.minima.map(minimumOf)]))
     ).toEqual({
-      'rs-p10': [24, 96, 48, 96, 288, 12, 24, 46096, 936, 10000],
-      'rs-t11': [72, 864, 1728],
-      'rs-g07': [46096, 936, 672],
-      'rs-l14': [72, 24, 96, 3],
+      'rs-p10': [12, 48, 24, 48, 144, 6, 12, 23056, 468, 5000],
+      'rs-t11': [36, 432, 864],
+      'rs-g07': [23056, 468, 336],
+      'rs-l14': [36, 12, 48, 3],
       'rs-l15': [80000, 80000],
-      'rs-l16': [1000000, 72],
-      'rs-l22': [384, 288, 1728, 288],
-      'rs-l24': [96, 192, 144],
+      'rs-l16': [475000, 36],
+      'rs-l22': [192, 144, 864, 144],
+      'rs-l24': [48, 96, 72],
     })
     const rulesOf = (name) => matrix.predicates[name].rules.join(' ')
     const anchors = {
@@ -1031,6 +1031,42 @@ describe('scripts/soak/finalSoakSchema', () => {
     expect(lengthOf(4 * matrix.schedule.hourMs)).toEqual([])
     expect(lengthOf(2 * matrix.schedule.hourMs)).toEqual([problem])
     expect(lengthOf(3.5 * matrix.schedule.hourMs)).toEqual([problem])
+  })
+
+  it('the acceptance run is exactly twelve hours, the rehearsal shorter, and every schedule total is what the hourly plan makes over the run', () => {
+    expect(validateMatrix(matrix)).toEqual([])
+    expect(matrix.acceptance.modes.acceptance.requestedMs.value).toBe(12 * matrix.schedule.hourMs)
+    const edited = (edit) => {
+      const m = copy(matrix)
+      edit(m)
+      return validateMatrix(m)
+    }
+    expect(
+      edited((m) => {
+        m.acceptance.modes.acceptance.requestedMs.value = 86400000
+        m.sampling.periodicSlots.value = 2881
+      })
+    ).toEqual([
+      'matrix.acceptance.modes.acceptance.requestedMs is not twelve hours',
+      'matrix.schedule.totals.idleWindows is not the 24 the acceptance plan makes',
+      'matrix.schedule.totals.regexExecutions is not the 96 the acceptance plan makes',
+      'matrix.schedule.totals.recreations is not the 48 the acceptance plan makes',
+      'matrix.schedule.totals.membershipExecutions is not the 96 the acceptance plan makes',
+      'matrix.schedule.totals.pauseSequencesPerOrdinaryKind is not the 288 the acceptance plan makes',
+      'matrix.schedule.totals.outages is not the 12 the acceptance plan makes',
+      'matrix.schedule.totals.staticRestartsPerStaticKind is not the 24 the acceptance plan makes',
+    ])
+    expect(edited((m) => (m.schedule.totals.outages = 12))).toEqual([
+      'matrix.schedule.totals.outages is not the 6 the acceptance plan makes',
+    ])
+    expect(edited((m) => (m.schedule.totals.idleWindows = 11))).toEqual([
+      'matrix.schedule.totals.idleWindows is not the 12 the acceptance plan makes',
+    ])
+    expect(
+      edited((m) => (m.acceptance.modes.rehearsal.requestedMs.value = 12 * m.schedule.hourMs))
+    ).toEqual([
+      'matrix.acceptance.modes.rehearsal.requestedMs is not shorter than the acceptance run',
+    ])
   })
 
   it('a complete fixture with every record kind and variant is structurally valid', () => {
@@ -1310,8 +1346,8 @@ describe('scripts/soak/finalSoakSchema', () => {
         'rows[1].scope is not',
       ],
       'periodic slots off the grid': [
-        edited((m) => (m.sampling.periodicSlots.value = 2880)),
-        'periodicSlots does not cover the day',
+        edited((m) => (m.sampling.periodicSlots.value = 1440)),
+        'periodicSlots does not cover the acceptance run',
       ],
       'one forced collection': [
         edited((m) => (m.sampling.gcCollections.value = 1)),
