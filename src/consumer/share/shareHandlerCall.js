@@ -297,12 +297,14 @@ class ShareHandlerCall {
 
   /**
    * Promotes only the explicit choices of a handler that is still running at a forced close, so
-   * undecided work is lost, not accepted. The call stops being authoritative.
+   * undecided work is lost, not accepted. The call stops being authoritative. A call that already
+   * lost its acquisition (session reset, leader move) promotes nothing, as a fenced return does not.
    * @returns {void}
    */
   freeze() {
     if (!this.open) return
     this.open = false
+    if (!this.authority.current()) return
     const offsets = this.offsetsWhere(true)
     if (offsets.length) this.ledger.complete(offsets, 'release')
   }
