@@ -215,7 +215,8 @@ bytes of a snapshot are the self bytes of every node except those of the exclude
 endpoint (2,097,152 bytes, median of the last three boundaries minus the first three) and slope (262,144 B/min over the
 snapshot start times) bounds to them, in every mode that judges the row. On an acceptance run the endpoint bound is scaled
 to the hours between its endpoint medians, so it rejects the same steady growth per hour as the 21 hours of a 24-hour run:
-floor(2,097,152 x 9 / 21) = 898,779 bytes on 12 boundaries (about 100 KB per hour). The seed's breach bound stays
+floor(2,097,152 x 9 / 21) = 898,779 bytes on 12 boundaries (about 100 KB per hour). A smoke, a rehearsal and a subject
+with a missing boundary are judged on the unscaled 2,097,152 bytes. The seed's breach bound stays
 2,097,152 bytes.
 
 Excluded node types: `code`.

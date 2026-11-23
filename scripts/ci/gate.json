@@ -22684,6 +22684,7 @@
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a rehearsal judges K5 by the matrix endpoint bound on judged bytes, not scaled to its length: growth of exactly the bound passes, one byte more fails",
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore a rehearsal judges K5 by the matrix slope bound per minute on judged bytes: just under it no slope reason, just over it a slope FAIL",
         "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore K5 heap fails a steady judged growth of 150,000 bytes an hour, which a 24-hour run rejected, on the endpoint bound scaled to the run",
+        "scripts/evidence/__tests__/finalSoakCore.spec.js \u203a scripts/evidence/finalSoakCore K5 heap judges a series with a missing snapshot on the unscaled endpoint bound, so the row is inconclusive and not a FAIL",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on UNKNOWN_MEMBER_ID",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap looks the coordinator up again after the rebootstrap retired it and rejoins at epoch 0 on FENCED_MEMBER_EPOCH",
         "src/consumer/share/__tests__/shareConsumerRebootstrap.spec.js \u203a share membership across a rebootstrap logs the name, type and code of each failing share heartbeat",

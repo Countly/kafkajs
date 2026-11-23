@@ -1383,6 +1383,7 @@ function judgeHeap(row, ctx) {
   const { matrix, config, supervisor, plan, mode } = ctx
   const limits = {
     endpoint: endpointCeiling(matrix.bounds['heap-endpoint'].value, plan, mode),
+    bound: matrix.bounds['heap-endpoint'].value,
     slope: matrix.bounds['heap-slope'].value,
   }
   const problems = []
@@ -1404,8 +1405,10 @@ function judgeHeap(row, ctx) {
     if (points.length < 2) continue
     const r = heapScreen(points)
     row.numbers[slot] = screenNumbers(r)
-    if (!(r.endpoint <= limits.endpoint))
-      row.fail(`${slot} judged heap endpoint ${r.endpoint} bytes exceeds ${limits.endpoint}`)
+    // A series with a missing boundary spans unknown hours: only the unscaled bound holds for it.
+    const endpoint = points.length === plan.hours ? limits.endpoint : limits.bound
+    if (!(r.endpoint <= endpoint))
+      row.fail(`${slot} judged heap endpoint ${r.endpoint} bytes exceeds ${endpoint}`)
     if (!(r.slope <= limits.slope))
       row.fail(`${slot} judged heap slope ${Math.round(r.slope)} B/min exceeds ${limits.slope}`)
   }

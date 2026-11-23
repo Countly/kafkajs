@@ -1262,6 +1262,18 @@ describe('scripts/evidence/finalSoakCore', () => {
       expect(core.endpointCeiling(bound, plan(3), 'rehearsal')).toBe(bound)
     })
 
+    it('judges a series with a missing snapshot on the unscaled endpoint bound, so the row is inconclusive and not a FAIL', async () => {
+      const world = receipt(
+        'p03',
+        'h10',
+        (r) => ({ at: r.at + 3600000 }),
+        judged('p03', (h) => 9e6 + h * 120000)
+      )
+      const report = await check(world)
+      expectRow(report, 'K5', 'INCONCLUSIVE', /p03 has 11 of 12 usable heap snapshots/)
+      expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p03 judged heap endpoint/)
+    })
+
     it('fails a judged slope above the bound even when the endpoint is clean', async () => {
       const world = judged('p05', (h) => 9e6 + (h >= 6 && h <= 8 ? 600 * MIB : 0))
       const report = await check(world)

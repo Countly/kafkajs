@@ -698,7 +698,7 @@
     "HeapOK": {
       "rules": [
         "Only the 12 unseeded subject processes are judged; for process p and h = 0..11, Y[h] = the judged bytes of the V8 heap snapshot p writes after the last quiet reading of boundary h, the self bytes of every snapshot node except those of node type code (compiled code, bytecode and their bookkeeping), whoever owns them; X[h] = the minute the snapshot began.",
-        "endpoint = median(Y[9..11]) - median(Y[0..2]); slope = the least-squares slope of Y over X; HeapOK(p) iff endpoint <= the heap endpoint bound and slope <= the heap slope bound.",
+        "endpoint = median(Y[9..11]) - median(Y[0..2]); slope = the least-squares slope of Y over X; HeapOK(p) iff endpoint <= the heap endpoint bound scaled to the hours between the endpoint medians (bound x 9 / 21 on 12 boundaries) and slope <= the heap slope bound.",
         "Medians of an even count take the upper middle.",
         "A boundary without a usable snapshot leaves HeapOK(p) INCONCLUSIVE, never PASS. Every judged Y[h] is re-derived from its own sealed snapshot file (the process's file of boundary h, with the size the worker recorded); a summary record its file does not confirm leaves HeapOK(p) INCONCLUSIVE.",
         "The seed writes the same snapshots and its endpoint is computed the same way; it is the positive control of the snapshot pipeline: unless it exceeds the seed's breach bound, HeapOK is INCONCLUSIVE for every process, and the seed never fails an unseeded process.",
