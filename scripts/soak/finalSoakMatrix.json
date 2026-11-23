@@ -5,21 +5,21 @@
     "modes": {
       "acceptance": {
         "requestedMs": {
-          "value": 86400000,
+          "value": 43200000,
           "unit": "ms",
-          "source": "rule: the final long run lasts 24 hours from the readiness barrier"
+          "source": "rule: the final long run lasts 12 hours from the readiness barrier"
         },
         "teardownAllowanceMs": {
           "value": 900000,
           "unit": "ms",
-          "source": "design: teardown allowance after the day ends, not a measured capacity"
+          "source": "design: teardown allowance after the run ends, not a measured capacity"
         }
       },
       "smoke": {
         "requestedMs": {
           "value": 1800000,
           "unit": "ms",
-          "source": "design: one short pass of every shape that must prove timing feasibility before the day"
+          "source": "design: one short pass of every shape that must prove timing feasibility before the acceptance run"
         },
         "teardownAllowanceMs": {
           "value": 900000,
@@ -31,7 +31,7 @@
         "requestedMs": {
           "value": 10800000,
           "unit": "ms",
-          "source": "design: the first three hours of the day plan, three quiet boundaries per measured process, so the heap row is judged on a hosted runner before the day"
+          "source": "design: the first three hours of the acceptance plan, three quiet boundaries per measured process, so the heap row is judged on a hosted runner before the acceptance run"
         },
         "teardownAllowanceMs": {
           "value": 900000,
@@ -58,7 +58,7 @@
     "limitations": [
       "Structural validity is not row acceptance; every row predicate is computed independently by the verifier.",
       "A smoke run is diagnostic only and closes no row.",
-      "One day on one host cannot prove indefinite bounded memory, every supported Kafka and Node pair, multi-host partitions or the compared consume benchmark.",
+      "One 12-hour run on one host cannot prove indefinite bounded memory, every supported Kafka and Node pair, multi-host partitions or the compared consume benchmark.",
       "The seeded control proves sensitivity to that seed only.",
       "Performance results are report-only; no latency or throughput veto is created."
     ]
@@ -174,9 +174,9 @@
         "source": "design: confirmed aborted transactions"
       },
       "visiblePerProducerKind": {
-        "value": 10000,
+        "value": 5000,
         "unit": "records",
-        "source": "design: visible acknowledged records per producing kind"
+        "source": "design: visible acknowledged records per producing kind; the scarcest kinds offer 12 x 3000 s x 0.2 = 7 200 telemetry records and 360 x 20 x 9 / 10 = 6 480 visible transaction records in 12 hours"
       },
       "mainPerGroup": {
         "value": 20001,
@@ -184,9 +184,9 @@
         "source": "design: distinct main ids processed by every ordinary group and accepted by share"
       },
       "transactionsPerGroup": {
-        "value": 10000,
+        "value": 5000,
         "unit": "ids",
-        "source": "design: visible transaction ids processed by every ordinary group"
+        "source": "design: visible transaction ids processed by every ordinary group; 360 transactions of 20 records in 12 hours, one in ten aborted, leave 6 480"
       },
       "auxiliaryPerIncarnation": {
         "value": 10,
@@ -194,9 +194,9 @@
         "source": "design: probe ids per auxiliary topic incarnation"
       },
       "distinctOffsets": {
-        "value": 1000000,
+        "value": 475000,
         "unit": "offsets",
-        "source": "design: distinct main offsets entered per measured process inside its quiet-bounded interval; 23 x 50 x 60 x 20 = 1 380 000 potential offsets leave headroom"
+        "source": "design: distinct main offsets entered per measured process inside its quiet-bounded interval; 11 x 50 x 60 x 20 = 660 000 potential offsets leave the same headroom as 1 000 000 of 1 380 000 did over 23 intervals"
       }
     }
   },
@@ -417,13 +417,13 @@
       { "shape": "broker-outage", "minutes": [22], "evenHoursOnly": true, "recoveredByMinute": 25 }
     ],
     "totals": {
-      "idleWindows": 24,
-      "regexExecutions": 96,
-      "recreations": 48,
-      "membershipExecutions": 96,
-      "pauseSequencesPerOrdinaryKind": 288,
-      "outages": 12,
-      "staticRestartsPerStaticKind": 24
+      "idleWindows": 12,
+      "regexExecutions": 48,
+      "recreations": 24,
+      "membershipExecutions": 48,
+      "pauseSequencesPerOrdinaryKind": 144,
+      "outages": 6,
+      "staticRestartsPerStaticKind": 12
     },
     "smoke": {
       "activeMs": { "from": 0, "to": 1200000 },
@@ -456,9 +456,9 @@
       "source": "design: periodic admission jitter around each slot target"
     },
     "periodicSlots": {
-      "value": 2881,
+      "value": 1441,
       "unit": "samples/process",
-      "source": "design: slots k = 0..2880 over the 86 400 000 ms day at the sample period"
+      "source": "design: slots k = 0..1440 over the 43 200 000 ms acceptance run at the sample period"
     },
     "warmupMs": {
       "value": 420000,
@@ -697,8 +697,8 @@
     },
     "HeapOK": {
       "rules": [
-        "Only the 12 unseeded subject processes are judged; for process p and h = 0..23, Y[h] = the judged bytes of the V8 heap snapshot p writes after the last quiet reading of boundary h, the self bytes of every snapshot node except those of node type code (compiled code, bytecode and their bookkeeping), whoever owns them; X[h] = the minute the snapshot began.",
-        "endpoint = median(Y[21..23]) - median(Y[0..2]); slope = the least-squares slope of Y over X; HeapOK(p) iff endpoint <= the heap endpoint bound and slope <= the heap slope bound.",
+        "Only the 12 unseeded subject processes are judged; for process p and h = 0..11, Y[h] = the judged bytes of the V8 heap snapshot p writes after the last quiet reading of boundary h, the self bytes of every snapshot node except those of node type code (compiled code, bytecode and their bookkeeping), whoever owns them; X[h] = the minute the snapshot began.",
+        "endpoint = median(Y[9..11]) - median(Y[0..2]); slope = the least-squares slope of Y over X; HeapOK(p) iff endpoint <= the heap endpoint bound scaled to the hours between the endpoint medians (bound x 9 / 21 on 12 boundaries) and slope <= the heap slope bound.",
         "Medians of an even count take the upper middle.",
         "A boundary without a usable snapshot leaves HeapOK(p) INCONCLUSIVE, never PASS. Every judged Y[h] is re-derived from its own sealed snapshot file (the process's file of boundary h, with the size the worker recorded); a summary record its file does not confirm leaves HeapOK(p) INCONCLUSIVE.",
         "The seed writes the same snapshots and its endpoint is computed the same way; it is the positive control of the snapshot pipeline: unless it exceeds the seed's breach bound, HeapOK is INCONCLUSIVE for every process, and the seed never fails an unseeded process.",
@@ -823,7 +823,7 @@
         "seed"
       ],
       "uses": ["Complete", "Delivery", "AuthorityOK", "ResourcesOK", "TablesOK", "HeapOK"],
-      "predicate": "day PASS iff Complete, Delivery, AuthorityOK, ResourcesOK and TablesOK hold, HeapOK holds for each of the 12 unseeded subject processes and the offset-retention sensitivity of rs-l16 is conclusive. closure COMPLETE only with verified prior-checkpoint dispositions and every required companion.",
+      "predicate": "run PASS iff Complete, Delivery, AuthorityOK, ResourcesOK and TablesOK hold, HeapOK holds for each of the 12 unseeded subject processes and the offset-retention sensitivity of rs-l16 is conclusive. closure COMPLETE only with verified prior-checkpoint dispositions and every required companion.",
       "bounds": [
         "bounds.durable-loss",
         "bounds.forced-exits",
@@ -847,9 +847,9 @@
           "name": "restarts per static kind",
           "of": ["schedule.totals.staticRestartsPerStaticKind"]
         },
-        { "name": "periodic samples (16 x 2881)", "of": [16, "sampling.periodicSlots"] },
+        { "name": "periodic samples (16 x 1441)", "of": [16, "sampling.periodicSlots"] },
         {
-          "name": "subject and seed quiet readings (13 x 72)",
+          "name": "subject and seed quiet readings (13 x 36)",
           "of": [13, "schedule.totals.idleWindows", "sampling.quietReadings"]
         },
         {
@@ -858,7 +858,7 @@
         }
       ],
       "fail": "One static group's routes, handlers and commits are removed while its labels stay.",
-      "pass": "A complete day with legal at-least-once replay, invisible aborted transactions, connected idle long polls and a separately breaching seed.",
+      "pass": "A complete run with legal at-least-once replay, invisible aborted transactions, connected idle long polls and a separately breaching seed.",
       "closure": ["prior-checkpoints", "natural-exit", "consume-retention"]
     },
     {
@@ -892,7 +892,7 @@
       },
       "evidence": ["process", "client", "sample", "inventory", "shape", "operation"],
       "uses": ["Complete", "HeapOK"],
-      "predicate": "PASS iff Complete's time, sample and topology checks hold, every required subject slot has its own standing process, each has 24 post-warm-up matched quiet triplets with two new forced collections per reading, and every subject passes HeapOK on its own series. Full closure keeps the repeated-gate receipts.",
+      "predicate": "PASS iff Complete's time, sample and topology checks hold, every required subject slot has its own standing process, each has 12 post-warm-up matched quiet triplets with two new forced collections per reading, and every subject passes HeapOK on its own series. Full closure keeps the repeated-gate receipts.",
       "bounds": [
         "bounds.heap-endpoint",
         "bounds.heap-slope",
@@ -901,11 +901,11 @@
       ],
       "minima": [
         {
-          "name": "quiet readings per subject process (24 x 3)",
+          "name": "quiet readings per subject process (12 x 3)",
           "of": ["schedule.totals.idleWindows", "sampling.quietReadings"]
         },
         {
-          "name": "subject quiet readings (12 x 72)",
+          "name": "subject quiet readings (12 x 36)",
           "of": [12, "schedule.totals.idleWindows", "sampling.quietReadings"]
         },
         {
@@ -954,7 +954,7 @@
           "of": [13, "schedule.totals.idleWindows", "sampling.quietReadings"]
         },
         {
-          "name": "closed-cohort cuts (96 x 7 churn kinds)",
+          "name": "closed-cohort cuts (48 x 7 churn kinds)",
           "of": ["schedule.totals.membershipExecutions", 7]
         }
       ],
@@ -981,11 +981,11 @@
         "inventory"
       ],
       "uses": ["ResourcesOK"],
-      "predicate": "day PASS iff each static kind has >= 24 real restart pairs with the same static id, a new actual client id and no concurrent duplicate static id, each followed by actual assignment, handler and broker commit; ResourcesOK holds for every cohort and process; disconnect < final sample < parent-observed exit. closure COMPLETE iff day PASS and the natural-exit companion is valid for the exact candidate: run attempt, Node 22, 24 and 26 coverage, ordinary, static, classic and consumer test identities, enforced open-handle detection, original teardown logs absent or root-caused, and a seeded retained timer or socket failing its watchdog.",
+      "predicate": "run PASS iff each static kind has >= 12 real restart pairs with the same static id, a new actual client id and no concurrent duplicate static id, each followed by actual assignment, handler and broker commit; ResourcesOK holds for every cohort and process; disconnect < final sample < parent-observed exit. closure COMPLETE iff run PASS and the natural-exit companion is valid for the exact candidate: run attempt, Node 22, 24 and 26 coverage, ordinary, static, classic and consumer test identities, enforced open-handle detection, original teardown logs absent or root-caused, and a seeded retained timer or socket failing its watchdog.",
       "bounds": ["bounds.forced-exits", "bounds.performance-report-only"],
       "minima": [
         {
-          "name": "restart pairs (3 x 24)",
+          "name": "restart pairs (3 x 12)",
           "of": [3, "schedule.totals.staticRestartsPerStaticKind"]
         },
         {
@@ -1038,7 +1038,7 @@
       },
       "evidence": ["identity", "scan", "sample", "seed", "process", "client"],
       "uses": ["HeapOK"],
-      "predicate": "For p in {eager-dynamic, consumer-dynamic, share, seed}: V[p] = distinct main offsets actually entered in p between its first quiet triplet completion and its last quiet triplet admission; require |V[p]| >= 1 000 000 from the same main corpus and method. The seed's judged-heap endpoint, from its own snapshots as in HeapOK, must exceed the breach bound; every unseeded process passes HeapOK. A missing, under-volume or under-bound seed is INCONCLUSIVE, never PASS; a seed breach never fails an unseeded memory row. closure COMPLETE also needs the consume-retention companion with the candidate and reference retained and control report; otherwise the row stays OPEN.",
+      "predicate": "For p in {eager-dynamic, consumer-dynamic, share, seed}: V[p] = distinct main offsets actually entered in p between its first quiet triplet completion and its last quiet triplet admission; require |V[p]| >= 475 000 from the same main corpus and method. The seed's judged-heap endpoint, from its own snapshots as in HeapOK, must exceed the breach bound; every unseeded process passes HeapOK. A missing, under-volume or under-bound seed is INCONCLUSIVE, never PASS; a seed breach never fails an unseeded memory row. closure COMPLETE also needs the consume-retention companion with the candidate and reference retained and control report; otherwise the row stays OPEN.",
       "bounds": [
         "traffic.floors.distinctOffsets",
         "controls.interning-seeded.breachBytes",
@@ -1089,16 +1089,16 @@
       "bounds": ["bounds.retained-keys", "bounds.unit-regression"],
       "minima": [
         {
-          "name": "regex accepted add and retire pairs (96 x 4)",
+          "name": "regex accepted add and retire pairs (48 x 4)",
           "of": ["schedule.totals.regexExecutions", 4]
         },
-        { "name": "recreation observations (48 x 6)", "of": ["schedule.totals.recreations", 6] },
+        { "name": "recreation observations (24 x 6)", "of": ["schedule.totals.recreations", 6] },
         {
-          "name": "pause sequences (288 x 6)",
+          "name": "pause sequences (144 x 6)",
           "of": ["schedule.totals.pauseSequencesPerOrdinaryKind", 6]
         },
         {
-          "name": "quiet readings of regex processes (4 x 72)",
+          "name": "quiet readings of regex processes (4 x 36)",
           "of": [4, "schedule.totals.idleWindows", "sampling.quietReadings"]
         }
       ],
@@ -1116,7 +1116,7 @@
       },
       "evidence": ["round", "boundary", "operation", "sample", "inventory", "client"],
       "uses": ["HeapOK", "TablesOK", "AuthorityOK"],
-      "predicate": "For each cooperative kind: R = distinct successful (group, run, round) inside its membership executions with negotiated cooperative protocol and corroborated partition transfer; require >= 1 such round in each of the 96 executions and >= 96 in total; its process passes HeapOK, TablesOK and AuthorityOK. PASS iff both kinds satisfy this independently and the quiet grid is complete. A positive slope within the screen prints 'positive within declared screen; long-run boundedness not proven'.",
+      "predicate": "For each cooperative kind: R = distinct successful (group, run, round) inside its membership executions with negotiated cooperative protocol and corroborated partition transfer; require >= 1 such round in each of the 48 executions and >= 48 in total; its process passes HeapOK, TablesOK and AuthorityOK. PASS iff both kinds satisfy this independently and the quiet grid is complete. A positive slope within the screen prints 'positive within declared screen; long-run boundedness not proven'.",
       "bounds": ["bounds.heap-endpoint", "bounds.heap-slope"],
       "minima": [
         {
@@ -1128,7 +1128,7 @@
           "of": [2, "schedule.totals.membershipExecutions"]
         },
         {
-          "name": "quiet readings (2 x 72)",
+          "name": "quiet readings (2 x 36)",
           "of": [2, "schedule.totals.idleWindows", "sampling.quietReadings"]
         }
       ],

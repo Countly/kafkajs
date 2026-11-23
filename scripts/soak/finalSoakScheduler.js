@@ -110,11 +110,12 @@ class MonotonicClock {
 }
 
 /**
- * Expands the matrix schedule into timed steps, in start order. Each hour of the day holds the
- * matrix's one outage window on even hours; a rehearsal is the day's plan cut at its length (its
+ * Expands the matrix schedule into timed steps, in start order. The plan follows the mode's length:
+ * every hour holds the matrix's executions and idle window, and the outage window on even hours;
+ * a rehearsal is the acceptance plan cut at its length (its
  * first hours, unchanged); the smoke holds as many windows as fit between its
  * first outage and its recovery deadline, so it exercises the two down times (two seconds, then
- * twelve) in the order the day does. Work steps (`lane: 'work'`) run one
+ * twelve) in the order the acceptance run does. Work steps (`lane: 'work'`) run one
  * at a time; timer steps (periodic and quiet samples, idle windows, seed and teardown marks) start
  * at their own time regardless of work. Each execution names the client kinds that must act in it.
  * @param {object} matrix the reviewed matrix

@@ -4,7 +4,7 @@
 /**
  * Load profile driver: offers a target record rate through producers of each kind, consumes it in
  * one group, optionally runs a fault schedule, then reads every partition once with Apache's own
- * console consumer and judges it with the sequence oracle. Separate from the final soak's day plan.
+ * console consumer and judges it with the sequence oracle. Separate from the final soak's acceptance plan.
  *
  * Usage: see `loadProfile.USAGE`; `--recheck <artifact>` judges a sealed artifact again offline.
  * A run needs the repository's three-broker Compose cluster

@@ -1,7 +1,7 @@
 'use strict'
 /**
  * Final soak driver: runs the reviewed matrix's twelve real client kinds, the isolated interning
- * seed and the observer processes for one exactly timed smoke, rehearsal or 24-hour acceptance run,
+ * seed and the observer processes for one exactly timed smoke, rehearsal or 12-hour acceptance run,
  * and writes
  * the schema-3 artifact the independent verifier judges. It judges nothing itself.
  *
@@ -25,8 +25,8 @@
  * `--finalize`, which appends the parent-observed supervisor exit, hashes every file and writes
  * `header.json`; without a supervisor receipt it writes a partial manifest naming what is absent. `--duration` is
  * accepted only in smoke mode, where the matrix fixes its length. A rehearsal runs the first hours
- * of the day plan unchanged (the matrix fixes how many), so the heap row has several quiet
- * boundaries to judge before the day; like a smoke it is never acceptance evidence. `--diagnostic`
+ * of the acceptance plan unchanged (the matrix fixes how many), so the heap row has several quiet
+ * boundaries to judge before the acceptance run; like a smoke it is never acceptance evidence. `--diagnostic`
  * (smoke or rehearsal) marks a run on a host that does not meet the quiet-host floors, such as a
  * hosted CI runner; such a run proves only that the driver works against a live cluster. The modules it is split into
  * (scheduler, collector, observer, workers) are archived with it.
@@ -103,8 +103,9 @@ const HEAP_SNAPSHOT_MS = 60000
  */
 const HEAP_SNAPSHOT_ROLES = Object.freeze(['subject', 'seed', 'reader', 'decoder'])
 /**
- * Free disk kept back for a day's heap snapshots, all of which stay in the artifact: 14 processes
- * × 24 of 15 to 25 MB, and the seed's 24 growing to about 200 MB, about 7.5 to 11 GB.
+ * Free disk kept back for an acceptance run's heap snapshots, all of which stay in the artifact: 14
+ * processes × 12 of 15 to 25 MB, and the seed's 12 growing to about 100 MB, about 3 to 5 GB; the
+ * reserve is kept at the size it had for a 24-hour run.
  */
 const HEAP_SNAPSHOT_BYTES = 16 * GIB
 
@@ -303,7 +304,7 @@ function recipientGroups(config, matrix, role) {
  * and kills a child only when it is still alive a teardown allowance after its disconnect, naming
  * it in the receipt. Every failure of the run (a lost or silent child, a refused or unwritten
  * record, a late or failed step, an unconfirmed outage) is listed in the receipt's `problems`, so
- * a natural exit is never read as a successful day.
+ * a natural exit is never read as a successful run.
  */
 class Supervisor {
   /** @param {ReturnType<typeof parseArgs>} options */
@@ -396,7 +397,7 @@ class Supervisor {
   /**
    * Records a settled plan step that was not on time or not performed. A step that failed stops the
    * admission of later ones, so a run whose workload cannot be trusted does not spend the rest of
-   * its day; a step that only ended after its deadline is recorded and the run goes on.
+   * its time; a step that only ended after its deadline is recorded and the run goes on.
    * @param {{ id: string, outcome: string, error: string|null }} outcome a scheduler outcome
    * @returns {void}
    */
@@ -408,7 +409,7 @@ class Supervisor {
 
   /**
    * Sends every process its start command and checks each started: a process that could not
-   * construct or connect its clients, or was given no partition, fails readiness and the day does
+   * construct or connect its clients, or was given no partition, fails readiness and the run does
    * not start.
    * @returns {Promise<boolean>} whether every process is ready
    */
