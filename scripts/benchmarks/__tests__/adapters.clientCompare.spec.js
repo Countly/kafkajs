@@ -92,17 +92,16 @@ describe('Benchmark report clientCompare adapter', () => {
       })
     })
 
-    test('each consume corpus gives the faster arm at least 35 seconds of measured work at the fastest rate run 45023473404 saw', () => {
-      // Records per second of the fastest single run of either arm in benchmark run 45023473404
-      // (kafkajs 2.2.4 in each row); its 1 KiB 2.2.4 arm never ran, so that row allows 2.2.4
-      // twice the fork's fastest 1 KiB rate (226,457), against 1.32 times at 200 bytes.
+    test('each consume corpus gives a client reading 1,000,000 200-byte records per second, or twice the fastest 1 KiB rate of the fork, at least 35 seconds of measured work', () => {
+      // The fork reads 200-byte records at about 670,000 per second, so those rows allow
+      // 1,000,000; the 1 KiB rows allow twice the fork's fastest 1 KiB rate (226,457).
       const fastest = {
-        'compare-consume-throughput': 562872,
-        'compare-consume-throughput-same': 540005,
+        'compare-consume-throughput': 1e6,
+        'compare-consume-throughput-same': 1e6,
         'compare-consume-throughput-1k': 2 * 226457,
         'compare-consume-throughput-1k-same': 2 * 226457,
-        'compare-consume-throughput-lz4': 538654,
-        'compare-consume-throughput-12p': 502499,
+        'compare-consume-throughput-lz4': 1e6,
+        'compare-consume-throughput-12p': 1e6,
       }
       const consumeRows = compareRows.filter(
         (row) => valueOf(row.command, '--workload') === 'consume-throughput'
@@ -150,7 +149,7 @@ describe('Benchmark report clientCompare adapter', () => {
       )
       const minutes = compareRows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
 
-      expect(Math.round(minutes)).toBe(217)
+      expect(Math.round(minutes)).toBe(208)
       expect(minutes + 20).toBeLessThanOrEqual(workflow.jobs.bench['timeout-minutes'])
     })
   })

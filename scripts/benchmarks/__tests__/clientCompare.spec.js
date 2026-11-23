@@ -52,7 +52,8 @@ const legacyPartitioner = () => () => 0
 
 /**
  * An in-memory Kafka that keeps what it was asked to do in `state`. Its admin throws, as kafkajs
- * 2.2.4's does, when `createTopics` is asked to wait for leaders the broker does not know yet;
+ * 2.2.4's does, when `createTopics` waits for leaders the broker does not know yet, which both
+ * packages do unless `waitForLeaders` is false; `state.leaderWaits` lists each call's choice;
  * `metadata` lists what each `fetchTopicMetadata` answers in turn (`'unknown'`, `'no leader'`,
  * leaders for every partition when absent). `offsets` replaces what `fetchTopicOffsets` answers
  * (each partition's count of the records sent to it when absent); `state.eachMessage` is the
@@ -83,6 +84,7 @@ const fakeKafka = ({
     callbacks: 0,
     timers: new Map(),
     createdTopics: [],
+    leaderWaits: [],
     consumerConfigs: [],
     producerConfigs: [],
     metadataReads: 0,
@@ -152,7 +154,8 @@ const fakeKafka = ({
     admin() {
       return {
         connect: () => connect('admin'),
-        createTopics: async ({ topics, waitForLeaders }) => {
+        createTopics: async ({ topics, waitForLeaders = true }) => {
+          state.leaderWaits.push(waitForLeaders)
           if (waitForLeaders) throw unknownTopic()
           for (const { topic } of topics) state.topics.set(topic, [])
           state.createdTopics.push(...topics)
@@ -1057,6 +1060,14 @@ describe('Benchmarks > clientCompare', () => {
       expect(state.createdTopics).toHaveLength(1)
       expect(state.metadataReads).toBe(4)
       expect(state.sleeps).toEqual([100, 100, 100])
+    })
+
+    test('every workload asks createTopics not to wait for leaders, which both packages do by default', async () => {
+      for (const workload of WORKLOADS) {
+        const { state } = await runWith(workload, { messages: 5 })
+
+        expect([workload, state.leaderWaits]).toEqual([workload, [false]])
+      }
     })
 
     test('gives up on a topic without leaders after 30 seconds with the last answer', async () => {

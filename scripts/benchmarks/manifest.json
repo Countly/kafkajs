@@ -182,7 +182,9 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "22000000"
+        "10000000",
+        "--passes",
+        "4"
       ],
       "broker": true,
       "metrics": [
@@ -212,7 +214,9 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "22000000",
+        "10000000",
+        "--passes",
+        "4",
         "--settings",
         "same"
       ],
@@ -317,7 +321,9 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "22000000",
+        "10000000",
+        "--passes",
+        "4",
         "--compression",
         "lz4"
       ],
@@ -349,7 +355,9 @@
         "--workload",
         "consume-throughput",
         "--messages",
-        "22000000",
+        "10000000",
+        "--passes",
+        "4",
         "--partitions",
         "12"
       ],
