@@ -206,18 +206,24 @@ class FrameBuffer {
 
   /**
    * Makes the buffer hold `needed` bytes: allocated on first use, and replaced by one twice as
-   * large (up to `size`) when it is too small.
+   * large (up to `size`) when it is too small. Each buffer owns its store (never a slice of Node's
+   * pool), and an outgrown store is released at once by detaching it, so the growth of a large
+   * frame does not leave external memory for V8 to count until a collection: that count starts
+   * full (mark-compact) collections when it passes V8's limit.
    * @private
    * @param {number} needed
    * @param {number} first the bytes of the chunk, which size the first allocation when large
    */
   grow(needed, first) {
     if (this.body === null) {
-      this.body = Buffer.allocUnsafe(Math.min(this.size, Math.max(INITIAL_CAPACITY, first)))
+      this.body = Buffer.allocUnsafeSlow(Math.min(this.size, Math.max(INITIAL_CAPACITY, first)))
     } else if (needed > this.body.length) {
-      const larger = Buffer.allocUnsafe(Math.min(this.size, Math.max(this.body.length * 2, needed)))
+      const larger = Buffer.allocUnsafeSlow(
+        Math.min(this.size, Math.max(this.body.length * 2, needed))
+      )
       this.body.copy(larger, 0, 0, this.received)
       this.copied += this.received
+      this.body.buffer.transfer(0)
       this.body = larger
     }
   }
