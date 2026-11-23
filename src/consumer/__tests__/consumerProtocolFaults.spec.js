@@ -1349,6 +1349,7 @@ describe('Consumer > seam fault episodes', () => {
 })
 
 const { KafkaJSCommitFailedError } = require('../../errors')
+const createRetry = require('../../retry')
 
 /**
  * @param {object} options
@@ -1461,4 +1462,72 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
     await expect(manager.commitOffsets()).rejects.toBeInstanceOf(KafkaJSCommitFailedError)
     expect(offsetCommit).toHaveBeenCalledTimes(2)
   })
+
+  // The leave epoch is installed before the leave heartbeat is answered, and a coordinator can
+  // accept a commit under it, so a retry still backing off would overwrite the final commit.
+  test.each([
+    ['dynamic', null, -1],
+    ['static', 'instance-a', -2],
+  ])(
+    'refuses a detached commit retry after a %s leave without a request, keeping the final commit',
+    async (_kind, groupInstanceId, leaveEpoch) => {
+      jest.useFakeTimers()
+      try {
+        const stored = {}
+        const offsetCommit = jest
+          .fn(async ({ topics }) => {
+            for (const { partitions } of topics) {
+              for (const { partition, offset } of partitions) stored[partition] = offset
+            }
+          })
+          .mockRejectedValueOnce(new KafkaJSProtocolError(createErrorFromCode(3)))
+        const { group } = staleEpochHarness({ epoch: 7, offsetCommit })
+        const membership = group.groupMembership
+        membership.groupInstanceId = groupInstanceId
+        membership.ownedPartitions = [{ topic: 'topic', partitions: [0] }]
+        membership.commitBeforeRelease = (...args) => group.commitBeforeRelease(...args)
+        let answerLeave
+        membership.coordinator.consumerGroupHeartbeat = jest.fn(
+          () =>
+            new Promise((resolve) => {
+              answerLeave = resolve
+            })
+        )
+        const retrier = createRetry({ retries: 1, initialRetryTime: 1000, factor: 0 })
+        const detached = retrier(async (bail) => {
+          try {
+            await group.commitOffsets({
+              topics: [{ topic: 'topic', partitions: [{ partition: '0', offset: '3' }] }],
+            })
+          } catch (error) {
+            if (error instanceof KafkaJSCommitFailedError) return bail(error)
+            throw error
+          }
+        }).catch((error) => error)
+        await jest.advanceTimersByTimeAsync(10)
+        expect(offsetCommit).toHaveBeenCalledTimes(1)
+
+        const leaving = membership.leave()
+        await jest.advanceTimersByTimeAsync(10)
+        expect(membership.coordinator.consumerGroupHeartbeat).toHaveBeenCalledWith(
+          expect.objectContaining({ memberEpoch: leaveEpoch })
+        )
+        expect(group.generationId).toBe(leaveEpoch)
+        expect(stored).toEqual({ 0: '6' })
+
+        await jest.advanceTimersByTimeAsync(1000)
+        const caught = await detached
+        answerLeave({})
+        await leaving
+
+        expect(caught).toBeInstanceOf(KafkaJSCommitFailedError)
+        expect(caught.reason).toBe('stale-assignment')
+        const epochs = offsetCommit.mock.calls.map(([payload]) => payload.groupGenerationId)
+        expect(epochs).toEqual([7, 7])
+        expect(stored).toEqual({ 0: '6' })
+      } finally {
+        jest.useRealTimers()
+      }
+    }
+  )
 })

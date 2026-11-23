@@ -1,6 +1,6 @@
 const OffsetManager = require('../index')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
-const { KafkaJSProtocolError } = require('../../../errors')
+const { KafkaJSProtocolError, KafkaJSCommitFailedError } = require('../../../errors')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { sentGeneration, isDeletedGroupCommit } = require('../../rebalanceErrorContract')
 const { newLogger } = require('testHelpers')
@@ -174,6 +174,194 @@ describe('Consumer > OffsetManager > the member epoch a commit carries', () => {
 
     expect(epochs(offsetCommit)).toEqual([3, 3])
     expect(manager.generationId).toEqual(3)
+  })
+
+  // 0 is a member that is joining or rejoining; -1 and -2 are a dynamic and a static member that
+  // left, which the coordinator can accept and so overwrite the final commit.
+  it.each([0, -1, -2])(
+    'refuses a commit built under member epoch %i without a request',
+    async (epoch) => {
+      const offsetCommit = jest.fn(async () => {})
+      const { manager, coordinator } = build({ membershipProtocol: 'consumer', offsetCommit })
+      manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+      manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+
+      await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
+      const caught = await manager.commitOffsets().catch((e) => e)
+
+      expect(caught).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(caught.message).toBe('The commit outlived its assignment')
+      expect(caught.reason).toBe('stale-assignment')
+      expect(offsetCommit).not.toHaveBeenCalled()
+      expect(manager.resolvedOffsetAt(TOPIC, 0)).toEqual('6')
+    }
+  )
+
+  it.each(['classic', 'manual'])(
+    'sends a nonpositive generation as given under the %s protocol',
+    async (membershipProtocol) => {
+      const offsetCommit = jest.fn(async () => {})
+      const { manager } = build({ membershipProtocol, offsetCommit })
+      manager.useMembership({
+        generationId: -1,
+        memberId: 'member-a',
+        coordinator: manager.coordinator,
+      })
+      manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+
+      await manager.commitOffsets()
+
+      expect(epochs(offsetCommit)).toEqual([-1])
+    }
+  )
+})
+
+// A default selection refused before its write because a seek reached one of its cells is sent
+// again with the remaining cells (`sendAndRecordCommit`).
+describe('Consumer > OffsetManager > the member epoch of a rebuilt selection', () => {
+  const epochs = (offsetCommit) =>
+    offsetCommit.mock.calls.map(([{ groupGenerationId }]) => groupGenerationId)
+
+  /**
+   * A manager over partitions 0 and 1, both resolved, whose first OffsetCommit waits before its
+   * write and then runs the pre-write check as the broker does. `seek()` makes partition 0 sought.
+   * @param {object} [options]
+   * @param {'classic'|'consumer'} [options.membershipProtocol='consumer']
+   * @param {(request: object) => Promise<void>} [options.answer] the answer to a written request
+   * @returns {object} the manager, its coordinator and commit mock, and the controls
+   */
+  const heldAtWrite = ({ membershipProtocol = 'consumer', answer = async () => {} } = {}) => {
+    let release
+    let reached
+    const opened = new Promise((resolve) => {
+      release = resolve
+    })
+    const arrived = new Promise((resolve) => {
+      reached = resolve
+    })
+    const offsetCommit = jest.fn(async (request, options) => {
+      if (offsetCommit.mock.calls.length === 1) {
+        reached()
+        await opened
+      }
+      const refusal = options.guard()
+      if (refusal) throw refusal
+      return answer(request)
+    })
+    const { manager, coordinator } = build({ membershipProtocol, offsetCommit })
+    let sought = false
+    manager.seeks = {
+      clock: () => 0,
+      changedSince: () => sought,
+      isStaleSince: (_topic, partition) => sought && Number(partition) === 0,
+      isGated: () => false,
+    }
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+    manager.resolveOffset({ topic: TOPIC, partition: 1, offset: '7' })
+    const seek = () => {
+      sought = true
+    }
+    return { manager, coordinator, offsetCommit, arrived, release, seek }
+  }
+
+  it('sends the remainder under the current epoch and the same caller guard', async () => {
+    let epoch = 7
+    let callerRefusal = null
+    const { manager, coordinator, offsetCommit, arrived, release, seek } = heldAtWrite()
+    manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+
+    const committing = manager.commitOffsets({}, { guard: () => callerRefusal })
+    await arrived
+    epoch = 8
+    seek()
+    release()
+    await committing
+
+    expect(epochs(offsetCommit)).toEqual([7, 8])
+    expect(offsetCommit.mock.calls[1][0].topics).toEqual([
+      { topic: TOPIC, partitions: [{ partition: '1', offset: '8', leaderEpoch: -1 }] },
+    ])
+    expect(manager.committedOffsets()[TOPIC]).toEqual({ 1: '8' })
+    callerRefusal = new Error('the caller was replaced')
+    expect(offsetCommit.mock.calls[1][1].guard()).toBe(callerRefusal)
+  })
+
+  it('reports a failed remainder with the epoch it was sent under', async () => {
+    let epoch = 7
+    const { manager, coordinator, offsetCommit, arrived, release, seek } = heldAtWrite({
+      answer: async () => {
+        throw staleEpoch()
+      },
+    })
+    manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+
+    const committing = manager.commitOffsets().catch((e) => e)
+    await arrived
+    epoch = 8
+    seek()
+    release()
+    const caught = await committing
+
+    expect(epochs(offsetCommit)).toEqual([7, 8])
+    expect(caught.type).toEqual('STALE_MEMBER_EPOCH')
+    expect(caught.retriable).toBe(false)
+    expect(sentGeneration(caught)).toEqual(8)
+  })
+
+  it('keeps the selected generation for the remainder under the classic protocol', async () => {
+    const { manager, coordinator, offsetCommit, arrived, release, seek } = heldAtWrite({
+      membershipProtocol: 'classic',
+    })
+
+    const committing = manager.commitOffsets()
+    await arrived
+    manager.useMembership({ generationId: 4, memberId: 'member-a', coordinator })
+    seek()
+    release()
+    await committing
+
+    expect(epochs(offsetCommit)).toEqual([3, 3])
+  })
+
+  it('never sends a written attempt again, and reports the epoch it was sent under', async () => {
+    let epoch = 7
+    let release
+    let reached
+    const opened = new Promise((resolve) => {
+      release = resolve
+    })
+    const arrived = new Promise((resolve) => {
+      reached = resolve
+    })
+    const offsetCommit = jest.fn(async (_request, options) => {
+      const refusal = options.guard()
+      if (refusal) throw refusal
+      reached()
+      await opened
+      throw staleEpoch()
+    })
+    const { manager, coordinator } = build({ membershipProtocol: 'consumer', offsetCommit })
+    manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+    let sought = false
+    manager.seeks = {
+      clock: () => 0,
+      changedSince: () => sought,
+      isStaleSince: (_topic, partition) => sought && Number(partition) === 0,
+      isGated: () => false,
+    }
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+    manager.resolveOffset({ topic: TOPIC, partition: 1, offset: '7' })
+
+    const committing = manager.commitOffsets().catch((e) => e)
+    await arrived
+    epoch = 8
+    sought = true
+    release()
+    const caught = await committing
+
+    expect(offsetCommit).toHaveBeenCalledTimes(1)
+    expect(caught.type).toEqual('STALE_MEMBER_EPOCH')
+    expect(sentGeneration(caught)).toEqual(7)
   })
 })
 
