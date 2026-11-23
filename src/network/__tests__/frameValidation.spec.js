@@ -387,6 +387,116 @@ describe('FrameBuffer > retained memory and copying', () => {
     expect(buffer.usage.copied).toBe(2 * size)
   })
 
+  it('releases each outgrown store as the frame grows, and delivers the whole body intact', () => {
+    const delivered = []
+    const buffer = new FrameBuffer({ maxBodySize: MIB, onFrame: (body) => delivered.push(body) })
+
+    buffer.push(prefixOf(3 * INITIAL))
+    buffer.push(Buffer.alloc(INITIAL, 1))
+    const first = buffer.body
+    buffer.push(Buffer.alloc(INITIAL, 2))
+    expect(first.buffer.detached).toBe(true)
+    const second = buffer.body
+    expect(second.buffer.detached).toBe(false)
+    buffer.push(Buffer.alloc(INITIAL, 3))
+
+    expect(second.buffer.detached).toBe(true)
+    expect(delivered[0].buffer.detached).toBe(false)
+    expect(delivered).toEqual([Buffer.concat([1, 2, 3].map((fill) => Buffer.alloc(INITIAL, fill)))])
+  })
+
+  it('keeps a delivered body intact through the growth of a later frame and a reset', () => {
+    const delivered = []
+    const buffer = new FrameBuffer({ maxBodySize: MIB, onFrame: (body) => delivered.push(body) })
+    const grown = frameOf(1, Buffer.alloc(2 * INITIAL, 5))
+    const whole = frameOf(2, Buffer.alloc(100, 6))
+
+    buffer.push(grown.subarray(0, INITIAL))
+    buffer.push(grown.subarray(INITIAL))
+    buffer.push(whole.subarray(0, 50))
+    buffer.push(whole.subarray(50))
+    const later = frameOf(3, Buffer.alloc(3 * INITIAL))
+    buffer.push(later.subarray(0, INITIAL))
+    buffer.push(later.subarray(INITIAL, 2 * INITIAL + 1))
+    buffer.reset()
+
+    expect(delivered.map((body) => body.buffer.detached)).toEqual([false, false])
+    expect(delivered).toEqual([grown.subarray(4), whole.subarray(4)])
+  })
+
+  it('never passes its store to a method of the chunk it copies from', () => {
+    const { buffer, frames } = recording()
+    const frame = frameOf(1, Buffer.alloc(3 * INITIAL - 4, 4))
+    const wrapped = frame.subarray(INITIAL, 2 * INITIAL)
+    wrapped.copy = jest.fn((...args) => Buffer.prototype.copy.apply(wrapped, args))
+
+    buffer.push(frame.subarray(0, INITIAL))
+    buffer.push(wrapped)
+    buffer.push(frame.subarray(2 * INITIAL))
+
+    expect(wrapped.copy).not.toHaveBeenCalled()
+    expect(frames).toEqual([frame.subarray(4)])
+  })
+
+  it('assembles a small split frame in a pooled store, as any Buffer', () => {
+    const delivered = []
+    const buffer = new FrameBuffer({ maxBodySize: MIB, onFrame: (body) => delivered.push(body) })
+    const frame = frameOf(1, Buffer.from('12 bytes'))
+
+    buffer.push(frame.subarray(0, 6))
+    buffer.push(frame.subarray(6))
+
+    expect(delivered).toEqual([frame.subarray(4)])
+    expect(delivered[0].buffer.byteLength).toBeGreaterThan(delivered[0].length)
+  })
+
+  it('leaves an outgrown store to the collector when the runtime cannot detach it', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'transfer')
+    let Isolated
+    try {
+      delete ArrayBuffer.prototype.transfer
+      jest.isolateModules(() => {
+        Isolated = require('../frameBuffer')
+      })
+    } finally {
+      // eslint-disable-next-line no-extend-native -- restores the built-in deleted above
+      if (descriptor) Object.defineProperty(ArrayBuffer.prototype, 'transfer', descriptor)
+    }
+    const frames = []
+    const buffer = new Isolated({ maxBodySize: MIB, onFrame: (body) => frames.push(body) })
+    const frame = frameOf(1, Buffer.alloc(2 * INITIAL, 8))
+
+    buffer.push(frame.subarray(0, INITIAL))
+    const outgrown = buffer.body
+    buffer.push(frame.subarray(INITIAL))
+
+    expect(outgrown.buffer.byteLength).toBe(INITIAL)
+    expect(frames).toEqual([frame.subarray(4)])
+  })
+
+  it('grows into stores of its own, never slices of the shared pool, however large the pool', () => {
+    const poolSize = Buffer.poolSize
+    const owned = []
+    const own = (body) => owned.push([body.byteOffset, body.buffer.byteLength])
+    try {
+      Buffer.poolSize = 4 * MIB
+      const { buffer } = recording()
+
+      buffer.push(prefixOf(4 * INITIAL))
+      buffer.push(Buffer.alloc(KIB))
+      own(buffer.body)
+      buffer.push(Buffer.alloc(INITIAL))
+      own(buffer.body)
+    } finally {
+      Buffer.poolSize = poolSize
+    }
+
+    expect(owned).toEqual([
+      [0, INITIAL],
+      [0, 2 * INITIAL],
+    ])
+  })
+
   it('allocates a frame of at most 64 KiB once and copies each byte once', () => {
     const { buffer } = recording()
     const frame = frameOf(1, Buffer.alloc(10 * KIB))
