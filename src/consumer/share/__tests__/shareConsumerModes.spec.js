@@ -280,6 +280,16 @@ describe('Share consumer handler decisions', () => {
     expect(c.call.open).toBe(false)
     expect(c.ledger.prepare({ token: c.token }).ticket).toBeNull()
   })
+  test('freezing a call promotes its choice by the delivered record even after the handler changed the message offset', () => {
+    const c = setup({ offsets: ['0', '1'] })
+    c.call.acknowledge(c.messages[0], 'reject')
+    c.messages[0].offset = '7'
+    c.call.freeze()
+    expect(c.call.open).toBe(false)
+    expect(c.ledger.prepare({ token: c.token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] },
+    ])
+  })
 })
 
 describe('public share handler contract', () => {
