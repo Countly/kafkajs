@@ -1421,6 +1421,30 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
     expect(offsetCommit).toHaveBeenCalledTimes(1)
   })
 
+  test('commits under an epoch a heartbeat advanced with the same assignment', async () => {
+    const offsetCommit = jest.fn(async ({ groupGenerationId }) => {
+      if (groupGenerationId !== 8) throw staleEpoch()
+    })
+    const { group, manager } = staleEpochHarness({ epoch: 7, offsetCommit })
+    group.groupMembership.onSuccess({ memberEpoch: 8, heartbeatIntervalMs: 0, assignment: null })
+    expect(group.groupMembership.memberEpoch).toBe(8)
+
+    manager.lastCommit = 0
+    await manager.commitOffsets({}, { auto: true })
+    manager.resolveOffset({ topic: 'topic', partition: 0, offset: '6' })
+    await manager.commitOffsets({}, { auto: true })
+    manager.resolveOffset({ topic: 'topic', partition: 0, offset: '7' })
+    await expect(manager.commitOffsets()).resolves.toBeUndefined()
+
+    expect(offsetCommit.mock.calls.map(([payload]) => payload.groupGenerationId)).toEqual([8, 8, 8])
+    expect(offsetCommit.mock.calls[2][0].topics).toEqual([
+      expect.objectContaining({
+        topic: 'topic',
+        partitions: [expect.objectContaining({ partition: '0', offset: '8' })],
+      }),
+    ])
+  })
+
   test('waits for a newer epoch before pre-release commit', async () => {
     const offsetCommit = jest.fn(async ({ groupGenerationId }) => {
       if (groupGenerationId === 7) throw staleEpoch()
