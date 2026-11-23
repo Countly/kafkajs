@@ -59,6 +59,28 @@ const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
 }
 
 /**
+ * Whether a fresh empty object already sees any message key, that is, whether `Object.prototype`
+ * carries one as a property of any kind. `Object.prototype` is the only object on the chain of an
+ * empty literal and its own prototype is always null, so when this is false an assignment of a
+ * message key to that object creates an own data property, exactly as a literal defines one. When
+ * it is true (a polluted or hardened prototype) an assignment could run an inherited setter or be
+ * refused by an inherited read-only property, so the caller uses the literal instead. Checked per
+ * record: the properties of `Object.prototype` can change at any time.
+ * @param {object} empty an object literal with no own properties
+ * @returns {boolean}
+ */
+const messageKeyIsInherited = (empty) =>
+  'magicByte' in empty ||
+  'attributes' in empty ||
+  'timestamp' in empty ||
+  'offset' in empty ||
+  'key' in empty ||
+  'value' in empty ||
+  'headers' in empty ||
+  'isControlRecord' in empty ||
+  'batchContext' in empty
+
+/**
  * Decodes one record of a v0 record batch.
  * @param {Decoder} decoder positioned at the start of one record's body
  * @param {object} [batchContext] the batch-level values shared by every record in the batch; this
@@ -129,15 +151,34 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
     }
   }
 
-  return {
-    magicByte,
-    attributes, // Record level attributes are presently unused
-    timestamp,
-    offset,
-    key,
-    value,
-    headers,
-    isControlRecord: isControlBatch,
-    batchContext,
+  // The message is an empty literal filled by assignments, not a populated literal: V8 may switch
+  // a populated literal's allocation site to old-space allocation once a batch of its objects
+  // outlives a young-generation collection, and an empty literal has no such site (a V8 heuristic,
+  // not a guarantee). The check is the last step before the stores: the reads above can run
+  // inherited getters.
+  const message = {}
+  if (messageKeyIsInherited(message)) {
+    return {
+      magicByte,
+      attributes, // Record level attributes are presently unused
+      timestamp,
+      offset,
+      key,
+      value,
+      headers,
+      isControlRecord: isControlBatch,
+      batchContext,
+    }
   }
+
+  message.magicByte = magicByte
+  message.attributes = attributes // Record level attributes are presently unused
+  message.timestamp = timestamp
+  message.offset = offset
+  message.key = key
+  message.value = value
+  message.headers = headers
+  message.isControlRecord = isControlBatch
+  message.batchContext = batchContext
+  return message
 }
