@@ -41,7 +41,10 @@ const outcomes = (acks) =>
 describe('public share subscription and run lifecycle', () => {
   let h
   let extra
+  /** Releases of held application handlers, run in cleanup even after a failed assertion. */
+  const releases = []
   afterEach(async () => {
+    for (const release of releases.splice(0)) release()
     await extra?.disconnect({ timeout: 0 })
     extra = undefined
     await h?.close()
@@ -277,6 +280,7 @@ describe('public share subscription and run lifecycle', () => {
       ]),
     ])
     const held = deferred()
+    releases.push(held.resolve)
     const handled = []
     await consumer.run({
       eachMessage: async ({ topic, message }) => {
@@ -420,6 +424,7 @@ describe('public share subscription and run lifecycle', () => {
         fetchAnswer([acquire(0, 5, ['a5'])]),
       ])
       const held = deferred()
+      releases.push(held.resolve)
       const handled = []
       await h.consumer.run({
         eachMessage: async ({ message }) => {
@@ -576,6 +581,8 @@ describe('public share subscription and run lifecycle', () => {
       await reach(() => handled.length === 1, 'the delivery of the added partition')
       expect(handled).toEqual(['1:0'])
       expect(metadataCount()).toBeGreaterThan(before)
+      const routes = h.cluster.requests().filter((call) => call.api === 'Metadata' && byId(call))
+      expect(routes.map(({ fields }) => fields.topics.map(({ topicId }) => topicId))).toEqual([[A]])
       const added = h.frames(78).find(({ fields }) => lists(fields, 1))
       expect(added.fields.shareSessionEpoch).toBeGreaterThan(0)
       expect(h.frames(78).filter(({ fields }) => fields.shareSessionEpoch === 0)).toHaveLength(1)
