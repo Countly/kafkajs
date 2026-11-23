@@ -23041,7 +23041,10 @@
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler whose renewal lost its session still finals the other node and leaves",
         "src/consumer/share/__tests__/shareConsumerSubscription.spec.js \u203a public share subscription and run lifecycle a node whose last partition is revoked and restored runs no second handler and opens no second session while its handler runs",
         "src/consumer/share/__tests__/shareConsumerSubscription.spec.js \u203a public share subscription and run lifecycle a node whose last partition is revoked and restored opens no second session while its fetch is in flight",
-        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js \u203a public share subscription and run lifecycle a node whose last partition is revoked and restored opens a new session only after the final of the ended one was answered"
+        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js \u203a public share subscription and run lifecycle a node whose last partition is revoked and restored opens a new session only after the final of the ended one was answered",
+        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader is fetched once a refresh names the leader of a partition added while running",
+        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader is fetched once a retried refresh finds a leader for a topic cached leaderless",
+        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader ends a refresh in flight with the stop and starts no node after it"
       ],
       "capMinutes": 85,
       "allowedSkips": [

@@ -7,6 +7,7 @@ const {
   acquired,
   ackAnswer,
   deferred,
+  echo,
   fetchAnswer,
   flush,
   part,
@@ -349,42 +350,44 @@ describe('public share subscription and run lifecycle', () => {
     ])
   })
 
+  let assignments
+  /**
+   * Starts a subscribed client that records its assignment changes.
+   * @param {object} [topics] The metadata the wire serves, by topic name.
+   * @returns {Promise<void>}
+   */
+  const start = async (topics) => {
+    h = shareClient({ interval: 5, ...(topics && { topics }) })
+    assignments = []
+    const { consumer } = h
+    consumer.on(consumer.events.ASSIGNMENT_CHANGED, ({ payload }) => assignments.push(payload))
+    await consumer.subscribe({ topics: ['topic-a'] })
+  }
+  /**
+   * Answers the next steady heartbeat with a new assignment, then waits until it was applied.
+   * @param {number} memberEpoch The answer's member epoch.
+   * @param {Array<{topicId: string, partitions: number[]}>} topicPartitions The assignment.
+   * @returns {Promise<void>}
+   */
+  const assignNext = async (memberEpoch, topicPartitions) => {
+    const count = assignments.length
+    const beat = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch > 0,
+    })
+    const call = await beat.arrived()
+    beat.release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: call.fields.memberId,
+      memberEpoch,
+      heartbeatIntervalMs: 5,
+      assignment: { topicPartitions },
+    })
+    await until(() => assignments.length === count + 1, `the assignment at epoch ${memberEpoch}`)
+  }
+
   describe('a node whose last partition is revoked and restored', () => {
-    let assignments
-    /**
-     * Starts a subscribed client that records its assignment changes.
-     * @returns {Promise<void>}
-     */
-    const start = async () => {
-      h = shareClient({ interval: 5 })
-      assignments = []
-      const { consumer } = h
-      consumer.on(consumer.events.ASSIGNMENT_CHANGED, ({ payload }) => assignments.push(payload))
-      await consumer.subscribe({ topics: ['topic-a'] })
-    }
-    /**
-     * Answers the next steady heartbeat with a new assignment, then waits until it was applied.
-     * @param {number} memberEpoch The answer's member epoch.
-     * @param {Array<{topicId: string, partitions: number[]}>} topicPartitions The assignment.
-     * @returns {Promise<void>}
-     */
-    const assignNext = async (memberEpoch, topicPartitions) => {
-      const count = assignments.length
-      const beat = h.hold({
-        api: 'ShareGroupHeartbeat',
-        match: ({ fields }) => fields.memberEpoch > 0,
-      })
-      const call = await beat.arrived()
-      beat.release({
-        errorCode: 0,
-        errorMessage: null,
-        memberId: call.fields.memberId,
-        memberEpoch,
-        heartbeatIntervalMs: 5,
-        assignment: { topicPartitions },
-      })
-      await until(() => assignments.length === count + 1, `the assignment at epoch ${memberEpoch}`)
-    }
     /** @returns {number[]} The session epoch of every fetch, oldest first. */
     const fetchEpochs = () => h.frames(78).map(({ fields }) => fields.shareSessionEpoch)
     /** @returns {object[]} The final acknowledgements (epoch -1), oldest first. */
@@ -478,6 +481,86 @@ describe('public share subscription and run lifecycle', () => {
         { topicId: A, partitions: [{ partitionIndex: 0, acknowledgementBatches: [] }] },
       ])
       expect(opening.order).toBeGreaterThan(closing.answeredOrder)
+    })
+  })
+
+  describe('an assigned partition without a cached leader', () => {
+    const LEADERLESS = { 'topic-a': { topicId: A, partitions: [{ leader: -1, epoch: 1 }] } }
+    /** @returns {number} The Metadata requests written so far. */
+    const metadataCount = () => h.cluster.requests().filter(({ api }) => api === 'Metadata').length
+    /**
+     * @param {object} fields A ShareFetch request's fields.
+     * @param {number} partition A partition of topic A.
+     * @returns {boolean} Whether the request lists that partition.
+     */
+    const lists = (fields, partition) =>
+      fields.topics.some(
+        ({ topicId, partitions }) =>
+          topicId === A && partitions.some(({ partitionIndex }) => partitionIndex === partition)
+      )
+
+    test('is fetched once a refresh names the leader of a partition added while running', async () => {
+      await start()
+      const crashes = []
+      h.consumer.on(h.consumer.events.CRASH, ({ payload }) => crashes.push(payload.error))
+      let given = false
+      h.cluster.answer('ShareFetch', (fields) => {
+        if (given || !lists(fields, 1)) return echo('ShareFetch', fields)
+        given = true
+        return fetchAnswer([acquire(1, 0, ['p1'])])
+      })
+      const handled = []
+      await h.consumer.run({
+        eachMessage: async ({ partition, message }) =>
+          handled.push(`${partition}:${message.offset}`),
+      })
+      await until(() => h.frames(78).length > 0, 'the opening fetch')
+      h.table.set('topic-a', { topicId: A, partitions: [LEADER, LEADER] })
+      const before = metadataCount()
+      await assignNext(2, [{ topicId: A, partitions: [0, 1] }])
+      await until(() => handled.length === 1, 'the delivery of the added partition')
+      expect(handled).toEqual(['1:0'])
+      expect(metadataCount()).toBeGreaterThan(before)
+      const added = h.frames(78).find(({ fields }) => lists(fields, 1))
+      expect(added.fields.shareSessionEpoch).toBeGreaterThan(0)
+      expect(h.frames(78).filter(({ fields }) => fields.shareSessionEpoch === 0)).toHaveLength(1)
+      expect(crashes).toEqual([])
+    })
+
+    test('is fetched once a retried refresh finds a leader for a topic cached leaderless', async () => {
+      await start(LEADERLESS)
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+      const handled = []
+      const before = metadataCount()
+      await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
+      await until(() => metadataCount() >= before + 2, 'a retried refresh')
+      await flush()
+      expect(h.frames(78)).toEqual([])
+      expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+
+      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 2 }] })
+      await until(() => handled.length === 1, 'the delivery once the partition has a leader')
+      expect(handled).toEqual(['0'])
+      expect(h.frames(78)[0].fields.shareSessionEpoch).toBe(0)
+    })
+
+    test('ends a refresh in flight with the stop and starts no node after it', async () => {
+      await start(LEADERLESS)
+      let joined = false
+      h.consumer.on(h.consumer.events.GROUP_JOIN, () => {
+        joined = true
+      })
+      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 2 }] })
+      const refresh = h.hold({ api: 'Metadata', match: () => joined })
+      await h.consumer.run({ eachMessage: async () => {} })
+      await refresh.arrived()
+      await h.consumer.stop()
+      const count = metadataCount()
+      refresh.release()
+      await flush()
+      expect(h.frames(78)).toEqual([])
+      expect(metadataCount()).toBe(count)
+      expect(h.consumer.assignment()).toEqual([])
     })
   })
 })
