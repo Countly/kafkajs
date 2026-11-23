@@ -105,11 +105,12 @@ function createMessage(
 
 /**
  * Whether any message key exists on `Object.prototype`, as an own property of any kind.
- * `Object.prototype` is the only object on a `Message`'s prototype chain and is an ordinary object,
- * so when this is false each assignment in `Message` creates an own data property, exactly as a
- * literal defines one. When it is true (a polluted or hardened prototype) an assignment could run
- * an inherited setter or be refused by an inherited read-only property, so the caller uses the
- * literal instead. Checked per record: the prototype can change at any time.
+ * `Object.prototype` is the only object on a message's prototype chain and its own prototype is
+ * always null, so when this is false each assignment in `createMessage` creates an own data
+ * property, exactly as a literal defines one. When it is true (a polluted or hardened prototype)
+ * an assignment could run an inherited setter or be refused by an inherited read-only property,
+ * so the caller uses the literal instead. Checked per record: its properties can change at any
+ * time.
  * @returns {boolean}
  */
 const messageKeyIsInherited = () =>
