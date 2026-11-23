@@ -58,7 +58,8 @@ const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
     : Long.fromValue(firstTimestamp).add(timestampDelta).toString()
 }
 
-const ObjectPrototype = Object.prototype
+// The prototype an object literal gets, read from a literal and not from the global `Object`.
+const ObjectPrototype = Reflect.getPrototypeOf({})
 
 /**
  * Builds a decoded message as a plain object: the same own keys, order, values, descriptors,
