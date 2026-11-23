@@ -88,7 +88,7 @@ class ShareRun {
     this.facade = null
     this.waiters = new Set()
     this.lookups = new Set()
-    this.routeless = false
+    this.routeless = new Set()
     this.routeRefresh = null
     this.routeBackoff = new HeartbeatBackoff(options.retry)
     this.firstJoin = deferred()
@@ -210,12 +210,14 @@ class ShareRun {
   }
 
   /**
-   * Retires every coordinator lookup in flight, so none can outlive the membership it served.
+   * Retires every coordinator lookup and the route refresh in flight, so none can outlive the
+   * membership it served.
    * Callers run it once that membership is closed, replaced or frozen for captured traffic.
    * @private
    * @returns {void}
    */
   retireLookups() {
+    this.routeRefresh = null
     if (this.lookups.size === 0) return
     const refusal = new KafkaJSNonRetriableError('Share membership is no longer current')
     for (const lookup of this.lookups) lookup.retire(refusal)
@@ -418,12 +420,12 @@ class ShareRun {
     const { cluster } = this.options
     const wanted = new Map()
     const routed = new Set()
-    this.routeless = false
+    this.routeless = new Set()
     for (const [topicId, { topic, partitions }] of this.assignment) {
       for (const partition of partitions) {
         const leader = cluster.cachedLeader(topic, partition)
         if (leader < 0) {
-          this.routeless = true
+          this.routeless.add(topicId)
           continue
         }
         if (!wanted.has(leader)) wanted.set(leader, [])
@@ -449,17 +451,21 @@ class ShareRun {
 
   /**
    * Refreshes metadata while an assigned partition has no cached leader (a partition added to its
-   * topic, or one cached while leaderless), so it is fetched once the cluster names a leader. The
-   * first refresh waits one backoff step, which lets a refresh already under way (a leader move,
-   * a rebootstrap) settle first; each refresh that leaves a partition without a leader arms the
-   * next step. At most one runs at a time, fenced by the run's current authority and retired with
-   * the coordinator lookups at a close. Every heartbeat answer runs a routing sync, which retries
-   * once the backoff passed, so no timer is needed.
+   * topic, or one whose leader became unknown), so it is fetched once the cluster names a leader.
+   * Only the assigned topics with such a partition are asked for, by topic id: a subscribed topic
+   * that was deleted is never asked for, cannot fail the answer of the others and is never
+   * created, and a partition without a leader is installed as it is. The first refresh waits one
+   * backoff step, which lets a refresh already under way (a leader move, a rebootstrap) settle
+   * first; each refresh that leaves a partition without a leader arms the next step. At most one
+   * runs at a time. It counts only while it is the run's current flight under the authority it
+   * started with: a close, a fence or a new membership ends it, and its late answer installs
+   * nothing and arms no retry. Every heartbeat answer runs a routing sync, which retries once the
+   * backoff passed, so no timer is needed.
    * @private
    * @returns {void}
    */
   refreshRoutes() {
-    if (!this.routeless) {
+    if (this.routeless.size === 0) {
       this.routeBackoff.reset()
       return
     }
@@ -470,23 +476,21 @@ class ShareRun {
     }
     if (this.routeRefresh || this.routeBackoff.pending(now)) return
     const issued = this.authorityToken
-    const fence = new ConsumerOperation({ guard: () => this.ordinaryRefusal(issued) })
-    this.routeRefresh = fence
-    this.lookups.add(fence)
+    const flight = {}
+    const isCurrent = () => this.routeRefresh === flight && this.ordinaryRefusal(issued) === null
+    this.routeRefresh = flight
     const refresh = async () => {
       try {
-        await fence.wait(() =>
-          this.options.cluster.refreshMetadata({ fence, allowLeaderless: true })
-        )
+        await this.options.cluster.refreshMetadataForTopicIds([...this.routeless], {
+          isCurrent,
+          allowLeaderless: true,
+        })
       } catch (error) {
         this.options.logger.debug('Share route refresh failed', { error: error.message })
-      } finally {
-        this.lookups.delete(fence)
-        fence.finish()
-        this.routeRefresh = null
       }
-      if (this.routeless && !this.closing && this.ordinaryRefusal(issued) === null)
-        this.routeBackoff.onFailedAttempt(performance.now())
+      const current = isCurrent()
+      if (this.routeRefresh === flight) this.routeRefresh = null
+      if (current && this.routeless.size) this.routeBackoff.onFailedAttempt(performance.now())
     }
     refresh()
   }
@@ -1109,7 +1113,7 @@ class ShareRun {
     episode.done = done.promise
     this.closing = episode
     this.admitting = false
-    this.routeRefresh?.retire(new KafkaJSNonRetriableError('Share run is closing'))
+    this.routeRefresh = null
     for (const node of this.nodes.values())
       node.pacing.retire(new KafkaJSNonRetriableError('Share run is closing'))
     if (kind === 'disconnect') episode.disconnect(timeout, startedAt)

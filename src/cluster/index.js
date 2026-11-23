@@ -696,15 +696,20 @@ module.exports = class Cluster {
    * @see clients/src/main/resources/common/message/MetadataRequest.json
    * @public
    * @param {string[]} topicIds canonical uuid strings
-   * @param {{ isCurrent?: () => boolean, surface?: boolean }} [options] `isCurrent` is checked
-   *   before requests and cache installs; guarded old-version discovery reads names without
-   *   installing global routing metadata. `surface` makes code 17 or 29 for an id throw, for a
-   *   consumer resolving its own current target
+   * @param {{ isCurrent?: () => boolean, surface?: boolean, allowLeaderless?: boolean }} [options]
+   *   `isCurrent` is checked before requests and cache installs; guarded old-version discovery
+   *   reads names without installing global routing metadata. `surface` makes code 17 or 29 for
+   *   an id throw, for a consumer resolving its own current target. `allowLeaderless` installs a
+   *   partition without a leader as it is (leader -1) instead of failing its topic with
+   *   `LEADER_NOT_AVAILABLE`
    * @returns {Promise<{ resolved: string[], unresolved: string[] }>} the requested ids, split by
    *   whether the cache can name them now. Duplicates and nulls are dropped from both lists.
    * @throws {Error} only with `surface`: an id answered 17 or 29
    */
-  async refreshMetadataForTopicIds(topicIds, { isCurrent = () => true, surface = false } = {}) {
+  async refreshMetadataForTopicIds(
+    topicIds,
+    { isCurrent = () => true, surface = false, allowLeaderless = false } = {}
+  ) {
     const ids = [...new Set(topicIds)].filter((topicId) => topicId != null)
 
     if (!isCurrent() || ids.length === 0) {
@@ -729,7 +734,11 @@ module.exports = class Cluster {
         }
 
         try {
-          return await this.fetchMetadataByTopicIds(broker, ids, { isCurrent, surface })
+          return await this.fetchMetadataByTopicIds(broker, ids, {
+            isCurrent,
+            surface,
+            allowLeaderless,
+          })
         } catch (e) {
           // `withBroker` would try the next broker and drop the error: the answer is the verdict.
           if (!surfaced(e, surface)) throw e
@@ -789,15 +798,24 @@ module.exports = class Cluster {
    * @private
    * @param {import("../broker")} broker
    * @param {string[]} ids
-   * @param {{ isCurrent?: () => boolean, surface?: boolean }} [options] stale responses have no
-   *   cache effects; `surface` throws an id's code 17 or 29
+   * @param {{ isCurrent?: () => boolean, surface?: boolean, allowLeaderless?: boolean }} [options]
+   *   stale responses have no cache effects; `surface` throws an id's code 17 or 29;
+   *   `allowLeaderless` installs a partition without a leader as it is
    * @returns {Promise<'resolved'|'failed'>} whether the client managed to ask at all
    * @throws {Error} only with `surface`: an id answered 17 or 29
    */
-  async fetchMetadataByTopicIds(broker, ids, { isCurrent = () => true, surface = false } = {}) {
+  async fetchMetadataByTopicIds(
+    broker,
+    ids,
+    { isCurrent = () => true, surface = false, allowLeaderless = false } = {}
+  ) {
+    const options = allowLeaderless ? [{ allowLeaderless }] : []
     try {
       if (!isCurrent()) return FAILED
-      const response = await broker.metadata(ids.map((topicId) => ({ topicId })))
+      const response = await broker.metadata(
+        ids.map((topicId) => ({ topicId })),
+        ...options
+      )
       if (!isCurrent()) return FAILED
       this.metadataCache.updateTopicsById(response)
       return RESOLVED
@@ -820,7 +838,7 @@ module.exports = class Cluster {
       for (const topicId of ids) {
         if (!isCurrent()) return FAILED
         try {
-          const response = await broker.metadata([{ topicId }])
+          const response = await broker.metadata([{ topicId }], ...options)
           if (!isCurrent()) return FAILED
           this.metadataCache.updateTopicsById(response)
         } catch (topicError) {
