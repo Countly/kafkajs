@@ -485,7 +485,7 @@ class ShareRun {
         fence.finish()
         this.routeRefresh = null
       }
-      if (this.routeless && this.ordinaryRefusal(issued) === null)
+      if (this.routeless && !this.closing && this.ordinaryRefusal(issued) === null)
         this.routeBackoff.onFailedAttempt(performance.now())
     }
     refresh()
@@ -1076,7 +1076,8 @@ class ShareRun {
    * Starts or joins this run's one close. Forced kinds (`crash`, `fence`, `poll`) freeze at once,
    * also when they escalate a natural close in progress; `stop` and `disconnect` latch the stop
    * request synchronously, so no handler starts after them, and wait naturally for running
-   * handlers until the handler boundary. A stop or disconnect that arrives while a fence or poll
+   * handlers until the handler boundary. Every close ends the route refresh in flight at once, so
+   * its late answer installs nothing and arms no retry while handlers drain. A stop or disconnect that arrives while a fence or poll
    * recovery is closing ends the run once that recovery cleanup is done. Later calls reuse the
    * episode, so a disconnect never recaptures a replacement run. A zero timeout on a close in
    * progress revokes the episode, which retires its traffic operation in the same tick: a final
@@ -1108,6 +1109,7 @@ class ShareRun {
     episode.done = done.promise
     this.closing = episode
     this.admitting = false
+    this.routeRefresh?.retire(new KafkaJSNonRetriableError('Share run is closing'))
     for (const node of this.nodes.values())
       node.pacing.retire(new KafkaJSNonRetriableError('Share run is closing'))
     if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
