@@ -15607,6 +15607,7 @@
         "src/protocol/recordBatch/crc32C/index.spec.js \u203a Protocol > RecordBatch > crc32C word and byte paths a slice of a slice and a plain Uint8Array view give the same checksum as a copy",
         "src/protocol/recordBatch/crc32C/index.spec.js \u203a Protocol > RecordBatch > crc32C word and byte paths a buffer ending at the end of its store, at a length that is not a multiple of 4, matches a byte-at-a-time reference",
         "src/protocol/recordBatch/crc32C/index.spec.js \u203a Protocol > RecordBatch > crc32C word and byte paths a view over shared memory matches a byte-at-a-time reference",
+        "src/protocol/recordBatch/record/v0/decoder.spec.js \u203a Protocol > RecordBatch > Record > v0 a decoded message is a plain object, indistinguishable from an object literal",
         "src/protocol/recordBatch/record/v0/decoder.spec.js \u203a Protocol > RecordBatch > Record > v0 a header named like a property of every object is kept as data, and a repeated one makes an array",
         "src/protocol/recordBatch/record/v0/decoder.spec.js \u203a Protocol > RecordBatch > Record > v0 decodes",
         "src/protocol/recordBatch/record/v0/decoder.spec.js \u203a Protocol > RecordBatch > Record > v0 decodes control record",
