@@ -20095,6 +20095,8 @@
         "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true shareConsumer a close waiting for the periodic codec keeps its 20 ms deadline",
         "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true shareConsumer a close waiting for the periodic codec keeps its 1000 ms deadline",
         "src/network/__tests__/frameValidation.spec.js \u203a FrameBuffer > retained memory and copying reuses a dedicated four-byte prefix without retaining a pooled backing store",
+        "src/network/__tests__/frameValidation.spec.js \u203a FrameBuffer > retained memory and copying releases each outgrown store as the frame grows, and delivers the whole body intact",
+        "src/network/__tests__/frameValidation.spec.js \u203a FrameBuffer > retained memory and copying grows into stores of its own, never slices of the shared pool, however large the pool",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation diagnostic acceptance isolation and recorded boundary replay rejects diagnostic marker {\"diagnostic\": true} even in a schema-6 envelope",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation diagnostic acceptance isolation and recorded boundary replay rejects diagnostic marker {\"acceptanceEligible\": false} even in a schema-6 envelope",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation the schema and the shape of the evidence rejects schema 5 without frozen module evidence",

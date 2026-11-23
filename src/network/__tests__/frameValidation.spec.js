@@ -387,6 +387,45 @@ describe('FrameBuffer > retained memory and copying', () => {
     expect(buffer.usage.copied).toBe(2 * size)
   })
 
+  it('releases each outgrown store as the frame grows, and delivers the whole body intact', () => {
+    const { buffer, frames } = recording()
+    const size = 3 * INITIAL
+
+    buffer.push(prefixOf(size))
+    buffer.push(Buffer.alloc(INITIAL, 1))
+    const first = buffer.body
+    buffer.push(Buffer.alloc(INITIAL, 2))
+    const second = buffer.body
+    buffer.push(Buffer.alloc(INITIAL, 3))
+
+    expect([first.buffer.detached, second.buffer.detached]).toEqual([true, true])
+    expect(frames).toEqual([Buffer.concat([1, 2, 3].map((fill) => Buffer.alloc(INITIAL, fill)))])
+  })
+
+  it('grows into stores of its own, never slices of the shared pool, however large the pool', () => {
+    const poolSize = Buffer.poolSize
+    const owned = []
+    const own = (body) => owned.push([body.byteOffset, body.buffer.byteLength])
+    try {
+      Buffer.poolSize = 4 * MIB
+      const { buffer } = recording()
+
+      buffer.push(prefixOf(2 * INITIAL))
+      buffer.push(Buffer.alloc(KIB))
+      own(buffer.body)
+      buffer.push(Buffer.alloc(INITIAL))
+      own(buffer.body)
+    } finally {
+      Buffer.poolSize = poolSize
+    }
+
+    expect(owned).toEqual([
+      [0, INITIAL],
+      [0, 2 * INITIAL],
+    ])
+    expect(Buffer.from('pooled neighbour').toString()).toBe('pooled neighbour')
+  })
+
   it('allocates a frame of at most 64 KiB once and copies each byte once', () => {
     const { buffer } = recording()
     const frame = frameOf(1, Buffer.alloc(10 * KIB))
