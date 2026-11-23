@@ -23047,7 +23047,7 @@
         "src/consumer/share/__tests__/shareConsumerSubscription.spec.js \u203a public share subscription and run lifecycle a node whose last partition is revoked and restored opens a new session only after the final of the ended one was answered",
         "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader is fetched once a refresh names the leader of a partition added while running",
         "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader is fetched once a retried refresh finds a leader for a topic cached leaderless",
-        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader ends a refresh in flight with the stop and starts no node after it"
+        "src/consumer/share/__tests__/shareConsumerSubscription.spec.js › public share subscription and run lifecycle an assigned partition without a cached leader a stop that waits for a running handler ends the refresh in flight: its late answer installs nothing and no refresh follows"
       ],
       "capMinutes": 85,
       "allowedSkips": [

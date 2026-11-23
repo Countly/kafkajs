@@ -14,7 +14,9 @@ const {
   recordsHex,
   shareClient,
   until,
+  ShareClock,
 } = require('../../../../testHelpers/shareHarness')
+const MetadataCache = require('../../../cluster/metadataCache')
 
 const C = '20112233-4455-6677-8899-aabbccddeeff'
 const LEADER = { leader: 0, epoch: 1 }
@@ -351,17 +353,35 @@ describe('public share subscription and run lifecycle', () => {
   })
 
   let assignments
+  /** The fake clock of the tests that install one; null while real timers run. */
+  let clock = null
+  /**
+   * Waits for a stage: on real timers as `until` does, on the fake clock by moving it 5 ms at a
+   * time (one heartbeat interval) until the stage is reached, at most two fake seconds.
+   * @param {() => boolean} predicate The reached-stage condition.
+   * @param {string} what What is awaited, named by the failure.
+   * @returns {Promise<void>}
+   * @throws {Error} When the stage is not reached.
+   */
+  const reach = async (predicate, what) => {
+    if (!clock) return until(predicate, what)
+    for (let step = 0; step < 400 && !predicate(); step++) await clock.advance(5)
+    if (!predicate()) throw new Error(`${what} did not happen`)
+  }
   /**
    * Starts a subscribed client that records its assignment changes.
    * @param {object} [topics] The metadata the wire serves, by topic name.
+   * @param {object} [options] Client options.
+   * @param {number} [options.nodes=1] Node count.
+   * @param {string[]} [options.subscribe=['topic-a']] The subscribed names.
    * @returns {Promise<void>}
    */
-  const start = async (topics) => {
-    h = shareClient({ interval: 5, ...(topics && { topics }) })
+  const start = async (topics, { nodes = 1, subscribe = ['topic-a'] } = {}) => {
+    h = shareClient({ interval: 5, nodes, ...(topics && { topics }) })
     assignments = []
     const { consumer } = h
     consumer.on(consumer.events.ASSIGNMENT_CHANGED, ({ payload }) => assignments.push(payload))
-    await consumer.subscribe({ topics: ['topic-a'] })
+    await consumer.subscribe({ topics: subscribe })
   }
   /**
    * Answers the next steady heartbeat with a new assignment, then waits until it was applied.
@@ -375,16 +395,16 @@ describe('public share subscription and run lifecycle', () => {
       api: 'ShareGroupHeartbeat',
       match: ({ fields }) => fields.memberEpoch > 0,
     })
-    const call = await beat.arrived()
+    await reach(() => beat.call !== null, `the heartbeat for epoch ${memberEpoch}`)
     beat.release({
       errorCode: 0,
       errorMessage: null,
-      memberId: call.fields.memberId,
+      memberId: beat.call.fields.memberId,
       memberEpoch,
       heartbeatIntervalMs: 5,
       assignment: { topicPartitions },
     })
-    await until(() => assignments.length === count + 1, `the assignment at epoch ${memberEpoch}`)
+    await reach(() => assignments.length === count + 1, `the assignment at epoch ${memberEpoch}`)
   }
 
   describe('a node whose last partition is revoked and restored', () => {
@@ -486,6 +506,36 @@ describe('public share subscription and run lifecycle', () => {
 
   describe('an assigned partition without a cached leader', () => {
     const LEADERLESS = { 'topic-a': { topicId: A, partitions: [{ leader: -1, epoch: 1 }] } }
+    /** Releases of the application handlers a test holds; cleanup runs them even after a failure. */
+    const held = []
+    beforeEach(() => {
+      clock = new ShareClock().install()
+    })
+    afterEach(async () => {
+      for (const release of held.splice(0)) release()
+      try {
+        await h?.close()
+      } finally {
+        h = undefined
+        jest.restoreAllMocks()
+        clock.restore()
+        clock = null
+      }
+    })
+    /** @returns {{promise: Promise<void>, resolve: () => void}} A handler gate the cleanup releases. */
+    const hold = () => {
+      const gate = deferred()
+      held.push(gate.resolve)
+      return gate
+    }
+    /**
+     * Moves the fake clock `ms` in 5 ms steps, so every heartbeat on the way is written and answered.
+     * @param {number} ms Fake milliseconds.
+     * @returns {Promise<void>}
+     */
+    const pass = async (ms) => {
+      for (let moved = 0; moved < ms; moved += 5) await clock.advance(5)
+    }
     /** @returns {number} The Metadata requests written so far. */
     const metadataCount = () => h.cluster.requests().filter(({ api }) => api === 'Metadata').length
     /**
@@ -514,11 +564,11 @@ describe('public share subscription and run lifecycle', () => {
         eachMessage: async ({ partition, message }) =>
           handled.push(`${partition}:${message.offset}`),
       })
-      await until(() => h.frames(78).length > 0, 'the opening fetch')
+      await reach(() => h.frames(78).length > 0, 'the opening fetch')
       h.table.set('topic-a', { topicId: A, partitions: [LEADER, LEADER] })
       const before = metadataCount()
       await assignNext(2, [{ topicId: A, partitions: [0, 1] }])
-      await until(() => handled.length === 1, 'the delivery of the added partition')
+      await reach(() => handled.length === 1, 'the delivery of the added partition')
       expect(handled).toEqual(['1:0'])
       expect(metadataCount()).toBeGreaterThan(before)
       const added = h.frames(78).find(({ fields }) => lists(fields, 1))
@@ -533,34 +583,55 @@ describe('public share subscription and run lifecycle', () => {
       const handled = []
       const before = metadataCount()
       await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
-      await until(() => metadataCount() >= before + 2, 'a retried refresh')
+      await reach(() => metadataCount() >= before + 2, 'a retried refresh')
       await flush()
       expect(h.frames(78)).toEqual([])
       expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
 
       h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 2 }] })
-      await until(() => handled.length === 1, 'the delivery once the partition has a leader')
+      await reach(() => handled.length === 1, 'the delivery once the partition has a leader')
       expect(handled).toEqual(['0'])
       expect(h.frames(78)[0].fields.shareSessionEpoch).toBe(0)
     })
 
-    test('ends a refresh in flight with the stop and starts no node after it', async () => {
-      await start(LEADERLESS)
-      let joined = false
-      h.consumer.on(h.consumer.events.GROUP_JOIN, () => {
-        joined = true
+    test('a stop that waits for a running handler ends the refresh in flight: its late answer installs nothing and no refresh follows', async () => {
+      await start()
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a0'])])])
+      const gate = hold()
+      const handled = []
+      await h.consumer.run({
+        eachMessage: async ({ partition, message }) => {
+          handled.push(`${partition}:${message.offset}`)
+          await gate.promise
+        },
       })
-      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 2 }] })
-      const refresh = h.hold({ api: 'Metadata', match: () => joined })
-      await h.consumer.run({ eachMessage: async () => {} })
-      await refresh.arrived()
-      await h.consumer.stop()
+      await reach(() => handled.length === 1, 'the held handler')
+      h.table.set('topic-a', { topicId: A, partitions: [LEADER, LEADER] })
+      const refresh = h.hold({ api: 'Metadata' })
+      await assignNext(2, [{ topicId: A, partitions: [0, 1] }])
+      await reach(() => refresh.call !== null, 'the route refresh')
+      const installs = [
+        jest.spyOn(MetadataCache.prototype, 'update'),
+        jest.spyOn(MetadataCache.prototype, 'updateTopicsById'),
+      ]
+      let stopped = false
+      const stopping = h.consumer.stop().then(() => {
+        stopped = true
+      })
+      await flush()
       const count = metadataCount()
       refresh.release()
-      await flush()
-      expect(h.frames(78)).toEqual([])
+      await pass(500)
+      expect(stopped).toBe(false)
+      expect(installs.map((spy) => spy.mock.calls.length)).toEqual([0, 0])
       expect(metadataCount()).toBe(count)
-      expect(h.consumer.assignment()).toEqual([])
+      expect(h.frames(78).some(({ fields }) => lists(fields, 1))).toBe(false)
+
+      gate.resolve()
+      await reach(() => stopped, 'the stop')
+      await stopping
+      expect(handled).toEqual(['0:0'])
+      expect(h.frames(78).some(({ fields }) => lists(fields, 1))).toBe(false)
     })
   })
 })
