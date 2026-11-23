@@ -58,6 +58,70 @@ const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
     : Long.fromValue(firstTimestamp).add(timestampDelta).toString()
 }
 
+const ObjectPrototype = Object.prototype
+
+/**
+ * Builds a decoded message as a plain object: the same own keys, order, values, descriptors,
+ * prototype (`Object.prototype`) and `constructor` (`Object`) as the object literal it replaces.
+ * The aim is to keep V8 from pretenuring decoded messages: an object literal has an allocation
+ * site, which V8 may switch to old-space allocation once a batch of its objects outlives a
+ * young-generation collection; a `new` call has no such site. This depends on V8 and is not
+ * guaranteed. Debugger tools may label these objects `Message` instead of `Object`.
+ * The assignments create own data properties only because `messageKeyIsInherited()` was false
+ * just before; see there.
+ * @param {number} magicByte the batch magic byte
+ * @param {number} attributes the record attributes
+ * @param {string} timestamp the record timestamp
+ * @param {string} offset the record offset
+ * @param {Buffer|null} key the record key
+ * @param {Buffer|null} value the record value
+ * @param {object} headers the decoded headers
+ * @param {boolean} isControlRecord whether the record belongs to a control batch
+ * @param {object} batchContext the batch-level values shared by every record of the batch
+ */
+function Message(
+  magicByte,
+  attributes,
+  timestamp,
+  offset,
+  key,
+  value,
+  headers,
+  isControlRecord,
+  batchContext
+) {
+  this.magicByte = magicByte
+  this.attributes = attributes
+  this.timestamp = timestamp
+  this.offset = offset
+  this.key = key
+  this.value = value
+  this.headers = headers
+  this.isControlRecord = isControlRecord
+  this.batchContext = batchContext
+}
+Message.prototype = ObjectPrototype
+
+/**
+ * Whether any message key exists on `Object.prototype`, as an own property of any kind.
+ * `Object.prototype` is the only object on a `Message`'s prototype chain and is an ordinary object,
+ * so when this is false each assignment in `Message` creates an own data property, exactly as a
+ * literal defines one. When it is true (a polluted or hardened prototype) an assignment could run
+ * an inherited setter or be refused by an inherited read-only property, so the caller uses the
+ * literal instead. Checked per record: the prototype can change at any time.
+ * @returns {boolean}
+ */
+const messageKeyIsInherited = () =>
+  'magicByte' in ObjectPrototype ||
+  'attributes' in ObjectPrototype ||
+  'timestamp' in ObjectPrototype ||
+  'offset' in ObjectPrototype ||
+  'key' in ObjectPrototype ||
+  'value' in ObjectPrototype ||
+  'headers' in ObjectPrototype ||
+  'isControlRecord' in ObjectPrototype ||
+  'batchContext' in ObjectPrototype
+
 /**
  * Decodes one record of a v0 record batch.
  * @param {Decoder} decoder positioned at the start of one record's body
@@ -127,6 +191,21 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
     } else {
       setHeader(headers, headerKey, [existing, headerValue])
     }
+  }
+
+  // Last step before the message is built: the reads above can run inherited getters.
+  if (!messageKeyIsInherited()) {
+    return new Message(
+      magicByte,
+      attributes,
+      timestamp,
+      offset,
+      key,
+      value,
+      headers,
+      isControlBatch,
+      batchContext
+    )
   }
 
   return {
