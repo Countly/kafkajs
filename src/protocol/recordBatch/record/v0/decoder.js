@@ -58,72 +58,27 @@ const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
     : Long.fromValue(firstTimestamp).add(timestampDelta).toString()
 }
 
-// The prototype an object literal gets, read from a literal and not from the global `Object`.
-const ObjectPrototype = Reflect.getPrototypeOf({})
-const createObject = Object.create
-
 /**
- * Builds a decoded message as a plain object: the same own keys, order, values, descriptors,
- * prototype (`Object.prototype`) and `constructor` (`Object`) as the object literal it replaces.
- * The aim is to keep V8 from pretenuring decoded messages: an object literal has an allocation
- * site, which V8 may switch to old-space allocation once a batch of its objects outlives a
- * young-generation collection; `Object.create` has no such site. This depends on V8 and is not
- * guaranteed. The assignments create own data properties only because `messageKeyIsInherited()`
- * was false just before; see there.
- * @param {number} magicByte the batch magic byte
- * @param {number} attributes the record attributes
- * @param {string} timestamp the record timestamp
- * @param {string} offset the record offset
- * @param {Buffer|null} key the record key
- * @param {Buffer|null} value the record value
- * @param {object} headers the decoded headers
- * @param {boolean} isControlRecord whether the record belongs to a control batch
- * @param {object} batchContext the batch-level values shared by every record of the batch
- */
-function createMessage(
-  magicByte,
-  attributes,
-  timestamp,
-  offset,
-  key,
-  value,
-  headers,
-  isControlRecord,
-  batchContext
-) {
-  const message = createObject(ObjectPrototype)
-  message.magicByte = magicByte
-  message.attributes = attributes
-  message.timestamp = timestamp
-  message.offset = offset
-  message.key = key
-  message.value = value
-  message.headers = headers
-  message.isControlRecord = isControlRecord
-  message.batchContext = batchContext
-  return message
-}
-
-/**
- * Whether any message key exists on `Object.prototype`, as an own property of any kind.
- * `Object.prototype` is the only object on a message's prototype chain and its own prototype is
- * always null, so when this is false each assignment in `createMessage` creates an own data
- * property, exactly as a literal defines one. When it is true (a polluted or hardened prototype)
- * an assignment could run an inherited setter or be refused by an inherited read-only property,
- * so the caller uses the literal instead. Checked per record: its properties can change at any
- * time.
+ * Whether a fresh empty object already sees any message key, that is, whether `Object.prototype`
+ * carries one as a property of any kind. `Object.prototype` is the only object on the chain of an
+ * empty literal and its own prototype is always null, so when this is false an assignment of a
+ * message key to that object creates an own data property, exactly as a literal defines one. When
+ * it is true (a polluted or hardened prototype) an assignment could run an inherited setter or be
+ * refused by an inherited read-only property, so the caller uses the literal instead. Checked per
+ * record: the properties of `Object.prototype` can change at any time.
+ * @param {object} empty an object literal with no own properties
  * @returns {boolean}
  */
-const messageKeyIsInherited = () =>
-  'magicByte' in ObjectPrototype ||
-  'attributes' in ObjectPrototype ||
-  'timestamp' in ObjectPrototype ||
-  'offset' in ObjectPrototype ||
-  'key' in ObjectPrototype ||
-  'value' in ObjectPrototype ||
-  'headers' in ObjectPrototype ||
-  'isControlRecord' in ObjectPrototype ||
-  'batchContext' in ObjectPrototype
+const messageKeyIsInherited = (empty) =>
+  'magicByte' in empty ||
+  'attributes' in empty ||
+  'timestamp' in empty ||
+  'offset' in empty ||
+  'key' in empty ||
+  'value' in empty ||
+  'headers' in empty ||
+  'isControlRecord' in empty ||
+  'batchContext' in empty
 
 /**
  * Decodes one record of a v0 record batch.
@@ -196,30 +151,34 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
     }
   }
 
-  // Last step before the message is built: the reads above can run inherited getters.
-  if (!messageKeyIsInherited()) {
-    return createMessage(
+  // The message is an empty literal filled by assignments, not a populated literal: V8 may switch
+  // a populated literal's allocation site to old-space allocation once a batch of its objects
+  // outlives a young-generation collection, and an empty literal has no such site (a V8 heuristic,
+  // not a guarantee). The check is the last step before the stores: the reads above can run
+  // inherited getters.
+  const message = {}
+  if (messageKeyIsInherited(message)) {
+    return {
       magicByte,
-      attributes,
+      attributes, // Record level attributes are presently unused
       timestamp,
       offset,
       key,
       value,
       headers,
-      isControlBatch,
-      batchContext
-    )
+      isControlRecord: isControlBatch,
+      batchContext,
+    }
   }
 
-  return {
-    magicByte,
-    attributes, // Record level attributes are presently unused
-    timestamp,
-    offset,
-    key,
-    value,
-    headers,
-    isControlRecord: isControlBatch,
-    batchContext,
-  }
+  message.magicByte = magicByte
+  message.attributes = attributes // Record level attributes are presently unused
+  message.timestamp = timestamp
+  message.offset = offset
+  message.key = key
+  message.value = value
+  message.headers = headers
+  message.isControlRecord = isControlBatch
+  message.batchContext = batchContext
+  return message
 }
