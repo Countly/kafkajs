@@ -3,6 +3,7 @@ const { builtinModules } = require('node:module')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { constants } = require('node:perf_hooks')
 const {
   parseArgs,
   runWorkload,
@@ -12,6 +13,9 @@ const {
   PACKAGE_DEFAULTS,
   SAME_PRODUCER_SETTINGS,
   PRODUCER_DEFAULTS,
+  CORPUS_PRODUCER_SETTINGS,
+  CORPUS_LAYOUT,
+  countFullGcs,
 } = require('../clientCompare')
 
 const SCRIPT = path.join(__dirname, '..', 'clientCompare.js')
@@ -51,7 +55,11 @@ const legacyPartitioner = () => () => 0
  * 2.2.4's does, when `createTopics` is asked to wait for leaders the broker does not know yet;
  * `metadata` lists what each `fetchTopicMetadata` answers in turn (`'unknown'`, `'no leader'`,
  * leaders for every partition when absent). `offsets` replaces what `fetchTopicOffsets` answers
- * (one partition 0 holding the corpus when absent); `state.eachMessage` is the consumer's handler.
+ * (each partition's count of the records sent to it when absent); `state.eachMessage` is the
+ * consumer's handler, which gets each record in send order from its partition, with offsets counted
+ * per partition, and a sought partition's records again from the sought offset.
+ * `threadCpu: false` stands for a Node without `process.threadCpuUsage`; `state.gc` records when the
+ * full-GC count started, stopped, counted and closed, in callbacks.
  */
 const fakeKafka = ({
   failSend = false,
@@ -61,6 +69,7 @@ const fakeKafka = ({
   sendMs,
   metadata = [],
   offsets,
+  threadCpu = true,
 } = {}) => {
   const state = {
     topics: new Map(),
@@ -82,6 +91,7 @@ const fakeKafka = ({
     compressions: [],
     listeners: [],
     delay: { enabledAt: [], disabledAt: [] },
+    gc: { startedAt: [], stoppedAt: [], countedAt: [], closedAt: [] },
   }
   let elapsedNs = 0n
   let ready
@@ -102,6 +112,21 @@ const fakeKafka = ({
     },
     cpuUsage: (previous) =>
       previous ? { user: 600 * state.callbacks + 1200, system: 300 } : { user: 0, system: 0 },
+    threadCpuUsage: threadCpu
+      ? (previous) =>
+          previous ? { user: 400 * state.callbacks + 800, system: 100 } : { user: 0, system: 0 }
+      : null,
+    countFullGcs: () => {
+      state.gc.startedAt.push(state.callbacks)
+      return {
+        stop: () => state.gc.stoppedAt.push(state.callbacks),
+        count: async () => {
+          state.gc.countedAt.push(state.callbacks)
+          return 3
+        },
+        close: () => state.gc.closedAt.push(state.callbacks),
+      }
+    },
     eventLoopDelay: () => ({
       enable: () => state.delay.enabledAt.push(state.callbacks),
       disable: () => state.delay.disabledAt.push(state.callbacks),
@@ -148,15 +173,18 @@ const fakeKafka = ({
             }),
           }
         },
-        fetchTopicOffsets: async (topic) =>
-          offsets ?? [
-            {
-              partition: 0,
-              offset: String(state.topics.get(topic).length),
-              high: String(state.topics.get(topic).length),
-              low: '0',
-            },
-          ],
+        fetchTopicOffsets: async (topic) => {
+          if (offsets) return offsets
+          const { numPartitions } = state.createdTopics.find((created) => created.topic === topic)
+          const counts = Array(numPartitions).fill(0)
+          for (const { partition = 0 } of state.topics.get(topic)) counts[partition]++
+          return counts.map((count, partition) => ({
+            partition,
+            offset: String(count),
+            high: String(count),
+            low: '0',
+          }))
+        },
         deleteTopics: async ({ topics }) => {
           for (const topic of topics) state.deleted.push(topic)
           state.events.push('delete topics')
@@ -189,7 +217,7 @@ const fakeKafka = ({
       state.consumerGroups.push(config.groupId)
       state.consumerConfigs.push(config)
       let topic
-      let index = 0
+      let seekTo = () => {}
       return {
         events: { REQUEST: 'consumer.network.request' },
         on: (event, listener) => {
@@ -203,19 +231,33 @@ const fakeKafka = ({
         },
         seek: ({ topic: sought, partition, offset }) => {
           state.seeks.push({ topic: sought, partition, offset })
-          index = Number(offset)
+          seekTo(partition, Number(offset))
         },
         run: async ({ eachMessage }) => {
           state.eachMessage = eachMessage
           const records = state.topics.get(topic)
           state.deliverable = records.length
+          const logs = new Map()
+          const queue = records.map((record) => {
+            const partition = record.partition ?? 0
+            if (!logs.has(partition)) logs.set(partition, [])
+            const log = logs.get(partition)
+            log.push(record)
+            return { partition, offset: log.length - 1, record }
+          })
+          seekTo = (partition, from) =>
+            logs
+              .get(partition)
+              .slice(from)
+              .forEach((record, i) => queue.push({ partition, offset: from + i, record }))
+          let index = 0
           state.deliver = async (count = Infinity) => {
-            for (let i = 0; i < count && index < records.length; i++) {
-              const offset = String(index)
-              const message = { ...records[index++], offset }
+            for (let i = 0; i < count && index < queue.length; i++) {
+              const { partition, offset, record } = queue[index++]
+              const message = { ...record, offset: String(offset) }
               elapsedNs += 10000000n
               state.callbacks += 1
-              await eachMessage({ topic, partition: 0, message })
+              await eachMessage({ topic, partition, message })
             }
           }
           ready()
@@ -675,6 +717,9 @@ describe('Benchmarks > clientCompare', () => {
         measuredMessages: 90,
         messagesPerSecond: 100,
         cpuMicrosPerMessage: (600 * 100 + 1200 + 300) / 90,
+        threadCpuUsageSupported: true,
+        mainThreadCpuMicrosPerMessage: (400 * 100 + 800 + 100) / 90,
+        fullGcCount: 3,
         eventLoopDelayP50: 50,
         eventLoopDelayP99: 99,
         eventLoopDelayMax: 250,
@@ -683,8 +728,224 @@ describe('Benchmarks > clientCompare', () => {
         messagesPerFetch: 45,
         fetchVersion: 17,
         passes: 1,
+        corpus: CORPUS_LAYOUT,
         settings: { defaults: null },
       })
+    })
+
+    test('consume-throughput writes one corpus layout on both arms under either settings: record i to partition i % partitions, sends of 500, the corpus producer settings', async () => {
+      const runs = []
+      for (const name of ['@countly/kafkajs', 'kafkajs']) {
+        for (const settings of ['defaults', 'same']) {
+          const kafka = fakeKafka()
+          kafka.client.name = name
+          runs.push(await runWith('consume-throughput', { messages: 1200, settings }, kafka))
+        }
+      }
+      const layoutOf = ({ state, metrics }) => {
+        const [records] = state.topics.values()
+        return {
+          producerConfigs: state.producerConfigs,
+          sends: state.sends,
+          partitions: records.map(({ partition }) => partition),
+          corpus: metrics.corpus,
+        }
+      }
+      const expected = {
+        producerConfigs: [CORPUS_PRODUCER_SETTINGS],
+        sends: [500, 500, 200],
+        partitions: Array.from({ length: 1200 }, (_, i) => i % 3),
+        corpus: CORPUS_LAYOUT,
+      }
+
+      for (const run of runs) expect(layoutOf(run)).toEqual(expected)
+      expect(CORPUS_PRODUCER_SETTINGS).toEqual({
+        idempotent: false,
+        maxInFlightRequests: null,
+        retry: { retries: 5 },
+        linger: 0,
+        batchSize: 1,
+      })
+      expect(CORPUS_LAYOUT).toEqual({
+        partitioning: 'record i to partition i % partitions',
+        recordsPerSend: 500,
+        concurrentSends: 8,
+        producer: CORPUS_PRODUCER_SETTINGS,
+      })
+    })
+
+    test('consume-throughput spreads the corpus over the requested partitions', async () => {
+      const { state } = await runWith('consume-throughput', { messages: 30, partitions: 12 })
+
+      const [records] = state.topics.values()
+      expect(records.map(({ partition }) => partition)).toEqual(
+        Array.from({ length: 30 }, (_, i) => i % 12)
+      )
+    })
+
+    test('consume-throughput counts main-thread CPU and full GCs over the measured window only', async () => {
+      const kafka = fakeKafka({ manualDelivery: true })
+      const pending = runWith('consume-throughput', { messages: 100 }, kafka)
+      await kafka.state.ready
+      await kafka.state.deliver(9)
+
+      expect(kafka.state.gc).toEqual({ startedAt: [], stoppedAt: [], countedAt: [], closedAt: [] })
+      await kafka.state.deliver(91)
+      const { metrics } = await pending
+
+      expect(kafka.state.gc).toEqual({
+        startedAt: [10],
+        stoppedAt: [100],
+        countedAt: [100],
+        closedAt: [100],
+      })
+      expect(metrics.mainThreadCpuMicrosPerMessage).toBe((400 * 100 + 800 + 100) / 90)
+      expect(metrics.fullGcCount).toBe(3)
+    })
+
+    test('consume-throughput leaves main-thread CPU out, without failing, on a Node without process.threadCpuUsage', async () => {
+      const { metrics } = await runWith(
+        'consume-throughput',
+        { messages: 100 },
+        fakeKafka({ threadCpu: false })
+      )
+
+      expect(Object.hasOwn(metrics, 'mainThreadCpuMicrosPerMessage')).toBe(false)
+      expect(metrics).toMatchObject({
+        threadCpuUsageSupported: false,
+        measuredMessages: 90,
+        cpuMicrosPerMessage: (600 * 100 + 1200 + 300) / 90,
+        fullGcCount: 3,
+      })
+    })
+
+    test('a consume run that fails stops its full-GC count', async () => {
+      const kafka = fakeKafka({ manualDelivery: true })
+      const pending = runWith('consume-throughput', { messages: 10 }, kafka).catch((error) => error)
+      await kafka.state.ready
+      await kafka.state.deliver(2)
+      const [{ callback }] = kafka.state.timers.values()
+      callback()
+
+      expect(await pending).toEqual(new Error('received 2 of 10 messages in time'))
+      expect(kafka.state.gc).toEqual({
+        startedAt: [1],
+        stoppedAt: [],
+        countedAt: [],
+        closedAt: [2],
+      })
+    })
+
+    describe('countFullGcs', () => {
+      const major = (startTime) => ({
+        startTime,
+        detail: { kind: constants.NODE_PERFORMANCE_GC_MAJOR },
+      })
+      const minor = (startTime) => ({
+        startTime,
+        detail: { kind: constants.NODE_PERFORMANCE_GC_MINOR },
+      })
+      /** A `gc` observer the test drives: `deliver` calls its callback, `buffered` is what `takeRecords` returns. */
+      const controlled = () => {
+        const observers = []
+        class Observer {
+          constructor(callback) {
+            this.callback = callback
+            this.buffered = []
+            this.disconnects = 0
+            observers.push(this)
+          }
+
+          observe(options) {
+            this.options = options
+          }
+
+          takeRecords() {
+            const taken = this.buffered
+            this.buffered = []
+            return taken
+          }
+
+          disconnect() {
+            this.disconnects++
+          }
+
+          deliver(...entries) {
+            this.callback({ getEntries: () => entries })
+          }
+        }
+        return { Observer, observers }
+      }
+
+      test('counts a full collection that started in the window though its entry arrives in the drain after stop, and not one that started after stop', async () => {
+        const { Observer, observers } = controlled()
+        let clock = 10
+        let drained = false
+        const drain = async () => {
+          observer.deliver(major(15), minor(16))
+          observer.deliver(major(25))
+          observer.buffered.push(major(18), major(5))
+          drained = true
+        }
+        const counter = countFullGcs({ Observer, now: () => clock, drain })
+        const [observer] = observers
+        observer.deliver(major(12), minor(13))
+        clock = 20
+        counter.stop()
+        clock = 30
+        counter.stop()
+
+        expect(observer.options).toEqual({ entryTypes: ['gc'] })
+        expect(drained).toBe(false)
+        expect(await counter.count()).toBe(3)
+        expect(drained).toBe(true)
+        expect(observer.disconnects).toBe(1)
+      })
+
+      test('disconnects its observer once, whether it was counted or only closed', async () => {
+        const { Observer, observers } = controlled()
+        const counted = countFullGcs({ Observer, now: () => 0, drain: async () => {} })
+        const closed = countFullGcs({ Observer, now: () => 0, drain: async () => {} })
+
+        counted.stop()
+        await counted.count()
+        counted.close()
+        closed.close()
+        closed.close()
+
+        expect(observers.map(({ disconnects }) => disconnects)).toEqual([1, 1])
+      })
+    })
+
+    test('consume-throughput fails before consuming when a partition does not hold the records its layout puts there', async () => {
+      const exact = [
+        { partition: 0, offset: '2', high: '2', low: '0' },
+        { partition: 1, offset: '2', high: '2', low: '0' },
+        { partition: 2, offset: '2', high: '2', low: '0' },
+      ]
+      const retried = fakeKafka({ offsets: [exact[0], { ...exact[1], high: '3' }, exact[2]] })
+      const missing = fakeKafka({ offsets: exact.slice(0, 2) })
+      const shifted = fakeKafka({ offsets: [exact[0], exact[1], { ...exact[2], low: '1' }] })
+
+      await expect(runWith('consume-throughput', { messages: 6 }, retried)).rejects.toThrow(
+        'corpus partition 1 holds 3 records where its layout puts 2: a send was retried or lost, so the arms would not read the same corpus'
+      )
+      await expect(runWith('consume-throughput', { messages: 6 }, missing)).rejects.toThrow(
+        'corpus partition 2 holds 0 records where its layout puts 2'
+      )
+      await expect(runWith('consume-throughput', { messages: 6 }, shifted)).rejects.toThrow(
+        'corpus partition 2 holds 1 records where its layout puts 2'
+      )
+      for (const { state } of [retried, missing, shifted]) {
+        expect(state.consumerConfigs).toEqual([])
+        expect(state.deleted).toEqual([...state.topics.keys()])
+      }
+      const { metrics } = await runWith(
+        'consume-throughput',
+        { messages: 6 },
+        fakeKafka({ offsets: exact })
+      )
+      expect(metrics.measuredMessages).toBe(5)
     })
 
     test('consume-throughput with --settings same gives the consumer one explicit configuration and reports it; defaults report the package defaults', async () => {
@@ -812,10 +1073,13 @@ describe('Benchmarks > clientCompare', () => {
     test('consume-throughput with --passes reads the corpus that many times, seeking each partition back after its last record', async () => {
       const { metrics, state } = await runWith('consume-throughput', { messages: 50, passes: 3 })
 
-      expect(state.seeks).toEqual([
-        { topic: state.subscription.topic, partition: 0, offset: '0' },
-        { topic: state.subscription.topic, partition: 0, offset: '0' },
-      ])
+      expect(state.seeks).toEqual(
+        [2, 0, 1, 2, 0, 1].map((partition) => ({
+          topic: state.subscription.topic,
+          partition,
+          offset: '0',
+        }))
+      )
       expect(state.callbacks).toBe(150)
       expect(metrics).toMatchObject({ measuredMessages: 145, elapsedMs: 1450, passes: 3 })
     })
@@ -829,7 +1093,11 @@ describe('Benchmarks > clientCompare', () => {
       const replay = async () => {
         const kafka = fakeKafka({ manualDelivery: true, offsets: twoPartitions })
         let completed = false
-        const pending = runWith('consume-throughput', { messages: 6, passes: 2 }, kafka).then(
+        const pending = runWith(
+          'consume-throughput',
+          { messages: 6, passes: 2, partitions: 2 },
+          kafka
+        ).then(
           (result) => {
             completed = true
             return result
