@@ -594,6 +594,46 @@ describe('public share subscription and run lifecycle', () => {
       expect(h.frames(78)[0].fields.shareSessionEpoch).toBe(0)
     })
 
+    test('is fetched while another subscribed topic was deleted, and the deleted topic is never asked for by name', async () => {
+      await start(
+        topicsOf([
+          ['topic-a', A],
+          ['topic-b', B],
+        ]),
+        { subscribe: ['topic-a', 'topic-b'] }
+      )
+      let given = false
+      h.cluster.answer('ShareFetch', (fields) => {
+        const listed = fields.topics.some(
+          ({ topicId, partitions }) =>
+            topicId === B && partitions.some(({ partitionIndex }) => partitionIndex === 1)
+        )
+        if (given || !listed) return echo('ShareFetch', fields)
+        given = true
+        return fetchAnswer([acquire(1, 0, ['b1'], { topicId: B })])
+      })
+      const handled = []
+      await h.consumer.run({
+        eachMessage: async ({ topic, partition, message }) =>
+          handled.push(`${topic}:${partition}:${message.offset}`),
+      })
+      await reach(() => h.frames(78).length > 0, 'the opening fetch')
+      h.table.delete('topic-a')
+      h.table.set('topic-b', { topicId: B, partitions: [LEADER, LEADER] })
+      const from = h.cluster.requests().length
+      await assignNext(2, [{ topicId: B, partitions: [0, 1] }])
+      await reach(() => handled.length === 1, 'the delivery of the added partition')
+      expect(handled).toEqual(['topic-b:1:0'])
+      const asked = h.cluster
+        .requests()
+        .slice(from)
+        .filter(({ api }) => api === 'Metadata')
+      expect(asked.length).toBeGreaterThan(0)
+      expect(
+        asked.flatMap(({ fields }) => (fields.topics ?? []).map(({ name }) => name))
+      ).not.toContain('topic-a')
+    })
+
     test('a stop that waits for a running handler ends the refresh in flight: its late answer installs nothing and no refresh follows', async () => {
       await start()
       h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a0'])])])
