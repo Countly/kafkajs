@@ -327,4 +327,28 @@ describe('filterAbortedMessages > several aborted transactions', () => {
       '9007199254740996',
     ])
   })
+
+  // As Numbers, 9007199254740995 and 9007199254740996 are equal, so a lossy activation would start
+  // the second producer's aborted transaction at its earlier commit marker.
+  test('activates a transaction beyond the safe integer range exactly: an earlier commit marker of its producer survives', () => {
+    const messages = [
+      record({ offset: '9007199254740994', producerId: '1' }),
+      record({
+        offset: '9007199254740995',
+        producerId: '2',
+        key: COMMIT_KEY,
+        isControlRecord: true,
+      }),
+      record({ offset: '9007199254740996', producerId: '2' }),
+      abortMarker('9007199254740997', '1'),
+      abortMarker('9007199254740998', '2'),
+    ]
+    const abortedTransactions = [aborted('2', '9007199254740996'), aborted('1', '9007199254740994')]
+
+    expect(offsetsOf(filterAbortedMessages({ messages, abortedTransactions }))).toEqual([
+      '9007199254740995',
+      '9007199254740997',
+      '9007199254740998',
+    ])
+  })
 })
