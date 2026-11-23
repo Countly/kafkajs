@@ -59,6 +59,46 @@ const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
 }
 
 /**
+ * Builds one decoded message, the same plain object an object literal would give: same own keys in
+ * the same order, prototype `Object.prototype` and `constructor === Object`.
+ * It is a constructor and not a literal because V8 tracks each literal's allocation site and, once a
+ * whole batch of its objects survives a young-generation collection, creates every later object of
+ * that site directly in old space. Messages then fill old space one batch per fetch and cause
+ * regular full collections. A `new` call has no such site.
+ * @param {number} magicByte the batch magic byte
+ * @param {number} attributes the record attributes
+ * @param {string} timestamp the record timestamp
+ * @param {string} offset the record offset
+ * @param {Buffer|null} key the record key
+ * @param {Buffer|null} value the record value
+ * @param {object} headers the decoded headers
+ * @param {boolean} isControlRecord whether the record belongs to a control batch
+ * @param {object} batchContext the batch-level values shared by every record of the batch
+ */
+function Message(
+  magicByte,
+  attributes,
+  timestamp,
+  offset,
+  key,
+  value,
+  headers,
+  isControlRecord,
+  batchContext
+) {
+  this.magicByte = magicByte
+  this.attributes = attributes
+  this.timestamp = timestamp
+  this.offset = offset
+  this.key = key
+  this.value = value
+  this.headers = headers
+  this.isControlRecord = isControlRecord
+  this.batchContext = batchContext
+}
+Message.prototype = Object.prototype
+
+/**
  * Decodes one record of a v0 record batch.
  * @param {Decoder} decoder positioned at the start of one record's body
  * @param {object} [batchContext] the batch-level values shared by every record in the batch; this
@@ -129,7 +169,7 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
     }
   }
 
-  return {
+  return new Message(
     magicByte,
     attributes, // Record level attributes are presently unused
     timestamp,
@@ -137,7 +177,7 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
     key,
     value,
     headers,
-    isControlRecord: isControlBatch,
-    batchContext,
-  }
+    isControlBatch,
+    batchContext
+  )
 }
