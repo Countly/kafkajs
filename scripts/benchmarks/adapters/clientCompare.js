@@ -5,13 +5,19 @@
  * than 30 seconds is `inconclusive`: a shorter window does not mean anything in either direction.
  * Beside the rows, each arm shows the median, minimum, maximum and spread of every metric, and,
  * from its first run, the producer or consumer settings in force, the LZ4 codec, the Fetch
- * version and the consume passes, so a ratio can be read from the report alone. A row with
- * `profile` names each arm's CPU profile, taken in one extra run outside the medians.
+ * version, the consume passes and the consume corpus layout, so a ratio can be read from the
+ * report alone. A row with `profile` names each arm's CPU profile, taken in one extra run outside
+ * the medians. A metric in `OPTIONAL_METRICS` that no run of an arm reported is left out of that
+ * arm's rows with a note, instead of making them errors.
  */
 const { readRun, rowsOf } = require('../report')
 
 const RUNS = 5
 const MIN_WINDOW_MS = 30000
+/** Metrics a run reports only where its Node can measure them, with why one is missing. */
+const OPTIONAL_METRICS = {
+  mainThreadCpuMicrosPerMessage: 'the Node running this arm has no process.threadCpuUsage',
+}
 
 /**
  * Seconds one run spends outside its warm-up and measured window: process start, topic creation
@@ -71,7 +77,7 @@ const plannedSeconds = ({ command, arms, profile }, runs = RUNS) => {
  * @param {object} output one run's JSON line
  * @param {string} workload the row's `--workload`
  * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 codec, Fetch
- *   version and passes
+ *   version, passes and corpus layout
  */
 const notesOf = (output, workload) => {
   const pairs = (settings) =>
@@ -103,6 +109,11 @@ const notesOf = (output, workload) => {
       `the corpus is read ${output.passes} times: each partition is sought back to its first offset after its last record`
     )
   }
+  if (output.corpus) {
+    notes.push(
+      `corpus layout (the same on both arms, each written by the arm's own client): ${pairs(output.corpus)}`
+    )
+  }
   return notes
 }
 
@@ -112,10 +123,21 @@ const notesOf = (output, workload) => {
  * @param {import('../report').Outcome} outcome
  * @param {number} runs
  * @returns {{ rows: import('../report').Row[], detail: import('../report').Detail }} the plain
- *   rows, `inconclusive` when a run's window is under 30 s, and the arm's spread table and notes
+ *   rows, `inconclusive` when a run's window is under 30 s, and the arm's spread table and notes;
+ *   an optional metric no run reported has no row
  */
 const rows = (entry, arm, outcome, runs) => {
-  const plain = rowsOf(entry, arm, outcome, runs)
+  const absent = entry.metrics
+    .map(({ key }) => key)
+    .filter(
+      (key) =>
+        Object.hasOwn(OPTIONAL_METRICS, key) &&
+        !outcome.error &&
+        outcome.outputs.length > 0 &&
+        outcome.outputs.every((output) => output[key] === undefined)
+    )
+  const metrics = entry.metrics.filter(({ key }) => !absent.includes(key))
+  const plain = rowsOf({ ...entry, metrics }, arm, outcome, runs)
   const short = outcome.outputs
     .map((output, i) => [i + 1, output.elapsedMs])
     .filter(([, ms]) => !(ms >= MIN_WINDOW_MS))
@@ -143,6 +165,7 @@ const rows = (entry, arm, outcome, runs) => {
       ...(outcome.outputs.length
         ? notesOf(outcome.outputs[0], valueOf(entry.command, '--workload'))
         : []),
+      ...absent.map((key) => `${key}: not reported, ${OPTIONAL_METRICS[key]}`),
       ...(outcome.profile
         ? [`CPU profile (one extra run, not in the medians): ${outcome.profile}`]
         : []),
@@ -173,4 +196,5 @@ module.exports = {
   spreadOf,
   plannedSeconds,
   MIN_WINDOW_MS,
+  OPTIONAL_METRICS,
 }

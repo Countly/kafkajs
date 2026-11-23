@@ -188,6 +188,8 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
         { "key": "eventLoopDelayP50", "unit": "ms" },
         { "key": "eventLoopDelayP99", "unit": "ms" },
         { "key": "eventLoopDelayMax", "unit": "ms" },
@@ -218,6 +220,8 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
         { "key": "eventLoopDelayP50", "unit": "ms" },
         { "key": "eventLoopDelayP99", "unit": "ms" },
         { "key": "eventLoopDelayMax", "unit": "ms" },
@@ -251,6 +255,8 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
         { "key": "eventLoopDelayP50", "unit": "ms" },
         { "key": "eventLoopDelayP99", "unit": "ms" },
         { "key": "eventLoopDelayMax", "unit": "ms" },
@@ -259,7 +265,45 @@
         { "key": "messagesPerFetch", "unit": "messages" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
-      "arms": ["fork", "kafkajs@2.2.4"]
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
+    },
+    {
+      "name": "compare-consume-throughput-1k-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "4000000",
+        "--size",
+        "1024",
+        "--passes",
+        "5",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
     },
     {
       "name": "compare-consume-throughput-lz4",
@@ -281,6 +325,8 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
         { "key": "eventLoopDelayP50", "unit": "ms" },
         { "key": "eventLoopDelayP99", "unit": "ms" },
         { "key": "eventLoopDelayMax", "unit": "ms" },
@@ -311,6 +357,8 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
         { "key": "eventLoopDelayP50", "unit": "ms" },
         { "key": "eventLoopDelayP99", "unit": "ms" },
         { "key": "eventLoopDelayMax", "unit": "ms" },
