@@ -505,7 +505,6 @@ describe('public share subscription and run lifecycle', () => {
   })
 
   describe('an assigned partition without a cached leader', () => {
-    const LEADERLESS = { 'topic-a': { topicId: A, partitions: [{ leader: -1, epoch: 1 }] } }
     /** Releases of the application handlers a test holds; cleanup runs them even after a failure. */
     const held = []
     beforeEach(() => {
@@ -538,6 +537,12 @@ describe('public share subscription and run lifecycle', () => {
     }
     /** @returns {number} The Metadata requests written so far. */
     const metadataCount = () => h.cluster.requests().filter(({ api }) => api === 'Metadata').length
+    /**
+     * @param {{fields: object}} call A Metadata request.
+     * @returns {boolean} Whether it asks for topics by id only, as the route refresh does.
+     */
+    const byId = ({ fields }) =>
+      (fields.topics ?? []).length > 0 && fields.topics.every(({ name }) => !name)
     /**
      * @param {object} fields A ShareFetch request's fields.
      * @param {number} partition A partition of topic A.
@@ -577,21 +582,54 @@ describe('public share subscription and run lifecycle', () => {
       expect(crashes).toEqual([])
     })
 
-    test('is fetched once a retried refresh finds a leader for a topic cached leaderless', async () => {
-      await start(LEADERLESS)
-      h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    test('is fetched again once one refresh at a time, under the backoff, finds a leader for a partition the broker answered LEADER_NOT_AVAILABLE', async () => {
+      await start()
+      let lose = false
+      let restored = false
+      h.cluster.answer('ShareFetch', (fields) => {
+        if (lose && fields.shareSessionEpoch > 0) {
+          lose = false
+          return fetchAnswer([part({ partition: 0, code: 6 })])
+        }
+        if (restored && fields.shareSessionEpoch === 0) {
+          restored = false
+          return fetchAnswer([acquire(0, 0, ['a'])])
+        }
+        return echo('ShareFetch', fields)
+      })
       const handled = []
-      const before = metadataCount()
       await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
-      await reach(() => metadataCount() >= before + 2, 'a retried refresh')
-      await flush()
-      expect(h.frames(78)).toEqual([])
-      expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+      await reach(() => h.frames(78).length > 0, 'the opening fetch')
+      const routes = () =>
+        h.cluster.requests().filter((call) => call.api === 'Metadata' && byId(call))
+      const first = h.hold({ api: 'Metadata', match: byId })
+      h.table.set('topic-a', { topicId: A, partitions: [{ leader: -1, epoch: 2, code: 5 }] })
+      lose = true
+      await reach(() => first.call !== null, 'the route refresh')
+      await pass(300)
+      expect(routes()).toHaveLength(1)
+      const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+      expect(finals).toHaveLength(1)
+      const fetches = h.frames(78).length
 
-      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 2 }] })
+      const second = h.hold({ api: 'Metadata', match: byId })
+      first.release()
+      await flush()
+      const answeredAt = performance.now()
+      await pass(90)
+      expect(second.call).toBeNull()
+      await reach(() => second.call !== null, 'the retried route refresh')
+      expect(performance.now() - answeredAt).toBeGreaterThanOrEqual(100)
+      expect(performance.now() - answeredAt).toBeLessThanOrEqual(110)
+      expect(h.frames(78)).toHaveLength(fetches)
+
+      h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 3 }] })
+      restored = true
+      second.release()
       await reach(() => handled.length === 1, 'the delivery once the partition has a leader')
       expect(handled).toEqual(['0'])
-      expect(h.frames(78)[0].fields.shareSessionEpoch).toBe(0)
+      expect(routes()).toHaveLength(2)
+      expect(h.frames(78).filter(({ fields }) => fields.shareSessionEpoch === 0)).toHaveLength(2)
     })
 
     test('is fetched while another subscribed topic was deleted, and the deleted topic is never asked for by name', async () => {

@@ -598,8 +598,10 @@ const heartbeatAnswer = (fields, { interval, epochs, topics }) => {
  * @param {object} [options.kafka] Overrides of the Kafka options.
  * @param {object} [options.share] Overrides of the shareConsumer options.
  * @param {number} [options.interval=50] The `heartbeatIntervalMs` the coordinator answers.
- * @param {Record<string, {topicId: string, partitions: Array<{leader: number, epoch: number}>}>} [options.topics]
+ * @param {Record<string, {topicId: string, partitions: Array<{leader: number, epoch: number, code?: number}>}>} [options.topics]
  *   The metadata the wire serves, by topic name; the test edits the returned `table` to change it.
+ *   A partition's `code` is its error code, 0 by default (a broker answers a partition without a
+ *   leader with 5, `LEADER_NOT_AVAILABLE`, and leader -1).
  * @returns {object} `{ client, consumer, cluster, schedule, table, script, hold, frames, close }`.
  */
 const shareClient = ({
@@ -636,9 +638,9 @@ const shareClient = ({
         topicId: entry ? entry.topicId : '00000000-0000-0000-0000-000000000000',
         isInternal: false,
         topicAuthorizedOperations: -2147483648,
-        partitions: (entry ? entry.partitions : []).map(({ leader, epoch }, partitionIndex) => ({
-          errorCode: 0,
-          partitionIndex,
+        partitions: (entry ? entry.partitions : []).map(({ leader, epoch, code = 0 }, index) => ({
+          errorCode: code,
+          partitionIndex: index,
           leaderId: leader,
           leaderEpoch: epoch,
           replicas: [leader],
