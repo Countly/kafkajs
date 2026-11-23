@@ -23052,7 +23052,10 @@
         "scripts/soak/__tests__/loadMeters.spec.js \u203a load throughput series merges another process's series: counts add, acknowledgement times widen, an interval's gap is the shortest any process saw",
         "src/consumer/__tests__/seekOffsets.spec.js \u203a Consumer > SeekOffsets has answers false on an empty map without building a key",
         "src/consumer/__tests__/seekOffsets.spec.js \u203a Consumer > SeekOffsets has finds a pending seek and misses every other partition",
-        "src/consumer/__tests__/seekOffsets.spec.js \u203a Consumer > SeekOffsets has answers false again once the last pending seek is popped"
+        "src/consumer/__tests__/seekOffsets.spec.js \u203a Consumer > SeekOffsets has answers false again once the last pending seek is popped",
+        "src/consumer/share/__tests__/shareConsumerModes.spec.js \u203a Share consumer handler decisions freezing a call whose acquisition was retired closes it without touching the ledger",
+        "src/consumer/share/__tests__/shareConsumerModes.spec.js \u203a Share consumer handler decisions freezing a call that lost its authority promotes none of its choices",
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler whose renewal lost its session still finals the other node and leaves"
       ],
       "capMinutes": 85,
       "allowedSkips": [
