@@ -90,6 +90,11 @@ describe('scripts/ci/sweeps.sh shipped-doc identifiers', () => {
     ['an id in the quarantine list', 'QUARANTINE.md', 'Waits on P10.\n'],
     ['an id in the contributing guide', 'CONTRIBUTING.md', 'Per D200.\n'],
     ['an id in the OpenTelemetry README', 'otel/README.md', 'Covered by O17.\n'],
+    ['a maintainer machine in a guide', 'docs/Other.md', 'Measured on the development host.\n'],
+    ['a run controller in a guide', 'docs/Other.md', 'The controller supplies the guard.\n'],
+    ['a local-run rule in a guide', 'docs/Other.md', 'Local acceptance uses Node 26.\n'],
+    ['a private phase process in a guide', 'docs/Other.md', 'It does not block a phase merge.\n'],
+    ['a private branch prefix in a guide', 'docs/Other.md', 'Runs on p9m/ pull requests.\n'],
   ])('fails on %s', (_name, file, text) => {
     const section = sweep({ ...realDocs(), [file]: text })
 

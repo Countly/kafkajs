@@ -760,7 +760,7 @@ describe('documented live scenario scripts', () => {
     expect(block).toContain('npm run test:e2e:rack-aware-producer')
     expect(block).toContain('180000 ms')
     expect(block).toContain('docker-compose.racks.yml')
-    expect(block).toContain('sole cluster guard')
+    expect(block).toContain('cluster guard script named by `P9_CLUSTER_GUARD`')
   })
 
   it('documents the consumer-churn soak profile and its script', () => {

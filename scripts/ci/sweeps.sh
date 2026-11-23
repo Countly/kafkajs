@@ -3,7 +3,9 @@
 # label grep against alpha.9b, test-only exports, focused or failing tests, host paths, TODO text and leftover .orig/.rej files. Each
 # hit is compared as `file:text` (line numbers dropped) with the enumerated exceptions, as a
 # multiset, so an exception that moves still matches and a second copy of one is a new hit.
-# It also fails on planning ids (acceptance, decision or plan ids) in the shipped README, governance files and guides.
+# It also fails on planning ids (acceptance, decision or plan ids) and on private working-process wording (a
+# maintainer's machine, run controller, local-run rule, phase process or private branch) in the shipped README,
+# governance files and guides.
 # Usage: sweeps.sh <out directory>     Writes <out>/sweeps.txt, whose last line is the verdict.
 # Every `git grep` is checked by its own exit status (0 hits, 1 none, anything else a failure);
 # a failure stops the sweeps with `sweeps: FAIL`, never with a clean verdict.
@@ -223,6 +225,11 @@ DOC_PATTERNS=(
   'D[12][0-9]{2}' # decision id
   'E[0-9]{2}'     # evidence check id
   'O[0-9]{2}'     # requirement id
+  'development host|developer host|developer-host'   # a maintainer's machine
+  'controller (supplies|acceptance)'               # a private run controller
+  'Local (acceptance|correctness|gates)'           # a rule for local runs
+  'phase (merges?|PRs?)|[Pp]hase-blocking|sub-phase' # private phase process
+  'p9[a-z]'       # private branch prefix
 )
 DOC_IDS="\\b($(IFS='|'; echo "${DOC_PATTERNS[*]}"))\\b"
 hits shipped-doc -n -E "$DOC_IDS" -- README.md RELEASING.md SECURITY.md QUARANTINE.md CONTRIBUTING.md otel/README.md \
