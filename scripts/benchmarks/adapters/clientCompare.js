@@ -7,16 +7,23 @@
  * from its first run, the producer or consumer settings in force, the LZ4 codec, the Fetch
  * version, the consume passes and the consume corpus layout, so a ratio can be read from the
  * report alone. A row with `profile` names each arm's CPU profile, taken in one extra run outside
- * the medians. A metric in `OPTIONAL_METRICS` that no run of an arm reported is left out of that
- * arm's rows with a note, instead of making them errors.
+ * the medians. A metric in `OPTIONAL_METRICS` is left out of an arm's rows, with a note, only when
+ * every run of the arm says its Node cannot measure it; a run that can but did not report it makes
+ * the metric, and the arm, an error.
  */
 const { readRun, rowsOf } = require('../report')
 
 const RUNS = 5
 const MIN_WINDOW_MS = 30000
-/** Metrics a run reports only where its Node can measure them, with why one is missing. */
+/**
+ * Metrics a run reports only where its Node can measure them: the run's flag that says whether it
+ * can, and why the metric is missing when it cannot.
+ */
 const OPTIONAL_METRICS = {
-  mainThreadCpuMicrosPerMessage: 'the Node running this arm has no process.threadCpuUsage',
+  mainThreadCpuMicrosPerMessage: {
+    supported: 'threadCpuUsageSupported',
+    reason: 'the Node running this arm has no process.threadCpuUsage',
+  },
 }
 
 /**
@@ -111,7 +118,8 @@ const notesOf = (output, workload) => {
   }
   if (output.corpus) {
     notes.push(
-      `corpus layout (the same on both arms, each written by the arm's own client): ${pairs(output.corpus)}`
+      `corpus layout (the same on both arms, each written by the arm's own client): ${pairs(output.corpus)}`,
+      "each partition's record count was checked against the layout before measuring; the order of the batches inside a partition was not"
     )
   }
   return notes
@@ -124,7 +132,8 @@ const notesOf = (output, workload) => {
  * @param {number} runs
  * @returns {{ rows: import('../report').Row[], detail: import('../report').Detail }} the plain
  *   rows, `inconclusive` when a run's window is under 30 s, and the arm's spread table and notes;
- *   an optional metric no run reported has no row
+ *   an optional metric that every run says it cannot measure has no row, and an error row makes
+ *   the arm an error
  */
 const rows = (entry, arm, outcome, runs) => {
   const absent = entry.metrics
@@ -134,7 +143,7 @@ const rows = (entry, arm, outcome, runs) => {
         Object.hasOwn(OPTIONAL_METRICS, key) &&
         !outcome.error &&
         outcome.outputs.length > 0 &&
-        outcome.outputs.every((output) => output[key] === undefined)
+        outcome.outputs.every((output) => output[OPTIONAL_METRICS[key].supported] === false)
     )
   const metrics = entry.metrics.filter(({ key }) => !absent.includes(key))
   const plain = rowsOf({ ...entry, metrics }, arm, outcome, runs)
@@ -154,18 +163,19 @@ const rows = (entry, arm, outcome, runs) => {
     row.status === 'valid' && reason ? { ...row, status: 'inconclusive', reason } : row
   )
   const numbered = result.filter((row) => row.median !== undefined)
-  const status = outcome.error ? 'error' : reason ? 'inconclusive' : 'valid'
+  const failed = outcome.error ?? result.find((row) => row.status === 'error')?.reason
+  const status = failed ? 'error' : reason ? 'inconclusive' : 'valid'
   const fmt = (n) => (n === undefined ? '-' : String(Number(n.toPrecision(4))))
   const detail = {
     status,
-    ...(outcome.error && { reason: outcome.error }),
+    ...(failed && { reason: failed }),
     controls: [window],
     notes: [
       `${arm}: ${outcome.outputs.length} of ${runs} runs, interleaved with the other arm; each run's warm-up is not measured`,
       ...(outcome.outputs.length
         ? notesOf(outcome.outputs[0], valueOf(entry.command, '--workload'))
         : []),
-      ...absent.map((key) => `${key}: not reported, ${OPTIONAL_METRICS[key]}`),
+      ...absent.map((key) => `${key}: not reported, ${OPTIONAL_METRICS[key].reason}`),
       ...(outcome.profile
         ? [`CPU profile (one extra run, not in the medians): ${outcome.profile}`]
         : []),

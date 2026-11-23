@@ -310,10 +310,11 @@ describe('Benchmark report clientCompare adapter', () => {
 
       expect(detail.notes.slice(1)).toEqual([
         'corpus layout (the same on both arms, each written by the arm\'s own client): partitioning="record i to partition i % partitions", recordsPerSend=500',
+        "each partition's record count was checked against the layout before measuring; the order of the batches inside a partition was not",
       ])
     })
 
-    test('an arm whose runs report no main-thread CPU leaves that metric out with a note instead of an error row', () => {
+    test('an arm whose every run says its Node has no process.threadCpuUsage leaves main-thread CPU out with a note instead of an error row', () => {
       const withThread = {
         ...entry,
         metrics: [
@@ -324,12 +325,21 @@ describe('Benchmark report clientCompare adapter', () => {
       }
       const runs = [output(100, 30000, { fullGcCount: 4 }), output(120, 30000, { fullGcCount: 6 })]
 
-      const absent = adapter.rows(withThread, 'kafkajs@2.2.4', { outputs: runs }, 2)
+      const absent = adapter.rows(
+        withThread,
+        'kafkajs@2.2.4',
+        { outputs: runs.map((run) => ({ ...run, threadCpuUsageSupported: false })) },
+        2
+      )
       const present = adapter.rows(
         withThread,
         'fork',
         {
-          outputs: runs.map((run, i) => ({ ...run, mainThreadCpuMicrosPerMessage: 3 + i })),
+          outputs: runs.map((run, i) => ({
+            ...run,
+            threadCpuUsageSupported: true,
+            mainThreadCpuMicrosPerMessage: 3 + i,
+          })),
         },
         2
       )
@@ -350,18 +360,41 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(present.detail.notes.some((note) => note.includes('not reported'))).toBe(false)
     })
 
-    test('a run that lacks a metric the other runs report is still an error row', () => {
+    test('a run that can measure main-thread CPU but omits it is an error row, and the arm is an error', () => {
       const withThread = {
         ...entry,
         metrics: [{ key: 'mainThreadCpuMicrosPerMessage', unit: 'us' }],
       }
-      const outputs = [output(1, 30000, { mainThreadCpuMicrosPerMessage: 3 }), output(1, 30000)]
+      const supported = { threadCpuUsageSupported: true }
+      const outputs = [
+        output(1, 30000, { ...supported, mainThreadCpuMicrosPerMessage: 3 }),
+        output(1, 30000, supported),
+      ]
 
-      const { rows } = adapter.rows(withThread, 'fork', { outputs }, 2)
+      const { rows, detail } = adapter.rows(withThread, 'fork', { outputs }, 2)
 
-      expect(rows.map(({ status, reason }) => [status, reason])).toEqual([
-        ['error', 'run 2 of 2: mainThreadCpuMicrosPerMessage is not a finite number'],
-      ])
+      const reason = 'run 2 of 2: mainThreadCpuMicrosPerMessage is not a finite number'
+      expect(rows.map(({ status, reason: why }) => [status, why])).toEqual([['error', reason]])
+      expect(detail).toMatchObject({ status: 'error', reason })
+      expect(detail.notes.some((note) => note.includes('not reported'))).toBe(false)
+    })
+
+    test('runs that omit main-thread CPU without saying their Node lacks it are errors, not a left-out metric', () => {
+      const withThread = {
+        ...entry,
+        metrics: [{ key: 'mainThreadCpuMicrosPerMessage', unit: 'us' }],
+      }
+      const outputs = [
+        output(1, 30000),
+        output(1, 30000, { threadCpuUsageSupported: false }),
+        output(1, 30000),
+      ]
+
+      const { rows, detail } = adapter.rows(withThread, 'fork', { outputs }, 3)
+
+      const reason = 'run 1 of 3: mainThreadCpuMicrosPerMessage is not a finite number'
+      expect(rows.map(({ status, reason: why }) => [status, why])).toEqual([['error', reason]])
+      expect(detail).toMatchObject({ status: 'error', reason })
     })
 
     test('an arm that failed is an error with its reason and no table', () => {
