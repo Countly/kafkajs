@@ -66,10 +66,9 @@ const ObjectPrototype = Reflect.getPrototypeOf({})
  * prototype (`Object.prototype`) and `constructor` (`Object`) as the object literal it replaces.
  * The aim is to keep V8 from pretenuring decoded messages: an object literal has an allocation
  * site, which V8 may switch to old-space allocation once a batch of its objects outlives a
- * young-generation collection; a `new` call has no such site. This depends on V8 and is not
- * guaranteed. Debugger tools may label these objects `Message` instead of `Object`.
- * The assignments create own data properties only because `messageKeyIsInherited()` was false
- * just before; see there.
+ * young-generation collection; `Object.create` has no such site. This depends on V8 and is not
+ * guaranteed. The assignments create own data properties only because `messageKeyIsInherited()`
+ * was false just before; see there.
  * @param {number} magicByte the batch magic byte
  * @param {number} attributes the record attributes
  * @param {string} timestamp the record timestamp
@@ -80,7 +79,7 @@ const ObjectPrototype = Reflect.getPrototypeOf({})
  * @param {boolean} isControlRecord whether the record belongs to a control batch
  * @param {object} batchContext the batch-level values shared by every record of the batch
  */
-function Message(
+function createMessage(
   magicByte,
   attributes,
   timestamp,
@@ -91,17 +90,18 @@ function Message(
   isControlRecord,
   batchContext
 ) {
-  this.magicByte = magicByte
-  this.attributes = attributes
-  this.timestamp = timestamp
-  this.offset = offset
-  this.key = key
-  this.value = value
-  this.headers = headers
-  this.isControlRecord = isControlRecord
-  this.batchContext = batchContext
+  const message = Object.create(ObjectPrototype)
+  message.magicByte = magicByte
+  message.attributes = attributes
+  message.timestamp = timestamp
+  message.offset = offset
+  message.key = key
+  message.value = value
+  message.headers = headers
+  message.isControlRecord = isControlRecord
+  message.batchContext = batchContext
+  return message
 }
-Message.prototype = ObjectPrototype
 
 /**
  * Whether any message key exists on `Object.prototype`, as an own property of any kind.
@@ -196,7 +196,7 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
 
   // Last step before the message is built: the reads above can run inherited getters.
   if (!messageKeyIsInherited()) {
-    return new Message(
+    return createMessage(
       magicByte,
       attributes,
       timestamp,
