@@ -410,7 +410,9 @@ class ShareRun {
    * its drive finished its handlers, final and disposal; only then does a node wanted again start
    * a new drive, so a node never has two sessions or two running handlers. Moved partitions lose
    * their old-node acquisitions synchronously; revoked partitions keep their handler
-   * completion/release policy.
+   * completion/release policy. A node, ended or not, keeps holding an assigned partition whose
+   * leader became unknown (`node.held`), so when that partition later moves to another node its
+   * old acquisitions are retired in the same sync, before the new node fetches it.
    * Never runs while a close owns the run.
    * @private
    * @returns {void}
@@ -419,26 +421,34 @@ class ShareRun {
     if (!this.admitting || this.retired || this.closing || this.stopRequested) return
     const { cluster } = this.options
     const wanted = new Map()
-    const routed = new Set()
+    const routed = new Map()
+    const unrouted = new Set()
     this.routeless = new Set()
     for (const [topicId, { topic, partitions }] of this.assignment) {
       for (const partition of partitions) {
         const leader = cluster.cachedLeader(topic, partition)
         if (leader < 0) {
           this.routeless.add(topicId)
+          unrouted.add(`${topicId}:${partition}`)
           continue
         }
         if (!wanted.has(leader)) wanted.set(leader, [])
         wanted.get(leader).push({ topicId, topic, partition })
-        routed.add(`${topicId}:${partition}`)
+        routed.set(`${topicId}:${partition}`, leader)
       }
     }
     const moved = []
     for (const [nodeId, node] of this.nodes) {
-      if (node.ended) continue
-      const rows = wanted.get(nodeId) || []
+      const rows = node.ended ? [] : wanted.get(nodeId) || []
       const keys = new Set(rows.map((row) => `${row.topicId}:${row.partition}`))
-      for (const key of node.keys) if (!keys.has(key) && routed.has(key)) moved.push({ node, key })
+      const held = new Set()
+      for (const key of [...node.keys, ...node.held]) {
+        if (keys.has(key)) continue
+        if (routed.has(key) && routed.get(key) !== nodeId) moved.push({ node, key })
+        else if (unrouted.has(key) || routed.has(key)) held.add(key)
+      }
+      node.held = held
+      if (node.ended) continue
       node.wanted = rows
       node.keys = keys
       node.ended = rows.length === 0
@@ -508,6 +518,7 @@ class ShareRun {
       issued,
       wanted: rows,
       keys: new Set(rows.map((row) => `${row.topicId}:${row.partition}`)),
+      held: new Set(),
       ended: false,
       loop: null,
       session: null,
