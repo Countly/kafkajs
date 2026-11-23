@@ -1,6 +1,6 @@
 name: Final soak smoke (diagnostic)
 # Runs the final soak runbook in smoke mode (or, when a dispatch selects it, rehearsal mode: the
-# first three hours of the day plan, so the heap row is judged on three quiet boundaries) against
+# first three hours of the 12-hour acceptance plan, so the heap row is judged on three quiet boundaries) against
 # the repository's three-broker Kafka 4.4.0 telemetry Compose cluster on a hosted runner. A smoke
 # job takes about 35 minutes, a rehearsal about 3.5 hours. Diagnostic only: a hosted runner cannot
 # meet the quiet-host floors, so preflight records those checks without failing on them and the
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Run mode (smoke 30 min; rehearsal 3 h of the day plan)
+        description: Run mode (smoke 30 min; rehearsal 3 h of the acceptance plan)
         type: choice
         options: ['smoke', 'rehearsal']
         default: 'smoke'

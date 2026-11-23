@@ -8,7 +8,7 @@
  *
  * Each row is PASS, FAIL or INCONCLUSIVE with the numbers behind it; the overall verdict is
  * ACCEPTED only when all seven PASS in an acceptance run. A smoke or a rehearsal is diagnostic and
- * at best NOT ACCEPTED; K5 judges a rehearsal's hourly boundaries by the day's rule, while a smoke
+ * at best NOT ACCEPTED; K5 judges a rehearsal's hourly boundaries by the acceptance rule, while a smoke
  * has one boundary and leaves K5 INCONCLUSIVE. Every other contract row is printed as NOT JUDGED with the CI lane that covers it.
  *
  * Inputs (the runbook's artifact directory): `config.json`, `header.json`, `supervisor.json`,
@@ -272,7 +272,7 @@ class Journal {
   }
 
   /**
-   * Keeps a broker's down or ready instant for the report, up to two per scheduled outage of a day
+   * Keeps a broker's down or ready instant for the report, up to two per scheduled outage of a run
    * (`schedule.totals.outages`); beyond that it only counts them.
    * @param {object} r a `broker-state` record other than `isr` @returns {void}
    */

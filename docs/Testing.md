@@ -441,7 +441,7 @@ The single-client memory and native arms of `src/telemetry/__tests__/resources.s
 
 Retain all memory inputs, stamped sidecar hashes, worker disconnect receipts, close events and stdout/stderr. Every child must close naturally with code zero and no signal, unexpected stderr or unhandled rejection, within 10 seconds of its explicit-disconnect receipt. A watchdog, missing resource source, missing client kind, changed baseline or failed restoration fails the run.
 
-Local resource gates use Kafka 4.3.1 and Node 26 on a quiet host. Other Kafka and Node lines and the separate performance measurements remain CI hand-offs. A short telemetry pass never closes the final 24-hour idle/churn gate.
+Local resource gates use Kafka 4.3.1 and Node 26 on a quiet host. Other Kafka and Node lines and the separate performance measurements remain CI hand-offs. A short telemetry pass never closes the final 12-hour idle/churn gate.
 
 ### Telemetry resource measurements
 

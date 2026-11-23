@@ -1,6 +1,8 @@
 # Runbook: the Apache dumps and the core checker
 
-Applies to a smoke, rehearsal or acceptance run of `scripts/soak/finalSoakNode.sh`. The canonical dump procedure is the driver's own
+Applies to a smoke, rehearsal or acceptance run of `scripts/soak/finalSoakNode.sh`. An acceptance run lasts 12 hours
+(43,200,000 ms) from the readiness barrier, on the release owner's own machine or a dedicated machine provisioned for the
+run, which must meet the same quiet-host floors. The canonical dump procedure is the driver's own
 `scripts/soak/finalSoakDump.js`, which `finalSoakNode.sh` runs; this page says what it must leave in the artifact, how to
 reproduce one dump by hand if ever needed, and how to run and read the checker.
 
@@ -118,7 +120,7 @@ node scripts/evidence/finalSoakCore.js "$out"        # exit 0 only when the verd
 It streams `stream.ndjson` once (no scratch store), validates config, header, matrix and stream with the merged schema, reads
 the dumps, and prints one block per row. Memory: about 86 bytes of typed arrays per offered-id slot (about 172 MB at the
 2-million cap, `traffic.maxOffers`, touched only as ids arrive: the full payload digest and one ownership serial per judged
-group) plus one id string and map entry per offered id. A synthetic replay of about one day of offers (60 copies of a smoke)
+group) plus one id string and map entry per offered id. A synthetic replay of about 24 hours of offers (60 copies of a smoke, about twice an acceptance run's)
 took about 15 minutes and stayed under 0.6 GiB RSS; plan for under 1 GiB RSS and tens of minutes.
 
 Verdicts: `ACCEPTED` (all seven rows PASS in an acceptance run; a smoke or a rehearsal is diagnostic and never reaches it),
@@ -182,7 +184,7 @@ the end of traffic is the latest such record from the supervisor.
 
 ## 5b. Information printed but not judged
 
-Under "NOT JUDGED information": each broker `down` and `ready` instant (two per scheduled outage of a day, 24, then a count
+Under "NOT JUDGED information": each broker `down` and `ready` instant (two per scheduled outage of the acceptance run, 12, then a count
 of any more) with the configured down time and the container's stop
 or start instant (`downMs`, `processAt`), the wave transfer, return and not-observed counts from the `wave` records with, per event, the paused keys and the keys the
 member held from their `wave-key` records, every wave whose counted `wave-key` records did not all arrive (`incomplete wave:
@@ -198,7 +200,7 @@ the same rule as K5 on processes without the measured client). None of them chan
 
 Read `lateSteps` (K7) and every INCONCLUSIVE reason. A late supervisor step is information only: `lateSteps` never changes a
 row or the verdict, as with the items under NOT JUDGED. Only a late sample changes a row (a periodic slot outside its jitter
-fails K7). Do not start the day until a two-outage smoke with one committed and one aborted transaction replays from its own
+fails K7). Do not start the acceptance run until a two-outage smoke with one committed and one aborted transaction replays from its own
 checkout with K1 to K4, K6 and K7 PASS and K5 INCONCLUSIVE only for its single boundary ("has 1 of 1 usable heap snapshots").
 
 ## 6a. The judged heap and the triage of a K5 FAIL
@@ -262,7 +264,7 @@ what a rehearsal (run 3afda68743d9, consumer p03 at `h02`, 10,220,632 excluded a
 
 Why code is excluded: over a rehearsal hour 88 to 98 % of the growth was in these rows, for functions that become hot for
 the first time on rarely run paths (outage, recreation, regex churn); none was ever freed and the count of functions that can
-still tier up gives no ceiling, so on the day it would fail the bound without any product leak (run 3afda68743d9: consumers
+still tier up gives no ceiling, so on an acceptance run it would fail the bound without any product leak (run 3afda68743d9: consumers
 grew 0.27 to 0.39 MB an hour in `heapUsed`, judged bytes 27 to 30 KB an hour). The product compiles no code at run time
 (no `eval`, `new Function` or `vm` under `src/`), so a leak of the client cannot hide in it. Everything else stays judged:
 maps and hidden classes (`object shape`), `hidden` system objects even when their name looks like code (a `hidden`
@@ -289,12 +291,12 @@ that boundary, or a size other than the file's, gets a record with that error an
 the artifact. When the summary cannot be written, finalize records why in `heap/summary-error.txt`, still seals the run, and
 K5 is INCONCLUSIVE with that reason.
 
-Sizes for a day (estimates from rehearsal 3afda68743d9, not yet measured on a day): 14 processes × 24 snapshots of 15 to
-25 MB, plus the seed's 24 growing with its map to about 200 MB, about 7.5 to 11 GB in all, which the run's disk monitor keeps
-free (16 GiB reserved); a rehearsal writes 15 × 3 snapshots, about 0.7 to 1 GB. Summarising takes about one second and
-140 MB to 400 MB of RSS per 15 MB snapshot (about ten minutes for a day, the seed's last snapshots up to about 1 GB of RSS,
+Sizes for an acceptance run (estimates from rehearsal 3afda68743d9, not yet measured on one): 14 processes × 12 snapshots of
+15 to 25 MB, plus the seed's 12 growing with its map to about 100 MB, about 3 to 5 GB in all, which the run's disk monitor
+keeps free (16 GiB reserved, the size kept from the 24-hour plan); a rehearsal writes 15 × 3 snapshots, about 0.7 to 1 GB. Summarising takes about one second and
+140 MB to 400 MB of RSS per 15 MB snapshot (about five minutes for an acceptance run, the seed's last snapshots up to about 1 GB of RSS,
 inside the finalize limit). The checker reads every counted snapshot, one at a time (subjects, seed, reader and decoder,
-360 on a day, about the same time again, inside its own limit), and re-derives node count, total, judged and excluded
+180 on an acceptance run, about the same time again, inside its own limit), and re-derives node count, total, judged and excluded
 bytes, size and sha256 from the file itself; any disagreement leaves that process without numbers and K5 INCONCLUSIVE. The
 summary's other fields (`growing`, owner classes) are triage aids and judge nothing.
 
@@ -311,28 +313,28 @@ summary's other fields (`growing`, owner classes) are triage aids and judge noth
 
 The verdict stays REJECTED either way; the triage decides what gets fixed.
 
-## 6b. A rehearsal before the day
+## 6b. A rehearsal before the acceptance run
 
 A smoke has one quiet boundary per measured process, so K5 is always INCONCLUSIVE there. A rehearsal
-(`finalSoakNode.sh <sha> rehearsal`) runs the first three hours of the day plan unchanged: the same hourly executions,
+(`finalSoakNode.sh <sha> rehearsal`) runs the first three hours of the 12-hour acceptance plan unchanged: the same hourly executions,
 outages on even hours, idle windows, quiet triplets and heap snapshots (`h00` to `h02`) and seed timing, for 10,800,000 ms
-(`acceptance.modes.rehearsal`). The checker judges it with the day's rules: every periodic slot of its length, and K5 on the
+(`acceptance.modes.rehearsal`). The checker judges it with the acceptance rules: every periodic slot of its length, and K5 on the
 judged heap of its three boundaries with the same endpoint bound (absolute bytes, not scaled to the length, so it fails above
-about 1 MiB of sustained judged growth per hour instead of about 0.1 MiB on the day) and the same slope bound per minute. Its
+about 1 MiB of sustained judged growth per hour instead of about 0.2 MiB on the acceptance run) and the same slope bound per minute. Its
 verdict is at best NOT ACCEPTED. `FINAL_SOAK_DIAGNOSTIC=1` is accepted, as for a smoke.
 
 On a hosted runner, dispatch the `Final soak smoke (diagnostic)` workflow with `mode: rehearsal`. A push to one of the
 workflow's smoke branches always runs a smoke. The job takes about 3.5 hours (three hours of plan, about 15 minutes of start,
 teardown, dumps, heap summary, check and archive, and the upload); its runbook step is limited to 17,400 s and the job to 335
-minutes, inside the runner's six hours. Read K5 with section 6a before the day: forecast the day from the judged growth per
-hour of each subject (about 21 hours separate the day's endpoint medians). Rehearsal 3afda68743d9 snapshotted only two
-subjects (p03 and p09, forecast 0.60 and 0.22 MB for the day); a forecast for the other ten from it is an extrapolation
+minutes, inside the runner's six hours. Read K5 with section 6a before the acceptance run: forecast it from the judged growth
+per hour of each subject (about 9 hours separate its endpoint medians). Rehearsal 3afda68743d9 snapshotted only two
+subjects (p03 and p09, forecast 0.26 and 0.09 MB for the acceptance run); a forecast for the other ten from it is an extrapolation
 from their `heapUsed`, not a measurement, until a rehearsal of this tree snapshots every subject.
 
-## 7. The load profile (separate from the day plan)
+## 7. The load profile (separate from the acceptance plan)
 
 `scripts/soak/loadRun.js` measures the client at a target record rate with a loss and duplicate oracle that does not grow
-with the record count. It shares no code path with the day plan: `finalSoakMatrix.json`, the scheduler and the checker above
+with the record count. It shares no code path with the acceptance plan: `finalSoakMatrix.json`, the scheduler and the checker above
 are unchanged by it, and nothing here judges a final soak.
 
 ### 7.1 Running it

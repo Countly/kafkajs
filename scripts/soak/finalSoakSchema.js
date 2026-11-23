@@ -132,7 +132,7 @@ const SEED_TIMING = Object.freeze({
 
 const COMPANIONS = Object.freeze(['natural-exit', 'consume-retention', 'prior-checkpoints'])
 const CONTROL = 'interning-seeded'
-/** The run modes: smoke and rehearsal are diagnostic and never ACCEPTED; acceptance is the day. */
+/** The run modes: smoke and rehearsal are diagnostic and never ACCEPTED; acceptance is the 12-hour run. */
 const MODES = Object.freeze(['smoke', 'rehearsal', 'acceptance'])
 const PROCESS_ROLES = Object.freeze(['subject', 'seed', 'reader', 'collector', 'decoder'])
 const SAMPLE_ROLES = Object.freeze(['baseline', 'periodic', 'quiet', 'closed', 'final'])
@@ -145,7 +145,7 @@ const MAX_PROBLEMS = 1000
 const MAX_HELD = 100000
 /**
  * Entries the stream validator keeps of any one kind of live state (constructed clients, open and
- * closed executions, open inventory cuts, open counting records and their open items); a normal day
+ * closed executions, open inventory cuts, open counting records and their open items); a normal run
  * keeps far fewer, and a stream that needs more fails.
  */
 const MAX_OPEN = 100000
@@ -1326,7 +1326,7 @@ const EXECUTIONS = Object.freeze({
   'broker-outage': { minutes: Minutes, evenHoursOnly: Bool, recoveredByMinute: Positive },
 })
 
-/** @param {object} schedule @returns {string[]} the exact day schedule, totals and smoke profile */
+/** @param {object} schedule @returns {string[]} the exact hourly schedule, totals and smoke profile */
 const scheduleProblems = (schedule) => {
   const path = 'matrix.schedule'
   const problems = [
@@ -1355,6 +1355,35 @@ const scheduleProblems = (schedule) => {
   return problems
 }
 
+/**
+ * Checks that the schedule totals are what the hourly plan makes over the acceptance run, so the
+ * totals follow the run length: per hour one idle window, each execution at each of its minutes
+ * (the outage on even hours only), a pause sequence per membership wave and one static restart.
+ * @param {object} schedule a structurally valid schedule
+ * @param {number} hours the acceptance run in hours
+ * @returns {string[]}
+ */
+const totalsProblems = (schedule, hours) => {
+  const per = Object.fromEntries(schedule.executions.map((e) => [e.shape, e]))
+  const membership = hours * per['membership-churn'].minutes.length
+  const outageHours = per['broker-outage'].evenHoursOnly ? Math.ceil(hours / 2) : hours
+  const expected = {
+    idleWindows: hours,
+    regexExecutions: hours * per['regex-churn'].minutes.length,
+    recreations: hours * per['topic-recreation'].minutes.length,
+    membershipExecutions: membership,
+    pauseSequencesPerOrdinaryKind: membership * per['membership-churn'].waves,
+    outages: outageHours * per['broker-outage'].minutes.length,
+    staticRestartsPerStaticKind: hours,
+  }
+  return Object.entries(expected).flatMap(([name, n]) =>
+    unless(
+      schedule.totals[name] === n,
+      `matrix.schedule.totals.${name} is not the ${n} the acceptance plan makes`
+    )
+  )
+}
+
 const RuleList = nonEmptyListOf('a non-empty list of rules', Text.test)
 const TableRule = shape('a table rule', { source: Source, owner: Text })
 
@@ -1377,7 +1406,7 @@ const predicateProblems = (predicates) => {
 
 /**
  * Checks the matrix: version 3, every mandatory section with its container type, the exact nested
- * acceptance, host, traffic, schedule (day, executions, totals, smoke) and sampling settings, the
+ * acceptance, host, traffic, schedule (hour, executions, totals, smoke) and sampling settings, the
  * twelve kinds, the single isolated seed control with its per-mode timing, exact section and record
  * vocabularies, the sourced bound catalogue, the six shared predicate definitions, and the eight
  * ordered rows with scope, evidence, predicate uses, bound references, derived minima and closure.
@@ -1441,10 +1470,14 @@ const validateMatrix = (matrix) => {
   )
   if (problems.length === 0) {
     const period = sampling.periodMs.value
-    if (acceptance.modes.acceptance.requestedMs.value !== 86400000)
-      problems.push('matrix.acceptance.modes.acceptance.requestedMs is not one day')
+    const hours = acceptance.modes.acceptance.requestedMs.value / schedule.hourMs
+    if (acceptance.modes.acceptance.requestedMs.value !== 43200000)
+      problems.push('matrix.acceptance.modes.acceptance.requestedMs is not twelve hours')
     if (sampling.periodicSlots.value !== acceptance.modes.acceptance.requestedMs.value / period + 1)
-      problems.push('matrix.sampling.periodicSlots does not cover the day at the sample period')
+      problems.push(
+        'matrix.sampling.periodicSlots does not cover the acceptance run at the sample period'
+      )
+    problems.push(...totalsProblems(schedule, hours))
     if (schedule.smoke.periodicSlots !== acceptance.modes.smoke.requestedMs.value / period + 1)
       problems.push(
         'matrix.schedule.smoke.periodicSlots does not cover the smoke at the sample period'
@@ -1453,6 +1486,10 @@ const validateMatrix = (matrix) => {
     if (!(Number.isInteger(rehearsalHours) && rehearsalHours >= 3))
       problems.push(
         'matrix.acceptance.modes.rehearsal.requestedMs is not a whole number of hours, at least three'
+      )
+    if (!(rehearsalHours < hours))
+      problems.push(
+        'matrix.acceptance.modes.rehearsal.requestedMs is not shorter than the acceptance run'
       )
     if (sampling.gcCollections.value !== 2) problems.push('matrix.sampling.gcCollections is not 2')
     if (
@@ -1519,9 +1556,9 @@ const topologyProblems = (topology, kinds) => {
 }
 
 /**
- * Checks the single isolated seed control, including its fixed per-mode timing: the day starts the
+ * Checks the single isolated seed control, including its fixed per-mode timing: acceptance starts the
  * map after the first quiet triplet and requires sensitivity; the smoke starts it after the
- * baseline before traffic and only reports growth; the rehearsal times it as the day does and only
+ * baseline before traffic and only reports growth; the rehearsal times it as acceptance does and only
  * reports growth.
  * @param {object} controls
  * @param {object} kinds

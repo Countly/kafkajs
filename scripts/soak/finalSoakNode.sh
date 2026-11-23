@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Final soak runbook: one smoke, rehearsal or 24-hour acceptance run on this host, on the frozen
-# candidate. A rehearsal runs the first hours of the day plan (the matrix fixes how many), so the
-# core checker judges the heap row on several quiet boundaries before the day; like a smoke it is
-# diagnostic and never ACCEPTED.
+# Final soak runbook: one smoke, rehearsal or 12-hour acceptance run on this host, on the frozen
+# candidate. A rehearsal runs the first hours of the acceptance plan (the matrix fixes how many), so
+# the core checker judges the heap row on several quiet boundaries before the acceptance run;
+# like a smoke it is diagnostic and never ACCEPTED.
 #
 #   scripts/soak/finalSoakNode.sh <40-hex sha> <smoke|rehearsal|acceptance>
 #
