@@ -60,6 +60,7 @@ const addTimestamp = (firstTimestamp, firstTimestampNumber, timestampDelta) => {
 
 // The prototype an object literal gets, read from a literal and not from the global `Object`.
 const ObjectPrototype = Reflect.getPrototypeOf({})
+const createObject = Object.create
 
 /**
  * Builds a decoded message as a plain object: the same own keys, order, values, descriptors,
@@ -90,7 +91,7 @@ function createMessage(
   isControlRecord,
   batchContext
 ) {
-  const message = Object.create(ObjectPrototype)
+  const message = createObject(ObjectPrototype)
   message.magicByte = magicByte
   message.attributes = attributes
   message.timestamp = timestamp
