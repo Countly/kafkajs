@@ -4,6 +4,7 @@ const apiKeys = require('../../protocol/requests/apiKeys')
 const { ConsumerOperation } = require('../groupProtocol/interface')
 const { MEMBER_STATES } = require('../groupProtocol/memberState')
 const HeartbeatManager = require('../heartbeatManager')
+const HeartbeatBackoff = require('../groupProtocol/heartbeatBackoff')
 const { ShareMembership, SharePollView } = require('./shareMembership')
 const { ShareSession } = require('./shareSession')
 const { ShareFetchLoop } = require('./shareFetchLoop')
@@ -87,6 +88,9 @@ class ShareRun {
     this.facade = null
     this.waiters = new Set()
     this.lookups = new Set()
+    this.routeless = false
+    this.routeRefresh = null
+    this.routeBackoff = new HeartbeatBackoff(options.retry)
     this.firstJoin = deferred()
     this.membership = new ShareMembership({
       cluster: this.membershipCluster(),
@@ -414,10 +418,14 @@ class ShareRun {
     const { cluster } = this.options
     const wanted = new Map()
     const routed = new Set()
+    this.routeless = false
     for (const [topicId, { topic, partitions }] of this.assignment) {
       for (const partition of partitions) {
         const leader = cluster.cachedLeader(topic, partition)
-        if (leader < 0) continue
+        if (leader < 0) {
+          this.routeless = true
+          continue
+        }
         if (!wanted.has(leader)) wanted.set(leader, [])
         wanted.get(leader).push({ topicId, topic, partition })
         routed.add(`${topicId}:${partition}`)
@@ -436,6 +444,51 @@ class ShareRun {
     for (const { node, key } of moved) node.loop?.retireKey(key, 'session-lost')
     if (!this.admitting || this.retired || this.closing || this.stopRequested) return
     for (const [nodeId, rows] of wanted) if (!this.nodes.has(nodeId)) this.startNode(nodeId, rows)
+    this.refreshRoutes()
+  }
+
+  /**
+   * Refreshes metadata while an assigned partition has no cached leader (a partition added to its
+   * topic, or one cached while leaderless), so it is fetched once the cluster names a leader. The
+   * first refresh waits one backoff step, which lets a refresh already under way (a leader move,
+   * a rebootstrap) settle first; each refresh that leaves a partition without a leader arms the
+   * next step. At most one runs at a time, fenced by the run's current authority and retired with
+   * the coordinator lookups at a close. Every heartbeat answer runs a routing sync, which retries
+   * once the backoff passed, so no timer is needed.
+   * @private
+   * @returns {void}
+   */
+  refreshRoutes() {
+    if (!this.routeless) {
+      this.routeBackoff.reset()
+      return
+    }
+    const now = performance.now()
+    if (!this.routeBackoff.due) {
+      this.routeBackoff.onFailedAttempt(now)
+      return
+    }
+    if (this.routeRefresh || this.routeBackoff.pending(now)) return
+    const issued = this.authorityToken
+    const fence = new ConsumerOperation({ guard: () => this.ordinaryRefusal(issued) })
+    this.routeRefresh = fence
+    this.lookups.add(fence)
+    const refresh = async () => {
+      try {
+        await fence.wait(() =>
+          this.options.cluster.refreshMetadata({ fence, allowLeaderless: true })
+        )
+      } catch (error) {
+        this.options.logger.debug('Share route refresh failed', { error: error.message })
+      } finally {
+        this.lookups.delete(fence)
+        fence.finish()
+        this.routeRefresh = null
+      }
+      if (this.routeless && this.ordinaryRefusal(issued) === null)
+        this.routeBackoff.onFailedAttempt(performance.now())
+    }
+    refresh()
   }
 
   /**
