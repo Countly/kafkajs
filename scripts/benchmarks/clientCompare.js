@@ -531,14 +531,16 @@ const produceThroughput = (kafka, target, options, timing) =>
  * Produces the corpus untimed, then times `eachMessage` from the end of the warm-up (the first
  * tenth of the corpus) to the last delivery, so group formation and warm-up are outside the
  * window. With `passes` above one, each partition is sought back to its first offset when it
- * delivers its last record, until it has been read `passes` times. Over the window it also takes
+ * delivers its last record, until it has been read `passes` times. Only a partition's next offset in
+ * its current pass counts, so a duplicate or out-of-order delivery is not counted and the run ends
+ * only once every partition delivered each pass in order. Over the window it also takes
  * process CPU, an event-loop delay histogram and the consumer's Fetch requests
  * (`consumer.events.REQUEST`, whose `size` is the response's bytes). Gives up after
  * `CONSUME_TIMEOUT_MS`.
  * @param {object} kafka
  * @param {object} target topic and codec of the corpus sends
  * @param {{ messages: number, values: Buffer[], consumerSettings: object, passes?: number,
- *   admin: object }} options `admin` reads the corpus's offsets when `passes` is above one
+ *   admin: object }} options `admin` reads each partition's corpus offsets
  * @param {Timing} timing
  * @returns {Promise<object>} messagesPerSecond, cpuMicrosPerMessage, eventLoopDelayP50,
  *   eventLoopDelayP99, eventLoopDelayMax (ms), fetchRequests, bytesPerFetch, messagesPerFetch,
@@ -551,10 +553,11 @@ const consumeThroughput = async (kafka, target, options, timing) => {
   await withProducer(kafka, (producer) =>
     sendAll(producer, target, messages, values, CORPUS_CONCURRENCY)
   )
-  const ends = new Map()
-  if (passes > 1) {
-    for (const { partition, high, low } of await admin.fetchTopicOffsets(target.topic)) {
-      if (high !== low) ends.set(partition, { last: String(BigInt(high) - 1n), low, laps: 0 })
+  const parts = new Map()
+  for (const { partition, high, low } of await admin.fetchTopicOffsets(target.topic)) {
+    if (high !== low) {
+      const first = Number(low)
+      parts.set(partition, { low, first, last: Number(high) - 1, next: first, laps: 0 })
     }
   }
   const total = messages * passes
@@ -585,9 +588,14 @@ const consumeThroughput = async (kafka, target, options, timing) => {
       consumer
         .run({
           eachMessage: async ({ partition, message }) => {
-            const end = ends.get(partition)
-            if (end && message.offset === end.last && ++end.laps < passes) {
-              consumer.seek({ topic: target.topic, partition, offset: end.low })
+            const part = parts.get(partition)
+            if (!part || part.laps === passes || Number(message.offset) !== part.next) return
+            if (part.next === part.last) {
+              part.next = part.first
+              if (++part.laps < passes)
+                consumer.seek({ topic: target.topic, partition, offset: part.low })
+            } else {
+              part.next++
             }
             if (++received === warmup) {
               measuring = true

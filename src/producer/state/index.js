@@ -602,7 +602,8 @@ class ProducerStateManager {
 
   /**
    * @returns {boolean} whether the coordinator may hold the current transaction: something joined
-   *   it, or an AddPartitionsToTxn or AddOffsetsToTxn of it was sent, answered or not
+   *   it, or an AddPartitionsToTxn or AddOffsetsToTxn of it was attempted, answered or not. The
+   *   attempt is recorded before the coordinator lookup, so one whose lookup failed counts too.
    */
   transactionReached() {
     return this.#started || this.#addSent
@@ -613,7 +614,10 @@ class ProducerStateManager {
     this.#started = true
   }
 
-  /** Records that an AddOffsetsToTxn of the current transaction is being sent. @returns {void} */
+  /**
+   * Records that an AddOffsetsToTxn of the current transaction is attempted, before its coordinator
+   * lookup. @returns {void}
+   */
   markAddSent() {
     this.#addSent = true
   }
