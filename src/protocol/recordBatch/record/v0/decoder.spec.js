@@ -1,3 +1,4 @@
+const { isDeepStrictEqual } = require('node:util')
 const Decoder = require('../../../decoder')
 const recordDecoder = require('./decoder')
 const TimestampTypes = require('../../../timestampTypes')
@@ -107,5 +108,51 @@ describe('Protocol > RecordBatch > Record > v0', () => {
     ])
     expect(Object.getOwnPropertyDescriptor(headers, 'toString').value).toEqual(Buffer.from('c'))
     expect(Object.getPrototypeOf(headers)).toBe(Object.prototype)
+  })
+
+  test('a decoded message is a plain object, indistinguishable from an object literal', () => {
+    const decoded = recordDecoder(
+      new Decoder(Buffer.from(require('../../fixtures/v0_record.json'))),
+      {
+        firstOffset: '0',
+        firstTimestamp: '1509827900073',
+        magicByte: 2,
+      }
+    )
+    const literal = {
+      magicByte: decoded.magicByte,
+      attributes: decoded.attributes,
+      timestamp: decoded.timestamp,
+      offset: decoded.offset,
+      key: decoded.key,
+      value: decoded.value,
+      headers: decoded.headers,
+      isControlRecord: decoded.isControlRecord,
+      batchContext: decoded.batchContext,
+    }
+
+    expect(Object.getPrototypeOf(decoded)).toBe(Object.prototype)
+    expect(decoded.constructor).toBe(Object)
+    expect(Object.prototype.toString.call(decoded)).toBe('[object Object]')
+    expect(Reflect.ownKeys(decoded)).toEqual([
+      'magicByte',
+      'attributes',
+      'timestamp',
+      'offset',
+      'key',
+      'value',
+      'headers',
+      'isControlRecord',
+      'batchContext',
+    ])
+    expect(Object.getOwnPropertyDescriptors(decoded)).toEqual(
+      Object.getOwnPropertyDescriptors(literal)
+    )
+    expect(Object.isExtensible(decoded)).toBe(true)
+    expect(isDeepStrictEqual(decoded, literal)).toBe(true)
+    expect(decoded).toStrictEqual(literal)
+    expect({ ...decoded }).toStrictEqual(literal)
+    expect(JSON.stringify(decoded)).toBe(JSON.stringify(literal))
+    expect(isDeepStrictEqual(structuredClone(decoded), structuredClone(literal))).toBe(true)
   })
 })
