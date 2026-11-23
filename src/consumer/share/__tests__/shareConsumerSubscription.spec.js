@@ -672,6 +672,74 @@ describe('public share subscription and run lifecycle', () => {
       ).not.toContain('topic-a')
     })
 
+    test('retires the old node acquisition before another node fetches a partition whose leader was unknown in between', async () => {
+      const topics = { 'topic-a': { topicId: A, partitions: [LEADER, { leader: 1, epoch: 1 }] } }
+      await start(topics, { nodes: 2 })
+      let given = false
+      let lose = false
+      h.cluster.answer('ShareFetch', (fields, call) => {
+        if (call.node === 0 && !given && fields.shareSessionEpoch === 0) {
+          given = true
+          return fetchAnswer([acquire(0, 0, ['a'])])
+        }
+        if (call.node === 1 && lose && fields.shareSessionEpoch > 0) {
+          lose = false
+          return fetchAnswer([part({ partition: 1, code: 6 })])
+        }
+        return echo('ShareFetch', fields)
+      })
+      const gate = hold()
+      const decisions = []
+      let started = false
+      await h.consumer.run({
+        eachMessage: async ({ partition, acknowledge }) => {
+          if (partition !== 0) return
+          started = true
+          await gate.promise
+          try {
+            acknowledge('accept')
+            decisions.push('accepted')
+          } catch (error) {
+            decisions.push(error.message)
+          }
+        },
+      })
+      await reach(() => started, 'the held handler on node 0')
+      /** @returns {boolean} Whether node 1 has fetched partition 0. */
+      const movedFetch = () =>
+        h.frames(78).some(({ node, fields }) => node === 1 && lists(fields, 0))
+      const before = metadataCount()
+      h.table.set('topic-a', {
+        topicId: A,
+        partitions: [
+          { leader: -1, epoch: 2, code: 5 },
+          { leader: 1, epoch: 1 },
+        ],
+      })
+      lose = true
+      await reach(() => !lose && metadataCount() > before, 'the refresh that finds no leader')
+      await pass(20)
+      expect(movedFetch()).toBe(false)
+
+      h.table.set('topic-a', {
+        topicId: A,
+        partitions: [
+          { leader: 1, epoch: 3 },
+          { leader: 1, epoch: 1 },
+        ],
+      })
+      lose = true
+      await reach(movedFetch, 'node 1 fetching partition 0')
+      gate.resolve()
+      await reach(() => decisions.length === 1, 'the decision of the old handler')
+      expect(decisions).toEqual(['Handler call is no longer current'])
+      /** @returns {object[]} The final acknowledgements of node 0. */
+      const finals = () =>
+        h.frames(79).filter(({ node, fields }) => node === 0 && fields.shareSessionEpoch === -1)
+      await reach(() => finals().length === 1, 'the final of node 0')
+      expect(finals()[0].fields.topics).toEqual([])
+    })
+
     test('a stop that waits for a running handler ends the refresh in flight: its late answer installs nothing and no refresh follows', async () => {
       await start()
       h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a0'])])])
