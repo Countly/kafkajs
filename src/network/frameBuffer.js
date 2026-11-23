@@ -7,6 +7,12 @@ const INITIAL_CAPACITY = 64 * 1024
 
 const LENGTH_PREFIX_SIZE = 4
 
+/** Detaches an `ArrayBuffer`, freeing its memory at once; absent where the runtime disables it. */
+const { transfer } = ArrayBuffer.prototype
+
+/** Node's own copy, called on chunks so a chunk's own `copy` never sees the frame's store. */
+const { copy } = Buffer.prototype
+
 /** The four size bytes of an HTTP response (`HTTP`) read as a signed int32. */
 const HTTP_AS_SIZE = 0x48545450
 
@@ -118,7 +124,7 @@ class FrameBuffer {
    */
   takePrefix(chunk, offset) {
     const taken = Math.min(LENGTH_PREFIX_SIZE - this.prefixLength, chunk.length - offset)
-    chunk.copy(this.prefix, this.prefixLength, offset, offset + taken)
+    copy.call(chunk, this.prefix, this.prefixLength, offset, offset + taken)
     this.prefixLength += taken
 
     if (this.prefixLength === LENGTH_PREFIX_SIZE) {
@@ -187,7 +193,7 @@ class FrameBuffer {
   accumulate(chunk, offset) {
     const taken = Math.min(this.size - this.received, chunk.length - offset)
     this.grow(this.received + taken, taken)
-    chunk.copy(this.body, this.received, offset, offset + taken)
+    copy.call(chunk, this.body, this.received, offset, offset + taken)
     this.received += taken
     this.copied += taken
 
@@ -206,26 +212,36 @@ class FrameBuffer {
 
   /**
    * Makes the buffer hold `needed` bytes: allocated on first use, and replaced by one twice as
-   * large (up to `size`) when it is too small. Each buffer owns its store (never a slice of Node's
-   * pool), and an outgrown store is released at once by detaching it, so the growth of a large
-   * frame does not leave external memory for V8 to count until a collection: that count starts
-   * full (mark-compact) collections when it passes V8's limit.
+   * large (up to `size`) when it is too small. A buffer that can still grow owns its store (never a
+   * slice of Node's pool), and when outgrown it is released at once by detaching it, so the growth
+   * of a large frame does not leave external memory for V8 to count until a collection: that count
+   * starts full (mark-compact) collections when it passes V8's limit. A buffer of the full `size`
+   * never grows, is allocated as any Buffer and is never detached.
    * @private
    * @param {number} needed
    * @param {number} first the bytes of the chunk, which size the first allocation when large
    */
   grow(needed, first) {
     if (this.body === null) {
-      this.body = Buffer.allocUnsafeSlow(Math.min(this.size, Math.max(INITIAL_CAPACITY, first)))
+      this.body = this.allocate(Math.max(INITIAL_CAPACITY, first))
     } else if (needed > this.body.length) {
-      const larger = Buffer.allocUnsafeSlow(
-        Math.min(this.size, Math.max(this.body.length * 2, needed))
-      )
-      this.body.copy(larger, 0, 0, this.received)
+      const outgrown = this.body
+      this.body = this.allocate(Math.max(outgrown.length * 2, needed))
+      copy.call(outgrown, this.body, 0, 0, this.received)
       this.copied += this.received
-      this.body.buffer.transfer(0)
-      this.body = larger
+      if (transfer !== undefined) {
+        transfer.call(outgrown.buffer, 0)
+      }
     }
+  }
+
+  /**
+   * @private
+   * @param {number} capacity wanted, capped at `size`
+   * @returns {Buffer} a store of its own when it can still grow, any Buffer when it is final
+   */
+  allocate(capacity) {
+    return capacity >= this.size ? Buffer.allocUnsafe(this.size) : Buffer.allocUnsafeSlow(capacity)
   }
 
   /**
