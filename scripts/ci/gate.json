@@ -6986,6 +6986,8 @@
         "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages > what ends an aborted transaction another producer's abort marker does not end this producer's transaction",
         "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages filters out aborted messages with malformed keys",
         "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages filters out all aborted messages",
+        "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages > several aborted transactions a record of a legacy message set, which has no batch, is delivered beside an aborted transaction",
+        "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages > several aborted transactions orders first offsets beyond the safe integer range exactly, and hides a record at the first offset",
         "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages returns all committed messages",
         "src/consumer/__tests__/filterAbortedMessages.spec.js \u203a filterAbortedMessages returns all nontransactional messages",
         "src/consumer/__tests__/groupMaxSize.spec.js \u203a surfaces the group size limit once with restart override false",

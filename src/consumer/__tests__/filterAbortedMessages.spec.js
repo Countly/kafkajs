@@ -302,4 +302,29 @@ describe('filterAbortedMessages > several aborted transactions', () => {
       '13',
     ])
   })
+
+  test('a record of a legacy message set, which has no batch, is delivered beside an aborted transaction', () => {
+    const legacy = { offset: '9', key: Buffer.from('key'), isControlRecord: false }
+    const messages = [legacy, record({ offset: 10, producerId: '2' }), abortMarker(11, '2')]
+    const abortedTransactions = [aborted('2', 10)]
+
+    expect(offsetsOf(filterAbortedMessages({ messages, abortedTransactions }))).toEqual(['9', '11'])
+  })
+
+  test('orders first offsets beyond the safe integer range exactly, and hides a record at the first offset', () => {
+    const messages = [
+      record({ offset: '9007199254740992', producerId: '1' }),
+      record({ offset: '9007199254740993', producerId: '2' }),
+      record({ offset: '9007199254740994', producerId: '3' }),
+      abortMarker('9007199254740995', '1'),
+      abortMarker('9007199254740996', '2'),
+    ]
+    const abortedTransactions = [aborted('2', '9007199254740993'), aborted('1', '9007199254740992')]
+
+    expect(offsetsOf(filterAbortedMessages({ messages, abortedTransactions }))).toEqual([
+      '9007199254740994',
+      '9007199254740995',
+      '9007199254740996',
+    ])
+  })
 })

@@ -61,6 +61,11 @@ module.exports = ({ messages, abortedTransactions }) => {
       }
     }
 
+    // A record of a legacy message set has no batch and cannot belong to a transaction.
+    if (!message.batchContext) {
+      return true
+    }
+
     const { producerId, inTransaction } = message.batchContext
 
     if (isAbortMarker(message)) {
