@@ -461,12 +461,17 @@ module.exports = class OffsetManager {
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
       const observed = attempt || onWrite || this.ownership || guard || since !== undefined
-      const options = { guard: check }
-      if (onWrite) options[ON_WRITE] = onWrite
-      if (onAccepted && observed) {
-        options[ON_DECODED] = (reply) => {
-          decoded = reply
-        }
+      // One literal: a closure added to `options` after creation kept this call's scope, and so
+      // the caller's guard, reachable for young-generation collections after the commit settled.
+      const options = {
+        guard: check,
+        [ON_WRITE]: onWrite,
+        [ON_DECODED]:
+          onAccepted && observed
+            ? (reply) => {
+                decoded = reply
+              }
+            : undefined,
       }
       const result = observed
         ? await coordinator.offsetCommit(request, options)
