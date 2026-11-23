@@ -1,5 +1,6 @@
 const HeartbeatManager = require('../../heartbeatManager')
 const { ShareRunner } = require('../shareRunner')
+const { ShareFetchLoop } = require('../shareFetchLoop')
 const {
   A,
   ackAnswer,
@@ -298,6 +299,76 @@ describe('share handlers on parallel leader nodes', () => {
       expect(h.seen.stops).toEqual([true])
       expect(h.seen.crashes).toEqual([])
     })
+
+    test('a node whose final capture fails does not keep the other node from its final or the leave', async () => {
+      const capture = jest
+        .spyOn(ShareFetchLoop.prototype, 'captureFinal')
+        .mockImplementationOnce(() => {
+          throw new Error('capture failed')
+        })
+      await expireBoth()
+      expect(capture).toHaveBeenCalledTimes(2)
+      const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+      expect(finals.map(({ node }) => node)).toEqual([1])
+      expect(finals[0].order).toBeLessThan(leaves()[0].order)
+      expect(h.seen.crashes).toEqual([])
+    })
+  })
+
+  test('a poll expiry over a handler that changed its message offset after acknowledging finals both nodes and leaves', async () => {
+    await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
+    serveNodes(1)
+    const gate = deferred()
+    const completions = []
+    holds.push({ release: () => gate.resolve(), completions })
+    const started = []
+    await run({
+      eachMessage: async ({ partition, message, acknowledge }) => {
+        const completed = deferred()
+        completions.push(completed.promise)
+        try {
+          started.push(partition)
+          acknowledge(partition === 0 ? 'reject' : 'accept')
+          if (partition === 0) message.offset = '7'
+          await gate.promise
+        } finally {
+          completed.resolve()
+        }
+      },
+    })
+    await until(() => started.length === 2, 'both handlers')
+    for (let count = 2; count <= 5; count++) await beat(count)
+    expect(leaves()).toHaveLength(0)
+    await advance(50)
+    await until(() => leaves().length === 1, 'the poll-expiry leave')
+    await flush()
+    const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+    expect(finals.map(({ node }) => node).sort()).toEqual([0, 1])
+    const topicsOf = (node) => finals.find((final) => final.node === node).fields.topics
+    expect(topicsOf(0)).toEqual([
+      {
+        topicId: A,
+        partitions: [
+          {
+            partitionIndex: 0,
+            acknowledgementBatches: [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] }],
+          },
+        ],
+      },
+    ])
+    expect(topicsOf(1)).toEqual([
+      {
+        topicId: A,
+        partitions: [
+          {
+            partitionIndex: 1,
+            acknowledgementBatches: [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] }],
+          },
+        ],
+      },
+    ])
+    for (const final of finals) expect(final.order).toBeLessThan(leaves()[0].order)
+    expect(h.seen.crashes).toEqual([])
   })
 
   test('a poll expiry over a handler whose renewal lost its session still finals the other node and leaves', async () => {
