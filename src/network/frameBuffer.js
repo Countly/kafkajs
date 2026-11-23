@@ -251,7 +251,9 @@ class FrameBuffer {
    */
   checkHeader(correlationId) {
     this.headerChecked = true
-    const minimum = this.minBodyOf(correlationId)
+    // Called without a receiver, so the callback never holds the framer or its store.
+    const { minBodyOf } = this
+    const minimum = minBodyOf(correlationId)
     if (this.size < minimum) {
       this.refuse(
         `A response frame declared ${this.size} bytes, too few for the response header of correlation id ${correlationId} (${minimum}).`,

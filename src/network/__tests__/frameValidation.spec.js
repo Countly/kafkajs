@@ -460,7 +460,7 @@ describe('FrameBuffer > retained memory and copying', () => {
       })
     } finally {
       // eslint-disable-next-line no-extend-native -- restores the built-in deleted above
-      Object.defineProperty(ArrayBuffer.prototype, 'transfer', descriptor)
+      if (descriptor) Object.defineProperty(ArrayBuffer.prototype, 'transfer', descriptor)
     }
     const frames = []
     const buffer = new Isolated({ maxBodySize: MIB, onFrame: (body) => frames.push(body) })
@@ -470,7 +470,7 @@ describe('FrameBuffer > retained memory and copying', () => {
     const outgrown = buffer.body
     buffer.push(frame.subarray(INITIAL))
 
-    expect(outgrown.buffer.detached).toBe(false)
+    expect(outgrown.buffer.byteLength).toBe(INITIAL)
     expect(frames).toEqual([frame.subarray(4)])
   })
 
