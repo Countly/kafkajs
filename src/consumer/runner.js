@@ -1316,7 +1316,6 @@ module.exports = class Runner extends EventEmitter {
   async processEachBatch(batch) {
     const { topic, partition } = batch
     const authority = this.resolutionAuthority(batch)
-    const identity = this.batchIdentity(batch)
     const lastFilteredMessage = batch.messages[batch.messages.length - 1]
 
     const pause = () => {
@@ -1366,7 +1365,7 @@ module.exports = class Runner extends EventEmitter {
          */
         commitOffsetsIfNecessary: async (offsets) => {
           if (offsets) {
-            return this.commitOwnedOffsets(offsets, identity)
+            return this.commitOwnedOffsets(offsets, batch)
           }
 
           // The no-argument form commits on this batch's behalf, so it follows this batch's
@@ -1387,7 +1386,7 @@ module.exports = class Runner extends EventEmitter {
           }
 
           return this.consumerGroup.commitOffsetsIfNecessary({
-            guard: this.commitGuard(identity),
+            guard: () => this.commitRefusal(undefined, batch),
           })
         },
         uncommittedOffsets: () => this.consumerGroup.uncommittedOffsets(),
@@ -1444,16 +1443,16 @@ module.exports = class Runner extends EventEmitter {
    * batch fences it through the guard.
    *
    * @param {import('../../types').OffsetsByTopicPartition} offsets
-   * @param {import('./handlerContext').BatchIdentity} identity the calling handler's batch identity
+   * @param {object} batch the calling handler's batch
    * @returns {Promise<void>}
    * @throws {KafkaJSCommitFailedError} when the batch or the membership no longer owns the commit
    * @throws {KafkaJSNonRetriableError} when this consumer has no group: an explicit payload is group-only
    */
-  async commitOwnedOffsets(offsets, identity) {
+  async commitOwnedOffsets(offsets, batch) {
     if (this.consumerGroup.groupId === undefined) {
       throw new KafkaJSNonRetriableError('Consumer groupId must be a non-empty string.')
     }
-    const guard = this.commitGuard(identity)
+    const guard = () => this.commitRefusal(undefined, batch)
     const refusal = guard()
     if (refusal) throw refusal
     if (!Array.isArray(offsets.topics)) {
@@ -1816,8 +1815,17 @@ module.exports = class Runner extends EventEmitter {
 
       this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
-      const { topic, partition } = batch
-      const identity = this.batchIdentity(batch)
+      const { topic, partition, assignmentEpoch, acquireClock, ownershipKey, acquisition } = batch
+      const identity = {
+        topic,
+        partition,
+        assignmentEpoch,
+        acquireClock,
+        ownershipKey,
+        acquisition,
+        groupId: this.consumerGroup.groupId,
+        runIdentity: this.consumerGroup.runIdentity,
+      }
       // A START_BATCH_PROCESS listener can seek the partition: such a batch is not handed over,
       // and END_BATCH_PROCESS still pairs with START.
       if (this.isSuperseded(batch)) {
@@ -1853,9 +1861,9 @@ module.exports = class Runner extends EventEmitter {
         this.consumerGroup.offsetManager?.autoCommitInterval != null ||
         this.consumerGroup.offsetManager?.autoCommitThreshold != null
       ) {
-        await this.autoCommitOffsetsIfNecessary(identity)
+        await this.autoCommitOffsetsIfNecessary(batch)
       } else {
-        await this.autoCommitOffsets(identity)
+        await this.autoCommitOffsets(batch)
       }
       this.outages.commit.end()
       await this.heartbeat()
@@ -2068,36 +2076,6 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * The ownership identity of a fetched batch: the fields `isBatchStale` reads, plus the group
-   * that fetched it. Commit guards keep this small object, never the batch, so a commit that
-   * settled cannot keep a batch's records reachable.
-   * @param {import('./batch')} batch
-   * @returns {import('./handlerContext').BatchIdentity}
-   */
-  batchIdentity(batch) {
-    const { topic, partition, assignmentEpoch, acquireClock, ownershipKey, acquisition } = batch
-    return {
-      topic,
-      partition,
-      assignmentEpoch,
-      acquireClock,
-      ownershipKey,
-      acquisition,
-      groupId: this.consumerGroup.groupId,
-      runIdentity: this.consumerGroup.runIdentity,
-    }
-  }
-
-  /**
-   * A commit guard fenced by one batch: `commitRefusal` for the current token and that batch.
-   * @param {import('./handlerContext').BatchIdentity|null} identity the committing batch's identity
-   * @returns {() => Error|null}
-   */
-  commitGuard(identity) {
-    return () => this.commitRefusal(undefined, identity)
-  }
-
-  /**
    * Checks the immutable operation identity and the calling handler's original batch.
    * @param {number} [token] the captured token; automatic calls default to current
    * @param {object} [batch] the captured batch; detached callers have no batch
@@ -2138,9 +2116,8 @@ module.exports = class Runner extends EventEmitter {
 
   /**
    * Commits the resolved offsets unless autoCommit is off or the batch no longer owns the commit.
-   * @param {import('./handlerContext').BatchIdentity|null} [batch] the identity of the batch
-   *   committing; defaults to the calling handler's, `null` for none, as a commit outside any
-   *   handler passes
+   * @param {object|null} [batch] the batch committing; defaults to the calling handler's, `null`
+   *   for none, as a commit outside any handler passes
    * @param {object|null} [round] the captured rebalance round the commit belongs to; its expiry or
    *   retirement refuses the commit before and after transmission
    * @returns {Promise<void>|undefined} undefined when nothing is attempted
@@ -2154,15 +2131,17 @@ module.exports = class Runner extends EventEmitter {
 
   /**
    * Commits the resolved offsets when the interval or threshold is due, unless autoCommit is off
-   * or the batch no longer owns the commit. The guard keeps the batch identity it was created for,
-   * so a transport that evaluates it later, in another async context, still checks the same batch.
-   * @param {import('./handlerContext').BatchIdentity|null} [batch] the identity of the batch
-   *   committing; defaults to the calling handler's, `null` for none
+   * or the batch no longer owns the commit. The guard keeps the batch it was created for, so a
+   * transport that evaluates it later, in another async context, still checks the same batch.
+   * @param {object|null} [batch] the batch committing; defaults to the calling handler's, `null`
+   *   for none
    * @returns {Promise<void>|undefined} undefined when nothing is attempted
    */
   autoCommitOffsetsIfNecessary(batch = handlerContext.current() ?? null) {
     if (this.autoCommit && !this.commitRefusal(undefined, batch)) {
-      return this.consumerGroup.commitOffsetsIfNecessary({ guard: this.commitGuard(batch) })
+      return this.consumerGroup.commitOffsetsIfNecessary({
+        guard: () => this.commitRefusal(undefined, batch),
+      })
     }
   }
 

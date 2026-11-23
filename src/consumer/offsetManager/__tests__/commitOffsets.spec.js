@@ -191,35 +191,41 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
   })
 
   describe('with a caller guard', () => {
-    const offsets = {
-      topics: [
-        {
-          topic: topic1,
-          partitions: [
-            { partition: '0', offset: '3' },
-            { partition: '1', offset: '3' },
-          ],
-        },
-      ],
-    }
+    let offsets
+
+    beforeEach(() => {
+      offsets = {
+        topics: [
+          {
+            topic: topic1,
+            partitions: [
+              { partition: '0', offset: '3' },
+              { partition: '1', offset: '3' },
+            ],
+          },
+        ],
+      }
+    })
 
     /**
-     * A coordinator that decodes a reply with the given partition answers for topic-1.
+     * Hands the coordinator's decode observer a reply with the given partition answers for the
+     * request's topic, as the connection does before it parses the reply.
+     * @param {object} request the OffsetCommit request
+     * @param {object} options the private options handed to `offsetCommit`
      * @param {{partition: number, errorCode: number}[]} partitions
-     * @returns {Function} an `offsetCommit` implementation
+     * @returns {void}
      */
-    const answering = (partitions) => async (request, options) => {
+    const decode = (request, options, partitions) =>
       options[ON_DECODED]({ responses: [{ topic: request.topics[0].topic, partitions }] })
-      return {}
-    }
 
-    it('hands the coordinator one options object whose private keys exist from its creation', async () => {
-      mockCoordinator.offsetCommit.mockImplementation(
-        answering([
+    it('hands the coordinator an options object laid out as guard, write observer and decode observer', async () => {
+      mockCoordinator.offsetCommit.mockImplementation(async (request, options) => {
+        decode(request, options, [
           { partition: 0, errorCode: 0 },
           { partition: 1, errorCode: 0 },
         ])
-      )
+        return {}
+      })
 
       await offsetManager.commitOffsets(offsets, { guard: () => null })
 
@@ -229,35 +235,39 @@ describe('Consumer > OffsetMananger > commitOffsets', () => {
       expect(options[ON_DECODED]).toEqual(expect.any(Function))
     })
 
-    it('records only the cells the decoded reply accepted', async () => {
-      mockCoordinator.offsetCommit.mockImplementation(
-        answering([
+    it('records the cell the decoded reply accepted and rejects with the error of the other', async () => {
+      const illegalGeneration = createErrorFromCode(22)
+      mockCoordinator.offsetCommit.mockImplementation(async (request, options) => {
+        decode(request, options, [
           { partition: 0, errorCode: 0 },
           { partition: 1, errorCode: 22 },
         ])
+        throw illegalGeneration
+      })
+
+      await expect(offsetManager.commitOffsets(offsets, { guard: () => null })).rejects.toBe(
+        illegalGeneration
       )
-
-      await offsetManager.commitOffsets(offsets, { guard: () => null })
-
       expect(offsetManager.committedOffsets()[topic1]).toEqual({ 0: '3' })
     })
 
-    it('rejects with the guard refusal learned during the write and records nothing', async () => {
+    it('rejects with the guard refusal learned after the reply was decoded and records neither cell', async () => {
       const refusal = new Error('the batch no longer owns the commit')
       let refused = null
       mockCoordinator.offsetCommit.mockImplementation(async (request, options) => {
-        await answering([
+        decode(request, options, [
           { partition: 0, errorCode: 0 },
           { partition: 1, errorCode: 0 },
-        ])(request, options)
+        ])
         refused = refusal
-        return {}
+        throw options.guard()
       })
 
       await expect(offsetManager.commitOffsets(offsets, { guard: () => refused })).rejects.toBe(
         refusal
       )
       expect(offsetManager.committedOffsets()[topic1]?.[0]).toBeUndefined()
+      expect(offsetManager.committedOffsets()[topic1]?.[1]).toBeUndefined()
     })
   })
 
