@@ -337,6 +337,82 @@ describeConsumerProtocol('Consumer > the consumer group protocol (live)', () => 
     ROW_BUDGET_MS
   )
 
+  // A member joining with another subscription moves the group epoch while the first member's
+  // partitions stay the same, so the coordinator raises that member's epoch by a heartbeat with no
+  // assignment. Its commits are refused with STALE_MEMBER_EPOCH unless they carry the new epoch.
+  it(
+    'commits under a member epoch a heartbeat advanced without an assignment change',
+    async () => {
+      const otherTopic = `e2e-consumer-protocol-other-${secureRandom()}`
+      await createTopic({ topic: otherTopic, partitions: 1 })
+      const admin = kafka.admin()
+      const a = createMember('a')
+      const b = createMember('b')
+      const committedAt = async () => {
+        const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [topic] })
+        return partitions.find(({ partition }) => partition === 0).offset
+      }
+      /**
+       * Produces one record to partition 0.
+       * @param {string} value
+       * @returns {Promise<string>} the offset a commit past that record stores
+       */
+      const produceOne = async (value) => {
+        const [{ baseOffset }] = await producer.send({ topic, messages: [{ value, partition: 0 }] })
+        return String(Number(baseOffset) + 1)
+      }
+      try {
+        await admin.connect()
+        await a.consumer.connect()
+        await a.consumer.subscribe({ topic, fromBeginning: true })
+        await a.consumer.run({ autoCommitThreshold: 1, eachMessage: async () => {} })
+        expect(
+          await waitForCondition(() => ownedBy(a.observed).length === PARTITIONS, ASSIGNMENT_BUDGET)
+        ).toBe(true)
+
+        const first = await produceOne('before')
+        expect(
+          await waitForCondition(async () => (await committedAt()) === first, DELIVERY_BUDGET)
+        ).toBe(true)
+        const before = a.consumer.groupMetadata()
+        const joinsBefore = a.observed.groupJoins.length
+
+        await b.consumer.connect()
+        await b.consumer.subscribe({ topic: otherTopic, fromBeginning: true })
+        await b.consumer.run({ eachMessage: async () => {} })
+        expect(
+          await waitForCondition(async () => {
+            const { members } = await a.consumer.describeGroup()
+            const member = members.find(({ memberId }) => memberId === before.memberId)
+            return (
+              members.length === 2 &&
+              member?.memberEpoch > before.generationId &&
+              a.consumer.groupMetadata().generationId === member.memberEpoch
+            )
+          }, ASSIGNMENT_BUDGET)
+        ).toBe(true)
+
+        expect(a.consumer.groupMetadata().memberId).toBe(before.memberId)
+        expect(ownedBy(a.observed)).toEqual(allPartitions())
+        expect(a.observed.groupJoins).toHaveLength(joinsBefore)
+
+        const second = await produceOne('after')
+        expect(
+          await waitForCondition(async () => (await committedAt()) === second, DELIVERY_BUDGET)
+        ).toBe(true)
+        expect(a.observed.lost).toEqual([])
+        expect(a.observed.crashes).toEqual([])
+        expect(b.observed.crashes).toEqual([])
+      } finally {
+        await withTimeout(
+          admin.disconnect().catch(() => {}),
+          DISCONNECT_BUDGET_MS
+        )
+      }
+    },
+    ROW_BUDGET_MS
+  )
+
   it(
     'keeps a static member’s partitions across a restart, and releases a dynamic member’s on leave',
     async () => {
