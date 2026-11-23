@@ -9,6 +9,7 @@ const {
   KafkaJSNotImplemented,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSDeliveryTimeout,
+  KafkaJSCommitFailedError,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { stampOffsetCommit, stampMembership } = require('../rebalanceErrorContract')
@@ -719,6 +720,36 @@ describe('Consumer > Runner', () => {
 
       expect(eachBatch).toHaveBeenCalled()
       expect(consumerGroup.commitOffsets).toHaveBeenCalled()
+    })
+
+    it('refuses the per-batch commit when the epoch moves while it is in flight', async () => {
+      let refusal = null
+      consumerGroup.commitOffsets.mockImplementation(async (offsets, { guard }) => {
+        consumerGroup.assignmentEpoch += 1
+        refusal = guard()
+      })
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.commitOffsets.mock.calls[0][1].auto).toBe(true)
+      expect(refusal).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(refusal.message).toBe('The handler outlived its assignment')
+    })
+
+    it('fences the per-batch commit by the membership once its ownership is lost', async () => {
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+      const lost = new Error('the membership was lost')
+      consumerGroup.ownership = { token: () => 7, refusal: (token) => (token === 7 ? lost : null) }
+
+      try {
+        expect(consumerGroup.commitOffsets.mock.calls[0][1].guard()).toBe(lost)
+      } finally {
+        delete consumerGroup.ownership
+      }
     })
 
     it('stops "eachMessage" after the message it was inside, resolving only that offset', async () => {
