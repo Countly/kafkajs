@@ -31,15 +31,30 @@
  * messagesPerSecond; `produce-throughput` messagesPerSecond and cpuMicrosPerMessage of sends of 500
  * messages; `consume-throughput` messagesPerSecond, cpuMicrosPerMessage (user plus system),
  * event-loop delay p50, p99 and max (ms), Fetch requests, bytes and messages per Fetch, all over the
- * measured window, plus the Fetch version, the passes and the LZ4 codec. Each also reports
- * elapsedMs, measuredMessages and the producer or consumer settings in force. Exit codes: 0 done, 1 the client or the workload
- * failed, 2 a bad argument.
+ * measured window, plus the Fetch version, the passes and the LZ4 codec. A consume run also
+ * reports mainThreadCpuMicrosPerMessage (the JavaScript thread only, from `process.threadCpuUsage`;
+ * absent on a Node without it, which threadCpuUsageSupported says), fullGcCount (major
+ * collections that started in the measured window) and the corpus layout. Each also reports elapsedMs, measuredMessages and the producer or consumer
+ * settings in force. Exit codes: 0 done, 1 the client or the workload failed, 2 a bad argument.
+ *
+ * The consume corpus is laid out the same on both arms, whatever `--settings` says: each arm's own
+ * client writes it (loading the other package would break the arm's isolation) with
+ * `CORPUS_PRODUCER_SETTINGS`, in sends of `BATCH` records where record `i` goes to partition
+ * `i % partitions`, so each send leaves one batch per partition and neither package's
+ * partitioner or batching defaults shape the log. Before measuring, the run checks that each
+ * partition holds exactly the records the layout puts there, so a retried or lost send fails the
+ * run; the order of the batches inside a partition is not checked.
  */
 const fs = require('node:fs')
 const { createRequire } = require('node:module')
 const path = require('node:path')
-const { monitorEventLoopDelay } = require('node:perf_hooks')
-const { setTimeout: sleep } = require('node:timers/promises')
+const {
+  monitorEventLoopDelay,
+  performance,
+  PerformanceObserver,
+  constants,
+} = require('node:perf_hooks')
+const { setTimeout: sleep, setImmediate: nextTurn } = require('node:timers/promises')
 
 const WORKLOADS = ['produce-latency', 'produce-throughput', 'consume-throughput']
 const DEFAULT_MESSAGES = {
@@ -148,6 +163,29 @@ const SAME_PRODUCER_SETTINGS = Object.freeze({
   retry: Object.freeze({ retries: 5 }),
   linger: 0,
   batchSize: 1048576,
+})
+
+/**
+ * The producer configuration that writes every consume corpus, on both arms and under either
+ * `--settings`: not idempotent, unbounded in-flight requests, five retries, no linger, and a
+ * one-byte `batchSize`, so on the fork every send's records for a partition fill a batch of their
+ * own at once and never join another send's. kafkajs 2.2.4 ignores `linger` and `batchSize` and
+ * sends each `send()` as its own request, which gives it the same batches.
+ */
+const CORPUS_PRODUCER_SETTINGS = Object.freeze({
+  idempotent: false,
+  maxInFlightRequests: null,
+  retry: Object.freeze({ retries: 5 }),
+  linger: 0,
+  batchSize: 1,
+})
+
+/** The consume corpus layout each consume run reports. */
+const CORPUS_LAYOUT = Object.freeze({
+  partitioning: 'record i to partition i % partitions',
+  recordsPerSend: BATCH,
+  concurrentSends: CORPUS_CONCURRENCY,
+  producer: CORPUS_PRODUCER_SETTINGS,
 })
 
 /**
@@ -342,12 +380,66 @@ const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(
 /** @returns {bigint} a monotonic clock reading in nanoseconds */
 const now = () => process.hrtime.bigint()
 
+/** Lets Node publish the `gc` entries of collections that already ended: two event-loop turns. */
+const drainGcEntries = async () => {
+  await nextTurn()
+  await nextTurn()
+}
+
+/**
+ * Starts counting major (full) garbage collections through a `gc` PerformanceObserver, by the
+ * entries' start on the performance clock: a collection counts when it started between this call
+ * and `stop()`, even if Node delivers its entry later, during `count()`'s drain.
+ * @param {{ Observer?: Function, now?: () => number, drain?: () => Promise<void> }} [seams] the
+ *   observer class, the performance clock and the wait for late entries, replaced in tests
+ * @returns {{ stop: () => void, count: () => Promise<number>, close: () => void }} `stop` ends the
+ *   window (the first call counts); `count` drains late entries, closes the observer and returns
+ *   the window's count; `close` disconnects the observer once, without counting
+ */
+const countFullGcs = ({
+  Observer = PerformanceObserver,
+  now = () => performance.now(),
+  drain = drainGcEntries,
+} = {}) => {
+  const starts = []
+  const keep = (entries) => {
+    for (const { startTime, detail } of entries) {
+      if (detail?.kind === constants.NODE_PERFORMANCE_GC_MAJOR) starts.push(startTime)
+    }
+  }
+  const observer = new Observer((list) => keep(list.getEntries()))
+  observer.observe({ entryTypes: ['gc'] })
+  const from = now()
+  let to = null
+  let closed = false
+  const close = () => {
+    if (closed) return
+    closed = true
+    observer.disconnect()
+  }
+  return {
+    stop: () => {
+      to ??= now()
+    },
+    count: async () => {
+      await drain()
+      if (!closed) keep(observer.takeRecords())
+      close()
+      return starts.filter((start) => start >= from && start <= to).length
+    },
+    close,
+  }
+}
+
 /**
  * @typedef {{ now: () => bigint, setTimeout: Function, clearTimeout: Function,
  *   sleep: (ms: number) => Promise<void>,
  *   cpuUsage: (previous?: object) => { user: number, system: number },
+ *   threadCpuUsage: ((previous?: object) => { user: number, system: number })|null,
+ *   countFullGcs: () => { stop: () => void, count: () => Promise<number>, close: () => void },
  *   eventLoopDelay: () => { enable: Function, disable: Function, percentile: (p: number) => number,
- *     max: number } }} Timing clocks, timers, process CPU and an event-loop delay histogram (ns)
+ *     max: number } }} Timing clocks, timers, process CPU, the JavaScript thread's CPU (null on a
+ *   Node without `process.threadCpuUsage`), a full-GC counter and an event-loop delay histogram (ns)
  */
 const DEFAULT_TIMING = {
   now,
@@ -355,6 +447,13 @@ const DEFAULT_TIMING = {
   clearTimeout,
   sleep: (ms) => sleep(ms),
   cpuUsage: (previous) => process.cpuUsage(previous),
+  threadCpuUsage:
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- feature detection
+    typeof process.threadCpuUsage === 'function'
+      ? // eslint-disable-next-line n/no-unsupported-features/node-builtins -- guarded above
+        (previous) => process.threadCpuUsage(previous)
+      : null,
+  countFullGcs,
   eventLoopDelay: () => monitorEventLoopDelay({ resolution: 10 }),
 }
 
@@ -382,10 +481,15 @@ const valuePool = (size) => {
  * @param {Buffer[]} values the corpus values
  * @param {number} from index of the first message
  * @param {number} count
- * @returns {{ value: Buffer }[]} `count` messages cycling through `values`
+ * @param {number} [partitions] when given, message `n` names partition `n % partitions`
+ * @returns {{ value: Buffer, partition?: number }[]} `count` messages cycling through `values`
  */
-const messagesOf = (values, from, count) =>
-  Array.from({ length: count }, (_, i) => ({ value: values[(from + i) % values.length] }))
+const messagesOf = (values, from, count, partitions) =>
+  Array.from({ length: count }, (_, i) =>
+    partitions === undefined
+      ? { value: values[(from + i) % values.length] }
+      : { value: values[(from + i) % values.length], partition: (from + i) % partitions }
+  )
 
 /**
  * Sends `messages` messages in sends of at most `BATCH`, `concurrency` sends at a time.
@@ -394,15 +498,19 @@ const messagesOf = (values, from, count) =>
  * @param {number} messages
  * @param {Buffer[]} values
  * @param {number} [concurrency]
+ * @param {number} [partitions] when given, message `n` goes to partition `n % partitions`
  * @returns {Promise<void>}
  */
-const sendAll = async (producer, target, messages, values, concurrency = 1) => {
+const sendAll = async (producer, target, messages, values, concurrency = 1, partitions) => {
   let next = 0
   const lane = async () => {
     while (next < messages) {
       const from = next
       next += Math.min(BATCH, messages - from)
-      await producer.send({ ...target, messages: messagesOf(values, from, next - from) })
+      await producer.send({
+        ...target,
+        messages: messagesOf(values, from, next - from, partitions),
+      })
     }
   }
   await Promise.all(Array.from({ length: concurrency }, lane))
@@ -528,33 +636,52 @@ const produceThroughput = (kafka, target, options, timing) =>
   )
 
 /**
- * Produces the corpus untimed, then times `eachMessage` from the end of the warm-up (the first
+ * Produces the corpus untimed, laid out as `CORPUS_LAYOUT` says, checks each partition's record
+ * count against that layout, then times `eachMessage` from the end of the warm-up (the first
  * tenth of the corpus) to the last delivery, so group formation and warm-up are outside the
  * window. With `passes` above one, each partition is sought back to its first offset when it
  * delivers its last record, until it has been read `passes` times. Only a partition's next offset in
  * its current pass counts, so a duplicate or out-of-order delivery is not counted and the run ends
  * only once every partition delivered each pass in order. Over the window it also takes
- * process CPU, an event-loop delay histogram and the consumer's Fetch requests
- * (`consumer.events.REQUEST`, whose `size` is the response's bytes). Gives up after
- * `CONSUME_TIMEOUT_MS`.
+ * process CPU, the JavaScript thread's CPU when the timing has it, major GCs, an event-loop delay
+ * histogram and the consumer's Fetch requests (`consumer.events.REQUEST`, whose `size` is the
+ * response's bytes). The full-GC count waits for late `gc` entries after the window has closed.
+ * Gives up after `CONSUME_TIMEOUT_MS`.
  * @param {object} kafka
  * @param {object} target topic and codec of the corpus sends
  * @param {{ messages: number, values: Buffer[], consumerSettings: object, passes?: number,
- *   admin: object }} options `admin` reads each partition's corpus offsets
+ *   partitions: number, admin: object }} options `admin` reads each partition's corpus offsets
  * @param {Timing} timing
- * @returns {Promise<object>} messagesPerSecond, cpuMicrosPerMessage, eventLoopDelayP50,
- *   eventLoopDelayP99, eventLoopDelayMax (ms), fetchRequests, bytesPerFetch, messagesPerFetch,
- *   fetchVersion, passes, measuredMessages and elapsedMs
- * @throws {Error} when the corpus is not delivered in time
+ * @returns {Promise<object>} messagesPerSecond, cpuMicrosPerMessage,
+ *   threadCpuUsageSupported, mainThreadCpuMicrosPerMessage (absent without
+ *   `timing.threadCpuUsage`), fullGcCount,
+ *   eventLoopDelayP50, eventLoopDelayP99, eventLoopDelayMax (ms), fetchRequests, bytesPerFetch,
+ *   messagesPerFetch, fetchVersion, passes, corpus, measuredMessages and elapsedMs
+ * @throws {Error} when a partition does not hold the records the layout puts there, or the corpus
+ *   is not delivered in time
  */
 const consumeThroughput = async (kafka, target, options, timing) => {
-  const { messages, values, consumerSettings, passes = 1, admin } = options
-  const { now, setTimeout, clearTimeout, cpuUsage, eventLoopDelay } = timing
-  await withProducer(kafka, (producer) =>
-    sendAll(producer, target, messages, values, CORPUS_CONCURRENCY)
+  const { messages, values, consumerSettings, passes = 1, partitions, admin } = options
+  const { now, setTimeout, clearTimeout, cpuUsage, threadCpuUsage, countFullGcs, eventLoopDelay } =
+    timing
+  await withProducer(
+    kafka,
+    (producer) => sendAll(producer, target, messages, values, CORPUS_CONCURRENCY, partitions),
+    CORPUS_PRODUCER_SETTINGS
   )
   const parts = new Map()
-  for (const { partition, high, low } of await admin.fetchTopicOffsets(target.topic)) {
+  const answered = await admin.fetchTopicOffsets(target.topic)
+  for (let partition = 0; partition < partitions; partition++) {
+    const offsets = answered.find((answer) => answer.partition === partition)
+    const held = offsets ? Number(offsets.high) - Number(offsets.low) : 0
+    const laid = Math.max(0, Math.ceil((messages - partition) / partitions))
+    if (held !== laid) {
+      throw new Error(
+        `corpus partition ${partition} holds ${held} records where its layout puts ${laid}: a send was retried or lost, so the arms would not read the same corpus`
+      )
+    }
+  }
+  for (const { partition, high, low } of answered) {
     if (high !== low) {
       const first = Number(low)
       parts.set(partition, { low, first, last: Number(high) - 1, next: first, laps: 0 })
@@ -567,6 +694,7 @@ const consumeThroughput = async (kafka, target, options, timing) => {
   const fetches = { requests: 0, bytes: 0, version: null }
   let measuring = false
   let timer
+  let gc = null
   try {
     consumer.on(consumer.events.REQUEST, ({ payload }) => {
       if (!measuring || payload.apiName !== 'Fetch') return
@@ -580,6 +708,7 @@ const consumeThroughput = async (kafka, target, options, timing) => {
     let first
     let last
     let cpu
+    let thread = null
     const delivered = new Promise((resolve, reject) => {
       timer = setTimeout(
         () => reject(new Error(`received ${received} of ${total} messages in time`)),
@@ -599,13 +728,17 @@ const consumeThroughput = async (kafka, target, options, timing) => {
             }
             if (++received === warmup) {
               measuring = true
+              gc = countFullGcs()
               delay.enable()
               cpu = cpuUsage()
+              thread = threadCpuUsage ? threadCpuUsage() : null
               first = now()
             }
             if (received === total) {
               last = now()
               cpu = cpuUsage(cpu)
+              if (thread) thread = threadCpuUsage(thread)
+              gc.stop()
               delay.disable()
               measuring = false
               resolve()
@@ -615,11 +748,17 @@ const consumeThroughput = async (kafka, target, options, timing) => {
         .catch(reject)
     })
     await delivered
+    const fullGcCount = await gc.count()
     const elapsedMs = Number(last - first) / 1e6
     const measuredMessages = total - warmup
     return {
       messagesPerSecond: (measuredMessages / elapsedMs) * 1000,
       cpuMicrosPerMessage: (cpu.user + cpu.system) / measuredMessages,
+      threadCpuUsageSupported: thread !== null,
+      ...(thread && {
+        mainThreadCpuMicrosPerMessage: (thread.user + thread.system) / measuredMessages,
+      }),
+      fullGcCount,
       eventLoopDelayP50: delay.percentile(50) / 1e6,
       eventLoopDelayP99: delay.percentile(99) / 1e6,
       eventLoopDelayMax: delay.max / 1e6,
@@ -628,11 +767,13 @@ const consumeThroughput = async (kafka, target, options, timing) => {
       messagesPerFetch: measuredMessages / fetches.requests,
       fetchVersion: fetches.version,
       passes,
+      corpus: CORPUS_LAYOUT,
       measuredMessages,
       elapsedMs,
     }
   } finally {
     measuring = false
+    gc?.close()
     delay.disable()
     clearTimeout(timer)
     await consumer.disconnect()
@@ -735,6 +876,7 @@ const runWorkload = async (client, workload, options, timing = {}) => {
         durationMs: null,
         ...options,
         values,
+        partitions,
         consumerSettings,
         producerSettings,
         admin,
@@ -796,6 +938,9 @@ module.exports = {
   PACKAGE_DEFAULTS,
   SAME_PRODUCER_SETTINGS,
   PRODUCER_DEFAULTS,
+  CORPUS_PRODUCER_SETTINGS,
+  CORPUS_LAYOUT,
+  countFullGcs,
 }
 
 if (require.main === module) {

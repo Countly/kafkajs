@@ -9,6 +9,8 @@ const ARMS = ['fork', 'kafkajs@2.2.4']
 const CONSUME_METRICS = [
   'messagesPerSecond',
   'cpuMicrosPerMessage',
+  'mainThreadCpuMicrosPerMessage',
+  'fullGcCount',
   'eventLoopDelayP50',
   'eventLoopDelayP99',
   'eventLoopDelayMax',
@@ -84,6 +86,7 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-consume-throughput': ['consume-throughput', '200', 'none', '3', 'defaults'],
         'compare-consume-throughput-same': ['consume-throughput', '200', 'none', '3', 'same'],
         'compare-consume-throughput-1k': ['consume-throughput', '1024', 'none', '3', 'defaults'],
+        'compare-consume-throughput-1k-same': ['consume-throughput', '1024', 'none', '3', 'same'],
         'compare-consume-throughput-lz4': ['consume-throughput', '200', 'lz4', '3', 'defaults'],
         'compare-consume-throughput-12p': ['consume-throughput', '200', 'none', '12', 'defaults'],
       })
@@ -97,6 +100,7 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-consume-throughput': 562872,
         'compare-consume-throughput-same': 540005,
         'compare-consume-throughput-1k': 2 * 226457,
+        'compare-consume-throughput-1k-same': 2 * 226457,
         'compare-consume-throughput-lz4': 538654,
         'compare-consume-throughput-12p': 502499,
       }
@@ -117,12 +121,27 @@ describe('Benchmark report clientCompare adapter', () => {
       }
     })
 
-    test('the same-settings produce and consume rows take one CPU profile per arm, and no other row does', () => {
+    test('the same-settings produce and consume rows and both 1 KiB consume rows take one CPU profile per arm, and no other row does', () => {
       expect(compareRows.filter((row) => row.profile).map(({ name }) => name)).toEqual([
         'compare-produce-throughput-same',
         'compare-consume-throughput-same',
+        'compare-consume-throughput-1k',
+        'compare-consume-throughput-1k-same',
       ])
       expect(compareRows.filter((row) => 'profile' in row && row.profile !== true)).toEqual([])
+    })
+
+    test('the 1 KiB same-settings consume row is the 1 KiB consume row with --settings same', () => {
+      const byName = (name) => compareRows.find((row) => row.name === name)
+      const defaults = byName('compare-consume-throughput-1k')
+      const same = byName('compare-consume-throughput-1k-same')
+
+      expect(same).toEqual({
+        ...defaults,
+        name: 'compare-consume-throughput-1k-same',
+        command: [...defaults.command, '--settings', 'same'],
+      })
+      expect(valueOf(defaults.command, '--settings')).toBeUndefined()
     })
 
     test('the planned compare minutes fit the bench job timeout with 20 minutes left for setup', () => {
@@ -131,7 +150,7 @@ describe('Benchmark report clientCompare adapter', () => {
       )
       const minutes = compareRows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
 
-      expect(Math.round(minutes)).toBe(184)
+      expect(Math.round(minutes)).toBe(217)
       expect(minutes + 20).toBeLessThanOrEqual(workflow.jobs.bench['timeout-minutes'])
     })
   })
@@ -282,6 +301,100 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(consumed.detail.notes.slice(1)).toEqual([
         'the corpus is read 4 times: each partition is sought back to its first offset after its last record',
       ])
+    })
+
+    test('a consume arm notes its corpus layout', () => {
+      const corpus = { partitioning: 'record i to partition i % partitions', recordsPerSend: 500 }
+
+      const { detail } = adapter.rows(entry, 'fork', { outputs: [output(1, 30000, { corpus })] }, 1)
+
+      expect(detail.notes.slice(1)).toEqual([
+        'corpus layout (the same on both arms, each written by the arm\'s own client): partitioning="record i to partition i % partitions", recordsPerSend=500',
+        "each partition's record count was checked against the layout before measuring; the order of the batches inside a partition was not",
+      ])
+    })
+
+    test('an arm whose every run says its Node has no process.threadCpuUsage leaves main-thread CPU out with a note instead of an error row', () => {
+      const withThread = {
+        ...entry,
+        metrics: [
+          { key: 'messagesPerSecond', unit: 'msg/s' },
+          { key: 'mainThreadCpuMicrosPerMessage', unit: 'us' },
+          { key: 'fullGcCount', unit: 'collections' },
+        ],
+      }
+      const runs = [output(100, 30000, { fullGcCount: 4 }), output(120, 30000, { fullGcCount: 6 })]
+
+      const absent = adapter.rows(
+        withThread,
+        'kafkajs@2.2.4',
+        { outputs: runs.map((run) => ({ ...run, threadCpuUsageSupported: false })) },
+        2
+      )
+      const present = adapter.rows(
+        withThread,
+        'fork',
+        {
+          outputs: runs.map((run, i) => ({
+            ...run,
+            threadCpuUsageSupported: true,
+            mainThreadCpuMicrosPerMessage: 3 + i,
+          })),
+        },
+        2
+      )
+
+      expect(absent.rows.map(({ metric, status }) => [metric, status])).toEqual([
+        ['messagesPerSecond', 'valid'],
+        ['fullGcCount', 'valid'],
+      ])
+      expect(absent.detail.status).toBe('valid')
+      expect(absent.detail.notes).toContain(
+        'mainThreadCpuMicrosPerMessage: not reported, the Node running this arm has no process.threadCpuUsage'
+      )
+      expect(present.rows.map(({ metric, status, median }) => [metric, status, median])).toEqual([
+        ['messagesPerSecond', 'valid', 120],
+        ['mainThreadCpuMicrosPerMessage', 'valid', 4],
+        ['fullGcCount', 'valid', 6],
+      ])
+      expect(present.detail.notes.some((note) => note.includes('not reported'))).toBe(false)
+    })
+
+    test('a run that can measure main-thread CPU but omits it is an error row, and the arm is an error', () => {
+      const withThread = {
+        ...entry,
+        metrics: [{ key: 'mainThreadCpuMicrosPerMessage', unit: 'us' }],
+      }
+      const supported = { threadCpuUsageSupported: true }
+      const outputs = [
+        output(1, 30000, { ...supported, mainThreadCpuMicrosPerMessage: 3 }),
+        output(1, 30000, supported),
+      ]
+
+      const { rows, detail } = adapter.rows(withThread, 'fork', { outputs }, 2)
+
+      const reason = 'run 2 of 2: mainThreadCpuMicrosPerMessage is not a finite number'
+      expect(rows.map(({ status, reason: why }) => [status, why])).toEqual([['error', reason]])
+      expect(detail).toMatchObject({ status: 'error', reason })
+      expect(detail.notes.some((note) => note.includes('not reported'))).toBe(false)
+    })
+
+    test('runs that omit main-thread CPU without saying their Node lacks it are errors, not a left-out metric', () => {
+      const withThread = {
+        ...entry,
+        metrics: [{ key: 'mainThreadCpuMicrosPerMessage', unit: 'us' }],
+      }
+      const outputs = [
+        output(1, 30000),
+        output(1, 30000, { threadCpuUsageSupported: false }),
+        output(1, 30000),
+      ]
+
+      const { rows, detail } = adapter.rows(withThread, 'fork', { outputs }, 3)
+
+      const reason = 'run 1 of 3: mainThreadCpuMicrosPerMessage is not a finite number'
+      expect(rows.map(({ status, reason: why }) => [status, why])).toEqual([['error', reason]])
+      expect(detail).toMatchObject({ status: 'error', reason })
     })
 
     test('an arm that failed is an error with its reason and no table', () => {
