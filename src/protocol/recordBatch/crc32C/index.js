@@ -1,4 +1,4 @@
-const crc32C = require('./crc32C')
+const { crc32C } = require('./crc32C')
 
 /**
  * @param {Buffer} buffer
