@@ -183,12 +183,13 @@ module.exports = class OffsetManager {
    * @param {() => {generationId: number, memberId: string,
    *                                coordinator: import("../../../types").Broker}} [options.membership]
    *                                a LIVE read of the membership this manager should send under.
-   *                                The offset-fetch retry consults it before every attempt under
-   *                                the consumer protocol, because the epoch it needs is installed
-   *                                by the heartbeats while the retry loop is running - a snapshot
-   *                                would re-send a rejected epoch forever. Defaults to this
-   *                                manager's own snapshot, which is what every caller that has no
-   *                                membership to offer wants.
+   *                                Under the consumer protocol every new commit and offset fetch
+   *                                takes its member epoch from it, because the heartbeats install
+   *                                the epoch, also with no assignment change, and the offset-fetch
+   *                                retry consults it before every attempt - a snapshot would
+   *                                re-send a rejected epoch forever. Defaults to this manager's own
+   *                                snapshot, which is what every caller that has no membership to
+   *                                offer wants.
    * @param {() => boolean} [options.isStopping] whether the consumer has been asked to stop. The
    *                                offset-fetch retry abandons its deadline the moment this is
    *                                true, because the fetch loop it runs inside is one
@@ -293,7 +294,7 @@ module.exports = class OffsetManager {
     this.membership =
       membership ||
       (() => ({
-        generationId: this.generationId,
+        generationId: this.snapshotGenerationId,
         memberId: this.memberId,
         coordinator: this.coordinator,
       }))
@@ -708,7 +709,9 @@ module.exports = class OffsetManager {
    * under the consumer one.
    *
    * Under the consumer protocol `generationId` IS the member epoch: `ConsumerGroup.generationId`
-   * aliases it, so the same field carries `GenerationIdOrMemberEpoch` on the wire.
+   * aliases it, so the same field carries `GenerationIdOrMemberEpoch` on the wire. That epoch is
+   * read from `membership()` (see `generationId`), so the value written here is what the default
+   * accessor reports.
    *
    * @param {object} membership
    * @param {number} membership.generationId
@@ -720,6 +723,26 @@ module.exports = class OffsetManager {
     this.generationId = generationId
     this.memberId = memberId
     this.coordinator = coordinator
+  }
+
+  /**
+   * The generation, or under the consumer protocol the member epoch, a new request is built with.
+   *
+   * Under the consumer protocol it is read from `membership()` on every call: a heartbeat can move
+   * the member to a new epoch without changing its assignment, so no `updateAssignment` follows,
+   * and the coordinator rejects any other epoch with STALE_MEMBER_EPOCH. A request keeps the
+   * epoch it was built with. Under the classic protocol it is the snapshot taken at construction,
+   * `updateAssignment` and `useMembership`.
+   * @type {number}
+   */
+  get generationId() {
+    return this.membershipProtocol === 'consumer'
+      ? this.membership().generationId
+      : this.snapshotGenerationId
+  }
+
+  set generationId(value) {
+    this.snapshotGenerationId = value
   }
 
   /**

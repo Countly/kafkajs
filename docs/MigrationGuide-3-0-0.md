@@ -865,7 +865,8 @@ says so, `groupProtocol: 'consumer'`.
   - **`consumer.commitOffsets(offsets)`**, and `commitOffsetsIfNecessary(offsets)` with your own
     payload, still fail: they reject with a non-retriable error whose message begins `OffsetCommit
     failed with stale member epoch.` and whose `type` is `STALE_MEMBER_EPOCH`. Handle it as you would
-    any other commit failure — retrying it yourself under the same epoch cannot succeed.
+    any other commit failure. Every new commit is built with the epoch the heartbeats have installed
+    by then, so a retry succeeds only once a heartbeat has brought the member's epoch up to date.
 
   An `OffsetFetch` rejected the same way is re-sent under whatever epoch the heartbeats have
   installed by then, for up to the rebalance timeout, so a first fetch of committed offsets around a
