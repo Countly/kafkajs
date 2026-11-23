@@ -1148,6 +1148,29 @@ function judgeCommits(row, { journal, describes, config }) {
 /** @param {number[]} values @returns {number} the middle value; the upper middle of an even count */
 const upperMedian = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
 
+/** @param {number} n boundaries @returns {number} how many boundaries each endpoint median takes */
+const edgeOf = (n) => Math.max(1, Math.min(3, Math.floor(n / 2)))
+
+/**
+ * The hours between the endpoint medians of the 24-boundary run the heap-endpoint bound was set
+ * for (h01 to h22).
+ */
+const ENDPOINT_REFERENCE_SPAN = 21
+
+/**
+ * The acceptance endpoint ceiling: the matrix bound scaled to the hours between this run's
+ * endpoint medians, so a shorter run rejects the same steady growth per hour (12 boundaries:
+ * floor(2,097,152 x 9 / 21) = 898,779 bytes). Never above the bound. Smoke and rehearsal keep
+ * the bound as absolute bytes.
+ * @param {number} bound the matrix endpoint bound @param {object} plan @param {string} mode
+ * @returns {number}
+ */
+function endpointCeiling(bound, plan, mode) {
+  if (mode !== 'acceptance') return bound
+  const span = plan.hours - edgeOf(plan.hours)
+  return Math.min(bound, Math.floor((bound * span) / ENDPOINT_REFERENCE_SPAN))
+}
+
 /**
  * The heap screen over one value per boundary, in boundary order: the endpoint compares the
  * medians of the last and first three boundaries (one each below six) and the slope is the
@@ -1159,7 +1182,7 @@ function heapScreen(points) {
   const Y = points.map((p) => p.bytes)
   const X = points.map((p) => p.minutes)
   const n = Y.length
-  const edge = Math.max(1, Math.min(3, Math.floor(n / 2)))
+  const edge = edgeOf(n)
   const endpoint = upperMedian(Y.slice(n - edge)) - upperMedian(Y.slice(0, edge))
   const mean = (v) => v.reduce((s, x) => s + x, 0) / v.length
   const [mx, my] = [mean(X), mean(Y)]
@@ -1344,21 +1367,22 @@ function snapshotSeries(ctx, slot, records, receipts) {
 /**
  * K5: the judged heap of each unseeded subject process, one heap snapshot per hourly quiet
  * boundary: every live byte but V8 code (`heapSummary.EXCLUDED_TYPE`), whoever owns it. The
- * endpoint and slope of `heapScreen` must stay within the matrix bounds. A boundary without a
+ * endpoint and slope of `heapScreen` must stay within the matrix bounds, the endpoint as scaled by
+ * `endpointCeiling`. A boundary without a
  * usable snapshot leaves the process INCONCLUSIVE, never PASS, and fewer than two usable
  * boundaries cannot be screened. The seed's snapshots, judged the same way, are the positive
  * control: unless its endpoint exceeds the seed's breach bound the row cannot PASS, and the seed
  * never fails it. The harness-only snapshot processes (reader, decoder) and every subject's
  * whole-process `heapUsed` screen are returned as information, never a verdict.
  * @param {Row} row @param {object} ctx `{ dir, manifest, journal, matrix, config, plan, header,
- *   supervisor }`
+ *   supervisor, mode }`
  * @returns {{ heapUsed: object, comparison: object, control: object, controlBound: number }} the
  *   information lines
  */
 function judgeHeap(row, ctx) {
-  const { matrix, config, supervisor } = ctx
+  const { matrix, config, supervisor, plan, mode } = ctx
   const limits = {
-    endpoint: matrix.bounds['heap-endpoint'].value,
+    endpoint: endpointCeiling(matrix.bounds['heap-endpoint'].value, plan, mode),
     slope: matrix.bounds['heap-slope'].value,
   }
   const problems = []
@@ -1826,6 +1850,7 @@ module.exports = {
   checkArtifact,
   formatReport,
   heapScreen,
+  endpointCeiling,
   judge,
   judgeHeap,
   main,

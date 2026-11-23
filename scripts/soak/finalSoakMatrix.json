@@ -823,7 +823,7 @@
         "seed"
       ],
       "uses": ["Complete", "Delivery", "AuthorityOK", "ResourcesOK", "TablesOK", "HeapOK"],
-      "predicate": "day PASS iff Complete, Delivery, AuthorityOK, ResourcesOK and TablesOK hold, HeapOK holds for each of the 12 unseeded subject processes and the offset-retention sensitivity of rs-l16 is conclusive. closure COMPLETE only with verified prior-checkpoint dispositions and every required companion.",
+      "predicate": "run PASS iff Complete, Delivery, AuthorityOK, ResourcesOK and TablesOK hold, HeapOK holds for each of the 12 unseeded subject processes and the offset-retention sensitivity of rs-l16 is conclusive. closure COMPLETE only with verified prior-checkpoint dispositions and every required companion.",
       "bounds": [
         "bounds.durable-loss",
         "bounds.forced-exits",
@@ -981,7 +981,7 @@
         "inventory"
       ],
       "uses": ["ResourcesOK"],
-      "predicate": "day PASS iff each static kind has >= 12 real restart pairs with the same static id, a new actual client id and no concurrent duplicate static id, each followed by actual assignment, handler and broker commit; ResourcesOK holds for every cohort and process; disconnect < final sample < parent-observed exit. closure COMPLETE iff day PASS and the natural-exit companion is valid for the exact candidate: run attempt, Node 22, 24 and 26 coverage, ordinary, static, classic and consumer test identities, enforced open-handle detection, original teardown logs absent or root-caused, and a seeded retained timer or socket failing its watchdog.",
+      "predicate": "run PASS iff each static kind has >= 12 real restart pairs with the same static id, a new actual client id and no concurrent duplicate static id, each followed by actual assignment, handler and broker commit; ResourcesOK holds for every cohort and process; disconnect < final sample < parent-observed exit. closure COMPLETE iff run PASS and the natural-exit companion is valid for the exact candidate: run attempt, Node 22, 24 and 26 coverage, ordinary, static, classic and consumer test identities, enforced open-handle detection, original teardown logs absent or root-caused, and a seeded retained timer or socket failing its watchdog.",
       "bounds": ["bounds.forced-exits", "bounds.performance-report-only"],
       "minima": [
         {

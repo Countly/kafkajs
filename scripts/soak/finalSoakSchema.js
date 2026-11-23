@@ -1323,7 +1323,7 @@ const EXECUTIONS = Object.freeze({
   },
   'regex-churn': { minutes: Minutes, maxMs: Positive },
   'topic-recreation': { minutes: Minutes, maxMs: Positive },
-  'broker-outage': { minutes: Minutes, evenHoursOnly: Bool, recoveredByMinute: Positive },
+  'broker-outage': { minutes: Minutes, evenHoursOnly: oneOf(true), recoveredByMinute: Positive },
 })
 
 /** @param {object} schedule @returns {string[]} the exact hourly schedule, totals and smoke profile */
@@ -1358,7 +1358,8 @@ const scheduleProblems = (schedule) => {
 /**
  * Checks that the schedule totals are what the hourly plan makes over the acceptance run, so the
  * totals follow the run length: per hour one idle window, each execution at each of its minutes
- * (the outage on even hours only), a pause sequence per membership wave and one static restart.
+ * (the outage on even hours only, as the scheduler places it), a pause sequence per membership wave
+ * and one static restart.
  * @param {object} schedule a structurally valid schedule
  * @param {number} hours the acceptance run in hours
  * @returns {string[]}
@@ -1366,14 +1367,13 @@ const scheduleProblems = (schedule) => {
 const totalsProblems = (schedule, hours) => {
   const per = Object.fromEntries(schedule.executions.map((e) => [e.shape, e]))
   const membership = hours * per['membership-churn'].minutes.length
-  const outageHours = per['broker-outage'].evenHoursOnly ? Math.ceil(hours / 2) : hours
   const expected = {
     idleWindows: hours,
     regexExecutions: hours * per['regex-churn'].minutes.length,
     recreations: hours * per['topic-recreation'].minutes.length,
     membershipExecutions: membership,
     pauseSequencesPerOrdinaryKind: membership * per['membership-churn'].waves,
-    outages: outageHours * per['broker-outage'].minutes.length,
+    outages: Math.ceil(hours / 2) * per['broker-outage'].minutes.length,
     staticRestartsPerStaticKind: hours,
   }
   return Object.entries(expected).flatMap(([name, n]) =>

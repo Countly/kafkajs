@@ -213,7 +213,10 @@ cleared at the end) is judged bytes like any other, so the seed's judged endpoin
 that judges K5: that shows, inside the run, that capture, summary and checker see a leak. V8 runs a full collection before it writes, so a snapshot holds only live nodes. The judged
 bytes of a snapshot are the self bytes of every node except those of the excluded node type below; K5 applies the matrix
 endpoint (2,097,152 bytes, median of the last three boundaries minus the first three) and slope (262,144 B/min over the
-snapshot start times) bounds to them, in every mode that judges the row.
+snapshot start times) bounds to them, in every mode that judges the row. On an acceptance run the endpoint bound is scaled
+to the hours between its endpoint medians, so it rejects the same steady growth per hour as the 21 hours of a 24-hour run:
+floor(2,097,152 x 9 / 21) = 898,779 bytes on 12 boundaries (about 100 KB per hour). The seed's breach bound stays
+2,097,152 bytes.
 
 Excluded node types: `code`.
 
@@ -318,9 +321,10 @@ The verdict stays REJECTED either way; the triage decides what gets fixed.
 A smoke has one quiet boundary per measured process, so K5 is always INCONCLUSIVE there. A rehearsal
 (`finalSoakNode.sh <sha> rehearsal`) runs the first three hours of the 12-hour acceptance plan unchanged: the same hourly executions,
 outages on even hours, idle windows, quiet triplets and heap snapshots (`h00` to `h02`) and seed timing, for 10,800,000 ms
-(`acceptance.modes.rehearsal`). The checker judges it with the acceptance rules: every periodic slot of its length, and K5 on the
-judged heap of its three boundaries with the same endpoint bound (absolute bytes, not scaled to the length, so it fails above
-about 1 MiB of sustained judged growth per hour instead of about 0.2 MiB on the acceptance run) and the same slope bound per minute. Its
+(`acceptance.modes.rehearsal`). Every workload step and periodic slot up to that length is the acceptance plan's own; only the
+traffic window, the seed clear and the disconnect follow the rehearsal's length. The checker judges it with the acceptance rules: every periodic slot of its length, and K5 on the
+judged heap of its three boundaries with the matrix endpoint bound of 2,097,152 bytes (not scaled to its length, so it fails above
+about 1 MiB of sustained judged growth per hour instead of about 0.1 MiB on the acceptance run) and the same slope bound per minute. Its
 verdict is at best NOT ACCEPTED. `FINAL_SOAK_DIAGNOSTIC=1` is accepted, as for a smoke.
 
 On a hosted runner, dispatch the `Final soak smoke (diagnostic)` workflow with `mode: rehearsal`. A push to one of the
