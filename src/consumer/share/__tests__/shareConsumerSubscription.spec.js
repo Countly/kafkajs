@@ -324,12 +324,22 @@ describe('public share subscription and run lifecycle', () => {
       added: [{ topic: 'topic-a', partitions: [0] }],
       removed: [],
     })
+    await flush()
+    expect(handled).toEqual(['topic-a:a0'])
+    expect(
+      h.frames(78).every(({ fields }) => fields.topics.every(({ topicId }) => topicId !== B))
+    ).toBe(true)
+
+    held.resolve()
     await until(() => handled.length === 2, 'the handler of the new identity')
     expect(
       h.frames(78).some(({ fields }) => fields.topics.some(({ topicId }) => topicId === B))
     ).toBe(true)
-
-    held.resolve()
+    const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+    const openings = h.frames(78).filter(({ fields }) => fields.shareSessionEpoch === 0)
+    expect(finals).toHaveLength(1)
+    expect(openings).toHaveLength(2)
+    expect(openings[1].order).toBeGreaterThan(finals[0].answeredOrder)
     await until(() => acks.length === 3, 'the settled acknowledgements')
     expect(handled).toEqual(['topic-a:a0', 'topic-a:b0'])
     expect(outcomes(acks).sort((x, y) => Number(x[0]) - Number(y[0]))).toEqual([
@@ -337,5 +347,137 @@ describe('public share subscription and run lifecycle', () => {
       ['1', '2', 'release', null],
       ['10', '10', 'accept', null],
     ])
+  })
+
+  describe('a node whose last partition is revoked and restored', () => {
+    let assignments
+    /**
+     * Starts a subscribed client that records its assignment changes.
+     * @returns {Promise<void>}
+     */
+    const start = async () => {
+      h = shareClient({ interval: 5 })
+      assignments = []
+      const { consumer } = h
+      consumer.on(consumer.events.ASSIGNMENT_CHANGED, ({ payload }) => assignments.push(payload))
+      await consumer.subscribe({ topics: ['topic-a'] })
+    }
+    /**
+     * Answers the next steady heartbeat with a new assignment, then waits until it was applied.
+     * @param {number} memberEpoch The answer's member epoch.
+     * @param {Array<{topicId: string, partitions: number[]}>} topicPartitions The assignment.
+     * @returns {Promise<void>}
+     */
+    const assignNext = async (memberEpoch, topicPartitions) => {
+      const count = assignments.length
+      const beat = h.hold({
+        api: 'ShareGroupHeartbeat',
+        match: ({ fields }) => fields.memberEpoch > 0,
+      })
+      const call = await beat.arrived()
+      beat.release({
+        errorCode: 0,
+        errorMessage: null,
+        memberId: call.fields.memberId,
+        memberEpoch,
+        heartbeatIntervalMs: 5,
+        assignment: { topicPartitions },
+      })
+      await until(() => assignments.length === count + 1, `the assignment at epoch ${memberEpoch}`)
+    }
+    /** @returns {number[]} The session epoch of every fetch, oldest first. */
+    const fetchEpochs = () => h.frames(78).map(({ fields }) => fields.shareSessionEpoch)
+    /** @returns {object[]} The final acknowledgements (epoch -1), oldest first. */
+    const finals = () => h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+
+    test('runs no second handler and opens no second session while its handler runs', async () => {
+      await start()
+      h.script('ShareFetch', [
+        fetchAnswer([acquire(0, 0, ['a0'])]),
+        fetchAnswer([acquire(0, 5, ['a5'])]),
+      ])
+      const held = deferred()
+      const handled = []
+      await h.consumer.run({
+        eachMessage: async ({ message }) => {
+          handled.push(message.offset)
+          if (message.offset === '0') await held.promise
+        },
+      })
+      await until(() => handled.length === 1, 'the held handler')
+      await assignNext(2, [])
+      await assignNext(3, [{ topicId: A, partitions: [0] }])
+      await flush()
+      expect(fetchEpochs()).toEqual([0])
+      expect(handled).toEqual(['0'])
+
+      held.resolve()
+      await until(() => handled.length === 2, 'the delivery of the new session')
+      expect(handled).toEqual(['0', '5'])
+      expect(fetchEpochs().slice(0, 2)).toEqual([0, 0])
+      expect(finals()).toHaveLength(1)
+      expect(finals()[0].fields.topics).toEqual([
+        {
+          topicId: A,
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: [
+                { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+              ],
+            },
+          ],
+        },
+      ])
+      expect(h.frames(78)[1].order).toBeGreaterThan(finals()[0].answeredOrder)
+    })
+
+    test('opens no second session while its fetch is in flight', async () => {
+      await start()
+      const fetch = h.hold({
+        api: 'ShareFetch',
+        match: ({ fields }) => fields.shareSessionEpoch === 1,
+      })
+      await h.consumer.run({ eachMessage: async () => {} })
+      await fetch.arrived()
+      await assignNext(2, [])
+      await assignNext(3, [{ topicId: A, partitions: [0] }])
+      await flush()
+      expect(fetchEpochs()).toEqual([0, 1])
+
+      fetch.release(fetchAnswer([]))
+      await until(() => h.frames(78).length === 3, 'the opening fetch of the new session')
+      expect(fetchEpochs().slice(0, 3)).toEqual([0, 1, 0])
+      expect(finals()).toHaveLength(1)
+      expect(h.frames(78)[2].order).toBeGreaterThan(finals()[0].answeredOrder)
+    })
+
+    test('opens a new session only after the final of the ended one was answered', async () => {
+      await start()
+      await h.consumer.run({ eachMessage: async () => {} })
+      await until(() => h.frames(78).length > 0, 'the opening fetch')
+      const final = h.hold({
+        api: 'ShareAcknowledge',
+        match: ({ fields }) => fields.shareSessionEpoch === -1,
+      })
+      await assignNext(2, [])
+      await final.arrived()
+      const before = h.frames(78).length
+      await assignNext(3, [{ topicId: A, partitions: [0] }])
+      await flush()
+      expect(h.frames(78)).toHaveLength(before)
+
+      final.release(ackAnswer([]))
+      await until(() => h.frames(78).length === before + 1, 'the opening fetch of the new session')
+      const [closing] = h.frames(79)
+      const opening = h.frames(78)[before]
+      expect(h.frames(79)).toHaveLength(1)
+      expect(closing.fields.shareSessionEpoch).toBe(-1)
+      expect(opening.fields.shareSessionEpoch).toBe(0)
+      expect(opening.fields.topics).toEqual([
+        { topicId: A, partitions: [{ partitionIndex: 0, acknowledgementBatches: [] }] },
+      ])
+      expect(opening.order).toBeGreaterThan(closing.answeredOrder)
+    })
   })
 })
