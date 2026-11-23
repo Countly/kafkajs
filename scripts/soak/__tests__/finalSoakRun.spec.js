@@ -662,7 +662,7 @@ describe('final soak supervisor commands', () => {
     ])
   })
 
-  test('the day does not start when any process failed to start, and the failure is recorded', async () => {
+  test('the run does not start when any process failed to start, and the failure is recorded', async () => {
     const { s, remove } = supervisor()
     try {
       for (const slot of ['p05', 'p06']) s.children.set(slot, fakeChild())
@@ -1754,7 +1754,7 @@ describe('final soak retained harness state', () => {
     })
   })
 
-  test("a day's membership waves and regex topics leave the retained state at the live set", () => {
+  test("an acceptance run's membership waves and regex topics leave the retained state at the live set", () => {
     const { worker, child } = retaining()
     const rig = { id: 'c01.1', uncommitted: new Map() }
     worker.standing.push(rig)

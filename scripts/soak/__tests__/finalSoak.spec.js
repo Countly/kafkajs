@@ -302,7 +302,7 @@ describe('final soak driver', () => {
     )
   })
 
-  test('rehearsal mode runs the first three hours of the day plan unchanged, so each measured process gets three quiet boundaries', () => {
+  test('rehearsal mode is a prefix of the acceptance plan: the same workload steps and periodic slots up to its length, with traffic, seed clear and disconnect framed by its own length, so each measured process gets three quiet boundaries', () => {
     const { offerPlan } = require('../finalSoak')
     const hourMs = matrix.schedule.hourMs
     const plan = planSchedule(matrix, 'rehearsal')
@@ -323,12 +323,13 @@ describe('final soak driver', () => {
     expect([...new Set(boundaries)]).toEqual(['h00', 'h01', 'h02'])
     const shaped = (steps) =>
       steps
-        .filter(
-          (s) => s.shape !== 'traffic' && !['periodic', 'seed-clear', 'disconnect'].includes(s.type)
-        )
+        .filter((s) => s.shape !== 'traffic' && !['seed-clear', 'disconnect'].includes(s.type))
         .map(({ order, ...step }) => step)
-    const day = planSchedule(matrix, 'acceptance').steps.filter((s) => s.at < 3 * hourMs)
-    expect(shaped(plan.steps)).toEqual(shaped(day))
+    const prefix = planSchedule(matrix, 'acceptance').steps.filter((s) => s.at <= plan.requestedMs)
+    expect(shaped(plan.steps)).toEqual(shaped(prefix))
+    expect(shaped(plan.steps).filter((s) => s.type === 'periodic')).toHaveLength(
+      plan.requestedMs / matrix.sampling.periodMs.value + 1
+    )
     const seedStart = plan.steps.find((s) => s.type === 'seed-start')
     expect(seedStart.at).toBeGreaterThan(plan.steps.find((s) => s.id === 'h00q2').at)
     const { expected, capacity } = offerPlan(matrix, 'rehearsal')

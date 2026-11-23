@@ -1040,7 +1040,7 @@ describe('final soak record line sizes', () => {
   const { chunk } = require('../finalSoakCollector')
   const CAP = matrix.host.maxEventLineBytes.value
   const INVENTORY_CAP = matrix.host.maxInventoryLineBytes.value
-  /** About 28 hours on the run clock, past the end of a day run with its setup and teardown. */
+  /** About 28 hours on the run clock, past the end of an acceptance run with its setup and teardown. */
   const T = 99999999.12345679
   const N = 9999999
   const SHA = 'f'.repeat(64)

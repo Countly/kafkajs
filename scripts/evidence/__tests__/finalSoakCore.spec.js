@@ -77,7 +77,7 @@ const smoke = () => fx.healthy({ mode: 'smoke', withInventory: true })
 const rehearsal = () => fx.healthy({ mode: 'rehearsal', withInventory: true })
 
 describe('scripts/evidence/finalSoakCore', () => {
-  describe('a healthy day', () => {
+  describe('a healthy acceptance run', () => {
     it('is ACCEPTED by K1 to K7 and says it is a core verdict with the rows it does not judge', async () => {
       const report = await check(fx.healthy())
       expect(report.rows.map((r) => `${r.id}:${r.verdict}`)).toEqual(
@@ -1250,8 +1250,20 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(world), 'K5', 'FAIL', /p04 judged heap endpoint 3145728 bytes/)
     })
 
+    it('fails a steady judged growth of 150,000 bytes an hour, which a 24-hour run rejected, on the endpoint bound scaled to the run', async () => {
+      const world = judged('p04', (h) => 9e6 + h * 150000)
+      const report = await check(world)
+      expectRow(report, 'K5', 'FAIL', /p04 judged heap endpoint 1350000 bytes exceeds 898779/)
+      expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p04 judged heap slope/)
+      const bound = world.matrix.bounds['heap-endpoint'].value
+      const plan = (hours) => ({ hours })
+      expect(core.endpointCeiling(bound, plan(12), 'acceptance')).toBe(898779)
+      expect(core.endpointCeiling(bound, plan(24), 'acceptance')).toBe(bound)
+      expect(core.endpointCeiling(bound, plan(3), 'rehearsal')).toBe(bound)
+    })
+
     it('fails a judged slope above the bound even when the endpoint is clean', async () => {
-      const world = judged('p05', (h) => 9e6 + (h >= 6 && h <= 8 ? 500 * MIB : 0))
+      const world = judged('p05', (h) => 9e6 + (h >= 6 && h <= 8 ? 600 * MIB : 0))
       const report = await check(world)
       expectRow(report, 'K5', 'FAIL', /p05 judged heap slope/)
       expect(row(report, 'K5').reasons.join('\n')).not.toMatch(/p05.*endpoint/)
@@ -1394,13 +1406,13 @@ describe('scripts/evidence/finalSoakCore', () => {
       ],
       [
         'a steady leak raised at the start and lowered at the end',
-        (h) => 9e6 + h * 300000,
+        (h) => 9e6 + h * 150000,
         (h) => ({ 1: 11e6, 2: 11e6, 9: 9e6, 10: 9e6 })[h],
         [],
-        /p04 h01 snapshot does not confirm its summary: heap\/p04\.h01\.heapsnapshot has judgedBytes 9300000, its summary 11000000/,
+        /p04 h01 snapshot does not confirm its summary: heap\/p04\.h01\.heapsnapshot has judgedBytes 9150000, its summary 11000000/,
       ],
     ])(
-      'never passes a day whose middle summary records lie about the endpoint inputs, %s: every snapshot is re-derived from its file',
+      'never passes a run whose middle summary records lie about the endpoint inputs, %s: every snapshot is re-derived from its file',
       async (_, bytes, lie, deleted, reason) => {
         const world = judged('p04', bytes)
         world.heap.edit = (dir) => {
@@ -2004,8 +2016,8 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('fails a gap in the periodic sample grid', async () => {
-      const edit = without((r) => isSample('p03', 'periodic')(r) && r.slot === 1500)
-      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /p03 misses periodic slot 1500/)
+      const edit = without((r) => isSample('p03', 'periodic')(r) && r.slot === 1400)
+      expectRow(await check(fx.healthy(), { edit }), 'K7', 'FAIL', /p03 misses periodic slot 1400/)
     })
 
     it('fails a periodic sample admitted before its slot', async () => {
@@ -2014,12 +2026,12 @@ describe('scripts/evidence/finalSoakCore', () => {
     })
 
     it('fails a periodic sample admitted after its slot window', async () => {
-      const edit = periodic('p03', 1500, (r) => ({ admittedAt: r.admittedAt + 6000 }))
+      const edit = periodic('p03', 1400, (r) => ({ admittedAt: r.admittedAt + 6000 }))
       expectRow(
         await check(fx.healthy(), { edit }),
         'K7',
         'FAIL',
-        /p03 slot 1500 was admitted late/
+        /p03 slot 1400 was admitted late/
       )
     })
 
@@ -2560,7 +2572,7 @@ describe('scripts/evidence/finalSoakCore', () => {
       return world
     }
 
-    it('judges K5 by the day’s endpoint bound on judged bytes, not scaled to its length: growth of exactly the bound passes, one byte more fails', async () => {
+    it('judges K5 by the matrix endpoint bound on judged bytes, not scaled to its length: growth of exactly the bound passes, one byte more fails', async () => {
       const bound = fx.matrix.bounds['heap-endpoint'].value
       const grown = (bytes) => judgedRehearsal('p04', (h) => 9e6 + (h === 2 ? bytes : 0))
       const at = await check(grown(bound))
@@ -2569,7 +2581,7 @@ describe('scripts/evidence/finalSoakCore', () => {
       expectRow(await check(grown(bound + 1)), 'K5', 'FAIL', /p04 judged heap endpoint/)
     })
 
-    it('judges K5 by the day’s slope bound per minute on judged bytes: just under it no slope reason, just over it a slope FAIL', async () => {
+    it('judges K5 by the matrix slope bound per minute on judged bytes: just under it no slope reason, just over it a slope FAIL', async () => {
       const slope = fx.matrix.bounds['heap-slope'].value
       const reasons = async (minutes) =>
         row(

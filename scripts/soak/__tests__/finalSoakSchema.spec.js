@@ -1016,7 +1016,7 @@ describe('scripts/soak/finalSoakSchema', () => {
     }
   })
 
-  it('a rehearsal is a third mode of whole day hours, at least three, with the seed timed as on the day and its sensitivity only reported, and a rehearsal stream is structurally valid', () => {
+  it('a rehearsal is a third mode of whole hours, at least three, with the seed timed as in acceptance and its sensitivity only reported, and a rehearsal stream is structurally valid', () => {
     expect(matrix.acceptance.modes.rehearsal.requestedMs.value).toBe(3 * matrix.schedule.hourMs)
     const seed = matrix.controls['interning-seeded'].timing
     expect(seed.rehearsal).toEqual({ ...seed.acceptance, sensitivity: 'report-only' })
@@ -1059,6 +1059,12 @@ describe('scripts/soak/finalSoakSchema', () => {
     expect(edited((m) => (m.schedule.totals.outages = 12))).toEqual([
       'matrix.schedule.totals.outages is not the 6 the acceptance plan makes',
     ])
+    expect(
+      edited((m) => {
+        m.schedule.executions[3].evenHoursOnly = false
+        m.schedule.totals.outages = 12
+      })
+    ).toEqual(['matrix.schedule.executions[3].evenHoursOnly is not one of true'])
     expect(edited((m) => (m.schedule.totals.idleWindows = 11))).toEqual([
       'matrix.schedule.totals.idleWindows is not the 12 the acceptance plan makes',
     ])
@@ -1285,7 +1291,7 @@ describe('scripts/soak/finalSoakSchema', () => {
         edited((m) => m.rows[4].uses.push('HeapOK')),
         'rows[4].uses differs from the predicates its text names',
       ],
-      'the smoke seed borrows the day start': [
+      'the smoke seed borrows the acceptance start': [
         edited((m) => {
           m.controls['interning-seeded'].timing.smoke.starts = 'after-first-quiet-triplet'
         }),
@@ -1295,7 +1301,7 @@ describe('scripts/soak/finalSoakSchema', () => {
         edited((m) => (m.controls['interning-seeded'].timing.smoke.sensitivity = 'required')),
         'matrix.controls.interning-seeded.timing.smoke.sensitivity is not',
       ],
-      'the day seed takes the smoke start': [
+      'the acceptance seed takes the smoke start': [
         edited((m) => {
           m.controls['interning-seeded'].timing.acceptance.starts = 'after-baseline-before-traffic'
         }),
@@ -2124,7 +2130,7 @@ describe('scripts/soak/finalSoakSchema', () => {
     })
   })
 
-  it("a day's membership waves validate with their live state released as each closes", () => {
+  it("an acceptance run's membership waves validate with their live state released as each closes", () => {
     const records = baseRecords()
     const exit = records.pop()
     for (let w = 0; w < 288; w++) {
