@@ -87,6 +87,96 @@ describe('Consumer > OffsetManager > useMembership', () => {
   })
 })
 
+// The broker moves a stable member to a new group epoch without sending an assignment when its
+// partitions stay the same (another member joined or left), so no apply reaches the manager.
+describe('Consumer > OffsetManager > the member epoch a commit carries', () => {
+  const epochs = (offsetCommit) =>
+    offsetCommit.mock.calls.map(([{ groupGenerationId }]) => groupGenerationId)
+
+  it('sends an epoch a heartbeat advanced without an assignment change, and records progress', async () => {
+    let epoch = 3
+    const offsetCommit = jest.fn(async ({ groupGenerationId }) => {
+      if (groupGenerationId !== epoch) throw staleEpoch()
+    })
+    const { manager, coordinator } = build({ membershipProtocol: 'consumer', offsetCommit })
+    manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+    await manager.commitOffsets({}, { auto: true })
+    epoch = 4
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '6' })
+    await manager.commitOffsets({}, { auto: true })
+    expect(manager.committedOffsets()[TOPIC]).toEqual({ 0: '7' })
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '7' })
+    await manager.commitOffsets({}, { auto: true })
+    expect(manager.committedOffsets()[TOPIC]).toEqual({ 0: '8' })
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '8' })
+    await manager.commitOffsets()
+
+    expect(epochs(offsetCommit)).toEqual([3, 4, 4, 4])
+    expect(manager.committedOffsets()[TOPIC]).toEqual({ 0: '9' })
+  })
+
+  it('builds a seek commit with the current epoch', async () => {
+    let epoch = 3
+    const offsetCommit = jest.fn(async () => {})
+    const { manager, coordinator } = build({ membershipProtocol: 'consumer', offsetCommit })
+    manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+    epoch = 4
+
+    await expect(manager.seek({ topic: TOPIC, partition: 0, offset: '20' })).resolves.toBe(true)
+
+    expect(epochs(offsetCommit)).toEqual([4])
+  })
+
+  it('keeps the epoch an in-flight commit was built with', async () => {
+    let epoch = 3
+    let reached
+    const sent = new Promise((resolve) => {
+      reached = resolve
+    })
+    let rejectFirst
+    const offsetCommit = jest
+      .fn(async () => {})
+      .mockImplementationOnce(() => {
+        reached()
+        return new Promise((_resolve, reject) => {
+          rejectFirst = reject
+        })
+      })
+    const { manager, coordinator } = build({ membershipProtocol: 'consumer', offsetCommit })
+    manager.membership = () => ({ generationId: epoch, memberId: 'member-a', coordinator })
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+
+    const inFlight = manager.commitOffsets().catch((e) => e)
+    await sent
+    epoch = 4
+    rejectFirst(staleEpoch())
+    const caught = await inFlight
+
+    expect(caught.type).toEqual('STALE_MEMBER_EPOCH')
+    expect(sentGeneration(caught)).toEqual(3)
+
+    await manager.commitOffsets()
+
+    expect(epochs(offsetCommit)).toEqual([3, 4])
+    expect(manager.committedOffsets()[TOPIC]).toEqual({ 0: '6' })
+  })
+
+  it('keeps the generation it was given under the classic protocol', async () => {
+    const offsetCommit = jest.fn(async () => {})
+    const { manager, coordinator } = build({ offsetCommit })
+    manager.membership = () => ({ generationId: 9, memberId: 'member-a', coordinator })
+    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+
+    await manager.commitOffsets({}, { auto: true })
+    await manager.seek({ topic: TOPIC, partition: 1, offset: '20' })
+
+    expect(epochs(offsetCommit)).toEqual([3, 3])
+    expect(manager.generationId).toEqual(3)
+  })
+})
+
 describe('Consumer > OffsetManager > resolvedOffsetAt', () => {
   it('reads without seeding, allocating or throwing', () => {
     const { manager, committedOffsets } = build()
