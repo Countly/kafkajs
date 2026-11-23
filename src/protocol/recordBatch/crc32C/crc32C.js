@@ -8,6 +8,7 @@
  */
 
 const os = require('os')
+const { isSharedArrayBuffer } = require('util').types
 
 const REVERSED_POLYNOMIAL = 0x82f63b78
 
@@ -113,7 +114,7 @@ const MIN_WORD_LENGTH = 64
  * Builds a CRC32C function. On a little-endian machine the bulk of a buffer is read as aligned
  * 32-bit words through one `Uint32Array` view of its own bytes: a few head bytes up to the first
  * 4-byte boundary, then whole eight-byte steps, then the tail, each by bytes. Buffers shorter than
- * {@link MIN_WORD_LENGTH} and big-endian machines read every byte on its own. Both give the same
+ * {@link MIN_WORD_LENGTH}, views over shared memory and big-endian machines read every byte on its own. Both give the same
  * checksum for every input.
  * @param {boolean} littleEndian whether this machine stores words little-endian
  * @returns {(buffer: Uint8Array) => number} the checksum function
@@ -125,8 +126,13 @@ const createCrc32C = (littleEndian) => (buffer) => {
     return (foldBytes(0xffffffff, buffer, 0, length) ^ 0xffffffff) >>> 0
   }
 
+  // Shared memory can change under the read, and a word load would see a write differently.
+  if (isSharedArrayBuffer(buffer.buffer)) {
+    return (foldBytes(0xffffffff, buffer, 0, length) ^ 0xffffffff) >>> 0
+  }
+
   const head = (4 - (buffer.byteOffset & 3)) & 3
-  const wordCount = ((length - head) >>> 3) << 1
+  const wordCount = 2 * Math.floor((length - head) / 8)
   const tail = head + wordCount * 4
 
   let crc = foldBytes(0xffffffff, buffer, 0, head)

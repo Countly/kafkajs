@@ -119,7 +119,7 @@ describe('Protocol > RecordBatch > crc32C', () => {
       ])
     })
 
-    test('a buffer ending at the end of its store, at a length that is not a multiple of 4, reads only its own bytes', () => {
+    test('a buffer ending at the end of its store, at a length that is not a multiple of 4, matches a byte-at-a-time reference', () => {
       for (let length = 64; length < 80; length++) {
         const store = new ArrayBuffer(length)
         const bytes = new Uint8Array(store)
@@ -129,6 +129,12 @@ describe('Protocol > RecordBatch > crc32C', () => {
           expect(nativeOrder(buffer)).toEqual(reference(buffer))
         }
       }
+    })
+
+    test('a view over shared memory matches a byte-at-a-time reference', () => {
+      const buffer = Buffer.from(new SharedArrayBuffer(1024), 1, 1001)
+      buffer.set(pool.subarray(0, 1001))
+      expect([crc32C(buffer), nativeOrder(buffer)]).toEqual([reference(buffer), reference(buffer)])
     })
   })
 })
