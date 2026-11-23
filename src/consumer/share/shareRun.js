@@ -400,8 +400,11 @@ class ShareRun {
 
   /**
    * Routes the assignment to leader nodes: new nodes start their loop, existing nodes get their
-   * current wanted sets, and a node with nothing left ends. Moved partitions lose their old-node
-   * acquisitions synchronously; revoked partitions keep their handler completion/release policy.
+   * current wanted sets, and a node with nothing left ends. An ended node keeps its place until
+   * its drive finished its handlers, final and disposal; only then does a node wanted again start
+   * a new drive, so a node never has two sessions or two running handlers. Moved partitions lose
+   * their old-node acquisitions synchronously; revoked partitions keep their handler
+   * completion/release policy.
    * Never runs while a close owns the run.
    * @private
    * @returns {void}
@@ -432,11 +435,7 @@ class ShareRun {
     }
     for (const { node, key } of moved) node.loop?.retireKey(key, 'session-lost')
     if (!this.admitting || this.retired || this.closing || this.stopRequested) return
-    for (const [nodeId, rows] of wanted) {
-      const node = this.nodes.get(nodeId)
-      if (node?.ended) this.nodes.delete(nodeId)
-      if (!node || node.ended) this.startNode(nodeId, rows)
-    }
+    for (const [nodeId, rows] of wanted) if (!this.nodes.has(nodeId)) this.startNode(nodeId, rows)
   }
 
   /**
@@ -470,7 +469,8 @@ class ShareRun {
 
   /**
    * Finds the node's Broker under its own operation, builds its session and loop, and polls
-   * until the node ends or loses authority. A failure that still has authority is terminal.
+   * until the node ends or loses authority. A failure that still has authority is terminal. An
+   * ended node sends its final, then leaves the run, and a node wanted again meanwhile starts anew.
    * @private
    * @param {object} node The node record.
    * @returns {Promise<void>} Never rejects.
@@ -495,9 +495,12 @@ class ShareRun {
         this.crash(error)
       }
     }
-    if (node.ended && node.loop && !this.closing) {
-      await node.loop.finishNode().catch(() => {})
-      if (this.nodes.get(node.id) === node) this.nodes.delete(node.id)
+    if (node.ended && !this.closing) {
+      await node.loop?.finishNode().catch(() => {})
+      if (this.nodes.get(node.id) === node) {
+        this.nodes.delete(node.id)
+        this.syncNodes()
+      }
     }
   }
 
