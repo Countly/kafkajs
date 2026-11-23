@@ -294,6 +294,23 @@ class ShareAckLedger {
   }
 
   /**
+   * Promotes the held entries of the given delivered records, found by the record objects this
+   * ledger was built from, never by their `offset` field, which a handler can change. A record the
+   * ledger no longer holds is skipped. Meant for a close boundary: it scans the entries once.
+   * @param {object[]} records Delivered records of this acquisition.
+   * @param {'accept'|'release'} defaultType Outcome for an entry that has no local choice.
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} For an invalid default, before any entry changes.
+   */
+  completeRecords(records, defaultType) {
+    if (defaultType !== 'accept' && defaultType !== 'release')
+      throw new KafkaJSNonRetriableError('Invalid default acknowledgement')
+    const selected = new Set(records)
+    for (const entry of this.#entries.values())
+      if (entry.state === 'held' && selected.has(entry.record)) this.#promote(entry, defaultType)
+  }
+
+  /**
    * @param {object} entry A held delivered entry.
    * @param {'accept'|'release'} defaultType Outcome used when the entry has no local choice.
    * @returns {void} Makes the entry eligible for a terminal request.

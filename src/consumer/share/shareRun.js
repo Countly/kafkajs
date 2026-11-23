@@ -1191,7 +1191,8 @@ class ShareRun {
    * which settles the uncaptured remainder membership-lost. Busy and unopened nodes capture
    * nothing. Every session discarded this way publishes one `session_reset` with reason
    * `membership`. The heartbeat chain is suspended for a poll or fence recovery, so no join can
-   * overlap its traffic, and ended for good by every other kind.
+   * overlap its traffic, and ended for good by every other kind. A node whose capture fails
+   * captures nothing; every other node still captures, and every node is retired and disposed.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1202,8 +1203,16 @@ class ShareRun {
     const bindings = []
     for (const node of this.nodes.values()) {
       if (!node.loop) continue
-      this.finalizeActive(node)
-      node.captured = node.loop.captureFinal()
+      try {
+        this.finalizeActive(node)
+        node.captured = node.loop.captureFinal()
+      } catch (error) {
+        node.captured = null
+        this.options.logger.error('Share final capture failed', {
+          nodeId: node.id,
+          error: error.message,
+        })
+      }
       if (node.captured) {
         const { binding } = node.captured
         bindings.push({ nodeId: node.id, current: () => !ShareSession.bindingLost(binding) })
@@ -1221,10 +1230,17 @@ class ShareRun {
     }
     for (const node of this.nodes.values()) {
       const discarded = node.loop !== null && !node.loop.disposed
-      node.loop?.dispose(new KafkaJSNonRetriableError('Share run closed'), {
-        reason: 'membership-lost',
-        preserve: node.captured,
-      })
+      try {
+        node.loop?.dispose(new KafkaJSNonRetriableError('Share run closed'), {
+          reason: 'membership-lost',
+          preserve: node.captured,
+        })
+      } catch (error) {
+        this.options.logger.error('Share node disposal failed', {
+          nodeId: node.id,
+          error: error.message,
+        })
+      }
       node.operation.retire(new KafkaJSNonRetriableError('Share run closed'))
       node.pacing.retire(new KafkaJSNonRetriableError('Share run closed'))
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
