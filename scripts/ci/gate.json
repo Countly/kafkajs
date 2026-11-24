@@ -24425,7 +24425,9 @@
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes an eachMessage handler that changed its message offset to the next record acknowledges its own record, and the next record is released",
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close an offset-only selector after another message took its offset decides the record acquired at that offset",
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close records lost at the close are counted by their acquired offsets after the handler changed one",
-        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes expired handlers on both nodes a zero-timeout disconnect requested from the capture failure log neither re-enters the close nor leaves the other node choice without an outcome"
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes expired handlers on both nodes a zero-timeout disconnect requested from the capture failure log neither re-enters the close nor leaves the other node choice without an outcome",
+        "src/consumer/share/__tests__/shareConsumerModes.spec.js › Share consumer handler decisions a delivered message is resolved by identity before its shape or offset is read",
+        "src/consumer/share/__tests__/shareConsumerModes.spec.js › Share consumer handler decisions a selector that revokes the call while it is read leaves no decision and queues no renewal"
       ],
       "capMinutes": 85,
       "allowedSkips": [

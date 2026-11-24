@@ -312,6 +312,56 @@ describe('Share consumer handler decisions', () => {
       { firstOffset: '0', lastOffset: '2', acknowledgeTypes: [3, 1, 1] },
     ])
   })
+  test('a delivered message is resolved by identity before its shape or offset is read', async () => {
+    const c = setup({ mode: 'explicit', offsets: ['0', '1'] })
+    const [first, second] = c.messages
+    delete first.value
+    first.offset = '1'
+    c.call.acknowledge(first, 'reject')
+    await c.call.renew([first])
+    expect(c.renew).toHaveBeenLastCalledWith(['0'])
+    const read = jest.fn(() => {
+      throw new Error('offset read')
+    })
+    Object.defineProperty(second, 'offset', { get: read })
+    await c.call.renew([second])
+    expect(c.renew).toHaveBeenLastCalledWith(['1'])
+    c.call.acknowledge({ offset: '1' }, 'accept')
+    expect(read).not.toHaveBeenCalled()
+    expect(c.call.complete()).toBeNull()
+    expect(c.ledger.prepare({ token: c.token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [3, 1] },
+    ])
+  })
+  test('a selector that revokes the call while it is read leaves no decision and queues no renewal', () => {
+    /** @param {object} c A case. @returns {object} An offset-only selector whose read revokes `c`. */
+    const revoking = (c) => ({
+      get offset() {
+        c.retire()
+        return '1'
+      },
+    })
+    const decided = setup({ offsets: ['0', '1'] })
+    expect(() => decided.call.acknowledge(revoking(decided), 'reject')).toThrow('no longer current')
+    expect(
+      decided.ledger
+        .invalidate('session-lost')
+        .map(({ firstOffset, lastOffset, type }) => [firstOffset, lastOffset, type])
+    ).toEqual([['0', '1', 'release']])
+    const renewed = setup({ offsets: ['0', '1'] })
+    expect(() => renewed.call.renew([renewed.messages[0], revoking(renewed)])).toThrow(
+      'no longer current'
+    )
+    const throwing = setup({ offsets: ['0', '1'] })
+    const unreadable = {
+      get offset() {
+        throw new Error('offset read')
+      },
+    }
+    expect(() => throwing.call.renew([throwing.messages[0], unreadable])).toThrow('offset read')
+    expect(renewed.renew).not.toHaveBeenCalled()
+    expect(throwing.renew).not.toHaveBeenCalled()
+  })
 })
 
 describe('public share handler contract', () => {
