@@ -1,5 +1,7 @@
 const { createLogger } = require('../../loggers')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
+const Runner = require('../runner')
+const { MemberAssignment } = require('../assignerProtocol')
 const { KafkaJSError, KafkaJSTopicRecreatedError } = require('../../errors')
 const {
   fenced,
@@ -21,6 +23,8 @@ const {
 const TOPIC_A_ID = 'aAaAaAaAaAaAaAaAaAaAaA'
 const UNKNOWN_ID = 'cCcCcCcCcCcCcCcCcCcCcC'
 const HANDLERS_IDLE = 'handlers-idle'
+const REBALANCE_IN_PROGRESS = 27
+const NOT_COORDINATOR = 16
 
 /** The disconnect owed by a run `beginJoin` built, which the fixture's teardown does not know. */
 let closeJoin = null
@@ -127,6 +131,84 @@ const beginJoin = async (options = {}) => {
   return { ...built, coordinators, started }
 }
 
+/** An eager classic assigner, named as the coordinator double's JoinGroup answer names it. */
+const eager = () => ({
+  name: 'eager',
+  version: 0,
+  protocol: () => ({ name: 'eager', metadata: Buffer.alloc(0) }),
+  assign: async () => [],
+})
+
+/**
+ * Starts a run of topic-a/0 over the scripted cluster under the classic protocol, as a follower
+ * that joins with JoinGroup and SyncGroup, or under manual assignment. Waits until `run()` settled,
+ * or, when `joined` holds the first JoinGroup answer, until that JoinGroup was sent. A handler
+ * receives the payload and `held`, which the run's teardown resolves.
+ * @param {'classic'|'manual'} kind
+ * @param {object} [options]
+ * @returns {Promise<object>} the run, its runner and its group
+ */
+const startOther = async (kind, { eachMessage, eachBatch, hook, joined } = {}) => {
+  const runs = jest.spyOn(Runner.prototype, 'start')
+  const built = buildConsumer({ groupProtocol: 'classic', partitionAssigners: [eager] })
+  const { consumer, coordinator, cluster, state } = built
+  Object.assign(coordinator, {
+    joinGroup: jest.fn(async () => {
+      await joined?.promise
+      return {
+        generationId: 1,
+        leaderId: 'another-member',
+        memberId: 'member-1',
+        members: [],
+        groupProtocol: 'eager',
+      }
+    }),
+    syncGroup: jest.fn(async () => ({
+      memberAssignment: MemberAssignment.encode({ version: 0, assignment: { 'topic-a': [0] } }),
+    })),
+    heartbeat: jest.fn(async () => {}),
+    leaveGroup: jest.fn(async () => {}),
+  })
+  cluster.stageMetadata = jest.fn(async ({ topics }) => ({
+    topicMetadata: topics.map((topic) => ({
+      topic,
+      partitionMetadata: [{ partitionId: 0 }, { partitionId: 1 }],
+    })),
+  }))
+  if (eachMessage || eachBatch) state.queue['topic-a|0'] = [40]
+  if (kind === 'manual') {
+    const assigned = settled(consumer.assign([{ topic: 'topic-a', partitions: [0] }]))
+    await advanceUntil(() => assigned.done, 1000)
+    expect(assigned).toMatchObject({ done: true, value: undefined })
+  } else {
+    await consumer.subscribe({ topic: 'topic-a' })
+  }
+  const held = deferred()
+  const started = settled(
+    consumer.run({
+      eachMessage: eachMessage && ((payload) => eachMessage(payload, held)),
+      eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
+      ...(hook && { rebalanceListener: hook }),
+    })
+  )
+  closeJoin = async () => {
+    held.resolve()
+    const end = settled(consumer.disconnect({ timeout: 0 }))
+    await jest.advanceTimersByTimeAsync(10)
+    expect(end.done).toBe(true)
+  }
+  if (joined) {
+    await advanceUntil(() => coordinator.joinGroup.mock.calls.length > 0)
+    expect(started.done).toBe(false)
+  } else {
+    await advanceUntil(() => started.done)
+    expect(started).toMatchObject({ done: true, value: undefined })
+  }
+  expect(runs).toHaveBeenCalledTimes(1)
+  const runner = runs.mock.contexts[0]
+  return { ...built, held, started, runner, group: runner.consumerGroup }
+}
+
 describe('Consumer > a run stopped for good with an error', () => {
   it('after stopRun no Fetch request is sent and an answered Fetch delivers nothing', async () => {
     const delivered = []
@@ -154,6 +236,29 @@ describe('Consumer > a run stopped for good with an error', () => {
     expect(broker.fetch.mock.calls.length).toBe(sent)
     expect(run.crashes).toHaveLength(1)
     expect(run.crashes[0].error).toBe(error)
+  }, 30000)
+
+  it('after stopRun a saved eachBatch resolveOffset resolves nothing', async () => {
+    let resolveOffset = null
+    const run = await start({
+      eachBatch: async (payload, held) => {
+        resolveOffset = payload.resolveOffset
+        await held.promise
+      },
+    })
+    await advanceUntil(() => resolveOffset !== null)
+    const { group } = parts(run)
+    const manager = group.offsetManager
+    const commits = run.coordinator.offsetCommit.mock.calls.length
+    resolveOffset('40')
+    expect(manager.resolvedOffsets['topic-a'][0]).toBe('41')
+
+    group.stopRun(recreated())
+    resolveOffset('45')
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(manager.resolvedOffsets['topic-a'][0]).toBe('41')
+    expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(commits)
   }, 30000)
 
   it('after stopRun no OffsetCommit is written', async () => {
@@ -450,6 +555,38 @@ describe('Consumer > a run stopped for good with an error', () => {
       expect(discarded).not.toHaveBeenCalled()
     }, 30000)
 
+    it('a revoked verdict waiting in the pre-rebalance commit changes no membership when it resumes', async () => {
+      const run = await start()
+      const { group, runner } = parts(run)
+      const gate = deferred()
+      let committing = false
+      jest.spyOn(runner, 'autoCommitOffsets').mockImplementationOnce(async () => {
+        committing = true
+        await gate.promise
+      })
+      const notified = jest.spyOn(group, 'onMembershipError')
+      const discarded = jest.spyOn(group, 'discardUncommittedOffsets')
+      const rounds = RebalanceCoordinator.prototype.runRound.mock.calls.length
+      const verdict = settled(
+        runner.resolveRebalanceVerdict({
+          kind: 'revoked',
+          reason: 'revoked',
+          error: protocolError(REBALANCE_IN_PROGRESS),
+        })
+      )
+      await advanceUntil(() => committing, 1000)
+      expect(verdict.done).toBe(false)
+
+      group.stopRun(recreated())
+      gate.resolve()
+      await advanceUntil(() => verdict.done, 1000)
+
+      expect(verdict).toMatchObject({ done: true, value: undefined })
+      expect(notified).not.toHaveBeenCalled()
+      expect(discarded).not.toHaveBeenCalled()
+      expect(RebalanceCoordinator.prototype.runRound.mock.calls.length).toBe(rounds)
+    }, 30000)
+
     it('a KIP-848 round resolving its target adopts and acknowledges nothing', async () => {
       const run = await start()
       const { group, membership } = parts(run)
@@ -552,6 +689,34 @@ describe('Consumer > a run stopped for good with an error', () => {
     expect(leaves(run)).toEqual([])
   }, 30000)
 
+  it('a poll-expiry leave without stopRun still leaves and rejoins (control)', async () => {
+    const run = await start()
+    const { rc, group, runner, membership } = parts(run)
+    const gate = deferred()
+    const stop = runner.heartbeatManager.stop.bind(runner.heartbeatManager)
+    let stopping = false
+    jest.spyOn(runner.heartbeatManager, 'stop').mockImplementationOnce(async () => {
+      stopping = true
+      await gate.promise
+      return stop()
+    })
+    const left = jest.spyOn(group, 'leaveForPollExpiry')
+    const joins = beats(run, false)
+    const expiry = settled(rc.onPollExpired({ elapsedMs: 5000, isStatic: false }))
+    await advanceUntil(() => stopping, 1000)
+
+    gate.resolve()
+    await advanceUntil(() => expiry.done && beats(run, false) > joins, 10000)
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(expiry).toMatchObject({ done: true, value: undefined })
+    expect(left).toHaveBeenCalledTimes(1)
+    expect(leaves(run)).toHaveLength(1)
+    expect(beats(run, false)).toBe(joins + 1)
+    expect(membership.memberEpoch).toBe(2)
+    expect(run.crashes).toEqual([])
+  }, 30000)
+
   it('stopRun sends no LeaveGroup and does not call the close callback', async () => {
     const hook = { onPartitionsRevoked: jest.fn(), onPartitionsLost: jest.fn() }
     const run = await start({ hook })
@@ -631,4 +796,150 @@ describe('Consumer > a run stopped for good with an error', () => {
     expect(run.crashes[0].error).toBe(error)
     expect(Date.now() - at).toBeLessThan(300)
   }, 30000)
+
+  describe.each([
+    ['the classic protocol', 'classic'],
+    ['manual assignment', 'manual'],
+  ])('under %s', (_, kind) => {
+    it('after stopRun no Fetch request is sent and an answered Fetch delivers nothing', async () => {
+      const delivered = []
+      const run = await startOther(kind, {
+        eachMessage: async ({ message }) => delivered.push(message.offset),
+      })
+      await advanceUntil(() => delivered.length === 1)
+      const broker = await run.cluster.findBroker()
+      const fetch = broker.fetch.getMockImplementation()
+      const gate = deferred()
+      const before = broker.fetch.mock.calls.length
+      broker.fetch.mockImplementationOnce(async (request) => {
+        await gate.promise
+        return fetch(request)
+      })
+      await advanceUntil(() => broker.fetch.mock.calls.length > before)
+      run.state.queue['topic-a|0'] = [40, 41]
+      const error = recreated()
+
+      run.group.stopRun(error)
+      const sent = broker.fetch.mock.calls.length
+      gate.resolve()
+      await advanceUntil(() => run.crashes.length > 0)
+      await jest.advanceTimersByTimeAsync(5000)
+
+      expect(delivered).toEqual(['40'])
+      expect(broker.fetch.mock.calls.length).toBe(sent)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+    }, 30000)
+
+    it('after stopRun no OffsetCommit is written', async () => {
+      const gate = deferred()
+      let entered = false
+      const run = await startOther(kind, {
+        eachBatch: async ({ batch, resolveOffset, commitOffsetsIfNecessary }) => {
+          entered = true
+          resolveOffset(batch.messages[0].offset)
+          await gate.promise
+          await commitOffsetsIfNecessary().catch(() => {})
+        },
+      })
+      await advanceUntil(() => entered)
+      const commits = run.coordinator.offsetCommit.mock.calls.length
+      const error = recreated()
+
+      run.group.stopRun(error)
+      await jest.advanceTimersByTimeAsync(6000)
+      gate.resolve()
+      await advanceUntil(() => run.crashes.length > 0)
+      await jest.advanceTimersByTimeAsync(10000)
+
+      expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(commits)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+    }, 30000)
+  })
+
+  describe('a classic member', () => {
+    /** Starts a classic run whose eachMessage parks on `held`, and waits until it has entered. */
+    const startHeldClassic = async (options = {}) => {
+      let entered = false
+      const run = await startOther('classic', {
+        ...options,
+        eachMessage: async (_, held) => {
+          entered = true
+          await held.promise
+        },
+      })
+      await advanceUntil(() => entered)
+      expect(entered).toBe(true)
+      return run
+    }
+
+    it.each([
+      ['a success', () => Promise.resolve()],
+      ['a coordinator error', () => Promise.reject(protocolError(NOT_COORDINATOR))],
+    ])(
+      'after stopRun a heartbeat in flight answered with %s changes nothing',
+      async (_, reply) => {
+        const run = await startHeldClassic()
+        const { coordinator, group } = run
+        const membership = group.groupMembership
+        const gate = deferred()
+        const sent = coordinator.heartbeat.mock.calls.length
+        coordinator.heartbeat.mockImplementationOnce(async () => {
+          await gate.promise
+          return reply()
+        })
+        await advanceUntil(() => coordinator.heartbeat.mock.calls.length > sent)
+        expect(coordinator.heartbeat).toHaveBeenCalledTimes(sent + 1)
+        const lastRequest = membership.lastRequest
+        expect(membership.coordinatorUnknown).toBe(false)
+        const events = jest.fn()
+        run.consumer.on(run.consumer.events.HEARTBEAT, events)
+
+        group.stopRun(recreated())
+        gate.resolve()
+        await jest.advanceTimersByTimeAsync(10000)
+
+        expect(events).not.toHaveBeenCalled()
+        expect(membership.lastRequest).toBe(lastRequest)
+        expect(membership.coordinatorUnknown).toBe(false)
+        expect(coordinator.heartbeat).toHaveBeenCalledTimes(sent + 1)
+        expect(run.crashes).toEqual([])
+      },
+      30000
+    )
+
+    it('stopRun during the initial join reports its own error and a later JoinGroup answer syncs nothing', async () => {
+      const joined = deferred()
+      const run = await startOther('classic', { joined })
+      const error = recreated()
+
+      run.group.stopRun(error)
+      joined.resolve()
+      await advanceUntil(() => run.started.done && run.crashes.length > 0)
+      await jest.advanceTimersByTimeAsync(10000)
+
+      expect(run.started).toMatchObject({ done: true, value: undefined })
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+      expect(run.crashes[0].restart).toBe(false)
+      expect(run.coordinator.syncGroup).not.toHaveBeenCalled()
+      expect(run.coordinator.heartbeat).not.toHaveBeenCalled()
+      expect(run.log.filter(({ kind }) => kind === 'fetch')).toEqual([])
+    }, 30000)
+
+    it('stopRun sends no LeaveGroup and does not call the close callback', async () => {
+      const hook = { onPartitionsRevoked: jest.fn(), onPartitionsLost: jest.fn() }
+      const run = await startOther('classic', { hook })
+
+      run.group.stopRun(recreated())
+      await advanceUntil(() => run.crashes.length > 0)
+      await jest.advanceTimersByTimeAsync(5000)
+
+      expect(run.crashes).toHaveLength(1)
+      expect(run.coordinator.leaveGroup).not.toHaveBeenCalled()
+      expect(hook.onPartitionsRevoked).not.toHaveBeenCalled()
+      expect(hook.onPartitionsLost).not.toHaveBeenCalled()
+    }, 30000)
+  })
 })
