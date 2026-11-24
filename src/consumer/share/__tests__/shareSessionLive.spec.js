@@ -625,7 +625,7 @@ class SettlementCapture {
             ? [args[0]]
             : method === 'complete'
               ? args[0]
-              : args[0].slice(args[1], args[2]).map(({ offset }) => offset)
+              : args[0].slice(args[1], args[2])
         const type = method === 'completeRange' ? args[3] : (args[1] ?? 'accept')
         for (const offset of offsets)
           this.decisions.push({ ledger, offset, type, method, ...this.stamp() })

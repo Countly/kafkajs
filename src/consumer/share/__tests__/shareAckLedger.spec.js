@@ -61,9 +61,9 @@ describe('deterministic compact acknowledgement ledger', () => {
   })
   test('range completion promotes only the selected records and validates before mutating', () => {
     const { ledger, token } = make()
-    const records = [{ offset: '1' }, { offset: '2' }, { offset: '3' }]
+    const records = ['1', '2', '3']
     ledger.decide('2', 'reject')
-    expect(() => ledger.completeRange([records[0], { offset: '99' }], 0, 2, 'accept')).toThrow(
+    expect(() => ledger.completeRange([records[0], '99'], 0, 2, 'accept')).toThrow(
       failure(KafkaJSNonRetriableError, OUTSIDE)
     )
     expect(() => ledger.completeRange(records, 0, 3, 'done')).toThrow(
