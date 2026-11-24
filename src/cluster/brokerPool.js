@@ -278,7 +278,10 @@ module.exports = class BrokerPool {
     this.metadataClusterCheck = metadataClusterCheck ?? true
     this.metadataRecoveryRebootstrapTriggerMs = metadataRecoveryRebootstrapTriggerMs ?? 300000
 
-    /** Failures `onApiVersionsFailure` already recovered from, so a surrounding catch skips them. */
+    /**
+     * Failures `onApiVersionsFailure` already recovered from, and the synthetic refusals of
+     * overtaken refreshes, so a surrounding catch starts no recovery from them.
+     */
     this.recoveredFailures = new WeakSet()
 
     /** Set at the first failed metadata attempt following a success; cleared on any success. */
@@ -811,7 +814,8 @@ module.exports = class BrokerPool {
    * seed is reported as a retriable connection error rather than dereferenced - the retrier
    * treats a `TypeError` as unrecoverable and would turn a transient window into a crash. A seed
    * replaced while it connected neither rotates the list nor writes its versions; the next attempt
-   * connects today's seed.
+   * connects today's seed. When the seed's removal left the slot empty, with no disconnect or
+   * rebootstrap since, the next address is built into it.
    *
    * @public
    * @param {object} [options]
@@ -848,6 +852,12 @@ module.exports = class BrokerPool {
       fence?.check()
       checked(null)
       const seedBroker = this.seedBroker
+      const disconnects = this.disconnects
+      const recoveries = this.recoveries
+      // This seed still holds the slot, or its removal emptied the slot in the same generation.
+      const ownsSeed = () =>
+        this.seedBroker === seedBroker ||
+        (!this.seedBroker && this.disconnects === disconnects && this.recoveries === recoveries)
 
       if (!seedBroker) {
         throw new KafkaJSConnectionError('No seed broker available, the client is rebootstrapping')
@@ -864,10 +874,8 @@ module.exports = class BrokerPool {
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
         if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
-          // Connection builder will always rotate the seed broker, unless a rebootstrap already did
-          if (this.seedBroker === seedBroker) {
-            await this.createSeedBroker({ fence, isCurrent: () => this.seedBroker === seedBroker })
-          }
+          // Connection builder rotates the seed broker, unless another seed was installed meanwhile
+          if (ownsSeed()) await this.createSeedBroker({ fence, isCurrent: ownsSeed })
           try {
             this.logger.error(
               `Failed to connect to seed broker, trying another broker from the list: ${describeThrown(e)}`,
@@ -883,8 +891,9 @@ module.exports = class BrokerPool {
         if (describeThrown(e, 'retriable') === 'true') throw e
         return bail(e)
       }
-      // A rebootstrap replaced the seed while it connected: the next attempt uses today's seed.
+      // The seed was replaced or removed while it connected: the next attempt uses today's seed.
       if (this.seedBroker !== seedBroker) {
+        if (ownsSeed()) await this.createSeedBroker({ fence, isCurrent: ownsSeed })
         throw new KafkaJSConnectionError('Seed broker was replaced')
       }
       this.versions = seedBroker.versions
@@ -988,9 +997,11 @@ module.exports = class BrokerPool {
    * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
-   * and rebuilds the seed, so re-resolving both on every iteration is what keeps a later attempt
-   * from calling a disconnected object or building a duplicate `Broker` for the seed's own node
-   * id via a stale `seedHost`/`seedPort` pair. `findConnectedBroker()`'s own throw is `bail()`ed
+   * and rebuilds the seed, so re-resolving both on every iteration is what keeps an attempt from
+   * calling a disconnected object or building a duplicate `Broker` for the seed's own node id via
+   * a stale `seedHost`/`seedPort` pair. A rebootstrap during the first selection lets the request
+   * go to a current broker; once a request was sent, a rebootstrap stops the refresh, which
+   * rejects as retriable instead of trying again. `findConnectedBroker()`'s own throw is `bail()`ed
    * immediately rather than left for the retrier to reclassify - the retrier's generic
    * catch-and-wrap would otherwise turn e.g. a `KafkaJSSASLAuthenticationError` into a
    * `KafkaJSNonRetriableError` and replace its `retryCount`/`retryTime`, breaking callers (the
@@ -1087,6 +1098,7 @@ module.exports = class BrokerPool {
       ...((accept || establishment) && { retainTopicErrors: true }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
+    let dispatched = false
     try {
       await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         if (!applicable()) return
@@ -1099,12 +1111,13 @@ module.exports = class BrokerPool {
           return bail(err)
         }
         if (this.recoveries !== recoveries) {
-          // A rebootstrap during selection: nothing was sent yet, so a current broker asks anew.
+          // A rebootstrap during the first selection: nothing was sent yet, so a current broker
+          // asks anew. A refresh that already sent a request is overtaken.
           const current =
             broker &&
             !broker.retired &&
             (broker === this.seedBroker || values(this.brokers).includes(broker))
-          if (!current) return bail(this.overtaken())
+          if (dispatched || !current) return bail(this.overtaken())
           recoveries = this.recoveries
         }
         fence?.check()
@@ -1120,6 +1133,7 @@ module.exports = class BrokerPool {
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
+          dispatched = true
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
@@ -1250,8 +1264,9 @@ module.exports = class BrokerPool {
         }
       })
 
-      if (this.recoveries !== recoveries && this.disconnects === disconnects) {
+      if (this.recoveries !== recoveries) {
         check()
+        if (this.disconnects !== disconnects) return
         throw this.overtaken()
       }
       if (applicable()) this.onMetadataSuccess()
