@@ -981,9 +981,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
       .catch((e) => e)
 
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
-    expect(error.message).toBe(
-      `Invalid message without value for topic "${TOPIC}" at index 0`
-    )
+    expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 0`)
     expect(admission.reserved).toBe(0)
     await producer.disconnect()
   })
