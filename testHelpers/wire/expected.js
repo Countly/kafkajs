@@ -2304,6 +2304,7 @@ module.exports.deleteGroupsV3 = {
       {
         groupId: 'group',
         errorCode: 0,
+        errorMessage: null,
       },
     ],
   },

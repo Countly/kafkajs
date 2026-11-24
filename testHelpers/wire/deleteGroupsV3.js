@@ -14,7 +14,11 @@ module.exports = {
       .writeInt32(r.throttleTime)
       .writeUVarIntArray(
         r.results.map((g) =>
-          new Encoder().writeUVarIntString(g.groupId).writeInt16(g.errorCode).writeTaggedFields()
+          new Encoder()
+            .writeUVarIntString(g.groupId)
+            .writeInt16(g.errorCode)
+            .writeUVarIntString(g.errorMessage ?? null)
+            .writeTaggedFields()
         )
       )
       .writeTaggedFields().buffer
