@@ -74,7 +74,9 @@ module.exports = class ConnectionPool {
   /**
    * Called when a Connection reports SASL_AUTHENTICATION_FAILED (code 58). Blacks this
    * broker out for `max(authenticationTimeout, 1000ms)`, so getConnection() refuses to
-   * (re)authenticate immediately and turn a bad credential into a reconnect storm.
+   * (re)authenticate immediately and turn a bad credential into a reconnect storm. Entries of
+   * other addresses whose pause has ended are dropped first, so the shared map holds only live
+   * pauses.
    * @public
    * @param {string} errorMessage A sanitized description of the failure (mechanism, broker,
    *                              stage), surfaced again if a later attempt is refused during
@@ -82,8 +84,12 @@ module.exports = class ConnectionPool {
    */
   recordAuthenticationFailure(errorMessage) {
     const blackoutMs = Math.max(this.authenticationTimeout || 0, MIN_AUTHENTICATION_BLACKOUT_MS)
+    const now = Date.now()
+    for (const [address, entry] of this.authenticationBlackout) {
+      if (entry.until <= now) this.authenticationBlackout.delete(address)
+    }
     this.authenticationBlackout.set(this.brokerAddress, {
-      until: Date.now() + blackoutMs,
+      until: now + blackoutMs,
       errorMessage,
     })
   }
