@@ -846,7 +846,7 @@ describe('scripts/mutants/generate.js', () => {
         'share runner: the budget a disconnect hands to the telemetry close',
         'src/consumer/share/shareRunner.js',
         'async disconnect(',
-        '          deadline === Infinity ? Infinity : Math.max(0, deadline - performance.now()),',
+        '            deadline === Infinity ? Infinity : Math.max(0, deadline - performance.now()),',
         'constant',
         ['src/telemetry/__tests__/close.spec.js', `${SHARE}/shareConsumerClose.spec.js`],
       ],

@@ -1,7 +1,7 @@
 const { ShareHandlerCall } = jest.requireActual('../shareHandlerCall')
 
 describe('handler call construction', () => {
-  const FRAME_KEYS = ['authority', 'batch', 'ledger', 'mode', 'records']
+  const FRAME_KEYS = ['authority', 'batch', 'ledger', 'mode', 'offsets', 'records']
   /** The constructor arguments of every call the run built, in order. */
   const constructed = []
   const instances = []
