@@ -646,4 +646,81 @@ describe('written admin mutations', () => {
       }
     }
   )
+
+  it.each(['lost', 'retriable'])(
+    'setOffsets retries a written commit after a %s reply',
+    async (kind) => {
+      const { describeGroupAs } = require('./fixtures/describeGroupAs')
+      const described = describeGroupAs()
+      const { admin, schedule, scripted } = fixture()
+      const api = 'OffsetCommit'
+      const gate = schedule.hold({ api })
+      scripted.answer(api, ({ topics }) => ({
+        topics: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        })),
+      }))
+      try {
+        await admin.connect()
+        const input = { groupId: 'g', topic: 't', partitions: [{ partition: 0, offset: '5' }] }
+        const result = admin.setOffsets(input).catch((error) => error)
+        await Promise.race([gate.arrived(), result])
+        if (kind === 'lost') gate.fail(new Error('lost reply'))
+        else
+          gate.release({
+            topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 14 }] }],
+          })
+        await jest.advanceTimersByTimeAsync(50)
+        await expect(result).resolves.toBeUndefined()
+        expect(
+          scripted
+            .requests()
+            .filter((frame) => frame.api === api)
+            .map(({ fields }) => fields)
+        ).toEqual(
+          Array.from({ length: 2 }, () =>
+            expect.objectContaining({
+              groupId: 'g',
+              topics: [
+                {
+                  topic: 't',
+                  partitions: [expect.objectContaining({ partition: 0, offset: '5' })],
+                },
+              ],
+            })
+          )
+        )
+      } finally {
+        described.restore()
+        await admin.disconnect()
+        scripted.assertClean()
+      }
+    }
+  )
+
+  it('a controller refusal for deleteTopics by id prevents a follow-up refresh', async () => {
+    const { admin, schedule, scripted } = fixture()
+    const api = 'DeleteTopics'
+    schedule.once(
+      { api },
+      { topicErrors: [{ topic: null, topicId, errorCode: 41, errorMessage: null }] }
+    )
+    try {
+      await admin.connect()
+      const result = admin.deleteTopics({ topicIds: [topicId] }).catch((error) => error)
+      await jest.advanceTimersByTimeAsync(50)
+      await expect(result).resolves.toMatchObject({
+        code: 41,
+        topicErrors: [expect.objectContaining({ topicId, errorCode: 41 })],
+      })
+      const frames = scripted.requests()
+      const written = frames.findIndex((frame) => frame.api === api)
+      expect(written).toBeGreaterThanOrEqual(0)
+      expect(frames.slice(written).map((frame) => frame.api)).toEqual([api])
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
 })
