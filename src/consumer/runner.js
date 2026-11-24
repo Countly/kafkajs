@@ -158,6 +158,8 @@ module.exports = class Runner extends EventEmitter {
     this.stopRetired = null
     /** Whether `terminate` owns this run's crash, so its stop drains instead of returning. */
     this.terminated = false
+    /** Whether a stop of this run has told the assigners to forget their state. */
+    this.assignersCleared = false
     /** @type {{ previous: Array<import('../../types').TopicPartitions>, invoked?: boolean }|null} */
     this.episode = null
     /**
@@ -876,8 +878,9 @@ module.exports = class Runner extends EventEmitter {
       if (closing) await scope.wait(() => this.invokeCloseHook(closing, scope))
 
       await this.commitFinalOffsetsContained(scope)
+      scope.check()
 
-      this.consumerGroup.clearAssignerState()
+      this.clearAssignersOnce()
 
       // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member tells
       // the coordinator it is gone by default; the protocol picks epoch -1 or -2 from
@@ -888,6 +891,8 @@ module.exports = class Runner extends EventEmitter {
         this.consumerGroup.kind === 'classic' &&
         this.consumerGroup.groupInstanceId
       ) {
+        // An assigner callback can end the run.
+        scope.check()
         this.consumerGroup.forgetMemberId()
       } else {
         await scope.wait(() =>
@@ -903,7 +908,7 @@ module.exports = class Runner extends EventEmitter {
         this.logger.error('Error while stopping the consumer group', {
           groupId: this.consumerGroup.groupId,
           memberId: this.consumerGroup.memberId,
-          error: e.message || e,
+          error: describeThrown(e),
         })
       }
     } finally {
@@ -918,8 +923,9 @@ module.exports = class Runner extends EventEmitter {
 
   /**
    * The stop of a run `terminate` ended: waits, under the stop's scope, for the fetch manager, the
-   * rebalance chain and the running handlers, then clears the assigner state. It closes no fetch
-   * session, calls no close callback, commits nothing and does not leave the group. A close
+   * rebalance chain and the running handlers, then clears the assigner state unless the stop it
+   * took over already did. It closes no fetch session, calls no close callback, commits nothing
+   * and does not leave the group. A close
    * deadline, also one that passed before this stop began, ends the wait. A stage that fails is
    * logged and the next one still runs, so the stop always settles and the run can be uninstalled.
    * @private
@@ -942,13 +948,26 @@ module.exports = class Runner extends EventEmitter {
       ]) {
         await scope.wait(stage).catch((error) => scope.guard() || failed(error))
       }
-      this.consumerGroup.clearAssignerState()
+      this.clearAssignersOnce()
     } catch (error) {
       failed(error)
     } finally {
       this.terminated = false
       if (!operation) scope.finish()
     }
+  }
+
+  /**
+   * Tells the assigners to forget their retained state, once per run: marked before their
+   * callbacks run, so a terminal stop a callback starts does not clear them a second time.
+   * @private
+   * @returns {void}
+   * @throws {*} the first assigner's failure
+   */
+  clearAssignersOnce() {
+    if (this.assignersCleared) return
+    this.assignersCleared = true
+    this.consumerGroup.clearAssignerState()
   }
 
   /**

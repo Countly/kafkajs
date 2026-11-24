@@ -895,7 +895,9 @@ module.exports = class RebalanceCoordinator {
     if (this.consumerGroup.kind === 'consumer') {
       await this.contain('poll leave', () => this.consumerGroup.leaveForPollExpiry(leaving))
     } else if (!isStatic) {
-      await this.contain('poll leave', () => this.consumerGroup.leave({ operation: leaving }))
+      await this.contain('poll leave', () =>
+        this.consumerGroup.leave({ operation: leaving, fenced: true })
+      )
     }
 
     if (leaving.guard() || this.consumerGroup.joinCount !== joinsBefore) {
@@ -905,8 +907,9 @@ module.exports = class RebalanceCoordinator {
     await this.contain('generation reset', () => this.consumerGroup.resetGenerationLocally())
 
     // A running chain that still renews this membership owns the rejoin, and a second LOST would
-    // be an orphan in the slot after it. One that cannot - waiting or joining - gets the LOST.
-    if (this.isRebalancing() && !this.lostRoundOwed()) {
+    // be an orphan in the slot after it. One that cannot - waiting or joining - gets the LOST,
+    // unless the run ended or a fatal answer arrived during the reset.
+    if (leaving.guard() || (this.isRebalancing() && !this.lostRoundOwed())) {
       return
     }
 

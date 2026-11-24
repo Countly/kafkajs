@@ -826,18 +826,20 @@ module.exports = class ClassicGroupProtocol {
    * loses its generation: retained state from a generation that no longer exists would otherwise
    * be used to compute the next assignment.
    * @returns {void}
-   * @throws {Error} the first assigner's failure, once every assigner was told
+   * @throws {*} the first assigner's failure, whatever value it threw, once every assigner was told
    */
   clearAssignerState() {
-    let failure = null
+    let failed = false
+    let failure
     for (const assigner of this.assigners) {
       try {
         assigner.onAssignment?.(null, { generationId: -1, groupProtocol: null })
       } catch (error) {
-        failure ??= error
+        if (!failed) failure = error
+        failed = true
       }
     }
-    if (failure) throw failure
+    if (failed) throw failure
   }
 
   /**
@@ -861,15 +863,17 @@ module.exports = class ClassicGroupProtocol {
    * its connection is closed.
    * The member id, joined or pending, is forgotten whether the request succeeds, fails or is not
    * sent, unless a newer membership replaced it while the request was in flight.
-   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation }} [options]
-   *   `false` sends no request and only forgets the member id; `true` and `undefined` send it
-   *   (nothing calls this for a static member that leaves by default). The close `operation`, when
-   *   given, bounds the coordinator lookup and refuses the write once it expires.
+   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation,
+   *   fenced?: boolean }} [options] `leaveGroup: false` sends no request and only forgets the
+   *   member id; `true` and `undefined` send it (nothing calls this for a static member that leaves
+   *   by default). The close `operation`, when given, bounds the coordinator lookup and refuses
+   *   the write once it expires. `fenced`: once that operation refuses, nothing is forgotten
+   *   either, because the run that asked has ended (a poll-expiry leave)
    * @returns {Promise<void>}
    * @throws {import('../../errors').KafkaJSProtocolError} the coordinator's error for this member
    * @throws {Error} the operation's refusal
    */
-  async leave({ leaveGroup, operation } = {}) {
+  async leave({ leaveGroup, operation, fenced = false } = {}) {
     const { groupId, groupInstanceId, joinCount, membershipRevision } = this
     const memberId = this.memberId || this.pendingMemberId
 
@@ -890,7 +894,11 @@ module.exports = class ClassicGroupProtocol {
         }
       }
     } finally {
-      if (this.joinCount === joinCount && this.forgetMemberId(membershipRevision)) {
+      if (
+        !(fenced && operation.guard()) &&
+        this.joinCount === joinCount &&
+        this.forgetMemberId(membershipRevision)
+      ) {
         this.clearAssignerState()
       }
     }

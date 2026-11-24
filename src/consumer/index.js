@@ -365,8 +365,10 @@ module.exports = (params) => {
    * The cleanup of the crash being reported, published before its first diagnostic and settled
    * once its stop, cluster disconnect and forced `loss` callback are done, before the restart
    * decision. Every public close joins it, so it returns only after that cleanup's transport and
-   * registry work.
-   * @type {{ promise: Promise<void>, loss?: import('./runner').ForcedLoss }|null}
+   * registry work. `teardown` is its cluster disconnect once started; a later close leaves
+   * DISCONNECT to it.
+   * @type {{ promise: Promise<void>, loss?: import('./runner').ForcedLoss,
+   *   teardown?: Promise<void> }|null}
    */
   let crashCleanup = null
 
@@ -720,15 +722,18 @@ module.exports = (params) => {
    * Stops the runner and disconnects the cluster, for `disconnect()` and for the crash handler.
    * A user disconnect ends the consumer, so its reset obligations are emptied. A crash restart
    * unlinks them and keeps them: the topics still owe those resets to the group it builds next.
+   * A close and a crash cleanup that overlap emit one DISCONNECT: a close admitted before the
+   * crash cleanup's disconnect starts owns the disconnect, and a later close only bounds it.
    * @param {{ leaveGroup?: boolean }} [stopOptions]
-   * @param {{ keepResets?: boolean, preserveSetupState?: boolean }} [shutDownOptions] `true` for the crash handler
-   * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent, it waits
-   *   naturally
+   * @param {{ keepResets?: boolean, preserveSetupState?: boolean, cleanup?: object }}
+   *   [shutDownOptions] `true` and the crash's cleanup record for the crash handler
+   * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent for the
+   *   crash handler, which waits naturally
    * @returns {Promise<void>}
    */
   const shutDown = async (
     stopOptions,
-    { keepResets = false, preserveSetupState = false } = {},
+    { keepResets = false, preserveSetupState = false, cleanup } = {},
     operation
   ) => {
     if (keepResets) telemetry?.suspend()
@@ -737,12 +742,18 @@ module.exports = (params) => {
 
     try {
       if (operation) {
-        await closeWithin(operation, stopOptions, owned)
+        if (!(await closeWithin(operation, stopOptions, owned))) return
       } else {
         await stopShared(stopOptions)
-        logger.debug('consumer has stopped, disconnecting', { groupId })
-        if (ownsCluster)
-          await cluster.disconnect(...(preserveSetupState ? [{ preserveSetupState }] : []))
+        if (closing) return
+        // Published before its diagnostic and transport run, so a close they start joins it.
+        const teardown = Promise.resolve().then(async () => {
+          logger.debug('consumer has stopped, disconnecting', { groupId })
+          if (ownsCluster)
+            await cluster.disconnect(...(preserveSetupState ? [{ preserveSetupState }] : []))
+        })
+        cleanup.teardown = teardown
+        await teardown
       }
       instrumentationEmitter.emit(DISCONNECT)
     } catch (e) {
@@ -768,10 +779,14 @@ module.exports = (params) => {
    * @param {ConsumerOperation} operation the close scope
    * @param {{ leaveGroup?: boolean }} [stopOptions]
    * @param {ControlLifetime} owned the lifetime this close ends; its calls and connect are retired
-   * @returns {Promise<void>} rejects only for an ordinary failure of a close that was not forced
+   * @returns {Promise<boolean>} whether this close owns the DISCONNECT: false when a crash
+   *   cleanup it overlaps had already started its disconnect; rejects only for an ordinary failure
+   *   of a close that was not forced
    */
   const closeWithin = async (operation, stopOptions, owned) => {
     const captured = runner
+    // A disconnect the crash cleanup already started owns DISCONNECT; this close only bounds it.
+    const joined = crashCleanup?.teardown
     /** @type {Promise<void>[]} every cluster disconnect this close made, in order */
     const transport = []
     let lastDrain = null
@@ -807,6 +822,7 @@ module.exports = (params) => {
       if (failure && !forced) throw failure.reason
       if (failure)
         logger.warn('Disconnecting the cluster failed', { error: failure.reason.message })
+      return !joined
     } finally {
       unregister()
     }
@@ -1342,10 +1358,11 @@ module.exports = (params) => {
      * @param {ControlLifetime} owned the lifetime the run belongs to
      * @param {number} startGeneration `stopGeneration` when the run started
      * @param {{ forced?: boolean, loss?: import('./runner').ForcedLoss }} [claim] `forced` when a
-     *   fatal deadline retired the run while a handler may still run: such a crash joins a close
-     *   already in progress instead of tearing down beside it, and never restarts. Its cleanup also
-     *   waits for `loss`, the close callback the claim delivered, which the first close's deadline
-     *   retires early.
+     *   fatal deadline retired the run while a handler may still run: such a crash never restarts.
+     *   Every crash joins a close already in progress instead of tearing down beside it, and
+     *   leaves the disconnect to a close admitted while it stops. Its cleanup also waits for
+     *   `loss`, the close callback the claim delivered, which the first close's deadline retires
+     *   early.
      * @returns {Promise<void>}
      */
     const onCrash = async (e, owned, startGeneration, { forced = false, loss } = {}) => {
@@ -1388,10 +1405,15 @@ module.exports = (params) => {
         if (e.name === 'KafkaJSConnectionClosedError') {
           cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
         }
-        // Read after the diagnostic: a forced crash joins a close admitted before or during it, for
-        // one stop and one teardown. That close joins this cleanup, so it is awaited only after.
-        joining = forced ? closing : null
-        if (!joining) await shutDown(undefined, { keepResets: true, preserveSetupState: true })
+        // Read after the diagnostic: a crash joins a close admitted before or during it, for one
+        // stop and one teardown. That close joins this cleanup, so it is awaited only after.
+        joining = closing
+        if (!joining)
+          await shutDown(undefined, {
+            keepResets: true,
+            preserveSetupState: true,
+            cleanup: cleaned,
+          })
       } catch {
       } finally {
         if (loss) await loss.promise.catch(() => {})
