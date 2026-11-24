@@ -930,7 +930,7 @@ describe.each(['magic', 'decompression'])(
         expect(halt.offsets(0)).toEqual(['0'])
       })
 
-      test('across a recreation, fetched by name because another topic of the request has no id', async () => {
+      test('across a recreation, fetched by name from a broker without topic ids, with the topic that has no id left out', async () => {
         halt = scenario({
           leaders: { 0: 0, 1: 1 },
           consumer: { metadataMaxAge: 0 },
@@ -950,7 +950,7 @@ describe.each(['magic', 'decompression'])(
         await halt.until(() => halt.offsets(0).includes('0'), 'the record of the new incarnation')
 
         expect(call.version).toBe(12)
-        expect(call.fields.topics.map(({ topic }) => topic).sort()).toEqual([TOPIC, IDLESS_TOPIC])
+        expect(call.fields.topics.map(({ topic }) => topic)).toEqual([TOPIC])
         expect(halt.halts).toHaveLength(0)
         expect(halt.offsets(0)).toEqual(['0'])
       })
