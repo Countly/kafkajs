@@ -3347,9 +3347,6 @@ export class KafkaJSTimeout extends KafkaJSNonRetriableError {
   constructor()
 }
 
-  constructor()
-}
-
 /** One written request that changes broker state and got no answer, and the items it carried. */
 export interface UnknownOutcomeRequest {
   /** The API name, such as `'DeleteRecords'`. */
