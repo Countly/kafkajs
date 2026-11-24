@@ -8,7 +8,6 @@ const {
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
   KafkaJSProtocolError,
-  KafkaJSDeleteTopicRecordsError,
   KafkaJSUnknownOutcomeError,
 } = require('../errors')
 
@@ -150,22 +149,8 @@ const settleMutations = async (work, accept) => {
   }
   const whole = failures.find(endsCall)
   if (whole) throw whole
-  const errors = failures.filter(
-    (error) => isAnsweredError(error) || error instanceof KafkaJSDeleteTopicRecordsError
-  )
-  if (errors.length > 0) {
-    if (
-      errors.length > 1 &&
-      errors.every((error) => error instanceof KafkaJSDeleteTopicRecordsError)
-    ) {
-      const aggregate = new KafkaJSDeleteTopicRecordsError({
-        partitions: errors.flatMap((error) => error.partitions),
-      })
-      answered.add(aggregate)
-      throw aggregate
-    }
-    throw errors[0]
-  }
+  const answer = failures.find(isAnsweredError)
+  if (answer) throw answer
   if (accept) {
     outcomes.forEach((outcome, index) => {
       if (outcome.status === 'fulfilled') accept(outcome.value, index)

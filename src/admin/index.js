@@ -2183,9 +2183,11 @@ module.exports = ({
    * partition without a leader within the `retry` budget and then fails. The partitions' leaders
    * are looked up next, inside the retrier: a cached leader of -1 refreshes the metadata and goes
    * round again, as the Java `Admin#deleteRecords` retries its leader lookup, and so does any
-   * retriable failure. The request to each leader is built on the first attempt that finds them all
-   * and kept: a broker that already answered is not asked again, and a retry goes to the node it
-   * was built for, after a stale-metadata answer too.
+   * retriable failure before a request is written. The request to each leader is built on the
+   * first attempt that finds them all and kept: a leader that answered, with or without partition
+   * errors, is not asked again, and a retry goes only to the leaders whose request was not sent,
+   * at the node it was built for. A written request that got no answer rejects the call with
+   * `KafkaJSUnknownOutcomeError`, which wins over partition errors from other leaders.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    *
    * The public call checks and copies its input (`deletionInput`) synchronously, when it is made,
@@ -2200,11 +2202,13 @@ module.exports = ({
    * @throws {KafkaJSDeleteTopicRecordsError} at once, not retried, when a requested partition is
    *   not in the topic's metadata, once the offsets read has succeeded: a topic that stays
    *   leaderless fails that read first, with the `KafkaJSNonRetriableError` below
-   * @throws {KafkaJSNumberOfRetriesExceeded} when a retriable failure outlives the `retry` budget;
-   *   its `cause` is the last failure
-   * @throws {KafkaJSNonRetriableError} when a broker refuses a partition for good (its `cause` is
-   *   the `KafkaJSDeleteTopicRecordsError` naming the partitions), or when the offsets read fails,
-   *   as for a partition that stays without a leader (`type` `LEADER_NOT_AVAILABLE`)
+   * @throws {KafkaJSNumberOfRetriesExceeded} when a failure before a request is written outlives
+   *   the `retry` budget; its `cause` is the last failure
+   * @throws {KafkaJSNonRetriableError} once every leader answered, when any answered with
+   *   partition errors (its `cause` is one `KafkaJSDeleteTopicRecordsError` naming the refused
+   *   partitions of all leaders), or when the offsets read fails, as for a partition that stays
+   *   without a leader (`type` `LEADER_NOT_AVAILABLE`)
+   * @throws {KafkaJSUnknownOutcomeError} when a written request got no answer
    *
    * @typedef {Object} SeekEntry
    * @property {number} partition
@@ -2214,6 +2218,8 @@ module.exports = ({
     const topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
+    /** @type {{ partition: number, offset: string, error: Error }[]} answered partition errors */
+    const refused = []
 
     const retrier = retrierOf(retry)
     return retrier(async (bail) => {
@@ -2276,21 +2282,30 @@ module.exports = ({
           ([nodeId, { topic, partitions }]) =>
             async () => {
               const broker = checked(await waitOf(async () => cluster.findBroker({ nodeId })))
-              checked(
-                await waitOf(async () => broker.deleteRecords({ topics: [{ topic, partitions }] }))
-              )
-              // remove successful entry so it's ignored on retry
+              try {
+                checked(
+                  await waitOf(async () =>
+                    broker.deleteRecords({ topics: [{ topic, partitions }] })
+                  )
+                )
+              } catch (e) {
+                if (!(e instanceof KafkaJSDeleteTopicRecordsError)) throw e
+                refused.push(...e.partitions)
+              }
+              // an answered leader is not asked again
               delete seekEntriesByBroker[nodeId]
             }
         )
 
         checked(await waitOf(() => settleMutations(brokerRequests.map((request) => request()))))
       } catch (e) {
-        if (endsCall(e) || isAnsweredError(e) || e instanceof KafkaJSDeleteTopicRecordsError) {
-          return bail(e)
-        }
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (e.retriable && staleMetadata(e)) checked(await waitOf(() => cluster.refreshMetadata()))
         throw e
+      }
+      if (refused.length > 0) {
+        const error = new KafkaJSDeleteTopicRecordsError({ topic, partitions: refused })
+        return bail(new KafkaJSNonRetriableError(error, { cause: error }))
       }
     })
   }
