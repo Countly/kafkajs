@@ -1660,10 +1660,18 @@ describe('Consumer > a run stopped for good with an error', () => {
       const delivered = []
       const run = await startOther('classic', {
         config: { partitionAssigners: [() => retaining] },
+        autoCommitThreshold: 2,
         eachMessage: async ({ message }) => delivered.push(message.offset),
       })
-      await advanceUntil(() => delivered.length === 1)
       const { runner, coordinator } = run
+      const manager = run.group.offsetManager
+      await advanceUntil(() => manager.selectUncommitted().length > 0)
+
+      expect(delivered).toEqual(['40'])
+      expect(coordinator.offsetCommit).not.toHaveBeenCalled()
+      expect(manager.selectUncommitted()).toMatchObject([
+        { topic: 'topic-a', partitions: [{ partition: '0', offset: '41' }] },
+      ])
       expect(retained).toMatchObject({ generationId: 1 })
       const commitFinal = runner.commitFinalOffsetsContained.bind(runner)
       let written = null
@@ -1683,6 +1691,7 @@ describe('Consumer > a run stopped for good with an error', () => {
       const [{ topics }] = coordinator.offsetCommit.mock.calls[commits]
       expect(String(topics[0].partitions[0].offset)).toBe('41')
       expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+      expect(retained).toMatchObject({ generationId: 1 })
 
       const joins = coordinator.joinGroup.mock.calls.length
       const again = settled(run.consumer.run({ eachMessage: async () => {} }))
@@ -1763,12 +1772,20 @@ describe('Consumer > a run stopped for good with an error', () => {
     it('stopRun sends no LeaveGroup and does not call the close callback', async () => {
       const hook = { onPartitionsRevoked: jest.fn(), onPartitionsLost: jest.fn() }
       const run = await startOther('classic', { hook })
+      expect(hook.onPartitionsRevoked.mock.calls).toEqual([
+        [{ groupId: 'loss-driver-group', generationId: null, memberId: null, partitions: [] }],
+      ])
+      expect(hook.onPartitionsLost).not.toHaveBeenCalled()
+      expect(run.group.assigned()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+      hook.onPartitionsRevoked.mockClear()
 
-      run.group.stopRun(recreated())
+      const error = recreated()
+      run.group.stopRun(error)
       await advanceUntil(() => run.crashes.length > 0)
       await jest.advanceTimersByTimeAsync(5000)
 
       expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
       expect(run.coordinator.leaveGroup).not.toHaveBeenCalled()
       expect(hook.onPartitionsRevoked).not.toHaveBeenCalled()
       expect(hook.onPartitionsLost).not.toHaveBeenCalled()
