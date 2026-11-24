@@ -1808,7 +1808,7 @@ module.exports = class BrokerPool {
     } catch (e) {
       this.logger.error('Instrumentation event listener threw, ignoring it', {
         eventName,
-        error: e.message,
+        error: describeThrown(e),
       })
     }
   }

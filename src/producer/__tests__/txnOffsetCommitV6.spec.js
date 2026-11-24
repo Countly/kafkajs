@@ -11,6 +11,7 @@ const { NO_TOPIC_ID } = require('../../protocol/requests/topicIds')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSCommitFailedError,
   KafkaJSInvariantViolation,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProducerClosedError,
@@ -486,14 +487,21 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
    * @param {object} [options]
    * @param {Record<string, string|null>} [options.ids] the topic ids the cluster cache holds
    * @param {object} [options.groupCoordinator] a broker to commit the offsets through
+   * @param {1|2} [options.transactionVersion=2] the transaction version the coordinator finalizes
    */
-  const openTransaction = async ({ ids = { 'topic-a': ID_A }, groupCoordinator } = {}) => {
+  const openTransaction = async ({
+    ids = { 'topic-a': ID_A },
+    groupCoordinator,
+    transactionVersion = 2,
+  } = {}) => {
     const cluster = createFakeCluster()
     const { broker } = cluster
     cluster.cache = { ...ids }
     cluster.topicId = jest.fn((topic) => cluster.cache[topic])
     Object.assign(broker, {
-      finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: 2 } },
+      finalizedFeatures: {
+        'transaction.version': { minVersionLevel: 0, maxVersionLevel: transactionVersion },
+      },
       finalizedFeaturesEpoch: 1,
       negotiatedVersion: () => 5,
       addOffsetsToTxn: jest.fn(async () => ({})),
@@ -527,12 +535,23 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
     await Promise.all(open.splice(0).map((producer) => producer.disconnect()))
   })
 
-  test('resolves the topic ids from the cluster cache on every attempt, into a private map', async () => {
-    const { cluster, broker, transaction } = await openTransaction()
+  /**
+   * @param {Error} error what `sendOffsets` rejected with
+   * @param {string|null} current the id the producer's metadata holds now, null for none
+   * @param {string|null} [captured=ID_A] the id read when `sendOffsets` was called, null for none
+   */
+  const expectTopicIdRefusal = (error, current, captured = ID_A) => {
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(error.cause.reason).toEqual('stale-assignment')
+    expect(error.message).toContain('can no longer verify that topic "topic-a"')
+    expect(error.message).toContain(`its id was ${captured ?? 'unknown'} when`)
+    expect(error.message).toContain(`is ${current ?? 'unknown'} now`)
+  }
+
+  test('sends the captured ids on every attempt', async () => {
+    const { broker, transaction } = await openTransaction()
     const before = JSON.parse(JSON.stringify(TOPICS))
-    cluster.topicId.mockImplementation(() =>
-      broker.txnOffsetCommit.mock.calls.length === 0 ? ID_A : ID_B
-    )
     broker.txnOffsetCommit.mockRejectedValueOnce(protocolError(COORDINATOR_LOAD_IN_PROGRESS))
 
     await transaction.sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
@@ -540,14 +559,87 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
     const [first, second] = broker.txnOffsetCommit.mock.calls.map(([call]) => call)
     expect(first.transactionVersion).toEqual(2)
     expect(first.generationId).toEqual(7)
+    expect(second.topicIds).toBe(first.topicIds)
     expect([...first.topicIds]).toEqual([['topic-a', ID_A]])
-    expect([...second.topicIds]).toEqual([['topic-a', ID_B]])
-    expect(second.topicIds).not.toBe(first.topicIds)
+    expect([...second.topicIds]).toEqual([['topic-a', ID_A]])
     expect(TOPICS).toEqual(before)
     // the snapshot the wire is built from carries names alone, and is one object across attempts
     expect(second.topics).toBe(first.topics)
     expect(Object.keys(first.topics[0])).toEqual(['topic', 'partitions'])
     expect(Object.isFrozen(first.topics)).toBe(true)
+  })
+
+  test('copies the offsets and reads their topic ids at admission', async () => {
+    const { cluster, broker, transaction } = await openTransaction()
+    const topics = JSON.parse(JSON.stringify(TOPICS))
+    cluster.topicId.mockClear()
+
+    const sending = transaction.sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics })
+    const readAtAdmission = cluster.topicId.mock.calls.map(([topic]) => topic)
+    topics[0].partitions[0].offset = '99'
+    topics.push({ topic: 'topic-b', partitions: [{ partition: '0', offset: '1' }] })
+    await sending
+
+    expect(readAtAdmission).toEqual(['topic-a'])
+    expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(1)
+    const [[call]] = broker.txnOffsetCommit.mock.calls
+    expect(call.topics).toEqual([
+      {
+        topic: 'topic-a',
+        partitions: [
+          { partition: '0', offset: '11', leaderEpoch: 3 },
+          { partition: '1', offset: '7' },
+        ],
+      },
+    ])
+    expect([...call.topicIds]).toEqual([['topic-a', ID_A]])
+  })
+
+  test('refuses a name-keyed call whose topic gained an id before the first write', async () => {
+    const { cluster, broker, producer, transaction } = await openTransaction({ ids: {} })
+    const held = deferred()
+    cluster.findGroupCoordinator.mockClear()
+    cluster.findGroupCoordinator.mockImplementationOnce(async () => held.promise)
+
+    const sending = transaction
+      .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+      .catch((e) => e)
+    await expect(
+      waitForCondition(() => cluster.findGroupCoordinator.mock.calls.length === 1, {
+        attempts: 100,
+        delay: 5,
+      })
+    ).resolves.toBe(true)
+    cluster.cache['topic-a'] = ID_B
+    held.resolve(broker)
+    const error = await sending
+
+    expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
+    expectTopicIdRefusal(error, ID_B, null)
+    await expect(transaction.commit()).rejects.toBe(error)
+    await expect(transaction.abort()).resolves.toBeUndefined()
+    await expect(producer.transaction()).resolves.toBeDefined()
+    expect(published(cluster)).toEqual([])
+  })
+
+  test('refuses the retry when the producer can no longer verify a captured topic id, and the producer carries on after abort', async () => {
+    const { cluster, broker, producer, transaction } = await openTransaction()
+    broker.txnOffsetCommit.mockImplementationOnce(async () => {
+      // What a rebootstrap or idle pruning does to the cache while the call waits to retry.
+      delete cluster.cache['topic-a']
+      throw protocolError(COORDINATOR_LOAD_IN_PROGRESS)
+    })
+
+    const error = await transaction
+      .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+      .catch((e) => e)
+
+    expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(1)
+    expectTopicIdRefusal(error, null)
+    await expect(transaction.commit()).rejects.toBe(error)
+    await expect(transaction.abort()).resolves.toBeUndefined()
+    await expect(producer.transaction()).resolves.toBeDefined()
+    expect(published(cluster)).toEqual([])
   })
 
   test.each([
@@ -599,8 +691,8 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
     }
   )
 
-  test('unknown transactional topic ID refreshes metadata before retry, never creating a topic or adding a target', async () => {
-    const { cluster, broker, transaction } = await openTransaction()
+  test('refuses to send transactional offsets for a topic whose id changed after UNKNOWN_TOPIC_ID', async () => {
+    const { cluster, broker, producer, transaction } = await openTransaction()
     const before = JSON.parse(JSON.stringify(TOPICS))
     const order = []
     broker.txnOffsetCommit.mockImplementation(async ({ topicIds }) => {
@@ -612,13 +704,15 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
       cluster.cache['topic-a'] = ID_B
     })
 
-    await transaction.sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+    const error = await transaction
+      .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+      .catch((e) => e)
+    const commitError = await transaction.commit().catch((e) => e)
 
-    expect(order).toEqual([
-      'TxnOffsetCommit with ID-A',
-      'refresh metadata',
-      'TxnOffsetCommit with ID-B',
-    ])
+    expect(order).toEqual(['TxnOffsetCommit with ID-A', 'refresh metadata'])
+    expectTopicIdRefusal(error, ID_B)
+    expect(commitError).toBe(error)
+    expect(broker.endTxn).not.toHaveBeenCalled()
     expect(cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
     const [[refreshOptions]] = cluster.refreshMetadata.mock.calls
     expect(refreshOptions).toEqual({
@@ -628,12 +722,9 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
     })
     expect(refreshOptions.guard).toBe(refreshOptions.fence.guard)
     expect(TOPICS).toEqual(before)
+    await expect(transaction.abort()).resolves.toBeUndefined()
+    await expect(producer.transaction()).resolves.toBeDefined()
     expect(published(cluster)).toEqual([])
-    await transaction.commit()
-    expect(published(cluster)).toEqual([
-      { groupId: 'group-a', topic: 'topic-a', partition: '0', offset: '11' },
-      { groupId: 'group-a', topic: 'topic-a', partition: '1', offset: '7' },
-    ])
   })
 
   describe('with a real cluster behind the producer', () => {
@@ -691,7 +782,7 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
       cluster.addMultipleTargetTopics = jest.fn((...args) => real.addMultipleTargetTopics(...args))
     }
 
-    test('the retry after an unknown topic id uses the id the refresh read, and no request allows topic creation', async () => {
+    test('the retry after an unknown topic id is refused once the refresh read a new id, and no request allows topic creation', async () => {
       const ids = { 'topic-a': ID_A }
       const { real, requests } = realCluster(ids)
       await real.addTargetTopic('topic-a')
@@ -708,9 +799,12 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
       })
       const registered = requests.length
 
-      await transaction.sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+      const error = await transaction
+        .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+        .catch((e) => e)
 
-      expect(sentIds).toEqual([ID_A, ID_B])
+      expect(sentIds).toEqual([ID_A])
+      expectTopicIdRefusal(error, ID_B)
       expect(requests.slice(registered)).toEqual([
         { topics: ['topic-a'], allowAutoTopicCreation: false },
       ])
@@ -851,6 +945,164 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
         { groupId: 'group-a', topic: 'topic-a', partition: '0', offset: '11' },
         { groupId: 'group-a', topic: 'topic-a', partition: '1', offset: '7' },
       ])
+    })
+
+    test('refuses an id-bearing retry when the coordinator can no longer take topic ids', async () => {
+      const NOT_COORDINATOR = 16
+      const first = groupCoordinatorAnswering(() =>
+        answer(
+          [
+            {
+              key: ID_A,
+              partitions: [
+                { partition: 0, errorCode: NOT_COORDINATOR },
+                { partition: 1, errorCode: NOT_COORDINATOR },
+              ],
+            },
+          ],
+          true
+        )
+      )
+      const older = createGroupApiBroker({
+        versions: { [apiKeys.TxnOffsetCommit]: { minVersion: 0, maxVersion: 5 } },
+        respond: () => answer(everything((topic) => topic).slice(0, 1), false),
+      })
+      harnesses.push(older)
+      const { cluster, broker, transaction } = await openTransaction()
+      const coordinators = [first.broker, older.broker]
+      cluster.findGroupCoordinator.mockImplementation(async ({ coordinatorType }) =>
+        coordinatorType === COORDINATOR_TYPES.GROUP
+          ? (coordinators.shift() ?? older.broker)
+          : broker
+      )
+
+      const error = await transaction
+        .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+        .catch((e) => e)
+
+      expect(first.requests.map(({ apiVersion }) => apiVersion)).toEqual([6])
+      expect(older.requests).toEqual([])
+      expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(error.cause).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(error.cause.reason).toEqual('stale-assignment')
+      expect(error.message).toContain('v5')
+      await expect(transaction.abort()).resolves.toBeUndefined()
+      expect(published(cluster)).toEqual([])
+    })
+
+    test('keeps a retry name-keyed when the first attempt went by name and the next coordinator could take topic ids', async () => {
+      const NOT_COORDINATOR = 16
+      const byName = (partitions) => answer([{ key: 'topic-a', partitions }], false)
+      const older = createGroupApiBroker({
+        versions: { [apiKeys.TxnOffsetCommit]: { minVersion: 0, maxVersion: 5 } },
+        respond: () =>
+          byName([
+            { partition: 0, errorCode: NOT_COORDINATOR },
+            { partition: 1, errorCode: NOT_COORDINATOR },
+          ]),
+      })
+      harnesses.push(older)
+      const newer = groupCoordinatorAnswering((apiVersion) =>
+        apiVersion >= 6
+          ? answer(everyPartitionOf(ID_A), true)
+          : byName([{ partition: 0 }, { partition: 1 }])
+      )
+      const { cluster, broker, transaction } = await openTransaction()
+      const coordinators = [older.broker, newer.broker]
+      cluster.findGroupCoordinator.mockImplementation(async ({ coordinatorType }) =>
+        coordinatorType === COORDINATOR_TYPES.GROUP
+          ? (coordinators.shift() ?? newer.broker)
+          : broker
+      )
+
+      await transaction.sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+
+      expect(older.requests.map(({ apiVersion }) => apiVersion)).toEqual([5])
+      expect(newer.requests.map(({ apiVersion }) => apiVersion)).toEqual([5])
+      expect(readRequest(newer.requests[0].body, 5).topics.map(({ key }) => key)).toEqual([
+        'topic-a',
+      ])
+    })
+
+    test('refuses a commit frame held in the connection queue once the topic id changes, and writes nothing', async () => {
+      let written = 0
+      const coordinator = createGroupApiBroker({
+        versions: { [apiKeys.TxnOffsetCommit]: { minVersion: 0, maxVersion: 6 } },
+        maxInFlightRequests: 1,
+        forwardGuards: true,
+        respond: ({ apiVersion }) => (written++ === 0 ? null : succeed(apiVersion)),
+      })
+      harnesses.push(coordinator)
+      // An unanswered request takes the connection's only in-flight slot.
+      const blocker = coordinator.broker.txnOffsetCommit({
+        ...ARGUMENTS,
+        transactionVersion: 2,
+        topicIds: ALL_IDS,
+      })
+      await expect(
+        waitForCondition(() => coordinator.requests.length === 1, { attempts: 100, delay: 5 })
+      ).resolves.toBe(true)
+      const { cluster, producer, transaction } = await openTransaction({
+        groupCoordinator: coordinator.broker,
+      })
+
+      const sending = transaction
+        .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+        .catch((e) => e)
+      await expect(
+        waitForCondition(() => coordinator.connection.requestQueue.pending.length === 1, {
+          attempts: 100,
+          delay: 5,
+        })
+      ).resolves.toBe(true)
+      cluster.cache['topic-a'] = ID_B
+      await coordinator.release(succeed(6))
+      await blocker
+      const error = await sending
+
+      expect(coordinator.requests).toHaveLength(1)
+      expectTopicIdRefusal(error, ID_B)
+      await expect(transaction.commit()).rejects.toBe(error)
+      await expect(transaction.abort()).resolves.toBeUndefined()
+      await expect(producer.transaction()).resolves.toBeDefined()
+      expect(published(cluster)).toEqual([])
+    })
+
+    test('keeps a transaction at version 1 name-keyed on the wire and refuses the retry once the topic id changed', async () => {
+      const opened = {}
+      const { requests, broker: coordinator } = groupCoordinatorAnswering(() => {
+        opened.cluster.cache['topic-a'] = ID_B
+        return answer(
+          [
+            {
+              key: 'topic-a',
+              partitions: [
+                { partition: 0, errorCode: COORDINATOR_LOAD_IN_PROGRESS },
+                { partition: 1, errorCode: COORDINATOR_LOAD_IN_PROGRESS },
+              ],
+            },
+          ],
+          false
+        )
+      })
+      Object.assign(
+        opened,
+        await openTransaction({ transactionVersion: 1, groupCoordinator: coordinator })
+      )
+      const { cluster, broker, transaction } = opened
+
+      const error = await transaction
+        .sendOffsets({ consumerGroupMetadata: GROUP_METADATA, topics: TOPICS })
+        .catch((e) => e)
+
+      expect(broker.addOffsetsToTxn).toHaveBeenCalledTimes(1)
+      expect(requests).toHaveLength(1)
+      expect(requests[0].apiVersion).toEqual(4)
+      expect(readRequest(requests[0].body, 4).topics.map(({ key }) => key)).toEqual(['topic-a'])
+      expectTopicIdRefusal(error, ID_B)
+      await expect(transaction.commit()).rejects.toBe(error)
+      await expect(transaction.abort()).resolves.toBeUndefined()
+      expect(published(cluster)).toEqual([])
     })
 
     test('an abort after v6 staged the offsets publishes nothing', async () => {
