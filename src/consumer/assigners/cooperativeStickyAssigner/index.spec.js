@@ -271,6 +271,22 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
     expect(result).toEqual({ 'member-a': { 'topic-A': [1] }, 'member-b': { 'topic-A': [0] } })
   })
 
+  test('assigns a recreated topic with fewer partitions exactly once when a member claims a partition it no longer has', async () => {
+    metadata['topic-A'] = partitions(1)
+
+    const result = decodeAssignment(
+      await assigner.assign({
+        members: [
+          member('member-a', { owned: [{ topic: 'topic-A', partitions: [1] }], generationId: 1 }),
+          member('member-b', { owned: [{ topic: 'topic-A', partitions: [0] }], generationId: 1 }),
+        ],
+        topics: ['topic-A'],
+      })
+    )
+
+    expect(result).toEqual({ 'member-a': {}, 'member-b': { 'topic-A': [0] } })
+  })
+
   test('carries the four-byte userData into the subscription', () => {
     const { name, metadata: encoded } = assigner.protocol({
       topics: ['topic-A'],

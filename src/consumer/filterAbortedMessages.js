@@ -19,7 +19,10 @@ const isAbortMarker = ({ key, isControlRecord }) => {
 /**
  * Remove messages marked as aborted according to the aborted transactions list.
  *
- * Start of an aborted transaction is determined by message offset.
+ * Start of an aborted transaction is determined by message offset: every listed transaction whose
+ * first offset is at or before a record is active for that record, so transactions that began
+ * before the first record of the fetch are all active from it. The list is sorted by first offset
+ * here, as in Java: the protocol does not promise that order.
  * End of an aborted transaction is determined by control messages.
  * @param {Message[]} messages
  * @param {Transaction[]} [abortedTransactions]
@@ -40,23 +43,27 @@ const isAbortMarker = ({ key, isControlRecord }) => {
  * @param {boolean}  inTransaction
  */
 module.exports = ({ messages, abortedTransactions }) => {
-  const currentAbortedTransactions = new Map()
-
   if (!abortedTransactions || !abortedTransactions.length) {
     return messages
   }
 
-  const remainingAbortedTransactions = [...abortedTransactions]
+  const pending = [...abortedTransactions].sort((a, b) =>
+    Long.fromValue(a.firstOffset).compare(b.firstOffset)
+  )
+  let next = 0
+  const currentAbortedTransactions = new Set()
 
   return messages.filter((message) => {
-    // If the message offset is GTE the first offset of the next aborted transaction
-    // then we have stepped into an aborted transaction.
-    if (
-      remainingAbortedTransactions.length &&
-      Long.fromValue(message.offset).gte(remainingAbortedTransactions[0].firstOffset)
-    ) {
-      const { producerId } = remainingAbortedTransactions.shift()
-      currentAbortedTransactions.set(producerId, true)
+    if (next < pending.length) {
+      const offset = Long.fromValue(message.offset)
+      while (next < pending.length && offset.gte(pending[next].firstOffset)) {
+        currentAbortedTransactions.add(pending[next++].producerId)
+      }
+    }
+
+    // A record of a legacy message set has no batch and cannot belong to a transaction.
+    if (!message.batchContext) {
+      return true
     }
 
     const { producerId, inTransaction } = message.batchContext

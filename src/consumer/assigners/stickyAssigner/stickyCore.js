@@ -118,14 +118,21 @@ class MembersByLoad {
  * and at the same generation neither does - a stale zombie would otherwise win a claim purely by
  * iteration order.
  *
+ * A claim on a partition the group has no metadata for is ignored: a topic recreated with fewer
+ * partitions leaves members claiming partitions that no longer exist.
+ *
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractStickyAssignor.java
  * @param {object} input
  * @param {StickyMember[]} input.members already in member-info order
- * @param {Set<string>} input.allTopics topics the group has metadata for
+ * @param {{[topic: string]: number[]}} input.partitionsPerTopic every partition the group has
+ *   metadata for
  * @returns {{ subscriptionsEqual: boolean, owned: Map<string, Set<string>>,
  *   doublyClaimed: Set<string>, maxGeneration: number }}
  */
-const resolveOwnership = ({ members, allTopics }) => {
+const resolveOwnership = ({ members, partitionsPerTopic }) => {
+  const existing = new Map(
+    Object.keys(partitionsPerTopic).map((topic) => [topic, new Set(partitionsPerTopic[topic])])
+  )
   const owned = new Map()
   const doublyClaimed = new Set()
   const owner = new Map()
@@ -155,11 +162,16 @@ const resolveOwnership = ({ members, allTopics }) => {
     owned.set(memberId, mine)
 
     for (const { topic, partitions } of member.ownedPartitions) {
-      if (!allTopics.has(topic)) {
+      const current = existing.get(topic)
+      if (current === undefined) {
         continue
       }
 
       for (const partition of partitions) {
+        if (!current.has(partition)) {
+          continue
+        }
+
         const key = keyOf(topic, partition)
         const other = owner.get(key)
 
@@ -970,7 +982,7 @@ const assignSticky = ({ partitionsPerTopic, members, contested }) => {
 
   const { subscriptionsEqual, owned, doublyClaimed, maxGeneration } = resolveOwnership({
     members: ordered,
-    allTopics: new Set(Object.keys(partitions)),
+    partitionsPerTopic: partitions,
   })
 
   if (contested) {
