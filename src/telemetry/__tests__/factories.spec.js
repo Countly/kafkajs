@@ -584,6 +584,7 @@ describe('returned telemetry surfaces', () => {
       telemetryMetrics: collector,
       retireTelemetryNode: BrokerPool.prototype.retireTelemetryNode,
       trackDrain: BrokerPool.prototype.trackDrain,
+      reserveDrain: BrokerPool.prototype.reserveDrain,
       closeInBackground: (promise) => {
         promise.catch(() => {})
       },

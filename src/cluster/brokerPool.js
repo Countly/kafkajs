@@ -626,8 +626,8 @@ module.exports = class BrokerPool {
     if (this.retiredBrokers.has(broker)) return
     this.retiredBrokers.add(broker)
     this.retireTelemetryNode(broker.connectionPool)
-    const drain = (async () => broker.retire({ drainTimeout: this.drainTimeout }))()
-    this.trackDrain(broker, drain)
+    const complete = this.reserveDrain(broker)
+    const drain = complete((async () => broker.retire({ drainTimeout: this.drainTimeout }))())
     this.closeInBackground(drain)
   }
 
@@ -645,6 +645,30 @@ module.exports = class BrokerPool {
       if (records.get(closed) === all) records.delete(closed)
     })
     records.set(closed, all)
+  }
+
+  /**
+   * Records a drain before it starts. Its synchronous part can reach application code (a log sink
+   * or a listener) that starts a disconnect, which must already see and await this drain.
+   * @private
+   * @param {object} closed the broker or pool about to be drained
+   * @param {Map<object, Promise<unknown>>} [records] `draining` for brokers, `drainingPools` for pools
+   * @returns {(drain: Promise<void>) => Promise<void>} completes the record with the started drain,
+   *   and returns it; it must be called, or the record never leaves
+   */
+  reserveDrain(closed, records = this.draining) {
+    let complete
+    this.trackDrain(
+      closed,
+      new Promise((resolve) => {
+        complete = resolve
+      }),
+      records
+    )
+    return (drain) => {
+      complete(drain)
+      return drain
+    }
   }
 
   /**
@@ -674,21 +698,23 @@ module.exports = class BrokerPool {
    */
   closePool(pool) {
     this.retireTelemetryNode(pool)
-    const drain = (async () => {
-      let failure = null
-      try {
-        pool.retire()
-      } catch (error) {
-        failure = error
-      }
-      try {
-        await pool.destroy({ drainTimeout: this.drainTimeout })
-      } catch (error) {
-        failure ??= error
-      }
-      if (failure) throw failure
-    })()
-    this.trackDrain(pool, drain, this.drainingPools)
+    const complete = this.reserveDrain(pool, this.drainingPools)
+    const drain = complete(
+      (async () => {
+        let failure = null
+        try {
+          pool.retire()
+        } catch (error) {
+          failure = error
+        }
+        try {
+          await pool.destroy({ drainTimeout: this.drainTimeout })
+        } catch (error) {
+          failure ??= error
+        }
+        if (failure) throw failure
+      })()
+    )
     this.closeInBackground(drain)
   }
 
@@ -931,17 +957,18 @@ module.exports = class BrokerPool {
     this.authenticationBlackout.clear()
 
     const args = options ? [options] : []
-    const drains = [...brokers].map((broker) => {
-      const drain = (async () =>
-        broker === this.seedBroker ? broker.disconnect(...args) : broker.retire(...args))()
-      this.trackDrain(broker, drain)
-      return drain
+    // All recorded before any starts, so a disconnect one of them starts sees the whole batch.
+    const brokerRecords = [...brokers].map((broker) => this.reserveDrain(broker))
+    const poolRecords = pools.map((pool) => this.reserveDrain(pool, this.drainingPools))
+    const drains = [...brokers].map((broker, index) =>
+      brokerRecords[index](
+        (async () =>
+          broker === this.seedBroker ? broker.disconnect(...args) : broker.retire(...args))()
+      )
+    )
+    pools.forEach((pool, index) => {
+      drains.push(poolRecords[index]((async () => pool.destroy(...args))()))
     })
-    for (const pool of pools) {
-      const drain = (async () => pool.destroy(...args))()
-      this.trackDrain(pool, drain, this.drainingPools)
-      drains.push(drain)
-    }
     await Promise.all([
       ...[...brokers].map((broker) => this.draining.get(broker)),
       ...pools.map((pool) => this.drainingPools.get(pool)),
