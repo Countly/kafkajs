@@ -1775,6 +1775,102 @@ describe('Metadata answers across a rebootstrap', () => {
       jest.useRealTimers()
     }
   })
+
+  describe('a displaced pattern refresh', () => {
+    /** @returns {Subscription} a pattern subscription */
+    const patterns = () => {
+      const subscription = new Subscription()
+      subscription.add({ topics: [/^t-/], policy: { kind: 'latest' } })
+      return subscription
+    }
+
+    it('stops waiting for the newer refresh when its own lifecycle closes', async () => {
+      const { pool, replies } = acrossRebootstrap()
+      const subscription = patterns()
+      const observer = jest.fn()
+      const generation = new Generation()
+      const closedBy = new Error('run stopped')
+      let firstSettled = false
+      const first = outcome(
+        pool.refreshMetadata([], {
+          metadataScope: subscription,
+          onMetadata: observer,
+          fence: generation,
+        })
+      ).finally(() => {
+        firstSettled = true
+      })
+      await settled()
+      const second = outcome(
+        pool.refreshMetadata([], { metadataScope: subscription, onMetadata: observer })
+      )
+      await settled()
+      expect(replies).toHaveLength(2)
+
+      replies[0].resolve(answer('first', [SEED_NODE], ['t-first']))
+      await settled()
+      expect(firstSettled).toBe(false)
+      generation.close(closedBy)
+      await settled()
+      expect(firstSettled).toBe(true)
+      expect((await first).error).toBe(closedBy)
+
+      replies[1].resolve(answer('second', [SEED_NODE], ['t-second']))
+      expect(await second).toEqual({ value: undefined })
+      expect(observer.mock.calls.map(([metadata]) => metadata.clusterId)).toEqual(['second'])
+      expect(replies).toHaveLength(2)
+    })
+
+    it('asks once more when the newer refresh with another observer completed before its own answer arrived', async () => {
+      const { pool, replies } = acrossRebootstrap()
+      const subscription = patterns()
+      const declaring = jest.fn()
+      const discovering = jest.fn()
+      const first = outcome(
+        pool.refreshMetadata([], { metadataScope: subscription, onMetadata: declaring })
+      )
+      await settled()
+      const second = outcome(
+        pool.refreshMetadata([], { metadataScope: subscription, onMetadata: discovering })
+      )
+      await settled()
+      expect(replies).toHaveLength(2)
+      replies[1].resolve(answer('second', [SEED_NODE], ['t-second']))
+      expect(await second).toEqual({ value: undefined })
+
+      replies[0].resolve(answer('first', [SEED_NODE], ['t-first']))
+      await settled()
+      expect(replies).toHaveLength(3)
+      replies[2].resolve(answer('third', [SEED_NODE], ['t-third']))
+      expect(await first).toEqual({ value: undefined })
+      expect(discovering.mock.calls.map(([metadata]) => metadata.clusterId)).toEqual(['second'])
+      expect(declaring.mock.calls.map(([metadata]) => metadata.clusterId)).toEqual(['third'])
+    })
+
+    it('asks the rebuilt cluster itself when a rebootstrap cleared the answer of the newer refresh', async () => {
+      const { pool, replies } = acrossRebootstrap()
+      const subscription = patterns()
+      const observer = jest.fn()
+      const refresh = () =>
+        outcome(pool.refreshMetadata([], { metadataScope: subscription, onMetadata: observer }))
+      const first = refresh()
+      await settled()
+      const second = refresh()
+      await settled()
+      expect(replies).toHaveLength(2)
+      replies[1].resolve(answer('second', [SEED_NODE], ['t-second']))
+      expect(await second).toEqual({ value: undefined })
+
+      await pool.rebootstrap('required')
+      replies[0].resolve(answer('first', [SEED_NODE], ['t-first']))
+      await settled()
+      expect(replies).toHaveLength(3)
+      replies[2].resolve(answer('new', [NEW_SEED], ['t-new']))
+      expect(await first).toEqual({ value: undefined })
+      expect(observer.mock.calls.map(([metadata]) => metadata.clusterId)).toEqual(['second', 'new'])
+      expect(pool.metadataCache.leader('t-new', 0)).toBe(0)
+    })
+  })
 })
 
 describe('One install step per metadata answer', () => {
