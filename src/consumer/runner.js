@@ -152,6 +152,10 @@ module.exports = class Runner extends EventEmitter {
     this.retirement = null
     /** @type {ConsumerOperation|null} the scope of this run's one stop, which `retire` ends */
     this.stopScope = null
+    /** @type {Error|null} a close deadline that passed after the run was retired */
+    this.stopRetired = null
+    /** Whether `terminate` owns this run's crash, so its stop drains instead of returning. */
+    this.terminated = false
     /** @type {{ previous: Array<import('../../types').TopicPartitions>, invoked?: boolean }|null} */
     this.episode = null
     /**
@@ -727,6 +731,7 @@ module.exports = class Runner extends EventEmitter {
    *   rebalance
    */
   async resolveRebalanceVerdict({ kind, reason, error: e, membershipNotified = false }) {
+    if (this.retirement) return
     const ownership = this.consumerGroup.ownership
     if (obsoleteOwnership(ownership, e)) return
     if (kind === 'lost') {
@@ -823,6 +828,7 @@ module.exports = class Runner extends EventEmitter {
    * @returns {Promise<void>} resolves also when the close deadline ended the stages
    */
   async stop(options, operation) {
+    if (this.terminated) return this.drainTerminated(operation)
     if (!this.running) {
       this.latchStop()
       return
@@ -898,6 +904,58 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * The stop of a run `terminate` ended: waits, under the stop's scope, for the fetch manager, the
+   * rebalance chain and the running handlers, then clears the assigner state. It closes no fetch
+   * session, calls no close callback, commits nothing and does not leave the group. A close
+   * deadline, also one that passed before this stop began, ends the wait.
+   * @private
+   * @param {ConsumerOperation} [operation] the close that bounds the drain
+   * @returns {Promise<void>}
+   * @throws {Error} a failure of the drain that no close deadline caused
+   */
+  async drainTerminated(operation) {
+    const scope = (this.stopScope = operation ?? new ConsumerOperation())
+    if (this.stopRetired) scope.retire(this.stopRetired)
+    try {
+      await scope.wait(() => this.fetchManager.stop())
+      await scope.wait(() => this.rebalanceCoordinator.idle())
+      await scope.wait(() => this.waitForHandlers(scope))
+    } catch (e) {
+      if (!scope.guard()) throw e
+    } finally {
+      this.consumerGroup.clearAssignerState()
+      this.terminated = false
+      if (!operation) scope.finish()
+    }
+  }
+
+  /**
+   * Ends this run for good with `error`, as a forced close does, and reports `error` once as its
+   * crash: no fetch, commit, heartbeat, rebalance or LeaveGroup follows, and the crash cleanup's
+   * stop waits for running handlers before the crash is reported. A run already retired keeps its
+   * first cause; a pending fatal heartbeat answer wins and is reported by its own forced claim.
+   * @param {Error} error the reason the run ends, reported unwrapped through `CRASH`
+   * @returns {void}
+   */
+  terminate(error) {
+    if (this.retirement) return
+    const ownership = this.consumerGroup.ownership
+    ownership?.abandon(error, ownership.token())
+    if (this.fatal && !this.fatal.claimed) return this.retire(error)
+    this.terminated = true
+    this.retire(error)
+    this.rebalanceCoordinator.runInternal(() =>
+      Promise.resolve(this.onCrash(error)).catch((failure) =>
+        this.logger.error('Crash handler failed', {
+          groupId: this.consumerGroup.groupId,
+          error: describeThrown(failure),
+          cause: error.message,
+        })
+      )
+    )
+  }
+
+  /**
    * The synchronous half of a stop, run once: refuses new batches, ends the inter-round yield and
    * the heartbeat and poll timers, retires the run's idle state and rounds and clears a waiting
    * verdict. A stop that finds no running run still latches, so a start in flight joins nothing.
@@ -931,12 +989,18 @@ module.exports = class Runner extends EventEmitter {
    * never rejects: the close's own stop never reaches it once its deadline has passed, and with
    * `running` false every fetch returns [] in microtasks, so a fetcher left running would spin on
    * `setImmediate` for the life of the process.
-   * Synchronous and idempotent; application promises are left as they are.
+   * Synchronous and idempotent; application promises are left as they are. A later call keeps the
+   * first reason and only ends the stop in progress, so a close deadline also cuts the drain of a
+   * terminated run.
    * @param {Error} error the first terminal reason
    * @returns {void}
    */
   retire(error) {
-    if (this.retirement) return
+    if (this.retirement) {
+      this.stopRetired ??= error
+      this.stopScope?.retire(error)
+      return
+    }
     this.retirement = error
     this.claimFatal()
     this.latchStop()
@@ -1892,9 +1956,10 @@ module.exports = class Runner extends EventEmitter {
    * was raised has already returned by the time anything awaits this, so the wait cannot be on
    * the caller's own stack.
    *
+   * @param {ConsumerOperation} [operation] whose retirement removes this wait's listener
    * @returns {Promise<void>}
    */
-  waitForHandlers() {
+  waitForHandlers(operation) {
     if (this.inFlightHandlers === 0) {
       return Promise.resolve()
     }
@@ -1905,7 +1970,15 @@ module.exports = class Runner extends EventEmitter {
       inFlightHandlers: this.inFlightHandlers,
     })
 
-    return new Promise((resolve) => this.once(HANDLERS_IDLE, () => resolve()))
+    return new Promise((resolve) => {
+      let unregister = () => {}
+      const done = () => {
+        unregister()
+        resolve()
+      }
+      this.once(HANDLERS_IDLE, done)
+      if (operation) unregister = operation.register(() => this.off(HANDLERS_IDLE, done))
+    })
   }
 
   /**

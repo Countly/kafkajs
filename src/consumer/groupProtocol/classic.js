@@ -164,6 +164,8 @@ module.exports = class ClassicGroupProtocol {
           if (refusal) throw refusal
           await coordinator.heartbeat(guard ? { ...payload, guard } : payload)
         } catch (e) {
+          const late = guard?.()
+          if (late && late !== e) throw late
           if (losesCoordinator(e)) {
             this.coordinatorUnknown = true
           }
@@ -175,6 +177,9 @@ module.exports = class ClassicGroupProtocol {
           )
         }
 
+        // A caller that refused while the answer was in flight takes no effect from it.
+        const late = guard?.()
+        if (late) throw late
         this.instrumentationEmitter.emit(HEARTBEAT, payload)
         this.lastRequest = Date.now()
       }

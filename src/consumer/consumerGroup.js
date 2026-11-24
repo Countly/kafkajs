@@ -892,6 +892,16 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Ends the current run for good and reports `error` once as its crash (see `Runner#terminate`).
+   * Does nothing without a run, or when the run already ended with an earlier cause.
+   * @param {Error} error the reason the run ends
+   * @returns {void}
+   */
+  stopRun(error) {
+    this.rebalanceCoordinator?.runner?.terminate(error)
+  }
+
+  /**
    * Sends one session-closing Fetch to a node under the close's operation: the lookup, the
    * connection and the pre-write check all end at that operation's deadline.
    * @private
@@ -1233,6 +1243,7 @@ module.exports = class ConsumerGroup {
           return this.coordinatorLookup.find(fence)
         },
         isStopping: () => this.isStopping(),
+        stopRun: (error) => this.stopRun(error),
         seeks: {
           clock: () => this.acquireClock,
           changedSince: (since) =>

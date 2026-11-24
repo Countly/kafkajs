@@ -633,6 +633,8 @@ module.exports = class ConsumerGroupProtocol {
       const refusal = round?.guard()
       if (refusal) throw refusal
     }
+    const stopped = round?.guard()
+    if (stopped) throw stopped
     // Growth may have left names pending: what is applied and acknowledged is what remains.
     resolved = this.resolveFromCache(this.target)
     this.recordResolution(resolved)
@@ -885,13 +887,15 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {(() => boolean) & { member: () => boolean }} true only while this member may use the
    *   captured target; `member()` true while the captured membership still holds a target, whatever
    *   became of the target revision and the scope (a fencing, a fatal error and a leave clear the
-   *   target, a leave only after its commit, hence the state check)
+   *   target, a leave only after its commit, hence the state check), and the run was not ended
+   *   for good
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
     const scope = this.subscription?.captureScope()
     const member = () =>
+      !this.ownership?.permanent &&
       membership === this.membershipRevision &&
       this.target != null &&
       !isNotInGroup(this.state) &&

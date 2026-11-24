@@ -332,7 +332,11 @@ module.exports = class RebalanceCoordinator {
           this.emitPartitions(PARTITIONS_LOST, previous)
         }
 
-        if (hooks) await this.prepareListenerRound({ round, kind, previous, rebuildOffsets })
+        if (hooks) {
+          await this.prepareListenerRound({ round, kind, previous, rebuildOffsets })
+          const stopped = round.guard()
+          if (stopped) throw stopped
+        }
 
         // Java's onJoinPrepare: the same rounds stop advertising ownership before they join, so
         // the JoinGroup carries no `OwnedPartitions` and no peer withholds a partition for a
@@ -875,6 +879,7 @@ module.exports = class RebalanceCoordinator {
     }
 
     await this.contain('heartbeat stop', () => this.heartbeatManager.stop())
+    if (this.runner.stopRequested) return
 
     const joinsBefore = this.consumerGroup.joinCount
 

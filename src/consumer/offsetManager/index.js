@@ -211,6 +211,8 @@ module.exports = class OffsetManager {
    *                                offset-fetch retry abandons its deadline the moment this is
    *                                true, because the fetch loop it runs inside is one
    *                                `Runner#stop()` waits for.
+   * @param {(error: Error) => void} [options.stopRun] ends the consumer's run for good and reports
+   *                                `error` once as its crash. Defaults to a no-op.
    * @param {() => boolean} [options.isRebalancePending] whether a rebalance is waiting for the
    *                                current fetch round to end. The offset-fetch retry abandons its
    *                                deadline the moment this is true, so the member can rejoin.
@@ -269,6 +271,7 @@ module.exports = class OffsetManager {
     staleEpochTimeout = 300000,
     membership = null,
     isStopping = null,
+    stopRun = null,
     isRebalancePending = null,
     markPolled = null,
     captureResetContext = null,
@@ -316,6 +319,7 @@ module.exports = class OffsetManager {
         coordinator: this.coordinator,
       }))
     this.isStopping = isStopping || (() => false)
+    this.stopRun = stopRun || (() => {})
     this.isRebalancePending = isRebalancePending || (() => false)
     this.markPolled = markPolled || (() => {})
     this.captureResetContext = captureResetContext
