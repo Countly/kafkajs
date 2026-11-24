@@ -222,7 +222,9 @@ with a missing boundary are judged on the unscaled 2,097,152 bytes. The seed's b
 Excluded node types: `code`.
 
 V8 gives the `code` type to compiled code and its bookkeeping and to nothing a program allocates. Its name categories, with
-what a rehearsal (consumer p03 at `h02`, 10,220,632 excluded and 13,816,934 judged bytes) held in each:
+what the historical rehearsal held in each (the earlier three-hour rehearsal whose heap snapshots covered subjects p03 and
+p09 only, before snapshots were taken of every subject; here consumer p03 at `h02`, 10,220,632 excluded and 13,816,934
+judged bytes):
 
 | Category | p03 bytes | What it is |
 |---|---|---|
