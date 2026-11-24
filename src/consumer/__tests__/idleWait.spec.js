@@ -1629,7 +1629,7 @@ describe('terminal run cancellation of work started by a run', () => {
 })
 
 describe('validation response continuation', () => {
-  it('leaves validation enabled once its run retires during the last outcome', async () => {
+  it('holds the partition with an unexpected answer and validates nothing once its run retires during the last outcome', async () => {
     const group = idleGroup()
     group.offsetManager = { clearPendingSeeks() {} }
     const { FetchPreparation } = require('../fetchPreparation')
@@ -1654,19 +1654,24 @@ describe('validation response continuation', () => {
         group.startIdleWait()
       }
     )
-    const disable = jest.spyOn(group.positionValidator, 'disable')
     const markAll = jest.spyOn(group, 'markAllValidated')
+    const item = (partition) => {
+      group.positionValidator.request('orders', partition, {
+        offset: '0',
+        trackedEpoch: 1,
+        currentLeaderEpoch: 2,
+      })
+      return {
+        topic: 'orders',
+        partition,
+        generation: 0,
+        currentLeaderEpoch: 2,
+        entry: group.positionValidator.entryOf('orders', partition),
+      }
+    }
     await group
       .applyValidationResponse(
-        [
-          {
-            topic: 'orders',
-            entries: [
-              { partition: 0, generation: 0 },
-              { partition: 1, generation: 0 },
-            ],
-          },
-        ],
+        [{ topic: 'orders', entries: [item(0), item(1)] }],
         {
           topics: [
             {
@@ -1683,8 +1688,10 @@ describe('validation response continuation', () => {
       .catch(() => {})
     expect(group.positionValidator.complete).toHaveBeenCalledTimes(2)
     expect(prep.fence.closed).toBe(true)
-    expect(disable).not.toHaveBeenCalled()
     expect(markAll).not.toHaveBeenCalled()
+    expect(group.positionValidator.holdsFetch('orders', 0)).toBe(true)
+    expect(group.positionValidator.validatedAgainst('orders', 0)).toBeUndefined()
+    expect(group.positionValidator.validatedAgainst('orders', 1)).toBeUndefined()
     group.onStopRequested()
   })
 })

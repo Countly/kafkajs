@@ -23,7 +23,7 @@ const SCENARIOS = {
   reset: { position: '120', endOffset: '-1' },
   discarded: { position: '120', endOffset: '100', seekDuringValidation: true },
   'retriable-exhausted': { validationErrorCode: 6 },
-  'non-retriable': { validationErrorCode: 29 },
+  'non-retriable': { validationErrorCode: -1 }, // UNKNOWN_SERVER_ERROR; 29 fails the round instead
   'transport-failure': { validationThrows: true },
   'unsupported-api': { advertiseOffsetForLeaderEpoch: false },
 }
@@ -67,6 +67,26 @@ const apiKeysOf = (requests) => requests().map(({ apiKey }) => apiKey)
 /** How many OffsetForLeaderEpoch frames were written. */
 const validationCount = (requests) =>
   apiKeysOf(requests).filter((apiKey) => apiKey === apiKeys.OffsetForLeaderEpoch).length
+
+/** The partitions one decoded Fetch frame asks for. */
+const partitionsOf = (frame) =>
+  frame.topics.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+
+/** The message every warning about a held partition carries. */
+const HELD_WARNING =
+  'Position validation did not complete; the partition is not fetched until it validates'
+
+/**
+ * A monotonic clock the case moves by hand: `performance.now()` answers `clock.now`, which is what
+ * the per-partition backoff and the warning interval read. Timers stay real, so the in-round
+ * retrier keeps its own short delays. Restored by the describe's `afterEach`.
+ * @returns {{ now: number }}
+ */
+const manualClock = () => {
+  const clock = { now: 1000 }
+  jest.spyOn(performance, 'now').mockImplementation(() => clock.now)
+  return clock
+}
 
 describe('Consumer > position validation', () => {
   test('validation runs before the first fetch of an assignment, and goes to the leader', async () => {
@@ -126,9 +146,9 @@ describe('Consumer > position validation', () => {
     expect(validationCount(requests)).toEqual(0)
   })
 
-  test('while validation is disabled, a leader-epoch change still clears the preferred read replica', async () => {
-    const { group } = await createGroup({ preferredReadReplica: 2 })
-    group.positionValidator.disable()
+  test('with an unknown tracked epoch, a leader-epoch change still clears the preferred read replica', async () => {
+    // No request is made, but the partition still counts as having changed leader.
+    const { group } = await createGroup({ preferredReadReplica: 2, committedEpoch: -1 })
 
     await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
 
@@ -144,86 +164,39 @@ describe('Consumer > position validation', () => {
     expect(group.preferredReadReplicasPerTopicPartition[TOPIC][0]).toBeUndefined()
   })
 
-  test('a non-retriable validation error disables validation for the assignment, and sync re-arms it', async () => {
-    // Two partitions on two different leaders, both read from node 0 through a replica preference,
-    // so one round asks two brokers: the first answers non-retriable and the second must never be
-    // asked at all.
-    const { group, cluster, logger, requests, setResponse, sync } = await createGroup({
-      validationScenario: 'non-retriable',
-      partitions: [0, 1],
-      partitionLeaders: { 0: 0, 1: 1 },
-      preferredReadReplica: NODE_ID,
-    })
-    const warn = jest.spyOn(logger, 'warn')
-    // The round fetches partition 0 alone, so the broker answers for that partition only.
-    setResponse(fetchResponse([{ partition: 0, errorCode: 0 }]))
-
-    await group.fetch(NODE_ID)
-
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(validationCount(requests)).toEqual(1)
-    expect(group.positionValidator.isDisabled()).toBe(true)
-
-    // Partition 1 went back to its own leader when validation dropped its replica preference, so
-    // this round is node 0's partition alone.
-    cluster.leaderEpoch = () => 6
-    setResponse(fetchResponse([{ partition: 0, errorCode: 0 }]))
-    await group.fetch(NODE_ID)
-
-    expect(warn).toHaveBeenCalledTimes(1) // one warn per assignment, not per round
-    expect(validationCount(requests)).toEqual(1)
-
-    await sync()
-    expect(group.positionValidator.isDisabled()).toBe(false)
-  })
-
-  test('nothing thrown inside validation reaches the fetch', async () => {
+  test('nothing thrown inside validation reaches the fetch, and the partition is held', async () => {
     const { group, cluster, logger, requests, requestRejoin } = await createGroup()
     const warn = jest.spyOn(logger, 'warn')
     cluster.findLeaderForPartitions = () => {
       throw new Error('metadata gone')
     }
 
-    await expect(group.fetch(NODE_ID)).resolves.toHaveLength(1)
+    await expect(group.fetch(NODE_ID)).resolves.toEqual([])
     expect(warn).toHaveBeenCalledTimes(1)
-    expect(apiKeysOf(requests)).toContain(apiKeys.Fetch)
+    expect(warn).toHaveBeenCalledWith(
+      HELD_WARNING,
+      expect.objectContaining({ topic: TOPIC, partition: 0, error: 'metadata gone' })
+    )
+    expect(apiKeysOf(requests)).not.toContain(apiKeys.Fetch)
     expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
+    expect(group.positionValidator.holdsFetch(TOPIC, 0)).toBe(true)
     expect(requestRejoin).not.toHaveBeenCalled()
   })
 
-  test('a reposition that fails leaves the partition unvalidated, and the next round applies it', async () => {
-    const events = []
-    const { group, offsetManager } = await createGroup({ validationScenario: 'truncated' })
-    group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-    jest.spyOn(offsetManager, 'reposition').mockRejectedValueOnce(new Error('coordinator is down'))
-
-    await group.fetch(NODE_ID)
-
-    // The outcome was decided but never applied, so nothing may claim it was.
-    expect(events).toEqual([])
-    expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('120')
-    expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
-
-    await group.fetch(NODE_ID)
-
-    expect(events).toEqual([
-      { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
-    ])
-    expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('100')
-  })
-
-  test('an unexpected failure inside validation is warned, never thrown, and asked once', async () => {
+  test('an unexpected failure inside validation is warned once, never thrown, asked once, and holds the partition', async () => {
     const { group, logger, requests, requestRejoin, setValidationResponse } = await createGroup()
     const warn = jest.spyOn(logger, 'warn')
     setValidationResponse(() => {
       throw new TypeError('answer is not a function')
     })
 
-    await expect(group.fetch(NODE_ID)).resolves.toHaveLength(1)
+    await expect(group.fetch(NODE_ID)).resolves.toEqual([])
     expect(warn).toHaveBeenCalledTimes(1)
     // An unrecoverable error is not retried, so the round costs exactly one attempt.
     expect(validationCount(requests)).toEqual(1)
+    expect(apiKeysOf(requests)).not.toContain(apiKeys.Fetch)
     expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
+    expect(group.positionValidator.holdsFetch(TOPIC, 0)).toBe(true)
     expect(requestRejoin).not.toHaveBeenCalled()
   })
 
@@ -299,17 +272,19 @@ describe('Consumer > position validation', () => {
       ])
     })
 
-    test('retriable exhausted: the epoch is cleared, the offset is not moved, the partition is fetched', async () => {
-      const { group, offsetManager } = await createGroup({
+    test('retriable exhausted: the epoch is kept, the offset is not moved, the partition is not fetched until it validates', async () => {
+      const { group, offsetManager, fetchFrames } = await createGroup({
         validationScenario: 'retriable-exhausted',
         position: '120',
       })
 
       const batches = await group.fetch(NODE_ID)
 
-      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
-      expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('120')
-      expect(batches).toHaveLength(1)
+      expect(batches).toEqual([])
+      expect(fetchFrames()).toEqual([])
+      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(4)
+      expect(offsetManager.positionOf(TOPIC, 0)).toEqual('120')
+      expect(group.positionValidator.holdsFetch(TOPIC, 0)).toBe(true)
     })
   })
 
@@ -403,9 +378,9 @@ describe('Consumer > position validation', () => {
 
     await group.fetch(NODE_ID)
 
-    // createRetry({ retries: 2 }) means three attempts, not fifty-one.
+    // createRetry({ retries: 2 }) means three attempts, not fifty-one; the partition is then held.
     expect(validationCount(requests)).toEqual(3)
-    expect(apiKeysOf(requests)).toContain(apiKeys.Fetch)
+    expect(apiKeysOf(requests)).not.toContain(apiKeys.Fetch)
   })
 
   test('a retry is narrowed to the partitions that asked for one', async () => {
@@ -434,7 +409,7 @@ describe('Consumer > position validation', () => {
     // stubbed here: a single-fetcher round cannot produce it, because the gate blocks first.
     const { group, fetchRequestPartitions } = await createGroup({ partitions: [0, 1] })
     jest
-      .spyOn(group.positionValidator, 'isAwaiting')
+      .spyOn(group.positionValidator, 'holdsFetch')
       .mockImplementation((topic, partition) => partition === 0)
 
     await group.fetch(NODE_ID)
@@ -445,7 +420,7 @@ describe('Consumer > position validation', () => {
   test('a fetched partition that entered validation meanwhile is dropped, not delivered', async () => {
     const { group, setResponse } = await createGroup({ committedEpoch: -1 })
     let awaiting = false
-    jest.spyOn(group.positionValidator, 'isAwaiting').mockImplementation(() => awaiting)
+    jest.spyOn(group.positionValidator, 'holdsFetch').mockImplementation(() => awaiting)
 
     // The body is written after the request went out, which is the only window in which a
     // partition can enter validation between its own request and its own response.
@@ -585,5 +560,467 @@ describe('Consumer > position validation', () => {
 
     expect(request).not.toHaveBeenCalled()
     expect(nextOffset).not.toHaveBeenCalled()
+  })
+
+  describe('a validation that does not complete', () => {
+    afterEach(() => jest.restoreAllMocks())
+
+    /** Partition 1 has no tracked epoch, so it is fetched every round without a request. */
+    const withBusySibling = async (options) => {
+      const harness = await createGroup({ partitions: [0, 1], ...options })
+      harness.offsetManager.resolvedEpochs[TOPIC][1] = -1
+      return harness
+    }
+
+    /** Answers `errorCode` for partition 0 and a valid end offset for any other. */
+    const failPartitionZero = (errorCode) => (partitions) =>
+      offsetForLeaderEpochResponse(
+        partitions.map((partition) =>
+          partition === 0
+            ? { partition, errorCode, leaderEpoch: -1, endOffset: '-1' }
+            : { partition, endOffset: '20' }
+        )
+      )
+
+    test.each([false, true])(
+      'retriable answers until the budget is spent: the partition is not fetched, keeps offset 100 and epoch 1, and a later round validates and resumes at the divergence 50 (autoCommit %s)',
+      async (autoCommit) => {
+        const clock = manualClock()
+        const harness = await createGroup({
+          committedEpoch: 1,
+          leaderEpoch: 2,
+          position: '100',
+          autoCommit,
+        })
+        const { group, broker, offsetManager, offsetCommit, fetchFrames } = harness
+        let answer = { errorCode: 56, leaderEpoch: -1, endOffset: '-1' } // KAFKA_STORAGE_ERROR
+        harness.setValidationResponse((partitions) =>
+          offsetForLeaderEpochResponse(partitions.map((partition) => ({ partition, ...answer })))
+        )
+
+        // The budget is spent in the first round; the second, at the same epoch, is still held.
+        await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+        await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+
+        expect(harness.validationRequests()).toHaveLength(3)
+        expect(fetchFrames()).toEqual([])
+        expect(offsetCommit).not.toHaveBeenCalled()
+        expect(offsetManager.positionOf(TOPIC, 0)).toEqual('100')
+        expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(1)
+
+        // The new leader's log ends epoch 1 at 50: records 50-99 of epoch 2 must not be skipped.
+        answer = { errorCode: 0, leaderEpoch: 1, endOffset: '50' }
+        clock.now += 100
+        await group.fetch(NODE_ID)
+        expect(harness.validationRequests()).toHaveLength(4)
+
+        if (autoCommit) {
+          // The divergence is committed and read back before the partition is fetched again.
+          const committed = offsetCommit.mock.calls.flatMap(([{ topics }]) =>
+            topics.flatMap(({ partitions }) => partitions.map(({ offset }) => offset))
+          )
+          expect(committed).toEqual(['50'])
+          jest.spyOn(broker, 'offsetFetch').mockResolvedValue({
+            responses: [
+              { topic: TOPIC, partitions: [{ partition: 0, offset: '50', metadata: '' }] },
+            ],
+          })
+          await group.fetch(NODE_ID)
+        } else {
+          expect(offsetCommit).not.toHaveBeenCalled()
+        }
+
+        expect(fetchFrames().map(partitionsOf)).toEqual([[0]])
+        expect(harness.fetchRequestOffsets()).toEqual(['50'])
+      }
+    )
+
+    test('a transport failure of the validation request keeps the partition out of the next two Fetch requests and forces a metadata refresh', async () => {
+      manualClock()
+      const { group, cluster, fetchFrames, validationRequests } = await withBusySibling({
+        validationScenario: 'transport-failure',
+      })
+
+      await group.fetch(NODE_ID)
+      await group.fetch(NODE_ID)
+
+      expect(fetchFrames().map(partitionsOf)).toEqual([[1], [1]])
+      // The in-round budget (three attempts) is spent in the first round only.
+      expect(validationRequests()).toHaveLength(3)
+      // Asked for once, by the round after the failure, before that round's validation.
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    })
+
+    test('a reposition that fails keeps the partition out of the Fetch in this and the next round, and a later round applies it', async () => {
+      const clock = manualClock()
+      const events = []
+      const { group, offsetManager, fetchFrames, fetchRequestOffsets } = await withBusySibling({
+        validationScenario: 'truncated',
+      })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+      jest
+        .spyOn(offsetManager, 'reposition')
+        .mockRejectedValueOnce(new Error('coordinator is down'))
+
+      await group.fetch(NODE_ID)
+      await group.fetch(NODE_ID)
+
+      // The outcome was decided but never applied, so nothing may claim it was.
+      expect(events).toEqual([])
+      expect(offsetManager.positionOf(TOPIC, 0)).toEqual('120')
+      expect(fetchFrames().map(partitionsOf)).toEqual([[1], [1]])
+
+      clock.now += 100
+      await group.fetch(NODE_ID)
+
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(fetchFrames().map(partitionsOf)).toEqual([[1], [1], [0, 1]])
+      expect(fetchRequestOffsets()).toEqual(['100', '120'])
+    })
+
+    test('a truncation outcome keeps the partition out of the Fetch until the reposition has been applied', async () => {
+      const { group, offsetManager, fetchRequestOffsets } = await withBusySibling({
+        validationScenario: 'truncated',
+      })
+      const reposition = offsetManager.reposition.bind(offsetManager)
+      let builtDuringReposition
+      jest.spyOn(offsetManager, 'reposition').mockImplementation(async (...args) => {
+        // What a Fetch built while the reposition's own request is in flight would ask for.
+        builtDuringReposition = group.buildFetchRequests([{ topic: TOPIC, partitions: [0, 1] }])
+        return reposition(...args)
+      })
+
+      await group.fetch(NODE_ID)
+
+      expect(builtDuringReposition.flatMap(({ partitions }) => partitions)).toEqual([
+        expect.objectContaining({ partition: 1 }),
+      ])
+      expect(fetchRequestOffsets()).toEqual(['100', '120'])
+    })
+
+    test('leader move: the old leader answers NOT_LEADER_OR_FOLLOWER, the forced refresh names the new leader, which validates; the partition is fetched within the backoff, not after metadataMaxAge', async () => {
+      manualClock()
+      const harness = await createGroup({ knownNodes: [0, 1] })
+      const { group, cluster, fetchFrames, validationRequests, installRouting } = harness
+      let answered = 0
+      harness.setValidationResponse((partitions) =>
+        offsetForLeaderEpochResponse(
+          partitions.map((partition) =>
+            ++answered <= 3
+              ? { partition, errorCode: 6, leaderEpoch: -1, endOffset: '-1' }
+              : { partition, endOffset: '20' }
+          )
+        )
+      )
+      cluster.refreshMetadata.mockImplementation(async () => {
+        installRouting({ 0: 1 })
+        cluster.leaderEpoch = () => 6
+      })
+
+      await expect(group.fetch(0)).resolves.toEqual([])
+      expect(fetchFrames()).toEqual([])
+
+      // The clock never moves: neither the backoff nor metadataMaxAge (300000 ms) is waited for.
+      const batches = await group.fetch(1)
+
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+      expect(
+        validationRequests().map(({ topics }) => topics[0].partitions[0].currentLeaderEpoch)
+      ).toEqual([5, 5, 5, 6])
+      expect(fetchFrames().map(partitionsOf)).toEqual([[0]])
+      expect(harness.lastFetchRequest()[0].currentLeaderEpoch).toEqual(6)
+      expect(batches.map(({ partition }) => partition)).toEqual([0])
+    })
+
+    test('UNKNOWN_LEADER_EPOCH forgets the cached epoch, is not retried in the same round, and the refreshed epoch validates', async () => {
+      const harness = await createGroup()
+      const { group, cluster, fetchFrames, validationRequests } = harness
+      let errorCode = 75
+      harness.setValidationResponse((partitions) =>
+        offsetForLeaderEpochResponse(
+          partitions.map((partition) =>
+            errorCode
+              ? { partition, errorCode, leaderEpoch: -1, endOffset: '-1' }
+              : { partition, endOffset: '20' }
+          )
+        )
+      )
+
+      await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+      expect(validationRequests()).toHaveLength(1)
+      expect(cluster.forgetLeaderEpoch).toHaveBeenCalledWith(TOPIC, 0)
+      expect(fetchFrames()).toEqual([])
+
+      cluster.refreshMetadata.mockImplementation(async () => {
+        cluster.leaderEpoch = () => 6
+      })
+      errorCode = 0
+      await group.fetch(NODE_ID)
+
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+      expect(
+        validationRequests().map(({ topics }) => topics[0].partitions[0].currentLeaderEpoch)
+      ).toEqual([5, 6])
+      expect(fetchFrames().map(partitionsOf)).toEqual([[0]])
+    })
+
+    test('per-partition backoff: with a busy sibling partition, a failing partition is asked again no sooner than 100 ms, then 200 ms, … at most 1000 ms; a new epoch is asked at once', async () => {
+      const clock = manualClock()
+      const harness = await withBusySibling()
+      const { group, cluster, fetchFrames, validationRequests } = harness
+      harness.setValidationResponse(failPartitionZero(-1))
+      const roundAt = async (at) => {
+        clock.now = 1000 + at
+        await group.fetch(NODE_ID)
+        return validationRequests().length
+      }
+
+      const asked = []
+      for (const at of [0, 99, 100, 299, 300, 699, 700, 1499, 1500, 2499, 2500]) {
+        asked.push(await roundAt(at))
+      }
+
+      // 100, 200, 400, 800, then capped at 1000 ms after each failure.
+      expect(asked).toEqual([1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6])
+      cluster.leaderEpoch = () => 6
+      expect(await roundAt(2500)).toEqual(7)
+      // The sibling is fetched every round; the failing partition never is.
+      expect(fetchFrames().map(partitionsOf)).toEqual(Array(12).fill([1]))
+    })
+
+    test('an unexpected non-retriable answer holds that partition and keeps validating and fetching the others', async () => {
+      const harness = await createGroup({ partitions: [0, 1] })
+      const { group, cluster, fetchFrames, validationRequests } = harness
+      harness.setValidationResponse(failPartitionZero(-1)) // UNKNOWN_SERVER_ERROR
+
+      await group.fetch(NODE_ID)
+
+      expect(group.positionValidator.validatedAgainst(TOPIC, 1)).toEqual(5)
+      expect(fetchFrames().map(partitionsOf)).toEqual([[1]])
+
+      // A new leader epoch is validated for both: validation was not switched off.
+      cluster.leaderEpoch = () => 6
+      await group.fetch(NODE_ID)
+
+      expect(
+        validationRequests().map(({ topics }) =>
+          topics[0].partitions.map(({ partition }) => partition)
+        )
+      ).toEqual([
+        [0, 1],
+        [0, 1],
+      ])
+      expect(group.positionValidator.validatedAgainst(TOPIC, 1)).toEqual(6)
+      expect(fetchFrames().map(partitionsOf)).toEqual([[1], [1]])
+    })
+
+    test('TOPIC_AUTHORIZATION_FAILED on a validation answer fails the fetch round with that error; a sibling in the same answer is still validated', async () => {
+      const harness = await createGroup({ partitions: [0, 1] })
+      const { group, fetchFrames, requestRejoin } = harness
+      harness.setValidationResponse(failPartitionZero(29))
+
+      await expect(group.fetch(NODE_ID)).rejects.toMatchObject({
+        type: 'TOPIC_AUTHORIZATION_FAILED',
+        code: 29,
+      })
+
+      expect(group.positionValidator.validatedAgainst(TOPIC, 1)).toEqual(5)
+      expect(group.positionValidator.holdsFetch(TOPIC, 0)).toBe(true)
+      expect(fetchFrames()).toEqual([])
+      expect(requestRejoin).not.toHaveBeenCalled()
+    })
+
+    test('one answer with 29 for p0 and a retriable code for p1: p1 is retried in the round and validates on the next attempt, then the round fails with the 29 error, and p0 stays out of the next Fetch', async () => {
+      manualClock()
+      const harness = await createGroup({ partitions: [0, 1] })
+      const { group, fetchFrames, validationRequests } = harness
+      let attempt = 0
+      harness.setValidationResponse((partitions) => {
+        attempt += 1
+        return offsetForLeaderEpochResponse(
+          partitions.map((partition) => {
+            if (partition === 0) {
+              return { partition, errorCode: 29, leaderEpoch: -1, endOffset: '-1' }
+            }
+            return attempt === 1
+              ? { partition, errorCode: 6, leaderEpoch: -1, endOffset: '-1' }
+              : { partition, endOffset: '20' }
+          })
+        )
+      })
+
+      await expect(group.fetch(NODE_ID)).rejects.toMatchObject({ code: 29 })
+
+      expect(
+        validationRequests().map(({ topics }) =>
+          topics[0].partitions.map(({ partition }) => partition)
+        )
+      ).toEqual([[0, 1], [1]])
+      expect(group.positionValidator.validatedAgainst(TOPIC, 1)).toEqual(5)
+
+      // The clock has not moved, so partition 0 is still within its backoff.
+      await group.fetch(NODE_ID)
+
+      expect(validationRequests()).toHaveLength(2)
+      expect(fetchFrames().map(partitionsOf)).toEqual([[1]])
+    })
+
+    test('an OFFSET_OUT_OF_RANGE answer to a Fetch built before the partition became held arrives while it is held: no reset, position and committed offset unchanged', async () => {
+      const harness = await createGroup()
+      const { group, cluster, offsetManager, fetchFrames } = harness
+      // Validated against the current epoch, so the round's Fetch goes out at once.
+      group.positionValidator.markValidated(TOPIC, 0, 5)
+      harness.setValidationResponse(failPartitionZero(-1))
+      const setDefaultOffset = jest.spyOn(offsetManager, 'setDefaultOffset').mockResolvedValue()
+      let validating
+
+      // Written while the Fetch is out: the epoch moves and validation of partition 0 begins.
+      harness.setResponse(() => {
+        cluster.leaderEpoch = () => 6
+        validating = group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+        return fetchResponse([{ partition: 0, errorCode: 1 }])
+      })
+
+      await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+      await validating
+
+      expect(fetchFrames().map(partitionsOf)).toEqual([[0]])
+      expect(setDefaultOffset).not.toHaveBeenCalled()
+      expect(group.consecutiveFetchErrors.size).toEqual(0)
+      expect(offsetManager.positionOf(TOPIC, 0)).toEqual('10')
+      expect(offsetManager.committedOffsets()[TOPIC][0]).toEqual('10')
+      expect(group.positionValidator.holdsFetch(TOPIC, 0)).toBe(true)
+    })
+
+    test('after a slow in-round retry (fake time advanced past the backoff during the attempts), the same epoch is not asked again for 100 ms after exhaustion; a new epoch is asked at once; the next warning comes only after 60 s', async () => {
+      const clock = manualClock()
+      const harness = await createGroup()
+      const { group, cluster, logger, validationRequests } = harness
+      const warn = jest.spyOn(logger, 'warn')
+      const heldWarnings = () => warn.mock.calls.filter(([message]) => message === HELD_WARNING)
+      // Every attempt takes 400 ms of the monotonic clock, so three take 1200 ms.
+      harness.setValidationResponse((partitions) => {
+        clock.now += 400
+        return offsetForLeaderEpochResponse(
+          partitions.map((partition) => ({
+            partition,
+            errorCode: 6,
+            leaderEpoch: -1,
+            endOffset: '-1',
+          }))
+        )
+      })
+
+      await group.fetch(NODE_ID) // exhausted at 2200, so held until 2300
+      expect(validationRequests()).toHaveLength(3)
+      expect(heldWarnings()).toHaveLength(1)
+
+      await group.fetch(NODE_ID)
+      clock.now = 2299
+      await group.fetch(NODE_ID)
+      expect(validationRequests()).toHaveLength(3)
+
+      clock.now = 2300
+      await group.fetch(NODE_ID) // exhausted at 3500, held until 3700
+      expect(validationRequests()).toHaveLength(6)
+
+      cluster.leaderEpoch = () => 6
+      await group.fetch(NODE_ID) // a new epoch is asked within the backoff
+      expect(validationRequests()).toHaveLength(9)
+      expect(heldWarnings()).toHaveLength(1)
+
+      clock.now = 2200 + 60000
+      await group.fetch(NODE_ID)
+      expect(validationRequests()).toHaveLength(12)
+      expect(heldWarnings()).toHaveLength(2)
+      expect(heldWarnings()[1][1]).toEqual(expect.objectContaining({ partition: 0, failures: 4 }))
+    })
+
+    test('the first failure warns once with topic, partition, error and failures; a second failure within a minute does not warn; one after a minute does', async () => {
+      const clock = manualClock()
+      const harness = await createGroup()
+      const { group, logger } = harness
+      harness.setValidationResponse(failPartitionZero(-1))
+      const warn = jest.spyOn(logger, 'warn')
+
+      await group.fetch(NODE_ID)
+      clock.now += 100
+      await group.fetch(NODE_ID)
+      clock.now = 1000 + 60000
+      await group.fetch(NODE_ID)
+
+      const error = 'The server experienced an unexpected error when processing the request'
+      expect(warn.mock.calls).toEqual([
+        [
+          HELD_WARNING,
+          {
+            groupId: 'test-group',
+            memberId: group.memberId,
+            topic: TOPIC,
+            partition: 0,
+            error,
+            failures: 1,
+            heldMs: 0,
+          },
+        ],
+        [
+          HELD_WARNING,
+          {
+            groupId: 'test-group',
+            memberId: group.memberId,
+            topic: TOPIC,
+            partition: 0,
+            error,
+            failures: 3,
+            heldMs: 60000,
+          },
+        ],
+      ])
+    })
+
+    test('another partition of the same node is fetched while one is held', async () => {
+      const { group, setResponse, setValidationResponse, fetchFrames } = await withBusySibling({
+        position: '0', // the shared record batch holds offset 0
+      })
+      setValidationResponse(failPartitionZero(-1))
+      setResponse(fetchResponse([{ partition: 1, errorCode: 0, records: true }]))
+
+      const batches = await group.fetch(NODE_ID)
+
+      expect(fetchFrames().map(partitionsOf)[0]).toContain(1)
+      expect(batches.filter(({ partition }) => partition === 1)).toHaveLength(1)
+      expect(batches.find(({ partition }) => partition === 1).messages).toHaveLength(1)
+    })
+
+    test('a broker with no usable OffsetForLeaderEpoch version is fetched unvalidated with one notice', async () => {
+      const { group, logger, requests } = await createGroup({
+        validationScenario: 'unsupported-api',
+      })
+      const info = jest.spyOn(logger, 'info')
+      const warn = jest.spyOn(logger, 'warn')
+
+      const batches = await group.fetch(NODE_ID)
+
+      expect(batches).toHaveLength(1)
+      expect(validationCount(requests)).toEqual(0)
+      expect(info).toHaveBeenCalledTimes(1)
+      expect(warn).not.toHaveBeenCalled()
+      expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toEqual(5)
+    })
+
+    test('a seek of a held partition releases it at the sought position', async () => {
+      const { group, fetchFrames, fetchRequestOffsets } = await createGroup({
+        validationScenario: 'non-retriable',
+      })
+
+      await group.fetch(NODE_ID)
+      group.seek({ topic: TOPIC, partition: 0, offset: '500' })
+      await group.fetch(NODE_ID)
+
+      expect(fetchFrames().map(partitionsOf).at(-1)).toEqual([0])
+      expect(fetchRequestOffsets()).toEqual(['500'])
+    })
   })
 })

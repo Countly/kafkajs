@@ -54,16 +54,6 @@ describe('Consumer > PositionValidator', () => {
         expect(validator.validatedAgainst(TOPIC, 0)).toEqual(currentLeaderEpoch)
       }
     )
-
-    it('answers validated while disabled', () => {
-      const validator = create()
-      validator.disable()
-
-      expect(
-        validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 }).action
-      ).toEqual('validated')
-      expect(validator.isDisabled()).toBe(true)
-    })
   })
 
   describe('complete', () => {
@@ -383,7 +373,7 @@ describe('Consumer > PositionValidator', () => {
   })
 
   describe('lifetime', () => {
-    it('clear drops every key, stamps a new generation and re-arms validation', () => {
+    it('clear drops every key, held ones included, and stamps a new generation', () => {
       const validator = create()
       const observe = () =>
         validator.request('generation-probe', 0, {
@@ -393,13 +383,15 @@ describe('Consumer > PositionValidator', () => {
         }).generation
 
       validator.markValidated(TOPIC, 0, 5)
-      validator.disable()
+      validator.request(TOPIC, 1, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      validator.fail([{ topic: TOPIC, partition: 1, entry: validator.entryOf(TOPIC, 1) }], 0)
       const before = observe()
 
       validator.clear()
 
       expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
-      expect(validator.isDisabled()).toBe(false)
+      expect(validator.holdsFetch(TOPIC, 1)).toBe(false)
+      expect(validator.entryOf(TOPIC, 1)).toBeUndefined()
       expect(observe()).not.toEqual(before)
     })
 
@@ -501,6 +493,123 @@ describe('Consumer > PositionValidator', () => {
       validator.markValidated(TOPIC, 0, 5)
       validator.release([replacement])
       expect(validator.validatedAgainst(TOPIC, 0)).toBe(5)
+    })
+  })
+
+  describe('held partitions', () => {
+    /** Puts partition 0 into awaiting under leader epoch 5 and returns its item. */
+    const awaitingItem = (validator, partition = 0) => {
+      validator.request(TOPIC, partition, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      return {
+        topic: TOPIC,
+        partition,
+        currentLeaderEpoch: 5,
+        entry: validator.entryOf(TOPIC, partition),
+      }
+    }
+
+    it('fail holds a pending entry with backoff, only for the same entry object', () => {
+      const validator = create()
+      const item = awaitingItem(validator)
+
+      expect(validator.fail([item], 1000)).toEqual([item])
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(false)
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(true)
+      expect(validator.entryOf(TOPIC, 0)).toMatchObject({
+        failures: 1,
+        retryAt: 1100,
+        failedAgainst: 5,
+        heldSince: 1000,
+      })
+
+      // A new request for the same partition carries the episode on: 200, 400, 800, then 1000 ms.
+      const backoffs = []
+      for (let now = 2000; now < 7000; now += 1000) {
+        const next = awaitingItem(validator)
+        validator.fail([next], now)
+        backoffs.push(validator.entryOf(TOPIC, 0).retryAt - now)
+      }
+      expect(backoffs).toEqual([200, 400, 800, 1000, 1000])
+      expect(validator.entryOf(TOPIC, 0)).toMatchObject({ failures: 6, heldSince: 1000 })
+
+      // A replaced entry is not touched by a late failure of the one it replaced.
+      const stale = awaitingItem(validator)
+      validator.forgetTopic(TOPIC, [0])
+      const fresh = awaitingItem(validator)
+      expect(validator.fail([stale], 9000)).toEqual([])
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
+      expect(fresh.entry.failures).toEqual(0)
+    })
+
+    it('confirm validates only the same entry object', () => {
+      const validator = create()
+      const stale = awaitingItem(validator)
+      validator.forgetTopic(TOPIC, [0])
+      const fresh = awaitingItem(validator)
+
+      validator.confirm(stale)
+      expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
+
+      validator.confirm(fresh)
+      expect(validator.validatedAgainst(TOPIC, 0)).toEqual(5)
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(false)
+    })
+
+    it('holdsFetch is true while awaiting and held, false when validated or forgotten', () => {
+      const validator = create()
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(false)
+
+      const item = awaitingItem(validator)
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(true)
+
+      validator.fail([item], 0)
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(true)
+
+      validator.markValidated(TOPIC, 0, 5)
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(false)
+
+      awaitingItem(validator, 1)
+      validator.forgetPartitions([{ topic: TOPIC, partitions: [1] }])
+      expect(validator.holdsFetch(TOPIC, 1)).toBe(false)
+    })
+
+    it.each([
+      ['truncated', '5'],
+      ['reset', '-1'],
+    ])('complete leaves a %s outcome held', (action, endOffset) => {
+      const validator = create()
+      const { generation } = validator.request(TOPIC, 0, {
+        offset: '10',
+        trackedEpoch: 4,
+        currentLeaderEpoch: 5,
+      })
+
+      expect(
+        validator.complete(TOPIC, 0, position('10', 4), {
+          errorCode: 0,
+          endOffset,
+          leaderEpoch: 4,
+          seekQueued: false,
+          generation,
+        }).action
+      ).toEqual(action)
+
+      expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(false)
+      expect(validator.holdsFetch(TOPIC, 0)).toBe(true)
+    })
+
+    it('needsValidation honours the backoff for the same epoch and not for a new epoch', () => {
+      const validator = create()
+      validator.fail([awaitingItem(validator)], 1000)
+
+      expect(validator.needsValidation(TOPIC, 0, 5, 1099)).toBe(false)
+      expect(validator.needsValidation(TOPIC, 0, 5, 1100)).toBe(true)
+      expect(validator.needsValidation(TOPIC, 0, 6, 1000)).toBe(true)
+      // A partition validated since needs nothing at its epoch, whatever the clock says.
+      validator.markValidated(TOPIC, 0, 5)
+      expect(validator.needsValidation(TOPIC, 0, 5, 0)).toBe(false)
     })
   })
 })

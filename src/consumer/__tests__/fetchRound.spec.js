@@ -371,7 +371,7 @@ function oracleBuildFetchRequests(topicPartitions) {
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          !this.positionValidator.isAwaiting(topic, partition) &&
+          !this.positionValidator.holdsFetch(topic, partition) &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -493,7 +493,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        positionValidator: { isAwaiting: coin(2) },
+        positionValidator: { holdsFetch: coin(2) },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
@@ -523,7 +523,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { holdsFetch: () => false },
     })
     const route = () => group.filterPartitionsByNode(1, state.assigned())[0].partitions
     const fetched = () =>
@@ -590,7 +590,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { holdsFetch: () => false },
       cluster: { leaderEpoch: () => 0 },
     })
     const parts = assignment.map(({ topic }) => ({
