@@ -1173,3 +1173,128 @@ describe('polling enrollment and recovery publication', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 })
+
+describe('replay latch', () => {
+  const {
+    currentDeadline,
+    currentMutation,
+    endsCall,
+    isAnsweredError,
+    retrierOf,
+    runWithDeadline,
+    settleMutations,
+    wrapAdmin,
+  } = require('../deadline')
+  const { DeleteGroups } = require('../../protocol/requests/apiKeys')
+  const { createErrorFromCode } = require('../../protocol/error')
+  const { attachResponseSource } = require('../../network/failureSource')
+  const { KafkaJSUnknownOutcomeError, KafkaJSPartialMessageError } = require('../../errors')
+
+  /** Creates a built request without involving a different invocation. */
+  const request = (groupId) => ({
+    request: { apiKey: DeleteGroups, apiName: 'DeleteGroups', apiVersion: 3 },
+    args: [groupId],
+  })
+
+  /** Writes the named item through the latch's private transport hook. */
+  const write = (groupId) => {
+    const latch = currentMutation().latch(request(groupId), 0)
+    latch.request.onWrite()
+    return latch
+  }
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  it('a nested public admin call can write both a different item and the same item', async () => {
+    const calls = []
+    const admin = wrapAdmin(
+      {
+        outer: async () => {
+          const latch = write('first')
+          latch.request.onDecoded()
+          calls.push(currentDeadline())
+          await admin.inner({ groupId: 'second' })
+          await admin.inner({ groupId: 'first' })
+          expect(() => write('first')).toThrow('an earlier request of this call')
+        },
+        inner: async ({ groupId }) => {
+          calls.push(currentDeadline())
+          write(groupId).request.onDecoded()
+        },
+      },
+      { outer: 0, inner: 0 },
+      100
+    )
+    await admin.outer()
+    expect(calls).toEqual([calls[0], calls[0], calls[0]])
+  })
+
+  it('a second write within one invocation is refused', async () => {
+    await runWithDeadline('deleteGroups', 100, () => {
+      write('first').request.onDecoded()
+      expect(() => write('first')).toThrow('an earlier request of this call')
+    })
+  })
+
+  it('a send that fails before its write leaves no record and the retry sends once', async () => {
+    const error = new KafkaJSError('dial failed')
+    await runWithDeadline('deleteGroups', 100, () => {
+      const unsent = currentMutation().latch(request('first'), 0)
+      expect(unsent.failed(error)).toBe(error)
+      write('first').request.onDecoded()
+      expect(() => write('first')).toThrow('an earlier request of this call')
+    })
+  })
+
+  it('a decoded error of a written request and a replay refusal end the retries unwrapped', async () => {
+    await runWithDeadline('deleteGroups', 100, async () => {
+      const latch = write('first')
+      latch.request.onDecoded()
+      const answered = createErrorFromCode(41)
+      expect(latch.failed(answered)).toBe(answered)
+      const retry = retrierOf({ retries: 1 })
+      const action = jest.fn(async () => { throw answered })
+      await expect(retry(action)).rejects.toBe(answered)
+      expect(action).toHaveBeenCalledTimes(1)
+      const replay = jest.fn(async () => write('first'))
+      await expect(retry(replay)).rejects.toMatchObject({ cause: answered })
+      expect(replay).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('latch.failed counts a broker code thrown inside decode() as an answer and a malformed body as an unknown outcome', async () => {
+    await runWithDeadline('deleteGroups', 100, () => {
+      const answered = createErrorFromCode(35)
+      attachResponseSource(answered, DeleteGroups)
+      expect(write('first').failed(answered)).toBe(answered)
+      expect(isAnsweredError(answered)).toBe(true)
+      const malformed = new KafkaJSPartialMessageError('incomplete response')
+      attachResponseSource(malformed, DeleteGroups)
+      const failure = write('second').failed(malformed)
+      expect(failure).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+      expect(failure.cause).toBe(malformed)
+      expect(endsCall(failure)).toBe(true)
+    })
+  })
+
+  it('settleMutations orders deadline or close, unknown, final decoded, retry candidate, whatever the input and completion order', async () => {
+    await runWithDeadline('deleteGroups', 100, async () => {
+      const retry = new KafkaJSError('dial failed')
+      const latch = write('answered')
+      latch.request.onDecoded()
+      const answered = latch.failed(createErrorFromCode(41))
+      const unknown = write('lost').failed(new KafkaJSError('lost'))
+      for (const reasons of [[retry, answered, unknown], [unknown, answered, retry]]) {
+        await expect(settleMutations(reasons.map((error) => Promise.reject(error))))
+          .rejects.toBe(unknown)
+      }
+      await expect(settleMutations([Promise.reject(retry), Promise.reject(answered)]))
+        .rejects.toBe(answered)
+      const deadline = currentDeadline()
+      const close = new KafkaJSError('closed')
+      deadline.stop(close)
+      await expect(settleMutations([Promise.reject(unknown)])).rejects.toBe(close)
+    }).catch((error) => expect(error.message).toBe('closed'))
+  })
+})
