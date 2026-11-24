@@ -1,6 +1,11 @@
 const Runner = require('../runner')
 const ConsumerGroup = require('../consumerGroup')
 const Batch = require('../batch')
+const createWorker = require('../worker')
+const createWorkerQueue = require('../workerQueue')
+const {
+  events: { START_BATCH_PROCESS, END_BATCH_PROCESS },
+} = require('../instrumentationEvents')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger, secureRandom, waitFor } = require('testHelpers')
 const sleep = require('../../utils/sleep')
@@ -1471,6 +1476,207 @@ describe('Consumer > Runner', () => {
       )
       expect(round.guard()).toMatchObject({ type: 'CONSUMER_STOPPING' })
       expect(consumerGroup.rebalanceHooks.retire).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('a queued batch of a paused partition', () => {
+    let paused, handled, gate
+
+    const batchOf = (partitionId, offsets, fetchedOffset = offsets[0]) =>
+      new Batch(topicName, fetchedOffset, {
+        partition: partitionId,
+        highWatermark: 100,
+        messages: offsets.map((offset) => ({ offset: String(offset), key: 'k', value: 'v' })),
+      })
+
+    const pauseOf = (...partitions) => consumerGroup.pause([{ topic: topicName, partitions }])
+
+    /** A handler that records what it is given and holds partitions 0 and 2 until `gate` opens. */
+    const recordingHandler = () =>
+      jest.fn(async ({ partition: partitionId, message, batch }) => {
+        const id = partitionId ?? batch.partition
+        handled.push({ partition: id, offset: message?.offset })
+        if (id !== 1) await gate.promise
+      })
+
+    const start = async (partial) => {
+      runner = createTestRunner(partial)
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+    }
+
+    /** The queue and workers the fetch manager gives a runner, over its real `handleBatch`. */
+    const queueWith = (workerCount) =>
+      createWorkerQueue({
+        workers: Array.from({ length: workerCount }, (_, workerId) =>
+          createWorker({ handler: (batch) => runner.handleBatch(batch), workerId })
+        ),
+      })
+
+    const until = async (condition) => {
+      for (let turns = 0; turns < 500 && !condition(); turns++) {
+        await new Promise(setImmediate)
+      }
+      if (!condition()) throw new Error('the schedule never reached its hold point')
+    }
+
+    const resolvedOf = (partitionId) =>
+      consumerGroup.resolveOffset.mock.calls
+        .map(([resolved]) => resolved)
+        .filter((resolved) => resolved.partition === partitionId)
+        .map(({ offset }) => offset)
+
+    beforeEach(() => {
+      paused = new Set()
+      handled = []
+      let open
+      gate = { promise: new Promise((resolve) => (open = resolve)), open: () => open() }
+      consumerGroup.pause = jest.fn((topicPartitions) => {
+        for (const { topic, partitions } of topicPartitions) {
+          for (const p of partitions) paused.add(`${topic}|${p}`)
+        }
+      })
+      consumerGroup.resume = jest.fn((topicPartitions) => {
+        for (const { topic, partitions } of topicPartitions) {
+          for (const p of partitions) paused.delete(`${topic}|${p}`)
+        }
+      })
+      consumerGroup.isPaused = jest.fn((topic, p) => paused.has(`${topic}|${p}`))
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+    })
+
+    it.each([
+      ['eachMessage', (handler) => ({ eachBatch: undefined, eachMessage: handler })],
+      ['eachBatch', (handler) => ({ eachBatch: handler })],
+    ])(
+      "pause p1 while p0's handler runs: p1's queued batch reaches no handler and resolves nothing with %s",
+      async (_name, handlers) => {
+        await start(handlers(recordingHandler()))
+        const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+        await until(() => handled.length === 1)
+
+        pauseOf(1)
+        gate.open()
+        await done
+
+        expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
+        expect(resolvedOf(1)).toEqual([])
+      }
+    )
+
+    it("after resume, p1's records are delivered once, in order, from the unchanged position", async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const queue = queueWith(1)
+      const first = queue.push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 1)
+      pauseOf(1)
+      gate.open()
+      await first
+
+      consumerGroup.resume([{ topic: topicName, partitions: [1] }])
+      await queue.push(batchOf(1, [4, 5]))
+
+      const delivered = handled.filter(({ partition: id }) => id === 1).map(({ offset }) => offset)
+      expect(delivered).toEqual(['4', '5'])
+      expect(resolvedOf(1)).toEqual(['4', '5'])
+    })
+
+    it('concurrency 2 with two other partitions blocked keeps p1 queued, and a pause keeps it from a handler', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(2).push(batchOf(0, [4]), batchOf(2, [4]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 2)
+
+      pauseOf(1)
+      gate.open()
+      await done
+
+      expect(handled.map(({ partition: id }) => id).sort()).toEqual([0, 2])
+      expect(resolvedOf(1)).toEqual([])
+    })
+
+    describe('a start_batch_process listener that pauses the partition', () => {
+      /** Pauses the partition of the first batch that starts, and records the events in order. */
+      const pauseOnStart = () => {
+        const events = []
+        instrumentationEmitter.addListener(START_BATCH_PROCESS, ({ payload }) => {
+          events.push('start')
+          if (events.length === 1) pauseOf(payload.partition)
+        })
+        instrumentationEmitter.addListener(END_BATCH_PROCESS, () => events.push('end'))
+        return events
+      }
+
+      it('keeps the batch from the handler, and end_batch_process still fires', async () => {
+        const eachMessage = jest.fn()
+        await start({ eachBatch: undefined, eachMessage })
+        const events = pauseOnStart()
+
+        await runner.handleBatch(batchOf(1, [4, 5]))
+
+        expect(eachMessage).not.toHaveBeenCalled()
+        expect(resolvedOf(1)).toEqual([])
+        expect(events).toEqual(['start', 'end'])
+      })
+
+      it('resolves nothing for a control-only batch while paused, and moves past the record after resume', async () => {
+        await start()
+        pauseOnStart()
+        const control = () =>
+          new Batch(topicName, '5', {
+            partition: 1,
+            highWatermark: 100,
+            messages: [{ offset: '5', isControlRecord: true }],
+          })
+
+        await runner.handleBatch(control())
+        expect(resolvedOf(1)).toEqual([])
+
+        consumerGroup.resume([{ topic: topicName, partitions: [1] }])
+        await runner.handleBatch(control())
+        expect(resolvedOf(1)).toEqual(['5'])
+      })
+
+      it('resolves nothing for a batch whose records are all below the fetch offset', async () => {
+        await start()
+        pauseOnStart()
+        const compacted = () =>
+          new Batch(topicName, '10', {
+            partition: 1,
+            highWatermark: 100,
+            messages: [{ offset: '3', key: 'k', value: 'v' }],
+          })
+
+        await runner.handleBatch(compacted())
+        expect(resolvedOf(1)).toEqual([])
+
+        consumerGroup.resume([{ topic: topicName, partitions: [1] }])
+        await runner.handleBatch(compacted())
+        expect(resolvedOf(1)).toEqual(['10'])
+      })
+    })
+
+    it('does not stop a handler that already runs: eachMessage stops after the current message', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(1).push(batchOf(0, [4, 5]))
+      await until(() => handled.length === 1)
+
+      pauseOf(0)
+      gate.open()
+      await done
+
+      expect(handled.map(({ offset }) => offset)).toEqual(['4'])
+      expect(resolvedOf(0)).toEqual(['4'])
+    })
+
+    it('admits and delivers the batch as today for a group double without isPaused', async () => {
+      delete consumerGroup.isPaused
+      const handler = jest.fn()
+      await start({ eachBatch: handler })
+
+      await runner.handleBatch(batchOf(1, [4, 5]))
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(resolvedOf(1)).toEqual(['5'])
     })
   })
 })
