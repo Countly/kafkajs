@@ -1,5 +1,6 @@
 const Cluster = require('../../../cluster')
 const Connection = require('../../../network/connection')
+const { ShareAckLedger } = require('../shareAckLedger')
 const { ShareRun } = require('../shareRun')
 const { LEVELS } = require('../../../loggers')
 const {
@@ -300,37 +301,70 @@ describe('bounded share consumer stop', () => {
     await until(() => stopping.settled, 'the stop within the request timeout')
     expect(stopping.error).toBeNull()
     expect(rig.finals().map(({ node }) => node)).toEqual([0])
+    expect(rig.finals()[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+    ])
+    expect(rig.model.acquisitionsOf(A, 0, 0).map(({ state }) => state)).toEqual(['ACKNOWLEDGED'])
     expect(rig.closesOf(busy.call)).toBe(1)
     expect(rig.model.sessions()).toEqual([])
   })
 
   test('stop freezes once at half the request timeout: the idle node finals, the busy node is closed, and the member leaves', async () => {
-    rig = new BoundRig({ nodes: 3 })
+    rig = new BoundRig({ nodes: 4 })
+    const lookup = rig.gate()
+    let entered = 0
     const findBroker = Cluster.prototype.findBroker
-    jest.spyOn(Cluster.prototype, 'findBroker').mockImplementation(function (args) {
-      if (args.nodeId === 2) return new Promise(() => {})
-      return findBroker.call(this, args)
-    })
+    jest.spyOn(Cluster.prototype, 'findBroker').mockImplementation(
+      /** @this {Cluster} @param {object} args Broker lookup options. @returns {Promise<object>} */
+      async function (args) {
+        if (args.nodeId === 2) {
+          entered++
+          await lookup.promise
+        }
+        return findBroker.call(this, args)
+      }
+    )
     const busy = rig.holdFetch(1)
-    await rig.begin()
+    const answeredDuringDrain = rig.holdFetch(3)
+    const handled = jest.fn(async () => {})
+    await rig.begin(handled)
     await rig.advanceUntil(
-      () => rig.established(0) && busy.call !== null,
-      'an established idle node and a held fetch'
+      () => rig.established(0) && busy.call !== null && answeredDuringDrain.call !== null,
+      'an established idle node and two held fetches'
     )
     await flush()
+    expect(entered).toBe(1)
+    const drive = track(rig.run.nodes.get(2).drive)
     const stopping = track(rig.h.consumer.stop())
+    answeredDuringDrain.release(fetchAnswer([acquire(3, 0, ['after stop'])]))
     await rig.clock.advance(DRAIN - 1)
+    expect(handled).not.toHaveBeenCalled()
+    expect(rig.model.acquisitionsOf(A, 3, 0).map(({ state }) => state)).toEqual(['ACQUIRED'])
     expect(rig.finals()).toHaveLength(0)
     expect(rig.closesOf(busy.call)).toBe(0)
     expect(stopping.settled).toBe(false)
+    expect(drive.settled).toBe(false)
     await rig.clock.advance(1)
     await until(() => stopping.settled, 'the stop at the drain bound')
-    expect(rig.finals().map(({ node }) => node)).toEqual([0])
-    expect(rig.finals()[0].answeredOrder).toBeDefined()
+    const finalNodes = rig.finals().map(({ node }) => node)
+    expect(finalNodes.sort()).toEqual([0, 3])
+    const release = rig.finals().find(({ node }) => node === 3)
+    expect(release.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [2] },
+    ])
+    expect(rig.model.acquisitionsOf(A, 3, 0).map(({ state }) => state)).toEqual(['AVAILABLE'])
     expect(rig.closesOf(busy.call)).toBe(1)
     expect(rig.model.session(1, rig.member())).toBeNull()
     expect(rig.leaves()).toHaveLength(1)
+    for (const final of rig.finals())
+      expect(rig.leaves()[0].order).toBeGreaterThan(final.answeredOrder)
+    expect(rig.leaves()[0].answeredOrder).toBeGreaterThan(rig.leaves()[0].order)
+    expect(drive).toEqual({ settled: true, error: null })
+    const closes = rig.closes.slice()
+    lookup.resolve()
+    await flush()
     expect(rig.h.cluster.requests().filter(({ node }) => node === 2)).toEqual([])
+    expect(rig.closes).toEqual(closes)
     expect(rig.model.sessions()).toEqual([])
   })
 
@@ -353,6 +387,19 @@ describe('bounded share consumer stop', () => {
     await rig.advanceUntil(() => rig.established(0), 'the session')
     await flush()
     const final = rig.holdFinal()
+    const blocked = rig.gate()
+    const drain = Connection.prototype.drain
+    let connection
+    jest.spyOn(Connection.prototype, 'drain').mockImplementation(
+      /** @this {Connection} @param {number} timeout Drain budget. @returns {Promise<void>} */
+      async function (timeout) {
+        if (timeout === 0 && final.call && this.socket === rig.socketOf(final.call)) {
+          connection = this
+          await blocked.promise
+        }
+        return drain.call(this, timeout)
+      }
+    )
     const stopping = track(rig.h.consumer.stop())
     await rig.advanceUntil(() => final.call !== null, 'the held final')
     await rig.clock.advance(rig.run.closing.finalDeadline - rig.now() - 1)
@@ -360,19 +407,30 @@ describe('bounded share consumer stop', () => {
     expect(rig.closesOf(final.call)).toBe(0)
     await rig.clock.advance(1)
     await until(() => stopping.settled, 'the capped stop')
+    const socket = rig.socketOf(final.call)
+    expect(connection.socket).toBe(socket)
+    expect(connection.isConnected()).toBe(true)
+    expect(socket.destroyed).toBe(false)
     expect(rig.closesOf(final.call)).toBe(1)
     expect(rig.leaves()).toHaveLength(0)
     expect(rig.skipped('close-deadline')).toBe(1)
+    blocked.resolve()
+    await until(() => socket.destroyed, 'the original socket closing')
   })
 
   test('a clean stop keeps no connection to an unfinished share session', async () => {
     rig = new BoundRig({ nodes: 3 })
-    const busy = rig.holdFetch(2)
+    const opening = rig.h.cluster.holdReply({
+      api: 'ShareFetch',
+      node: 2,
+      match: ({ fields }) => fields.shareSessionEpoch === 0,
+    })
     await rig.begin()
-    await rig.advanceUntil(
-      () => rig.established(0) && rig.established(1) && busy.call !== null,
-      'two idle sessions and a held fetch'
-    )
+    await rig.advanceUntil(() => rig.established(0) && rig.established(1), 'two idle sessions')
+    const busy = await opening.executed()
+    expect(busy.answeredOrder).toBeUndefined()
+    expect(rig.run.nodes.get(2).session.epoch).toBe(0)
+    expect(rig.model.session(2, rig.member()).generation).toBe(busy.generation)
     await flush()
     const stopping = track(rig.h.consumer.stop())
     await rig.clock.advance(DRAIN)
@@ -383,7 +441,7 @@ describe('bounded share consumer stop', () => {
       expect(final.answeredOrder).toBeDefined()
       expect(rig.closesOf(final)).toBe(0)
     }
-    expect(rig.closesOf(busy.call)).toBe(1)
+    expect(rig.closesOf(busy)).toBe(1)
     expect(rig.model.sessions()).toEqual([])
   })
 
@@ -522,46 +580,140 @@ describe('bounded share consumer stop', () => {
   test("a flush still queued after a node's drive ended keeps that node busy until the drain ends", async () => {
     rig = new BoundRig()
     rig.serve()
-    const flushHeld = rig.h.hold({
+    const renewal = rig.h.hold({
       api: 'ShareAcknowledge',
       match: ({ fields }) => fields.shareSessionEpoch > 0,
     })
-    await rig.begin(async () => {
+    const thrown = rig.gate()
+    await rig.begin(async ({ renew }) => {
+      renew()
+      await thrown.promise
       throw new Error('handler failed')
     })
-    const held = await flushHeld.arrived()
+    const held = await renewal.arrived()
+    expect(held.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [4] },
+    ])
+    const { session, drive } = rig.run.nodes.get(0)
+    thrown.resolve()
+    await until(() => session.queue.length === 1, 'the release flush behind the renewal')
+    const driving = track(drive)
     const stopping = track(rig.h.consumer.stop())
     await rig.clock.advance(DRAIN - 1)
+    expect(driving).toEqual({ settled: true, error: null })
+    expect(session.queue).toHaveLength(1)
     expect(rig.closesOf(held)).toBe(0)
     expect(stopping.settled).toBe(false)
     await rig.clock.advance(1)
     await until(() => stopping.settled, 'the stop at the drain bound')
     expect(rig.closesOf(held)).toBe(1)
-    expect(rig.finals()).toHaveLength(0)
+    expect(rig.h.frames(79)).toEqual([held])
     expect(rig.model.sessions()).toEqual([])
+    expect(rig.model.acquisitionsOf(A, 0, 0).map(({ state }) => state)).toEqual(['AVAILABLE'])
   })
 
-  test('an escalation during the handler wait skips the drain', async () => {
-    rig = new BoundRig({ nodes: 2 })
+  test('a broker fence during the handler wait skips the drain and the leave', async () => {
+    rig = new BoundRig({ nodes: 2, interval: 50 })
     rig.serve((node) => node === 0)
     const held = rig.gate()
     const busy = rig.holdFetch(1)
+    const heartbeat = rig.h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch > 0,
+    })
     let started = false
     await rig.begin(async () => {
       started = true
       await held.promise
     })
-    await rig.advanceUntil(() => started && busy.call !== null, 'the handler and the held fetch')
+    await rig.advanceUntil(
+      () => started && busy.call !== null && heartbeat.call !== null,
+      'the handler, held fetch and steady heartbeat'
+    )
     const stopping = track(rig.h.consumer.stop())
     await flush()
     const episode = rig.run.closing
-    const crashed = rig.run.crash(new Error('terminal'))
-    expect(episode.frozen).toBe(true)
+    expect(stopping.settled).toBe(false)
+    heartbeat.release({ errorCode: 110 })
     await until(() => stopping.settled, 'the escalated stop without a timer')
-    await crashed
+    expect(heartbeat.call.answeredOrder).toBeGreaterThan(heartbeat.call.order)
+    expect(episode.frozen).toBe(true)
     expect(episode.drainGate).toBeUndefined()
     expect(rig.finals().map(({ node }) => node)).toEqual([0])
+    expect(rig.closesOf(busy.call)).toBe(1)
+    await rig.clock.advance(REQUEST_TIMEOUT)
+    expect(rig.leaves()).toEqual([])
+    expect(rig.joins()).toHaveLength(1)
   })
+
+  test('a stop from a lock expiry listener releases the live batch records before handler admission', async () => {
+    rig = new BoundRig()
+    rig.h.cluster.answer('ShareFetch', (fields) =>
+      fields.shareSessionEpoch === 0
+        ? fetchAnswer([acquire(0, 0, ['expired', 'live'])])
+        : echo('ShareFetch', fields)
+    )
+    const canStart = ShareAckLedger.prototype.canStart
+    jest.spyOn(ShareAckLedger.prototype, 'canStart').mockImplementation(
+      /** @this {ShareAckLedger} @param {string} offset @param {number} now @returns {boolean} */
+      function (offset, now) {
+        return offset !== '0' && canStart.call(this, offset, now)
+      }
+    )
+    const handled = jest.fn(async () => {})
+    const expired = []
+    let stopping
+    rig.h.consumer.on(rig.h.consumer.events.LOCK_EXPIRED, ({ payload }) => {
+      expired.push(payload)
+      stopping ??= track(rig.h.consumer.stop())
+    })
+    await rig.h.consumer.subscribe({ topics: ['topic-a'] })
+    await rig.h.consumer.run({ eachBatch: handled })
+    await until(() => stopping?.settled, 'the stop from the expiry listener')
+    expect(expired).toEqual([
+      { topic: 'topic-a', partition: 0, offsets: ['0'], stage: 'before-handler' },
+    ])
+    expect(handled).not.toHaveBeenCalled()
+    const [final] = rig.finals()
+    expect(rig.finals()).toHaveLength(1)
+    expect(final.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '1', lastOffset: '1', acknowledgeTypes: [2] },
+    ])
+    expect(rig.model.acquisitionsOf(A, 0, 1).map(({ state }) => state)).toEqual(['AVAILABLE'])
+    const written = rig.h.frames(76, 78, 79)
+    await rig.clock.advance(REQUEST_TIMEOUT)
+    expect(rig.h.frames(76, 78, 79)).toEqual(written)
+  })
+
+  test.each(['stop', 'disconnect'])(
+    'a crash releases its resources before a pending restart decision and %s allows a fresh run',
+    async (method) => {
+      const deciding = deferred()
+      const retry = { restartOnFailure: jest.fn(() => deciding.promise) }
+      rig = new BoundRig({ share: { retry } })
+      rig.gates.push({ resolve: () => deciding.resolve(false) })
+      await rig.begin()
+      await rig.advanceUntil(() => rig.established(0), 'the crashed run session')
+      await flush()
+      const { run } = rig
+      const routing = run.options.cluster.metadataCache.routingListeners
+      const listeners = routing.size
+      if (method === 'disconnect') run.stop()
+      const crashed = track(run.crash(new Error('terminal')))
+      await until(() => retry.restartOnFailure.mock.calls.length === 1, 'the pending verdict')
+      expect(crashed.settled).toBe(false)
+      expect(run.finished).toBe(true)
+      expect([run.nodes.size, run.detached.size, run.assignment.size]).toEqual([0, 0, 0])
+      expect(routing.size).toBe(listeners - 1)
+      await rig.h.consumer[method]()
+      await rig.begin()
+      expect(rig.runs).toHaveLength(2)
+      expect(rig.joins()).toHaveLength(2)
+      deciding.resolve(true)
+      await until(() => crashed.settled, 'the old verdict being discarded')
+      expect(rig.runs[1].runner.current).toBe(rig.runs[1])
+    }
+  )
 
   test('stop during the first join resolves and writes nothing after it', async () => {
     rig = new BoundRig()
@@ -604,6 +756,39 @@ describe('bounded share consumer stop', () => {
     expect(rig.finals()).toHaveLength(0)
   })
 
+  test('stop during an invalid epoch backoff closes the broker session on the replacement socket', async () => {
+    rig = new BoundRig()
+    const execute = jest.spyOn(rig.model, 'execute')
+    await rig.begin()
+    await rig.advanceUntil(() => rig.established(0), 'the first data session')
+    const [first] = rig.h.frames(78)
+    rig.h.cluster.brokerDisconnect(0, first.generation)
+    await rig.advanceUntil(
+      () => rig.established(0) && rig.model.session(0, rig.member())?.generation > first.generation,
+      'the reopened session on the replacement socket'
+    )
+    const { session, loop } = rig.run.nodes.get(0)
+    const remote = rig.model.session(0, rig.member())
+    const next = rig.holdFetch(0)
+    session.epoch = remote.epoch + 1
+    session.resetStreak = 1
+    await rig.advanceUntil(() => next.call !== null, 'the mismatched incremental fetch')
+    expect(next.call.fields.shareSessionEpoch).toBe(remote.epoch + 1)
+    next.release()
+    await until(() => session.epoch === 0 && loop.retryTime !== null, 'the invalid epoch backoff')
+    const index = execute.mock.calls.findIndex(([record]) => record === next.call)
+    expect(execute.mock.results[index].value.errorCode).toBe(123)
+    expect(rig.model.session(0, rig.member())).toEqual(remote)
+    expect(next.call.generation).toBe(remote.generation)
+    const oldCloses = rig.closesOf(first)
+    const stopping = track(rig.h.consumer.stop())
+    await until(() => stopping.settled, 'the stop during backoff')
+    expect(rig.finals()).toEqual([])
+    expect(rig.closesOf(first)).toBe(oldCloses)
+    expect(rig.closesOf(next.call)).toBe(1)
+    expect(rig.model.session(0, rig.member())).toBeNull()
+  })
+
   test('a current node whose drive already ended when admission stopped still sends its final', async () => {
     rig = new BoundRig({ nodes: 2 })
     const busy = rig.holdFetch(1)
@@ -631,10 +816,23 @@ describe('bounded share consumer stop', () => {
     const final = rig.holdFinal()
     const cluster = rig.holdClusterDisconnect()
     const node = rig.run.nodes.get(0)
+    const writeFinal = node.loop.writeFinal
+    jest.spyOn(node.loop, 'closeSocket').mockImplementation(() => {})
+    jest.spyOn(node.loop, 'writeFinal').mockImplementation(
+      /**
+       * @param {object} operation The capped operation.
+       * @param {Function} guard The original final guard.
+       * @param {object} captured The captured final.
+       * @returns {Promise<void>}
+       */
+      (operation, guard, captured) =>
+        writeFinal.call(node.loop, operation, guard, captured, () => {})
+    )
     const closing = track(rig.h.consumer.disconnect())
     await rig.advanceUntil(() => final.call !== null, 'the held final')
     const drive = track(node.drive)
     await until(() => drive.settled, 'the settled drive')
+    node.captured = null
     await rig.clock.advance(rig.run.closing.finalDeadline - rig.now() - 1)
     expect(rig.closesOf(final.call)).toBe(0)
     await rig.clock.advance(1)
@@ -679,12 +877,12 @@ describe('bounded stop with a detached node record', () => {
    * Revokes the node's only partition, holds the final its drive then sends mid-run, and restores
    * the partition, so the ended record is detached while a replacement record takes the node.
    * @param {object} [options] Fixture options.
-   * @param {boolean} [options.stopAtRestore=false] Stop the run in the tick the replacement record
-   *   is created, before it can bind a connection.
-   * @returns {Promise<{final: object, stopping: object|null, stoppedAt: number|null}>} The held
-   *   mid-run final, and the stop started at the restore (if any) with its clock reading.
+   * @param {boolean} [options.stopAtRestore=false] Stop as the replacement record is created.
+   * @param {boolean} [options.holdLookup=false] Hold the replacement before it binds a socket.
+   * @returns {Promise<{final: object, original: object, stopping: object|null, stoppedAt: number|null}>}
+   *   The held final, its node record and any stop started at restore.
    */
-  const detachHeldFinal = async ({ stopAtRestore = false } = {}) => {
+  const detachHeldFinal = async ({ stopAtRestore = false, holdLookup = false } = {}) => {
     rig = new BoundRig({ interval: 50 })
     let next = null
     rig.h.script(
@@ -706,14 +904,30 @@ describe('bounded stop with a detached node record', () => {
     let stopping = null
     let stoppedAt = null
     let restoring = false
-    const startNode = ShareRun.prototype.startNode
-    jest.spyOn(ShareRun.prototype, 'startNode').mockImplementation(function (...args) {
-      startNode.apply(this, args)
-      if (stopAtRestore && next === null && restoring && stopping === null) {
-        stoppedAt = performance.now()
-        stopping = track(rig.h.consumer.stop())
-      }
-    })
+    if (stopAtRestore) {
+      const startNode = ShareRun.prototype.startNode
+      jest.spyOn(ShareRun.prototype, 'startNode').mockImplementation(
+        /** @this {ShareRun} @param {...*} args Original node start arguments. @returns {void} */
+        function (...args) {
+          startNode.apply(this, args)
+          if (restoring && stopping === null) {
+            stoppedAt = performance.now()
+            stopping = track(rig.h.consumer.stop())
+          }
+        }
+      )
+    }
+    if (holdLookup) {
+      const lookup = rig.gate()
+      const findBroker = Cluster.prototype.findBroker
+      jest.spyOn(Cluster.prototype, 'findBroker').mockImplementation(
+        /** @this {Cluster} @param {object} args Broker lookup options. @returns {Promise<object>} */
+        async function (args) {
+          if (restoring && args.nodeId === 0) await lookup.promise
+          return findBroker.call(this, args)
+        }
+      )
+    }
     const final = rig.holdFinal()
     await rig.begin()
     await rig.advanceUntil(() => rig.established(0), 'the session')
@@ -722,14 +936,20 @@ describe('bounded stop with a detached node record', () => {
     await rig.advanceUntil(() => final.call !== null, 'the held mid-run final')
     restoring = true
     next = 'restore'
-    await rig.advanceUntil(() => rig.run.nodes.get(0) !== original, 'the replacement record')
-    return { final, stopping, stoppedAt }
+    await rig.advanceUntil(
+      () => next === null && rig.run.assignmentSnapshot()[0]?.partitions.includes(0),
+      'the restored assignment'
+    )
+    return { final, original, stopping, stoppedAt }
   }
 
   test('after revoke and restore with the old request held, stop ends within the request timeout', async () => {
-    await detachHeldFinal()
-    await rig.advanceUntil(() => rig.established(0), 'the replacement session')
+    const { final, original } = await detachHeldFinal()
     await flush()
+    expect(original.ended).toBe(true)
+    expect(final.call.executedOrder).toBeUndefined()
+    const oldDrive = track(original.drive)
+    expect(oldDrive.settled).toBe(false)
     const stopping = track(rig.h.consumer.stop())
     await rig.clock.advance(REQUEST_TIMEOUT - 1)
     await until(() => stopping.settled, 'the stop within the request timeout')
@@ -737,7 +957,7 @@ describe('bounded stop with a detached node record', () => {
     expect(rig.leaves()).toHaveLength(1)
   })
 
-  test('a detached node record on its own connection is drained and closed at stop without touching the replacement', async () => {
+  test('stop drains and closes the detached connection before the replacement binds', async () => {
     const { final, stopping, stoppedAt } = await detachHeldFinal({ stopAtRestore: true })
     expect(stopping).not.toBeNull()
     const written = rig.h.frames(78).length
@@ -752,10 +972,34 @@ describe('bounded stop with a detached node record', () => {
     expect(rig.run.detached.size).toBe(0)
   })
 
+  test('stop without a leave closes a detached session whose final was refused after the restore', async () => {
+    const { final, original } = await detachHeldFinal({ holdLookup: true })
+    expect(rig.run.nodes.get(0)).not.toBe(original)
+    expect(rig.run.nodes.get(0).session).toBeNull()
+    const execute = jest.spyOn(rig.model, 'execute')
+    const drive = track(original.drive)
+    final.release({ errorCode: -1 })
+    await until(() => drive.settled, 'the detached drive after the refused final')
+    await flush()
+    const index = execute.mock.calls.findIndex(([record]) => record === final.call)
+    expect(execute.mock.results[index].value.errorCode).toBe(-1)
+    expect(final.call.answeredOrder).toBeGreaterThan(final.call.order)
+    expect(rig.model.session(0, rig.member()).generation).toBe(final.call.generation)
+    expect(rig.closesOf(final.call)).toBe(0)
+    rig.run.coordinator = null
+    const stopping = track(rig.h.consumer.stop())
+    await until(() => stopping.settled, 'the stop without a coordinator binding')
+    expect(rig.leaves()).toEqual([])
+    expect(rig.skipped('coordinator-unknown')).toBe(1)
+    expect(rig.closesOf(final.call)).toBe(1)
+    expect(rig.model.session(0, rig.member())).toBeNull()
+  })
+
   test("a detached node record that shares the replacement's connection never closes it before the replacement's final", async () => {
     const { final } = await detachHeldFinal()
     await rig.advanceUntil(() => rig.established(0), 'the replacement session')
     await flush()
+    const execute = jest.spyOn(rig.model, 'execute')
     const stopping = track(rig.h.consumer.stop())
     await rig.clock.advance(DRAIN - 1)
     expect(rig.finals()).toHaveLength(1)
@@ -764,7 +1008,10 @@ describe('bounded stop with a detached node record', () => {
     const [, replacementFinal] = rig.finals()
     expect(rig.finals()).toHaveLength(2)
     expect(replacementFinal.generation).toBe(final.call.generation)
-    expect(replacementFinal.answeredOrder).toBeDefined()
+    expect(final.call.executedOrder).toBeUndefined()
+    const index = execute.mock.calls.findIndex(([record]) => record === replacementFinal)
+    expect(execute.mock.results[index].value.errorCode).toBe(0)
+    expect(replacementFinal.answeredOrder).toBeGreaterThan(replacementFinal.order)
     expect(rig.closesOf(final.call)).toBe(0)
     expect(rig.model.sessions()).toEqual([])
   })
@@ -781,6 +1028,6 @@ describe('bounded stop with a detached node record', () => {
     expect(episode.records).toBeNull()
     expect(episode.bindings.size).toBe(0)
     expect(episode.closedConnections.size).toBe(0)
-    expect(rig.run.detached.size).toBe(0)
+    expect([rig.run.nodes.size, rig.run.detached.size, rig.run.handlers.size]).toEqual([0, 0, 0])
   })
 })
