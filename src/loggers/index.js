@@ -1,4 +1,5 @@
 const { assign } = Object
+const { sharedSetup } = require('../admin/deadline')
 
 const LEVELS = {
   NOTHING: 0,
@@ -9,9 +10,10 @@ const LEVELS = {
 }
 
 /**
- * Builds one level's log function. The user's sink is invoked synchronously; a synchronous throw
- * from it is swallowed and a rejection of a promise it returns is discarded, so a failing sink
- * never decides the outcome of the client code that logged, nor ends the process.
+ * Builds one level's log function. The user's sink is invoked synchronously, outside any admin
+ * call's scope, so work it starts owns its own deadline; a synchronous throw from it is swallowed
+ * and a rejection of a promise it returns is discarded, so a failing sink never decides the
+ * outcome of the client code that logged, nor ends the process.
  * @param {string} label
  * @param {number} level
  * @param {() => number} currentLevel
@@ -37,7 +39,7 @@ const createLevel =
       ),
     }
     try {
-      const result = logFunction(entry)
+      const result = sharedSetup(() => logFunction(entry))
       if (typeof result?.then === 'function') result.then(undefined, () => {})
     } catch {}
   }
