@@ -773,14 +773,17 @@ class ShareRun {
     }
     if (expired !== null) {
       cohort.ledger.dropExpired(expired, now)
+      cohort.expired = new Set(expired)
       this.runner.emit(events.LOCK_EXPIRED, {
         topic: cohort.topic,
         partition: cohort.partition,
         offsets: expired,
         stage: 'before-handler',
       })
-      if (expired.length === to - from) return 'drop'
-      cohort.expired = new Set(expired)
+      if (expired.length === to - from) {
+        cohort.expired = null
+        return 'drop'
+      }
     }
     // A synchronous instrumentation listener can stop the run before the call is registered.
     return this.admitHandler(node, cohort, from) ? 'start' : 'stop'
@@ -859,7 +862,7 @@ class ShareRun {
   }
 
   /**
-   * Releases the unstarted records of an acquisition that must not start another handler.
+   * Releases live unstarted records of an acquisition that must not start another handler.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -869,7 +872,12 @@ class ShareRun {
   releaseFrom(node, cohort, from) {
     if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return
     const { offsets } = cohort.ledger
-    cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
+    if (cohort.expired) {
+      const live = offsets.slice(from).filter((offset) => !cohort.expired.has(offset))
+      cohort.ledger.complete(live, 'release')
+    } else {
+      cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
+    }
     if (node.active?.cohort === cohort) node.active.next = offsets.length
   }
 
@@ -1480,10 +1488,8 @@ class ShareRun {
    */
   finalizeActive(node) {
     const release = (cohort, from) => {
-      if (!node.loop.isLive(cohort)) return
       try {
-        const { offsets } = cohort.ledger
-        cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
+        this.releaseFrom(node, cohort, from)
       } catch (error) {
         this.options.logger.debug('Share unstarted release skipped', { error: error.message })
       }
