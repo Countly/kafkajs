@@ -373,12 +373,19 @@ test('a genuine SCRAM describe top-level response still rejects after peer compl
 })
 
 test('SCRAM alteration retries a pre-write route failure and keeps decoded rows', async () => {
-  const method = 'alterUserScramCredentials'
-  const f = fixture(method)
-  f.route.mockRejectedValueOnce(createErrorFromCode(15))
-  const rows = await f.admin[method](input(method))
-  expectResults(method, rows, [0, 7])
-  expect(f.requests).toEqual([['a', 'b']])
-  expect(f.route).toHaveBeenCalledTimes(2)
-  expectScope(f.scopes)
+  jest.useFakeTimers()
+  try {
+    const method = 'alterUserScramCredentials'
+    const f = fixture(method)
+    f.route.mockRejectedValueOnce(createErrorFromCode(15))
+    const result = f.admin[method](input(method))
+    await jest.advanceTimersByTimeAsync(10)
+    const rows = await result
+    expectResults(method, rows, [0, 7])
+    expect(f.requests).toEqual([['a', 'b']])
+    expect(f.route).toHaveBeenCalledTimes(2)
+    expectScope(f.scopes)
+  } finally {
+    jest.useRealTimers()
+  }
 })
