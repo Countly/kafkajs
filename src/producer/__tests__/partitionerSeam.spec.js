@@ -337,7 +337,8 @@ describe('Producer > a partitioner that returns an invalid partition', () => {
   })
 
   test('a custom partitioner that returns -1 rejects the send at once', async () => {
-    await start(() => () => -1)
+    const partitioner = jest.fn(() => -1)
+    await start(() => partitioner)
 
     await expect(producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })).rejects.toMatchObject(
       {
@@ -345,6 +346,7 @@ describe('Producer > a partitioner that returns an invalid partition', () => {
         message: `Invalid partition -1 for topic "${TOPIC}"`,
       }
     )
+    expect(partitioner).toHaveBeenCalledTimes(1)
     expect(produced).not.toHaveBeenCalled()
   })
 
