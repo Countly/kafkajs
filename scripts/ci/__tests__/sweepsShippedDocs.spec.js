@@ -164,7 +164,7 @@ describe('scripts/ci/sweeps.sh private working-process wording', () => {
   it.each([
     ['a development host in a guide', GUIDE, 'Measured on the development host.\n'],
     ['a developer machine in a guide', GUIDE, 'Install it on a developer machine.\n'],
-    ['development hosts in the release guide', 'RELEASING.md', 'Copy it to the development hosts.\n'],
+    ['hosts in the release guide', 'RELEASING.md', 'Copy it to the development hosts.\n'],
     ['a supplying controller in a guide', GUIDE, 'The controller supplies the guard.\n'],
     ['a test controller in a guide', GUIDE, 'The test controller starts it.\n'],
     ['a local acceptance rule in a guide', GUIDE, 'Local acceptance uses Node 26.\n'],
