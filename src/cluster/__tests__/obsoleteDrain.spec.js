@@ -4,6 +4,8 @@ const Cluster = require('../index')
 const Generation = require('../../producer/generation')
 const ConnectionPool = require('../../network/connectionPool')
 const Subscription = require('../../consumer/subscription')
+const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
 const { KafkaJSConnectionClosedError, KafkaJSConnectionError } = require('../../errors')
 const { responseHeaderVersion } = require('../../protocol/headers')
 const apiKeys = require('../../protocol/requests/apiKeys')
@@ -96,16 +98,17 @@ const outcome = (promise) =>
 /**
  * Makes every pool the builder produces wait for the test, newest last.
  * @param {{ build: jest.Mock }} builder the fixture's builder
- * @returns {Array<{ host: string, pool: ConnectionPool, release: () => void }>} the builds, in call order
+ * @returns {Array<{ host: string, pool: ConnectionPool, release: () => void, fail: (error: Error) => void }>}
+ *   the builds, in call order
  */
 const holdBuilds = (builder) => {
   const builds = []
   builder.build.mockImplementation(
-    ({ host, port, rack }) =>
-      new Promise((resolve) => {
+    ({ host, port, rack } = {}) =>
+      new Promise((resolve, reject) => {
         const pool = new ConnectionPool({ logger: newLogger(), host, port, rack })
         pool.destroy = jest.fn(async () => {})
-        builds.push({ host, pool, release: () => resolve(pool) })
+        builds.push({ host, pool, release: () => resolve(pool), fail: reject })
       })
   )
   return builds
@@ -1945,6 +1948,195 @@ describe('One install step per metadata answer', () => {
       expect(cluster.targetTopics.has('fresh')).toBe(false)
       expect(cluster.targetTopics.has('gone')).toBe(true)
       expect(cluster.findTopicPartitionMetadata('gone')).toHaveLength(1)
+    })
+  })
+
+  describe('callbacks and the installed receipt', () => {
+    const FIRST_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    const SECOND_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
+
+    it('a topic status is reported once the answer brokers, metadata and freshness are installed', async () => {
+      const snapshots = []
+      let pool = null
+      const fixture = clusterWith({
+        onTopicMetadataStatus: ({ topic, status }) =>
+          snapshots.push({
+            topic,
+            status,
+            peer: pool.brokers[1]?.connectionPool.host ?? null,
+            routed: pool.metadata.topicMetadata.map((entry) => entry.topic),
+            fresh: pool.metadataExpireAt !== null,
+          }),
+      })
+      const { cluster, seed, builder } = fixture
+      pool = fixture.pool
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('healthy'), row('doomed')],
+      })
+      await cluster.addMultipleTargetTopics(['healthy', 'doomed'])
+      const builds = holdBuilds(builder)
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE, PEER],
+        topicMetadata: [row('healthy'), row('doomed', { code: 3 })],
+      })
+      const refreshing = outcome(cluster.refreshMetadata())
+      await settled()
+      expect(builds).toHaveLength(1)
+      expect(snapshots).toEqual([])
+
+      builds[0].release()
+      expect(await refreshing).toEqual({ value: undefined })
+      expect(snapshots).toEqual([
+        { topic: 'doomed', status: 'unavailable', peer: 'peer', routed: ['healthy'], fresh: true },
+      ])
+    })
+
+    it('a topic-recreated listener that throws a non-Error neither fails the refresh nor stops its routing notice', async () => {
+      const emitter = new InstrumentationEventEmitter()
+      const thrown = null
+      emitter.addListener(CLUSTER_TOPIC_RECREATED, () => {
+        throw thrown
+      })
+      const { cluster, pool, seed } = clusterWith({ instrumentationEmitter: emitter })
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders', { topicId: FIRST_ID })],
+      })
+      await cluster.addTargetTopic('orders')
+      const seen = watchRouting(pool)
+      pool.metadataExpireAt = null
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders', { topicId: SECOND_ID })],
+      })
+
+      expect(await outcome(cluster.refreshMetadata())).toEqual({ value: undefined })
+      expect(cluster.topicId('orders')).toBe(SECOND_ID)
+      expect(pool.metadataExpireAt).not.toBeNull()
+      expect(seen).toEqual(['0:seed'])
+    })
+
+    it('a topic-recreated listener that closes the refreshing lifecycle leaves the install complete and fresh, and routing listeners are still woken', async () => {
+      const emitter = new InstrumentationEventEmitter()
+      const generation = new Generation()
+      const closedBy = new Error('producer closed')
+      emitter.addListener(CLUSTER_TOPIC_RECREATED, () => generation.close(closedBy))
+      const { cluster, pool, seed } = clusterWith({ instrumentationEmitter: emitter })
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders', { topicId: FIRST_ID })],
+      })
+      await cluster.addTargetTopic('orders')
+      const seen = watchRouting(pool)
+      pool.metadataExpireAt = null
+      const observer = jest.fn()
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders', { topicId: SECOND_ID })],
+      })
+
+      const { error } = await outcome(
+        pool.refreshMetadata(['orders'], { fence: generation, onMetadata: observer })
+      )
+      expect(error).toBe(closedBy)
+      expect(observer).not.toHaveBeenCalled()
+      expect(cluster.topicId('orders')).toBe(SECOND_ID)
+      expect(pool.metadataExpireAt).not.toBeNull()
+      expect(seen).toEqual(['0:seed'])
+    })
+
+    it('an observer that throws fails its refresh only after the install is fresh and routing listeners were woken', async () => {
+      const { pool, seed } = build()
+      seed.metadata.mockResolvedValueOnce({ brokers: [SEED_NODE], topicMetadata: [] })
+      const seen = []
+      pool.metadataCache.onRoutingChange(() => seen.push(pool.metadataExpireAt !== null))
+      const thrown = new Error('observer failed')
+
+      const { error } = await outcome(
+        pool.refreshMetadata([], {
+          onMetadata: () => {
+            throw thrown
+          },
+        })
+      )
+      expect(error).toBe(thrown)
+      expect(seen).toEqual([true])
+    })
+
+    it('an answer a newer install replaced before its call settled reports no success of its own', async () => {
+      const { pool, seed } = build()
+      const success = jest.spyOn(pool, 'onMetadataSuccess')
+      const retryFor = pool.retryFor.bind(pool)
+      let first = true
+      pool.retryFor = (fence) => {
+        const retrier = retryFor(fence)
+        return async (fn) => {
+          try {
+            return await retrier(fn)
+          } finally {
+            if (first) {
+              first = false
+              await pool.refreshMetadata([], { isCurrent: () => true })
+            }
+          }
+        }
+      }
+      seed.metadata
+        .mockResolvedValueOnce({ clusterId: 'older', brokers: [SEED_NODE], topicMetadata: [] })
+        .mockResolvedValueOnce({ clusterId: 'newer', brokers: [SEED_NODE], topicMetadata: [] })
+
+      expect(await outcome(pool.refreshMetadata([]))).toEqual({ value: undefined })
+      expect(pool.metadata.clusterId).toBe('newer')
+      expect(success).toHaveBeenCalledTimes(1)
+    })
+
+    it('an answer whose pool build fails does not stop a rebootstrap that was building its seed', async () => {
+      const { pool, seed, builder } = build()
+      const builds = holdBuilds(builder)
+      const recovering = outcome(pool.rebootstrap('required'))
+      await settled()
+      expect(builds).toHaveLength(1)
+      seed.metadata.mockResolvedValueOnce({ brokers: [SEED_NODE, PEER], topicMetadata: [] })
+      const refreshing = outcome(pool.refreshMetadata([]))
+      await settled()
+      expect(builds).toHaveLength(2)
+
+      const failure = Object.assign(new Error('build failed'), { retriable: false })
+      builds[1].fail(failure)
+      expect((await refreshing).error).toBe(failure)
+      builds[0].release()
+      expect(await recovering).toEqual({ value: undefined })
+      expect(pool.seedBroker.connectionPool === builds[0].pool).toBe(true)
+      expect(seed.retire).toHaveBeenCalledTimes(1)
+    })
+
+    it('an answer keeps the seed pool and endpoint an endpoint hint swapped in place while its pools were built', async () => {
+      const { pool, seed, builder } = build()
+      const builds = holdBuilds(builder)
+      seed.metadata.mockResolvedValueOnce({ brokers: [SEED_NODE, PEER], topicMetadata: [] })
+      const refreshing = outcome(pool.refreshMetadata([]))
+      await settled()
+      expect(builds).toHaveLength(1)
+
+      const hinting = pool.applyNodeEndpoints([
+        { nodeId: 0, host: 'hinted', port: 9092, rack: null },
+      ])
+      await settled()
+      expect(builds).toHaveLength(2)
+      builds[1].release()
+      await hinting
+      const hinted = seed.connectionPool
+      expect(hinted.host).toBe('hinted')
+
+      builds[0].release()
+      expect(await refreshing).toEqual({ value: undefined })
+      expect(pool.brokers[0] === seed).toBe(true)
+      expect(seed.connectionPool === hinted).toBe(true)
+      expect(hinted.retired).toBe(false)
+      expect(pool.brokers[1].connectionPool.host).toBe('peer')
+      expect(pool.setupMetadataEndpoints.get('0')).toBe('hinted:9092')
+      expect(pool.setupMetadataEndpoints.get('1')).toBe('peer:9092')
     })
   })
 })
