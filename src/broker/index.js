@@ -670,7 +670,7 @@ module.exports = class Broker {
    * `lookupRequest`, with an optional per-request ceiling.
    *
    * A capped builder is memoised per `(apiKey, maxVersion)` because the cap is a hot-path
-   * decision — a fetch downgraded to v12 while a topic id is unknown, a produce held at v11 or
+   * decision — a fetch keyed by name capped at v12, a produce held at v11 or
    * v12 by its transaction version — and rebuilding the selector per request would allocate on
    * it. The map holds one entry per cap a caller uses, a handful per `Broker` instance. It is
    * cleared wherever `lookupRequest` or `versionsGeneration` is assigned, so it can never outlive

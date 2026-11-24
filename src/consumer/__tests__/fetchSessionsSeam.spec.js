@@ -475,32 +475,35 @@ describe('Fetch sessions through the consumer group', () => {
     expect(frame.forgottenTopics).toEqual([{ topic: TOPIC, topicId: null, partitions: [0] }])
     await harness.broker.disconnect()
 
-    harness = await open()
-    harness.cluster.topicId = () => undefined
-    await nextRound(harness.group, reply(42, [0], { apiVersion: 12 }))
-    harness.group.pause([{ topic: TOPIC, partitions: [0] }])
-    await nextRound(harness.group, reply(42, [], { apiVersion: 12 }))
-    ;[frame] = harness.fetchFrames().slice(-1)
-    expect(frame).toMatchObject({ apiVersion: 12, sessionId: 42, sessionEpoch: 1 })
-    expect(frame.forgottenTopics).toEqual([{ topic: TOPIC, topicId: null, partitions: [0] }])
-    await harness.broker.disconnect()
-
+    // A lost ID removes the partition by its recorded ID; the restored ID adds it back.
     harness = await open()
     await nextRound(harness.group, reply(42, [0]))
     harness.cluster.topicId = () => undefined
-    await nextRound(harness.group, reply(43, [0], { apiVersion: 12 }))
+    expect(await nextRound(harness.group, reply(42, []))).toEqual([])
+    ;[frame] = harness.fetchFrames().slice(-1)
+    expect(frame).toMatchObject({ apiVersion: 18, sessionId: 42, sessionEpoch: 1, topics: [] })
+    expect(frame.forgottenTopics).toEqual([{ topic: null, topicId: TOPIC_ID, partitions: [0] }])
+    expect(harness.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+
     harness.cluster.topicId = () => TOPIC_ID
-    await nextRound(harness.group, reply(43, [0]))
-    expect(
-      harness.fetchFrames().map((sent) => [sent.apiVersion, sent.sessionId, sent.sessionEpoch])
-    ).toEqual([
-      [18, 0, 0],
-      [12, 42, 0],
-      [18, 43, 0],
+    const restored = await nextRound(harness.group, reply(42, [0]))
+    ;[frame] = harness.fetchFrames().slice(-1)
+    expect(frame).toMatchObject({ apiVersion: 18, sessionId: 42, sessionEpoch: 2 })
+    expect(frame.forgottenTopics).toEqual([])
+    expect(frame.topics).toEqual([
+      {
+        topic: null,
+        topicId: TOPIC_ID,
+        partitions: [expect.objectContaining({ partition: 0, fetchOffset: '5' })],
+      },
     ])
+    expect(restored.map(({ partition, fetchedOffset }) => [partition, fetchedOffset])).toEqual([
+      [0, '5'],
+    ])
+    expect(harness.fetchFrames().map(({ apiVersion }) => apiVersion)).toEqual([18, 18, 18])
   })
 
-  test('keeps fallback and same-offset seeks safe across ID mode changes', async () => {
+  test('keeps a same-offset seek safe while its topic id is missing', async () => {
     harness = await open()
     expect(await nextRound(harness.group, reply(0, [0]))).toHaveLength(1)
 
@@ -512,32 +515,36 @@ describe('Fetch sessions through the consumer group', () => {
     expect(await harness.group.fetch(NODE_ID)).toEqual([])
     harness.group.resume([{ topic: TOPIC, partitions: [0] }])
 
+    // The session still holds the partition, so the round without an ID sends an empty full
+    // request in place of it and asks for the metadata once.
     harness.cluster.topicId = () => undefined
-    const named = await nextRound(harness.group, reply(55, [0], { apiVersion: 12 }))
+    expect(await nextRound(harness.group, reply(0, []))).toEqual([])
+    expect(harness.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     harness.cluster.topicId = () => TOPIC_ID
     const keyed = await nextRound(harness.group, reply(55, [0]))
     const incremental = await nextRound(harness.group, reply(55, []))
 
-    expect(named.map(({ fetchedOffset }) => fetchedOffset)).toEqual(['5'])
     expect(keyed.map(({ fetchedOffset }) => fetchedOffset)).toEqual(['5'])
     expect(incremental).toEqual([])
+    const frames = harness.fetchFrames()
     expect(
-      harness
-        .fetchFrames()
-        .map((frame) => [
-          frame.apiVersion,
-          frame.sessionId,
-          frame.sessionEpoch,
-          shape(frame).topics,
-        ])
+      frames.map((frame) => [
+        frame.apiVersion,
+        frame.sessionId,
+        frame.sessionEpoch,
+        shape(frame).topics,
+        shape(frame).forgotten,
+      ])
     ).toEqual([
-      [18, 0, 0, [0]],
-      [18, 0, 0, [0]],
-      [12, 0, 0, [0]],
-      [18, 55, 0, [0]],
-      [18, 55, 1, []],
+      [18, 0, 0, [0], []],
+      [18, 0, 0, [0], []],
+      [18, 0, 0, [], []],
+      [18, 0, 0, [0], []],
+      [18, 55, 1, [], []],
     ])
-    expect(harness.cluster.refreshMetadata).not.toHaveBeenCalled()
+    expect(frames[3].topics[0]).toMatchObject({ topic: null, topicId: TOPIC_ID })
+    expect(frames[3].topics[0].partitions[0].fetchOffset).toBe('5')
+    expect(harness.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     expect(harness.requestRejoin).not.toHaveBeenCalled()
   })
 

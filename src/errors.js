@@ -193,10 +193,12 @@ class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
     this.retryTime = retryTime
 
     // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
-    // walk the chain for the first typed link.
+    // walk the chain for the first typed link. A chain may loop: a link seen before ends it.
     let source = e
+    const seen = new Set()
     try {
-      while (source && source.type === undefined && source.cause) {
+      while (source && source.type === undefined && !seen.has(source)) {
+        seen.add(source)
         source = source.cause
       }
       if (source && source.type !== undefined) {
@@ -715,6 +717,31 @@ class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
 }
 
 /**
+ * A topic this consumer holds positions of came back under a new topic id: it was deleted and
+ * recreated. The new topic has its own offsets, so the consumer's run stops with this error and is
+ * never restarted automatically, whatever `restartOnFailure` decides. Non-retriable.
+ */
+class KafkaJSTopicRecreatedError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {string} options.topic the topic name
+   * @param {string} options.previousTopicId the id the consumer's positions belong to
+   * @param {string} options.topicId the id the topic has now
+   * @param {string|null} [options.groupId=null] the consumer group, null without one
+   * @param {Error} [options.cause]
+   */
+  constructor(e, { topic, previousTopicId, topicId, groupId = null, cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSTopicRecreatedError'
+    this.topic = topic
+    this.previousTopicId = previousTopicId
+    this.topicId = topicId
+    this.groupId = groupId
+  }
+}
+
+/**
  * An offset commit was refused because the consumer lost its group membership, or because a
  * handler or a retry outlived a rejoin. Reason `stale-assignment` also covers a handler commit of
  * offsets for a batch fetched before a `consumer.seek()` of its partition, with no rejoin, so it
@@ -961,6 +988,7 @@ module.exports = {
   KafkaJSNoOffsetError,
   KafkaJSRebalanceListenerError,
   KafkaJSRebalanceNotConvergedError,
+  KafkaJSTopicRecreatedError,
   KafkaJSProducerClosedError,
   KafkaJSTelemetryError,
   KafkaJSError,
