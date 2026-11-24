@@ -1337,7 +1337,7 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
     })
 
     test.each([
-      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', () => createErrorFromCode(53)],
+      ['CLUSTER_AUTHORIZATION_FAILED', () => createErrorFromCode(31)],
       ['a TypeError', () => new TypeError('boom')],
       ...(method === 'beginTransaction'
         ? [['a coordinator that was not found', () => new KafkaJSGroupCoordinatorNotFound('none')]]
@@ -1355,7 +1355,7 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
 
     test('rejects at once, as it is, on an error that is not retriable after a reset', async () => {
       const { manager, cluster, broker } = await build(options)
-      const refused = createErrorFromCode(53)
+      const refused = createErrorFromCode(31)
       cluster.findGroupCoordinator.mockRejectedValueOnce(reset()).mockRejectedValueOnce(refused)
 
       await expect(manager[method]()).rejects.toBe(refused)
@@ -1363,6 +1363,25 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
       expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
       expect(broker.initProducerId).not.toHaveBeenCalled()
     })
+
+    test.each([0, 1])(
+      'arms FATAL_ERROR on TRANSACTIONAL_ID_AUTHORIZATION_FAILED after %i connection resets',
+      async (resets) => {
+        const { manager, cluster, broker } = await build(options)
+        const refused = createErrorFromCode(53)
+        failLookups(cluster, resets)
+        cluster.findGroupCoordinator.mockRejectedValueOnce(refused)
+
+        const error = await manager[method]().catch((e) => e)
+
+        expect(error).toBe(manager.stateManager.transaction.armedError())
+        expect(error.name).toBe('KafkaJSApplicationRecoverableError')
+        expect(error.cause).toBe(refused)
+        expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(resets + 1)
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+      }
+    )
 
     test('stops retrying when the producer lifecycle closes meanwhile, and writes nothing late', async () => {
       const generation = new Generation()

@@ -364,6 +364,181 @@ const closeNow = async (producer, cluster) => {
   cluster.assertClean()
 }
 
+describe('a coordinator lookup refused by an ACL', () => {
+  const TRANSACTION_KEY = 1
+  const offsets = {
+    consumerGroupId: 'group',
+    topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '3' }] }],
+  }
+
+  /**
+   * Answers every later FindCoordinator with the code `codeFor` gives its key type; 0 names node 0.
+   * @param {object} cluster scripted broker
+   * @param {(keyType: number) => number} codeFor
+   * @returns {void}
+   */
+  const answerLookups = (cluster, codeFor) => {
+    cluster.answer('FindCoordinator', ({ coordinatorKeys, keyType }) => ({
+      coordinators: coordinatorKeys.map((key) =>
+        codeFor(keyType) === 0
+          ? { key, nodeId: 0, host: 'node0', port: 9092, errorCode: 0, errorMessage: null }
+          : { key, nodeId: -1, host: '', port: -1, errorCode: codeFor(keyType), errorMessage: null }
+      ),
+    }))
+  }
+
+  /**
+   * @param {Error} error
+   * @returns {unknown[]} the `code` of the error and of each of its first causes
+   */
+  const codesIn = (error) => {
+    const codes = []
+    for (let link = error, depth = 0; link != null && depth < 10; link = link.cause, depth++) {
+      codes.push(link.code)
+    }
+    return codes
+  }
+
+  /**
+   * Runs `scenario` on a fresh wire-backed producer, then closes it and checks the wire.
+   * @param {string} profile transaction protocol profile
+   * @param {(cluster: object, producer: object) => Promise<void>} scenario
+   * @returns {Promise<void>}
+   */
+  const withProducer = async (profile, scenario) => {
+    const { cluster, producer } = publicFixture(profile, FAST_RETRY)
+    let primary
+    try {
+      await producer.connect()
+      await scenario(cluster, producer)
+    } catch (error) {
+      primary = error
+    } finally {
+      await close(primary, producer, cluster)
+    }
+  }
+
+  /**
+   * @param {Error} error
+   * @param {object} producer
+   * @returns {Promise<void>} once `error` is shown to be the armed fatal error
+   */
+  const expectFatal = async (error, producer) => {
+    expect(error).toMatchObject({
+      name: 'KafkaJSApplicationRecoverableError',
+      category: 'applicationRecoverable',
+    })
+    expect(codesIn(error)).toContain(53)
+    await expect(producer.transaction()).rejects.toBe(error)
+  }
+
+  it('commit() after a successful send, every FindCoordinator answered 53: rejects with KafkaJSApplicationRecoverableError whose chain holds 53, FATAL_ERROR armed, no EndTxn', async () => {
+    for (const profile of ['tv1', 'tv2']) {
+      await withProducer(profile, async (cluster, producer) => {
+        const transaction = await producer.transaction()
+        await transaction.send({ topic: TOPIC, messages: [{ value: 'sent' }] })
+        answerLookups(cluster, () => 53)
+
+        const error = await transaction.commit().catch((failure) => failure)
+
+        await expectFatal(error, producer)
+        await expect(transaction.abort()).rejects.toBe(error)
+        expect(framesOf(cluster, 'EndTxn')).toBe(0)
+      })
+    }
+  })
+
+  it("the first transaction()'s initialization lookup answered 53 fails fatally and a later transaction() rejects with the same armed error", async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      answerLookups(cluster, () => 53)
+
+      const error = await producer.transaction().catch((failure) => failure)
+
+      await expectFatal(error, producer)
+      expect(framesOf(cluster, 'InitProducerId', true)).toBe(0)
+    })
+  })
+
+  it("a later transaction()'s begin lookup answered 53 fails fatally", async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      await (await producer.transaction()).abort()
+      answerLookups(cluster, () => 53)
+
+      const error = await producer.transaction().catch((failure) => failure)
+
+      await expectFatal(error, producer)
+    })
+  })
+
+  it('TV1 sendOffsets whose transaction coordinator lookup is answered 53 arms FATAL_ERROR', async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      const transaction = await producer.transaction()
+      await transaction.send({ topic: TOPIC, messages: [{ value: 'sent' }] })
+      answerLookups(cluster, (keyType) => (keyType === TRANSACTION_KEY ? 53 : 0))
+
+      const error = await transaction.sendOffsets(offsets).catch((failure) => failure)
+
+      await expectFatal(error, producer)
+      await expect(transaction.commit()).rejects.toBe(error)
+      expect(framesOf(cluster, 'AddOffsetsToTxn')).toBe(0)
+    })
+  })
+
+  it('sendOffsets with the group lookup answered 30 arms ABORTABLE_ERROR and keeps 30 in the chain', async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      const transaction = await producer.transaction()
+      await transaction.send({ topic: TOPIC, messages: [{ value: 'sent' }] })
+      answerLookups(cluster, (keyType) => (keyType === TRANSACTION_KEY ? 0 : 30))
+
+      const error = await transaction.sendOffsets(offsets).catch((failure) => failure)
+
+      expect(error).toMatchObject({
+        name: 'KafkaJSTransactionAbortableError',
+        category: 'abortable',
+      })
+      expect(codesIn(error)).toContain(30)
+      await expect(transaction.commit()).rejects.toBe(error)
+      await expect(transaction.abort()).resolves.toBeUndefined()
+
+      const next = await producer.transaction()
+      await next.send({ topic: TOPIC, messages: [{ value: 'recovered' }] })
+      await expect(next.commit()).resolves.toBeUndefined()
+    })
+  })
+
+  it('abort() whose lookup is answered 53 throws the armed FATAL error', async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      const transaction = await producer.transaction()
+      await transaction.send({ topic: TOPIC, messages: [{ value: 'sent' }] })
+      answerLookups(cluster, () => 53)
+
+      const error = await transaction.abort().catch((failure) => failure)
+
+      await expectFatal(error, producer)
+      expect(framesOf(cluster, 'EndTxn')).toBe(0)
+    })
+  })
+
+  it('a coordinator that is truly unavailable still leaves a pending commit', async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      const transaction = await producer.transaction()
+      await transaction.send({ topic: TOPIC, messages: [{ value: 'sent' }] })
+      answerLookups(cluster, () => 15)
+
+      const error = await transaction.commit().catch((failure) => failure)
+
+      expect(error).toMatchObject({
+        retriable: true,
+        message:
+          'The transaction coordinator could not be found; the commit is pending, call commit() again',
+      })
+      answerLookups(cluster, () => 0)
+      await expect(transaction.commit()).resolves.toBeUndefined()
+      expect(framesOf(cluster, 'EndTxn')).toBe(1)
+    })
+  })
+})
+
 describe('initial fencing of one identity stops the whole producer', () => {
   it.each(FENCED_AT_INIT)(
     'an open transaction cannot send once the ordinary initialization is fenced $profile/$code',
