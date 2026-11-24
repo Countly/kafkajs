@@ -1534,8 +1534,7 @@ class ShareFetchLoop {
    * @param {{prepared: object[]}} [options.preserve] A captured final whose exact tickets survive.
    * @param {number} [options.drainTimeout=0] Milliseconds the data socket may drain before it closes.
    * @param {boolean} [options.closeSockets=true] Whether disposal closes those sockets itself; a
-   *   close episode passes false and decides every connection once, after reading
-   *   {@link ShareFetchLoop#writtenBindings} first.
+   *   close episode passes false and decides every connection once from the run's open bindings.
    * @returns {void} Idempotent and synchronous; a socket close is observed in the background.
    */
   dispose(

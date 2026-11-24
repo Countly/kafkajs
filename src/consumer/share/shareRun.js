@@ -79,7 +79,7 @@ class ShareRun {
     this.refusalError = null
     this.nodes = new Map()
     this.detached = new Set()
-    this.cleanupOwners = new WeakMap()
+    this.openBindings = new Map()
     this.handlers = new Map()
     this.assignment = new Map()
     this.applying = 0
@@ -444,8 +444,8 @@ class ShareRun {
   }
 
   /**
-   * Takes an ended node out of the map. A close still owns its drive until it settles, and
-   * afterward still owns any socket on which the broker may have kept its session.
+   * Takes an ended node record out of the map while its drive may still run its last request, and
+   * keeps it in `detached` until that drive settled, so a close still drains and disposes it.
    * @private
    * @param {object} node The ended node record.
    * @returns {void}
@@ -453,21 +453,7 @@ class ShareRun {
   detach(node) {
     this.nodes.delete(node.id)
     this.detached.add(node)
-    node.drive.then(() => this.pruneDetached(node))
-  }
-
-  /**
-   * Keeps at most one settled cleanup record per data socket. The episode already owns
-   * its snapshot if a close started while the drive was settling.
-   * @private
-   * @param {object} node The detached node whose drive settled.
-   * @returns {void}
-   */
-  pruneDetached(node) {
-    if (this.closing) return
-    for (const record of this.detached)
-      if ((record === node || record.loop?.disposed) && !record.session?.cleanupBinding)
-        this.detached.delete(record)
+    node.drive.then(() => this.detached.delete(node))
   }
 
   /**
@@ -501,8 +487,7 @@ class ShareRun {
 
   /**
    * Finds the node's Broker under its own operation, builds its session and loop, and polls
-   * until the node ends or loses authority. An ended record with remaining socket cleanup
-   * passes to the detached set. A failure that still has authority is terminal.
+   * until the node ends or loses authority. A failure that still has authority is terminal.
    * @private
    * @param {object} node The node record.
    * @returns {Promise<void>} Never rejects.
@@ -517,7 +502,7 @@ class ShareRun {
       node.operation.check()
       node.session = new ShareSession({
         operation: node.operation,
-        cleanupOwners: this.cleanupOwners,
+        openBindings: this.openBindings,
       })
       node.schedule = createRetry.backoff(retry)
       node.loop = this.createLoop(node, broker)
@@ -532,7 +517,7 @@ class ShareRun {
     }
     if (node.ended && node.loop && !this.closing) {
       await node.loop.finishNode().catch(() => {})
-      if (!this.closing && this.nodes.get(node.id) === node) this.detach(node)
+      if (this.nodes.get(node.id) === node) this.nodes.delete(node.id)
     }
   }
 
@@ -765,6 +750,7 @@ class ShareRun {
   startGate(node, cohort, from, to) {
     if (!this.admitHandler(node, cohort, from)) return 'stop'
     this.flushIfDue(node, cohort)
+    if (!this.admitHandler(node, cohort, from)) return 'stop'
     const now = performance.now()
     const { offsets } = cohort.ledger
     let expired = null
@@ -772,21 +758,25 @@ class ShareRun {
       if (!cohort.ledger.canStart(offsets[i], now)) (expired ??= []).push(offsets[i])
     }
     if (expired !== null) {
+      const dropped = expired.length === to - from
       cohort.ledger.dropExpired(expired, now)
       cohort.expired = new Set(expired)
+      if (dropped) node.active.next = to
       this.runner.emit(events.LOCK_EXPIRED, {
         topic: cohort.topic,
         partition: cohort.partition,
         offsets: expired,
         stage: 'before-handler',
       })
-      if (expired.length === to - from) {
+      if (dropped) {
         cohort.expired = null
         return 'drop'
       }
     }
     // A synchronous instrumentation listener can stop the run before the call is registered.
-    return this.admitHandler(node, cohort, from) ? 'start' : 'stop'
+    if (this.admitHandler(node, cohort, from)) return 'start'
+    cohort.expired = null
+    return 'stop'
   }
 
   /**
@@ -1118,7 +1108,7 @@ class ShareRun {
    * wait and the drain. A zero timeout on a close in progress revokes the episode, which retires
    * its drain and traffic operations in the same tick: a final that was written and is unanswered
    * settles lost and its exact socket closes at once. The episode works on a snapshot of every
-   * current node record plus detached drives and their unresolved socket cleanup, taken here.
+   * current node record plus every detached record whose drive has not settled, taken here.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
    * @param {number} [timeout] Validated disconnect timeout, when this call supplies one.
    * @param {number} [startedAt] Original public entry time of that call.
@@ -1321,13 +1311,12 @@ class ShareRun {
    * an error that throws when read cannot stop another node's capture or disposal.
    *
    * It works on the episode's records. Only a record still current in the map captures a final;
-   * a detached record is disposed like the others. The data binding of each record that may
-   * still own a broker session moves to the episode, including after a reset or refused final.
-   * Disposal closes no socket and each connection is then decided once:
-   * one carrying a captured final waits for that final; otherwise one a record could not capture
-   * is closed now, unless only a detached record holds it while a current record is bound to it.
-   * The calls the freeze closes leave the poll view, except the expired calls a poll close
-   * captured, and no longer count for a stop.
+   * a detached record is disposed like the others. The run's open bindings, one per data
+   * connection, and the binding of every captured final move to the episode, keyed by connection.
+   * Disposal closes no socket, and each connection is then decided once: one carrying a captured
+   * final waits for that final, and every other one is closed now. The calls the freeze closes
+   * leave the poll view, except the expired calls a poll close captured, and no longer count for
+   * a stop.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1351,6 +1340,7 @@ class ShareRun {
       if (node.captured) {
         const { binding } = node.captured
         bindings.push({ nodeId: node.id, current: () => !ShareSession.bindingLost(binding) })
+        episode.finals.set(binding.connection, node.captured)
       }
     }
     episode.freeze(bindings)
@@ -1366,11 +1356,11 @@ class ShareRun {
       this.manager.shutdown()
       this.poll.stop()
     }
-    for (const node of records) {
-      const binding = node.session?.cleanupBinding
-      episode.bindings.set(node, binding ? [binding] : [])
-      node.session?.releaseCleanup()
-    }
+    for (const [connection, binding] of this.openBindings)
+      if (!ShareSession.bindingLost(binding)) episode.bindings.set(connection, binding)
+    for (const [connection, { binding }] of episode.finals)
+      episode.bindings.set(connection, binding)
+    this.openBindings.clear()
     for (const node of records) {
       const discarded = node.loop !== null && !node.loop.disposed
       try {
@@ -1387,48 +1377,12 @@ class ShareRun {
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
-    this.closeUncaptured(episode)
+    for (const [connection, binding] of episode.bindings)
+      if (!episode.finals.has(connection) && !ShareSession.bindingLost(binding))
+        episode.closeConnection(connection)
     this.notifyDrained()
     for (const [message, nodeId, error] of failures)
       this.options.logger.error(message, { nodeId, error: describeThrown(error) })
-  }
-
-  /**
-   * @private
-   * @param {ShareCloseEpisode} episode The frozen episode.
-   * @returns {Map<object, object>} Each connection that carries a captured final, with its record.
-   */
-  finalConnections(episode) {
-    const held = new Map()
-    for (const node of episode.records)
-      if (node.captured) held.set(node.captured.binding.connection, node)
-    return held
-  }
-
-  /**
-   * Closes, at the freeze, the connection of every record that holds a session or a written
-   * request and captured no final, so the broker drops that session. A connection that carries a
-   * captured final is left to the cleanup, and a detached record never closes a connection a
-   * current record is bound to.
-   * @private
-   * @param {ShareCloseEpisode} episode The frozen episode.
-   * @returns {void}
-   */
-  closeUncaptured(episode) {
-    const held = this.finalConnections(episode)
-    const current = new Set()
-    for (const node of episode.records)
-      if (this.nodes.get(node.id) === node)
-        for (const { connection } of episode.bindings.get(node)) current.add(connection)
-    for (const node of episode.records) {
-      if (node.captured) continue
-      const detached = this.nodes.get(node.id) !== node
-      for (const binding of episode.bindings.get(node)) {
-        const { connection } = binding
-        if (held.has(connection) || (detached && current.has(connection))) continue
-        if (!ShareSession.bindingLost(binding)) episode.closeConnection(connection)
-      }
-    }
   }
 
   /**
@@ -1626,26 +1580,20 @@ class ShareRun {
   }
 
   /**
-   * Closes, once per connection, every data connection of the episode's records whose session
-   * has no confirmed final, so no connection to an unfinished share session stays open. A
-   * connection that carries a captured final follows only that final's record. A clean stop keeps
-   * the connections of confirmed finals and the coordinator's; a disconnect, crash or revoked
-   * close closes every captured connection and the coordinator's. Only the exact captured
-   * generations that are still current are touched, so a replacement socket is never closed.
+   * Closes, once, every data connection of the episode that carries no confirmed final, so no
+   * connection to an unfinished share session stays open. A clean stop keeps the connections of
+   * confirmed finals and the coordinator's; a disconnect, crash or revoked close closes every
+   * episode connection and the coordinator's. Only the exact frozen generations that are still
+   * current are touched, so a replacement socket is never closed.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
    */
   teardown(episode) {
     const dirty = episode.closeSockets || episode.revoked
-    const held = this.finalConnections(episode)
-    for (const node of episode.records) {
-      if (!dirty && node.captured?.confirmed) continue
-      for (const binding of episode.bindings.get(node) ?? []) {
-        const owner = held.get(binding.connection)
-        if (owner && owner !== node) continue
-        if (!ShareSession.bindingLost(binding)) episode.closeConnection(binding.connection)
-      }
+    for (const [connection, binding] of episode.bindings) {
+      if (!dirty && episode.finals.get(connection)?.confirmed) continue
+      if (!ShareSession.bindingLost(binding)) episode.closeConnection(connection)
     }
     for (const node of episode.records) node.captured = null
     if (dirty && this.coordinator?.current()) episode.closeConnection(this.coordinator.connection)

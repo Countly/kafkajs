@@ -31,10 +31,10 @@ class ShareSession {
    * @param {(oldToken: symbol, reason: string, cause?: Error) => void} [options.onReset]
    *   Synchronous: called once per reset, after the old open is invalid and before any
    *   replacement work can use the new one.
-   * @param {WeakMap<object, object>} [options.cleanupOwners] The last open on each data
-   *   connection. Shared by the run's current and detached records.
+   * @param {Map<object, object>} [options.openBindings] The run's map from each data connection to
+   *   the binding of the last opening fetch written on it, shared by all its node records.
    */
-  constructor({ operation, onReset = () => {}, cleanupOwners = new WeakMap() }) {
+  constructor({ operation, onReset = () => {}, openBindings = new Map() }) {
     this.operation = operation
     this.onReset = onReset
     this.epoch = 0
@@ -45,8 +45,7 @@ class ShareSession {
     this.closed = false
     this.resetStreak = 0
     this.binding = null
-    this.cleanupOwners = cleanupOwners
-    this.openedBinding = null
+    this.openBindings = openBindings
     this.idlers = []
   }
 
@@ -173,32 +172,16 @@ class ShareSession {
   }
 
   /**
-   * Records a written opener before its reply. A replacement opener on the same socket
-   * takes responsibility for that socket even if the broker refuses it.
-   * @param {{connection: object}} binding The opening fetch's exact data binding.
+   * Records a written opening fetch, before its reply, as the owner of its data connection,
+   * replacing any earlier open there: the broker keeps at most the last session opened on a
+   * connection. Entries whose socket is gone are dropped here.
+   * @param {object} binding The opening fetch's exact data binding.
    * @returns {void}
    */
   trackOpen(binding) {
-    this.openedBinding = binding
-    this.cleanupOwners.set(binding.connection, binding)
-  }
-
-  /** @returns {object|null} The live socket binding whose broker session this record may own. */
-  get cleanupBinding() {
-    const binding = this.openedBinding
-    return binding &&
-      this.cleanupOwners.get(binding.connection) === binding &&
-      !ShareSession.bindingLost(binding)
-      ? binding
-      : null
-  }
-
-  /** @returns {void} Releases ownership after a confirmed final or transfer to the close. */
-  releaseCleanup() {
-    const binding = this.openedBinding
-    if (binding && this.cleanupOwners.get(binding.connection) === binding)
-      this.cleanupOwners.delete(binding.connection)
-    this.openedBinding = null
+    for (const [connection, open] of this.openBindings)
+      if (ShareSession.bindingLost(open)) this.openBindings.delete(connection)
+    this.openBindings.set(binding.connection, binding)
   }
 
   /**
@@ -249,7 +232,9 @@ class ShareSession {
    */
   applyFinal(request, response) {
     const policy = sessionAction(request.apiKey, response.errorCode)
-    if (policy.error === null) this.releaseCleanup()
+    const { binding } = this
+    if (policy.error === null && binding && this.openBindings.get(binding.connection) === binding)
+      this.openBindings.delete(binding.connection)
     this.model.clear()
     this.binding = null
     this.closed = true

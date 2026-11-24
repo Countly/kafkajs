@@ -11,9 +11,10 @@ const { ConsumerOperation } = require('../groupProtocol/interface')
  * forbids traffic. Time is read from the injected clock at every check, so a late timer cannot
  * authorize a write.
  *
- * The episode also keeps the node records it closes (`records`), the data bindings each of them
- * held at the freeze (`bindings`, keyed by record) and the connections it closed, so every
- * connection is closed at most once; `finish` releases all of them.
+ * The episode also keeps the node records it closes (`records`), the data binding of each
+ * connection frozen at the freeze (`bindings`), the captured final on a connection (`finals`)
+ * and the connections it closed, so every connection is closed at most once; `finish` releases
+ * all of them.
  */
 class ShareCloseEpisode {
   /**
@@ -43,6 +44,7 @@ class ShareCloseEpisode {
     this.records = records
     this.expired = []
     this.bindings = new Map()
+    this.finals = new Map()
     this.closedConnections = new Set()
     this.operation = null
     this.drainOperation = null
@@ -236,6 +238,7 @@ class ShareCloseEpisode {
     this.records = null
     this.expired = []
     this.bindings.clear()
+    this.finals.clear()
     this.closedConnections.clear()
     this.drainOperation?.retire()
     this.drainOperation = null
