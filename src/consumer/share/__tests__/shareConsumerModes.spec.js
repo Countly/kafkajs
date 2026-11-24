@@ -585,6 +585,40 @@ describe('public share handler contract', () => {
     await until(() => h.frames(78).length >= 3, 'the node keeps fetching')
   })
 
+  test('eachBatch: acknowledging after sorting batch.messages descending applies each choice to its own record', async () => {
+    await start()
+    h.script('ShareFetch', [answer(['a', 'b'])])
+    await h.consumer.run({
+      eachBatch: async ({ batch, acknowledge }) => {
+        batch.messages.sort((x, y) => Number(y.offset) - Number(x.offset))
+        const [one, zero] = batch.messages
+        acknowledge(one, 'accept')
+        acknowledge(zero, 'reject')
+      },
+    })
+    await until(
+      () => h.errors.length > 0 || batches().some((b) => b.length > 0),
+      'the acknowledgement or a handler error'
+    )
+    expect(h.errors).toEqual([])
+    const pairs = batches()
+      .find((b) => b.length > 0)
+      .flatMap(({ firstOffset, lastOffset, acknowledgeTypes }) => {
+        const decoded = []
+        for (let offset = BigInt(firstOffset), i = 0; offset <= BigInt(lastOffset); offset++, i++)
+          decoded.push([
+            String(offset),
+            acknowledgeTypes.length === 1 ? acknowledgeTypes[0] : acknowledgeTypes[i],
+          ])
+        return decoded
+      })
+    expect(pairs).toEqual([
+      ['0', 3],
+      ['1', 1],
+    ])
+    expect(h.crashes).toHaveLength(0)
+  })
+
   test('rejects late, foreign and invalid acknowledgements', async () => {
     await start({ share: { acknowledgementMode: 'explicit' } })
     const both = (deliveryCount) =>

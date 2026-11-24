@@ -67,8 +67,9 @@ describe('share handlers on parallel leader nodes', () => {
    */
   const start = async (options) => {
     h = shareClient({ ...options })
-    h.seen = { crashes: [], joins: [], stops: [] }
+    h.seen = { acks: [], crashes: [], joins: [], stops: [] }
     const { events, on } = h.consumer
+    on(events.ACKNOWLEDGE, ({ payload }) => h.seen.acks.push(payload))
     on(events.CRASH, ({ payload }) => h.seen.crashes.push(payload))
     on(events.GROUP_JOIN, ({ payload }) => h.seen.joins.push(payload))
     on(events.STOP, () => h.seen.stops.push(true))
@@ -144,6 +145,21 @@ describe('share handlers on parallel leader nodes', () => {
   const leaves = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === -1)
   /** @returns {object[]} The join frames (ShareGroupHeartbeat at epoch 0). */
   const joins = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+  /** @returns {object[]} The final acknowledgements (ShareAcknowledge at session epoch -1). */
+  const finalFrames = () => h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+  /**
+   * @param {number} partition Partition index.
+   * @returns {Array<Array>} Range, type and error reason of each published acknowledgement of it.
+   */
+  const outcomesOf = (partition) =>
+    h.seen.acks
+      .filter((ack) => ack.partition === partition)
+      .map(({ firstOffset, lastOffset, type, error }) => [
+        firstOffset,
+        lastOffset,
+        type,
+        error ? error.reason : null,
+      ])
 
   /**
    * Node 0 hands partition 0 one record on its opening fetch; node 1 hands partition 1 one record
@@ -254,11 +270,13 @@ describe('share handlers on parallel leader nodes', () => {
 
   describe('expired handlers on both nodes', () => {
     /**
+     * @param {() => void} [observe] Runs once the client exists, before it runs.
      * @returns {Promise<object>} A run whose two handlers start together and stay held, driven to
      *   the first tick that sees both of them older than the poll interval.
      */
-    const expireBoth = async () => {
+    const expireBoth = async (observe = () => {}) => {
       await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
+      observe()
       serveNodes(1)
       const held = gatedHandler()
       await run({ eachMessage: held.handler })
@@ -306,11 +324,22 @@ describe('share handlers on parallel leader nodes', () => {
         .mockImplementationOnce(() => {
           throw new Error('capture failed')
         })
-      await expireBoth()
+      let logged
+      await expireBoth(() => {
+        logged = jest.spyOn(h.consumer.logger(), 'error')
+      })
       expect(capture).toHaveBeenCalledTimes(2)
-      const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+      const finals = finalFrames()
       expect(finals.map(({ node }) => node)).toEqual([1])
       expect(finals[0].order).toBeLessThan(leaves()[0].order)
+      await until(() => outcomesOf(0).length === 1, 'the outcome of node 0')
+      expect(outcomesOf(0)).toEqual([['0', '0', 'release', 'membership-lost']])
+      const failures = logged.mock.calls.filter(
+        ([message]) => message === 'Share final capture failed'
+      )
+      expect(failures).toEqual([
+        ['Share final capture failed', { nodeId: 0, error: 'capture failed' }],
+      ])
       expect(h.seen.crashes).toEqual([])
     })
   })
@@ -433,6 +462,63 @@ describe('share handlers on parallel leader nodes', () => {
     expect(fromNode0.map(({ fields }) => fields.isRenewAck)).toEqual([true])
     expect(started.sort()).toEqual(['0:0', '1:0'])
     expect(h.seen.crashes).toEqual([])
+  })
+
+  describe('eachBatch arrays at a forced close', () => {
+    test('reversing batch.messages after rejecting one record keeps only that reject in the forced-close final', async () => {
+      await start({ share: { maxPollInterval: 200 } })
+      let given = false
+      h.cluster.answer('ShareFetch', (fields) => {
+        if (given || fields.shareSessionEpoch !== 0) return echo('ShareFetch', fields)
+        given = true
+        return fetchAnswer([acquire(0, 0, ['a', 'b'])])
+      })
+      const gate = deferred()
+      const completions = []
+      holds.push({ release: () => gate.resolve(), completions })
+      const started = []
+      await run({
+        eachBatch: async ({ batch, acknowledge }) => {
+          const completed = deferred()
+          completions.push(completed.promise)
+          try {
+            started.push(batch.messages.map(({ offset }) => offset))
+            acknowledge(batch.messages[0], 'reject')
+            batch.messages.reverse()
+            await gate.promise
+          } finally {
+            completed.resolve()
+          }
+        },
+      })
+      await until(() => started.length === 1, 'the batch handler')
+      expect(started).toEqual([['0', '1']])
+      for (let count = 2; count <= 5; count++) await beat(count)
+      expect(leaves()).toHaveLength(0)
+      await advance(50)
+      await until(() => leaves().length === 1, 'the poll-expiry leave')
+      await flush()
+      const finals = finalFrames()
+      expect(finals).toHaveLength(1)
+      expect(finals[0].fields.topics).toEqual([
+        {
+          topicId: A,
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: [
+                { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] },
+              ],
+            },
+          ],
+        },
+      ])
+      expect(finals[0].order).toBeLessThan(leaves()[0].order)
+      const lost = () => outcomesOf(0).filter(([, , , reason]) => reason === 'membership-lost')
+      await until(() => lost().length === 1, 'the lost outcome')
+      expect(lost()).toEqual([['1', '1', 'release', 'membership-lost']])
+      expect(h.seen.crashes).toEqual([])
+    })
   })
 
   test('uses one completion-rearmed heartbeat chain', async () => {
