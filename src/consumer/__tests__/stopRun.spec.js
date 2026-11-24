@@ -789,7 +789,7 @@ describe('Consumer > a run stopped for good with an error', () => {
       forget()
     }, 30000)
 
-    it('a close asked while the crash cleanup disconnects joins that disconnect and shortens it at its deadline', async () => {
+    it('a close asked while the crash cleanup disconnects only bounds that disconnect and leaves DISCONNECT to it', async () => {
       const run = await start()
       const disconnected = countDisconnects(run.consumer)
       const transport = run.cluster.disconnect.mock.calls.length
@@ -816,6 +816,7 @@ describe('Consumer > a run stopped for good with an error', () => {
       expect(disconnected).toHaveBeenCalledTimes(1)
       expect(run.cluster.disconnect.mock.calls.slice(transport)).toEqual([
         [{ preserveSetupState: true }],
+        [{ drainTimeout: 1000 }],
         [{ drainTimeout: 0 }],
       ])
       forget()

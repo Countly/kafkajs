@@ -241,23 +241,17 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
     return { run, hookHeld, crashTransport }
   }
 
-  it('a timed disconnect resolves only after the crash cleanup it overlaps has finished its own cluster disconnect', async () => {
-    const { run, hookHeld, crashTransport } = await startCrashing()
+  it('a timed disconnect admitted while the crash cleanup stops owns the only cluster disconnect and DISCONNECT', async () => {
+    const { run, hookHeld } = await startCrashing()
     const close = settled(run.consumer.disconnect({ timeout: 5 }))
-    await jest.advanceTimersByTimeAsync(200)
+    await advanceUntil(() => close.done && run.crashes.length > 0, 200)
 
-    expect(close.done).toBe(false)
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(run.crashes).toHaveLength(1)
     expect(
       run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
     ).toEqual([{ drainTimeout: 0 }])
-
-    crashTransport.resolve()
-    await advanceUntil(() => close.done && run.crashes.length > 0, 1000)
-
-    expect(close).toEqual({ done: true, value: undefined })
-    expect(
-      run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
-    ).toEqual([{ drainTimeout: 0 }, { preserveSetupState: true }])
+    expect(count(run, 'DISCONNECT')).toBe(1)
     hookHeld.resolve()
   }, 60000)
 
@@ -274,7 +268,7 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
     await advanceUntil(() => close.done && run.crashes.length > 0, 1000)
 
     expect(close).toEqual({ done: true, value: undefined })
-    expect(count(run, 'DISCONNECT')).toBe(2)
+    expect(count(run, 'DISCONNECT')).toBe(1)
   }, 60000)
 
   it('a timed disconnect is still bounded by its timeout when the crash cleanup it overlaps is held in a close callback', async () => {
