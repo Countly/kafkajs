@@ -7,10 +7,12 @@ const { partitionResults } = require('../protocol/requests/produce/partitionResu
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
+  KafkaJSCommitFailedError,
   KafkaJSConnectionClosedError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
+  KafkaJSTransactionAbortableError,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
 const { ON_WRITE, ON_DECODED } = require('./privateOptions')
@@ -2345,6 +2347,10 @@ module.exports = class Broker {
    *   that offers v5 at most, it is keyed by name. The ids are read once, so the answer is
    *   bound to the topics this request named even if the cluster's metadata changes meanwhile;
    *   it is never given to a caller.
+   * @param {{ idBearing: boolean }} [request.topicIdBinding] private: shared by every attempt of
+   *   one `sendOffsets` call. An attempt built keyed by id sets `idBearing`; once it is set, an
+   *   attempt that would be built keyed by name (a coordinator offering v5 at most) is refused
+   *   before it is written
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
    *
@@ -2360,6 +2366,8 @@ module.exports = class Broker {
    * @property {string} [metadata]
    *
    * @returns {Promise}
+   * @throws {KafkaJSTransactionAbortableError} `cause` a `KafkaJSCommitFailedError`
+   *   (`stale-assignment`), when `topicIdBinding` refuses the attempt; nothing is written
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
    */
   async txnOffsetCommit({
@@ -2373,6 +2381,7 @@ module.exports = class Broker {
     groupInstanceId = null,
     transactionVersion = 1,
     topicIds,
+    topicIdBinding,
     guard,
   }) {
     this.throwIfRefused(guard)
@@ -2385,20 +2394,34 @@ module.exports = class Broker {
       requests.TxnOffsetCommit,
       txnOffsetCommitCeiling(transactionVersion, idsOf)
     )
-    return await this[PRIVATE.SEND_REQUEST](
-      txnOffsetCommit({
-        transactionalId,
-        groupId,
-        producerId,
-        producerEpoch,
-        topics,
-        generationId,
-        memberId,
-        groupInstanceId,
-        topicIds: idsOf,
-      }),
-      guard
-    )
+    const protocolRequest = txnOffsetCommit({
+      transactionalId,
+      groupId,
+      producerId,
+      producerEpoch,
+      topics,
+      generationId,
+      memberId,
+      groupInstanceId,
+      topicIds: idsOf,
+    })
+    if (topicIdBinding) {
+      const { apiVersion } = protocolRequest.request
+      if (apiVersion > TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION) {
+        topicIdBinding.idBearing = true
+      } else if (topicIdBinding.idBearing) {
+        throw new KafkaJSTransactionAbortableError(
+          `TxnOffsetCommit would be retried at v${apiVersion}, keyed by topic name, after an attempt keyed by topic id; call abort() on the transaction and process the records again in a new one`,
+          {
+            cause: new KafkaJSCommitFailedError(
+              'The group coordinator no longer takes transactional offsets keyed by topic id',
+              { reason: 'stale-assignment' }
+            ),
+          }
+        )
+      }
+    }
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**
