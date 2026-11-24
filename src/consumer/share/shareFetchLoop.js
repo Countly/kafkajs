@@ -525,7 +525,11 @@ class ShareFetchLoop {
         exchange.refused = refused
         return refused
       }
-      if (frameLength !== undefined) exchange.sentAt = this.now()
+      if (frameLength !== undefined) {
+        exchange.sentAt = this.now()
+        if (exchange.kind === 'fetch' && exchange.descriptor.epoch === 0)
+          this.session.trackOpen(exchange.binding)
+      }
       return null
     }
     return exchange

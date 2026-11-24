@@ -31,8 +31,10 @@ class ShareSession {
    * @param {(oldToken: symbol, reason: string, cause?: Error) => void} [options.onReset]
    *   Synchronous: called once per reset, after the old open is invalid and before any
    *   replacement work can use the new one.
+   * @param {WeakMap<object, object>} [options.cleanupOwners] The last open on each data
+   *   connection. Shared by the run's current and detached records.
    */
-  constructor({ operation, onReset = () => {} }) {
+  constructor({ operation, onReset = () => {}, cleanupOwners = new WeakMap() }) {
     this.operation = operation
     this.onReset = onReset
     this.epoch = 0
@@ -43,6 +45,8 @@ class ShareSession {
     this.closed = false
     this.resetStreak = 0
     this.binding = null
+    this.cleanupOwners = cleanupOwners
+    this.openedBinding = null
     this.idlers = []
   }
 
@@ -169,6 +173,35 @@ class ShareSession {
   }
 
   /**
+   * Records a written opener before its reply. A replacement opener on the same socket
+   * takes responsibility for that socket even if the broker refuses it.
+   * @param {{connection: object}} binding The opening fetch's exact data binding.
+   * @returns {void}
+   */
+  trackOpen(binding) {
+    this.openedBinding = binding
+    this.cleanupOwners.set(binding.connection, binding)
+  }
+
+  /** @returns {object|null} The live socket binding whose broker session this record may own. */
+  get cleanupBinding() {
+    const binding = this.openedBinding
+    return binding &&
+      this.cleanupOwners.get(binding.connection) === binding &&
+      !ShareSession.bindingLost(binding)
+      ? binding
+      : null
+  }
+
+  /** @returns {void} Releases ownership after a confirmed final or transfer to the close. */
+  releaseCleanup() {
+    const binding = this.openedBinding
+    if (binding && this.cleanupOwners.get(binding.connection) === binding)
+      this.cleanupOwners.delete(binding.connection)
+    this.openedBinding = null
+  }
+
+  /**
    * Applies a current top-level answer exactly once: advances or wraps the epoch, updates the
    * model, or resets on a session error. Acknowledgements and records are the caller's job.
    * A final (epoch -1) answer is terminal and checked before any reset policy, so it never reopens.
@@ -216,6 +249,7 @@ class ShareSession {
    */
   applyFinal(request, response) {
     const policy = sessionAction(request.apiKey, response.errorCode)
+    if (policy.error === null) this.releaseCleanup()
     this.model.clear()
     this.binding = null
     this.closed = true

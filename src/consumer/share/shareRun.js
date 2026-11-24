@@ -79,6 +79,7 @@ class ShareRun {
     this.refusalError = null
     this.nodes = new Map()
     this.detached = new Set()
+    this.cleanupOwners = new WeakMap()
     this.handlers = new Map()
     this.assignment = new Map()
     this.applying = 0
@@ -443,8 +444,8 @@ class ShareRun {
   }
 
   /**
-   * Takes an ended node record out of the map while its drive may still run its last request, and
-   * keeps it in `detached` until that drive settled, so a close still drains and disposes it.
+   * Takes an ended node out of the map. A close still owns its drive until it settles, and
+   * afterward still owns any socket on which the broker may have kept its session.
    * @private
    * @param {object} node The ended node record.
    * @returns {void}
@@ -452,7 +453,21 @@ class ShareRun {
   detach(node) {
     this.nodes.delete(node.id)
     this.detached.add(node)
-    node.drive.then(() => this.detached.delete(node))
+    node.drive.then(() => this.pruneDetached(node))
+  }
+
+  /**
+   * Keeps at most one settled cleanup record per data socket. The episode already owns
+   * its snapshot if a close started while the drive was settling.
+   * @private
+   * @param {object} node The detached node whose drive settled.
+   * @returns {void}
+   */
+  pruneDetached(node) {
+    if (this.closing) return
+    for (const record of this.detached)
+      if ((record === node || record.loop?.disposed) && !record.session?.cleanupBinding)
+        this.detached.delete(record)
   }
 
   /**
@@ -486,7 +501,8 @@ class ShareRun {
 
   /**
    * Finds the node's Broker under its own operation, builds its session and loop, and polls
-   * until the node ends or loses authority. A failure that still has authority is terminal.
+   * until the node ends or loses authority. An ended record with remaining socket cleanup
+   * passes to the detached set. A failure that still has authority is terminal.
    * @private
    * @param {object} node The node record.
    * @returns {Promise<void>} Never rejects.
@@ -499,7 +515,10 @@ class ShareRun {
         retry
       )
       node.operation.check()
-      node.session = new ShareSession({ operation: node.operation })
+      node.session = new ShareSession({
+        operation: node.operation,
+        cleanupOwners: this.cleanupOwners,
+      })
       node.schedule = createRetry.backoff(retry)
       node.loop = this.createLoop(node, broker)
       while (!node.ended && this.admitting && this.ordinaryRefusal(node.issued) === null) {
@@ -513,7 +532,7 @@ class ShareRun {
     }
     if (node.ended && node.loop && !this.closing) {
       await node.loop.finishNode().catch(() => {})
-      if (this.nodes.get(node.id) === node) this.nodes.delete(node.id)
+      if (!this.closing && this.nodes.get(node.id) === node) this.detach(node)
     }
   }
 
@@ -744,11 +763,7 @@ class ShareRun {
    * @returns {'start'|'drop'|'stop'} Whether a handler may start, all records expired, or none may.
    */
   startGate(node, cohort, from, to) {
-    if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return 'stop'
-    if (!node.keys.has(cohort.key) || this.stopRequested) {
-      this.releaseFrom(node, cohort, from)
-      return 'stop'
-    }
+    if (!this.admitHandler(node, cohort, from)) return 'stop'
     this.flushIfDue(node, cohort)
     const now = performance.now()
     const { offsets } = cohort.ledger
@@ -756,17 +771,33 @@ class ShareRun {
     for (let i = from; i < to; i++) {
       if (!cohort.ledger.canStart(offsets[i], now)) (expired ??= []).push(offsets[i])
     }
-    if (expired === null) return 'start'
-    cohort.ledger.dropExpired(expired, now)
-    this.runner.emit(events.LOCK_EXPIRED, {
-      topic: cohort.topic,
-      partition: cohort.partition,
-      offsets: expired,
-      stage: 'before-handler',
-    })
-    if (expired.length === to - from) return 'drop'
-    cohort.expired = new Set(expired)
-    return 'start'
+    if (expired !== null) {
+      cohort.ledger.dropExpired(expired, now)
+      this.runner.emit(events.LOCK_EXPIRED, {
+        topic: cohort.topic,
+        partition: cohort.partition,
+        offsets: expired,
+        stage: 'before-handler',
+      })
+      if (expired.length === to - from) return 'drop'
+      cohort.expired = new Set(expired)
+    }
+    // A synchronous instrumentation listener can stop the run before the call is registered.
+    return this.admitHandler(node, cohort, from) ? 'start' : 'stop'
+  }
+
+  /**
+   * @private
+   * @param {object} node The node record.
+   * @param {object} cohort The acquisition.
+   * @param {number} from First unstarted record.
+   * @returns {boolean} Whether the handler may start. Releases unstarted work when admission closes.
+   */
+  admitHandler(node, cohort, from) {
+    if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return false
+    if (node.keys.has(cohort.key) && !this.stopRequested) return true
+    this.releaseFrom(node, cohort, from)
+    return false
   }
 
   /**
@@ -1049,8 +1080,8 @@ class ShareRun {
 
   /**
    * Reacts to a membership retirement. The hook runs before anything else can observe it, so the
-   * old identity still authorizes the capture: a fence or fatal error freezes eligible terminal
-   * work now, a join only adopts the new identity, and our own leave has already captured.
+   * old identity still authorizes the capture. A broker fence or fatal error escalates an
+   * in-progress stop; the run's own leave and stop never escalate it.
    * @private
    * @param {symbol} oldToken The retired membership identity.
    * @param {'joined'|'fenced'|'fatal'|'stopped'|'poll-expired'} reason Why it retired.
@@ -1062,8 +1093,9 @@ class ShareRun {
       return
     }
     this.retireLookups()
-    if (oldToken !== this.authorityToken || this.closing) return
-    this.beginClose(reason === 'fenced' ? 'fence' : 'crash')
+    if (oldToken !== this.authorityToken) return
+    if (reason === 'fenced') this.beginClose('fence')
+    else if (reason === 'fatal') this.beginClose('crash')
   }
 
   /**
@@ -1078,7 +1110,7 @@ class ShareRun {
    * wait and the drain. A zero timeout on a close in progress revokes the episode, which retires
    * its drain and traffic operations in the same tick: a final that was written and is unanswered
    * settles lost and its exact socket closes at once. The episode works on a snapshot of every
-   * current node record plus every detached record whose drive has not settled, taken here.
+   * current node record plus detached drives and their unresolved socket cleanup, taken here.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
    * @param {number} [timeout] Validated disconnect timeout, when this call supplies one.
    * @param {number} [startedAt] Original public entry time of that call.
@@ -1090,6 +1122,10 @@ class ShareRun {
     if (!forced) this.stopRequested = true
     let episode = this.closing
     if (episode) {
+      if (this.finished) {
+        if (!forced) this.finishRun()
+        return episode
+      }
       if (kind === 'disconnect') {
         episode.disconnect(timeout, startedAt)
         episode.closeSockets = true
@@ -1097,7 +1133,14 @@ class ShareRun {
         this.armDrain(episode)
         if (episode.revoked) this.escalate(episode)
       }
-      if (forced) this.escalate(episode)
+      if (forced) {
+        if (!episode.forced && !episode.frozen) {
+          episode.kind = kind
+          episode.forced = true
+        }
+        if (kind === 'crash') episode.closeSockets = true
+        this.escalate(episode)
+      }
       return episode
     }
     episode = new ShareCloseEpisode({
@@ -1270,9 +1313,9 @@ class ShareRun {
    * an error that throws when read cannot stop another node's capture or disposal.
    *
    * It works on the episode's records. Only a record still current in the map captures a final;
-   * a detached record is disposed like the others. The data bindings of every record (its
-   * established session and every written, unanswered request) are copied onto the episode before
-   * disposal clears them, disposal closes no socket, and each connection is then decided once:
+   * a detached record is disposed like the others. The data binding of each record that may
+   * still own a broker session moves to the episode, including after a reset or refused final.
+   * Disposal closes no socket and each connection is then decided once:
    * one carrying a captured final waits for that final; otherwise one a record could not capture
    * is closed now, unless only a detached record holds it while a current record is bound to it.
    * The calls the freeze closes leave the poll view, except the expired calls a poll close
@@ -1315,7 +1358,11 @@ class ShareRun {
       this.manager.shutdown()
       this.poll.stop()
     }
-    for (const node of records) episode.bindings.set(node, this.dataBindings(node))
+    for (const node of records) {
+      const binding = node.session?.cleanupBinding
+      episode.bindings.set(node, binding ? [binding] : [])
+      node.session?.releaseCleanup()
+    }
     for (const node of records) {
       const discarded = node.loop !== null && !node.loop.disposed
       try {
@@ -1336,20 +1383,6 @@ class ShareRun {
     this.notifyDrained()
     for (const [message, nodeId, error] of failures)
       this.options.logger.error(message, { nodeId, error: describeThrown(error) })
-  }
-
-  /**
-   * @private
-   * @param {object} node A node record, read before its loop is disposed.
-   * @returns {object[]} The bindings of its established session and of every request it wrote
-   *   and has no answer for, each still on the socket it was bound to.
-   */
-  dataBindings(node) {
-    if (!node.loop) return []
-    const bindings = node.loop.writtenBindings()
-    const { binding, epoch } = node.session
-    if (binding && epoch !== 0 && !ShareSession.bindingLost(binding)) bindings.push(binding)
-    return bindings
   }
 
   /**
@@ -1608,6 +1641,7 @@ class ShareRun {
         if (!ShareSession.bindingLost(binding)) episode.closeConnection(binding.connection)
       }
     }
+    for (const node of episode.records) node.captured = null
     if (dirty && this.coordinator?.current()) episode.closeConnection(this.coordinator.connection)
     episode.boundaryOperation?.retire()
   }
@@ -1615,8 +1649,8 @@ class ShareRun {
   /**
    * Completes the episode for its kind: a stop or disconnect ends the run, and so does a fence or
    * poll recovery that a stop or disconnect arrived in. Otherwise a fence resumes the run for the
-   * rejoin, restarting the suspended heartbeat chain, a poll recovery waits for its own rejoin,
-   * and a crash is finished by its supervisor.
+   * rejoin, restarting the suspended heartbeat chain, and a poll recovery waits for its own
+   * rejoin. A crash releases its resources before the supervisor asks for a restart verdict.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1625,7 +1659,10 @@ class ShareRun {
     this.closed = true
     const { kind } = episode
     const recovery = kind === 'fence' || kind === 'poll'
-    if (kind === 'stop' || kind === 'disconnect' || (recovery && this.stopRequested)) {
+    if (kind === 'crash' || this.crashed) {
+      if (this.stopRequested) this.runner.emit(events.STOP)
+      this.finishRun(this.stopRequested)
+    } else if (kind === 'stop' || kind === 'disconnect' || (recovery && this.stopRequested)) {
       this.runner.emit(events.STOP)
       this.finishRun()
     } else if (recovery) {
@@ -1648,11 +1685,15 @@ class ShareRun {
   /**
    * Ends the run for good: heartbeat, poll view, listeners, nodes and the first-join promise.
    * The assignment and every public snapshot of the client are cleared; the subscription stays.
-   * @param {boolean} [release=true] Whether the client forgets this run as its current one.
+   * @param {boolean} [release=true] Whether the client forgets this run as its current one,
+   *   including if it has already been cleaned up before a restart verdict.
    * @returns {void}
    */
   finishRun(release = true) {
-    if (this.finished) return
+    if (this.finished) {
+      if (release && this.runner.current === this) this.runner.current = null
+      return
+    }
     this.finished = true
     this.retired = true
     this.admitting = false
