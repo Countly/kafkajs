@@ -70,8 +70,9 @@ class AdminLifecycle {
    * the call body must also use the captured fence at every continuation and private write.
    * @template T
    * @param {(generation: Generation, input: unknown) => Promise<T>|T} work unstarted public call
-   * @param {() => unknown} [admit] runs synchronously once the call is admitted, before any
-   *   await; what it returns is passed to `work`, what it throws rejects the call
+   * @param {() => unknown} [admit] runs synchronously once the call is admitted and tracked, so a
+   *   close it requests drains this call; what it returns is passed to `work`, what it throws
+   *   rejects the call
    * @returns {Promise<T>} result while this captured generation remains usable
    * @throws {KafkaJSNonRetriableError|Error} closing/closed refusal, `admit` failure or original
    *   call failure
@@ -84,15 +85,13 @@ class AdminLifecycle {
         )
       )
     }
-    let input
-    try {
-      input = admit?.()
-    } catch (error) {
-      return Promise.reject(error)
-    }
     const generation = this.generation
+    let input
+    let failed = false
+    let failure
     const task = generation.wait(
       Promise.resolve().then(() => {
+        if (failed) throw failure
         const error = generation.guard()
         if (error) throw error
         return work(generation, input)
@@ -103,6 +102,12 @@ class AdminLifecycle {
       () => this.active.delete(task),
       () => this.active.delete(task)
     )
+    try {
+      input = admit?.()
+    } catch (error) {
+      failed = true
+      failure = error
+    }
     return task
   }
 

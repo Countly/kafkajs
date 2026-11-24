@@ -164,10 +164,14 @@ const commitOffsetOf = (offset) => {
  * @param {unknown[]} list
  * @param {(index: number) => string} holeMessage
  * @returns {unknown[]}
- * @throws {KafkaJSNonRetriableError} with `holeMessage` of the first index the array does not own
+ * @throws {KafkaJSNonRetriableError} with `holeMessage` of the first index the array does not own,
+ *   or for a length that is not an array length (which only a proxy can report)
  */
 const itemsOf = (list, holeMessage) => {
   const length = list.length
+  if (!Number.isInteger(length) || length < 0 || length > 2 ** 32 - 1) {
+    throw new KafkaJSNonRetriableError(`Invalid array length ${printable(length)}`)
+  }
   const items = []
   for (let i = 0; i < length; i++) {
     if (!Object.hasOwn(list, i)) throw new KafkaJSNonRetriableError(holeMessage(i))
@@ -185,12 +189,11 @@ const itemsOf = (list, holeMessage) => {
  *   id listed once and an offset from 0 to 2^63 - 1, or `-1` (the high watermark)
  */
 const deletionsOf = (partitions) => {
-  if (!Array.isArray(partitions) || partitions.length === 0) {
-    throw new KafkaJSNonRetriableError('Invalid partitions')
-  }
+  if (!Array.isArray(partitions)) throw new KafkaJSNonRetriableError('Invalid partitions')
 
   const expected = (i) => `Invalid partitions, expected { partition, offset } at index ${i}`
   const items = itemsOf(partitions, expected)
+  if (items.length === 0) throw new KafkaJSNonRetriableError('Invalid partitions')
   const copy = []
   const seen = new Set()
   for (let i = 0; i < items.length; i++) {
