@@ -200,11 +200,18 @@ module.exports = class BrokerPool {
     this.drainTimeout = drainTimeout
     this.retiredBrokers = new WeakSet()
     /**
-     * Brokers a disconnect or a failure removal detached, each with the settlement of its drains,
-     * until those settle: a later disconnect reaches their sockets again and awaits them.
+     * Brokers a disconnect, a failure removal or a replacement detached, each with the settlement
+     * of its drains, until those settle: a later disconnect reaches their sockets again and awaits
+     * them.
      * @type {Map<import('../broker'), Promise<unknown>>}
      */
     this.draining = new Map()
+    /**
+     * Replaced or never-installed connection pools, each with the settlement of its drains, until
+     * those settle; a later disconnect destroys them again and awaits them.
+     * @type {Map<import('../network/connectionPool'), Promise<unknown>>}
+     */
+    this.drainingPools = new Map()
     this.rootLogger = logger
     this.connectionPoolBuilder = connectionPoolBuilder
     this.bootstrapResolution = bootstrapResolution
@@ -604,11 +611,12 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Detaches only aliases of this obsolete identity and retires it once. The active seed is
-   * shared with direct seed users and must be replaced before it can be retired.
+   * Detaches only aliases of this obsolete identity and retires it once, recording the drain so a
+   * later disconnect reaches it. The active seed is shared with direct seed users and must be
+   * replaced before it can be retired.
    * @private
    * @param {import('../broker')|undefined} broker replaced broker
-   * @returns {Promise<void>|undefined} the drain this call started, which it never waits for
+   * @returns {void}
    */
   closeObsolete(broker) {
     if (!broker || broker === this.seedBroker) return
@@ -618,24 +626,25 @@ module.exports = class BrokerPool {
     if (this.retiredBrokers.has(broker)) return
     this.retiredBrokers.add(broker)
     this.retireTelemetryNode(broker.connectionPool)
-    const drain = broker.retire({ drainTimeout: this.drainTimeout })
+    const drain = (async () => broker.retire({ drainTimeout: this.drainTimeout }))()
+    this.trackDrain(broker, drain)
     this.closeInBackground(drain)
-    return drain
   }
 
   /**
-   * Records one drain of a detached broker, joined with the earlier ones of that broker; the
-   * broker leaves the record once all of them have settled.
+   * Records one drain of a detached broker or pool, joined with the earlier ones of the same
+   * object; the object leaves the record once all of them have settled.
    * @private
-   * @param {import('../broker')} broker
+   * @param {object} closed the broker or pool being drained
    * @param {Promise<void>} drain
+   * @param {Map<object, Promise<unknown>>} [records] `draining` for brokers, `drainingPools` for pools
    * @returns {void}
    */
-  trackDrain(broker, drain) {
-    const all = Promise.allSettled([this.draining.get(broker), drain]).then(() => {
-      if (this.draining.get(broker) === all) this.draining.delete(broker)
+  trackDrain(closed, drain, records = this.draining) {
+    const all = Promise.allSettled([records.get(closed), drain]).then(() => {
+      if (records.get(closed) === all) records.delete(closed)
     })
-    this.draining.set(broker, all)
+    records.set(closed, all)
   }
 
   /**
@@ -656,15 +665,21 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Fences a replaced or never-installed pool, then drains it in the background.
+   * Fences a replaced or never-installed pool, then drains it in the background, recording the
+   * drain so a later disconnect reaches it. A throw from `retire` or `destroy` fails only that
+   * drain.
    * @private
    * @param {import('../network/connectionPool')} pool obsolete pool
    * @returns {void}
    */
   closePool(pool) {
     this.retireTelemetryNode(pool)
-    pool.retire()
-    this.closeInBackground(pool.destroy({ drainTimeout: this.drainTimeout }))
+    const drain = (async () => {
+      pool.retire()
+      return pool.destroy({ drainTimeout: this.drainTimeout })
+    })()
+    this.trackDrain(pool, drain, this.drainingPools)
+    this.closeInBackground(drain)
   }
 
   /**
@@ -875,13 +890,14 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Disconnects the seed, every broker in the table and every broker an earlier disconnect or a
-   * failure removal detached that is still draining, starting all drains concurrently, so a
-   * shorter `drainTimeout` reaches a drain already in progress. Detaches the captured table before
-   * draining, and retires its non-seed brokers so a stale lookup cannot reconnect an orphan. The
-   * seed stays reusable and owned. Work resumed during the drain builds a new table, which this
-   * call leaves intact. Resolves once every drain of those brokers, earlier ones included, has
-   * settled; if one of this call's drains failed, it then rejects with the first failure.
+   * Disconnects the seed, every broker in the table, every broker an earlier disconnect, a failure
+   * removal or a replacement detached that is still draining, and every replaced pool still
+   * draining, starting all drains concurrently, so a shorter `drainTimeout` reaches a drain already
+   * in progress. Detaches the captured table before draining, and retires its non-seed brokers so
+   * a stale lookup cannot reconnect an orphan. The seed stays reusable and owned. Work resumed
+   * during the drain builds a new table, which this call leaves intact. Resolves once every drain
+   * of those brokers and pools, earlier ones included, has settled; if one of this call's drains
+   * failed, it then rejects with the first failure.
    * @public
    * @param {object} [options]
    * @param {number} [options.drainTimeout] ms each connection waits for its requests, 0 closing
@@ -896,6 +912,7 @@ module.exports = class BrokerPool {
     }
     this.retainSetupEndpoints()
     const brokers = new Set([...values(this.brokers), ...this.draining.keys()])
+    const pools = [...this.drainingPools.keys()]
     if (this.seedBroker) brokers.add(this.seedBroker)
     this.disconnects++
     this.brokers = {}
@@ -910,7 +927,15 @@ module.exports = class BrokerPool {
       this.trackDrain(broker, drain)
       return drain
     })
-    await Promise.all([...brokers].map((broker) => this.draining.get(broker)))
+    for (const pool of pools) {
+      const drain = (async () => pool.destroy(...args))()
+      this.trackDrain(pool, drain, this.drainingPools)
+      drains.push(drain)
+    }
+    await Promise.all([
+      ...[...brokers].map((broker) => this.draining.get(broker)),
+      ...pools.map((pool) => this.drainingPools.get(pool)),
+    ])
     const failure = (await Promise.allSettled(drains)).find(({ status }) => status === 'rejected')
     if (failure) throw failure.reason
   }
@@ -942,8 +967,7 @@ module.exports = class BrokerPool {
       this.seedBroker = shuffle(values(this.brokers).filter((candidate) => candidate !== broker))[0]
     }
     this.metadataExpireAt = null
-    const drain = this.closeObsolete(broker)
-    if (drain) this.trackDrain(broker, drain)
+    this.closeObsolete(broker)
   }
 
   /**

@@ -581,16 +581,24 @@ until it is stale) and then hits one transient failure, such as a rolling restar
 election, does **not** rebootstrap; it only rebootstraps once the failures are back-to-back for
 the whole window.
 
-A rebootstrap waits for each connection's in-flight requests to drain, then closes every
-connection the client holds. A request already in flight when it starts normally completes on the
-old socket rather than being rejected; the connections themselves are gone by the time
-`rebootstrap()` returns, so the *next* request the caller makes goes through the caller's normal
-retry path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster —
-it is not itself a source of message loss, but a producer created with `idempotent: false` can
-duplicate records the broker had already appended when a produce is retried. SASL authentication state
+A rebootstrap does not wait for the connections it replaces. They take no new request and drain in
+the background: a request already in flight completes on its old socket when the broker answers
+within `requestTimeout`, and is rejected with `KafkaJSConnectionClosedError` when the connection
+closes first. The *next* request the caller makes goes through the caller's normal retry path (the
+producer's or consumer's own `retry` configuration) against the rebuilt cluster — it is not itself
+a source of message loss, but a producer created with `idempotent: false` can duplicate records the
+broker had already appended when a produce is retried. A client `disconnect()` waits for these
+draining connections as it does for its current ones. SASL authentication state
 (the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
 authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
 reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.
+
+A rebootstrap trusts the configured broker list. If that list now leads to a different Kafka
+cluster, the client installs the new cluster's metadata without noticing the change, and a consumer
+keeps the positions it held on the old cluster: it can fetch from the new cluster at those offsets
+at least until its group membership is rebuilt there, and a consumer that uses `assign()` has no
+group membership to rebuild and keeps doing so. Point the broker list of a running client only at
+brokers of the same cluster.
 
 ## Default Retry
 
