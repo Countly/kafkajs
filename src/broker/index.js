@@ -3,7 +3,8 @@ const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
-const { partitionResults, exactRows } = require('../protocol/requests/produce/partitionResults')
+const { partitionResults } = require('../protocol/requests/produce/partitionResults')
+const { requireCoverage } = require('../protocol/requests/responseCoverage')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
@@ -15,7 +16,7 @@ const {
   KafkaJSTransactionAbortableError,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
-const { ON_WRITE, ON_DECODED } = require('./privateOptions')
+const { ON_WRITE, ON_DECODED, UNCHECKED_ROWS } = require('./privateOptions')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -1033,7 +1034,14 @@ module.exports = class Broker {
         ...protocolRequest,
         response: {
           decode: protocolRequest.response.decode,
-          parse: (data) => exactRows(partitionResults(data), topicData),
+          parse: (data) => {
+            requireCoverage('Produce', topicData, data.topics, {
+              rowTopic: 'topicName',
+              repeats: 'refuse',
+              missing: 'allow',
+            })
+            return partitionResults(data)
+          },
         },
       },
       guard
@@ -1732,8 +1740,14 @@ module.exports = class Broker {
    *   of the write after it counts as possibly written
    * @param {(decoded: object) => void} [options[ON_DECODED]] internal (`./privateOptions`): called
    *   once with the decoded reply, before a caller refusal, the throttle or parse can end the
-   *   request
+   *   request. A reply that does not cover the request never reaches it (see `@throws`)
+   * @param {boolean} [options[UNCHECKED_ROWS]] internal (`./privateOptions`): the caller checks
+   *   every row of the answer itself, so the reply is not held to the request
    * @returns {Promise}
+   * @throws {import('../errors').KafkaJSError} retriable, when the answer leaves out a partition of
+   *   the request, names one it did not carry, or names a partition more often than the request
+   *   did. Raised in decode, before the decoded-reply hook, the throttle and parse, so nothing in
+   *   such an answer is taken as committed
    */
   async offsetCommit(
     { groupId, groupGenerationId, memberId, groupInstanceId, retentionTime, topics },
@@ -1758,6 +1772,17 @@ module.exports = class Broker {
     })
     if (options?.[ON_WRITE]) protocolRequest.onWrite = options[ON_WRITE]
     if (options?.[ON_DECODED]) protocolRequest.onDecoded = options[ON_DECODED]
+    if (!options?.[UNCHECKED_ROWS]) {
+      const own = protocolRequest.response
+      protocolRequest.response = {
+        ...own,
+        decode: async (rawData) => {
+          const decoded = await own.decode(rawData)
+          requireCoverage('OffsetCommit', topics, decoded.responses)
+          return decoded
+        },
+      }
+    }
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
