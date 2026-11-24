@@ -158,7 +158,8 @@ const createConsumerGroup = (broker, { checkCrcs }) => {
     findBroker: async () => broker,
     findTopicPartitionMetadata: () => [{ partitionId: 0, leader: NODE_ID }],
     committedOffsets: () => ({}),
-    topicId: () => undefined,
+    // A topic without an id is never fetched; the broker's v11 still keys this one by name.
+    topicId: () => '01020304-0506-0708-090a-0b0c0d0e0f10',
     leaderEpoch: () => -1,
   }
 
