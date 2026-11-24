@@ -238,17 +238,22 @@ describe('Consumer > CRASH contract', () => {
     }
 
     it.each([
-      ['returns true', jest.fn(async () => true)],
+      ['returns true', () => jest.fn(async () => true)],
       [
         'throws',
-        jest.fn(async () => {
-          throw new Error('restartOnFailure itself is broken')
-        }),
+        () =>
+          jest.fn(async () => {
+            throw new Error('restartOnFailure itself is broken')
+          }),
       ],
-    ])('is never restarted when restartOnFailure %s', async (_, restartOnFailure) => {
+    ])('is never restarted when restartOnFailure %s', async (_, callback) => {
       const error = recreated()
+      const restartOnFailure = callback()
 
       expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+      // The callback is still asked; its answer is overruled.
+      expect(restartOnFailure).toHaveBeenCalledTimes(1)
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
     })
 
     it('is never restarted when the error is inside the cause chain of the crash', async () => {
@@ -260,6 +265,32 @@ describe('Consumer > CRASH contract', () => {
       const restartOnFailure = jest.fn(async () => true)
 
       expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+    })
+
+    it('is never restarted by default when the retries were exhausted on it', async () => {
+      // Without restartOnFailure an exhausted retry restarts, whatever it wraps.
+      const error = new KafkaJSNumberOfRetriesExceeded(recreated(), { retryCount: 3 })
+
+      expectCrashedForGood(await crashWith(error), error)
+    })
+
+    it('leaves an unrelated error to restartOnFailure', async () => {
+      const error = new KafkaJSNonRetriableError('fatal misconfiguration')
+      const restartOnFailure = jest.fn(async () => true)
+
+      const { crashes, restartsArmed, cleanups, connects } = await crashWith(
+        error,
+        restartOnFailure
+      )
+
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].error).toBe(error)
+      expect(crashes[0].restart).toBe(true)
+      expect(cleanups).toEqual([{ preserveSetupState: true }])
+      expect(restartsArmed).toBe(1)
+      expect(connects).toBe(1)
     })
 
     it('is never restarted when the error sits in a cause chain that loops', async () => {
