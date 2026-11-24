@@ -46,12 +46,15 @@ const decodeTopic = (version) => (decoder) => {
  * @returns {(rawData: Buffer) => Promise<object>} the decoder for that version: `throttleTime` is
  *   pinned at 0 and the broker's value is reported as `clientSideThrottleTime` (KIP-219), and the
  *   topics are sorted by name as v1's are
+ * @throws {KafkaJSPartialMessageError} when `Responses` is null, which no version allows
  */
 const buildDecode = (version) => async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  // A compact null count (0x00) reads as an empty list, as v1's classic -1 does
-  const listed = decoder.readUVarIntArray(decodeTopic(version)) || []
+  const listed = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopic(version)),
+    'DeleteTopicsResponse.Responses'
+  )
 
   decoder.readTaggedFields()
   return {
