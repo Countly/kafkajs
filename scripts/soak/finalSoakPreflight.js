@@ -15,8 +15,8 @@
  * with metrics from a probe producer and a probe consumer; per-node
  * broker provenance (image digests from `docker image inspect`, or operator evidence for a supplied
  * cluster); the prepared reporter's file cap, mounted jar digest and the cap each broker's load proof
- * reports; a quiet host (no agent or test
- * process other than this run's own broker containers, judged only once every broker container root
+ * reports; a quiet host (no build, test, runtime or assistant command-line process, by executable name,
+ * other than this run's own broker containers, judged only once every broker container root
  * is visible to the census), MemAvailable, free disk and load within the matrix floors. With `--diagnostic` (smoke
  * or rehearsal, for a hosted CI runner) the four host-capacity checks are still taken and written but do not
  * fail the preflight, and the record says so; such a run is never acceptance evidence.
@@ -152,7 +152,8 @@ const run = (command, args, options = {}) =>
 /**
  * Classes one `ps -eo pid=,ppid=,pcpu=,rss=,comm=` table for the paused-work census. A process whose
  * ancestry reaches a visible root of this run's broker containers is `own-broker` and names its node
- * and container; any other agent or test process, a foreign `java` included, keeps its class.
+ * and container. Any other process is classed by executable name: an assistant command-line tool
+ * `agent`, a `BUSY` name (a foreign `java` included) `test`, anything else `other`.
  * @param {string} table the `ps` output
  * @param {{ self?: number, roots?: { node: number, container: string, pid: number,
  *   visible: boolean }[] }} [options] the preflight's own pid (it and its children are left out) and

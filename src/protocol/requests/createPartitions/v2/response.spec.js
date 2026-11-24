@@ -1,5 +1,7 @@
 const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 const { decode, parse } = require('./response')
+const { decode: decodeV3 } = require('../v3/response')
 
 const vector = (caseId) => require(`../fixtures/java/createPartitionsResponse-v2-${caseId}.json`)
 
@@ -58,13 +60,29 @@ describe('Protocol > Requests > CreatePartitions > v2 response', () => {
     })
   })
 
-  test('reads a compact null count as no topics, never as a native error', async () => {
-    const body = new Encoder().writeInt32(25).writeUVarIntArray(null).writeTaggedFields().buffer
+  test('refuses a null result list', async () => {
+    const body = Buffer.from('000000000000', 'hex')
 
-    expect(await decode(body)).toEqual({
-      throttleTime: 0,
-      clientSideThrottleTime: 25,
-      topicErrors: [],
-    })
+    for (const codec of [decode, decodeV3]) {
+      const error = await codec(body).then(
+        () => null,
+        (rejection) => rejection
+      )
+
+      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect(error.message).toContain('CreatePartitionsResponse.Results')
+    }
+  })
+
+  test('keeps an empty result list (control)', async () => {
+    const body = Buffer.from('000000000100', 'hex')
+
+    for (const codec of [decode, decodeV3]) {
+      expect(await codec(body)).toEqual({
+        throttleTime: 0,
+        clientSideThrottleTime: 0,
+        topicErrors: [],
+      })
+    }
   })
 })

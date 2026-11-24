@@ -5,8 +5,9 @@ const { verifyEvidence, verifyScenario, verifyQuietResources } = require('./evid
 const { ordinaryOwnership } = require('./semantics')
 
 /**
- * Requires the D142 resource verdicts from a functionally verified, digest-bound archive.
- * This entry point is required only by memory-gates; phase lanes retain functional validation.
+ * Requires the resource verdicts (socket ownership, quiet-window resource equality and no surviving
+ * owned resource) from a functionally verified, digest-bound archive. Only the Memory gates
+ * workflow requires this entry point; the functional telemetry lanes keep functional validation.
  * @param {object} record stamped scenario and sidecar catalogue
  * @param {string} directory absolute evidence directory
  * @returns {void}

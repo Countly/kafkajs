@@ -71,4 +71,4 @@ Node and flags. A `pairs[].failure` leaves both raw records available and fails 
 completeness; there is no rerun or acceptance fallback.
 
 CI invokes `node scripts/e2e/telemetry/warmupWitness.js --diagnostic-only <new-directory>` on a
-quiet, broker-free runner. Runtime execution belongs in CI; local review uses static checks.
+quiet, broker-free runner.

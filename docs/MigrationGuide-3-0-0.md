@@ -865,7 +865,14 @@ says so, `groupProtocol: 'consumer'`.
   - **`consumer.commitOffsets(offsets)`**, and `commitOffsetsIfNecessary(offsets)` with your own
     payload, still fail: they reject with a non-retriable error whose message begins `OffsetCommit
     failed with stale member epoch.` and whose `type` is `STALE_MEMBER_EPOCH`. Handle it as you would
-    any other commit failure — retrying it yourself under the same epoch cannot succeed.
+    any other commit failure. Each new attempt is built with the latest positive epoch the
+    heartbeats have installed, and can still draw 113 if the coordinator moves the epoch again.
+
+  A commit is never sent under a member epoch of 0 or below (a member that is joining, or one that
+  has left): it is refused before it is written, an automatic commit is skipped, and
+  `consumer.commitOffsets()` rejects with `KafkaJSCommitFailedError` (reason `stale-assignment`).
+  This keeps a commit that is still retrying when the consumer leaves from overwriting the offsets
+  of the final commit.
 
   An `OffsetFetch` rejected the same way is re-sent under whatever epoch the heartbeats have
   installed by then, for up to the rebalance timeout, so a first fetch of committed offsets around a

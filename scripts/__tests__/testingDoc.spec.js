@@ -643,7 +643,7 @@ describe('documented live scenario scripts', () => {
       budgetsMs: [90000],
       wording: [
         'manual assignment with and without a group',
-        'acceptance runs use the reviewed guarded live entry',
+        'acceptance runs use the Exit gate check `e2e-direct-consumer`',
       ],
     },
     {
@@ -685,7 +685,7 @@ describe('documented live scenario scripts', () => {
       wording: [
         'duplicate static instance',
         'short and long coordinator outages',
-        'reviewed guarded live entry',
+        'Exit gate check `e2e-group-faults`',
       ],
     },
     {
@@ -697,7 +697,7 @@ describe('documented live scenario scripts', () => {
       wording: [
         'open and aborted transactions',
         'oversized first record',
-        'reviewed guarded live entry',
+        'Exit gate check `e2e-fetch-semantics`',
       ],
     },
     {
@@ -760,7 +760,7 @@ describe('documented live scenario scripts', () => {
     expect(block).toContain('npm run test:e2e:rack-aware-producer')
     expect(block).toContain('180000 ms')
     expect(block).toContain('docker-compose.racks.yml')
-    expect(block).toContain('sole cluster guard')
+    expect(block).toContain('cluster guard script named by `P9_CLUSTER_GUARD`')
   })
 
   it('documents the consumer-churn soak profile and its script', () => {

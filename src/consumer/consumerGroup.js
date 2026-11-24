@@ -1213,11 +1213,11 @@ module.exports = class ConsumerGroup {
         obligations: this.obligations,
         membershipProtocol: this.kind,
         staleEpochTimeout: this.rebalanceTimeout,
-        // Live reads, not the snapshot above: the offset-fetch retry inside the manager needs the
-        // epoch the heartbeats install while it is sleeping, and it must abandon its deadline the
-        // moment the runner is asked to stop or a rebalance is waiting for this fetch round to end.
-        // The rebalance coordinator is attached after this group is built, so it is read at call
-        // time.
+        // Live reads, not the snapshot above: under the consumer protocol every commit and offset
+        // fetch needs the epoch the heartbeats install, also between applies, and the fetch retry
+        // must abandon its deadline the moment the runner is asked to stop or a rebalance is
+        // waiting for this fetch round to end. The rebalance coordinator is attached after this
+        // group is built, so it is read at call time.
         membership: () => ({
           generationId: this.generationId,
           memberId: this.memberId,

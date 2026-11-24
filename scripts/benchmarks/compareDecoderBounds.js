@@ -17,18 +17,18 @@
  * Bonferroni median intervals use all 15 registered rows, including unavailable optional codecs.
  * A/A interval and median calibration and all three spreads determine validity. PASS requires
  * both the paired upper candidate bound and the unpaired median ratio at most 1.05. A valid lower
- * bound above 1.05 is REGRESSION; a failed median check is FAIL; otherwise INCONCLUSIVE. D171
- * accepts ordinary INVALID rows only for the named interval/spread noise problems when the
- * unpaired median ratio is at most 1.05. Control-median calibration remains blocking. D194
- * accepts an ordinary INCONCLUSIVE row without problems when its unpaired median ratio is at most
- * 1.05 and the evidence is complete. All other invalid, inconclusive, fail, regression and timeout
- * results exit 1 for ordinary rows. D167/D168
- * information-only rows retain their verdicts; valid FAIL or REGRESSION, structural errors and
- * timeouts still fail. Exceptions must remain empty.
+ * bound above 1.05 is REGRESSION; a failed median check is FAIL; otherwise INCONCLUSIVE. The
+ * invalid-noise rule accepts ordinary INVALID rows only for the named interval/spread noise
+ * problems when the unpaired median ratio is at most 1.05. Control-median calibration remains
+ * blocking. The inconclusive-noise rule accepts an ordinary INCONCLUSIVE row without problems when
+ * its unpaired median ratio is at most 1.05 and the evidence is complete. All other invalid,
+ * inconclusive, fail, regression and timeout results exit 1 for ordinary rows. The frame rows in
+ * INFORMATION_ONLY_ROWS are report-only for runner noise and retain their verdicts; valid FAIL or
+ * REGRESSION, structural errors and timeouts still fail. Exceptions must remain empty.
  *
  * The summary holds { baselineSha, candidateSha, node, registeredRows, seed, schedule, arms,
  * unavailable, unavailableInvocations, timedOut, result }. The result records informationOnlyRows
- * with their reasons, noiseAcceptedRows naming strict rows accepted under D171 or D194, and
+ * with their reasons, noiseAcceptedRows naming strict rows accepted under either noise rule, and
  * noiseAcceptedReasons giving each such row its verdict and reason. --combine appends that table
  * to $GITHUB_STEP_SUMMARY when it is set.
  * Arms retain oldNsPerOp, newNsPerOp,
@@ -53,12 +53,12 @@ const COLLECTION_DEADLINE_MS = 25 * 60 * 1000
 const MAX_RATIO = 1.05
 const MIN_CONTROL_RATIO = 0.95
 const MAX_SPREAD = 0.15
-/** Exact problem identities waived by D171; the separate unpaired C/A calibration is retained. */
+/** Exact problem identities the invalid-noise rule waives; the separate unpaired C/A calibration is retained. */
 const NOISE_PROBLEMS = Object.freeze({
   CONTROL_INTERVAL: 'A/A interval outside [0.95, 1.05]',
   SPREAD: 'spread exceeds fifteen percent',
 })
-/** D167/D168 frame rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
+/** Information-only frame rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
 const INFORMATION_ONLY_ROWS = Object.freeze({
   'frame-decode:1m': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
   'frame-decode:64b': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
@@ -427,7 +427,7 @@ const judgeRow = (row) => {
   }
 }
 
-/** Verdicts D167 waives on its information-only rows: noise, never valid slowdown evidence. */
+/** Verdicts waived on the information-only rows: noise, never valid slowdown evidence. */
 const WAIVED_NOISE = Object.freeze(['invalid', 'inconclusive'])
 /** Summary reason and report label of each verdict accepted as runner noise on an ordinary row. */
 const NOISE_ACCEPTANCE = Object.freeze({
@@ -443,7 +443,7 @@ const NOISE_ACCEPTANCE = Object.freeze({
 
 /**
  * @param {object} row computed row verdict, problems and unpaired medians
- * @returns {boolean} strict INVALID accepted only for D171 noise within the D164 median bound
+ * @returns {boolean} strict INVALID accepted only for interval/spread noise within the 1.05 median bound
  */
 const passesNoiseGate = ({ name, verdict, problems, oldMedian, newMedian }) =>
   !Object.hasOwn(INFORMATION_ONLY_ROWS, name) &&
@@ -457,9 +457,9 @@ const passesNoiseGate = ({ name, verdict, problems, oldMedian, newMedian }) =>
 
 /**
  * A valid INCONCLUSIVE row is noise only: no calibration problem, no proven regression and an
- * unpaired median within 5 %. Frame rows keep their D167/D168 treatment instead.
+ * unpaired median within 5 %. Frame rows keep their information-only treatment instead.
  * @param {object} row computed row verdict, problems and unpaired medians
- * @returns {boolean} strict INCONCLUSIVE accepted under D194 within the D164 median bound
+ * @returns {boolean} strict INCONCLUSIVE accepted within the 1.05 median bound
  */
 const passesInconclusiveNoise = ({ name, verdict, problems, oldMedian, newMedian }) =>
   !Object.hasOwn(INFORMATION_ONLY_ROWS, name) &&
@@ -472,7 +472,7 @@ const passesInconclusiveNoise = ({ name, verdict, problems, oldMedian, newMedian
 
 /**
  * @param {object} row computed row verdict; structural problems remain separate gate failures
- * @returns {boolean} PASS, D167/D168 information-only waiver, or D171/D194 noise-only acceptance
+ * @returns {boolean} PASS, information-only waiver, or noise-only acceptance
  */
 const rowPassesGate = (row) =>
   row.verdict === 'pass' ||
@@ -481,7 +481,7 @@ const rowPassesGate = (row) =>
   passesInconclusiveNoise(row)
 
 /**
- * Lists the ordinary rows accepted as runner noise. D194 needs complete evidence, so any
+ * Lists the ordinary rows accepted as runner noise. The inconclusive-noise rule needs complete evidence, so any
  * structural, timeout or partition problem withholds an INCONCLUSIVE acceptance.
  * @param {object[]} arms computed rows
  * @param {string[]} problems evidence problems of the same result
@@ -504,7 +504,7 @@ const noiseAcceptance = (arms, problems) => {
 
 /**
  * @param {*} input summary; live and offline use this same decision path
- * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[], informationOnlyRows: object, noiseAcceptedRows: string[], noiseAcceptedReasons: object }} gate verdict, D167/D168 reasons and D171/D194 row acceptances
+ * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[], informationOnlyRows: object, noiseAcceptedRows: string[], noiseAcceptedReasons: object }} gate verdict, information-only reasons and noise-only row acceptances
  */
 const compare = (input) => {
   const problems = validateInput(input)
@@ -527,7 +527,7 @@ const compare = (input) => {
  * Combines exactly the three complete, disjoint partitions. Seeds and clocks are independent;
  * tree identities, Node version, registration and work must agree. No unavailable row is a PASS.
  * @param {object[]} inputs partition evidence files, in any order
- * @returns {ReturnType<typeof compare>} all fifteen verdicts with D167/D168 and D171/D194 treatment
+ * @returns {ReturnType<typeof compare>} all fifteen verdicts with information-only and noise-only treatment
  */
 const combine = (inputs) => {
   if (!Array.isArray(inputs))
