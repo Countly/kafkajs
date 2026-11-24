@@ -23,21 +23,18 @@ const wholeCall = new WeakSet()
 /** @param {unknown} error @returns {boolean} whether this is a final broker answer */
 const isAnsweredError = (error) => answered.has(error)
 /** @param {unknown} error @returns {boolean} whether the entire call must reject */
-const endsCall = (error) => wholeCall.has(error)
+const endsCall = (error) => error instanceof KafkaJSUnknownOutcomeError || wholeCall.has(error)
 
 const mutations = new AsyncLocalStorage()
 
 /** @param {string} method @param {object[]} requests @param {Error} cause
  * @returns {KafkaJSUnknownOutcomeError} the failure for the written, unanswered requests
  */
-const unknownOutcome = (method, requests, cause) => {
-  const error = new KafkaJSUnknownOutcomeError(`${method}: no usable answer to a written request`, {
+const unknownOutcome = (method, requests, cause) =>
+  new KafkaJSUnknownOutcomeError(`${method}: no usable answer to a written request`, {
     requests,
     cause,
   })
-  wholeCall.add(error)
-  return error
-}
 
 /** The writes of one public invocation, independent of its deadline. */
 class MutationHistory {
@@ -70,7 +67,8 @@ class MutationHistory {
         ...protocolRequest,
         onWrite: () => {
           this.deadline.check()
-          if (this.closed) throw new KafkaJSNonRetriableError(`${this.method}: admin call completed`)
+          if (this.closed)
+            throw new KafkaJSNonRetriableError(`${this.method}: admin call completed`)
           let history = this.apis.get(apiKey)
           if (!history) {
             history = { first: null, unnamed: null, byKey: new Map() }
@@ -139,23 +137,27 @@ const currentMutation = () => {
 const settleMutations = async (work, accept) => {
   const outcomes = await Promise.allSettled(work)
   checked(null)
-  const failures = outcomes.filter((outcome) => outcome.status === 'rejected')
+  const failures = outcomes.flatMap((outcome) =>
+    outcome.status === 'rejected' ? [outcome.reason] : []
+  )
   const unknowns = [
-    ...new Set(
-      failures.map(({ reason }) => reason).filter((error) => error instanceof KafkaJSUnknownOutcomeError)
-    ),
+    ...new Set(failures.filter((error) => error instanceof KafkaJSUnknownOutcomeError)),
   ]
   if (unknowns.length === 1) throw unknowns[0]
   if (unknowns.length > 1) {
     const requests = [...new Set(unknowns.flatMap((error) => error.requests))]
     throw unknownOutcome(currentMutation()?.method ?? 'Admin mutation', requests, unknowns[0].cause)
   }
-  const whole = failures.find(({ reason }) => endsCall(reason))
-  if (whole) throw whole.reason
-  const final = failures.filter(({ reason }) => isAnsweredError(reason))
-  if (final.length > 0) {
-    const errors = final.map(({ reason }) => reason)
-    if (errors.length > 1 && errors.every((error) => error instanceof KafkaJSDeleteTopicRecordsError)) {
+  const whole = failures.find(endsCall)
+  if (whole) throw whole
+  const errors = failures.filter(
+    (error) => isAnsweredError(error) || error instanceof KafkaJSDeleteTopicRecordsError
+  )
+  if (errors.length > 0) {
+    if (
+      errors.length > 1 &&
+      errors.every((error) => error instanceof KafkaJSDeleteTopicRecordsError)
+    ) {
       const aggregate = new KafkaJSDeleteTopicRecordsError({
         partitions: errors.flatMap((error) => error.partitions),
       })
@@ -169,7 +171,7 @@ const settleMutations = async (work, accept) => {
       if (outcome.status === 'fulfilled') accept(outcome.value, index)
     })
   }
-  if (failures.length > 0) throw failures[0].reason
+  if (failures.length > 0) throw failures[0]
   return outcomes.map(({ value }) => value)
 }
 
@@ -700,7 +702,7 @@ const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle, inputs = {}) =
       const timeoutMs = validateApiTimeout(args[index]?.apiTimeout, defaultTimeout)
       const admit = inputOf && (() => inputOf(...args))
       const run = (generation, admitted = args) =>
-runWithDeadline(method, timeoutMs, () => work(...admitted), generation, startedAt, true)
+        runWithDeadline(method, timeoutMs, () => work(...admitted), generation, startedAt, true)
       return lifecycle ? lifecycle.run(run, admit) : run(null, admit?.())
     }
   }

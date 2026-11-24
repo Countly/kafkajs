@@ -199,8 +199,11 @@ const mutationDefinition = (apiKey, definition) => ({
     const build = definition.protocol(options)
     const shared = apiKey === apiKeys.InitProducerId || apiKey === apiKeys.LeaveGroup
     return (args, ownership) => {
-      if ((shared && ownership !== ADMIN_MUTATION) ||
-          !currentMutation() || !isMutation(apiKey, options.version, args)) {
+      if (
+        (shared && ownership !== ADMIN_MUTATION) ||
+        !currentMutation() ||
+        !isMutation(apiKey, options.version, args)
+      ) {
         return build(args)
       }
       const input = owned(args)

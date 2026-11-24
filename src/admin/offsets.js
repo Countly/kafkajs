@@ -8,7 +8,7 @@ const {
 const { createErrorFromCode, failure } = require('../protocol/error')
 const { ON_DECODED } = require('../broker/privateOptions')
 const { itemRetry, isLocal } = require('./itemRetry')
-const { checked, waitOf, currentDeadline } = require('./deadline')
+const { checked, waitOf, currentDeadline, endsCall, isAnsweredError } = require('./deadline')
 const { exact, validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
@@ -211,7 +211,7 @@ class OffsetAdmin {
         items,
         keyOf: cellKey,
         retry: this.retry,
-        retryable: (row) => [14, 15, 16].includes(row.errorCode),
+        retryable: () => false,
         callFailure: (error) =>
           [30, 69, 24, 68].includes(error?.code) ||
           (!worked && callFailure(error)) ||
@@ -240,6 +240,8 @@ class OffsetAdmin {
         return rows
       }
     ).catch((error) => {
+      checked(null)
+      if (endsCall(error) || isAnsweredError(error)) throw error
       if (groupFailure && error.code === groupFailure.code) throw groupFailure
       throw failureOf(error) ?? error
     })

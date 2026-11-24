@@ -10,6 +10,9 @@ const { inspect } = require('util')
 const AdminLifecycle = require('./lifecycle')
 const {
   retrierOf,
+  endsCall,
+  isAnsweredError,
+  settleMutations,
   wrapAdmin,
   validateApiTimeout,
   checked,
@@ -927,7 +930,6 @@ module.exports = ({
       const ids = topicIds.map((id) => id.toLowerCase())
       if (new Set(ids).size !== ids.length)
         throw new KafkaJSInvalidConfigurationError('Duplicate topicIds')
-      let pending = ids
       const knownNames = new Map()
       const forget = (confirmed) => {
         for (const id of confirmed) {
@@ -939,15 +941,13 @@ module.exports = ({
       await retrierOf(retry)(async (bail) => {
         try {
           checked(await waitOf(() => cluster.refreshMetadata()))
-          for (const id of pending) {
+          for (const id of ids) {
             const name = cluster.metadataCache?.topicName(id)
             if (name !== undefined && !knownNames.has(id)) knownNames.set(id, name)
           }
           const broker = checked(await waitOf(() => cluster.findControllerBroker()))
-          checked(await waitOf(() => broker.deleteTopics({ topicIds: pending, timeout })))
-          const confirmed = pending
-          pending = []
-          forget(confirmed)
+          checked(await waitOf(() => broker.deleteTopics({ topicIds: ids, timeout })))
+          forget(ids)
         } catch (error) {
           const failures = error.topicErrors?.map((row) => ({
             ...row,
@@ -956,17 +956,9 @@ module.exports = ({
           if (failures) error.topicErrors = failures
           if (failures) {
             const failed = new Set(failures.map((row) => row.topicId))
-            forget(pending.filter((id) => !failed.has(id)))
+            forget(ids.filter((id) => !failed.has(id)))
           }
-          if (
-            failures?.length > 0 &&
-            failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
-          ) {
-            const refused = new Set(failures.map((row) => row.topicId))
-            pending = pending.filter((id) => refused.has(id))
-            if (pending.length === 0) bail(error)
-            throw error
-          }
+          if (endsCall(error) || isAnsweredError(error) || failures) return bail(error)
           if (error.type === 'NOT_CONTROLLER') {
             checked(await waitOf(() => cluster.refreshMetadata()))
             throw error
@@ -991,63 +983,34 @@ module.exports = ({
       throw new KafkaJSNonRetriableError('Invalid topics array, the names must be a valid string')
     }
 
-    const retrier = retrierOf(retry)
-    let pending = topics
-
-    return retrier(async (bail, retryCount, retryTime) => {
+    const names = topics.slice()
+    await retrierOf(retry)(async (bail, retryCount, retryTime) => {
       try {
-        checked(await waitOf(async () => cluster.refreshMetadata()))
-        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
-        checked(await waitOf(async () => broker.deleteTopics({ topics: pending, timeout })))
-
-        // Remove deleted topics
-
-        // Remove deleted topics
-        for (const topic of topics) {
-          cluster.targetTopics.delete(topic)
-        }
-
-        checked(await waitOf(async () => cluster.refreshMetadata()))
-      } catch (e) {
-        if (e.topicErrors) {
-          // a name the broker did not list as failed was deleted: the next refresh must not ask for it
-          const failed = new Set(e.topicErrors.map(({ topic }) => topic))
-          for (const topic of pending) {
-            if (!failed.has(topic)) {
-              cluster.targetTopics.delete(topic)
-            }
+        checked(await waitOf(() => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(() => cluster.findControllerBroker()))
+        checked(await waitOf(() => broker.deleteTopics({ topics: names, timeout })))
+      } catch (error) {
+        if (error.topicErrors) {
+          const failed = new Set(error.topicErrors.map(({ topic }) => topic))
+          for (const topic of names) {
+            if (!failed.has(topic)) cluster.targetTopics.delete(topic)
           }
         }
-
-        const refused = throttledTopics(e)
-
-        if (refused) {
-          pending = pending.filter((topic) => refused.has(topic))
-          logger.warn('A quota refused topic deletions', {
-            topics: [...refused],
-            retryCount,
-            retryTime,
-          })
-          throw e
+        if (endsCall(error) || isAnsweredError(error) || error.topicErrors) return bail(error)
+        if (error.type === 'NOT_CONTROLLER') {
+          logger.warn('Could not delete topics', { error: error.message, retryCount, retryTime })
+          throw error
         }
-
-        if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(e.type)) {
-          logger.warn('Could not delete topics', { error: e.message, retryCount, retryTime })
-          throw e
-        }
-
-        if (e.type === 'REQUEST_TIMED_OUT') {
-          logger.error(
-            'Could not delete topics, check if "delete.topic.enable" is set to "true" (the default value is "false") or increase the timeout',
-            {
-              error: e.message,
-              retryCount,
-              retryTime,
-            }
-          )
-        }
-
-        bail(e)
+        return bail(error)
+      }
+      for (const topic of names) cluster.targetTopics.delete(topic)
+    })
+    return retrierOf(retry)(async (bail) => {
+      try {
+        checked(await waitOf(() => cluster.refreshMetadata()))
+      } catch (error) {
+        if (error.type === 'NOT_CONTROLLER') throw error
+        bail(error)
       }
     })
   }
@@ -1624,7 +1587,10 @@ module.exports = ({
 
         const brokers = Array.from(resourcerByBroker.keys())
         const responses = checked(
-          await waitOf(async () => Promise.all(brokers.map(alterConfigsAction)))
+          await waitOf(() => {
+            const sends = brokers.map(alterConfigsAction)
+            return validateOnly ? Promise.all(sends) : settleMutations(sends)
+          })
         )
         const responseResources = responses.reduce(
           (result, { resources }) => [...result, ...resources],
@@ -1633,6 +1599,7 @@ module.exports = ({
 
         return { resources: responseResources }
       } catch (e) {
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
           throw e
@@ -1709,22 +1676,22 @@ module.exports = ({
           )
         )
         const responses = checked(
-          await waitOf(async () =>
-            Promise.all(
-              Array.from(resourcesByBroker, ([broker, group]) =>
-                broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
-              )
+          await waitOf(() => {
+            const sends = Array.from(resourcesByBroker, async ([broker, group]) =>
+              broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
             )
-          )
+            return validateOnly ? Promise.all(sends) : settleMutations(sends)
+          })
         )
         const results = responses.flatMap((response) => response.resources)
 
-        if (results.some(({ errorCode }) => errorCode === NOT_CONTROLLER_CODE)) {
+        if (validateOnly && results.some(({ errorCode }) => errorCode === NOT_CONTROLLER_CODE)) {
           throw createErrorFromCode(NOT_CONTROLLER_CODE)
         }
 
         return { resources: inRequestOrder(resources, results) }
       } catch (e) {
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
           throw e
@@ -2045,27 +2012,20 @@ module.exports = ({
           }
 
           const nodeIds = Object.keys(brokersPerNode)
-          const outcomes = checked(
-            await Promise.allSettled(
-              nodeIds.map(async (nodeId) =>
-                checked(
-                  await waitOf(async () =>
-                    brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
-                  )
-                )
+          checked(
+            await waitOf(() =>
+              settleMutations(
+                nodeIds.map(async (nodeId) =>
+                  brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
+                ),
+                (value, index) => {
+                  const nodeId = nodeIds[index]
+                  rowsByNode[nodeId] = [...(rowsByNode[nodeId] || []), ...value.results]
+                  for (const groupId of brokersPerGroups[nodeId]) answered.add(groupId)
+                }
               )
             )
           )
-
-          outcomes.forEach((outcome, index) => {
-            if (outcome.status !== 'fulfilled') return
-            const nodeId = nodeIds[index]
-            rowsByNode[nodeId] = [...(rowsByNode[nodeId] || []), ...outcome.value.results]
-            for (const groupId of brokersPerGroups[nodeId]) answered.add(groupId)
-          })
-
-          const rejected = outcomes.find(({ status }) => status === 'rejected')
-          if (rejected) throw rejected.reason
         }
 
         // Rows keep coordinator order, as a single attempt returns them, whichever attempt answered.
@@ -2195,6 +2155,7 @@ module.exports = ({
 
         return leaving.map((member, index) => toRemoveMemberResult(member, response.members[index]))
       } catch (e) {
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (isStaleCoordinator(e) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE) {
           logger.warn('Could not remove members from the group', {
             error: e.message,
@@ -2305,8 +2266,6 @@ module.exports = ({
           )
         }
 
-        const partitionErrors = []
-
         const brokerRequests = entries(seekEntriesByBroker).map(
           ([nodeId, { topic, partitions }]) =>
             async () => {
@@ -2319,45 +2278,12 @@ module.exports = ({
             }
         )
 
-        checked(
-          await waitOf(async () =>
-            Promise.all(
-              brokerRequests.map((request) =>
-                request().catch((e) => {
-                  if (e.name === 'KafkaJSDeleteTopicRecordsError') {
-                    e.partitions.forEach(({ partition, offset, error }) => {
-                      partitionErrors.push({
-                        partition,
-                        offset,
-                        error,
-                      })
-                    })
-                  } else {
-                    // then it's an unknown error, not from the broker response
-                    throw e
-                  }
-                })
-              )
-            )
-          )
-        )
-
-        if (partitionErrors.length > 0) {
-          throw new KafkaJSDeleteTopicRecordsError({
-            topic,
-            partitions: partitionErrors,
-          })
-        }
+        checked(await waitOf(() => settleMutations(brokerRequests.map((request) => request()))))
       } catch (e) {
-        if (
-          e.retriable &&
-          (staleMetadata(e) ||
-            e.partitions?.some(
-              ({ error }) => staleMetadata(error) || error.name === 'KafkaJSMetadataNotLoaded'
-            ))
-        ) {
-          checked(await waitOf(async () => cluster.refreshMetadata()))
+        if (endsCall(e) || isAnsweredError(e) || e instanceof KafkaJSDeleteTopicRecordsError) {
+          return bail(e)
         }
+        if (e.retriable && staleMetadata(e)) checked(await waitOf(() => cluster.refreshMetadata()))
         throw e
       }
     })
@@ -2753,6 +2679,7 @@ module.exports = ({
               )
               outcome.succeeded()
             } catch (e) {
+              if (endsCall(e) || isAnsweredError(e) || isPerItemFailure(e)) return bail(e)
               if (e.type === 'NOT_CONTROLLER') {
                 logger.warn('Could not reassign partitions', {
                   error: e.message,
@@ -2760,21 +2687,6 @@ module.exports = ({
                   retryTime,
                 })
                 throw e
-              }
-
-              if (isPerItemFailure(e)) {
-                const retryable = outcome.settle(e)
-                if (retryable) {
-                  logger.warn('Could not reassign some partitions yet', {
-                    partitions: retryable.errors.map(({ topic, partition }) =>
-                      partitionKey(topic, partition)
-                    ),
-                    retryCount,
-                    retryTime,
-                  })
-                  throw retryable
-                }
-                return
               }
 
               bail(e)

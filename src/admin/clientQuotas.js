@@ -146,7 +146,7 @@ class ClientQuotas {
         items: [...wire.values()].map(({ entity }) => ({ entity })),
         keyOf,
         retry: this.retry,
-        retryable: (row) => row.errorCode === 7,
+        retryable: (row) => validateOnly && row.errorCode === 7,
         callFailure,
         sanitize: (message) => message,
       },

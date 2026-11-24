@@ -3351,8 +3351,9 @@ export interface UnknownOutcomeRequest {
   /** The API name, such as `'DeleteRecords'`. */
   readonly api: string
   readonly apiVersion: number
-  readonly nodeId: number
-  /** The items it carried, such as `{ topic, partition }` cells; `null` when they could not be named. */
+  /** Null when the request went to a bootstrap broker whose id is unknown. */
+  readonly nodeId: number | null
+  /** The named items, or null for a single-frame API or when the items could not be named. */
   readonly items: unknown[] | null
 }
 
