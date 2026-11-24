@@ -587,17 +587,33 @@ within `requestTimeout`, and is rejected with `KafkaJSConnectionClosedError` whe
 closes first. The *next* request the caller makes goes through the caller's normal retry path (the
 producer's or consumer's own `retry` configuration) against the rebuilt cluster — it is not itself
 a source of message loss, but a producer created with `idempotent: false` can duplicate records the
-broker had already appended when a produce is retried. A client `disconnect()` waits for these
-draining connections as it does for its current ones. SASL authentication state
+broker had already appended when a produce is retried.
+
+Each replaced connection drains on its own for at most `requestTimeout`, counted from when it was
+replaced. The same holds for the connections a metadata refresh replaces: a broker whose address
+moved, one the answer no longer lists, and a replaced connection pool. A client `disconnect()`
+started meanwhile closes these connections too. Without a close timeout it waits, alongside its
+current connections, for what is left of that bound on the slowest of them, so at most
+`requestTimeout`; a shorter close timeout closes them sooner, and a timeout of 0 at once. This is
+only the transport part of a close; stopping, leaving the group and the final telemetry push come on
+top. Closing one of these connections can fail, for example when a custom socket's `destroy()`
+throws. A failure of the background drain is logged. A failure of the close the `disconnect()`
+itself starts on them is reported once every drain it waits for has settled, as a failure on a
+current connection is: a consumer's `disconnect()` rejects with it unless its timeout forced the
+close, an admin client's `disconnect()` without a timeout and the share consumer's `disconnect()`
+reject with it, and a producer's `disconnect()` or an admin `disconnect({ timeout })` logs it and
+resolves.
+
+SASL authentication state
 (the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
 authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
 reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.
 
 A rebootstrap trusts the configured broker list. If that list now leads to a different Kafka
 cluster, the client installs the new cluster's metadata without noticing the change, and a consumer
-keeps the positions it held on the old cluster: it can fetch from the new cluster at those offsets
-at least until its group membership is rebuilt there, and a consumer that uses `assign()` has no
-group membership to rebuild and keeps doing so. Point the broker list of a running client only at
+keeps the positions it held on the old cluster: it may fetch from the new cluster at those offsets
+before it rejoins its group or is reassigned there, and a consumer that uses `assign()` may keep
+doing so for as long as it keeps those positions. Point the broker list of a running client only at
 brokers of the same cluster.
 
 ## Default Retry
