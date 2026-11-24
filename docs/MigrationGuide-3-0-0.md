@@ -296,6 +296,14 @@ notice and what, if anything, to do.
   `0`/absent for the send time (numeric `0`, `0n` and absent still mean the send time; the string
   `'0'` and `new Date(0)` are the literal epoch).
 
+- **A custom partitioner that returns an invalid partition now rejects the send.** 2.2.4
+  resolved such a send and dropped the records whose partition was not a partition of the topic.
+  3.0.0 rejects it with `KafkaJSInvalidConfigurationError` before anything is queued. The value
+  must be an integer from 0 to 2147483647, as a number or a canonical decimal string. The built-in
+  partitioners return an explicit `message.partition` as it is, so a message with an invalid
+  `message.partition` is rejected the same way. *What to do:* make the partitioner return a
+  partition id, and give messages only valid `partition` values.
+
 ### Transactions
 
 Transactions move to the transaction protocol Kafka 4.x brokers speak, and a failed send now ends a
