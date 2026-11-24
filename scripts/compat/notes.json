@@ -77,7 +77,7 @@
       "since": "2026-10-08"
     },
     "WriteTxnMarkers": {
-      "note": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented.",
+      "note": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228).",
       "since": "2026-10-19"
     },
     "TxnOffsetCommit": {

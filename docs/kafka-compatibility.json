@@ -647,7 +647,7 @@
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented."
+      "notes": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228)."
     },
     {
       "kafkaName": "TxnOffsetCommit",
