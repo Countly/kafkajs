@@ -203,7 +203,7 @@ const adminOverDeletingBroker = (answers, targets) => {
 const sentTopics = (broker) => broker.deleteTopics.mock.calls.map(([{ topics }]) => topics)
 
 describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
-  test('a quota refusal drops the deleted target and keeps the refused target without resending', async () => {
+  test('a quota refusal drops the deleted target without resending', async () => {
     const { admin, broker, cluster } = adminOverDeletingBroker(
       [
         [
