@@ -1570,7 +1570,7 @@ describe('Consumer > Runner', () => {
       }
     )
 
-    it("after resume, p1's records are delivered once, in order, from the unchanged position", async () => {
+    it('after resume, a replacement batch handed to the worker for p1 is delivered once, in order, and the queued batch delivered nothing', async () => {
       await start({ eachBatch: undefined, eachMessage: recordingHandler() })
       const queue = queueWith(1)
       const first = queue.push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
@@ -1578,6 +1578,8 @@ describe('Consumer > Runner', () => {
       pauseOf(1)
       gate.open()
       await first
+      expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
+      expect(resolvedOf(1)).toEqual([])
 
       consumerGroup.resume([{ topic: topicName, partitions: [1] }])
       await queue.push(batchOf(1, [4, 5]))
@@ -1626,7 +1628,6 @@ describe('Consumer > Runner', () => {
 
       it('resolves nothing for a control-only batch while paused, and moves past the record after resume', async () => {
         await start()
-        pauseOnStart()
         const control = () =>
           new Batch(topicName, '5', {
             partition: 1,
@@ -1634,17 +1635,20 @@ describe('Consumer > Runner', () => {
             messages: [{ offset: '5', isControlRecord: true }],
           })
 
+        const events = pauseOnStart()
         await runner.handleBatch(control())
         expect(resolvedOf(1)).toEqual([])
+        expect(events).toEqual(['start', 'end'])
 
         consumerGroup.resume([{ topic: topicName, partitions: [1] }])
         await runner.handleBatch(control())
         expect(resolvedOf(1)).toEqual(['5'])
+        expect(events).toEqual(['start', 'end', 'start', 'end'])
       })
 
       it('resolves nothing for a batch whose records are all below the fetch offset', async () => {
         await start()
-        pauseOnStart()
+        const events = pauseOnStart()
         const compacted = () =>
           new Batch(topicName, '10', {
             partition: 1,
@@ -1654,10 +1658,12 @@ describe('Consumer > Runner', () => {
 
         await runner.handleBatch(compacted())
         expect(resolvedOf(1)).toEqual([])
+        expect(events).toEqual(['start', 'end'])
 
         consumerGroup.resume([{ topic: topicName, partitions: [1] }])
         await runner.handleBatch(compacted())
         expect(resolvedOf(1)).toEqual(['10'])
+        expect(events).toEqual(['start', 'end', 'start', 'end'])
       })
     })
 

@@ -1,4 +1,10 @@
 const Batch = require('../batch')
+const Decoder = require('../../protocol/decoder')
+const Encoder = require('../../protocol/encoder')
+const decodeMessages = require('../../protocol/requests/fetch/v4/decodeMessages')
+const {
+  batch: recordBatchBytes,
+} = require('../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 
 describe('Consumer > Batch', () => {
   const topic = 'topic-name'
@@ -243,12 +249,17 @@ describe('Consumer > Batch', () => {
       expect(below.lastOffset()).toEqual('10')
     })
 
-    it('gives no header progress when the header end would pass int64', () => {
+    it('gives no header progress when the header end would pass int64', async () => {
+      const header = recordBatchBytes({ baseOffset: 9223372036854775807n })
+      const decoded = await decodeMessages(
+        new Decoder(new Encoder().writeInt32(header.length).writeBuffer(header).buffer)
+      )
       const batch = build('9223372036854775807', {
-        messages: [],
+        ...decoded,
         highWatermark: '9223372036854775807',
       })
 
+      expect(decoded).toEqual({ messages: [] })
       expect(batch.isEmptyDueToFiltering()).toEqual(false)
       expect(batch.lastOffset()).toEqual('9223372036854775806')
     })
