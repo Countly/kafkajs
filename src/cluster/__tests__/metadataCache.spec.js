@@ -383,6 +383,43 @@ describe('Cluster > MetadataCache', () => {
     })
   })
 
+  test('a TOPIC_RECREATED listener that throws null does not break the metadata refresh', async () => {
+    emitter.addListener(CLUSTER_TOPIC_RECREATED, () => {
+      throw null // eslint-disable-line no-throw-literal
+    })
+    const pool = new BrokerPool({
+      connectionPoolBuilder: {},
+      logger: newLogger(),
+      retry: { retries: 0 },
+      metadataCache: cache,
+    })
+    let answer = response({ topicId: ID_A, brokers: [0] })
+    pool.seedBroker = {
+      isConnected: () => true,
+      metadata: async () => answer,
+      connectionPool: { host: '127.0.0.1', port: 9092, rack: null },
+    }
+    const published = jest.fn()
+    cache.onRoutingChange(published)
+    await pool.refreshMetadata([])
+    const errors = jest.spyOn(cache.logger, 'error')
+
+    answer = response({ topicId: ID_B, leader: 2, leaderEpoch: 6, brokers: [0] })
+    await expect(pool.refreshMetadata([])).resolves.toBeUndefined()
+
+    expect(pool.metadata).toBe(answer)
+    expect(cache.topicId('test-topic')).toEqual(ID_B)
+    expect(cache.leader('test-topic', 0)).toEqual(2)
+    expect(published).toHaveBeenCalledTimes(2)
+    expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_B }])
+    expect(errors).toHaveBeenCalledTimes(1)
+    expect(errors).toHaveBeenCalledWith('Instrumentation event listener threw, ignoring it', {
+      eventName: CLUSTER_TOPIC_RECREATED,
+      topic: 'test-topic',
+      error: 'undefined',
+    })
+  })
+
   test('the all-zero topic id is treated as no id at all', () => {
     cache.update(response({ topicId: '00000000-0000-0000-0000-000000000000' }))
     expect(cache.topicId('test-topic')).toBeUndefined()
@@ -1056,5 +1093,25 @@ describe('Cluster > MetadataCache > routing change notifications', () => {
     cache.update(response())
     expect(listener).not.toHaveBeenCalled()
     expect(survivor).toHaveBeenCalledTimes(1)
+  })
+
+  it('a routing listener that throws undefined does not break the publication', () => {
+    const { cache, listener } = build()
+    cache.onRoutingChange(() => {
+      throw undefined // eslint-disable-line no-throw-literal
+    })
+    const survivor = jest.fn()
+    cache.onRoutingChange(survivor)
+    const errors = jest.spyOn(cache.logger, 'error')
+
+    expect(() => cache.update(response())).not.toThrow()
+
+    expect(cache.topicId('test-topic')).toEqual(ID_A)
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(survivor).toHaveBeenCalledTimes(1)
+    expect(errors).toHaveBeenCalledTimes(1)
+    expect(errors).toHaveBeenCalledWith('Routing change listener threw, ignoring it', {
+      error: 'undefined',
+    })
   })
 })
