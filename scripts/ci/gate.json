@@ -24635,8 +24635,10 @@
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a flush still queued after a node's drive ended keeps that node busy until the drain ends",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a broker fence during the handler wait skips the drain and the leave",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a stop from a lock expiry listener releases the live batch records before handler admission",
+        "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a close in the tick after eachMessage dropped an expired record releases the live record behind it in the final",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a crash releases its resources before a pending restart decision and stop allows a fresh run",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a crash releases its resources before a pending restart decision and disconnect allows a fresh run",
+        "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a crash that supersedes a natural stop closes the data connection and ends the run before a pending restart decision",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop stop during the first join resolves and writes nothing after it",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop stop during a reset backoff resolves and writes nothing after it",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop stop during an invalid epoch backoff closes the broker session on the replacement socket",
@@ -24647,7 +24649,8 @@
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded stop with a detached node record stop drains and closes the detached connection before the replacement binds",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded stop with a detached node record stop without a leave closes a detached session whose final was refused after the restore",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded stop with a detached node record a detached node record that shares the replacement's connection never closes it before the replacement's final",
-        "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded stop with a detached node record a finished close episode keeps no node record, binding or connection"
+        "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded stop with a detached node record a finished close episode keeps no node record, binding or connection",
+        "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded stop with a detached node record a detached node's late opening fetch on the replacement's connection is closed once after the replacement's final is refused"
       ],
       "capMinutes": 85,
       "allowedSkips": [

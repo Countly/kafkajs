@@ -1,5 +1,6 @@
 const Cluster = require('../../../cluster')
 const Connection = require('../../../network/connection')
+const { requests } = require('../../../protocol/requests')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { ShareRun } = require('../shareRun')
 const { LEVELS } = require('../../../loggers')
@@ -172,6 +173,37 @@ class BoundRig {
       reached = true
       await gate.promise
       return original.apply(this, args)
+    })
+    return { reached: () => reached, release: () => gate.resolve() }
+  }
+
+  /**
+   * Holds the first opening fetch (epoch 0) while it is encoded, before its transmission guard
+   * runs, so the client has not written it yet.
+   * @returns {{reached: () => boolean, release: () => void}} The hold, also released in `end`.
+   */
+  holdOpenBeforeWrite() {
+    const gate = this.gate()
+    let reached = false
+    const protocol = requests.ShareFetch.protocol
+    jest.spyOn(requests.ShareFetch, 'protocol').mockImplementation((selection) => {
+      const factory = protocol(selection)
+      return (options) => {
+        const built = factory(options)
+        if (options?.shareSessionEpoch !== 0 || reached) return built
+        reached = true
+        const { encode } = built.request
+        return {
+          ...built,
+          request: {
+            ...built.request,
+            encode: async () => {
+              await gate.promise
+              return encode()
+            },
+          },
+        }
+      }
     })
     return { reached: () => reached, release: () => gate.resolve() }
   }
@@ -685,6 +717,41 @@ describe('bounded share consumer stop', () => {
     expect(rig.h.frames(76, 78, 79)).toEqual(written)
   })
 
+  test('a close in the tick after eachMessage dropped an expired record releases the live record behind it in the final', async () => {
+    rig = new BoundRig()
+    rig.h.cluster.answer('ShareFetch', (fields) =>
+      fields.shareSessionEpoch === 0
+        ? fetchAnswer([acquire(0, 0, ['expired', 'live'])])
+        : echo('ShareFetch', fields)
+    )
+    const canStart = ShareAckLedger.prototype.canStart
+    jest.spyOn(ShareAckLedger.prototype, 'canStart').mockImplementation(
+      /** @this {ShareAckLedger} @param {string} offset @param {number} now @returns {boolean} */
+      function (offset, now) {
+        return offset !== '0' && canStart.call(this, offset, now)
+      }
+    )
+    const handled = jest.fn(async () => {})
+    const expired = []
+    let crashed
+    rig.h.consumer.on(rig.h.consumer.events.LOCK_EXPIRED, ({ payload }) => {
+      expired.push(payload.offsets)
+      Promise.resolve().then(() => {
+        crashed ??= track(rig.run.crash(new Error('terminal')))
+      })
+    })
+    await rig.h.consumer.subscribe({ topics: ['topic-a'] })
+    await rig.h.consumer.run({ eachMessage: handled })
+    await until(() => crashed?.settled, 'the close in the tick after the drop')
+    expect(expired).toEqual([['0']])
+    expect(handled).not.toHaveBeenCalled()
+    expect(rig.acks).toEqual([[0, '1', '1', 'release', null]])
+    expect(rig.finals()).toHaveLength(1)
+    expect(rig.finals()[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '1', lastOffset: '1', acknowledgeTypes: [2] },
+    ])
+  })
+
   test.each(['stop', 'disconnect'])(
     'a crash releases its resources before a pending restart decision and %s allows a fresh run',
     async (method) => {
@@ -698,14 +765,15 @@ describe('bounded share consumer stop', () => {
       const { run } = rig
       const routing = run.options.cluster.metadataCache.routingListeners
       const listeners = routing.size
-      if (method === 'disconnect') run.stop()
       const crashed = track(run.crash(new Error('terminal')))
       await until(() => retry.restartOnFailure.mock.calls.length === 1, 'the pending verdict')
       expect(crashed.settled).toBe(false)
       expect(run.finished).toBe(true)
       expect([run.nodes.size, run.detached.size, run.assignment.size]).toEqual([0, 0, 0])
       expect(routing.size).toBe(listeners - 1)
+      expect(run.runner.current).toBe(run)
       await rig.h.consumer[method]()
+      expect(run.runner.current).toBeNull()
       await rig.begin()
       expect(rig.runs).toHaveLength(2)
       expect(rig.joins()).toHaveLength(2)
@@ -714,6 +782,43 @@ describe('bounded share consumer stop', () => {
       expect(rig.runs[1].runner.current).toBe(rig.runs[1])
     }
   )
+
+  test('a crash that supersedes a natural stop closes the data connection and ends the run before a pending restart decision', async () => {
+    const deciding = deferred()
+    const retry = { restartOnFailure: jest.fn(() => deciding.promise) }
+    rig = new BoundRig({ share: { retry } })
+    rig.gates.push({ resolve: () => deciding.resolve(false) })
+    rig.serve()
+    const held = rig.gate()
+    let started = false
+    await rig.begin(async () => {
+      started = true
+      await held.promise
+    })
+    await until(() => started, 'the held handler')
+    const { run } = rig
+    const [open] = rig.h.frames(78)
+    let stops = 0
+    rig.h.consumer.on(rig.h.consumer.events.STOP, () => stops++)
+    const stopping = track(rig.h.consumer.stop())
+    await flush()
+    expect(stopping.settled).toBe(false)
+    const crashed = track(run.crash(new Error('terminal')))
+    await until(() => retry.restartOnFailure.mock.calls.length === 1, 'the pending verdict')
+    expect(rig.closesOf(open)).toBe(1)
+    expect(stopping).toEqual({ settled: true, error: null })
+    expect(stops).toBe(1)
+    expect(crashed.settled).toBe(false)
+    expect(run.finished).toBe(true)
+    expect([run.nodes.size, run.detached.size, run.assignment.size]).toEqual([0, 0, 0])
+    expect(run.runner.current).toBeNull()
+    await rig.begin()
+    expect(rig.runs).toHaveLength(2)
+    expect(rig.joins()).toHaveLength(2)
+    deciding.resolve(true)
+    await until(() => crashed.settled, 'the old verdict being discarded')
+    expect(rig.runs[1].runner.current).toBe(rig.runs[1])
+  })
 
   test('stop during the first join resolves and writes nothing after it', async () => {
     rig = new BoundRig()
@@ -874,23 +979,18 @@ describe('bounded stop with a detached node record', () => {
   })
 
   /**
-   * Revokes the node's only partition, holds the final its drive then sends mid-run, and restores
-   * the partition, so the ended record is detached while a replacement record takes the node.
-   * @param {object} [options] Fixture options.
-   * @param {boolean} [options.stopAtRestore=false] Stop as the replacement record is created.
-   * @param {boolean} [options.holdLookup=false] Hold the replacement before it binds a socket.
-   * @returns {Promise<{final: object, original: object, stopping: object|null, stoppedAt: number|null}>}
-   *   The held final, its node record and any stop started at restore.
+   * Scripts the coordinator so the next steady heartbeat after `change.next` is set answers once
+   * with no partition ('revoke') or with partition 0 ('restore'), then clears `change.next`.
+   * @returns {{next: 'revoke'|'restore'|null}} The change the next steady heartbeat applies.
    */
-  const detachHeldFinal = async ({ stopAtRestore = false, holdLookup = false } = {}) => {
-    rig = new BoundRig({ interval: 50 })
-    let next = null
+  const scriptAssignment = () => {
+    const change = { next: null }
     rig.h.script(
       'ShareGroupHeartbeat',
       Array.from({ length: 400 }, () => (fields) => {
-        if (fields.memberEpoch <= 0 || next === null) return undefined
-        const assignment = next === 'revoke' ? [] : [{ topicId: A, partitions: [0] }]
-        next = null
+        if (fields.memberEpoch <= 0 || change.next === null) return undefined
+        const assignment = change.next === 'revoke' ? [] : [{ topicId: A, partitions: [0] }]
+        change.next = null
         return {
           errorCode: 0,
           errorMessage: null,
@@ -901,6 +1001,21 @@ describe('bounded stop with a detached node record', () => {
         }
       })
     )
+    return change
+  }
+
+  /**
+   * Revokes the node's only partition, holds the final its drive then sends mid-run, and restores
+   * the partition, so the ended record is detached while a replacement record takes the node.
+   * @param {object} [options] Fixture options.
+   * @param {boolean} [options.stopAtRestore=false] Stop as the replacement record is created.
+   * @param {boolean} [options.holdLookup=false] Hold the replacement before it binds a socket.
+   * @returns {Promise<{final: object, original: object, stopping: object|null, stoppedAt: number|null}>}
+   *   The held final, its node record and any stop started at restore.
+   */
+  const detachHeldFinal = async ({ stopAtRestore = false, holdLookup = false } = {}) => {
+    rig = new BoundRig({ interval: 50 })
+    const change = scriptAssignment()
     let stopping = null
     let stoppedAt = null
     let restoring = false
@@ -932,12 +1047,12 @@ describe('bounded stop with a detached node record', () => {
     await rig.begin()
     await rig.advanceUntil(() => rig.established(0), 'the session')
     const original = rig.run.nodes.get(0)
-    next = 'revoke'
+    change.next = 'revoke'
     await rig.advanceUntil(() => final.call !== null, 'the held mid-run final')
     restoring = true
-    next = 'restore'
+    change.next = 'restore'
     await rig.advanceUntil(
-      () => next === null && rig.run.assignmentSnapshot()[0]?.partitions.includes(0),
+      () => change.next === null && rig.run.assignmentSnapshot()[0]?.partitions.includes(0),
       'the restored assignment'
     )
     return { final, original, stopping, stoppedAt }
@@ -1029,5 +1144,42 @@ describe('bounded stop with a detached node record', () => {
     expect(episode.bindings.size).toBe(0)
     expect(episode.closedConnections.size).toBe(0)
     expect([rig.run.nodes.size, rig.run.detached.size, rig.run.handlers.size]).toEqual([0, 0, 0])
+  })
+
+  test("a detached node's late opening fetch on the replacement's connection is closed once after the replacement's final is refused", async () => {
+    rig = new BoundRig({ interval: 50 })
+    const change = scriptAssignment()
+    const opening = rig.holdOpenBeforeWrite()
+    await rig.begin()
+    await rig.advanceUntil(() => opening.reached(), 'the opening fetch held before its write')
+    const original = rig.run.nodes.get(0)
+    change.next = 'revoke'
+    await rig.advanceUntil(() => original.ended, 'the revocation')
+    change.next = 'restore'
+    await rig.advanceUntil(
+      () => rig.run.nodes.get(0) !== original && rig.established(0),
+      'the replacement session'
+    )
+    await flush()
+    const openings = () => rig.h.frames(78).filter(({ fields }) => fields.shareSessionEpoch === 0)
+    expect(openings()).toHaveLength(1)
+    expect(original.session.epoch).toBe(0)
+    opening.release()
+    await until(() => original.session.epoch === 1, 'the late opening answer')
+    const opens = openings()
+    expect(opens).toHaveLength(2)
+    const [replacementOpen, lateOpen] = opens
+    expect(lateOpen.generation).toBe(replacementOpen.generation)
+    expect(rig.model.executedAfter(lateOpen, replacementOpen)).toBe(true)
+    const refused = rig.holdFinal()
+    const stopping = track(rig.h.consumer.stop())
+    const final = await refused.arrived()
+    expect(final.generation).toBe(lateOpen.generation)
+    refused.release({ errorCode: -1 })
+    await until(() => stopping.settled, 'the stop after the refused final')
+    expect(stopping.error).toBeNull()
+    expect(rig.closesOf(lateOpen)).toBe(1)
+    expect(rig.model.sessions()).toEqual([])
+    expect(rig.run.openBindings.size).toBe(0)
   })
 })
