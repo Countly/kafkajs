@@ -262,6 +262,10 @@ module.exports = class BrokerPool {
     this.metadataExpireAt = null
     /** Counts `disconnect()` calls: a refresh started before one installs nothing after it. */
     this.disconnects = 0
+    /** Counts completed rebootstraps: a metadata request sent before one installs nothing after it. */
+    this.recoveries = 0
+    /** Refresh failures raised only because a rebootstrap replaced the request's connection. */
+    this.supersededFailures = new WeakSet()
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
@@ -312,12 +316,15 @@ module.exports = class BrokerPool {
         if (!ownsRouting() || this.seedBroker !== installed) {
           throw new KafkaJSConnectionError('Recovery routing was superseded')
         }
+        this.recoveries += 1
         this.metadata = null
         this.metadataExpireAt = null
         this.metadataCache.clear()
-        for (const broker of brokers) {
+        this.setupMetadataEndpoints.clear()
+        for (const broker of new Set([...brokers, ...values(this.brokers)])) {
           if (broker !== seed && broker !== installed) this.closeObsolete(broker)
         }
+        this.retainSetupEndpoints()
         this.lastRebootstrapAt = Date.now()
         this.metadataUnavailableSince = null
         this.rebootstrapArmed = false
@@ -337,9 +344,11 @@ module.exports = class BrokerPool {
    * authentication attempt. The negotiated `versions` table is kept for the same reason it is
    * kept across a reconnect - it belongs to the broker software, not to the metadata.
    *
-   * A replacement seed is installed before the captured old identities are detached and
-   * retired. Aliases are deduplicated and replacements installed during the build survive.
-   * Draining proceeds in the background under the configured obsolete-resource bound.
+   * A replacement seed is installed before the old brokers are detached and retired: those held
+   * when it began and any added while the seed was built, since they came from the old cluster.
+   * Aliases are deduplicated. The old cluster's setup endpoints are forgotten, and `recoveries`
+   * advances, so a metadata answer to a request sent before is never installed (see
+   * `refreshMetadata`). Draining proceeds in the background under the obsolete-resource bound.
    *
    * Concurrent callers join one in-flight rebootstrap, except that a producer lifecycle's call
    * joins only calls of the same lifecycle. Once that lifecycle closed, its rebootstrap tears
@@ -984,6 +993,15 @@ module.exports = class BrokerPool {
    * reachable at all) start trigger (a)'s clock, and what lets trigger (b)'s `REBOOTSTRAP_REQUIRED`
    * (raised by `bail()` with the raw error) reach `onMetadataFailure` after the retrier settles.
    *
+   * Each request is stamped with the `recoveries` count when its broker is chosen. An answer or a
+   * failure that arrives after a rebootstrap moved that count belongs to the old cluster: nothing
+   * of it is installed, it starts no recovery clock, and the call asks the rebuilt cluster once
+   * more, outside the retrier's count, so `retries: 0` still gets that one request. A broker chosen
+   * by a rebootstrap that selection itself ran (trigger (c)) takes the new count. A failure that
+   * caused the rebootstrap keeps its path. A second rebootstrap during that request rejects the
+   * call with a retriable `KafkaJSConnectionError`. A refresh begun after a rebootstrap never
+   * joins one begun before it. Routing listeners are told once the answer's brokers are in place.
+   *
    * @public
    * @param {Array<String>} topics
    * @param {object} [options]
@@ -1011,7 +1029,8 @@ module.exports = class BrokerPool {
               this.consumerMetadataScope?.shareKey() ?? null,
               names || [],
             ]),
-      () => this.disconnects
+      () => this.disconnects,
+      () => this.recoveries
     )
     return this.metadataDiscovery(topics, options)
   }
@@ -1067,76 +1086,95 @@ module.exports = class BrokerPool {
       ...((accept || establishment) && { retainTopicErrors: true }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
-    try {
-      await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
-        if (!applicable()) return
-        let broker
-        try {
-          check()
-          broker = await this.findConnectedBroker(...(fence ? [{ fence }] : []))
-          check()
-        } catch (err) {
-          return bail(err)
+    let recovery = this.recoveries
+    const current = () => this.recoveries === recovery
+    // A failure that caused the rebootstrap (KIP-1242 on ApiVersions) is not superseded by it.
+    const supersedes = (error) => !current() && !this.recoveredFailures.has(error)
+    const superseded = () => {
+      const error = new KafkaJSConnectionError('A rebootstrap replaced the metadata connection')
+      this.supersededFailures.add(error)
+      return error
+    }
+    const attempt = async (bail, retryCount, retryTime) => {
+      if (!applicable()) return
+      recovery = this.recoveries
+      let broker
+      try {
+        check()
+        broker = await this.findConnectedBroker(...(fence ? [{ fence }] : []))
+        check()
+      } catch (err) {
+        return bail(applicable() && supersedes(err) ? superseded() : err)
+      }
+      fence?.check()
+      checked(null)
+      if (!current()) {
+        if (broker !== this.seedBroker && !values(this.brokers).includes(broker)) {
+          return bail(superseded())
         }
+        recovery = this.recoveries
+      }
+
+      // Captured once, before any `await` in this callback: a concurrent rebootstrap (reachable
+      // because `Cluster#metadata()` calls `refreshMetadataIfNecessary` directly, bypassing
+      // both of `Cluster`'s shared-promise guards) swaps `this.seedBroker` for a fresh instance
+      // partway through, and re-reading it after the `await` below would mix the two seeds'
+      // state within one attempt.
+      if (!applicable()) return
+      const seedBroker = this.seedBroker
+      const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
+
+      try {
+        const response = await broker.metadata(topics, ...requestArgs)
         fence?.check()
-        checked(null)
-
-        // Captured once, before any `await` in this callback: a concurrent rebootstrap (reachable
-        // because `Cluster#metadata()` calls `refreshMetadataIfNecessary` directly, bypassing
-        // both of `Cluster`'s shared-promise guards) swaps `this.seedBroker` for a fresh instance
-        // partway through, and re-reading it after the `await` below would mix the two seeds'
-        // state within one attempt.
+        check()
         if (!applicable()) return
-        const seedBroker = this.seedBroker
-        const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
-
-        try {
-          const response = await broker.metadata(topics, ...requestArgs)
-          fence?.check()
-          check()
-          if (!applicable()) return
-          if (accept) {
-            const settled = this.settleTopicErrors(response.topicMetadata, accept)
-            checkPartitions(settled, { allowLeaderless })
-            const incoming = settled.filter(({ topic }) => accept(topic))
-            const replaced = new Set(incoming.map(({ topic }) => topic))
-            const retained = (this.metadata?.topicMetadata || []).filter(
-              ({ topic }) => !replaced.has(topic)
-            )
-            this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
-          } else if (establishment) {
-            this.metadata = {
-              ...response,
-              topicMetadata: this.isolateUnknownTopics(response.topicMetadata, establishment, {
-                allowLeaderless,
-              }),
-            }
-          } else {
-            this.metadata = response
+        if (!current()) return bail(superseded())
+        if (accept) {
+          const settled = this.settleTopicErrors(response.topicMetadata, accept)
+          checkPartitions(settled, { allowLeaderless })
+          const incoming = settled.filter(({ topic }) => accept(topic))
+          const replaced = new Set(incoming.map(({ topic }) => topic))
+          const retained = (this.metadata?.topicMetadata || []).filter(
+            ({ topic }) => !replaced.has(topic)
+          )
+          this.metadata = { ...response, topicMetadata: [...retained, ...incoming] }
+        } else if (establishment) {
+          this.metadata = {
+            ...response,
+            topicMetadata: this.isolateUnknownTopics(response.topicMetadata, establishment, {
+              allowLeaderless,
+            }),
           }
-          // Captured synchronously, in the same statement-tick as the assignment above and
-          // before anything below can `await` - a concurrent rebootstrap nulls `this.metadata`
-          // as soon as it starts (see the `seedBroker` capture above for why this concurrency is
-          // reachable), and the reduce below awaits once per broker. Reading `this.metadata`
-          // again after those awaits - as this used to - risks a `TypeError` the retrier treats
-          // as unrecoverable, which would both escape to the caller undiagnosed and (wrongly)
-          // start trigger (a)'s clock over an internal race rather than real broker
-          // unavailability. Everything below reads this local instead.
-          const metadata = this.metadata
-          const publication = ++this.metadataPublications
-          const isLatest = () =>
-            applicable() &&
-            this.metadataPublications === publication &&
-            !fence?.closed &&
-            !guard?.()
-          // Applied here, on the statement after the assignment and before any await, so no
-          // reader can observe the fresh response with the monotonic leader guard not yet
-          // applied. An empty topic list is encoded as the null array, which asks for every topic
-          // in the cluster - the cache prunes what such a response does not carry.
-          this.metadataCache.update(metadata, {
-            full: !accept && (!topics || topics.length === 0),
-            isCurrent: applicable,
-          })
+        } else {
+          this.metadata = response
+        }
+        // Captured synchronously, in the same statement-tick as the assignment above and
+        // before anything below can `await` - a concurrent rebootstrap nulls `this.metadata`
+        // as soon as it starts (see the `seedBroker` capture above for why this concurrency is
+        // reachable), and the reduce below awaits once per broker. Reading `this.metadata`
+        // again after those awaits - as this used to - risks a `TypeError` the retrier treats
+        // as unrecoverable, which would both escape to the caller undiagnosed and (wrongly)
+        // start trigger (a)'s clock over an internal race rather than real broker
+        // unavailability. Everything below reads this local instead.
+        const metadata = this.metadata
+        const publication = ++this.metadataPublications
+        const isLatest = () =>
+          applicable() &&
+          current() &&
+          this.metadataPublications === publication &&
+          !fence?.closed &&
+          !guard?.()
+        // Applied here, on the statement after the assignment and before any await, so no
+        // reader can observe the fresh response with the monotonic leader guard not yet
+        // applied. An empty topic list is encoded as the null array, which asks for every topic
+        // in the cluster - the cache prunes what such a response does not carry.
+        const installed = this.metadataCache.update(metadata, {
+          full: !accept && (!topics || topics.length === 0),
+          isCurrent: applicable,
+          publish: false,
+        })
+        try {
           if (!isLatest()) return
           onMetadata?.(metadata)
           if (!isLatest()) return
@@ -1205,28 +1243,44 @@ module.exports = class BrokerPool {
               else this.closeObsolete(previous)
             }
           }
-        } catch (e) {
-          fence?.check()
-          if (guard?.()) return bail(e)
-          if (!applicable()) return
-          if (
-            e.type === 'LEADER_NOT_AVAILABLE' ||
-            ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
-              e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
-          ) {
-            throw e
-          }
-
-          bail(e)
+          // A rebootstrap during the builds above cleared this answer: ask the rebuilt cluster.
+          if (applicable() && !current()) return bail(superseded())
+        } finally {
+          if (installed) this.metadataCache.publishRoutingChange()
         }
-      })
+      } catch (e) {
+        fence?.check()
+        if (guard?.()) return bail(e)
+        if (!applicable()) return
+        if (supersedes(e)) return bail(superseded())
+        if (
+          e.type === 'LEADER_NOT_AVAILABLE' ||
+          ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
+            e.type === 'UNKNOWN_TOPIC_OR_PARTITION')
+        ) {
+          throw e
+        }
 
-      if (applicable()) this.onMetadataSuccess()
+        bail(e)
+      }
+    }
+
+    try {
+      try {
+        await this.retryFor(fence)(attempt)
+      } catch (e) {
+        if (!this.supersededFailures.has(e)) throw e
+        // Once more on the rebuilt cluster, outside the retrier: `retries: 0` never retries a throw.
+        await this.retryFor(fence)(attempt)
+      }
+      if (applicable() && current()) this.onMetadataSuccess()
     } catch (e) {
       check()
       if (guard?.()) throw e
       if (!applicable()) return
-      if (!fence?.closed) await this.onMetadataFailure(e, { fence })
+      if (!fence?.closed && !this.supersededFailures.has(e)) {
+        await this.onMetadataFailure(e, { fence })
+      }
       throw e
     }
   }

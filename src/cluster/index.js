@@ -305,6 +305,8 @@ module.exports = class Cluster {
     const fenceOf = ({ fence } = {}) => fence
     // Nor does a call join one started before the pool's last disconnect, which installs nothing.
     const disconnectsOf = () => this.brokerPool.disconnects
+    // Nor does a refresh join one started before the pool's last rebootstrap.
+    const recoveriesOf = () => this.brokerPool.recoveries
 
     this[PRIVATE.CONNECT] = shareMetadata(
       async ({ fence } = {}) => {
@@ -335,7 +337,8 @@ module.exports = class Cluster {
         )
       },
       shareScopeOf,
-      disconnectsOf
+      disconnectsOf,
+      recoveriesOf
     )
 
     this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareMetadata(
@@ -350,7 +353,8 @@ module.exports = class Cluster {
         )
       },
       shareScopeOf,
-      disconnectsOf
+      disconnectsOf,
+      recoveriesOf
     )
 
     this[PRIVATE.FIND_CONTROLLER_BROKER] = shareMetadata(async () => {

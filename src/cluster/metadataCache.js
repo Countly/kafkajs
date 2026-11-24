@@ -101,10 +101,12 @@ module.exports = class MetadataCache {
    * @param {boolean} [options.full=false] true when the refresh was unscoped, i.e. the response
    *        describes every topic in the cluster
    * @param {() => boolean} [options.isCurrent] refuses stale work before any cache/event effect
-   * @returns {void}
+   * @param {boolean} [options.publish=true] `false` leaves the routing notification to the caller,
+   *        which sends it once the answer's brokers are installed
+   * @returns {boolean} whether the answer was installed
    */
-  update(metadata, { full = false, isCurrent = () => true } = {}) {
-    if (!isCurrent()) return
+  update(metadata, { full = false, isCurrent = () => true, publish = true } = {}) {
+    if (!isCurrent()) return false
     const liveBrokerIds = this.liveBrokerIds(metadata)
 
     this.generation += 1
@@ -179,7 +181,8 @@ module.exports = class MetadataCache {
       this.emit(CLUSTER_TOPIC_RECREATED, recreation)
     }
 
-    this.publishRoutingChange()
+    if (publish) this.publishRoutingChange()
+    return true
   }
 
   /**

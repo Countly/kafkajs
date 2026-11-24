@@ -202,13 +202,15 @@ class MetadataDiscovery extends AdminDeadline {
    * @param {() => Promise<any>} work one metadata refresh
    * @param {() => void} remove deletes only this episode from its owning map
    * @param {any} [epoch] the epoch it started in, see `shareMetadata`
+   * @param {any} [generation] the generation it started in, see `shareMetadata`
    * @returns {MetadataDiscovery} not started until its first caller is enrolled
    */
-  constructor(work, remove, epoch) {
+  constructor(work, remove, epoch, generation) {
     super('metadata discovery', null)
     this.work = work
     this.remove = remove
     this.epoch = epoch
+    this.generation = generation
     this.callers = new Set()
     this.running = null
     this.settled = false
@@ -309,21 +311,35 @@ const runWithDeadline = async (
  * @param {Function} [keyOf] existing scope key selector
  * @param {() => any} [epochOf] a call never joins an episode started in another epoch, and an
  *   episode whose epoch moved before its deferred start skips the work and resolves undefined
+ * @param {() => any} [generationOf] a call never joins an episode started in another generation;
+ *   unlike an epoch, a generation that moved does not skip the work
  * @returns {Function} enrollment wrapper; each argument list is captured once per episode
  */
-const shareMetadata = (work, keyOf = () => undefined, epochOf = () => undefined) => {
+const shareMetadata = (
+  work,
+  keyOf = () => undefined,
+  epochOf = () => undefined,
+  generationOf = () => undefined
+) => {
   const entries = new Map()
   return function (...args) {
     const key = keyOf(...args)
     const epoch = epochOf()
+    const generation = generationOf()
     let episode = entries.get(key)
-    if (!episode || episode.epoch !== epoch || episode.refusal()) {
+    if (
+      !episode ||
+      episode.epoch !== epoch ||
+      episode.generation !== generation ||
+      episode.refusal()
+    ) {
       episode = new MetadataDiscovery(
         () => (epochOf() === epoch ? work.apply(this, args) : undefined),
         () => {
           if (entries.get(key) === episode) entries.delete(key)
         },
-        epoch
+        epoch,
+        generation
       )
       entries.set(key, episode)
     }

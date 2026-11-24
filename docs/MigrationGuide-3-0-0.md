@@ -1442,7 +1442,9 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
   running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
   every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
-  through the caller's normal retry path against the rebuilt cluster. On an idempotent
+  through the caller's normal retry path against the rebuilt cluster. A metadata answer that
+  arrives on an old connection after the rebootstrap is not used: the refresh asks the rebuilt
+  cluster once more. On an idempotent
   producer (the default) the retry carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose
@@ -1656,8 +1658,8 @@ These issues are known in 3.0.0. A fix for each is planned for a later release.
   do:* read each topic once, awaited, before you read topics in parallel, or await the calls in
   sequence.
 - **A metadata answer can arrive without its brokers.** This applies to every client. When the
-  seed broker is replaced while a metadata request is in flight (a rebootstrap, or a connection
-  failure that removed the seed broker), the answer's topic metadata is installed, but the brokers
+  seed broker is replaced while a metadata request is in flight because a connection failure
+  removed it, the answer's topic metadata is installed, but the brokers
   it lists that the client did not already know, or knew at another address, are not added. The
   next request to such a broker fails with the transient `KafkaJSBrokerNotFound` error
   `Broker N not found in the cached metadata`, and the client refreshes its metadata. A call with
