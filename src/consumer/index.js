@@ -67,17 +67,28 @@ const deferred = () => {
 }
 
 /**
- * Whether a crash was caused by a topic recreation: the error itself or any error in its cause
- * chain is a `KafkaJSTopicRecreatedError`. A cause cycle ends the walk.
- * @param {unknown} error the crash's error
- * @returns {boolean}
+ * Walks a crash's cause chain once. Every link is followed, whether or not it is an `Error` of
+ * this realm (a plain object or another realm's error may sit in the middle); the walk stops at a
+ * link it has seen, a missing cause or a link that throws when inspected, so a loop ends it.
+ * @param {Error} error the crash's error
+ * @returns {{ deepest: unknown, recreated: boolean }} the deepest distinct link, and whether any
+ *   link is a `KafkaJSTopicRecreatedError`
  */
-const causedByRecreation = (error) => {
-  for (const seen = new Set(); error instanceof Error && !seen.has(error); error = error.cause) {
-    if (error instanceof KafkaJSTopicRecreatedError) return true
-    seen.add(error)
+const walkCauses = (error) => {
+  const seen = new Set()
+  let deepest = error
+  let recreated = false
+  for (let link = error; link && !seen.has(link);) {
+    seen.add(link)
+    deepest = link
+    try {
+      if (link instanceof KafkaJSTopicRecreatedError) recreated = true
+      link = link.cause
+    } catch {
+      break
+    }
   }
-  return false
+  return { deepest, recreated }
 }
 
 const specialOffsets = [
@@ -1350,7 +1361,7 @@ module.exports = (params) => {
         if (crashCleanup === cleaned) crashCleanup = null
       }
       let joining = null
-      const getOriginalCause = (error) => (error.cause ? getOriginalCause(error.cause) : error)
+      const { deepest: originalCause, recreated } = walkCauses(e)
       const crashStopGeneration = startGeneration + 1
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
@@ -1372,8 +1383,7 @@ module.exports = (params) => {
         }
 
         // The restart rejoins under the id the expired round held, read before the shutdown forgets it.
-        if (isJoinDeadline(getOriginalCause(e)))
-          retainedMemberId = consumerGroup?.retainableMemberId()
+        if (isJoinDeadline(originalCause)) retainedMemberId = consumerGroup?.retainableMemberId()
 
         if (e.name === 'KafkaJSConnectionClosedError') {
           cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
@@ -1390,7 +1400,7 @@ module.exports = (params) => {
       if (joining) await joining.promise.catch(() => {})
 
       const isErrorRetriable =
-        e.name === 'KafkaJSNumberOfRetriesExceeded' || getOriginalCause(e).retriable === true
+        e.name === 'KafkaJSNumberOfRetriesExceeded' || originalCause.retriable === true
 
       let shouldRestart = isErrorRetriable
       if (retry && retry.restartOnFailure) {
@@ -1419,7 +1429,7 @@ module.exports = (params) => {
 
       // A recreated topic has its own offsets: the application reconciles them before it starts
       // the consumer again, so no restart policy may resume it.
-      if (causedByRecreation(e)) shouldRestart = false
+      if (recreated) shouldRestart = false
 
       if (!ownsCluster) shouldRestart = false
       // Two handlers must never process one partition at once.
