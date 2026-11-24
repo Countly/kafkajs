@@ -349,6 +349,7 @@
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry rotation readback compares empty metrics exactly without accepting missing or null values",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn coordinated stage replay accepts a polled readback only before every worker release",
         "src/protocol/requests/index.spec.js \u203a Recorded broker captures Recorded broker capture coverage includes Kafka 4.4.0 and 4.3.2",
+        "src/protocol/requests/index.spec.js \u203a the builder keeps args only for latched APIs inside an admin scope, and for InitProducerId and LeaveGroup only when marked",
         "src/protocol/requests/index.spec.js \u203a released share source domains 4.4.0 records the share ranges by name and the internal ones by key",
         "src/protocol/requests/index.spec.js \u203a released share source domains 4.3.2 records the share ranges by name and the internal ones by key",
         "src/consumer/share/__tests__/shareCapability.spec.js \u203a share capability the recorded 4.4.0 broker is judged as its capture says, from the committed ranges and features",

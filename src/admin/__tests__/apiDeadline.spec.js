@@ -1187,7 +1187,7 @@ describe('replay latch', () => {
   } = require('../deadline')
   const { DeleteGroups } = require('../../protocol/requests/apiKeys')
   const { createErrorFromCode } = require('../../protocol/error')
-  const { attachResponseSource } = require('../../network/failureSource')
+  const { attachResponseSource } = require('../../broker/failureSource')
   const { KafkaJSUnknownOutcomeError, KafkaJSPartialMessageError } = require('../../errors')
 
   /** Creates a built request without involving a different invocation. */

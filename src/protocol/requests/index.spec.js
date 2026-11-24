@@ -476,3 +476,27 @@ describe('Recorded broker captures', () => {
     }
   })
 })
+
+test('the builder keeps args only for latched APIs inside an admin scope, and for InitProducerId and LeaveGroup only when marked', async () => {
+  const { ADMIN_MUTATION } = require('../../broker/privateOptions')
+  const { runWithDeadline } = require('../../admin/deadline')
+  const versions = [apiKeys.DeleteGroups, apiKeys.InitProducerId, apiKeys.LeaveGroup, apiKeys.OffsetCommit]
+  const ranges = Object.fromEntries(versions.map((apiKey) => [apiKey, { minVersion: 0, maxVersion: 9 }]))
+  const choose = lookup(ranges)
+  const groups = choose(apiKeys.DeleteGroups, requests.DeleteGroups)
+  const init = choose(apiKeys.InitProducerId, requests.InitProducerId)
+  const leave = choose(apiKeys.LeaveGroup, requests.LeaveGroup)
+  const commit = choose(apiKeys.OffsetCommit, requests.OffsetCommit)
+  expect(Object.hasOwn(groups(['g']), 'args')).toBe(false)
+  await runWithDeadline('test', 1000, () => {
+    const input = ['g']
+    const built = groups(input)
+    input[0] = 'changed'
+    expect(built.args).toEqual(['g'])
+    expect(Object.hasOwn(init({ transactionalId: 'tx' }), 'args')).toBe(false)
+    expect(Object.hasOwn(leave({ groupId: 'g' }), 'args')).toBe(false)
+    expect(Object.hasOwn(commit({ groupId: 'g', topics: [] }), 'args')).toBe(false)
+    expect(init({ transactionalId: 'tx' }, ADMIN_MUTATION).args).toEqual({ transactionalId: 'tx' })
+    expect(leave({ groupId: 'g' }, ADMIN_MUTATION).args).toEqual({ groupId: 'g' })
+  })
+})
