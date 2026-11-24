@@ -2,6 +2,8 @@ const { Kafka, Partitioners } = require('../../../index')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC, TOPIC_ID } = require('../../consumer/__tests__/fixtures/fetchHarness')
+const Broker = require('../../broker')
+const { KafkaJSInvalidConfigurationError } = require('../../errors')
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 const until = async (predicate) => {
@@ -273,5 +275,124 @@ describe('Producer > the partitioner seam', () => {
     expect(custom.attach).toBeUndefined()
     expect([observed({ ...record, message: { value: '' } }), custom(record)]).toEqual([0, 0])
     expect(calls).toBe(2)
+  })
+})
+
+describe('Producer > a partitioner that returns an invalid partition', () => {
+  const RETRY = { retries: 2, initialRetryTime: 1, maxRetryTime: 2 }
+  let producer, cluster, produced
+
+  /** A producer over a scripted cluster whose topic has one partition; `produced` counts Produce requests. */
+  const start = async (createPartitioner, options = {}, profile = 'default') => {
+    cluster = producerScript(
+      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+    )
+    produced = jest.spyOn(Broker.prototype, 'produce')
+    producer = new Kafka(cluster.kafkaOptions()).producer({
+      linger: 0,
+      retry: RETRY,
+      createPartitioner,
+      ...options,
+    })
+    await producer.connect()
+  }
+
+  const stop = async () => {
+    if (producer) await producer.disconnect()
+    if (cluster) cluster.assertClean()
+    jest.restoreAllMocks()
+    producer = cluster = produced = null
+  }
+
+  afterEach(stop)
+
+  const symbolFor =
+    (value) =>
+    () =>
+    ({ message }) =>
+      message.value === value ? Symbol('p') : 0
+
+  test('a Symbol for every record rejects the send and writes no Produce request', async () => {
+    for (const options of [{}, { idempotent: true }, { idempotent: false }]) {
+      await start(() => () => Symbol('p'), options)
+
+      await expect(
+        producer.send({ topic: TOPIC, messages: [{ value: 'a' }, { value: 'b' }] })
+      ).rejects.toMatchObject({
+        name: 'KafkaJSInvalidConfigurationError',
+        message: `Invalid partition symbol for topic "${TOPIC}"`,
+      })
+      expect(produced).not.toHaveBeenCalled()
+      await stop()
+    }
+  })
+
+  test('a Symbol for one of two records rejects the whole send', async () => {
+    await start(symbolFor('bad'))
+
+    await expect(
+      producer.send({ topic: TOPIC, messages: [{ value: 'good' }, { value: 'bad' }] })
+    ).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
+    expect(produced).not.toHaveBeenCalled()
+  })
+
+  test('a custom partitioner that returns -1 rejects the send at once', async () => {
+    await start(() => () => -1)
+
+    await expect(producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })).rejects.toMatchObject(
+      {
+        name: 'KafkaJSInvalidConfigurationError',
+        message: `Invalid partition -1 for topic "${TOPIC}"`,
+      }
+    )
+    expect(produced).not.toHaveBeenCalled()
+  })
+
+  test('a partitioner that ignores an invalid message.partition and returns 0 sends the record', async () => {
+    await start(() => () => 0)
+
+    const metadata = await producer.send({
+      topic: TOPIC,
+      messages: [{ value: 'a', partition: -1 }],
+    })
+
+    expect(metadata).toEqual([expect.objectContaining({ topicName: TOPIC, partition: 0 })])
+    expect(produced).toHaveBeenCalledTimes(1)
+  })
+
+  test('inside a transaction a partitioner returning -1 rejects that send and leaves the transaction usable: a corrected send and commit() succeed', async () => {
+    await start(
+      () =>
+        ({ message }) =>
+          message.value === 'bad' ? -1 : 0,
+      { transactionalId: 'invalid-partition', maxInFlightRequests: 1 },
+      'tv1'
+    )
+    const transaction = await producer.transaction()
+
+    await expect(
+      transaction.send({ topic: TOPIC, messages: [{ value: 'bad' }] })
+    ).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
+    expect(produced).not.toHaveBeenCalled()
+    await transaction.send({ topic: TOPIC, messages: [{ value: 'good' }] })
+    await transaction.commit()
+
+    expect(produced).toHaveBeenCalledTimes(1)
+  })
+
+  test("a throwing partitioner rejects with its own error and releases the send's buffer charge", async () => {
+    const failure = new Error('partitioner failed')
+    let calls = 0
+    await start(
+      () => () => {
+        if (calls++ === 0) throw failure
+        return 0
+      },
+      { bufferMemory: 4096, maxBlockMs: 200 }
+    )
+    const messages = [{ value: 'x'.repeat(3000) }]
+
+    await expect(producer.send({ topic: TOPIC, messages })).rejects.toBe(failure)
+    await expect(producer.send({ topic: TOPIC, messages })).resolves.toHaveLength(1)
   })
 })
