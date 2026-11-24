@@ -1141,12 +1141,22 @@ class ShareRun {
    * `membership`. The heartbeat chain is suspended for a poll or fence recovery, so no join can
    * overlap its traffic, and ended for good by every other kind. A node whose capture fails
    * captures nothing; every other node still captures, and every node is retired and disposed.
+   * The boundary runs once: an application callback reached from inside it (a logger, an event
+   * listener) that closes again joins it instead of capturing a second time, and capture and
+   * disposal failures are logged only after it is complete.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
    */
   freeze(episode) {
-    if (episode.frozen) return
+    if (episode.frozen || episode.freezing) return
+    episode.freezing = true
+    const failures = []
+    const failed = (message, node, error) =>
+      failures.push([
+        message,
+        { nodeId: node.id, error: error instanceof Error ? error.message : 'Non-Error thrown' },
+      ])
     this.captureCloseCoordinator(episode)
     const bindings = []
     for (const node of this.nodes.values()) {
@@ -1156,10 +1166,7 @@ class ShareRun {
         node.captured = node.loop.captureFinal()
       } catch (error) {
         node.captured = null
-        this.options.logger.error('Share final capture failed', {
-          nodeId: node.id,
-          error: error.message,
-        })
+        failed('Share final capture failed', node, error)
       }
       if (node.captured) {
         const { binding } = node.captured
@@ -1184,16 +1191,14 @@ class ShareRun {
           preserve: node.captured,
         })
       } catch (error) {
-        this.options.logger.error('Share node disposal failed', {
-          nodeId: node.id,
-          error: error.message,
-        })
+        failed('Share node disposal failed', node, error)
       }
       node.operation.retire(new KafkaJSNonRetriableError('Share run closed'))
       node.pacing.retire(new KafkaJSNonRetriableError('Share run closed'))
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
+    for (const [message, extra] of failures) this.options.logger.error(message, extra)
   }
 
   /**
