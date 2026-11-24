@@ -818,7 +818,7 @@ describe('Consumer > Runner', () => {
 
       expect(calls).toEqual(['fetchManager.stop', 'closeFetchSessions', 'leave'])
       const [scope] = consumerGroup.closeFetchSessions.mock.calls[0]
-      expect(scope).toEqual({ deadlineAt: operation.deadlineAt, guard: operation.guard })
+      expect(scope).toEqual({ deadlineAt: operation.deadlineAt, guard: runner.stopScope.guard })
     })
 
     it('passes no finite deadline when the stop has none, and still closes', async () => {
