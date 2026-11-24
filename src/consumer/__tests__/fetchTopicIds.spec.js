@@ -3,6 +3,8 @@ const ConsumerGroup = require('../consumerGroup')
 const OffsetManager = require('../offsetManager')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const apiKeys = require('../../protocol/requests/apiKeys')
+const { createErrorFromCode } = require('../../protocol/error')
+const { KafkaJSNonRetriableError } = require('../../errors')
 const { newLogger, readRequestHeader } = require('testHelpers')
 // The wire decoder and the fake broker are shared with the other fetch specs: two copies of a
 // hand-written request decoder would drift the first time the request layout changes.
@@ -327,6 +329,78 @@ describe('Consumer > fetch topic ids', () => {
         topics: [],
         forgottenTopics: [{ topic: null, topicId: TOPIC_ID, partitions: [0] }],
       })
+    })
+
+    // The current metadata is fresh, so only the refresh asked for the left-out topic learns the
+    // refusal; the retrier hands a non-retriable code over wrapped, its type kept.
+    test.each([
+      ['code 29 while a sibling fetches', 29, { [TOPIC]: TOPIC_ID }],
+      ['code 17 while a sibling fetches', 17, { [TOPIC]: TOPIC_ID }],
+      ['code 29 with no topic left to fetch', 29, {}],
+    ])('a refresh refused for good fails the round: %s', async (_, code, topicIds) => {
+      const cause = createErrorFromCode(code)
+      const refusal = new KafkaJSNonRetriableError(cause, { cause })
+      const refreshMetadata = jest.fn(async () => {
+        throw refusal
+      })
+      const { group, requests } = await createGroup({
+        fetchMaxVersion: 18,
+        topics: [TOPIC, OTHER_TOPIC],
+        topicIds,
+        refreshMetadata,
+        respond: () => flexibleFetchResponse([{ topicId: TOPIC_ID }]),
+      })
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue(undefined)
+
+      await expect(group.fetch(NODE_ID)).rejects.toBe(refusal)
+
+      expect(refusal.type).toBe(cause.type)
+      expect(refreshMetadata).toHaveBeenCalledTimes(1)
+      expect(
+        requests()
+          .filter(({ apiKey }) => apiKey === apiKeys.Fetch)
+          .map(({ apiVersion }) => apiVersion)
+      ).toEqual(topicIds[TOPIC] ? [18] : [])
+    })
+
+    test('a refresh refusal that can clear is waited out, and the id it brings puts the topic back', async () => {
+      const topicIds = { [TOPIC]: TOPIC_ID }
+      const refreshMetadata = jest
+        .fn()
+        .mockRejectedValueOnce(createErrorFromCode(3))
+        .mockImplementationOnce(async () => {
+          topicIds[OTHER_TOPIC] = OTHER_TOPIC_ID
+        })
+      const { group, requests, lastFetchRequest } = await createGroup({
+        fetchMaxVersion: 18,
+        topics: [TOPIC, OTHER_TOPIC],
+        topicIds,
+        refreshMetadata,
+        respond: () =>
+          flexibleFetchResponse(lastFetchRequest().topics.map(({ topicId }) => ({ topicId }))),
+      })
+      // Every round is due for its own refresh.
+      group.leaderlessRefreshInterval = 0
+
+      const delivered = []
+      for (let round = 1; round <= 3; round++) {
+        delivered.push((await group.fetch(NODE_ID)).map(({ topic }) => topic).sort())
+      }
+
+      expect(delivered).toEqual([[TOPIC], [TOPIC], [OTHER_TOPIC, TOPIC]])
+      expect(refreshMetadata).toHaveBeenCalledTimes(2)
+      expect(
+        requests()
+          .filter(({ apiKey }) => apiKey === apiKeys.Fetch)
+          .map(({ apiVersion }) => apiVersion)
+      ).toEqual([18, 18, 18])
+      expect(lastFetchRequest().topics.map(({ topic, topicId }) => ({ topic, topicId }))).toEqual(
+        expect.arrayContaining([
+          { topic: null, topicId: TOPIC_ID },
+          { topic: null, topicId: OTHER_TOPIC_ID },
+        ])
+      )
+      expect(lastFetchRequest().topics).toHaveLength(2)
     })
   })
 
