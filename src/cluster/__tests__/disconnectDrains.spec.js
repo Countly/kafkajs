@@ -764,7 +764,8 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
 
         expect(context.destroy).toHaveBeenCalledTimes(1)
         expect(context.socket.destroyed).toBe(true)
-        expect(context.close).toEqual({ done: true, error: detachFailure })
+        expect(context.close.done).toBe(true)
+        expect(context.close.error).toBe(detachFailure)
         expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
         expect(context.cluster.brokerPool.drainingPools.size).toBe(0)
       } finally {
@@ -786,6 +787,31 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
         expect(context.destroy).toHaveBeenCalledTimes(1)
         expect(context.socket.destroyed).toBe(true)
         expect(context.close).toStrictEqual({ done: true, error: null })
+        expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
+        expect(context.cluster.brokerPool.drainingPools.size).toBe(0)
+      } finally {
+        await cleanUpBroken(context)
+      }
+    })
+
+    it('a zero-bound disconnect during a replaced pool drain whose listener removal destroys the socket and then throws destroys it once and rejects with that failure', async () => {
+      const context = {}
+      const detachFailure = new Error('listener removal failed after closing the socket')
+      try {
+        await disconnectBroken(context, (socket) => {
+          let armed = true
+          socket.on('removeListener', (event) => {
+            if (!armed || event !== 'data') return
+            armed = false
+            socket.destroy()
+            throw detachFailure
+          })
+        })
+
+        expect(context.destroy).toHaveBeenCalledTimes(1)
+        expect(context.socket.destroyed).toBe(true)
+        expect(context.close.done).toBe(true)
+        expect(context.close.error).toBe(detachFailure)
         expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
         expect(context.cluster.brokerPool.drainingPools.size).toBe(0)
       } finally {
