@@ -44,13 +44,14 @@ const countWithin = (offsets, firstOffset, lastOffset) =>
  *
  * It views `records[start, end)` of one acquisition's delivered records and the parallel offsets
  * they were acquired at. Every decision, renewal and completion is keyed by those acquired
- * offsets, never by a message's `offset` field, which the handler can change. The offsets are
- * ascending, so a selector is found by binary search and decisions live in one byte each. The
- * public callbacks are closures of this one invocation: sharing them across invocations would let
- * a late old call authorize a new acquisition, so each record (`eachMessage`) or batch
- * (`eachBatch`) gets its own set. Beyond the invocation, its public payload and those callbacks, a
- * call allocates nothing per record: the acquisition's context is one frame that every call of the
- * acquisition reads.
+ * offsets, never by a message's `offset` field, which the handler can change. A delivered message
+ * is found by identity; the offsets are ascending, so an offset-only selector is found by binary
+ * search, and decisions live in one byte each. The public callbacks are closures of this one
+ * invocation: sharing them across invocations would let a late old call authorize a new
+ * acquisition, so each record (`eachMessage`) or batch (`eachBatch`) gets its own set. Beyond the
+ * invocation, its public payload and those callbacks, a call allocates per record only the identity
+ * index of a batch that selects messages: the acquisition's context is one frame that every call
+ * of the acquisition reads.
  */
 class ShareHandlerCall {
   /**
@@ -83,6 +84,7 @@ class ShareHandlerCall {
     this.open = true
     this.marks = null
     this.decided = 0
+    this.identities = null
   }
 
   /** @returns {number} How many records this call covers. */
@@ -135,22 +137,31 @@ class ShareHandlerCall {
   }
 
   /**
-   * Resolves a delivered message of this call by identity, or the supported offset-only selector
-   * (an object whose only own key is `offset`) by the offset it was acquired at. A full message of
-   * another call that has an equal offset stays foreign. Only a message whose `offset` the handler
-   * changed costs a scan of this call's records.
+   * Resolves a delivered message of this call by identity, before reading anything from it, so
+   * its current shape and fields never matter. Any other value must be the supported offset-only
+   * selector (an object whose only own key is `offset`), resolved by the offset it was acquired
+   * at; a full message of another call stays foreign even with an equal offset. The identity index
+   * is built once, on the call's first selector.
    * @param {object} message Delivered message or an object containing only `offset`.
    * @returns {number} Index of the message within this call's records.
    * @throws {KafkaJSNonRetriableError} For malformed or foreign selectors.
    */
   indexOf(message) {
-    const offset = message?.offset
-    const found = typeof offset === 'string' ? this.search(offset) : -1
-    if (found !== -1 && this.records[found] === message) return found
-    if (found !== -1 && Object.keys(message).length === 1 && Object.hasOwn(message, 'offset'))
-      return found
-    if (message !== null && typeof message === 'object') {
-      for (let i = this.start; i < this.end; i++) if (this.records[i] === message) return i
+    if (this.identities === null) {
+      this.identities = new Map()
+      for (let i = this.start; i < this.end; i++) this.identities.set(this.records[i], i)
+    }
+    const owned = this.identities.get(message)
+    if (owned !== undefined) return owned
+    if (
+      message !== null &&
+      typeof message === 'object' &&
+      Object.keys(message).length === 1 &&
+      Object.hasOwn(message, 'offset')
+    ) {
+      const offset = message.offset
+      const found = typeof offset === 'string' ? this.search(offset) : -1
+      if (found !== -1) return found
     }
     throw new KafkaJSNonRetriableError('Message does not belong to this handler call')
   }
@@ -183,7 +194,9 @@ class ShareHandlerCall {
    */
   acknowledge(message, type = 'accept') {
     this.check()
-    this.decide(this.indexOf(message), type)
+    const index = this.indexOf(message)
+    this.check()
+    this.decide(index, type)
   }
 
   /**
@@ -203,7 +216,8 @@ class ShareHandlerCall {
   }
 
   /**
-   * Renews the selected current held messages through the node FIFO.
+   * Renews the selected current held messages through the node FIFO. Every selector is resolved
+   * before authority is checked again, so a selector that closes the call queues nothing.
    * @param {object[]} [messages] Local selectors; omission means every message of this call.
    * @returns {Promise<number>} Broker-applied lock duration, without terminal settlement.
    * @throws {KafkaJSNonRetriableError} For invalid local selectors or stale authority; nothing is
@@ -218,10 +232,13 @@ class ShareHandlerCall {
       if (!Array.isArray(messages) || messages.length === 0) {
         throw new KafkaJSNonRetriableError('renew requires a non-empty array of local messages')
       }
-      offsets = messages.map((message) => this.acquired[this.indexOf(message)])
+      offsets = []
+      for (let i = 0; i < messages.length; i++)
+        offsets.push(this.acquired[this.indexOf(messages[i])])
       if (new Set(offsets).size !== offsets.length) {
         throw new KafkaJSNonRetriableError('renew messages must be distinct')
       }
+      this.check()
     }
     return this.authority.renew(offsets)
   }
