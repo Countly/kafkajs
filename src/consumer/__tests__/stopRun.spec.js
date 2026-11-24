@@ -1694,6 +1694,53 @@ describe('Consumer > a run stopped for good with an error', () => {
       ])
     }, 30000)
 
+    it('a stop called by the assigner while the next run clears it is honoured: that run sends no JoinGroup', async () => {
+      let retained = null
+      let interrupt = false
+      let stopping = null
+      const retaining = {
+        ...eager(),
+        protocol: () => ({ name: 'eager', metadata: Buffer.from(JSON.stringify(retained)) }),
+        onAssignment: (assignment, { generationId }) => {
+          retained = assignment && { partitions: assignment.partitions, generationId }
+          if (assignment === null && interrupt) {
+            interrupt = false
+            stopping = settled(run.consumer.stop())
+          }
+        },
+      }
+      const delivered = []
+      const run = await startOther('classic', {
+        config: { partitionAssigners: [() => retaining] },
+        eachMessage: async ({ message }) => delivered.push(message.offset),
+      })
+      await advanceUntil(() => delivered.length === 1)
+      const { runner, coordinator } = run
+      const commitFinal = runner.commitFinalOffsetsContained.bind(runner)
+      jest.spyOn(runner, 'commitFinalOffsetsContained').mockImplementationOnce(async (scope) => {
+        await commitFinal(scope)
+        await new Promise((resolve) => setTimeout(resolve, 600))
+      })
+
+      const closing = settled(run.consumer.disconnect({ timeout: 500 }))
+      await advanceUntil(() => closing.done, 2000)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+      expect(retained).toMatchObject({ generationId: 1 })
+
+      const joins = coordinator.joinGroup.mock.calls.length
+      interrupt = true
+      const again = settled(run.consumer.run({ eachMessage: async () => {} }))
+      await advanceUntil(() => again.done && stopping?.done === true, 2000)
+      await jest.advanceTimersByTimeAsync(5000)
+
+      expect(stopping).toMatchObject({ done: true, value: undefined })
+      expect(again).toMatchObject({ done: true, value: undefined })
+      expect(coordinator.joinGroup).toHaveBeenCalledTimes(joins)
+      expect(retained).toBeNull()
+    }, 30000)
+
     it('stopRun during the initial join reports its own error and a later JoinGroup answer syncs nothing', async () => {
       const joined = deferred()
       const run = await startOther('classic', { joined })

@@ -9797,6 +9797,7 @@
         "src/consumer/__tests__/stopRun.spec.js › Consumer > a run stopped for good with an error a crash cleanup and a public close that overlaps it disconnect once a close asked while the crash cleanup disconnects emits DISCONNECT itself when that disconnect fails",
         "src/consumer/__tests__/stopRun.spec.js › Consumer > a run stopped for good with an error a poll-expiry leave overtaken by stopRun completes nothing when stopRun comes from its diagnostic that no coordinator is known",
         "src/consumer/__tests__/stopRun.spec.js › Consumer > a run stopped for good with an error a classic member a bounded close whose deadline passes after its accepted final commit clears the assigners before the first JoinGroup of the next run",
+        "src/consumer/__tests__/stopRun.spec.js › Consumer > a run stopped for good with an error a classic member a stop called by the assigner while the next run clears it is honoured: that run sends no JoinGroup",
         "src/consumer/__tests__/subscriptionCodec.spec.js \u203a Consumer > subscription codec decode does not over-read a v1-declared buffer written by kafkajs 2.2.4",
         "src/consumer/__tests__/subscriptionCodec.spec.js \u203a Consumer > subscription codec decode ignores a trailing group a future version would add",
         "src/consumer/__tests__/subscriptionCodec.spec.js \u203a Consumer > subscription codec decode reads exactly the groups the declared version carries",
