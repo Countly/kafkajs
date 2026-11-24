@@ -15613,6 +15613,8 @@
         "src/protocol/messageSet/decoder.spec.js \u203a Protocol > MessageSet > decoder a compressed message under a decompression bound is refused as a corrupt record when its output is one byte over the bound",
         "src/protocol/messageSet/decoder.spec.js \u203a Protocol > MessageSet > decoder message v0 decode gzip messages",
         "src/protocol/messageSet/decoder.spec.js \u203a Protocol > MessageSet > decoder message v0 decode uncompressed messages",
+        "src/protocol/messageSet/decoder.spec.js \u203a Protocol > MessageSet > decoder rebases magic 1 compressed offsets above 2^53 exactly",
+        "src/protocol/messageSet/decoder.spec.js \u203a Protocol > MessageSet > decoder rebases magic 1 compressed offsets below 2^53 as before",
         "src/protocol/messageSet/decoder.spec.js \u203a Protocol > MessageSet > decoder skip partial messages",
         "src/protocol/recordBatch/crc32C/index.spec.js \u203a Protocol > RecordBatch > crc32C empty",
         "src/protocol/recordBatch/crc32C/index.spec.js \u203a Protocol > RecordBatch > crc32C match the java CRC32C code",

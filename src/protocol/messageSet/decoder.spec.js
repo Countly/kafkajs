@@ -2,6 +2,36 @@ const Encoder = require('../encoder')
 const Decoder = require('../decoder')
 const MessageSet = require('./index')
 const MessageSetDecoder = require('./decoder')
+const MessageV1 = require('../message/v1')
+const gzip = require('../message/compression/gzip')
+const { Types: Compression } = require('../message/compression')
+
+/**
+ * Builds a size-prefixed message set holding one magic 1 gzip wrapper whose inner messages carry
+ * the relative offsets 0..count-1.
+ * @param {string} wrapperOffset the wrapper's absolute offset, written as an exact int64
+ * @param {number} count inner messages
+ * @returns {Promise<Decoder>}
+ */
+const magic1GzipWrapper = async (wrapperOffset, count) => {
+  const entries = Array.from({ length: count }, (_, i) => ({
+    timestamp: 1,
+    key: `key-${i}`,
+    value: `value-${i}`,
+  }))
+  const inner = MessageSet({ messageVersion: 1, compression: Compression.GZIP, entries })
+  const wrapper = MessageV1({
+    compression: Compression.GZIP,
+    timestamp: 1,
+    key: null,
+    value: await gzip.compress(inner),
+  })
+  const set = new Encoder()
+    .writeInt64(wrapperOffset)
+    .writeInt32(wrapper.size())
+    .writeEncoder(wrapper)
+  return new Decoder(new Encoder().writeInt32(set.size()).writeEncoder(set).buffer)
+}
 
 const messages = [
   {
@@ -80,6 +110,33 @@ describe('Protocol > MessageSet > decoder', () => {
         limit: decompressed - 1,
       })
     })
+  })
+
+  test('rebases magic 1 compressed offsets above 2^53 exactly', async () => {
+    const one = await MessageSetDecoder(await magic1GzipWrapper('9007199254740993', 1))
+    expect(one.map((m) => m.offset)).toEqual(['9007199254740993'])
+
+    const three = await MessageSetDecoder(await magic1GzipWrapper('9007199254740993', 3))
+    expect(three.map((m) => m.offset)).toEqual([
+      '9007199254740991',
+      '9007199254740992',
+      '9007199254740993',
+    ])
+  })
+
+  test('rebases magic 1 compressed offsets below 2^53 as before', async () => {
+    const decoded = await MessageSetDecoder(await magic1GzipWrapper('12', 3))
+    const fields = decoded.map(({ offset, magicByte, key, value }) => ({
+      offset,
+      magicByte,
+      key,
+      value,
+    }))
+    expect(fields).toEqual([
+      { offset: '10', magicByte: 1, key: Buffer.from('key-0'), value: Buffer.from('value-0') },
+      { offset: '11', magicByte: 1, key: Buffer.from('key-1'), value: Buffer.from('value-1') },
+      { offset: '12', magicByte: 1, key: Buffer.from('key-2'), value: Buffer.from('value-2') },
+    ])
   })
 
   test('skip partial messages', async () => {
