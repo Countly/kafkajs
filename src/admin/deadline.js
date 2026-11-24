@@ -202,7 +202,7 @@ class MetadataDiscovery extends AdminDeadline {
    * @param {() => Promise<any>} work one metadata refresh
    * @param {() => void} remove deletes only this episode from its owning map
    * @param {any} [epoch] the epoch it started in, see `shareMetadata`
-   * @param {any} [generation] the generation it started in, see `shareMetadata`
+   * @param {number|undefined} [generation] the generation it started in, see `shareMetadata`
    * @returns {MetadataDiscovery} not started until its first caller is enrolled
    */
   constructor(work, remove, epoch, generation) {
@@ -311,7 +311,7 @@ const runWithDeadline = async (
  * @param {Function} [keyOf] existing scope key selector
  * @param {() => any} [epochOf] a call never joins an episode started in another epoch, and an
  *   episode whose epoch moved before its deferred start skips the work and resolves undefined
- * @param {() => any} [generationOf] a call never joins an episode started in another generation;
+ * @param {() => number|undefined} [generationOf] a call never joins an episode started in another generation;
  *   unlike an epoch, a generation that moved does not skip the work
  * @returns {Function} enrollment wrapper; each argument list is captured once per episode
  */

@@ -194,8 +194,9 @@ describe('Cluster > metadata indexes', () => {
       pool.metadataExpireAt = Date.now() + 100000
       expect(await wouldRefresh(pool, ['a'])).toBe(false)
       const fresh = { ...seed }
-      pool.createSeedBroker = async () => {
+      pool.createSeedBroker = async ({ install } = {}) => {
         pool.seedBroker = fresh
+        install?.(fresh)
         return fresh
       }
       pool.closeObsolete = () => {}

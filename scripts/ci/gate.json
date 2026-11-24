@@ -5007,7 +5007,7 @@
         "src/cluster/__tests__/rebootstrap.spec.js \u203a Cluster > a failing best-effort metadata refresh never replaces the original error Cluster#findGroupCoordinator: a failing best-effort refresh does not replace the original error",
         "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a caller of another lifecycle does not join the obsolete rebootstrap",
         "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a closed lifecycle starts no rebootstrap and clears no state",
-        "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a lifecycle that closes as the seed is installed publishes no recovery",
+        "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a lifecycle that closes as the seed is installed gets its close error, and the recovery is not left half done",
         "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a pool built for a timeout rebootstrap after the close is retired unused",
         "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a pool built for an all-brokers-unavailable rebootstrap after the close is retired unused",
         "src/cluster/__tests__/rebootstrapFence.spec.js \u203a rebootstrap and the producer lifecycle that asked for it a rebootstrap pool built after the close is retired unused beside a later lifecycle seed",

@@ -1443,8 +1443,8 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
   every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
   through the caller's normal retry path against the rebuilt cluster. A metadata answer that
-  arrives on an old connection after the rebootstrap is not used: the refresh asks the rebuilt
-  cluster once more. On an idempotent
+  arrives on an old connection after the rebootstrap is not used: the metadata refresh asks the
+  rebuilt cluster once more. On an idempotent
   producer (the default) the retry carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose

@@ -588,8 +588,8 @@ old socket rather than being rejected; the connections themselves are gone by th
 retry path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster —
 it is not itself a source of message loss, but a producer created with `idempotent: false` can
 duplicate records the broker had already appended when a produce is retried. A metadata answer
-that arrives on an old connection after the rebootstrap is not used; the refresh asks the rebuilt
-cluster once more. SASL authentication state
+that arrives on an old connection after the rebootstrap is not used; the metadata refresh asks the
+rebuilt cluster once more. SASL authentication state
 (the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
 authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
 reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.

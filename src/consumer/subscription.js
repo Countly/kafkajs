@@ -79,20 +79,21 @@ class Subscription {
   /**
    * Captures one actual full/named refresh before acquisition or any await.
    * Newer issued work supersedes older replies even if the newer work fails.
-   * @returns {{generation: number, sequence: number, declarationRevision: number, isCurrent: () => boolean}}
+   * @returns {{generation: number, sequence: number, declarationRevision: number,
+   *   isLive: () => boolean, isCurrent: () => boolean}} `isLive` while neither the generation nor
+   *   the declarations moved; `isCurrent` also while no newer refresh was issued
    */
   captureMetadata() {
     const generation = this.generation
     const sequence = ++this.sequence
     const declarationRevision = this.order
+    const isLive = () => this.generation === generation && this.order === declarationRevision
     return {
       generation,
       sequence,
       declarationRevision,
-      isCurrent: () =>
-        this.generation === generation &&
-        this.sequence === sequence &&
-        this.order === declarationRevision,
+      isLive,
+      isCurrent: () => isLive() && this.sequence === sequence,
     }
   }
 

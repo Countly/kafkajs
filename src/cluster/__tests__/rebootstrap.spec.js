@@ -93,10 +93,11 @@ const stubSeed = (pool, metadata) => {
   }
   pool.brokers = {}
   pool.seedBroker = seed
-  pool.createSeedBroker = async () => {
+  pool.createSeedBroker = async ({ install } = {}) => {
     const previous = seed
     seed = { ...seed }
     pool.seedBroker = seed
+    install?.(seed)
     pool.closeObsolete(previous)
     return seed
   }
@@ -624,9 +625,9 @@ describe('BrokerPool > rebootstrap', () => {
 
       let seedsBuilt = 0
       const createSeedBroker = pool.createSeedBroker.bind(pool)
-      pool.createSeedBroker = async () => {
+      pool.createSeedBroker = async (options) => {
         seedsBuilt += 1
-        return createSeedBroker()
+        return createSeedBroker(options)
       }
 
       await Promise.all([

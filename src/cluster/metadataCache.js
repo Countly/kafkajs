@@ -103,10 +103,10 @@ module.exports = class MetadataCache {
    * @param {() => boolean} [options.isCurrent] refuses stale work before any cache/event effect
    * @param {boolean} [options.publish=true] `false` leaves the routing notification to the caller,
    *        which sends it once the answer's brokers are installed
-   * @returns {boolean} whether the answer was installed
+   * @returns {void}
    */
   update(metadata, { full = false, isCurrent = () => true, publish = true } = {}) {
-    if (!isCurrent()) return false
+    if (!isCurrent()) return
     const liveBrokerIds = this.liveBrokerIds(metadata)
 
     this.generation += 1
@@ -182,7 +182,6 @@ module.exports = class MetadataCache {
     }
 
     if (publish) this.publishRoutingChange()
-    return true
   }
 
   /**

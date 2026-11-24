@@ -167,10 +167,12 @@ describe('rebootstrap and the producer lifecycle that asked for it', () => {
     }
   })
 
-  test('a lifecycle that closes as the seed is installed publishes no recovery', async () => {
+  test('a lifecycle that closes as the seed is installed gets its close error, and the recovery is not left half done', async () => {
     const { cluster, pool, builds, events } = await rebootstrappingCluster()
     const generation = new Generation()
     const error = new Error('closed')
+    const seed = pool.seedBroker
+    pool.metadata = { brokers: [], topicMetadata: [] }
     const closeObsolete = pool.closeObsolete.bind(pool)
     pool.closeObsolete = (broker) => {
       generation.close(error)
@@ -183,8 +185,11 @@ describe('rebootstrap and the producer lifecycle that asked for it', () => {
       await flushAll()
       expect(rebootstrapping.state).toBe('rejected')
       expect(rebootstrapping.value).toBe(error)
-      expect(events).toEqual([])
-      expect(pool.lastRebootstrapAt).toBeNull()
+      expect(pool.seedBroker).not.toBe(seed)
+      expect(seed.retire).toHaveBeenCalledTimes(1)
+      expect(pool.recoveries).toBe(1)
+      expect(pool.metadata).toBeNull()
+      expect(events).toEqual([{ reason: 'required' }])
     } finally {
       await cluster.disconnect({ drainTimeout: 0 })
     }
