@@ -773,6 +773,9 @@ class ShareRun {
   }
 
   /**
+   * Hands one acquisition to `eachBatch`. The handler gets its own copy of the records array, so
+   * reordering or changing `batch.messages` cannot move a choice onto another record: the call,
+   * the ledger and the close still read the acquisition's ordered array.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -796,7 +799,7 @@ class ShareRun {
     const batch = {
       topic: cohort.topic,
       partition: cohort.partition,
-      messages: records,
+      messages: records.slice(),
       acquisitionLockTimeoutMs: cohort.lockDuration,
     }
     await this.invoke(node, cohort, call, call.batchPayload(batch))
