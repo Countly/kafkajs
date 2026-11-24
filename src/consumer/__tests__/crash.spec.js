@@ -3,7 +3,12 @@ const Runner = require('../runner')
 const { newLogger, waitFor } = require('testHelpers')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const OffsetOperations = require('../offsetManager/offsetOperations')
-const { KafkaJSNumberOfRetriesExceeded, KafkaJSNonRetriableError } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSNumberOfRetriesExceeded,
+  KafkaJSNonRetriableError,
+  KafkaJSTopicRecreatedError,
+} = require('../../errors')
 
 const createFakeCluster = ({ connect = async () => {} } = {}) => ({
   connect,
@@ -165,6 +170,246 @@ describe('Consumer > CRASH contract', () => {
     expect(crashes[0].restart).toBe(true)
 
     await consumer.disconnect()
+  })
+
+  describe('a crash caused by a recreated topic', () => {
+    const recreated = () =>
+      new KafkaJSTopicRecreatedError('topic crash-topic was recreated', {
+        topic: 'crash-topic',
+        previousTopicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+        topicId: '11121314-1516-1718-191a-1b1c1d1e1f20',
+        groupId: 'crash-recreated',
+        cause: new Error('seen in a metadata answer'),
+      })
+
+    // Nothing else in these runs arms a timer with this delay, so it identifies the restart timer.
+    const RESTART_DELAY = 4321
+
+    /**
+     * Starts a consumer whose run dies at once with `error`, and returns what its crash did.
+     * @param {Error} error the run's failure
+     * @param {Function} [restartOnFailure] the user's restart callback, none by default
+     * @returns {Promise<{crashes: object[], restartsArmed: number, cleanups: object[],
+     *   connects: number}>} the CRASH payloads, the restart timers armed, the cluster disconnects
+     *   of the crash cleanup, and the connect attempts, all read before the final disconnect
+     */
+    const crashWith = async (error, restartOnFailure) => {
+      const cluster = createFakeCluster()
+      const crashes = []
+      const consumer = createConsumer({
+        cluster,
+        groupId: 'crash-recreated',
+        logger: createFakeLogger(),
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        retry: { retries: 0, initialRetryTime: RESTART_DELAY, restartOnFailure },
+      })
+      consumer.on(consumer.events.CRASH, (e) => crashes.push(e.payload))
+      jest.spyOn(cluster, 'connect').mockImplementation(async () => {
+        throw error
+      })
+
+      const timers = jest.spyOn(global, 'setTimeout')
+      let restartsArmed
+      try {
+        await consumer.subscribe({ topic: 'crash-topic' })
+        await consumer.run({ eachMessage: async () => {} })
+        restartsArmed = timers.mock.calls.filter(([, delay]) => delay === RESTART_DELAY).length
+      } finally {
+        timers.mockRestore()
+      }
+      const cleanups = cluster.disconnect.mock.calls.map(([options]) => options)
+      const connects = cluster.connect.mock.calls.length
+      await consumer.disconnect()
+      return { crashes, restartsArmed, cleanups, connects }
+    }
+
+    /**
+     * One CRASH for `error`, after a finished cleanup, with no restart reported or armed.
+     * @param {object} outcome what `crashWith` returned
+     * @param {Error} error the run's failure
+     */
+    const expectCrashedForGood = ({ crashes, restartsArmed, cleanups, connects }, error) => {
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].error).toBe(error)
+      expect(crashes[0].restart).toBe(false)
+      expect(cleanups).toEqual([{ preserveSetupState: true }])
+      expect(restartsArmed).toBe(0)
+      expect(connects).toBe(1)
+    }
+
+    it.each([
+      ['returns true', () => jest.fn(async () => true)],
+      [
+        'throws',
+        () =>
+          jest.fn(async () => {
+            throw new Error('restartOnFailure itself is broken')
+          }),
+      ],
+    ])('is never restarted when restartOnFailure %s', async (_, callback) => {
+      const error = recreated()
+      const restartOnFailure = callback()
+
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+      // The callback is still asked; its answer is overruled.
+      expect(restartOnFailure).toHaveBeenCalledTimes(1)
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+    })
+
+    it('is never restarted when the error is inside the cause chain of the crash', async () => {
+      // In the middle of the chain: neither the reported error nor its deepest cause.
+      const error = new KafkaJSError('the fetch round failed', {
+        retriable: true,
+        cause: recreated(),
+      })
+      const restartOnFailure = jest.fn(async () => true)
+
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+    })
+
+    it('is never restarted by default when the retries were exhausted on it', async () => {
+      // Without restartOnFailure an exhausted retry restarts, whatever it wraps.
+      const error = new KafkaJSNumberOfRetriesExceeded(recreated(), { retryCount: 3 })
+
+      expectCrashedForGood(await crashWith(error), error)
+    })
+
+    it('leaves an unrelated error to restartOnFailure', async () => {
+      const error = new KafkaJSNonRetriableError('fatal misconfiguration')
+      const restartOnFailure = jest.fn(async () => true)
+
+      const { crashes, restartsArmed, cleanups, connects } = await crashWith(
+        error,
+        restartOnFailure
+      )
+
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].error).toBe(error)
+      expect(crashes[0].restart).toBe(true)
+      expect(cleanups).toEqual([{ preserveSetupState: true }])
+      expect(restartsArmed).toBe(1)
+      expect(connects).toBe(1)
+    })
+
+    it('is never restarted when the error sits in a cause chain that loops', async () => {
+      const error = new KafkaJSError('the fetch round failed', {
+        retriable: true,
+        cause: recreated(),
+      })
+      error.cause.cause = error
+      const restartOnFailure = jest.fn(async () => true)
+
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+    })
+
+    it('is never restarted when a plain object links the error into the chain', async () => {
+      const error = new KafkaJSError('the fetch round failed', {
+        retriable: true,
+        cause: { message: 'reported by another library', cause: recreated() },
+      })
+      const restartOnFailure = jest.fn(async () => true)
+
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+    })
+
+    it('leaves an unrelated crash whose cause chain loops to its own restart policy', async () => {
+      const inner = new KafkaJSError('the broker went away', { retriable: true })
+      const error = new KafkaJSNonRetriableError('the fetch round failed', { cause: inner })
+      inner.cause = error
+
+      const { crashes, restartsArmed, cleanups, connects } = await crashWith(error)
+
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].error).toBe(error)
+      // The deepest distinct cause is retriable, so the default policy restarts.
+      expect(crashes[0].restart).toBe(true)
+      expect(cleanups).toEqual([{ preserveSetupState: true }])
+      expect(restartsArmed).toBe(1)
+      expect(connects).toBe(1)
+    })
+  })
+
+  it('crashes and reports when the retries run out on a handler error whose cause chain loops', async () => {
+    const failure = new KafkaJSError('the handler failed', { retriable: true })
+    const inner = new Error('the store refused it')
+    failure.cause = inner
+    // Every bounded walk reads this a few times; only an unbounded one gets past the limit, and
+    // throwing there ends it instead of hanging the run.
+    const LIMIT = 10000
+    let reads = 0
+    Object.defineProperty(inner, 'cause', {
+      get() {
+        reads += 1
+        if (reads > LIMIT) throw new Error('the cause chain was walked round its loop')
+        return failure
+      },
+    })
+
+    const cluster = createFakeCluster()
+    const crashes = []
+    const consumer = createConsumer({
+      cluster,
+      groupId: 'crash-looping-cause',
+      logger: createFakeLogger(),
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      retry: { retries: 0, restartOnFailure: async () => false },
+    })
+    consumer.on(consumer.events.CRASH, (e) => crashes.push(e.payload))
+    // The run goes straight to its fetch loop, which fails as a handler's error makes it fail.
+    const start = jest.spyOn(Runner.prototype, 'start').mockImplementationOnce(async function () {
+      this.running = true
+      this.fetchManager = {
+        start: async () => {
+          throw failure
+        },
+        stop: async () => {},
+      }
+      this.scheduleFetchManager()
+    })
+
+    jest.useFakeTimers()
+    try {
+      const advanceUntil = async (done) => {
+        for (let spent = 0; !done() && spent < 5000; spent += 10) {
+          await jest.advanceTimersByTimeAsync(10)
+        }
+      }
+      await consumer.subscribe({ topic: 'crash-topic' })
+      let ran = false
+      const run = consumer.run({ eachMessage: async () => {} })
+      run.then(
+        () => (ran = true),
+        () => {}
+      )
+      await advanceUntil(() => ran && crashes.length > 0)
+      const cleanups = cluster.disconnect.mock.calls.map(([options]) => options)
+
+      expect(reads).toBeLessThanOrEqual(LIMIT)
+      expect(ran).toBe(true)
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(crashes[0].error.cause).toBe(failure)
+      expect(crashes[0].error.retryCount).toBe(0)
+      expect(crashes[0].error).not.toHaveProperty('type')
+      expect(crashes[0].restart).toBe(false)
+      expect(cleanups).toContainEqual({ preserveSetupState: true })
+
+      let ended = false
+      const end = consumer.disconnect()
+      end.then(
+        () => (ended = true),
+        () => {}
+      )
+      await advanceUntil(() => ended)
+      expect(ended).toBe(true)
+      await end
+    } finally {
+      jest.useRealTimers()
+      start.mockRestore()
+    }
   })
 
   it('does not resurrect a consumer that was disconnected while restartOnFailure was still deciding', async () => {

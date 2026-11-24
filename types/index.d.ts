@@ -3094,6 +3094,27 @@ export class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
   constructor(e: Error | string, options?: { cause?: Error })
 }
 
+/**
+ * A topic the consumer holds positions of came back under a new topic id (deleted and recreated).
+ * The run stops with it and `CRASH` reports `restart: false`, whatever `restartOnFailure` returns.
+ */
+export class KafkaJSTopicRecreatedError extends KafkaJSNonRetriableError {
+  readonly topic: string
+  readonly previousTopicId: string
+  readonly topicId: string
+  readonly groupId: string | null
+  constructor(
+    e: Error | string,
+    options: {
+      topic: string
+      previousTopicId: string
+      topicId: string
+      groupId?: string | null
+      cause?: Error
+    }
+  )
+}
+
 /** No buffer memory became available within `maxBlockMs`, or too many sends were already waiting. Retriable. */
 export class KafkaJSBufferExhaustedError extends KafkaJSError {
   readonly reason: 'timeout' | 'queue-full'

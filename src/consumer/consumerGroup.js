@@ -92,6 +92,7 @@ const {
   obsoleteOwnership,
   consumerStoppingError,
   joinDeadlineError,
+  isFatalTopicError,
   REBALANCE_PATHS,
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
@@ -127,10 +128,13 @@ const STALE_METADATA_ERRORS = [
   'FETCH_SESSION_TOPIC_ID_ERROR',
 ]
 
-// The last Fetch version that keys topics by name. A request whose topics are not all known by id
-// is capped here rather than being split across two versions.
+// The last Fetch version that keys topics by name: the ceiling of a removal-only request for a
+// session that was built by name.
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
+
+// Recorded for a partition left out of a fetch round because its topic id is not known yet.
+const UNKNOWN_TOPIC_ID_CODE = 100
 
 /** The first Fetch version that carries a session ID and epoch (KIP-227). */
 const FETCH_SESSION_MIN_VERSION = 7
@@ -478,8 +482,9 @@ module.exports = class ConsumerGroup {
     this.preparationEpoch = 0
     /**
      * The pending metadata refresh for partitions without a leader, shared by every node's fetcher
-     * of the current run, and when the last one started (`performance.now()`).
-     * @type {{ promise: Promise<void> }|null}
+     * of the current run, and when the last one started (`performance.now()`). `error` is its
+     * failure, once it failed.
+     * @type {{ promise: Promise<void>, error?: Error }|null}
      */
     this.leaderlessRefresh = null
     this.leaderlessRefreshAt = -Infinity
@@ -2456,16 +2461,26 @@ module.exports = class ConsumerGroup {
       prepared.check()
       const { assignmentEpoch } = prepared
       requestClock = this.acquireClock
-      const requests = this.buildFetchRequests(prepared.parts)
+      const resolved = this.resolveTopicIds(this.buildFetchRequests(prepared.parts))
+      const { requests, missing } = resolved
+      if (missing) {
+        for (const { topic, partitions } of missing) {
+          for (const { partition } of partitions) {
+            this.recordFetchError(topic, partition, UNKNOWN_TOPIC_ID_CODE)
+          }
+        }
+      }
       const registry = this.fetchSessions
       // With sessions, a node whose last partitions just left still owes the broker one removal.
       const forgetting = requests.length === 0 ? registry?.active(nodeId) : undefined
 
-      if (!requests.length && !forgetting) return await this.idleFetchRound(prepared, run)
+      if (!requests.length && !forgetting) {
+        return await this.idleFetchRound(prepared, run, missing !== null)
+      }
 
       const { topicIds, maxVersion } = forgetting
         ? this.forgettingAddressing(forgetting)
-        : this.resolveTopicIds(requests)
+        : { topicIds: resolved.topicIds, maxVersion: undefined }
 
       if (this.logger.debugEnabled()) {
         this.logger.debug('Fetching', {
@@ -2491,7 +2506,7 @@ module.exports = class ConsumerGroup {
         const version = this.negotiatedFetchVersion(broker, maxVersion)
         if (version == null || version < FETCH_SESSION_MIN_VERSION) {
           registry.release(nodeId)
-          if (!requests.length) return await this.idleFetchRound(prepared, run)
+          if (!requests.length) return await this.idleFetchRound(prepared, run, missing !== null)
         } else {
           tracked = this.trackFetch(
             registry,
@@ -2614,6 +2629,9 @@ module.exports = class ConsumerGroup {
       if (needsRefresh) {
         await this.refreshCluster({ fence: run.fence })
         run.fence.check()
+      } else if (missing) {
+        await this.refreshMissingTopicIds(run)
+        run.fence.check()
       } else if (prepared.leaderless) {
         await this.refreshLeaderlessMetadata(run)
         run.fence.check()
@@ -2648,14 +2666,17 @@ module.exports = class ConsumerGroup {
 
   /**
    * Waits out a round with nothing to ask this node: it sleeps while its snapshot stays current,
-   * after asking for the routing of partitions that have no leader.
+   * after asking for the metadata of partitions that have no leader or no topic id.
    * @private
    * @param {FetchPreparation} prepared the round's snapshot
    * @param {IdleWait} run the run that owns the round
+   * @param {boolean} [missingIds=false] whether a topic was left out for a missing topic id
    * @returns {Promise<Batch[]>} always empty
+   * @throws {Error} a terminal topic refusal learned for a missing id, see `refreshMissingTopicIds`
    */
-  async idleFetchRound(prepared, run) {
-    if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
+  async idleFetchRound(prepared, run, missingIds = false) {
+    if (missingIds) await this.refreshMissingTopicIds(run)
+    else if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
     // Registers only while the snapshot is current: an invalidated one returns through the
     // fetcher's yield floor and a fresh snapshot is captured next round.
     await run.wait(
@@ -2910,34 +2931,34 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Resolves the topic ids for one round's requests, all-or-nothing.
+   * Resolves the topic ids for one round's requests and leaves out every topic without one.
    *
-   * A fetch goes out keyed by id only when every topic in it has one, otherwise the whole request
-   * falls back to the last version keyed by name. This is the rule the Java consumer applies, and
-   * it avoids splitting one round into two requests at two versions. No extra metadata refresh is
-   * issued for a missing id: the round already refreshed if necessary, and an id is only missing
-   * inside a delete/recreate window.
+   * A topic is never fetched by name: after a delete and recreate the name belongs to the new
+   * topic, and a by-name fetch would read it at the old topic's position. A topic left out is
+   * fetched again once a metadata refresh brings its id; the caller reports it and asks for that
+   * refresh. Costs one cache lookup per topic; the list is copied only when a topic is left out.
    *
    * @private
    * @param {{topic: string}[]} requests this round's request entries
-   * @returns {{topicIds: Map<string, string>|undefined, maxVersion: number|undefined}} the
-   *   name -> id map and no ceiling when every topic has an id; `undefined` and the last
-   *   name-keyed version when any is missing
+   * @returns {{requests: object[], topicIds: Map<string, string>, missing: object[]|null}} the
+   *   entries that have an id (the same array when all do), their name -> id map, and the entries
+   *   left out, or null when none was
    */
   resolveTopicIds(requests) {
     const topicIds = new Map()
+    let missing = null
 
-    for (const { topic } of requests) {
-      const topicId = this.cluster.topicId(topic)
-
-      if (topicId === undefined) {
-        return { topicIds: undefined, maxVersion: FETCH_TOPIC_NAMES_MAX_VERSION }
-      }
-
-      topicIds.set(topic, topicId)
+    for (const request of requests) {
+      const topicId = this.cluster.topicId(request.topic)
+      if (topicId === undefined) (missing ??= []).push(request)
+      else topicIds.set(request.topic, topicId)
     }
 
-    return { topicIds, maxVersion: undefined }
+    return {
+      requests: missing ? requests.filter(({ topic }) => topicIds.has(topic)) : requests,
+      topicIds,
+      missing,
+    }
   }
 
   /**
@@ -4548,18 +4569,20 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Refreshes the metadata because a partition has no leader, once for all the nodes' fetchers of
-   * a run. Callers share the pending refresh, and a new one starts at most once per initial retry
-   * interval, measured start to start; a due caller waits for its own refresh, an early one
-   * returns at once. There is no retry timer: the next round that finds a leader missing and the
-   * interval elapsed asks again.
+   * Refreshes the metadata because a partition has no leader or a topic has no id, once for all
+   * the nodes' fetchers of a run. Callers share the pending refresh, and a new one starts at most
+   * once per initial retry interval, measured start to start; a due caller waits for its own
+   * refresh, an early one returns at once. There is no retry timer: the next round that finds a
+   * leader or an id missing and the interval elapsed asks again.
    *
    * The refresh is bound to the run's fence, so a stop or restart settles every caller and the
    * refresh publishes nothing afterwards. A failure is logged at debug level and never becomes a
-   * membership verdict or discards the round's healthy batches.
+   * membership verdict by itself; it is returned to every caller that waited for it, so a caller
+   * can judge it for its own reason.
    * @private
    * @param {IdleWait} run the run that owns the calling round, captured before any await
-   * @returns {Promise<void>} resolves when the refresh settled, was not due, or the run stopped
+   * @returns {Promise<Error|undefined>} the failure of the refresh this caller waited for, if it
+   *   failed; undefined when it succeeded or was not due
    */
   async refreshLeaderlessMetadata(run) {
     if (run.fence.closed) return
@@ -4578,6 +4601,7 @@ module.exports = class ConsumerGroup {
               error: describeThrown(error),
             })
           }
+          attempt.error = error
         })
         .finally(() => {
           if (this.leaderlessRefresh === attempt) this.leaderlessRefresh = null
@@ -4585,5 +4609,21 @@ module.exports = class ConsumerGroup {
       this.leaderlessRefresh = attempt
     }
     await run.fence.wait(attempt.promise).catch(() => {})
+    return attempt.error
+  }
+
+  /**
+   * Refreshes the metadata for a round that left a topic out for a missing id, and fails the
+   * round when the refresh learned a refusal that will not clear (`TOPIC_AUTHORIZATION_FAILED`,
+   * `INVALID_TOPIC_EXCEPTION`), as a conditional refresh before the round would. Other failures
+   * are waited out: the next refresh may bring the id.
+   * @private
+   * @param {IdleWait} run the run that owns the calling round
+   * @returns {Promise<void>}
+   * @throws {Error} the refresh's terminal topic refusal
+   */
+  async refreshMissingTopicIds(run) {
+    const error = await this.refreshLeaderlessMetadata(run)
+    if (isFatalTopicError(error)) throw error
   }
 }
