@@ -659,11 +659,12 @@ says so, `groupProtocol: 'consumer'`.
   round has its own small budget — at most two retries, capped at five seconds of backoff — and is
   not governed by your `retry` options. A partition whose check does not complete (the request
   fails, retriable errors outlast the budget, or the leader answers with an unexpected error) stays
-  held, as in the Java client: the consumer refreshes its metadata and asks again after a
-  per-partition backoff of 100 ms doubling up to 1 s, at once when the leader epoch changes, and
-  logs a warning naming the partition when it is first held and at most once a minute while it
-  stays held. A partition is never fetched unvalidated because a check failed, since that could
-  skip records after an unclean leader election. A `TOPIC_AUTHORIZATION_FAILED` answer fails the
+  held, as in the Java client. The consumer refreshes its metadata before trying again. A
+  partition becomes eligible for a check after a backoff of 100 ms, doubling up to 1 s, or as
+  soon as a new known leader epoch is available. An idle fetch wait can delay the next check.
+  The consumer logs a warning naming the partition when it is first held and at most once a
+  minute while it stays held. Keeping the partition out of fetches prevents skipped records
+  after an unclean leader election. A `TOPIC_AUTHORIZATION_FAILED` answer fails the
   fetch round like the same error on a Fetch. Partitions whose epoch did not change are fetched
   throughout. Usually this is a latency change measured in milliseconds around leader elections and
   at the first fetch of a new assignment; a partition whose current leader keeps refusing the check
