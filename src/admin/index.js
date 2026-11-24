@@ -443,14 +443,6 @@ const throttledTopics = ({ topicErrors }) =>
     : null
 
 /**
- * The key of one partition of one topic, for the calls that answer per partition.
- * @param {string} topic
- * @param {number} partition
- * @returns {string}
- */
-const partitionKey = (topic, partition) => `${topic}|${partition}`
-
-/**
  * Whether a config resource names something: a non-empty string, except for BROKER, whose empty
  * name stands for the cluster-wide default broker config.
  * @param {{ type: number, name: unknown }} resource
@@ -2646,10 +2638,9 @@ module.exports = ({
   }
 
   /**
-   * Alter the replicas partitions are assigned to for a topic. A failure that names only some
-   * partitions does not repeat the others: each retry sends just the partitions the broker said
-   * could still go through (`retriable`), with their original replicas, and a partition it refused
-   * for good is remembered across the retries.
+   * Alter the replicas partitions are assigned to for a topic. The request is written at most
+   * once: a controller lookup that fails before it (`NOT_CONTROLLER`) is retried, and a broker
+   * answer, including per-partition errors, ends the call.
    * @param {Object} request
    * @param {import("../../types").IPartitionReassignment[]} request.topics topics and the paritions to be reassigned
    * @param {number} [request.timeout]
@@ -2657,69 +2648,44 @@ module.exports = ({
    * @throws {KafkaJSNonRetriableError} before any request, for topics that `reassignmentInput`
    *   refuses; the public call copies the topics when it is made, so a later change by the caller
    *   reaches no request
-   * @throws {KafkaJSAggregateError} when a partition was refused for good: one error per such
-   *   partition, not retriable, followed by the failures of an attempt that ran out of retries
-   * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no
-   *   partition was refused for good
+   * @throws {KafkaJSAggregateError} the broker's per-partition errors, one child per partition
+   * @throws {KafkaJSUnknownOutcomeError} when the written request got no answer
+   * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries before the request was
+   *   written, unchanged
    */
   const alterPartitionReassignments = async ({ topics, timeout, allowReplicationFactorChange }) => {
-    const outcome = new AggregateOutcome({
-      keys: topics.flatMap(({ topic, partitionAssignment }) =>
-        partitionAssignment.map(({ partition }) => partitionKey(topic, partition))
-      ),
-      keyOf: ({ topic, partition }) => partitionKey(topic, partition),
-      select: (keys) =>
-        topics
-          .map((entry) => ({
-            ...entry,
-            partitionAssignment: entry.partitionAssignment.filter(({ partition }) =>
-              keys.has(partitionKey(entry.topic, partition))
-            ),
-          }))
-          .filter(({ partitionAssignment }) => partitionAssignment.length > 0),
-      message: 'Errors altering partition reassignments',
-    })
-    const retrier = retrierOf(retry)
-    let outstanding
-
-    try {
-      checked(
-        await waitOf(async () =>
-          retrier(async (bail, retryCount, retryTime) => {
-            try {
-              checked(await waitOf(async () => cluster.refreshMetadata()))
-              const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
-              checked(
-                await waitOf(async () =>
-                  broker.alterPartitionReassignments({
-                    topics: outcome.pending,
-                    timeout,
-                    allowReplicationFactorChange,
-                  })
-                )
-              )
-              outcome.succeeded()
-            } catch (e) {
-              if (endsCall(e) || isAnsweredError(e) || isPerItemFailure(e)) return bail(e)
-              if (e.type === 'NOT_CONTROLLER') {
-                logger.warn('Could not reassign partitions', {
-                  error: e.message,
-                  retryCount,
-                  retryTime,
+    const sent = topics.filter(({ partitionAssignment }) => partitionAssignment.length > 0)
+    checked(
+      await waitOf(async () =>
+        retrierOf(retry)(async (bail, retryCount, retryTime) => {
+          try {
+            checked(await waitOf(async () => cluster.refreshMetadata()))
+            const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+            checked(
+              await waitOf(async () =>
+                broker.alterPartitionReassignments({
+                  topics: sent,
+                  timeout,
+                  allowReplicationFactorChange,
                 })
-                throw e
-              }
-
-              bail(e)
+              )
+            )
+          } catch (e) {
+            if (endsCall(e) || isAnsweredError(e) || isPerItemFailure(e)) return bail(e)
+            if (e.type === 'NOT_CONTROLLER') {
+              logger.warn('Could not reassign partitions', {
+                error: e.message,
+                retryCount,
+                retryTime,
+              })
+              throw e
             }
-          })
-        )
-      )
-    } catch (e) {
-      outstanding = e
-    }
 
-    outcome.finish(outstanding)
+            bail(e)
+          }
+        })
+      )
+    )
   }
 
   /**
