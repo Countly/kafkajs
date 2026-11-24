@@ -1605,6 +1605,16 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * Whether the batch's partition is paused now. A group without `isPaused` (a test double; the
+   * consumer group always has it) reads as not paused.
+   * @param {import('./batch')} batch
+   * @returns {boolean}
+   */
+  #paused(batch) {
+    return this.consumerGroup.isPaused?.(batch.topic, batch.partition) === true
+  }
+
+  /**
    * Whether the batch's records were superseded after it was fetched: its topic was deleted and
    * recreated, so they belong to an incarnation this member no longer reads, its partition was
    * sought (`ConsumerGroup#seek`), so they are not at the position the application asked for, or
@@ -1742,6 +1752,19 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    // A partition paused while its batch waited in the queue is not delivered; resume fetches it
+    // again from the position it holds, which nothing here has moved.
+    if (this.#paused(batch)) {
+      this.logger.debug('Dropping a queued batch for a paused partition', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topic: batch.topic,
+        partition: batch.partition,
+      })
+
+      return
+    }
+
     /** @param {import('./batch')} batch */
     const onBatch = async (batch) => {
       const startBatchProcess = Date.now()
@@ -1795,6 +1818,16 @@ module.exports = class Runner extends EventEmitter {
       if (batch.isEmptyDueToFiltering()) {
         this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
+        // A START_BATCH_PROCESS listener can pause the partition: nothing is resolved, and
+        // END_BATCH_PROCESS still pairs with START.
+        if (this.#paused(batch)) {
+          this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
+            ...payload,
+            duration: Date.now() - startBatchProcess,
+          })
+          return
+        }
+
         const lastOffset = batch.lastOffset()
         this.resolveBatchOffset(batch, lastOffset, batch.leaderEpochAt(lastOffset))
         await this.autoCommitOffsetsIfNecessary(null)
@@ -1826,10 +1859,15 @@ module.exports = class Runner extends EventEmitter {
         groupId: this.consumerGroup.groupId,
         runIdentity: this.consumerGroup.runIdentity,
       }
-      // A START_BATCH_PROCESS listener can seek the partition: such a batch is not handed over,
-      // and END_BATCH_PROCESS still pairs with START.
+      // A START_BATCH_PROCESS listener can seek or pause the partition: such a batch is not handed
+      // over, and END_BATCH_PROCESS still pairs with START.
       if (this.isSuperseded(batch)) {
         this.logger.debug('Not handing over a batch a seek superseded', { topic, partition })
+      } else if (this.#paused(batch)) {
+        this.logger.debug('Not handing over a batch of a partition a listener paused', {
+          topic,
+          partition,
+        })
       } else if (this.eachMessage) {
         await handlerContext.run(identity, () => this.processEachMessage(batch))
       } else if (this.eachBatch) {
