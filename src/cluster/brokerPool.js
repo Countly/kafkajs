@@ -701,18 +701,19 @@ module.exports = class BrokerPool {
     const complete = this.reserveDrain(pool, this.drainingPools)
     const drain = complete(
       (async () => {
+        // Boxed, so a falsy reason still counts as a failure.
         let failure = null
         try {
           pool.retire()
-        } catch (error) {
-          failure = error
+        } catch (reason) {
+          failure = { reason }
         }
         try {
           await pool.destroy({ drainTimeout: this.drainTimeout })
-        } catch (error) {
-          failure ??= error
+        } catch (reason) {
+          failure ??= { reason }
         }
-        if (failure) throw failure
+        if (failure) throw failure.reason
       })()
     )
     this.closeInBackground(drain)

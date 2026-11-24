@@ -527,18 +527,19 @@ module.exports = class Broker {
    */
   async retire(options) {
     this.retired = true
+    // Boxed, so a falsy reason still counts as a failure.
     let failure = null
     try {
       this.connectionPool.retire()
-    } catch (error) {
-      failure = error
+    } catch (reason) {
+      failure = { reason }
     }
     try {
       await this.disconnect(options)
-    } catch (error) {
-      failure ??= error
+    } catch (reason) {
+      failure ??= { reason }
     }
-    if (failure) throw failure
+    if (failure) throw failure.reason
   }
 
   /**
