@@ -259,7 +259,16 @@ module.exports = class Connection {
           port: this.port,
         })
         this.setupAttempt?.fail(error)
-        this.closeGeneration(error)
+        try {
+          this.closeGeneration(error)
+        } catch (reason) {
+          try {
+            this.logError('Failed to close the timed-out connection', {
+              error: describeThrown(reason),
+              cause: reason,
+            })
+          } catch {}
+        }
       },
       onDispatchFailure: (error) => this.failGeneration(error),
     })
@@ -706,7 +715,7 @@ module.exports = class Connection {
         failure = { reason }
       }
       try {
-        socket.destroy()
+        if (!socket.destroyed) socket.destroy()
       } catch (reason) {
         failure ??= { reason }
       }
