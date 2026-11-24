@@ -125,4 +125,31 @@ describe('Producer > what a failure inside the producer logs instead of throwing
       'The producer is disconnected'
     )
   })
+
+  test('a forced disconnect whose cluster close rejects with undefined still ends, and logs the failure as a warning', async () => {
+    const { producer, cluster, logged } = loggingProducer()
+    const disconnected = jest.fn()
+    producer.on(producer.events.DISCONNECT, disconnected)
+    await producer.connect()
+    const nothing = undefined
+    cluster.disconnect.mockRejectedValue(nothing)
+    const outcome = []
+    producer.disconnect({ timeout: 0 }).then(
+      (value) => outcome.push(['resolved', value]),
+      (error) => outcome.push(['rejected', error])
+    )
+    await turn()
+    await turn()
+
+    expect(outcome).toEqual([['resolved', undefined]])
+    expect(logged()).toEqual([
+      expect.objectContaining({
+        level: LEVELS.WARN,
+        message: 'Disconnecting the cluster failed',
+        error: 'undefined',
+      }),
+    ])
+    expect(cluster.disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
+    expect(disconnected).toHaveBeenCalledTimes(1)
+  })
 })

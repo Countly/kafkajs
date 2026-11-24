@@ -474,14 +474,16 @@ class ShareRunner {
    * @returns {Promise<void>}
    */
   async closeClient(episode, finalTelemetry = null) {
+    let wasConnected = false
     try {
       await episode?.done
       await this.options.cluster.disconnect({ drainTimeout: 0 })
     } finally {
       if (finalTelemetry) await finalTelemetry
+      // Reset even when the close failed: the cluster may have detached its brokers already.
+      wasConnected = this.connected
+      this.connected = false
     }
-    const wasConnected = this.connected
-    this.connected = false
     if (wasConnected) this.emit(events.DISCONNECT)
   }
 

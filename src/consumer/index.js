@@ -806,7 +806,7 @@ module.exports = (params) => {
       const failure = results.find(({ status }) => status === 'rejected')
       if (failure && !forced) throw failure.reason
       if (failure)
-        logger.warn('Disconnecting the cluster failed', { error: failure.reason.message })
+        logger.warn('Disconnecting the cluster failed', { error: describeThrown(failure.reason) })
     } finally {
       unregister()
     }

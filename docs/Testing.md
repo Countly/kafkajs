@@ -744,11 +744,13 @@ In order to avoid overloading the terminal with huge logs, we filter any buffers
 KAFKAJS_LOG_LEVEL=debug npx jest --watch
 ```
 
-Because the `Fetch` response log can be extremely large, we always filter the `Fetch` response payload, unless the `KAFKAJS_DEBUG_EXTENDED_PROTOCOL_BUFFERS` environment variable is *also* set. To see the full `Fetch` response buffer values, run with both flags set:
+Because the `Fetch` and `ShareFetch` response logs can be extremely large and hold record data, we always filter their decoded data and, when a response fails to decode, its raw bytes, unless the `KAFKAJS_DEBUG_EXTENDED_PROTOCOL_BUFFERS` environment variable is *also* set. To see the full `Fetch` and `ShareFetch` response values, run with both flags set:
 
 ```sh
-KAFKAJS_LOG_LEVEL=debug KAFKAJS_DEBUG_EXTENDED_PROTOCOL_BUFFERS=1 npx jest --watch
+KAFKAJS_LOG_LEVEL=debug KAFKAJS_DEBUG_PROTOCOL_BUFFERS=1 KAFKAJS_DEBUG_EXTENDED_PROTOCOL_BUFFERS=1 npx jest --watch
 ```
+
+Setting both flags writes record keys, values and headers to the log, so keep such logs out of shared systems. The responses to `DescribeConfigs`, `CreateTopics`, `AlterConfigs` and `IncrementalAlterConfigs` carry config values, which can be passwords, so their decoded data and raw bytes are never logged, whatever the flags. Application-chosen opaque fields are not filtered: the metadata of a committed offset, the metadata and assignments of group members (including the leader's assignment line) and the `COMMIT_OFFSETS` event's metadata stay visible at the debug level, as in kafkajs 2.2.4.
 
 ## Helpers
 
