@@ -1871,6 +1871,134 @@ describe('Metadata answers across a rebootstrap', () => {
       expect(pool.metadataCache.leader('t-new', 0)).toBe(0)
     })
   })
+
+  describe('broker selection', () => {
+    it('a node connection that a disconnect overtook is not returned by its lookup', async () => {
+      const { pool } = build()
+      delete pool.findConnectedBroker
+      const peer = broker(1)
+      let connected
+      peer.isConnected = () => false
+      peer.connect = jest.fn(() => new Promise((resolve) => (connected = resolve)))
+      pool.brokers = { 0: pool.seedBroker, 1: peer }
+      const finding = outcome(pool.findBroker({ nodeId: 1 }))
+      await settled()
+      expect(peer.connect).toHaveBeenCalledTimes(1)
+
+      await pool.disconnect()
+      connected()
+      const { error } = await finding
+      expect(error).toBeInstanceOf(KafkaJSConnectionError)
+      expect(error.retriable).toBe(true)
+    })
+
+    it('a seed selection that a disconnect overtook after its last check is not returned', async () => {
+      const { pool, seed } = build()
+      delete pool.findConnectedBroker
+      pool.brokers = {}
+      seed.isConnected = () => false
+      seed.versions = { connected: true }
+      seed.connect = jest.fn(async () => {})
+      let versions = null
+      let disconnecting = null
+      // The seed connection publishes its versions right after its last check, so the disconnect
+      // lands between that check and the return of the selection.
+      Object.defineProperty(pool, 'versions', {
+        configurable: true,
+        get: () => versions,
+        set: (value) => {
+          versions = value
+          if (value === seed.versions && !disconnecting) disconnecting = pool.disconnect()
+        },
+      })
+
+      const { error } = await outcome(pool.findConnectedBroker())
+      expect(disconnecting).not.toBeNull()
+      expect(error).toBeInstanceOf(KafkaJSConnectionError)
+      expect(error.retriable).toBe(true)
+      await disconnecting
+    })
+
+    it('a seed fallback whose connect finds a peer connected returns that peer, not the cold seed', async () => {
+      const { pool, seed } = build()
+      delete pool.findConnectedBroker
+      const peer = broker(1)
+      let up = false
+      peer.isConnected = () => up
+      // Another caller connects the peer while this attempt fails.
+      peer.connect = jest.fn(async () => {
+        up = true
+        throw new KafkaJSConnectionError('Connection refused')
+      })
+      seed.isConnected = () => false
+      seed.connect = jest.fn(async () => {})
+      pool.brokers = { 1: peer }
+
+      const { value } = await outcome(pool.findConnectedBroker())
+      expect(value === peer).toBe(true)
+      expect(seed.connect).not.toHaveBeenCalled()
+    })
+
+    it('a node whose illegal SASL state cleanup a rebootstrap overtook builds no replacement pool and fails retriably', async () => {
+      const { pool, builder } = build()
+      delete pool.findConnectedBroker
+      const old = broker(1)
+      let disconnected
+      old.isConnected = () => false
+      old.connect = jest.fn(async () => {
+        throw Object.assign(new Error('Illegal SASL state'), {
+          type: 'ILLEGAL_SASL_STATE',
+          retriable: true,
+        })
+      })
+      old.disconnect.mockImplementation(() => new Promise((resolve) => (disconnected = resolve)))
+      pool.brokers = { 0: pool.seedBroker, 1: old }
+      const finding = outcome(pool.findBroker({ nodeId: 1 }))
+      await settled()
+      expect(old.disconnect).toHaveBeenCalledTimes(1)
+
+      await pool.rebootstrap('required')
+      expect(builder.build).toHaveBeenCalledTimes(1)
+      disconnected()
+      const { error } = await finding
+      expect(builder.build).toHaveBeenCalledTimes(1)
+      expect(error).toBeInstanceOf(KafkaJSConnectionError)
+      expect(error.retriable).toBe(true)
+    })
+
+    it('a coordinator lookup whose broker selection was superseded asks again within its retries', async () => {
+      jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] })
+      try {
+        const cluster = new Cluster({
+          logger: newLogger(),
+          clientId: 'client',
+          brokers: ['seed:9092'],
+          requestTimeout: 1000,
+          retry: { retries: 1, initialRetryTime: 100, maxRetryTime: 100 },
+        })
+        const coordinator = broker(0, 'seed')
+        cluster.brokerPool.brokers = { 0: coordinator }
+        cluster.findGroupCoordinatorMetadata = jest.fn(async () => ({
+          coordinator: { nodeId: 0, host: 'seed', port: 9092 },
+        }))
+        const superseded = new KafkaJSConnectionError(
+          'The broker was replaced while it was selected',
+          { code: BrokerPool.SELECTION_SUPERSEDED }
+        )
+        cluster.findBroker = jest
+          .fn()
+          .mockRejectedValueOnce(superseded)
+          .mockResolvedValueOnce(coordinator)
+
+        const finding = outcome(cluster.findGroupCoordinator({ groupId: 'group' }))
+        await jest.advanceTimersByTimeAsync(1000)
+        expect((await finding).value === coordinator).toBe(true)
+        expect(cluster.findBroker).toHaveBeenCalledTimes(2)
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+  })
 })
 
 describe('One install step per metadata answer', () => {
