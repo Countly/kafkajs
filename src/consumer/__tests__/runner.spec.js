@@ -6,6 +6,12 @@ const createWorkerQueue = require('../workerQueue')
 const {
   events: { START_BATCH_PROCESS, END_BATCH_PROCESS },
 } = require('../instrumentationEvents')
+const Decoder = require('../../protocol/decoder')
+const decodeMessages = require('../../protocol/requests/fetch/v4/decodeMessages')
+const {
+  batch: batchBytes,
+  record: recordBytes,
+} = require('../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger, secureRandom, waitFor } = require('testHelpers')
 const sleep = require('../../utils/sleep')
@@ -1677,6 +1683,110 @@ describe('Consumer > Runner', () => {
 
       expect(handler).toHaveBeenCalledTimes(1)
       expect(resolvedOf(1)).toEqual(['5'])
+    })
+  })
+
+  describe('a compacted batch that decoding left without records to deliver', () => {
+    const EPOCH = 5
+
+    /** A Batch built from what the Fetch decoder returns for these record batches. */
+    const decoded = async (fetchedOffset, ...batches) => {
+      const body = Buffer.concat(batches)
+      const size = Buffer.alloc(4)
+      size.writeInt32BE(body.length)
+      const partitionData = await decodeMessages(new Decoder(Buffer.concat([size, body])))
+      return new Batch(topicName, fetchedOffset, {
+        partition,
+        highWatermark: '500',
+        ...partitionData,
+      })
+    }
+    const emptyCompacted = () =>
+      batchBytes({ baseOffset: 0n, partitionLeaderEpoch: EPOCH, lastOffsetDelta: 99 })
+
+    const start = async (partial) => {
+      runner = createTestRunner(partial)
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+    }
+
+    it('moves the position to the end of an empty batch, with its epoch, and delivers the later record', async () => {
+      await start()
+
+      await runner.handleBatch(await decoded(0, emptyCompacted()))
+
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith({
+        topic: topicName,
+        partition,
+        offset: '99',
+        leaderEpoch: EPOCH,
+      })
+      expect(eachBatch).not.toHaveBeenCalled()
+
+      const later = batchBytes({
+        baseOffset: 100n,
+        partitionLeaderEpoch: EPOCH,
+        records: [recordBytes({ key: 'k', value: 'v' })],
+      })
+      await runner.handleBatch(await decoded(100, later))
+
+      expect(eachBatch).toHaveBeenCalledTimes(1)
+      expect(eachBatch.mock.calls[0][0].batch.messages.map(({ offset }) => offset)).toEqual(['100'])
+    })
+
+    it('reaches the end of a batch whose only retained record is behind the fetch offset in one step', async () => {
+      await start()
+      const compacted = batchBytes({
+        baseOffset: 0n,
+        partitionLeaderEpoch: EPOCH,
+        lastOffsetDelta: 99,
+        records: [recordBytes({ offsetDelta: 1 })],
+      })
+
+      await runner.handleBatch(await decoded(2, compacted))
+
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith({
+        topic: topicName,
+        partition,
+        offset: '99',
+        leaderEpoch: EPOCH,
+      })
+    })
+
+    it.each([
+      ['eachMessage', { eachBatch: undefined, eachMessage: jest.fn() }],
+      ['eachBatch', { eachBatch: jest.fn() }],
+      ['eachBatch with auto-resolve off', { eachBatch: jest.fn(), eachBatchAutoResolve: false }],
+    ])('is resolved without calling %s', async (_name, handlers) => {
+      await start(handlers)
+
+      await runner.handleBatch(await decoded(0, emptyCompacted()))
+
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith(
+        expect.objectContaining({ offset: '99', leaderEpoch: EPOCH })
+      )
+      expect(handlers.eachMessage || handlers.eachBatch).not.toHaveBeenCalled()
+    })
+
+    it('leaves a handler that resolves explicitly with its own resolution', async () => {
+      const handler = jest.fn(async ({ resolveOffset }) => resolveOffset('100'))
+      await start({ eachBatch: handler, eachBatchAutoResolve: false })
+      const retained = batchBytes({
+        baseOffset: 100n,
+        partitionLeaderEpoch: EPOCH,
+        lastOffsetDelta: 99,
+        records: [recordBytes({ key: 'k', value: 'v' })],
+      })
+
+      await runner.handleBatch(await decoded(100, retained))
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith(
+        expect.objectContaining({ offset: '100', leaderEpoch: EPOCH })
+      )
     })
   })
 })

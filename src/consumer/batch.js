@@ -17,6 +17,18 @@ const epochOf = (message) => {
  * A batch could contain _multiple_ Kafka RecordBatches.
  */
 module.exports = class Batch {
+  #nextBatchOffset
+  #nextBatchLeaderEpoch
+  #advances
+
+  /**
+   * @param {string} topic
+   * @param {string|number} fetchedOffset the offset the Fetch asked for
+   * @param {object} partitionData a decoded Fetch partition. Its `nextBatchOffset` and
+   *   `nextBatchLeaderEpoch` (the offset after the last complete record batch and that batch's
+   *   leader epoch) let a batch with no record at or after `fetchedOffset` move the position to the
+   *   end of that record batch
+   */
   constructor(topic, fetchedOffset, partitionData) {
     this.fetchedOffset = fetchedOffset
     const longFetchedOffset = Long.fromValue(this.fetchedOffset)
@@ -50,6 +62,13 @@ module.exports = class Batch {
     }).filter((message) => !message.isControlRecord)
 
     this.leaderEpochIndex = null
+
+    this.#nextBatchOffset = partitionData.nextBatchOffset
+    this.#nextBatchLeaderEpoch = partitionData.nextBatchLeaderEpoch
+    this.#advances =
+      this.#nextBatchOffset !== undefined &&
+      this.messagesWithinOffset.length === 0 &&
+      Long.fromValue(this.#nextBatchOffset).compare(longFetchedOffset) > 0
   }
 
   /**
@@ -70,6 +89,10 @@ module.exports = class Batch {
    * @returns {number}
    */
   leaderEpochAt(offset) {
+    if (this.#advances) {
+      return offset === this.lastOffset() ? (this.#nextBatchLeaderEpoch ?? -1) : -1
+    }
+
     const messages = this.messagesWithinOffset
 
     if (messages.length === 0) {
@@ -102,10 +125,11 @@ module.exports = class Batch {
 
   /**
    * If the batch contained raw messages (i.e was not truly empty) but all messages were filtered out due to
-   * log compaction, control records or other reasons
+   * log compaction, control records or other reasons. Also true for a batch with no record at all
+   * that still moves the position to the end of an emptied record batch.
    */
   isEmptyDueToFiltering() {
-    return this.isEmpty() && this.rawMessages.length > 0
+    return this.isEmpty() && (this.rawMessages.length > 0 || this.#advances)
   }
 
   isEmptyControlRecord() {
@@ -133,7 +157,18 @@ module.exports = class Batch {
     return this.isEmptyIncludingFiltered() ? null : this.messagesWithinOffset[0].offset
   }
 
+  /**
+   * The offset to resolve after this batch. A batch with no record at or after the fetch offset
+   * whose last complete record batch ends beyond it gives the last offset of that record batch;
+   * otherwise it is the last record, the fetch offset when every record is below it, or the high
+   * watermark - 1 for a batch with no record at all.
+   * @returns {string}
+   */
   lastOffset() {
+    if (this.#advances) {
+      return Long.fromValue(this.#nextBatchOffset).add(-1).toString()
+    }
+
     if (this.isEmptyDueToLogCompactedMessages()) {
       return this.fetchedOffset
     }
