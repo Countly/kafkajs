@@ -1303,23 +1303,11 @@ module.exports = (params) => {
         rebalanceListener: listener,
       })
       retainedMemberId = null
-      if (assignersOwed) {
-        assignersOwed = false
-        try {
-          group.clearAssignerState()
-        } catch (e) {
-          logger.error('Error while clearing the assigner state', {
-            groupId,
-            error: describeThrown(e),
-          })
-        }
-      }
-      for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
       // A background chain and the fetch loop can both await one failed chain: the run reports
       // its crash once, so the crash policy and its restart decision run once.
       let crashReport = null
-      runner = new Runner({
+      const startedRunner = (runner = new Runner({
         logger: rootLogger,
         consumerGroup,
         instrumentationEmitter,
@@ -1335,9 +1323,22 @@ module.exports = (params) => {
         onJoinComplete: () => recordJoin(group),
         concurrency,
         maxPrefetchBatches,
-      })
+      }))
+      // After the runner is published: an assigner that stops or disconnects the consumer from
+      // this callback latches that runner, so its start joins nothing.
+      if (assignersOwed) {
+        assignersOwed = false
+        try {
+          group.clearAssignerState()
+        } catch (e) {
+          logger.error('Error while clearing the assigner state', {
+            groupId,
+            error: describeThrown(e),
+          })
+        }
+      }
+      for (const seekEntry of seeks) group.seek(seekEntry)
 
-      const startedRunner = runner
       const started = startedRunner.start()
       pendingStart = started.catch(() => {})
       await started
