@@ -18909,6 +18909,7 @@
         "testHelpers/__tests__/holdingSocket.spec.js \u203a HoldingSocket passes split and coalesced frames whole in both directions",
         "testHelpers/__tests__/holdingSocket.spec.js \u203a HoldingSocket withholds the response its predicate picks from the request frame",
         "testHelpers/__tests__/holdingSocket.spec.js \u203a HoldingSocket teardown settles unmatched holds, rejects a pending forward and closes every broker side",
+        "testHelpers/__tests__/holdingSocket.spec.js \u203a HoldingSocket rejects a forward made in the turn the broker side was destroyed, and writes nothing to it",
         "testHelpers/__tests__/index.spec.js \u203a testHelpers exports Gate, the same one its own module does",
         "testHelpers/__tests__/index.spec.js \u203a testHelpers exports Schedule, the same one its own module does",
         "testHelpers/__tests__/index.spec.js \u203a testHelpers exports createResourceProbe, the same one its own module does",

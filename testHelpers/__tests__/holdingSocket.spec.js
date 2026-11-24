@@ -297,6 +297,10 @@ describe('HoldingSocket', () => {
     socket.write((await joinFrame('kept')).frame)
     await kept.arrived()
     const answered = kept.forward()
+    const other = factory({ host: 'node1', port: 9092, onConnect: () => {} })
+    const stranded = factory.holdRequest(HEARTBEAT)
+    other.write((await joinFrame('stranded')).frame)
+    await stranded.arrived()
     const request = factory.holdRequest(HEARTBEAT)
     const response = factory.withholdResponse(HEARTBEAT)
 
@@ -306,5 +310,28 @@ describe('HoldingSocket', () => {
     await expect(settled(request.arrived())).resolves.toBeNull()
     await expect(settled(response.arrived())).resolves.toBeNull()
     expect(upstream.destroyed).toBe(true)
+    expect(other.upstream.destroyed).toBe(true)
+    expect(stranded.frame).toBeNull()
+    await expect(settled(stranded.forward())).rejects.toThrow(
+      'HoldingSocket: the broker side closed'
+    )
+    expect(other.upstream.writes).toEqual([])
+  })
+
+  test('rejects a forward made in the turn the broker side was destroyed, and writes nothing to it', async () => {
+    const { factory, socket, upstream } = inMemory()
+    try {
+      const hold = factory.holdRequest(HEARTBEAT)
+      socket.write((await joinFrame('held')).frame)
+      await hold.arrived()
+
+      upstream.destroy()
+      const answered = hold.forward()
+
+      expect(upstream.writes).toEqual([])
+      await expect(settled(answered)).rejects.toThrow('HoldingSocket: the broker side closed')
+    } finally {
+      factory.closeUpstreams()
+    }
   })
 })

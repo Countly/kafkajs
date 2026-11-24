@@ -805,15 +805,16 @@ describe('ScriptedCluster execution hooks', () => {
         throw failure
       },
     })
+    hooked.hold = hooked.cluster.holdReply({ api: 'ShareGroupHeartbeat' })
     const selected = setup({ model: false })
-    selected.cluster.holdReply({
+    selected.hold = selected.cluster.holdReply({
       api: 'ShareGroupHeartbeat',
       match: () => {
         throw failure
       },
     })
 
-    for (const { cluster, connect, send } of [hooked, selected]) {
+    for (const { cluster, connect, send, hold } of [hooked, selected]) {
       const connection = connect()
       await send(connection, beat('m1', 0))
 
@@ -822,6 +823,12 @@ describe('ScriptedCluster execution hooks', () => {
       expect(connection.socket.destroyed).toBe(true)
       expect(connection.errors).toEqual([failure])
       expect(connection.replies).toEqual([])
+      await expect(
+        Promise.race([
+          hold.executed(),
+          flush().then(() => Promise.reject(new Error('the hold is still waiting'))),
+        ])
+      ).resolves.toBeNull()
     }
   })
 
