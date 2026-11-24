@@ -355,6 +355,12 @@ module.exports = (params) => {
   // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
   /**
+   * Counts admitted `run()` calls, so a crash report can tell that an explicit run was admitted
+   * while it was reported: that run supersedes the automatic restart. A call refused as already
+   * running is not counted.
+   */
+  let runRequests = 0
+  /**
    * The one pending automatic restart after a crash: its timer and the lifetime that crashed. The
    * object is the restart's identity, so a restart that was cancelled or superseded can tell. It
    * acquires nothing, so cancelling it has nothing of the restart to release.
@@ -1228,6 +1234,9 @@ module.exports = (params) => {
       logger.warn('consumer#run was called, but the consumer is already running', { groupId })
       return
     }
+    // Admitted: it supersedes the crash being reported and any restart published while it waited.
+    runRequests++
+    cancelRestart()
 
     /** The classic member id a crash by a round's join deadline hands to the restart. */
     let retainedMemberId = null
@@ -1371,7 +1380,9 @@ module.exports = (params) => {
      * Reports a run's crash: cleans the run up, decides on a restart (the error's retriability,
      * `restartOnFailure`, and the fatal membership errors that override it), emits `CRASH` and arms
      * the restart. A stop or disconnect asked at any time after the run started - before this
-     * handler ran included - cancels the restart.
+     * handler ran included - cancels the restart, and so does an explicit `run()` admitted while the
+     * crash is reported, even from its log line or its CRASH listener: that run owns the consumer.
+     * The restart is published before its log line, so a call made from that line finds it.
      * @param {Error} e what the run failed with
      * @param {ControlLifetime} owned the lifetime the run belongs to
      * @param {number} startGeneration `stopGeneration` when the run started
@@ -1397,6 +1408,7 @@ module.exports = (params) => {
       let joining = null
       const { deepest: originalCause, recreated } = walkCauses(e)
       const crashStopGeneration = startGeneration + 1
+      const runsBefore = runRequests
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
       // user gets, because consumer.run() has already resolved by the time the runner dies.
@@ -1480,28 +1492,33 @@ module.exports = (params) => {
         shouldRestart = false
       }
 
+      // An explicit run() admitted while this crash was reported supersedes the automatic restart.
+      if (runRequests !== runsBefore) shouldRestart = false
+
       instrumentationEmitter.emit(CRASH, {
         error: e,
         groupId: groupId ?? null,
         restart: shouldRestart,
       })
 
-      if (shouldRestart && !owned.forced) {
+      if (shouldRestart && !owned.forced && runRequests === runsBefore) {
         const retryTime = e.retryTime || (retry && retry.initialRetryTime) || initialRetryTime
+        const pending = { timer: null, crashed: owned }
+        // Published before the log, so a call made from its sink cancels or supersedes it.
+        restart = pending
         logger.error(`Restarting the consumer in ${retryTime}ms`, {
           retryCount: e.retryCount,
           retryTime,
           groupId,
         })
+        if (restart !== pending) return
 
-        const pending = { timer: null, crashed: owned }
         // Created outside any handler or callback store: the restart must not inherit its authority.
         pending.timer = handlerContext.run(null, () =>
           RebalanceHooks.outside(() =>
             setTimeout(() => restartAfterCrash(onCrash, pending), retryTime)
           )
         )
-        restart = pending
       }
     }
 
