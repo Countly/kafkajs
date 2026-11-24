@@ -578,49 +578,155 @@ describe('written admin mutations', () => {
   })
 
   it.each([
-    [0, false],
-    [0, true],
-    [1, false],
-    [1, true],
+    ...[
+      [0, false],
+      [0, true],
+      [1, false],
+      [1, true],
+    ].map(([id, lostFirst]) => [
+      'AlterConfigs',
+      id,
+      lostFirst,
+      'alterConfigs',
+      'alterConfigs',
+      2,
+      'config',
+    ]),
+    ...[
+      [0, false],
+      [0, true],
+      [1, false],
+      [1, true],
+    ].map(([id, lostFirst]) => [
+      'IncrementalAlterConfigs',
+      id,
+      lostFirst,
+      'incrementalAlterConfigs',
+      'incrementalAlterConfigs',
+      1,
+      'config',
+    ]),
+    ...[
+      [0, false],
+      [0, true],
+      [1, false],
+      [1, true],
+    ].map(([id, lostFirst]) => [
+      'DeleteRecords',
+      id,
+      lostFirst,
+      'deleteRecords',
+      'deleteTopicRecords',
+      2,
+      'records',
+    ]),
+    ...[
+      [0, false],
+      [0, true],
+      [1, false],
+      [1, true],
+    ].map(([id, lostFirst]) => [
+      'DeleteGroups',
+      id,
+      lostFirst,
+      'deleteGroups',
+      'deleteGroups',
+      3,
+      'groups',
+    ]),
+    ...[
+      [0, false],
+      [0, true],
+      [1, false],
+      [1, true],
+    ].map(([id, lostFirst]) => [
+      'AlterReplicaLogDirs',
+      id,
+      lostFirst,
+      'alterReplicaLogDirs',
+      'alterReplicaLogDirs',
+      2,
+      'logDirs',
+    ]),
   ])(
-    'a pre-write config failure cannot hide another broker’s lost reply with node %i and lost reply first %p',
-    async (failedNode, lostFirst) => {
-      const { admin, schedule, scripted } = fixture([node(0), node(1)], { retry: { retries: 0 } })
-      const api = 'AlterConfigs'
+    '%s preserves a lost reply beside a pre-write failure on node %i (lost first %p)',
+    async (api, failedNode, lostFirst, brokerMethod, adminMethod, apiVersion, family) => {
+      const nodes = [node(0), node(1)]
+      const { admin, schedule, scripted } = fixture(nodes, { retry: { retries: 0 } })
       const lostNode = 1 - failedNode
+      if (family === 'groups') {
+        scripted.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+          coordinators: coordinatorKeys.map((key) => {
+            const { id, host, port } = nodes[Number(key)]
+            return { key, nodeId: id, host, port, errorCode: 0, errorMessage: null }
+          }),
+        }))
+      }
+      if (family === 'logDirs') {
+        const { AlterReplicaLogDirs } = require('../../protocol/requests/apiKeys')
+        scripted.answer('ApiVersions', (_fields, { node }) => {
+          const answer = scripted.apiVersionsAnswer()
+          if (node !== failedNode) return answer
+          return {
+            ...answer,
+            apiKeys: answer.apiKeys.filter(({ apiKey }) => apiKey !== AlterReplicaLogDirs),
+          }
+        })
+      }
+
+      const order = failedNode === 0 ? [lostNode, failedNode] : [failedNode, lostNode]
+      const input = {
+        config: {
+          resources: order.map((id) => ({ type: 4, name: String(id), configEntries: [] })),
+        },
+        records: {
+          topic: 't',
+          partitions: order.map((partition) => ({ partition, offset: '-1' })),
+        },
+        groups: order.map(String),
+        logDirs: {
+          replicas: order.map((id) => ({
+            brokerId: id,
+            topic: 't',
+            partition: id,
+            logDir: '/data/a',
+          })),
+        },
+      }
+      const item = {
+        config: { type: 4, name: String(lostNode) },
+        records: { topic: 't', partition: lostNode },
+        groups: String(lostNode),
+        logDirs: { brokerId: lostNode, topic: 't', partition: lostNode },
+      }
       const heldReply = schedule.hold({ api, node: lostNode })
-      const send = Broker.prototype.alterConfigs
+      const send = Broker.prototype[brokerMethod]
       let startDial
       const dialAllowed = new Promise((resolve) => {
         startDial = resolve
       })
-      let dialFailed
+      let dialFinished
       const failed = new Promise((resolve) => {
-        dialFailed = resolve
+        dialFinished = resolve
       })
       const spy = jest
-        .spyOn(Broker.prototype, 'alterConfigs')
+        .spyOn(Broker.prototype, brokerMethod)
         .mockImplementation(async function (options) {
           if (this.nodeId !== failedNode) return send.call(this, options)
           await dialAllowed
-          await this.disconnect()
-          scripted.down(failedNode)
           try {
+            if (family !== 'logDirs') {
+              await this.disconnect()
+              scripted.down(failedNode)
+            }
             return await send.call(this, options)
           } finally {
-            dialFailed()
+            dialFinished()
           }
         })
-      const response = { resources: [] }
       try {
         await admin.connect()
-        const order = failedNode === 0 ? [lostNode, failedNode] : [failedNode, lostNode]
-        const resources = order.map((id) => ({
-          type: 4,
-          name: String(id),
-          configEntries: [],
-        }))
-        const result = admin.alterConfigs({ resources }).catch((error) => error)
+        const result = admin[adminMethod](input[family]).catch((error) => error)
         await Promise.race([heldReply.arrived(), result])
         if (lostFirst) {
           heldReply.fail(new Error('lost reply'))
@@ -632,14 +738,14 @@ describe('written admin mutations', () => {
         const error = await result
         expect(error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
         expect(error.requests).toEqual([
-          { api, apiVersion: 2, nodeId: lostNode, items: [{ type: 4, name: String(lostNode) }] },
+          { api, apiVersion, nodeId: lostNode, items: [item[family]] },
         ])
         expect(scripted.requests().filter((frame) => frame.api === api)).toEqual([
           expect.objectContaining({ node: lostNode }),
         ])
       } finally {
         startDial()
-        if (heldReply.settle) heldReply.release(response)
+        if (heldReply.settle) heldReply.fail(new Error('test ended'))
         spy.mockRestore()
         await admin.disconnect()
         scripted.assertClean()
@@ -719,6 +825,70 @@ describe('written admin mutations', () => {
       expect(written).toBeGreaterThanOrEqual(0)
       expect(frames.slice(written).map((frame) => frame.api)).toEqual([api])
     } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteRecords retries only the unwritten leader after its sibling answers', async () => {
+    const { admin, schedule, scripted } = fixture([node(0), node(1)])
+    const api = 'DeleteRecords'
+    const answer = ({ topics }) => ({
+      topics: topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          lowWatermark: '5',
+          errorCode: 0,
+        })),
+      })),
+    })
+    scripted.answer(api, answer)
+    const gate = schedule.hold({ api, node: 0 })
+    const send = Broker.prototype.deleteRecords
+    let ready
+    const firstDialFinished = new Promise((resolve) => {
+      ready = resolve
+    })
+    let failFirst = true
+    const spy = jest
+      .spyOn(Broker.prototype, 'deleteRecords')
+      .mockImplementation(async function (options) {
+        if (this.nodeId !== 1 || !failFirst) return send.call(this, options)
+        failFirst = false
+        await this.disconnect()
+        scripted.down(1)
+        try {
+          return await send.call(this, options)
+        } finally {
+          scripted.up(1)
+          ready()
+        }
+      })
+    try {
+      await admin.connect()
+      const partitions = [0, 1].map((partition) => ({ partition, offset: '5' }))
+      const result = admin.deleteTopicRecords({ topic: 't', partitions }).catch((error) => error)
+      await Promise.race([Promise.all([gate.arrived(), firstDialFinished]), result])
+      await jest.advanceTimersByTimeAsync(50)
+      expect(
+        scripted
+          .requests()
+          .filter((frame) => frame.api === api)
+          .map(({ node }) => node)
+      ).toEqual([0])
+      gate.release()
+      await jest.advanceTimersByTimeAsync(50)
+      await expect(result).resolves.toBeUndefined()
+      expect(
+        scripted
+          .requests()
+          .filter((frame) => frame.api === api)
+          .map(({ node }) => node)
+      ).toEqual([0, 1])
+    } finally {
+      if (gate.settle) gate.fail(new Error('test ended'))
+      spy.mockRestore()
       await admin.disconnect()
       scripted.assertClean()
     }
