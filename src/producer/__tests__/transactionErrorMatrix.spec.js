@@ -622,3 +622,110 @@ describe('initial fencing of one identity stops the whole producer', () => {
     }
   )
 })
+
+describe('AddPartitions with an unattempted partition', () => {
+  /**
+   * Answers the next AddPartitionsToTxn with one row per code, in the order given, as a broker
+   * that validates the whole request answers a request it refused in part.
+   * @param {object} cluster scripted broker
+   * @param {number[]} codes
+   * @returns {void}
+   */
+  const answerAdd = (cluster, codes) => {
+    cluster.schedule.once({ api: 'AddPartitionsToTxn' }, ({ fields }) => ({
+      errors: [
+        {
+          topic: fields.topics[0].topic,
+          partitionErrors: codes.map((errorCode, partition) => ({ partition, errorCode })),
+        },
+      ],
+    }))
+  }
+
+  /**
+   * Opens a transaction, sends one message whose AddPartitionsToTxn is answered with `codes`, and
+   * returns what the send settled with.
+   * @param {object} cluster scripted broker
+   * @param {object} producer public client
+   * @param {number[]} codes
+   * @returns {Promise<{ transaction: object, result: unknown }>}
+   */
+  const sendAnswered = async (cluster, producer, codes) => {
+    await producer.connect()
+    const transaction = await producer.transaction()
+    answerAdd(cluster, codes)
+    const result = await transaction
+      .send({ topic: TOPIC, messages: [{ value: 'refused' }] })
+      .catch((error) => error)
+    return { transaction, result }
+  }
+
+  it('[55, 29] and [29, 55]: the send rejects with the authorization error, the transaction is ABORTABLE_ERROR, commit is refused, abort succeeds and the next transaction commits', async () => {
+    for (const codes of [
+      [55, 29],
+      [29, 55],
+    ]) {
+      const { cluster, producer } = publicFixture('tv1', FAST_RETRY)
+      let primary
+      try {
+        const { transaction, result } = await sendAnswered(cluster, producer, codes)
+        expect(result).toMatchObject({
+          name: 'KafkaJSTransactionAbortableError',
+          category: 'abortable',
+          cause: { code: 29 },
+        })
+        await expect(transaction.commit()).rejects.toBe(result)
+        expect(framesOf(cluster, 'EndTxn')).toBe(0)
+        await expect(transaction.abort()).resolves.toBeUndefined()
+
+        const next = await producer.transaction()
+        await next.send({ topic: TOPIC, messages: [{ value: 'recovered' }] })
+        await expect(next.commit()).resolves.toBeUndefined()
+      } catch (error) {
+        primary = error
+      } finally {
+        await close(primary, producer, cluster)
+      }
+    }
+  })
+
+  it('[3, 29, 55] in either order leaves the transaction abortable after one AddPartitions request', async () => {
+    for (const codes of [
+      [3, 29, 55],
+      [55, 29, 3],
+    ]) {
+      const { cluster, producer } = publicFixture('tv1', FAST_RETRY)
+      let primary
+      try {
+        const { transaction, result } = await sendAnswered(cluster, producer, codes)
+        expect(result).toMatchObject({
+          name: 'KafkaJSTransactionAbortableError',
+          category: 'abortable',
+          cause: { code: 29 },
+        })
+        expect(framesOf(cluster, 'AddPartitionsToTxn')).toBe(1)
+        await expect(transaction.abort()).resolves.toBeUndefined()
+      } catch (error) {
+        primary = error
+      } finally {
+        await close(primary, producer, cluster)
+      }
+    }
+  })
+
+  it('[55, 3]: the add is retried and the transaction stays usable when the retry succeeds', async () => {
+    const { cluster, producer } = publicFixture('tv1', FAST_RETRY)
+    let primary
+    try {
+      const { transaction, result } = await sendAnswered(cluster, producer, [55, 3])
+      expect(result).toEqual([expect.objectContaining({ topicName: TOPIC, errorCode: 0 })])
+      expect(framesOf(cluster, 'AddPartitionsToTxn')).toBe(2)
+      await expect(transaction.commit()).resolves.toBeUndefined()
+      expect(framesOf(cluster, 'EndTxn')).toBe(1)
+    } catch (error) {
+      primary = error
+    } finally {
+      await close(primary, producer, cluster)
+    }
+  })
+})
