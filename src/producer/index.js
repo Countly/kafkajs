@@ -824,7 +824,7 @@ const createProducer = ({
       (cleanup ??= (async () =>
         cluster.disconnect(...(drainTimeout === undefined ? [] : [{ drainTimeout }])))().catch(
         (error) => {
-          logger.warn('Disconnecting the cluster failed', { error: error.message })
+          logger.warn('Disconnecting the cluster failed', { error: describeThrown(error) })
         }
       ))
     let forced = false

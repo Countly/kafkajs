@@ -1,5 +1,6 @@
 const Decoder = require('../../../decoder')
 const { failure, createErrorFromCode } = require('../../../error')
+const { KafkaJSTransactionAbortableError } = require('../../../../errors')
 
 /**
  * AddPartitionsToTxn Response (Version: 0) => throttle_time_ms [errors]
@@ -31,18 +32,43 @@ const decodePartitionError = (decoder) => ({
   errorCode: decoder.readInt16(),
 })
 
-const parse = async (data) => {
-  const topicsWithErrors = data.errors
-    .map(({ partitionErrors }) => ({
-      partitionsWithErrors: partitionErrors.filter(({ errorCode }) => failure(errorCode)),
-    }))
-    .filter(({ partitionsWithErrors }) => partitionsWithErrors.length)
+const OPERATION_NOT_ATTEMPTED = 55
 
-  if (topicsWithErrors.length > 0) {
-    throw createErrorFromCode(topicsWithErrors[0].partitionsWithErrors[0].errorCode)
+/**
+ * @param {import('../../../../errors').KafkaJSProtocolError} error
+ * @returns {number} 0 for a non-retriable error other than OPERATION_NOT_ATTEMPTED, 1 for a
+ *   retriable one, 2 for OPERATION_NOT_ATTEMPTED
+ */
+const rankOf = (error) =>
+  error.code === OPERATION_NOT_ATTEMPTED ? 2 : error.retriable === true ? 1 : 0
+
+/**
+ * Throws when any partition failed, picking one failure whatever the row order: a non-retriable
+ * error other than OPERATION_NOT_ATTEMPTED (55) first, then a retriable one, the lowest code first
+ * within each. A broker fills the partitions it did not try with 55, so 55 alone means nothing was
+ * attempted and the transaction can only be aborted.
+ * @param {object} data the decoded answer
+ * @returns {Promise<object>} `data`, when no partition failed
+ * @throws {import('../../../../errors').KafkaJSProtocolError} the chosen partition's error
+ * @throws {KafkaJSTransactionAbortableError} when every failure is 55, with the 55 error as `cause`
+ */
+const parse = async (data) => {
+  const failures = data.errors
+    .flatMap(({ partitionErrors }) => partitionErrors)
+    .filter(({ errorCode }) => failure(errorCode))
+    .map(({ errorCode }) => createErrorFromCode(errorCode))
+  if (failures.length === 0) {
+    return data
   }
 
-  return data
+  const [chosen] = failures.sort((a, b) => rankOf(a) - rankOf(b) || a.code - b.code)
+  if (chosen.code === OPERATION_NOT_ATTEMPTED) {
+    throw new KafkaJSTransactionAbortableError(
+      'No partition of the AddPartitionsToTxn request was attempted',
+      { cause: chosen }
+    )
+  }
+  throw chosen
 }
 
 module.exports = {
