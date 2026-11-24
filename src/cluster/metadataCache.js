@@ -49,8 +49,8 @@ module.exports = class MetadataCache {
      * its id and epochs but releases `decoded` (set to `null`), because that object belongs to a
      * response nothing reads any more and holding it would pin the whole partition record.
      *
-     * `seenAt` is the refresh generation that last carried the topic (0 when only an id lookup
-     * has); it is what the release and prune pass at the end of `update()` compares against.
+     * `seenAt` is the refresh generation that last carried the topic in a healthy row (0 when only
+     * an id lookup has); it is what the release and prune pass at the end of `update()` compares against.
      *
      * Entries are mutated in place and reused across refreshes - only a first sighting, a topic
      * recreation or `clear()` allocates.
@@ -87,15 +87,18 @@ module.exports = class MetadataCache {
    * which is what stops one regex subscription or one `listTopics()` from seeding this cache with
    * every topic in the cluster forever.
    *
-   * A row with a topic error or no name writes nothing; it only marks a known entry as carried.
+   * A row with a topic error or no name writes nothing: its topic counts as not carried, so its
+   * `decoded` references are released and an unowned one is dropped. Only a full-cluster response
+   * keeps an owned topic it names in an error row, with its last id and epochs.
    *
    * `TOPIC_RECREATED` is emitted last, once every entry above has been written, so a listener
    * that throws cannot leave the cache un-advanced and re-diffing the same recreation on every
    * later refresh - and `emit()` swallows such a throw anyway.
    *
    * Allocation contract: one `Set` of live broker ids per call (plus one array only when a
-   * recreation actually happened), and one entry per topic and per partition only on its first
-   * sighting (or after a recreation or a `clear()`). A steady-state refresh mutates the existing
+   * recreation actually happened, and one `Set` only when an error row names a cached topic), and
+   * one entry per topic and per partition only on its first sighting (or after a recreation or a
+   * `clear()`). A steady-state refresh mutates the existing
    * entries - this runs on every admin call, since the admin client has no `metadataMaxAge`.
    *
    * @param {{ brokers: Array<{ nodeId: number }>, topicMetadata: Array<{ topic: string, topicId?: string|null, partitionMetadata: Array<{ partitionId: number, leader: number, leaderEpoch: number }> }> }} metadata decoded response, mutated in place
@@ -111,14 +114,14 @@ module.exports = class MetadataCache {
 
     this.generation += 1
     let recreations = null
+    let errored = null
 
     for (const topicMetadata of metadata.topicMetadata) {
       const name = topicMetadata.topic
       let entry = this.topics.get(name)
 
       if (!this.isHealthyRow(topicMetadata)) {
-        // Carried, so a full refresh does not prune what the cache knows; nothing else changes.
-        if (entry) entry.seenAt = this.generation
+        if (entry) (errored = errored || new Set()).add(name)
         continue
       }
 
@@ -181,7 +184,7 @@ module.exports = class MetadataCache {
       }
     }
 
-    this.releaseTopicsAbsentFrom(full)
+    this.releaseTopicsAbsentFrom(full, errored)
 
     for (const recreation of recreations || []) {
       this.emit(CLUSTER_TOPIC_RECREATED, recreation)
@@ -250,17 +253,20 @@ module.exports = class MetadataCache {
   }
 
   /**
-   * Second pass of `update()`: every cached topic the response did not carry either loses its
-   * `decoded` references (a scoped response says nothing about it) or is dropped entirely (a
-   * full-cluster response says it no longer exists, or nothing wants it any more). A pending id
-   * resolution (`pendingTopics`) is kept until its owner registers or retires it; one the client
-   * now wants stops being pending here. Bounded by the number of cached topics.
+   * Second pass of `update()`: every cached topic the response did not carry in a healthy row
+   * either loses its `decoded` references (a scoped response says nothing about it) or is dropped
+   * entirely (a full-cluster response says it no longer exists, or nothing wants it any more). A
+   * full-cluster response that names a topic only in an error row keeps it while it is owned, so a
+   * later healthy row can still detect its recreation. A pending id resolution (`pendingTopics`)
+   * is kept until its owner registers or retires it; one the client now wants stops being pending
+   * here. Bounded by the number of cached topics.
    *
    * @private
    * @param {boolean} full true when the response described the whole cluster
+   * @param {Set<string>|null} errored cached names the response carried only in error rows
    * @returns {void}
    */
-  releaseTopicsAbsentFrom(full) {
+  releaseTopicsAbsentFrom(full, errored) {
     for (const [name, entry] of this.topics) {
       if (this.pendingTopics.has(name) && this.isWanted(name)) this.pendingTopics.delete(name)
 
@@ -268,7 +274,8 @@ module.exports = class MetadataCache {
         continue
       }
 
-      if (full || (!this.pendingTopics.has(name) && !this.isWanted(name))) {
+      const owned = this.pendingTopics.has(name) || this.isWanted(name)
+      if (!owned || (full && !errored?.has(name))) {
         this.topics.delete(name)
         this.pendingTopics.delete(name)
         entry.topicId != null && this.topicIds.delete(entry.topicId)
