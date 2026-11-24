@@ -3,6 +3,7 @@ const Broker = require('../../broker')
 const Cluster = require('../index')
 const ConnectionPool = require('../../network/connectionPool')
 const { KafkaJSConnectionClosedError } = require('../../errors')
+const { LEVELS } = require('../../loggers')
 const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 const { newLogger } = require('testHelpers')
 
@@ -164,6 +165,33 @@ describe('BrokerPool > a disconnect reaches the drains an earlier one started', 
     await flush()
 
     expect(close).toEqual({ done: true, error: failure })
+  })
+
+  it('a disconnect started synchronously from inside one broker drain dispatches to and waits for every broker the outer one captured', async () => {
+    const { pool, one, two } = build()
+    const held = deferred()
+    let nested
+    one.retire.mockImplementationOnce((options) => {
+      one.calls.push(['retire', options])
+      nested = settled(pool.disconnect({ drainTimeout: 0 }))
+      return Promise.resolve()
+    })
+    two.next.push(() => held.promise)
+    const outer = settled(pool.disconnect())
+    await flush()
+
+    expect(two.calls).toEqual([
+      ['retire', { drainTimeout: 0 }],
+      ['retire', undefined],
+    ])
+    expect([outer.done, nested.done]).toEqual([false, false])
+
+    held.resolve()
+    await flush()
+
+    expect(outer).toEqual({ done: true, value: undefined })
+    expect(nested).toEqual({ done: true, value: undefined })
+    expect(pool.draining.size).toBe(0)
   })
 
   it('a broker leaves the drain record once its drains settle, so the next disconnect does not dispatch to it (control)', async () => {
@@ -541,7 +569,8 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
    * Connects a client over scripted sockets, its bootstrap list pinned to the seed and requests
    * never timed out, holds one Metadata request on the scenario's node and runs the replacement,
    * all under fake time. Fills `context` as it goes, so the caller can clean up after a failure.
-   * @param {object} context receives `seam`, `cluster`, `gate`, `held`, `socket`, `broker`, `pool`
+   * @param {object} context receives `seam`, `cluster`, `gate`, `held`, `socket`, `broker`, `pool`;
+   *   its `logger`, when set, is the client's
    * @param {object} replacement one of `REPLACEMENTS`
    * @returns {Promise<void>}
    */
@@ -570,7 +599,7 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
         requestTimeout: BOUND,
         enforceRequestTimeout: false,
       }),
-      logger: newLogger(),
+      logger: context.logger ?? newLogger(),
       retry: { retries: 0 },
       metadataRecoveryStrategy: 'none',
     })
@@ -613,6 +642,42 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
 
         expect(context.socket.destroyed).toBe(true)
         await flush()
+        expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
+      } finally {
+        await cleanUp(context)
+      }
+    })
+
+    it('a zero-bound disconnect started from a log sink during the teardown closes the old socket and settles without waiting for the bound', async () => {
+      const context = {}
+      let armed = false
+      context.logger = newLogger({
+        level: LEVELS.DEBUG,
+        logCreator:
+          () =>
+          ({ log }) => {
+            if (!armed || log.message !== 'Waiting for pending requests') return
+            armed = false
+            context.nested = settled(context.cluster.disconnect({ drainTimeout: 0 }))
+          },
+      })
+      const { replace, ...replacement } = REPLACEMENTS[name]
+      try {
+        await leaveDraining(context, {
+          ...replacement,
+          replace: async (cluster, listed) => {
+            armed = true
+            const replacing = replace(cluster, listed)
+            // A rebootstrap the nested disconnect superseded rejects; only the close is checked here.
+            context.replaced = settled(replacing)
+            await replacing.catch(() => {})
+          },
+        })
+        await flush()
+
+        expect(context.replaced.done).toBe(true)
+        expect(context.nested).toEqual({ done: true, value: undefined })
+        expect(context.socket.destroyed).toBe(true)
         expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
       } finally {
         await cleanUp(context)
