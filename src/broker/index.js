@@ -2347,10 +2347,11 @@ module.exports = class Broker {
    *   that offers v5 at most, it is keyed by name. The ids are read once, so the answer is
    *   bound to the topics this request named even if the cluster's metadata changes meanwhile;
    *   it is never given to a caller.
-   * @param {{ idBearing: boolean }} [request.topicIdBinding] private: shared by every attempt of
-   *   one `sendOffsets` call. An attempt built keyed by id sets `idBearing`; once it is set, an
-   *   attempt that would be built keyed by name (a coordinator offering v5 at most) is refused
-   *   before it is written
+   * @param {{ keyedBy: 'id'|'name'|null }} [request.topicIdBinding] private: shared by every
+   *   attempt of one `sendOffsets` call, and set by the first attempt built. After one keyed by
+   *   name, every attempt is built keyed by name (v5 or below); after one keyed by id, an attempt
+   *   that would be built keyed by name (a coordinator offering v5 at most) is refused before it
+   *   is written
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
    *
@@ -2385,10 +2386,13 @@ module.exports = class Broker {
     guard,
   }) {
     this.throwIfRefused(guard)
-    const idsOf = usableTopicIds(
-      topics.map(({ topic }) => topic),
-      (name) => topicIds?.get(name)
-    )
+    const idsOf =
+      topicIdBinding?.keyedBy === 'name'
+        ? undefined
+        : usableTopicIds(
+            topics.map(({ topic }) => topic),
+            (name) => topicIds?.get(name)
+          )
     const txnOffsetCommit = this.lookupRequestWithMax(
       apiKeys.TxnOffsetCommit,
       requests.TxnOffsetCommit,
@@ -2407,9 +2411,8 @@ module.exports = class Broker {
     })
     if (topicIdBinding) {
       const { apiVersion } = protocolRequest.request
-      if (apiVersion > TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION) {
-        topicIdBinding.idBearing = true
-      } else if (topicIdBinding.idBearing) {
+      const keyedBy = apiVersion > TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION ? 'id' : 'name'
+      if (topicIdBinding.keyedBy === 'id' && keyedBy === 'name') {
         throw new KafkaJSTransactionAbortableError(
           `TxnOffsetCommit would be retried at v${apiVersion}, keyed by topic name, after an attempt keyed by topic id; call abort() on the transaction and process the records again in a new one`,
           {
@@ -2420,6 +2423,7 @@ module.exports = class Broker {
           }
         )
       }
+      topicIdBinding.keyedBy = keyedBy
     }
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }

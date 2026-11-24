@@ -150,7 +150,7 @@ const nothingToAbort = (error, confirmed) => !confirmed && error.type === 'INVAL
  */
 const hasPartitions = (topics) => topics.some(({ partitions }) => partitions.length > 0)
 
-/** The captured ids of a call that names no topic with a usable id; never written to. */
+/** The captured ids of a call that names no topic; never written to. */
 const NO_TOPIC_IDS = new Map()
 
 /**
@@ -191,34 +191,41 @@ const supersededInputError = (input) =>
   )
 
 /**
- * The refusal of offsets whose topic no longer has the id they were given for: the topic was
- * deleted or recreated under its name, so the offsets would land on a topic they do not belong to.
+ * The refusal of offsets once the producer can no longer verify the topic they were given for: its
+ * id in the producer's metadata changed, appeared or disappeared since `sendOffsets` was called. A
+ * changed id is a recreation; an id that appeared or disappeared may be one too, or only metadata
+ * the producer had not loaded yet or has since cleared (a rebootstrap, idle pruning).
  * @param {string} topic
- * @param {string} captured the id read when `sendOffsets` was called
- * @param {string|null|undefined} current the id the producer's metadata holds now
+ * @param {string|null} captured the id read when `sendOffsets` was called, null for none
+ * @param {string|null} current the id the producer's metadata holds now, null for none
  * @returns {KafkaJSTransactionAbortableError}
  */
 const topicIdChangedError = (topic, captured, current) =>
   new KafkaJSTransactionAbortableError(
-    `The offsets for topic "${topic}" were given for topic id ${captured}, which it no longer has (now ${current ?? 'unknown'}); call abort() on the transaction and process the records again in a new one`,
+    `The producer can no longer verify that topic "${topic}" is the topic the offsets were given for: its id was ${captured ?? 'unknown'} when sendOffsets was called and is ${current ?? 'unknown'} now; call abort() on the transaction and process the records again in a new one`,
     {
       cause: new KafkaJSCommitFailedError(
-        `Topic "${topic}" changed from id ${captured} to ${current ?? 'unknown'}`,
+        `Topic "${topic}" had id ${captured ?? 'unknown'} when the offsets were given and has ${current ?? 'unknown'} now`,
         { reason: 'stale-assignment' }
       ),
     }
   )
 
 /**
+ * @param {string|null|undefined} id
+ * @returns {string|null} the id, or null for a missing, null or all-zero one
+ */
+const comparableTopicId = (id) => (isUsableTopicId(id) ? id : null)
+
+/**
  * @param {ReadonlyArray<{ topic: string }>} topics offsets as `sendOffsets` copied them
  * @param {(name: string) => string|null|undefined} idOf the producer's metadata
- * @returns {Map<string, string>} topic name to id, for each topic with a usable id
+ * @returns {Map<string, string|null>} each topic name to its id, null for a topic with none
  */
 const captureTopicIds = (topics, idOf) => {
   const ids = new Map()
   for (const { topic } of topics) {
-    const id = idOf(topic)
-    if (isUsableTopicId(id)) ids.set(topic, id)
+    if (!ids.has(topic)) ids.set(topic, comparableTopicId(idOf(topic)))
   }
   return ids
 }
@@ -331,13 +338,14 @@ const createEosManager = ({
   }
 
   /**
-   * @param {Map<string, string>} captured the topic ids a `sendOffsets` call read when it was made
+   * @param {Map<string, string|null>} captured the topic ids a `sendOffsets` call read when it was
+   *   made, null for a topic with none
    * @returns {KafkaJSTransactionAbortableError|null} the refusal once the producer's metadata
-   *   holds another id, or none, for one of those topics
+   *   holds another id for one of those topics: a different one, one where there was none, or none
    */
   const topicIdRefusal = (captured) => {
     for (const [topic, id] of captured) {
-      const current = cluster.topicId(topic)
+      const current = comparableTopicId(cluster.topicId(topic))
       if (current !== id) return topicIdChangedError(topic, id, current)
     }
     return null
@@ -345,10 +353,11 @@ const createEosManager = ({
 
   /**
    * The private options of an AddOffsetsToTxn or TxnOffsetCommit attempt: the lifecycle's guard,
-   * and, while the transaction holds input dependencies or the offsets carry topic ids, their
-   * refusals too, so a request is not written once an input was superseded or a topic changed id.
+   * and, while the transaction holds input dependencies or the offsets name topics, their refusals
+   * too, so a request is not written once an input was superseded or a topic's id changed.
    * @param {import('../generation')} [generation]
-   * @param {Map<string, string>} [captured] the topic ids the offsets were given for
+   * @param {Map<string, string|null>} [captured] the topic ids the offsets were given for; only a
+   *   TxnOffsetCommit attempt passes them
    * @returns {{ guard?: (frameLength?: number) => Error|null }}
    */
   const offsetGuardOf = (generation, captured = NO_TOPIC_IDS) =>
@@ -371,11 +380,12 @@ const createEosManager = ({
 
   /**
    * Re-reads the metadata the producer's cluster tracks after the broker answered UNKNOWN_TOPIC_ID,
-   * so the next attempt's check sees the id a recreated topic has now in the cache
-   * `cluster.topicId` reads, and refuses the attempt. It never creates a topic and registers none:
-   * an offset commit's topics are not targets of this producer, and one that became a target here would stay eligible for automatic creation
-   * in every later refresh. A topic whose id the cache holds is already a target, so it is
-   * refreshed with the rest. The refresh is guarded, so it shares no promise with the send path's
+   * so that, for a topic the producer already targets, the next attempt's check sees the id it has
+   * now in the cache `cluster.topicId` reads, and refuses the attempt when it changed. It never
+   * creates a topic and registers none: an offset topic that became a target here would stay
+   * eligible for automatic creation in every later refresh. An offset topic the producer does not
+   * target is not refreshed, so its cached id, if any, stays as it was. The refresh is guarded, so
+   * it shares no promise with the send path's
    * refreshes, which may create a topic. Best effort: a failed refresh leaves the original error
    * to the retrier, but a closed lifecycle ends the attempt with its close error and publishes
    * nothing.
@@ -1146,11 +1156,14 @@ const createEosManager = ({
      *
      * Each topic's id is read from the producer's metadata when the method is called, and every
      * attempt sends those ids, never ids read later. Before each write the call is refused when the
-     * metadata holds another id, or none, for a topic that had one: the topic was deleted or
-     * recreated, and its offsets would land on the new topic. Under transaction version 1, or while
-     * a topic has no id, the request is keyed by name and only this client-side check applies. Once
-     * an attempt was built keyed by id (v6), a retry that would go out keyed by name, to a
-     * coordinator that offers v5 at most, is refused before it is written.
+     * metadata holds another id for a topic than it did then: a different one, one where there was
+     * none, or none where there was one. The producer then can no longer verify that the offsets
+     * land on the topic they were given for; a cleared cache refuses too. Under transaction version
+     * 1, or while a topic had no id at the call, the request is keyed by name and only this
+     * client-side check applies; it cannot see a recreation the metadata has not loaded. The first
+     * attempt fixes the key: a retry of one keyed by name stays keyed by name, and one that would
+     * go out by name after an attempt keyed by id (v6), to a coordinator that offers v5 at most, is
+     * refused before it is written.
      *
      * Under version 2 offsets holding no partition are skipped, as the Java producer skips them:
      * nothing is sent and the transaction is not marked started, since the broker starts none for
@@ -1178,8 +1191,9 @@ const createEosManager = ({
      *   call is sent. Called from a consumer handler with offsets of its own group and partition,
      *   the call ties the transaction to that batch until the commit EndTxn is written
      * @throws {import('../../errors').KafkaJSTransactionAbortableError} armed, `cause` a
-     *   `KafkaJSCommitFailedError` (`stale-assignment`), when a topic's id changed after the call,
-     *   or an id-bearing request would be retried keyed by name; that attempt is not written
+     *   `KafkaJSCommitFailedError` (`stale-assignment`), when a topic's id in the producer's
+     *   metadata differs from the one read at the call, or an id-bearing request would be retried
+     *   keyed by name; that attempt is not written
      *
      * @typedef {Object} OffsetCommitTopic
      * @property {string} topic
@@ -1209,7 +1223,7 @@ const createEosManager = ({
         snapshot.topics.map(({ topic }) => topic),
         (name) => captured.get(name)
       )
-      const topicIdBinding = { idBearing: false }
+      const topicIdBinding = { keyedBy: null }
       const identity = handlerContext.current()
       if (
         identity?.acquisition !== undefined &&
