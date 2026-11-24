@@ -84,17 +84,14 @@ const request = ({
 
 /**
  * The topics a v6 request carries: those holding a partition. The group coordinator forwards and
- * answers only those (`KafkaApis.handleTxnOffsetCommitRequest`), so an empty topic would never be
- * answered, and the response check expects exactly these. A call whose topics are all empty keeps
- * them all.
+ * answers only those (`KafkaApis.handleTxnOffsetCommitRequest`), so an empty topic of a known
+ * topic id would never be answered, and the response check expects exactly these. A call whose
+ * topics are all empty sends none, and the broker answers none.
  * @see core/src/main/scala/kafka/server/KafkaApis.scala (Apache Kafka 4.4.0)
  * @param {{ topic: string, partitions: unknown[] }[]} topics what the caller committed
  * @returns {{ topic: string, partitions: unknown[] }[]} the topics to send and to expect back
  */
-const sentTopics = (topics) => {
-  const withPartitions = topics.filter(({ partitions }) => partitions.length > 0)
-  return withPartitions.length === 0 ? topics : withPartitions
-}
+const sentTopics = (topics) => topics.filter(({ partitions }) => partitions.length > 0)
 
 const encodeTopic = (topicId, partitions) =>
   new Encoder()
