@@ -110,8 +110,8 @@ const markLookupFailure = (error) => {
 
 /**
  * @param {Error} error
- * @returns {boolean} whether TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53) is in the cause chain:
- *   the transactional id's ACL refused, which no retry and no abort can change
+ * @returns {boolean} whether a coordinator lookup's cause chain holds
+ *   TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53)
  */
 const refusesTransactionalId = (error) =>
   causeChain(error).some((link) => link.code === TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
@@ -492,6 +492,19 @@ const createEosManager = ({
   }
 
   /**
+   * Arms a transaction coordinator lookup refusal after checking that its lifecycle is still open.
+   * @param {Error} failure a lookup failure carrying TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
+   * @returns {import('../../errors').KafkaJSApplicationRecoverableError} the armed error
+   */
+  const armRefusedTransactionLookup = (failure, generation) => {
+    generation?.check()
+    stateManager.classify(failure, 'txn')
+    stateManager.arm(failure)
+    return stateManager.transaction.armedError()
+  }
+
+  /**
    * The transaction coordinator for an InitProducerId - a first one or an epoch bump - its lookup
    * retried as `retryTransactionCoordinator` does. A discovery that ran out rejects with a
    * retriable error before the state manager sees it, so it arms nothing: the producer stays as it
@@ -499,6 +512,7 @@ const createEosManager = ({
    * @param {import('../generation')} [generation] the lifecycle the caller captured
    * @returns {Promise<import('../../../types').Broker>} the coordinator
    * @throws {KafkaJSError} retriable, `cause` the discovery error, when discovery ran out
+   * @throws {import('../../errors').KafkaJSApplicationRecoverableError} on a refused lookup (53)
    * @throws {Error} any other failure, as `retryTransactionCoordinator` does
    */
   const lookUpTransactionCoordinator = async (generation) => {
@@ -506,6 +520,11 @@ const createEosManager = ({
       return await findTransactionCoordinator(generation)
     } catch (error) {
       return retryTransactionCoordinator(error, generation).catch((failure) => {
+        if (refusesTransactionalId(failure)) {
+          const armed = armRefusedTransactionLookup(failure, generation)
+          if (!stateManager.isInitialized()) onFenced?.(armed)
+          throw armed
+        }
         throw isDiscoveryExhausted(failure)
           ? discoveryUnavailable(
               'The transaction coordinator could not be found; no producer id was requested, try again',
@@ -832,8 +851,10 @@ const createEosManager = ({
      * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED,
      *   naming both remedies
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} initial fencing codes
-     *   47 or 90, or TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53) from the request or its coordinator
-     *   lookup; the error remains its cause and the producer stays fatal
+     *   47 or 90, or when the coordinator lookup is refused with 53; the error remains its cause
+     *   and the producer stays fatal
+     * @throws {import('../../errors').KafkaJSProtocolError} a direct TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+     *   (53) from InitProducerId; the producer can try again after the ACL is corrected
      * @throws {KafkaJSError} retriable, `cause` the discovery error, when the transaction
      *   coordinator could not be found; nothing is armed and the call can be made again
      */
@@ -848,7 +869,7 @@ const createEosManager = ({
           }
         }, generation)
       } catch (error) {
-        if (error.code === 47 || error.code === 90 || refusesTransactionalId(error)) {
+        if (error.code === 47 || error.code === 90) {
           generation?.check()
           stateManager.classify(error, 'txn')
           stateManager.arm(error)
@@ -929,9 +950,7 @@ const createEosManager = ({
       } catch (error) {
         coordinator = await retryTransactionCoordinator(error, generation).catch((failure) => {
           if (!refusesTransactionalId(failure)) throw failure
-          stateManager.classify(failure, 'txn')
-          stateManager.arm(failure)
-          throw stateManager.transaction.armedError()
+          throw armRefusedTransactionLookup(failure, generation)
         })
       }
       generation?.check()
