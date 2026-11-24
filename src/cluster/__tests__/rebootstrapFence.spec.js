@@ -187,7 +187,6 @@ describe('rebootstrap and the producer lifecycle that asked for it', () => {
       expect(rebootstrapping.value).toBe(error)
       expect(pool.seedBroker).not.toBe(seed)
       expect(seed.retire).toHaveBeenCalledTimes(1)
-      expect(pool.recoveries).toBe(1)
       expect(pool.metadata).toBeNull()
       expect(events).toEqual([{ reason: 'required' }])
     } finally {

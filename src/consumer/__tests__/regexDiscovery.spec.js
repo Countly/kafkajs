@@ -475,6 +475,20 @@ describe('discovery refreshes and their scope', () => {
     expect(harness.applied()).toEqual(['orders-1'])
   })
 
+  test('the conditional and the explicit running discovery hand the cluster one observer', async () => {
+    // The cluster lets a refresh that a newer one displaced settle with it only when both observe
+    // alike, so a running discovery never observes twice and never goes unobserved.
+    const harness = createPatternGroup({ catalog: { 'orders-1': ID_A } })
+    await harness.group.refreshCluster({ ifNecessary: true })
+    await harness.group.refreshCluster()
+
+    expect(harness.cluster.refreshMetadataIfNecessary).toHaveBeenCalledTimes(1)
+    expect(harness.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    const [conditional, explicit] = harness.refreshes
+    expect(typeof conditional.onMetadata).toBe('function')
+    expect(explicit.onMetadata).toBe(conditional.onMetadata)
+  })
+
   test('a follower cannot recreate a deleted match through the leader union', async () => {
     const harness = createPatternGroup({ catalog: { 'orders-1': ID_A } })
     const { group, cluster } = harness

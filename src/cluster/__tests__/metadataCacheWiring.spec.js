@@ -204,8 +204,8 @@ describe('Cluster > metadata cache wiring', () => {
     expect(events).toHaveLength(2)
   })
 
-  test('cache.update runs before the awaited broker rebuild that follows the assignment', async () => {
-    // The guard must be applied while nothing else has had a chance to read brokerPool.metadata.
+  test('cache.update runs after the answer brokers are built, in the step that installs the answer', async () => {
+    // Nothing of an answer is visible while its brokers are built; the cache is fed as it installs.
     const responses = [metadata({ topicId: ID_A, leader: 1, leaderEpoch: 5 })]
     stubBrokers(cluster, responses)
 
@@ -222,7 +222,7 @@ describe('Cluster > metadata cache wiring', () => {
     }
 
     await cluster.brokerPool.refreshMetadata(['test-topic'])
-    expect(order).toEqual(['update', 'buildConnectionPool'])
+    expect(order).toEqual(['buildConnectionPool', 'update'])
   })
 
   test('update() runs with no await between it and the metadata assignment', () => {
@@ -231,8 +231,8 @@ describe('Cluster > metadata cache wiring', () => {
     // function - any await inserted directly after the assignment would still pass that test.
     // This asserts the no-intervening-await guarantee directly, by inspecting the method body
     // between the two statements for a bare `await`.
-    const source = BrokerPool.prototype.refreshMetadataUnshared.toString()
-    const assignmentText = 'this.metadata = response'
+    const source = BrokerPool.prototype.refreshPass.toString()
+    const assignmentText = 'this.metadata = metadata'
     const assignmentIndex = source.lastIndexOf(assignmentText)
     const updateIndex = source.indexOf('this.metadataCache.update(', assignmentIndex)
 
