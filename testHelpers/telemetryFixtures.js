@@ -375,7 +375,7 @@ const withTelemetryResource = async (
 }
 
 /**
- * Reads the current sole-guard run directory without retaining resources.
+ * Reads the run directory that `TELEMETRY_EVIDENCE_DIR` selects, without retaining resources.
  * @param {{uuid?:string,after?:Object<string,number>}} [options] selection
  * @returns {object[]} bounded independent exporter records
  * @throws {Error} for absent configuration or corrupt evidence
