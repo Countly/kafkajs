@@ -461,7 +461,10 @@ export interface ConsumerConfig extends ClientTelemetryConfig {
    * derived ceiling of `max(1, floor(value / 512))` records per batch, checked before any record
    * is allocated; a batch can pass the byte limit and still exceed the record ceiling (it then
    * halts the partition the same way), and raising this option raises both. Decoded records
-   * measure 208 to 321 bytes of heap each; header objects and concurrent fetches are extra.
+   * measure 208 to 321 bytes of heap each. It also sets a header ceiling of
+   * `max(1, floor(value / 128))` record headers across all records of a batch; a record whose
+   * headers would cross it halts the partition with reason `count` before they are decoded.
+   * Concurrent fetches are extra.
    */
   maxDecompressedBatchBytes?: number
   retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }

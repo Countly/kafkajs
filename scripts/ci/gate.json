@@ -105,6 +105,20 @@
       ]
     },
     {
+      "id": "header-heap-cost",
+      "kind": "host",
+      "compose": null,
+      "env": {},
+      "jest": null,
+      "jestScript": null,
+      "nodeTest": null,
+      "command": "node --expose-gc scripts/benchmarks/headerHeapCost.js --assert || exit 1",
+      "needs": {},
+      "evidence": [],
+      "titles": [],
+      "capMinutes": 15
+    },
+    {
       "id": "unit",
       "kind": "host",
       "compose": null,

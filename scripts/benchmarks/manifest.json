@@ -1096,6 +1096,10 @@
       "reason": "Run by the consumer-sessions-* rows through adapters/consumerSession.js, which supplies BENCH_NODES, the evidence directory, the topics and the L2 producer; never a plain entry."
     },
     {
+      "file": "headerHeapCost.js",
+      "reason": "An exit-gate check, not a measurement entry: it prints the heap each decoded record header retains per shape and exits 1 when the worst is above the batch decoder's header ceiling bytes."
+    },
+    {
       "file": "produceFrameSize.js",
       "reason": "A frame-size check against maxRequestSize that reports exact counts, not timings, and re-spawns itself with NODE_PATH set."
     },
