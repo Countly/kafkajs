@@ -2061,3 +2061,26 @@ import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
   // @ts-expect-error the fields are read-only
   recreated.topicId = 'other'
 }
+
+import {
+  KafkaJSUnknownOutcomeError as UnknownOutcome,
+  UnknownOutcomeRequest,
+  KafkaJSNonRetriableError as NonRetriableBase,
+} from './index'
+{
+  const lost = new UnknownOutcome('lost', {
+    requests: [{ api: 'DeleteRecords', apiVersion: 2, nodeId: 1, items: [{ topic: 't' }] }],
+    cause: new Error('closed'),
+  })
+  const asBase: NonRetriableBase = lost
+  const outcome: 'unknown' = lost.outcome
+  const request: UnknownOutcomeRequest = lost.requests[0]
+  const items: unknown[] | null = request.items
+  void asBase
+  void outcome
+  void items
+  new UnknownOutcome('lost')
+  // @ts-expect-error outcome is always 'unknown'
+  const other: 'applied' = lost.outcome
+  void other
+}

@@ -10482,6 +10482,7 @@
         "src/consumer/workerQueue.spec.js \u203a WorkerQueue should handle all messages within one push",
         "src/consumer/workerQueue.spec.js \u203a WorkerQueue should should finish processing before throwing exception",
         "src/errors.spec.js \u203a KafkaJSAggregateError derives retriable and category from its children a child whose retriable is truthy but not true",
+        "src/errors.spec.js \u203a KafkaJSUnknownOutcomeError carries outcome, requests and cause and is not retriable",
         "src/errors.spec.js \u203a KafkaJSAggregateError derives retriable and category from its children a custom retrier sees a retriable flag it can act on",
         "src/errors.spec.js \u203a KafkaJSAggregateError derives retriable and category from its children a hole among retriable children",
         "src/errors.spec.js \u203a KafkaJSAggregateError derives retriable and category from its children a huge sparse list is read without being copied, so construction never throws",
