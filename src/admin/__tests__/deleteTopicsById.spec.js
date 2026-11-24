@@ -70,6 +70,12 @@ describe('delete topics by id', () => {
     expect(broker.deleteTopics).toHaveBeenCalledWith({ topics: ['t'], timeout: undefined })
     expect(cluster.targetTopics.has('t')).toBe(false)
   })
+  it('retries a name deletion after an unknown-topic failure before the request', async () => {
+    const { admin, broker, cluster } = fixture()
+    cluster.refreshMetadata.mockRejectedValueOnce(createErrorFromCode(3))
+    expect(await admin.deleteTopics({ topics: ['t'] })).toBeUndefined()
+    expect(broker.deleteTopics.mock.calls).toEqual([[{ topics: ['t'], timeout: undefined }]])
+  })
 })
 
 describe('delete id capabilities', () => {
