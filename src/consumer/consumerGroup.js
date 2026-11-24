@@ -92,6 +92,7 @@ const {
   obsoleteOwnership,
   consumerStoppingError,
   joinDeadlineError,
+  isFatalTopicError,
   REBALANCE_PATHS,
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
@@ -481,8 +482,9 @@ module.exports = class ConsumerGroup {
     this.preparationEpoch = 0
     /**
      * The pending metadata refresh for partitions without a leader, shared by every node's fetcher
-     * of the current run, and when the last one started (`performance.now()`).
-     * @type {{ promise: Promise<void> }|null}
+     * of the current run, and when the last one started (`performance.now()`). `error` is its
+     * failure, once it failed.
+     * @type {{ promise: Promise<void>, error?: Error }|null}
      */
     this.leaderlessRefresh = null
     this.leaderlessRefreshAt = -Infinity
@@ -2627,7 +2629,10 @@ module.exports = class ConsumerGroup {
       if (needsRefresh) {
         await this.refreshCluster({ fence: run.fence })
         run.fence.check()
-      } else if (prepared.leaderless || missing) {
+      } else if (missing) {
+        await this.refreshMissingTopicIds(run)
+        run.fence.check()
+      } else if (prepared.leaderless) {
         await this.refreshLeaderlessMetadata(run)
         run.fence.check()
       }
@@ -2667,9 +2672,11 @@ module.exports = class ConsumerGroup {
    * @param {IdleWait} run the run that owns the round
    * @param {boolean} [missingIds=false] whether a topic was left out for a missing topic id
    * @returns {Promise<Batch[]>} always empty
+   * @throws {Error} a terminal topic refusal learned for a missing id, see `refreshMissingTopicIds`
    */
   async idleFetchRound(prepared, run, missingIds = false) {
-    if (prepared.leaderless || missingIds) await this.refreshLeaderlessMetadata(run)
+    if (missingIds) await this.refreshMissingTopicIds(run)
+    else if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
     // Registers only while the snapshot is current: an invalidated one returns through the
     // fetcher's yield floor and a fresh snapshot is captured next round.
     await run.wait(
@@ -4562,18 +4569,20 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Refreshes the metadata because a partition has no leader, once for all the nodes' fetchers of
-   * a run. Callers share the pending refresh, and a new one starts at most once per initial retry
-   * interval, measured start to start; a due caller waits for its own refresh, an early one
-   * returns at once. There is no retry timer: the next round that finds a leader missing and the
-   * interval elapsed asks again.
+   * Refreshes the metadata because a partition has no leader or a topic has no id, once for all
+   * the nodes' fetchers of a run. Callers share the pending refresh, and a new one starts at most
+   * once per initial retry interval, measured start to start; a due caller waits for its own
+   * refresh, an early one returns at once. There is no retry timer: the next round that finds a
+   * leader or an id missing and the interval elapsed asks again.
    *
    * The refresh is bound to the run's fence, so a stop or restart settles every caller and the
    * refresh publishes nothing afterwards. A failure is logged at debug level and never becomes a
-   * membership verdict or discards the round's healthy batches.
+   * membership verdict by itself; it is returned to every caller that waited for it, so a caller
+   * can judge it for its own reason.
    * @private
    * @param {IdleWait} run the run that owns the calling round, captured before any await
-   * @returns {Promise<void>} resolves when the refresh settled, was not due, or the run stopped
+   * @returns {Promise<Error|undefined>} the failure of the refresh this caller waited for, if it
+   *   failed; undefined when it succeeded or was not due
    */
   async refreshLeaderlessMetadata(run) {
     if (run.fence.closed) return
@@ -4592,6 +4601,7 @@ module.exports = class ConsumerGroup {
               error: describeThrown(error),
             })
           }
+          attempt.error = error
         })
         .finally(() => {
           if (this.leaderlessRefresh === attempt) this.leaderlessRefresh = null
@@ -4599,5 +4609,21 @@ module.exports = class ConsumerGroup {
       this.leaderlessRefresh = attempt
     }
     await run.fence.wait(attempt.promise).catch(() => {})
+    return attempt.error
+  }
+
+  /**
+   * Refreshes the metadata for a round that left a topic out for a missing id, and fails the
+   * round when the refresh learned a refusal that will not clear (`TOPIC_AUTHORIZATION_FAILED`,
+   * `INVALID_TOPIC_EXCEPTION`), as a conditional refresh before the round would. Other failures
+   * are waited out: the next refresh may bring the id.
+   * @private
+   * @param {IdleWait} run the run that owns the calling round
+   * @returns {Promise<void>}
+   * @throws {Error} the refresh's terminal topic refusal
+   */
+  async refreshMissingTopicIds(run) {
+    const error = await this.refreshLeaderlessMetadata(run)
+    if (isFatalTopicError(error)) throw error
   }
 }
