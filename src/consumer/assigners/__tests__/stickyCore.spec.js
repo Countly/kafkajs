@@ -1,4 +1,4 @@
-const { assignSticky, DEFAULT_GENERATION } = require('../stickyAssigner/stickyCore')
+const { assignSticky, DEFAULT_GENERATION, keyOf } = require('../stickyAssigner/stickyCore')
 
 /**
  * @param {string} memberId
@@ -491,5 +491,84 @@ describe('Consumer > assigners > stickyCore', () => {
       // stays deterministic on a loaded host while still failing on an algorithmic blow-up.
       expect(elapsedMs).toBeLessThan(BUDGET_MS * 6)
     }
+  })
+})
+
+describe('Consumer > assigners > stickyCore > a claim on a partition the topic no longer has', () => {
+  test('a recreated topic with fewer partitions assigns its partition exactly once', () => {
+    const assignment = assignSticky({
+      partitionsPerTopic: { x: partitions(1) },
+      members: [
+        member('member-a', { topics: ['x'], owned: { x: [1] }, generationId: 1 }),
+        member('member-b', { topics: ['x'], owned: { x: [0] }, generationId: 1 }),
+      ],
+    })
+
+    expect(plain(assignment)).toEqual({
+      'member-a': {},
+      'member-b': { x: [0] },
+    })
+  })
+
+  test('keeps valid claims sticky when a topic shrank', () => {
+    const assignment = assignSticky({
+      partitionsPerTopic: { x: partitions(2) },
+      members: [
+        member('member-a', { topics: ['x'], owned: { x: [0, 2] }, generationId: 3 }),
+        member('member-b', { topics: ['x'], owned: { x: [1, 3] }, generationId: 3 }),
+      ],
+    })
+
+    expect(plain(assignment)).toEqual({
+      'member-a': { x: [0] },
+      'member-b': { x: [1] },
+    })
+  })
+
+  test('never assigns a claimed partition the topic no longer has on the general path', () => {
+    const assignment = assignSticky({
+      partitionsPerTopic: { x: partitions(2), y: partitions(1) },
+      members: [
+        member('member-a', { topics: ['x'], owned: { x: [0, 2] }, generationId: 3 }),
+        member('member-b', { topics: ['x', 'y'], owned: { x: [1], y: [0, 1] }, generationId: 3 }),
+      ],
+    })
+
+    expect(allAssigned(assignment).sort()).toEqual(['x-0', 'x-1', 'y-0'])
+    expect(plain(assignment)['member-a'].x).toContain(0)
+    expect(plain(assignment)['member-b'].y).toEqual([0])
+  })
+
+  test('a partition two members claim at one generation after the topic shrank is assigned once and contested', () => {
+    const contested = new Set()
+    const assignment = assignSticky({
+      partitionsPerTopic: { x: partitions(1) },
+      members: [
+        member('member-a', { topics: ['x'], owned: { x: [0, 1] }, generationId: 2 }),
+        member('member-b', { topics: ['x'], owned: { x: [0] }, generationId: 2 }),
+      ],
+      contested,
+    })
+
+    expect(allAssigned(assignment)).toEqual(['x-0'])
+    expect([...contested]).toEqual([keyOf('x', 0)])
+  })
+
+  test('a claim on a partition the topic no longer has is never contested', () => {
+    const contested = new Set()
+    const assignment = assignSticky({
+      partitionsPerTopic: { x: partitions(2) },
+      members: [
+        member('member-a', { topics: ['x'], owned: { x: [0, 2] }, generationId: 2 }),
+        member('member-b', { topics: ['x'], owned: { x: [1, 2] }, generationId: 2 }),
+      ],
+      contested,
+    })
+
+    expect(plain(assignment)).toEqual({
+      'member-a': { x: [0] },
+      'member-b': { x: [1] },
+    })
+    expect([...contested]).toEqual([])
   })
 })
