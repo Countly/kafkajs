@@ -2,6 +2,7 @@ const { inspect } = require('util')
 const createRetry = require('../index')
 const testDefaults = require('../defaults.test')
 const { createErrorFromCode } = require('../../protocol/error')
+const { skipMonotonicTo } = require('../../../testHelpers/monotonicSkip')
 const {
   KafkaJSDeliveryTimeout,
   KafkaJSInvalidConfigurationError,
@@ -235,4 +236,124 @@ describe('Retry > maxTotalTime, the delay clamp and the shared backoff', () => {
     jest.spyOn(Math, 'random').mockReturnValue(0)
     expect(createRetry.backoff({ initialRetryTime: 100, factor: 3 }).initial()).toEqual(0)
   })
+})
+
+/** Every delay is 100 ms and the whole call may take 500 ms. */
+const LATE = {
+  initialRetryTime: 100,
+  factor: 0,
+  multiplier: 1,
+  maxRetryTime: 100,
+  retries: 5,
+  maxTotalTime: 500,
+}
+const fence = { register: () => () => {} }
+const PLAIN = ['plain', (options) => createRetry(options)]
+const FENCED = ['fenced', (options) => createRetry({ ...options, fence })]
+
+describe('Retry > the budget on a late or stepped clock', () => {
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0 })
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+  })
+
+  /**
+   * @param {...any} outcomes what each call does, in order: an error to throw or a value to return
+   * @returns {jest.Mock} the retried function
+   */
+  const scripted = (...outcomes) =>
+    jest.fn(async () => {
+      const outcome = outcomes.shift()
+      if (outcome instanceof Error) throw outcome
+      return outcome
+    })
+
+  /**
+   * @param {Promise<any>} promise
+   * @returns {Promise<{ value?: any, error?: Error }>} how the promise ended
+   */
+  const outcomeOf = (promise) =>
+    promise.then(
+      (value) => ({ value }),
+      (error) => ({ error })
+    )
+
+  test.each([
+    ['a retry whose timer fires after the deadline is not started', PLAIN],
+    ['a fenced retry whose timer fires after the deadline is not started', FENCED],
+  ])('%s', async (_title, [, retrier]) => {
+    const first = createErrorFromCode(REQUEST_TIMED_OUT)
+    const fn = scripted(first, 'done')
+    const settled = outcomeOf(retrier(LATE)(fn))
+
+    await jest.advanceTimersByTimeAsync(0)
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(1)
+
+    skipMonotonicTo(1000)
+    await jest.advanceTimersByTimeAsync(100)
+
+    const outcome = await settled
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(outcome.error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(outcome.error.message).toEqual(
+      'Gave up after 1 attempts: the next one would start after the 500 ms deadline'
+    )
+    expect(outcome.error.cause).toBe(first)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test.each([PLAIN, FENCED])(
+    'a forward wall step does not end the budget early (%s)',
+    async (_kind, retrier) => {
+      const fn = scripted(createErrorFromCode(REQUEST_TIMED_OUT), 'done')
+      const settled = outcomeOf(retrier(LATE)(fn))
+      jest.setSystemTime(1000)
+
+      await jest.advanceTimersByTimeAsync(100)
+
+      expect(await settled).toEqual({ value: 'done' })
+      expect(fn).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  test.each([PLAIN, FENCED])(
+    'a backward wall step does not extend the budget (%s)',
+    async (_kind, retrier) => {
+      const startedAt = []
+      const fn = jest.fn(async () => {
+        startedAt.push(performance.now())
+        throw createErrorFromCode(REQUEST_TIMED_OUT)
+      })
+      const settled = outcomeOf(retrier({ ...LATE, retries: 20, maxTotalTime: 350 })(fn))
+
+      await jest.advanceTimersByTimeAsync(0)
+      jest.setSystemTime(-100000)
+      await jest.runAllTimersAsync()
+
+      const outcome = await settled
+      expect(startedAt).toEqual([0, 100, 200, 300])
+      expect(outcome.error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(outcome.error.message).toEqual(
+        'Gave up after 4 attempts: the next one would start after the 350 ms deadline'
+      )
+    }
+  )
+
+  test.each([PLAIN, FENCED])(
+    'an attempt whose timer fires exactly at the deadline still starts (%s)',
+    async (_kind, retrier) => {
+      const fn = scripted(createErrorFromCode(REQUEST_TIMED_OUT), 'done')
+      const settled = outcomeOf(retrier({ ...LATE, maxTotalTime: 100 })(fn))
+
+      await jest.advanceTimersByTimeAsync(100)
+
+      expect(await settled).toEqual({ value: 'done' })
+      expect(fn).toHaveBeenCalledTimes(2)
+    }
+  )
 })
