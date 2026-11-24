@@ -17,10 +17,10 @@ const {
   installSessionModel,
 } = require('../shareHarness')
 
-const NODES = [{ id: 0, host: 'node0', port: 9092 }]
 const ACCEPT = 1
 const RENEW = 4
 const SESSION_EPOCH_FINAL = -1
+const INT32_MAX = 2147483647
 
 let correlationId = 0
 /**
@@ -39,17 +39,23 @@ const frameOf = async (request) => {
   return { id, frame: new Encoder().writeInt32(framed.size()).writeEncoder(framed).buffer }
 }
 
-const fetch = (memberId, epoch, { topics = [], forgotten = [] } = {}) =>
+/** A renewing fetch (`renew`) asks for no records unless `asking` says otherwise. */
+const fetch = (
+  memberId,
+  epoch,
+  { topics = [], forgotten = [], renew = false, asking = !renew } = {}
+) =>
   shareFetchRequest({
     groupId: 'group',
     memberId,
     shareSessionEpoch: epoch,
     maxWaitMs: 0,
-    minBytes: 1,
-    maxBytes: 1048576,
-    maxRecords: 500,
+    minBytes: asking ? 1 : 0,
+    maxBytes: asking ? 1048576 : 0,
+    maxRecords: asking ? 500 : 0,
     batchSize: 500,
     shareAcquireMode: 1,
+    isRenewAck: renew,
     topics,
     forgottenTopicsData: forgotten,
   })
@@ -86,24 +92,36 @@ const batch = (first, last, type) => ({
 /** @returns {object} a fetch answer that acquires offsets first..last of partition 0 of topic A */
 const acquiring = (first, last) =>
   fetchAnswer([part({ partition: 0, acquire: [acquired(first, last)] })])
+/** @returns {object} a fetch answer that acquires offset 0 of partitions 0 and 1 of topic A */
+const acquiringBoth = () =>
+  fetchAnswer([
+    part({ partition: 0, acquire: [acquired(0, 0)] }),
+    part({ partition: 1, acquire: [acquired(0, 0)] }),
+  ])
+/** @returns {string[]} the messages of the cluster's recorded failures */
+const failed = (cluster) => cluster.failures().map(({ message }) => message)
 
 /**
- * A scripted share cluster with the model installed, and raw connections to node 0.
+ * A scripted share cluster, by default with the model installed, and raw connections to its nodes.
+ * @param {{ nodes?: number, model?: boolean }} [options]
  * @returns {object} `cluster`, `model`, `answers` (queued ShareFetch and ShareAcknowledge
  *   answers, the quiet broker's after them), `connect`, `send`, `reply`
  */
-const setup = () => {
-  const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+const setup = ({ nodes = 1, model: modelled = true } = {}) => {
+  const cluster = createScriptedCluster({
+    nodes: Array.from({ length: nodes }, (_, id) => ({ id, host: `node${id}`, port: 9092 })),
+    profile: 'share',
+  })
   const answers = { ShareFetch: [], ShareAcknowledge: [] }
   for (const api of Object.keys(answers)) {
     cluster.answer(api, (fields) => answers[api].shift() ?? echo(api, fields))
   }
   const context = { interval: 50, epochs: new Map(), topics: new Map() }
   cluster.answer('ShareGroupHeartbeat', (fields) => heartbeatAnswer(fields, context))
-  const model = installSessionModel({ cluster })
-  /** @returns {object} a new connection to node 0: `socket`, `replies`, `errors` */
-  const connect = () => {
-    const socket = cluster.socketFactory({ host: 'node0', port: 9092, onConnect: () => {} })
+  const model = modelled ? installSessionModel({ cluster }) : null
+  /** @returns {object} a new connection to the node: `socket`, `replies`, `errors` */
+  const connect = (node = 0) => {
+    const socket = cluster.socketFactory({ host: `node${node}`, port: 9092, onConnect: () => {} })
     const connection = { socket, replies: [], errors: [] }
     socket.on('data', (chunk) => connection.replies.push(chunk))
     socket.on('error', (error) => connection.errors.push(error))
@@ -188,6 +206,68 @@ describe('ShareSessionModel', () => {
     const missingAck = await send(connection, acknowledge('m2', 1, []))
     expect(reply(connection, missing)).toMatchObject({ errorCode: 122, responses: [] })
     expect(reply(connection, missingAck)).toMatchObject({ errorCode: 122, responses: [] })
+    cluster.assertClean()
+  })
+
+  test('an epoch-0 fetch carrying acknowledgements and a renewing fetch asking for records are answered 42 and change nothing', async () => {
+    const { cluster, model, answers, connect, send, reply } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', 0, { topics: topicA([0]) }))
+
+    const other = connect()
+    const reopen = await send(other, fetch('m1', 0, { topics: topicA([0, [batch(0, 0, ACCEPT)]]) }))
+    const renewing = await send(
+      connection,
+      fetch('m1', 1, { renew: true, asking: true, topics: topicA([0, [batch(0, 0, RENEW)]]) })
+    )
+
+    expect(reply(other, reopen)).toMatchObject({ errorCode: 42, responses: [] })
+    expect(reply(connection, renewing)).toMatchObject({ errorCode: 42, responses: [] })
+    expect(model.sessions()).toEqual([
+      { node: 0, member: 'm1', epoch: 1, generation: 1, partitions: [`${A}:0`] },
+    ])
+    expect(model.acquisitionsOf(A, 0, 0)).toEqual([
+      { observationId: 1, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
+    cluster.assertClean()
+  })
+
+  test('a scripted top-level error is a refusal before admission, and a scripted 122, 123 or 133 must agree with the session', async () => {
+    const { cluster, model, answers, connect, send, reply } = setup()
+    const connection = connect()
+    await send(connection, fetch('m1', 0, { topics: topicA([0]) }))
+
+    answers.ShareFetch.push(topError(30))
+    const denied = await send(connection, fetch('m1', 1))
+    expect(reply(connection, denied)).toMatchObject({ errorCode: 30, responses: [] })
+    expect(model.session(0, 'm1').epoch).toBe(1)
+    expect(failed(cluster)).toEqual([])
+
+    answers.ShareFetch.push(topError(122), topError(133))
+    await send(connection, fetch('m1', 1))
+    await send(connection, fetch('m1', 1))
+
+    expect(failed(cluster)).toEqual([
+      expect.stringContaining('answered 122 where the broker answers 0'),
+      expect.stringContaining('answered 133 where the broker answers 0'),
+    ])
+    expect(model.session(0, 'm1').epoch).toBe(1)
+  })
+
+  test('the session epoch after 2147483647 is 1', async () => {
+    const { cluster, model, connect, send, reply } = setup()
+    const connection = connect()
+    await send(connection, fetch('m1', 0, { topics: topicA([0]) }))
+    model.live.get('0|m1').epoch = INT32_MAX
+
+    const last = await send(connection, acknowledge('m1', INT32_MAX, []))
+    expect(reply(connection, last).errorCode).toBe(0)
+    expect(model.session(0, 'm1').epoch).toBe(1)
+
+    const wrapped = await send(connection, fetch('m1', 1))
+    expect(reply(connection, wrapped).errorCode).toBe(0)
+    expect(model.session(0, 'm1').epoch).toBe(2)
     cluster.assertClean()
   })
 
@@ -276,6 +356,29 @@ describe('ShareSessionModel', () => {
 
     expect(model.sessions()).toEqual([])
     expect(model.changesTo(1)).toEqual([
+      { state: 'AVAILABLE', cause: 'disconnect', order: expect.any(Number) },
+    ])
+    cluster.assertClean()
+  })
+
+  test('a broker-side disconnect removes only the session last opened on that connection', async () => {
+    const { cluster, model, answers, connect, send } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', 0, { topics: topicA([0]) }))
+    answers.ShareFetch.push(acquiring(1, 1))
+    await send(connection, fetch('m2', 0, { topics: topicA([0]) }))
+
+    cluster.brokerDisconnect(0, 1)
+    await flush()
+
+    expect(model.sessions()).toEqual([
+      { node: 0, member: 'm1', epoch: 1, generation: 1, partitions: [`${A}:0`] },
+    ])
+    expect(model.acquisitionsOf(A, 0, 0)).toEqual([
+      { observationId: 1, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
+    expect(model.changesTo(2)).toEqual([
       { state: 'AVAILABLE', cause: 'disconnect', order: expect.any(Number) },
     ])
     cluster.assertClean()
@@ -374,18 +477,113 @@ describe('ShareSessionModel', () => {
   })
 
   test("an incremental fetch with no topic rows keeps the session's partitions", async () => {
-    const { cluster, model, connect, send } = setup()
+    const { cluster, model, answers, connect, send } = setup()
     const connection = connect()
     await send(connection, fetch('m1', 0, { topics: topicA([0], [1]) }))
 
+    answers.ShareFetch.push(fetchAnswer([part({ partition: 1, acquire: [acquired(0, 0)] })]))
     await send(connection, fetch('m1', 1))
 
     expect(model.session(0, 'm1')).toMatchObject({ epoch: 2, partitions: [`${A}:0`, `${A}:1`] })
+    expect(model.acquisitionsOf(A, 1, 0)).toEqual([
+      { observationId: 1, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
 
     await send(connection, fetch('m1', 2, { forgotten: [{ topicId: A, partitions: [1] }] }))
 
     expect(model.session(0, 'm1')).toMatchObject({ epoch: 3, partitions: [`${A}:0`] })
     cluster.assertClean()
+  })
+
+  test('a fetch that acquires outside its fetch set is a recorded failure and acquires nothing', async () => {
+    const { cluster, model, answers, connect, send } = setup()
+    const connection = connect()
+    await send(connection, fetch('m1', 0, { topics: topicA([0], [1]) }))
+
+    answers.ShareFetch.push(fetchAnswer([part({ partition: 1, acquire: [acquired(0, 0)] })]))
+    await send(connection, fetch('m1', 1, { forgotten: [{ topicId: A, partitions: [1] }] }))
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', 2, { renew: true }))
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', SESSION_EPOCH_FINAL))
+
+    expect(failed(cluster)).toEqual([
+      expect.stringContaining(`${A}:1 outside its fetch set`),
+      expect.stringContaining(`${A}:0 outside its fetch set`),
+      expect.stringContaining(`${A}:0 outside its fetch set`),
+    ])
+    expect(model.acquisitionsOf(A, 1, 0)).toEqual([])
+    expect(model.acquisitionsOf(A, 0, 0)).toEqual([])
+  })
+
+  test("a final releases the member's records only on the partitions its session caches", async () => {
+    const { cluster, model, answers, connect, send, reply } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(acquiringBoth())
+    await send(connection, fetch('m1', 0, { topics: topicA([0], [1]) }))
+    await send(connection, fetch('m1', 1, { forgotten: [{ topicId: A, partitions: [1] }] }))
+
+    const final = await send(connection, fetch('m1', SESSION_EPOCH_FINAL))
+
+    expect(reply(connection, final).errorCode).toBe(0)
+    expect(model.sessions()).toEqual([])
+    expect(model.changesTo(1)).toEqual([
+      { state: 'AVAILABLE', cause: 'final', order: final.executedOrder },
+    ])
+    expect(model.acquisitionsOf(A, 1, 0)).toEqual([
+      { observationId: 2, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
+    cluster.assertClean()
+  })
+
+  test("acknowledgements and a final on one node leave another node's records alone", async () => {
+    const { cluster, model, answers, connect, send, reply } = setup({ nodes: 2 })
+    const zero = connect(0)
+    const one = connect(1)
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(zero, fetch('m1', 0, { topics: topicA([0]) }))
+    await send(one, fetch('m1', 0, { topics: topicA([0]) }))
+
+    const elsewhere = await send(one, acknowledge('m1', 1, topicA([0, [batch(0, 0, ACCEPT)]])))
+    const final = await send(one, fetch('m1', SESSION_EPOCH_FINAL))
+
+    expect(reply(one, elsewhere).responses[0].partitions[0]).toMatchObject({
+      partitionIndex: 0,
+      errorCode: 121,
+    })
+    expect(reply(one, final).errorCode).toBe(0)
+    expect(model.sessions()).toEqual([
+      { node: 0, member: 'm1', epoch: 1, generation: 1, partitions: [`${A}:0`] },
+    ])
+    expect(model.acquisitionsOf(A, 0, 0)).toEqual([
+      { observationId: 1, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
+
+    const home = await send(zero, acknowledge('m1', 1, topicA([0, [batch(0, 0, ACCEPT)]])))
+
+    expect(reply(zero, home).responses[0].partitions[0].errorCode).toBe(0)
+    expect(model.changesTo(1)).toEqual([
+      { state: 'ACKNOWLEDGED', cause: 'accept', order: home.executedOrder },
+    ])
+    cluster.assertClean()
+  })
+
+  test('a fetch that acquires an acknowledged offset again is a recorded failure', async () => {
+    const { cluster, model, answers, connect, send } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', 0, { topics: topicA([0]) }))
+    await send(connection, acknowledge('m1', 1, topicA([0, [batch(0, 0, ACCEPT)]])))
+
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', 2))
+
+    expect(failed(cluster)).toEqual([
+      expect.stringContaining(`${A}:0:0 acquired while ACKNOWLEDGED`),
+    ])
+    expect(model.acquisitionsOf(A, 0, 0)).toEqual([
+      { observationId: 1, member: 'm1', node: 0, state: 'ACKNOWLEDGED', renewals: 0 },
+    ])
   })
 
   test('a renewal checks ownership and keeps the acquisition', async () => {
@@ -428,10 +626,6 @@ describe('ShareSessionModel', () => {
       connection,
       fetch('m2', 2, { topics: topicA([0, [batch(0, 0, ACCEPT)]]) })
     )
-    const partlyHeld = await send(
-      connection,
-      acknowledge('m1', 1, topicA([0, [batch(0, 1, ACCEPT), batch(5, 5, ACCEPT)]]))
-    )
 
     expect(reply(connection, standalone).responses[0].partitions[0]).toMatchObject({
       partitionIndex: 0,
@@ -442,7 +636,6 @@ describe('ShareSessionModel', () => {
       errorCode: 0,
       acknowledgeErrorCode: 121,
     })
-    expect(reply(connection, partlyHeld).responses[0].partitions[0].errorCode).toBe(121)
     for (const offset of [0, 1]) {
       expect(model.acquisitionsOf(A, 0, offset)).toEqual([
         expect.objectContaining({ member: 'm1', state: 'ACQUIRED' }),
@@ -450,6 +643,73 @@ describe('ShareSessionModel', () => {
     }
     expect(model.changesTo(1)).toEqual([])
     expect(model.changesTo(2)).toEqual([])
+    cluster.assertClean()
+  })
+
+  test('an acknowledgement over an offset another member holds is answered 121 while a sibling partition applies', async () => {
+    const { cluster, model, answers, connect, send, reply } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(acquiringBoth())
+    await send(connection, fetch('m1', 0, { topics: topicA([0], [1]) }))
+    answers.ShareFetch.push(fetchAnswer([part({ partition: 0, acquire: [acquired(1, 1)] })]))
+    await send(connect(), fetch('m2', 0, { topics: topicA([0]) }))
+
+    const mixed = await send(
+      connection,
+      acknowledge('m1', 1, topicA([0, [batch(0, 1, ACCEPT)]], [1, [batch(0, 0, ACCEPT)]]))
+    )
+
+    expect(reply(connection, mixed).responses[0].partitions).toEqual([
+      expect.objectContaining({ partitionIndex: 0, errorCode: 121 }),
+      expect.objectContaining({ partitionIndex: 1, errorCode: 0 }),
+    ])
+    expect(model.acquisitionsOf(A, 0, 0)).toEqual([
+      { observationId: 1, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
+    expect(model.acquisitionsOf(A, 0, 1)).toEqual([
+      { observationId: 3, member: 'm2', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
+    expect(model.changesTo(2)).toEqual([
+      { state: 'ACKNOWLEDGED', cause: 'accept', order: mixed.executedOrder },
+    ])
+    cluster.assertClean()
+  })
+
+  test('an acknowledgement past the cached tail or breaking a batch rule is answered 42 and changes nothing', async () => {
+    const { cluster, model, answers, connect, send, reply } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(
+      fetchAnswer([
+        part({ partition: 0, acquire: [acquired(0, 1)] }),
+        part({ partition: 1, acquire: [acquired(0, 0)] }),
+      ])
+    )
+    await send(connection, fetch('m1', 0, { topics: topicA([0], [1]) }))
+
+    const pastTail = await send(
+      connection,
+      acknowledge('m1', 1, topicA([0, [batch(0, 1, ACCEPT), batch(5, 5, ACCEPT)]]))
+    )
+    const malformed = await send(
+      connection,
+      acknowledge('m1', 2, topicA([0, [batch(1, 0, ACCEPT)]], [1, [batch(0, 0, RENEW)]]))
+    )
+
+    expect(reply(connection, pastTail).responses[0].partitions).toEqual([
+      expect.objectContaining({ partitionIndex: 0, errorCode: 42 }),
+    ])
+    expect(reply(connection, malformed).responses[0].partitions).toEqual([
+      expect.objectContaining({ partitionIndex: 0, errorCode: 42 }),
+      expect.objectContaining({ partitionIndex: 1, errorCode: 42 }),
+    ])
+    for (const offset of [0, 1]) {
+      expect(model.acquisitionsOf(A, 0, offset)).toEqual([
+        expect.objectContaining({ member: 'm1', state: 'ACQUIRED' }),
+      ])
+    }
+    expect(model.acquisitionsOf(A, 1, 0)).toEqual([
+      { observationId: 3, member: 'm1', node: 0, state: 'ACQUIRED', renewals: 0 },
+    ])
     cluster.assertClean()
   })
 
@@ -461,7 +721,7 @@ describe('ShareSessionModel', () => {
     const gate = cluster.schedule.hold({ api: 'ShareAcknowledge' })
     const accept = await send(old, acknowledge('m1', 1, topicA([0, [batch(0, 0, ACCEPT)]])))
     await gate.arrived()
-    model.expireLock(A, 0, 0)
+    model.expireLock(1)
     answers.ShareFetch.push(acquiring(0, 0))
     const reacquire = await send(connect(), fetch('m1', 0, { topics: topicA([0]) }))
     expect(model.session(0, 'm1')).toMatchObject({ generation: 2, epoch: 1 })
@@ -509,5 +769,72 @@ describe('ShareSessionModel', () => {
       },
     ])
     cluster.assertClean()
+  })
+})
+
+describe('ScriptedCluster execution hooks', () => {
+  test('a kept reply is cancelled once when its socket closes, and teardown settles a hold that never matched', async () => {
+    const { cluster, answers, connect, send } = setup()
+    const connection = connect()
+    answers.ShareFetch.push(acquiring(0, 0))
+    await send(connection, fetch('m1', 0, { topics: topicA([0]) }))
+    const held = cluster.holdReply({ api: 'ShareAcknowledge' })
+    const unmatched = cluster.holdReply({ api: 'ShareGroupHeartbeat' })
+    const accept = await send(connection, acknowledge('m1', 1, topicA([0, [batch(0, 0, ACCEPT)]])))
+    expect(await held.executed()).toBe(accept)
+
+    cluster.clientLoss(0, 1)
+    await flush()
+
+    expect(cluster.tally('ShareAcknowledge', 'cancelled')).toBe(1)
+    expect(() => held.deliver()).toThrow('ReplyHold: no kept reply to deliver')
+
+    cluster.cancelReplyHolds()
+
+    await expect(unmatched.executed()).resolves.toBeNull()
+    expect(cluster.tally('ShareAcknowledge', 'cancelled')).toBe(1)
+    expect(accept.answeredOrder).toBeUndefined()
+    cluster.assertClean()
+  })
+
+  test('a throwing execution hook or reply selector is a recorded failure that cancels the request and closes its socket', async () => {
+    const failure = new Error('hook failed')
+    const hooked = setup({ model: false })
+    hooked.cluster.hook({
+      onExecute: () => {
+        throw failure
+      },
+    })
+    const selected = setup({ model: false })
+    selected.cluster.holdReply({
+      api: 'ShareGroupHeartbeat',
+      match: () => {
+        throw failure
+      },
+    })
+
+    for (const { cluster, connect, send } of [hooked, selected]) {
+      const connection = connect()
+      await send(connection, beat('m1', 0))
+
+      expect(cluster.failures()).toEqual([failure])
+      expect(cluster.tally('ShareGroupHeartbeat', 'cancelled')).toBe(1)
+      expect(connection.socket.destroyed).toBe(true)
+      expect(connection.errors).toEqual([failure])
+      expect(connection.replies).toEqual([])
+    }
+  })
+
+  test('split socket loss is refused in bounded capture', () => {
+    const cluster = createScriptedCluster({
+      nodes: [{ id: 0, host: 'node0', port: 9092 }],
+      profile: 'share',
+      bounded: true,
+    })
+    cluster.socketFactory({ host: 'node0', port: 9092, onConnect: () => {} })
+
+    expect(() => cluster.clientLoss(0, 1)).toThrow(
+      'ScriptedCluster: clientLoss() needs the full history'
+    )
   })
 })

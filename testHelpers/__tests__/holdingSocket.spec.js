@@ -3,8 +3,11 @@ const apiKeys = require('../../src/protocol/requests/apiKeys')
 const heartbeatRequest = require('../../src/protocol/requests/shareGroupHeartbeat/v1/request')
 const heartbeatWire = require('../wire/shareGroupHeartbeatV1')
 const { createScriptedCluster } = require('../scriptedCluster')
+const { createFakeSocketFactory } = require('../fakeSocket')
 const { createHoldingSocketFactory } = require('../holdingSocket')
 const { flush, heartbeatAnswer } = require('../shareHarness')
+
+const HEARTBEAT = { apiKey: apiKeys.ShareGroupHeartbeat }
 
 let correlationId = 0
 /**
@@ -52,6 +55,43 @@ const setup = () => {
   for (const event of ['end', 'close', 'error']) socket.on(event, () => seen.events.push(event))
   return { cluster, factory, socket, seen }
 }
+
+/**
+ * A holding socket over an in-memory broker side the test answers by emitting `data` chunks.
+ * @returns {object} `factory`, `socket`, `upstream` (the fake broker-side socket, which records
+ *   `writes`), `seen` (`data` frames and event names the client saw)
+ */
+const inMemory = () => {
+  const factory = createHoldingSocketFactory(createFakeSocketFactory().factory)
+  const socket = factory({ host: 'node0', port: 9092, onConnect: () => {} })
+  const seen = { data: [], events: [] }
+  socket.on('data', (frame) => seen.data.push(frame))
+  for (const event of ['end', 'close', 'error']) socket.on(event, () => seen.events.push(event))
+  return { factory, socket, upstream: socket.upstream, seen }
+}
+
+/**
+ * @param {number} id the correlation id
+ * @param {string} [body='']
+ * @returns {Buffer} a response frame: size, correlation id, body
+ */
+const responseFrame = (id, body = '') => {
+  const frame = Buffer.alloc(8 + body.length)
+  frame.writeInt32BE(4 + body.length, 0)
+  frame.writeInt32BE(id, 4)
+  frame.write(body, 8)
+  return frame
+}
+
+/**
+ * @param {Promise} promise
+ * @returns {Promise} the promise, or a rejection naming it still pending after the turns of `flush`
+ */
+const settled = (promise) =>
+  Promise.race([
+    promise,
+    flush().then(() => Promise.reject(new Error('still pending after flush'))),
+  ])
 
 describe('HoldingSocket', () => {
   test('holds one frame, reports the client side closed and forwards the frame upstream later', async () => {
@@ -162,5 +202,109 @@ describe('HoldingSocket', () => {
     } finally {
       factory.closeUpstreams()
     }
+  })
+
+  test('closes the broker side once the last kept frame after a client close has its response', async () => {
+    const { factory, socket, upstream } = inMemory()
+    try {
+      const hold = factory.holdRequest(HEARTBEAT)
+      const { id, frame } = await joinFrame('held')
+      socket.write(frame)
+      await hold.arrived()
+      socket.destroy()
+      await flush()
+      expect(upstream.destroyed).toBe(false)
+
+      const answered = hold.forward()
+      expect(upstream.writes).toEqual([frame])
+      upstream.emit('data', responseFrame(id))
+
+      expect(await settled(answered)).toEqual(responseFrame(id))
+      expect(upstream.destroyed).toBe(true)
+    } finally {
+      factory.closeUpstreams()
+    }
+  })
+
+  test('rejects a forward when the broker side ends before the response, and one after it closed', async () => {
+    const { factory, socket, upstream } = inMemory()
+    try {
+      const first = factory.holdRequest(HEARTBEAT)
+      const second = factory.holdRequest(HEARTBEAT)
+      socket.write((await joinFrame('first')).frame)
+      socket.write((await joinFrame('second')).frame)
+      await second.arrived()
+
+      const answered = first.forward()
+      upstream.emit('end')
+
+      await expect(settled(answered)).rejects.toThrow('HoldingSocket: the broker side closed')
+      await expect(settled(second.forward())).rejects.toThrow(
+        'HoldingSocket: the broker side closed'
+      )
+    } finally {
+      factory.closeUpstreams()
+    }
+  })
+
+  test('passes split and coalesced frames whole in both directions', async () => {
+    const { factory, socket, upstream, seen } = inMemory()
+    try {
+      const [a, b, c] = await Promise.all(['a', 'b', 'c'].map((member) => joinFrame(member)))
+      socket.write(a.frame.subarray(0, 7))
+      socket.write(a.frame.subarray(7))
+      socket.write(Buffer.concat([b.frame, c.frame]))
+
+      expect(upstream.writes).toEqual([a.frame, b.frame, c.frame])
+
+      const replies = [responseFrame(a.id, 'x'), responseFrame(b.id, 'yy'), responseFrame(c.id)]
+      const stream = Buffer.concat(replies)
+      upstream.emit('data', stream.subarray(0, 3))
+      upstream.emit('data', stream.subarray(3, replies[0].length + 2))
+      upstream.emit('data', stream.subarray(replies[0].length + 2))
+
+      expect(seen.data).toEqual(replies)
+    } finally {
+      factory.closeUpstreams()
+    }
+  })
+
+  test('withholds the response its predicate picks from the request frame', async () => {
+    const { factory, socket, upstream, seen } = inMemory()
+    try {
+      const first = await joinFrame('first')
+      const second = await joinFrame('second')
+      const withheld = factory.withholdResponse({
+        ...HEARTBEAT,
+        match: (request) => request.readInt32BE(8) === second.id,
+      })
+      socket.write(first.frame)
+      socket.write(second.frame)
+
+      upstream.emit('data', responseFrame(first.id))
+      upstream.emit('data', responseFrame(second.id))
+
+      expect(await settled(withheld.arrived())).toEqual(responseFrame(second.id))
+      expect(seen.data).toEqual([responseFrame(first.id)])
+    } finally {
+      factory.closeUpstreams()
+    }
+  })
+
+  test('teardown settles unmatched holds, rejects a pending forward and closes every broker side', async () => {
+    const { factory, socket, upstream } = inMemory()
+    const kept = factory.holdRequest(HEARTBEAT)
+    socket.write((await joinFrame('kept')).frame)
+    await kept.arrived()
+    const answered = kept.forward()
+    const request = factory.holdRequest(HEARTBEAT)
+    const response = factory.withholdResponse(HEARTBEAT)
+
+    factory.closeUpstreams()
+
+    await expect(settled(answered)).rejects.toThrow('HoldingSocket: the broker side closed')
+    await expect(settled(request.arrived())).resolves.toBeNull()
+    await expect(settled(response.arrived())).resolves.toBeNull()
+    expect(upstream.destroyed).toBe(true)
   })
 })
