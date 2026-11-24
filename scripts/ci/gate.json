@@ -9451,7 +9451,7 @@
         "src/consumer/__tests__/regexDiscovery.spec.js \u203a a topic created after a pattern subscription on the fake lane joins again with both names at the next metadata refresh",
         "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope a changed desired list during heartbeat encoding is sent on the following tick",
         "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope a follower cannot recreate a deleted match through the leader union",
-        "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope a newer failed refresh never authorizes an older full reply",
+        "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope a newer failed refresh never authorizes an older full reply, which ends with that failure",
         "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope the conditional and the explicit running discovery hand the cluster one observer",
         "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope concurrent refreshes join only within one subscription key through refreshMetadata",
         "src/consumer/__tests__/regexDiscovery.spec.js \u203a discovery refreshes and their scope concurrent refreshes join only within one subscription key through refreshMetadataIfNecessary",

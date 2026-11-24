@@ -1,5 +1,6 @@
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const { sharedSetup } = require('../admin/deadline')
+const describeThrown = require('../network/describeThrown')
 
 const UNKNOWN_EPOCH = -1
 const NO_LEADER_ID = -1
@@ -103,9 +104,11 @@ module.exports = class MetadataCache {
    * @param {() => boolean} [options.isCurrent] refuses stale work before any cache/event effect
    * @param {boolean} [options.publish=true] `false` leaves the routing notification to the caller,
    *        which sends it once the answer's brokers are installed
+   * @param {Array<() => void>} [options.notices] receives the debug logs and topic-recreated events
+   *        instead of running them, so a caller installing more in the same step runs them after it
    * @returns {void}
    */
-  update(metadata, { full = false, isCurrent = () => true, publish = true } = {}) {
+  update(metadata, { full = false, isCurrent = () => true, publish = true, notices } = {}) {
     if (!isCurrent()) return
     const liveBrokerIds = this.liveBrokerIds(metadata)
 
@@ -118,7 +121,7 @@ module.exports = class MetadataCache {
 
       // Step 1 - topic-id diff, before any epoch comparison. A recreation drops this topic's
       // partition entries entirely, so the new incarnation's epoch 0 is accepted.
-      const recreation = this.diffTopicId(name, entry, topicMetadata.topicId)
+      const recreation = this.diffTopicId(name, entry, topicMetadata.topicId, notices)
 
       if (!entry || recreation) {
         entry = { topicId: null, seenAt: 0, decodedReleased: false, partitions: new Map() }
@@ -153,12 +156,18 @@ module.exports = class MetadataCache {
         // Step 2 - never defend a positive leader the cluster no longer advertises.
         // Step 3 - compare only when both sides know their epoch.
         if (this.isStale(cached, partition, liveBrokerIds)) {
-          this.logger.debug('Ignoring stale metadata for partition, keeping the cached leader', {
+          const stale = {
             topic: name,
             partition: partition.partitionId,
             cachedLeaderEpoch: cached.leaderEpoch,
             decodedLeaderEpoch: partition.leaderEpoch,
-          })
+          }
+          this.notify(notices, () =>
+            this.logger.debug(
+              'Ignoring stale metadata for partition, keeping the cached leader',
+              stale
+            )
+          )
           partition.leader = cached.leader
           partition.leaderEpoch = cached.leaderEpoch
         } else {
@@ -178,10 +187,22 @@ module.exports = class MetadataCache {
     this.releaseTopicsAbsentFrom(full)
 
     for (const recreation of recreations || []) {
-      this.emit(CLUSTER_TOPIC_RECREATED, recreation)
+      this.notify(notices, () => this.emit(CLUSTER_TOPIC_RECREATED, recreation))
     }
 
     if (publish) this.publishRoutingChange()
+  }
+
+  /**
+   * Runs a notification now, or queues it when the caller collects them.
+   * @private
+   * @param {Array<() => void>|undefined} notices the caller's queue, if any
+   * @param {() => void} notice a log line or an event
+   * @returns {void}
+   */
+  notify(notices, notice) {
+    if (notices) notices.push(notice)
+    else notice()
   }
 
   /**
@@ -208,7 +229,9 @@ module.exports = class MetadataCache {
       try {
         sharedSetup(listener)
       } catch (e) {
-        this.logger.error('Routing change listener threw, ignoring it', { error: e.message })
+        this.logger.error('Routing change listener threw, ignoring it', {
+          error: describeThrown(e),
+        })
       }
     }
   }
@@ -217,14 +240,16 @@ module.exports = class MetadataCache {
    * Removes a topic and the reverse mapping for its remembered id.
    * Repeated removal is harmless; no entry is retained for a forgotten name.
    * @param {string} topic name to forget
+   * @param {{publish?: boolean}} [options] `publish: false` leaves the routing notification to a
+   *   caller that installs more in the same step
    * @returns {void}
    */
-  forget(topic) {
+  forget(topic, { publish = true } = {}) {
     const entry = this.topics.get(topic)
     if (entry?.topicId != null) this.topicIds.delete(entry.topicId)
     this.topics.delete(topic)
     this.pendingTopics.delete(topic)
-    if (entry) this.publishRoutingChange()
+    if (entry && publish) this.publishRoutingChange()
   }
 
   /**
@@ -422,10 +447,11 @@ module.exports = class MetadataCache {
    * @param {string} name
    * @param {{ topicId: string|null }|undefined} entry
    * @param {string|null|undefined} topicId the id the fresh response carries
+   * @param {Array<() => void>} [notices] receives the debug log instead of running it
    * @returns {{ topic: string, previousTopicId: string, topicId: string }|null} the event payload
    *          for a recreation, null otherwise
    */
-  diffTopicId(name, entry, topicId) {
+  diffTopicId(name, entry, topicId, notices) {
     const previousTopicId = entry && entry.topicId
     const freshTopicId = this.usableTopicId(topicId)
     const isRecreation =
@@ -436,12 +462,11 @@ module.exports = class MetadataCache {
     }
 
     this.topicIds.delete(previousTopicId)
-    this.logger.debug('Topic has been recreated under a new id', {
-      topic: name,
-      previousTopicId,
-      topicId: freshTopicId,
-    })
-    return { topic: name, previousTopicId, topicId: freshTopicId }
+    const recreation = { topic: name, previousTopicId, topicId: freshTopicId }
+    this.notify(notices, () =>
+      this.logger.debug('Topic has been recreated under a new id', { ...recreation })
+    )
+    return recreation
   }
 
   /**
@@ -594,7 +619,7 @@ module.exports = class MetadataCache {
       this.logger.error('Instrumentation event listener threw, ignoring it', {
         eventName,
         topic: payload && payload.topic,
-        error: e.message,
+        error: describeThrown(e),
       })
     }
   }

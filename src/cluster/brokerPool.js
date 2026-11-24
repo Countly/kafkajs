@@ -4,6 +4,7 @@ const {
   shareMetadata,
   sharedSetup,
   retrierOf,
+  waitOf,
   withAdminGuard,
 } = require('../admin/deadline')
 const { isNativeError } = require('util').types
@@ -30,8 +31,16 @@ const UNKNOWN_TOPIC_OR_PARTITION = 3
 const ISOLATED_RECHECK_MS = 1000
 /** A metadata request whose cluster a rebootstrap replaced before its outcome took effect. */
 const SUPERSEDED = Symbol('superseded')
-/** A refresh pass whose newer pass of the same scope did not do its work: the call asks again. */
-const AGAIN = Symbol('again')
+/** A metadata answer that a newer accepted answer overtook while its pools were built. */
+const OVERTAKEN = Symbol('overtaken')
+/** The `code` of the retriable error a selection fails with when its broker was replaced. */
+const SELECTION_SUPERSEDED = 'SELECTION_SUPERSEDED'
+
+/**
+ * Names one installed metadata answer: its place in acceptance order, the rebootstrap generation
+ * and the disconnect count it was installed under.
+ * @typedef {{publication: number, recovery: number, disconnects: number}} MetadataReceipt
+ */
 
 /** Topic errors that drop an earlier producer target the broker no longer serves. */
 const DROPPED_TOPIC_ERRORS = new Set([
@@ -68,6 +77,23 @@ const { keys, assign, values } = Object
  */
 const hasBrokerMoved = (broker, { host, port }) =>
   broker.connectionPool.host !== host || broker.connectionPool.port !== port
+
+/**
+ * @param {Broker|undefined} broker
+ * @param {{ host: string, port: number }} address
+ * @returns {boolean} whether the broker exists and is at the address
+ */
+const atAddress = (broker, address) => !!broker && !hasBrokerMoved(broker, address)
+
+/**
+ * @param {Error} [cause] the failure the selection met, if any
+ * @returns {KafkaJSConnectionError} retriable: the selected broker was replaced or disconnected
+ */
+const selectionSuperseded = (cause) =>
+  new KafkaJSConnectionError('The broker was replaced while it was selected', {
+    code: SELECTION_SUPERSEDED,
+    cause,
+  })
 
 /**
  * The broker option of a producer lifecycle's private pre-write check, as an argument list: none
@@ -140,7 +166,7 @@ module.exports = class BrokerPool {
    *   a collaborator it can build itself. `Cluster` always injects its own, which is then the
    *   single instance every route reads.
    * @param {(topics: string[]) => ((topic: string) => boolean)} [options.captureTopics] scoped producer publication predicate
-   * @param {(topic: string) => boolean} [options.dropTopic] required when `captureTopics` is
+   * @param {(topic: string, options?: {publish?: boolean}) => boolean} [options.dropTopic] required when `captureTopics` is
    *   given: forgets a producer target the broker no longer serves, unless producer work still
    *   owns it; returns whether it did
    * @param {(topic: string) => boolean} [options.isNewTarget] required when `captureTopics` is
@@ -270,9 +296,14 @@ module.exports = class BrokerPool {
     this.recoveries = 0
     /** Counts the accepted metadata answers, so an answer can tell a newer one overtook it. */
     this.metadataPublications = 0
+    /** @type {{publication: number, settled: boolean, done: Promise<void>}|null} the newest accepted answer */
+    this.acceptedAnswer = null
+    /** @type {MetadataReceipt|null} the installed answer; null once a rebootstrap or disconnect cleared it */
+    this.installedMetadata = null
     /**
-     * The newest in-flight refresh pass of each subscription scope, until it settles.
-     * @type {WeakMap<object, {sequence: number, onMetadata?: Function, done: Promise<unknown>}>}
+     * The newest refresh of each subscription scope, kept while any refresh of that scope runs, so
+     * an older one can still read its outcome.
+     * @type {WeakMap<object, {newest: object, active: number}>}
      */
     this.scopeRefreshes = new WeakMap()
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
@@ -310,10 +341,11 @@ module.exports = class BrokerPool {
         checked(null)
         const seed = this.seedBroker
         const table = this.brokers
-        const publication = this.metadataPublications
-        const brokers = new Set([seed, ...values(table)])
+        const installedMetadata = this.installedMetadata
+        const brokers = new Set(values(table))
+        // Only an answer installed meanwhile shows the cluster answers; one still preparing does not.
         const ownsRouting = () =>
-          this.brokers === table && this.metadataPublications === publication
+          this.brokers === table && this.installedMetadata === installedMetadata
         await this.createSeedBroker({
           fence,
           isCurrent: () => ownsRouting() && this.seedBroker === seed,
@@ -322,9 +354,11 @@ module.exports = class BrokerPool {
             this.recoveries += 1
             this.metadata = null
             this.metadataExpireAt = null
+            this.installedMetadata = null
             this.setupMetadataEndpoints.clear()
+            // `createSeedBroker` retired the replaced seed just before this step.
             for (const broker of new Set([...brokers, ...values(this.brokers)])) {
-              if (broker !== installed) this.closeObsolete(broker)
+              if (broker !== installed && broker !== seed) this.closeObsolete(broker)
             }
             this.retainSetupEndpoints()
             this.lastRebootstrapAt = Date.now()
@@ -786,7 +820,7 @@ module.exports = class BrokerPool {
    *   it closed, a pool built meanwhile is retired unused instead of installed
    * @param {() => boolean} [options.isCurrent] captured recovery routing identity
    * @param {(seed: Broker) => void} [options.install] runs synchronously right after the new seed
-   *   is installed and before the replaced one is retired; not run for an adopted seed
+   *   is installed and the replaced one retired; not run for an adopted seed
    * @returns {Promise<Broker>} installed seed
    * @throws {Error} original caller refusal or superseded recovery identity
    */
@@ -813,8 +847,8 @@ module.exports = class BrokerPool {
       connectionPool,
       logger: this.rootLogger,
     })
-    install?.(this.seedBroker)
     this.closeObsolete(previousSeedBroker)
+    install?.(this.seedBroker)
     return this.seedBroker
   }
 
@@ -936,6 +970,7 @@ module.exports = class BrokerPool {
     this.disconnects++
     this.brokers = {}
     this.metadata = null
+    this.installedMetadata = null
     this.versions = null
     this.authenticationBlackout.clear()
 
@@ -1076,69 +1111,45 @@ module.exports = class BrokerPool {
   }
 
   /**
-   * Refreshes one discovery episode with the original subscription and lifecycle checks. A pass
-   * that handed over to a newer pass of its scope that did not do its work runs once more; a
-   * second handover is not followed.
+   * Refreshes one discovery episode with the original subscription and lifecycle checks.
    * @param {string[]} topics requested names
    * @param {object} [options] see `refreshMetadata`
+   * @param {import('../consumer/subscription')} [options.metadataScope]
+   * @param {() => boolean} [options.isCurrent]
+   * @returns {Promise<void>} installs only a current snapshot
+   * @throws {Error} as `refreshPass`
+   */
+  async refreshMetadataUnshared(topics, options = {}) {
+    const { metadataScope = this.consumerMetadataScope, isCurrent = () => true } = options
+    if (!isCurrent()) return
+    await this.refreshPass(topics, options, metadataScope)
+  }
+
+  /**
+   * One refresh: its requests, the install of its answer and its settlement, as `refreshMetadata`
+   * describes them. A scoped refresh is the newest of its scope from its start. A refresh whose
+   * answer newer work took over waits for that work within its own lifecycle and deadline, and
+   * takes its outcome when it serves this call (see `takeOver` inside); otherwise it asks once
+   * more itself, spending the call's one reissue, within the same retry attempt.
+   * @param {string[]} topics requested names
+   * @param {object} options see `refreshMetadata`
    * @param {import('../producer/generation')} [options.fence]
    * @param {() => Error|null} [options.guard]
-   * @param {import('../consumer/subscription')} [options.metadataScope]
    * @param {() => boolean} [options.isCurrent]
    * @param {boolean} [options.allowAutoTopicCreation]
    * @param {boolean} [options.allowLeaderless]
    * @param {(metadata: object) => void} [options.onMetadata]
-   * @returns {Promise<void>} installs only a current snapshot
-   * @throws {Error} original routing or episode refusal, or the failure of the pass it handed over to
-   * @throws {KafkaJSConnectionError} retriable, when a rebootstrap superseded the call's request
-   */
-  async refreshMetadataUnshared(topics, options = {}) {
-    if ((await this.startRefresh(topics, options)) === AGAIN) {
-      await this.startRefresh(topics, options)
-    }
-  }
-
-  /**
-   * Starts one refresh pass. A scoped pass is the newest of its scope until it settles, so an
-   * older pass of that scope can hand over to it.
-   * @param {string[]} topics requested names
-   * @param {object} options see `refreshMetadata`
-   * @returns {Promise<boolean|typeof AGAIN>} see `refreshPass`
-   */
-  startRefresh(topics, options) {
-    const { metadataScope = this.consumerMetadataScope, isCurrent = () => true } = options
-    if (!isCurrent()) return Promise.resolve(false)
-    const ticket = metadataScope?.captureMetadata()
-    const done = this.refreshPass(topics, options, metadataScope, ticket)
-    if (ticket) {
-      const pass = { sequence: ticket.sequence, onMetadata: options.onMetadata, done }
-      this.scopeRefreshes.set(metadataScope, pass)
-      const release = () => {
-        if (this.scopeRefreshes.get(metadataScope) === pass)
-          this.scopeRefreshes.delete(metadataScope)
-      }
-      done.then(release, release)
-    }
-    return done
-  }
-
-  /**
-   * One refresh pass: its requests, the install of its answer and its settlement, as
-   * `refreshMetadata` describes them.
-   * @param {string[]} topics requested names
-   * @param {object} options see `refreshMetadata`
-   * @param {import('../consumer/subscription')|null|undefined} metadataScope the pass's scope
-   * @param {object|undefined} ticket the scope's ticket of this pass
-   * @returns {Promise<boolean|typeof AGAIN>} true once its answer, or the answer of the newer pass
-   *   of its scope it handed over to, is installed; AGAIN when that newer pass installed nothing
-   *   or observed with another observer
-   * @throws {Error} as `refreshMetadata`, or the failure of the pass it handed over to
+   * @param {import('../consumer/subscription')|null|undefined} metadataScope the refresh's scope
+   * @returns {Promise<void>}
+   * @throws {Error} original refresh failure, caller refusal, or the failure of the newer refresh
+   *   of its scope it was handed over to
+   * @throws {KafkaJSConnectionError} retriable, when a rebootstrap or newer work superseded the
+   *   call's request and its one reissue
    */
   async refreshPass(
     topics,
     { fence, guard, isCurrent = () => true, allowAutoTopicCreation, allowLeaderless, onMetadata },
-    metadataScope,
-    ticket
+    metadataScope
   ) {
     guard = withAdminGuard(guard)
     const check = () => {
@@ -1149,7 +1160,26 @@ module.exports = class BrokerPool {
     }
     const modeGeneration = this.consumerMetadataGeneration ?? 0
     const disconnects = this.disconnects
-    // The call's scope still stands, though a newer pass of that scope may have taken over.
+    let settlePass
+    /** What an older refresh of the scope reads once this one settled; `failure` is a genuine one. */
+    const pass = {
+      sequence: 0,
+      onMetadata,
+      settled: false,
+      done: new Promise((resolve) => (settlePass = resolve)),
+      receipt: null,
+      observed: false,
+      failure: null,
+    }
+    let record = null
+    let ticket = null
+    /** Takes a new ticket of the scope and makes this refresh its newest. */
+    const issue = () => {
+      ticket = metadataScope.captureMetadata()
+      pass.sequence = ticket.sequence
+      record.newest = pass
+    }
+    // The call's scope still stands, though a newer refresh of that scope may have taken over.
     const live = () =>
       this.disconnects === disconnects &&
       !fence?.closed &&
@@ -1158,6 +1188,7 @@ module.exports = class BrokerPool {
       isCurrent() &&
       (!ticket || ticket.isLive())
     const applicable = () => live() && (!ticket || ticket.isCurrent())
+    const displaced = () => !!ticket && live() && !ticket.isCurrent()
     const clientPattern = metadataScope?.hasPatterns()
     if (clientPattern) topics = []
     if (clientPattern || this.consumerBrokerRegex) allowAutoTopicCreation = false
@@ -1177,36 +1208,95 @@ module.exports = class BrokerPool {
     const current = () => this.recoveries === recovery
     const superseded = () =>
       new KafkaJSConnectionError('A rebootstrap replaced the metadata connection')
+    /** The place in acceptance order of this call's latest answer. */
+    let accepted = 0
+    let observed = false
+    /**
+     * Waits for `promise` no longer than this call's lifecycle and deadline allow.
+     * @param {Promise<unknown>} promise newer work's settlement, which never rejects
+     * @returns {Promise<unknown>}
+     * @throws {Error} the lifecycle's close error or the deadline's refusal
+     */
+    const bounded = (promise) => waitOf(() => (fence ? fence.wait(promise) : promise))
 
     /**
-     * Builds the pools of the brokers the answer adds or moves, then installs the answer in one
-     * synchronous step: the broker table, the setup endpoints, `this.metadata`, the cache, the
-     * observer, the freshness and the routing notification. Nothing of it is visible before. An
-     * answer that a newer answer, a rebootstrap or the caller overtook while its pools were built
-     * installs nothing. Pools the install did not take are closed unused.
+     * Judges the answer's topics against the targets as they stand now, with no effect.
      * @param {object} response the decoded Metadata answer
-     * @param {object[]|null} incoming a producer refresh's accepted topics, merged at install
-     * @returns {Promise<boolean|typeof SUPERSEDED>} whether the answer was installed; SUPERSEDED
-     *   when a rebootstrap overtook it
-     * @throws {Error} a pool build or topic failure; nothing was installed
+     * @returns {(notices: Array<() => void>) => object} applies the judgement inside the install
+     *   step and returns the metadata to install
+     * @throws {Error} a topic or partition error of the answer
      */
-    const install = async (response, incoming) => {
+    const judge = (response) => {
+      if (accept) {
+        const { settled, drop } = this.settleTopicErrors(response.topicMetadata, accept)
+        checkPartitions(settled, { allowLeaderless })
+        const incoming = settled.filter(({ topic }) => accept(topic))
+        return (notices) => {
+          drop(notices)
+          const replaced = new Set(incoming.map(({ topic }) => topic))
+          const retained = (this.metadata?.topicMetadata || []).filter(
+            ({ topic }) => !replaced.has(topic)
+          )
+          return { ...response, topicMetadata: [...retained, ...incoming] }
+        }
+      }
+      if (establishment) {
+        const { healthy, commit } = this.isolateUnknownTopics(
+          response.topicMetadata,
+          establishment,
+          { allowLeaderless }
+        )
+        return (notices) => {
+          commit(notices)
+          return { ...response, topicMetadata: healthy }
+        }
+      }
+      return () => response
+    }
+
+    /**
+     * Builds the pools of the brokers the answer adds or moves, then installs it in the one
+     * synchronous step (`installMetadata`), with its topics judged again against the targets as
+     * they stand then. Only then do notices, the observer and the routing notification run. An
+     * answer that a rebootstrap, the caller or a newer accepted answer overtook while its pools
+     * were built installs nothing; pools the install did not take are closed on every path.
+     * @param {object} response the decoded Metadata answer
+     * @returns {Promise<MetadataReceipt|false|typeof SUPERSEDED|typeof OVERTAKEN>} the receipt;
+     *   false when the caller's scope no longer applies
+     * @throws {Error} a pool build, topic or observer failure; an observer runs after the install
+     */
+    const install = async (response) => {
+      judge(response)
       const publication = ++this.metadataPublications
-      const previousBrokers = { ...this.brokers }
+      accepted = publication
+      let settleAnswer
+      const answer = { publication, settled: false }
+      answer.done = new Promise((resolve) => (settleAnswer = resolve))
+      this.acceptedAnswer = answer
       const owns = () => applicable() && current() && this.metadataPublications === publication
-      const at = (broker, { host, port }) => !!broker && !hasBrokerMoved(broker, { host, port })
-      // An entry installed while the pools were built (an endpoint hint) is newer than the answer.
-      const newer = (nodeId, table) => !!table[nodeId] && table[nodeId] !== previousBrokers[nodeId]
-      const needsPool = (node, table) =>
-        !newer(node.nodeId, table) && !at(table[node.nodeId], node) && !at(this.seedBroker, node)
+      const previous = { ...this.brokers }
+      const previousPools = new Map(
+        Object.entries(previous).map(([nodeId, entry]) => [nodeId, entry.connectionPool])
+      )
+      // An entry, or a pool swapped in place, that an endpoint hint installed since is newer.
+      const newer = (nodeId, table) => {
+        const entry = table[nodeId]
+        return (
+          !!entry &&
+          (entry !== previous[nodeId] || entry.connectionPool !== previousPools.get(String(nodeId)))
+        )
+      }
+      const needsPool = (node) =>
+        !newer(node.nodeId, this.brokers) &&
+        !atAddress(this.brokers[node.nodeId], node) &&
+        !atAddress(this.seedBroker, node)
       const pools = new Map()
       try {
         let missing
         while (
           owns() &&
-          (missing = response.brokers.filter(
-            (node) => !pools.has(node.nodeId) && needsPool(node, this.brokers)
-          )).length > 0
+          (missing = response.brokers.filter((node) => !pools.has(node.nodeId) && needsPool(node)))
+            .length > 0
         ) {
           for (const { nodeId, host, port, rack } of missing) {
             const pool = await this.buildConnectionPool(
@@ -1217,86 +1307,48 @@ module.exports = class BrokerPool {
             pools.set(nodeId, pool)
           }
         }
-        if (!owns()) return current() ? false : SUPERSEDED
+        if (!owns()) return !current() ? SUPERSEDED : applicable() ? OVERTAKEN : false
 
-        let metadata = response
-        if (incoming) {
-          const replaced = new Set(incoming.map(({ topic }) => topic))
-          const retained = (this.metadata?.topicMetadata || []).filter(
-            ({ topic }) => !replaced.has(topic)
-          )
-          metadata = { ...response, topicMetadata: [...retained, ...incoming] }
-        } else if (establishment) {
-          metadata = {
-            ...response,
-            topicMetadata: this.isolateUnknownTopics(response.topicMetadata, establishment, {
-              allowLeaderless,
-            }),
+        const commit = judge(response)
+        const notices = []
+        // An empty topic list asks for every topic: the cache prunes what the answer lacks.
+        const full = !accept && (!topics || topics.length === 0)
+        const receipt = this.installMetadata(
+          publication,
+          { full, notices, isCurrent: owns },
+          () => {
+            this.installBrokers(response.brokers, { previous, newer, pools })
+            return commit(notices)
           }
-        }
-
-        const table = { ...this.brokers }
-        const seed = this.seedBroker
-        const seedAdvertised = metadata.brokers.some((node) => at(seed, node))
-        for (const node of metadata.brokers) {
-          const { nodeId, rack } = node
-          const entry = table[nodeId]
-          if (newer(nodeId, table)) continue
-          if (at(entry, node)) {
-            entry.connectionPool.rack = rack
-          } else if (at(seed, node)) {
-            seed.nodeId = nodeId
-            this.bindTelemetryNode(seed)
-            seed.connectionPool.rack = rack
-            this.brokers[nodeId] = seed
-            this.closeObsolete(entry)
-          } else if (entry && entry === seed && !seedAdvertised) {
-            this.replacePool(entry, pools.get(nodeId))
-            pools.delete(nodeId)
-          } else {
-            this.brokers[nodeId] = this.createBroker({
-              logger: this.rootLogger,
-              versions: this.versions,
-              connectionPool: pools.get(nodeId),
-              nodeId,
-            })
-            pools.delete(nodeId)
-            this.closeObsolete(entry)
-          }
-        }
-        const listed = new Set(metadata.brokers.map(({ nodeId }) => String(nodeId)))
-        for (const [nodeId, previous] of Object.entries(previousBrokers)) {
-          if (!listed.has(nodeId) && this.brokers[nodeId] === previous) {
-            if (previous === this.seedBroker) delete this.brokers[nodeId]
-            else this.closeObsolete(previous)
-          }
-        }
-        this.setupMetadataEndpoints = new Map(
-          metadata.brokers.map(({ nodeId, host, port }) => [String(nodeId), `${host}:${port}`])
         )
-        this.retainSetupEndpoints()
-        // No await between the assignment and the cache update, so no reader sees one without the
-        // other. An empty topic list asks for every topic: the cache prunes what the answer lacks.
-        this.metadata = metadata
-        this.metadataCache.update(metadata, {
-          full: !accept && (!topics || topics.length === 0),
-          publish: false,
-        })
-        // The cache's synchronous topic-recreated event may have retired this call.
-        if (applicable()) onMetadata?.(metadata)
-        if (applicable()) this.metadataExpireAt = Date.now() + this.metadataMaxAge
-        this.metadataCache.publishRoutingChange()
-        return true
+        const metadata = this.metadata
+        this.runNotices(notices)
+        let thrown = null
+        // A notice may have retired this call, or started a rebootstrap or a disconnect.
+        if (onMetadata && applicable() && this.installedMetadata === receipt) {
+          try {
+            onMetadata(metadata)
+            observed = true
+          } catch (error) {
+            thrown = error
+          }
+        }
+        if (this.installedMetadata === receipt) this.metadataCache.publishRoutingChange()
+        if (thrown) throw thrown
+        return receipt
       } finally {
         for (const pool of pools.values()) this.closePool(pool)
+        answer.settled = true
+        settleAnswer()
       }
     }
 
     /**
      * Sends one Metadata request and installs its answer.
      * @param {(error: Error) => void} bail ends the call with `error`
-     * @returns {Promise<boolean|typeof SUPERSEDED|void>} whether the answer was installed;
-     *   SUPERSEDED when a rebootstrap replaced the cluster the request went to
+     * @returns {Promise<MetadataReceipt|false|typeof SUPERSEDED|typeof OVERTAKEN|void>} see
+     *   `install`; SUPERSEDED when a rebootstrap replaced the cluster the request went to;
+     *   undefined once `bail` ended the call
      * @throws {Error} a failure the retrier retries
      */
     const request = async (bail) => {
@@ -1324,13 +1376,7 @@ module.exports = class BrokerPool {
         check()
         if (!applicable()) return false
         if (!current()) return SUPERSEDED
-        let incoming = null
-        if (accept) {
-          const settled = this.settleTopicErrors(response.topicMetadata, accept)
-          checkPartitions(settled, { allowLeaderless })
-          incoming = settled.filter(({ topic }) => accept(topic))
-        }
-        return await install(response, incoming)
+        return await install(response)
       } catch (e) {
         fence?.check()
         if (guard?.()) return bail(e)
@@ -1348,50 +1394,248 @@ module.exports = class BrokerPool {
       }
     }
 
-    let reissued = false
     /**
-     * One retrier attempt: a request, and once per call a second one when a rebootstrap replaced
-     * the first one's cluster. The second runs inside the same attempt, so the call keeps its one
-     * retry count and deadline, and `retries: 0` still gets it.
-     * @param {(error: Error) => void} bail ends the call with `error`
-     * @returns {Promise<boolean>} whether the last request's answer was installed
+     * Waits for the newer work that took this call's answer over: the newest refresh of its scope
+     * when a newer one was issued, else the newest accepted answer. Its outcome serves this call
+     * when it is installed and still held by the pool and, for a call with an observer, observed
+     * by the same observer.
+     * @returns {Promise<MetadataReceipt|null|false>} the receipt that serves the call; null when
+     *   the call asks again itself; false when no newer refresh of its scope exists (another
+     *   ticket of the scope took over) or the scope moved, so the call ends as before
+     * @throws {Error} the call's refusal, or the failure of the newer refresh of its scope
      */
-    const attempt = async (bail) => {
-      let outcome = await request(bail)
-      if (outcome === SUPERSEDED && !reissued) {
-        reissued = true
-        outcome = await request(bail)
+    const takeOver = async () => {
+      if (displaced()) {
+        let newest = record.newest
+        while (newest !== pass && !newest.settled) {
+          await bounded(newest.done)
+          check()
+          newest = record.newest
+        }
+        if (newest === pass || !live()) return false
+        if (newest.failure) throw newest.failure
+        const serves =
+          !!newest.receipt &&
+          newest.onMetadata === onMetadata &&
+          (!onMetadata || newest.observed) &&
+          this.holdsInstall(newest.receipt)
+        return serves ? newest.receipt : null
       }
-      if (outcome === SUPERSEDED) bail(superseded())
-      return outcome === true
+      let newest
+      while ((newest = this.acceptedAnswer).publication > accepted && !newest.settled) {
+        await bounded(newest.done)
+        check()
+      }
+      const installed = this.installedMetadata
+      return !onMetadata && installed && installed.publication > accepted ? installed : null
     }
 
-    let installed = false
-    let failure = null
+    let reissued = false
+    /** @type {MetadataReceipt|null} newer work's receipt this call took over */
+    let adopted = null
+    /** @type {Error|null} newer work's failure, or the refusal met while waiting for it */
+    let adoptedFailure = null
+    /**
+     * One retrier attempt: a request, then, once per call, a second one when a rebootstrap
+     * replaced the first one's cluster or newer work that took its answer over does not serve the
+     * call. All of it runs inside the same attempt, so the call keeps its one retry count and
+     * deadline, and `retries: 0` still gets the second request.
+     * @param {(error: Error) => void} bail ends the call with `error`
+     * @returns {Promise<MetadataReceipt|null>} the receipt of the answer that serves the call
+     */
+    const attempt = async (bail) => {
+      for (;;) {
+        const outcome = await request(bail)
+        if (outcome === undefined) return null
+        if (outcome === OVERTAKEN || (outcome === false && displaced())) {
+          let taken
+          try {
+            taken = await takeOver()
+          } catch (error) {
+            adoptedFailure = error
+            return bail(error)
+          }
+          if (taken) return (adopted = taken)
+          if (taken === false) return null
+        } else if (outcome !== SUPERSEDED) {
+          return outcome || null
+        }
+        if (reissued) {
+          return bail(
+            outcome === SUPERSEDED
+              ? superseded()
+              : new KafkaJSConnectionError('A newer metadata refresh superseded this one')
+          )
+        }
+        reissued = true
+        if (ticket && !ticket.isCurrent()) issue()
+      }
+    }
+
+    if (metadataScope) {
+      record = this.scopeRefreshes.get(metadataScope) ?? { newest: pass, active: 0 }
+      this.scopeRefreshes.set(metadataScope, record)
+      record.active += 1
+      issue()
+    }
     try {
-      installed = await this.retryFor(fence)(attempt)
-    } catch (error) {
-      failure = error
-    }
-    // The caller's refusal comes first, whatever the outcome.
-    check()
-    if (ticket && live() && !ticket.isCurrent()) {
-      // A newer pass of this live scope took over: its outcome is this call's.
-      const successor = this.scopeRefreshes.get(metadataScope)
-      if (!(successor?.sequence > ticket.sequence)) return false
-      const done = await successor.done
+      let receipt = null
+      let failure = null
+      try {
+        receipt = await this.retryFor(fence)(attempt)
+      } catch (error) {
+        failure = error
+      }
+      // The caller's refusal comes first, whatever the outcome.
       check()
-      return done === true && successor.onMetadata === onMetadata ? true : AGAIN
+      if (adopted || (failure && failure === adoptedFailure)) {
+        if (failure) throw failure
+        return
+      }
+      if (!applicable()) return
+      // An outcome takes effect only on the cluster its request went to.
+      if (!current() && !this.recoveredFailures.has(failure)) throw superseded()
+      if (failure) {
+        pass.failure = failure
+        if (!fence?.closed) await this.onMetadataFailure(failure, { fence })
+        throw failure
+      }
+      pass.receipt = receipt
+      pass.observed = observed
+      if (receipt && this.installedMetadata === receipt) this.onMetadataSuccess()
+    } finally {
+      pass.settled = true
+      settlePass()
+      if (record && --record.active === 0 && this.scopeRefreshes.get(metadataScope) === record) {
+        this.scopeRefreshes.delete(metadataScope)
+      }
     }
-    if (!applicable()) return false
-    // An outcome takes effect only on the cluster its request went to.
-    if (!current() && !this.recoveredFailures.has(failure)) throw superseded()
-    if (failure) {
-      if (!fence?.closed) await this.onMetadataFailure(failure, { fence })
-      throw failure
+  }
+
+  /**
+   * The one install step of a metadata answer, synchronous and free of callbacks, so every
+   * reader sees an answer whole or not at all. `apply` reconciles the writer's own state (broker
+   * table, setup endpoints, topic targets) and returns the metadata to install; then
+   * `this.metadata`, the cache and the freshness change, and a receipt names the install. Logs,
+   * events and statuses go to `notices`. The caller then runs them (`runNotices`), calls its
+   * observer, and wakes the routing listeners once while the receipt is still the installed one.
+   * @private
+   * @param {number} publication the answer's place in acceptance order
+   * @param {object} options
+   * @param {boolean} options.full whether the answer lists every topic
+   * @param {Array<() => void>} options.notices receives the step's notifications
+   * @param {() => boolean} options.isCurrent the install's ownership, checked by the caller
+   * @param {() => object} apply the writer's own mutation
+   * @returns {MetadataReceipt}
+   */
+  installMetadata(publication, { full, notices, isCurrent }, apply) {
+    const metadata = apply()
+    this.metadata = metadata
+    this.metadataCache.update(metadata, { full, isCurrent, publish: false, notices })
+    this.metadataExpireAt = Date.now() + this.metadataMaxAge
+    this.installedMetadata = {
+      publication,
+      recovery: this.recoveries,
+      disconnects: this.disconnects,
     }
-    if (installed) this.onMetadataSuccess()
-    return installed
+    return this.installedMetadata
+  }
+
+  /**
+   * Runs an install's notifications in order. One that throws is dropped, so application code
+   * there can neither undo nor interrupt the install.
+   * @private
+   * @param {Array<() => void>} notices
+   * @returns {void}
+   */
+  runNotices(notices) {
+    for (const notice of notices) {
+      try {
+        notice()
+      } catch {}
+    }
+  }
+
+  /**
+   * Whether the pool still holds an install: the same answer, or a newer one of the same
+   * rebootstrap generation and connection.
+   * @private
+   * @param {MetadataReceipt} receipt
+   * @returns {boolean}
+   */
+  holdsInstall(receipt) {
+    const installed = this.installedMetadata
+    return (
+      !!installed &&
+      installed.recovery === receipt.recovery &&
+      installed.disconnects === receipt.disconnects &&
+      installed.publication >= receipt.publication
+    )
+  }
+
+  /**
+   * Reconciles the broker table and setup endpoints with an answer's brokers, synchronously. A
+   * cached broker the answer repeats keeps its object (a new rack is written in place), the seed
+   * is adopted at its own address, a moved broker takes its prepared pool and the old one is
+   * retired, and a broker the answer no longer lists is retired. An entry or pool installed after
+   * the answer was accepted is newer: it is kept, with its own endpoint.
+   * @private
+   * @param {Array<{nodeId: number, host: string, port: number, rack: string|null}>} nodes
+   * @param {object} prepared
+   * @param {Record<string, Broker>} prepared.previous the table when the answer was accepted
+   * @param {(nodeId: number, table: object) => boolean} prepared.newer
+   * @param {Map<number, import('../network/connectionPool')>} prepared.pools built for the
+   *   answer; the ones taken are removed
+   * @returns {void}
+   */
+  installBrokers(nodes, { previous, newer, pools }) {
+    const table = { ...this.brokers }
+    const seed = this.seedBroker
+    const seedAdvertised = nodes.some((node) => atAddress(seed, node))
+    const kept = new Set()
+    for (const node of nodes) {
+      const { nodeId, rack } = node
+      const entry = table[nodeId]
+      if (newer(nodeId, table)) {
+        kept.add(String(nodeId))
+      } else if (atAddress(entry, node)) {
+        entry.connectionPool.rack = rack
+      } else if (atAddress(seed, node)) {
+        seed.nodeId = nodeId
+        this.bindTelemetryNode(seed)
+        seed.connectionPool.rack = rack
+        this.brokers[nodeId] = seed
+        this.closeObsolete(entry)
+      } else if (entry && entry === seed && !seedAdvertised) {
+        this.replacePool(entry, pools.get(nodeId))
+        pools.delete(nodeId)
+      } else {
+        this.brokers[nodeId] = this.createBroker({
+          logger: this.rootLogger,
+          versions: this.versions,
+          connectionPool: pools.get(nodeId),
+          nodeId,
+        })
+        pools.delete(nodeId)
+        this.closeObsolete(entry)
+      }
+    }
+    const listed = new Set(nodes.map(({ nodeId }) => String(nodeId)))
+    for (const [nodeId, broker] of Object.entries(previous)) {
+      if (!listed.has(nodeId) && this.brokers[nodeId] === broker) {
+        if (broker === this.seedBroker) delete this.brokers[nodeId]
+        else this.closeObsolete(broker)
+      }
+    }
+    this.setupMetadataEndpoints = new Map(
+      nodes.map((node) => {
+        const { host, port } = kept.has(String(node.nodeId))
+          ? table[node.nodeId].connectionPool
+          : node
+        return [String(node.nodeId), `${host}:${port}`]
+      })
+    )
+    this.retainSetupEndpoints()
   }
 
   /**
@@ -1404,37 +1648,51 @@ module.exports = class BrokerPool {
    * they recover once the broker serves it again, or end as any send does: with the broker's
    * answer, a routing error or the delivery timeout. A topic being added is not judged this way:
    * its refusal fails the call. A topic this refresh no longer captures is skipped. Any other
-   * topic error is thrown, as the version's own parse would throw it, after the drops. The caller
-   * checks the partitions of the returned topics only afterwards, so a topic error takes
-   * precedence over a partition error, as in the strict parse.
+   * topic error is thrown, as the version's own parse would throw it, and nothing is dropped. The
+   * caller checks the partitions of the returned topics only afterwards, so a topic error takes
+   * precedence over a partition error, as in the strict parse. Judging changes nothing: the drops
+   * happen in the install step of the answer, through `drop`, so an answer that is not installed
+   * drops nothing, and they wake no routing listener of their own.
    * @param {object[]} topicMetadata the answer's topics, topic and partition errors retained
    * @param {(topic: string) => boolean} accept this refresh's publication predicate
-   * @returns {object[]} the topics answered without an error
+   * @returns {{settled: object[], drop: (notices: Array<() => void>) => void}} the topics
+   *   answered without an error, and the drops, which queue their log lines on `notices`
    * @throws {import('../errors').KafkaJSProtocolError} the first other topic error
    */
   settleTopicErrors(topicMetadata, accept) {
     const failed = topicMetadata.filter(
       ({ topicErrorCode }) => topicErrorCode != null && failure(topicErrorCode)
     )
-    if (failed.length === 0) return topicMetadata
+    const drops = []
     let thrown = null
     for (const { topic, topicErrorCode } of failed) {
       if (!accept(topic)) continue
       const error = createErrorFromCode(topicErrorCode)
       if (!this.isNewTarget(topic) && DROPPED_TOPIC_ERRORS.has(error.type)) {
-        const dropped = this.dropTopic(topic)
-        this.logger.warn(
-          dropped
-            ? 'Dropping a target topic the broker no longer serves'
-            : 'Keeping the metadata of a target topic its sends still own',
-          { topic, error: error.message }
-        )
+        drops.push({ topic, error })
       } else {
         thrown ??= error
       }
     }
     if (thrown) throw thrown
-    return topicMetadata.filter((entry) => !failed.includes(entry))
+    return {
+      settled: failed.length
+        ? topicMetadata.filter((entry) => !failed.includes(entry))
+        : topicMetadata,
+      drop: (notices) => {
+        for (const { topic, error } of drops) {
+          const dropped = this.dropTopic(topic, { publish: false })
+          notices.push(() =>
+            this.logger.warn(
+              dropped
+                ? 'Dropping a target topic the broker no longer serves'
+                : 'Keeping the metadata of a target topic its sends still own',
+              { topic, error: error.message }
+            )
+          )
+        }
+      },
+    }
   }
 
   /**
@@ -1447,8 +1705,9 @@ module.exports = class BrokerPool {
    * code wins over code 3, whatever the wire order, so a missing topic never hides a fatal one (17,
    * 29); between two such codes the first in wire order wins. The healthy topics' partitions are
    * checked only then, so a topic error takes precedence over a partition error as in the strict
-   * parse, and nothing changes before the whole answer passed. Then the healthy topics are
-   * established and installed. A topic that stopped being a target since the refresh began (a
+   * parse, and nothing changes before the whole answer passed. Judging changes nothing: `commit`
+   * establishes the healthy topics and records the statuses inside the install step of the
+   * answer, and queues the reports on its notices. A topic that is no longer a target (a
    * withdrawn first-add row, say) is left out first: it is neither judged, installed nor reported.
    * The Java consumer and franz-go keep a missing topic per topic too.
    *
@@ -1459,7 +1718,8 @@ module.exports = class BrokerPool {
    * @param {object[]} answered the answer's topics, topic and partition errors retained
    * @param {TargetEstablishment} establishment captured when the refresh began
    * @param {{ allowLeaderless?: boolean }} options lets a partition without a leader through
-   * @returns {object[]} the topics answered without an error
+   * @returns {{healthy: object[], commit: (notices: Array<() => void>) => void}} the topics
+   *   answered without an error, and the step that establishes them and records the statuses
    * @throws {import('../errors').KafkaJSProtocolError} the first topic error other than code 3,
    *   else the first code 3 not isolated, else the first partition error
    */
@@ -1476,25 +1736,27 @@ module.exports = class BrokerPool {
       ? topicMetadata.filter((entry) => !failed.includes(entry))
       : topicMetadata
     checkPartitions(healthy, { allowLeaderless })
-    establish(healthy.map(({ topic }) => topic))
-    this.isolatedRecheckAt = Date.now() + Math.min(this.metadataMaxAge, ISOLATED_RECHECK_MS)
-
-    for (const { topic } of failed) {
-      if (this.unavailableTopics.has(topic)) continue
-      this.unavailableTopics.add(topic)
-      this.onTopicMetadataStatus({
-        topic,
-        status: 'unavailable',
-        type: 'UNKNOWN_TOPIC_OR_PARTITION',
-        code: UNKNOWN_TOPIC_OR_PARTITION,
-      })
+    const commit = (notices) => {
+      establish(healthy.map(({ topic }) => topic))
+      this.isolatedRecheckAt = Date.now() + Math.min(this.metadataMaxAge, ISOLATED_RECHECK_MS)
+      const report = (status) => notices.push(() => this.onTopicMetadataStatus(status))
+      for (const { topic } of failed) {
+        if (this.unavailableTopics.has(topic)) continue
+        this.unavailableTopics.add(topic)
+        report({
+          topic,
+          status: 'unavailable',
+          type: 'UNKNOWN_TOPIC_OR_PARTITION',
+          code: UNKNOWN_TOPIC_OR_PARTITION,
+        })
+      }
+      for (const topic of this.unavailableTopics) {
+        if (!healthy.some((entry) => entry.topic === topic)) continue
+        this.unavailableTopics.delete(topic)
+        report({ topic, status: 'available', type: null, code: 0 })
+      }
     }
-    for (const topic of this.unavailableTopics) {
-      if (!healthy.some((entry) => entry.topic === topic)) continue
-      this.unavailableTopics.delete(topic)
-      this.onTopicMetadataStatus({ topic, status: 'available', type: null, code: 0 })
-    }
-    return healthy
+    return { healthy, commit }
   }
 
   /**
@@ -1720,34 +1982,51 @@ module.exports = class BrokerPool {
    *   close ends the connection attempts, and a closed one is refused
    * @returns {Promise<Broker>}
    * @throws {Error} the lifecycle's close error
-   * @throws {KafkaJSConnectionError} retriable, when the pool retired the broker while it connected
+   * @throws {KafkaJSConnectionError} retriable, with code `SELECTION_SUPERSEDED`, when the broker
+   *   was retired, its pool swapped or the pool disconnected while it connected
    */
   async findBroker({ nodeId, fence }) {
     fence?.check()
     checked(null)
+    const disconnects = this.disconnects
     const broker = this.brokers[nodeId]
 
     if (!broker) {
       throw new KafkaJSBrokerNotFound(`Broker ${nodeId} not found in the cached metadata`)
     }
 
-    await this.connectBroker(broker, ...(fence ? [{ fence }] : []))
+    const pool = await this.connectBroker(broker, ...(fence ? [{ fence }] : []))
     fence?.check()
     checked(null)
-    return this.owned(broker)
+    return this.owned(broker, disconnects, pool)
+  }
+
+  /** @returns {string} the `code` of the error a superseded broker selection fails with */
+  static get SELECTION_SUPERSEDED() {
+    return SELECTION_SUPERSEDED
   }
 
   /**
-   * Hands a selected broker on only while the pool has not retired it (a rebootstrap or a
-   * replacement did while it connected), so no caller gets a broker the pool gave up.
+   * Hands a selected broker on only while the pool still holds it as it was selected: not
+   * retired (by a rebootstrap, a replacement or a disconnect), still on the connection pool that
+   * connected, and no disconnect since the selection began. So no caller gets a broker the pool
+   * gave up, or one whose connected pool was swapped for a cold one.
    * @private
-   * @param {Broker|undefined} broker the selected broker
-   * @returns {Broker|undefined} the same broker
-   * @throws {KafkaJSConnectionError} retriable, when the pool retired it
+   * @param {Broker} broker the selected broker
+   * @param {number} disconnects the disconnect count when the selection began
+   * @param {import('../network/connectionPool')} [pool] the pool that connected; the attached one
+   *   when the selection did not connect it
+   * @returns {Broker} the same broker
+   * @throws {KafkaJSConnectionError} retriable, with code `SELECTION_SUPERSEDED`
    */
-  owned(broker) {
-    if (this.retiredBrokers.has(broker)) {
-      throw new KafkaJSConnectionError('The broker was replaced while it was selected')
+  owned(broker, disconnects, pool = broker.connectionPool) {
+    if (
+      this.retiredBrokers.has(broker) ||
+      broker.retired ||
+      broker.connectionPool !== pool ||
+      this.disconnects !== disconnects
+    ) {
+      throw selectionSuperseded()
     }
     return broker
   }
@@ -1801,13 +2080,16 @@ module.exports = class BrokerPool {
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, no broker is tried, no socket opens, and a rebootstrap it started installs no pool
    * @returns {Promise<Broker>} a broker the pool still holds: a broker of a scan that a
-   *   rebootstrap overtook is not returned, and that rebootstrap's seed is connected instead
+   *   rebootstrap overtook is not returned, and that rebootstrap's seed is connected instead;
+   *   when the seed fallback finds a cached broker connected already, that broker
    * @throws {Error} the lifecycle's close error
-   * @throws {KafkaJSConnectionError} retriable, when the pool retired the broker it connected
+   * @throws {KafkaJSConnectionError} retriable, with code `SELECTION_SUPERSEDED`, when the broker
+   *   it connected was retired or replaced, or the pool disconnected, before it returned
    */
   async findConnectedBroker({ fence } = {}) {
     fence?.check()
     checked(null)
+    const disconnects = this.disconnects
     const recovery = this.recoveries
     const nodeIds = shuffle(keys(this.brokers))
     const connectedBrokerId = nodeIds.find((nodeId) => this.brokers[nodeId].isConnected())
@@ -1857,10 +2139,15 @@ module.exports = class BrokerPool {
     }
 
     // Failed to connect to all known brokers, metadata might be old
+    const seedRecovery = this.recoveries
     await this.connect(...(fence ? [{ fence }] : []))
     fence?.check()
     checked(null)
-    return this.owned(this.seedBroker)
+    // A rebootstrap after the connect replaced the seed it connected with a cold one.
+    if (this.recoveries !== seedRecovery) throw selectionSuperseded()
+    // `connect` returns at once when a cached broker is connected already: that one is selected.
+    const connected = values(this.brokers).find((broker) => broker.isConnected())
+    return this.owned(connected ?? this.seedBroker, disconnects)
   }
 
   /**
@@ -1868,30 +2155,36 @@ module.exports = class BrokerPool {
    * @param {Broker} broker
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] see `findBroker`
-   * @returns {Promise<null>}
+   * @returns {Promise<import('../network/connectionPool')>} the pool that connected
+   * @throws {KafkaJSConnectionError} retriable, with code `SELECTION_SUPERSEDED`, when the pool
+   *   retired the broker while it connected or cleaned up; a retired broker is not repaired
    */
   async connectBroker(broker, { fence } = {}) {
     if (broker.isConnected()) {
-      return
+      return broker.connectionPool
     }
 
+    // A broker the pool retired is draining already: it is not repaired, and its cleanup stops.
+    const retired = () => this.retiredBrokers.has(broker) || broker.retired
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
+      const pool = broker.connectionPool
       try {
         fence?.check()
         checked(null)
         await broker.connect(...guardArgs(fence))
         fence?.check()
         checked(null)
+        return pool
       } catch (caught) {
         fence?.check()
         checked(null)
         const e = isNativeError(caught)
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
-        // A broker the pool retired meanwhile is draining already and is not repaired.
-        if (this.retiredBrokers.has(broker)) return bail(e)
+        if (retired()) return bail(selectionSuperseded(e))
         if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
           await broker.disconnect()
+          if (retired()) return bail(selectionSuperseded(e))
         }
 
         // To avoid reconnecting to an unavailable host, we bail on connection errors
@@ -1906,13 +2199,12 @@ module.exports = class BrokerPool {
           // re-negotiates against the replacement pool (KIP-35 rule 7) rather than comparing
           // against the generation the old, discarded pool had reached.
           const previousPool = broker.connectionPool
-          const isCurrent = () => broker.connectionPool === previousPool
+          const isCurrent = () => broker.connectionPool === previousPool && !retired()
           const replacement = await this.buildConnectionPool(
             { host: previousPool.host, port: previousPool.port, rack: previousPool.rack },
             { fence, isCurrent }
           )
-          if (!replacement)
-            return bail(new KafkaJSConnectionError('Broker pool build was superseded'))
+          if (!replacement) return bail(selectionSuperseded(e))
           if (fence?.closed || currentDeadline()?.guard()) {
             this.closePool(replacement)
             fence?.check()
@@ -1920,7 +2212,7 @@ module.exports = class BrokerPool {
           }
           if (!isCurrent()) {
             this.closePool(replacement)
-            return bail(new KafkaJSConnectionError('Broker pool build was superseded'))
+            return bail(selectionSuperseded(e))
           }
           this.replacePool(broker, replacement)
 

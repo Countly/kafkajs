@@ -311,21 +311,24 @@ describe('subscription matching and metadata scope', () => {
 })
 
 describe('discovery refreshes and their scope', () => {
-  test('a newer failed refresh never authorizes an older full reply', async () => {
+  test('a newer failed refresh never authorizes an older full reply, which ends with that failure', async () => {
     const held = gate()
     const newer = metadata(['new-topic'])
     const boom = new Error('metadata unavailable')
     const { cluster } = clusterWith([held.promise, failing(boom), newer])
     const scope = new Subscription()
     const onMetadata = jest.fn()
-    const first = cluster.brokerPool.refreshMetadata([], { metadataScope: scope, onMetadata })
+    const first = cluster.brokerPool.refreshMetadata([], { metadataScope: scope, onMetadata }).then(
+      () => null,
+      (error) => error
+    )
     await Promise.resolve()
     try {
       await expect(
         cluster.brokerPool.refreshMetadata([], { metadataScope: scope, onMetadata })
       ).rejects.toThrow('metadata unavailable')
       held.release(metadata(['old-topic']))
-      await first
+      expect(await first).toBe(boom)
       expect(cluster.brokerPool.metadata).toBeNull()
       expect(cluster.metadataCache.topics.size).toBe(0)
       expect(onMetadata).not.toHaveBeenCalled()

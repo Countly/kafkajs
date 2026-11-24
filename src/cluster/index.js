@@ -280,7 +280,9 @@ module.exports = class Cluster {
       captureTopics:
         this.targetTopicState === null ? undefined : (topics) => this.captureTopics(topics),
       dropTopic:
-        this.targetTopicState === null ? undefined : (topic) => this.dropTargetTopic(topic),
+        this.targetTopicState === null
+          ? undefined
+          : (topic, options) => this.dropTargetTopic(topic, options),
       isNewTarget:
         this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
       onTopicMetadataStatus,
@@ -1207,11 +1209,12 @@ module.exports = class Cluster {
    * queued and retried batches need its routing and its later refreshes. A later send adds a
    * forgotten target again as a new incarnation.
    * @param {string} topic target name
+   * @param {{publish?: boolean}} [options] see `forgetTargetTopic`
    * @returns {boolean} whether it was forgotten
    */
-  dropTargetTopic(topic) {
+  dropTargetTopic(topic, options) {
     if (this.topicPins.has(topic)) return false
-    this.forgetTargetTopic(topic)
+    this.forgetTargetTopic(topic, options)
     return true
   }
 
@@ -1219,15 +1222,17 @@ module.exports = class Cluster {
    * Forgets one producer target, its incarnation and both cached representations; its pins stay
    * with their owners. Used for idle expiry, a refused add, and `dropTargetTopic`.
    * @param {string} topic target name
+   * @param {{publish?: boolean}} [options] `publish: false` leaves the routing notification to the
+   *   metadata install that drops the target
    * @returns {void}
    */
-  forgetTargetTopic(topic) {
+  forgetTargetTopic(topic, options) {
     this.targetTopics.delete(topic)
     this.establishedTopics.delete(topic)
     this.firstAddTopics.delete(topic)
     this.targetRevision++
     this.targetTopicState.delete(topic)
-    this.metadataCache.forget(topic)
+    this.metadataCache.forget(topic, options)
     this.brokerPool.forgetTopic(topic)
   }
 
@@ -1752,7 +1757,8 @@ module.exports = class Cluster {
           throw e
         }
 
-        if (e.code === 'ECONNREFUSED') {
+        // A selection a rebootstrap or a disconnect overtook asks again, as a refused connection does.
+        if (e.code === 'ECONNREFUSED' || e.code === BrokerPool.SELECTION_SUPERSEDED) {
           // During maintenance the current coordinator can go down; findBroker will
           // refresh metadata and re-throw the error. findGroupCoordinator has to re-throw
           // the error to go through the retry cycle.

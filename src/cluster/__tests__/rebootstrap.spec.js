@@ -97,8 +97,8 @@ const stubSeed = (pool, metadata) => {
     const previous = seed
     seed = { ...seed }
     pool.seedBroker = seed
-    install?.(seed)
     pool.closeObsolete(previous)
+    install?.(seed)
     return seed
   }
   pool.buildConnectionPool = async (d) => ({
