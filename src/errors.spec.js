@@ -27,6 +27,7 @@ const {
   KafkaJSCommitFailedError,
   KafkaJSBufferExhaustedError,
   KafkaJSRecordTooLargeError,
+  KafkaJSTopicRecreatedError,
   isPollIntervalExceeded,
 } = errors
 const createRetry = require('./retry')
@@ -663,6 +664,66 @@ describe('KafkaJSCorruptRecordError', () => {
     for (const key of ['nextOffset', 'codec', 'limit']) {
       expect(Object.keys(error)).not.toContain(key)
     }
+  })
+})
+
+describe('KafkaJSTopicRecreatedError', () => {
+  const OLD_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+  const NEW_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
+
+  test('is a non-retriable error with its fields', () => {
+    const cause = new Error('seen in a metadata answer')
+    const error = new KafkaJSTopicRecreatedError('topic orders was recreated', {
+      topic: 'orders',
+      previousTopicId: OLD_ID,
+      topicId: NEW_ID,
+      groupId: 'billing',
+      cause,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSTopicRecreatedError',
+      message: 'topic orders was recreated',
+      retriable: false,
+      topic: 'orders',
+      previousTopicId: OLD_ID,
+      topicId: NEW_ID,
+      groupId: 'billing',
+    })
+    expect(error.cause).toBe(cause)
+    // A consumer without a group (manual assignment) has none.
+    const manual = new KafkaJSTopicRecreatedError('x', {
+      topic: 'orders',
+      previousTopicId: OLD_ID,
+      topicId: NEW_ID,
+    })
+    expect(manual.groupId).toBeNull()
+  })
+
+  test('it is exported from the CommonJS and ESM entry points', () => {
+    const { execFileSync } = require('child_process')
+    const path = require('path')
+    const { pathToFileURL } = require('url')
+
+    expect(typeof packageEntry.KafkaJSTopicRecreatedError).toBe('function')
+    expect(packageEntry.KafkaJSTopicRecreatedError).toBe(KafkaJSTopicRecreatedError)
+
+    // One process loads both entry points, so the comparison is of the class objects themselves.
+    const esm = pathToFileURL(path.join(__dirname, '..', 'index.mjs')).href
+    const cjs = path.join(__dirname, '..', 'index.js')
+    const script = [
+      `import * as entry from ${JSON.stringify(esm)}`,
+      `import { createRequire } from 'node:module'`,
+      `const Cjs = createRequire(${JSON.stringify(cjs)})(${JSON.stringify(cjs)}).KafkaJSTopicRecreatedError`,
+      `const Esm = entry.KafkaJSTopicRecreatedError`,
+      `console.log(JSON.stringify({ isClass: typeof Esm === 'function', same: Esm === Cjs }))`,
+    ].join('\n')
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+    })
+
+    expect(JSON.parse(output)).toEqual({ isClass: true, same: true })
   })
 })
 
