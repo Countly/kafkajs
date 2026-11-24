@@ -666,8 +666,8 @@ module.exports = class BrokerPool {
 
   /**
    * Fences a replaced or never-installed pool, then drains it in the background, recording the
-   * drain so a later disconnect reaches it. A throw from `retire` or `destroy` fails only that
-   * drain.
+   * drain so a later disconnect reaches it. `destroy` runs even when `retire` throws, so the
+   * sockets close; a throw from either fails only that drain, after the destroy settled.
    * @private
    * @param {import('../network/connectionPool')} pool obsolete pool
    * @returns {void}
@@ -675,8 +675,18 @@ module.exports = class BrokerPool {
   closePool(pool) {
     this.retireTelemetryNode(pool)
     const drain = (async () => {
-      pool.retire()
-      return pool.destroy({ drainTimeout: this.drainTimeout })
+      let failure = null
+      try {
+        pool.retire()
+      } catch (error) {
+        failure = error
+      }
+      try {
+        await pool.destroy({ drainTimeout: this.drainTimeout })
+      } catch (error) {
+        failure ??= error
+      }
+      if (failure) throw failure
     })()
     this.trackDrain(pool, drain, this.drainingPools)
     this.closeInBackground(drain)
