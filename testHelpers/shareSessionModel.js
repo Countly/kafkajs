@@ -1,8 +1,19 @@
 /** Error codes the model writes (`src/protocol/error.js`). */
+const UNKNOWN_TOPIC_OR_PARTITION = 3
+const INVALID_REQUEST = 42
 const INVALID_RECORD_STATE = 121
 const SHARE_SESSION_NOT_FOUND = 122
 const INVALID_SHARE_SESSION_EPOCH = 123
 const SHARE_SESSION_LIMIT_REACHED = 133
+/** Top-level codes a script may only give where the broker would give them too. */
+const SESSION_CODES = [
+  SHARE_SESSION_NOT_FOUND,
+  INVALID_SHARE_SESSION_EPOCH,
+  SHARE_SESSION_LIMIT_REACHED,
+]
+
+const FINAL_EPOCH = -1
+const INT32_MAX = 2147483647
 
 /** What each terminal acknowledgement type leaves a record in; type 4 renews instead. */
 const OUTCOMES = Object.freeze({
@@ -44,15 +55,10 @@ const stampOf = ({ api, node, generation, correlationId, order, executedOrder })
 })
 
 /**
- * @param {string|number} first
- * @param {string|number} last
- * @returns {string[]} every offset of the inclusive range, as int64 decimal strings
+ * @param {number} epoch
+ * @returns {number} the epoch after it, wrapping as Kafka's `ShareRequestMetadata.nextEpoch`
  */
-const offsetsOf = (first, last) => {
-  const offsets = []
-  for (let offset = BigInt(first); offset <= BigInt(last); offset++) offsets.push(String(offset))
-  return offsets
-}
+const nextEpoch = (epoch) => (epoch === INT32_MAX ? 1 : epoch + 1)
 
 /**
  * @param {Array<{ topicId: string, partitions: Array<number|{ partitionIndex: number }> }>} topics
@@ -64,26 +70,75 @@ const partitionKeys = (topics = []) =>
   )
 
 /**
- * A share-group broker's session, acquisition and membership state, kept as Kafka 4.2.0 keeps it,
- * behind a scripted cluster. It does not invent answers: the test still scripts what a ShareFetch
- * acquires. When a request executes, the model applies Kafka's rules to the scripted answer and
- * rewrites what the broker would refuse:
+ * @param {object} acquisition
+ * @returns {'ACQUIRED'|Change['state']} what the acquired record is now
+ */
+const stateOf = ({ changes }) => (changes.length ? changes[changes.length - 1].state : 'ACQUIRED')
+
+/**
+ * Kafka's `KafkaApis#validateAcknowledgementBatches`.
+ * @param {Array<{ firstOffset: string, lastOffset: string, acknowledgeTypes: number[] }>} batches
+ * @param {number} maxType 4 at version 2, else 3
+ * @param {boolean} isRenewAck
+ * @returns {number} 42 when a batch breaks a rule, else 0
+ */
+const invalidBatches = (batches, maxType, isRenewAck) => {
+  let previousLast = -1n
+  for (const { firstOffset, lastOffset, acknowledgeTypes: types } of batches) {
+    const first = BigInt(firstOffset)
+    const last = BigInt(lastOffset)
+    if (
+      first > last ||
+      first < previousLast ||
+      !types?.length ||
+      (types.length > 1 && last - first !== BigInt(types.length - 1)) ||
+      types.some((type) => type < 0 || type > maxType) ||
+      (types.includes(RENEW) && !isRenewAck)
+    ) {
+      return INVALID_REQUEST
+    }
+    previousLast = last
+  }
+  return 0
+}
+
+/**
+ * A share-group broker's session, acquisition and membership state, kept as Apache Kafka 4.3.1
+ * keeps it, behind a scripted cluster. It does not invent answers: the test still scripts what a
+ * ShareFetch acquires. When a request executes, the model applies Kafka's rules to the scripted
+ * answer and rewrites what the broker would refuse:
  *
- * - Sessions are keyed (node, member). An epoch-0 ShareFetch answered without an error replaces
- *   the member's session and opens one at epoch 1 on the request's connection; one answered 133
- *   removes the old session and opens nothing; any other error changes nothing. An ordinary
- *   request needs a session (else 122) at its epoch (else 123), and moves it to the next epoch. A
- *   final (epoch -1) needs some session (else 122), applies its acknowledgements, removes the
- *   session and releases the member's records on that node. A broker-side close of the connection
- *   a session was opened on does the same; a replaced session's old connection removes nothing.
- * - Records are keyed (topic id, partition, offset), owned by a member id; each acquisition has its
- *   own observation id. An acknowledgement applies only when every offset of the partition is
- *   acquired by the sending member, else the partition is answered 121 and nothing changes; renew
- *   (4) keeps the acquisition. Session identity and epoch are never compared, as on the broker.
+ * - Sessions are keyed (node, member). A scripted top-level error other than 122, 123 and 133 is
+ *   a refusal before admission: the answer passes unchanged and nothing changes. A scripted 122 or
+ *   123 that differs from the model's own verdict, and a 133 anywhere but an admitted epoch-0
+ *   ShareFetch, is a recorded failure. An epoch-0 ShareFetch carrying acknowledgements, and a
+ *   renewing ShareFetch asking for records, are answered 42. An epoch-0 ShareFetch replaces the
+ *   member's session and opens one at epoch 1 on its connection; answered 133 it removes the old
+ *   session and opens nothing. ShareAcknowledge at epoch 0 is answered 123; any other request needs
+ *   a session (else 122) at its epoch (else 123) and moves it to the next epoch, after 2^31-1
+ *   to 1. A final (epoch -1) needs a session (else 122), applies its acknowledgements, then
+ *   removes the member's session and releases the member's acquired records on the partitions
+ *   that session caches. A broker-side close of a connection does the same for the session last
+ *   opened on it, unless a removal since marked that connection stale.
+ * - A ShareFetch fetches its effective set: the request's partitions at epoch 0, the session's
+ *   cached partitions after the update otherwise, nothing for a final or a renewing fetch. An
+ *   answer that acquires outside it, or acquires a record that is acquired, acknowledged or
+ *   archived, is a recorded failure and acquires nothing there.
+ * - Records are kept per node and partition, as each broker keeps its share partitions; a node has
+ *   a share partition once a fetch there fetched it. Acknowledgements are checked partition by
+ *   partition, all or nothing: 42 for a batch that breaks Kafka's batch rules or ends past the
+ *   cached records, 121 for a batch that starts below every cached record or covers a cached
+ *   record the sending member does not hold acquired, 3 when the node has no share partition.
+ *   Renew (4) keeps the acquisition. Session identity and epoch are never compared, as on the
+ *   broker. `expireLock(observationId)` is the scheduled lock expiry.
  * - Joins (member epoch 0) and leaves (-1) of answered heartbeats are logged with their orders.
  *
- * A Buffer answer, a request of another group and an answer without `responses` change nothing.
- * Install it with `installSessionModel`, before the client writes anything.
+ * Not modelled: persistence, the log start offset and its archiving, delivery-count exhaustion,
+ * renewal timers, the group-config renew switch, `onGroupEmpty`, partition leadership, Kafka's
+ * batch-level checks on a cached batch only partly inside an acknowledged range, and the interleaving
+ * of a final's acknowledgements with its release (one execution step here). A Buffer answer and a
+ * request of another group pass through untouched. Install it with `installSessionModel`, before
+ * the client writes anything.
  */
 class ShareSessionModel {
   /**
@@ -95,10 +150,12 @@ class ShareSessionModel {
     this.cluster = null
     /** @type {Map<string, object>} live sessions by `node|member` */
     this.live = new Map()
+    /** @type {Map<string, { key: string, stale: boolean }>} session last opened per `node/generation` */
+    this.connections = new Map()
     /** @type {Array<{ session: object, by: Stamp|null }>} every removal; `by` is null for a close */
     this.removals = []
-    /** @type {Map<string, object>} the acquisition holding each `topicId:partition:offset` */
-    this.current = new Map()
+    /** @type {Map<string, Map<string, object>>} per `node|topicId:partition`, the last acquisition of each offset */
+    this.partitions = new Map()
     /** @type {object[]} every acquisition, observation id - 1 */
     this.observations = []
     /** @type {Array<{ kind: 'join'|'leave', member: string } & Stamp>} */
@@ -136,33 +193,36 @@ class ShareSessionModel {
   }
 
   /**
-   * Applies a broker-side close: removes the sessions opened on that connection.
+   * Applies a broker-side close: removes the session last opened on that connection, unless the
+   * connection was marked stale, and releases its member's records.
    * @param {{ node: number, generation: number, kind: 'client'|'broker' }} closed
    * @returns {void}
    */
   socketClosed({ node, generation, kind }) {
     if (kind !== 'broker') return
+    const connection = `${node}/${generation}`
+    const mapping = this.connections.get(connection)
+    this.connections.delete(connection)
+    if (!mapping || mapping.stale) return
+    const session = this.live.get(mapping.key)
+    if (!session) return
     const order = this.cluster.clock++
-    for (const session of [...this.live.values()]) {
-      if (session.node === node && session.opened.generation === generation) {
-        this.remove(session, null)
-        this.release(session.member, node, 'disconnect', order)
-      }
-    }
+    this.remove(session, null)
+    this.release(session, 'disconnect', order)
   }
 
   /**
-   * The acquisition lock of one record expires: it becomes available again.
-   * @param {string} topicId
-   * @param {number} partition
-   * @param {string|number} offset
+   * The acquisition lock of one acquisition expires: the record becomes available again.
+   * @param {number} observationId the acquisition, as `acquisitionsOf` lists it
    * @returns {void}
-   * @throws {Error} when the record is not acquired
+   * @throws {Error} for an unknown observation id, or one no longer acquired (a stale expiry)
    */
-  expireLock(topicId, partition, offset) {
-    const key = `${topicId}:${partition}:${offset}`
-    const acquisition = this.current.get(key)
-    if (!acquisition) throw new Error(`ShareSessionModel: ${key} is not acquired`)
+  expireLock(observationId) {
+    const acquisition = this.observations[observationId - 1]
+    if (!acquisition) throw new Error(`ShareSessionModel: no observation ${observationId}`)
+    if (stateOf(acquisition) !== 'ACQUIRED') {
+      throw new Error(`ShareSessionModel: observation ${observationId} is no longer acquired`)
+    }
     this.settle(acquisition, 'AVAILABLE', 'expiry', this.cluster.clock++)
   }
 
@@ -232,18 +292,19 @@ class ShareSessionModel {
    * @param {number} partition
    * @param {string|number} offset
    * @returns {Array<{ observationId: number, member: string, node: number, state: string, renewals: number }>}
-   *   every acquisition of the record, oldest first; `state` is `ACQUIRED` or its last change
+   *   every acquisition of the record on any node, oldest first; `state` is `ACQUIRED` or its last
+   *   change
    */
   acquisitionsOf(topicId, partition, offset) {
     const key = `${topicId}:${partition}:${String(offset)}`
     return this.observations
       .filter((acquisition) => acquisition.key === key)
-      .map(({ observationId, member, node, changes, renewals }) => ({
-        observationId,
-        member,
-        node,
-        state: changes.length ? changes[changes.length - 1].state : 'ACQUIRED',
-        renewals,
+      .map((acquisition) => ({
+        observationId: acquisition.observationId,
+        member: acquisition.member,
+        node: acquisition.node,
+        state: stateOf(acquisition),
+        renewals: acquisition.renewals,
       }))
   }
 
@@ -280,53 +341,92 @@ class ShareSessionModel {
    * @returns {object} the answer, with the refusals the broker would write
    */
   share(record, answer) {
-    const { memberId, shareSessionEpoch: epoch } = record.fields
     const fetch = record.api === 'ShareFetch'
+    const { memberId, shareSessionEpoch: epoch } = record.fields
     const key = `${record.node}|${memberId}`
-    const session = this.live.get(key)
-    const stamp = stampOf(record)
+    const scripted = answer.errorCode ?? 0
+    if (scripted && !SESSION_CODES.includes(scripted)) return answer
 
-    if (fetch && epoch === 0) {
-      if (answer.errorCode && answer.errorCode !== SHARE_SESSION_LIMIT_REACHED) return answer
-      if (session) this.remove(session, stamp)
-      if (answer.errorCode) return answer
-      this.live.set(key, {
-        node: record.node,
-        member: memberId,
-        epoch: 1,
-        opened: stamp,
-        partitions: new Set(partitionKeys(record.fields.topics)),
-      })
-      this.acquire(record, answer)
+    const verdict = this.admission(record, fetch, this.live.get(key))
+    if (scripted === SHARE_SESSION_LIMIT_REACHED && fetch && epoch === 0 && !verdict) {
+      this.drop(key, stampOf(record))
       return answer
     }
-
-    const refusal =
-      epoch === 0
-        ? INVALID_SHARE_SESSION_EPOCH
-        : !session
-          ? SHARE_SESSION_NOT_FOUND
-          : epoch !== -1 && epoch !== session.epoch
-            ? INVALID_SHARE_SESSION_EPOCH
-            : 0
-    if (refusal) return { ...answer, errorCode: refusal, errorMessage: null, responses: [] }
-    if (answer.errorCode) return answer
-
-    const answered = this.acknowledge(record, answer)
-    if (epoch === -1) {
-      this.remove(session, stamp)
-      this.release(memberId, record.node, 'final', record.executedOrder)
-      return answered
+    if (scripted && scripted !== verdict) {
+      this.fail(`${record.api} answered ${scripted} where the broker answers ${verdict}`)
+      return answer
     }
-    session.epoch += 1
-    if (fetch) {
-      for (const partition of partitionKeys(record.fields.topics)) session.partitions.add(partition)
-      for (const partition of partitionKeys(record.fields.forgottenTopicsData)) {
-        session.partitions.delete(partition)
-      }
-      this.acquire(record, answered)
-    }
+    if (verdict) return { ...answer, errorCode: verdict, errorMessage: null, responses: [] }
+
+    const fetchSet = this.admit(record, fetch, key)
+    const answered = this.acknowledge(record, answer, fetch)
+    if (fetch) this.acquire(record, answered, fetchSet)
+    if (epoch === FINAL_EPOCH) this.closeSession(key, stampOf(record), record.executedOrder)
     return answered
+  }
+
+  /**
+   * The broker's refusal of a request before any state changes, in Kafka's order.
+   * @private
+   * @param {object} record
+   * @param {boolean} fetch
+   * @param {object|undefined} session the member's session on the node
+   * @returns {number} the top-level error code, or 0 when the broker admits it
+   */
+  admission({ version, fields }, fetch, session) {
+    const { shareSessionEpoch: epoch } = fields
+    if (fetch) {
+      const { isRenewAck, maxBytes, minBytes, maxRecords, maxWaitMs } = fields
+      if (version >= 2 && isRenewAck && (maxBytes || minBytes || maxRecords || maxWaitMs)) {
+        return INVALID_REQUEST
+      }
+      if (epoch === 0) {
+        const acknowledging = fields.topics.some(({ partitions }) =>
+          partitions.some(({ acknowledgementBatches }) => acknowledgementBatches?.length)
+        )
+        return acknowledging ? INVALID_REQUEST : 0
+      }
+    } else if (epoch === 0) {
+      return INVALID_SHARE_SESSION_EPOCH
+    }
+    if (!session) return SHARE_SESSION_NOT_FOUND
+    return epoch === FINAL_EPOCH || epoch === session.epoch ? 0 : INVALID_SHARE_SESSION_EPOCH
+  }
+
+  /**
+   * Opens or updates the member's session for an admitted request.
+   * @private
+   * @param {object} record
+   * @param {boolean} fetch
+   * @param {string} key `node|member`
+   * @returns {Set<string>} the `topicId:partition` keys a ShareFetch fetches
+   */
+  admit(record, fetch, key) {
+    const { node, generation, fields } = record
+    if (fetch && fields.shareSessionEpoch === 0) {
+      this.drop(key, stampOf(record))
+      const session = {
+        node,
+        member: fields.memberId,
+        epoch: 1,
+        opened: stampOf(record),
+        connection: `${node}/${generation}`,
+        partitions: new Set(partitionKeys(fields.topics)),
+      }
+      this.live.set(key, session)
+      this.connections.set(session.connection, { key, stale: false })
+      return new Set(session.partitions)
+    }
+    if (fields.shareSessionEpoch === FINAL_EPOCH) return new Set()
+
+    const session = this.live.get(key)
+    session.epoch = nextEpoch(session.epoch)
+    if (!fetch) return new Set()
+    for (const partition of partitionKeys(fields.topics)) session.partitions.add(partition)
+    for (const partition of partitionKeys(fields.forgottenTopicsData)) {
+      session.partitions.delete(partition)
+    }
+    return record.version >= 2 && fields.isRenewAck ? new Set() : new Set(session.partitions)
   }
 
   /**
@@ -334,28 +434,27 @@ class ShareSessionModel {
    * @private
    * @param {object} record
    * @param {object} answer
-   * @returns {object} the answer; a copy with a 121 row for each refused partition
+   * @param {boolean} fetch
+   * @returns {object} the answer; a copy with the refusal code on each refused partition's row
    */
-  acknowledge(record, answer) {
-    const fetch = record.api === 'ShareFetch'
+  acknowledge(record, answer, fetch) {
+    const { memberId, isRenewAck, topics } = record.fields
+    const maxType = record.version === 2 ? RENEW : 3
     const refused = []
-    for (const { topicId, partitions } of record.fields.topics) {
-      for (const { partitionIndex, acknowledgementBatches } of partitions) {
-        if (!acknowledgementBatches?.length) continue
+    for (const { topicId, partitions } of topics) {
+      for (const { partitionIndex, acknowledgementBatches: batches } of partitions) {
+        if (!batches?.length) continue
         const row = answer.responses
           ?.find((topic) => topic.topicId === topicId)
           ?.partitions.find((partition) => partition.partitionIndex === partitionIndex)
         if (row && (fetch ? row.acknowledgeErrorCode : row.errorCode)) continue
 
-        const steps = acknowledgementBatches.flatMap(
-          ({ firstOffset, lastOffset, acknowledgeTypes }) =>
-            offsetsOf(firstOffset, lastOffset).map((offset, i) => ({
-              acquisition: this.current.get(`${topicId}:${partitionIndex}:${offset}`),
-              type: acknowledgeTypes.length === 1 ? acknowledgeTypes[0] : acknowledgeTypes[i],
-            }))
-        )
-        if (steps.some(({ acquisition }) => acquisition?.member !== record.fields.memberId)) {
-          refused.push({ topicId, partitionIndex })
+        const partition = `${topicId}:${partitionIndex}`
+        const { code, steps } = invalidBatches(batches, maxType, isRenewAck)
+          ? { code: INVALID_REQUEST }
+          : this.check(record.node, partition, memberId, batches)
+        if (code) {
+          refused.push({ topicId, partitionIndex, code })
           continue
         }
         for (const { acquisition, type } of steps) {
@@ -368,11 +467,48 @@ class ShareSessionModel {
   }
 
   /**
+   * Kafka's `SharePartition#acknowledge` checks over one node's share partition, before any change.
+   * @private
+   * @param {number} node
+   * @param {string} partition `topicId:partition`
+   * @param {string} member
+   * @param {Array<{ firstOffset: string, lastOffset: string, acknowledgeTypes: number[] }>} batches
+   * @returns {{ code: number, steps?: Array<{ acquisition: object, type: number }> }}
+   */
+  check(node, partition, member, batches) {
+    const cached = this.partitions.get(`${node}|${partition}`)
+    if (!cached) return { code: UNKNOWN_TOPIC_OR_PARTITION }
+    const offsets = [...cached.keys()].map(BigInt).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    const steps = []
+    const transitioning = new Set()
+    for (const { firstOffset, lastOffset, acknowledgeTypes: types } of batches) {
+      const first = BigInt(firstOffset)
+      const last = BigInt(lastOffset)
+      if (!offsets.some((offset) => offset <= first)) return { code: INVALID_RECORD_STATE }
+      if (!cached.has(String(last))) return { code: INVALID_REQUEST }
+      for (const offset of offsets.filter((candidate) => candidate >= first && candidate <= last)) {
+        const acquisition = cached.get(String(offset))
+        const type = types.length === 1 ? types[0] : types[Number(offset - first)]
+        if (
+          stateOf(acquisition) !== 'ACQUIRED' ||
+          acquisition.member !== member ||
+          transitioning.has(offset)
+        ) {
+          return { code: INVALID_RECORD_STATE }
+        }
+        if (type !== RENEW) transitioning.add(offset)
+        steps.push({ acquisition, type })
+      }
+    }
+    return { code: 0, steps }
+  }
+
+  /**
    * @private
    * @param {object} answer
-   * @param {Array<{ topicId: string, partitionIndex: number }>} refused
+   * @param {Array<{ topicId: string, partitionIndex: number, code: number }>} refused
    * @param {boolean} fetch whether the answer is a ShareFetch answer
-   * @returns {object} a copy of the answer with code 121 on each refused partition's row
+   * @returns {object} a copy of the answer with each refused partition's code on its row
    */
   refuse(answer, refused, fetch) {
     const field = fetch ? 'acknowledgeErrorCode' : 'errorCode'
@@ -380,12 +516,12 @@ class ShareSessionModel {
       ...topic,
       partitions: topic.partitions.map((partition) => ({ ...partition })),
     }))
-    for (const { topicId, partitionIndex } of refused) {
+    for (const { topicId, partitionIndex, code } of refused) {
       let topic = responses.find((entry) => entry.topicId === topicId)
       if (!topic) responses.push((topic = { topicId, partitions: [] }))
       let row = topic.partitions.find((entry) => entry.partitionIndex === partitionIndex)
       if (!row) topic.partitions.push((row = this.quietRow(partitionIndex, fetch)))
-      row[field] = INVALID_RECORD_STATE
+      row[field] = code
     }
     return { ...answer, responses }
   }
@@ -415,41 +551,66 @@ class ShareSessionModel {
   }
 
   /**
-   * Records what a ShareFetch answer acquires for the member.
+   * Records what a ShareFetch answer acquires for the member on the node, within the fetch set.
    * @private
    * @param {object} record
    * @param {object} answer
+   * @param {Set<string>} fetchSet the `topicId:partition` keys the request fetches
    * @returns {void}
-   * @throws {Error} into the cluster's failures when an offset is acquired while it is held
    */
-  acquire(record, answer) {
+  acquire(record, answer, fetchSet) {
+    const { node, fields } = record
+    const failed = new Set()
     for (const { topicId, partitions } of answer.responses ?? []) {
       for (const { partitionIndex, errorCode, acquiredRecords } of partitions) {
-        if (errorCode) continue
-        for (const { firstOffset, lastOffset, deliveryCount } of acquiredRecords ?? []) {
-          for (const offset of offsetsOf(firstOffset, lastOffset)) {
-            const key = `${topicId}:${partitionIndex}:${offset}`
-            if (this.current.has(key)) {
-              this.cluster.errors.push(
-                new Error(`ShareSessionModel: ${key} acquired while it is still acquired`)
-              )
+        const partition = `${topicId}:${partitionIndex}`
+        if (errorCode) {
+          failed.add(partition)
+          continue
+        }
+        if (!acquiredRecords?.length) continue
+        if (!fetchSet.has(partition)) {
+          this.fail(
+            `ShareFetch at epoch ${fields.shareSessionEpoch} acquired ${partition} outside its fetch set`
+          )
+          continue
+        }
+        const cached = this.cachedOf(node, partition)
+        for (const { firstOffset, lastOffset } of acquiredRecords) {
+          for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+            const held = cached.get(String(offset))
+            if (held && stateOf(held) !== 'AVAILABLE') {
+              this.fail(`${node}|${partition}:${offset} acquired while ${stateOf(held)}`)
               continue
             }
             const acquisition = {
               observationId: this.observations.length + 1,
-              key,
-              member: record.fields.memberId,
-              node: record.node,
-              deliveryCount,
+              key: `${partition}:${offset}`,
+              member: fields.memberId,
+              node,
               renewals: 0,
               changes: [],
             }
             this.observations.push(acquisition)
-            this.current.set(key, acquisition)
+            cached.set(String(offset), acquisition)
           }
         }
       }
     }
+    for (const partition of fetchSet) if (!failed.has(partition)) this.cachedOf(node, partition)
+  }
+
+  /**
+   * @private
+   * @param {number} node
+   * @param {string} partition `topicId:partition`
+   * @returns {Map<string, object>} the node's share partition, created when missing
+   */
+  cachedOf(node, partition) {
+    const key = `${node}|${partition}`
+    let cached = this.partitions.get(key)
+    if (!cached) this.partitions.set(key, (cached = new Map()))
+    return cached
   }
 
   /**
@@ -462,27 +623,54 @@ class ShareSessionModel {
    */
   settle(acquisition, state, cause, order) {
     acquisition.changes.push({ state, cause, order })
-    this.current.delete(acquisition.key)
   }
 
   /**
-   * Makes every record the member holds through the node available again.
+   * Kafka's `releaseSession`: removes the session the key holds now and releases its member's
+   * acquired records on the partitions it caches.
    * @private
-   * @param {string} member
-   * @param {number} node
+   * @param {string} key `node|member`
+   * @param {Stamp} by the final request
+   * @param {number} order
+   * @returns {void}
+   */
+  closeSession(key, by, order) {
+    const session = this.live.get(key)
+    if (!session) return
+    this.remove(session, by)
+    this.release(session, 'final', order)
+  }
+
+  /**
+   * @private
+   * @param {object} session a removed session
    * @param {'final'|'disconnect'} cause
    * @param {number} order
    * @returns {void}
    */
-  release(member, node, cause, order) {
-    for (const acquisition of [...this.current.values()]) {
-      if (acquisition.member === member && acquisition.node === node) {
-        this.settle(acquisition, 'AVAILABLE', cause, order)
+  release({ node, member, partitions }, cause, order) {
+    for (const partition of partitions) {
+      for (const acquisition of this.partitions.get(`${node}|${partition}`)?.values() ?? []) {
+        if (acquisition.member === member && stateOf(acquisition) === 'ACQUIRED') {
+          this.settle(acquisition, 'AVAILABLE', cause, order)
+        }
       }
     }
   }
 
   /**
+   * @private
+   * @param {string} key `node|member`
+   * @param {Stamp} by
+   * @returns {void}
+   */
+  drop(key, by) {
+    const session = this.live.get(key)
+    if (session) this.remove(session, by)
+  }
+
+  /**
+   * Removes a session and, as Kafka's `ShareSessionCache#remove`, marks its connection stale.
    * @private
    * @param {object} session
    * @param {Stamp|null} by the removing request, or null for a connection close
@@ -491,6 +679,17 @@ class ShareSessionModel {
   remove(session, by) {
     this.live.delete(`${session.node}|${session.member}`)
     this.removals.push({ session, by })
+    const mapping = this.connections.get(session.connection)
+    if (mapping) mapping.stale = true
+  }
+
+  /**
+   * @private
+   * @param {string} message
+   * @returns {void}
+   */
+  fail(message) {
+    this.cluster.errors.push(new Error(`ShareSessionModel: ${message}`))
   }
 
   /**

@@ -256,19 +256,25 @@ const targetOf = (fields) => {
 
 /**
  * The reply of one executed request, kept until the test delivers it: the broker has done the
- * work, the client has not heard about it.
+ * work, the client has not heard about it. Its request settles once: answered at `deliver`, or
+ * cancelled when its socket closes first or the cluster's `cancelReplyHolds` runs.
  */
 class ReplyHold {
   /** @param {import('./schedule').Selector} selector which request's reply to keep */
   constructor(selector) {
     this.selector = selector
+    this.socket = null
     this.send = null
+    this.drop = null
     this.arrival = new Promise((resolve) => {
       this.announce = resolve
     })
   }
 
-  /** @returns {Promise<RequestRecord>} the request, once it executed and its reply was kept */
+  /**
+   * @returns {Promise<RequestRecord|null>} the request, once it executed and its reply was kept;
+   *   null when the hold was cancelled before any request matched
+   */
   executed() {
     return this.arrival
   }
@@ -276,24 +282,42 @@ class ReplyHold {
   /**
    * Sends the kept reply; a socket destroyed meanwhile gets nothing.
    * @returns {void}
-   * @throws {Error} before the request executed, or when the reply was already delivered
+   * @throws {Error} before the request executed, or once the reply was delivered or cancelled
    */
   deliver() {
     if (!this.send) throw new Error('ReplyHold: no kept reply to deliver')
     const send = this.send
     this.send = null
+    this.drop = null
     send()
   }
 
   /**
    * @internal
    * @param {RequestRecord} record the executed request
+   * @param {import('events').EventEmitter} socket the socket it came in on
    * @param {() => void} send writes its reply
+   * @param {() => void} drop settles it cancelled
    * @returns {void}
    */
-  keep(record, send) {
+  keep(record, socket, send, drop) {
+    this.socket = socket
     this.send = send
+    this.drop = drop
     this.announce(record)
+  }
+
+  /**
+   * @internal
+   * Drops a kept reply, or ends the wait of a hold nothing matched.
+   * @returns {void}
+   */
+  cancel() {
+    const drop = this.drop
+    this.send = null
+    this.drop = null
+    if (drop) drop()
+    else this.announce(null)
   }
 }
 
@@ -379,6 +403,8 @@ class ScriptedCluster {
     this.hooks = { onExecute: null, onSocketClosed: null }
     /** @type {ReplyHold[]} rules that keep a reply after its request executed */
     this.replyHolds = []
+    /** @type {Set<ReplyHold>} holds that kept a reply not yet delivered or cancelled */
+    this.keptReplies = new Set()
     /** @type {WeakSet<object>} sockets whose client side `clientLoss` closed */
     this.clientLost = new WeakSet()
     /** @type {WeakSet<object>} sockets whose close the broker side has noticed */
@@ -645,7 +671,9 @@ class ScriptedCluster {
    * executes it: after any hold, before the socket is checked, so a request whose client socket
    * already closed still executes. It sees the answer that will be encoded (scripted, default or
    * released with a custom value) and returns the answer to send instead, or nothing to keep it;
-   * `record.executedOrder` is stamped first. `onSocketClosed({ node, generation, kind })` reports
+   * `record.executedOrder` is stamped first. It runs for scheduled requests, not for the refused
+   * ApiVersions request of a discovery. A hook that throws is a recorded failure: its request is
+   * cancelled and its socket destroyed. `onSocketClosed({ node, generation, kind })` reports
    * `'client'` when `clientLoss` closed only the client side, and `'broker'` once the broker side
    * noticed a close: at `brokerDisconnect`, or at once when the client or the cluster destroys
    * the socket.
@@ -664,8 +692,11 @@ class ScriptedCluster {
 
   /**
    * Keeps the reply of the next request the selector picks after the broker executed it, until
-   * the test calls `deliver` on the returned hold. A socket closed by then gets nothing.
-   * @param {import('./schedule').Selector} selector matched against the logged request record
+   * the test calls `deliver` on the returned hold. Closing the request's socket first cancels the
+   * request instead. Hooks and holds see scheduled requests only, not the refused ApiVersions
+   * request of a discovery.
+   * @param {import('./schedule').Selector} selector matched as a schedule selector is: against the
+   *   request record with its `topic` and `partition` target
    * @returns {ReplyHold}
    */
   holdReply(selector) {
@@ -675,15 +706,28 @@ class ScriptedCluster {
   }
 
   /**
+   * Teardown of `holdReply`: cancels every kept reply's request and ends the wait of every hold
+   * nothing matched (its `executed()` resolves null).
+   * @returns {void}
+   */
+  cancelReplyHolds() {
+    const unmatched = this.replyHolds
+    this.replyHolds = []
+    for (const hold of [...unmatched, ...this.keptReplies]) hold.cancel()
+  }
+
+  /**
    * Closes only the client side of a connection, as a network loss the broker has not noticed:
    * the client sees `ECONNRESET`, and `onSocketClosed` reports `'client'`. Requests already
    * written still execute; their replies are not delivered.
    * @param {number} node the node's id
    * @param {number} generation which connection of the node, counting from 1
    * @returns {ScriptedCluster} this
-   * @throws {Error} when the cluster holds no such socket
+   * @throws {Error} in bounded mode, which drops a closed socket before `brokerDisconnect` could
+   *   find it, or when the cluster holds no such socket
    */
   clientLoss(node, generation) {
+    this.assertFullHistory('clientLoss')
     const socket = this.socketOf(node, generation)
     this.clientLost.add(socket)
     socket.destroy(Object.assign(new Error('Connection lost'), { code: 'ECONNRESET' }))
@@ -734,7 +778,11 @@ class ScriptedCluster {
       this.brokerClosed.add(socket)
     }
     const [node, generation] = this.socketKeys.get(socket).split('/').map(Number)
-    this.hooks.onSocketClosed?.({ node, generation, kind })
+    try {
+      this.hooks.onSocketClosed?.({ node, generation, kind })
+    } catch (error) {
+      this.errors.push(error)
+    }
   }
 
   /**
@@ -962,7 +1010,10 @@ class ScriptedCluster {
     socket.destroy = (error) => {
       const closing = !socket.destroyed
       destroy(error)
-      if (closing) this.closed(socket, this.clientLost.has(socket) ? 'client' : 'broker')
+      if (closing) {
+        for (const hold of [...this.keptReplies]) if (hold.socket === socket) hold.cancel()
+        this.closed(socket, this.clientLost.has(socket) ? 'client' : 'broker')
+      }
       return socket
     }
   }
@@ -1168,11 +1219,20 @@ class ScriptedCluster {
           // A macrotask, as the bytes of a real answer arrive: a client that loops on empty
           // answers must not be able to starve the timers behind a chain of microtasks.
           setImmediate(() => {
-            const executed = this.execute(record, answer)
+            let executed
+            let hold
+            try {
+              executed = this.execute(record, answer)
+              hold = this.replyHoldFor(record)
+            } catch (error) {
+              this.errors.push(error)
+              this.settle(record, 'cancelled')
+              socket.destroy(error)
+              return
+            }
             const deliver = () => this.deliver(socket, record, pair, executed)
-            const index = this.replyHolds.findIndex(({ selector }) => selects(selector, record))
-            if (index === -1) deliver()
-            else this.replyHolds.splice(index, 1)[0].keep(record, deliver)
+            if (hold) this.keepReply(hold, socket, record, deliver)
+            else deliver()
           }),
         (error) => {
           socket.destroy(error)
@@ -1194,6 +1254,46 @@ class ScriptedCluster {
     if (!this.hooks.onExecute) return answer
     record.executedOrder = this.clock++
     return this.hooks.onExecute(record, answer) ?? answer
+  }
+
+  /**
+   * @private
+   * @param {RequestRecord} record an executed request
+   * @returns {ReplyHold|null} the first reply hold whose selector picks it, taken off the rules
+   * @throws {Error} what a selector's `match` throws
+   */
+  replyHoldFor(record) {
+    if (this.replyHolds.length === 0) return null
+    const target = { ...record, ...targetOf(record.fields) }
+    const index = this.replyHolds.findIndex(({ selector }) => selects(selector, target))
+    return index === -1 ? null : this.replyHolds.splice(index, 1)[0]
+  }
+
+  /**
+   * Keeps an executed request's reply in its hold until `deliver`, or cancels the request when its
+   * socket is already closed.
+   * @private
+   * @param {ReplyHold} hold
+   * @param {import('events').EventEmitter} socket
+   * @param {RequestRecord} record
+   * @param {() => void} deliver writes the reply
+   * @returns {void}
+   */
+  keepReply(hold, socket, record, deliver) {
+    this.keptReplies.add(hold)
+    hold.keep(
+      record,
+      socket,
+      () => {
+        this.keptReplies.delete(hold)
+        deliver()
+      },
+      () => {
+        this.keptReplies.delete(hold)
+        this.settle(record, 'cancelled')
+      }
+    )
+    if (socket.destroyed) hold.cancel()
   }
 
   /**

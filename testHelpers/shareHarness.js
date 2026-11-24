@@ -536,6 +536,7 @@ const harness = async ({
      */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
+      cluster.cancelReplyHolds()
       for (const run of runs) {
         run.loop.dispose()
         for (const timer of [...run.timers]) timer.release()
@@ -706,6 +707,7 @@ const shareClient = ({
      */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
+      cluster.cancelReplyHolds()
       await consumer.disconnect({ timeout: 0 })
       cluster.assertClean()
     },

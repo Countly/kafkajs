@@ -38,26 +38,34 @@ class RequestHold {
     })
   }
 
-  /** @returns {Promise<RequestHold>} this hold, once its frame was written and kept */
+  /**
+   * @returns {Promise<RequestHold|null>} this hold, once its frame was written and kept; null when
+   *   the factory was torn down first
+   */
   arrived() {
     return this.arrival
   }
 
   /**
    * Writes the kept frame on the broker side, whatever the client side's state.
-   * @returns {Promise<Buffer>} the broker's response frame to it, never delivered to the client
+   * @returns {Promise<Buffer>} the broker's response frame to it, never delivered to the client;
+   *   rejects when the broker side closes, ends or fails first, or was already closed
    * @throws {Error} before the frame arrived, or when it was already forwarded
    */
   forward() {
     if (!this.socket || this.forwarded) throw new Error('RequestHold: nothing to forward')
     this.forwarded = this.socket.forward(this.frame)
+    this.frame = null
     return this.forwarded
   }
 }
 
 /** One response frame kept from the client. */
 class ResponseHold {
-  /** @param {{ apiKey: number }} select which request's response to keep */
+  /**
+   * @param {{ apiKey: number, match?: (request: Buffer) => boolean }} select which request's
+   *   response to keep; `match` sees that request's frame
+   */
   constructor(select) {
     this.select = select
     this.arrival = new Promise((resolve) => {
@@ -65,7 +73,10 @@ class ResponseHold {
     })
   }
 
-  /** @returns {Promise<Buffer>} the kept response frame, once the broker sent it */
+  /**
+   * @returns {Promise<Buffer|null>} the kept response frame, once the broker sent it; null when
+   *   the factory was torn down first
+   */
   arrived() {
     return this.arrival
   }
@@ -91,17 +102,19 @@ class HoldingSocket extends EventEmitter {
     this.endpoint = { host, port }
     this.rules = rules
     this.clientClosed = false
+    this.upstreamClosed = false
     this.keeping = 0
     this.requests = new FrameSplitter()
     this.responses = new FrameSplitter()
-    /** @type {Map<number, number>} api key of each written request by correlation id */
+    /** @type {Map<number, Buffer>} each written request frame by correlation id, until answered */
     this.written = new Map()
-    /** @type {Map<number, (frame: Buffer) => void>} forwarded frames awaiting a response */
+    /** @type {Map<number, { resolve: Function, reject: Function }>} forwards awaiting a response */
     this.awaiting = new Map()
 
     upstream.on('data', (chunk) => this.receive(chunk))
     for (const event of ['connect', 'end', 'error', 'close', 'timeout']) {
       upstream.on(event, (...args) => {
+        if (event === 'end' || event === 'error' || event === 'close') this.lost()
         if (!this.clientClosed) this.emit(event, ...args)
       })
     }
@@ -122,7 +135,7 @@ class HoldingSocket extends EventEmitter {
     if (this.clientClosed) return true
     for (const frame of this.requests.push(Buffer.from(data, encoding))) {
       const apiKey = frame.readInt16BE(4)
-      this.written.set(frame.readInt32BE(8), apiKey)
+      this.written.set(frame.readInt32BE(8), frame)
       const hold = take(
         this.rules.requests,
         ({ select }) => select.apiKey === apiKey && (!select.match || select.match(frame))
@@ -181,20 +194,56 @@ class HoldingSocket extends EventEmitter {
     return this
   }
 
-  /** @returns {void} closes the broker side */
+  /**
+   * Closes the broker side and rejects every forward still awaiting a response.
+   * @returns {void}
+   */
   closeUpstream() {
+    this.lost()
+    this.written.clear()
     this.upstream.destroy()
   }
 
   /**
    * @internal
    * @param {Buffer} frame a kept request frame
-   * @returns {Promise<Buffer>} the broker's response frame to it
+   * @returns {Promise<Buffer>} the broker's response frame to it; rejects when the broker side
+   *   closes first or is closed already
    */
   forward(frame) {
-    const response = new Promise((resolve) => this.awaiting.set(frame.readInt32BE(8), resolve))
-    this.upstream.write(frame)
+    const response = this.upstreamClosed
+      ? Promise.reject(new Error('HoldingSocket: the broker side closed before the forward'))
+      : new Promise((resolve, reject) => {
+          this.awaiting.set(frame.readInt32BE(8), { resolve, reject })
+          this.upstream.write(frame)
+        })
+    if (this.upstreamClosed) this.settled()
+    response.catch(() => {})
     return response
+  }
+
+  /**
+   * Marks the broker side closed and rejects every forward awaiting a response.
+   * @private
+   * @returns {void}
+   */
+  lost() {
+    if (this.upstreamClosed) return
+    this.upstreamClosed = true
+    const error = new Error('HoldingSocket: the broker side closed before the response')
+    for (const { reject } of this.awaiting.values()) reject(error)
+    this.keeping -= this.awaiting.size
+    this.awaiting.clear()
+  }
+
+  /**
+   * One kept frame no longer needs the broker side; the last one after a client close closes it.
+   * @private
+   * @returns {void}
+   */
+  settled() {
+    this.keeping -= 1
+    if (this.keeping === 0 && this.clientClosed) this.upstream.destroy()
   }
 
   /**
@@ -205,16 +254,22 @@ class HoldingSocket extends EventEmitter {
   receive(chunk) {
     for (const frame of this.responses.push(chunk)) {
       const correlationId = frame.readInt32BE(4)
-      const apiKey = this.written.get(correlationId)
+      const request = this.written.get(correlationId)
       this.written.delete(correlationId)
-      const reply = this.awaiting.get(correlationId)
-      if (reply) {
+      const waiter = this.awaiting.get(correlationId)
+      if (waiter) {
         this.awaiting.delete(correlationId)
-        this.keeping -= 1
-        reply(frame)
+        waiter.resolve(frame)
+        this.settled()
         continue
       }
-      const hold = take(this.rules.responses, ({ select }) => select.apiKey === apiKey)
+      const hold =
+        request &&
+        take(
+          this.rules.responses,
+          ({ select }) =>
+            select.apiKey === request.readInt16BE(4) && (!select.match || select.match(request))
+        )
       if (hold) hold.announce(frame)
       else if (!this.clientClosed) this.emit('data', frame)
     }
@@ -239,9 +294,10 @@ const take = (items, picks) => {
  * @param {Function} inner the broker-side socket factory
  * @returns {Function & { sockets: HoldingSocket[], holdRequest: Function,
  *   withholdResponse: Function, closeUpstreams: Function }} the factory: `holdRequest({ apiKey,
- *   match? })` keeps the next matching request frame of any socket, `withholdResponse({ apiKey })`
- *   keeps the next response to a request of that key from the client, `closeUpstreams()` closes
- *   every broker-side socket
+ *   match? })` keeps the next matching request frame of any socket, `withholdResponse({ apiKey,
+ *   match? })` keeps the next response to a matching request from the client, `closeUpstreams()`
+ *   is the teardown: it closes every broker-side socket, rejects pending forwards and resolves
+ *   the waits of holds nothing matched with null
  */
 const createHoldingSocketFactory = (inner) => {
   const rules = { requests: [], responses: [] }
@@ -261,7 +317,7 @@ const createHoldingSocketFactory = (inner) => {
     return hold
   }
   /**
-   * @param {{ apiKey: number }} select
+   * @param {{ apiKey: number, match?: (request: Buffer) => boolean }} select
    * @returns {ResponseHold}
    */
   factory.withholdResponse = (select) => {
@@ -272,6 +328,9 @@ const createHoldingSocketFactory = (inner) => {
   /** @returns {void} */
   factory.closeUpstreams = () => {
     for (const socket of factory.sockets) socket.closeUpstream()
+    for (const hold of [...rules.requests.splice(0), ...rules.responses.splice(0)]) {
+      hold.announce(null)
+    }
   }
   return factory
 }
