@@ -35,18 +35,19 @@ const partitionsOf = (body) => {
 
 /**
  * A Produce v7 response body for `TOPIC` with one row per entry, in the order given.
- * @param {{ partition: number, errorCode?: number }[]} rows
+ * @param {{ partition: number, errorCode?: number, offset?: number }[]} rows a success row
+ *   carries `offset` (default 100) as its base offset
  * @returns {Buffer}
  */
 const answerWith = (rows) =>
   new Encoder()
     .writeArray([
       new Encoder().writeString(TOPIC).writeArray(
-        rows.map(({ partition, errorCode = 0 }) =>
+        rows.map(({ partition, errorCode = 0, offset = 100 }) =>
           new Encoder()
             .writeInt32(partition)
             .writeInt16(errorCode)
-            .writeInt64(errorCode === 0 ? 100 : -1)
+            .writeInt64(errorCode === 0 ? offset : -1)
             .writeInt64(-1)
             .writeInt64(0)
         )
@@ -57,7 +58,7 @@ const answerWith = (rows) =>
 /** Partition 0 acknowledged, then partition 0 again with a retriable refusal. */
 const DUPLICATE_ROWS = [{ partition: 0 }, { partition: 0, errorCode: NOT_LEADER_OR_FOLLOWER }]
 
-describe('Producer > a Produce answer that does not match its request', () => {
+describe('Producer > a Produce answer checked against its request', () => {
   const closers = []
 
   afterEach(async () => {
@@ -67,7 +68,8 @@ describe('Producer > a Produce answer that does not match its request', () => {
   /**
    * A connected producer whose one broker is a real `Broker` over a fake socket. The broker
    * answers each Produce with the next of `answers`, and the last one for every request after.
-   * @param {Buffer[]} answers
+   * An answer given as a function is built from the batches that request carried.
+   * @param {(Buffer|((sent: { topic: string, partition: number }[]) => Buffer))[]} answers
    * @param {object} [options] `createProducer` options
    * @param {number} [partitions=1] partitions of every topic
    * @returns {Promise<{ producer: object, produces: () => { topic: string, partition: number,
@@ -77,7 +79,12 @@ describe('Producer > a Produce answer that does not match its request', () => {
     const queue = [...answers]
     const wire = createGroupApiBroker({
       versions: { [apiKeys.Produce]: { minVersion: 3, maxVersion: 7 } },
-      respond: () => (queue.length > 1 ? queue.shift() : queue[0]),
+      respond: () => {
+        const next = queue.length > 1 ? queue.shift() : queue[0]
+        return typeof next === 'function'
+          ? next(partitionsOf(wire.requests[wire.requests.length - 1].body))
+          : next
+      },
     })
     wire.broker.nodeId = 0
     const cluster = createFakeCluster({ partitions })
@@ -104,16 +111,16 @@ describe('Producer > a Produce answer that does not match its request', () => {
     }
   }
 
-  test('idempotent: the batch retries with the same producer id, epoch and sequence and succeeds on a valid answer; settled once', async () => {
+  test('idempotent: the batch retries with the same producer id, epoch and sequence and resolves from the valid answer', async () => {
     const { producer, produces } = await connectedProducer([
       answerWith(DUPLICATE_ROWS),
-      answerWith([{ partition: 0 }]),
+      answerWith([{ partition: 0, offset: 200 }]),
     ])
 
     const results = await producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })
 
     expect(results).toHaveLength(1)
-    expect(results[0]).toMatchObject({ topicName: TOPIC, partition: 0, baseOffset: '100' })
+    expect(results[0]).toMatchObject({ topicName: TOPIC, partition: 0, baseOffset: '200' })
     const requests = produces()
     expect(requests).toHaveLength(2)
     const [first, second] = await Promise.all(
@@ -147,9 +154,9 @@ describe('Producer > a Produce answer that does not match its request', () => {
     expect(produces().length).toBeGreaterThan(1)
   })
 
-  test('a valid answer with rows in another order still settles every batch', async () => {
+  test('a valid answer with rows in the reverse of the request order still settles every batch', async () => {
     const { producer, produces } = await connectedProducer(
-      [answerWith([{ partition: 1 }, { partition: 0 }])],
+      [(sent) => answerWith(sent.map(({ partition }) => ({ partition })).reverse())],
       {},
       2
     )
@@ -163,6 +170,44 @@ describe('Producer > a Produce answer that does not match its request', () => {
     })
 
     expect(results.map(({ partition }) => partition).sort()).toEqual([0, 1])
-    expect(produces()).toHaveLength(1)
+    const requests = produces()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].map(({ partition }) => partition)).toEqual([0, 1])
+  })
+
+  const sendToTwoPartitions = (producer) =>
+    producer.send({
+      topic: TOPIC,
+      messages: [
+        { value: 'a', partition: 0 },
+        { value: 'b', partition: 1 },
+      ],
+    })
+
+  describe.each([
+    ['idempotent', {}],
+    ['plain', { idempotent: false }],
+  ])('%s: a request for two partitions answered for one', (_mode, options) => {
+    test('acknowledges the answered partition once and sends the missing one again until it is answered', async () => {
+      const { producer, produces } = await connectedProducer(
+        [answerWith([{ partition: 0, offset: 100 }]), answerWith([{ partition: 1, offset: 200 }])],
+        options,
+        2
+      )
+
+      const results = await sendToTwoPartitions(producer)
+
+      expect(results).toHaveLength(2)
+      expect(results.filter(({ partition }) => partition === 0)).toMatchObject([
+        { topicName: TOPIC, partition: 0, baseOffset: '100' },
+      ])
+      expect(results.filter(({ partition }) => partition === 1)).toMatchObject([
+        { topicName: TOPIC, partition: 1, baseOffset: '200' },
+      ])
+      expect(produces().map((batches) => batches.map(({ partition }) => partition))).toEqual([
+        [0, 1],
+        [1],
+      ])
+    })
   })
 })
