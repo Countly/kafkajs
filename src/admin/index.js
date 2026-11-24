@@ -21,7 +21,7 @@ const { createOffsets, OffsetAdmin } = require('./offsets')
 const createLogDirs = require('./logDirs')
 const groupBy = require('../utils/groupBy')
 const Long = require('../utils/long')
-const { assertPartitionId } = require('../utils/partitionId')
+const { assertPartitionId, isPartitionId, printable } = require('../utils/partitionId')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const {
@@ -148,12 +148,134 @@ const commitOffsetOf = (offset) => {
       ? BigInt(text)
       : null
   if (value === null || value > MAX_OFFSET) {
-    throw new KafkaJSNonRetriableError(`Invalid offset, expected a long received ${String(offset)}`)
+    throw new KafkaJSNonRetriableError(
+      `Invalid offset, expected a long received ${printable(offset)}`
+    )
   }
   if (value < 0n && value !== BigInt(EARLIEST_OFFSET) && value !== BigInt(LATEST_OFFSET)) {
     throw new KafkaJSNonRetriableError('Offset must not be a negative number')
   }
   return value.toString()
+}
+
+/**
+ * A copy of the partitions `deleteTopicRecords` was asked to delete from, each entry read once, so
+ * later changes by the caller cannot reach the request.
+ * @param {unknown} partitions
+ * @returns {{ partition: number, offset: string }[]} each offset in decimal
+ * @throws {KafkaJSNonRetriableError} for anything but a non-empty array of entries with a partition
+ *   id listed once and an offset from 0 to 2^63 - 1, or `-1` (the high watermark)
+ */
+const deletionsOf = (partitions) => {
+  if (!Array.isArray(partitions) || partitions.length === 0) {
+    throw new KafkaJSNonRetriableError('Invalid partitions')
+  }
+
+  const copy = []
+  const seen = new Set()
+  for (let i = 0; i < partitions.length; i++) {
+    const entry = partitions[i]
+    if (entry === null || typeof entry !== 'object') {
+      throw new KafkaJSNonRetriableError(
+        `Invalid partitions, expected { partition, offset } at index ${i}`
+      )
+    }
+    const { partition, offset } = entry
+    assertPartitionId(partition)
+    if (seen.has(partition)) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid partitions, partition ${partition} is listed more than once`
+      )
+    }
+    const value = commitOffsetOf(offset)
+    if (value === String(EARLIEST_OFFSET)) {
+      throw new KafkaJSNonRetriableError('Offset must not be a negative number')
+    }
+    seen.add(partition)
+    copy.push({ partition, offset: value })
+  }
+  return copy
+}
+
+/**
+ * A copy of the reassignments `alterPartitionReassignments` was asked for, each entry read once,
+ * so later changes by the caller cannot reach the request. Holes and `null` entries are refused,
+ * not skipped.
+ * @param {unknown[]} topics
+ * @returns {{ topic: string, partitionAssignment: { partition: number, replicas: number[] }[] }[]}
+ * @throws {KafkaJSNonRetriableError} for an entry that is not an object, a topic name that is not
+ *   a string or is listed twice, a partition or replica id that is not an integer from 0 to
+ *   2^31 - 1, a partition listed twice for a topic, or replicas that are not an array
+ */
+const reassignmentsOf = (topics) => {
+  const copy = []
+  for (let i = 0; i < topics.length; i++) {
+    const entry = topics[i]
+    if (entry === null || typeof entry !== 'object') {
+      throw new KafkaJSNonRetriableError(
+        `Invalid topics array, expected { topic, partitionAssignment } at index ${i}`
+      )
+    }
+    const { topic, partitionAssignment } = entry
+    if (typeof topic !== 'string') {
+      throw new KafkaJSNonRetriableError(
+        'Invalid topics array, the topic names have to be a valid string'
+      )
+    }
+    copy.push({ topic, partitionAssignment })
+  }
+
+  if (new Set(copy.map(({ topic }) => topic)).size < copy.length) {
+    throw new KafkaJSNonRetriableError(
+      'Invalid topics array, it cannot have multiple entries for the same topic'
+    )
+  }
+
+  for (const entry of copy) {
+    const { topic, partitionAssignment } = entry
+    if (!Array.isArray(partitionAssignment)) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid partitions array: ${printable(partitionAssignment)} for topic: ${topic}`
+      )
+    }
+
+    const partitions = new Set()
+    entry.partitionAssignment = []
+    for (let i = 0; i < partitionAssignment.length; i++) {
+      const assignment = partitionAssignment[i]
+      if (assignment === null || typeof assignment !== 'object') {
+        throw new KafkaJSNonRetriableError(
+          `Invalid partitions array, expected { partition, replicas } at index ${i} for topic: ${topic}`
+        )
+      }
+      const { partition, replicas } = assignment
+      if (!isPartitionId(partition)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid partitions index: ${printable(partition)} for topic: ${topic}`
+        )
+      }
+      if (partitions.has(partition)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid partitions array, partition ${partition} is listed more than once for topic: ${topic}`
+        )
+      }
+      partitions.add(partition)
+
+      if (!Array.isArray(replicas)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid replica assignment: ${printable(replicas)} for topic: ${topic} on partition: ${partition}`
+        )
+      }
+      const replicaIds = Array.from(replicas)
+      if (!replicaIds.every(isPartitionId)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid replica assignment: ${printable(replicas)} for topic: ${topic} on partition: ${partition}. Replicas must be a non negative number`
+        )
+      }
+      entry.partitionAssignment.push({ partition, replicas: replicaIds })
+    }
+  }
+  return copy
 }
 
 /**
@@ -2028,9 +2150,15 @@ module.exports = ({
    * was built for, after a stale-metadata answer too.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    *
+   * The partitions are checked and copied before anything is sent, so a change the caller makes
+   * to them later reaches no request.
+   *
    * @param {string} topic
    * @param {Array<SeekEntry>} partitions
    * @return {Promise}
+   * @throws {KafkaJSNonRetriableError} before any request, when the partitions are not a
+   *   non-empty array of entries with a partition id listed once and an offset from 0 to 2^63 - 1
+   *   or `-1`
    * @throws {KafkaJSDeleteTopicRecordsError} at once, not retried, when a requested partition is
    *   not in the topic's metadata, once the offsets read has succeeded: a topic that stays
    *   leaderless fails that read first, with the `KafkaJSNonRetriableError` below
@@ -2049,10 +2177,7 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topic "${topic}"`)
     }
 
-    if (!partitions || partitions.length === 0) {
-      throw new KafkaJSNonRetriableError(`Invalid partitions`)
-    }
-
+    partitions = deletionsOf(partitions)
     const topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
@@ -2084,7 +2209,7 @@ module.exports = ({
               low: undefined,
             }
             // warn in case of offset below low watermark
-            if (parseInt(offset) < parseInt(low) && parseInt(offset) !== -1) {
+            if (offset !== '-1' && low !== undefined && BigInt(offset) < BigInt(low)) {
               logger.warn(
                 'The requested offset is before the earliest offset maintained on the partition - no records will be deleted from this partition',
                 {
@@ -2516,6 +2641,8 @@ module.exports = ({
    * @param {import("../../types").IPartitionReassignment[]} request.topics topics and the paritions to be reassigned
    * @param {number} [request.timeout]
    * @returns {Promise<void>}
+   * @throws {KafkaJSNonRetriableError} before any request, for topics that `reassignmentsOf`
+   *   refuses; the topics are copied first, so a later change by the caller reaches no request
    * @throws {KafkaJSAggregateError} when a partition was refused for good: one error per such
    *   partition, not retriable, followed by the failures of an attempt that ran out of retries
    * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no
@@ -2529,54 +2656,9 @@ module.exports = ({
     if (typeof allowReplicationFactorChange !== 'boolean')
       throw new KafkaJSInvalidConfigurationError('Invalid allowReplicationFactorChange')
     if (!topics || !Array.isArray(topics)) {
-      throw new KafkaJSNonRetriableError(`Invalid topics array ${topics}`)
+      throw new KafkaJSNonRetriableError(`Invalid topics array ${printable(topics)}`)
     }
-
-    if (topics.filter(({ topic }) => typeof topic !== 'string').length > 0) {
-      throw new KafkaJSNonRetriableError(
-        'Invalid topics array, the topic names have to be a valid string'
-      )
-    }
-
-    const topicNames = new Set(topics.map(({ topic }) => topic))
-    if (topicNames.size < topics.length) {
-      throw new KafkaJSNonRetriableError(
-        'Invalid topics array, it cannot have multiple entries for the same topic'
-      )
-    }
-
-    for (const { topic, partitionAssignment } of topics) {
-      if (!partitionAssignment || !Array.isArray(partitionAssignment)) {
-        throw new KafkaJSNonRetriableError(
-          `Invalid partitions array: ${partitionAssignment} for topic: ${topic}`
-        )
-      }
-
-      for (const { partition, replicas } of partitionAssignment) {
-        if (
-          partition === null ||
-          partition === undefined ||
-          typeof partition !== 'number' ||
-          partition < 0
-        ) {
-          throw new KafkaJSNonRetriableError(
-            `Invalid partitions index: ${partition} for topic: ${topic}`
-          )
-        }
-
-        if (!replicas || !Array.isArray(replicas)) {
-          throw new KafkaJSNonRetriableError(
-            `Invalid replica assignment: ${replicas} for topic: ${topic} on partition: ${partition}`
-          )
-        }
-
-        if (replicas.filter((replica) => typeof replica !== 'number' || replica < 0).length >= 1) {
-          throw new KafkaJSNonRetriableError(
-            `Invalid replica assignment: ${replicas} for topic: ${topic} on partition: ${partition}. Replicas must be a non negative number`
-          )
-        }
-      }
-    }
+    topics = reassignmentsOf(topics)
 
     const outcome = new AggregateOutcome({
       keys: topics.flatMap(({ topic, partitionAssignment }) =>
