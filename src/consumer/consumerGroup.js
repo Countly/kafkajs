@@ -478,13 +478,6 @@ module.exports = class ConsumerGroup {
       (fence) => fence
     )
 
-    /**
-     * Position validation gets its own bounded retrier rather than the group's: the group's budget
-     * comes from the user's `retry` options and could block a whole node's fetch loop for one
-     * round. A partition that is still unvalidated afterwards is held and asked again later.
-     */
-    this.validationRetrier = createRetry({ retries: 2, maxRetryTime: 5000 })
-
     this.offsetManager = null
     /**
      * Monotonic invalidation version for the inputs of node selection (leaders, preferred
@@ -2481,7 +2474,6 @@ module.exports = class ConsumerGroup {
       prepared.check()
       const { assignmentEpoch } = prepared
       requestClock = this.acquireClock
-      const requestRouting = this.routingVersion
       const resolved = this.resolveTopicIds(this.buildFetchRequests(prepared.parts))
       const { requests, missing } = resolved
       if (missing) {
@@ -2540,14 +2532,9 @@ module.exports = class ConsumerGroup {
       }
 
       let response
-      let staleWrite = null
       try {
         response = await broker.fetch({
-          guard: () =>
-            prepared.guard() ||
-            (requestRouting !== this.routingVersion || requestClock !== this.acquireClock
-              ? (staleWrite ??= new KafkaJSNonRetriableError('The Fetch request became stale'))
-              : null),
+          guard: prepared.guard,
           maxWaitTime: this.maxWaitTime,
           minBytes: this.minBytes,
           maxBytes: this.maxBytes,
@@ -2563,10 +2550,6 @@ module.exports = class ConsumerGroup {
           forgottenTopics: tracked?.wire.forgottenTopics,
         })
       } catch (error) {
-        if (staleWrite && error === staleWrite) {
-          tracked?.session.handleError(tracked.token)
-          return []
-        }
         // A retired run's failure may only reset the session whose epoch it left unknown: replica
         // hints and routing belong to the run that replaced it.
         if (tracked && run.fence.closed) {
@@ -3108,9 +3091,10 @@ module.exports = class ConsumerGroup {
       return false
     }
 
-    // A partition that entered validation after its request was built is not used either: not
-    // even an error answer may reset or reroute a position that is being checked.
-    if (this.positionValidator.holdsFetch(topicName, partition)) {
+    // Nor is one held since the request was built, or validated since against another epoch than
+    // the request carried: the answer may come from a leader the position was not checked with,
+    // and not even an error answer may reset or reroute a position that is being checked.
+    if (this.positionValidator.holdsFetch(topicName, partition, requested?.currentLeaderEpoch)) {
       this.logger.debug('Dropping fetched partition', {
         topic: topicName,
         partition,
@@ -3168,8 +3152,7 @@ module.exports = class ConsumerGroup {
 
     const dropReason = fetchedPartitionDropReason(
       this.seekOffset.size !== 0 && this.seekOffset.has(topicName, partition),
-      this.subscriptionState.isPaused(topicName, partition),
-      false // a held partition returned above, and nothing was awaited since
+      this.subscriptionState.isPaused(topicName, partition)
     )
 
     if (dropReason != null) {
@@ -4024,12 +4007,14 @@ module.exports = class ConsumerGroup {
    * is awaiting a reply or held is absent from the request built afterwards, and this method never
    * returns leaving one awaiting.
    *
-   * A partition whose validation does not complete - a transport failure, retriable answers past
-   * the budget, an unexpected answer, a failed reposition - is held: it keeps its position and
-   * tracked epoch, the next round's metadata refresh is a full one, and it is asked again once its
-   * backoff passes (at once under a new leader epoch). The first failure of a held partition is
-   * warned, then at most once a minute. Other partitions are fetched throughout. Only an ACL
-   * refusal (`TOPIC_AUTHORIZATION_FAILED`) reaches the caller, as the same code on a Fetch does.
+   * Each leader is asked once per call, as the Java client does. A partition whose validation does
+   * not complete - a failed request, a retriable or unexpected answer, a failed reposition - is
+   * held: it keeps its position and tracked epoch, the next round's metadata refresh is a full one,
+   * and it is asked again once its backoff passes (at once under a new leader epoch). The first
+   * failure of a held partition is warned, then at most once a minute. Other partitions, other
+   * leaders' included, are validated and fetched throughout. Only an ACL refusal
+   * (`TOPIC_AUTHORIZATION_FAILED`) reaches the caller, after every leader was asked, as the same
+   * code on a Fetch does.
    *
    * Positions are read without seeding (`peekNextOffset`): validation observes a position and
    * never makes the committed offset count as resolved progress, which a seek being applied has
@@ -4100,11 +4085,7 @@ module.exports = class ConsumerGroup {
           }
 
           if (action === 'awaiting') {
-            if (!awaiting) {
-              // A new validation can invalidate an already built Fetch without a route change.
-              this.acquireClock += 1
-              awaiting = []
-            }
+            awaiting = awaiting || []
             awaiting.push({
               topic,
               partition,
@@ -4161,9 +4142,9 @@ module.exports = class ConsumerGroup {
    * first held, then at most once per `HELD_WARNING_INTERVAL`. Reads the clock when the failure is
    * recorded, not when the round began, so a slow round cannot shorten the backoff.
    * @private
-   * @param {{topic: string, partition: number, entry: object, currentLeaderEpoch: number,
-   *   errorCode?: number}[]} items the awaiting items that failed
-   * @param {string} [error] what failed, for every item; otherwise each item's `errorCode`
+   * @param {{topic: string, partition: number, entry: object, currentLeaderEpoch: number}[]} items
+   *   the awaiting items that failed
+   * @param {string} error what failed, for the warning
    * @returns {void}
    */
   holdUnvalidated(items, error) {
@@ -4172,7 +4153,7 @@ module.exports = class ConsumerGroup {
     if (held.length === 0) return
     this.validationRefresh = Symbol('validation refresh')
 
-    for (const { topic, partition, entry, errorCode } of held) {
+    for (const { topic, partition, entry } of held) {
       if (entry.warnedAt !== undefined && now - entry.warnedAt < HELD_WARNING_INTERVAL) continue
       entry.warnedAt = now
       this.logger.warn(
@@ -4182,7 +4163,7 @@ module.exports = class ConsumerGroup {
           memberId: this.memberId,
           topic,
           partition,
-          error: error ?? createErrorFromCode(errorCode).message,
+          error,
           failures: entry.failures,
           heldMs: now - entry.heldSince,
         }
@@ -4198,11 +4179,15 @@ module.exports = class ConsumerGroup {
    * from a preferred replica while only its leader can answer for its epochs. It is by topic as
    * well, because `Topic` is a map key on the request.
    *
+   * A leader whose request fails holds only its own partitions; the next leader is still asked.
+   *
    * @private
    * @param {{topic: string, partition: number, trackedEpoch: number, currentLeaderEpoch: number,
    *   generation: number, entry: object}[]} awaiting
    * @param {FetchPreparation} [preparation] the fetch round's identity, see `validatePositions`
    * @returns {Promise<void>}
+   * @throws {Error} the preparation's refusal, or the first `TOPIC_AUTHORIZATION_FAILED` answer
+   *   once every leader was asked
    */
   async runValidationRequests(awaiting, preparation) {
     const entriesByTopic = new Map()
@@ -4229,30 +4214,46 @@ module.exports = class ConsumerGroup {
       }
     }
 
+    let authorization = null
     for (const [nodeId, topics] of perLeader) {
       preparation?.check()
-      await this.validateOnLeader(nodeId, topics, preparation)
+      try {
+        const refused = await this.validateOnLeader(nodeId, topics, preparation)
+        authorization ??= refused
+      } catch (e) {
+        preparation?.check()
+        if (e.code === TOPIC_AUTHORIZATION_FAILED_CODE) authorization ??= e
+        const unanswered = topics.flatMap(({ entries }) => entries)
+        this.holdUnvalidated(
+          unanswered.filter(({ topic, partition }) =>
+            this.positionValidator.isAwaiting(topic, partition)
+          ),
+          e.message
+        )
+      }
       preparation?.check()
     }
+
+    if (authorization) throw authorization
   }
 
   /**
-   * Validates one leader's share of this round, retrying only the partitions that asked for it.
+   * Validates one leader's share of this round with one request. A partition the answer does not
+   * settle is held and asked again in a later round, after a metadata refresh: resending it to
+   * the same leader at the same epoch could not succeed.
    *
    * Whether the leader can serve the API at all is decided from its advertised versions, never by
    * catching `KafkaJSServerDoesNotSupportApiKey`: that error is non-retriable and would reach the
    * fetch's own recovery, crashing the consumer once per round.
    *
-   * Partitions still retriable when the budget is spent are held (`holdUnvalidated`). An ACL
-   * refusal of one partition is raised only after the retrier has settled the others.
-   *
    * @private
    * @param {number} nodeId the leader of every partition in `topics`
    * @param {{topic: string, entries: object[]}[]} topics
    * @param {FetchPreparation} [preparation] the fetch round's identity: checked after the broker
-   *   lookup and every reply, forwarded to the request, and the retry delays are bound to its fence
-   * @returns {Promise<void>}
-   * @throws {Error} the preparation's refusal, or the first `TOPIC_AUTHORIZATION_FAILED` answer
+   *   lookup and the reply, and forwarded to the request
+   * @returns {Promise<Error|null>} the first `TOPIC_AUTHORIZATION_FAILED` answer, for the caller to
+   *   raise once every leader was asked
+   * @throws {Error} the preparation's refusal, or the failure of the request itself
    */
   async validateOnLeader(nodeId, topics, preparation) {
     const broker = await this.cluster.findBroker({ nodeId, fence: preparation?.fence })
@@ -4272,80 +4273,43 @@ module.exports = class ConsumerGroup {
         })
       }
 
-      this.markAllValidated(topics)
-      return
+      this.confirmAll(topics)
+      return null
     }
 
-    let pending = topics
-    let authorization = null
-    let retryResponse
-    const retrier = preparation
-      ? createRetry({ retries: 2, maxRetryTime: 5000, fence: preparation.fence })
-      : this.validationRetrier
+    const response = await broker.offsetForLeaderEpoch({
+      topics: topics.map(({ topic, entries }) => ({
+        topic,
+        partitions: entries.map(({ partition, currentLeaderEpoch, trackedEpoch }) => ({
+          partition,
+          currentLeaderEpoch,
+          leaderEpoch: trackedEpoch,
+        })),
+      })),
+      guard: preparation?.guard,
+    })
+    preparation?.check()
 
-    try {
-      await retrier(async () => {
-        preparation?.check()
-        const response = await broker.offsetForLeaderEpoch({
-          topics: pending.map(({ topic, entries }) => ({
-            topic,
-            partitions: entries.map(({ partition, currentLeaderEpoch, trackedEpoch }) => ({
-              partition,
-              currentLeaderEpoch,
-              leaderEpoch: trackedEpoch,
-            })),
-          })),
-          guard: preparation?.guard,
-        })
-        preparation?.check()
-
-        const outcome = await this.applyValidationResponse(pending, response, preparation)
-        pending = outcome.retry
-        authorization ??= outcome.authorization
-        preparation?.check()
-
-        if (pending.length > 0) {
-          // `createRetry` only retries a thrown error, and the response codec deliberately does
-          // not throw on a per-partition code.
-          throw (retryResponse ??= new KafkaJSError('Position validation retriable'))
-        }
-      })
-    } catch (e) {
-      preparation?.check()
-      if (!authorization && e.name !== 'KafkaJSNumberOfRetriesExceeded') {
-        throw e
-      }
-
-      // The offset and the tracked epoch stay as they are: the partition is asked again later.
-      // For a broker response, each warning names its partition's code.
-      this.holdUnvalidated(
-        pending.flatMap(({ entries }) => entries),
-        retryResponse && e.cause === retryResponse ? undefined : e.message
-      )
-    }
-
-    if (authorization) throw authorization
+    return this.applyValidationResponse(topics, response, preparation)
   }
 
   /**
    * Classifies every partition of one OffsetForLeaderEpoch reply and applies its outcome.
    *
-   * Each partition is handled on its own: a retriable code is asked again in this round, except
-   * `UNKNOWN_LEADER_EPOCH`, which forgets the cached epoch and holds the partition; any other code
-   * holds only that partition; a truncation or reset outcome holds it until its reposition is
-   * applied (`confirm`), and a failed reposition keeps it held.
+   * Each partition is handled on its own: any error code holds only that partition, and
+   * `UNKNOWN_LEADER_EPOCH` also forgets the cached epoch, which the forced refresh brings back; a
+   * truncation or reset outcome holds it until its reposition is applied (`confirm`), and a failed
+   * reposition keeps it held.
    *
    * @private
-   * @param {{topic: string, entries: object[]}[]} pending the partitions this attempt asked about
+   * @param {{topic: string, entries: object[]}[]} pending the partitions the request asked about
    * @param {object} response the decoded reply
    * @param {FetchPreparation} [preparation] the fetch round's identity, checked before each
    *   partition's outcome is applied; a refusal is rethrown after the partition it interrupted is
    *   returned to unvalidated
-   * @returns {Promise<{retry: {topic: string, entries: object[]}[], authorization: Error|null}>}
-   *   the partitions to ask again about, empty when the round is done, and the first
-   *   `TOPIC_AUTHORIZATION_FAILED` error, which the caller raises once its retries settled. A
-   *   partition the reply does not mention is left to the caller's awaiting sweep rather than
-   *   retried: the broker answered without it.
+   * @returns {Promise<Error|null>} the first `TOPIC_AUTHORIZATION_FAILED` error, which the caller
+   *   raises once every leader was asked. A partition the reply does not mention is left to the
+   *   caller's awaiting sweep: the broker answered without it.
    * @throws {Error} the preparation's refusal
    */
   async applyValidationResponse(pending, response, preparation) {
@@ -4357,12 +4321,9 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    const retry = []
     let authorization = null
 
     for (const { topic, entries } of pending) {
-      const retriable = []
-
       for (const entry of entries) {
         preparation?.check()
         const reply = replies.get(`${topic}|${entry.partition}`)
@@ -4397,20 +4358,15 @@ module.exports = class ConsumerGroup {
           }
         )
 
-        if (outcome.action === 'retry' && reply.errorCode !== UNKNOWN_LEADER_EPOCH_CODE) {
-          entry.errorCode = reply.errorCode
-          retriable.push(entry)
-        } else if (outcome.action === 'retry' || outcome.action === 'fatal') {
+        if (outcome.action === 'retry' || outcome.action === 'fatal') {
           // Resending an epoch the leader does not know cannot succeed: it is forgotten, and the
-          // forced refresh brings the current one. Every other code holds only this partition.
+          // forced refresh brings the current one.
           if (reply.errorCode === UNKNOWN_LEADER_EPOCH_CODE) {
             this.cluster.forgetLeaderEpoch(topic, entry.partition)
           }
-          if (reply.errorCode === TOPIC_AUTHORIZATION_FAILED_CODE) {
-            authorization ??= createErrorFromCode(reply.errorCode)
-          }
-          entry.errorCode = reply.errorCode
-          this.holdUnvalidated([entry])
+          const error = createErrorFromCode(reply.errorCode)
+          if (reply.errorCode === TOPIC_AUTHORIZATION_FAILED_CODE) authorization ??= error
+          this.holdUnvalidated([entry], error.message)
         } else if (outcome.action === 'truncated' || outcome.action === 'reset') {
           try {
             const applied = await this.applyValidationOutcome(
@@ -4436,25 +4392,21 @@ module.exports = class ConsumerGroup {
           }
         }
       }
-
-      if (retriable.length > 0) {
-        retry.push({ topic, entries: retriable })
-      }
     }
 
-    return { retry, authorization }
+    return authorization
   }
 
   /**
-   * Moves every partition of these entries on without a reply, leaving their tracked epochs alone.
-   *
-   * Only the captured entries can be confirmed.
+   * Records every captured entry as validated against the epoch it was requested under, without
+   * a reply, leaving tracked epochs alone: the exit for a leader that cannot serve the API. An
+   * entry replaced, forgotten or cleared since is left alone (`PositionValidator#confirm`).
    *
    * @private
    * @param {{topic: string, entries: object[]}[]} topics
    * @returns {void}
    */
-  markAllValidated(topics) {
+  confirmAll(topics) {
     for (const { entries } of topics) {
       for (const entry of entries) this.positionValidator.confirm(entry)
     }

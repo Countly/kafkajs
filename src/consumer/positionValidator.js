@@ -62,9 +62,11 @@ module.exports = class PositionValidator {
    * The single entry point for both the "cached leader epoch changed" trigger and the transition
    * into `awaiting`: a partition whose `validatedAgainst` differs from `currentLeaderEpoch` — a
    * partition that was never validated counts as different — needs a request, unless either epoch
-   * is unknown, in which case it is recorded as validated straight away. That recording matters:
-   * without it the partition would be re-examined, and re-logged, on every round. A held entry it
-   * replaces passes on its failure count, `heldSince` and `warnedAt`.
+   * is unknown. A held or awaiting entry stays as it is while the cached leader epoch is unknown
+   * and a tracked epoch exists; only a partition with no entry, or one validated before, is
+   * recorded as validated against an unknown epoch straight away. That recording matters: without
+   * it the partition would be re-examined, and re-logged, on every round. A held entry it replaces
+   * passes on its failure count, `heldSince` and `warnedAt`.
    *
    * Anything other than `'unchanged'` means the leader epoch moved, which is the caller's signal to
    * clear the partition's preferred read replica. There is no separate "mark unvalidated" call.
@@ -195,10 +197,9 @@ module.exports = class PositionValidator {
    * a late reply cannot resurrect an entry the new assignment may not own, nor undo the validation
    * of a partition the new assignment has since validated itself.
    *
-   * `'retry'` is not an exit from `awaiting`: it says the request should be reissued, and the
-   * partition is left in flight. `'fatal'` likewise leaves the state alone; the caller holds the
-   * partition with `fail()`. `'truncated'` and `'reset'` leave the partition held, not validated:
-   * the caller confirms it with `confirm()` once the reposition has been applied.
+   * `'retry'` and `'fatal'` leave the state alone; the caller holds the partition with `fail()`
+   * and asks again in a later round. `'truncated'` and `'reset'` leave the partition held, not
+   * validated: the caller confirms it with `confirm()` once the reposition has been applied.
    *
    * @param {string} topic
    * @param {number} partition
@@ -313,9 +314,11 @@ module.exports = class PositionValidator {
   }
 
   /**
+   * Whether this partition must be kept out of a Fetch request, or its answer dropped.
    * @param {string} topic
    * @param {number} partition
-   * @param {number} [currentLeaderEpoch] the epoch a new Fetch will send
+   * @param {number} [currentLeaderEpoch] the epoch the Fetch carries; without it only awaiting,
+   *   applying and held entries hold
    * @returns {boolean} whether the partition is awaiting, applying, held or validated for a
    *   different epoch. An absent entry does not hold Fetch.
    */
