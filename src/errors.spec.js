@@ -169,6 +169,46 @@ describe('error wrapping preserves the protocol type', () => {
     expect(exceeded.type).toEqual('REBALANCE_IN_PROGRESS')
   })
 
+  it('KafkaJSNumberOfRetriesExceeded stops at a cause chain that loops, reading each link once', () => {
+    const first = new Error('the handler failed')
+    const second = new Error('the store refused it')
+    first.cause = second
+    let reads = 0
+    // A second read means the scan went round the loop; throwing ends it instead of spinning.
+    Object.defineProperty(second, 'cause', {
+      get() {
+        reads += 1
+        if (reads > 1) throw new Error('the cause of the second link was read again')
+        return first
+      },
+    })
+
+    const exceeded = new KafkaJSNumberOfRetriesExceeded(first, { retryCount: 0, retryTime: 300 })
+
+    expect(reads).toBe(1)
+    expect(exceeded).not.toHaveProperty('type')
+    expect(exceeded).not.toHaveProperty('code')
+    expect(exceeded.cause).toBe(first)
+    expect(exceeded.retryCount).toBe(0)
+    expect(exceeded.retryTime).toBe(300)
+  })
+
+  it('KafkaJSNumberOfRetriesExceeded finds the typed link of a cause chain that loops', () => {
+    const untyped = new Error('the fetch round failed')
+    const typed = Object.assign(new Error('the group is rebalancing'), {
+      type: 'REBALANCE_IN_PROGRESS',
+      code: 27,
+    })
+    untyped.cause = typed
+    typed.cause = untyped
+
+    const exceeded = new KafkaJSNumberOfRetriesExceeded(untyped, { retryCount: 2, retryTime: 100 })
+
+    expect(exceeded.type).toBe('REBALANCE_IN_PROGRESS')
+    expect(exceeded.code).toBe(27)
+    expect(exceeded.cause).toBe(untyped)
+  })
+
   it('KafkaJSNonRetriableError keeps type and code for a fenced static member (code 82)', () => {
     const fencedError = new KafkaJSProtocolError({
       type: 'FENCED_INSTANCE_ID',
