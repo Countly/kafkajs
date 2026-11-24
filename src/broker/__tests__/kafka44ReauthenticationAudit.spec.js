@@ -1,7 +1,12 @@
+const { createHmac, pbkdf2Sync } = require('crypto')
 const { Kafka } = require('../../../index')
+const { newLogger } = require('testHelpers')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
+const ConnectionPool = require('../../network/connectionPool')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
+const Broker = require('../index')
+const { DIGESTS, SCRAM } = require('../saslAuthenticator/scram')
 
 const BLACKOUT_MS = 1000
 const RETRY_MS = 100
@@ -140,5 +145,153 @@ describe('Kafka 4.4 client fix audit', () => {
     expect(cluster.requests()).toHaveLength(written)
     expect(cluster.sockets()).toHaveLength(dials)
     expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
+describe('session start', () => {
+  const PASSWORD = 'fixture-password'
+  const SESSION_LIFETIME = '1000'
+  const LOGIN_DELAY = 2000
+  let broker
+  let cluster
+
+  beforeEach(() => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+  })
+
+  afterEach(async () => {
+    try {
+      cluster?.cancelReplyHolds()
+      await broker?.disconnect({ drainTimeout: 0 })
+      await jest.advanceTimersByTimeAsync(1)
+      cluster?.assertClean()
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      jest.restoreAllMocks()
+      jest.useRealTimers()
+      broker = null
+      cluster = null
+    }
+  })
+
+  /**
+   * Scripts a broker with a one-second session and a separate login timeout.
+   * @param {string} mechanism SASL handshake mechanism
+   * @param {(fields: { authBytes: Buffer }) => object} [answer] SASL reply fields
+   * @returns {void}
+   */
+  const arrange = (mechanism, answer = () => ({ authBytes: Buffer.alloc(0) })) => {
+    const node = { id: 0, host: 'node', port: 9092 }
+    cluster = createScriptedCluster({ nodes: [node], profile: 'sasl' })
+      .answer('SaslHandshake', () => ({ enabledMechanisms: [mechanism] }))
+      .answer('SaslAuthenticate', (fields) => ({
+        errorCode: 0,
+        errorMessage: null,
+        sessionLifetimeMs: SESSION_LIFETIME,
+        ...answer(fields),
+      }))
+    const logger = newLogger()
+    const connectionPool = new ConnectionPool({
+      ...node,
+      logger,
+      socketFactory: cluster.socketFactory,
+      connectionTimeout: 10000,
+      requestTimeout: 5000,
+      authenticationTimeout: 5000,
+      connectionsMaxIdle: 0,
+      reauthenticationThreshold: 0,
+      sasl: { mechanism, username: 'user', password: PASSWORD },
+    })
+    broker = new Broker({ connectionPool, logger, nodeId: node.id })
+  }
+
+  /**
+   * Answers both SCRAM messages using the client's nonce and a valid server signature.
+   * @param {{ type: string, length: number, minIterations: number }} digest SCRAM digest
+   * @returns {(fields: { authBytes: Buffer }) => { authBytes: Buffer }} responder
+   */
+  const scramAnswer = ({ type, length, minIterations }) => {
+    const salt = Buffer.from('fixture-salt')
+    const saltedPassword = pbkdf2Sync(PASSWORD, salt, minIterations, length, type)
+    const serverKey = createHmac(type, saltedPassword).update('Server Key').digest()
+    let clientFirstBare
+    let serverFirst
+    return ({ authBytes }) => {
+      const message = authBytes.toString()
+      if (message.startsWith('n,,')) {
+        clientFirstBare = message.slice('n,,'.length)
+        const clientNonce = clientFirstBare.slice('n=user,r='.length)
+        serverFirst = `r=${clientNonce}fixture,s=${salt.toString('base64')},i=${minIterations}`
+        return { authBytes: Buffer.from(serverFirst), sessionLifetimeMs: '0' }
+      }
+      const withoutProof = message.slice(0, message.indexOf(',p='))
+      const transcript = [clientFirstBare, serverFirst, withoutProof].join(',')
+      const signature = createHmac(type, serverKey).update(transcript).digest('base64')
+      return { authBytes: Buffer.from(`v=${signature}`) }
+    }
+  }
+
+  test('a session is counted from when its final SASL request was written', async () => {
+    arrange('PLAIN')
+    const reply = cluster.holdReply({ api: 'SaslAuthenticate' })
+    const connected = broker.connect()
+    expect(await Promise.race([reply.executed(), connected])).toMatchObject({
+      api: 'SaslAuthenticate',
+    })
+    await jest.advanceTimersByTimeAsync(LOGIN_DELAY)
+    reply.deliver()
+    await connected
+
+    await broker.metadata()
+
+    expect(cluster.requests().map(({ api }) => api)).toEqual([
+      'SaslHandshake',
+      'SaslAuthenticate',
+      'SaslHandshake',
+      'SaslAuthenticate',
+      'Metadata',
+    ])
+  })
+
+  test.each([
+    ['SCRAM-SHA-256', DIGESTS.SHA256],
+    ['SCRAM-SHA-512', DIGESTS.SHA512],
+  ])(
+    'a SCRAM session whose signature check crosses the deadline re-authenticates first (%s)',
+    async (mechanism, digest) => {
+      arrange(mechanism, scramAnswer(digest))
+      const serverKey = SCRAM.prototype.serverKey
+      jest.spyOn(SCRAM.prototype, 'serverKey').mockImplementationOnce(async function (response) {
+        await jest.advanceTimersByTimeAsync(LOGIN_DELAY)
+        return serverKey.call(this, response)
+      })
+      await broker.connect()
+
+      await broker.metadata()
+
+      expect(cluster.requests().map(({ api }) => api)).toEqual([
+        'SaslHandshake',
+        'SaslAuthenticate',
+        'SaslAuthenticate',
+        'SaslHandshake',
+        'SaslAuthenticate',
+        'SaslAuthenticate',
+        'Metadata',
+      ])
+    }
+  )
+
+  test('a session answered at once keeps its lifetime', async () => {
+    arrange('PLAIN')
+    await broker.connect()
+    await jest.advanceTimersByTimeAsync(900)
+
+    await broker.metadata()
+
+    expect(cluster.requests().map(({ api }) => api)).toEqual([
+      'SaslHandshake',
+      'SaslAuthenticate',
+      'Metadata',
+    ])
   })
 })
