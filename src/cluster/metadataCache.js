@@ -1,5 +1,6 @@
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const { sharedSetup } = require('../admin/deadline')
+const describeThrown = require('../network/describeThrown')
 
 const UNKNOWN_EPOCH = -1
 const NO_LEADER_ID = -1
@@ -217,7 +218,9 @@ module.exports = class MetadataCache {
       try {
         sharedSetup(listener)
       } catch (e) {
-        this.logger.error('Routing change listener threw, ignoring it', { error: e.message })
+        this.logger.error('Routing change listener threw, ignoring it', {
+          error: describeThrown(e),
+        })
       }
     }
   }
@@ -621,7 +624,7 @@ module.exports = class MetadataCache {
       this.logger.error('Instrumentation event listener threw, ignoring it', {
         eventName,
         topic: payload && payload.topic,
-        error: e.message,
+        error: describeThrown(e),
       })
     }
   }
