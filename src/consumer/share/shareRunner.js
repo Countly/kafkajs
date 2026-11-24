@@ -7,6 +7,7 @@ const { ShareRun, handlerRunIdentity, outsideHandler } = require('./shareRun')
 const { ShareHandlerCall } = require('./shareHandlerCall')
 const { ShareCloseEpisode } = require('./shareCloseEpisode')
 const { events, wrap, unwrap } = require('./instrumentationEvents')
+const describeThrown = require('../../network/describeThrown')
 const {
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
@@ -127,9 +128,9 @@ class ShareRunner {
     }
     const { logger } = this.options
     const report = (error) =>
-      logger.error(`Failed to execute listener: ${error?.message}`, {
+      logger.error(`Failed to execute listener: ${describeThrown(error)}`, {
         eventName,
-        stack: error?.stack,
+        stack: describeThrown(error, 'stack'),
       })
     return this.options.instrumentationEmitter.addListener(unwrap(eventName), (event) => {
       event.type = wrap(event.type)

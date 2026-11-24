@@ -11,6 +11,7 @@ const { ShareHandlerCall, countWithin } = require('./shareHandlerCall')
 const { ShareCloseEpisode } = require('./shareCloseEpisode')
 const { events } = require('./instrumentationEvents')
 const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
+const describeThrown = require('../../network/describeThrown')
 
 const INITIAL_HEARTBEAT_MS = 1000
 /** Holds only the identity of the run whose handler is executing, never a record or batch. */
@@ -1142,8 +1143,9 @@ class ShareRun {
    * overlap its traffic, and ended for good by every other kind. A node whose capture fails
    * captures nothing; every other node still captures, and every node is retired and disposed.
    * The boundary runs once: an application callback reached from inside it (a logger, an event
-   * listener) that closes again joins it instead of capturing a second time, and capture and
-   * disposal failures are logged only after it is complete.
+   * listener) that closes again joins it instead of capturing a second time. A capture or disposal
+   * failure is kept as the raw thrown value, and read and logged only after every node retired, so
+   * an error that throws when read cannot stop another node's capture or disposal.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1152,11 +1154,6 @@ class ShareRun {
     if (episode.frozen || episode.freezing) return
     episode.freezing = true
     const failures = []
-    const failed = (message, node, error) =>
-      failures.push([
-        message,
-        { nodeId: node.id, error: error instanceof Error ? error.message : 'Non-Error thrown' },
-      ])
     this.captureCloseCoordinator(episode)
     const bindings = []
     for (const node of this.nodes.values()) {
@@ -1166,7 +1163,7 @@ class ShareRun {
         node.captured = node.loop.captureFinal()
       } catch (error) {
         node.captured = null
-        failed('Share final capture failed', node, error)
+        failures.push(['Share final capture failed', node.id, error])
       }
       if (node.captured) {
         const { binding } = node.captured
@@ -1191,14 +1188,15 @@ class ShareRun {
           preserve: node.captured,
         })
       } catch (error) {
-        failed('Share node disposal failed', node, error)
+        failures.push(['Share node disposal failed', node.id, error])
       }
       node.operation.retire(new KafkaJSNonRetriableError('Share run closed'))
       node.pacing.retire(new KafkaJSNonRetriableError('Share run closed'))
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
-    for (const [message, extra] of failures) this.options.logger.error(message, extra)
+    for (const [message, nodeId, error] of failures)
+      this.options.logger.error(message, { nodeId, error: describeThrown(error) })
   }
 
   /**
