@@ -489,3 +489,19 @@ telemetryShare.registerMetricForSubscription({ name: 'com.example.share', type: 
 // @ts-expect-error the ID getter does not accept signal strings
 telemetryShare.clientInstanceId('SIGTERM')
 void [telemetryShareSurface, telemetryShareId, telemetryShareDisconnect]
+
+// A recreated topic stops the consumer's run with this error.
+const topicRecreated = new kafkajs.KafkaJSTopicRecreatedError('topic orders was recreated', {
+  topic: 'orders',
+  previousTopicId: 'old-id',
+  topicId: 'new-id',
+  groupId: null,
+})
+const topicRecreatedBase: kafkajs.KafkaJSNonRetriableError = topicRecreated
+const topicRecreatedFields: [string, string, string, string | null] = [
+  topicRecreated.topic,
+  topicRecreated.previousTopicId,
+  topicRecreated.topicId,
+  topicRecreated.groupId,
+]
+void [topicRecreatedBase, topicRecreatedFields]
