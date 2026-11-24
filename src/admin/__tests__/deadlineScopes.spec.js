@@ -1,4 +1,7 @@
-const { KafkaJSTimeout } = require('../../errors')
+const createAdmin = require('..')
+const { createLogger, LEVELS } = require('../../loggers')
+const { createErrorFromCode } = require('../../protocol/error')
+const { KafkaJSTimeout, KafkaJSNumberOfRetriesExceeded } = require('../../errors')
 const {
   AdminDeadline,
   runWithDeadline,
@@ -230,6 +233,108 @@ describe('admin invocation scopes', () => {
 
       await expect(methods.probe({ apiTimeout: 250 })).resolves.toBe(250)
       await expect(methods.probe()).resolves.toBe(1000)
+    })
+  })
+
+  describe('a public call made from a log sink', () => {
+    beforeEach(() => jest.useFakeTimers())
+
+    const loggerOf = (sink) => createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+
+    test('owns its own deadline and settles after the call that logged', async () => {
+      const gate = held()
+      let child
+      const logger = loggerOf(() => {
+        child = observe(admin.child())
+      })
+      const admin = wrapAdmin(
+        {
+          parent: async () => {
+            logger.warn('started a call')
+            throw new Error('parent failed')
+          },
+          child: async () => {
+            await gate.promise
+            return 'child done'
+          },
+        },
+        { parent: 0, child: 0 },
+        1000
+      )
+
+      await expect(admin.parent()).rejects.toThrow('parent failed')
+      await flush()
+      expect(child.settled).toBe(false)
+
+      gate.resolve()
+      await flush()
+
+      expect(child).toMatchObject({ settled: true, value: 'child done' })
+    })
+
+    test('keeps its own budget and method name', async () => {
+      const parentGate = held()
+      const childGate = held()
+      let child
+      const logger = loggerOf(() => {
+        child = observe(admin.child({ apiTimeout: 50 }))
+      })
+      const admin = wrapAdmin(
+        {
+          parent: async () => {
+            logger.warn('started a call')
+            await parentGate.promise
+          },
+          child: async () => childGate.promise,
+        },
+        { parent: 0, child: 0 },
+        1000
+      )
+      const parent = admin.parent()
+
+      await jest.advanceTimersByTimeAsync(51)
+      await flush()
+
+      expect(child.settled).toBe(true)
+      expect(child.error).toBeInstanceOf(KafkaJSTimeout)
+      expect(child.error.message).toContain('child did not complete within 50 ms')
+
+      parentGate.resolve()
+      childGate.resolve()
+      await parent
+    })
+
+    test('createPartitions answered NOT_CONTROLLER logs a retry whose listTopics resolves after createPartitions rejected', async () => {
+      const metadata = held()
+      let listed
+      const logger = loggerOf(({ log }) => {
+        if (log.message === 'Could not create topics') listed = observe(admin.listTopics())
+      })
+      const broker = {
+        createPartitions: jest.fn(async () => {
+          throw createErrorFromCode(41)
+        }),
+      }
+      const admin = createAdmin({
+        logger,
+        retry: { retries: 0 },
+        cluster: {
+          refreshMetadata: jest.fn(async () => {}),
+          findControllerBroker: jest.fn(async () => broker),
+          metadata: jest.fn(() => metadata.promise),
+        },
+      })
+
+      await expect(
+        admin.createPartitions({ topicPartitions: [{ topic: 't', count: 2 }] })
+      ).rejects.toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      await flush()
+      expect(listed.settled).toBe(false)
+
+      metadata.resolve({ topicMetadata: [{ topic: 't' }] })
+      await flush()
+
+      expect(listed).toMatchObject({ settled: true, value: ['t'] })
     })
   })
 })

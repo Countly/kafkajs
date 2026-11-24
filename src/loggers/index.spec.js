@@ -1,5 +1,7 @@
+const { AsyncLocalStorage } = require('node:async_hooks')
 const MockDate = require('mockdate')
 const { createLogger, LEVELS } = require('./index')
+const { runWithDeadline, currentDeadline } = require('../admin/deadline')
 
 describe('Loggers', () => {
   let logger, timeNow, MyLogCreator, myLogger
@@ -203,6 +205,73 @@ describe('Loggers', () => {
         throw new Error('creator failed')
       }
       expect(() => createLogger({ logCreator: creator })).toThrow('creator failed')
+    })
+  })
+
+  describe('a log sink called inside an admin invocation', () => {
+    const flush = async () => {
+      for (let n = 0; n < 30; n++) await Promise.resolve()
+    }
+    const loggerOf = (sink) => createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+
+    it('calls the sink outside any admin invocation', async () => {
+      const seen = []
+      const root = loggerOf(() => {
+        seen.push(currentDeadline())
+      })
+
+      await runWithDeadline('outer', 1000, async () => root.info('x'))
+
+      expect(seen).toEqual([undefined])
+    })
+
+    it('keeps the sink outside any admin invocation after an async hop', async () => {
+      const seen = []
+      const root = loggerOf(async () => {
+        await Promise.resolve()
+        seen.push(currentDeadline())
+      })
+
+      await runWithDeadline('outer', 1000, async () => {
+        root.namespace('Ns').warn('x')
+        await flush()
+      })
+
+      expect(seen).toEqual([undefined])
+    })
+
+    it('leaves the admin invocation current for the caller once the sink returned', async () => {
+      const root = loggerOf(() => {})
+      let before
+      let after
+
+      await runWithDeadline('outer', 1000, async () => {
+        before = currentDeadline()
+        root.error('x')
+        after = currentDeadline()
+      })
+
+      expect(before.method).toBe('outer')
+      expect(after).toBe(before)
+    })
+
+    it("keeps the application's own async context in the sink, also after an async hop", async () => {
+      const own = new AsyncLocalStorage()
+      const seen = []
+      const root = loggerOf(async () => {
+        seen.push(own.getStore())
+        await Promise.resolve()
+        seen.push(own.getStore())
+      })
+
+      await own.run('request-1', () =>
+        runWithDeadline('outer', 1000, async () => {
+          root.info('x')
+          await flush()
+        })
+      )
+
+      expect(seen).toEqual(['request-1', 'request-1'])
     })
   })
 })
