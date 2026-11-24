@@ -364,20 +364,69 @@ describe('BrokerPool > a disconnect reaches the drains a replacement started', (
     expect(close).toEqual({ done: true, error: failure })
   })
 
-  it('a synchronous throw while retiring a replaced pool does not fail the refresh', async () => {
+  it('a synchronous throw while retiring a replaced pool does not fail the refresh, still destroys the pool and keeps its drain joinable', async () => {
     const { pool, seed } = refreshable(MOVED_SEED)
     const oldPool = seed.connectionPool
     const failure = new Error('retire threw')
+    const drain = deferred()
     oldPool.retire = jest.fn(() => {
       throw failure
     })
-    oldPool.destroy = jest.fn(async () => {})
+    oldPool.destroy = jest.fn().mockReturnValueOnce(drain.promise).mockResolvedValue(undefined)
 
     await pool.refreshMetadata([])
 
     expect(seed.connectionPool).not.toBe(oldPool)
     expect(oldPool.retire).toHaveBeenCalledTimes(1)
-    await expect(pool.disconnect()).resolves.toBeUndefined()
+    expect(oldPool.destroy.mock.calls).toEqual([[{ drainTimeout: 50 }]])
+    expect(pool.drainingPools.has(oldPool)).toBe(true)
+
+    const close = settled(pool.disconnect({ drainTimeout: 0 }))
+    await flush()
+    expect(oldPool.destroy.mock.calls).toEqual([[{ drainTimeout: 50 }], [{ drainTimeout: 0 }]])
+    expect(close.done).toBe(false)
+
+    drain.resolve()
+    await flush()
+    // The background drain's retire failure is logged; only this call's own drains can reject it.
+    expect(close).toEqual({ done: true, value: undefined })
+    expect(pool.drainingPools.size).toBe(0)
+  })
+
+  it('a synchronous throw while fencing a removed broker still destroys its pool, and a disconnect waits for that destroy', async () => {
+    const { pool } = build()
+    const connectionPool = new ConnectionPool({ logger: newLogger(), host: 'b3', port: 9092 })
+    const failure = new Error('retire threw')
+    const drain = deferred()
+    connectionPool.retire = jest.fn(() => {
+      throw failure
+    })
+    connectionPool.destroy = jest
+      .fn()
+      .mockReturnValueOnce(drain.promise)
+      .mockResolvedValue(undefined)
+    const three = new Broker({ connectionPool, logger: newLogger(), nodeId: 3 })
+    pool.brokers[3] = three
+
+    pool.removeBroker({ host: 'b3', port: 9092 })
+    await flush()
+
+    expect(connectionPool.destroy.mock.calls).toEqual([[{ drainTimeout: 50 }]])
+    expect(pool.draining.has(three)).toBe(true)
+
+    const close = settled(pool.disconnect({ drainTimeout: 0 }))
+    await flush()
+    expect(connectionPool.destroy.mock.calls).toEqual([
+      [{ drainTimeout: 50 }],
+      [{ drainTimeout: 0 }],
+    ])
+    expect(close.done).toBe(false)
+
+    drain.resolve()
+    await flush()
+    // This call's own redispatch fenced again, so it reports the fencing failure after teardown.
+    expect(close).toEqual({ done: true, error: failure })
+    expect(pool.draining.size).toBe(0)
   })
 
   it('both drain records hold the drains while they run and are empty once they settle', async () => {
