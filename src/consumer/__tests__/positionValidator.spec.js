@@ -429,7 +429,7 @@ describe('Consumer > PositionValidator', () => {
       validator.clear()
       validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 9 })
 
-      // A's sweep, retry exhaustion or markAllValidated now runs with the epoch it observed.
+      // A late exit of A's round now runs with the epoch it observed.
       expect(validator.markValidated(TOPIC, 0, 5, generation)).toBe(false)
       expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
       expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()

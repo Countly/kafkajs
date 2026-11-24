@@ -1650,7 +1650,7 @@ describe('validation response continuation', () => {
         group.startIdleWait()
       }
     )
-    const markAll = jest.spyOn(group, 'markAllValidated')
+    const markAll = jest.spyOn(group, 'confirmAll')
     const item = (partition) => {
       const { generation } = group.positionValidator.request('orders', partition, {
         offset: '10',

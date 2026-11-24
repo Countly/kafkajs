@@ -371,7 +371,11 @@ function oracleBuildFetchRequests(topicPartitions) {
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          !this.positionValidator.holdsFetch(topic, partition) &&
+          !this.positionValidator.holdsFetch(
+            topic,
+            partition,
+            this.cluster.leaderEpoch(topic, partition)
+          ) &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -493,7 +497,10 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        positionValidator: { holdsFetch: coin(2) },
+        positionValidator: {
+          // Also holds every partition validated for another epoch than the request carries.
+          holdsFetch: (topic, partition, epoch) => coin(2)(topic, partition) || epoch === 2,
+        },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
