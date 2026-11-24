@@ -205,7 +205,7 @@ describe('Admin > alterPartitionReassignments > input', () => {
     expect(sent).toEqual([oneTopic({ partition: 0, replicas: [1, 2] })])
   })
 
-  test('reads each topic, partition and replica entry once', async () => {
+  test('reads the topic, partitionAssignment, partition and replicas fields and each replica slot once', async () => {
     const { admin, sent } = adminOver()
     const reads = {}
     const once = (name, first, later) => ({

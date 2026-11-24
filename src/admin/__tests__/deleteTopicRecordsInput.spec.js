@@ -218,6 +218,41 @@ describe('Admin > deleteTopicRecords > input', () => {
     expect(sent).toEqual([[{ partition: 0, offset: '5' }]])
   })
 
+  test('reads the length of the partitions array once and sends what it first saw', async () => {
+    const { admin, sent } = adminOver()
+    let lengthReads = 0
+    const partitions = new Proxy([{ partition: 0, offset: '5' }], {
+      get(target, key, receiver) {
+        if (key !== 'length') return Reflect.get(target, key, receiver)
+        lengthReads += 1
+        return lengthReads === 1 ? 1 : 0
+      },
+    })
+
+    await admin.deleteTopicRecords({ topic: TOPIC, partitions })
+
+    expect(lengthReads).toBe(1)
+    expect(sent).toEqual([[{ partition: 0, offset: '5' }]])
+  })
+
+  test.each([
+    ['a numeric string', '1'],
+    ['an object whose valueOf is 1', { valueOf: () => 1 }],
+    ['-1', -1],
+    ['NaN', NaN],
+  ])('refuses partitions whose length is %s before any request', async (_, length) => {
+    const { admin, cluster } = adminOver()
+    const partitions = new Proxy([{ partition: 0, offset: '5' }], {
+      get: (target, key, receiver) =>
+        key === 'length' ? length : Reflect.get(target, key, receiver),
+    })
+
+    await expect(admin.deleteTopicRecords({ topic: TOPIC, partitions })).rejects.toMatchObject({
+      name: 'KafkaJSNonRetriableError',
+    })
+    expect(clusterCalls(cluster)).toBe(0)
+  })
+
   test('refuses a call on a disconnected admin before reading its input', async () => {
     const { admin, cluster } = adminOver()
     cluster.disconnect = jest.fn(async () => {})
