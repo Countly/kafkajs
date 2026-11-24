@@ -1,5 +1,9 @@
 const Decoder = require('./decoder')
-const { KafkaJSInvalidVarIntError, KafkaJSPartialMessageError } = require('../errors')
+const {
+  KafkaJSInvalidLongError,
+  KafkaJSInvalidVarIntError,
+  KafkaJSPartialMessageError,
+} = require('../errors')
 
 describe('Protocol > Decoder', () => {
   describe('bounds checking on VarInt/UVarInt-prefixed readers', () => {
@@ -122,6 +126,62 @@ describe('Protocol > Decoder', () => {
       for (const bytes of [[], [0x80, 0x80], [0xff, 0xff, 0xff, 0xff]]) {
         expect(() => read(bytes)).toThrow(KafkaJSPartialMessageError)
       }
+    })
+  })
+
+  describe('varint terminal byte', () => {
+    const decoder = (bytes) => new Decoder(Buffer.from(bytes))
+    const tenBytes = (first, last) => [first, ...Array(8).fill(0xff), last]
+
+    it('rejects a fifth byte above 0x0f in readVarInt', () => {
+      expect(() => decoder([0x80, 0x80, 0x80, 0x80, 0x10]).readVarInt()).toThrow(
+        KafkaJSInvalidVarIntError
+      )
+    })
+
+    it('rejects a fifth byte above 0x0f in readUVarInt', () => {
+      expect(() => decoder([0x80, 0x80, 0x80, 0x80, 0x10]).readUVarInt()).toThrow(
+        KafkaJSInvalidVarIntError
+      )
+    })
+
+    it('rejects a tenth byte above 0x01 in readVarLong', () => {
+      expect(() => decoder([...Array(9).fill(0x80), 0x02]).readVarLong()).toThrow(
+        KafkaJSInvalidLongError
+      )
+    })
+
+    it('rejects a 0x7f terminal byte', () => {
+      const fiveBytes = [0x80, 0x80, 0x80, 0x80, 0x7f]
+      expect(() => decoder(fiveBytes).readVarInt()).toThrow(KafkaJSInvalidVarIntError)
+      expect(() => decoder(fiveBytes).readUVarInt()).toThrow(KafkaJSInvalidVarIntError)
+      expect(() => decoder([...Array(9).fill(0x80), 0x7f]).readVarLong()).toThrow(
+        KafkaJSInvalidLongError
+      )
+    })
+
+    it('keeps the largest valid five- and ten-byte values', () => {
+      expect(decoder([0xff, 0xff, 0xff, 0xff, 0x0f]).readVarInt()).toBe(-2147483648)
+      expect(decoder([0xfe, 0xff, 0xff, 0xff, 0x0f]).readVarInt()).toBe(2147483647)
+      expect(decoder([0xff, 0xff, 0xff, 0xff, 0x0f]).readUVarInt()).toBe(4294967295)
+
+      const minimum = decoder(tenBytes(0xff, 0x01))
+      expect(minimum.readVarLong().toString()).toBe('-9223372036854775808')
+      expect(minimum.offset).toBe(10)
+      expect(decoder(tenBytes(0xfe, 0x01)).readVarLong().toString()).toBe('9223372036854775807')
+    })
+
+    it('keeps the over-long message for a fifth byte with its continuation bit', () => {
+      const fiveContinued = [0x80, 0x80, 0x80, 0x80, 0x80, 0x01]
+      expect(() => decoder(fiveContinued).readVarInt()).toThrow(
+        'Invalid VarInt, must contain 5 bytes or less'
+      )
+      expect(() => decoder(fiveContinued).readUVarInt()).toThrow(
+        'Invalid VarInt, must contain 5 bytes or less'
+      )
+      expect(() => decoder([...Array(10).fill(0x80), 0x01]).readVarLong()).toThrow(
+        'Invalid Long, must contain 9 bytes or less'
+      )
     })
   })
 
