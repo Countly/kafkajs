@@ -640,8 +640,8 @@ describe('BrokerPool > rebootstrap', () => {
 
     test('a concurrent rebootstrap that nulls this.metadata mid-refresh does not throw a TypeError', async () => {
       // refreshMetadata() must read its own local copy of the decoded response, not `this.metadata`,
-      // once a rebootstrap can run concurrently: `rebootstrap()` nulls `this.metadata` synchronously
-      // on its first tick, and this refresh is still awaiting `buildConnectionPool()` for the
+      // once a rebootstrap can run concurrently: `rebootstrap()` nulls `this.metadata` when it
+      // installs the new seed, and this refresh is still awaiting `buildConnectionPool()` for the
       // second (non-seed) broker in the response when that happens.
       const { cluster } = createCluster()
       const pool = cluster.brokerPool
@@ -653,8 +653,12 @@ describe('BrokerPool > rebootstrap', () => {
         ],
       }
       let triggered = false
+      let asked = 0
       // The rebuilt seed is asked again and answers with itself alone, so no stub pool becomes a Broker.
-      stubSeed(pool, async () => (triggered ? ok : twoBrokerResponse))
+      stubSeed(pool, async () => {
+        asked += 1
+        return triggered ? ok : twoBrokerResponse
+      })
 
       const stubbedBuildConnectionPool = pool.buildConnectionPool.bind(pool)
       pool.buildConnectionPool = async (destination) => {
@@ -668,6 +672,9 @@ describe('BrokerPool > rebootstrap', () => {
       }
 
       await expect(pool.refreshMetadata([])).resolves.toBeUndefined()
+      expect(asked).toBe(2)
+      expect(pool.metadata.brokers).toEqual(ok.brokers)
+      expect(pool.brokers[0]).toBe(pool.seedBroker)
     })
 
     test('the seed broker is never unset while a rebootstrap is in flight', async () => {
