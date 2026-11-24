@@ -336,5 +336,46 @@ describe('admin invocation scopes', () => {
 
       expect(listed).toMatchObject({ settled: true, value: ['t'] })
     })
+
+    test('a sink that enters a consumer operation inline still starts an admin call that owns its deadline', async () => {
+      const metadata = held()
+      const seen = []
+      let listed
+      const logger = loggerOf(async ({ log }) => {
+        if (log.message !== 'Could not create topics') return
+        seen.push(currentDeadline())
+        withConsumerOperation(operationOf(), () => {})
+        seen.push(currentDeadline())
+        listed = observe(admin.listTopics())
+        await Promise.resolve()
+        seen.push(currentDeadline())
+      })
+      const broker = {
+        createPartitions: jest.fn(async () => {
+          throw createErrorFromCode(41)
+        }),
+      }
+      const admin = createAdmin({
+        logger,
+        retry: { retries: 0 },
+        cluster: {
+          refreshMetadata: jest.fn(async () => {}),
+          findControllerBroker: jest.fn(async () => broker),
+          metadata: jest.fn(() => metadata.promise),
+        },
+      })
+
+      await expect(
+        admin.createPartitions({ topicPartitions: [{ topic: 't', count: 2 }] })
+      ).rejects.toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      await flush()
+      expect(seen).toEqual([undefined, undefined, undefined])
+      expect(listed.settled).toBe(false)
+
+      metadata.resolve({ topicMetadata: [{ topic: 't' }] })
+      await flush()
+
+      expect(listed).toMatchObject({ settled: true, value: ['t'] })
+    })
   })
 })

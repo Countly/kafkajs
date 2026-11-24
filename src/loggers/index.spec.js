@@ -1,7 +1,7 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
 const MockDate = require('mockdate')
 const { createLogger, LEVELS } = require('./index')
-const { runWithDeadline, currentDeadline } = require('../admin/deadline')
+const { runWithDeadline, currentDeadline, withConsumerOperation } = require('../admin/deadline')
 
 describe('Loggers', () => {
   let logger, timeNow, MyLogCreator, myLogger
@@ -272,6 +272,46 @@ describe('Loggers', () => {
       )
 
       expect(seen).toEqual(['request-1', 'request-1'])
+    })
+
+    it('runs a returned thenable inside the same boundary as the sink', async () => {
+      const reads = []
+      const lazy = {
+        get then() {
+          reads.push(['getter', currentDeadline()])
+          return () => {
+            reads.push(['method', currentDeadline()])
+          }
+        },
+      }
+      const root = loggerOf(() => lazy)
+
+      await runWithDeadline('outer', 1000, async () => root.info('x'))
+
+      expect(reads.map(([where]) => where)).toContain('getter')
+      expect(reads.map(([where]) => where)).toContain('method')
+      expect(reads.filter(([, deadline]) => deadline !== undefined)).toEqual([])
+    })
+
+    it('keeps the sink outside the admin invocation after it entered a consumer operation inline', async () => {
+      const operation = { guard: () => null }
+      const seen = []
+      const root = loggerOf(() => {
+        withConsumerOperation(operation, () => {})
+        seen.push(currentDeadline())
+      })
+      let before
+      let after
+
+      await runWithDeadline('outer', 1000, async () => {
+        before = currentDeadline()
+        root.warn('x')
+        after = currentDeadline()
+      })
+
+      expect(seen).toEqual([undefined])
+      expect(before.method).toBe('outer')
+      expect(after).toBe(before)
     })
   })
 })

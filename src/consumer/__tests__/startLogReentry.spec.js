@@ -4,6 +4,7 @@ const createConsumer = require('../index')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { createLogger, LEVELS } = require('../../loggers')
 const { consumerStoppingError } = require('../rebalanceErrorContract')
+const { KafkaJSNoBrokerAvailableError } = require('../../errors')
 const { newLogger } = require('testHelpers')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC, prepareRecordBatches } = require('./fixtures/fetchHarness')
@@ -98,6 +99,16 @@ describe('Consumer > public calls made from the Starting log', () => {
     }
   }
 
+  /**
+   * Saves a call made from the sink for the test to await; a rejection is reported by that await,
+   * not as an unhandled one in between.
+   * @param {Promise<any>} promise
+   */
+  const keep = (promise) => {
+    promise.catch(() => {})
+    calls.push(promise)
+  }
+
   const frames = (apis) => scripted.requests().filter(({ api }) => apis.includes(api)).length
   const joins = () => frames(['JoinGroup'])
 
@@ -131,12 +142,19 @@ describe('Consumer > public calls made from the Starting log', () => {
   })
 
   it('a run from the Starting log adds no second member, and after an awaited stop nothing is sent', async () => {
-    build(() => calls.push(consumer.run(handlers)))
+    let armed = true
+    build(() => {
+      if (!armed) return
+      armed = false
+      keep(consumer.run(handlers))
+    })
     await prepare()
 
     await finish(consumer.run(handlers), 'run')
     await settle(50)
+    await pump(() => frames(['Fetch']) > 0, 'a fetch from the live run')
 
+    expect(calls).toHaveLength(1)
     await expect(finish(calls[0], 'nested run')).resolves.toBeUndefined()
     expect(messages).toContain(ALREADY_RUNNING)
     expect(joins()).toBe(1)
@@ -175,33 +193,48 @@ describe('Consumer > public calls made from the Starting log', () => {
 
   it('a run from the Starting log of a crash restart adds no second member', async () => {
     build((count) => {
-      if (count === 2) calls.push(consumer.run(handlers))
+      if (count === 2) keep(consumer.run(handlers))
     })
     const crashed = new Promise((resolve) => consumer.on(consumer.events.CRASH, resolve))
     await prepare()
     await finish(consumer.run(handlers), 'run')
-    await settle(20)
+    await pump(() => frames(['Fetch']) > 0, 'a fetch from the first run')
     expect(joins()).toBe(1)
 
-    cluster.disconnect()
+    const failure = new KafkaJSNoBrokerAvailableError()
+    jest.spyOn(runners[0].consumerGroup, 'fetch').mockRejectedValueOnce(failure)
     const { payload } = await finish(crashed, 'crash')
     await pump(() => joins() >= 2, 'restart join')
     await settle(100)
 
+    expect(payload.error).toBe(failure)
     expect(payload.restart).toBe(true)
     expect(startings).toBe(2)
     expect(messages).toContain(ALREADY_RUNNING)
+    expect(calls).toHaveLength(1)
+    await expect(finish(calls[0], 'nested run')).resolves.toBeUndefined()
     expect(joins()).toBe(2)
+    expect(runners).toHaveLength(2)
   })
 
   it('three start and stop rounds with a run from each Starting log send one JoinGroup per round', async () => {
-    build(() => calls.push(consumer.run(handlers)))
+    let armed = false
+    build(() => {
+      if (!armed) return
+      armed = false
+      keep(consumer.run(handlers))
+    })
     await prepare()
 
     for (let round = 1; round <= 3; round++) {
+      const fetched = frames(['Fetch'])
+      armed = true
       await finish(consumer.run(handlers), `run ${round}`)
       await settle(20)
+      await pump(() => frames(['Fetch']) > fetched, `a fetch from run ${round}`)
       expect(joins()).toBe(round)
+      expect(calls).toHaveLength(round)
+      await expect(finish(calls[round - 1], `nested run ${round}`)).resolves.toBeUndefined()
 
       await finish(consumer.stop(), `stop ${round}`)
       const sent = frames(MEMBER_FRAMES)

@@ -39,8 +39,10 @@ const createLevel =
       ),
     }
     try {
-      const result = sharedSetup(() => logFunction(entry))
-      if (typeof result?.then === 'function') result.then(undefined, () => {})
+      sharedSetup(() => {
+        const result = logFunction(entry)
+        if (typeof result?.then === 'function') result.then(undefined, () => {})
+      })
     } catch {}
   }
 
