@@ -463,8 +463,9 @@ export interface ConsumerConfig extends ClientTelemetryConfig {
    * halts the partition the same way), and raising this option raises both. Decoded records
    * measure 208 to 321 bytes of heap each. It also sets a header ceiling of
    * `max(1, floor(value / 128))` record headers across all records of a batch; a record whose
-   * headers would cross it halts the partition with reason `count` before they are decoded.
-   * Concurrent fetches are extra.
+   * headers would cross it halts the partition with reason `count` before they are decoded. The
+   * header ceiling limits how many headers a batch decodes, not their heap: key sizes, a
+   * decode's temporary allocations and concurrent fetches still add to it.
    */
   maxDecompressedBatchBytes?: number
   retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }
@@ -2213,7 +2214,7 @@ export type ConsumerPartitionHaltedEventPayload = ConsumerPartitionHaltedBase &
         nextOffset?: string
         /** The codec of a compressed batch, when present on the error. */
         codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
-        /** The bound in force: bytes, or records for a `count` over the record ceiling. */
+        /** The bound in force: bytes; for a `count`, records over the record ceiling or headers over the header ceiling. */
         limit?: number
       }
     | { reason: 'no-offset'; offset: null; error: KafkaJSNoOffsetError }
@@ -3019,7 +3020,7 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   readonly nextOffset?: string
   /** The codec of a compressed batch. */
   readonly codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
-  /** The bound in force: bytes for `decompressed-size` and `decompression`, records for a `count` over the record ceiling. */
+  /** The bound in force: bytes for `decompressed-size` and `decompression`; for a `count`, records over the record ceiling or headers over the header ceiling. */
   readonly limit?: number
   constructor(
     e: Error | string,

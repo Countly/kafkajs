@@ -689,8 +689,8 @@ class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
  * read. `nextOffset`, present only when the batch boundary was validated (a readable, non-negative
  * `lastOffsetDelta` and, with `checkCrcs`, a matching checksum), is where `consumer.seek` goes to
  * skip the batch. `codec` names the compression codec of a compressed batch, and `limit` the bound
- * in force: bytes for `decompressed-size` and `decompression`, and for a `count` over a derived
- * ceiling, records, or headers for a header count.
+ * in force: bytes for `decompressed-size` and `decompression`; for a `count`, records over the
+ * record ceiling or headers over the header ceiling.
  */
 class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   /**
