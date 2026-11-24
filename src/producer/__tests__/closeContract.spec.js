@@ -20,6 +20,19 @@ const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 
+/**
+ * Consults the write guard every Produce request carries, as the connection does at a frame of 100
+ * bytes. A request without a callable guard fails loudly instead of passing as allowed.
+ * @param {object} request
+ * @returns {Error|null} the refusal, or null when the write is allowed
+ */
+const consultGuard = (request) => {
+  if (typeof request.guard !== 'function') {
+    throw new Error('The Produce request carries no write guard')
+  }
+  return request.guard(100)
+}
+
 describe('producer close cancellation', () => {
   beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }))
   afterEach(() => jest.useRealTimers())
@@ -186,9 +199,11 @@ describe('forced producer close on the wire', () => {
     'disconnect({ timeout: 0 }) after one partition was acknowledged rejects the send with KafkaJSProducerClosedError outcome unknown, idempotent %s',
     async (idempotent) => {
       const held = deferred()
+      const refusals = []
       const { producer, cluster, second } = twoLeaders(idempotent, async (request) => {
         await held.promise
-        const refusal = request.guard?.(100)
+        const refusal = consultGuard(request)
+        refusals.push(refusal)
         if (refusal) throw refusal
         return succeeded(request)
       })
@@ -219,6 +234,9 @@ describe('forced producer close on the wire', () => {
         held.resolve()
         await flushAll()
       }
+      expect(typeof second.produce.mock.calls[0][0].guard).toBe('function')
+      expect(refusals).toHaveLength(1)
+      expect(refusals[0]).toBeInstanceOf(KafkaJSProducerClosedError)
     }
   )
 
@@ -229,7 +247,7 @@ describe('forced producer close on the wire', () => {
       const refusals = []
       const { producer, second } = twoLeaders(idempotent, async (request) => {
         await held.promise
-        const refusal = request.guard?.(100)
+        const refusal = consultGuard(request)
         refusals.push(refusal)
         if (refusal) throw refusal
         return succeeded(request)
@@ -249,8 +267,9 @@ describe('forced producer close on the wire', () => {
         held.resolve()
         await flushAll()
       }
+      expect(typeof second.produce.mock.calls[0][0].guard).toBe('function')
       expect(refusals).toHaveLength(1)
-      expect(refusals[0]).toBeInstanceOf(Error)
+      expect(refusals[0]).toBeInstanceOf(KafkaJSProducerClosedError)
     }
   )
 
@@ -258,8 +277,10 @@ describe('forced producer close on the wire', () => {
     'a forced close while a Produce call is held after the write guard accepted it reports outcome unknown, idempotent %s',
     async (idempotent) => {
       const held = deferred()
+      const accepted = []
       const { producer, second } = twoLeaders(idempotent, async (request) => {
-        const refusal = request.guard?.(100)
+        const refusal = consultGuard(request)
+        accepted.push(refusal)
         if (refusal) throw refusal
         await held.promise
         return succeeded(request)
@@ -279,6 +300,10 @@ describe('forced producer close on the wire', () => {
         held.resolve()
         await flushAll()
       }
+      expect(accepted).toEqual([null])
+      const { guard } = second.produce.mock.calls[0][0]
+      expect(typeof guard).toBe('function')
+      expect(guard(100)).toBeInstanceOf(KafkaJSProducerClosedError)
     }
   )
 
@@ -286,12 +311,14 @@ describe('forced producer close on the wire', () => {
     'a forced close after a retry requeued a written delivery still reports outcome unknown, idempotent %s',
     async (idempotent) => {
       const held = deferred()
+      const refusals = []
       const { producer, second } = twoLeaders(
         idempotent,
         async (request) => {
           const retried = second.produce.mock.calls.length > 1
           if (retried) await held.promise
-          const refusal = request.guard?.(100)
+          const refusal = consultGuard(request)
+          refusals.push(refusal)
           if (refusal) throw refusal
           if (!retried) throw new KafkaJSConnectionError('Connection error')
           return succeeded(request)
@@ -317,6 +344,13 @@ describe('forced producer close on the wire', () => {
         held.resolve()
         await flushAll()
       }
+      expect(second.produce.mock.calls.map(([request]) => typeof request.guard)).toEqual([
+        'function',
+        'function',
+      ])
+      expect(refusals).toHaveLength(2)
+      expect(refusals[0]).toBeNull()
+      expect(refusals[1]).toBeInstanceOf(KafkaJSProducerClosedError)
     }
   )
 })
@@ -336,7 +370,7 @@ describe('producer close contract', () => {
     const fixture = bufferedProducer({ idempotent: false, ...options })
     const held = deferred()
     fixture.cluster.broker.produce.mockImplementationOnce(async (request) => {
-      const refusal = request.guard?.(100)
+      const refusal = consultGuard(request)
       if (refusal) throw refusal
       await held.promise
       return succeeded(request)
@@ -442,6 +476,9 @@ describe('producer close contract', () => {
       await pump(10)
       await first
       expect(send.value).toMatchObject({ name: 'KafkaJSProducerClosedError', outcome: 'unknown' })
+      const { guard } = cluster.broker.produce.mock.calls[0][0]
+      expect(typeof guard).toBe('function')
+      expect(guard(100)).toBeInstanceOf(KafkaJSProducerClosedError)
       expect(third.state).toBe('fulfilled')
       expect(cluster.disconnect).toHaveBeenCalledTimes(1)
     } finally {
@@ -454,7 +491,7 @@ describe('producer close contract', () => {
     const { producer, cluster } = bufferedProducer({ deliveryTimeout: 60000 })
     const held = deferred()
     cluster.broker.produce.mockImplementationOnce(async (request) => {
-      const refusal = request.guard?.(100)
+      const refusal = consultGuard(request)
       if (refusal) throw refusal
       await held.promise
       return succeeded(request)
@@ -476,6 +513,9 @@ describe('producer close contract', () => {
         state: 'rejected',
         value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
       })
+      const { guard } = cluster.broker.produce.mock.calls[0][0]
+      expect(typeof guard).toBe('function')
+      expect(guard(100)).toBeInstanceOf(KafkaJSProducerClosedError)
     } finally {
       held.resolve()
       await pump()
