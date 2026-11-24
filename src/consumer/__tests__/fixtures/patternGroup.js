@@ -99,7 +99,10 @@ const createPatternGroup = ({
     ...groupOptions,
   })
   group.memberId = 'member-1'
-  group.generationId = 1
+  // The consumer protocol ignores a generation assignment; a member holding an assignment there
+  // always has the positive epoch the coordinator gave it.
+  if (group.kind === 'consumer') group.groupMembership.memberEpoch = 1
+  else group.generationId = 1
   // A coordinator that behaves like a broker: it holds the last commit of each partition.
   const stored = new Map()
   const heldAt = (topic, partition) => stored.get(`${topic}|${partition}`) ?? initialCommit
