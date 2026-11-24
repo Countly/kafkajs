@@ -685,7 +685,7 @@ module.exports = class Connection {
    * @param {object} [socket=this.socket] the socket of the generation being ended
    * @returns {void}
    * @throws {*} the first failure detaching or destroying the socket, once the rest of the
-   *   teardown has run; callers still run the queue observers before rethrowing it
+   *   teardown has run; callers still run the queue observers, then rethrow or log it
    */
   closeGeneration(error, socket = this.socket) {
     clearTimeout(this.idleTimer)
