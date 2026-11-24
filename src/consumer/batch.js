@@ -89,14 +89,12 @@ module.exports = class Batch {
    * @returns {number}
    */
   leaderEpochAt(offset) {
-    if (this.#advances) {
-      return offset === this.lastOffset() ? (this.#nextBatchLeaderEpoch ?? -1) : -1
-    }
-
     const messages = this.messagesWithinOffset
 
     if (messages.length === 0) {
-      return -1
+      return this.#advances && offset === this.lastOffset()
+        ? (this.#nextBatchLeaderEpoch ?? -1)
+        : -1
     }
 
     const last = messages[messages.length - 1]
