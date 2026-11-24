@@ -16,6 +16,9 @@ const MEMBER_ID = 'member-1'
 const MEMBER_ID_REQUIRED = 79
 const WAIT_MS = 12000
 const QUIET_MS = 250
+const POLL_MS = 5
+/** Polls in a row that must see no new activity: each is its own event-loop turn. */
+const QUIET_POLLS = QUIET_MS / POLL_MS
 const BACKOFF_FLOOR_MS = 50
 const REQUEST_TIMEOUT_MS = 300
 const ROUND_TIMEOUT_MS = 400
@@ -102,7 +105,7 @@ const until = async (predicate, label, budget = WAIT_MS) => {
   const deadline = Date.now() + budget
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`Did not happen in time: ${label}`)
-    await pause(5)
+    await pause(POLL_MS)
   }
 }
 
@@ -513,11 +516,24 @@ class ClassicFaultEpisode {
   }
 
   /**
+   * Waits until the group did nothing for `QUIET_POLLS` polls in a row. Quiet is counted in
+   * event-loop turns, not wall time: a process the machine did not schedule runs no turn, so a
+   * stall cannot pass for quiet while the answer it delayed still waits in the queue.
    * @private
    * @returns {Promise<void>} when the group did nothing for a quiet interval
    */
   async quiet() {
-    await until(() => performance.now() - this.lastActivity() > QUIET_MS, 'a quiet wire')
+    let last = this.lastActivity()
+    let polls = 0
+    await until(() => {
+      const latest = this.lastActivity()
+      if (latest !== last) {
+        last = latest
+        polls = 0
+      }
+      polls += 1
+      return polls > QUIET_POLLS
+    }, 'a quiet wire')
   }
 
   /**
