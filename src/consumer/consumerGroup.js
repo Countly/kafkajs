@@ -796,10 +796,12 @@ module.exports = class ConsumerGroup {
   /**
    * The poll-expiry variant of `leave()`: no commit, no callbacks, response ignored. A no-op under
    * classic, whose poll-expiry path uses `leave()` or sends nothing at all.
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] refuses the leave's
+   *   write and its answer
    * @returns {Promise<void>}
    */
-  async leaveForPollExpiry() {
-    return this.groupMembership.leaveForPollExpiry()
+  async leaveForPollExpiry(operation) {
+    return this.groupMembership.leaveForPollExpiry(operation)
   }
 
   /**

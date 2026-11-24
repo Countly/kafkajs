@@ -15,7 +15,7 @@ const {
   obsoleteOwnership,
   learnOwnershipLoss,
 } = require('./rebalanceErrorContract')
-const { COOPERATIVE } = require('./groupProtocol/interface')
+const { COOPERATIVE, ConsumerOperation } = require('./groupProtocol/interface')
 const {
   events: {
     REBALANCING,
@@ -879,9 +879,13 @@ module.exports = class RebalanceCoordinator {
     }
 
     await this.contain('heartbeat stop', () => this.heartbeatManager.stop())
-    if (this.runner.stopRequested) return
+    if (this.runner.stopRequested || this.runner.fatal) return
 
     const joinsBefore = this.consumerGroup.joinCount
+    // Refuses the leave's write, its answer and everything after it once the run ended for good.
+    const leaving = new ConsumerOperation({
+      guard: () => this.runner.retirement ?? this.runner.fatal?.error ?? null,
+    })
 
     // KIP-848 members always tell the coordinator they are gone, static or not - the protocol picks
     // epoch -1 or -2 from `groupInstanceId`. KIP-345's "a static member sends nothing" rule is the
@@ -889,12 +893,12 @@ module.exports = class RebalanceCoordinator {
     // `STALE`, so it would never rejoin.
     // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
     if (this.consumerGroup.kind === 'consumer') {
-      await this.contain('poll leave', () => this.consumerGroup.leaveForPollExpiry())
+      await this.contain('poll leave', () => this.consumerGroup.leaveForPollExpiry(leaving))
     } else if (!isStatic) {
-      await this.contain('poll leave', () => this.consumerGroup.leave())
+      await this.contain('poll leave', () => this.consumerGroup.leave({ operation: leaving }))
     }
 
-    if (this.consumerGroup.joinCount !== joinsBefore) {
+    if (leaving.guard() || this.consumerGroup.joinCount !== joinsBefore) {
       return
     }
 

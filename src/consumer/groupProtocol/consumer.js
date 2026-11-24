@@ -1874,30 +1874,34 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * The poll-expiry variant: no commit, no partition events, the response ignored, and the member
    * parks in a state that sends nothing until the recovering round rejoins it.
+   * @param {import('./interface').ConsumerOperation} [operation] refuses the leave's write and its
+   *   answer
    * @returns {Promise<void>}
    */
-  async leaveForPollExpiry() {
+  async leaveForPollExpiry(operation) {
     if (isNotInGroup(this.state)) return
 
     if (isLeavingGroup(this.state)) {
       return this.joinInFlightLeave()
     }
 
-    return this.trackLeave(this.performPollExpiryLeave())
+    return this.trackLeave(this.performPollExpiryLeave(operation))
   }
 
   /**
    * The poll-expiry leave itself, once the guards have let it start.
    * @private
+   * @param {import('./interface').ConsumerOperation} [operation] refuses the leave's write and its
+   *   answer
    * @returns {Promise<void>}
    */
-  async performPollExpiryLeave() {
+  async performPollExpiryLeave(operation) {
     this.clearFirstMembership()
     this.pollTimerExpired = true
     this.transitionTo(PREPARE_LEAVING)
     this.ownedPartitions = []
 
-    await this.sendLeaveHeartbeat()
+    await this.sendLeaveHeartbeat(undefined, operation)
   }
 
   /**

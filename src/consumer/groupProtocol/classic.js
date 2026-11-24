@@ -164,8 +164,9 @@ module.exports = class ClassicGroupProtocol {
           if (refusal) throw refusal
           await coordinator.heartbeat(guard ? { ...payload, guard } : payload)
         } catch (e) {
+          // A refusal, also the one this write was refused with, is the caller's, not the broker's.
           const late = guard?.()
-          if (late && late !== e) throw late
+          if (late) throw late
           if (losesCoordinator(e)) {
             this.coordinatorUnknown = true
           }
@@ -825,13 +826,18 @@ module.exports = class ClassicGroupProtocol {
    * loses its generation: retained state from a generation that no longer exists would otherwise
    * be used to compute the next assignment.
    * @returns {void}
+   * @throws {Error} the first assigner's failure, once every assigner was told
    */
   clearAssignerState() {
+    let failure = null
     for (const assigner of this.assigners) {
-      if (assigner.onAssignment) {
-        assigner.onAssignment(null, { generationId: -1, groupProtocol: null })
+      try {
+        assigner.onAssignment?.(null, { generationId: -1, groupProtocol: null })
+      } catch (error) {
+        failure ??= error
       }
     }
+    if (failure) throw failure
   }
 
   /**
