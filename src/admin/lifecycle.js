@@ -69,11 +69,14 @@ class AdminLifecycle {
    * Admits one lazy call and observes its late outcome. Forced close settles the client waiter;
    * the call body must also use the captured fence at every continuation and private write.
    * @template T
-   * @param {(generation: Generation) => Promise<T>|T} work unstarted public call
+   * @param {(generation: Generation, input: unknown) => Promise<T>|T} work unstarted public call
+   * @param {() => unknown} [admit] runs synchronously once the call is admitted, before any
+   *   await; what it returns is passed to `work`, what it throws rejects the call
    * @returns {Promise<T>} result while this captured generation remains usable
-   * @throws {KafkaJSNonRetriableError|Error} closing/closed refusal or original call failure
+   * @throws {KafkaJSNonRetriableError|Error} closing/closed refusal, `admit` failure or original
+   *   call failure
    */
-  run(work) {
+  run(work, admit) {
     if (this.closing || this.closed) {
       return Promise.reject(
         new KafkaJSNonRetriableError(
@@ -81,12 +84,18 @@ class AdminLifecycle {
         )
       )
     }
+    let input
+    try {
+      input = admit?.()
+    } catch (error) {
+      return Promise.reject(error)
+    }
     const generation = this.generation
     const task = generation.wait(
       Promise.resolve().then(() => {
         const error = generation.guard()
         if (error) throw error
-        return work(generation)
+        return work(generation, input)
       })
     )
     this.active.add(task)

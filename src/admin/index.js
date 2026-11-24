@@ -159,6 +159,24 @@ const commitOffsetOf = (offset) => {
 }
 
 /**
+ * The items of an array, its length and each index read once. The array's own iterator is not
+ * used, and an index the array does not own (a hole, even one its prototype fills) is refused.
+ * @param {unknown[]} list
+ * @param {(index: number) => string} holeMessage
+ * @returns {unknown[]}
+ * @throws {KafkaJSNonRetriableError} with `holeMessage` of the first index the array does not own
+ */
+const itemsOf = (list, holeMessage) => {
+  const length = list.length
+  const items = []
+  for (let i = 0; i < length; i++) {
+    if (!Object.hasOwn(list, i)) throw new KafkaJSNonRetriableError(holeMessage(i))
+    items.push(list[i])
+  }
+  return items
+}
+
+/**
  * A copy of the partitions `deleteTopicRecords` was asked to delete from, each entry read once, so
  * later changes by the caller cannot reach the request.
  * @param {unknown} partitions
@@ -171,14 +189,14 @@ const deletionsOf = (partitions) => {
     throw new KafkaJSNonRetriableError('Invalid partitions')
   }
 
+  const expected = (i) => `Invalid partitions, expected { partition, offset } at index ${i}`
+  const items = itemsOf(partitions, expected)
   const copy = []
   const seen = new Set()
-  for (let i = 0; i < partitions.length; i++) {
-    const entry = partitions[i]
+  for (let i = 0; i < items.length; i++) {
+    const entry = items[i]
     if (entry === null || typeof entry !== 'object') {
-      throw new KafkaJSNonRetriableError(
-        `Invalid partitions, expected { partition, offset } at index ${i}`
-      )
+      throw new KafkaJSNonRetriableError(expected(i))
     }
     const { partition, offset } = entry
     assertPartitionId(partition)
@@ -205,16 +223,18 @@ const deletionsOf = (partitions) => {
  * @returns {{ topic: string, partitionAssignment: { partition: number, replicas: number[] }[] }[]}
  * @throws {KafkaJSNonRetriableError} for an entry that is not an object, a topic name that is not
  *   a string or is listed twice, a partition or replica id that is not an integer from 0 to
- *   2^31 - 1, a partition listed twice for a topic, or replicas that are not an array
+ *   2^31 - 1, a partition listed twice for a topic, replicas that are not an array, or a replica
+ *   listed twice for a partition
  */
 const reassignmentsOf = (topics) => {
+  const expected = (i) =>
+    `Invalid topics array, expected { topic, partitionAssignment } at index ${i}`
+  const items = itemsOf(topics, expected)
   const copy = []
-  for (let i = 0; i < topics.length; i++) {
-    const entry = topics[i]
+  for (let i = 0; i < items.length; i++) {
+    const entry = items[i]
     if (entry === null || typeof entry !== 'object') {
-      throw new KafkaJSNonRetriableError(
-        `Invalid topics array, expected { topic, partitionAssignment } at index ${i}`
-      )
+      throw new KafkaJSNonRetriableError(expected(i))
     }
     const { topic, partitionAssignment } = entry
     if (typeof topic !== 'string') {
@@ -239,14 +259,15 @@ const reassignmentsOf = (topics) => {
       )
     }
 
+    const expected = (i) =>
+      `Invalid partitions array, expected { partition, replicas } at index ${i} for topic: ${topic}`
+    const assignments = itemsOf(partitionAssignment, expected)
     const partitions = new Set()
     entry.partitionAssignment = []
-    for (let i = 0; i < partitionAssignment.length; i++) {
-      const assignment = partitionAssignment[i]
+    for (let i = 0; i < assignments.length; i++) {
+      const assignment = assignments[i]
       if (assignment === null || typeof assignment !== 'object') {
-        throw new KafkaJSNonRetriableError(
-          `Invalid partitions array, expected { partition, replicas } at index ${i} for topic: ${topic}`
-        )
+        throw new KafkaJSNonRetriableError(expected(i))
       }
       const { partition, replicas } = assignment
       if (!isPartitionId(partition)) {
@@ -266,16 +287,61 @@ const reassignmentsOf = (topics) => {
           `Invalid replica assignment: ${printable(replicas)} for topic: ${topic} on partition: ${partition}`
         )
       }
-      const replicaIds = Array.from(replicas)
+      const where = `for topic: ${topic} on partition: ${partition}`
+      const replicaIds = itemsOf(
+        replicas,
+        (i) => `Invalid replica assignment: hole at index ${i} ${where}`
+      )
       if (!replicaIds.every(isPartitionId)) {
         throw new KafkaJSNonRetriableError(
-          `Invalid replica assignment: ${printable(replicas)} for topic: ${topic} on partition: ${partition}. Replicas must be a non negative number`
+          `Invalid replica assignment: ${replicaIds.map(printable).join(',')} ${where}. Replicas must be a non negative number`
         )
+      }
+      const unique = new Set()
+      for (const id of replicaIds) {
+        if (unique.has(id)) {
+          throw new KafkaJSNonRetriableError(
+            `Invalid replica assignment: replica ${id} is listed more than once ${where}`
+          )
+        }
+        unique.add(id)
       }
       entry.partitionAssignment.push({ partition, replicas: replicaIds })
     }
   }
   return copy
+}
+
+/**
+ * Reads and checks the `deleteTopicRecords` options when the call is admitted, before any await.
+ * @param {{ topic: string, partitions: unknown }} options
+ * @returns {[{ topic: string, partitions: { partition: number, offset: string }[] }]} the
+ *   arguments the method runs with
+ * @throws {KafkaJSNonRetriableError} for an invalid topic, or partitions `deletionsOf` refuses
+ */
+const deletionInput = ({ topic, partitions }) => {
+  if (!topic || typeof topic !== 'string') {
+    throw new KafkaJSNonRetriableError(`Invalid topic "${topic}"`)
+  }
+  return [{ topic, partitions: deletionsOf(partitions) }]
+}
+
+/**
+ * Reads and checks the `alterPartitionReassignments` options when the call is admitted, before any
+ * await.
+ * @param {{ topics: unknown, timeout?: number, allowReplicationFactorChange?: boolean }} options
+ * @returns {[{ topics: object[], timeout?: number, allowReplicationFactorChange: boolean }]} the
+ *   arguments the method runs with
+ * @throws {KafkaJSInvalidConfigurationError} when `allowReplicationFactorChange` is not a boolean
+ * @throws {KafkaJSNonRetriableError} for topics that are not an array or `reassignmentsOf` refuses
+ */
+const reassignmentInput = ({ topics, timeout, allowReplicationFactorChange = true }) => {
+  if (typeof allowReplicationFactorChange !== 'boolean')
+    throw new KafkaJSInvalidConfigurationError('Invalid allowReplicationFactorChange')
+  if (!topics || !Array.isArray(topics)) {
+    throw new KafkaJSNonRetriableError(`Invalid topics array ${printable(topics)}`)
+  }
+  return [{ topics: reassignmentsOf(topics), timeout, allowReplicationFactorChange }]
 }
 
 /**
@@ -2150,8 +2216,8 @@ module.exports = ({
    * was built for, after a stale-metadata answer too.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    *
-   * The partitions are checked and copied before anything is sent, so a change the caller makes
-   * to them later reaches no request.
+   * The public call checks and copies its input (`deletionInput`) synchronously, when it is made,
+   * so a change the caller makes to the input afterwards reaches no request.
    *
    * @param {string} topic
    * @param {Array<SeekEntry>} partitions
@@ -2173,11 +2239,6 @@ module.exports = ({
    * @property {string} offset
    */
   const deleteTopicRecords = async ({ topic, partitions }) => {
-    if (!topic || typeof topic !== 'string') {
-      throw new KafkaJSNonRetriableError(`Invalid topic "${topic}"`)
-    }
-
-    partitions = deletionsOf(partitions)
     const topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
@@ -2641,25 +2702,15 @@ module.exports = ({
    * @param {import("../../types").IPartitionReassignment[]} request.topics topics and the paritions to be reassigned
    * @param {number} [request.timeout]
    * @returns {Promise<void>}
-   * @throws {KafkaJSNonRetriableError} before any request, for topics that `reassignmentsOf`
-   *   refuses; the topics are copied first, so a later change by the caller reaches no request
+   * @throws {KafkaJSNonRetriableError} before any request, for topics that `reassignmentInput`
+   *   refuses; the public call copies the topics when it is made, so a later change by the caller
+   *   reaches no request
    * @throws {KafkaJSAggregateError} when a partition was refused for good: one error per such
    *   partition, not retriable, followed by the failures of an attempt that ran out of retries
    * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no
    *   partition was refused for good
    */
-  const alterPartitionReassignments = async ({
-    topics,
-    timeout,
-    allowReplicationFactorChange = true,
-  }) => {
-    if (typeof allowReplicationFactorChange !== 'boolean')
-      throw new KafkaJSInvalidConfigurationError('Invalid allowReplicationFactorChange')
-    if (!topics || !Array.isArray(topics)) {
-      throw new KafkaJSNonRetriableError(`Invalid topics array ${printable(topics)}`)
-    }
-    topics = reassignmentsOf(topics)
-
+  const alterPartitionReassignments = async ({ topics, timeout, allowReplicationFactorChange }) => {
     const outcome = new AggregateOutcome({
       keys: topics.flatMap(({ topic, partitionAssignment }) =>
         partitionAssignment.map(({ partition }) => partitionKey(topic, partition))
@@ -2922,6 +2973,7 @@ module.exports = ({
       deleteGroups: 1,
     },
     apiTimeout,
-    lifecycle
+    lifecycle,
+    { deleteTopicRecords: deletionInput, alterPartitionReassignments: reassignmentInput }
   )
 }
