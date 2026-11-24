@@ -458,6 +458,16 @@ describe('share handlers on parallel leader nodes', () => {
           if (++captures === 2) throw unreadable
           return captureFinal.call(this)
         })
+      const retired = () =>
+        capture.mock.contexts.map((loop) => [loop.disposed, loop.session.closed])
+      const sendFinal = ShareFetchLoop.prototype.sendFinal
+      let atFinal = null
+      const finalSend = jest
+        .spyOn(ShareFetchLoop.prototype, 'sendFinal')
+        .mockImplementation(function (closing) {
+          atFinal ??= retired()
+          return sendFinal.call(this, closing)
+        })
       await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
       const logged = jest.spyOn(h.consumer.logger(), 'error')
       let listened = 0
@@ -512,6 +522,16 @@ describe('share handlers on parallel leader nodes', () => {
       expect(
         messages.filter((message) => message.startsWith('Failed to execute listener'))
       ).toEqual(['Failed to execute listener: <unreadable thrown value>'])
+      expect(finalSend).toHaveBeenCalledTimes(1)
+      expect(finalSend.mock.contexts[0]).toBe(capture.mock.contexts[0])
+      expect(atFinal).toEqual([
+        [true, true],
+        [true, true],
+      ])
+      expect(retired()).toEqual([
+        [true, true],
+        [true, true],
+      ])
       gate.resolve()
       await flush()
       await advance(1)

@@ -191,15 +191,29 @@ describe('share client admission while a close is in progress', () => {
     const entered = deferred()
     const proceed = deferred()
     const outcomes = []
+    const settled = []
+    /**
+     * @param {string} name Recorded once the call settles either way.
+     * @param {Promise<void>} call A public disconnect.
+     * @returns {Promise<string|Error>} `'resolved'` or the rejection.
+     */
+    const track = (name, call) =>
+      call.then(
+        () => {
+          settled.push(name)
+          return 'resolved'
+        },
+        (failure) => {
+          settled.push(name)
+          return failure
+        }
+      )
     let nested = null
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => {
       const { firstOffset, lastOffset, type, error } = payload
       outcomes.push([firstOffset, lastOffset, type, error ? error.reason : null])
-      nested ??= h.consumer.disconnect({ timeout: 0 }).then(
-        () => 'resolved',
-        (failure) => failure
-      )
+      nested ??= track('nested', h.consumer.disconnect({ timeout: 0 }))
     })
     await h.consumer.subscribe({ topics: ['topic-a'] })
     await h.consumer.run({
@@ -208,30 +222,33 @@ describe('share client admission while a close is in progress', () => {
         await proceed.promise
       },
     })
-    await entered.promise
-    const teardown = hold()
-    const closing = h.consumer.disconnect({ timeout: 0 }).then(
-      () => 'resolved',
-      (failure) => failure
-    )
-    await until(() => nested !== null, 'the listener disconnect')
-    await until(teardown.reached, 'the held teardown')
-    await flush()
-    const waiter = h.consumer.connect().then(() => seen.push('connect() resolved'))
-    await flush()
-    expect(seen).toEqual(['connect'])
-    expect(teardown.spy).toHaveBeenCalledTimes(1)
-    teardown.release()
-    expect(await closing).toBe('resolved')
-    expect(await nested).toBe('resolved')
-    await waiter
-    proceed.resolve()
-    await flush()
-    expect(teardown.spy).toHaveBeenCalledTimes(1)
-    expect(seen).toEqual(['connect', 'disconnect', 'connect', 'connect() resolved'])
-    expect(outcomes).toEqual([['0', '0', 'release', 'membership-lost']])
-    expect(h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)).toEqual([])
-    expect(leaves(h)).toEqual([])
+    try {
+      await entered.promise
+      const teardown = hold()
+      const closing = track('closing', h.consumer.disconnect({ timeout: 0 }))
+      await until(() => nested !== null, 'the listener disconnect')
+      await until(teardown.reached, 'the held teardown')
+      await flush()
+      const waiter = h.consumer.connect().then(() => seen.push('connect() resolved'))
+      await flush()
+      expect(settled).toEqual([])
+      expect(seen).toEqual(['connect'])
+      expect(teardown.spy).toHaveBeenCalledTimes(1)
+      teardown.release()
+      expect(await closing).toBe('resolved')
+      expect(await nested).toBe('resolved')
+      expect(settled.sort()).toEqual(['closing', 'nested'])
+      await waiter
+      proceed.resolve()
+      await flush()
+      expect(teardown.spy).toHaveBeenCalledTimes(1)
+      expect(seen).toEqual(['connect', 'disconnect', 'connect', 'connect() resolved'])
+      expect(outcomes).toEqual([['0', '0', 'release', 'membership-lost']])
+      expect(h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)).toEqual([])
+      expect(leaves(h)).toEqual([])
+    } finally {
+      proceed.resolve()
+    }
   })
 
   test('a stopped waiter cannot restart membership', async () => {
