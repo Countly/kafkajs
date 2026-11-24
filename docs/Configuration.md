@@ -587,7 +587,9 @@ the recovery clock. A request already written to an old connection can still com
 still succeed. A metadata answer or failure that arrives after the rebootstrap, for a refresh sent
 before it, changes no cached metadata, no broker table and no recovery clock, starts no further
 rebootstrap, and the refresh rejects with a retriable `KafkaJSConnectionError` ("Metadata refresh
-was overtaken by a rebootstrap"). A refresh whose answer was accepted just before the rebootstrap
+was overtaken by a rebootstrap"). Two exceptions keep their own error: a caller that refused first
+(a lifecycle close or a deadline), and a `REBOOTSTRAP_REQUIRED` answer to the refresh's own
+requests that started the rebootstrap. A refresh whose answer was accepted just before the rebootstrap
 stops installing at the rebootstrap and rejects the same way, but what it already did before (for
 example a `TOPIC_RECREATED` event or a dropped producer topic) stays done. A refresh started after a
 rebootstrap never shares a request with one started before it. The client does not resend the

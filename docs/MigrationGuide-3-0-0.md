@@ -1447,21 +1447,24 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   or every broker the client knows about has become unreachable. "Continuously" is measured from
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
-  running. A rebootstrap closes every old connection in the background, so requests still
-  outstanding fail with `KafkaJSConnectionClosedError` and go through the caller's normal retry
-  path against the rebuilt cluster. On an idempotent
-  producer (the default) the retry carries the same producer id and sequence numbers, so the broker
-  deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
-  turned idempotence off, a produce request that the broker had already appended, but whose
-  response was lost when the connection closed, is sent again on the retry and can duplicate those
-  records.** The SASL authentication blackout survives a rebootstrap, and an authentication
+  running. A rebootstrap closes every old connection in the background. A request already written
+  to an old connection can still complete, and can still succeed, during that drain; requests
+  still outstanding when the connection closes fail with `KafkaJSConnectionClosedError` and go
+  through the caller's normal retry path against the rebuilt cluster. On an idempotent producer
+  (the default) a retry against the same cluster carries the same producer id and sequence
+  numbers, so the broker deduplicates it; **on a producer created with `idempotent: false`, or one
+  whose configuration turned idempotence off, a produce request that the broker had already
+  appended, but whose response was lost when the connection closed, is sent again on the retry
+  and can duplicate those records.** The SASL authentication blackout survives a rebootstrap, and an authentication
   failure is never a trigger — a rejected credential means the broker is reachable and healthy,
   which no rebootstrap can fix. Setting `metadataRecoveryStrategy: 'none'` disables all three
   triggers and restores the previous behavior exactly, with code 129 surfacing as the non-retriable
   protocol error it already was.
 
   *New during a rebootstrap:* a metadata refresh that a rebootstrap overtakes rejects with a
-  retriable `KafkaJSConnectionError`. This can reach `consumer.subscribe()` (it rejects; with a
+  retriable `KafkaJSConnectionError`, unless the caller refused first (a lifecycle close or a
+  deadline, whose own error wins) or a `REBOOTSTRAP_REQUIRED` answer to the refresh's own requests
+  started the rebootstrap (that error is kept). This can reach `consumer.subscribe()` (it rejects; with a
   pattern it keeps the previous subscription; call it again), `consumer.run()` startup (the run
   crashes with this retriable error and restarts by the restart policy, also with
   `retry: { retries: 0 }`), admin calls (many reject at once; call them again) and producer sends
