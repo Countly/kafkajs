@@ -14,6 +14,7 @@ const { runInNewContext } = require('vm')
 const { AsyncLocalStorage } = require('async_hooks')
 const { Kafka, logLevel } = require('../../../../index')
 const { createChaosSocketFactory } = require('../../../../testHelpers/chaosSocket')
+const { createHoldingSocketFactory } = require('../../../../testHelpers/holdingSocket')
 const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
 const { waitForFullIsr } = require('../../../../testHelpers/leaderElection')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
@@ -3542,6 +3543,95 @@ const declare = (action) => {
   )
 }
 
+const BOUNDED_STOP_TITLE =
+  'stop with transport timeouts disabled ends within the request timeout while a broker withholds a fetch answer'
+
+/**
+ * One member consumes one record; the broker's answer to its next fetch is withheld from it, so
+ * that fetch stays unanswered while transport timeouts are disabled. `stop()` must still end
+ * within the request timeout: the busy node's connection is closed at the drain bound and the
+ * member leaves.
+ * @param {AbortSignal} scope the case scope
+ * @returns {Promise<void>}
+ * @throws {Error} a stop that does not end within the request timeout, or a failed step
+ */
+const boundedStopCase = async (scope) => {
+  const nonce = secureRandom()
+  const topic = shareTopicName('session-stop')
+  const groupId = `${SHARE_TOPIC_PREFIX}session-stop-${nonce}`
+  const plain = (clientId, options = {}) =>
+    new Kafka({ brokers: plainTextBrokers(), logLevel: logLevel.NOTHING, clientId, ...options })
+  const admin = plain(`share-stop-admin-${nonce}`).admin()
+  const factory = createHoldingSocketFactory(defaultSocketFactory())
+  const consumer = plain(`share-stop-${nonce}`, {
+    socketFactory: factory,
+    requestTimeout: REQUEST_TIMEOUT_MS,
+    enforceRequestTimeout: false,
+  }).shareConsumer({ groupId })
+  const outer = new CleanupStack()
+  outer.add('disconnect admin', () => admin.disconnect())
+  await outer.run(
+    async () => {
+      await bounded(scope, STEP_MS, () => admin.connect())
+      const stack = new CleanupStack()
+      await stack.run(
+        async () => {
+          stack.add('delete topic', (signal) => dropTopic(signal, admin, topic))
+          await bounded(scope, STEP_MS, () => createTopic({ topic, partitions: 1, replicas: 1 }))
+          stack.add(`delete group ${groupId}`, (signal) => dropGroup(signal, admin, groupId))
+          stack.add(`reset config of ${groupId}`, (signal) =>
+            resetShareGroupConfigs(admin, groupId, ['share.auto.offset.reset'], { signal })
+          )
+          await bounded(scope, STEP_MS, () =>
+            setShareGroupConfigs(admin, groupId, { 'share.auto.offset.reset': 'earliest' })
+          )
+          const producer = plain(`share-stop-producer-${nonce}`).producer()
+          stack.add('disconnect producer', () => producer.disconnect())
+          await bounded(scope, STEP_MS, async () => {
+            await producer.connect()
+            await producer.send({ topic, acks: -1, messages: [{ partition: 0, value: 'one' }] })
+            await producer.disconnect()
+          })
+
+          stack.add('close the held broker sides', () => factory.closeUpstreams())
+          stack.add('disconnect the member', () => consumer.disconnect({ timeout: 5000 }))
+          let armed = false
+          const handled = []
+          const withheld = factory.withholdResponse({
+            apiKey: API_SHARE_FETCH,
+            match: () => armed,
+          })
+          await bounded(scope, STEP_MS, () => consumer.subscribe({ topics: [topic] }))
+          await bounded(scope, STEP_MS, () =>
+            consumer.run({
+              eachMessage: async ({ message }) => {
+                handled.push(message.offset)
+                armed = true
+              },
+            })
+          )
+          await pollUntil(scope, DELIVERY_MS, () => handled.length === 1, {
+            delayMs: 50,
+            label: 'The first delivery',
+          })
+          const kept = await bounded(scope, STEP_MS, () => withheld.arrived(), {
+            label: 'The withheld fetch answer',
+          })
+          expect(kept).not.toBeNull()
+          const startedAt = performance.now()
+          await bounded(scope, REQUEST_TIMEOUT_MS + 2000, () => consumer.stop(), {
+            label: 'The stop',
+          })
+          expect(performance.now() - startedAt).toBeLessThan(REQUEST_TIMEOUT_MS)
+          expect(handled).toEqual(['0'])
+        },
+        { budgetMs: CLEANUP_MS }
+      )
+    },
+    { budgetMs: PROOF_MS }
+  )
+}
+
 /**
  * Installs the hooks every live case of this file shares: a clean-run check before the file and
  * after each case that was admitted.
@@ -3568,6 +3658,11 @@ enabled(`share session ${LIMIT ? 'limit' : 'recovery'} on a live broker`, () => 
   } else {
     declare('timeout')
     declare('leader')
+    it(
+      BOUNDED_STOP_TITLE,
+      liveCase(SHARE_CASE_BUDGET_MS, boundedStopCase),
+      caseTimeout(SHARE_CASE_BUDGET_MS)
+    )
   }
 })
 
