@@ -246,9 +246,10 @@ WORDING_PATTERNS=(
 WORDING=$(IFS='|'; echo "${WORDING_PATTERNS[*]}")
 hits private-wording -n -i -E "$WORDING" -- "${DOCS[@]}" CHANGELOG.md 'scripts/*.md'
 check private-wording ''
-# A numbered phase is a private plan step in changelog prose and workflow comments; changelog headings keep theirs.
-PHASE_NUMBER='\bphase[- ]?[0-9]'
-hits changelog-phase -n -i -E "^([^#]|#+[^#[:blank:]]).*$PHASE_NUMBER" -- CHANGELOG.md
+# A numbered phase is a private plan step in changelog prose and workflow comments; changelog ATX headings keep theirs.
+PHASE_NUMBER='\bphase[[:blank:]-]*[0-9]'
+ATX_HEADING='^ {0,3}#{1,6}([[:blank:]]|$)'
+hits changelog-phase -n -i -E -e "$PHASE_NUMBER" --and --not -e "$ATX_HEADING" -- CHANGELOG.md
 check changelog-phase ''
 hits workflow-comment -n -i -E "^[[:space:]]*#.*($WORDING|$PHASE_NUMBER)" -- '.github/workflows/*.yml'
 check workflow-comment ''

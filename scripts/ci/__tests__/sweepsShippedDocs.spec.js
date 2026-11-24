@@ -233,7 +233,12 @@ describe('scripts/ci/sweeps.sh private working-process wording', () => {
       'CHANGELOG.md',
       '- Added in phase-7.\n',
     ],
+    ['a numbered phase at the start of a changelog line', 'CHANGELOG.md', `${PHASE} 12 began.\n`],
+    ['a tab-separated phase number in changelog prose', 'CHANGELOG.md', '- Added in phase\t7.\n'],
+    ['a multiple-blank phase number in changelog prose', 'CHANGELOG.md', '- Added in phase   7.\n'],
+    ['a seven-hash phase line in the changelog', 'CHANGELOG.md', `####### ${PHASE} 3 notes.\n`],
     ['a numbered phase in a workflow comment', WORKFLOW, `# Added in ${PHASE} 10.\n`],
+    ['a tab-separated phase number in a workflow comment', WORKFLOW, '# Added in phase\t\t10.\n'],
   ])('fails on %s', (_name, file, text) => {
     const name = file === WORKFLOW ? 'workflow-comment' : 'changelog-phase'
     const section = sweep({ ...realDocs(), [file]: text }, name)
@@ -248,6 +253,19 @@ describe('scripts/ci/sweeps.sh private working-process wording', () => {
       `### ${PHASE} 4 — flexible protocol foundation`,
       '',
       '- Each phase ends with a disconnect; a two-phase commit; tag 3.0.0-alpha.9e; scope p9f.zero.scope.',
+      '',
+    ].join('\n')
+    const section = sweep({ ...realDocs(), 'CHANGELOG.md': changelog }, 'changelog-phase')
+
+    expect(section).toContain('changelog-phase: 0 hit(s)')
+    expect(section).not.toContain('-- changelog-phase:')
+  })
+
+  it('does not flag changelog headings indented by up to three spaces or six hashes deep', () => {
+    const changelog = [
+      ` ## ${PHASE} 5`,
+      `   ### ${PHASE} 6 — indented heading`,
+      `######\t${PHASE} 7`,
       '',
     ].join('\n')
     const section = sweep({ ...realDocs(), 'CHANGELOG.md': changelog }, 'changelog-phase')
