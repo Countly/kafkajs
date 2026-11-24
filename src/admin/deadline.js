@@ -196,6 +196,9 @@ class AdminDeadline {
   }
 }
 
+/** The generation of a discovery whose work has not started. */
+const UNSTARTED = Symbol('unstarted')
+
 /** Shared metadata work owns its retries; individual callers only own their wait. */
 class MetadataDiscovery extends AdminDeadline {
   /**
@@ -209,6 +212,8 @@ class MetadataDiscovery extends AdminDeadline {
     this.work = work
     this.remove = remove
     this.epoch = epoch
+    /** Taken when the work starts: an episode not started yet is joined in any generation. */
+    this.generation = UNSTARTED
     this.callers = new Set()
     this.running = null
     this.settled = false
@@ -309,17 +314,33 @@ const runWithDeadline = async (
  * @param {Function} [keyOf] existing scope key selector
  * @param {() => any} [epochOf] a call never joins an episode started in another epoch, and an
  *   episode whose epoch moved before its deferred start skips the work and resolves undefined
+ * @param {() => any} [generationOf] a call never joins an episode whose work started in another
+ *   generation; an episode not started yet takes the generation its work starts in
  * @returns {Function} enrollment wrapper; each argument list is captured once per episode
  */
-const shareMetadata = (work, keyOf = () => undefined, epochOf = () => undefined) => {
+const shareMetadata = (
+  work,
+  keyOf = () => undefined,
+  epochOf = () => undefined,
+  generationOf = () => undefined
+) => {
   const entries = new Map()
   return function (...args) {
     const key = keyOf(...args)
     const epoch = epochOf()
     let episode = entries.get(key)
-    if (!episode || episode.epoch !== epoch || episode.refusal()) {
+    if (
+      !episode ||
+      episode.epoch !== epoch ||
+      (episode.generation !== UNSTARTED && episode.generation !== generationOf()) ||
+      episode.refusal()
+    ) {
       episode = new MetadataDiscovery(
-        () => (epochOf() === epoch ? work.apply(this, args) : undefined),
+        () => {
+          if (epochOf() !== epoch) return undefined
+          episode.generation = generationOf()
+          return work.apply(this, args)
+        },
         () => {
           if (entries.get(key) === episode) entries.delete(key)
         },

@@ -1447,9 +1447,9 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   or every broker the client knows about has become unreachable. "Continuously" is measured from
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
-  running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
-  every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
-  through the caller's normal retry path against the rebuilt cluster. On an idempotent
+  running. A rebootstrap closes every old connection in the background, so requests still
+  outstanding fail with `KafkaJSConnectionClosedError` and go through the caller's normal retry
+  path against the rebuilt cluster. On an idempotent
   producer (the default) the retry carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose
@@ -1459,6 +1459,14 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   which no rebootstrap can fix. Setting `metadataRecoveryStrategy: 'none'` disables all three
   triggers and restores the previous behavior exactly, with code 129 surfacing as the non-retriable
   protocol error it already was.
+
+  *New during a rebootstrap:* a metadata refresh that a rebootstrap overtakes rejects with a
+  retriable `KafkaJSConnectionError`. This can reach `consumer.subscribe()` (it rejects; with a
+  pattern it keeps the previous subscription; call it again), `consumer.run()` startup (the run
+  crashes with this retriable error and restarts by the restart policy, also with
+  `retry: { retries: 0 }`), admin calls (many reject at once; call them again) and producer sends
+  (retried within their retry settings). kafkajs 2.2.4 never rebootstraps and never shows this
+  error; `metadataRecoveryStrategy: 'none'` removes it.
 
 - **Negotiated protocol versions moved up.** Against a Kafka 4.1 or 4.3 broker the client now
   negotiates: Metadata **v13** (was v6), Produce **v13** (was v7; **v11** when a topic's id is not
@@ -1663,12 +1671,24 @@ These issues are known in 3.0.0. A fix for each is planned for a later release.
   do:* read each topic once, awaited, before you read topics in parallel, or await the calls in
   sequence.
 - **A metadata answer can arrive without its brokers.** This applies to every client. When the
-  seed broker is replaced while a metadata request is in flight (a rebootstrap, or a connection
-  failure that removed the seed broker), the answer's topic metadata is installed, but the brokers
-  it lists that the client did not already know, or knew at another address, are not added. The
-  next request to such a broker fails with the transient `KafkaJSBrokerNotFound` error
+  seed broker is replaced by a connection failure while a metadata request is in flight, or while
+  an answer's new brokers are still being connected, the answer's topic metadata is installed and
+  routing listeners are told before those brokers are in the broker table. If a rebootstrap
+  happens while those brokers are being connected, the refresh stops and rejects, but the answer's
+  topic metadata events and dropped producer topics are not undone. A metadata answer that arrives
+  after a rebootstrap installs nothing and its refresh rejects with a retriable
+  `KafkaJSConnectionError`. The next request to a broker the answer listed but the client did not
+  already know, or knew at another address, fails with the transient `KafkaJSBrokerNotFound` error
   `Broker N not found in the cached metadata`, and the client refreshes its metadata. A call with
   retries left recovers on its next attempt; a call with no retries left fails with that error.
+
+- **Metadata answers other than a refresh are not fenced across a rebootstrap.** Coordinator
+  lookups, lookups by topic id, `assign()`, offset lookups and the leader hints carried in Produce
+  and Fetch answers can still act on an answer from before a rebootstrap until the next metadata
+  refresh replaces it. If the old cluster is still reachable, such an answer can send a later
+  request there, and a write or offset commit that succeeds there stays. A broker chosen just
+  before a rebootstrap can be handed to a caller; its request may fail with a retriable connection
+  error or may still succeed on the old cluster.
 
 ### Coming from the Java or Go client
 

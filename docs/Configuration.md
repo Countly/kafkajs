@@ -581,16 +581,34 @@ until it is stale) and then hits one transient failure, such as a rolling restar
 election, does **not** rebootstrap; it only rebootstraps once the failures are back-to-back for
 the whole window.
 
-A rebootstrap waits for each connection's in-flight requests to drain, then closes every
-connection the client holds. A request already in flight when it starts normally completes on the
-old socket rather than being rejected; the connections themselves are gone by the time
-`rebootstrap()` returns, so the *next* request the caller makes goes through the caller's normal
-retry path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster —
-it is not itself a source of message loss, but a producer created with `idempotent: false` can
-duplicate records the broker had already appended when a produce is retried. SASL authentication state
-(the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
-authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
-reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.
+A rebootstrap replaces the seed broker, then in one step forgets the cached metadata and the broker
+table, starts closing every old connection in the background without waiting for it, and resets
+the recovery clock. A request already written to an old connection can still complete, and can
+still succeed. A metadata answer or failure that arrives after the rebootstrap, for a refresh sent
+before it, changes no cached metadata, no broker table and no recovery clock, starts no further
+rebootstrap, and the refresh rejects with a retriable `KafkaJSConnectionError` ("Metadata refresh
+was overtaken by a rebootstrap"). A refresh whose answer was accepted just before the rebootstrap
+stops installing at the rebootstrap and rejects the same way, but what it already did before (for
+example a `TOPIC_RECREATED` event or a dropped producer topic) stays done. A refresh started after a
+rebootstrap never shares a request with one started before it. The client does not resend the
+overtaken request itself. A consumer whose startup is overtaken crashes with this retriable error
+and restarts by its restart policy. Many admin calls and `consumer.subscribe()` reject with it at
+once, so call them again (a `subscribe()` with a pattern keeps its previous subscription). Producer
+sends retry it within their retry settings, so with `retry: { retries: 0 }` the send fails and must
+be made again. A producer created with `idempotent: false` can still duplicate records when a send
+that was already appended is retried.
+
+Not covered in 3.0.0: coordinator lookups, lookups by topic id, `assign()`, offset lookups and the
+leader hints carried in Produce and Fetch answers can still act on an answer from before a
+rebootstrap until the next metadata refresh replaces it. If the old cluster is still reachable,
+such an answer can send a later request there, and a write or offset commit that succeeds there
+stays. A broker chosen just before a rebootstrap can be handed to a caller; its request may fail
+with a retriable connection error or may still succeed on the old cluster.
+
+SASL authentication state (the blackout applied after a rejected credential) is preserved across a
+rebootstrap, and a SASL authentication failure is never a rebootstrap trigger — a rejected
+credential means the broker is reachable and fine, only this client's credentials are bad, which no
+rebootstrap can fix.
 
 ## Default Retry
 
