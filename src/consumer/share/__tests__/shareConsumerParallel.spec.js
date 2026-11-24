@@ -342,6 +342,52 @@ describe('share handlers on parallel leader nodes', () => {
       ])
       expect(h.seen.crashes).toEqual([])
     })
+
+    test('a zero-timeout disconnect requested from the capture failure log neither re-enters the close nor leaves the other node choice without an outcome', async () => {
+      const capture = jest
+        .spyOn(ShareFetchLoop.prototype, 'captureFinal')
+        .mockImplementationOnce(() => {
+          throw new Error('capture failed')
+        })
+      await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
+      const gate = deferred()
+      const completions = []
+      holds.push({ release: () => gate.resolve(), completions })
+      let requested = 0
+      jest.spyOn(h.consumer.logger(), 'error').mockImplementation((message) => {
+        if (message !== 'Share final capture failed' || requested++ > 0) return
+        completions.push(h.consumer.disconnect({ timeout: 0 }).catch(() => {}))
+      })
+      serveNodes(1)
+      const started = []
+      await run({
+        eachMessage: async ({ partition, acknowledge }) => {
+          const completed = deferred()
+          completions.push(completed.promise)
+          try {
+            started.push(partition)
+            if (partition === 1) acknowledge('accept')
+            await gate.promise
+          } finally {
+            completed.resolve()
+          }
+        },
+      })
+      await until(() => started.length === 2, 'both handlers')
+      for (let count = 2; count <= 5; count++) await beat(count)
+      expect(leaves()).toHaveLength(0)
+      await advance(50)
+      await until(() => outcomesOf(1).length === 1, 'the outcome of the choice captured on node 1')
+      await flush()
+      expect(requested).toBe(1)
+      expect(capture).toHaveBeenCalledTimes(2)
+      expect(new Set(capture.mock.contexts).size).toBe(2)
+      expect(outcomesOf(1)).toEqual([['0', '0', 'accept', 'not-sent']])
+      expect(outcomesOf(0)).toEqual([['0', '0', 'release', 'membership-lost']])
+      expect(finalFrames()).toEqual([])
+      expect(leaves()).toEqual([])
+      expect(h.seen.crashes).toEqual([])
+    })
   })
 
   test('a poll expiry over a handler that changed its message offset after acknowledging finals both nodes and leaves', async () => {
