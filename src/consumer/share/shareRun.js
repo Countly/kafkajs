@@ -11,6 +11,7 @@ const { ShareHandlerCall, countWithin } = require('./shareHandlerCall')
 const { ShareCloseEpisode } = require('./shareCloseEpisode')
 const { events } = require('./instrumentationEvents')
 const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
+const describeThrown = require('../../network/describeThrown')
 
 const INITIAL_HEARTBEAT_MS = 1000
 /** Holds only the identity of the run whose handler is executing, never a record or batch. */
@@ -600,11 +601,7 @@ class ShareRun {
     for (const outcome of results) {
       const reason = outcome.error?.reason
       if (outcome.type !== 'renew' && (reason === 'session-lost' || reason === 'membership-lost'))
-        node.dropped += countWithin(
-          cohort.walk.deliver.records,
-          outcome.firstOffset,
-          outcome.lastOffset
-        )
+        node.dropped += countWithin(cohort.ledger.offsets, outcome.firstOffset, outcome.lastOffset)
     }
     this.runner.publishResults(cohort, results)
   }
@@ -681,6 +678,7 @@ class ShareRun {
     const frame = {
       ledger: cohort.ledger,
       records,
+      offsets: cohort.ledger.offsets,
       mode: this.options.acknowledgementMode,
       batch: this.batch,
       authority: this.authorityOf(node, cohort),
@@ -727,16 +725,16 @@ class ShareRun {
    */
   startGate(node, cohort, from, to) {
     if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return 'stop'
-    const { records } = cohort.walk.deliver
     if (!node.keys.has(cohort.key) || this.stopRequested) {
       this.releaseFrom(node, cohort, from)
       return 'stop'
     }
     this.flushIfDue(node, cohort)
     const now = performance.now()
+    const { offsets } = cohort.ledger
     let expired = null
     for (let i = from; i < to; i++) {
-      if (!cohort.ledger.canStart(records[i].offset, now)) (expired ??= []).push(records[i].offset)
+      if (!cohort.ledger.canStart(offsets[i], now)) (expired ??= []).push(offsets[i])
     }
     if (expired === null) return 'start'
     cohort.ledger.dropExpired(expired, now)
@@ -773,6 +771,9 @@ class ShareRun {
   }
 
   /**
+   * Hands one acquisition to `eachBatch`. The handler gets its own copy of the records array, so
+   * reordering or changing `batch.messages` cannot move a choice onto another record: the call,
+   * the ledger and the close still read the acquisition's ordered array.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -781,22 +782,26 @@ class ShareRun {
    */
   async dispatchBatch(node, cohort, frame) {
     const { deliveryCounts } = cohort.walk.deliver
-    let { records } = cohort.walk.deliver
+    let { records, offsets } = frame
     const verdict = this.startGate(node, cohort, 0, records.length)
     if (verdict !== 'start') return
     if (cohort.expired) {
-      records = records.filter((record) => !cohort.expired.has(record.offset))
+      const live = (_, i) => !cohort.expired.has(frame.offsets[i])
+      records = records.filter(live)
+      offsets = offsets.filter(live)
       cohort.expired = null
     }
     const delivered = cohort.walk.deliver.records
     for (let i = 0; i < delivered.length; i++) delivered[i].deliveryCount = deliveryCounts[i]
     node.active.next = delivered.length
-    const call = new ShareHandlerCall(records === frame.records ? frame : { ...frame, records })
+    const call = new ShareHandlerCall(
+      records === frame.records ? frame : { ...frame, records, offsets }
+    )
     node.active.call = call
     const batch = {
       topic: cohort.topic,
       partition: cohort.partition,
-      messages: records,
+      messages: records.slice(),
       acquisitionLockTimeoutMs: cohort.lockDuration,
     }
     await this.invoke(node, cohort, call, call.batchPayload(batch))
@@ -812,9 +817,9 @@ class ShareRun {
    */
   releaseFrom(node, cohort, from) {
     if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return
-    const { records } = cohort.walk.deliver
-    cohort.ledger.completeRange(records, from, records.length, 'release')
-    if (node.active?.cohort === cohort) node.active.next = records.length
+    const { offsets } = cohort.ledger
+    cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
+    if (node.active?.cohort === cohort) node.active.next = offsets.length
   }
 
   /**
@@ -1022,7 +1027,8 @@ class ShareRun {
    * request synchronously, so no handler starts after them, and wait naturally for running
    * handlers until the handler boundary. A stop or disconnect that arrives while a fence or poll
    * recovery is closing ends the run once that recovery cleanup is done. Later calls reuse the
-   * episode, so a disconnect never recaptures a replacement run. A zero timeout on a close in
+   * episode, so a disconnect never recaptures a replacement run, and the first disconnect's budget
+   * is set before anything that can call application code. A zero timeout on a close in
    * progress revokes the episode, which retires its traffic operation in the same tick: a final
    * that was written and is unanswered settles lost and its exact socket closes at once.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
@@ -1052,9 +1058,9 @@ class ShareRun {
     episode.done = done.promise
     this.closing = episode
     this.admitting = false
+    if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
     for (const node of this.nodes.values())
       node.pacing.retire(new KafkaJSNonRetriableError('Share run is closing'))
-    if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
     this.close(episode).then(done.resolve, done.resolve)
     return episode
   }
@@ -1135,19 +1141,31 @@ class ShareRun {
    * which settles the uncaptured remainder membership-lost. Busy and unopened nodes capture
    * nothing. Every session discarded this way publishes one `session_reset` with reason
    * `membership`. The heartbeat chain is suspended for a poll or fence recovery, so no join can
-   * overlap its traffic, and ended for good by every other kind.
+   * overlap its traffic, and ended for good by every other kind. A node whose capture fails
+   * captures nothing; every other node still captures, and every node is retired and disposed.
+   * The boundary runs once: an application callback reached from inside it (a logger, an event
+   * listener) that closes again joins it instead of capturing a second time. A capture or disposal
+   * failure is kept as the raw thrown value, and read and logged only after every node retired, so
+   * an error that throws when read cannot stop another node's capture or disposal.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
    */
   freeze(episode) {
-    if (episode.frozen) return
+    if (episode.frozen || episode.freezing) return
+    episode.freezing = true
+    const failures = []
     this.captureCloseCoordinator(episode)
     const bindings = []
     for (const node of this.nodes.values()) {
       if (!node.loop) continue
-      this.finalizeActive(node)
-      node.captured = node.loop.captureFinal()
+      try {
+        this.finalizeActive(node)
+        node.captured = node.loop.captureFinal()
+      } catch (error) {
+        node.captured = null
+        failures.push(['Share final capture failed', node.id, error])
+      }
       if (node.captured) {
         const { binding } = node.captured
         bindings.push({ nodeId: node.id, current: () => !ShareSession.bindingLost(binding) })
@@ -1165,15 +1183,21 @@ class ShareRun {
     }
     for (const node of this.nodes.values()) {
       const discarded = node.loop !== null && !node.loop.disposed
-      node.loop?.dispose(new KafkaJSNonRetriableError('Share run closed'), {
-        reason: 'membership-lost',
-        preserve: node.captured,
-      })
+      try {
+        node.loop?.dispose(new KafkaJSNonRetriableError('Share run closed'), {
+          reason: 'membership-lost',
+          preserve: node.captured,
+        })
+      } catch (error) {
+        failures.push(['Share node disposal failed', node.id, error])
+      }
       node.operation.retire(new KafkaJSNonRetriableError('Share run closed'))
       node.pacing.retire(new KafkaJSNonRetriableError('Share run closed'))
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
+    for (const [message, nodeId, error] of failures)
+      this.options.logger.error(message, { nodeId, error: describeThrown(error) })
   }
 
   /**
@@ -1235,8 +1259,8 @@ class ShareRun {
     const release = (cohort, from) => {
       if (!node.loop.isLive(cohort)) return
       try {
-        const { records } = cohort.walk.deliver
-        cohort.ledger.completeRange(records, from, records.length, 'release')
+        const { offsets } = cohort.ledger
+        cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
       } catch (error) {
         this.options.logger.debug('Share unstarted release skipped', { error: error.message })
       }
