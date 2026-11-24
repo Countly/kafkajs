@@ -22,6 +22,19 @@ An admin client keeps every topic it has read offsets of as a metadata target, u
 client that refresh metadata fail with `UNKNOWN_TOPIC_OR_PARTITION`, until you create a new admin
 client. See [Known issues](MigrationGuide-3-0-0.md#known-issues).
 
+## Unanswered mutations
+
+Each public admin call sends a mutating request at most once per item. Broker errors after
+sending are final and keep the method's existing error or result shape. If a reply is missing
+or cannot be decoded, the call rejects with `KafkaJSUnknownOutcomeError` even if other requests
+returned rows. The `requests` field names the APIs, versions, brokers and, where available,
+items of unresolved writes. Check the broker state before repeating the call.
+
+The invocation deadline reports `KafkaJSTimeout`, and a closing client reports its close
+error, even when a sent mutation may already have applied. Offset commits through
+`setOffsets`, `resetOffsets` or `fetchOffsets({ resolveOffsets: true })`, topic and partition
+creation, and requests that carry `validateOnly: true` keep their existing retries.
+
 ## Admin API ledger
 
 The following rows cover the complete public Admin method surface and its direct options.
@@ -151,7 +164,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | deleteShareGroups | equivalent | deleteGroups | no separate method; the existing call takes the group id and apiTimeout |
 | deleteStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | deleteStreamsGroups | excluded | Streams-group administration excluded | not implemented |
-| deleteTopics | implemented | deleteTopics | name or topic ID; retryOnQuotaViolation uses existing quota retry; timeoutMs maps to apiTimeout |
+| deleteTopics | implemented | deleteTopics | name or topic ID; quota refusals are final; timeoutMs maps to apiTimeout |
 | describeAcls | implemented | describeAcls | ordinary method fields and apiTimeout; no semantic option is silently dropped |
 | describeClassicGroups | equivalent | describeGroups | includeAuthorizedOperations; same classic group description facade |
 | describeClientQuotas | implemented | describeClientQuotas | components; strict |
@@ -354,7 +367,7 @@ await admin.createPartitions({
 
 ### Throttled requests
 
-When a controller-mutation quota throttles `createTopics`, `deleteTopics` or `createPartitions` (KIP-599), the broker refuses the topics it did not process with `THROTTLING_QUOTA_EXCEEDED` (89) and reports how long to wait. The admin client sends only those topics again, within the `retry` budget, and the connection holds the next request back for the throttle time the answer carried, so a call that a quota only slows still succeeds, a little later. The topics the broker did process are not sent again. Once the `retries` are spent the call rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota error (for `createTopics`, the `KafkaJSAggregateError` that lists the refused topics). For `deleteTopics` and `createPartitions`, the quota alone sends nothing again when another topic failed in the same answer, and that failure is handled as it always has been (a retried `NOT_CONTROLLER`, or for `deleteTopics` `UNKNOWN_TOPIC_OR_PARTITION`, still sends the whole request again, quota-refused topics included); `createTopics` sends again every topic whose failure is retriable, the refused ones included (see above). Java's `Admin` retries these refusals until its timeout (`retryOnQuotaViolation`). The throttle wait comes on top of the retry backoff: `retry.maxRetryTime` only caps one backoff delay, so by default nothing bounds the call as a whole, and the worst case is about `retries` throttle times plus the backoff delays, where Java bounds the whole call at its default 60 s (`default.api.timeout.ms`). To bound it, set `retry.maxTotalTime`: it counts the time already spent, throttle waits included, and the call then rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the quota error; the attempt it lets start can still wait out one more throttle time.
+A controller-mutation quota can return `THROTTLING_QUOTA_EXCEEDED` (89) and a throttle time. `createTopics` and `createPartitions` keep their quota retries within the call's retry budget. A quota error from `deleteTopics` is final. The connection honors the broker's throttle time before sending another request. An admin call's `apiTimeout` bounds the whole invocation.
 
 ## <a name="fetch-topic-metadata"></a> Fetch topic metadata
 

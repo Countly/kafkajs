@@ -1140,7 +1140,7 @@ Group visibility and the admin client.
   resource whose name is the empty string. That name now stands for the cluster-wide default broker
   config, and all three config methods send it to the controller. Every other resource type still
   needs a non-empty name. *What to do:* nothing.
-- **`createTopics`, `deleteTopics` and `createPartitions` retry a quota refusal.** On a cluster with
+- **`createTopics` and `createPartitions` retry a quota refusal.** On a cluster with
   controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
   request it used to slow down, because the client negotiates newer versions of these APIs. The
   client waits the throttle time the broker reports and sends only the refused topics again within
@@ -1172,14 +1172,26 @@ Group visibility and the admin client.
   `fetchTopicMetadata()` with no topics now returns such a partition with its `partitionErrorCode`
   and `leader: -1` instead of waiting. *What to do:* code that used `fetchTopicMetadata()` to wait
   for leaders should name the topics: a named request still waits.
-- **`deleteTopicRecords` retries connection errors.** A retriable error without per-partition
-  detail, such as `KafkaJSConnectionError`, used to hit a `TypeError` in the method's own error
-  handling, which the retrier reported at once as `KafkaJSNonRetriableError`; it is now retried, and
-  the call ends in success or in `KafkaJSNumberOfRetriesExceeded` whose `cause` is the connection
-  error. It also works as an admin's first call now, where 2.2.4 failed with
-  `KafkaJSTopicMetadataNotLoaded`. *What to do:* a transient connection failure no longer aborts
-  `deleteTopicRecords`; if you caught `KafkaJSNonRetriableError` from it, expect
-  `KafkaJSNumberOfRetriesExceeded` after the retry budget instead.
+- **Admin mutations write each item at most once per call.** If the broker's answer is missing
+  or cannot be decoded, the call rejects with `KafkaJSUnknownOutcomeError` (`retriable: false`).
+  Its `requests` lists the unresolved requests and their items where available. The mutation
+  may already have applied. The call's own deadline (`KafkaJSTimeout`) and close errors take
+  precedence. An unknown outcome takes precedence over ordinary result rows.
+- A broker error after sending is final, including moved-controller, coordinator, leader, quota
+  and request-timeout errors. Pre-write failures keep their existing retry policy.
+- In kafkajs 2.2.4, `deleteTopics`, `deleteTopicRecords`, `alterConfigs`, `createAcls`,
+  `deleteAcls` and `alterPartitionReassignments` retried some such errors. These methods and
+  `deleteGroups` now report lost replies as `KafkaJSUnknownOutcomeError`. In 2.2.4,
+  `deleteTopicRecords` could instead surface a `TypeError` after a lost reply.
+- **Calls that keep their retries** include `setOffsets`, `resetOffsets`,
+  `fetchOffsets({ resolveOffsets: true })`, `createTopics`, `createPartitions` and calls
+  whose request carries `validateOnly: true`. Repeating an offset write can overwrite another
+  admin's later write to the same idle group. A creation retry can recreate or grow a topic
+  deleted meanwhile. An already-exists or invalid-partition-count error does not identify which
+  call made the change.
+- Before repeating a call, check the current state of the affected items with the relevant
+  metadata, offsets, group or transaction read. A broker error can follow an applied change.
+- Use `deleteTopics({ topicIds })` to target a specific topic incarnation.
 - **`admin.listGroups` takes filters, and `admin.describeGroups` reports errors per group id.**
   `admin.listGroups({ states, types })` filters server-side with lower-case values, and every row
   now carries `groupState` and `groupType`. `admin.describeGroups` describes classic and consumer
@@ -1215,27 +1227,16 @@ Group visibility and the admin client.
   the `retry` budget; `useDescribeTopicPartitions` has no such cap. *What to do:* replace a
   `TypeError` catch with a check of the error's class or `type`. Read `KafkaJSTimeout` from
   `fetchTopicMetadata()` as "no usable Metadata answer within 10 s", not only as "no leader yet".
-- **`createTopics` and `alterPartitionReassignments` retry only what can still succeed.**
-  KafkaJS 2.2.4 retried these calls only on a top-level `NOT_CONTROLLER`; an answer that named any
-  failed topic or partition ended the call at once, so a retriable failure such as
-  `REQUEST_TIMED_OUT` on one topic failed the call and the topics that had been created were not
-  reported (`createTopics` resolved `false` when every failed topic already existed). Now each
-  retry sends only the items the broker marked retriable, never an item it confirmed, and the call
-  ends with one result over the whole request: it resolves (`createTopics` resolves `false` only
-  when every topic that did not go through already exists), or rejects with a
-  `KafkaJSAggregateError` of the items refused for good (followed by the failures that ended the
-  retries), or, when nothing was refused for good, with what ended the retries, unchanged. For example, reassigning a partition of a topic that
-  does not exist (`UNKNOWN_TOPIC_OR_PARTITION`, which Kafka marks retriable) is now retried until
-  the budget is spent and rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause.errors` lists
-  it; 2.2.4 rejected at once with the aggregate.
-  `waitForLeaders` waits once, after the last attempt, for the topics the call created; a call
-  whose attempts fail does not enter that wait, and a metadata error or timeout from the wait
-  itself rejects the call directly, not as an aggregate.
-  `alterPartitionReassignments` no longer sends a topic whose `partitionAssignment` is empty.
-  *What to do:* a retrier of your own around these calls that only existed to repeat a retriable
-  topic can go; code that reads `error.errors` finds the items refused for good first (when
-  nothing was refused for good and the retries ran out on failed items, `error.cause.errors` lists
-  them); `retry: { retries: 0 }` makes a single attempt.
+- **`createTopics` retries only topics that can still succeed.** KafkaJS 2.2.4 retried
+  only a top-level `NOT_CONTROLLER`. This version also retries individual topics the broker
+  marks retriable, without resending confirmed topics. The result covers the whole request.
+  It resolves `false` when every failed topic already existed, or rejects with
+  `KafkaJSAggregateError` for terminal item failures, followed by any failures that ended
+  the retries. If no item was refused for good, the retry failure is returned unchanged.
+  `waitForLeaders` waits once for the topics created by the call. A failure during that wait
+  rejects directly.
+  `alterPartitionReassignments` skips topics with empty assignments and reports decoded
+  partition failures in the broker's aggregate after one send.
 - **`deleteTopicRecords` and `alterPartitionReassignments` check all of their input first.**
   Both read and copy their input when they are called, before they return, and refuse the whole
   call with `KafkaJSNonRetriableError` before any request when one entry is invalid. Some input
@@ -1268,7 +1269,7 @@ Describe calls can request the optional raw authorized-operations mask; an unsup
 
 Topic-offset reads accept isolationLevel: 'read_committed' (the unchanged default) or 'read_uncommitted'. During an open transaction, the default high is the last stable offset; use read_uncommitted for high-watermark committed lag and a raw fetchOffsets read with resolveOffsets: false. Missing commits are distinct from zero. Broker errorMessage is separate from stable protocol messages. deleteTopicRecords still returns Promise<void>; inspect the existing error/cause chain for its failing partitions and read low watermarks with fetchTopicOffsets. listTopics remains string[]; fetchTopicMetadata() provides topicId and isInternal from the same fresh Metadata snapshot.
 
-Transaction diagnostics and recovery are available through `describeProducers`, `describeTransactions`, `listTransactions`, `abortTransaction` and `fenceProducers`. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`; there is no separate method. Producer IDs and other 64-bit results are decimal strings. Diagnostic and fence calls return per-item errors, while `abortTransaction` resolves without a value or throws and `listTransactions` fails as a whole if a broker fails. All five calls use the admin `apiTimeout`; expiry cannot recall an abort or fence already sent. Existing producer transaction methods keep their behavior.
+Transaction diagnostics and recovery are available through `describeProducers`, `describeTransactions`, `listTransactions`, `abortTransaction` and `fenceProducers`. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`; there is no separate method. Producer IDs and other 64-bit results are decimal strings. Diagnostic and fence calls return per-item errors. A lost fence reply rejects the whole call with `KafkaJSUnknownOutcomeError` instead of returning rows. `fenceProducers` returns code 51 for a broker that is aborting an ongoing transaction. Once the abort is complete, the caller can fence again. `abortTransaction` resolves without a value or throws and `listTransactions` fails as a whole if a broker fails. All five calls use the admin `apiTimeout`; expiry cannot recall an abort or fence already sent. Existing producer transaction methods keep their behavior.
 
 | Behavior | Configuration | Default | Migration | Area |
 | --- | --- | --- | --- | --- |
