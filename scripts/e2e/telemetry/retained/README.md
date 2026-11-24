@@ -50,6 +50,8 @@ Surviving ownership instead requires the cold stable-ID ledger and named retaini
 paths, with release/replacement checked at the later existing captures. Both
 phenomena can occur together. An immediate post-GC overage alone proves no owner,
 and a released JS wrapper proves no native scratch release. Observer allocations
-and snapshot perturbation remain diagnostic effects. Unknown material ownership
-keeps `attributionComplete: false` until reviewed. No snapshot totals or temporal
+and snapshot perturbation remain diagnostic effects. Graph generation leaves
+ownership attribution incomplete, so the reports always set
+`attributionComplete: false`; the reader must examine the material increments and
+their owners. No snapshot totals or temporal
 deltas are subtracted from heapUsed, external, original M or an acceptance result.

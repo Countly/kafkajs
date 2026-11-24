@@ -3045,8 +3045,8 @@ const verifyChurnSegments = (record, directory, manifest, archive) => {
 }
 
 /**
- * The complete-stream accounting of the churn segments: F08's request, error and cancellation
- * predicate over every segment with allowances fixed by the catalogue and the schedule, never by
+ * The complete-stream accounting of the churn segments: every telemetry request, error and
+ * cancellation accounted for over every segment with allowances fixed by the catalogue and the schedule, never by
  * the transcript itself (error 42 only, and faults exactly on the sockets the segment's scheduled
  * retirements faulted); no Get error at all; and the final of each segment's one close. Under a
  * nonempty selection in force when the close began, the close owes exactly one final, written
