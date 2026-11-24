@@ -926,7 +926,9 @@ module.exports = class Broker {
    *   failing one included, instead of throwing the first failing partition's error. With
    *   `acks: 0` the broker sends no response, so the call resolves `undefined` either way. An
    *   answer with a duplicate row, or a row the request did not carry, rejects with a retriable
-   *   `KafkaJSError`. Internal: serves the producer's send path; not typed.
+   *   `KafkaJSError`; a row that is missing is not an error here, and the caller retries the
+   *   batch it belonged to. A request without this option keeps its existing parse and is not
+   *   checked. Internal: serves the producer's send path; not typed.
    * @returns {Promise<object|import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined>}
    *   the decoded response, or with `perPartitionResults` one `PartitionResult` per partition;
    *   `undefined` with `acks: 0`

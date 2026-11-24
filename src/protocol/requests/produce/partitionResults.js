@@ -138,7 +138,8 @@ const rowRefused = (topicName, partition, what) =>
 /**
  * Checks every row of a Produce answer against the request it answers: a row for a topic or
  * partition the request did not carry, or a second row for one pair (also when the request named
- * that pair twice), is an error and never an acknowledgement. A missing row is not an error here.
+ * that pair twice), is an error and never an acknowledgement. A missing row is not an error here:
+ * the rows that are present are returned and the producer retries the batch whose row is missing.
  * Partition ids are compared as numbers, and repeated topic entries of the request are merged.
  * @param {PartitionResult[]} results the answer's rows, as `partitionResults` builds them
  * @param {{ topic: string, partitions: { partition: number|string }[] }[]} topicData the request
