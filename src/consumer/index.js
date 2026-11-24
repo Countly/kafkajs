@@ -28,6 +28,7 @@ const {
   KafkaJSNonRetriableError,
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
+  KafkaJSTopicRecreatedError,
   isFencedInstance,
 } = require('../errors')
 const {
@@ -63,6 +64,20 @@ const deferred = () => {
   const settle = {}
   settle.promise = new Promise((resolve, reject) => Object.assign(settle, { resolve, reject }))
   return settle
+}
+
+/**
+ * Whether a crash was caused by a topic recreation: the error itself or any error in its cause
+ * chain is a `KafkaJSTopicRecreatedError`. A cause cycle ends the walk.
+ * @param {unknown} error the crash's error
+ * @returns {boolean}
+ */
+const causedByRecreation = (error) => {
+  for (const seen = new Set(); error instanceof Error && !seen.has(error); error = error.cause) {
+    if (error instanceof KafkaJSTopicRecreatedError) return true
+    seen.add(error)
+  }
+  return false
 }
 
 const specialOffsets = [
@@ -1401,6 +1416,10 @@ module.exports = (params) => {
         // with the verdict that produced it.
         shouldRestart = false
       }
+
+      // A recreated topic has its own offsets: the application reconciles them before it starts
+      // the consumer again, so no restart policy may resume it.
+      if (causedByRecreation(e)) shouldRestart = false
 
       if (!ownsCluster) shouldRestart = false
       // Two handlers must never process one partition at once.

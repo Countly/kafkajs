@@ -64,6 +64,7 @@ export const {
   KafkaJSCommitFailedError,
   KafkaJSRebalanceListenerError,
   KafkaJSRebalanceNotConvergedError,
+  KafkaJSTopicRecreatedError,
   KafkaJSBufferExhaustedError,
   KafkaJSRecordTooLargeError,
 } = cjs
