@@ -2,11 +2,13 @@
  * The heap decoded record headers take, against `HEADER_CEILING_BYTES`, the bytes of
  * `maxDecompressedBatchBytes` that the batch decoder lets pay for one header. Every layout goes
  * through the real batch decoder in two passes:
- * - calibration: `CALIBRATION_HEADERS` headers whatever the constant, under the largest bound. The
- *   worst retained cost, rounded up to a power of two, is `calibratedCeilingBytes`, the constant
- *   these layouts call for.
+ * - calibration: `CALIBRATION_HEADERS` headers whatever the constant, under the largest bound.
  * - acceptance: as many headers as the header ceiling of a 16 MiB bound allows with the shipped
  *   constant.
+ * `suggestedCeilingBytes` is the worst unrounded retained cost of both passes rounded up to a power
+ * of two, never below the shipped constant. Raise the constant only on a failure that reproduces,
+ * then update the documented header formulas and default counts and rerun both passes: the
+ * acceptance count follows the constant.
  *
  * Retained cost: `heapUsed` after `gc()` with the decoded batch alive, less what the same records
  * without headers retain, per header. Sampled peak: the highest `heapUsed` read, without a
@@ -21,10 +23,11 @@
  *
  * Usage: node --expose-gc scripts/benchmarks/headerHeapCost.js [--assert]
  * Prints one JSON line per pass and layout: { pass, layout, headers, records, retainedPerHeader,
- * sampledPeakPerHeader }, then { ok, calibratedCeilingBytes, headerCeilingBytes,
- * worstCalibrationPerHeader, worstAcceptancePerHeader, worstSampledPeakPerHeader }. With `--assert`
- * it exits 1 when either pass retains more than `HEADER_CEILING_BYTES` per header; it exits 2
- * without `--expose-gc`.
+ * sampledPeakPerHeader }, then { ok, suggestedCeilingBytes, headerCeilingBytes,
+ * worstCalibrationPerHeader, worstAcceptancePerHeader, worstSampledPeakPerHeader }. Per-header
+ * costs are printed to one decimal; the gate and the suggestion use the unrounded values. With
+ * `--assert` it exits 1 when either pass retains more than `HEADER_CEILING_BYTES` per header; it
+ * exits 2 without `--expose-gc`.
  */
 const Decoder = require('../../src/protocol/decoder')
 const decodeBatch = require('../../src/protocol/recordBatch/v0/decoder')
@@ -80,6 +83,9 @@ const LAYOUTS = [
 let peak = 0
 let stride = 1
 let arrays = 0
+
+/** @param {number} value @returns {number} `value` to one decimal, for display only */
+const round = (value) => Number(value.toFixed(1))
 
 const sample = () => {
   peak = Math.max(peak, process.memoryUsage().heapUsed)
@@ -213,7 +219,7 @@ const measureLayout = async (layout, headers, options) => {
   const withHeaders = await measure(bytes, options, (decoded) => {
     if (headerCount(decoded) !== headers) throw new Error(`${layout.name}: not ${headers} headers`)
   })
-  const perHeader = (bytesUsed) => Number((bytesUsed / headers).toFixed(1))
+  const perHeader = (bytesUsed) => bytesUsed / headers
   return {
     layout: layout.name,
     headers,
@@ -234,7 +240,14 @@ const runPass = async (pass, headers, options) => {
   const results = []
   for (const layout of LAYOUTS) {
     const result = await measureLayout(layout, headers, options)
-    console.log(JSON.stringify({ pass, ...result }))
+    console.log(
+      JSON.stringify({
+        pass,
+        ...result,
+        retainedPerHeader: round(result.retainedPerHeader),
+        sampledPeakPerHeader: round(result.sampledPeakPerHeader),
+      })
+    )
     results.push(result)
   }
   return results
@@ -257,16 +270,22 @@ const main = async () => {
   const worst = (results, field) => Math.max(...results.map((result) => result[field]))
   const worstCalibration = worst(calibration, 'retainedPerHeader')
   const worstAcceptance = worst(acceptance, 'retainedPerHeader')
-  const ok = worstCalibration <= HEADER_CEILING_BYTES && worstAcceptance <= HEADER_CEILING_BYTES
+  const worstRetained = Math.max(worstCalibration, worstAcceptance)
+  const ok = worstRetained <= HEADER_CEILING_BYTES
 
   console.log(
     JSON.stringify({
       ok,
-      calibratedCeilingBytes: 2 ** Math.ceil(Math.log2(Math.max(1, worstCalibration))),
+      suggestedCeilingBytes: Math.max(
+        HEADER_CEILING_BYTES,
+        2 ** Math.ceil(Math.log2(Math.max(1, worstRetained)))
+      ),
       headerCeilingBytes: HEADER_CEILING_BYTES,
-      worstCalibrationPerHeader: worstCalibration,
-      worstAcceptancePerHeader: worstAcceptance,
-      worstSampledPeakPerHeader: worst([...calibration, ...acceptance], 'sampledPeakPerHeader'),
+      worstCalibrationPerHeader: round(worstCalibration),
+      worstAcceptancePerHeader: round(worstAcceptance),
+      worstSampledPeakPerHeader: round(
+        worst([...calibration, ...acceptance], 'sampledPeakPerHeader')
+      ),
     })
   )
   process.exit(ok || !process.argv.includes('--assert') ? 0 : 1)
