@@ -273,6 +273,56 @@ describe('OAuth file token', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
+  test('a token that expires while its unchanged file is being checked is refused', async () => {
+    const token = jwt(NOW / 1000 + 5)
+    write(token, 0)
+    const original = fs.promises.stat
+    const { stat, read } = spies()
+    const held = deferred()
+    const provider = make({ clockSkew: 0, maxRetryTime: 8000 })
+    expect((await provider()).value).toBe(token)
+    await jest.advanceTimersByTimeAsync(4000)
+    stat.mockImplementationOnce(async (...args) => {
+      await held.promise
+      return original(...args)
+    })
+
+    const call = provider()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(stat).toHaveBeenCalledTimes(2)
+    await jest.advanceTimersByTimeAsync(2000)
+    held.resolve()
+
+    await expect(call).rejects.toThrow('expired: the token has already expired')
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+
+  test('a token that crosses clockSkew while its file is being checked is not kept', async () => {
+    const token = jwt(NOW / 1000 + 10)
+    write(token, 0)
+    const original = fs.promises.stat
+    const { stat, read } = spies()
+    const held = deferred()
+    const provider = make({ clockSkew: 2000, maxRetryTime: 8000 })
+    expect((await provider()).value).toBe(token)
+    await jest.advanceTimersByTimeAsync(7000)
+    stat.mockImplementationOnce(async (...args) => {
+      await held.promise
+      return original(...args)
+    })
+
+    const call = provider()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(stat).toHaveBeenCalledTimes(2)
+    await jest.advanceTimersByTimeAsync(1500)
+    held.resolve()
+    expect((await call).value).toBe(token)
+
+    jest.setSystemTime(NOW + 7500)
+    expect((await provider()).value).toBe(token)
+    expect(read).toHaveBeenCalledTimes(2)
+  })
+
   test('a JWT without an expiry is read at every authentication', async () => {
     write(`${segment({ alg: 'none' })}.${segment({ sub: 'client' })}.`, 0)
     const { read } = spies()

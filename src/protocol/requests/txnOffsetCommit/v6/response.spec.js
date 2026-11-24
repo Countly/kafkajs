@@ -234,14 +234,14 @@ describe('Protocol > Requests > TxnOffsetCommit > v6 response', () => {
     describe('for a request whose topics all hold no partition', () => {
       const ALL_EMPTY = [{ topic: 'test-topic', partitions: [] }]
 
-      test('accepts the answer that names each of them', () => {
-        const answer = { topics: [{ topic: 'test-topic', partitions: [] }] }
-
-        expect(() => validate(answer, ALL_EMPTY)).not.toThrow()
+      test('accepts the answer that names none of them, as the broker answers a request that carries no topic', () => {
+        expect(() => validate({ topics: [] }, ALL_EMPTY)).not.toThrow()
       })
 
-      test('refuses an answer that names none of them', () => {
-        expect(() => validate({ topics: [] }, ALL_EMPTY)).toThrow(KafkaJSTransactionAbortableError)
+      test('refuses an answer that names one of them, as foreign', () => {
+        const answer = { topics: [{ topic: 'test-topic', partitions: [] }] }
+
+        expect(() => validate(answer, ALL_EMPTY)).toThrow(KafkaJSTransactionAbortableError)
       })
     })
   })
