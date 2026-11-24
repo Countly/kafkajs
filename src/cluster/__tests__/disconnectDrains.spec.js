@@ -717,3 +717,85 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
     })
   })
 })
+
+describe('BrokerPool > a close failure whose reason is falsy is still reported', () => {
+  const nothing = undefined
+  const CLOSE_FAILED = 'Closing a replaced broker connection failed'
+
+  /** @returns {{ broker: Broker, connectionPool: ConnectionPool }} a real broker over a real pool */
+  const retirable = () => {
+    const connectionPool = new ConnectionPool({ logger: newLogger(), host: 'b3', port: 9092 })
+    return {
+      connectionPool,
+      broker: new Broker({ connectionPool, logger: newLogger(), nodeId: 3 }),
+    }
+  }
+
+  /**
+   * The pool of `refreshable(MOVED_SEED)` with the replaced seed pool's warnings recorded.
+   * @returns {{ pool: BrokerPool, oldPool: ConnectionPool, failures: () => object[] }} `failures`
+   *   gives the fields of every warning that a replaced connection failed to close
+   */
+  const replacing = () => {
+    const { pool, seed } = refreshable(MOVED_SEED)
+    const warn = jest.spyOn(pool.logger, 'warn')
+    const failures = () =>
+      warn.mock.calls.filter(([message]) => message === CLOSE_FAILED).map(([, extra]) => extra)
+    return { pool, oldPool: seed.connectionPool, failures }
+  }
+
+  it('a broker retirement whose fencing throws undefined rejects with undefined, though its destroy then fails too', async () => {
+    const { connectionPool, broker } = retirable()
+    connectionPool.retire = jest.fn(() => {
+      throw nothing
+    })
+    connectionPool.destroy = jest.fn().mockRejectedValue(new Error('destroy failed'))
+
+    await expect(broker.retire()).rejects.toBeUndefined()
+    expect(connectionPool.destroy).toHaveBeenCalledTimes(1)
+  })
+
+  it('a broker retirement whose held destroy rejects with null rejects with null once it does', async () => {
+    const { connectionPool, broker } = retirable()
+    const drain = deferred()
+    connectionPool.destroy = jest.fn(() => drain.promise)
+    const retiring = settled(broker.retire())
+    await flush()
+    expect(retiring.done).toBe(false)
+
+    drain.reject(null)
+    await flush()
+
+    expect(retiring).toStrictEqual({ done: true, error: null })
+  })
+
+  it('a replaced pool whose fencing throws undefined reports undefined, though its destroy then fails too', async () => {
+    const { pool, oldPool, failures } = replacing()
+    oldPool.retire = jest.fn(() => {
+      throw nothing
+    })
+    oldPool.destroy = jest.fn().mockRejectedValue(new Error('destroy failed'))
+
+    await pool.refreshMetadata([])
+    await flush()
+
+    expect(oldPool.destroy).toHaveBeenCalledTimes(1)
+    expect(failures()).toEqual([{ error: 'undefined' }])
+  })
+
+  it('a replaced pool whose held destroy rejects with null reports null once it does', async () => {
+    const { pool, oldPool, failures } = replacing()
+    const drain = deferred()
+    oldPool.destroy = jest.fn(() => drain.promise)
+    await pool.refreshMetadata([])
+    await flush()
+    expect(failures()).toEqual([])
+    expect(pool.drainingPools.has(oldPool)).toBe(true)
+
+    drain.reject(null)
+    await flush()
+
+    expect(failures()).toEqual([{ error: 'null' }])
+    expect(pool.drainingPools.size).toBe(0)
+  })
+})
