@@ -3,6 +3,7 @@ const { createFakeSocketFactory } = require('../../../testHelpers/fakeSocket')
 const connectionPoolBuilder = require('../connectionPoolBuilder')
 const ConnectionPool = require('../../network/connectionPool')
 const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../../errors')
+const { createLogger, LEVELS } = require('../../loggers')
 
 describe('Cluster > ConnectionBuilder', () => {
   let builder
@@ -173,15 +174,19 @@ describe('Cluster > ConnectionBuilder', () => {
 
   describe('bootstrap addresses', () => {
     /** @param {string[]} list @returns {ReturnType<typeof connectionPoolBuilder>} */
-    const builderOf = (list, factory = socketFactory) =>
+    const builderOf = (list, factory = socketFactory, log = logger) =>
       connectionPoolBuilder({
         socketFactory: factory,
         brokers: list,
         clientId,
         connectionTimeout,
         requestTimeout: 30000,
-        logger,
+        logger: log,
       })
+
+    const MARKER = 'audit-secret-7f3a91'
+    const HOST_REASON =
+      "the host may use letters, digits, '.', '_', '-' and '%' (and ':' inside brackets)"
 
     test.each([
       ['[::1]:9092', { host: '::1', port: 9092 }],
@@ -205,7 +210,7 @@ describe('Cluster > ConnectionBuilder', () => {
     test('an unbracketed IPv6 literal is a configuration error', async () => {
       await expect(builderOf(['::1:9092']).build()).rejects.toStrictEqual(
         new KafkaJSNonRetriableError(
-          'Failed to connect: invalid broker "::1:9092", an IPv6 host must be written [::1]:9092'
+          'Failed to connect: invalid broker at index 0, an IPv6 host must be written [::1]:9092'
         )
       )
     })
@@ -226,14 +231,61 @@ describe('Cluster > ConnectionBuilder', () => {
 
       expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
       expect(error.message).toBe(
-        `Failed to connect: invalid broker "${address}", expected host:port with a port from 1 to 65535`
+        'Failed to connect: invalid broker at index 0, expected host:port with a port from 1 to 65535'
       )
     })
 
     test('every address of the list is checked, not only the one picked', async () => {
       await expect(builderOf(['host.test:7777', 'host2.test']).build()).rejects.toThrow(
-        'invalid broker "host2.test"'
+        'invalid broker at index 1'
       )
+    })
+
+    test('does not echo a credential-bearing broker string', async () => {
+      const address = `kafka://audit-user:${MARKER}@broker:9092`
+
+      for (const list of [[address], ['ok.test:9092', address]]) {
+        const error = await builderOf(list)
+          .build()
+          .catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(error.message).toContain(`invalid broker at index ${list.indexOf(address)},`)
+        for (const text of [error.message, error.stack, JSON.stringify(error)]) {
+          expect(text).not.toContain(MARKER)
+        }
+      }
+    })
+
+    test('refuses user info the old pattern accepted, before any dial', async () => {
+      for (const address of [`${MARKER}@broker:9092`, `[u:${MARKER}@broker]:9092`]) {
+        const { factory, state } = createFakeSocketFactory()
+        const entries = []
+        const capture = createLogger({
+          level: LEVELS.DEBUG,
+          logCreator: () => (entry) => entries.push(entry),
+        })
+
+        await expect(builderOf([address], factory, capture).build()).rejects.toThrow(
+          `Failed to connect: invalid broker at index 0, ${HOST_REASON}`
+        )
+
+        expect(state.issued).toBe(0)
+        expect(JSON.stringify(entries)).not.toContain(MARKER)
+      }
+    })
+
+    test('keeps accepting ordinary bootstrap addresses', async () => {
+      for (const [address, host] of [
+        ['kafka_1.test:9092', 'kafka_1.test'],
+        ['10.0.0.1:9092', '10.0.0.1'],
+        ['[::1]:9092', '::1'],
+        ['[fe80::1%eth0]:9092', 'fe80::1%eth0'],
+      ]) {
+        const connectionPool = await builderOf([address]).build()
+
+        expect(connectionPool.host).toBe(host)
+      }
     })
 
     test('an address returned by a brokers function is parsed the same way', async () => {
