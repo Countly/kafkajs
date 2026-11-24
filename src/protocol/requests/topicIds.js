@@ -85,4 +85,11 @@ const topicIdSchema = (previous) => ({
   ),
 })
 
-module.exports = { NO_TOPIC_ID, usableTopicIds, requireTopicIds, namesById, topicIdSchema }
+module.exports = {
+  NO_TOPIC_ID,
+  isUsableTopicId,
+  usableTopicIds,
+  requireTopicIds,
+  namesById,
+  topicIdSchema,
+}

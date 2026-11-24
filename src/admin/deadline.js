@@ -496,19 +496,23 @@ const withAdminGuard = (guard, deadline = currentDeadline()) =>
  * @param {object} optionsAt method to index of its public options argument
  * @param {number} defaultTimeout validated AdminConfig budget
  * @param {import('./lifecycle')} [lifecycle] admission and shared close owner
+ * @param {Object<string, (...args: any[]) => any[]>} [inputs] per method, reads and checks the
+ *   call's arguments when the call is admitted and returns the copy the method runs with
  * @returns {object} wrapped admin surface
  * @throws {KafkaJSInvalidConfigurationError} per-call invalid apiTimeout, before method work
  */
-const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle) => {
+const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle, inputs = {}) => {
   for (const [method, index] of Object.entries(optionsAt)) {
     const work = methods[method]
     if (typeof work !== 'function') throw new Error(`Missing admin operation ${method}`)
+    const inputOf = inputs[method]
     methods[method] = async (...args) => {
       const startedAt = performance.now()
       const timeoutMs = validateApiTimeout(args[index]?.apiTimeout, defaultTimeout)
-      const run = (generation) =>
-        runWithDeadline(method, timeoutMs, () => work(...args), generation, startedAt)
-      return lifecycle ? lifecycle.run(run) : run(null)
+      const admit = inputOf && (() => inputOf(...args))
+      const run = (generation, admitted = args) =>
+        runWithDeadline(method, timeoutMs, () => work(...admitted), generation, startedAt)
+      return lifecycle ? lifecycle.run(run, admit) : run(null, admit?.())
     }
   }
   return methods

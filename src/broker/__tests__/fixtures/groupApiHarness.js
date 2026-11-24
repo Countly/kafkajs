@@ -20,13 +20,24 @@ const {
  *
  * @param {object} options
  * @param {import("../../../../types").ApiVersions} options.versions the table to negotiate against
- * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} options.respond builds the
- *   response BODY for one recorded request; the harness frames it with the correct header version
+ * @param {(header: { apiKey: number, apiVersion: number }) => Buffer|null} options.respond builds
+ *   the response BODY for one recorded request, which the harness frames with the correct header
+ *   version; `null` leaves the request unanswered until `release`
+ * @param {number} [options.maxInFlightRequests] the connection's in-flight limit
+ * @param {boolean} [options.forwardGuards=false] hand each request's pre-write guard to the
+ *   connection, as the production pool does, so its request queue checks it before the write
  * @returns {{ broker: Broker, requests: { apiKey: number, apiVersion: number,
  *   correlationId: number, clientId: string, byteLength: number, body: Buffer }[],
- *   pool: object }} the broker, every request it wrote in order, and the pool for teardown
+ *   pool: object, connection: Connection, release: (body: Buffer) => Promise<void> }} the broker,
+ *   every request it wrote in order, the pool for teardown, the connection, and `release`, which
+ *   answers the oldest unanswered request with `body` and then answers what was written meanwhile
  */
-const createGroupApiBroker = ({ versions, respond }) => {
+const createGroupApiBroker = ({
+  versions,
+  respond,
+  maxInFlightRequests,
+  forwardGuards = false,
+}) => {
   const { factory, state } = createFakeSocketFactory()
   const connection = new Connection({
     host: '127.0.0.1',
@@ -37,10 +48,20 @@ const createGroupApiBroker = ({ versions, respond }) => {
     connectionTimeout: 120000,
     requestTimeout: 1000,
     enforceRequestTimeout: false,
+    ...(maxInFlightRequests === undefined ? {} : { maxInFlightRequests }),
   })
 
   const requests = []
+  const unanswered = []
   let answered = 0
+
+  const reply = (header, body) =>
+    respondWithFrame(
+      state,
+      header.correlationId,
+      responseHeaderVersion(header.apiKey, header.apiVersion),
+      body
+    )
 
   const pump = () => {
     while (answered < state.writes.length) {
@@ -48,13 +69,16 @@ const createGroupApiBroker = ({ versions, respond }) => {
       const header = readRequestHeader(frame)
       answered += 1
       requests.push({ ...header, body: frame.subarray(header.byteLength) })
-      respondWithFrame(
-        state,
-        header.correlationId,
-        responseHeaderVersion(header.apiKey, header.apiVersion),
-        respond(header)
-      )
+      const body = respond(header)
+      if (body === null) unanswered.push(header)
+      else reply(header, body)
     }
+  }
+
+  const release = async (body) => {
+    reply(unanswered.shift(), body)
+    await new Promise(setImmediate)
+    pump()
   }
 
   const pool = {
@@ -72,9 +96,10 @@ const createGroupApiBroker = ({ versions, respond }) => {
       return connection
     },
     getConnectionByRequest: async () => pool.getConnection(),
-    send: async (protocolRequest) => {
+    send: async (protocolRequest, _connection, options) => {
       const established = await pool.getConnection()
-      const promise = established.send(protocolRequest)
+      const guard = forwardGuards ? options?.guard : undefined
+      const promise = established.send(guard ? { ...protocolRequest, guard } : protocolRequest)
       await new Promise(setImmediate)
       pump()
       return promise
@@ -87,7 +112,7 @@ const createGroupApiBroker = ({ versions, respond }) => {
   broker.lookupRequest = lookup(versions)
   broker.versionsGeneration = pool.generation
 
-  return { broker, requests, pool }
+  return { broker, requests, pool, connection, release }
 }
 
 module.exports = { createGroupApiBroker }

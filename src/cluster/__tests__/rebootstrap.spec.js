@@ -783,6 +783,35 @@ describe('BrokerPool > rebootstrap', () => {
       expect(events).toEqual([{ reason: 'timeout' }])
     })
 
+    test('a REBOOTSTRAP listener that throws null does not fail the rebootstrap', async () => {
+      const { cluster, events } = createCluster()
+      const pool = cluster.brokerPool
+      const required = Object.assign(new Error('rebootstrap'), {
+        type: 'REBOOTSTRAP_REQUIRED',
+        code: 129,
+        name: 'KafkaJSProtocolError',
+        retriable: false,
+      })
+      const seedOf = stubSeed(pool, async () => {
+        throw required
+      })
+      const previousSeed = seedOf()
+      cluster.instrumentationEmitter.addListener(CLUSTER_REBOOTSTRAP, () => {
+        throw null // eslint-disable-line no-throw-literal
+      })
+      const errors = jest.spyOn(pool.logger, 'error')
+
+      await expect(pool.refreshMetadata([])).rejects.toBe(required)
+
+      expect(seedOf()).not.toBe(previousSeed)
+      expect(events).toEqual([{ reason: 'required' }])
+      expect(errors).toHaveBeenCalledTimes(1)
+      expect(errors).toHaveBeenCalledWith('Instrumentation event listener threw, ignoring it', {
+        eventName: CLUSTER_REBOOTSTRAP,
+        error: 'undefined',
+      })
+    })
+
     test('a REBOOTSTRAP listener can start independent work after rebootstrap settles', async () => {
       const { cluster } = createCluster()
       const pool = cluster.brokerPool
