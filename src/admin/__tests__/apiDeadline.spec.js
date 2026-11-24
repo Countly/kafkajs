@@ -1173,3 +1173,239 @@ describe('polling enrollment and recovery publication', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 })
+
+describe('replay latch', () => {
+  const Broker = require('../../broker')
+  const { lookup } = require('../../protocol/requests')
+  const { createErrorFromCode } = require('../../protocol/error')
+  const { runWithDeadline, retrierOf } = require('../deadline')
+  const { KafkaJSConnectionError, KafkaJSUnknownOutcomeError } = require('../../errors')
+  const versions = {
+    16: { minVersion: 0, maxVersion: 5 },
+    19: { minVersion: 2, maxVersion: 7 },
+    21: { minVersion: 0, maxVersion: 2 },
+    30: { minVersion: 1, maxVersion: 3 },
+    65: { minVersion: 0, maxVersion: 0 },
+  }
+  const retry = { retries: 2, initialRetryTime: 5, maxRetryTime: 5, factor: 0, multiplier: 1 }
+  const deletion = (partition) => ({
+    topics: [{ topic: 't', partitions: [{ partition, offset: '5' }] }],
+  })
+  const acl = (principal) => ({
+    resourceType: 2,
+    resourceName: 't',
+    resourcePatternType: 3,
+    principal,
+    host: '*',
+    operation: 3,
+    permissionType: 3,
+  })
+
+  /**
+   * A real Broker of node 1 over a pool that checks the request's pre-write guard, then writes it
+   * (`onWrite`) and answers with the next of `answers`: `'ok'` (decoded, `{}`), `'lost'` (written,
+   * then the connection fails, no answer), `'dial'` (fails before the write) or an Error (decoded,
+   * then thrown, as a parsed broker error is). The guard is asked once more after each write.
+   * @param {Array<string|Error>} answers one per send; `'ok'` once they run out
+   * @returns {{ broker: Broker, written: object[], afterWrite: Array<Error|null>, lost: Error }}
+   */
+  const brokerWith = (answers) => {
+    const written = []
+    const afterWrite = []
+    const lost = new KafkaJSConnectionError('Connection closed')
+    const connection = { isConnected: () => true }
+    const pool = {
+      generation: 0,
+      pool: [],
+      setupPolicy: { timeoutCeiling: 30000, waitCeiling: 1000 },
+      getConnectionByRequest: jest.fn(async () => connection),
+      send: jest.fn(async (protocolRequest, _connection, options) => {
+        const refusal = options?.guard?.()
+        if (refusal) throw refusal
+        const answer = answers.shift() ?? 'ok'
+        if (answer === 'dial') throw new KafkaJSConnectionError('Connection refused')
+        protocolRequest.onWrite?.()
+        written.push(protocolRequest.request.apiName)
+        afterWrite.push(options?.guard?.() ?? null)
+        if (answer === 'lost') throw lost
+        protocolRequest.onDecoded?.({})
+        if (answer instanceof Error) throw answer
+        return {}
+      }),
+      destroy: jest.fn(),
+    }
+    const broker = new Broker({ connectionPool: pool, logger, nodeId: 1, versions })
+    broker.lookupRequest = lookup(versions)
+    broker.versionsGeneration = 0
+    return { broker, written, afterWrite, lost }
+  }
+
+  /** @param {Function} work @returns {object} the observed outcome of `work` inside one admin call */
+  const call = (work) => observe(runWithDeadline('deleteTopicRecords', 1000, work))
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => {
+    expect(jest.getTimerCount()).toBe(0)
+    jest.useRealTimers()
+  })
+
+  it('refuses a second write of an item whose earlier write got no answer', async () => {
+    const { broker, written } = brokerWith(['lost', 'ok'])
+
+    const result = call(() => retrierOf(retry)(() => broker.deleteRecords(deletion(0))))
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['DeleteRecords'])
+    expect(result.error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+  })
+
+  it('refuses it also when the second write comes from a loop outside any retrier', async () => {
+    const { broker, written, lost } = brokerWith(['lost', 'ok'])
+
+    const result = call(async () => {
+      const failures = []
+      for (let n = 0; n < 2; n++)
+        await broker.deleteRecords(deletion(0)).catch(failures.push.bind(failures))
+      return failures
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['DeleteRecords'])
+    expect(result.value).toHaveLength(2)
+    expect(result.value[0]).toBe(lost)
+    expect(result.value[1]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+  })
+
+  it('refuses it also from a new retry scope', async () => {
+    const { broker, written } = brokerWith(['lost', 'ok'])
+    const converted = (error) =>
+      error instanceof KafkaJSUnknownOutcomeError
+        ? error
+        : new KafkaJSError('converted', { retriable: true })
+
+    const result = call(() =>
+      retrierOf(retry)(async () => {
+        try {
+          return await retrierOf({ ...retry, retries: 0 })(async () => {
+            try {
+              return await broker.deleteRecords(deletion(0))
+            } catch (error) {
+              throw converted(error)
+            }
+          })
+        } catch (error) {
+          throw converted(error)
+        }
+      })
+    )
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['DeleteRecords'])
+    expect(result.error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+  })
+
+  it('rejects with KafkaJSUnknownOutcomeError naming the request and its items, not wrapped', async () => {
+    const { broker, lost } = brokerWith(['lost', 'ok'])
+
+    const result = call(() => retrierOf(retry)(() => broker.deleteRecords(deletion(0))))
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(result.error.constructor).toBe(KafkaJSUnknownOutcomeError)
+    expect(result.error).toMatchObject({
+      name: 'KafkaJSUnknownOutcomeError',
+      message:
+        'deleteTopicRecords: a DeleteRecords request was sent and no answer arrived; it may have been sent and applied. It was not sent again.',
+      outcome: 'unknown',
+      retriable: false,
+      requests: [
+        { api: 'DeleteRecords', apiVersion: 2, nodeId: 1, items: [{ topic: 't', partition: 0 }] },
+      ],
+    })
+    expect(result.error.cause).toBe(lost)
+  })
+
+  it("rejects with the attempt's own error when the written request was answered", async () => {
+    const refused = createErrorFromCode(6)
+    const { broker, written } = brokerWith([refused, 'ok'])
+
+    const result = call(() => retrierOf(retry)(() => broker.deleteRecords(deletion(0))))
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['DeleteRecords'])
+    expect(result.error).toBe(refused)
+  })
+
+  it('allows a retry when nothing was written', async () => {
+    const { broker, written } = brokerWith(['dial', 'ok'])
+
+    const result = call(() => retrierOf(retry)(() => broker.deleteRecords(deletion(0))))
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(result).toEqual({ settled: true, value: {} })
+    expect(written).toEqual(['DeleteRecords'])
+  })
+
+  it('does not block concurrent writes with disjoint items', async () => {
+    const { broker, written, lost } = brokerWith(['lost', 'ok'])
+
+    const result = call(() =>
+      Promise.allSettled([broker.deleteRecords(deletion(0)), broker.deleteRecords(deletion(1))])
+    )
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(result.value).toEqual([
+      { status: 'rejected', reason: lost },
+      { status: 'fulfilled', value: {} },
+    ])
+    expect(written).toEqual(['DeleteRecords', 'DeleteRecords'])
+  })
+
+  it('fails closed on an API whose items are unknown', async () => {
+    const { broker, written, lost } = brokerWith(['lost', 'ok'])
+
+    const result = call(async () => {
+      const first = await broker.createAcls({ acl: [acl('User:a')] }).catch((error) => error)
+      const second = await broker.createAcls({ acl: [acl('User:b')] }).catch((error) => error)
+      return [first, second]
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['CreateAcls'])
+    expect(result.value[0]).toBe(lost)
+    expect(result.value[1]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(result.value[1].requests).toEqual([
+      expect.objectContaining({ api: 'CreateAcls', items: null }),
+    ])
+  })
+
+  it("never refuses a request's own answer (response guard)", async () => {
+    const { broker, afterWrite } = brokerWith(['ok'])
+
+    const result = call(() => broker.deleteRecords(deletion(0)))
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(result).toEqual({ settled: true, value: {} })
+    expect(afterWrite).toEqual([null])
+  })
+
+  it('ignores read APIs and validateOnly creations', async () => {
+    const { broker, written } = brokerWith(['lost', 'ok', 'lost', 'ok'])
+    const validated = { topics: [{ topic: 't' }], validateOnly: true }
+
+    const result = call(async () => [
+      await broker.describeTransactions({ transactionalIds: ['x'] }).catch((error) => error.name),
+      await broker.describeTransactions({ transactionalIds: ['x'] }),
+      await broker.createTopics(validated).catch((error) => error.name),
+      await broker.createTopics(validated),
+    ])
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(result.value).toEqual(['KafkaJSConnectionError', {}, 'KafkaJSConnectionError', {}])
+    expect(written).toEqual([
+      'DescribeTransactions',
+      'DescribeTransactions',
+      'CreateTopics',
+      'CreateTopics',
+    ])
+  })
+})

@@ -1,6 +1,6 @@
 const { itemRetry } = require('../itemRetry')
 const { runWithDeadline } = require('../deadline')
-const { KafkaJSInvariantViolation } = require('../../errors')
+const { KafkaJSInvariantViolation, KafkaJSUnknownOutcomeError } = require('../../errors')
 
 const options = (overrides = {}) => ({
   items: [{ name: 'a' }, { name: 'b' }, { name: 'c' }],
@@ -70,6 +70,18 @@ describe('admin item retry results', () => {
     expect(rows[0].errorCode).toBe(0)
     expect(rows[1].errorCode).toBe(29)
     expect(rows[2]).toMatchObject({ errorCode: -1, error: failure })
+  })
+
+  it('rethrows KafkaJSUnknownOutcomeError instead of turning it into a row', async () => {
+    const failure = new KafkaJSUnknownOutcomeError('lost', { requests: [] })
+    let attempts = 0
+    const result = itemRetry(options(), async () => {
+      if (++attempts === 1) return [row('a'), row('b', 29), row('c', 14)]
+      throw failure
+    }).catch((error) => error)
+    await jest.runAllTimersAsync()
+    expect(await result).toBe(failure)
+    expect(attempts).toBe(2)
   })
 
   it('rejects call-level capability failures with their original identity', async () => {

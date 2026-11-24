@@ -148,7 +148,17 @@ describe.each(['0', '1'])('token diagnostics buffers %s', (buffers) => {
       ).admin()
       try {
         await admin.connect()
-        await expect(call(admin, api)).rejects.toThrow('Unexpected response bytes')
+        const error = await call(admin, api).catch((e) => e)
+        // A token change with no usable answer may have been applied: it is not sent again.
+        const changes = api !== 'DescribeDelegationToken'
+        if (changes) {
+          expect(error).toMatchObject({ name: 'KafkaJSUnknownOutcomeError', outcome: 'unknown' })
+          expect(error.requests).toEqual([
+            expect.objectContaining({ api, apiVersion: version, items: null }),
+          ])
+        }
+        expect((changes ? error.cause : error).message).toContain('Unexpected response bytes')
+        expect(scripted.requests().filter((r) => r.api === api)).toHaveLength(1)
         expect(inspect(entries, { depth: null, maxArrayLength: null })).not.toContain(
           hmac.toString()
         )

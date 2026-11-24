@@ -83,6 +83,25 @@ describe('Protocol > Requests', () => {
   })
 
   describe('lookup', () => {
+    it('a built request keeps its input and does not encode it', async () => {
+      const versions = {
+        [apiKeys.DeleteRecords]: { minVersion: 0, maxVersion: 2 },
+        [apiKeys.Metadata]: { minVersion: 0, maxVersion: 2 },
+      }
+      const args = {
+        topics: [{ topic: 't', partitions: [{ partition: 0, offset: '5' }] }],
+        timeout: 5000,
+      }
+
+      const built = lookup(versions)(apiKeys.DeleteRecords, requests.DeleteRecords)(args)
+      const plain = requests.DeleteRecords.protocol({ version: 2 })(args)
+
+      expect(built.args).toBe(args)
+      expect((await built.request.encode()).buffer).toEqual((await plain.request.encode()).buffer)
+      const read = lookup(versions)(apiKeys.Metadata, requests.Metadata)({ topics: ['t'] })
+      expect(read).not.toHaveProperty('args')
+    })
+
     describe('when the client support more versions than the server', () => {
       it('returns the maximum version supported by the server', async () => {
         const apiKey = 1

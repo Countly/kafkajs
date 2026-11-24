@@ -1199,3 +1199,25 @@ describe('observational telemetry errors', () => {
     expect(() => new KafkaJSTelemetryError('x')).toThrow(TypeError)
   })
 })
+
+test('KafkaJSUnknownOutcomeError carries outcome, requests and cause and is not retriable', () => {
+  const { KafkaJSUnknownOutcomeError, KafkaJSConnectionError } = require('./errors')
+  const cause = new KafkaJSConnectionError('Connection closed')
+  const requests = [
+    { api: 'DeleteRecords', apiVersion: 2, nodeId: 1, items: [{ topic: 't', partition: 0 }] },
+  ]
+  const error = new KafkaJSUnknownOutcomeError('lost', { requests, cause })
+
+  expect(error).toBeInstanceOf(errors.KafkaJSNonRetriableError)
+  expect(error).toMatchObject({
+    name: 'KafkaJSUnknownOutcomeError',
+    message: 'lost',
+    outcome: 'unknown',
+    retriable: false,
+    category: 'applicationRecoverable',
+  })
+  expect(error.requests).toBe(requests)
+  expect(error.cause).toBe(cause)
+  expect(new KafkaJSUnknownOutcomeError('lost').requests).toEqual([])
+  expect(packageEntry.KafkaJSUnknownOutcomeError).toBe(KafkaJSUnknownOutcomeError)
+})
