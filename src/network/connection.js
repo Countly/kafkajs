@@ -259,7 +259,16 @@ module.exports = class Connection {
           port: this.port,
         })
         this.setupAttempt?.fail(error)
-        this.closeGeneration(error)
+        try {
+          this.closeGeneration(error)
+        } catch (reason) {
+          try {
+            this.logError('Failed to close the timed-out connection', {
+              error: describeThrown(reason),
+              cause: reason,
+            })
+          } catch {}
+        }
       },
       onDispatchFailure: (error) => this.failGeneration(error),
     })
@@ -596,13 +605,18 @@ module.exports = class Connection {
       return true
     }
 
-    this.closeGeneration(
-      new KafkaJSConnectionClosedError('Closed connection', {
-        host: this.host,
-        port: this.port,
-      }),
-      socket || this.socket
-    )
+    let teardownFailure = null
+    try {
+      this.closeGeneration(
+        new KafkaJSConnectionClosedError('Closed connection', {
+          host: this.host,
+          port: this.port,
+        }),
+        socket || this.socket
+      )
+    } catch (reason) {
+      teardownFailure = { reason }
+    }
     if (drainFailed) {
       try {
         this.logError('Failed to drain connection', {
@@ -612,6 +626,7 @@ module.exports = class Connection {
       } catch {}
     }
     this.requestQueue.emitQueueState()
+    if (teardownFailure) throw teardownFailure.reason
     try {
       this.logDebug('disconnected')
     } catch {}
@@ -643,11 +658,17 @@ module.exports = class Connection {
       return
     }
 
-    this.closeGeneration(error)
+    let teardownFailure = null
+    try {
+      this.closeGeneration(error)
+    } catch (reason) {
+      teardownFailure = { reason }
+    }
     if (messagePrefix !== null) {
       error.message = messagePrefix + describeThrown(error.cause)
     }
     this.requestQueue.emitQueueState()
+    if (teardownFailure) throw teardownFailure.reason
     try {
       this.logDebug('Generation failed', {
         cause: describeThrown(error, 'name'),
@@ -663,6 +684,8 @@ module.exports = class Connection {
    * @param {Error} error what the requests left on the connection are rejected with
    * @param {object} [socket=this.socket] the socket of the generation being ended
    * @returns {void}
+   * @throws {*} the first failure detaching or destroying the socket, once the rest of the
+   *   teardown has run; callers still run the queue observers, then rethrow or log it
    */
   closeGeneration(error, socket = this.socket) {
     clearTimeout(this.idleTimer)
@@ -682,21 +705,29 @@ module.exports = class Connection {
     }
 
     // `error` stays attached, inert once the attempt is over: a post-close error on the old socket
-    // (e.g. ECONNRESET) must not become an uncaught exception.
-    try {
-      if (socket && !socket.destroyed) {
+    // (e.g. ECONNRESET) must not become an uncaught exception. The socket is destroyed even when
+    // detaching throws; the failure is boxed, so a falsy reason still counts.
+    let failure = null
+    if (socket && !socket.destroyed) {
+      try {
         detachSocket(socket)
-        socket.destroy()
+      } catch (reason) {
+        failure = { reason }
       }
-    } finally {
-      if (this.socket === socket) {
-        this.socket = null
+      try {
+        if (!socket.destroyed) socket.destroy()
+      } catch (reason) {
+        failure ??= { reason }
       }
-
-      this.frames.reset()
-      this.requestQueue.settleAll(error)
-      this.requestQueue.destroy()
     }
+    if (this.socket === socket) {
+      this.socket = null
+    }
+
+    this.frames.reset()
+    this.requestQueue.settleAll(error)
+    this.requestQueue.destroy()
+    if (failure) throw failure.reason
   }
 
   /**

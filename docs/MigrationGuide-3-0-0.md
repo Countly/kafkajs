@@ -1471,9 +1471,14 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   or every broker the client knows about has become unreachable. "Continuously" is measured from
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
-  running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
-  every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
-  through the caller's normal retry path against the rebuilt cluster. On an idempotent
+  running. A rebootstrap does not wait for the connections it replaces: they take no new request
+  and drain in the background for at most `requestTimeout`, a request still outstanding when its
+  connection closes fails with `KafkaJSConnectionClosedError` and goes through the caller's normal
+  retry path against the rebuilt cluster, and a `disconnect()` closes those draining connections
+  too: without a close timeout it can wait for what is left of their `requestTimeout`, a shorter
+  timeout closes them sooner, and a failure closing them can reject the `disconnect()` as a failure
+  on a current connection can (see [Metadata recovery](Configuration.md#metadata-recovery)). On an
+  idempotent
   producer (the default) the retry carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose
@@ -1482,7 +1487,10 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   failure is never a trigger — a rejected credential means the broker is reachable and healthy,
   which no rebootstrap can fix. Setting `metadataRecoveryStrategy: 'none'` disables all three
   triggers and restores the previous behavior exactly, with code 129 surfacing as the non-retriable
-  protocol error it already was.
+  protocol error it already was. A rebootstrap does not notice when the broker list now leads to a
+  different cluster: a consumer keeps its old positions and may fetch the new cluster at those
+  offsets before it rejoins its group or is reassigned, and with `assign()` for as long as it keeps
+  them (see [Metadata recovery](Configuration.md#metadata-recovery)).
 
 - **Negotiated protocol versions moved up.** Against a Kafka 4.1 or 4.3 broker the client now
   negotiates: Metadata **v13** (was v6), Produce **v13** (was v7; **v11** when a topic's id is not
