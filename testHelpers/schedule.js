@@ -222,4 +222,4 @@ const permutations = (items) =>
         ])
       )
 
-module.exports = { Gate, Schedule, interleavings, mulberry32 }
+module.exports = { Gate, Schedule, interleavings, mulberry32, selects }
