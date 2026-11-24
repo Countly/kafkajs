@@ -336,6 +336,7 @@ describe('Consumer > a first round that fails after joining', () => {
       expect(member.crashes).toHaveLength(1)
       expect(member.order).toEqual(['disconnect', 'crash'])
       expect(member.leaves).toEqual([])
+      expect(member.coordinator.heartbeat).not.toHaveBeenCalled()
       expect(member.coordinator.consumerGroupHeartbeat).not.toHaveBeenCalled()
     }
   )
