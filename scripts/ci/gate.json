@@ -19252,6 +19252,7 @@
         "testHelpers/__tests__/scriptedCluster.spec.js \u203a a blackholed dial never connects and up only restores future dials",
         "testHelpers/__tests__/scriptedCluster.spec.js \u203a a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATION_MS fake milliseconds",
         "testHelpers/__tests__/wire.spec.js \u203a ApiVersions entries a profile adds are written as a Kafka 4.3.1 broker writes them a finalized feature entry is the bytes the broker sent",
+        "testHelpers/__tests__/wireDestructiveAdmin.spec.js \u203a each new wire module reads the bytes the production encoder writes and builds a body the production decoder reads",
         "testHelpers/__tests__/wire.spec.js \u203a ApiVersions entries a profile adds are written as a Kafka 4.3.1 broker writes them an API entry is the bytes the broker sent",
         "testHelpers/__tests__/wire.spec.js \u203a ApiVersions entries a profile adds are written as a Kafka 4.3.1 broker writes them frames three API entries, no supported feature and two finalized features as the layout says",
         "testHelpers/__tests__/wire.spec.js \u203a ApiVersions v5 pair answers an older broker\u2019s range, not a fixed one",
