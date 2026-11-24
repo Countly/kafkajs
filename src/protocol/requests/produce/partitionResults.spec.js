@@ -1,6 +1,6 @@
 const Encoder = require('../../encoder')
-const { KafkaJSProtocolError } = require('../../../errors')
-const { parse, partitionResults } = require('./partitionResults')
+const { KafkaJSError, KafkaJSProtocolError } = require('../../../errors')
+const { parse, partitionResults, exactRows } = require('./partitionResults')
 const { decode: decodeV3 } = require('./v3/response')
 const { decode: decodeV8, parse: parseV8 } = require('./v8/response')
 const { parse: parseV9 } = require('./v9/response')
@@ -354,5 +354,66 @@ describe('Protocol > Requests > Produce > partition results', () => {
         'a/2',
       ])
     })
+  })
+
+  const row = (topicName, partition) => ({ topicName, partition })
+  const asked = [{ topic: 't', partitions: [{ partition: 0 }, { partition: 1 }] }]
+
+  test('exactRows refuses a duplicate row in either order', () => {
+    for (const rows of [
+      [row('t', 0), row('t', 1), row('t', 0)],
+      [row('t', 0), row('t', 0), row('t', 1)],
+    ]) {
+      let thrown
+      try {
+        exactRows(rows, asked)
+      } catch (e) {
+        thrown = e
+      }
+
+      expect(thrown).toBeInstanceOf(KafkaJSError)
+      expect(thrown.retriable).toBe(true)
+      expect(thrown.message).toMatch(/partition 0 of topic t twice/)
+    }
+  })
+
+  test('exactRows refuses an unrequested partition, an unrequested topic and a null topic name', () => {
+    expect(() => exactRows([row('t', 0), row('t', 5)], asked)).toThrow(
+      /partition 5 of topic t that the request did not carry/
+    )
+    expect(() => exactRows([row('other', 0)], asked)).toThrow(
+      /partition 0 of topic other that the request did not carry/
+    )
+    expect(() => exactRows([row(null, 0)], asked)).toThrow(/that the request did not carry/)
+  })
+
+  test('exactRows accepts rows in another order and missing rows', () => {
+    const reordered = [row('t', 1), row('t', 0)]
+    const missing = [row('t', 1)]
+
+    expect(exactRows(reordered, asked)).toBe(reordered)
+    expect(exactRows(missing, asked)).toBe(missing)
+    expect(exactRows([], asked)).toEqual([])
+  })
+
+  test('exactRows merges two request entries for one topic and accepts string partition ids in the request', () => {
+    const request = [
+      { topic: 't', partitions: [{ partition: 0 }] },
+      { topic: 't', partitions: [{ partition: '1' }] },
+    ]
+    const rows = [row('t', 0), row('t', 1)]
+
+    expect(exactRows(rows, request)).toBe(rows)
+  })
+
+  test('exactRows refuses two identical rows when the request repeats the pair', () => {
+    const request = [
+      { topic: 't', partitions: [{ partition: 0 }] },
+      { topic: 't', partitions: [{ partition: '0' }] },
+    ]
+
+    expect(() => exactRows([row('t', 0), row('t', 0)], request)).toThrow(
+      /partition 0 of topic t twice/
+    )
   })
 })
