@@ -74,16 +74,19 @@ test.each([47, 52, 31])('abort code %i is typed and terminal', async (code) => {
   expect(f.broker.writeTxnMarkers).toHaveBeenCalledTimes(1)
 })
 
-test.each([6, 7])('abort code %i retries and refreshes only for a moved leader', async (code) => {
-  const f = fixture()
-  f.broker.writeTxnMarkers = jest
-    .fn()
-    .mockResolvedValueOnce(response(code))
-    .mockResolvedValueOnce(response())
-  await expect(f.admin.abortTransaction(options)).resolves.toBeUndefined()
-  expect(f.broker.writeTxnMarkers).toHaveBeenCalledTimes(2)
-  expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(code === 6 ? 2 : 1)
-})
+test.each([6, 7])(
+  'abort code %i returns the broker error without another send or refresh',
+  async (code) => {
+    const f = fixture()
+    f.broker.writeTxnMarkers = jest
+      .fn()
+      .mockResolvedValueOnce(response(code))
+      .mockResolvedValueOnce(response())
+    await expect(f.admin.abortTransaction(options)).rejects.toMatchObject({ code })
+    expect(f.broker.writeTxnMarkers).toHaveBeenCalledTimes(1)
+    expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+  }
+)
 
 test.each([
   'producer',
@@ -110,34 +113,22 @@ test.each([
   await expect(f.admin.abortTransaction(options)).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
 })
 
-test.each([14, 15, 16, 51])(
-  'fence retries code %i without resending a successful id',
-  async (code) => {
-    const f = fixture()
-    let pending = true
-    f.broker.initProducerId.mockImplementation(
-      async ({ transactionalId, transactionTimeout, ...rest }) => {
-        expect(transactionTimeout).toBe(60000)
-        expect(rest).toEqual({})
-        if (transactionalId === 'b' && pending) {
-          pending = false
-          throw reply(code)
-        }
-        return { producerId: '9007199254740993', producerEpoch: 8 }
-      }
-    )
-    const result = await f.admin.fenceProducers({ transactionalIds: ['a', 'b'] })
-    expect(result.map((x) => x.errorCode)).toEqual([0, 0])
-    expect(f.broker.initProducerId.mock.calls.map(([x]) => x.transactionalId)).toEqual([
-      'a',
-      'b',
-      'b',
-    ])
-    expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes([15, 16].includes(code) ? 3 : 2)
-  }
-)
+test.each([14, 15, 16, 51])('fence keeps code %i without resending either id', async (code) => {
+  const f = fixture()
+  f.broker.initProducerId.mockImplementation(async ({ transactionalId, transactionTimeout }) => {
+    expect(transactionTimeout).toBe(60000)
+    if (transactionalId === 'b') {
+      throw reply(code)
+    }
+    return { producerId: '9007199254740993', producerEpoch: 8 }
+  })
+  const result = await f.admin.fenceProducers({ transactionalIds: ['a', 'b'] })
+  expect(result.map((x) => x.errorCode)).toEqual([0, code])
+  expect(f.broker.initProducerId.mock.calls.map(([x]) => x.transactionalId)).toEqual(['a', 'b'])
+  expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+})
 
-test('exhausted fencing retains completed ids and the last broker error', async () => {
+test('fencing retains completed ids and the broker error', async () => {
   const f = fixture()
   f.broker.initProducerId.mockImplementation(async ({ transactionalId }) => {
     if (transactionalId === 'b') throw reply(51)
@@ -147,11 +138,7 @@ test('exhausted fencing retains completed ids and the last broker error', async 
   expect(result.map((x) => x.errorCode)).toEqual([0, 51])
   expect(result[1].error.code).toBe(51)
   expect(result[1].producerId).toBeNull()
-  expect(f.broker.initProducerId.mock.calls.map(([x]) => x.transactionalId)).toEqual([
-    'a',
-    'b',
-    'b',
-  ])
+  expect(f.broker.initProducerId.mock.calls.map(([x]) => x.transactionalId)).toEqual(['a', 'b'])
 })
 
 test.each(['coordinator lookup', 'InitProducerId call'])(

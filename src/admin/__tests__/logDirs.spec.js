@@ -151,7 +151,7 @@ describe('log directory administration', () => {
       futureLogDir: null,
     })
   })
-  it('keeps log-dir-not-found terminal while retrying only a timed-out replica', async () => {
+  it('keeps both log-dir-not-found and timeout rows after one request', async () => {
     const broker = {
       alterReplicaLogDirs: jest
         .fn()
@@ -174,11 +174,12 @@ describe('log directory administration', () => {
     const { admin } = fixture(new Map([[1, broker]]))
     const replicas = [0, 1, 2].map((p) => ({ ...replica(p), logDir: '/data/b' }))
     const rows = await admin.alterReplicaLogDirs({ replicas })
-    expect(rows.map((r) => r.errorCode)).toEqual([57, 0, 0])
+    expect(rows.map((r) => r.errorCode)).toEqual([57, 7, 0])
     expect(rows[0].error).toMatchObject({ type: 'LOG_DIR_NOT_FOUND' })
-    expect(broker.alterReplicaLogDirs.mock.calls[1][0]).toEqual({
-      dirs: [{ path: '/data/b', topics: [{ topic: 't', partitions: [1] }] }],
+    expect(broker.alterReplicaLogDirs).toHaveBeenCalledWith({
+      dirs: [{ path: '/data/b', topics: [{ topic: 't', partitions: [0, 1, 2] }] }],
     })
+    expect(broker.alterReplicaLogDirs).toHaveBeenCalledTimes(1)
     expect(replicas).toEqual([0, 1, 2].map((p) => ({ ...replica(p), logDir: '/data/b' })))
   })
   it('rejects a missing alteration response identity instead of inferring success', async () => {
@@ -705,8 +706,10 @@ describe('directory retry and monotonic expiry', () => {
         const observed = admin[method](options).catch((error) => error)
         await jest.advanceTimersByTimeAsync(21)
         const error = await observed
-        expect(error).toMatchObject({ name: 'KafkaJSTimeout' })
-        expect(error.message).toContain('unknown')
+        if (method === 'describeLogDirs') {
+          expect(error).toMatchObject({ name: 'KafkaJSTimeout' })
+          expect(error.message).toContain('unknown')
+        } else expect(error).toMatchObject([{ errorCode: 7 }])
         await jest.advanceTimersByTimeAsync(2000)
         expect(send).toHaveBeenCalledTimes(1)
         expect(jest.getTimerCount()).toBe(0)
@@ -733,8 +736,9 @@ describe('directory retry and monotonic expiry', () => {
           ? { brokers: [1] }
           : { replicas: [{ ...replica(), logDir: '/data/b' }] }
       const rows = await admin[method](options)
-      expect(rows[0].errorCode).toBe(-1)
-      expect(rows[0].error).toBe(failure)
+      expect(rows[0].errorCode).toBe(method === 'describeLogDirs' ? -1 : 7)
+      if (method === 'describeLogDirs') expect(rows[0].error).toBe(failure)
+      else expect(send).toHaveBeenCalledTimes(1)
     }
   )
 })

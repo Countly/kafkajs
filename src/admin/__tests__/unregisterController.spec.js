@@ -113,16 +113,26 @@ describe('Admin > unregisterController', () => {
     expect(broker.sent).toHaveLength(1)
   })
 
-  test('retries a retriable code and then succeeds', async () => {
-    const broker = brokerOver(1, CAPABLE, [wire.buildResponse({ errorCode: 7 }), OK])
-    const { admin } = fixture([broker])
-    const call = observe(admin.unregisterController({ controllerId: 7 }))
-    await jest.advanceTimersByTimeAsync(0)
-    expect(broker.sent).toHaveLength(1)
-    expect(call.state).toBe('pending')
-    await jest.advanceTimersByTimeAsync(1)
-    expect(call).toEqual({ state: 'fulfilled', value: undefined })
-    expect(broker.sent).toHaveLength(2)
+  test('reports an answered timeout after one frame', async () => {
+    const { Kafka } = require('../../..')
+    const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+    const scripted = createScriptedCluster({
+      profile: 'destructiveAdmin',
+      nodes: [{ id: 0, host: 'node0', port: 9092 }],
+    }).answer('UnregisterController', () => ({ errorCode: 7 }))
+    const admin = new Kafka(scripted.kafkaOptions({ retry })).admin()
+    try {
+      await admin.connect()
+      const result = admin.unregisterController({ controllerId: 7 }).catch((error) => error)
+      await jest.advanceTimersByTimeAsync(50)
+      await expect(result).resolves.toMatchObject({ code: 7 })
+      expect(scripted.requests().filter(({ api }) => api === 'UnregisterController')).toEqual([
+        expect.objectContaining({ fields: { controllerId: 7 } }),
+      ])
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
   })
 
   test('preserves null empty and custom broker error messages', async () => {

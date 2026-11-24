@@ -84,7 +84,7 @@ describe('SCRAM credential administration', () => {
     )
     expect(actual.toString('hex')).toBe(vector.hex)
   })
-  test('default salt is random 32 bytes and only unresolved users relocate on code 41', async () => {
+  test('default salt is random 32 bytes and code 41 is final for that user', async () => {
     const attempts = []
     const salts = []
     const first = {
@@ -113,10 +113,10 @@ describe('SCRAM credential administration', () => {
     const rows = await createAdmin({ cluster, logger, retry }).alterUserScramCredentials({
       upsertions: [change('a', { salt: undefined }), change('b', { salt: undefined })],
     })
-    expect(rows.map((x) => x.errorCode)).toEqual([0, 0])
-    expect(attempts).toEqual([['a', 'b'], ['b']])
-    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(2)
-    expect(cluster.findControllerBroker).toHaveBeenCalledTimes(2)
+    expect(rows.map((x) => x.errorCode)).toEqual([0, 41])
+    expect(attempts).toEqual([['a', 'b']])
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    expect(cluster.findControllerBroker).toHaveBeenCalledTimes(1)
     expect(hi).toHaveBeenCalledTimes(2)
     expect(salts.map((x) => x.length)).toEqual([32, 32])
     expect(salts[0].equals(salts[1])).toBe(false)

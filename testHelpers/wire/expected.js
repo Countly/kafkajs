@@ -2265,158 +2265,156 @@ module.exports.securityAdmin = {
 }
 
 module.exports.deleteRecordsV2 = {
-  "request": {
-    "topics": [
+  request: {
+    topics: [
       {
-        "topic": "t",
-        "partitions": [
+        topic: 't',
+        partitions: [
           {
-            "partition": 1,
-            "offset": "-1"
-          }
-        ]
-      }
+            partition: 1,
+            offset: '-1',
+          },
+        ],
+      },
     ],
-    "timeout": 5000
+    timeout: 5000,
   },
-  "response": {
-    "throttleTime": 0,
-    "topics": [
+  response: {
+    throttleTime: 0,
+    topics: [
       {
-        "topic": "t",
-        "partitions": [
+        topic: 't',
+        partitions: [
           {
-            "partition": 1,
-            "lowWatermark": "2",
-            "errorCode": 0
-          }
-        ]
-      }
-    ]
-  }
+            partition: 1,
+            lowWatermark: '2',
+            errorCode: 0,
+          },
+        ],
+      },
+    ],
+  },
 }
 
 module.exports.deleteGroupsV3 = {
-  "request": [
-    "group"
-  ],
-  "response": {
-    "throttleTime": 0,
-    "results": [
+  request: ['group'],
+  response: {
+    throttleTime: 0,
+    results: [
       {
-        "groupId": "group",
-        "errorCode": 0
-      }
-    ]
-  }
+        groupId: 'group',
+        errorCode: 0,
+      },
+    ],
+  },
 }
 
 module.exports.alterConfigsV2 = {
-  "request": {
-    "resources": [
+  request: {
+    resources: [
       {
-        "type": 2,
-        "name": "t",
-        "configEntries": [
+        type: 2,
+        name: 't',
+        configEntries: [
           {
-            "name": "retention.ms",
-            "value": "10"
-          }
-        ]
-      }
+            name: 'retention.ms',
+            value: '10',
+          },
+        ],
+      },
     ],
-    "validateOnly": false
+    validateOnly: false,
   },
-  "response": {
-    "throttleTime": 0,
-    "resources": [
+  response: {
+    throttleTime: 0,
+    resources: [
       {
-        "errorCode": 0,
-        "errorMessage": null,
-        "resourceType": 2,
-        "resourceName": "t"
-      }
-    ]
-  }
+        errorCode: 0,
+        errorMessage: null,
+        resourceType: 2,
+        resourceName: 't',
+      },
+    ],
+  },
 }
 
 module.exports.incrementalAlterConfigsV1 = {
-  "request": {
-    "resources": [
+  request: {
+    resources: [
       {
-        "type": 2,
-        "name": "t",
-        "configEntries": [
+        type: 2,
+        name: 't',
+        configEntries: [
           {
-            "name": "retention.ms",
-            "operation": 0,
-            "value": "10"
-          }
-        ]
-      }
+            name: 'retention.ms',
+            operation: 0,
+            value: '10',
+          },
+        ],
+      },
     ],
-    "validateOnly": false
+    validateOnly: false,
   },
-  "response": {
-    "throttleTime": 0,
-    "resources": [
+  response: {
+    throttleTime: 0,
+    resources: [
       {
-        "errorCode": 0,
-        "errorMessage": null,
-        "resourceType": 2,
-        "resourceName": "t"
-      }
-    ]
-  }
+        errorCode: 0,
+        errorMessage: null,
+        resourceType: 2,
+        resourceName: 't',
+      },
+    ],
+  },
 }
 
 module.exports.createAclsV3 = {
-  "request": {
-    "creations": [
+  request: {
+    creations: [
       {
-        "resourceType": 2,
-        "resourceName": "t",
-        "resourcePatternType": 3,
-        "principal": "User:u",
-        "host": "*",
-        "operation": 3,
-        "permissionType": 3
-      }
-    ]
+        resourceType: 2,
+        resourceName: 't',
+        resourcePatternType: 3,
+        principal: 'User:u',
+        host: '*',
+        operation: 3,
+        permissionType: 3,
+      },
+    ],
   },
-  "response": {
-    "throttleTime": 0,
-    "creationResponses": [
+  response: {
+    throttleTime: 0,
+    creationResponses: [
       {
-        "errorCode": 0,
-        "errorMessage": null
-      }
-    ]
-  }
+        errorCode: 0,
+        errorMessage: null,
+      },
+    ],
+  },
 }
 
 module.exports.deleteAclsV3 = {
-  "request": {
-    "filters": [
+  request: {
+    filters: [
       {
-        "resourceType": 2,
-        "resourceName": "t",
-        "resourcePatternType": 3,
-        "principal": "User:u",
-        "host": "*",
-        "operation": 3,
-        "permissionType": 3
-      }
-    ]
+        resourceType: 2,
+        resourceName: 't',
+        resourcePatternType: 3,
+        principal: 'User:u',
+        host: '*',
+        operation: 3,
+        permissionType: 3,
+      },
+    ],
   },
-  "response": {
-    "throttleTime": 0,
-    "filterResponses": [
+  response: {
+    throttleTime: 0,
+    filterResponses: [
       {
-        "errorCode": 0,
-        "errorMessage": null,
-        "matchingAcls": []
-      }
-    ]
-  }
+        errorCode: 0,
+        errorMessage: null,
+        matchingAcls: [],
+      },
+    ],
+  },
 }

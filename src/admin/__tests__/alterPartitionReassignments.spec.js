@@ -2,7 +2,7 @@ const createAdmin = require('../index')
 const Broker = require('../../broker')
 const {
   KafkaJSAggregateError,
-  KafkaJSNumberOfRetriesExceeded,
+
   KafkaJSProtocolError,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
@@ -110,7 +110,7 @@ describe('Admin', () => {
       )
     })
 
-    test('retries a topic that does not exist, then rejects with the retries exhausted and the topic’s error as the cause', async () => {
+    test('returns the aggregate for an unknown topic after one request', async () => {
       admin = createAdmin({
         cluster: createCluster(),
         logger: newLogger(),
@@ -129,9 +129,8 @@ describe('Admin', () => {
           })
           .catch((e) => e)
 
-        expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
-        expect(error.cause).toBeInstanceOf(KafkaJSAggregateError)
-        expect(error.cause).toMatchObject({
+        expect(error).toBeInstanceOf(KafkaJSAggregateError)
+        expect(error).toMatchObject({
           message: 'Errors altering partition reassignments',
           errors: expect.arrayContaining([
             expect.objectContaining({
@@ -141,7 +140,7 @@ describe('Admin', () => {
             }),
           ]),
         })
-        expect(asked).toHaveBeenCalledTimes(2)
+        expect(asked).toHaveBeenCalledTimes(1)
       } finally {
         asked.mockRestore()
       }

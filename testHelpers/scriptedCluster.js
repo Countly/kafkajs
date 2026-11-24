@@ -631,7 +631,7 @@ class ScriptedCluster {
    *   and under `share` the finalized `share.version` at level 1 with feature epoch 7
    */
   apiVersionsAnswer() {
-    if (this.profile === 'share') {
+    if (this.profile === 'share' || this.profile === 'destructiveAdmin') {
       return {
         apiKeys: this.apiVersionsTable(),
         finalizedFeaturesEpoch: 7,

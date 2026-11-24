@@ -40,18 +40,17 @@ describe('delete topics by id', () => {
     )
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
-  it('retries only the quota-refused id', async () => {
+  it('reports quota refusal for the original id batch once', async () => {
     const { admin, broker } = fixture()
     broker.deleteTopics.mockRejectedValueOnce(
       Object.assign(createErrorFromCode(89), {
         topicErrors: [{ topic: null, topicId: second, errorCode: 89 }],
       })
     )
-    await admin.deleteTopics({ topicIds: [first, second] })
-    expect(broker.deleteTopics.mock.calls.map((x) => x[0].topicIds)).toEqual([
-      [first, second],
-      [second],
-    ])
+    await expect(admin.deleteTopics({ topicIds: [first, second] })).rejects.toMatchObject({
+      code: 89,
+    })
+    expect(broker.deleteTopics.mock.calls.map((x) => x[0].topicIds)).toEqual([[first, second]])
   })
   it('retains failed id identity through the legacy thrown contract', async () => {
     const { admin, broker } = fixture()
@@ -101,12 +100,11 @@ describe('delete id capabilities', () => {
         topicErrors: [{ topic: null, topicId: second, errorCode: 89 }],
       })
     )
-    broker.deleteTopics.mockImplementationOnce(async () => {
-      expect(cluster.targetTopics.has('old')).toBe(false)
-      expect(cluster.targetTopics.has('new')).toBe(true)
+    await expect(admin.deleteTopics({ topicIds: [first, second] })).rejects.toMatchObject({
+      code: 89,
     })
-    await admin.deleteTopics({ topicIds: [first, second] })
-    expect([...cluster.targetTopics]).toEqual([])
+    expect([...cluster.targetTopics]).toEqual(['new'])
+    expect(broker.deleteTopics).toHaveBeenCalledTimes(1)
   })
 })
 

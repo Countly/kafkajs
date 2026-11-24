@@ -259,7 +259,7 @@ test('a transient controller refresh failure preserves feature successes', async
         errorMessage: null,
       })),
     }))
-  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2) })
+  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
   expect(f.broker.updateFeatures.mock.calls[1][0].featureUpdates.map((f) => f.feature)).toEqual([
     'b',
   ])
@@ -282,7 +282,7 @@ test('an exhausted controller refresh failure preserves feature successes', asyn
       errorMessage: null,
     })),
   }))
-  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2) })
+  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
   expect(rows.map((f) => f.errorCode)).toEqual([0, -1])
   expect(rows[0].error).toBeNull()
   expect(rows[1].error).toBe(original)
@@ -299,7 +299,7 @@ test('no retry budget preserves feature rows without controller refresh', async 
       { feature: 'b', errorCode: 41, errorMessage: 'moved' },
     ],
   }))
-  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2) })
+  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
   expect(rows.map((f) => f.errorCode)).toEqual([0, 41])
   expect(rows[0].error).toBeNull()
   expect(rows[1].error.code).toBe(41)
@@ -308,7 +308,7 @@ test('no retry budget preserves feature rows without controller refresh', async 
 })
 
 test.each(['KafkaJSSASLAuthenticationError', 'KafkaJSServerDoesNotSupportApiKey'])(
-  'controller refresh %s rejects the mutation call with the original error',
+  'controller refresh %s rejects the validation call with the original error',
   async (name) => {
     const f = fixture()
     const ErrorClass = require('../../errors')[name]
@@ -320,13 +320,15 @@ test.each(['KafkaJSSASLAuthenticationError', 'KafkaJSServerDoesNotSupportApiKey'
         { feature: 'b', errorCode: 41 },
       ],
     }))
-    await expect(f.admin.updateFeatures({ features: features.slice(0, 2) })).rejects.toBe(original)
+    await expect(
+      f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
+    ).rejects.toBe(original)
     expect(f.broker.updateFeatures).toHaveBeenCalledTimes(1)
     expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
   }
 )
 
-test('deadline during controller refresh forbids another mutation request', async () => {
+test('deadline during controller refresh forbids another validation request', async () => {
   jest.useFakeTimers()
   const baseline = jest.getTimerCount()
   let release
@@ -344,7 +346,7 @@ test('deadline during controller refresh forbids another mutation request', asyn
     ],
   }))
   const result = f.admin
-    .updateFeatures({ ...{ features: features.slice(0, 2) }, apiTimeout: 20 })
+    .updateFeatures({ features: features.slice(0, 2), apiTimeout: 20, validateOnly: true })
     .catch((e) => e)
   try {
     await jest.advanceTimersByTimeAsync(5)

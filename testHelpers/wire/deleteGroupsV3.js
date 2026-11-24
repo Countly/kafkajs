@@ -10,9 +10,14 @@ module.exports = {
   /** @param {object} [fields] response overrides @returns {Buffer} flexible response body */
   buildResponse(fields = {}) {
     const r = { ...expected.response, ...fields }
-    return new Encoder().writeInt32(r.throttleTime).writeUVarIntArray(r.results.map((g) =>
-      new Encoder().writeUVarIntString(g.groupId).writeInt16(g.errorCode).writeTaggedFields()
-    )).writeTaggedFields().buffer
+    return new Encoder()
+      .writeInt32(r.throttleTime)
+      .writeUVarIntArray(
+        r.results.map((g) =>
+          new Encoder().writeUVarIntString(g.groupId).writeInt16(g.errorCode).writeTaggedFields()
+        )
+      )
+      .writeTaggedFields().buffer
   },
 
   /** @param {Buffer} body request body @returns {object} decoded fixture fields */

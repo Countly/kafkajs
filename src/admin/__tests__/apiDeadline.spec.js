@@ -1254,7 +1254,9 @@ describe('replay latch', () => {
       const answered = createErrorFromCode(41)
       expect(latch.failed(answered)).toBe(answered)
       const retry = retrierOf({ retries: 1 })
-      const action = jest.fn(async () => { throw answered })
+      const action = jest.fn(async () => {
+        throw answered
+      })
       await expect(retry(action)).rejects.toBe(answered)
       expect(action).toHaveBeenCalledTimes(1)
       const replay = jest.fn(async () => write('first'))
@@ -1285,12 +1287,17 @@ describe('replay latch', () => {
       latch.request.onDecoded()
       const answered = latch.failed(createErrorFromCode(41))
       const unknown = write('lost').failed(new KafkaJSError('lost'))
-      for (const reasons of [[retry, answered, unknown], [unknown, answered, retry]]) {
-        await expect(settleMutations(reasons.map((error) => Promise.reject(error))))
-          .rejects.toBe(unknown)
+      for (const reasons of [
+        [retry, answered, unknown],
+        [unknown, answered, retry],
+      ]) {
+        await expect(settleMutations(reasons.map((error) => Promise.reject(error)))).rejects.toBe(
+          unknown
+        )
       }
-      await expect(settleMutations([Promise.reject(retry), Promise.reject(answered)]))
-        .rejects.toBe(answered)
+      await expect(settleMutations([Promise.reject(retry), Promise.reject(answered)])).rejects.toBe(
+        answered
+      )
       const deadline = currentDeadline()
       const close = new KafkaJSError('closed')
       deadline.stop(close)

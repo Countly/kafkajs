@@ -480,8 +480,15 @@ describe('Recorded broker captures', () => {
 test('the builder keeps args only for latched APIs inside an admin scope, and for InitProducerId and LeaveGroup only when marked', async () => {
   const { ADMIN_MUTATION } = require('../../broker/privateOptions')
   const { runWithDeadline } = require('../../admin/deadline')
-  const versions = [apiKeys.DeleteGroups, apiKeys.InitProducerId, apiKeys.LeaveGroup, apiKeys.OffsetCommit]
-  const ranges = Object.fromEntries(versions.map((apiKey) => [apiKey, { minVersion: 0, maxVersion: 9 }]))
+  const versions = [
+    apiKeys.DeleteGroups,
+    apiKeys.InitProducerId,
+    apiKeys.LeaveGroup,
+    apiKeys.OffsetCommit,
+  ]
+  const ranges = Object.fromEntries(
+    versions.map((apiKey) => [apiKey, { minVersion: 0, maxVersion: 9 }])
+  )
   const choose = lookup(ranges)
   const groups = choose(apiKeys.DeleteGroups, requests.DeleteGroups)
   const init = choose(apiKeys.InitProducerId, requests.InitProducerId)

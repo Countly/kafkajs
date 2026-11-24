@@ -70,7 +70,7 @@ describe('client quotas', () => {
     }
   )
 
-  test('retries only the unresolved entity, correlating tuple order without resending successes', async () => {
+  test('returns timeout rows while correlating reversed entity tuples', async () => {
     const attempts = []
     const broker = {
       alterClientQuotas: async ({ entries }) => {
@@ -88,9 +88,9 @@ describe('client quotas', () => {
     const admin = createAdmin({ cluster, logger, retry })
     const result = await admin.alterClientQuotas({ entries: [entry('a'), entry('b')] })
     expect(result.map(({ entity }) => entity[0].entityName)).toEqual(['a', 'b'])
+    expect(result.map(({ errorCode }) => errorCode)).toEqual([0, 7])
     expect(attempts.map((rows) => rows.map(({ entity }) => entity[0].entityName))).toEqual([
       ['a', 'b'],
-      ['b'],
     ])
   })
 
@@ -229,7 +229,7 @@ describe('security administration capability and retained outcomes', () => {
       }
     }
   )
-  test('quota route failure preserves completed entities and attaches the local error only to pending ones', async () => {
+  test('validation route failure preserves completed entities and attaches the local error only to pending ones', async () => {
     const local = new KafkaJSConnectionError('offline')
     const broker = {
       alterClientQuotas: async () => ({
@@ -252,7 +252,7 @@ describe('security administration capability and retained outcomes', () => {
       cluster: { findConnectedBroker },
       logger,
       retry,
-    }).alterClientQuotas({ entries: [entry('a'), entry('b')] })
+    }).alterClientQuotas({ entries: [entry('a'), entry('b')], validateOnly: true })
     expect(rows[0]).toMatchObject({ errorCode: 0, error: null })
     expect(rows[1].errorCode).toBe(-1)
     expect(rows[1].error).toBe(local)

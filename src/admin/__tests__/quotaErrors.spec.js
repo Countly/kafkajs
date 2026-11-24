@@ -203,40 +203,40 @@ const adminOverDeletingBroker = (answers, targets) => {
 const sentTopics = (broker) => broker.deleteTopics.mock.calls.map(([{ topics }]) => topics)
 
 describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
-  test('a quota refusal leaves the deleted topic out of the refresh, so the refused one is sent again', async () => {
+  test('a quota refusal drops the deleted target and keeps the refused target without resending', async () => {
     const { admin, broker, cluster } = adminOverDeletingBroker(
       [
         [
           ['gone', 0],
           ['kept', THROTTLING_QUOTA_EXCEEDED],
         ],
-        [['kept', 0]],
       ],
       ['gone']
     )
 
-    await admin.deleteTopics({ topics: ['gone', 'kept'] })
+    await expect(admin.deleteTopics({ topics: ['gone', 'kept'] })).rejects.toMatchObject({
+      type: 'THROTTLING_QUOTA_EXCEEDED',
+    })
 
-    expect(sentTopics(broker)).toEqual([['gone', 'kept'], ['kept']])
-    expect(cluster.targetTopics.size).toBe(0)
+    expect(sentTopics(broker)).toEqual([['gone', 'kept']])
+    expect([...cluster.targetTopics]).toEqual([])
   })
 
-  test('a quota refusal that outlives the retry budget keeps the refused topic as a target and drops the deleted one', async () => {
+  test('a quota reply preserves refused topics for later reads', async () => {
     const { admin, broker, cluster } = adminOverDeletingBroker(
       [
         [
           ['gone', 0],
           ['kept', THROTTLING_QUOTA_EXCEEDED],
         ],
-        [['kept', THROTTLING_QUOTA_EXCEEDED]],
       ],
       ['gone', 'kept']
     )
 
     const error = await admin.deleteTopics({ topics: ['gone', 'kept'] }).catch((e) => e)
 
-    expect(error.cause).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
-    expect(sentTopics(broker)).toEqual([['gone', 'kept'], ['kept'], ['kept']])
+    expect(error).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
+    expect(sentTopics(broker)).toEqual([['gone', 'kept']])
     expect([...cluster.targetTopics]).toEqual(['kept'])
     await expect(
       admin.describeConfigs({ resources: [{ type: TOPIC, name: 'kept' }] })
@@ -261,8 +261,8 @@ describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
 
       const error = await admin.deleteTopics({ topics: ['gone', 'other'] }).catch((e) => e)
 
-      expect(error.cause).toMatchObject({ type })
-      expect(broker.deleteTopics).toHaveBeenCalledTimes(RETRY.retries + 1)
+      expect(error).toMatchObject({ type })
+      expect(broker.deleteTopics).toHaveBeenCalledTimes(1)
       expect([...cluster.targetTopics]).toEqual(['other'])
     }
   )

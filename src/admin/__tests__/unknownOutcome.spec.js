@@ -8,8 +8,9 @@ it('names the items of the six multi-send APIs and none for the single-send APIs
   const resources = [{ type: 2, name: 't' }]
   expect(items('InitProducerId', { transactionalId: 'tx' })).toEqual(['tx'])
   expect(items('DeleteGroups', ['g'])).toEqual(['g'])
-  expect(items('DeleteRecords', { topics: [{ topic: 't', partitions: [{ partition: 0 }] }] }))
-    .toEqual([{ topic: 't', partition: 0 }])
+  expect(
+    items('DeleteRecords', { topics: [{ topic: 't', partitions: [{ partition: 0 }] }] })
+  ).toEqual([{ topic: 't', partition: 0 }])
   expect(items('AlterConfigs', { resources })).toEqual(resources)
   expect(items('IncrementalAlterConfigs', { resources })).toEqual(resources)
   expect(

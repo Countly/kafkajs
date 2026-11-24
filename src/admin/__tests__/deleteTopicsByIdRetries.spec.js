@@ -26,17 +26,14 @@ const rejection = (promise) =>
   )
 
 describe('delete topics by id retries', () => {
-  test('a NOT_CONTROLLER answer refreshes metadata and sends the same ids again', async () => {
+  test('a NOT_CONTROLLER lookup failure is retried before deleting the ids', async () => {
     const { admin, broker, cluster } = fixture()
-    broker.deleteTopics.mockRejectedValueOnce(createErrorFromCode(41))
+    cluster.findControllerBroker.mockRejectedValueOnce(createErrorFromCode(41))
 
     await admin.deleteTopics({ topicIds: [first] })
 
-    expect(broker.deleteTopics.mock.calls.map(([request]) => request.topicIds)).toEqual([
-      [first],
-      [first],
-    ])
-    // each attempt refreshes first, the NOT_CONTROLLER answer refreshes again, and one follows the delete
+    expect(broker.deleteTopics.mock.calls.map(([request]) => request.topicIds)).toEqual([[first]])
+    // each attempt refreshes first, the NOT_CONTROLLER lookup refreshes again, and one follows the delete
     expect(cluster.refreshMetadata).toHaveBeenCalledTimes(4)
   })
 
