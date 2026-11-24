@@ -222,7 +222,9 @@ with a missing boundary are judged on the unscaled 2,097,152 bytes. The seed's b
 Excluded node types: `code`.
 
 V8 gives the `code` type to compiled code and its bookkeeping and to nothing a program allocates. Its name categories, with
-what a rehearsal (run 3afda68743d9, consumer p03 at `h02`, 10,220,632 excluded and 13,816,934 judged bytes) held in each:
+what the historical rehearsal held in each (the earlier three-hour rehearsal whose heap snapshots covered subjects p03 and
+p09 only, before snapshots were taken of every subject; here consumer p03 at `h02`, 10,220,632 excluded and 13,816,934
+judged bytes):
 
 | Category | p03 bytes | What it is |
 |---|---|---|
@@ -268,7 +270,7 @@ what a rehearsal (run 3afda68743d9, consumer p03 at `h02`, 10,220,632 excluded a
 
 Why code is excluded: over a rehearsal hour 88 to 98 % of the growth was in these rows, for functions that become hot for
 the first time on rarely run paths (outage, recreation, regex churn); none was ever freed and the count of functions that can
-still tier up gives no ceiling, so on an acceptance run it would fail the bound without any product leak (run 3afda68743d9: consumers
+still tier up gives no ceiling, so on an acceptance run it would fail the bound without any product leak (in that rehearsal, consumers
 grew 0.27 to 0.39 MB an hour in `heapUsed`, judged bytes 27 to 30 KB an hour). The product compiles no code at run time
 (no `eval`, `new Function` or `vm` under `src/`), so a leak of the client cannot hide in it. Everything else stays judged:
 maps and hidden classes (`object shape`), `hidden` system objects even when their name looks like code (a `hidden`
@@ -282,7 +284,7 @@ some collector time, never judged bytes, and every measured process now pays it 
 
 The compilation cache that a process's first snapshot frees (about 0.9 to 1.2 MB, part of it old-space and script-source
 bytes) does not reach the judged bytes: every snapshot, the first included, is written after V8's own full collection, so
-all readings stand on the same footing. In run 3afda68743d9 the judged growth from `h00` to `h01` and from `h01` to `h02` was
+all readings stand on the same footing. In that rehearsal the judged growth from `h00` to `h01` and from `h01` to `h02` was
 +30,456 and +26,712 B (p03), +9,952 and +11,352 B (p09), +20,768 and +21,864 B (p14) and +2,168 and +3,040 B (p16), while
 `heapUsed` read before the first snapshot dropped by 0.9 to 1.2 MB after it.
 
@@ -295,7 +297,7 @@ that boundary, or a size other than the file's, gets a record with that error an
 the artifact. When the summary cannot be written, finalize records why in `heap/summary-error.txt`, still seals the run, and
 K5 is INCONCLUSIVE with that reason.
 
-Sizes for an acceptance run (estimates from rehearsal 3afda68743d9, not yet measured on one): 14 processes × 12 snapshots of
+Sizes for an acceptance run (estimates from that rehearsal, not yet measured on one): 14 processes × 12 snapshots of
 15 to 25 MB, plus the seed's 12 growing with its map to about 100 MB, about 3 to 5 GB in all, which the run's disk monitor
 keeps free (16 GiB reserved, the size kept from the 24-hour plan); a rehearsal writes 15 × 3 snapshots, about 0.7 to 1 GB. Summarising takes about one second and
 140 MB to 400 MB of RSS per 15 MB snapshot (about five minutes for an acceptance run, the seed's last snapshots up to about 1 GB of RSS,
@@ -332,7 +334,7 @@ On a hosted runner, dispatch the `Final soak smoke (diagnostic)` workflow with `
 workflow's smoke branches always runs a smoke. The job takes about 3.5 hours (three hours of plan, about 15 minutes of start,
 teardown, dumps, heap summary, check and archive, and the upload); its runbook step is limited to 17,400 s and the job to 335
 minutes, inside the runner's six hours. Read K5 with section 6a before the acceptance run: forecast it from the judged growth
-per hour of each subject (about 9 hours separate its endpoint medians). Rehearsal 3afda68743d9 snapshotted only two
+per hour of each subject (about 9 hours separate its endpoint medians). That rehearsal snapshotted only two
 subjects (p03 and p09, forecast 0.26 and 0.09 MB for the acceptance run); a forecast for the other ten from it is an extrapolation
 from their `heapUsed`, not a measurement, until a rehearsal of this tree snapshots every subject.
 
@@ -362,8 +364,8 @@ one process, `cluster.metadata` counts the consumers' Metadata requests only.
 
 Every flag has a default (`LOAD_DEFAULTS` in `scripts/soak/loadProfile.js`). On a hosted runner, dispatch the
 `Load profile (diagnostic)` workflow (`.github/workflows/load-profile.yml`): choice inputs for rate, record size, topics,
-partitions, duration, codec, fault schedule, replication factor, producer processes and Node; a push to a branch named `p12/load-profile*` runs
-it with the defaults.
+partitions, duration, codec, fault schedule, replication factor, producer processes and Node; a push to a branch that matches the workflow's
+`push` trigger runs it with the defaults.
 The job is limited to 30 minutes; the 600 s default window leaves about 10 minutes of slack, 900 s leaves little.
 
 ### 7.2 The oracle
@@ -398,8 +400,7 @@ from the beginning, with `print.partition`, `print.offset` and `print.key` on an
 of output however large it is. It shares no code with the client under test. The tool ends after 10 s without a record;
 the read is complete when every partition reaches the last offset an acknowledgement returned, and each topic's line count
 must equal the tool's own `Processed a total of` count. Estimate for a hosted runner (unverified until the first run): a
-600 s window at 10,000 records/s is 6,000,000 lines, about 1 to 2 minutes of reading; the checker takes about 1.3 million
-records a second (measured with plain Node on the development host), so the tool, not the checker, sets the pace.
+600 s window at 10,000 records/s is 6,000,000 lines, about 1 to 2 minutes of reading.
 
 ### 7.4 The artifact and the verdict
 

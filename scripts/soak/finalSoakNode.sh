@@ -6,7 +6,7 @@
 #
 #   scripts/soak/finalSoakNode.sh <40-hex sha> <smoke|rehearsal|acceptance>
 #
-# Pause every other agent and test on the host first; preflight fails on a busy host. Steps:
+# Pause every other workload on the host first; preflight fails on a busy host. Steps:
 # checkout of <sha> (detached), `npm ci --ignore-scripts`, reporter preparation with the run's file
 # cap, the three-broker Kafka 4.4.0 KRaft cluster from docker-compose.telemetry.yml plus the prepared
 # override, share.version finalized, preflight, the driver under nohup with a heartbeat file, the
