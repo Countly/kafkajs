@@ -110,9 +110,13 @@ allowance, or the recorded share allocation, differs from the recomputed bytes.
 
 ## Predictions, not acceptance results
 
-The following arithmetic uses the pre-packing baseline: the H2 reading of the Node 22 /
-Kafka 4.2.2 telemetry churn CI archive for commit `7fca0ccf` on `master`, with the four
-workers' recorded reserves. Assume fully resident buffers and identical
+The headroom figures below illustrate the model; they cannot be recomputed from this guide. They
+start from one pre-packing reading of the Node 22 / Kafka 4.2.2 telemetry churn CI job for commit
+`7fca0ccf` on `master`. For each worker they depend on four recorded values that this guide does
+not reproduce, and that another attempt at the same commit need not match: the delta over the
+control, the setup peak, the absolute peak, and the journal reserve allocated after the control.
+Only the 6,294,464-byte share reduction below follows from the declared constants above. Assume
+fully resident buffers and identical
 non-journal memory: add the new ordinary/share reserve to the control and setup peak; change the
 absolute peak by new minus old ordinary/share storage. Native/windows/sample storage was already
 present before the control. The resulting delta is the old delta minus the old after-control
