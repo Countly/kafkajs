@@ -231,10 +231,12 @@ describe('Admin > deleteTopicRecords', () => {
       })
     ) // fail once
 
-    await expect(
-      admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
-    ).rejects.toMatchObject({ partitions: [expect.objectContaining({ partition: 1 })] })
+    const error = await admin
+      .deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+      .catch((e) => e)
 
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause.partitions).toEqual([expect.objectContaining({ partition: 1 })])
     expect(brokerSpy).toHaveBeenCalledTimes(2)
     expect(brokerSpy.mock.calls[1]).not.toEqual(brokerSpy.mock.calls[0])
   })
@@ -254,12 +256,14 @@ describe('Admin > deleteTopicRecords', () => {
       )
 
       const recordsToDelete = [{ partition: 1, offset: '5' }]
-      await expect(
-        admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
-      ).rejects.toMatchObject({ partitions: [{ partition: 1, offset: '5', error }] })
+      const failure = await admin
+        .deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+        .catch((e) => e)
 
+      expect(failure).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(failure.cause.partitions).toEqual([{ partition: 1, offset: '5', error }])
       expect(brokerSpy).toHaveBeenCalledTimes(1)
-      expect(metadataSpy).toHaveBeenCalled()
+      expect(metadataSpy).not.toHaveBeenCalled()
     })
   }
 
@@ -338,9 +342,11 @@ describe('Admin > deleteTopicRecords', () => {
       error = e
     }
 
-    expect(error).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
-    expect(error.retriable).toBe(false)
-    expect(error.partitions).toEqual([
+    expect(error).toBeDefined()
+    expect(error.name).toBe('KafkaJSNonRetriableError')
+    expect(error.cause.name).toBe('KafkaJSDeleteTopicRecordsError')
+    expect(error.cause.retriable).toBe(false)
+    expect(error.cause.partitions).toEqual([
       {
         partition: 1,
         offset: '99',
@@ -400,9 +406,11 @@ describe('Admin > deleteTopicRecords', () => {
       error = e
     }
 
-    expect(error).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
-    expect(error.retriable).toBe(false)
-    expect(error.partitions).toEqual(
+    expect(error).toBeDefined()
+    expect(error.name).toBe('KafkaJSNonRetriableError')
+    expect(error.cause.name).toBe('KafkaJSDeleteTopicRecordsError')
+    expect(error.cause.retriable).toBe(false)
+    expect(error.cause.partitions).toEqual(
       expect.arrayContaining([
         {
           partition: 0,
@@ -464,14 +472,17 @@ describe('Admin > deleteTopicRecords', () => {
       })
     )
 
-    await expect(
-      admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
-    ).rejects.toMatchObject({
-      partitions: expect.arrayContaining([
+    const error = await admin
+      .deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause.partitions).toEqual(
+      expect.arrayContaining([
         expect.objectContaining({ partition: 0, offset: '7' }),
         expect.objectContaining({ partition: 1, offset: '5' }),
-      ]),
-    })
+      ])
+    )
     expect(brokerSpy).toHaveBeenCalledTimes(2)
   })
   test('reports the refused partition without resending to either broker', async () => {
@@ -508,8 +519,9 @@ describe('Admin > deleteTopicRecords', () => {
         ],
       })
       .catch((e) => e)
-    expect(error).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
-    expect(error.partitions).toEqual([
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
+    expect(error.cause.partitions).toEqual([
       { partition: 1, offset: '5', error: expect.objectContaining({ code: 6 }) },
     ])
     expect(calls.get(0)).toBe(1)

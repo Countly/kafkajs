@@ -485,14 +485,16 @@ describe('written admin mutations', () => {
     try {
       await admin.connect()
       const partitions = [0, 1].map((partition) => ({ partition, offset: '-1' }))
-      await expect(admin.deleteTopicRecords({ topic: 't', partitions })).rejects.toMatchObject({
-        name: 'KafkaJSDeleteTopicRecordsError',
-        partitions: [0, 1].map((partition) => ({
+      const error = await admin.deleteTopicRecords({ topic: 't', partitions }).catch((e) => e)
+      expect(error).toMatchObject({ name: 'KafkaJSNonRetriableError', retriable: false })
+      expect(error.cause).toMatchObject({ name: 'KafkaJSDeleteTopicRecordsError' })
+      expect([...error.cause.partitions].sort((a, b) => a.partition - b.partition)).toEqual(
+        [0, 1].map((partition) => ({
           partition,
           offset: '-1',
           error: expect.objectContaining({ code: 6 }),
-        })),
-      })
+        }))
+      )
       expect(
         scripted
           .requests()
@@ -880,6 +882,72 @@ describe('written admin mutations', () => {
       gate.release()
       await jest.advanceTimersByTimeAsync(50)
       await expect(result).resolves.toBeUndefined()
+      expect(
+        scripted
+          .requests()
+          .filter((frame) => frame.api === api)
+          .map(({ node }) => node)
+      ).toEqual([0, 1])
+    } finally {
+      if (gate.settle) gate.fail(new Error('test ended'))
+      spy.mockRestore()
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteRecords sends the unwritten leader after its sibling refuses and reports both refusals', async () => {
+    const { admin, schedule, scripted } = fixture([node(0), node(1)])
+    const api = 'DeleteRecords'
+    scripted.answer(api, ({ topics }) => ({
+      topics: topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({
+          partition,
+          lowWatermark: '0',
+          errorCode: 6,
+        })),
+      })),
+    }))
+    const gate = schedule.hold({ api, node: 0 })
+    const send = Broker.prototype.deleteRecords
+    let ready
+    const firstDialFinished = new Promise((resolve) => {
+      ready = resolve
+    })
+    let failFirst = true
+    const spy = jest
+      .spyOn(Broker.prototype, 'deleteRecords')
+      .mockImplementation(async function (options) {
+        if (this.nodeId !== 1 || !failFirst) return send.call(this, options)
+        failFirst = false
+        await this.disconnect()
+        scripted.down(1)
+        try {
+          return await send.call(this, options)
+        } finally {
+          scripted.up(1)
+          ready()
+        }
+      })
+    try {
+      await admin.connect()
+      const partitions = [0, 1].map((partition) => ({ partition, offset: '5' }))
+      const result = admin.deleteTopicRecords({ topic: 't', partitions }).catch((error) => error)
+      await Promise.race([Promise.all([gate.arrived(), firstDialFinished]), result])
+      await jest.advanceTimersByTimeAsync(50)
+      gate.release()
+      await jest.advanceTimersByTimeAsync(50)
+      const error = await result
+      expect(error).toMatchObject({ name: 'KafkaJSNonRetriableError', retriable: false })
+      expect(error.cause).toMatchObject({ name: 'KafkaJSDeleteTopicRecordsError' })
+      expect([...error.cause.partitions].sort((a, b) => a.partition - b.partition)).toEqual(
+        [0, 1].map((partition) => ({
+          partition,
+          offset: '5',
+          error: expect.objectContaining({ code: 6 }),
+        }))
+      )
       expect(
         scripted
           .requests()
