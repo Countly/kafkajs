@@ -43,12 +43,34 @@ const assigner = (cooperative) => () => ({
 /** Every consumer a case builds, disconnected after it so no timer outlives the case. */
 const built = []
 
+/** The join deadline of a round: the consumer's `maxPollInterval`, which is also its rebalance timeout. */
+const ROUND_MS = 60000
+
 /** @returns {Promise<boolean>} whether `done` held within 200 turns of the event loop */
 const settles = async (done) => {
   for (let turn = 0; turn < 200 && !done(); turn += 1) {
     await new Promise((resolve) => setImmediate(resolve))
   }
   return done()
+}
+
+/**
+ * Advances fake time in one-second steps until `promise` settles, so a deadline and the cleanup
+ * timers after it both run. Fails when it has not settled within `limitMs`.
+ * @param {Promise<unknown>} promise
+ * @param {number} limitMs
+ * @returns {Promise<void>}
+ */
+const advanceUntilSettled = async (promise, limitMs) => {
+  const state = { done: false }
+  const finish = () => {
+    state.done = true
+  }
+  promise.then(finish, finish)
+  for (let elapsed = 0; elapsed < limitMs && !state.done; elapsed += 1000) {
+    await jest.advanceTimersByTimeAsync(1000)
+  }
+  expect(state.done).toBe(true)
 }
 
 /**
@@ -61,6 +83,7 @@ const settles = async (done) => {
  * @param {string|null} [options.groupInstanceId=null]
  * @param {boolean} [options.cooperative=false] classic only: a cooperative assigner
  * @param {Function} [options.restartOnFailure] the consumer's `retry.restartOnFailure`
+ * @param {number} [options.maxPollInterval] the consumer's `maxPollInterval`, the round's deadline
  * @param {number[]} [options.knownPartitions] the partitions the topic's metadata lists
  * @param {Promise<void>} [options.leaveGate] a classic LeaveGroup waits for it
  * @param {(order: string[]) => object} [options.coordinator] members that replace the double's
@@ -78,6 +101,7 @@ const rig = ({
   groupInstanceId = null,
   cooperative = false,
   restartOnFailure = async () => false,
+  maxPollInterval,
   knownPartitions = [0, 1],
   leaveGate,
   coordinator: replacement,
@@ -141,6 +165,7 @@ const rig = ({
     groupInstanceId,
     logger: newLogger(),
     retry: { retries: 0, restartOnFailure },
+    maxPollInterval,
     ...(protocol === 'consumer'
       ? { groupProtocol: 'consumer' }
       : { partitionAssigners: [assigner(cooperative)], sessionTimeout: 30000 }),
@@ -295,12 +320,17 @@ describe('Consumer > a first round that fails after joining', () => {
   test.each(['classic', 'consumer'])(
     'a %s member whose FindCoordinator keeps failing before any join sends no LeaveGroup and no heartbeat',
     async (protocol) => {
+      // A consumer-protocol member keeps looking for its coordinator until the round's join
+      // deadline, so the failure is reached by advancing fake time.
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] })
       const findGroupCoordinator = jest.fn(async () => {
         throw new KafkaJSNonRetriableError('no coordinator')
       })
-      const member = rig({ protocol, findGroupCoordinator })
+      const member = rig({ protocol, findGroupCoordinator, maxPollInterval: ROUND_MS })
 
-      await run(member, { listener: false })
+      const running = run(member, { listener: false })
+      await advanceUntilSettled(running, ROUND_MS + 30000)
+      await running
 
       expect(findGroupCoordinator).toHaveBeenCalled()
       expect(member.crashes).toHaveLength(1)
@@ -342,6 +372,7 @@ describe('Consumer > a first round that fails after joining', () => {
     let joins = 0
     const member = rig({
       restartOnFailure: async () => true,
+      maxPollInterval: ROUND_MS,
       coordinator: (order) => ({
         joinGroup: jest.fn(async (_, options) => {
           order.push('join')
@@ -356,7 +387,7 @@ describe('Consumer > a first round that fails after joining', () => {
     })
 
     const running = run(member, { listener: false })
-    await jest.advanceTimersByTimeAsync(61000)
+    await advanceUntilSettled(running, ROUND_MS + 30000)
     await running
     await jest.advanceTimersByTimeAsync(5000)
 
