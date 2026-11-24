@@ -58,11 +58,18 @@ const {
   NODE_ID,
   TOPIC,
   TOPIC_ID,
+  buildRecordBatch,
   createFetchGroup,
   fetchResponse,
   prepareRecordBatches,
 } = require('./fixtures/fetchHarness')
 const { KafkaJSRequestTimeoutError } = require('../../errors')
+const {
+  batch: recordBatchBytes,
+} = require('../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const { newLogger } = require('testHelpers')
+const Runner = require('../runner')
 
 let harness
 beforeAll(() => prepareRecordBatches())
@@ -870,7 +877,7 @@ describe('Fetch sessions through the consumer group', () => {
       expect(harness.offsetManager.peekNextOffset(TOPIC, 0).toString()).toBe('10')
     })
 
-    test("an answer released after out-of-range recovery cleared the partition's offset is dropped", async () => {
+    test("an answer released after the partition's held offset was cleared is dropped", async () => {
       harness = await open({ position: '0', fetchSessions: false })
       const clear = () => harness.offsetManager.clearOffsets({ topic: TOPIC, partition: 0 })
 
@@ -881,14 +888,20 @@ describe('Fetch sessions through the consumer group', () => {
 
     test('an answer at the position it asked for is delivered: first fetch, after offsets were resolved, after a seek was applied', async () => {
       harness = await open({ position: '0', fetchSessions: false })
-      const fetchedOffsets = async () =>
-        (await nextRound(harness.group, reply(0, [0]))).map(({ fetchedOffset }) => fetchedOffset)
+      const delivered = async (firstOffset) => {
+        const records = await buildRecordBatch({ firstOffset })
+        const batches = await nextRound(harness.group, reply(0, [{ partition: 0, records }]))
+        return batches.map(({ fetchedOffset, messages }) => [
+          fetchedOffset,
+          messages.map(({ offset }) => offset),
+        ])
+      }
 
-      expect(await fetchedOffsets()).toEqual(['0'])
+      expect(await delivered('0')).toEqual([['0', ['0']]])
       harness.offsetManager.resolveOffset({ topic: TOPIC, partition: 0, offset: '0' })
-      expect(await fetchedOffsets()).toEqual(['1'])
+      expect(await delivered('1')).toEqual([['1', ['1']]])
       await harness.offsetManager.seek({ topic: TOPIC, partition: 0, offset: '9' })
-      expect(await fetchedOffsets()).toEqual(['9'])
+      expect(await delivered('9')).toEqual([['9', ['9']]])
     })
 
     test('a partition that did not move is delivered from the same answer', async () => {
@@ -916,5 +929,125 @@ describe('Fetch sessions through the consumer group', () => {
       })
       expect(harness.fetchRequestOffsets()).toEqual(['10'])
     })
+  })
+
+  describe('the runner over the real group and fetch path', () => {
+    const SESSIONS = [
+      ['off', false, 0],
+      ['on', true, 42],
+    ]
+
+    /** A runner whose heartbeat and fetch loop are out of the case: batches are handed to it by hand. */
+    const runnerWith = (handlers) => {
+      const runner = new Runner({
+        logger: newLogger(),
+        consumerGroup: harness.group,
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        concurrency: 1,
+        heartbeatInterval: 3000,
+        maxPollInterval: 300000,
+        autoCommit: false,
+        onCrash: (error) => {
+          throw error
+        },
+        ...handlers,
+      })
+      runner.heartbeat = async () => {}
+      runner.running = true
+      return runner
+    }
+
+    const summary = (batches) =>
+      batches.map(({ partition, fetchedOffset, messages }) => [
+        partition,
+        fetchedOffset,
+        messages.map(({ offset }) => offset),
+      ])
+
+    test.each(SESSIONS)(
+      'a batch whose partition was paused while it was queued is not delivered, the next Fetch after resume asks for its offset, and its records are delivered once with fetch sessions %s',
+      async (_name, fetchSessions, sessionId) => {
+        harness = await open({ partitions: [0, 1], position: '4', fetchSessions })
+        const handled = []
+        let openGate
+        const gate = new Promise((resolve) => (openGate = resolve))
+        const runner = runnerWith({
+          eachMessage: async ({ partition, message }) => {
+            handled.push(`${partition}:${message.offset}`)
+            if (partition === 0) await gate
+          },
+        })
+        const records = await buildRecordBatch({ firstOffset: '4' })
+        const [batch0, batch1] = await nextRound(
+          harness.group,
+          reply(sessionId, [
+            { partition: 0, records },
+            { partition: 1, records },
+          ])
+        )
+        expect([batch0.partition, batch1.partition]).toEqual([0, 1])
+
+        const running = runner.handleBatch(batch0)
+        await until(() => handled.length === 1)
+        harness.group.pause([{ topic: TOPIC, partitions: [1] }])
+        openGate()
+        await running
+        await runner.handleBatch(batch1)
+
+        expect(handled).toEqual(['0:4'])
+        expect(harness.offsetManager.positionOf(TOPIC, 0)).toBe('5')
+        expect(harness.offsetManager.positionOf(TOPIC, 1)).toBe('4')
+
+        await nextRound(harness.group, reply(sessionId, []))
+        expect(harness.fetchRequestPartitions()).toEqual([0])
+
+        harness.group.resume([{ topic: TOPIC, partitions: [1] }])
+        const resumed = await nextRound(
+          harness.group,
+          reply(sessionId, [{ partition: 1, records }])
+        )
+
+        expect(
+          harness.lastFetchRequest().find(({ partition }) => partition === 1).fetchOffset
+        ).toBe('4')
+        expect(summary(resumed)).toEqual([[1, '4', ['4']]])
+        await runner.handleBatch(resumed[0])
+        expect(handled).toEqual(['0:4', '1:4'])
+        expect(harness.offsetManager.positionOf(TOPIC, 1)).toBe('5')
+      }
+    )
+
+    test.each(SESSIONS)(
+      'a batch emptied by compaction moves the next Fetch to its end and the tracked epoch to its epoch before the later record is returned with fetch sessions %s',
+      async (_name, fetchSessions, sessionId) => {
+        harness = await open({ position: '0', fetchSessions })
+        const eachBatch = jest.fn(async () => {})
+        const runner = runnerWith({ eachBatch })
+        const emptied = recordBatchBytes({
+          baseOffset: 0n,
+          partitionLeaderEpoch: 5,
+          lastOffsetDelta: 99,
+        })
+
+        const [first] = await nextRound(
+          harness.group,
+          reply(sessionId, [{ partition: 0, records: emptied }])
+        )
+        await runner.handleBatch(first)
+
+        expect(eachBatch).not.toHaveBeenCalled()
+        expect(harness.offsetManager.positionOf(TOPIC, 0)).toBe('100')
+        expect(harness.offsetManager.lastConsumedEpoch(TOPIC, 0)).toBe(5)
+
+        const later = await buildRecordBatch({ firstOffset: '100' })
+        const next = await nextRound(
+          harness.group,
+          reply(sessionId, [{ partition: 0, records: later }])
+        )
+
+        expect(harness.fetchRequestOffsets()).toEqual(['100'])
+        expect(summary(next)).toEqual([[0, '100', ['100']]])
+      }
+    )
   })
 })
