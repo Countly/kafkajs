@@ -666,7 +666,12 @@ describe('BrokerPool > rebootstrap', () => {
         return stubbedBuildConnectionPool(destination)
       }
 
-      await expect(pool.refreshMetadata([])).resolves.toBeUndefined()
+      // The rebootstrap overtook the refresh: it stops installing and rejects as retriable.
+      await expect(pool.refreshMetadata([])).rejects.toMatchObject({
+        name: 'KafkaJSConnectionError',
+        message: 'Metadata refresh was overtaken by a rebootstrap',
+        retriable: true,
+      })
     })
 
     test('the seed broker is never unset while a rebootstrap is in flight', async () => {
@@ -978,11 +983,16 @@ describe('BrokerPool > rebootstrap', () => {
         return ok
       }
 
-      await pool.refreshMetadata([])
+      // The failure arrived after the rebootstrap, so the call rejects without another attempt.
+      await expect(pool.refreshMetadata([])).rejects.toMatchObject({
+        name: 'KafkaJSConnectionError',
+        message: 'Metadata refresh was overtaken by a rebootstrap',
+      })
 
-      expect(brokersUsed).toHaveLength(2)
-      expect(brokersUsed[1]).toBe(seedOf())
-      expect(Object.keys(pool.brokers)).toEqual(['0'])
+      expect(attempt).toBe(1)
+      expect(brokersUsed).toHaveLength(1)
+      expect(brokersUsed[0]).not.toBe(seedOf())
+      expect(pool.brokers).toEqual({})
     })
   })
 })

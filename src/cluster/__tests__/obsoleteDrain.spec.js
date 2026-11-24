@@ -3,7 +3,7 @@ const Broker = require('../../broker')
 const Cluster = require('../index')
 const Generation = require('../../producer/generation')
 const ConnectionPool = require('../../network/connectionPool')
-const { KafkaJSConnectionClosedError } = require('../../errors')
+const { KafkaJSConnectionClosedError, KafkaJSConnectionError } = require('../../errors')
 const { responseHeaderVersion } = require('../../protocol/headers')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
@@ -886,4 +886,624 @@ describe('a closed producer lifecycle and an endpoint pool that finishes late', 
       await cluster.disconnect({ drainTimeout: 0 })
     }
   })
+})
+
+describe('Metadata answers across a rebootstrap', () => {
+  /**
+   * A Metadata answer of one cluster.
+   * @param {string} clusterId which cluster answered
+   * @param {object[]} [brokers] the brokers it lists
+   * @param {string[]} [topics] the topics it lists, each with partition 0 led by node 0
+   * @returns {object} a fresh decoded answer
+   */
+  const answer = (clusterId, brokers = [], topics = []) => ({
+    throttleTime: 0,
+    clusterId,
+    controllerId: 0,
+    brokers,
+    topicMetadata: topics.map((topic) => ({
+      topicErrorCode: 0,
+      topic,
+      topicId: null,
+      isInternal: false,
+      partitionMetadata: [
+        {
+          partitionErrorCode: 0,
+          partitionId: 0,
+          leader: 0,
+          leaderEpoch: 1,
+          replicas: [0],
+          isr: [0],
+          offlineReplicas: [],
+        },
+      ],
+    })),
+  })
+  const OLD_PEER = { nodeId: 1, host: 'old-peer', port: 9092 }
+  /** The seed the first rebootstrap builds, as the rebuilt cluster lists it. */
+  const NEW_SEED = { nodeId: 0, host: 'seed-1', port: 9092 }
+  const closed = () => new KafkaJSConnectionClosedError('Closed', { host: 'seed', port: 9092 })
+  /** @returns {Error} a REBOOTSTRAP_REQUIRED answer */
+  const required = () =>
+    Object.assign(new Error('Rebootstrap required'), {
+      type: 'REBOOTSTRAP_REQUIRED',
+      code: 129,
+      retriable: false,
+    })
+
+  /**
+   * Asserts the refusal of a refresh a rebootstrap overtook: retriable, and without a cause.
+   * @param {Error} [error] what the refresh rejected with
+   * @returns {void}
+   */
+  const expectOvertaken = (error) => {
+    expect(error).toBeInstanceOf(KafkaJSConnectionError)
+    expect(error.retriable).toBe(true)
+    expect(error.message).toBe('Metadata refresh was overtaken by a rebootstrap')
+    expect(error.cause).toBeUndefined()
+  }
+
+  /**
+   * Makes every Metadata request of `pool`, on its seed or on any broker built later, wait for the
+   * test to answer it, and makes selection return the current seed, as it does once a rebootstrap
+   * has emptied the broker table.
+   * @param {BrokerPool} pool pool whose seed is a broker double
+   * @returns {Array<{ resolve: Function, reject: Function }>} one entry per request in send order
+   */
+  const holdMetadata = (pool) => {
+    const replies = []
+    const held = () =>
+      new Promise((resolve, reject) => {
+        replies.push({ resolve, reject })
+      })
+    pool.seedBroker.metadata.mockImplementation(held)
+    const create = pool.createBroker
+    pool.createBroker = jest.fn((options) => {
+      const created = create(options)
+      created.metadata.mockImplementation(held)
+      return created
+    })
+    pool.findConnectedBroker = jest.fn(async () => pool.seedBroker)
+    return replies
+  }
+
+  /** @returns {object} the `build()` fixture with `replies`, see `holdMetadata` */
+  const acrossRebootstrap = () => {
+    const fixture = build()
+    return { ...fixture, replies: holdMetadata(fixture.pool) }
+  }
+
+  /**
+   * A Cluster whose pool is wired like `acrossRebootstrap`, so refreshes go through both of the
+   * Cluster's shared refresh entry points.
+   * @returns {{ cluster: Cluster, pool: BrokerPool, replies: object[] }}
+   */
+  const clusterAcrossRebootstrap = () => {
+    const cluster = new Cluster({
+      logger: newLogger(),
+      clientId: 'client',
+      brokers: ['seed:9092'],
+      requestTimeout: 1000,
+      retry: { retries: 0 },
+      allowAutoTopicCreation: false,
+    })
+    const fixture = build()
+    const pool = cluster.brokerPool
+    pool.connectionPoolBuilder = fixture.builder
+    pool.createBroker = fixture.pool.createBroker
+    pool.seedBroker = fixture.seed
+    pool.brokers = { 0: fixture.seed }
+    return { cluster, pool, replies: holdMetadata(pool) }
+  }
+
+  /**
+   * Runs one rebootstrap after the call's retrier has settled and before the call reads the
+   * outcome, the last point at which a rebootstrap can overtake a refresh.
+   * @param {BrokerPool} pool
+   * @returns {void}
+   */
+  const rebootstrapAtSettlement = (pool) => {
+    const retryFor = pool.retryFor.bind(pool)
+    let done = false
+    pool.retryFor = (fence) => {
+      const retrier = retryFor(fence)
+      return async (fn) => {
+        try {
+          return await retrier(fn)
+        } finally {
+          if (!done) {
+            done = true
+            await pool.rebootstrap('required')
+          }
+        }
+      }
+    }
+  }
+
+  it('a reply held across a rebootstrap installs nothing and the call rejects as retriable', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    const success = jest.spyOn(pool, 'onMetadataSuccess')
+    const failure = jest.spyOn(pool, 'onMetadataFailure')
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+    expect(replies).toHaveLength(1)
+
+    await pool.rebootstrap('required')
+    replies[0].resolve(answer('old', [SEED_NODE, OLD_PEER], ['old-topic']))
+    const { error } = await refreshing
+
+    expectOvertaken(error)
+    expect(pool.metadata).toBeNull()
+    expect(pool.metadataCache.leader('old-topic', 0)).toBe(-1)
+    expect(pool.brokers).toEqual({})
+    expect(replies).toHaveLength(1)
+    expect(success).not.toHaveBeenCalled()
+    expect(failure).not.toHaveBeenCalled()
+  })
+
+  it('a rebootstrap during broker selection rejects the refresh as retriable', async () => {
+    const { pool, seed, replies } = acrossRebootstrap()
+    pool.findConnectedBroker.mockImplementationOnce(async () => {
+      await pool.rebootstrap('required')
+      throw new KafkaJSConnectionError('Closed by the rebootstrap')
+    })
+
+    const { error } = await outcome(pool.refreshMetadata([]))
+
+    expectOvertaken(error)
+    expect(pool.findConnectedBroker).toHaveBeenCalledTimes(1)
+    expect(replies).toHaveLength(0)
+    expect(seed.metadata).not.toHaveBeenCalled()
+    expect(pool.metadataUnavailableSince).toBeNull()
+  })
+
+  it('a connection closed by a rebootstrap starts no recovery clock and rejects as retriable', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    const failure = jest.spyOn(pool, 'onMetadataFailure')
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    await pool.rebootstrap('required')
+    replies[0].reject(closed())
+    const { error } = await refreshing
+
+    expectOvertaken(error)
+    expect(failure).not.toHaveBeenCalled()
+    expect(pool.metadataUnavailableSince).toBeNull()
+    expect(replies).toHaveLength(1)
+  })
+
+  it('with retry: { retries: 0 } a refresh overtaken by a rebootstrap rejects as retriable', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    expect(pool.retryOptions).toEqual({ retries: 0 })
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    await pool.rebootstrap('required')
+    replies[0].reject(closed())
+    const { error } = await refreshing
+
+    expectOvertaken(error)
+    expect(replies).toHaveLength(1)
+    expect(pool.metadataUnavailableSince).toBeNull()
+  })
+
+  it("a rebootstrap while an answer's pools are built stops the build and rejects", async () => {
+    const { pool, replies, builder } = acrossRebootstrap()
+    const peerPool = new ConnectionPool({ logger: newLogger(), host: 'old-peer', port: 9092 })
+    peerPool.destroy = jest.fn(async () => {})
+    let releasePeer
+    builder.build.mockImplementationOnce(
+      () => new Promise((resolve) => (releasePeer = () => resolve(peerPool)))
+    )
+    const seen = []
+    pool.metadataCache.onRoutingChange(() =>
+      seen.push({
+        cluster: pool.metadata?.clusterId ?? null,
+        brokers: Object.keys(pool.brokers),
+        endpoints: [...pool.setupMetadataEndpoints.keys()],
+      })
+    )
+    const success = jest.spyOn(pool, 'onMetadataSuccess')
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+    replies[0].resolve(answer('old', [SEED_NODE, OLD_PEER]))
+    await settled()
+    expect(builder.build).toHaveBeenCalledTimes(1)
+
+    await pool.rebootstrap('required')
+    // The rebootstrap's own wake sees the old cluster gone.
+    expect(seen.at(-1)).toEqual({ cluster: null, brokers: [], endpoints: [] })
+    releasePeer()
+    const { error } = await refreshing
+
+    expectOvertaken(error)
+    expect(success).not.toHaveBeenCalled()
+    expect(pool.brokers[1]).toBeUndefined()
+    expect(peerPool.retired).toBe(true)
+    expect(seen).toHaveLength(2)
+  })
+
+  it('setup endpoints of the old cluster are cleared by a rebootstrap', async () => {
+    const { pool } = build()
+    pool.setupMetadataEndpoints.set('1', 'old-peer:9092')
+    await pool.rebootstrap('required')
+    expect([...pool.setupMetadataEndpoints]).toEqual([])
+  })
+
+  it('a refresh started after a rebootstrap never joins one from before', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    const unshared = jest.spyOn(pool, 'refreshMetadataUnshared')
+    const first = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    await pool.rebootstrap('required')
+    const second = outcome(pool.refreshMetadata([]))
+    await settled()
+    expect(unshared).toHaveBeenCalledTimes(2)
+    expect(replies).toHaveLength(2)
+
+    replies[0].resolve(answer('old', [SEED_NODE, OLD_PEER], ['old-topic']))
+    expectOvertaken((await first).error)
+    replies[1].resolve(answer('new', [NEW_SEED], ['new-topic']))
+    expect(await second).toEqual({ value: undefined })
+    expect(pool.metadata.clusterId).toBe('new')
+    expect(pool.metadataCache.leader('new-topic', 0)).toBe(0)
+    expect(pool.metadataCache.leader('old-topic', 0)).toBe(-1)
+  })
+
+  it('a refresh whose own rebootstrap selected the new seed installs that answer once', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    pool.findConnectedBroker.mockImplementationOnce(async () => {
+      await pool.rebootstrap('all-brokers-unavailable')
+      return pool.seedBroker
+    })
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    expect(replies).toHaveLength(1)
+    replies[0].resolve(answer('new'))
+    expect(await refreshing).toEqual({ value: undefined })
+    expect(pool.metadata.clusterId).toBe('new')
+    expect(replies).toHaveLength(1)
+    expect(pool.findConnectedBroker).toHaveBeenCalledTimes(1)
+  })
+
+  it('a caller refusal after a rebootstrap wins over asking the new seed', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    const refusal = new Error('caller left')
+    let refused = null
+    const refreshing = outcome(pool.refreshMetadata([], { guard: () => refused }))
+    await settled()
+
+    await pool.rebootstrap('required')
+    refused = refusal
+    replies[0].resolve(answer('old', [SEED_NODE, OLD_PEER], ['old-topic']))
+
+    expect((await refreshing).error).toBe(refusal)
+    expect(replies).toHaveLength(1)
+    expect(pool.metadata).toBeNull()
+  })
+
+  it('a rebootstrap after the last answer was installed and before the call settles rejects it as retriable', async () => {
+    const { pool, seed, replies } = acrossRebootstrap()
+    rebootstrapAtSettlement(pool)
+    const success = jest.spyOn(pool, 'onMetadataSuccess')
+    const failure = jest.spyOn(pool, 'onMetadataFailure')
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    replies[0].resolve(answer('old', [SEED_NODE], ['old-topic']))
+    const { error } = await refreshing
+
+    expect(error).toBeInstanceOf(KafkaJSConnectionError)
+    expect(error.retriable).toBe(true)
+    expect(seed.retire).toHaveBeenCalledTimes(1)
+    expect(pool.metadata).toBeNull()
+    expect(pool.metadataCache.leader('old-topic', 0)).toBe(-1)
+    expect(success).not.toHaveBeenCalled()
+    expect(failure).not.toHaveBeenCalled()
+    expect(replies).toHaveLength(1)
+  })
+
+  it('a rebootstrap after the last request failed and before the call settles starts no recovery from that failure', async () => {
+    const { pool, builder, replies } = acrossRebootstrap()
+    rebootstrapAtSettlement(pool)
+    const failure = jest.spyOn(pool, 'onMetadataFailure')
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    replies[0].reject(required())
+    const { error } = await refreshing
+
+    expect(error).toBeInstanceOf(KafkaJSConnectionError)
+    expect(error.retriable).toBe(true)
+    expect(failure).not.toHaveBeenCalled()
+    // One seed was built, by the rebootstrap at settlement; the stale 129 started no second one.
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(pool.metadataUnavailableSince).toBeNull()
+  })
+
+  it('a disconnect after a rebootstrap still resolves an earlier refresh silently', async () => {
+    // A held answer that arrives after both returns from the attempt and reaches the success path.
+    const answered = acrossRebootstrap()
+    const answeredHooks = [
+      jest.spyOn(answered.pool, 'onMetadataSuccess'),
+      jest.spyOn(answered.pool, 'onMetadataFailure'),
+    ]
+    const refreshing = outcome(answered.pool.refreshMetadata([]))
+    await settled()
+    await answered.pool.rebootstrap('required')
+    await answered.pool.disconnect()
+    answered.replies[0].resolve(answer('old', [SEED_NODE, OLD_PEER], ['old-topic']))
+
+    expect(await refreshing).toEqual({ value: undefined })
+    expect(answered.pool.metadata).toBeNull()
+    expect(answered.pool.metadataCache.leader('old-topic', 0)).toBe(-1)
+    for (const hook of answeredHooks) expect(hook).not.toHaveBeenCalled()
+
+    // A selection that fails after both reaches the failure path.
+    const failed = acrossRebootstrap()
+    const failedHooks = [
+      jest.spyOn(failed.pool, 'onMetadataSuccess'),
+      jest.spyOn(failed.pool, 'onMetadataFailure'),
+    ]
+    failed.pool.findConnectedBroker.mockImplementationOnce(async () => {
+      await failed.pool.rebootstrap('required')
+      await failed.pool.disconnect()
+      throw closed()
+    })
+
+    expect(await outcome(failed.pool.refreshMetadata([]))).toEqual({ value: undefined })
+    expect(failed.pool.metadata).toBeNull()
+    expect(failed.replies).toHaveLength(0)
+    for (const hook of failedHooks) expect(hook).not.toHaveBeenCalled()
+  })
+
+  it('an old seed connect that fails after a rebootstrap does not rotate away from the new seed', async () => {
+    const { pool, seed, builder } = build()
+    let fail
+    seed.isConnected = () => false
+    seed.connect = jest.fn(() => new Promise((resolve, reject) => (fail = reject)))
+    const connecting = outcome(pool.connect())
+    await settled()
+    expect(seed.connect).toHaveBeenCalledTimes(1)
+
+    await pool.rebootstrap('required')
+    const installed = pool.seedBroker
+    fail(new KafkaJSConnectionError('Closed by the rebootstrap'))
+    await connecting
+
+    expect(pool.seedBroker).toBe(installed)
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(installed.retire).not.toHaveBeenCalled()
+  })
+
+  it('an old seed connect that succeeds after a rebootstrap does not write its versions', async () => {
+    const { pool, seed, builder } = build()
+    const stale = { 3: { minVersion: 0, maxVersion: 12 } }
+    const fresh = { 3: { minVersion: 0, maxVersion: 13 } }
+    pool.retryOptions = { retries: 1, initialRetryTime: 1, maxRetryTime: 1 }
+    const create = pool.createBroker
+    pool.createBroker = jest.fn((options) =>
+      Object.assign(create(options), { versions: fresh, connect: jest.fn(async () => {}) })
+    )
+    let succeed
+    seed.isConnected = () => false
+    seed.versions = stale
+    seed.connect = jest.fn(() => new Promise((resolve) => (succeed = resolve)))
+    const connecting = outcome(pool.connect())
+    await settled()
+    expect(seed.connect).toHaveBeenCalledTimes(1)
+
+    await pool.rebootstrap('required')
+    const installed = pool.seedBroker
+    succeed()
+
+    expect(await connecting).toEqual({ value: undefined })
+    expect(pool.versions).toBe(fresh)
+    expect(installed.connect).toHaveBeenCalledTimes(1)
+    expect(pool.seedBroker).toBe(installed)
+    expect(builder.build).toHaveBeenCalledTimes(1)
+  })
+
+  it('a node scan that a rebootstrap overtook does not run the all-brokers-unavailable rebootstrap', async () => {
+    const { pool, builder } = build()
+    delete pool.findConnectedBroker
+    const old = broker(1)
+    let fail
+    old.isConnected = () => false
+    old.connect = jest.fn(() => new Promise((resolve, reject) => (fail = reject)))
+    pool.brokers = { 1: old }
+    pool.rebootstrapArmed = true
+    const finding = outcome(pool.findConnectedBroker())
+    await settled()
+    expect(old.connect).toHaveBeenCalledTimes(1)
+
+    await pool.rebootstrap('required')
+    // An answer of the rebuilt cluster arms the trigger again.
+    pool.rebootstrapArmed = true
+    const installed = pool.seedBroker
+    fail(new KafkaJSConnectionError('Closed by the rebootstrap'))
+
+    expect((await finding).value).toBe(installed)
+    expect(pool.seedBroker).toBe(installed)
+    expect(builder.build).toHaveBeenCalledTimes(1)
+  })
+
+  it('a broker added to the table while the new seed is built is retired by the rebootstrap', async () => {
+    const { pool, builder } = build()
+    let releaseSeed
+    builder.build.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSeed = () =>
+            resolve(new ConnectionPool({ logger: newLogger(), host: 'seed-1', port: 9092 }))
+        })
+    )
+    const recovering = pool.rebootstrap('required')
+    await settled()
+    expect(builder.build).toHaveBeenCalledTimes(1)
+
+    await pool.applyNodeEndpoints([{ nodeId: 7, host: 'late', port: 9092, rack: null }])
+    const late = pool.brokers[7]
+    expect(late.connectionPool.host).toBe('late')
+    releaseSeed()
+    await recovering
+
+    expect(pool.brokers[7]).toBeUndefined()
+    expect(late.retire).toHaveBeenCalledTimes(1)
+    expect(late.retire).toHaveBeenCalledWith({ drainTimeout: 50 })
+  })
+
+  it('the rebootstrap wakes routing listeners only after the old brokers are detached', async () => {
+    const { pool, seed } = build()
+    const peer = broker(1, 'old-peer')
+    pool.brokers = { 0: seed, 1: peer }
+    pool.metadata = answer('old', [SEED_NODE, OLD_PEER])
+    pool.setupMetadataEndpoints.set('1', 'old-peer:9092')
+    const seen = []
+    pool.metadataCache.onRoutingChange(() =>
+      seen.push({
+        brokers: Object.keys(pool.brokers),
+        endpoints: [...pool.setupMetadataEndpoints.keys()],
+        metadata: pool.metadata,
+      })
+    )
+
+    await pool.rebootstrap('required')
+
+    expect(seen).toEqual([{ brokers: [], endpoints: [], metadata: null }])
+    expect(peer.retire).toHaveBeenCalledTimes(1)
+  })
+
+  it('a refresh episode overtaken before its work starts runs in the new generation and is joined by a later caller', async () => {
+    const { pool, replies } = acrossRebootstrap()
+    const unshared = jest.spyOn(pool, 'refreshMetadataUnshared')
+    let installSeed
+    pool.createSeedBroker = jest.fn(() => new Promise((resolve) => (installSeed = resolve)))
+    const recovering = pool.rebootstrap('required')
+    await settled()
+    expect(pool.createSeedBroker).toHaveBeenCalledTimes(1)
+    const next = pool.createBroker({
+      connectionPool: new ConnectionPool({ logger: newLogger(), host: 'seed-1', port: 9092 }),
+    })
+
+    // Resolved before the call, so the rebootstrap commits in the microtask before the episode's
+    // deferred start: the episode exists, its work has not started.
+    pool.seedBroker = next
+    installSeed(next)
+    const first = outcome(pool.refreshMetadata([]))
+    await recovering
+    await settled()
+    const second = outcome(pool.refreshMetadata([]))
+    await settled()
+
+    expect(unshared).toHaveBeenCalledTimes(1)
+    expect(replies).toHaveLength(1)
+    expect(next.metadata).toHaveBeenCalledTimes(1)
+    replies[0].resolve(answer('new', [NEW_SEED], ['new-topic']))
+    expect(await first).toEqual({ value: undefined })
+    expect(await second).toEqual({ value: undefined })
+    expect(pool.metadata.clusterId).toBe('new')
+    expect(pool.metadataCache.leader('new-topic', 0)).toBe(0)
+  })
+
+  it("the call's own ApiVersions 129 recovery rejects with the 129 error", async () => {
+    const { pool, seed, builder, replies } = acrossRebootstrap()
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+    const error = required()
+
+    // The request's connection was answered 129: its broker recovers first, then fails the request.
+    await pool.onApiVersionsFailure(error, { broker: seed, pool: seed.connectionPool })
+    replies[0].reject(error)
+
+    expect((await refreshing).error).toBe(error)
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(pool.seedBroker).not.toBe(seed)
+  })
+
+  it("the call's own metadata 129 starts one rebootstrap and rejects with the 129", async () => {
+    const { pool, seed, builder, replies } = acrossRebootstrap()
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+    const error = required()
+
+    replies[0].reject(error)
+
+    expect((await refreshing).error).toBe(error)
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(pool.seedBroker).not.toBe(seed)
+  })
+
+  it("a cached node's ApiVersions 129 during selection reaches the refresh as the original error", async () => {
+    const { pool, builder } = build()
+    delete pool.findConnectedBroker
+    const error = required()
+    const node = broker(1, 'cached')
+    node.isConnected = () => false
+    node.connect = jest.fn(async () => {
+      await pool.onApiVersionsFailure(error, { broker: node, pool: node.connectionPool })
+      throw error
+    })
+    pool.brokers = { 1: node }
+    const connect = jest.spyOn(pool, 'connect')
+
+    expect((await outcome(pool.refreshMetadata([]))).error).toBe(error)
+    expect(node.connect).toHaveBeenCalledTimes(1)
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(connect).not.toHaveBeenCalled()
+  })
+
+  it("a refresh whose selection ends on today's seed after an independent rebootstrap sends its request in the new generation", async () => {
+    const { pool, replies } = acrossRebootstrap()
+    delete pool.findConnectedBroker
+    const old = broker(1, 'old-peer')
+    let fail
+    old.isConnected = () => false
+    old.connect = jest.fn(() => new Promise((resolve, reject) => (fail = reject)))
+    pool.brokers = { 1: old }
+    const refreshing = outcome(pool.refreshMetadata([]))
+    await settled()
+    expect(old.connect).toHaveBeenCalledTimes(1)
+
+    await pool.rebootstrap('required')
+    const installed = pool.seedBroker
+    fail(new KafkaJSConnectionError('Closed by the rebootstrap'))
+    await settled()
+
+    expect(replies).toHaveLength(1)
+    expect(installed.metadata).toHaveBeenCalledTimes(1)
+    replies[0].resolve(answer('new', [NEW_SEED], ['new-topic']))
+    expect(await refreshing).toEqual({ value: undefined })
+    expect(pool.metadata.clusterId).toBe('new')
+    expect(pool.metadataCache.leader('new-topic', 0)).toBe(0)
+  })
+
+  it.each(['refreshMetadata', 'refreshMetadataIfNecessary'])(
+    'Cluster#%s: a refresh begun before a rebootstrap is not joined by a later one',
+    async (method) => {
+      const { cluster, pool, replies } = clusterAcrossRebootstrap()
+      const observer = jest.fn()
+      const refresh = () => outcome(cluster[method]({ onMetadata: observer }))
+      const first = refresh()
+      await settled()
+      expect(replies).toHaveLength(1)
+
+      await pool.rebootstrap('required')
+      const second = refresh()
+      await settled()
+      expect(replies).toHaveLength(2)
+
+      replies[0].resolve(answer('old', [SEED_NODE, OLD_PEER], ['old-topic']))
+      expectOvertaken((await first).error)
+      expect(observer).not.toHaveBeenCalled()
+
+      replies[1].resolve(answer('new', [NEW_SEED], ['new-topic']))
+      expect(await second).toEqual({ value: undefined })
+      expect(pool.metadata.clusterId).toBe('new')
+      expect(observer.mock.calls.map(([metadata]) => metadata.clusterId)).toEqual(['new'])
+    }
+  )
 })
