@@ -238,6 +238,47 @@ describe('Producer > deliveryTimeout', () => {
     })
   })
 
+  test("p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0 written once", async () => {
+    const cluster = createFakeCluster({ partitions: 2 })
+    cluster.findLeaderForPartitions = (_, ids) => (ids.map(Number).includes(0) ? { 0: [0] } : {})
+    const producer = createProducer({
+      cluster,
+      logger: silentLogger(),
+      idempotent: true,
+      deliveryTimeout: 100,
+      retry: { retries: 1000, initialRetryTime: 10, maxRetryTime: 20 },
+    })
+    producers.push(producer)
+    await producer.connect()
+    const sent = producer
+      .send({
+        topic: TOPIC,
+        messages: [
+          { partition: 0, value: 'value-0' },
+          { partition: 1, value: 'value-1' },
+        ],
+      })
+      .catch((e) => e)
+
+    await jest.advanceTimersByTimeAsync(150)
+    const error = await sent
+
+    expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(error.outcome).toBe('unknown')
+    expect(error.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(error.cause.outcome).toBe('unsent')
+    const written = cluster.broker.produce.mock.calls.flatMap(([request]) =>
+      request.topicData.flatMap(({ partitions }) =>
+        partitions.map(({ partition, firstSequence, messages }) => ({
+          partition,
+          firstSequence,
+          values: messages.map(({ value }) => value),
+        }))
+      )
+    )
+    expect(written).toEqual([{ partition: 0, firstSequence: 0, values: ['value-0'] }])
+  })
+
   test("kafka.producer({ deliveryTimeout }) bounds a send, ahead of the client's longer retry.maxTotalTime", async () => {
     Cluster.mockImplementation((options) =>
       createFakeCluster({
