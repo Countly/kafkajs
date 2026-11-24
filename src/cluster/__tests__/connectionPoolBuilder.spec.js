@@ -3,7 +3,8 @@ const { createFakeSocketFactory } = require('../../../testHelpers/fakeSocket')
 const connectionPoolBuilder = require('../connectionPoolBuilder')
 const ConnectionPool = require('../../network/connectionPool')
 const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../../errors')
-const { createLogger, LEVELS } = require('../../loggers')
+const { LEVELS } = require('../../loggers')
+const { Kafka } = require('../../../index')
 
 describe('Cluster > ConnectionBuilder', () => {
   let builder
@@ -174,14 +175,14 @@ describe('Cluster > ConnectionBuilder', () => {
 
   describe('bootstrap addresses', () => {
     /** @param {string[]} list @returns {ReturnType<typeof connectionPoolBuilder>} */
-    const builderOf = (list, factory = socketFactory, log = logger) =>
+    const builderOf = (list, factory = socketFactory) =>
       connectionPoolBuilder({
         socketFactory: factory,
         brokers: list,
         clientId,
         connectionTimeout,
         requestTimeout: 30000,
-        logger: log,
+        logger,
       })
 
     const MARKER = 'audit-secret-7f3a91'
@@ -261,16 +262,30 @@ describe('Cluster > ConnectionBuilder', () => {
       for (const address of [`${MARKER}@broker:9092`, `[u:${MARKER}@broker]:9092`]) {
         const { factory, state } = createFakeSocketFactory()
         const entries = []
-        const capture = createLogger({
-          level: LEVELS.DEBUG,
+        const admin = new Kafka({
+          clientId: 'user-info',
+          brokers: [address],
+          socketFactory: factory,
+          logLevel: LEVELS.DEBUG,
           logCreator: () => (entry) => entries.push(entry),
-        })
+          connectionTimeout: 100,
+          requestTimeout: 100,
+          retry: { retries: 0 },
+        }).admin()
+        let error
 
-        await expect(builderOf([address], factory, capture).build()).rejects.toThrow(
-          `Failed to connect: invalid broker at index 0, ${HOST_REASON}`
-        )
+        try {
+          error = await admin.connect().catch((e) => e)
+        } finally {
+          await admin.disconnect()
+        }
 
+        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(error.message).toBe(`Failed to connect: invalid broker at index 0, ${HOST_REASON}`)
         expect(state.issued).toBe(0)
+        for (const text of [error.message, error.stack, JSON.stringify(error)]) {
+          expect(text).not.toContain(MARKER)
+        }
         expect(JSON.stringify(entries)).not.toContain(MARKER)
       }
     })
@@ -278,6 +293,7 @@ describe('Cluster > ConnectionBuilder', () => {
     test('keeps accepting ordinary bootstrap addresses', async () => {
       for (const [address, host] of [
         ['kafka_1.test:9092', 'kafka_1.test'],
+        ['kafka.test.:9092', 'kafka.test.'],
         ['10.0.0.1:9092', '10.0.0.1'],
         ['[::1]:9092', '::1'],
         ['[fe80::1%eth0]:9092', 'fe80::1%eth0'],
