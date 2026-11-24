@@ -14,7 +14,7 @@ trap 'rm -rf "$PACK_DIR"' EXIT
 TARBALL="$(cd "$ROOT" && npm pack --loglevel=error --pack-destination "$PACK_DIR")"
 
 cd "$ROOT/otel"
-# --ignore-scripts: no dependency needs a lifecycle script, so none runs on a developer machine.
+# Install dependencies with lifecycle scripts disabled: no dependency needs one.
 npm ci --loglevel=error --no-audit --no-fund --ignore-scripts
 # The same tarball also goes in under the npm alias `kafkajs`, as `"kafkajs":
 # "npm:@countly/kafkajs@<version>"` installs it. Both in one command: a later --no-save install
@@ -41,7 +41,7 @@ run_tests() {
   fi
 }
 
-# Includes the mandatory O17–O19 meter/span/context/getter/logger containment matrix.
+# Includes the required meter, span, context, getter and logger containment checks.
 run_tests --test test/*.test.js
 
 # Each file runs in its own process: a loader or a registration hook applies to a whole process.

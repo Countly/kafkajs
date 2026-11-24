@@ -573,8 +573,9 @@ class FrameJournal {
 
 /**
  * Runs socket-free correctness controls or one explicitly selected public live arm.
- * Live entry requires the controller's node inventory, owned directory and separate
- * producer IPC for L2. It is never invoked locally by the plan writer.
+ * A live arm requires `BENCH_NODES` (a JSON array of the three brokers' `host`, `port` and
+ * `nodeId`), `BENCH_EVIDENCE_DIR` (an existing absolute evidence directory) and separate producer
+ * IPC for L2.
  * @param {string[]} [args] --control, or --arm A --sessions false|true --topic name
  * @returns {Promise<void>} one measured JSON record and independently audited evidence
  * @throws {Error} malformed options, absent GC/IPC/workload or failed observation

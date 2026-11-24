@@ -7,8 +7,8 @@ name: Load profile (diagnostic)
 # offer the load: no claim either way),
 # 4 flow stalled (slow-broker only: the other brokers' partitions stopped while one broker was slow
 # or frozen, or the slow broker's partitions did not flow again after it).
-# Diagnostic only: it gates nothing. A push to a branch named p12/load-profile* runs it with every
-# default, since a dispatch-only workflow must first exist on the default branch.
+# Diagnostic only: it gates nothing. A push to a branch that matches the `push` trigger below runs it
+# with every default, since a dispatch-only workflow must first exist on the default branch.
 on:
   workflow_dispatch:
     inputs:

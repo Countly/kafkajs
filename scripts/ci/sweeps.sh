@@ -3,7 +3,10 @@
 # label grep against alpha.9b, test-only exports, focused or failing tests, host paths, TODO text and leftover .orig/.rej files. Each
 # hit is compared as `file:text` (line numbers dropped) with the enumerated exceptions, as a
 # multiset, so an exception that moves still matches and a second copy of one is a new hit.
-# It also fails on planning ids (acceptance, decision or plan ids) in the shipped README, governance files and guides.
+# It also fails on planning ids (acceptance, decision or plan ids) in the shipped README, governance files and
+# guides, and on private working-process wording (a maintainer's machine, run controller, local-run rule, phase
+# process, private guard, run id or private branch) there, in the changelog, the scripts' Markdown and workflow comments,
+# and on numbered phases in changelog prose and workflow comments.
 # Usage: sweeps.sh <out directory>     Writes <out>/sweeps.txt, whose last line is the verdict.
 # Every `git grep` is checked by its own exit status (0 hits, 1 none, anything else a failure);
 # a failure stops the sweeps with `sweeps: FAIL`, never with a clean verdict.
@@ -225,9 +228,31 @@ DOC_PATTERNS=(
   'O[0-9]{2}'     # requirement id
 )
 DOC_IDS="\\b($(IFS='|'; echo "${DOC_PATTERNS[*]}"))\\b"
-hits shipped-doc -n -E "$DOC_IDS" -- README.md RELEASING.md SECURITY.md QUARANTINE.md CONTRIBUTING.md otel/README.md \
-  'docs/*.md' ':!docs/KafkaCompatibility.md'
+DOCS=(README.md RELEASING.md SECURITY.md QUARANTINE.md CONTRIBUTING.md otel/README.md 'docs/*.md' ':!docs/KafkaCompatibility.md')
+hits shipped-doc -n -E "$DOC_IDS" -- "${DOCS[@]}"
 check shipped-doc ''
+# Private working-process wording, in any case, in those files, the changelog, the scripts' Markdown and
+# full-line workflow comments. A comment after YAML on the same line is not read; a `#` line inside a block
+# scalar is read as a comment. Executable workflow lines, fixture names and release tags are not read.
+WORDING_PATTERNS=(
+  '\b(develop(ment|er)|dev)[[:blank:]-]+(host|machine)s?\b'                     # a maintainer's machine
+  '\b(run|test|acceptance) controller\b|\bcontroller (supplies|acceptance)\b'   # a private run controller
+  '\blocal (live )?(acceptance|correctness|gates?)\b|\blocal runs use\b'        # a rule for local runs
+  '\bphase[- ](merges?|prs?|blocking|exits?)\b|\bsub-phase\b'                   # private phase process
+  '\breviewed (live |cluster |shared )?guard(ed)?\b|\bsole[- ](live |cluster )?guard\b|\b(live|shared) reservation\b' # a private guard
+  '\b(runs?|rehearsal) [0-9a-f]{8,}\b'                                          # a CI or soak run id
+  '\bp(9[a-z]|1[0-2])/'                                                         # a private branch prefix
+)
+WORDING=$(IFS='|'; echo "${WORDING_PATTERNS[*]}")
+hits private-wording -n -i -E "$WORDING" -- "${DOCS[@]}" CHANGELOG.md 'scripts/*.md'
+check private-wording ''
+# A numbered phase is a private plan step in changelog prose and workflow comments; changelog ATX headings keep theirs.
+PHASE_NUMBER='\bphase[[:blank:]-]*[0-9]'
+ATX_HEADING='^ {0,3}#{1,6}([[:blank:]]|$)'
+hits changelog-phase -n -i -E -e "$PHASE_NUMBER" --and --not -e "$ATX_HEADING" -- CHANGELOG.md
+check changelog-phase ''
+hits workflow-comment -n -i -E "^[[:space:]]*#.*($WORDING|$PHASE_NUMBER)" -- '.github/workflows/*.yml'
+check workflow-comment ''
 leftovers leftover '*.orig' '*.rej' '*.swp' '*~'
 check leftover ''
 [ "$failed" = 0 ] && echo "sweeps: clean" >> "$report" || echo "sweeps: FAIL" >> "$report"
