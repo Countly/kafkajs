@@ -3,7 +3,7 @@ const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
-const { partitionResults } = require('../protocol/requests/produce/partitionResults')
+const { partitionResults, exactRows } = require('../protocol/requests/produce/partitionResults')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
@@ -922,8 +922,9 @@ module.exports = class Broker {
    *   the complete encoded frame length is supplied only at transmission
    * @param {boolean} [request.perPartitionResults=false] resolve every partition's outcome, a
    *   failing one included, instead of throwing the first failing partition's error. With
-   *   `acks: 0` the broker sends no response, so the call resolves `undefined` either way.
-   *   Internal: serves the producer's send path; not typed.
+   *   `acks: 0` the broker sends no response, so the call resolves `undefined` either way. An
+   *   answer with a duplicate row, or a row the request did not carry, rejects with a retriable
+   *   `KafkaJSError`. Internal: serves the producer's send path; not typed.
    * @returns {Promise<object|import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined>}
    *   the decoded response, or with `perPartitionResults` one `PartitionResult` per partition;
    *   `undefined` with `acks: 0`
@@ -1015,7 +1016,7 @@ module.exports = class Broker {
         ...protocolRequest,
         response: {
           decode: protocolRequest.response.decode,
-          parse: partitionResults,
+          parse: (data) => exactRows(partitionResults(data), topicData),
         },
       },
       guard

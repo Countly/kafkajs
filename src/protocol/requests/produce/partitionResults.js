@@ -1,4 +1,5 @@
 const { failure, createErrorFromCode } = require('../../error')
+const { KafkaJSError } = require('../../../errors')
 
 /**
  * One partition's outcome in a Produce response, as `Broker#produce({ perPartitionResults: true })`
@@ -123,4 +124,48 @@ const partitionResults = (data) => {
   return results
 }
 
-module.exports = { parse, partitionResults }
+/**
+ * @param {string|null} topicName
+ * @param {number} partition
+ * @param {string} what how the row is wrong, finishing the sentence
+ * @returns {KafkaJSError} retriable
+ */
+const rowRefused = (topicName, partition, what) =>
+  new KafkaJSError(`Produce response names partition ${partition} of topic ${topicName} ${what}`, {
+    retriable: true,
+  })
+
+/**
+ * Checks every row of a Produce answer against the request it answers: a row for a topic or
+ * partition the request did not carry, or a second row for one pair (also when the request named
+ * that pair twice), is an error and never an acknowledgement. A missing row is not an error here.
+ * Partition ids are compared as numbers, and repeated topic entries of the request are merged.
+ * @param {PartitionResult[]} results the answer's rows, as `partitionResults` builds them
+ * @param {{ topic: string, partitions: { partition: number|string }[] }[]} topicData the request
+ * @returns {PartitionResult[]} `results`, unchanged
+ * @throws {import('../../../errors').KafkaJSError} retriable, naming the topic and partition
+ */
+const exactRows = (results, topicData) => {
+  const asked = new Map()
+  for (const { topic, partitions } of topicData) {
+    let ids = asked.get(topic)
+    if (ids === undefined) asked.set(topic, (ids = new Set()))
+    for (const { partition } of partitions) ids.add(Number(partition))
+  }
+
+  const seen = new Map()
+  for (const { topicName, partition } of results) {
+    const id = Number(partition)
+    if (!asked.get(topicName)?.has(id)) {
+      throw rowRefused(topicName, id, 'that the request did not carry')
+    }
+
+    let ids = seen.get(topicName)
+    if (ids === undefined) seen.set(topicName, (ids = new Set()))
+    if (ids.has(id)) throw rowRefused(topicName, id, 'twice')
+    ids.add(id)
+  }
+  return results
+}
+
+module.exports = { parse, partitionResults, exactRows }
