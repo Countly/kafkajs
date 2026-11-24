@@ -716,6 +716,83 @@ describe('BrokerPool > a disconnect closes the socket a replacement left drainin
       }
     })
   })
+
+  describe('when tearing down the old socket throws', () => {
+    const SEED_POOL_MOVE = REPLACEMENTS['a seed address move that replaced the seed pool']
+
+    /**
+     * Leaves the replaced seed pool draining its held request, with the old socket's `destroy`
+     * recorded, then starts a zero-bound disconnect. The fake clock is never moved.
+     * @param {object} context as for `leaveDraining`; receives `destroy` and `close`
+     * @param {(socket: import('events').EventEmitter, destroy: Function) => void} breakSocket
+     *   makes the old socket's teardown throw
+     * @returns {Promise<void>}
+     */
+    const disconnectBroken = async (context, breakSocket) => {
+      await leaveDraining(context, SEED_POOL_MOVE)
+      await flush()
+      expect(tracked(context)).toBe(true)
+      expect(context.socket.destroyed).toBe(false)
+      const destroy = context.socket.destroy
+      context.destroy = jest.fn((...args) => destroy(...args))
+      context.socket.destroy = context.destroy
+      breakSocket(context.socket, destroy)
+
+      context.close = settled(context.cluster.disconnect({ drainTimeout: 0 }))
+      await flush()
+    }
+
+    /** @param {object} context @returns {Promise<void>} cleanup that cannot wait on the bound */
+    const cleanUpBroken = async (context) => {
+      await jest.advanceTimersByTimeAsync(BOUND)
+      await cleanUp(context)
+    }
+
+    it('a zero-bound disconnect during a replaced pool drain destroys the old socket when detaching its listeners throws, and rejects with that first failure', async () => {
+      const context = {}
+      const detachFailure = new Error('listener removal failed')
+      try {
+        await disconnectBroken(context, (socket, destroy) => {
+          socket.on('removeListener', (event) => {
+            if (event === 'data') throw detachFailure
+          })
+          context.destroy.mockImplementation((...args) => {
+            destroy(...args)
+            throw new Error('destroy failed after the socket closed')
+          })
+        })
+
+        expect(context.destroy).toHaveBeenCalledTimes(1)
+        expect(context.socket.destroyed).toBe(true)
+        expect(context.close).toEqual({ done: true, error: detachFailure })
+        expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
+        expect(context.cluster.brokerPool.drainingPools.size).toBe(0)
+      } finally {
+        await cleanUpBroken(context)
+      }
+    })
+
+    it('a zero-bound disconnect during a replaced pool drain whose destroy closes the socket and then throws null rejects with null and releases the earlier drain', async () => {
+      const context = {}
+      const none = null
+      try {
+        await disconnectBroken(context, (socket, destroy) => {
+          context.destroy.mockImplementation((...args) => {
+            destroy(...args)
+            throw none
+          })
+        })
+
+        expect(context.destroy).toHaveBeenCalledTimes(1)
+        expect(context.socket.destroyed).toBe(true)
+        expect(context.close).toStrictEqual({ done: true, error: null })
+        expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
+        expect(context.cluster.brokerPool.drainingPools.size).toBe(0)
+      } finally {
+        await cleanUpBroken(context)
+      }
+    })
+  })
 })
 
 describe('BrokerPool > a close failure whose reason is falsy is still reported', () => {
