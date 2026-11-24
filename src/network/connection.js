@@ -1052,7 +1052,6 @@ module.exports = class Connection {
           : null
       }
     }
-    const policy = responseLogPolicy(request.apiKey)
     const attempt = this.connectAttempt
     const telemetrySink = this.telemetrySink
     const telemetrySlot = telemetrySink ? this.telemetrySlot : null
@@ -1099,6 +1098,7 @@ module.exports = class Connection {
       return
     }
 
+    const policy = responseLogPolicy(request.apiKey)
     try {
       const payloadDecoded = await response.decode(responseBody(entry, payload))
       if (onDecoded) onDecoded(payloadDecoded)
