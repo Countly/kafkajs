@@ -3,7 +3,7 @@
 # Each job uploads `broker-capture-<version>`; import it with
 #   node scripts/protocol/importCaptureArtifacts.js --artifact <downloaded dir> --version <version> --tables <downloaded dir>/client-tables
 # and keep the logs artifact `broker-capture-logs-<version>` with the run record.
-# The 4.4.0 job also uploads an unreviewed `completing-rebalance-capture-4.4.0` candidate.
+# The 4.4.0 job also uploads `completing-rebalance-capture-4.4.0`, a candidate capture that must be validated before use.
 name: Kafka broker captures
 on:
   push:
@@ -29,7 +29,7 @@ jobs:
   capture:
     name: capture-${{ matrix.kafka }}
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
-    # Longest observed job: 99s (run 42982025606); 1.5x rounded to 5m, minimum 10m.
+    # Longest observed job: 99s; 1.5x rounded to 5m, minimum 10m.
     timeout-minutes: 10
     strategy:
       fail-fast: false

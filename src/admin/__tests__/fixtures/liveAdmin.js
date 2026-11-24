@@ -75,7 +75,7 @@ const CLOSE_TURNS = 10
 
 /**
  * Owns one admin scenario, its absolute budget, clients and reverse-order restoration.
- * The scenario runs under a reviewed guard when `P9_CLUSTER_GUARD` and `P9_CLUSTER_MANIFEST` are
+ * The scenario runs under an external cluster guard when `P9_CLUSTER_GUARD` and `P9_CLUSTER_MANIFEST` are
  * both set, and against the Compose cluster the process selected (`COMPOSE_FILE`) when neither is.
  */
 class AdminLiveProbe {
