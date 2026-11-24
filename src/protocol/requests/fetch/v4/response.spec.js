@@ -1,4 +1,5 @@
 const { decode, parse } = require('./response')
+const Batch = require('../../../../consumer/batch')
 const { KafkaJSOffsetOutOfRange, KafkaJSProtocolError } = require('../../../../errors')
 
 describe('Protocol > Requests > Fetch > v4', () => {
@@ -307,6 +308,25 @@ describe('Protocol > Requests > Fetch > v4', () => {
       // the fixture is too big, jest deepCheck matcher takes too long to compare the object,
       // and the purpose of the test is to check if the decoder can skip the 0.11 on this request
       expect(new Set(messagesMagicBytes)).toEqual(new Set([1]))
+    })
+
+    // The deferred 0.11 suffix is filtered on the fetch that decodes it; this one holds only the
+    // legacy prefix, whose records have no batch and cannot belong to a transaction.
+    test('a consumer batch delivers the 0.10 records beside an aborted transaction', async () => {
+      const data = await decode(Buffer.from(require('../fixtures/v4_response_mixed_formats.json')))
+      const { topicName, partitions } = data.responses[0]
+      const partitionData = partitions[0]
+      const offsets = partitionData.messages.map(({ offset }) => offset)
+      const batch = new Batch(topicName, offsets[0], {
+        ...partitionData,
+        abortedTransactions: [{ producerId: '7', firstOffset: offsets[0] }],
+      })
+
+      expect(offsets.length).toBeGreaterThan(0)
+      expect(new Set(partitionData.messages.map(({ magicByte }) => magicByte))).toEqual(
+        new Set([1])
+      )
+      expect(batch.messages.map(({ offset }) => offset)).toEqual(offsets)
     })
   })
 
