@@ -20,6 +20,7 @@ const { waitForFullIsr } = require('../../../../testHelpers/leaderElection')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const shareFetchWire = require('../../../../testHelpers/wire/shareFetchV2')
 const shareAcknowledgeWire = require('../../../../testHelpers/wire/shareAcknowledgeV2')
+const shareHeartbeatWire = require('../../../../testHelpers/wire/shareGroupHeartbeatV1')
 const {
   SHARE_TOPIC_PREFIX,
   shareTopicName,
@@ -3563,8 +3564,9 @@ const boundedStopCase = async (scope) => {
     new Kafka({ brokers: plainTextBrokers(), logLevel: logLevel.NOTHING, clientId, ...options })
   const admin = plain(`share-stop-admin-${nonce}`).admin()
   const factory = createHoldingSocketFactory(defaultSocketFactory())
+  const tap = new ShareWireTap()
   const consumer = plain(`share-stop-${nonce}`, {
-    socketFactory: factory,
+    socketFactory: tap.wrap(factory, 'member'),
     requestTimeout: REQUEST_TIMEOUT_MS,
     enforceRequestTimeout: false,
   }).shareConsumer({ groupId })
@@ -3595,18 +3597,32 @@ const boundedStopCase = async (scope) => {
 
           stack.add('close the held broker sides', () => factory.closeUpstreams())
           stack.add('disconnect the member', () => consumer.disconnect({ timeout: 5000 }))
-          let armed = false
+          let memberId
           const handled = []
+          const heartbeatKey = shareHeartbeatWire.apiKey
+          /** @param {object} fact The tapped heartbeat request. @returns {object} Decoded fields. */
+          const heartbeat = ({ frame, byteLength }) =>
+            shareHeartbeatWire.readRequest(frame.subarray(byteLength))
+          let heldRequest
           const withheld = factory.withholdResponse({
             apiKey: API_SHARE_FETCH,
-            match: () => armed,
+            /** @param {Buffer} frame The request whose broker reply arrived. @returns {boolean} */
+            match: (frame) => {
+              if (!memberId) return false
+              const header = readRequestHeader(frame)
+              const fields = shareFetchWire.readRequest(frame.subarray(header.byteLength))
+              if (fields.memberId !== memberId || fields.shareSessionEpoch <= 0) return false
+              heldRequest = frame
+              return true
+            },
           })
           await bounded(scope, STEP_MS, () => consumer.subscribe({ topics: [topic] }))
           await bounded(scope, STEP_MS, () =>
             consumer.run({
               eachMessage: async ({ message }) => {
                 handled.push(message.offset)
-                armed = true
+                const [join] = tap.requestsOf('member', heartbeatKey)
+                memberId = heartbeat(join).memberId
               },
             })
           )
@@ -3617,12 +3633,52 @@ const boundedStopCase = async (scope) => {
           const kept = await bounded(scope, STEP_MS, () => withheld.arrived(), {
             label: 'The withheld fetch answer',
           })
-          expect(kept).not.toBeNull()
+          const correlationId = kept.readInt32BE(4)
+          expect(correlationId).toBe(readRequestHeader(heldRequest).correlationId)
+          const data = tap
+            .requestsOf('member', API_SHARE_FETCH)
+            .filter(({ frame }) => frame.equals(heldRequest))
+          expect(data).toHaveLength(1)
+          const [fetch] = data
+          const [join] = tap.requestsOf('member', heartbeatKey)
+          expect(heartbeat(join)).toMatchObject({ groupId, memberId, memberEpoch: 0 })
+          const joinReply = tap.responseTo(join).frame
+          expect(joinReply[8]).toBe(0)
+          const joined = shareHeartbeatWire.readResponse(joinReply.subarray(9))
+          expect(joined).toMatchObject({ errorCode: 0, memberId })
+          expect(joined.memberEpoch).toBeGreaterThan(0)
+          expect(fetch.ref.socket.clientClosed).toBe(false)
+          expect(shareFetchWire.readRequest(fetch.frame.subarray(fetch.byteLength))).toMatchObject({
+            groupId,
+            memberId,
+            shareSessionEpoch: expect.any(Number),
+          })
+          expect(tap.decodeRequest(fetch).epoch).toBeGreaterThan(0)
+          expect((await tap.decodeResponse({ frame: kept })).errorCode).toBe(0)
+          expect(tap.responseTo(fetch)).toBeUndefined()
+          const beforeStop = tap.requestsOf('member', API_SHARE_FETCH)
           const startedAt = performance.now()
           await bounded(scope, REQUEST_TIMEOUT_MS + 2000, () => consumer.stop(), {
             label: 'The stop',
           })
           expect(performance.now() - startedAt).toBeLessThan(REQUEST_TIMEOUT_MS)
+          expect(fetch.ref.socket.clientClosed).toBe(true)
+          expect(fetch.ref.socket.upstream.destroyed).toBe(true)
+          expect(tap.responseTo(fetch)).toBeUndefined()
+          const leaves = tap
+            .requestsOf('member', heartbeatKey)
+            .filter((request) => heartbeat(request).memberEpoch === -1)
+          expect(leaves).toHaveLength(1)
+          expect(heartbeat(leaves[0])).toMatchObject({ groupId, memberId, memberEpoch: -1 })
+          const leaveReply = tap.responseTo(leaves[0]).frame
+          expect(leaveReply[8]).toBe(0)
+          expect(shareHeartbeatWire.readResponse(leaveReply.subarray(9))).toMatchObject({
+            errorCode: 0,
+            memberId,
+            memberEpoch: -1,
+          })
+          expect(tap.requestsOf('member', API_SHARE_FETCH)).toEqual(beforeStop)
+          expect(tap.requestsOf('member', API_SHARE_ACKNOWLEDGE)).toEqual([])
           expect(handled).toEqual(['0'])
         },
         { budgetMs: CLEANUP_MS }
