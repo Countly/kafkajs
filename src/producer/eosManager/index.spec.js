@@ -471,6 +471,7 @@ describe('Producer > eosManager', () => {
         memberId: '',
         groupInstanceId: null,
         transactionVersion: 1,
+        guard: expect.any(Function),
       })
     })
 
