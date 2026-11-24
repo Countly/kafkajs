@@ -37,7 +37,7 @@ const MIN_RECORD_BYTES = 7
 // record costs (208 to 321 bytes, measured) rounded up to a power of two.
 const RECORD_CEILING_BYTES = 512
 // The bytes of `maxDecompressedBatchBytes` that pay for one decoded header, by the same rule.
-const HEADER_CEILING_BYTES = 128
+const HEADER_CEILING_BYTES = 256
 
 const CONTROL_KEY_BYTES = 4
 const END_TRANSACTION_MARKER_TYPES = [0, 1]
@@ -207,7 +207,7 @@ const assertControlRecord = ({ key, value }, firstOffset) => {
  * @param {boolean} [options.checkCrcs=true] verify the batch CRC32C (Java's `check.crcs`)
  * @param {number} [options.maxDecompressedBatchBytes] the most the batch may decompress to; it also
  *        sets the record ceiling, `max(1, floor(bytes / 512))` records, and the header ceiling,
- *        `max(1, floor(bytes / 128))` headers across all records of the batch
+ *        `max(1, floor(bytes / 256))` headers across all records of the batch
  * @returns {Promise<object>} the decoded record batch, including its records
  * @throws {KafkaJSPartialMessageError} on a truncated batch
  * @throws {KafkaJSCorruptRecordError} when the batch is all here and impossible or over a bound:

@@ -37,7 +37,7 @@ await share.run({
 | `maxInFlightRequests` | 5 | `null` or integer at least 1 |
 | `allowAutoTopicCreation`, `checkCrcs` | `true` | booleans |
 
-Validation happens before creating the client's cluster, emitter, timers or requests. Unknown option names are ignored. Zero `minBytes` and `maxWaitTimeInMs` are legal; fast empty replies are paced to at most twenty requests per second per node. Share decode has a fixed 1073741824-byte decompressed-batch ceiling, a derived 2097152-record ceiling and a derived 8388608-header ceiling per batch; `maxBytes` does not change them. A batch past any of them is a decode halt (see below).
+Validation happens before creating the client's cluster, emitter, timers or requests. Unknown option names are ignored. Zero `minBytes` and `maxWaitTimeInMs` are legal; fast empty replies are paced to at most twenty requests per second per node. Share decode has a fixed 1073741824-byte decompressed-batch ceiling, a derived 2097152-record ceiling and a derived 4194304-header ceiling per batch; `maxBytes` does not change them. A batch past any of them is a decode halt (see below).
 
 `subscribe({ topics: ['a', 'b'] })` replaces the subscription while stopped. Names must be distinct, non-empty strings. A regex, `topic`, `regex`, `fromBeginning` or `offsetReset` in the subscription is rejected. To replace topics, use `await stop()`, then `subscribe`, then `run`. `subscription()` returns a fresh array, initially `[]`, and retains names after stop. `assignment()` returns fresh topic/partition snapshots, initially and after stop `[]`. `acquisitionLockTimeoutMs()` starts as `null` and then reports the latest broker lock duration, including a successful renew.
 
