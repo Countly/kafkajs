@@ -54,8 +54,7 @@ class RequestHold {
    */
   forward() {
     if (!this.socket || this.forwarded) throw new Error('RequestHold: nothing to forward')
-    this.forwarded = this.socket.forward(this.frame)
-    this.frame = null
+    this.forwarded = this.socket.forward(this)
     return this.forwarded
   }
 }
@@ -104,6 +103,8 @@ class HoldingSocket extends EventEmitter {
     this.clientClosed = false
     this.upstreamClosed = false
     this.keeping = 0
+    /** @type {Set<RequestHold>} holds that kept a frame not yet forwarded */
+    this.unforwarded = new Set()
     this.requests = new FrameSplitter()
     this.responses = new FrameSplitter()
     /** @type {Map<number, Buffer>} each written request frame by correlation id, until answered */
@@ -145,6 +146,7 @@ class HoldingSocket extends EventEmitter {
         continue
       }
       this.keeping += 1
+      this.unforwarded.add(hold)
       hold.socket = this
       hold.frame = frame
       hold.announce(hold)
@@ -200,30 +202,39 @@ class HoldingSocket extends EventEmitter {
    */
   closeUpstream() {
     this.lost()
-    this.written.clear()
     this.upstream.destroy()
   }
 
   /**
    * @internal
-   * @param {Buffer} frame a kept request frame
+   * @param {RequestHold} hold a hold of this socket that kept a request frame
    * @returns {Promise<Buffer>} the broker's response frame to it; rejects when the broker side
-   *   closes first or is closed already
+   *   closes first or is closed already, even if its close event has not been emitted yet
    */
-  forward(frame) {
-    const response = this.upstreamClosed
-      ? Promise.reject(new Error('HoldingSocket: the broker side closed before the forward'))
-      : new Promise((resolve, reject) => {
-          this.awaiting.set(frame.readInt32BE(8), { resolve, reject })
-          this.upstream.write(frame)
-        })
-    if (this.upstreamClosed) this.settled()
+  forward(hold) {
+    if (this.upstream.destroyed) this.lost()
+    let response
+    if (this.upstreamClosed) {
+      response = Promise.reject(
+        new Error('HoldingSocket: the broker side closed before the forward')
+      )
+    } else {
+      const frame = hold.frame
+      hold.frame = null
+      this.unforwarded.delete(hold)
+      response = new Promise((resolve, reject) => {
+        this.awaiting.set(frame.readInt32BE(8), { resolve, reject })
+        this.upstream.write(frame)
+      })
+    }
     response.catch(() => {})
     return response
   }
 
   /**
-   * Marks the broker side closed and rejects every forward awaiting a response.
+   * Marks the broker side closed once: rejects every forward awaiting a response, discards every
+   * kept frame not yet forwarded and the buffered bytes, and closes the broker side if the client
+   * side is closed already.
    * @private
    * @returns {void}
    */
@@ -232,8 +243,14 @@ class HoldingSocket extends EventEmitter {
     this.upstreamClosed = true
     const error = new Error('HoldingSocket: the broker side closed before the response')
     for (const { reject } of this.awaiting.values()) reject(error)
-    this.keeping -= this.awaiting.size
+    for (const hold of this.unforwarded) hold.frame = null
+    this.keeping -= this.awaiting.size + this.unforwarded.size
     this.awaiting.clear()
+    this.unforwarded.clear()
+    this.written.clear()
+    this.requests = new FrameSplitter()
+    this.responses = new FrameSplitter()
+    if (this.clientClosed) this.upstream.destroy()
   }
 
   /**

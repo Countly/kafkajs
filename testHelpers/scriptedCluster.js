@@ -289,6 +289,7 @@ class ReplyHold {
     const send = this.send
     this.send = null
     this.drop = null
+    this.socket = null
     send()
   }
 
@@ -316,6 +317,7 @@ class ReplyHold {
     const drop = this.drop
     this.send = null
     this.drop = null
+    this.socket = null
     if (drop) drop()
     else this.announce(null)
   }
@@ -1227,6 +1229,7 @@ class ScriptedCluster {
             } catch (error) {
               this.errors.push(error)
               this.settle(record, 'cancelled')
+              this.cancelReplyHolds()
               socket.destroy(error)
               return
             }
