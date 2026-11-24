@@ -2039,3 +2039,25 @@ import { KafkaJSRebalanceNotConvergedError as NotConverged } from './index'
   void retriable
   new NotConverged('x', { cause: new Error('y') })
 }
+
+import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
+{
+  const recreated = new TopicRecreated('topic orders was recreated', {
+    topic: 'orders',
+    previousTopicId: 'old-id',
+    topicId: 'new-id',
+    groupId: 'billing',
+    cause: new Error('y'),
+  })
+  const asBase: KafkaJSNonRetriableError = recreated
+  const topic: string = recreated.topic
+  const previousTopicId: string = recreated.previousTopicId
+  const topicId: string = recreated.topicId
+  const groupId: string | null = recreated.groupId
+  void [asBase, topic, previousTopicId, topicId, groupId]
+  new TopicRecreated('x', { topic: 'orders', previousTopicId: 'old-id', topicId: 'new-id' })
+  // @ts-expect-error the topic and both ids are required
+  new TopicRecreated('x', { topic: 'orders' })
+  // @ts-expect-error the fields are read-only
+  recreated.topicId = 'other'
+}
