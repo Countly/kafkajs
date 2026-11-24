@@ -580,8 +580,10 @@ describe('returned telemetry surfaces', () => {
       seedBroker: null,
       brokers: { 1: broker },
       retiredBrokers: new WeakSet(),
+      draining: new Map(),
       telemetryMetrics: collector,
       retireTelemetryNode: BrokerPool.prototype.retireTelemetryNode,
+      trackDrain: BrokerPool.prototype.trackDrain,
       closeInBackground: (promise) => {
         promise.catch(() => {})
       },
@@ -591,6 +593,7 @@ describe('returned telemetry surfaces', () => {
     expect(retire).toHaveBeenCalledWith(slot)
     expect(broker.retire).toHaveBeenCalledTimes(1)
     expect(owner.brokers).toEqual({})
+    expect(owner.draining.has(broker)).toBe(true)
   })
 
   test('a known node binds one slot per pool, an unknown node gets none and disabled binds nothing', () => {
