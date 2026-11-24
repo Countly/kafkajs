@@ -343,6 +343,52 @@ describe('BrokerPool > a disconnect reaches the drains a replacement started', (
     expect(plain).toEqual({ done: true, value: undefined })
   })
 
+  it('two overlapping disconnects, one forced, both wait for a replaced pool still draining', async () => {
+    const { pool, seed } = refreshable(MOVED_SEED)
+    const oldPool = seed.connectionPool
+    const drain = deferred()
+    oldPool.destroy = jest.fn().mockReturnValueOnce(drain.promise).mockResolvedValue(undefined)
+    await pool.refreshMetadata([])
+
+    const forced = settled(pool.disconnect({ drainTimeout: 0 }))
+    const plain = settled(pool.disconnect())
+    await flush()
+
+    expect(oldPool.destroy.mock.calls).toEqual([[{ drainTimeout: 50 }], [{ drainTimeout: 0 }], []])
+    expect([forced.done, plain.done]).toEqual([false, false])
+
+    drain.resolve()
+    await flush()
+
+    expect(forced).toEqual({ done: true, value: undefined })
+    expect(plain).toEqual({ done: true, value: undefined })
+    expect(pool.drainingPools.size).toBe(0)
+  })
+
+  it('a rebootstrap whose seed build a disconnect superseded neither opens nor installs its pool', async () => {
+    const { pool, seed } = refreshable()
+    const built = deferred()
+    pool.connectionPoolBuilder.build.mockImplementationOnce(() => built.promise)
+    const recovery = settled(pool.rebootstrap('required'))
+    await flush()
+    expect(pool.connectionPoolBuilder.build).toHaveBeenCalledTimes(1)
+
+    await pool.disconnect({ drainTimeout: 0 })
+    const unused = new ConnectionPool({ logger: newLogger(), host: 'next-seed', port: 9092 })
+    const connects = unused.pool.map((connection) => jest.spyOn(connection, 'connect'))
+    unused.destroy = jest.fn(async () => {})
+    built.resolve(unused)
+    await flush()
+
+    expect(recovery.done).toBe(true)
+    expect(recovery.error?.message).toBe('Seed broker build was superseded')
+    expect(pool.seedBroker).toBe(seed)
+    expect(unused.retired).toBe(true)
+    expect(unused.destroy).toHaveBeenCalledTimes(1)
+    for (const connect of connects) expect(connect).not.toHaveBeenCalled()
+    expect(pool.drainingPools.size).toBe(0)
+  })
+
   it('a synchronous throw from a pool destroy is tracked and rejects the disconnect after the other drains', async () => {
     const { pool, seed } = refreshable(MOVED_SEED)
     const failure = new Error('destroy threw')
@@ -447,5 +493,162 @@ describe('BrokerPool > a disconnect reaches the drains a replacement started', (
 
     expect(pool.draining.size).toBe(0)
     expect(pool.drainingPools.size).toBe(0)
+  })
+})
+
+describe('BrokerPool > a disconnect closes the socket a replacement left draining', () => {
+  const BOUND = 100
+
+  /**
+   * Each way a refresh or a rebootstrap leaves a socket draining: `node` carries the held request,
+   * `sender` picks the broker that sends it, and `replace` retires that broker or its pool.
+   */
+  const REPLACEMENTS = {
+    'an endpoint move': {
+      node: 1,
+      sender: (cluster) => cluster.findBroker({ nodeId: '1' }),
+      replace: (cluster, listed) => {
+        listed[1].host = 'second'
+        return cluster.refreshMetadata()
+      },
+    },
+    'a broker metadata no longer lists': {
+      node: 1,
+      sender: (cluster) => cluster.findBroker({ nodeId: '1' }),
+      replace: (cluster, listed) => {
+        listed.pop()
+        return cluster.refreshMetadata()
+      },
+    },
+    'a rebootstrap that replaced the seed': {
+      node: 0,
+      sender: (cluster) => cluster.brokerPool.seedBroker,
+      replace: (cluster) => cluster.brokerPool.rebootstrap('required'),
+    },
+    'a seed address move that replaced the seed pool': {
+      node: 0,
+      sender: (cluster) => cluster.brokerPool.seedBroker,
+      replace: (cluster, listed) => {
+        listed[0].host = 'moved'
+        return cluster.refreshMetadata()
+      },
+    },
+  }
+
+  afterEach(() => jest.useRealTimers())
+
+  /**
+   * Connects a client over scripted sockets, its bootstrap list pinned to the seed and requests
+   * never timed out, holds one Metadata request on the scenario's node and runs the replacement,
+   * all under fake time. Fills `context` as it goes, so the caller can clean up after a failure.
+   * @param {object} context receives `seam`, `cluster`, `gate`, `held`, `socket`, `broker`, `pool`
+   * @param {object} replacement one of `REPLACEMENTS`
+   * @returns {Promise<void>}
+   */
+  const leaveDraining = async (context, { node, sender, replace }) => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+    const seam = createScriptedCluster({
+      nodes: [
+        { id: 0, host: 'seed', port: 9092 },
+        { id: 1, host: 'first', port: 9092 },
+        { id: 2, host: 'second', port: 9092 },
+        { id: 3, host: 'moved', port: 9092 },
+      ],
+    })
+    const listed = [
+      { nodeId: 0, host: 'seed', port: 9092, rack: null },
+      { nodeId: 1, host: 'first', port: 9092, rack: null },
+    ]
+    seam.answer('Metadata', () => ({
+      brokers: listed.map((entry) => ({ ...entry })),
+      controllerId: 0,
+      topics: [],
+    }))
+    const cluster = new Cluster({
+      ...seam.kafkaOptions({
+        brokers: ['seed:9092'],
+        requestTimeout: BOUND,
+        enforceRequestTimeout: false,
+      }),
+      logger: newLogger(),
+      retry: { retries: 0 },
+      metadataRecoveryStrategy: 'none',
+    })
+    Object.assign(context, { seam, cluster })
+    await cluster.connect()
+    await cluster.refreshMetadata()
+    const broker = await sender(cluster)
+    context.broker = broker
+    context.pool = broker.connectionPool
+    context.gate = seam.schedule.hold({ api: 'Metadata', node })
+    context.held = settled(broker.metadata([]))
+    const { node: id, generation } = await context.gate.arrived()
+    context.socket = seam
+      .sockets()
+      .find((socket) => seam.socketKeys.get(socket) === `${id}/${generation}`)
+    await replace(cluster, listed)
+  }
+
+  /** @param {object} context what `leaveDraining` filled @returns {Promise<void>} */
+  const cleanUp = async ({ cluster, gate }) => {
+    if (gate?.call) gate.release()
+    await cluster?.disconnect({ drainTimeout: 0 })
+  }
+
+  /** @param {object} context @returns {boolean} whether the old broker or pool is still tracked */
+  const tracked = ({ cluster, broker, pool }) =>
+    cluster.brokerPool.draining.has(broker) || cluster.brokerPool.drainingPools.has(pool)
+
+  describe.each(Object.keys(REPLACEMENTS))('after %s', (name) => {
+    it('a forced disconnect closes the old socket at once and rejects its held request', async () => {
+      const context = {}
+      try {
+        await leaveDraining(context, REPLACEMENTS[name])
+        await jest.advanceTimersByTimeAsync(BOUND / 2)
+        await flush()
+        expect(tracked(context)).toBe(true)
+        expect(context.socket.destroyed).toBe(false)
+
+        await context.cluster.disconnect({ drainTimeout: 0 })
+
+        expect(context.socket.destroyed).toBe(true)
+        await flush()
+        expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
+      } finally {
+        await cleanUp(context)
+      }
+    })
+
+    it('a default disconnect waits only for the rest of the retirement bound, then closes the old socket', async () => {
+      const context = {}
+      try {
+        await leaveDraining(context, REPLACEMENTS[name])
+        await jest.advanceTimersByTimeAsync(40)
+        await flush()
+        expect(tracked(context)).toBe(true)
+        expect(context.socket.destroyed).toBe(false)
+
+        let disconnected = false
+        const closing = context.cluster.disconnect().then(() => {
+          disconnected = true
+        })
+        await jest.advanceTimersByTimeAsync(BOUND - 40 - 1)
+        await flush()
+
+        expect(disconnected).toBe(false)
+        expect(context.socket.destroyed).toBe(false)
+        expect(context.held.done).toBe(false)
+
+        await jest.advanceTimersByTimeAsync(1)
+        await flush()
+
+        expect(disconnected).toBe(true)
+        await closing
+        expect(context.socket.destroyed).toBe(true)
+        expect(context.held.error).toBeInstanceOf(KafkaJSConnectionClosedError)
+      } finally {
+        await cleanUp(context)
+      }
+    })
   })
 })
