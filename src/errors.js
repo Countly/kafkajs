@@ -400,7 +400,7 @@ class KafkaJSUnknownOutcomeError extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e diagnostic message
    * @param {object} [options]
-   * @param {{ api: string, apiVersion: number, nodeId: number, items: any[]|null }[]} [options.requests]
+   * @param {{ api: string, apiVersion: number, nodeId: number|null, items: any[]|null }[]} [options.requests]
    *   each written request without an answer and the items it carried (`null` when they could
    *   not be named)
    * @param {Error} [options.cause] the error that ended the first of those requests
