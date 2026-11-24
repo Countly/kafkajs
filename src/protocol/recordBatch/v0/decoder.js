@@ -323,6 +323,8 @@ module.exports = async (
   }
 }
 
+module.exports.RECORD_CEILING_BYTES = RECORD_CEILING_BYTES
+
 /**
  * Decodes the records section of a batch, decompressing it first when the batch is compressed.
  * The count is checked before anything is allocated for it, twice: against the record ceiling the

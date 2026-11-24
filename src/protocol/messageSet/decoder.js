@@ -3,7 +3,8 @@ const Decoder = require('../decoder')
 const MessageDecoder = require('../message/decoder')
 const { decompressBounded, lookupCodecByAttributes } = require('../message/compression')
 const { DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES } = require('../../constants')
-const { KafkaJSPartialMessageError } = require('../../errors')
+const { RECORD_CEILING_BYTES } = require('../recordBatch/v0/decoder')
+const { KafkaJSCorruptRecordError, KafkaJSPartialMessageError } = require('../../errors')
 
 /**
  * Decodes a legacy message set in wire order, bounding each compressed message before decoding
@@ -19,9 +20,11 @@ const { KafkaJSPartialMessageError } = require('../../errors')
  * @param {?number} [size=null] the set's byte length; omission reads its int32 size prefix
  * @param {object} [options]
  * @param {number} [options.maxDecompressedBatchBytes=1073741824] the output bound for each
- *   compressed message, forwarded as maxOutputLength to the codec
+ *   compressed message, forwarded as maxOutputLength to the codec; it also sets the record ceiling
+ *   of each compressed message, `max(1, floor(bytes / 512))` inner messages
  * @returns {Promise<object[]>} complete messages before any partial tail, in wire order
- * @throws {KafkaJSCorruptRecordError} for a corrupt compressed stream or output above the bound
+ * @throws {KafkaJSCorruptRecordError} for a corrupt compressed stream or output above the bound,
+ *   and with reason `count` for a compressed message holding more inner messages than the ceiling
  * @throws {KafkaJSNotImplemented} when the selected optional codec is unavailable
  */
 
@@ -31,6 +34,7 @@ module.exports = async (
   { maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES } = {}
 ) => {
   const messages = []
+  const recordLimit = Math.max(1, Math.floor(maxDecompressedBatchBytes / RECORD_CEILING_BYTES))
   const messageSetSize = size || primaryDecoder.readInt32()
   const messageSetDecoder = primaryDecoder.slice(messageSetSize)
 
@@ -47,7 +51,7 @@ module.exports = async (
           maxDecompressedBatchBytes
         )
         // push(...entries) throws a RangeError above about 125 000 entries
-        for (const entry of EntriesDecoder(new Decoder(buffer), message)) {
+        for (const entry of EntriesDecoder(new Decoder(buffer), message, recordLimit)) {
           messages.push(entry)
         }
       } else {
@@ -75,10 +79,26 @@ module.exports = async (
   return messages
 }
 
-const EntriesDecoder = (decoder, compressedMessage) => {
+/**
+ * Decodes the inner messages of one compressed legacy message and rebases magic 1 offsets on the
+ * wrapper's offset.
+ * @param {Decoder} decoder over the decompressed inner messages
+ * @param {object} compressedMessage the wrapper
+ * @param {number} recordLimit the most inner messages the wrapper may hold
+ * @returns {object[]} the inner messages, in wire order
+ * @throws {KafkaJSCorruptRecordError} with reason `count`, the wrapper's offset and `limit`, before
+ *   the inner message that would pass `recordLimit` is decoded
+ */
+const EntriesDecoder = (decoder, compressedMessage, recordLimit) => {
   const messages = []
 
   while (decoder.offset < decoder.buffer.length) {
+    if (messages.length === recordLimit) {
+      throw new KafkaJSCorruptRecordError(
+        `Compressed message holds more than the ${recordLimit} inner messages that maxDecompressedBatchBytes allows`,
+        { reason: 'count', offset: compressedMessage.offset, limit: recordLimit }
+      )
+    }
     messages.push(EntryDecoder(decoder))
   }
 
