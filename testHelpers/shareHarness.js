@@ -11,6 +11,7 @@ const {
 } = require('../src/protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 const { newLogger } = require('./index')
 const { createScriptedCluster } = require('./scriptedCluster')
+const { ShareSessionModel, installSessionModel } = require('./shareSessionModel')
 const { Schedule } = require('./schedule')
 const Kafka = require('../src')
 const { performance: monotonicClock } = require('node:perf_hooks')
@@ -535,6 +536,7 @@ const harness = async ({
      */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
+      cluster.cancelReplyHolds()
       for (const run of runs) {
         run.loop.dispose()
         for (const timer of [...run.timers]) timer.release()
@@ -705,6 +707,7 @@ const shareClient = ({
      */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
+      cluster.cancelReplyHolds()
       await consumer.disconnect({ timeout: 0 })
       cluster.assertClean()
     },
@@ -731,4 +734,6 @@ module.exports = {
   harness,
   heartbeatAnswer,
   shareClient,
+  ShareSessionModel,
+  installSessionModel,
 }
