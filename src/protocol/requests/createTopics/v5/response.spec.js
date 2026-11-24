@@ -1,5 +1,8 @@
 const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 const { decode, parse } = require('./response')
+const { decode: decodeV6 } = require('../v6/response')
+const { decode: decodeV7 } = require('../v7/response')
 
 const vector = (caseId) => require(`../fixtures/java/createTopicsResponse-v5-${caseId}.json`)
 
@@ -143,13 +146,29 @@ describe('Protocol > Requests > CreateTopics > v5 response', () => {
     })
   })
 
-  test('reads a compact null count as no topics, never as a native error', async () => {
-    const body = new Encoder().writeInt32(25).writeUVarIntArray(null).writeTaggedFields().buffer
+  test('refuses a null topic list', async () => {
+    const body = Buffer.from('000000000000', 'hex')
 
-    expect(await decode(body)).toEqual({
-      throttleTime: 0,
-      clientSideThrottleTime: 25,
-      topicErrors: [],
-    })
+    for (const codec of [decode, decodeV6, decodeV7]) {
+      const error = await codec(body).then(
+        () => null,
+        (rejection) => rejection
+      )
+
+      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect(error.message).toContain('CreateTopicsResponse.Topics')
+    }
+  })
+
+  test('keeps an empty topic list (control)', async () => {
+    const body = Buffer.from('000000000100', 'hex')
+
+    for (const codec of [decode, decodeV6, decodeV7]) {
+      expect(await codec(body)).toEqual({
+        throttleTime: 0,
+        clientSideThrottleTime: 0,
+        topicErrors: [],
+      })
+    }
   })
 })
