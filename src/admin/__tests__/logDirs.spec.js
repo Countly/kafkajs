@@ -686,11 +686,11 @@ describe('directory retry and monotonic expiry', () => {
     async (method) => {
       jest.useFakeTimers()
       try {
-        const send = jest.fn(async () =>
-          method === 'alterReplicaLogDirs'
-            ? { topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 7 }] }] }
-            : { errorCode: 7, logDirs: [] }
-        )
+        // an alteration answer is final, so its retry follows a failure before the request
+        const send = jest.fn(async () => {
+          if (method === 'alterReplicaLogDirs') throw new Error('connection refused')
+          return { errorCode: 7, logDirs: [] }
+        })
         const { cluster } = fixture(
           new Map([[1, { describeLogDirs: send, alterReplicaLogDirs: send }]])
         )
@@ -706,10 +706,8 @@ describe('directory retry and monotonic expiry', () => {
         const observed = admin[method](options).catch((error) => error)
         await jest.advanceTimersByTimeAsync(21)
         const error = await observed
-        if (method === 'describeLogDirs') {
-          expect(error).toMatchObject({ name: 'KafkaJSTimeout' })
-          expect(error.message).toContain('unknown')
-        } else expect(error).toMatchObject([{ errorCode: 7 }])
+        expect(error).toMatchObject({ name: 'KafkaJSTimeout' })
+        expect(error.message).toContain('unknown')
         await jest.advanceTimersByTimeAsync(2000)
         expect(send).toHaveBeenCalledTimes(1)
         expect(jest.getTimerCount()).toBe(0)
@@ -718,29 +716,31 @@ describe('directory retry and monotonic expiry', () => {
       }
     }
   )
-  it.each(['describeLogDirs', 'alterReplicaLogDirs'])(
-    'keeps latest transport failure after %s request timeout',
-    async (method) => {
-      const failure = new Error('latest transport error')
-      const send = jest
-        .fn()
-        .mockResolvedValueOnce(
-          method === 'describeLogDirs'
-            ? { errorCode: 7, logDirs: [] }
-            : { topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 7 }] }] }
-        )
-        .mockRejectedValueOnce(failure)
-      const { admin } = fixture(new Map([[1, { [method]: send }]]))
-      const options =
-        method === 'describeLogDirs'
-          ? { brokers: [1] }
-          : { replicas: [{ ...replica(), logDir: '/data/b' }] }
-      const rows = await admin[method](options)
-      expect(rows[0].errorCode).toBe(method === 'describeLogDirs' ? -1 : 7)
-      if (method === 'describeLogDirs') expect(rows[0].error).toBe(failure)
-      else expect(send).toHaveBeenCalledTimes(1)
-    }
-  )
+  it('keeps latest transport failure after describeLogDirs request timeout', async () => {
+    const failure = new Error('latest transport error')
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({ errorCode: 7, logDirs: [] })
+      .mockRejectedValueOnce(failure)
+    const { admin } = fixture(new Map([[1, { describeLogDirs: send }]]))
+    const rows = await admin.describeLogDirs({ brokers: [1] })
+    expect(rows[0].errorCode).toBe(-1)
+    expect(rows[0].error).toBe(failure)
+  })
+  it('keeps the latest failure before any alterReplicaLogDirs request is written', async () => {
+    const failure = new Error('latest transport error')
+    const send = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('first transport error'))
+      .mockRejectedValueOnce(failure)
+    const { admin } = fixture(new Map([[1, { alterReplicaLogDirs: send }]]))
+    const rows = await admin.alterReplicaLogDirs({
+      replicas: [{ ...replica(), logDir: '/data/b' }],
+    })
+    expect(rows[0].errorCode).toBe(-1)
+    expect(rows[0].error).toBe(failure)
+    expect(send).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('directory selection validation', () => {

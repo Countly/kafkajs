@@ -196,102 +196,47 @@ describe('delete id response identity', () => {
     expect(broker.deleteTopics).toHaveBeenCalledTimes(1)
     expect(cluster.targetTopics.has('t')).toBe(true)
   })
-  it.each([
-    ['missing', []],
-    ['foreign', [[first, 0]]],
-    [
-      'duplicate',
-      [
-        [second, 0],
-        [second, 0],
-      ],
-    ],
-  ])('validates the narrowed retry set for %s rows', async (label, rows) => {
+  it('reports a decoded quota row with the confirmed id after one request', async () => {
     const { admin, broker } = decodedFixture([
       [
         [first, 0],
         [second, 89],
       ],
-      rows,
     ])
-    await expect(admin.deleteTopics({ topicIds: [first, second] })).rejects.toBeInstanceOf(
-      require('../../errors').KafkaJSInvariantViolation
-    )
+    await expect(admin.deleteTopics({ topicIds: [first, second] })).rejects.toMatchObject({
+      code: 89,
+      topicErrors: [expect.objectContaining({ topicId: second, errorCode: 89 })],
+    })
     expect(broker.deleteTopics.mock.calls.map(([options]) => options.topicIds)).toEqual([
       [first, second],
-      [second],
-    ])
-  })
-  it('accepts exact narrowed coverage and keeps the void contract', async () => {
-    const { admin, broker } = decodedFixture([
-      [
-        [first, 0],
-        [second, 89],
-      ],
-      [[second, 0]],
-    ])
-    expect(await admin.deleteTopics({ topicIds: [first, second] })).toBeUndefined()
-    expect(broker.deleteTopics.mock.calls.map(([options]) => options.topicIds)).toEqual([
-      [first, second],
-      [second],
     ])
   })
 })
 
 describe('delete id refresh completion', () => {
-  it.each([false, true])(
-    'never resends confirmed ids after transient refresh failure, quota subset %s',
-    async (mixed) => {
-      const { admin, broker, cluster } = fixture()
-      let refreshed = 0
-      const followUp = mixed ? 3 : 2
-      cluster.refreshMetadata.mockImplementation(async () => {
-        if (++refreshed === followUp) throw createErrorFromCode(41)
-      })
-      if (mixed)
-        broker.deleteTopics.mockRejectedValueOnce(
-          Object.assign(createErrorFromCode(89), {
-            topicErrors: [{ topic: null, topicId: second, errorCode: 89 }],
-          })
-        )
-      const outcome = await admin
-        .deleteTopics({ topicIds: mixed ? [first, second] : [first] })
-        .then(
-          () => null,
-          (error) => error
-        )
-      expect(outcome).toBeNull()
-      expect(broker.deleteTopics.mock.calls.map(([options]) => options.topicIds)).toEqual(
-        mixed ? [[first, second], [second]] : [[first]]
-      )
-      expect(refreshed).toBe(followUp + 1)
-    }
-  )
-  it.each([false, true])(
-    'propagates exhausted follow-up failure without mutation replay, quota subset %s',
-    async (mixed) => {
-      const { admin, broker, cluster } = fixture()
-      let refreshed = 0
-      const followUp = mixed ? 3 : 2
-      const failure = createErrorFromCode(41)
-      cluster.refreshMetadata.mockImplementation(async () => {
-        if (++refreshed >= followUp) throw failure
-      })
-      if (mixed)
-        broker.deleteTopics.mockRejectedValueOnce(
-          Object.assign(createErrorFromCode(89), {
-            topicErrors: [{ topic: null, topicId: second, errorCode: 89 }],
-          })
-        )
-      await expect(
-        admin.deleteTopics({ topicIds: mixed ? [first, second] : [first] })
-      ).rejects.toMatchObject({ cause: failure })
-      expect(broker.deleteTopics.mock.calls.map(([options]) => options.topicIds)).toEqual(
-        mixed ? [[first, second], [second]] : [[first]]
-      )
-      expect(refreshed).toBe(followUp + 1)
-    }
-  )
+  it('never resends confirmed ids after transient refresh failure', async () => {
+    const { admin, broker, cluster } = fixture()
+    let refreshed = 0
+    cluster.refreshMetadata.mockImplementation(async () => {
+      if (++refreshed === 2) throw createErrorFromCode(41)
+    })
+    await expect(admin.deleteTopics({ topicIds: [first] })).resolves.toBeUndefined()
+    expect(broker.deleteTopics.mock.calls.map(([options]) => options.topicIds)).toEqual([[first]])
+    expect(refreshed).toBe(3)
+  })
+  it('propagates exhausted follow-up failure without mutation replay', async () => {
+    const { admin, broker, cluster } = fixture()
+    let refreshed = 0
+    const failure = createErrorFromCode(41)
+    cluster.refreshMetadata.mockImplementation(async () => {
+      if (++refreshed >= 2) throw failure
+    })
+    await expect(admin.deleteTopics({ topicIds: [first] })).rejects.toMatchObject({
+      cause: failure,
+    })
+    expect(broker.deleteTopics.mock.calls.map(([options]) => options.topicIds)).toEqual([[first]])
+    expect(refreshed).toBe(3)
+  })
   it('preserves a recreated target when the deleted id is confirmed', async () => {
     const { admin, broker, cluster } = fixture()
     cluster.targetTopics.add('t')

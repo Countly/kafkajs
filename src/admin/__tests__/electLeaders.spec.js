@@ -53,13 +53,12 @@ test('election returns success and both broker errors after one send', async () 
 })
 test('controller errors relocate once before retry', async () => {
   const f = fixture()
-  f.broker.electLeaders = jest
-    .fn()
-    .mockRejectedValueOnce(createErrorFromCode(41))
-    .mockResolvedValueOnce(answer([0, 0, 0]))
+  f.cluster.findControllerBroker.mockRejectedValueOnce(createErrorFromCode(41))
+  f.broker.electLeaders = jest.fn(async () => answer([0, 0, 0]))
   await f.admin.electLeaders({ topicPartitions: selection })
   expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
   expect(f.cluster.findControllerBroker).toHaveBeenCalledTimes(2)
+  expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
 })
 test('all partitions sends null once and reports the returned rows', async () => {
   const f = fixture()
@@ -80,18 +79,16 @@ test.each([31, 41])('exhausted top-level code %i throws', async (code) => {
   })
   await expect(f.admin.electLeaders({ topicPartitions: selection })).rejects.toMatchObject({ code })
 })
-test('item exhaustion after a transport failure preserves completed outcomes', async () => {
+test('item exhaustion after transport failures before the write leaves every partition unresolved', async () => {
   const f = fixture()
   const original = new KafkaJSConnectionError('lost')
-  f.broker.electLeaders = jest
-    .fn()
-    .mockResolvedValueOnce(answer([0, 80, 7]))
-    .mockRejectedValue(original)
+  f.broker.electLeaders = jest.fn().mockRejectedValue(original)
   const rows = await f.admin.electLeaders({ topicPartitions: selection })
-  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 80, -1])
-  expect(rows[0].partitions[2].error).toMatchObject({ name: 'KafkaJSConnectionError' })
-  expect(f.broker.electLeaders.mock.calls[1][0].topicPartitions).toEqual([
-    { topic: 'orders', partitions: [2] },
+  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([-1, -1, -1])
+  expect(rows[0].partitions[2].error).toBe(original)
+  expect(f.broker.electLeaders.mock.calls.map(([options]) => options.topicPartitions)).toEqual([
+    selection,
+    selection,
   ])
 })
 test.each([
@@ -330,18 +327,19 @@ test.each(['KafkaJSSASLAuthenticationError', 'KafkaJSServerDoesNotSupportApiKey'
   }
 )
 
-test('deadline during controller refresh forbids another mutation request', async () => {
+test('deadline during a controller refresh before the write forbids the election request', async () => {
   jest.useFakeTimers()
   const baseline = jest.getTimerCount()
   let release
   const f = fixture()
+  f.cluster.findControllerBroker.mockRejectedValueOnce(createErrorFromCode(41))
   f.cluster.refreshMetadata.mockImplementation(
     () =>
       new Promise((resolve) => {
         release = resolve
       })
   )
-  f.broker.electLeaders = jest.fn(async () => answer([0, 41]))
+  f.broker.electLeaders = jest.fn(async () => answer([0, 0]))
   const result = f.admin
     .electLeaders({
       ...{ topicPartitions: [{ topic: 'orders', partitions: [0, 1] }] },
@@ -356,7 +354,7 @@ test('deadline during controller refresh forbids another mutation request', asyn
     release()
     await Promise.resolve()
     await Promise.resolve()
-    expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
+    expect(f.broker.electLeaders).not.toHaveBeenCalled()
     expect(jest.getTimerCount()).toBe(baseline)
   } finally {
     release?.()
