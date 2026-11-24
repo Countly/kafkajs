@@ -219,4 +219,83 @@ describe('Broker > produce > per-partition results', () => {
       produceAnswering(MIXED, { acks: 0, perPartitionResults: true })
     ).resolves.toBeUndefined()
   })
+
+  describe('an answer whose rows do not match the request', () => {
+    /** Partition 0 acknowledged, then partition 0 again with a retriable refusal. */
+    const DUPLICATE = [
+      { partition: 0, errorCode: 0, baseOffset: 100, logStartOffset: 0 },
+      { partition: 0, errorCode: 6, baseOffset: -1, logStartOffset: 0 },
+    ]
+    /** Partition 0 acknowledged, then partition 7, which the request did not carry. */
+    const EXTRA = [
+      { partition: 0, errorCode: 0, baseOffset: 100, logStartOffset: 0 },
+      { partition: 7, errorCode: 0, baseOffset: 100, logStartOffset: 0 },
+    ]
+
+    /** A Produce v7 response body for `test-topic`, whose partitions are not keyed by id. */
+    const responseV7 = (partitions) =>
+      new Encoder()
+        .writeArray([
+          new Encoder()
+            .writeString('test-topic')
+            .writeArray(
+              partitions.map(({ partition, errorCode, baseOffset }) =>
+                new Encoder()
+                  .writeInt32(partition)
+                  .writeInt16(errorCode)
+                  .writeInt64(baseOffset)
+                  .writeInt64(-1)
+                  .writeInt64(0)
+              )
+            ),
+        ])
+        .writeInt32(0).buffer
+
+    /**
+     * One flagged produce answered with `partitions` encoded at `version`.
+     * @param {7|11|13} version
+     * @param {{ partition: number, errorCode: number, baseOffset: number, logStartOffset: number }[]} partitions
+     * @returns {Promise<any>}
+     */
+    const produceAt = async (version, partitions) => {
+      const body =
+        version === 7
+          ? responseV7(partitions)
+          : responseFor(
+              partitions,
+              version === 13
+                ? (topic) => topic.writeUuid(TOPIC_ID)
+                : (topic) => topic.writeUVarIntString('test-topic')
+            )
+      return harnessAnswering(body, version).broker.produce({
+        acks: -1,
+        timeout: 30000,
+        topicData,
+        topicIds: version === 13 ? new Map([['test-topic', TOPIC_ID]]) : undefined,
+        perPartitionResults: true,
+      })
+    }
+
+    test('an answer [p0 success, p0 NOT_LEADER_OR_FOLLOWER] rejects the request retriably', async () => {
+      for (const version of [7, 11, 13]) {
+        await expect(produceAt(version, DUPLICATE)).rejects.toMatchObject({
+          name: 'KafkaJSError',
+          retriable: true,
+          message: expect.stringMatching(/partition 0 of topic test-topic twice/),
+        })
+      }
+    })
+
+    test('an answer with an extra partition rejects the request retriably', async () => {
+      for (const version of [7, 11, 13]) {
+        await expect(produceAt(version, EXTRA)).rejects.toMatchObject({
+          name: 'KafkaJSError',
+          retriable: true,
+          message: expect.stringMatching(
+            /partition 7 of topic test-topic that the request did not carry/
+          ),
+        })
+      }
+    })
+  })
 })

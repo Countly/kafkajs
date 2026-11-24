@@ -543,6 +543,35 @@ describe('disconnect validation before cleanup', () => {
   })
 })
 
+describe('a forced close whose cluster disconnect fails', () => {
+  const createConsumer = require('../index')
+  const { createLogger, LEVELS } = require('../../loggers')
+
+  test('a rejection with undefined is contained: the close resolves and logs it as a warning', async () => {
+    const entries = []
+    const nothing = undefined
+    const disconnect = jest.fn().mockRejectedValue(nothing)
+    const consumer = createConsumer({
+      groupId: 'g',
+      partitionAssigners: [],
+      logger: createLogger({
+        level: LEVELS.WARN,
+        logCreator: () => (entry) => entries.push(entry),
+      }),
+      cluster: { onTopicRecreated: () => () => {}, disconnect },
+    })
+
+    await expect(consumer.disconnect({ timeout: 0 })).resolves.toBeUndefined()
+
+    expect(disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
+    expect(
+      entries
+        .filter(({ log }) => log.message === 'Disconnecting the cluster failed')
+        .map(({ log }) => log.error)
+    ).toEqual(['undefined'])
+  })
+})
+
 const NODE = { id: 0, host: 'node-0', port: 9092 }
 const WAIT_MS = 10000
 const BOUND_MS = 300

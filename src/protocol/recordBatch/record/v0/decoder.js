@@ -94,15 +94,25 @@ const messageKeyIsInherited = (empty) =>
  * @param {number} [firstTimestampNumber] `Number(batchContext.firstTimestamp)`, computed once per
  *   batch, the timestamp counterpart of `firstOffsetNumber` with the same guards. The delta is a
  *   varlong, so it is guarded too: an unsafe delta can still give a safe but inexact sum.
+ * @param {{ remaining: number, limit: number }} [headerBudget] the headers the batch may still
+ *   decode and its header ceiling, shared by every record of the batch and debited by this one.
+ *   The batch decoder always passes it; the unbounded default serves calls on a lone record.
  * @returns {object} the decoded record: `{ magicByte, attributes, timestamp, offset, key, value,
  *   headers, isControlRecord, batchContext }`, with `timestamp` and `offset` as decimal strings
  * @throws {KafkaJSPartialMessageError} when the header count is negative (other than -1, an empty
  *   set) or above the bytes left in the record, before any header is read, or when a header runs
- *   past the record. The count is bounded by those bytes only, not by the 1,000,000 limit of the
- *   protocol array readers. The header array grows as headers decode, without preallocation
- *   from the untrusted count.
+ *   past the record. The header array grows as headers decode, without preallocation from the
+ *   untrusted count.
+ * @throws {KafkaJSCorruptRecordError} with reason `count` when the header count is above what
+ *   `headerBudget` has left, before any header is read
  */
-module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampNumber) => {
+module.exports = (
+  decoder,
+  batchContext = {},
+  firstOffsetNumber,
+  firstTimestampNumber,
+  headerBudget = { remaining: Infinity, limit: Infinity }
+) => {
   const {
     firstOffset,
     firstTimestamp,
@@ -138,7 +148,8 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber, firstTimestampN
   // two-element array, later ones push onto it.
   const headers = {}
   for (const { key: headerKey, value: headerValue } of decoder.readVarIntArrayBytesBounded(
-    HeaderDecoder
+    HeaderDecoder,
+    headerBudget
   )) {
     const existing = Object.hasOwn(headers, headerKey) ? headers[headerKey] : undefined
 

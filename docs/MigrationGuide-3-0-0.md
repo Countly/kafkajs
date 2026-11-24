@@ -82,6 +82,7 @@ To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional
 - **The default partitioner weighs each partition's queue (adaptive partitioning, KIP-794).** When it picks the next partition for keyless records, a partition with more batches waiting is less likely, so a slow broker's partitions get fewer records, which reduces pressure on the buffer; a full buffer still refuses sends as described above. Keyed records and records with an explicit `partition` are placed as before. *What to do:* nothing; for the previous non-adaptive sticky behavior, pass `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384, adaptive: false })` with your `batchSize` as `stickyBytes` (16384 is the default `batchSize`)
 - **A producer forgets the metadata of topics it has not produced to, and has no work for, for `metadataMaxIdle` (300 000 ms).** Nothing to change; the first send to a forgotten topic loads its metadata again.
 - **Sends no longer wait at the `metadataMaxAge` mark.** When the cached metadata names every topic the producer targets (each topic it has sent to and not yet forgotten after `metadataMaxIdle`), metadata older than `metadataMaxAge` is refreshed in the background while the send uses the known leaders. New partitions of a known topic are picked up after that background refresh, not by the send that noticed the age. Nothing to change; a send to an unknown topic still waits for its metadata.
+- **The error for a record without a `value` names the topic and the record's zero-based index.** It reads `Invalid message without value for topic "t" at index 1` and no longer prints the record. It is still a `KafkaJSNonRetriableError`. If you match the full error message, update your match to this format.
 - **A send to a deleted topic may end with a missing-metadata error.** After a producer reconnect or a metadata rebootstrap, a fresh send to an earlier target that the broker has deleted can reject with `KafkaJSNumberOfRetriesExceeded` caused by `KafkaJSMetadataNotLoaded`, where kafkajs 2.2.4 reported `UNKNOWN_TOPIC_OR_PARTITION`. Sends to other topics proceed. Once no send owns the refused target it is dropped, and a later send adds it again and receives its own metadata refusal. Do not rely on every failed send to a deleted topic carrying the broker's topic error.
 
 
@@ -295,6 +296,14 @@ notice and what, if anything, to do.
 - **A negative timestamp, which Java also refuses, now fails at `send()`.** Omit it or use
   `0`/absent for the send time (numeric `0`, `0n` and absent still mean the send time; the string
   `'0'` and `new Date(0)` are the literal epoch).
+
+- **A custom partitioner that returns an invalid partition now rejects the send.** 2.2.4
+  resolved such a send and dropped the records whose partition was not a partition of the topic.
+  3.0.0 rejects it with `KafkaJSInvalidConfigurationError` before anything is queued. The value
+  must be an integer from 0 to 2147483647, as a number or a canonical decimal string. The built-in
+  partitioners return an explicit `message.partition` as it is, so a message with an invalid
+  `message.partition` is rejected the same way. *What to do:* make the partitioner return a
+  partition id, and give messages only valid `partition` values.
 
 ### Transactions
 
@@ -1472,9 +1481,14 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   or every broker the client knows about has become unreachable. "Continuously" is measured from
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
-  running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
-  every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
-  through the caller's normal retry path against the rebuilt cluster. On an idempotent
+  running. A rebootstrap does not wait for the connections it replaces: they take no new request
+  and drain in the background for at most `requestTimeout`, a request still outstanding when its
+  connection closes fails with `KafkaJSConnectionClosedError` and goes through the caller's normal
+  retry path against the rebuilt cluster, and a `disconnect()` closes those draining connections
+  too: without a close timeout it can wait for what is left of their `requestTimeout`, a shorter
+  timeout closes them sooner, and a failure closing them can reject the `disconnect()` as a failure
+  on a current connection can (see [Metadata recovery](Configuration.md#metadata-recovery)). On an
+  idempotent
   producer (the default) the retry carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose
@@ -1483,7 +1497,10 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   failure is never a trigger — a rejected credential means the broker is reachable and healthy,
   which no rebootstrap can fix. Setting `metadataRecoveryStrategy: 'none'` disables all three
   triggers and restores the previous behavior exactly, with code 129 surfacing as the non-retriable
-  protocol error it already was.
+  protocol error it already was. A rebootstrap does not notice when the broker list now leads to a
+  different cluster: a consumer keeps its old positions and may fetch the new cluster at those
+  offsets before it rejoins its group or is reassigned, and with `assign()` for as long as it keeps
+  them (see [Metadata recovery](Configuration.md#metadata-recovery)).
 
 - **Negotiated protocol versions moved up.** Against a Kafka 4.1 or 4.3 broker the client now
   negotiates: Metadata **v13** (was v6), Produce **v13** (was v7; **v11** when a topic's id is not

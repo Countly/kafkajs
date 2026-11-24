@@ -332,6 +332,26 @@ describe('public share connection contract', () => {
     expect(second.connects).toHaveLength(1)
   })
 
+  test('a disconnect whose transport teardown rejects leaves the client disconnected, so connect connects again', async () => {
+    const h = open()
+    const seen = observe(h)
+    const disconnects = []
+    h.consumer.on(h.consumer.events.DISCONNECT, () => disconnects.push(true))
+    await h.consumer.connect()
+    const failure = new Error('teardown failed')
+    const disconnect = Cluster.prototype.disconnect
+    jest.spyOn(Cluster.prototype, 'disconnect').mockImplementationOnce(async function (...args) {
+      await disconnect.apply(this, args)
+      throw failure
+    })
+
+    await expect(h.consumer.disconnect()).rejects.toBe(failure)
+
+    expect(disconnects).toEqual([])
+    await expect(h.consumer.connect()).resolves.toBeUndefined()
+    expect(seen.connects).toHaveLength(2)
+  })
+
   test('retires a coordinator lookup held across a disconnect and reconnects nothing', async () => {
     const lookups = []
     const original = Cluster.prototype.findGroupCoordinator
