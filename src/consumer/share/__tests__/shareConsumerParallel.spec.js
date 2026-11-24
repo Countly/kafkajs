@@ -388,6 +388,82 @@ describe('share handlers on parallel leader nodes', () => {
       expect(leaves()).toEqual([])
       expect(h.seen.crashes).toEqual([])
     })
+
+    test('a capture error whose message cannot be read still lets the captured node final before the leave', async () => {
+      const unreadable = new Error('capture failed')
+      Object.defineProperty(unreadable, 'message', {
+        get() {
+          throw new Error('message read')
+        },
+      })
+      const captureFinal = ShareFetchLoop.prototype.captureFinal
+      let captures = 0
+      const capture = jest
+        .spyOn(ShareFetchLoop.prototype, 'captureFinal')
+        .mockImplementation(function () {
+          if (++captures === 2) throw unreadable
+          return captureFinal.call(this)
+        })
+      await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
+      const logged = jest.spyOn(h.consumer.logger(), 'error')
+      let listened = 0
+      h.consumer.on(h.consumer.events.ACKNOWLEDGE, () => {
+        if (listened++ === 0) throw unreadable
+      })
+      const gate = deferred()
+      const completions = []
+      holds.push({ release: () => gate.resolve(), completions })
+      serveNodes(1)
+      const started = []
+      await run({
+        eachMessage: async ({ partition, acknowledge }) => {
+          const completed = deferred()
+          completions.push(completed.promise)
+          try {
+            started.push(partition)
+            if (partition === 0) acknowledge('accept')
+            await gate.promise
+          } finally {
+            completed.resolve()
+          }
+        },
+      })
+      await until(() => started.length === 2, 'both handlers')
+      for (let count = 2; count <= 5; count++) await beat(count)
+      expect(leaves()).toHaveLength(0)
+      await advance(50)
+      await until(() => leaves().length === 1, 'the poll-expiry leave')
+      await until(() => outcomesOf(0).length === 1, 'the outcome of the choice captured on node 0')
+      await flush()
+      expect(capture).toHaveBeenCalledTimes(2)
+      expect(new Set(capture.mock.contexts).size).toBe(2)
+      const finals = finalFrames()
+      expect(finals.map(({ node }) => node)).toEqual([0])
+      expect(finals[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+        { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+      ])
+      expect(finals[0].order).toBeLessThan(leaves()[0].order)
+      expect(outcomesOf(0)).toEqual([['0', '0', 'accept', null]])
+      expect(outcomesOf(1)).toEqual([['0', '0', 'release', 'membership-lost']])
+      const messages = logged.mock.calls.map(([message]) => message)
+      const closeFailures = new Set([
+        'Share final capture failed',
+        'Share node disposal failed',
+        'Share node observer failed',
+        'Share close failed',
+      ])
+      expect(logged.mock.calls.filter(([message]) => closeFailures.has(message))).toEqual([
+        ['Share final capture failed', { nodeId: 1, error: '<unreadable thrown value>' }],
+      ])
+      expect(
+        messages.filter((message) => message.startsWith('Failed to execute listener'))
+      ).toEqual(['Failed to execute listener: <unreadable thrown value>'])
+      gate.resolve()
+      await flush()
+      await advance(1)
+      await until(() => joins().length === 2, 'the rejoin after the close ended')
+      expect(h.seen.crashes).toEqual([])
+    })
   })
 
   test('a poll expiry over a handler that changed its message offset after acknowledging finals both nodes and leaves', async () => {
