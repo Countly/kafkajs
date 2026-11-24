@@ -3,6 +3,7 @@ const {
   KafkaJSApplicationRecoverableError,
   KafkaJSDeliveryTimeout,
   KafkaJSInvariantViolation,
+  KafkaJSProtocolError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const { RETRIABLE_CATEGORIES } = require('../../protocol/errorCategories')
@@ -23,6 +24,7 @@ const {
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
 const INVALID_PRODUCER_ID_MAPPING = 49
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED = 53
 const UNKNOWN_PRODUCER_ID = 59
 const PRODUCER_FENCED = 90
 
@@ -240,6 +242,8 @@ class ProducerStateManager {
    * @throws {KafkaJSInvariantViolation} while a batch is in flight
    * @throws {import('../../errors').KafkaJSApplicationRecoverableError} when the coordinator did
    *   not bump; the producer is then in `FATAL_ERROR`, as after any fatal error of the request
+   * @throws {KafkaJSTransactionAbortableError} when InitProducerId itself refuses the transactional
+   *   id (53); the caller keeps the bump owed
    * @throws {Error} a retriable error, unchanged, for the caller to retry
    */
   async reinitialize() {
@@ -250,6 +254,13 @@ class ProducerStateManager {
     try {
       await this.#identity.reinitialize()
     } catch (error) {
+      // Transaction coordinator lookup handles its own code 53 and throws the armed error.
+      if (
+        error instanceof KafkaJSProtocolError &&
+        error.code === TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+      ) {
+        throw new KafkaJSTransactionAbortableError(error, { cause: error })
+      }
       this.classify(error, 'txn')
       if (transactionStateFor(error) === FATAL_ERROR) {
         this.arm(error)

@@ -203,7 +203,10 @@ describe('Producer > the copier answers a failed chunk as the Java exactly-once 
       const failed = await copyChunk(producer)
 
       expect(failed.transaction).toBeNull()
-      expect(failed.error).toBeInstanceOf(KafkaJSGroupCoordinatorNotFound)
+      expect(failed.error).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+      expect(failed.error.cause).toBeInstanceOf(KafkaJSGroupCoordinatorNotFound)
+      expect(failed.error.cause.cause).toMatchObject({ code: 53 })
+      expect(recoveryFor(failed.error, { begun: false })).toBe('replace')
       expect(askedSince(cluster, since)).toEqual(['FindCoordinator@0'])
       await producer.disconnect()
     })
