@@ -178,8 +178,15 @@ class ShareAckLedger {
     const deadline = lockDeadline(sentAt, lockDuration)
     const entries = []
     const { records, deliveryCounts } = walk.deliver
+    /**
+     * The delivered offsets as acquired, parallel to `walk.deliver.records`. Read here, before any
+     * handler sees a record, so a handler that writes a message's `offset` cannot change them.
+     * @type {string[]}
+     */
+    this.offsets = new Array(records.length)
     for (let i = 0; i < records.length; i++) {
       const record = records[i]
+      this.offsets[i] = record.offset
       const first = parseOffset(record.offset)
       entries.push({
         first,
@@ -274,40 +281,23 @@ class ShareAckLedger {
   }
 
   /**
-   * Same promotion as {@link ShareAckLedger#complete} for the delivered records
-   * `records[start, end)`, read in place, so a caller on a hot path builds neither an offset array
-   * nor a `Set`. It is not allocation-free: every record lookup still parses its offset and
-   * stringifies the entry key.
-   * @param {Array<{offset: string}>} records The acquisition's delivered records, ascending.
-   * @param {number} start First record of the selection.
-   * @param {number} end One past the last record of the selection.
+   * Same promotion as {@link ShareAckLedger#complete} for `offsets[start, end)`, read in place, so
+   * a caller on a hot path builds neither an offset array nor a `Set`. It is not allocation-free:
+   * every lookup still parses its offset and stringifies the entry key.
+   * @param {string[]} offsets Acquired offsets, ascending, normally {@link ShareAckLedger#offsets}
+   *   or a subset of it.
+   * @param {number} start First offset of the selection.
+   * @param {number} end One past the last offset of the selection.
    * @param {'accept'|'release'} defaultType Runner-selected outcome for undecided records.
    * @returns {void} Validates the whole selection before any entry changes.
    * @throws {KafkaJSNonRetriableError} For an invalid default or a foreign, retired or
-   *   already-completed record.
+   *   already-completed offset.
    */
-  completeRange(records, start, end, defaultType) {
+  completeRange(offsets, start, end, defaultType) {
     if (defaultType !== 'accept' && defaultType !== 'release')
       throw new KafkaJSNonRetriableError('Invalid default acknowledgement')
-    for (let i = start; i < end; i++) this.#held(records[i].offset)
-    for (let i = start; i < end; i++) this.#promote(this.#held(records[i].offset), defaultType)
-  }
-
-  /**
-   * Promotes the held entries of the given delivered records, found by the record objects this
-   * ledger was built from, never by their `offset` field, which a handler can change. A record the
-   * ledger no longer holds is skipped. Meant for a close boundary: it scans the entries once.
-   * @param {object[]} records Delivered records of this acquisition.
-   * @param {'accept'|'release'} defaultType Outcome for an entry that has no local choice.
-   * @returns {void}
-   * @throws {KafkaJSNonRetriableError} For an invalid default, before any entry changes.
-   */
-  completeRecords(records, defaultType) {
-    if (defaultType !== 'accept' && defaultType !== 'release')
-      throw new KafkaJSNonRetriableError('Invalid default acknowledgement')
-    const selected = new Set(records)
-    for (const entry of this.#entries.values())
-      if (entry.state === 'held' && selected.has(entry.record)) this.#promote(entry, defaultType)
+    for (let i = start; i < end; i++) this.#held(offsets[i])
+    for (let i = start; i < end; i++) this.#promote(this.#held(offsets[i]), defaultType)
   }
 
   /**

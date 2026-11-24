@@ -11,17 +11,17 @@ const TYPE_CODES = Object.freeze({ accept: 1, release: 2, reject: 3 })
 const compareOffsets = (a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0)
 
 /**
- * @param {Array<{offset: string}>} records Records ascending by offset.
+ * @param {string[]} offsets Exact decimal offsets, ascending.
  * @param {string} offset An exact decimal offset.
- * @param {boolean} inclusive Whether a record at `offset` counts as before it.
- * @returns {number} How many records lie before `offset` (or at it, when `inclusive`).
+ * @param {boolean} inclusive Whether an offset equal to `offset` counts as before it.
+ * @returns {number} How many offsets lie before `offset` (or at it, when `inclusive`).
  */
-const countBefore = (records, offset, inclusive) => {
+const countBefore = (offsets, offset, inclusive) => {
   let low = 0
-  let high = records.length
+  let high = offsets.length
   while (low < high) {
     const middle = (low + high) >>> 1
-    const order = compareOffsets(records[middle].offset, offset)
+    const order = compareOffsets(offsets[middle], offset)
     if (order < 0 || (inclusive && order === 0)) low = middle + 1
     else high = middle
   }
@@ -31,24 +31,26 @@ const countBefore = (records, offset, inclusive) => {
 /**
  * Counts delivered records inside one compact range without a per-record pass, so a million-offset
  * range costs two binary searches.
- * @param {Array<{offset: string}>} records Delivered records, ascending by offset.
+ * @param {string[]} offsets The acquired offsets of the delivered records, ascending.
  * @param {string} firstOffset Inclusive lower bound, an exact decimal offset.
  * @param {string} lastOffset Inclusive upper bound, an exact decimal offset.
- * @returns {number} How many records have an offset in `[firstOffset, lastOffset]`.
+ * @returns {number} How many offsets lie in `[firstOffset, lastOffset]`.
  */
-const countWithin = (records, firstOffset, lastOffset) =>
-  countBefore(records, lastOffset, true) - countBefore(records, firstOffset, false)
+const countWithin = (offsets, firstOffset, lastOffset) =>
+  countBefore(offsets, lastOffset, true) - countBefore(offsets, firstOffset, false)
 
 /**
  * Owns one handler invocation's provisional decisions and its original authority.
  *
- * It views `records[start, end)` of one acquisition's delivered records, which the walk keeps in
- * ascending offset order, so a message is found by binary search and decisions live in one byte
- * each. No Map, per-call result array or linear lookup exists. The public callbacks are closures
- * of this one invocation: sharing them across invocations would let a late old call authorize a
- * new acquisition, so each record (`eachMessage`) or batch (`eachBatch`) gets its own set. Beyond
- * the invocation, its public payload and those callbacks, a call allocates nothing per record: the
- * acquisition's context is one frame that every call of the acquisition reads.
+ * It views `records[start, end)` of one acquisition's delivered records and the parallel offsets
+ * they were acquired at. Every decision, renewal and completion is keyed by those acquired
+ * offsets, never by a message's `offset` field, which the handler can change. The offsets are
+ * ascending, so a selector is found by binary search and decisions live in one byte each. The
+ * public callbacks are closures of this one invocation: sharing them across invocations would let
+ * a late old call authorize a new acquisition, so each record (`eachMessage`) or batch
+ * (`eachBatch`) gets its own set. Beyond the invocation, its public payload and those callbacks, a
+ * call allocates nothing per record: the acquisition's context is one frame that every call of the
+ * acquisition reads.
  */
 class ShareHandlerCall {
   /**
@@ -56,6 +58,7 @@ class ShareHandlerCall {
    *   and shared, unmodified, by every call of that acquisition.
    * @param {import('./shareAckLedger').ShareAckLedger} frame.ledger Original acknowledgement ledger.
    * @param {object[]} frame.records The acquisition's delivered records, ascending by offset.
+   * @param {string[]} frame.offsets The offsets `records` were acquired at, index for index.
    * @param {number} [frame.start=0] First record of this call, unless `start` is given.
    * @param {number} [frame.end=records.length] One past the last record, unless `end` is given.
    * @param {'implicit'|'explicit'} frame.mode Acknowledgement mode.
@@ -71,6 +74,7 @@ class ShareHandlerCall {
   constructor(frame, start = frame.start ?? 0, end = frame.end ?? frame.records.length) {
     this.ledger = frame.ledger
     this.records = frame.records
+    this.acquired = frame.offsets
     this.start = start
     this.end = end
     this.mode = frame.mode
@@ -97,7 +101,10 @@ class ShareHandlerCall {
       topic,
       partition,
       message: this.records[this.start],
-      acknowledge: (type) => this.acknowledge(this.records[this.start], type),
+      acknowledge: (type) => {
+        this.check()
+        this.decide(this.start, type)
+      },
       renew: () => this.renew(),
       isRunning: () => this.isRunning(),
     }
@@ -128,8 +135,10 @@ class ShareHandlerCall {
   }
 
   /**
-   * Resolves an exact local message or the supported offset-only selector. A full message of
-   * another call that has an equal offset stays foreign.
+   * Resolves a delivered message of this call by identity, or the supported offset-only selector
+   * (an object whose only own key is `offset`) by the offset it was acquired at. A full message of
+   * another call that has an equal offset stays foreign. Only a message whose `offset` the handler
+   * changed costs a scan of this call's records.
    * @param {object} message Delivered message or an object containing only `offset`.
    * @returns {number} Index of the message within this call's records.
    * @throws {KafkaJSNonRetriableError} For malformed or foreign selectors.
@@ -137,20 +146,17 @@ class ShareHandlerCall {
   indexOf(message) {
     const offset = message?.offset
     const found = typeof offset === 'string' ? this.search(offset) : -1
-    const local = found === -1 ? undefined : this.records[found]
-    const offsetOnly =
-      local !== undefined &&
-      message !== local &&
-      Object.keys(message).length === 1 &&
-      Object.hasOwn(message, 'offset')
-    if (local === undefined || (message !== local && !offsetOnly)) {
-      throw new KafkaJSNonRetriableError('Message does not belong to this handler call')
+    if (found !== -1 && this.records[found] === message) return found
+    if (found !== -1 && Object.keys(message).length === 1 && Object.hasOwn(message, 'offset'))
+      return found
+    if (message !== null && typeof message === 'object') {
+      for (let i = this.start; i < this.end; i++) if (this.records[i] === message) return i
     }
-    return found
+    throw new KafkaJSNonRetriableError('Message does not belong to this handler call')
   }
 
   /**
-   * Binary search by exact decimal offset.
+   * Binary search over the acquired offsets.
    * @private
    * @param {string} offset The offset to find.
    * @returns {number} Its index within `[start, end)`, or -1.
@@ -160,7 +166,7 @@ class ShareHandlerCall {
     let high = this.end - 1
     while (low <= high) {
       const middle = (low + high) >>> 1
-      const order = compareOffsets(this.records[middle].offset, offset)
+      const order = compareOffsets(this.acquired[middle], offset)
       if (order === 0) return middle
       if (order < 0) low = middle + 1
       else high = middle - 1
@@ -177,8 +183,19 @@ class ShareHandlerCall {
    */
   acknowledge(message, type = 'accept') {
     this.check()
-    const index = this.indexOf(message)
-    this.ledger.decide(this.records[index].offset, type)
+    this.decide(this.indexOf(message), type)
+  }
+
+  /**
+   * Records a decision for one record of this call, by the offset it was acquired at.
+   * @private
+   * @param {number} index Index of the record within this call's records.
+   * @param {'accept'|'release'|'reject'} [type='accept'] Terminal type.
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} For an invalid type or a record no longer held.
+   */
+  decide(index, type = 'accept') {
+    this.ledger.decide(this.acquired[index], type)
     this.marks ??= new Uint8Array(this.size)
     const mark = index - this.start
     if (this.marks[mark] === 0) this.decided++
@@ -201,7 +218,7 @@ class ShareHandlerCall {
       if (!Array.isArray(messages) || messages.length === 0) {
         throw new KafkaJSNonRetriableError('renew requires a non-empty array of local messages')
       }
-      offsets = messages.map((message) => this.records[this.indexOf(message)].offset)
+      offsets = messages.map((message) => this.acquired[this.indexOf(message)])
       if (new Set(offsets).size !== offsets.length) {
         throw new KafkaJSNonRetriableError('renew messages must be distinct')
       }
@@ -221,9 +238,7 @@ class ShareHandlerCall {
    * @returns {string[]} The offsets of every message of this call, ascending.
    */
   offsets() {
-    const offsets = []
-    for (let i = this.start; i < this.end; i++) offsets.push(this.records[i].offset)
-    return offsets
+    return this.acquired.slice(this.start, this.end)
   }
 
   /**
@@ -234,7 +249,7 @@ class ShareHandlerCall {
   expiredAt(now) {
     let expired = null
     for (let i = this.start; i < this.end; i++) {
-      const { offset } = this.records[i]
+      const offset = this.acquired[i]
       if (!this.ledger.canStart(offset, now)) (expired ??= []).push(offset)
     }
     return expired
@@ -250,7 +265,7 @@ class ShareHandlerCall {
     const offsets = []
     for (let i = this.start; i < this.end; i++) {
       if ((this.marks !== null && this.marks[i - this.start] !== 0) === decided)
-        offsets.push(this.records[i].offset)
+        offsets.push(this.acquired[i])
     }
     return offsets
   }
@@ -267,7 +282,7 @@ class ShareHandlerCall {
     if (!this.authority.current()) return null
     const stopping = this.authority.stopping()
     const release = failed || (this.batch && stopping) || this.mode === 'explicit'
-    this.ledger.completeRange(this.records, this.start, this.end, release ? 'release' : 'accept')
+    this.ledger.completeRange(this.acquired, this.start, this.end, release ? 'release' : 'accept')
     if (failed || stopping || this.mode !== 'explicit' || this.decided === this.size) return null
     return this.omission()
   }
@@ -299,18 +314,13 @@ class ShareHandlerCall {
    * Promotes only the explicit choices of a handler that is still running at a forced close, so
    * undecided work is lost, not accepted. The call stops being authoritative. A call that already
    * lost its acquisition (session reset, leader move) promotes nothing, as a fenced return does not.
-   * The choices are promoted by the delivered record objects, never by their `offset` field, which
-   * the still-running handler can change.
    * @returns {void}
    */
   freeze() {
     if (!this.open) return
     this.open = false
     if (!this.authority.current() || this.decided === 0) return
-    const records = []
-    for (let i = this.start; i < this.end; i++)
-      if (this.marks[i - this.start] !== 0) records.push(this.records[i])
-    this.ledger.completeRecords(records, 'release')
+    this.ledger.complete(this.offsetsWhere(true), 'release')
   }
 }
 

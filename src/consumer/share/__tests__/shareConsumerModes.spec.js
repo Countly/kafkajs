@@ -37,7 +37,14 @@ const setup = ({ mode = 'implicit', batch = true, stopping = false, offsets } = 
     stopping: () => stopping,
     renew,
   }
-  const call = new ShareHandlerCall({ ledger, records, mode, batch, authority })
+  const call = new ShareHandlerCall({
+    ledger,
+    records,
+    offsets: ledger.offsets,
+    mode,
+    batch,
+    authority,
+  })
   return {
     token,
     messages: records,
@@ -185,6 +192,7 @@ describe('Share consumer handler decisions', () => {
     const call = new ShareHandlerCall({
       ledger: c.ledger,
       records: c.messages,
+      offsets: c.ledger.offsets,
       start: 1,
       end: 2,
       mode: 'implicit',
@@ -204,6 +212,7 @@ describe('Share consumer handler decisions', () => {
     const second = new ShareHandlerCall({
       ledger: c.ledger,
       records: c.messages,
+      offsets: c.ledger.offsets,
       mode: 'implicit',
       batch: false,
       authority: c.authority,
@@ -223,7 +232,7 @@ describe('Share consumer handler decisions', () => {
       c.call.complete()
       expect(byRange).toHaveBeenCalledTimes(1)
       expect(byRange).toHaveBeenCalledWith(
-        c.messages,
+        c.ledger.offsets,
         0,
         3,
         mode === 'explicit' ? 'release' : 'accept'
@@ -234,9 +243,7 @@ describe('Share consumer handler decisions', () => {
     }
   })
   test('counts the delivered records inside a compact range by exact int64 offset', () => {
-    const records = ['0', '1', '2', '9', '10', '100', '9007199254740993'].map((offset) => ({
-      offset,
-    }))
+    const records = ['0', '1', '2', '9', '10', '100', '9007199254740993']
     expect(countWithin(records, '1', '9')).toBe(3)
     expect(countWithin(records, '3', '8')).toBe(0)
     expect(countWithin(records, '0', '9007199254740993')).toBe(7)

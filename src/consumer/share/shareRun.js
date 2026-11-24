@@ -600,11 +600,7 @@ class ShareRun {
     for (const outcome of results) {
       const reason = outcome.error?.reason
       if (outcome.type !== 'renew' && (reason === 'session-lost' || reason === 'membership-lost'))
-        node.dropped += countWithin(
-          cohort.walk.deliver.records,
-          outcome.firstOffset,
-          outcome.lastOffset
-        )
+        node.dropped += countWithin(cohort.ledger.offsets, outcome.firstOffset, outcome.lastOffset)
     }
     this.runner.publishResults(cohort, results)
   }
@@ -681,6 +677,7 @@ class ShareRun {
     const frame = {
       ledger: cohort.ledger,
       records,
+      offsets: cohort.ledger.offsets,
       mode: this.options.acknowledgementMode,
       batch: this.batch,
       authority: this.authorityOf(node, cohort),
@@ -727,16 +724,16 @@ class ShareRun {
    */
   startGate(node, cohort, from, to) {
     if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return 'stop'
-    const { records } = cohort.walk.deliver
     if (!node.keys.has(cohort.key) || this.stopRequested) {
       this.releaseFrom(node, cohort, from)
       return 'stop'
     }
     this.flushIfDue(node, cohort)
     const now = performance.now()
+    const { offsets } = cohort.ledger
     let expired = null
     for (let i = from; i < to; i++) {
-      if (!cohort.ledger.canStart(records[i].offset, now)) (expired ??= []).push(records[i].offset)
+      if (!cohort.ledger.canStart(offsets[i], now)) (expired ??= []).push(offsets[i])
     }
     if (expired === null) return 'start'
     cohort.ledger.dropExpired(expired, now)
@@ -784,17 +781,21 @@ class ShareRun {
    */
   async dispatchBatch(node, cohort, frame) {
     const { deliveryCounts } = cohort.walk.deliver
-    let { records } = cohort.walk.deliver
+    let { records, offsets } = frame
     const verdict = this.startGate(node, cohort, 0, records.length)
     if (verdict !== 'start') return
     if (cohort.expired) {
-      records = records.filter((record) => !cohort.expired.has(record.offset))
+      const live = (_, i) => !cohort.expired.has(frame.offsets[i])
+      records = records.filter(live)
+      offsets = offsets.filter(live)
       cohort.expired = null
     }
     const delivered = cohort.walk.deliver.records
     for (let i = 0; i < delivered.length; i++) delivered[i].deliveryCount = deliveryCounts[i]
     node.active.next = delivered.length
-    const call = new ShareHandlerCall(records === frame.records ? frame : { ...frame, records })
+    const call = new ShareHandlerCall(
+      records === frame.records ? frame : { ...frame, records, offsets }
+    )
     node.active.call = call
     const batch = {
       topic: cohort.topic,
@@ -815,9 +816,9 @@ class ShareRun {
    */
   releaseFrom(node, cohort, from) {
     if (this.ordinaryRefusal(node.issued) !== null || !node.loop.isLive(cohort)) return
-    const { records } = cohort.walk.deliver
-    cohort.ledger.completeRange(records, from, records.length, 'release')
-    if (node.active?.cohort === cohort) node.active.next = records.length
+    const { offsets } = cohort.ledger
+    cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
+    if (node.active?.cohort === cohort) node.active.next = offsets.length
   }
 
   /**
@@ -1254,8 +1255,8 @@ class ShareRun {
     const release = (cohort, from) => {
       if (!node.loop.isLive(cohort)) return
       try {
-        const { records } = cohort.walk.deliver
-        cohort.ledger.completeRange(records, from, records.length, 'release')
+        const { offsets } = cohort.ledger
+        cohort.ledger.completeRange(offsets, from, offsets.length, 'release')
       } catch (error) {
         this.options.logger.debug('Share unstarted release skipped', { error: error.message })
       }
