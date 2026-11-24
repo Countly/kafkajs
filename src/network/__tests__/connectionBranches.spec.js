@@ -154,6 +154,7 @@ describe('Connection > DEBUG response logs', () => {
   const EXTENDED_FLAG = 'KAFKAJS_DEBUG_EXTENDED_PROTOCOL_BUFFERS'
   const NEITHER = { first: false, extended: false }
   const FIRST_ONLY = { first: true, extended: false }
+  const EXTENDED_ONLY = { first: false, extended: true }
   const BOTH = { first: true, extended: true }
   const DATA_MARKERS = [
     'marker-key-3f1a',
@@ -188,6 +189,7 @@ describe('Connection > DEBUG response logs', () => {
     errorMessage: DATA_MARKERS[4],
   }
   let saved
+  let captured = []
 
   beforeEach(() => {
     saved = { first: process.env[FIRST_FLAG], extended: process.env[EXTENDED_FLAG] }
@@ -246,9 +248,16 @@ describe('Connection > DEBUG response logs', () => {
   }
 
   /**
+   * @param {string[]} markers
+   * @returns {string[]} the markers any entry logged by the last `responseLog` call shows
+   */
+  const leaksAnywhere = (markers) => leaks(captured, markers)
+
+  /**
    * Sends one request of `apiName` over a fake socket, answers it with a frame holding
-   * `BYTES_MARKER`, and returns the DEBUG log fields of the response. The flags are set before the
-   * connection is built, as it reads them in its constructor.
+   * `BYTES_MARKER`, and returns the DEBUG log fields of the response. Every entry the connection
+   * logged is kept for `leaksAnywhere`. The flags are set before the connection is built, as it
+   * reads them in its constructor.
    * @param {string} apiName
    * @param {{ first: boolean, extended: boolean }} flags
    * @param {boolean} fails whether parsing the response throws
@@ -258,6 +267,7 @@ describe('Connection > DEBUG response logs', () => {
     setFlag(FIRST_FLAG, flags.first)
     setFlag(EXTENDED_FLAG, flags.extended)
     const entries = []
+    captured = entries
     const logger = createLogger({
       level: LEVELS.DEBUG,
       logCreator: () => (entry) => entries.push(entry),
@@ -308,11 +318,12 @@ describe('Connection > DEBUG response logs', () => {
   }
 
   it('filters a ShareFetch response at DEBUG unless both buffer flags are set', async () => {
-    for (const flags of [NEITHER, FIRST_ONLY]) {
+    for (const flags of [NEITHER, FIRST_ONLY, EXTENDED_ONLY]) {
       const log = await responseLog('ShareFetch', flags, false)
 
       expect({ flags, data: log.data }).toEqual({ flags, data: '[filtered]' })
       expect({ flags, leaks: leaks(log, DATA_MARKERS) }).toEqual({ flags, leaks: [] })
+      expect({ flags, leaks: leaksAnywhere(DATA_MARKERS) }).toEqual({ flags, leaks: [] })
     }
     expect((await responseLog('ShareFetch', BOTH, false)).data).toBe(decodedData)
   })
@@ -330,19 +341,23 @@ describe('Connection > DEBUG response logs', () => {
 
   it('never logs config response data, whatever the flags', async () => {
     for (const apiName of CONFIG_APIS) {
-      for (const flags of [NEITHER, FIRST_ONLY, BOTH]) {
-        const success = await responseLog(apiName, flags, false)
-        const failure = await responseLog(apiName, flags, true)
+      for (const flags of [NEITHER, FIRST_ONLY, EXTENDED_ONLY, BOTH]) {
         const where = { apiName, flags }
+        const success = await responseLog(apiName, flags, false)
+        const successLeaks = leaksAnywhere(DATA_MARKERS)
+        const failure = await responseLog(apiName, flags, true)
+        const failureLeaks = leaksAnywhere([BYTES_MARKER])
 
         expect({ ...where, data: success.data }).toEqual({ ...where, data: '[filtered]' })
         expect({ ...where, leaks: leaks(success, DATA_MARKERS) }).toEqual({ ...where, leaks: [] })
+        expect({ ...where, leaks: successLeaks }).toEqual({ ...where, leaks: [] })
         expect({ ...where, error: failure.error, payload: failure.payload }).toEqual({
           ...where,
           error: PARSE_ERROR,
           payload: '[filtered]',
         })
         expect({ ...where, leaks: leaks(failure, [BYTES_MARKER]) }).toEqual({ ...where, leaks: [] })
+        expect({ ...where, leaks: failureLeaks }).toEqual({ ...where, leaks: [] })
       }
     }
   })
