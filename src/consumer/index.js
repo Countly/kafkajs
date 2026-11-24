@@ -1361,7 +1361,7 @@ module.exports = (params) => {
         if (crashCleanup === cleaned) crashCleanup = null
       }
       let joining = null
-      const { deepest: originalCause } = walkCauses(e)
+      const { deepest: originalCause, recreated } = walkCauses(e)
       const crashStopGeneration = startGeneration + 1
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
@@ -1426,6 +1426,10 @@ module.exports = (params) => {
         // with the verdict that produced it.
         shouldRestart = false
       }
+
+      // A recreated topic has its own offsets: the application reconciles them before it starts
+      // the consumer again, so no restart policy may resume it.
+      if (recreated) shouldRestart = false
 
       if (!ownsCluster) shouldRestart = false
       // Two handlers must never process one partition at once.
