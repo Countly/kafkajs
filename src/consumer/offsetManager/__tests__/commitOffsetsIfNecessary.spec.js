@@ -29,7 +29,7 @@ describe('Consumer > OffsetMananger > commitOffsetsIfNecessary', () => {
           committedOffsets[topic][partition] = offsetManager.resolvedOffsets[topic][partition]
         }
       }
-      offsetManager.lastCommit = Date.now()
+      offsetManager.lastCommit = performance.now()
     }
   })
 
@@ -50,7 +50,7 @@ describe('Consumer > OffsetMananger > commitOffsetsIfNecessary', () => {
       offsetManager.autoCommitThreshold = undefined
       offsetManager.countResolvedOffsets = jest.fn(() => Long.fromValue(0))
       offsetManager.commitOffsets.mockImplementation(() => {
-        offsetManager.lastCommit = Date.now()
+        offsetManager.lastCommit = performance.now()
       })
 
       await offsetManager.commitOffsetsIfNecessary()

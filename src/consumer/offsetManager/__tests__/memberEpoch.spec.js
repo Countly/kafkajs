@@ -440,12 +440,12 @@ describe('Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site', () => {
     const logger = { debug: jest.fn(), error: jest.fn(), warn: jest.fn(), info: jest.fn() }
     const { manager } = build({ membershipProtocol: 'consumer', offsetCommit, logger })
     manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
-    manager.lastCommit = 0
+    manager.lastCommit = -1
 
     await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
 
     expect(offsetCommit).toHaveBeenCalledTimes(1)
-    expect(manager.lastCommit).toBeGreaterThan(0)
+    expect(manager.lastCommit).toBeGreaterThanOrEqual(0)
     expect(logger.error).toHaveBeenCalledTimes(1)
     expect(logger.error).toHaveBeenCalledWith(
       expect.any(String),
