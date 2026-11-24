@@ -1773,3 +1773,178 @@ describe('Metadata answers across a rebootstrap', () => {
     }
   })
 })
+
+describe('One install step per metadata answer', () => {
+  const PEER = { nodeId: 1, host: 'peer', port: 9092 }
+
+  /**
+   * One topic row: healthy with partition 0 led by the seed, or refused with no partitions.
+   * @param {string} topic
+   * @param {object} [options]
+   * @param {number} [options.code=0] the topic error code
+   * @param {string|null} [options.topicId=null]
+   * @param {number} [options.leaderEpoch=1]
+   * @returns {object} a decoded topic row
+   */
+  const row = (topic, { code = 0, topicId = null, leaderEpoch = 1 } = {}) => ({
+    topicErrorCode: code,
+    topic,
+    topicId,
+    isInternal: false,
+    partitionMetadata: code
+      ? []
+      : [
+          {
+            partitionErrorCode: 0,
+            partitionId: 0,
+            leader: 0,
+            leaderEpoch,
+            replicas: [0],
+            isr: [0],
+            offlineReplicas: [],
+          },
+        ],
+  })
+
+  /**
+   * A Cluster whose pool sends to the seed double of `build()` and builds pools with its builder.
+   * @param {object} [options] Cluster options over the defaults
+   * @returns {{ cluster: Cluster, pool: BrokerPool, seed: Broker, builder: object }}
+   */
+  const clusterWith = (options = {}) => {
+    const cluster = new Cluster({
+      logger: newLogger(),
+      clientId: 'client',
+      brokers: ['seed:9092'],
+      requestTimeout: 1000,
+      retry: { retries: 0 },
+      allowAutoTopicCreation: false,
+      ...options,
+    })
+    const fixture = build()
+    const pool = cluster.brokerPool
+    pool.connectionPoolBuilder = fixture.builder
+    pool.createBroker = fixture.pool.createBroker
+    pool.seedBroker = fixture.seed
+    pool.brokers = { 0: fixture.seed }
+    pool.findConnectedBroker = async () => fixture.seed
+    return { cluster, pool, seed: fixture.seed, builder: fixture.builder }
+  }
+
+  /**
+   * Records the broker table each routing notice sees.
+   * @param {BrokerPool} pool
+   * @returns {string[]} one `id:host` list per notice
+   */
+  const watchRouting = (pool) => {
+    const seen = []
+    pool.metadataCache.onRoutingChange(() =>
+      seen.push(
+        Object.entries(pool.brokers)
+          .map(([id, entry]) => `${id}:${entry.connectionPool.host}`)
+          .join(',')
+      )
+    )
+    return seen
+  }
+
+  describe('producer targets', () => {
+    it('a target forgotten and declared again while the answer pools are built is not installed from that answer', async () => {
+      const { cluster, pool, seed, builder } = clusterWith({ metadataMaxIdle: 60000 })
+      seed.metadata.mockResolvedValueOnce({ brokers: [SEED_NODE], topicMetadata: [row('orders')] })
+      await cluster.addTargetTopic('orders')
+      expect(cluster.findTopicPartitionMetadata('orders')).toHaveLength(1)
+
+      const builds = holdBuilds(builder)
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE, PEER],
+        topicMetadata: [row('orders', { leaderEpoch: 2 })],
+      })
+      const refreshing = outcome(cluster.refreshMetadata())
+      await settled()
+      expect(builds).toHaveLength(1)
+
+      cluster.forgetTargetTopic('orders')
+      cluster.targetTopics.add('orders')
+      cluster.touchTargetTopic('orders')
+      builds[0].release()
+
+      expect(await refreshing).toEqual({ value: undefined })
+      expect(pool.brokers[1].connectionPool.host).toBe('peer')
+      expect(cluster.findTopicPartitionMetadata('orders')).toEqual([])
+      expect(cluster.metadataCache.leaderEpoch('orders', 0)).toBe(-1)
+    })
+
+    it('an earlier target the answer refuses keeps its target and routing when the answer is not installed', async () => {
+      const { cluster, pool, seed, builder } = clusterWith({ metadataMaxIdle: 60000 })
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders'), row('gone')],
+      })
+      await cluster.addMultipleTargetTopics(['orders', 'gone'])
+      const builds = holdBuilds(builder)
+      const seen = watchRouting(pool)
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE, PEER],
+        topicMetadata: [row('orders'), row('gone', { code: 3 })],
+      })
+      const refusal = new Error('caller left')
+      let refused = null
+      const refreshing = outcome(cluster.refreshMetadata({ guard: () => refused }))
+      await settled()
+      expect(builds).toHaveLength(1)
+
+      refused = refusal
+      builds[0].release()
+      expect((await refreshing).error).toBe(refusal)
+      expect(cluster.targetTopics.has('gone')).toBe(true)
+      expect(cluster.findTopicPartitionMetadata('gone')).toHaveLength(1)
+      expect(seen).toEqual([])
+    })
+
+    it('an answer that drops an earlier target drops it at its install and wakes routing listeners once', async () => {
+      const { cluster, pool, seed, builder } = clusterWith({ metadataMaxIdle: 60000 })
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders'), row('gone')],
+      })
+      await cluster.addMultipleTargetTopics(['orders', 'gone'])
+      const builds = holdBuilds(builder)
+      const seen = watchRouting(pool)
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE, PEER],
+        topicMetadata: [row('orders'), row('gone', { code: 3 })],
+      })
+      const refreshing = outcome(cluster.refreshMetadata())
+      await settled()
+      expect(builds).toHaveLength(1)
+      expect(cluster.targetTopics.has('gone')).toBe(true)
+
+      builds[0].release()
+      expect(await refreshing).toEqual({ value: undefined })
+      expect(cluster.targetTopics.has('gone')).toBe(false)
+      expect(cluster.findTopicPartitionMetadata('gone')).toEqual([])
+      expect(cluster.findTopicPartitionMetadata('orders')).toHaveLength(1)
+      expect(seen).toEqual(['0:seed,1:peer'])
+    })
+
+    it('a refused new target beside a droppable earlier one fails the add and drops nothing', async () => {
+      const { cluster, seed } = clusterWith({ metadataMaxIdle: 60000 })
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders'), row('gone')],
+      })
+      await cluster.addMultipleTargetTopics(['orders', 'gone'])
+      seed.metadata.mockResolvedValueOnce({
+        brokers: [SEED_NODE],
+        topicMetadata: [row('orders'), row('gone', { code: 3 }), row('fresh', { code: 29 })],
+      })
+
+      const { error } = await outcome(cluster.addTargetTopic('fresh'))
+      expect(error).toMatchObject({ type: 'TOPIC_AUTHORIZATION_FAILED' })
+      expect(cluster.targetTopics.has('fresh')).toBe(false)
+      expect(cluster.targetTopics.has('gone')).toBe(true)
+      expect(cluster.findTopicPartitionMetadata('gone')).toHaveLength(1)
+    })
+  })
+})
