@@ -1219,6 +1219,7 @@ module.exports = class ConsumerGroupProtocol {
         this.logger.debug('Leaving without a heartbeat: no coordinator is known', {
           groupId: this.groupId,
         })
+        if (!leaveOwned()) return false
         this.onRequestGenerated({ leaveEpoch, stateAtRequest: this.state })
         return false
       }

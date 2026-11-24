@@ -160,6 +160,8 @@ module.exports = class Runner extends EventEmitter {
     this.terminated = false
     /** Whether a stop of this run has told the assigners to forget their state. */
     this.assignersCleared = false
+    /** Whether this run's stop ended before that, leaving the clear to the next run. */
+    this.assignersOwed = false
     /** @type {{ previous: Array<import('../../types').TopicPartitions>, invoked?: boolean }|null} */
     this.episode = null
     /**
@@ -919,6 +921,7 @@ module.exports = class Runner extends EventEmitter {
     }
     // A terminal stop that ended these stages takes the stop over, under the same close.
     if (this.terminated) await this.drainTerminated(operation)
+    this.assignersOwed = !this.assignersCleared
   }
 
   /**

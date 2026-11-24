@@ -729,7 +729,8 @@ module.exports = (params) => {
    *   [shutDownOptions] `true` and the crash's cleanup record for the crash handler
    * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent for the
    *   crash handler, which waits naturally
-   * @returns {Promise<void>}
+   * @returns {Promise<{ promise: Promise<void> }|undefined>} for the crash handler, the close it
+   *   left the disconnect to, which its report then waits for
    */
   const shutDown = async (
     stopOptions,
@@ -745,7 +746,7 @@ module.exports = (params) => {
         if (!(await closeWithin(operation, stopOptions, owned))) return
       } else {
         await stopShared(stopOptions)
-        if (closing) return
+        if (closing) return closing
         // Published before its diagnostic and transport run, so a close they start joins it.
         const teardown = Promise.resolve().then(async () => {
           logger.debug('consumer has stopped, disconnecting', { groupId })
@@ -780,8 +781,8 @@ module.exports = (params) => {
    * @param {{ leaveGroup?: boolean }} [stopOptions]
    * @param {ControlLifetime} owned the lifetime this close ends; its calls and connect are retired
    * @returns {Promise<boolean>} whether this close owns the DISCONNECT: false when a crash
-   *   cleanup it overlaps had already started its disconnect; rejects only for an ordinary failure
-   *   of a close that was not forced
+   *   cleanup it overlaps had already started its disconnect and that disconnect succeeded;
+   *   rejects only for an ordinary failure of a close that was not forced
    */
   const closeWithin = async (operation, stopOptions, owned) => {
     const captured = runner
@@ -822,7 +823,9 @@ module.exports = (params) => {
       if (failure && !forced) throw failure.reason
       if (failure)
         logger.warn('Disconnecting the cluster failed', { error: failure.reason.message })
-      return !joined
+      // That disconnect emitted DISCONNECT only if it succeeded; it has settled by now.
+      const crashFailed = await joined?.then(() => false).catch(() => true)
+      return !joined || crashFailed
     } finally {
       unregister()
     }
@@ -927,6 +930,12 @@ module.exports = (params) => {
   let stopping = null
 
   /**
+   * Whether a stopped run's close deadline cut its stop before the assigners were told to forget
+   * their state; the next run tells them before its first join.
+   */
+  let assignersOwed = false
+
+  /**
    * The one stop of the current run, shared by every caller. It is published before its body
    * runs, so a caller reentering from a log sink or a listener joins it, and it is keyed by the
    * run it stops: a replacement run gets its own stop.
@@ -962,6 +971,7 @@ module.exports = (params) => {
     try {
       if (target) {
         await target.stop(options, operation)
+        if (target.assignersOwed) assignersOwed = true
         if (runner === target) {
           runner = null
           consumerGroup = null
@@ -1293,6 +1303,17 @@ module.exports = (params) => {
         rebalanceListener: listener,
       })
       retainedMemberId = null
+      if (assignersOwed) {
+        assignersOwed = false
+        try {
+          group.clearAssignerState()
+        } catch (e) {
+          logger.error('Error while clearing the assigner state', {
+            groupId,
+            error: describeThrown(e),
+          })
+        }
+      }
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
       // A background chain and the fetch loop can both await one failed chain: the run reports
@@ -1360,7 +1381,8 @@ module.exports = (params) => {
      * @param {{ forced?: boolean, loss?: import('./runner').ForcedLoss }} [claim] `forced` when a
      *   fatal deadline retired the run while a handler may still run: such a crash never restarts.
      *   Every crash joins a close already in progress instead of tearing down beside it, and
-     *   leaves the disconnect to a close admitted while it stops. Its cleanup also waits for
+     *   leaves the disconnect to a close admitted while it stops; either way it is reported only
+     *   after that close. Its cleanup also waits for
      *   `loss`, the close callback the claim delivered, which the first close's deadline retires
      *   early.
      * @returns {Promise<void>}
@@ -1409,7 +1431,7 @@ module.exports = (params) => {
         // stop and one teardown. That close joins this cleanup, so it is awaited only after.
         joining = closing
         if (!joining)
-          await shutDown(undefined, {
+          joining = await shutDown(undefined, {
             keepResets: true,
             preserveSetupState: true,
             cleanup: cleaned,
