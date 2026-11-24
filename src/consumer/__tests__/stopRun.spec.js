@@ -1,4 +1,4 @@
-const { createLogger } = require('../../loggers')
+const { createLogger, LEVELS } = require('../../loggers')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
 const Runner = require('../runner')
 const { MemberAssignment } = require('../assignerProtocol')
@@ -821,6 +821,41 @@ describe('Consumer > a run stopped for good with an error', () => {
       ])
       forget()
     }, 30000)
+
+    it('a close asked while the crash cleanup disconnects emits DISCONNECT itself when that disconnect fails', async () => {
+      const run = await start()
+      const disconnected = countDisconnects(run.consumer)
+      const transport = run.cluster.disconnect.mock.calls.length
+      let failDrain = null
+      const draining = new Promise((_, reject) => {
+        failDrain = reject
+      })
+      run.cluster.disconnect.mockImplementation(async (options) => {
+        if (options?.preserveSetupState) await draining
+      })
+      const error = recreated()
+
+      parts(run).group.stopRun(error)
+      await advanceUntil(() => run.cluster.disconnect.mock.calls.length > transport, 1000)
+      const closing = settled(run.consumer.disconnect({ timeout: 1000 }))
+      await jest.advanceTimersByTimeAsync(10)
+
+      expect(closing.done).toBe(false)
+      expect(run.crashes).toEqual([])
+      expect(run.cluster.disconnect.mock.calls.slice(transport)).toEqual([
+        [{ preserveSetupState: true }],
+        [{ drainTimeout: 1000 }],
+      ])
+
+      failDrain(new Error('the drain failed'))
+      await advanceUntil(() => closing.done && run.crashes.length > 0, 100)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+      expect(disconnected).toHaveBeenCalledTimes(1)
+      forget()
+    }, 30000)
   })
 
   describe('a failing drain stage still lets the crash cleanup uninstall the run', () => {
@@ -1156,6 +1191,7 @@ describe('Consumer > a run stopped for good with an error', () => {
         const reset = jest.spyOn(group, 'resetGenerationLocally')
         const expiry = settled(rc.onPollExpired({ elapsedMs: 5000, isStatic: false }))
         await advanceUntil(written, 1000)
+        const resets = jest.spyOn(membership.sentFields, 'reset')
         const events = jest.fn()
         run.consumer.on(run.consumer.events.HEARTBEAT, events)
 
@@ -1168,10 +1204,52 @@ describe('Consumer > a run stopped for good with an error', () => {
         expect(leaves(run)).toHaveLength(1)
         expect(events).not.toHaveBeenCalled()
         expect(reset).not.toHaveBeenCalled()
+        expect(resets).not.toHaveBeenCalled()
         expect(membership.state).toBe('LEAVING')
       },
       30000
     )
+
+    it('completes nothing when stopRun comes from its diagnostic that no coordinator is known', async () => {
+      const noCoordinator = 'Leaving without a heartbeat: no coordinator is known'
+      const sink = { onNoCoordinator: null }
+      const logger = createLogger({
+        level: LEVELS.DEBUG,
+        logCreator:
+          () =>
+          ({ log }) => {
+            if (log.message === noCoordinator) sink.onNoCoordinator?.()
+          },
+      })
+      const run = await start({ logger })
+      const { rc, group, runner, membership } = parts(run)
+      const error = recreated()
+      let resets = null
+      sink.onNoCoordinator = () => {
+        sink.onNoCoordinator = null
+        group.stopRun(error)
+        resets = jest.spyOn(membership.sentFields, 'reset')
+      }
+      const stop = runner.heartbeatManager.stop.bind(runner.heartbeatManager)
+      jest.spyOn(runner.heartbeatManager, 'stop').mockImplementationOnce(async () => {
+        await stop()
+        membership.coordinator = null
+      })
+      const reset = jest.spyOn(group, 'resetGenerationLocally')
+      const rejoin = jest.spyOn(rc, 'requestRejoin')
+      const expiry = settled(rc.onPollExpired({ elapsedMs: 5000, isStatic: false }))
+      await advanceUntil(() => expiry.done && run.crashes.length > 0, 1000)
+
+      expect(expiry).toMatchObject({ done: true, value: undefined })
+      expect(resets).not.toBeNull()
+      expect(resets).not.toHaveBeenCalled()
+      expect(leaves(run)).toEqual([])
+      expect(membership.state).toBe('LEAVING')
+      expect(reset).not.toHaveBeenCalled()
+      expect(rejoin).not.toHaveBeenCalled()
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+    }, 30000)
   })
 
   describe('a fatal answer reserved during a poll-expiry leave, without stopRun', () => {
@@ -1568,6 +1646,52 @@ describe('Consumer > a run stopped for good with an error', () => {
       expect(
         lines.filter(({ message }) => message === 'Error while stopping the consumer group')
       ).toEqual([{ message: 'Error while stopping the consumer group', error: 'undefined' }])
+    }, 30000)
+
+    it('a bounded close whose deadline passes after its accepted final commit clears the assigners before the first JoinGroup of the next run', async () => {
+      let retained = null
+      const retaining = {
+        ...eager(),
+        protocol: () => ({ name: 'eager', metadata: Buffer.from(JSON.stringify(retained)) }),
+        onAssignment: (assignment, { generationId }) => {
+          retained = assignment && { partitions: assignment.partitions, generationId }
+        },
+      }
+      const delivered = []
+      const run = await startOther('classic', {
+        config: { partitionAssigners: [() => retaining] },
+        eachMessage: async ({ message }) => delivered.push(message.offset),
+      })
+      await advanceUntil(() => delivered.length === 1)
+      const { runner, coordinator } = run
+      expect(retained).toMatchObject({ generationId: 1 })
+      const commitFinal = runner.commitFinalOffsetsContained.bind(runner)
+      let written = null
+      jest.spyOn(runner, 'commitFinalOffsetsContained').mockImplementationOnce(async (scope) => {
+        await commitFinal(scope)
+        written = coordinator.offsetCommit.mock.calls.length
+        await new Promise((resolve) => setTimeout(resolve, 600))
+      })
+      const commits = coordinator.offsetCommit.mock.calls.length
+
+      const closing = settled(run.consumer.disconnect({ timeout: 500 }))
+      await advanceUntil(() => closing.done, 2000)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(runner.commitFinalOffsetsContained).toHaveBeenCalledTimes(1)
+      expect(written).toBe(commits + 1)
+      const [{ topics }] = coordinator.offsetCommit.mock.calls[commits]
+      expect(String(topics[0].partitions[0].offset)).toBe('41')
+      expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+
+      const joins = coordinator.joinGroup.mock.calls.length
+      const again = settled(run.consumer.run({ eachMessage: async () => {} }))
+      await advanceUntil(() => again.done && coordinator.joinGroup.mock.calls.length > joins, 2000)
+
+      expect(again).toMatchObject({ done: true, value: undefined })
+      expect(coordinator.joinGroup.mock.calls[joins][0].groupProtocols).toEqual([
+        { name: 'eager', metadata: Buffer.from('null') },
+      ])
     }, 30000)
 
     it('stopRun during the initial join reports its own error and a later JoinGroup answer syncs nothing', async () => {

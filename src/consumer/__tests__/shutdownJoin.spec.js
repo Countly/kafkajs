@@ -216,9 +216,10 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
     const hookHeld = deferred()
     const revoked = jest.fn()
     const crashTransport = deferred()
+    const policy = jest.fn(async () => false)
     let fail = false
     const run = await start({
-      retry: { retries: 0, initialRetryTime: 300, restartOnFailure: async () => false },
+      retry: { retries: 0, initialRetryTime: 300, restartOnFailure: policy },
       hook: {
         onPartitionsRevoked: async () => {
           revoked()
@@ -238,21 +239,48 @@ describe('Consumer > a close joining crash cleanup that is past its stop', () =>
     run.state.queue['topic-a|0'] = [40, 41, 42]
     fail = true
     await advanceUntil(() => revoked.mock.calls.length === 1, 3000)
-    return { run, hookHeld, crashTransport }
+    return { run, hookHeld, crashTransport, policy }
   }
 
-  it('a timed disconnect admitted while the crash cleanup stops owns the only cluster disconnect and DISCONNECT', async () => {
-    const { run, hookHeld } = await startCrashing()
-    const close = settled(run.consumer.disconnect({ timeout: 5 }))
-    await advanceUntil(() => close.done && run.crashes.length > 0, 200)
+  it('a timed disconnect admitted while the crash cleanup stops owns the only cluster disconnect and DISCONNECT, and the crash is decided and reported only after them', async () => {
+    const { run, hookHeld, crashTransport, policy } = await startCrashing()
+    const closeTransport = deferred()
+    const crashOnly = run.cluster.disconnect.getMockImplementation()
+    run.cluster.disconnect.mockImplementation(async (options) => {
+      if (!options?.preserveSetupState) await closeTransport.promise
+      return crashOnly(options)
+    })
+    run.consumer.on(run.consumer.events.CRASH, () =>
+      run.log.push({ kind: 'CRASH', at: Date.now() })
+    )
+    try {
+      const close = settled(run.consumer.disconnect({ timeout: 5 }))
+      await advanceUntil(() => run.cluster.disconnect.mock.calls.length > 0, 200)
+      await jest.advanceTimersByTimeAsync(200)
 
-    expect(close).toEqual({ done: true, value: undefined })
-    expect(run.crashes).toHaveLength(1)
-    expect(
-      run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
-    ).toEqual([{ drainTimeout: 0 }])
-    expect(count(run, 'DISCONNECT')).toBe(1)
-    hookHeld.resolve()
+      expect(run.cluster.disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
+      expect([close.done, policy.mock.calls.length, run.crashes.length]).toEqual([false, 0, 0])
+      expect(count(run, 'DISCONNECT')).toBe(0)
+
+      closeTransport.resolve()
+      await advanceUntil(() => close.done && run.crashes.length > 0, 1000)
+
+      expect(close).toEqual({ done: true, value: undefined })
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(run.crashes).toHaveLength(1)
+      expect(
+        run.log.filter(({ kind }) => kind === 'transport').map(({ options }) => options)
+      ).toEqual([{ drainTimeout: 0 }])
+      expect(
+        run.log
+          .filter(({ kind }) => kind === 'DISCONNECT' || kind === 'CRASH')
+          .map(({ kind }) => kind)
+      ).toEqual(['DISCONNECT', 'CRASH'])
+    } finally {
+      closeTransport.resolve()
+      hookHeld.resolve()
+      crashTransport.resolve()
+    }
   }, 60000)
 
   it('a plain disconnect resolves only after the crash cleanup it overlaps has finished its own cluster disconnect and DISCONNECT', async () => {
