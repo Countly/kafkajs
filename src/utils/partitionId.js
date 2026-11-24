@@ -16,18 +16,25 @@ const printable = (value) => {
 }
 
 /**
- * Checks that a value is a Kafka partition id: an integer from 0 to 2^31 - 1. A numeric string
- * such as `'0'`, `NaN`, a fraction or a negative number is not.
+ * Whether a value is an integer from 0 to 2^31 - 1, as a partition or broker id on the wire. A
+ * numeric string such as `'0'`, `NaN`, a fraction or a negative number is not.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+const isPartitionId = (value) => Number.isInteger(value) && value >= 0 && value <= MAX_PARTITION
+
+/**
+ * Checks that a value is a Kafka partition id (see `isPartitionId`).
  * @param {unknown} partition
  * @returns {void}
  * @throws {KafkaJSNonRetriableError} when it is not a partition id
  */
 const assertPartitionId = (partition) => {
-  if (!Number.isInteger(partition) || partition < 0 || partition > MAX_PARTITION) {
+  if (!isPartitionId(partition)) {
     throw new KafkaJSNonRetriableError(
       `Invalid partition, expected a number received ${printable(partition)}`
     )
   }
 }
 
-module.exports = { assertPartitionId }
+module.exports = { assertPartitionId, isPartitionId, printable }
