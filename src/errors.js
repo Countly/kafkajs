@@ -193,10 +193,12 @@ class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
     this.retryTime = retryTime
 
     // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
-    // walk the chain for the first typed link.
+    // walk the chain for the first typed link. A chain may loop: a link seen before ends it.
     let source = e
+    const seen = new Set()
     try {
-      while (source && source.type === undefined && source.cause) {
+      while (source && source.type === undefined && !seen.has(source)) {
+        seen.add(source)
         source = source.cause
       }
       if (source && source.type !== undefined) {
