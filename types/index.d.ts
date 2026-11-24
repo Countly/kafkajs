@@ -3343,6 +3343,32 @@ export class KafkaJSTimeout extends KafkaJSNonRetriableError {
   constructor()
 }
 
+  constructor()
+}
+
+/** One written request that changes broker state and got no answer, and the items it carried. */
+export interface UnknownOutcomeRequest {
+  /** The API name, such as `'DeleteRecords'`. */
+  readonly api: string
+  readonly apiVersion: number
+  readonly nodeId: number
+  /** The items it carried, such as `{ topic, partition }` cells; `null` when they could not be named. */
+  readonly items: unknown[] | null
+}
+
+/**
+ * An admin request that changes broker state was written and no answer arrived, so it may have
+ * been applied. The client does not send it again. Never retried: check the state of the items in
+ * `requests` before repeating the call.
+ */
+export class KafkaJSUnknownOutcomeError extends KafkaJSNonRetriableError {
+  readonly outcome: 'unknown'
+  readonly requests: UnknownOutcomeRequest[]
+  /** The error that ended the first of those requests. */
+  readonly cause?: Error
+  constructor(e: Error | string, options?: { requests?: UnknownOutcomeRequest[]; cause?: Error })
+}
+
 export class KafkaJSLockTimeout extends KafkaJSTimeout {
   constructor()
 }
