@@ -270,7 +270,7 @@ describe('Consumer > position validation', () => {
         validationScenario: 'reset',
         groupProtocol,
       })
-      group.maxWaitTime = 0
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue()
       group.topicConfigurations[TOPIC].resetPolicy = { kind }
       offsetManager.topicConfigurations[TOPIC].resetPolicy = { kind }
       const defaultOffset = jest.spyOn(cluster, 'defaultOffset').mockReturnValue('-1')
@@ -854,6 +854,7 @@ describe('Consumer > position validation', () => {
     })
 
     test('leader move: the old leader answers NOT_LEADER_OR_FOLLOWER, the forced refresh names the new leader, which validates; the partition is fetched within the backoff, not after metadataMaxAge', async () => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'performance'] })
       manualClock()
       const harness = await createGroup({ knownNodes: [0, 1] })
       const { group, cluster, fetchFrames, validationRequests, installRouting, findBrokerCalls } =
@@ -873,7 +874,7 @@ describe('Consumer > position validation', () => {
         cluster.leaderEpoch = () => 6
       })
 
-      await expect(group.fetch(0)).resolves.toEqual([])
+      await expect(finishRetries(group.fetch(0))).resolves.toEqual([])
       expect(fetchFrames()).toEqual([])
       expect(findBrokerCalls.map(({ nodeId }) => nodeId)).toEqual([0])
 
@@ -894,7 +895,7 @@ describe('Consumer > position validation', () => {
       const harness = await createGroup()
       const { group, cluster, metadataCache, fetchFrames, validationRequests, installRouting } =
         harness
-      group.maxWaitTime = 0
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue()
       cluster.leaderEpoch = metadataCache.leaderEpoch.bind(metadataCache)
       cluster.forgetLeaderEpoch.mockImplementation(
         metadataCache.forgetLeaderEpoch.bind(metadataCache)
@@ -941,7 +942,7 @@ describe('Consumer > position validation', () => {
       const { group, cluster, validationRequests, fetchFrames } = await createGroup({
         validationScenario: 'non-retriable',
       })
-      group.maxWaitTime = 0
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue()
       await group.fetch(NODE_ID)
       const failure = new KafkaJSNonRetriableError('refresh failed')
       cluster.refreshMetadata.mockRejectedValueOnce(failure)
@@ -1022,7 +1023,7 @@ describe('Consumer > position validation', () => {
       expect(fetchFrames()[1].forgottenTopics.map(({ partitions }) => partitions)).toEqual([[0]])
     })
 
-    test('a hold during connection setup refuses the staged Fetch and the next session starts full', async () => {
+    test('a hold during connection setup refuses the staged Fetch and the next request is full', async () => {
       manualClock()
       const harness = await withBusySibling({ fetchSessions: true })
       const { group, cluster, broker, fetchFrames } = harness
@@ -1061,11 +1062,15 @@ describe('Consumer > position validation', () => {
       }
       expect(fetchFrames().map(partitionsOf)).toEqual([[0, 1]])
 
-      harness.setResponse(fetchResponse([{ partition: 1, errorCode: 0 }], { sessionId: 43 }))
+      harness.setResponse(fetchResponse([{ partition: 1, errorCode: 0 }], { sessionId: 42 }))
       await group.fetch(NODE_ID)
 
       expect(fetchFrames().map(partitionsOf)).toEqual([[0, 1], [1]])
-      expect(fetchFrames()[1]).toMatchObject({ sessionId: 0, sessionEpoch: 0, forgottenTopics: [] })
+      expect(fetchFrames()[1]).toMatchObject({
+        sessionId: 42,
+        sessionEpoch: 0,
+        forgottenTopics: [],
+      })
     })
 
     test('per-partition backoff: with a busy sibling partition, a failing partition is asked again no sooner than 100 ms, then 200 ms, … at most 1000 ms; a new epoch is asked at once', async () => {
@@ -1304,7 +1309,7 @@ describe('Consumer > position validation', () => {
       const clock = manualClock()
       const harness = await createGroup()
       const { group, cluster, logger } = harness
-      group.maxWaitTime = 0
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue()
       harness.setValidationResponse(failPartitionZero(-1))
       const warn = jest.spyOn(logger, 'warn')
 
@@ -1390,7 +1395,7 @@ describe('Consumer > position validation', () => {
         validationScenario: 'non-retriable',
       })
 
-      group.maxWaitTime = 0
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue()
       await group.fetch(NODE_ID)
       expect(group.positionValidator.holdsFetch(TOPIC, 0)).toBe(true)
       expect(fetchFrames()).toEqual([])

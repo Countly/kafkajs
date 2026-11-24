@@ -8216,7 +8216,7 @@
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete a rejected forced refresh is retried before validating the held position",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete concurrent fetch preparations wait for the same forced refresh",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete an incremental Fetch forgets the partition whose epoch changed during the last validation",
-        "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete a hold during connection setup refuses the staged Fetch and the next session starts full",
+        "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete a hold during connection setup refuses the staged Fetch and the next request is full",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete a terminal sibling retry failure preserves the authorization error and holds both partitions",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete a truncation outcome keeps the partition out of the Fetch until the reposition has been applied",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a validation that does not complete an unapplied reposition keeps the original position held and emits no truncation",
