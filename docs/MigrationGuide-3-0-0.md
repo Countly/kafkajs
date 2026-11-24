@@ -643,15 +643,23 @@ says so, `groupProtocol: 'consumer'`.
   `FENCED_LEADER_EPOCH` is unaffected: there the client is behind, and a metadata refresh already
   converged.
 
-- **A fetch round can pause briefly after a leader election while positions are checked.** The
+- **A partition is not fetched after a leader election until its position has been checked.** The
   truncation check ("Log truncation is detected and acted on.") is a gate rather than a
-  background task: when a partition's leader epoch
-  changes, that partition is held out of the next fetch request until the new leader has answered
-  for it. The check has its own small budget — at most two retries, capped at five seconds of
-  backoff — and is not governed by your `retry` options; if it has not resolved by then, the round
-  fetches that partition unvalidated rather than stalling. Partitions whose epoch did not change are
-  fetched throughout. In practice this is a latency change measured in milliseconds, visible only
-  around leader elections and at the first fetch of a new assignment, and never a stall.
+  background task: when a partition's leader epoch changes, that partition is held out of fetch
+  requests until the new leader has answered for it and any repositioning has been applied. Each
+  round has its own small budget — at most two retries, capped at five seconds of backoff — and is
+  not governed by your `retry` options. A partition whose check does not complete (the request
+  fails, retriable errors outlast the budget, or the leader answers with an unexpected error) stays
+  held, as in the Java client: the consumer refreshes its metadata and asks again after a
+  per-partition backoff of 100 ms doubling up to 1 s, at once when the leader epoch changes, and
+  logs a warning naming the partition when it is first held and at most once a minute while it
+  stays held. A partition is never fetched unvalidated because a check failed, since that could
+  skip records after an unclean leader election. A `TOPIC_AUTHORIZATION_FAILED` answer fails the
+  fetch round like the same error on a Fetch. Partitions whose epoch did not change are fetched
+  throughout. Usually this is a latency change measured in milliseconds around leader elections and
+  at the first fetch of a new assignment; a partition whose current leader keeps refusing the check
+  while serving fetches is not consumed until it answers, which shows as these warnings and as
+  growing lag.
 
 - **`maxPollInterval` must be an integer from 1 to 2147483647; other values throw when the consumer
   is created.**

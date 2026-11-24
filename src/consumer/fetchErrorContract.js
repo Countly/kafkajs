@@ -47,9 +47,9 @@ const TOP_LEVEL_ACTIONS = new Map([
 ])
 
 /**
- * Retriable per-partition codes on an OffsetForLeaderEpoch response. Anything else is fatal for
- * the assignment - `TOPIC_AUTHORIZATION_FAILED` (29) is the one to expect, since v3 is the version
- * that relaxes the ACL to TOPIC Describe.
+ * Retriable per-partition codes on an OffsetForLeaderEpoch response. Anything else holds only its
+ * own partition until a later round validates it - `TOPIC_AUTHORIZATION_FAILED` (29) is the one to
+ * expect, since v3 is the version that relaxes the ACL to TOPIC Describe.
  * @type {Set<number>}
  */
 const RETRIABLE_VALIDATION_CODES = new Set([

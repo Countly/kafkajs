@@ -7,6 +7,10 @@ const { validationPartitionAction } = require('./fetchErrorContract')
  */
 const UNKNOWN_EPOCH = -1
 
+/** The first retry backoff of a held partition, and its cap (Java's `retry.backoff` defaults). */
+const RETRY_BACKOFF_MS = 100
+const MAX_RETRY_BACKOFF_MS = 1000
+
 /**
  * One state per assigned partition for KIP-320 position validation, and the outcome rules for a
  * reply to the OffsetForLeaderEpoch request that state produced.
@@ -15,17 +19,22 @@ const UNKNOWN_EPOCH = -1
  * The consumer group performs the requests, the seeks and the event emission; this class only
  * decides what should happen and remembers what is in flight.
  *
- * A partition moves between three states, keyed by `` `${topic}|${partition}` ``:
+ * A partition moves between these states, keyed by `` `${topic}|${partition}` ``:
  *
- * - **unvalidated** — no entry, or an entry whose request was discarded. The next `request()`
- *   examines it.
+ * - **unvalidated** — no entry. The next `request()` examines it; it may be fetched.
  * - **awaiting** — a request is in flight; the position it was built from is captured so a reply
- *   that arrives after the position moved can be recognised and dropped. An awaiting partition is
- *   kept out of the fetch request by the caller, so it must never stay here without a request in
- *   flight: every exit is either performed by `complete()` (validated, truncated, reset,
- *   discarded) or by the caller through `markValidated()`, `clear()` or `forgetTopic()`.
+ *   that arrives after the position moved can be recognised and dropped. It must never stay here
+ *   without a request in flight: every exit is either performed by `complete()` or by the caller
+ *   through `confirm()`, `fail()`, `release()`, `markValidated()`, `clear()` or `forgetTopic()`.
+ * - **held** — no request in flight and not validated: the request failed (`fail()`), its reply was
+ *   discarded, or a truncation or reset outcome is being applied. A held partition that failed
+ *   carries `failures`, `retryAt`, `failedAgainst` (the leader epoch it failed under),
+ *   `heldSince` and `warnedAt`; it is asked again once `retryAt` passes, at once under a new
+ *   leader epoch, and leaves the state on a seek (`forgetTopic()`) or a rebalance.
  * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against.
  *   The partition is re-examined only when the cached leader epoch differs from it.
+ *
+ * Awaiting and held partitions are kept out of every Fetch (`holdsFetch()`).
  *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
@@ -43,7 +52,6 @@ module.exports = class PositionValidator {
     this.logger = logger.namespace('PositionValidator')
     this.entries = new Map()
     this.assignmentGeneration = 0
-    this.disabled = false
   }
 
   /**
@@ -53,9 +61,9 @@ module.exports = class PositionValidator {
    * The single entry point for both the "cached leader epoch changed" trigger and the transition
    * into `awaiting`: a partition whose `validatedAgainst` differs from `currentLeaderEpoch` — a
    * partition that was never validated counts as different — needs a request, unless either epoch
-   * is unknown or validation is disabled, in which case it is recorded as validated straight away.
-   * That recording matters: without it the partition would be re-examined, and re-logged, on every
-   * round.
+   * is unknown, in which case it is recorded as validated straight away. That recording matters:
+   * without it the partition would be re-examined, and re-logged, on every round. A held entry it
+   * replaces passes on its failure count, `heldSince` and `warnedAt`.
    *
    * Anything other than `'unchanged'` means the leader epoch moved, which is the caller's signal to
    * clear the partition's preferred read replica. There is no separate "mark unvalidated" call.
@@ -79,14 +87,18 @@ module.exports = class PositionValidator {
       return { action: 'unchanged', generation }
     }
 
-    if (this.disabled || trackedEpoch === UNKNOWN_EPOCH || currentLeaderEpoch === UNKNOWN_EPOCH) {
+    if (trackedEpoch === UNKNOWN_EPOCH || currentLeaderEpoch === UNKNOWN_EPOCH) {
       this.markValidated(topic, partition, currentLeaderEpoch)
       return { action: 'validated', generation }
     }
 
+    const held = entry?.validatedAgainst === undefined ? entry : undefined
     this.entries.set(key, {
       validatedAgainst: undefined,
       pending: { offset, trackedEpoch, currentLeaderEpoch },
+      failures: held?.failures ?? 0,
+      heldSince: held?.heldSince,
+      warnedAt: held?.warnedAt,
     })
 
     return { action: 'awaiting', generation }
@@ -96,9 +108,8 @@ module.exports = class PositionValidator {
    * Records the partition as validated against `currentLeaderEpoch` without a reply, and takes it
    * out of `awaiting`.
    *
-   * This is the exit the caller uses whenever a request was expected but never made or never
-   * answered: a leader that cannot serve the API, a retry budget that ran out, a non-retriable
-   * error, or an unexpected failure inside the validation round.
+   * This is the exit the caller uses when no request can be made at all: a leader that cannot
+   * serve the API. A request that failed holds the partition instead (`fail()`).
    *
    * Generation-guarded like `complete()`: an exit that belongs to a previous assignment writes
    * nothing, so a fetcher finishing its round after a rebalance cannot record another fetcher's
@@ -136,18 +147,29 @@ module.exports = class PositionValidator {
    * @param {string} topic
    * @param {number} partition
    * @param {number} currentLeaderEpoch the cached leader epoch
-   * @returns {boolean} true when the partition is unvalidated or was validated against a different
-   *   epoch; false when it is already validated against this epoch, or a request is in flight for
-   *   it (whoever put it there owns its exit)
+   * @param {number} [now] the monotonic time (`performance.now()`) a held partition's backoff is
+   *   compared with
+   * @returns {boolean} true when the partition is unvalidated, held, or was validated against a
+   *   different epoch; false when it is already validated against this epoch, a request is in
+   *   flight for it (whoever put it there owns its exit), or it failed under this same leader
+   *   epoch and its backoff has not passed
    */
-  needsValidation(topic, partition, currentLeaderEpoch) {
+  needsValidation(topic, partition, currentLeaderEpoch, now) {
     const entry = this.entries.get(this.getKey(topic, partition))
 
     if (!entry) {
       return true
     }
 
-    return entry.pending ? false : entry.validatedAgainst !== currentLeaderEpoch
+    if (entry.pending) {
+      return false
+    }
+
+    if (entry.validatedAgainst !== undefined) {
+      return entry.validatedAgainst !== currentLeaderEpoch
+    }
+
+    return entry.failedAgainst !== currentLeaderEpoch || !(entry.retryAt > now)
   }
 
   /**
@@ -156,16 +178,17 @@ module.exports = class PositionValidator {
    * Four guards decide whether the reply is still relevant, and a reply that fails any of them is
    * `'discarded'`: the assignment generation is stale, the partition is no longer awaiting, the
    * position moved under the request, or a user seek has been queued for it meanwhile. A discard
-   * returns the partition to *unvalidated* here, in this call — skipping the call instead would
-   * leave it awaiting with no request in flight, and it would never be fetched again. The two kinds
-   * of discard differ in what they write: a moved position or a queued seek returns *that* key to
-   * unvalidated, while a stale generation or an absent key writes nothing at all, so a late reply
-   * cannot resurrect an entry the new assignment may not own, nor undo the validation of a
-   * partition the new assignment has since validated itself.
+   * ends the request here, in this call — skipping the call instead would leave it awaiting with
+   * no request in flight, and it would never be fetched again. The two kinds of discard differ in
+   * what they write: a moved position or a queued seek leaves *that* key held with no backoff, so
+   * the next round asks again, while a stale generation or an absent key writes nothing at all, so
+   * a late reply cannot resurrect an entry the new assignment may not own, nor undo the validation
+   * of a partition the new assignment has since validated itself.
    *
    * `'retry'` is not an exit from `awaiting`: it says the request should be reissued, and the
-   * partition is left in flight. `'fatal'` likewise leaves the state alone — the caller disables
-   * validation for the rest of the assignment and moves the partition on with `markValidated()`.
+   * partition is left in flight. `'fatal'` likewise leaves the state alone; the caller holds the
+   * partition with `fail()`. `'truncated'` and `'reset'` leave the partition held, not validated:
+   * the caller confirms it with `confirm()` once the reposition has been applied.
    *
    * @param {string} topic
    * @param {number} partition
@@ -224,15 +247,69 @@ module.exports = class PositionValidator {
 
     const end = Long.fromValue(endOffset)
 
-    this.markValidated(topic, partition, pending.currentLeaderEpoch)
-
     if (end.equals(UNKNOWN_EPOCH) || Long.fromValue(leaderEpoch).equals(UNKNOWN_EPOCH)) {
+      entry.pending = null
       return { action: 'reset', divergingOffset: null, leaderEpoch: UNKNOWN_EPOCH }
     }
 
-    return end.lessThan(Long.fromValue(currentPosition.offset))
-      ? { action: 'truncated', divergingOffset: end.toString(), leaderEpoch }
-      : { action: 'validated', divergingOffset: null, leaderEpoch }
+    if (end.lessThan(Long.fromValue(currentPosition.offset))) {
+      entry.pending = null
+      return { action: 'truncated', divergingOffset: end.toString(), leaderEpoch }
+    }
+
+    this.markValidated(topic, partition, pending.currentLeaderEpoch)
+    return { action: 'validated', divergingOffset: null, leaderEpoch }
+  }
+
+  /**
+   * Marks a held partition validated once its truncation or reset outcome has been applied.
+   * Identity-guarded like `release()`: a partition replaced, forgotten or cleared since is left
+   * alone.
+   * @param {{topic: string, partition: number, entry: object, currentLeaderEpoch: number}} item
+   *   the awaiting item, its entry captured with `entryOf`
+   * @returns {void}
+   */
+  confirm({ topic, partition, entry, currentLeaderEpoch }) {
+    if (entry !== undefined && this.entries.get(this.getKey(topic, partition)) === entry) {
+      this.markValidated(topic, partition, currentLeaderEpoch)
+    }
+  }
+
+  /**
+   * Holds the given partitions after their validation failed, so they are not fetched, and sets
+   * each one's retry backoff: 100 ms after the first failure, doubling up to 1000 ms. Identity-
+   * guarded like `release()`: an entry validated, replaced or forgotten since is left alone.
+   * @param {{topic: string, partition: number, entry: object, currentLeaderEpoch: number}[]} items
+   *   awaiting items, each entry captured with `entryOf`
+   * @param {number} now the monotonic time (`performance.now()`) the failure is recorded at
+   * @returns {object[]} the items whose entry this call held, for the caller's warning
+   */
+  fail(items, now) {
+    const held = []
+    for (const item of items) {
+      const entry = this.entries.get(this.getKey(item.topic, item.partition))
+      if (entry === undefined || entry !== item.entry) continue
+
+      entry.pending = null
+      entry.failures += 1
+      entry.retryAt =
+        now + Math.min(RETRY_BACKOFF_MS * 2 ** (entry.failures - 1), MAX_RETRY_BACKOFF_MS)
+      entry.failedAgainst = item.currentLeaderEpoch
+      entry.heldSince ??= now
+      held.push(item)
+    }
+    return held
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean} whether the partition must stay out of a Fetch: it is awaiting a reply or
+   *   held. A partition with no entry was never asked and is not held.
+   */
+  holdsFetch(topic, partition) {
+    const entry = this.entries.get(this.getKey(topic, partition))
+    return entry !== undefined && entry.validatedAgainst === undefined
   }
 
   /**
@@ -286,20 +363,6 @@ module.exports = class PositionValidator {
   }
 
   /**
-   * Switches validation off for the rest of this assignment, after a non-retriable error. Every
-   * partition then validates without a request. Re-armed by `clear()`.
-   * @returns {void}
-   */
-  disable() {
-    this.disabled = true
-  }
-
-  /** @returns {boolean} */
-  isDisabled() {
-    return this.disabled
-  }
-
-  /**
    * Drops the state of the given partitions of one topic, so they are validated again from
    * scratch. Used when a topic is recreated: what a partition was validated against belonged to
    * the previous incarnation.
@@ -335,15 +398,14 @@ module.exports = class PositionValidator {
   }
 
   /**
-   * Drops every partition, re-arms validation and stamps the next assignment generation. Called
-   * when the group syncs: a partition that was revoked and reassigned must not keep counting as
-   * validated against an epoch it no longer holds, and a reply to a request the previous
-   * assignment made must no longer be applied.
+   * Drops every partition and stamps the next assignment generation. Called when the group syncs:
+   * a partition that was revoked and reassigned must not keep counting as validated against an
+   * epoch it no longer holds, and a reply to a request the previous assignment made must no longer
+   * be applied.
    * @returns {void}
    */
   clear() {
     this.entries.clear()
-    this.disabled = false
     this.assignmentGeneration++
   }
 
