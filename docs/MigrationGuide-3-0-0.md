@@ -1657,13 +1657,6 @@ These issues are known in 3.0.0. A fix for each is planned for a later release.
   been read once by that client, later parallel reads of those topics are not affected. *What to
   do:* read each topic once, awaited, before you read topics in parallel, or await the calls in
   sequence.
-- **A metadata answer can arrive without its brokers.** This applies to every client. When the
-  seed broker is replaced while a metadata request is in flight because a connection failure
-  removed it, the answer's topic metadata is installed, but the brokers
-  it lists that the client did not already know, or knew at another address, are not added. The
-  next request to such a broker fails with the transient `KafkaJSBrokerNotFound` error
-  `Broker N not found in the cached metadata`, and the client refreshes its metadata. A call with
-  retries left recovers on its next attempt; a call with no retries left fails with that error.
 
 ### Coming from the Java or Go client
 

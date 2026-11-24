@@ -353,6 +353,8 @@ module.exports = class ConsumerGroup {
     this.subscription = subscription
     /** @type {{revision: number}|null} the newest discovered snapshot not yet handed to `updateSubscription` */
     this.discovered = null
+    // One observer for every discovery refresh, so the pool can tell one refresh did another's work.
+    this.discoveryObserver = (metadata) => this.observeDiscovery(metadata)
     this.notifiedRevision = null
     this.maxPrefetchBatches = maxPrefetchBatches
 
@@ -962,7 +964,7 @@ module.exports = class ConsumerGroup {
       allowLeaderless: true,
       metadataScope: this.subscription,
       isCurrent,
-      onMetadata: (metadata) => this.observeDiscovery(metadata),
+      onMetadata: this.discoveryObserver,
     }
 
     await (ifNecessary
