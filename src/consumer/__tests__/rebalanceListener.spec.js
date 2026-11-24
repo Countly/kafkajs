@@ -561,6 +561,28 @@ describe('awaited rebalance callbacks in a round', () => {
         'event:GROUP_JOIN',
       ])
     })
+
+    it('an initial-round assigned-callback failure reaches the close callback once', async () => {
+      rig = createHookRig({
+        listener: (log) =>
+          eachHook(log, {
+            onPartitionsAssigned: () => {
+              throw new Error('store')
+            },
+          }),
+      })
+      // The crash handler of a real consumer stops the run it reports.
+      rig.onCrash.mockImplementation(() => rig.runner.stop())
+      rig.joins.push({ assignment: { orders: [0] }, generationId: 2 })
+
+      await rig.start()
+
+      expect(rig.onCrash).toHaveBeenCalledTimes(1)
+      expect(rig.log.slice(rig.log.lastIndexOf('event:GROUP_JOIN') + 1)).toEqual([
+        'hook:onPartitionsRevoked',
+        'leave',
+      ])
+    })
   })
 
   describe('expiry', () => {
