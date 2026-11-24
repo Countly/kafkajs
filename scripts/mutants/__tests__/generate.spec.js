@@ -190,6 +190,7 @@ describe('scripts/mutants/generate.js', () => {
       'src/cluster/brokerPool.js#refreshMetadata',
       'src/cluster/brokerPool.js#refreshMetadataIfNecessary',
       'src/cluster/brokerPool.js#refreshMetadataUnshared',
+      'src/cluster/brokerPool.js#refreshPass',
       'src/cluster/index.js#refreshMetadataIfNecessary',
       'src/cluster/index.js#serveFromCache',
     ])
@@ -1027,8 +1028,8 @@ describe('scripts/mutants/generate.js', () => {
       [
         'aged metadata: a refresh begun before a disconnect installs nothing',
         'src/cluster/brokerPool.js',
-        'async refreshMetadataUnshared(',
-        '        if (!applicable()) return',
+        'async refreshPass(',
+        '      if (!applicable()) return false',
         'negated-condition',
         [
           `${PRODUCER}/__tests__/agedMetadata.spec.js`,

@@ -437,6 +437,12 @@ const AREAS = [
           `${CLUSTER_TESTS}/obsoleteDrain.spec.js`,
           `${CLUSTER_TESTS}/consumerTopicIsolation.spec.js`,
         ],
+        refreshPass: [
+          AGED_METADATA_SPEC,
+          `${CLUSTER_TESTS}/metadataCacheWiring.spec.js`,
+          `${CLUSTER_TESTS}/obsoleteDrain.spec.js`,
+          `${CLUSTER_TESTS}/consumerTopicIsolation.spec.js`,
+        ],
       },
       'src/cluster/index.js': {
         refreshMetadataIfNecessary: [AGED_METADATA_SPEC],
