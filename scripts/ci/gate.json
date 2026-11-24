@@ -11626,6 +11626,8 @@
         "src/oauth/__tests__/fileToken.spec.js \u203a OAuth file token a token file with trailing whitespace fails without echoing bytes",
         "src/oauth/__tests__/fileToken.spec.js \u203a OAuth file token a token file with two final newlines fails without echoing bytes",
         "src/oauth/__tests__/fileToken.spec.js \u203a OAuth file token a token file with two segments fails without echoing bytes",
+        "src/oauth/__tests__/fileToken.spec.js › OAuth file token a token that crosses clockSkew while its file is being checked is not kept",
+        "src/oauth/__tests__/fileToken.spec.js › OAuth file token a token that expires while its unchanged file is being checked is refused",
         "src/oauth/__tests__/fileToken.spec.js \u203a OAuth file token an empty rotated file cannot fall back to the old usable token",
         "src/oauth/__tests__/fileToken.spec.js \u203a OAuth file token an expired token file is refused",
         "src/oauth/__tests__/fileToken.spec.js \u203a OAuth file token an unchanged file is read again once at its refresh point",
