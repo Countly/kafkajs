@@ -151,7 +151,7 @@ describe('log directory administration', () => {
       futureLogDir: null,
     })
   })
-  it('keeps log-dir-not-found terminal while retrying only a timed-out replica', async () => {
+  it('does not resend REQUEST_TIMED_OUT', async () => {
     const broker = {
       alterReplicaLogDirs: jest
         .fn()
@@ -174,12 +174,34 @@ describe('log directory administration', () => {
     const { admin } = fixture(new Map([[1, broker]]))
     const replicas = [0, 1, 2].map((p) => ({ ...replica(p), logDir: '/data/b' }))
     const rows = await admin.alterReplicaLogDirs({ replicas })
-    expect(rows.map((r) => r.errorCode)).toEqual([57, 0, 0])
+    expect(rows.map((r) => r.errorCode)).toEqual([57, 7, 0])
     expect(rows[0].error).toMatchObject({ type: 'LOG_DIR_NOT_FOUND' })
-    expect(broker.alterReplicaLogDirs.mock.calls[1][0]).toEqual({
-      dirs: [{ path: '/data/b', topics: [{ topic: 't', partitions: [1] }] }],
-    })
+    expect(rows[1].error).toMatchObject({ type: 'REQUEST_TIMED_OUT' })
+    expect(broker.alterReplicaLogDirs).toHaveBeenCalledTimes(1)
     expect(replicas).toEqual([0, 1, 2].map((p) => ({ ...replica(p), logDir: '/data/b' })))
+  })
+  it('passes KafkaJSUnknownOutcomeError through unchanged', async () => {
+    const { KafkaJSUnknownOutcomeError } = require('../../errors')
+    const unknown = new KafkaJSUnknownOutcomeError('lost', { requests: [] })
+    const ok = {
+      alterReplicaLogDirs: jest.fn(async () => ({
+        topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 0 }] }],
+      })),
+    }
+    const lost = {
+      alterReplicaLogDirs: jest.fn(async () => {
+        throw unknown
+      }),
+    }
+    const { admin } = fixture(
+      new Map([
+        [1, ok],
+        [2, lost],
+      ])
+    )
+    const replicas = [replica(0), replica(0, 2)].map((r) => ({ ...r, logDir: '/data/b' }))
+    await expect(admin.alterReplicaLogDirs({ replicas })).rejects.toBe(unknown)
+    expect(lost.alterReplicaLogDirs).toHaveBeenCalledTimes(1)
   })
   it('rejects a missing alteration response identity instead of inferring success', async () => {
     const { admin } = fixture(new Map([[1, { alterReplicaLogDirs: async () => ({ topics: [] }) }]]))
@@ -685,11 +707,12 @@ describe('directory retry and monotonic expiry', () => {
     async (method) => {
       jest.useFakeTimers()
       try {
-        const send = jest.fn(async () =>
-          method === 'alterReplicaLogDirs'
-            ? { topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 7 }] }] }
-            : { errorCode: 7, logDirs: [] }
-        )
+        // A move is retried only when it failed before it was sent.
+        const unsent = Object.assign(new Error('connection refused'), { retriable: true })
+        const send = jest.fn(async () => {
+          if (method === 'alterReplicaLogDirs') throw unsent
+          return { errorCode: 7, logDirs: [] }
+        })
         const { cluster } = fixture(
           new Map([[1, { describeLogDirs: send, alterReplicaLogDirs: send }]])
         )
@@ -715,24 +738,16 @@ describe('directory retry and monotonic expiry', () => {
       }
     }
   )
-  it.each(['describeLogDirs', 'alterReplicaLogDirs'])(
+  it.each(['describeLogDirs'])(
     'keeps latest transport failure after %s request timeout',
     async (method) => {
       const failure = new Error('latest transport error')
       const send = jest
         .fn()
-        .mockResolvedValueOnce(
-          method === 'describeLogDirs'
-            ? { errorCode: 7, logDirs: [] }
-            : { topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 7 }] }] }
-        )
+        .mockResolvedValueOnce({ errorCode: 7, logDirs: [] })
         .mockRejectedValueOnce(failure)
       const { admin } = fixture(new Map([[1, { [method]: send }]]))
-      const options =
-        method === 'describeLogDirs'
-          ? { brokers: [1] }
-          : { replicas: [{ ...replica(), logDir: '/data/b' }] }
-      const rows = await admin[method](options)
+      const rows = await admin[method]({ brokers: [1] })
       expect(rows[0].errorCode).toBe(-1)
       expect(rows[0].error).toBe(failure)
     }

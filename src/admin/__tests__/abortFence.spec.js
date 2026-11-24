@@ -74,15 +74,89 @@ test.each([47, 52, 31])('abort code %i is typed and terminal', async (code) => {
   expect(f.broker.writeTxnMarkers).toHaveBeenCalledTimes(1)
 })
 
-test.each([6, 7])('abort code %i retries and refreshes only for a moved leader', async (code) => {
+test('abort code 6 retries and refreshes for a moved leader', async () => {
   const f = fixture()
   f.broker.writeTxnMarkers = jest
     .fn()
-    .mockResolvedValueOnce(response(code))
+    .mockResolvedValueOnce(response(6))
     .mockResolvedValueOnce(response())
   await expect(f.admin.abortTransaction(options)).resolves.toBeUndefined()
   expect(f.broker.writeTxnMarkers).toHaveBeenCalledTimes(2)
-  expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(code === 6 ? 2 : 1)
+  expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(2)
+})
+
+test('abort code 7 is not resent', async () => {
+  const f = fixture()
+  f.broker.writeTxnMarkers = jest
+    .fn()
+    .mockResolvedValueOnce(response(7))
+    .mockResolvedValueOnce(response())
+  await expect(f.admin.abortTransaction(options)).rejects.toMatchObject({
+    code: 7,
+    type: 'REQUEST_TIMED_OUT',
+  })
+  expect(f.broker.writeTxnMarkers).toHaveBeenCalledTimes(1)
+  expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+})
+
+describe('through the replay latch of a real broker', () => {
+  const { latchedBroker } = require('../../../testHelpers/latchedBroker')
+  const { KafkaJSUnknownOutcomeError } = require('../../errors')
+  const versions = {
+    [apiKeys.InitProducerId]: { minVersion: 0, maxVersion: 5 },
+    [apiKeys.WriteTxnMarkers]: { minVersion: 1, maxVersion: 2 },
+  }
+  const fenced = { decoded: { errorCode: 0, producerId: '7', producerEpoch: 1 } }
+
+  /** @param {Array} answers see `latchedBroker` @returns {object} fixture routed to a real broker */
+  const routed = (answers) => {
+    const f = fixture()
+    const real = latchedBroker(answers, { versions })
+    f.cluster.findGroupCoordinator.mockImplementation(async () => real.broker)
+    f.cluster.findBroker.mockImplementation(async () => real.broker)
+    return { ...f, ...real }
+  }
+
+  test('an unanswered fence is not sent again and is reported unknown', async () => {
+    const f = routed(['lost', fenced])
+    const error = await f.admin.fenceProducers({ transactionalIds: ['x'] }).catch((e) => e)
+    expect(f.written).toEqual(['InitProducerId'])
+    expect(error.constructor).toBe(KafkaJSUnknownOutcomeError)
+    expect(error.cause).toBe(f.lost)
+    expect(error.requests).toEqual([
+      { api: 'InitProducerId', apiVersion: 5, nodeId: 1, items: ['x'] },
+    ])
+  })
+
+  test('a fence answered COORDINATOR_NOT_AVAILABLE is resent once', async () => {
+    const f = routed([{ decoded: { errorCode: 15 }, error: reply(15) }, fenced])
+    const rows = await f.admin.fenceProducers({ transactionalIds: ['x'] })
+    expect(f.written).toEqual(['InitProducerId', 'InitProducerId'])
+    expect(rows).toEqual([
+      expect.objectContaining({
+        transactionalId: 'x',
+        producerId: '7',
+        producerEpoch: 1,
+        errorCode: 0,
+      }),
+    ])
+  })
+
+  test('an abort marker answered NOT_LEADER_OR_FOLLOWER is resent once', async () => {
+    const f = routed([{ decoded: response(6) }, { decoded: response() }])
+    await expect(f.admin.abortTransaction(options)).resolves.toBeUndefined()
+    expect(f.written).toEqual(['WriteTxnMarkers', 'WriteTxnMarkers'])
+  })
+
+  test('an unanswered abort marker is not sent again and is reported unknown', async () => {
+    const f = routed(['lost', { decoded: response() }])
+    const error = await f.admin.abortTransaction(options).catch((e) => e)
+    expect(f.written).toEqual(['WriteTxnMarkers'])
+    expect(error.constructor).toBe(KafkaJSUnknownOutcomeError)
+    expect(error.requests[0].items).toEqual([
+      { topic: 'orders', partition: 2, producerId: options.producerId },
+    ])
+  })
 })
 
 test.each([

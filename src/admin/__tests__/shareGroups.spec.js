@@ -797,6 +797,42 @@ describe('share administration', () => {
       ).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
       expect(broker.describeShareGroupOffsets).toHaveBeenCalledTimes(1)
     })
+
+    describe('through the replay latch of a real coordinator', () => {
+      const { latchedBroker } = require('../../../testHelpers/latchedBroker')
+      const { KafkaJSUnknownOutcomeError } = require('../../errors')
+      const applied = expected.alterShareGroupOffsetsV0.response
+
+      /** @param {Array} answers see `latchedBroker` @returns {object} a real share coordinator */
+      const real = (answers) => {
+        const stub = coordinator()
+        const latched = latchedBroker(answers, { versions: stub.versions, nodeId: 0 })
+        latched.broker.finalizedFeatures = stub.finalizedFeatures
+        latched.broker.finalizedFeaturesEpoch = stub.finalizedFeaturesEpoch
+        return latched
+      }
+
+      test('resends an alteration answered COORDINATOR_LOAD_IN_PROGRESS once', async () => {
+        const loading = { ...applied, errorCode: 14, errorMessage: null, responses: [] }
+        const { broker, written } = real([{ decoded: loading }, { decoded: applied }])
+        f = fixture([broker])
+        const rows = await f.admin.alterShareGroupOffsets(ALTER[1])
+        expect(written).toEqual(['AlterShareGroupOffsets', 'AlterShareGroupOffsets'])
+        expect(rows).toEqual(await fixture([coordinator()]).admin.alterShareGroupOffsets(ALTER[1]))
+      })
+
+      test('does not resend an alteration whose answer was lost', async () => {
+        const { broker, written, lost } = real(['lost', { decoded: applied }])
+        f = fixture([broker])
+        const error = await f.admin.alterShareGroupOffsets(ALTER[1]).catch((e) => e)
+        expect(written).toEqual(['AlterShareGroupOffsets'])
+        expect(error.constructor).toBe(KafkaJSUnknownOutcomeError)
+        expect(error.cause).toBe(lost)
+        expect(error.requests[0].items).toEqual([
+          { groupId: 'share-group', topic: 'alpha', partition: 0 },
+        ])
+      })
+    })
   })
 
   describe('capability', () => {

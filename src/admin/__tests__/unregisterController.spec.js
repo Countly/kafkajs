@@ -114,7 +114,7 @@ describe('Admin > unregisterController', () => {
   })
 
   test('retries a retriable code and then succeeds', async () => {
-    const broker = brokerOver(1, CAPABLE, [wire.buildResponse({ errorCode: 7 }), OK])
+    const broker = brokerOver(1, CAPABLE, [wire.buildResponse({ errorCode: 41 }), OK])
     const { admin } = fixture([broker])
     const call = observe(admin.unregisterController({ controllerId: 7 }))
     await jest.advanceTimersByTimeAsync(0)

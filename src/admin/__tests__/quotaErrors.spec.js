@@ -267,3 +267,30 @@ describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
     }
   )
 })
+
+describe('Admin > createTopics > a written request gets no answer', () => {
+  test('passes KafkaJSUnknownOutcomeError through unchanged, even beside a topic refused for good', async () => {
+    const { KafkaJSUnknownOutcomeError } = require('../../errors')
+    const unknown = new KafkaJSUnknownOutcomeError('lost', { requests: [] })
+    const { admin, broker } = adminAnswering(APIS[0], [
+      [
+        ['a', 37],
+        ['b', NOT_CONTROLLER],
+      ],
+    ])
+    broker.createTopics.mockImplementationOnce(async () =>
+      createTopicsResponse.parse({
+        topicErrors: [
+          { topic: 'a', errorCode: 37 },
+          { topic: 'b', errorCode: NOT_CONTROLLER },
+        ],
+      })
+    )
+    broker.createTopics.mockRejectedValueOnce(unknown)
+
+    await expect(
+      admin.createTopics({ topics: [{ topic: 'a' }, { topic: 'b' }], waitForLeaders: false })
+    ).rejects.toBe(unknown)
+    expect(broker.createTopics).toHaveBeenCalledTimes(2)
+  })
+})

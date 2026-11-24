@@ -74,6 +74,19 @@ describe('delete group offsets', () => {
     })
     expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
   })
+  it('passes KafkaJSUnknownOutcomeError through unchanged, not the undecodable reply it carries', async () => {
+    const { KafkaJSUnknownOutcomeError, KafkaJSInvariantViolation } = require('../../errors')
+    const unknown = new KafkaJSUnknownOutcomeError('lost', {
+      requests: [],
+      cause: new KafkaJSInvariantViolation('Unexpected response bytes'),
+    })
+    const broker = { offsetDelete: jest.fn().mockRejectedValue(unknown) }
+    const cluster = { findGroupCoordinator: jest.fn(async () => broker) }
+    await expect(
+      createAdmin({ cluster, logger, retry }).deleteOffsets({ groupId: 'g', topics })
+    ).rejects.toBe(unknown)
+    expect(broker.offsetDelete).toHaveBeenCalledTimes(1)
+  })
   it.each(['', null, 'bad\0name'])('refuses invalid group %p before discovery', async (groupId) => {
     const cluster = { findGroupCoordinator: jest.fn() }
     await expect(

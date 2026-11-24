@@ -83,23 +83,44 @@ describe('Protocol > Requests', () => {
   })
 
   describe('lookup', () => {
-    it('a built request keeps its input and does not encode it', async () => {
-      const versions = {
-        [apiKeys.DeleteRecords]: { minVersion: 0, maxVersion: 2 },
-        [apiKeys.Metadata]: { minVersion: 0, maxVersion: 2 },
-      }
-      const args = {
-        topics: [{ topic: 't', partitions: [{ partition: 0, offset: '5' }] }],
-        timeout: 5000,
-      }
+    const lookupVersions = {
+      [apiKeys.DeleteRecords]: { minVersion: 0, maxVersion: 2 },
+      [apiKeys.Metadata]: { minVersion: 0, maxVersion: 2 },
+    }
+    const deletion = () => ({
+      topics: [{ topic: 't', partitions: [{ partition: 0, offset: '5' }] }],
+      timeout: 5000,
+    })
 
-      const built = lookup(versions)(apiKeys.DeleteRecords, requests.DeleteRecords)(args)
-      const plain = requests.DeleteRecords.protocol({ version: 2 })(args)
+    it('inside an admin call, builds a request that changes broker state from a private copy of its input, kept unencoded', async () => {
+      const { runWithDeadline } = require('../../admin/deadline')
+      const args = deletion()
+      const plain = await requests.DeleteRecords.protocol({ version: 2 })(
+        deletion()
+      ).request.encode()
 
-      expect(built.args).toBe(args)
-      expect((await built.request.encode()).buffer).toEqual((await plain.request.encode()).buffer)
-      const read = lookup(versions)(apiKeys.Metadata, requests.Metadata)({ topics: ['t'] })
+      const [built, read] = await runWithDeadline('deleteTopicRecords', 1000, () => [
+        lookup(lookupVersions)(apiKeys.DeleteRecords, requests.DeleteRecords)(args),
+        lookup(lookupVersions)(apiKeys.Metadata, requests.Metadata)({ topics: ['t'] }),
+      ])
+      args.topics[0].topic = 'other'
+      args.topics[0].partitions[0].offset = '9'
+
+      expect(built.args).not.toBe(args)
+      expect(built.args).toEqual(deletion())
+      expect((await built.request.encode()).buffer).toEqual(plain.buffer)
       expect(read).not.toHaveProperty('args')
+    })
+
+    it('outside an admin call, builds every request from its input as it is', async () => {
+      const args = deletion()
+
+      const built = lookup(lookupVersions)(apiKeys.DeleteRecords, requests.DeleteRecords)(args)
+      args.topics[0].topic = 'other'
+      const changed = await requests.DeleteRecords.protocol({ version: 2 })(args).request.encode()
+
+      expect(built).not.toHaveProperty('args')
+      expect((await built.request.encode()).buffer).toEqual(changed.buffer)
     })
 
     describe('when the client support more versions than the server', () => {

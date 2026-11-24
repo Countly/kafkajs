@@ -259,7 +259,7 @@ test('a transient controller refresh failure preserves feature successes', async
         errorMessage: null,
       })),
     }))
-  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2) })
+  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
   expect(f.broker.updateFeatures.mock.calls[1][0].featureUpdates.map((f) => f.feature)).toEqual([
     'b',
   ])
@@ -282,11 +282,48 @@ test('an exhausted controller refresh failure preserves feature successes', asyn
       errorMessage: null,
     })),
   }))
-  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2) })
+  const rows = await f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
   expect(rows.map((f) => f.errorCode)).toEqual([0, -1])
   expect(rows[0].error).toBeNull()
   expect(rows[1].error).toBe(original)
   expect(f.broker.updateFeatures).toHaveBeenCalledTimes(1)
+  expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+})
+
+test('a feature update answered NOT_CONTROLLER or REQUEST_TIMED_OUT on its own row is not sent again', async () => {
+  const f = fixture({}, { ...retry, retries: 2 })
+  f.broker.updateFeatures = jest
+    .fn()
+    .mockResolvedValueOnce({
+      results: [
+        { feature: 'a', errorCode: 0, errorMessage: null },
+        { feature: 'b', errorCode: 41, errorMessage: 'moved' },
+        { feature: 'c', errorCode: 7, errorMessage: null },
+      ],
+    })
+    .mockImplementation(async ({ featureUpdates }) => ({
+      results: featureUpdates.map(({ feature }) => ({ feature, errorCode: 0, errorMessage: null })),
+    }))
+  const rows = await f.admin.updateFeatures({ features })
+  expect(rows.map((r) => r.errorCode)).toEqual([0, 41, 7])
+  expect(f.broker.updateFeatures).toHaveBeenCalledTimes(1)
+  expect(f.cluster.refreshMetadata).not.toHaveBeenCalled()
+})
+
+test('resends a feature update whose whole request was answered NOT_CONTROLLER', async () => {
+  const f = fixture({}, { ...retry, retries: 2 })
+  f.broker.updateFeatures = jest
+    .fn()
+    .mockRejectedValueOnce(createErrorFromCode(41))
+    .mockResolvedValue({ results: null })
+  const rows = await f.admin.updateFeatures({ features })
+  expect(rows.map((r) => r.errorCode)).toEqual([0, 0, 0])
+  expect(
+    f.broker.updateFeatures.mock.calls.map(([call]) => call.featureUpdates.map((u) => u.feature))
+  ).toEqual([
+    ['a', 'b', 'c'],
+    ['a', 'b', 'c'],
+  ])
   expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
 })
 
@@ -320,7 +357,9 @@ test.each(['KafkaJSSASLAuthenticationError', 'KafkaJSServerDoesNotSupportApiKey'
         { feature: 'b', errorCode: 41 },
       ],
     }))
-    await expect(f.admin.updateFeatures({ features: features.slice(0, 2) })).rejects.toBe(original)
+    await expect(
+      f.admin.updateFeatures({ features: features.slice(0, 2), validateOnly: true })
+    ).rejects.toBe(original)
     expect(f.broker.updateFeatures).toHaveBeenCalledTimes(1)
     expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
   }
@@ -344,7 +383,7 @@ test('deadline during controller refresh forbids another mutation request', asyn
     ],
   }))
   const result = f.admin
-    .updateFeatures({ ...{ features: features.slice(0, 2) }, apiTimeout: 20 })
+    .updateFeatures({ features: features.slice(0, 2), validateOnly: true, apiTimeout: 20 })
     .catch((e) => e)
   try {
     await jest.advanceTimersByTimeAsync(5)

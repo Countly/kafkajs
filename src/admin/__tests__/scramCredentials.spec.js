@@ -415,7 +415,7 @@ describe('SCRAM request capabilities and read retry', () => {
       alterUserScramCredentials: async () => ({
         results: [
           { user: 'a', errorCode: 0 },
-          { user: 'b', errorCode: 7 },
+          { user: 'b', errorCode: 41 },
         ],
       }),
     }

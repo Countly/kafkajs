@@ -86,12 +86,36 @@ describe('client quotas', () => {
     }
     const cluster = { findConnectedBroker: async () => broker }
     const admin = createAdmin({ cluster, logger, retry })
-    const result = await admin.alterClientQuotas({ entries: [entry('a'), entry('b')] })
+    const result = await admin.alterClientQuotas({
+      entries: [entry('a'), entry('b')],
+      validateOnly: true,
+    })
     expect(result.map(({ entity }) => entity[0].entityName)).toEqual(['a', 'b'])
     expect(attempts.map((rows) => rows.map(({ entity }) => entity[0].entityName))).toEqual([
       ['a', 'b'],
       ['b'],
     ])
+  })
+
+  test('does not resend REQUEST_TIMED_OUT', async () => {
+    const broker = {
+      alterClientQuotas: jest.fn(async ({ entries }) => ({
+        entries: entries.map(({ entity }) => ({
+          entity,
+          errorCode: entity[0].entityName === 'b' ? 7 : 0,
+          errorMessage: null,
+        })),
+      })),
+    }
+    const admin = createAdmin({
+      cluster: { findConnectedBroker: async () => broker },
+      logger,
+      retry,
+    })
+    const rows = await admin.alterClientQuotas({ entries: [entry('a'), entry('b')] })
+    expect(rows.map(({ errorCode }) => errorCode)).toEqual([0, 7])
+    expect(rows[1].error).toMatchObject({ type: 'REQUEST_TIMED_OUT' })
+    expect(broker.alterClientQuotas).toHaveBeenCalledTimes(1)
   })
 
   test('exhaustion retains the last typed row and a remove has zero only on the wire', async () => {
@@ -252,7 +276,7 @@ describe('security administration capability and retained outcomes', () => {
       cluster: { findConnectedBroker },
       logger,
       retry,
-    }).alterClientQuotas({ entries: [entry('a'), entry('b')] })
+    }).alterClientQuotas({ entries: [entry('a'), entry('b')], validateOnly: true })
     expect(rows[0]).toMatchObject({ errorCode: 0, error: null })
     expect(rows[1].errorCode).toBe(-1)
     expect(rows[1].error).toBe(local)

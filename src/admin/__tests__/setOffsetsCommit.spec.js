@@ -147,32 +147,44 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
         api: 'OffsetCommit',
         nodeId: 0,
         items: [
-          { topic: TOPIC, partition: 0 },
-          { topic: TOPIC, partition: 1 },
+          { groupId: 'reset-group', topic: TOPIC, partition: 0 },
+          { groupId: 'reset-group', topic: TOPIC, partition: 1 },
         ],
       }),
     ])
     expect(commits()).toHaveLength(1)
   })
 
-  test('a retriable code is not sent again once answered: the call rejects with the aggregate naming that partition', async () => {
-    answerCommit((partition) => (partition === 1 ? 14 : 0))
-    await connect({ requestTimeout: 300, retry: { ...RETRY, retries: 1 } })
+  test('a partition answered with a retriable code is sent again alone, and a lost answer to that resend rejects with KafkaJSUnknownOutcomeError and no third commit', async () => {
+    let attempt = 0
+    scripted.answer('OffsetCommit', ({ topics }) => {
+      attempt += 1
+      if (attempt > 1) return new Promise((resolve) => release.push(resolve))
+      return {
+        topics: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({
+            partition,
+            errorCode: partition === 1 ? 14 : 0,
+          })),
+        })),
+      }
+    })
+    await connect({ requestTimeout: 300, retry: { ...RETRY, retries: 2 } })
 
     const error = await outcomeOf(() => set(twoPartitions), 50)
 
-    expect(error.name).toBe('KafkaJSAggregateError')
-    expect(error.message).toBe(
-      'Offsets not committed for 1 of 2 partitions: 1 (GROUP_LOAD_IN_PROGRESS)'
-    )
-    expect(error.errors.map(({ partition, topic, code }) => [partition, topic, code])).toEqual([
-      [1, TOPIC, 14],
+    expect(error).toMatchObject({ name: 'KafkaJSUnknownOutcomeError', outcome: 'unknown' })
+    expect(error.cause.name).toBe('KafkaJSRequestTimeoutError')
+    expect(error.requests.map(({ items }) => items)).toEqual([
+      [{ groupId: 'reset-group', topic: TOPIC, partition: 1 }],
     ])
     expect(cells()).toEqual([
       [
         [0, '3'],
         [1, '4'],
       ],
+      [[1, '4']],
     ])
   })
 
@@ -231,28 +243,32 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
   test.each([
     [14, 'GROUP_LOAD_IN_PROGRESS'],
     [27, 'REBALANCE_IN_PROGRESS'],
-  ])('a partition answered %i (%s) is not sent again and rejects naming it', async (code, name) => {
+  ])('a partition answered %i (%s) is sent again alone, to the same coordinator', async (code) => {
     answerCommit((partition, attempt) => (partition === 1 && attempt === 1 ? code : 0))
     await connect()
+    await expect(set(twoPartitions)).resolves.toBeUndefined()
 
-    const error = await outcomeOf(() => set(twoPartitions), 50)
-
-    expect(error.name).toBe('KafkaJSAggregateError')
-    expect(error.errors.map(({ partition, type }) => [partition, type])).toEqual([[1, name]])
     expect(cells()).toEqual([
       [
         [0, '3'],
         [1, '4'],
       ],
+      [[1, '4']],
     ])
+    const between = scripted
+      .requests()
+      .slice(scripted.requests().indexOf(commits()[0]), scripted.requests().indexOf(commits()[1]))
+      .map(({ api }) => api)
+    expect(between).not.toContain('FindCoordinator')
+    expect(commits().map(({ node }) => node)).toEqual([0, 0])
   })
 
   test.each([
     [15, 'GROUP_COORDINATOR_NOT_AVAILABLE'],
     [16, 'NOT_COORDINATOR_FOR_GROUP'],
   ])(
-    'a coordinator that answered %i (%s) is looked up again but the commit is not sent to the new one',
-    async (code, name) => {
+    'a coordinator that answered %i (%s) is looked up again and the retry goes to the new one',
+    async (code) => {
       scripted.answer('FindCoordinator', ({ coordinatorKeys }) => {
         const node = NODES[commits().length > 0 ? 1 : 0]
         return {
@@ -269,19 +285,18 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
       answerCommit((partition, attempt) => (attempt === 1 ? code : 0))
       await connect()
 
-      const error = await outcomeOf(() => set(twoPartitions), 50)
+      await expect(set(twoPartitions)).resolves.toBeUndefined()
 
-      expect(error.name).toBe('KafkaJSAggregateError')
-      expect(error.errors.map(({ partition, type }) => [partition, type])).toEqual([
-        [0, name],
-        [1, name],
-      ])
-      expect(commits().map(({ node }) => node)).toEqual([0])
-      expect(apis().slice(apis().indexOf('OffsetCommit'))).toContain('FindCoordinator')
+      expect(commits().map(({ node }) => node)).toEqual([0, 1])
+      const between = scripted
+        .requests()
+        .slice(scripted.requests().indexOf(commits()[0]), scripted.requests().indexOf(commits()[1]))
+        .map(({ api }) => api)
+      expect(between).toContain('FindCoordinator')
     }
   )
 
-  test('a coordinator answering NOT_COORDINATOR_FOR_GROUP (16) for every partition rejects with one child each, after one commit', async () => {
+  test('a coordinator that keeps moving rejects with NOT_COORDINATOR_FOR_GROUP (16) children after every attempt', async () => {
     answerCommit(() => 16)
     await connect()
 
@@ -292,7 +307,7 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
       [0, 'NOT_COORDINATOR_FOR_GROUP'],
       [1, 'NOT_COORDINATOR_FOR_GROUP'],
     ])
-    expect(commits()).toHaveLength(1)
+    expect(commits()).toHaveLength(RETRY.retries + 1)
   })
 
   test('a member that joined after the precheck makes the coordinator refuse with UNKNOWN_MEMBER_ID, and the admin never joins', async () => {
@@ -323,17 +338,29 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
     expect(commits()).toHaveLength(1)
   })
 
-  test('a partition confirmed, one refused and one answered with a retriable code: one child per failed partition, nothing sent again', async () => {
+  test('a partition confirmed, one refused and one retried then unanswered: only the retriable partition is sent again, and the call rejects with KafkaJSUnknownOutcomeError', async () => {
     scripted = groupScript(createScriptedCluster({ nodes: NODES }), { partitions: 3 })
-    answerCommit((partition) => [0, 12, 14][partition])
-    await connect({ requestTimeout: 300, retry: { ...RETRY, retries: 1 } })
+    let attempt = 0
+    scripted.answer('OffsetCommit', ({ topics }) => {
+      attempt += 1
+      if (attempt > 1) return new Promise((resolve) => release.push(resolve))
+      return {
+        topics: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({
+            partition,
+            errorCode: [0, 12, 14][partition],
+          })),
+        })),
+      }
+    })
+    await connect({ requestTimeout: 300, retry: { ...RETRY, retries: 2 } })
 
     const error = await outcomeOf(() => set([...twoPartitions, { partition: 2, offset: '5' }]), 50)
 
-    expect(error.name).toBe('KafkaJSAggregateError')
-    expect(error.errors.map(({ partition, topic, type }) => [partition, topic, type])).toEqual([
-      [1, TOPIC, 'OFFSET_METADATA_TOO_LARGE'],
-      [2, TOPIC, 'GROUP_LOAD_IN_PROGRESS'],
+    expect(error).toMatchObject({ name: 'KafkaJSUnknownOutcomeError', outcome: 'unknown' })
+    expect(error.requests.map(({ items }) => items)).toEqual([
+      [{ groupId: 'reset-group', topic: TOPIC, partition: 2 }],
     ])
     expect(cells()).toEqual([
       [
@@ -341,6 +368,7 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
         [1, '4'],
         [2, '5'],
       ],
+      [[2, '5']],
     ])
   })
 

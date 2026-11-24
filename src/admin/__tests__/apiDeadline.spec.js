@@ -1175,17 +1175,23 @@ describe('polling enrollment and recovery publication', () => {
 })
 
 describe('replay latch', () => {
-  const Broker = require('../../broker')
-  const { lookup } = require('../../protocol/requests')
+  const { requests } = require('../../protocol/requests')
   const { createErrorFromCode } = require('../../protocol/error')
   const { runWithDeadline, retrierOf } = require('../deadline')
-  const { KafkaJSConnectionError, KafkaJSUnknownOutcomeError } = require('../../errors')
+  const { KafkaJSUnknownOutcomeError, KafkaJSNonRetriableError } = require('../../errors')
+  const { latchedBroker } = require('../../../testHelpers/latchedBroker')
   const versions = {
     16: { minVersion: 0, maxVersion: 5 },
     19: { minVersion: 2, maxVersion: 7 },
+    20: { minVersion: 1, maxVersion: 6 },
     21: { minVersion: 0, maxVersion: 2 },
     30: { minVersion: 1, maxVersion: 3 },
+    33: { minVersion: 0, maxVersion: 2 },
+    43: { minVersion: 0, maxVersion: 2 },
+    47: { minVersion: 0, maxVersion: 0 },
+    49: { minVersion: 0, maxVersion: 1 },
     65: { minVersion: 0, maxVersion: 0 },
+    91: { minVersion: 0, maxVersion: 0 },
   }
   const retry = { retries: 2, initialRetryTime: 5, maxRetryTime: 5, factor: 0, multiplier: 1 }
   const deletion = (partition) => ({
@@ -1202,43 +1208,30 @@ describe('replay latch', () => {
   })
 
   /**
-   * A real Broker of node 1 over a pool that checks the request's pre-write guard, then writes it
-   * (`onWrite`) and answers with the next of `answers`: `'ok'` (decoded, `{}`), `'lost'` (written,
-   * then the connection fails, no answer), `'dial'` (fails before the write) or an Error (decoded,
-   * then thrown, as a parsed broker error is). The guard is asked once more after each write.
-   * @param {Array<string|Error>} answers one per send; `'ok'` once they run out
-   * @returns {{ broker: Broker, written: object[], afterWrite: Array<Error|null>, lost: Error }}
+   * @param {Array<string|Error|object>} answers see `latchedBroker`
+   * @param {object} [options] `latchedBroker` options other than `versions`
+   * @returns {ReturnType<typeof latchedBroker>} a real Broker of node 1
    */
-  const brokerWith = (answers) => {
-    const written = []
-    const afterWrite = []
-    const lost = new KafkaJSConnectionError('Connection closed')
-    const connection = { isConnected: () => true }
-    const pool = {
-      generation: 0,
-      pool: [],
-      setupPolicy: { timeoutCeiling: 30000, waitCeiling: 1000 },
-      getConnectionByRequest: jest.fn(async () => connection),
-      send: jest.fn(async (protocolRequest, _connection, options) => {
-        const refusal = options?.guard?.()
-        if (refusal) throw refusal
-        const answer = answers.shift() ?? 'ok'
-        if (answer === 'dial') throw new KafkaJSConnectionError('Connection refused')
-        protocolRequest.onWrite?.()
-        written.push(protocolRequest.request.apiName)
-        afterWrite.push(options?.guard?.() ?? null)
-        if (answer === 'lost') throw lost
-        protocolRequest.onDecoded?.({})
-        if (answer instanceof Error) throw answer
-        return {}
-      }),
-      destroy: jest.fn(),
-    }
-    const broker = new Broker({ connectionPool: pool, logger, nodeId: 1, versions })
-    broker.lookupRequest = lookup(versions)
-    broker.versionsGeneration = 0
-    return { broker, written, afterWrite, lost }
-  }
+  const brokerWith = (answers, options = {}) => latchedBroker(answers, { versions, ...options })
+  /** @param {Object<string, number>} codes topic → code @returns {object} a decoded CreateTopics answer */
+  const created = (codes) => ({
+    decoded: {
+      topicErrors: Object.entries(codes).map(([topic, errorCode]) => ({ topic, errorCode })),
+    },
+  })
+  /** @param {object} broker @param {...string} names @returns {Promise} one CreateTopics */
+  const create = (broker, ...names) =>
+    broker.createTopics({
+      topics: names.map((topic) => ({ topic, numPartitions: 1, replicationFactor: 1 })),
+    })
+  /** @param {number} errorCode top-level code @returns {object} a decoded ElectLeaders answer */
+  const elected = (errorCode) => ({ decoded: { errorCode, replicaElectionResults: [] } })
+  /**
+   * @param {Function} definition a request definition @param {number} version
+   * @param {object} args @returns {Promise<Buffer>} the bytes that request encodes to
+   */
+  const frameOf = async (definition, version, args) =>
+    (await definition.protocol({ version })(args).request.encode()).buffer
 
   /** @param {Function} work @returns {object} the observed outcome of `work` inside one admin call */
   const call = (work) => observe(runWithDeadline('deleteTopicRecords', 1000, work))
@@ -1272,7 +1265,8 @@ describe('replay latch', () => {
 
     expect(written).toEqual(['DeleteRecords'])
     expect(result.value).toHaveLength(2)
-    expect(result.value[0]).toBe(lost)
+    expect(result.value[0]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(result.value[0].cause).toBe(lost)
     expect(result.value[1]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
   })
 
@@ -1353,10 +1347,10 @@ describe('replay latch', () => {
     )
     await jest.advanceTimersByTimeAsync(50)
 
-    expect(result.value).toEqual([
-      { status: 'rejected', reason: lost },
-      { status: 'fulfilled', value: {} },
-    ])
+    expect(result.value.map(({ status }) => status)).toEqual(['rejected', 'fulfilled'])
+    expect(result.value[0].reason).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(result.value[0].reason.cause).toBe(lost)
+    expect(result.value[1].value).toEqual({})
     expect(written).toEqual(['DeleteRecords', 'DeleteRecords'])
   })
 
@@ -1371,7 +1365,8 @@ describe('replay latch', () => {
     await jest.advanceTimersByTimeAsync(50)
 
     expect(written).toEqual(['CreateAcls'])
-    expect(result.value[0]).toBe(lost)
+    expect(result.value[0]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(result.value[0].cause).toBe(lost)
     expect(result.value[1]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
     expect(result.value[1].requests).toEqual([
       expect.objectContaining({ api: 'CreateAcls', items: null }),
@@ -1407,5 +1402,243 @@ describe('replay latch', () => {
       'CreateTopics',
       'CreateTopics',
     ])
+  })
+
+  it('writes and names the input as it was when the request was built, whatever the caller changes later', async () => {
+    let release
+    const hold = new Promise((resolve) => (release = resolve))
+    const { broker, pool, frames } = brokerWith(['lost', 'lost'], { hold, encode: true })
+    const topics = ['a']
+    const resources = [
+      { type: 2, name: 'a', configEntries: [{ name: 'retention.ms', value: '1' }] },
+    ]
+
+    const result = call(() =>
+      Promise.all([
+        broker.deleteTopics({ topics, timeout: 5000 }).catch((error) => error),
+        broker.alterConfigs({ resources }).catch((error) => error),
+      ])
+    )
+    await flush()
+    expect(pool.getConnectionByRequest).toHaveBeenCalledTimes(2)
+    topics[0] = 'b'
+    resources[0].name = 'b'
+    resources[0].configEntries[0].value = '2'
+    release()
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(frames).toHaveLength(2)
+    expect(frames).toEqual(
+      expect.arrayContaining([
+        await frameOf(requests.DeleteTopics, 6, { topics: ['a'], timeout: 5000 }),
+        await frameOf(requests.AlterConfigs, 2, {
+          resources: [
+            { type: 2, name: 'a', configEntries: [{ name: 'retention.ms', value: '1' }] },
+          ],
+          validateOnly: false,
+        }),
+      ])
+    )
+    const [deletion, alteration] = result.value
+    expect(deletion).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(deletion.requests[0].items).toEqual(['a'])
+    expect(alteration).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(alteration.requests[0].items).toEqual([{ type: 2, name: 'a' }])
+  })
+
+  it('permits one resend of exactly the items a decoded answer definitely refused, again after a second refusal', async () => {
+    const answers = [created({ a: 41, b: 0 }), created({ a: 89 }), created({ a: 0 })]
+    const { broker, written } = brokerWith(answers)
+
+    const result = call(async () => {
+      await create(broker, 'a', 'b')
+      await create(broker, 'a')
+      await create(broker, 'a')
+      return 'done'
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(result).toEqual({ settled: true, value: 'done' })
+    expect(written).toEqual(['CreateTopics', 'CreateTopics', 'CreateTopics'])
+  })
+
+  it('a permit covers only the refused items of the one request it came from', async () => {
+    const { broker, written } = brokerWith([created({ a: 41, b: 0 }), created({ a: 0 })])
+
+    const result = call(async () => {
+      await create(broker, 'a', 'b')
+      const both = await create(broker, 'a', 'b').catch((error) => error)
+      const sibling = await create(broker, 'b').catch((error) => error)
+      await create(broker, 'a')
+      return [both, sibling]
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['CreateTopics', 'CreateTopics'])
+    for (const refusal of result.value) {
+      expect(refusal.constructor).toBe(KafkaJSNonRetriableError)
+      expect(refusal.message).toBe(
+        'deleteTopicRecords: a CreateTopics request for these items was answered; it was not sent again'
+      )
+    }
+  })
+
+  it.each([
+    ['a missing row', [{ topic: 'a', errorCode: 41 }]],
+    [
+      'a repeated row',
+      [
+        { topic: 'a', errorCode: 41 },
+        { topic: 'a', errorCode: 41 },
+      ],
+    ],
+    [
+      'a foreign row',
+      [
+        { topic: 'a', errorCode: 41 },
+        { topic: 'c', errorCode: 41 },
+      ],
+    ],
+  ])('an answer with %s permits nothing', async (_kind, topicErrors) => {
+    const { broker, written } = brokerWith([{ decoded: { topicErrors } }])
+
+    const result = call(async () => {
+      await create(broker, 'a', 'b')
+      return create(broker, 'a').catch((error) => error)
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['CreateTopics'])
+    expect(result.value.constructor).toBe(KafkaJSNonRetriableError)
+  })
+
+  it('two concurrent sends cannot both use one permit', async () => {
+    const { broker, written } = brokerWith([created({ a: 41 }), created({ a: 0 })])
+
+    const result = call(async () => {
+      await create(broker, 'a')
+      return Promise.allSettled([create(broker, 'a'), create(broker, 'a')])
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['CreateTopics', 'CreateTopics'])
+    expect(result.value.map(({ status }) => status)).toEqual(['fulfilled', 'rejected'])
+    expect(result.value[1].reason.constructor).toBe(KafkaJSNonRetriableError)
+  })
+
+  it('reports a lost answer to a permitted resend as unknown and sends nothing more', async () => {
+    const { broker, written, lost } = brokerWith([created({ a: 41 }), 'lost'])
+
+    const result = call(async () => {
+      await create(broker, 'a')
+      const resent = await create(broker, 'a').catch((error) => error)
+      const third = await create(broker, 'a').catch((error) => error)
+      return [resent, third]
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['CreateTopics', 'CreateTopics'])
+    const [resent, third] = result.value
+    expect(resent).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(resent.cause).toBe(lost)
+    expect(resent.requests).toEqual([
+      { api: 'CreateTopics', apiVersion: 7, nodeId: 1, items: ['a'] },
+    ])
+    expect(third).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+  })
+
+  it('refuses a request whose items cannot be named after a named one, even one holding permits', async () => {
+    const { broker, written } = brokerWith([elected(41), elected(0)])
+    const named = [{ topic: 't', partitions: [0] }]
+
+    const result = call(async () => {
+      await broker.electLeaders({ topicPartitions: named })
+      const all = await broker.electLeaders({ topicPartitions: null }).catch((error) => error)
+      await broker.electLeaders({ topicPartitions: named })
+      return all
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['ElectLeaders', 'ElectLeaders'])
+    expect(result.value.constructor).toBe(KafkaJSNonRetriableError)
+  })
+
+  it('resends a request whose items cannot be named once after its whole request was refused', async () => {
+    const { broker, written } = brokerWith([elected(41), elected(0)])
+
+    const result = call(async () => {
+      await broker.electLeaders({ topicPartitions: null })
+      await broker.electLeaders({ topicPartitions: null })
+      return broker.electLeaders({ topicPartitions: null }).catch((error) => error)
+    })
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['ElectLeaders', 'ElectLeaders'])
+    expect(result.value.constructor).toBe(KafkaJSNonRetriableError)
+  })
+
+  it('names share offset alterations by group, topic name and partition', async () => {
+    const { broker, written } = brokerWith(['lost', 'ok'])
+    const alter = (topicName) =>
+      broker.alterShareGroupOffsets({
+        groupId: 'g',
+        topics: [{ topicName, partitions: [{ partitionIndex: 0, startOffset: '5' }] }],
+      })
+
+    const result = call(async () => [await alter('t1').catch((error) => error), await alter('t2')])
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['AlterShareGroupOffsets', 'AlterShareGroupOffsets'])
+    expect(result.value[0]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+    expect(result.value[0].requests[0].items).toEqual([{ groupId: 'g', topic: 't1', partition: 0 }])
+  })
+
+  it('names offset deletions by group as well as topic and partition', async () => {
+    const { broker, written } = brokerWith(['lost', 'ok'])
+    const remove = (groupId) =>
+      broker.offsetDelete({ groupId, topics: [{ topic: 't', partitions: [{ partition: 0 }] }] })
+
+    const result = call(async () => [
+      await remove('g1').catch((error) => error),
+      await remove('g2'),
+    ])
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['OffsetDelete', 'OffsetDelete'])
+    expect(result.value[0].requests[0].items).toEqual([{ groupId: 'g1', topic: 't', partition: 0 }])
+  })
+
+  it('names a quota entity by its parts, in whatever order they were listed', async () => {
+    const { broker, written } = brokerWith(['lost'])
+    const user = { entityType: 'user', entityName: 'u' }
+    const client = { entityType: 'client-id', entityName: 'c' }
+    const quota = (entity) =>
+      broker
+        .alterClientQuotas({
+          entries: [{ entity, ops: [{ key: 'k', value: 1, remove: false }] }],
+          validateOnly: false,
+        })
+        .catch((error) => error)
+
+    const result = call(async () => [await quota([user, client]), await quota([client, user])])
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['AlterClientQuotas'])
+    expect(result.value[1]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+  })
+
+  it('treats a request with a malformed item as one whose items cannot be named', async () => {
+    const { broker, written } = brokerWith(['lost', 'ok'])
+    const malformed = { topics: [{ topic: 't', partitions: [{ offset: '5' }] }] }
+
+    const result = call(async () => [
+      await broker.deleteRecords(malformed).catch((error) => error),
+      await broker.deleteRecords(deletion(1)).catch((error) => error),
+    ])
+    await jest.advanceTimersByTimeAsync(50)
+
+    expect(written).toEqual(['DeleteRecords'])
+    expect(result.value[0].requests[0].items).toBeNull()
+    expect(result.value[1]).toBeInstanceOf(KafkaJSUnknownOutcomeError)
   })
 })
