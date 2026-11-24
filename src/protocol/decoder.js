@@ -1,4 +1,5 @@
 const {
+  KafkaJSCorruptRecordError,
   KafkaJSPartialMessageError,
   KafkaJSInvalidVarIntError,
   KafkaJSInvalidLongError,
@@ -16,8 +17,14 @@ const OTHER_BITS = 0x7f // 127
 
 const UUID_SIZE = 16
 
-/** Largest decoded protocol array count; record headers are bounded by bytes instead. */
+/** Largest decoded protocol array count; record headers are bounded by their batch budget instead. */
 const MAX_ARRAY_COUNT = 1000000
+
+/**
+ * @param {*} value
+ * @returns {boolean} whether `value` is a number of at least 0 (`Infinity` included, NaN not)
+ */
+const isBudgetValue = (value) => typeof value === 'number' && value >= 0
 
 /** Largest tagged-field count accepted in one tag section. */
 const MAX_TAGGED_FIELDS = 10000
@@ -346,15 +353,25 @@ module.exports = class Decoder {
   }
 
   /**
-   * Signed-varint-counted record headers, bounded only by the bytes left in this decoder.
-   * A count of -1 reads as an empty array. Unlike protocol arrays, headers have no count cap;
-   * the result grows as entries decode, without preallocating from the untrusted count.
+   * Signed-varint-counted record headers, bounded by the bytes left in this decoder and by the
+   * headers left in the batch's budget, which every record of the batch draws on. A count of -1
+   * reads as an empty array. The result grows as entries decode, without preallocating from the
+   * untrusted count; the count is debited from the budget once all of them have decoded.
    * @param {(decoder: Decoder) => *} reader reads one header
+   * @param {{ remaining: number, limit: number }} budget the headers the batch may still decode,
+   *   and the batch's header ceiling
    * @returns {Array} headers in wire order
+   * @throws {TypeError} when `remaining` or `limit` is not a number of at least 0, before any read
    * @throws {KafkaJSPartialMessageError} when the count is negative other than -1, exceeds the
    *   remaining bytes, or a header is truncated
+   * @throws {KafkaJSCorruptRecordError} with reason `count` and the ceiling as `limit` when the
+   *   count is above `remaining`, before any header is read
    */
-  readVarIntArrayBytesBounded(reader) {
+  readVarIntArrayBytesBounded(reader, budget) {
+    if (!isBudgetValue(budget?.remaining) || !isBudgetValue(budget.limit)) {
+      throw new TypeError('The header budget needs a remaining and a limit of at least 0')
+    }
+
     const length = this.readVarInt()
 
     if (length === -1) {
@@ -362,11 +379,20 @@ module.exports = class Decoder {
     }
 
     this.ensureReadable(length, 'readVarIntArrayBytesBounded')
+
+    if (length > budget.remaining) {
+      throw new KafkaJSCorruptRecordError(
+        `Record header count ${length} is above the ${budget.remaining} headers left of the batch header ceiling ${budget.limit}`,
+        { reason: 'count', limit: budget.limit }
+      )
+    }
+
     const array = []
     for (let i = 0; i < length; i++) {
       array.push(reader(this))
     }
 
+    budget.remaining -= length
     return array
   }
 
