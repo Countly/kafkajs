@@ -708,13 +708,14 @@ class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
 /**
  * A Fetch record batch is corrupt or breaks a decoding bound: its length, magic byte, record count
  * or control record is impossible, its checksum does not match, its compressed body is malformed,
- * or it decompresses past `maxDecompressedBatchBytes`. Non-retriable; repeating the fetch returns
+ * it decompresses past `maxDecompressedBatchBytes`, or its records carry more headers than the
+ * header ceiling that option sets. Non-retriable; repeating the fetch returns
  * the same bytes. `offset` is the first offset of the batch as a decimal string, when it could be
  * read. `nextOffset`, present only when the batch boundary was validated (a readable, non-negative
  * `lastOffsetDelta` and, with `checkCrcs`, a matching checksum), is where `consumer.seek` goes to
  * skip the batch. `codec` names the compression codec of a compressed batch, and `limit` the bound
- * in force: bytes for `decompressed-size` and `decompression`, records for a `count` over the
- * derived record ceiling.
+ * in force: bytes for `decompressed-size` and `decompression`; for a `count`, records over the
+ * record ceiling or headers over the header ceiling.
  */
 class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   /**

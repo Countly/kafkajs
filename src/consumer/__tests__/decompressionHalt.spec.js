@@ -1,4 +1,9 @@
 const { KafkaJSCorruptRecordError } = require('../../errors')
+const RecordBatchDecoder = require('../../protocol/recordBatch/v0/decoder')
+const {
+  batch: recordBatch,
+  record,
+} = require('../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 const { compressedBatch } = require('../../protocol/message/compression/fixtures/compressedBatch')
 const { bombOf, MIB } = require('../../protocol/message/compression/fixtures/hostileCases')
 const {
@@ -326,5 +331,102 @@ describe('Consumer > a batch that breaks the decompression bound, in the consume
 
     expect(events).toHaveLength(1)
     expect(harness.group.haltedPartitions.has(KEY)).toBe(false)
+  })
+})
+
+describe('Consumer > a batch past the header ceiling', () => {
+  const { HEADER_CEILING_BYTES, RECORD_CEILING_BYTES } = RecordBatchDecoder
+  // At least 8 headers per batch, and a bound that lets a batch hold two records.
+  const CEILING = Math.max(8, Math.ceil((RECORD_CEILING_BYTES * 2) / HEADER_CEILING_BYTES))
+  const BOUND_FOR_CEILING = HEADER_CEILING_BYTES * CEILING
+
+  const headers = (count) => Array.from({ length: count }, (_, n) => [`h${n}`, `v${n}`])
+  /** One batch of one record at `offset` carrying `count` headers. */
+  const oneRecord = (offset, count) =>
+    recordBatch({ baseOffset: BigInt(offset), records: [record({ headers: headers(count) })] })
+
+  /**
+   * Partition 0: two batches that each fill the ceiling (offsets 0 and 1), a batch one header over
+   * it (offset 2) and a valid batch after it (offset 3). Partition 1: one full batch at offset 5.
+   */
+  const partitions = () => [
+    {
+      partition: 0,
+      errorCode: 0,
+      records: Buffer.concat([
+        oneRecord(0, CEILING),
+        oneRecord(1, CEILING),
+        oneRecord(2, CEILING + 1),
+        oneRecord(3, 1),
+      ]),
+    },
+    { partition: 1, errorCode: 0, records: oneRecord(5, CEILING) },
+  ]
+
+  const headerCounts = (messages) => messages.map(({ headers }) => Object.keys(headers).length)
+
+  test('each batch of a partition gets a fresh budget, and only the crossing batch marks its partition', async () => {
+    const harness = await createFetchGroup({ partitions: [0, 1], fetchMaxVersion: 12 })
+    harness.setResponse(fetchResponse(partitions(), { apiVersion: 12 }))
+
+    const { responses } = await harness.broker.fetch(
+      request({ maxDecompressedBatchBytes: BOUND_FOR_CEILING })
+    )
+    const [halted, healthy] = responses[0].partitions
+
+    expect(offsetsOf(halted)).toEqual(['0', '1'])
+    expect(headerCounts(halted.messages)).toEqual([CEILING, CEILING])
+    expect(halted.corruption).toMatchObject({ reason: 'count', offset: '2' })
+    expect(halted.corruption.error).toBeInstanceOf(KafkaJSCorruptRecordError)
+    expect(halted.corruption.error).toMatchObject({ limit: CEILING, offset: '2', nextOffset: '3' })
+    expect(offsetsOf(healthy)).toEqual(['5'])
+    expect(headerCounts(healthy.messages)).toEqual([CEILING])
+    expect(healthy).not.toHaveProperty('corruption')
+  })
+
+  test('the consumer group halts only the partition of the crossing batch and fetches only the other one next', async () => {
+    const harness = await createFetchGroup({
+      partitions: [0, 1],
+      fetchMaxVersion: 12,
+      maxDecompressedBatchBytes: BOUND_FOR_CEILING,
+    })
+    harness.setResponse(() =>
+      fetchResponse(
+        partitions().filter(({ partition }) =>
+          harness.fetchRequestPartitions().includes(partition)
+        ),
+        { apiVersion: 12 }
+      )
+    )
+    const events = []
+    harness.group.instrumentationEmitter.addListener('consumer.partition_halted', (event) =>
+      events.push(event)
+    )
+
+    const fetched = await harness.group.fetch(NODE_ID)
+    const offsetsAt = (partition) =>
+      offsetsOf(fetched.find((fetchedBatch) => fetchedBatch.partition === partition))
+
+    expect(offsetsAt(0)).toEqual(['0', '1'])
+    expect(offsetsAt(1)).toEqual(['5'])
+    expect(harness.group.haltedPartitions.get(`${TOPIC}|0`)).toMatchObject({
+      offset: '2',
+      reason: 'count',
+    })
+    expect(harness.group.haltedPartitions.has(`${TOPIC}|1`)).toBe(false)
+    expect(events).toHaveLength(1)
+    expect(events[0].payload).toMatchObject({
+      topic: TOPIC,
+      partition: 0,
+      offset: '2',
+      reason: 'count',
+      limit: CEILING,
+      nextOffset: '3',
+    })
+
+    await harness.group.fetch(NODE_ID)
+
+    expect(harness.fetchRequestPartitions()).toEqual([1])
+    expect(events).toHaveLength(1)
   })
 })

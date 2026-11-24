@@ -314,6 +314,64 @@ describe('Network > a request timeout fails its generation', () => {
     )
   })
 
+  describe('when detaching the socket listeners throws', () => {
+    const DEADLINE = 10000
+
+    afterEach(() => jest.useRealTimers())
+
+    it('a timeout during a bounded drain closes the socket once, emits one timeout event, rejects the other held request with a close and releases the drain at once', async () => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+      const entries = []
+      const logger = createLogger({
+        level: LEVELS.ERROR,
+        logCreator: () => (entry) => entries.push(entry),
+      })
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const instrumentationEmitter = new InstrumentationEventEmitter()
+      const timeouts = []
+      instrumentationEmitter.addListener(NETWORK_REQUEST_TIMEOUT, (event) => timeouts.push(event))
+      const broker = open(cluster, { instrumentationEmitter, logger, maxInFlightRequests: 2 })
+      await broker.connect()
+      const connection = await broker.connectionPool.getConnection(0)
+      const firstGate = cluster.schedule.hold({ api: 'Metadata' })
+      const secondGate = cluster.schedule.hold({ api: 'Metadata' })
+      const timedOut = settle(broker.metadata([]))
+      await firstGate.arrived()
+      const peer = settle(broker.metadata([]))
+      await secondGate.arrived()
+      expect(cluster.sockets()).toHaveLength(1)
+
+      const [socket] = cluster.sockets()
+      const destroy = socket.destroy
+      socket.destroy = jest.fn((...args) => destroy(...args))
+      let closes = 0
+      socket.on('close', () => closes++)
+      const detachFailure = new Error('listener removal failed')
+      socket.on('removeListener', (event) => {
+        if (event === 'data') throw detachFailure
+      })
+      let drained = null
+      connection.disconnect({ drainTimeout: DEADLINE }).then(
+        (value) => (drained = { value }),
+        (error) => (drained = { error })
+      )
+      await jest.advanceTimersByTimeAsync(150)
+      await new Promise(setImmediate)
+
+      expect(drained).toEqual({ value: true })
+      expect(timeouts).toHaveLength(1)
+      expect(socket.destroy).toHaveBeenCalledTimes(1)
+      expect(socket.destroyed).toBe(true)
+      expect(closes).toBe(1)
+      expect((await timedOut).error).toBeInstanceOf(KafkaJSRequestTimeoutError)
+      expect((await peer).error).toBeInstanceOf(KafkaJSConnectionClosedError)
+      expect(connection.requestQueue.inflight.size).toBe(0)
+      expect(entries.map(({ log }) => log.message)).toContain(
+        'Failed to close the timed-out connection'
+      )
+    })
+  })
+
   describe('Connection#failGeneration', () => {
     const closed = (connection) =>
       new KafkaJSConnectionClosedError('Closed connection', { host: 'node0', port: 9092 })

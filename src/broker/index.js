@@ -525,16 +525,29 @@ module.exports = class Broker {
    * Retires a broker that was replaced: its pool opens nothing again, so an operation that held a
    * reference across an await fails with a retriable `KafkaJSConnectionError` (from `connect()`,
    * `getConnection()` or `send()`) and looks the broker up again, and its connections drain for at
-   * most `drainTimeout`. A retired broker stays retired.
+   * most `drainTimeout`. A retired broker stays retired. The connections are closed even when
+   * fencing the pool throws; the first failure rejects once they are.
    * @private
    * @param {object} [options]
    * @param {number} [options.drainTimeout] ms to wait for requests; the pool's own when omitted
-   * @returns {Promise} settles when the connections are closed; callers do not wait for it
+   * @returns {Promise<void>} settles when the connections are closed
+   * @throws {Error} the fencing failure, else the close failure
    */
-  retire(options) {
+  async retire(options) {
     this.retired = true
-    this.connectionPool.retire()
-    return this.disconnect(options)
+    // Boxed, so a falsy reason still counts as a failure.
+    let failure = null
+    try {
+      this.connectionPool.retire()
+    } catch (reason) {
+      failure = { reason }
+    }
+    try {
+      await this.disconnect(options)
+    } catch (reason) {
+      failure ??= { reason }
+    }
+    if (failure) throw failure.reason
   }
 
   /**
