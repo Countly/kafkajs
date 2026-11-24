@@ -400,6 +400,65 @@ describe('share handlers on parallel leader nodes', () => {
     expect(h.seen.crashes).toEqual([])
   })
 
+  test('an eachMessage handler that changed its message offset to the next record acknowledges its own record, and the next record is released', async () => {
+    await start({ share: { maxPollInterval: 200 } })
+    let given = false
+    h.cluster.answer('ShareFetch', (fields) => {
+      if (given || fields.shareSessionEpoch !== 0) return echo('ShareFetch', fields)
+      given = true
+      return fetchAnswer([acquire(0, 0, ['a', 'b'])])
+    })
+    const gate = deferred()
+    const completions = []
+    holds.push({ release: () => gate.resolve(), completions })
+    const started = []
+    const errors = []
+    await run({
+      eachMessage: async ({ message, acknowledge }) => {
+        const completed = deferred()
+        completions.push(completed.promise)
+        try {
+          started.push(message.offset)
+          acknowledge('reject')
+          message.offset = '1'
+          acknowledge('accept')
+        } catch (error) {
+          errors.push(error)
+        }
+        try {
+          await gate.promise
+        } finally {
+          completed.resolve()
+        }
+      },
+    })
+    await until(() => started.length === 1, 'the first handler')
+    for (let count = 2; count <= 5; count++) await beat(count)
+    expect(leaves()).toHaveLength(0)
+    await advance(50)
+    await until(() => leaves().length === 1, 'the poll-expiry leave')
+    await flush()
+    expect(started).toEqual(['0'])
+    expect(errors).toEqual([])
+    const finals = finalFrames()
+    expect(finals).toHaveLength(1)
+    expect(finals[0].fields.topics).toEqual([
+      {
+        topicId: A,
+        partitions: [
+          {
+            partitionIndex: 0,
+            acknowledgementBatches: [
+              { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [1, 2] },
+            ],
+          },
+        ],
+      },
+    ])
+    expect(finals[0].order).toBeLessThan(leaves()[0].order)
+    expect(h.seen.crashes).toEqual([])
+  })
+
   test('a poll expiry over a handler whose renewal lost its session still finals the other node and leaves', async () => {
     await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
     const opened = [false, false]
@@ -517,6 +576,101 @@ describe('share handlers on parallel leader nodes', () => {
       const lost = () => outcomesOf(0).filter(([, , , reason]) => reason === 'membership-lost')
       await until(() => lost().length === 1, 'the lost outcome')
       expect(lost()).toEqual([['1', '1', 'release', 'membership-lost']])
+      expect(h.seen.crashes).toEqual([])
+    })
+
+    /**
+     * Delivers `values` as one acquisition from offset 0 and runs `eachBatch` held after `decide`,
+     * then drives the first poll-expiry close.
+     * @param {string[]} values Record values.
+     * @param {(payload: object) => void} decide Runs in the handler before it is held.
+     * @returns {Promise<Error[]>} What `decide` threw.
+     */
+    const holdBatchThroughExpiry = async (values, decide) => {
+      let given = false
+      h.cluster.answer('ShareFetch', (fields) => {
+        if (given || fields.shareSessionEpoch !== 0) return echo('ShareFetch', fields)
+        given = true
+        return fetchAnswer([acquire(0, 0, values)])
+      })
+      const gate = deferred()
+      const completions = []
+      holds.push({ release: () => gate.resolve(), completions })
+      let started = 0
+      const errors = []
+      await run({
+        eachBatch: async (payload) => {
+          const completed = deferred()
+          completions.push(completed.promise)
+          started++
+          try {
+            decide(payload)
+          } catch (error) {
+            errors.push(error)
+          }
+          try {
+            await gate.promise
+          } finally {
+            completed.resolve()
+          }
+        },
+      })
+      await until(() => started === 1, 'the batch handler')
+      for (let count = 2; count <= 5; count++) await beat(count)
+      expect(leaves()).toHaveLength(0)
+      await advance(50)
+      await until(() => leaves().length === 1, 'the poll-expiry leave')
+      await flush()
+      return errors
+    }
+
+    test('an offset-only selector after another message took its offset decides the record acquired at that offset', async () => {
+      await start({ share: { maxPollInterval: 200 } })
+      const errors = await holdBatchThroughExpiry(['a', 'b'], ({ batch, acknowledge }) => {
+        const [first] = batch.messages
+        acknowledge(first, 'reject')
+        first.offset = '1'
+        acknowledge({ offset: '1' }, 'accept')
+      })
+      expect(errors).toEqual([])
+      const finals = finalFrames()
+      expect(finals).toHaveLength(1)
+      expect(finals[0].fields.topics).toEqual([
+        {
+          topicId: A,
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: [
+                { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [3, 1] },
+              ],
+            },
+          ],
+        },
+      ])
+      expect(finals[0].order).toBeLessThan(leaves()[0].order)
+      expect(outcomesOf(0).filter(([, , , reason]) => reason !== null)).toEqual([])
+      expect(h.seen.crashes).toEqual([])
+    })
+
+    test('records lost at the close are counted by their acquired offsets after the handler changed one', async () => {
+      await start({ share: { maxPollInterval: 200 } })
+      const resets = []
+      h.consumer.on(h.consumer.events.SESSION_RESET, ({ payload }) => resets.push(payload))
+      const errors = await holdBatchThroughExpiry(['a', 'b', 'c'], ({ batch, acknowledge }) => {
+        acknowledge(batch.messages[0], 'reject')
+        batch.messages[1].offset = '7'
+      })
+      expect(errors).toEqual([])
+      const lost = () => outcomesOf(0).filter(([, , , reason]) => reason === 'membership-lost')
+      await until(() => lost().length === 1, 'the lost outcome')
+      expect(lost()).toEqual([['1', '2', 'release', 'membership-lost']])
+      expect(resets.filter(({ reason }) => reason === 'membership')).toEqual([
+        { nodeId: 0, reason: 'membership', recordsDropped: 2 },
+      ])
+      expect(finalFrames()[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+        { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] },
+      ])
       expect(h.seen.crashes).toEqual([])
     })
   })

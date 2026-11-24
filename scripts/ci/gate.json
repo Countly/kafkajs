@@ -23060,7 +23060,11 @@
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler whose renewal lost its session still finals the other node and leaves",
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes expired handlers on both nodes a node whose final capture fails does not keep the other node from its final or the leave",
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler that changed its message offset after acknowledging finals both nodes and leaves",
-        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close reversing batch.messages after rejecting one record keeps only that reject in the forced-close final"
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close reversing batch.messages after rejecting one record keeps only that reject in the forced-close final",
+        "src/consumer/share/__tests__/shareConsumerModes.spec.js › Share consumer handler decisions a message whose offset the handler changed is still acknowledged, renewed and completed as the record acquired",
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes an eachMessage handler that changed its message offset to the next record acknowledges its own record, and the next record is released",
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close an offset-only selector after another message took its offset decides the record acquired at that offset",
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close records lost at the close are counted by their acquired offsets after the handler changed one"
       ],
       "capMinutes": 85,
       "allowedSkips": [

@@ -290,6 +290,21 @@ describe('Share consumer handler decisions', () => {
       { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] },
     ])
   })
+  test('a message whose offset the handler changed is still acknowledged, renewed and completed as the record acquired', async () => {
+    const c = setup({ offsets: ['0', '1', '2'] })
+    c.messages[0].offset = '1'
+    c.messages[2].offset = '0'
+    c.call.acknowledge(c.messages[0], 'reject')
+    await c.call.renew([c.messages[0]])
+    expect(c.renew).toHaveBeenCalledWith(['0'])
+    await c.call.renew()
+    expect(c.renew).toHaveBeenLastCalledWith(['0', '1', '2'])
+    expect(c.call.expiredAt(1000)).toEqual(['0', '1', '2'])
+    expect(c.call.complete()).toBeNull()
+    expect(c.ledger.prepare({ token: c.token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '2', acknowledgeTypes: [3, 1, 1] },
+    ])
+  })
 })
 
 describe('public share handler contract', () => {
