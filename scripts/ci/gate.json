@@ -12164,6 +12164,8 @@
         "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop order, the in-flight window and faults five requests rejected with a closed connection give their slots back: the next send to that broker completes",
         "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop order, the in-flight window and faults requests are handed to a broker in drain order even when finding the broker takes longer for the first",
         "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop order, the in-flight window and faults two requests drained together reach a real broker connection in drain order, the larger one first",
+        "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop per-broker hand-off state a broker\u2019s hand-off entry is gone once its requests settle",
+        "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop per-broker hand-off state a newer hand-off to the same broker is kept until it settles, and requests keep their order",
         "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop pipelining and drain rules a partition not yet in the transaction stays queued while its sibling goes out on the same pass",
         "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop pipelining and drain rules a send resolves with a RecordMetadata of exactly six keys, whatever else the broker answered with",
         "src/producer/__tests__/drainLoop.spec.js \u203a Producer > the idempotent drain loop pipelining and drain rules one request per broker and options triple: differing compression is never merged",
