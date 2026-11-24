@@ -223,7 +223,7 @@ describe('forced producer close on the wire', () => {
   )
 
   test.each([true, false])(
-    'a forced close while the only request waits in the client queue, before its write guard, reports outcome unsent, idempotent %s',
+    'a forced close while a Produce call is held before it consults the write guard reports outcome unsent, idempotent %s',
     async (idempotent) => {
       const held = deferred()
       const refusals = []
@@ -255,7 +255,7 @@ describe('forced producer close on the wire', () => {
   )
 
   test.each([true, false])(
-    'a forced close after the write guard passed, with the bytes buffered and unanswered, reports outcome unknown, idempotent %s',
+    'a forced close while a Produce call is held after the write guard accepted it reports outcome unknown, idempotent %s',
     async (idempotent) => {
       const held = deferred()
       const { producer, second } = twoLeaders(idempotent, async (request) => {

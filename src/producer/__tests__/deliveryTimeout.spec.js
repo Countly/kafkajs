@@ -239,7 +239,29 @@ describe('Producer > deliveryTimeout', () => {
   })
 
   test("p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0 written once", async () => {
-    const cluster = createFakeCluster({ partitions: 2 })
+    const written = []
+    const cluster = createFakeCluster({
+      partitions: 2,
+      produce: async (request) => {
+        const refusal = request.guard?.(100)
+        if (refusal) throw refusal
+        for (const { topic, partitions } of request.topicData)
+          for (const { partition, firstSequence, messages } of partitions)
+            written.push({ topic, partition, firstSequence, values: messages.map((m) => m.value) })
+        return {
+          topics: request.topicData.map(({ topic, partitions }) => ({
+            topicName: topic,
+            partitions: partitions.map(({ partition }) => ({
+              partition,
+              errorCode: 0,
+              baseOffset: '0',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+            })),
+          })),
+        }
+      },
+    })
     cluster.findLeaderForPartitions = (_, ids) => (ids.map(Number).includes(0) ? { 0: [0] } : {})
     const producer = createProducer({
       cluster,
@@ -267,16 +289,7 @@ describe('Producer > deliveryTimeout', () => {
     expect(error.outcome).toBe('unknown')
     expect(error.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
     expect(error.cause.outcome).toBe('unsent')
-    const written = cluster.broker.produce.mock.calls.flatMap(([request]) =>
-      request.topicData.flatMap(({ partitions }) =>
-        partitions.map(({ partition, firstSequence, messages }) => ({
-          partition,
-          firstSequence,
-          values: messages.map(({ value }) => value),
-        }))
-      )
-    )
-    expect(written).toEqual([{ partition: 0, firstSequence: 0, values: ['value-0'] }])
+    expect(written).toEqual([{ topic: TOPIC, partition: 0, firstSequence: 0, values: ['value-0'] }])
   })
 
   test("kafka.producer({ deliveryTimeout }) bounds a send, ahead of the client's longer retry.maxTotalTime", async () => {
