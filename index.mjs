@@ -37,6 +37,7 @@ export const {
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSDeleteGroupsError,
   KafkaJSTimeout,
+  KafkaJSUnknownOutcomeError,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,

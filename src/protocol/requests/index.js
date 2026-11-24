@@ -1,4 +1,5 @@
 const apiKeys = require('./apiKeys')
+const { MUTATING_APIS } = require('../../admin/unknownOutcome')
 const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('../../errors')
 
 /**
@@ -177,13 +178,26 @@ const selectVersion = (versions, apiKey, definition, maxVersions = {}) => {
  *
  * @param {import("../../../types").ApiVersions} versions the broker's advertised ranges
  * @param {{ [apiKey: number]: number }} [maxVersions] internal per-API ceiling
+ * A request that changes broker state (`MUTATING_APIS`) keeps its builder's input as `args`, which
+ * is never encoded: the admin replay check reads the items it carries from it. Other requests are
+ * built unchanged.
+ *
  * @returns {Lookup}
  * @throws {KafkaJSServerDoesNotSupportApiKey} from the returned selector, via `selectVersion`
  */
 const lookup =
   (versions, maxVersions = {}) =>
-  (apiKey, definition) =>
-    definition.protocol({ version: selectVersion(versions, apiKey, definition, maxVersions) })
+  (apiKey, definition) => {
+    const build = definition.protocol({
+      version: selectVersion(versions, apiKey, definition, maxVersions),
+    })
+    if (!MUTATING_APIS.has(apiKey)) return build
+    return (args) => {
+      const built = build(args)
+      built.args = args
+      return built
+    }
+  }
 
 module.exports = {
   requests,

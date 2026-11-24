@@ -1,4 +1,4 @@
-const { KafkaJSError, KafkaJSInvariantViolation } = require('../errors')
+const { KafkaJSError, KafkaJSInvariantViolation, KafkaJSUnknownOutcomeError } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
 const { retrierOf, currentDeadline, checked } = require('./deadline')
 
@@ -87,6 +87,7 @@ class ItemRetry {
    * @returns {Promise<object[]>} results in caller order, errorCode -1 for unresolved local failure
    *   (`isLocal` tells such a row from a broker's -1)
    * @throws {Error} API deadline always rejects the whole call, preserving unknown mutation outcome
+   * @throws {KafkaJSUnknownOutcomeError} as it is, never as a row: a written request got no answer
    */
   async run(send) {
     let outstanding
@@ -100,8 +101,10 @@ class ItemRetry {
           rows = checked(await send([...attempted.values()]))
           localFailure = null
         } catch (error) {
-          if (this.callFailure(error)) return bail(error)
-          localFailure = error
+          if (error instanceof KafkaJSUnknownOutcomeError || this.callFailure(error))
+            return bail(error)
+          // A resend the replay latch refused ends the call with the rows of the answered attempt.
+          if (!this.deadline?.resendRefusals?.has(error)) localFailure = error
           throw error
         }
         if (!Array.isArray(rows)) throw new KafkaJSInvariantViolation('Missing item results')
@@ -123,7 +126,12 @@ class ItemRetry {
       })
     } catch (error) {
       this.deadline?.check()
-      if (this.callFailure(error) || error instanceof KafkaJSInvariantViolation) throw error
+      if (
+        error instanceof KafkaJSUnknownOutcomeError ||
+        this.callFailure(error) ||
+        error instanceof KafkaJSInvariantViolation
+      )
+        throw error
       if (
         (error.cause && this.callFailure(error.cause)) ||
         error.cause instanceof KafkaJSInvariantViolation

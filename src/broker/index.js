@@ -2910,6 +2910,11 @@ module.exports = class Broker {
    * the pool's other connection is closed in the background (`retireSibling`), except for a share
    * heartbeat: its coordinator socket can reconnect without retiring a healthy data session.
    *
+   * Inside an admin call, a request that changes broker state goes through the call's replay
+   * latch (`AdminDeadline#latch`): its final pre-write check refuses it when an earlier written
+   * request of the same call carried one of its items, and the latch notes when it is written and
+   * answered. Other requests cost one check of the current admin scope.
+   *
    * @private
    * @param {{ request: { apiKey: number } }} protocolRequest a built request, as produced by
    *                                          `lookup()`/`lookupRequestWithMax()`'s returned builder
@@ -2919,8 +2924,11 @@ module.exports = class Broker {
    */
   async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
     const setupGuard = guard
-    guard = withAdminGuard(guard)
-    currentDeadline()?.check()
+    const deadline = currentDeadline()
+    const latch = deadline?.latch?.(protocolRequest, this.nodeId)
+    if (latch) protocolRequest = latch.request
+    if (deadline) guard = withAdminGuard(guard, deadline, latch?.guard)
+    deadline?.check()
     const pool = this.connectionPool
     let generation = pool.generation
     try {
@@ -2951,6 +2959,7 @@ module.exports = class Broker {
       generation = pool.generation
       return checked(await pool.send(protocolRequest, connection, guard ? { guard } : null, true))
     } catch (e) {
+      latch?.failed(e)
       currentDeadline()?.check()
       attachFailureSource(e, { broker: this, generation })
       if (protocolRequest.request.apiKey !== apiKeys.ShareGroupHeartbeat)

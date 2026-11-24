@@ -5,11 +5,72 @@ const {
   KafkaJSTimeout,
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
+const { isMutation, itemsOf, DEFINITE_REFUSALS } = require('./unknownOutcome')
 
 const context = new AsyncLocalStorage()
 const DEFAULT_API_TIMEOUT = 60000
 const MAX_API_TIMEOUT = 2147483647
+
+/** @param {any} item @returns {string} the identity an item is compared by */
+const keyOf = (item) => JSON.stringify(item)
+
+/** One physical send of a request that changes broker state, within one admin call. */
+class WriteRecord {
+  /**
+   * @param {{ request: { apiKey: number, apiName: string, apiVersion: number } }} protocolRequest
+   *   the built request; it is not kept
+   * @param {number} nodeId the broker it goes to
+   */
+  constructor(protocolRequest, nodeId) {
+    const { apiKey, apiName, apiVersion } = protocolRequest.request
+    this.apiKey = apiKey
+    this.api = apiName
+    this.apiVersion = apiVersion
+    this.nodeId = nodeId
+    this.items = itemsOf(protocolRequest)
+    this.keys = this.items && new Set(this.items.map(keyOf))
+    this.written = false
+    this.decoded = false
+    this.cause = null
+    this.permits = new Set()
+  }
+
+  /**
+   * Whether a later send must not be written because of this one: this one was written, and the
+   * later one may carry one of its items that holds no permit. Unknown items on either side count
+   * as an overlap.
+   * @param {WriteRecord} later
+   * @returns {boolean}
+   */
+  blocks(later) {
+    if (!this.written || this.apiKey !== later.apiKey) return false
+    if (this.keys === null) return true
+    if (later.keys === null) return this.permits.size < this.keys.size
+    for (const key of later.keys) if (this.keys.has(key) && !this.permits.has(key)) return true
+    return false
+  }
+
+  /**
+   * Adds a permit for each item the decoded answer definitely refused (`DEFINITE_REFUSALS`).
+   * Never throws.
+   * @param {object} decoded the decoded answer to this send
+   * @returns {void}
+   */
+  permit(decoded) {
+    const refused = DEFINITE_REFUSALS[this.apiKey]
+    if (!refused || this.items === null) return
+    try {
+      for (const item of refused(decoded, this.items)) this.permits.add(keyOf(item))
+    } catch {}
+  }
+
+  /** @returns {{ api: string, apiVersion: number, nodeId: number, items: any[]|null }} */
+  describe() {
+    return { api: this.api, apiVersion: this.apiVersion, nodeId: this.nodeId, items: this.items }
+  }
+}
 
 /**
  * Validates a caller's admin budget before any work starts. Undefined means the supplied default.
@@ -52,6 +113,8 @@ class AdminDeadline {
             Math.max(0, this.deadlineAt - performance.now())
           )
     this.guard = () => this.refusal()
+    this.writes = []
+    this.resendRefusals = new WeakSet()
   }
 
   /** @returns {KafkaJSTimeout} one stable error naming the original method and unknown outcome */
@@ -103,6 +166,7 @@ class AdminDeadline {
     this.reason = reason
     clearTimeout(this.timer)
     this.timer = null
+    this.writes = []
     const cleanups = [...this.cleanups]
     this.cleanups.clear()
     for (const cleanup of cleanups) {
@@ -186,13 +250,131 @@ class AdminDeadline {
 
   /**
    * Uses the existing counted retrier and the scoped ordinary branch, without changing options.
+   * An attempt that throws or bails with `KafkaJSUnknownOutcomeError`, or with the failure of a
+   * written request of this call that got no answer, ends the retries at once with that
+   * unknown-outcome error, unwrapped. An attempt refused because its request was already written
+   * and answered ends them with the error of the attempt before it.
    * @param {object} retryOptions existing retry settings
    * @returns {Function} call-scoped retrier
    * @throws {Error} existing configuration error, exhaustion, bail or invocation refusal
+   * @throws {KafkaJSUnknownOutcomeError} when a written request of the call got no answer
    */
   retrier(retryOptions) {
     const retry = createRetry(retryOptions)
-    return (fn) => retry(fn, this)
+    return (fn) => {
+      let previous = null
+      return retry((bail, ...rest) => {
+        const end = (error) => bail(this.finalError(error, previous) ?? error)
+        return fn(end, ...rest).catch((error) => {
+          const final = this.finalError(error, previous)
+          previous = error
+          if (final) return bail(final)
+          throw error
+        })
+      }, this)
+    }
+  }
+
+  /**
+   * The error that must end a retry loop instead of `error`, if any (see `retrier`).
+   * @param {unknown} error what the attempt failed with
+   * @param {unknown} previous what the attempt before it failed with, or `null`
+   * @returns {Error|null}
+   */
+  finalError(error, previous) {
+    if (error instanceof KafkaJSUnknownOutcomeError) return error
+    if (this.resendRefusals.has(error)) return previous ?? error
+    const lost = this.writes.filter(
+      (record) =>
+        record.written &&
+        !record.decoded &&
+        record.cause != null &&
+        (record.cause === error || record.cause === error?.cause)
+    )
+    return lost.length > 0 ? this.unknownOutcome(lost) : null
+  }
+
+  /**
+   * Starts the record of one physical send of a request that changes broker state, so that no
+   * layer can write the items it carried again within this call (`blocks`). Called once per send,
+   * before anything is written. Any other request gets `null` and nothing else happens.
+   * @param {{ request: { apiKey: number }, args?: object, onWrite?: Function, onDecoded?: Function }} protocolRequest
+   *   the built request
+   * @param {number} nodeId the broker it goes to
+   * @returns {{ request: object, guard: () => Error|null, failed: (error: unknown) => void }|null}
+   *   a copy of the request whose `onWrite` and `onDecoded` also keep the record (after the
+   *   caller's own hooks for a write, before them for an answer), the pre-write check of this
+   *   send, and what to call with the error that ended it
+   */
+  latch(protocolRequest, nodeId) {
+    if (!isMutation(protocolRequest)) return null
+    const record = new WriteRecord(protocolRequest, nodeId)
+    this.writes.push(record)
+    const { onWrite, onDecoded } = protocolRequest
+    return {
+      request: {
+        ...protocolRequest,
+        onWrite: () => {
+          onWrite?.()
+          this.consumePermits(record)
+          record.written = true
+        },
+        onDecoded: (decoded) => {
+          record.decoded = true
+          record.permit(decoded)
+          onDecoded?.(decoded)
+        },
+      },
+      guard: () => this.resendRefusal(record),
+      failed: (error) => {
+        record.cause ??= error
+      },
+    }
+  }
+
+  /**
+   * Refuses a send when an earlier written send of this call blocks it. A send is never compared
+   * with itself, so its own later checks never refuse it.
+   * @param {WriteRecord} record the send about to be written
+   * @returns {Error|null} `KafkaJSUnknownOutcomeError` when a blocking send got no answer, else a
+   *   `KafkaJSNonRetriableError` whose `cause` is the error of the answered send; `null` to write
+   */
+  resendRefusal(record) {
+    const blocking = this.writes.filter((earlier) => earlier !== record && earlier.blocks(record))
+    if (blocking.length === 0) return null
+    const unanswered = blocking.filter((earlier) => !earlier.decoded)
+    if (unanswered.length > 0) return this.unknownOutcome(unanswered)
+    const refusal = new KafkaJSNonRetriableError(
+      `${this.method}: a ${record.api} request for these items was answered; it was not sent again`,
+      { cause: blocking[0].cause ?? undefined }
+    )
+    this.resendRefusals.add(refusal)
+    return refusal
+  }
+
+  /**
+   * Uses the permits of earlier sends that a send now being written relies on.
+   * @param {WriteRecord} record the send being written
+   * @returns {void}
+   */
+  consumePermits(record) {
+    for (const earlier of this.writes) {
+      if (earlier === record || earlier.apiKey !== record.apiKey || earlier.permits.size === 0)
+        continue
+      if (record.keys === null) earlier.permits.clear()
+      else for (const key of record.keys) earlier.permits.delete(key)
+    }
+  }
+
+  /**
+   * @param {WriteRecord[]} records written sends of this call without an answer
+   * @returns {KafkaJSUnknownOutcomeError} naming them and their items
+   */
+  unknownOutcome(records) {
+    return new KafkaJSUnknownOutcomeError(
+      `${this.method}: a ${records[0].api} request was sent and no answer arrived; it may have been sent and applied. It was not sent again.`,
+      { requests: records.map((record) => record.describe()), cause: records[0].cause ?? undefined }
+    )
   }
 }
 
@@ -485,10 +667,14 @@ const waitForOf = (fn, options = {}) => {
  * Composes the established frame/lifecycle guard before the admin check, preserving byte lengths.
  * @param {Function|null|undefined} guard established guard
  * @param {AdminDeadline|undefined} [deadline] captured caller, defaults to the current store
+ * @param {(() => Error|null)|null} [latched] the replay check of one physical send
+ *   (`AdminDeadline#latch`), asked last
  * @returns {Function|null|undefined} original guard unchanged on the ordinary path
  */
-const withAdminGuard = (guard, deadline = currentDeadline()) =>
-  deadline ? (frameLength) => guard?.(frameLength) || deadline.guard() : guard
+const withAdminGuard = (guard, deadline = currentDeadline(), latched = null) =>
+  deadline
+    ? (frameLength) => guard?.(frameLength) || deadline.guard() || latched?.() || null
+    : guard
 
 /**
  * Wraps every public operation exactly once; control/event methods remain direct functions.

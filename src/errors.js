@@ -388,6 +388,29 @@ class KafkaJSTimeout extends KafkaJSNonRetriableError {
   }
 }
 
+/**
+ * A request that changes broker state was written and no usable answer arrived, so it may have
+ * been applied. The client does not send it again: the call rejects with this error instead.
+ * Not retriable: check the state of the items in `requests` before repeating the call.
+ * @class
+ */
+class KafkaJSUnknownOutcomeError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e diagnostic message
+   * @param {object} [options]
+   * @param {{ api: string, apiVersion: number, nodeId: number, items: any[]|null }[]} [options.requests]
+   *   each written request without an answer and the items it carried (`null` when they could
+   *   not be named)
+   * @param {Error} [options.cause] the error that ended the first of those requests
+   */
+  constructor(e, { requests = [], cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSUnknownOutcomeError'
+    this.outcome = 'unknown'
+    this.requests = requests
+  }
+}
+
 class KafkaJSLockTimeout extends KafkaJSTimeout {
   constructor() {
     super(...arguments)
@@ -982,6 +1005,7 @@ module.exports = {
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSDeleteGroupsError,
   KafkaJSTimeout,
+  KafkaJSUnknownOutcomeError,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,
