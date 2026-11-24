@@ -452,16 +452,43 @@ module.exports = (params) => {
   }
 
   /**
+   * The run identities and rebalance callback tables of this consumer's runs, current and retired.
+   * The handler and callback stores are shared by every client in the process, so a store another
+   * consumer set is ignored here and its calls count as calls from outside.
+   * @type {WeakSet<object>}
+   */
+  const ownRuns = new WeakSet()
+
+  /**
+   * @returns {object|null} the calling handler's batch identity, when one of this consumer's runs
+   *   set it; `null` otherwise, never `undefined`, so a default argument cannot read the store again
+   */
+  const ownHandler = () => {
+    const identity = handlerContext.current()
+    return identity && ownRuns.has(identity.runIdentity) ? identity : null
+  }
+
+  /**
+   * @returns {object|null} the calling rebalance callback's invocation, when one of this consumer's
+   *   runs made it; `null` otherwise, never `undefined`
+   */
+  const ownHook = () => {
+    const record = RebalanceHooks.current()
+    return record && ownRuns.has(record.owner) ? record : null
+  }
+
+  /**
    * Refuses a call made from a handler of a run that has since been retired, or from a rebalance
    * callback invocation that is settled, expired or retired, before it can read or change a
-   * replacement run's state. Detached callers, the current run's handlers and a current callback pass.
+   * replacement run's state. Detached callers, the current run's handlers, a current callback and
+   * every handler or callback of another consumer pass.
    * @throws {Error} `CONSUMER_STOPPING` or the callback's own refusal
    * @returns {void}
    */
   const refuseRetiredCaller = () => {
-    const refusal = RebalanceHooks.refusal()
+    const refusal = RebalanceHooks.refusal(ownHook())
     if (refusal) throw refusal
-    const identity = handlerContext.current()?.runIdentity
+    const identity = ownHandler()?.runIdentity
     if (identity && !identity.isCurrent()) throw consumerStoppingError()
   }
 
@@ -478,8 +505,8 @@ module.exports = (params) => {
    * @returns {ConsumerOperation} the call's scope
    */
   const beginCall = (calls, bounded = true) => {
-    const invocation = RebalanceHooks.current()
-    const identity = handlerContext.current()?.runIdentity
+    const invocation = ownHook()
+    const identity = ownHandler()?.runIdentity
     const maxTotalTime = bounded ? retry?.maxTotalTime : undefined
     const operation = new ConsumerOperation({
       deadlineAt: Math.min(
@@ -681,7 +708,7 @@ module.exports = (params) => {
    */
   const earlierClose = () => {
     const earlier = closing ?? crashCleanup
-    if (!earlier || RebalanceHooks.current() || handlerContext.current()) return null
+    if (!earlier || ownHook() || ownHandler()) return null
     const asked = closeRequests
     return earlier.promise.catch(() => {}).then(() => asked)
   }
@@ -900,7 +927,7 @@ module.exports = (params) => {
     // Option getters are user code and may have retired the calling run meanwhile.
     refuseRetiredCaller()
     const cleanup = closeShared(parsed)
-    if (RebalanceHooks.current()) return acceptFromHook(cleanup)
+    if (ownHook()) return acceptFromHook(cleanup)
     return cleanup
   }
 
@@ -982,7 +1009,7 @@ module.exports = (params) => {
     }
     noteStop()
     const cleanup = stopShared()
-    if (!RebalanceHooks.current()) return cleanup
+    if (!ownHook()) return cleanup
     acceptFromHook(cleanup)
     return Promise.resolve()
   }
@@ -1058,7 +1085,7 @@ module.exports = (params) => {
    */
   const refuseFromHook = (api) => {
     refuseRetiredCaller()
-    if (RebalanceHooks.current()) {
+    if (ownHook()) {
       throw new KafkaJSNonRetriableError(
         `consumer#${api} cannot be called from a rebalance callback`
       )
@@ -1216,6 +1243,7 @@ module.exports = (params) => {
       runSlot = token
       selectionRevision++
       const runIdentity = { isCurrent: () => runSlot === token }
+      ownRuns.add(runIdentity)
       let group = null
       // Taken before the first await, so a crash restart cannot replay a queued seek.
       const seeks = [...queuedSeeks.values()]
@@ -1275,6 +1303,7 @@ module.exports = (params) => {
         obligations: owned.obligations,
         rebalanceListener: listener,
       })
+      if (group.rebalanceHooks) ownRuns.add(group.rebalanceHooks)
       retainedMemberId = null
       for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
 
@@ -1302,7 +1331,11 @@ module.exports = (params) => {
       // Logged once the run is published, so a run(), stop() or disconnect() from the sink finds it.
       logger.info('Starting', { groupId })
       const startedRunner = runner
-      const started = startedRunner.start()
+      // Started outside any handler or callback store: the runner and the work it starts must not
+      // inherit the authority of whoever called run().
+      const started = handlerContext.run(null, () =>
+        RebalanceHooks.outside(() => startedRunner.start())
+      )
       pendingStart = started.catch(() => {})
       await started
       if (
@@ -1564,7 +1597,9 @@ module.exports = (params) => {
     }
     const committing = runner
 
-    return withinCall((operation) => committing.commitOffsets(offsets, undefined, { operation }))
+    return withinCall((operation) =>
+      committing.commitOffsets(offsets, ownHandler(), { operation, invocation: ownHook() })
+    )
   }
 
   /**
@@ -1978,7 +2013,7 @@ module.exports = (params) => {
         },
       })
     )
-    if (RebalanceHooks.current()) return acceptFromHook(cleanup)
+    if (ownHook()) return acceptFromHook(cleanup)
     return cleanup
   }
 
@@ -2023,7 +2058,10 @@ module.exports = (params) => {
       )
     }
     return withinCall((operation) =>
-      group.position({ topic: entry.topic, partition: entry.partition }, { operation })
+      group.position(
+        { topic: entry.topic, partition: entry.partition },
+        { operation, invocation: ownHook() }
+      )
     )
   }
 
