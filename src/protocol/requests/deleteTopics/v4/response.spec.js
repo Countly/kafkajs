@@ -1,5 +1,7 @@
-const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 const { decode, parse } = require('./response')
+const { decode: decodeV5 } = require('../v5/response')
+const { decode: decodeV6 } = require('../v6/response')
 
 const vector = (caseId) => require(`../fixtures/java/deleteTopicsResponse-v4-${caseId}.json`)
 const byName = (a, b) => a.topic.localeCompare(b.topic)
@@ -26,13 +28,29 @@ describe('Protocol > Requests > DeleteTopics > v4 response', () => {
     await expect(parse(disabled)).rejects.toMatchObject({ type: 'TOPIC_DELETION_DISABLED' })
   })
 
-  test('reads a compact null count as no topics, never as a native error', async () => {
-    const body = new Encoder().writeInt32(25).writeUVarIntArray(null).writeTaggedFields().buffer
+  test('refuses a null result list', async () => {
+    const body = Buffer.from('000000000000', 'hex')
 
-    expect(await decode(body)).toEqual({
-      throttleTime: 0,
-      clientSideThrottleTime: 25,
-      topicErrors: [],
-    })
+    for (const codec of [decode, decodeV5, decodeV6]) {
+      const error = await codec(body).then(
+        () => null,
+        (rejection) => rejection
+      )
+
+      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect(error.message).toContain('DeleteTopicsResponse.Responses')
+    }
+  })
+
+  test('keeps an empty result list (control)', async () => {
+    const body = Buffer.from('000000000100', 'hex')
+
+    for (const codec of [decode, decodeV5, decodeV6]) {
+      expect(await codec(body)).toEqual({
+        throttleTime: 0,
+        clientSideThrottleTime: 0,
+        topicErrors: [],
+      })
+    }
   })
 })

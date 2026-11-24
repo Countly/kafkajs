@@ -36,12 +36,15 @@ const decodeTopicError = (decoder) => {
  * @param {Buffer} rawData
  * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, topicErrors:
  *   { topic: string, errorCode: number, errorMessage: string|null }[] }>}
+ * @throws {KafkaJSPartialMessageError} when `Results` is null, which no version allows
  */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
-  // A compact null count (0x00) reads as an empty list, as v0's classic -1 does
-  const listed = decoder.readUVarIntArray(decodeTopicError) || []
+  const listed = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopicError),
+    'CreatePartitionsResponse.Results'
+  )
 
   decoder.readTaggedFields()
   return {

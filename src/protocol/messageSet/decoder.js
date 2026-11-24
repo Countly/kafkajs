@@ -85,7 +85,7 @@ const EntriesDecoder = (decoder, compressedMessage) => {
   if (compressedMessage.magicByte > 0 && compressedMessage.offset >= 0) {
     const compressedOffset = Long.fromValue(compressedMessage.offset)
     const lastMessageOffset = Long.fromValue(messages[messages.length - 1].offset)
-    const baseOffset = compressedOffset - lastMessageOffset
+    const baseOffset = compressedOffset.subtract(lastMessageOffset)
 
     for (const message of messages) {
       message.offset = Long.fromValue(message.offset).add(baseOffset).toString()
