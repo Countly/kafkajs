@@ -389,6 +389,60 @@ describe('share handlers on parallel leader nodes', () => {
       expect(h.seen.crashes).toEqual([])
     })
 
+    test('a zero-timeout disconnect from the outcome of a failed final frame build captures the other node once', async () => {
+      const buildAcknowledge = ShareFetchLoop.prototype.buildAcknowledge
+      let failed = false
+      jest
+        .spyOn(ShareFetchLoop.prototype, 'buildAcknowledge')
+        .mockImplementation(function (prepared, final) {
+          if (final && !failed) {
+            failed = true
+            throw new Error('frame build failed')
+          }
+          return buildAcknowledge.call(this, prepared, final)
+        })
+      const capture = jest.spyOn(ShareFetchLoop.prototype, 'captureFinal')
+      await start({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 200 } })
+      const gate = deferred()
+      const completions = []
+      holds.push({ release: () => gate.resolve(), completions })
+      let requested = 0
+      h.consumer.on(h.consumer.events.ACKNOWLEDGE, () => {
+        if (requested++ > 0) return
+        completions.push(h.consumer.disconnect({ timeout: 0 }).catch(() => {}))
+      })
+      serveNodes(1)
+      const started = []
+      await run({
+        eachMessage: async ({ partition, acknowledge }) => {
+          const completed = deferred()
+          completions.push(completed.promise)
+          try {
+            started.push(partition)
+            acknowledge(partition === 0 ? 'reject' : 'accept')
+            await gate.promise
+          } finally {
+            completed.resolve()
+          }
+        },
+      })
+      await until(() => started.length === 2, 'both handlers')
+      for (let count = 2; count <= 5; count++) await beat(count)
+      expect(leaves()).toHaveLength(0)
+      await advance(50)
+      await until(() => outcomesOf(1).length === 1, 'the outcome of the choice captured on node 1')
+      await flush()
+      expect(failed).toBe(true)
+      expect(requested).toBeGreaterThan(0)
+      expect(capture).toHaveBeenCalledTimes(2)
+      expect(new Set(capture.mock.contexts).size).toBe(2)
+      expect(outcomesOf(0)).toEqual([['0', '0', 'reject', 'not-sent']])
+      expect(outcomesOf(1)).toEqual([['0', '0', 'accept', 'not-sent']])
+      expect(finalFrames()).toEqual([])
+      expect(leaves()).toEqual([])
+      expect(h.seen.crashes).toEqual([])
+    })
+
     test('a capture error whose message cannot be read still lets the captured node final before the leave', async () => {
       const unreadable = new Error('capture failed')
       Object.defineProperty(unreadable, 'message', {

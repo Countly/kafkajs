@@ -185,6 +185,55 @@ describe('share client admission while a close is in progress', () => {
     expect(seen).toEqual(['connect', 'disconnect'])
   })
 
+  test('a disconnect from a listener inside a zero-timeout disconnect joins its close and tears the client down once', async () => {
+    const h = open()
+    const seen = lifecycle(h)
+    const entered = deferred()
+    const proceed = deferred()
+    const outcomes = []
+    let nested = null
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => {
+      const { firstOffset, lastOffset, type, error } = payload
+      outcomes.push([firstOffset, lastOffset, type, error ? error.reason : null])
+      nested ??= h.consumer.disconnect({ timeout: 0 }).then(
+        () => 'resolved',
+        (failure) => failure
+      )
+    })
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({
+      eachMessage: async () => {
+        entered.resolve()
+        await proceed.promise
+      },
+    })
+    await entered.promise
+    const teardown = hold()
+    const closing = h.consumer.disconnect({ timeout: 0 }).then(
+      () => 'resolved',
+      (failure) => failure
+    )
+    await until(() => nested !== null, 'the listener disconnect')
+    await until(teardown.reached, 'the held teardown')
+    await flush()
+    const waiter = h.consumer.connect().then(() => seen.push('connect() resolved'))
+    await flush()
+    expect(seen).toEqual(['connect'])
+    expect(teardown.spy).toHaveBeenCalledTimes(1)
+    teardown.release()
+    expect(await closing).toBe('resolved')
+    expect(await nested).toBe('resolved')
+    await waiter
+    proceed.resolve()
+    await flush()
+    expect(teardown.spy).toHaveBeenCalledTimes(1)
+    expect(seen).toEqual(['connect', 'disconnect', 'connect', 'connect() resolved'])
+    expect(outcomes).toEqual([['0', '0', 'release', 'membership-lost']])
+    expect(h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)).toEqual([])
+    expect(leaves(h)).toEqual([])
+  })
+
   test('a stopped waiter cannot restart membership', async () => {
     clock = new ShareClock().install()
     const h = open()
