@@ -1236,6 +1236,27 @@ Group visibility and the admin client.
   topic can go; code that reads `error.errors` finds the items refused for good first (when
   nothing was refused for good and the retries ran out on failed items, `error.cause.errors` lists
   them); `retry: { retries: 0 }` makes a single attempt.
+- **`deleteTopicRecords` and `alterPartitionReassignments` check all of their input first.**
+  Both read and copy their input when they are called, before they return, and refuse the whole
+  call with `KafkaJSNonRetriableError` before any request when one entry is invalid. Some input
+  that 2.2.4 sent, and that Kafka could accept, is now refused:
+  - a partition listed twice in `deleteTopicRecords`: 2.2.4 sent both entries and Kafka applied
+    the last one;
+  - a partition listed twice for a topic in `alterPartitionReassignments`: 2.2.4 sent both;
+  - a replica id listed twice in one assignment: 2.2.4 sent it, and Kafka refused that partition
+    but applied the other partitions of the call; now none is reassigned;
+  - a `deleteTopicRecords` offset that is not a decimal integer string (an optional sign, then
+    digits), a safe integer number or a bigint: 2.2.4 also sent strings with spaces around the
+    digits, a string of spaces only (as `0`), hex, octal and binary strings such as `'0x1F'`,
+    integral numbers above 2^53 - 1, booleans, one-element arrays and objects with a `valueOf`,
+    and sent `'NaN'`, `'Infinity'` and `NaN` as `0`.
+
+  Offsets outside the signed 64-bit range (2.2.4 sent `'18446744073709551615'` as `-1`, which
+  deletes everything up to the high watermark), offsets below `-1`, fractions, missing or `null`
+  entries, holes, and partition or replica ids that are not integers from 0 to 2^31 - 1 (2.2.4 sent
+  `NaN` as `0` and truncated fractions) are refused too. A change made to the input after the call
+  no longer reaches the request. *What to do:* list each partition and each replica once, and pass
+  offsets as decimal strings such as `'31'`, or `'-1'`.
 - **A DescribeTopicPartitions read shares the call's `apiTimeout` (60000 ms by default).** Metadata discovery, every page, every retry and an unsupported-API Metadata fallback use that one budget. The fallback's shorter Metadata polling cap is nested inside it, never added. At the deadline the call rejects with `KafkaJSTimeout`. A topic recreated between two pages is read again from the start within the remaining budget. *What to do:* increase `apiTimeout` if your cluster needs longer to page.
 
 Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Configure the default with `kafka.admin({ apiTimeout })`, or override one call. Values must be integers from 1 to 2147483647. A broker-side `timeout` remains independent and is not shortened on the wire.

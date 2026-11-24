@@ -1245,7 +1245,7 @@ Delete records for a selected topic. This will delete all records from the earli
 
 Note that you cannot delete records in an arbitrary range (it will always be from the earliest available offset)
 
-Each partition must be an integer from 0 to 2^31 - 1, listed once, and each offset a decimal integer string or a safe integer number from 0 to 2^63 - 1, or exactly `-1`. Anything else, such as a value outside the signed 64-bit range, `-2`, a fraction, `'NaN'` or a hole in the list, is refused with a `KafkaJSNonRetriableError` before any request. The list is copied when the call starts: a change made to it afterwards does not reach the request.
+Each partition must be an integer from 0 to 2^31 - 1, listed once, and each offset from 0 to 2^63 - 1, or exactly `-1`, given as a decimal integer string (an optional sign, then digits only), a safe integer number or a bigint. Anything else, such as a value outside the signed 64-bit range, `-2`, a fraction, `'NaN'`, a hex string, a string with spaces or a hole in the list, is refused with a `KafkaJSNonRetriableError` before any request. The list is read and copied when `deleteTopicRecords()` is called, before it returns: a change made to it afterwards does not reach the request.
 
 The topic's offsets are read first, by a metadata request that names the topic: a partition without a leader is waited for within the `retry` budget, and one that stays without a leader fails the call as it fails `fetchTopicOffsets`, with a `KafkaJSNonRetriableError` whose `type` is `LEADER_NOT_AVAILABLE`, before anything is deleted. Each partition's request then goes to the leader the metadata names. A request that fails with a retriable error, such as a lost connection, is retried within the `retry` budget, at the same broker, and a broker that already deleted its partitions is not asked again; once the budget is spent the call rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the last error. A partition the topic does not have rejects at once with `KafkaJSDeleteTopicRecordsError`, before anything is deleted, once that offsets read has succeeded: on a topic that stays without a leader, the offsets read fails first, with the `KafkaJSNonRetriableError` above.
 
@@ -1427,6 +1427,8 @@ PartitionReassignment Structure:
   partitionAssignment: <Number[]> // Example: [{ partition: 0, replicas: [0,1,2] }]
 }
 ```
+
+Each partition and each replica must be an integer from 0 to 2^31 - 1. A partition listed twice for a topic, a replica listed twice for a partition, a `null` or missing entry, a hole in any of the lists and `replicas` that are not an array are refused with a `KafkaJSNonRetriableError` before any request, so no partition of the call is reassigned. An empty `replicas` array is sent as it is; Kafka refuses it. The topics are read and copied when `alterPartitionReassignments()` is called, before it returns: a change made to them afterwards does not reach the request.
 
 When some partitions are refused and others are not, the retries send only the partitions the broker said could still go through, each with the replicas you gave, and a topic whose partitions all went through is not sent again. A partition refused for good rejects the call with a `KafkaJSAggregateError`, as described under [Create topics](#create-topics). A topic whose `partitionAssignment` is empty is not sent.
 
