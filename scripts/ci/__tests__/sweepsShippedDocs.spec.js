@@ -6,9 +6,12 @@ const { spawnSync } = require('child_process')
 const ROOT = path.resolve(__dirname, '..', '..', '..')
 const SWEEPS = path.join(ROOT, 'scripts', 'ci', 'sweeps.sh')
 const BASE = '3.0.0-alpha.9b'
-/** Built from parts so this file does not itself match the label sweep it feeds. */
-const LABEL_LINE = `${['Phase', '9'].join(' ')} baseline\n`
+/** Built from parts so this file does not itself match the label sweep it feeds. A heading, so prose checks skip it. */
+const PHASE = 'Phase'
+const LABEL_LINE = `### ${[PHASE, '9'].join(' ')} baseline\n`
 const PLAN_ID = `9${'F'}-12`
+/** A short hyphenated machine name, joined at run time so this file never spells one. */
+const SHORT_MACHINE = ['dev', 'machine'].join('-')
 
 /** Shipped markdown outside docs/ that the sweep also reads. */
 const GOVERNANCE = [
@@ -153,7 +156,7 @@ describe('scripts/ci/sweeps.sh private working-process wording', () => {
     expect(files['scripts/e2e/telemetry/README.md']).toContain('# Broker telemetry fixture')
     expect(files['.github/workflows/gate.yml']).toContain('name: Exit gate')
 
-    for (const name of ['private-wording', 'workflow-comment']) {
+    for (const name of ['private-wording', 'changelog-phase', 'workflow-comment']) {
       const section = sweep(files, name)
 
       expect(section).toContain(`${name}: 0 hit(s)`)
@@ -165,6 +168,9 @@ describe('scripts/ci/sweeps.sh private working-process wording', () => {
     ['a development host in a guide', GUIDE, 'Measured on the development host.\n'],
     ['a developer machine in a guide', GUIDE, 'Install it on a developer machine.\n'],
     ['hosts in the release guide', 'RELEASING.md', 'Copy it to the development hosts.\n'],
+    ['a hyphenated developer host in a guide', GUIDE, 'Measured on a developer-host.\n'],
+    ['a short hyphenated machine name in a guide', GUIDE, `Measured on the ${SHORT_MACHINE}.\n`],
+    ['tab-separated host wording in a guide', GUIDE, 'Measured on the development\t\thost.\n'],
     ['a supplying controller in a guide', GUIDE, 'The controller supplies the guard.\n'],
     ['a test controller in a guide', GUIDE, 'The test controller starts it.\n'],
     ['a local acceptance rule in a guide', GUIDE, 'Local acceptance uses Node 26.\n'],
@@ -212,10 +218,41 @@ describe('scripts/ci/sweeps.sh private working-process wording', () => {
     expect(section).toContain('private-wording: 0 hit(s)')
   })
 
-  it('does not read executable workflow lines', () => {
-    const yml = "on:\n  push:\n    branches: ['p9z/**']\n"
+  it('ignores a branch filter and a technical phase comment in a workflow', () => {
+    const yml =
+      "# Each phase of the soak ends with a disconnect.\non:\n  push:\n    branches: ['p9z/**']\n"
     const section = sweep({ ...realDocs(), [WORKFLOW]: yml }, 'workflow-comment')
 
     expect(section).toContain('workflow-comment: 0 hit(s)')
+  })
+
+  it.each([
+    ['a numbered phase in changelog prose', 'CHANGELOG.md', `- Present since ${PHASE} 6A.\n`],
+    [
+      'a lower-case hyphenated phase number in changelog prose',
+      'CHANGELOG.md',
+      '- Added in phase-7.\n',
+    ],
+    ['a numbered phase in a workflow comment', WORKFLOW, `# Added in ${PHASE} 10.\n`],
+  ])('fails on %s', (_name, file, text) => {
+    const name = file === WORKFLOW ? 'workflow-comment' : 'changelog-phase'
+    const section = sweep({ ...realDocs(), [file]: text }, name)
+
+    expect(section).toContain(`${name}: 1 hit(s)`)
+    expect(section).toContain(`${file}:${text.trim()}`)
+    expect(section).toContain(`-- ${name}: not an enumerated exception:`)
+  })
+
+  it('does not flag numbered changelog headings, technical phases, release tags or fixture scopes', () => {
+    const changelog = [
+      `### ${PHASE} 4 — flexible protocol foundation`,
+      '',
+      '- Each phase ends with a disconnect; a two-phase commit; tag 3.0.0-alpha.9e; scope p9f.zero.scope.',
+      '',
+    ].join('\n')
+    const section = sweep({ ...realDocs(), 'CHANGELOG.md': changelog }, 'changelog-phase')
+
+    expect(section).toContain('changelog-phase: 0 hit(s)')
+    expect(section).not.toContain('-- changelog-phase:')
   })
 })

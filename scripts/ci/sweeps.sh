@@ -5,7 +5,8 @@
 # multiset, so an exception that moves still matches and a second copy of one is a new hit.
 # It also fails on planning ids (acceptance, decision or plan ids) in the shipped README, governance files and
 # guides, and on private working-process wording (a maintainer's machine, run controller, local-run rule, phase
-# process, private guard, run id or private branch) there, in the changelog, the scripts' Markdown and workflow comments.
+# process, private guard, run id or private branch) there, in the changelog, the scripts' Markdown and workflow comments,
+# and on numbered phases in changelog prose and workflow comments.
 # Usage: sweeps.sh <out directory>     Writes <out>/sweeps.txt, whose last line is the verdict.
 # Every `git grep` is checked by its own exit status (0 hits, 1 none, anything else a failure);
 # a failure stops the sweeps with `sweeps: FAIL`, never with a clean verdict.
@@ -231,9 +232,10 @@ DOCS=(README.md RELEASING.md SECURITY.md QUARANTINE.md CONTRIBUTING.md otel/READ
 hits shipped-doc -n -E "$DOC_IDS" -- "${DOCS[@]}"
 check shipped-doc ''
 # Private working-process wording, in any case, in those files, the changelog, the scripts' Markdown and
-# workflow comments. Executable workflow lines, fixture names and release tags are not read.
+# full-line workflow comments. A comment after YAML on the same line is not read; a `#` line inside a block
+# scalar is read as a comment. Executable workflow lines, fixture names and release tags are not read.
 WORDING_PATTERNS=(
-  '\bdevelop(ment|er) (host|machine)s?\b'                                       # a maintainer's machine
+  '\b(develop(ment|er)|dev)[[:blank:]-]+(host|machine)s?\b'                     # a maintainer's machine
   '\b(run|test|acceptance) controller\b|\bcontroller (supplies|acceptance)\b'   # a private run controller
   '\blocal (live )?(acceptance|correctness|gates?)\b|\blocal runs use\b'        # a rule for local runs
   '\bphase[- ](merges?|prs?|blocking|exits?)\b|\bsub-phase\b'                   # private phase process
@@ -244,7 +246,11 @@ WORDING_PATTERNS=(
 WORDING=$(IFS='|'; echo "${WORDING_PATTERNS[*]}")
 hits private-wording -n -i -E "$WORDING" -- "${DOCS[@]}" CHANGELOG.md 'scripts/*.md'
 check private-wording ''
-hits workflow-comment -n -i -E "^[[:space:]]*#.*($WORDING)" -- '.github/workflows/*.yml'
+# A numbered phase is a private plan step in changelog prose and workflow comments; changelog headings keep theirs.
+PHASE_NUMBER='\bphase[- ]?[0-9]'
+hits changelog-phase -n -i -E "^([^#]|#+[^#[:blank:]]).*$PHASE_NUMBER" -- CHANGELOG.md
+check changelog-phase ''
+hits workflow-comment -n -i -E "^[[:space:]]*#.*($WORDING|$PHASE_NUMBER)" -- '.github/workflows/*.yml'
 check workflow-comment ''
 leftovers leftover '*.orig' '*.rej' '*.swp' '*~'
 check leftover ''
