@@ -581,15 +581,17 @@ until it is stale) and then hits one transient failure, such as a rolling restar
 election, does **not** rebootstrap; it only rebootstraps once the failures are back-to-back for
 the whole window.
 
-A rebootstrap waits for each connection's in-flight requests to drain, then closes every
-connection the client holds. A request already in flight when it starts normally completes on the
-old socket rather than being rejected; the connections themselves are gone by the time
-`rebootstrap()` returns, so the *next* request the caller makes goes through the caller's normal
-retry path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster —
-it is not itself a source of message loss, but a producer created with `idempotent: false` can
-duplicate records the broker had already appended when a produce is retried. A metadata answer
-that arrives on an old connection after the rebootstrap is not used; the metadata refresh asks the
-rebuilt cluster once more. SASL authentication state
+A rebootstrap installs the new seed broker at once and retires every connection the client holds
+in the background, without waiting for them. A request already in flight when it starts normally
+completes on the old socket (each connection waits at most its drain bound) rather than being
+rejected; the *next* request the caller makes goes through the caller's normal retry path (the
+producer's or consumer's own `retry` configuration) against the rebuilt cluster — it is not itself
+a source of message loss, but a producer created with `idempotent: false` can duplicate records
+the broker had already appended when a produce is retried. A metadata answer or failure that
+arrives on an old connection after the rebootstrap is not used: the metadata refresh that sent it
+asks the rebuilt cluster once more while its caller still waits, and rejects with a retriable
+`KafkaJSConnectionError` when a second rebootstrap replaces that connection too or one lands just
+as the refresh ends. SASL authentication state
 (the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
 authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
 reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.

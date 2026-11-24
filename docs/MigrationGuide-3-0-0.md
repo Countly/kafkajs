@@ -1447,11 +1447,13 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   or every broker the client knows about has become unreachable. "Continuously" is measured from
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
-  running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
-  every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
-  through the caller's normal retry path against the rebuilt cluster. A metadata answer that
-  arrives on an old connection after the rebootstrap is not used: the metadata refresh asks the
-  rebuilt cluster once more. On an idempotent
+  running. A rebootstrap retires every connection in the background, each closing after at most
+  its drain bound, so requests still outstanding then fail with `KafkaJSConnectionClosedError` and
+  go through the caller's normal retry path against the rebuilt cluster. A metadata answer or
+  failure that arrives on an old connection after the rebootstrap is not used: the metadata
+  refresh that sent it asks the rebuilt cluster once more while its caller still waits, and
+  rejects with a retriable `KafkaJSConnectionError` when a second rebootstrap replaces that
+  connection too or one lands just as the refresh ends. On an idempotent
   producer (the default) the retry carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose

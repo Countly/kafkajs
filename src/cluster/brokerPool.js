@@ -552,8 +552,8 @@ module.exports = class BrokerPool {
    * in flight can finish up to drainTimeout, then its sockets close and queued work rejects.
    * Recovery never waits for that drain.
    *
-   * An unknown node id at the seed broker's address adopts the seed, as `refreshMetadata`'s reduce
-   * does, so the seed's address is not connected twice; a seed the table already holds under
+   * An unknown node id at the seed broker's address adopts the seed, as a metadata install
+   * (`installBrokers`) does, so the seed's address is not connected twice; a seed the table already holds under
    * another id is never adopted again. `Cluster#findGroupCoordinator` adds a coordinator it
    * reached through FindCoordinator this way too.
    *
@@ -564,8 +564,9 @@ module.exports = class BrokerPool {
    *   out from under it would leave them holding a stale, disconnected reference. When the entry
    *   at `nodeId` *is* the seed, its connection pool is swapped in place instead - the seed's
    *   identity and `this.seedBroker` never change - and the pool it was using is drained
-   *   separately, mirroring how `refreshMetadata`'s reduce keeps the seed object rather than
-   *   rebuilding it when it recognises the address (see `refreshMetadata` above).
+   *   separately, mirroring how a metadata install keeps the seed object rather than rebuilding
+   *   it when it recognises the address. An answer whose pools were being built meanwhile keeps
+   *   this newer pool and its endpoint.
    * - **An endpoint with no usable address.** A blank host or a non-positive port is exactly the
    *   input `connectionPoolBuilder` treats as "no destination given" and answers with the next
    *   configured bootstrap broker - silently pointing this node id at an unrelated broker. Such an
@@ -1040,7 +1041,10 @@ module.exports = class BrokerPool {
    *
    * Refreshes may overlap, and their replies may arrive in one read. Each accepted answer takes a
    * publication number, and only the latest one is installed: an older answer still building its
-   * pools installs nothing, reports no success and closes its pools unused.
+   * pools installs nothing and closes its pools unused; its call waits for the newer answer and
+   * settles with it (a call with an observer asks once more instead). Success
+   * (`onMetadataSuccess`) is reported only for the answer still installed when its call settles,
+   * and only an installed answer stops a rebootstrap that is building its seed.
    *
    * `findConnectedBroker()` runs **inside** the retry callback and the seed is read at the
    * install: a rebootstrap partway through this method (trigger (c), fired from inside
@@ -1071,10 +1075,17 @@ module.exports = class BrokerPool {
    * before it.
    *
    * A consumer refresh whose subscription issued a newer refresh while it ran (and whose scope is
-   * otherwise unchanged) hands over to that newer refresh if it is still in flight: it settles
-   * with it, rejecting with its failure, and asks once more itself when that refresh installed
-   * nothing or observed with another `onMetadata` observer. With nothing in flight it resolves, as
-   * before.
+   * otherwise unchanged) hands over to that newer refresh, in flight or already settled: it waits
+   * for it no longer than its own lifecycle and deadline allow, rejects with its failure, takes
+   * its answer when the pool still holds it and the same `onMetadata` observer saw it, and
+   * otherwise asks once more itself, within the same retry attempt and its one reissue. When the
+   * newer ticket came from no refresh (an `assign()` validation, say), it resolves, as before.
+   *
+   * Topic judgement (producer drops, consumer isolation) changes nothing until the install step,
+   * where it is judged again against the targets as they stand then; statuses, drop logs,
+   * topic-recreated events and the observer run after it, each contained, so a listener can
+   * neither undo nor interrupt an install. A listener that retires this call still leaves the
+   * routing notice to the other listeners.
    *
    * @public
    * @param {Array<String>} topics
