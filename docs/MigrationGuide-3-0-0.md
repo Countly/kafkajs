@@ -298,8 +298,10 @@ notice and what, if anything, to do.
 - **A custom partitioner that returns an invalid partition now rejects the send.** 2.2.4
   resolved such a send and dropped the records whose partition was not a partition of the topic.
   3.0.0 rejects it with `KafkaJSInvalidConfigurationError` before anything is queued. The value
-  must be an integer from 0 to 2147483647, as a number or a canonical decimal string. *What to
-  do:* make the partitioner return a partition id.
+  must be an integer from 0 to 2147483647, as a number or a canonical decimal string. The built-in
+  partitioners return an explicit `message.partition` as it is, so a message with an invalid
+  `message.partition` is rejected the same way. *What to do:* make the partitioner return a
+  partition id, and give messages only valid `partition` values.
 
 ### Transactions
 

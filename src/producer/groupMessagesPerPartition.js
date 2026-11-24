@@ -3,6 +3,9 @@ const { KafkaJSInvalidConfigurationError } = require('../errors')
 /** The largest partition id a Kafka INT32 can carry. */
 const MAX_PARTITION = 2147483647
 
+/** The canonical decimal form of a partition id: no sign, no leading zeros, at most ten digits. */
+const CANONICAL_DECIMAL = /^(0|[1-9][0-9]{0,9})$/
+
 /**
  * Whether a partitioner's result names a partition id: an integer from 0 to 2147483647, as a
  * number or as its canonical decimal string (`'12'`, not `'012'`).
@@ -13,7 +16,7 @@ const valid = (partition) =>
   typeof partition === 'number'
     ? Number.isInteger(partition) && partition >= 0 && partition <= MAX_PARTITION
     : typeof partition === 'string' &&
-      /^(0|[1-9][0-9]{0,9})$/.test(partition) &&
+      CANONICAL_DECIMAL.test(partition) &&
       Number(partition) <= MAX_PARTITION
 
 /**
