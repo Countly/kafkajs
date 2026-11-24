@@ -78,6 +78,45 @@ const SENSITIVE_API_KEYS = new Set([
   apiKeys.AlterUserScramCredentials,
 ])
 
+/** APIs whose responses carry config values, or broker error text that can echo them. */
+const CONFIDENTIAL_API_KEYS = new Set([
+  apiKeys.DescribeConfigs,
+  apiKeys.CreateTopics,
+  apiKeys.AlterConfigs,
+  apiKeys.IncrementalAlterConfigs,
+])
+
+/** APIs whose responses carry records. */
+const CONTENT_API_KEYS = new Set([apiKeys.Fetch, apiKeys.ShareFetch])
+
+/**
+ * Decides what the DEBUG logs of a response may show, for both the decoded data and the raw bytes
+ * of a failed one. `sensitive` and `confidential` are never shown; `content` only when both
+ * buffer flags are set; `plain` always as data, and as raw bytes with the first flag.
+ * @param {number} apiKey
+ * @returns {'sensitive'|'confidential'|'content'|'plain'}
+ */
+const responseLogPolicy = (apiKey) => {
+  if (SENSITIVE_API_KEYS.has(apiKey)) return 'sensitive'
+  if (CONFIDENTIAL_API_KEYS.has(apiKey)) return 'confidential'
+  if (CONTENT_API_KEYS.has(apiKey)) return 'content'
+  return 'plain'
+}
+
+/**
+ * The raw bytes of a failed response as its DEBUG log may show them.
+ * @param {'sensitive'|'confidential'|'content'|'plain'} policy see `responseLogPolicy`
+ * @param {*} payload the response bytes
+ * @param {boolean} showBuffers whether the first buffer flag is set
+ * @param {boolean} showContent whether both buffer flags are set
+ * @returns {*} the payload, or its filtered stand-in
+ */
+const loggedPayload = (policy, payload, showBuffers, showContent) => {
+  if (policy === 'sensitive' || policy === 'confidential') return '[filtered]'
+  const shown = policy === 'content' ? showContent : showBuffers || !Buffer.isBuffer(payload)
+  return shown ? payload : { type: 'Buffer', data: '[filtered]' }
+}
+
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
@@ -1044,7 +1083,6 @@ module.exports = class Connection {
           : null
       }
     }
-    const sensitiveResponse = SENSITIVE_API_KEYS.has(request.apiKey)
     const attempt = this.connectAttempt
     const telemetrySink = this.telemetrySink
     const telemetrySlot = telemetrySink ? this.telemetrySlot : null
@@ -1091,6 +1129,7 @@ module.exports = class Connection {
       return
     }
 
+    const policy = responseLogPolicy(request.apiKey)
     try {
       const payloadDecoded = await response.decode(responseBody(entry, payload))
       if (onDecoded) onDecoded(payloadDecoded)
@@ -1106,13 +1145,14 @@ module.exports = class Connection {
       const data = await response.parse(payloadDecoded)
       const parsedRefusal = responseGuard && responseGuard()
       if (parsedRefusal) throw parsedRefusal
-      const isFetchApi = entry.apiName === 'Fetch'
       try {
         this.logDebug(`Response ${requestInfo(entry)}`, {
           correlationId,
           size,
           data:
-            sensitiveResponse || (isFetchApi && !this.shouldLogFetchBuffer) ? '[filtered]' : data,
+            policy === 'plain' || (policy === 'content' && this.shouldLogFetchBuffer)
+              ? data
+              : '[filtered]',
         })
       } catch {}
 
@@ -1120,24 +1160,20 @@ module.exports = class Connection {
     } catch (e) {
       attachResponseSource(e, request.apiKey)
       try {
-        const failure = sensitiveResponse
-          ? 'Sensitive response failed'
-          : this.authenticationOwner
-            ? 'Telemetry response failed'
-            : e.message
+        const failure =
+          policy === 'sensitive'
+            ? 'Sensitive response failed'
+            : this.authenticationOwner
+              ? 'Telemetry response failed'
+              : e.message
         if (logResponseError) {
           this.logError(`Response ${requestInfo(entry)}`, { error: failure, correlationId, size })
         }
 
-        const isBuffer = Buffer.isBuffer(payload)
         this.logDebug(`Response ${requestInfo(entry)}`, {
           error: failure,
           correlationId,
-          payload: sensitiveResponse
-            ? '[filtered]'
-            : isBuffer && !this.shouldLogBuffers
-              ? { type: 'Buffer', data: '[filtered]' }
-              : payload,
+          payload: loggedPayload(policy, payload, this.shouldLogBuffers, this.shouldLogFetchBuffer),
         })
       } catch {}
 
