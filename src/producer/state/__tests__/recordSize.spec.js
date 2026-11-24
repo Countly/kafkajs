@@ -982,8 +982,46 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
 
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
     expect(error.message).toBe(
-      `Invalid message without value for topic "${TOPIC}": {"key":"k","timestamp":"5"}`
+      `Invalid message without value for topic "${TOPIC}" at index 0`
     )
+    expect(admission.reserved).toBe(0)
+    await producer.disconnect()
+  })
+
+  test('a record without a value is named by topic and index, never by its contents', async () => {
+    const { producer, admission } = await heldProducer()
+    const marker = 'secret-marker-4d1f'
+
+    const error = await producer
+      .send({
+        topic: TOPIC,
+        messages: [
+          { value: 'ok' },
+          { key: `key-${marker}`, headers: { h: `header-${marker}` }, extra: `extra-${marker}` },
+        ],
+      })
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 1`)
+    for (const text of [error.message, error.stack, JSON.stringify(error)]) {
+      expect(text).not.toContain(marker)
+    }
+    expect(admission.reserved).toBe(0)
+    await producer.disconnect()
+  })
+
+  test('a string record without a value is not echoed', async () => {
+    const { producer, admission } = await heldProducer()
+    const marker = 'secret-marker-9b2e'
+
+    const error = await producer.send({ topic: TOPIC, messages: [marker] }).catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 0`)
+    for (const text of [error.message, error.stack, JSON.stringify(error)]) {
+      expect(text).not.toContain(marker)
+    }
     expect(admission.reserved).toBe(0)
     await producer.disconnect()
   })
@@ -992,7 +1030,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const { producer, admission } = await heldProducer()
 
     await expect(producer.send({ topic: TOPIC, messages: ['text'] })).rejects.toThrow(
-      `Invalid message without value for topic "${TOPIC}": "text"`
+      `Invalid message without value for topic "${TOPIC}" at index 0`
     )
     await expect(producer.send({ topic: TOPIC, messages: {} })).rejects.toThrow(TypeError)
     await expect(producer.sendBatch({ topicMessages: [null] })).rejects.toThrow(TypeError)
