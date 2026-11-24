@@ -2,7 +2,12 @@ const { createLogger } = require('../../loggers')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
 const Runner = require('../runner')
 const { MemberAssignment } = require('../assignerProtocol')
-const { KafkaJSError, KafkaJSTopicRecreatedError } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSCommitFailedError,
+  KafkaJSConnectionError,
+  KafkaJSTopicRecreatedError,
+} = require('../../errors')
 const {
   fenced,
   groupAuthorization,
@@ -313,7 +318,8 @@ describe('Consumer > a run stopped for good with an error', () => {
     await advanceUntil(() => after.done, 1000)
 
     expect(inFlight.done).toBe(true)
-    expect(inCauseChain(inFlight.error, error)).toBe(true)
+    expect(inFlight.error).toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(inFlight.error.cause).toBe(error)
     expect(attached.error.type).toBe('CONSUMER_STOPPING')
     expect(after.error.message).toBe(
       'Consumer group was not initialized, consumer#run must be called first'
@@ -322,6 +328,62 @@ describe('Consumer > a run stopped for good with an error', () => {
     expect(run.crashes).toHaveLength(1)
     expect(run.crashes[0].error).toBe(error)
   }, 30000)
+
+  describe('a commit overtaken by stopRun emits no COMMIT_OFFSETS', () => {
+    const offsets = [{ topic: 'topic-a', partition: 0, offset: '41' }]
+
+    it('when stopRun lands after its answer was taken and before it is recorded', async () => {
+      const run = await startHeld()
+      const { group } = parts(run)
+      const manager = group.offsetManager
+      const send = manager.sendOffsetCommit.bind(manager)
+      const error = recreated()
+      jest.spyOn(manager, 'sendOffsetCommit').mockImplementationOnce(async (...args) => {
+        const result = await send(...args)
+        group.stopRun(error)
+        return result
+      })
+      const events = jest.fn()
+      run.consumer.on(run.consumer.events.COMMIT_OFFSETS, events)
+      const commits = run.coordinator.offsetCommit.mock.calls.length
+
+      const inFlight = settled(run.consumer.commitOffsets(offsets))
+      await advanceUntil(() => inFlight.done, 1000)
+
+      expect(inFlight.done).toBe(true)
+      expect(inCauseChain(inFlight.error, error)).toBe(true)
+      expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(commits + 1)
+      expect(events).not.toHaveBeenCalled()
+    }, 30000)
+
+    it('when its answer arrives after stopRun (control)', async () => {
+      const run = await startHeld()
+      const { group } = parts(run)
+      const commit = run.coordinator.offsetCommit.getMockImplementation()
+      const gate = deferred()
+      let written = false
+      run.coordinator.offsetCommit.mockImplementationOnce(async (request) => {
+        written = true
+        await gate.promise
+        return commit(request)
+      })
+      const events = jest.fn()
+      run.consumer.on(run.consumer.events.COMMIT_OFFSETS, events)
+      const commits = run.coordinator.offsetCommit.mock.calls.length
+      const inFlight = settled(run.consumer.commitOffsets(offsets))
+      await advanceUntil(() => written, 1000)
+      const error = recreated()
+
+      group.stopRun(error)
+      gate.resolve()
+      await advanceUntil(() => inFlight.done, 1000)
+
+      expect(inFlight.done).toBe(true)
+      expect(inCauseChain(inFlight.error, error)).toBe(true)
+      expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(commits + 1)
+      expect(events).not.toHaveBeenCalled()
+    }, 30000)
+  })
 
   it('after stopRun no heartbeat is sent, and a handler heartbeat is refused', async () => {
     const run = await startHeld()
@@ -522,6 +584,108 @@ describe('Consumer > a run stopped for good with an error', () => {
     }, 30000)
   })
 
+  describe('stopRun during an ordinary stop takes it over and drains', () => {
+    it('a stop waiting for a running handler still waits for it before CRASH', async () => {
+      const run = await startHeld()
+      const { group } = parts(run)
+      const clear = jest.spyOn(group, 'clearAssignerState')
+      const stopping = settled(run.consumer.stop())
+      await jest.advanceTimersByTimeAsync(100)
+      expect(stopping.done).toBe(false)
+      const error = recreated()
+
+      group.stopRun(error)
+      await jest.advanceTimersByTimeAsync(5000)
+
+      expect(stopping.done).toBe(false)
+      expect(run.crashes).toEqual([])
+      expect(run.handlerEnded()).toBe(false)
+      expect(clear).not.toHaveBeenCalled()
+
+      run.held.resolve()
+      await advanceUntil(() => stopping.done && run.crashes.length > 0)
+
+      expect(stopping).toMatchObject({ done: true, value: undefined })
+      expect(clear).toHaveBeenCalledTimes(1)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+    }, 30000)
+
+    it('a bounded disconnect keeps its deadline, and its drain waits for the handler until then', async () => {
+      const run = await startHeld()
+      const { group, runner } = parts(run)
+      const clear = jest.spyOn(group, 'clearAssignerState')
+      const closing = settled(run.consumer.disconnect({ timeout: 2000 }))
+      await jest.advanceTimersByTimeAsync(100)
+      expect(closing.done).toBe(false)
+
+      group.stopRun(recreated())
+      await jest.advanceTimersByTimeAsync(1899)
+
+      expect(closing.done).toBe(false)
+      expect(run.crashes).toEqual([])
+      expect(clear).not.toHaveBeenCalled()
+
+      await advanceUntil(() => closing.done, 100)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(run.handlerEnded()).toBe(false)
+      expect(clear).toHaveBeenCalledTimes(1)
+      expect(runner.listenerCount(HANDLERS_IDLE)).toBe(0)
+      forget()
+      run.held.resolve()
+    }, 30000)
+  })
+
+  describe('a failing drain stage still lets the crash cleanup uninstall the run', () => {
+    const offsets = [{ topic: 'topic-a', partition: 0, offset: '41' }]
+    const notInitialized = 'Consumer group was not initialized, consumer#run must be called first'
+
+    it('a classic assigner that throws while its state is cleared', async () => {
+      const run = await startOther('classic')
+      const { assigners } = run.group.groupMembership
+      const failing = jest.fn((assignment) => {
+        if (assignment === null) throw new Error('the assigner failed')
+      })
+      const next = jest.fn()
+      assigners[0].onAssignment = failing
+      assigners.push({ name: 'next', onAssignment: next })
+      const disconnects = run.cluster.disconnect.mock.calls.length
+      const error = recreated()
+
+      run.group.stopRun(error)
+      await advanceUntil(() => run.crashes.length > 0)
+      const after = settled((async () => run.consumer.commitOffsets(offsets))())
+      await advanceUntil(() => after.done, 1000)
+
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+      expect(failing).toHaveBeenCalledWith(null, { generationId: -1, groupProtocol: null })
+      expect(next).toHaveBeenCalledWith(null, { generationId: -1, groupProtocol: null })
+      expect(run.cluster.disconnect).toHaveBeenCalledTimes(disconnects + 1)
+      expect(after.error.message).toBe(notInitialized)
+    }, 30000)
+
+    it('a rebalance chain that rejects', async () => {
+      const run = await start()
+      const { rc } = parts(run)
+      jest.spyOn(rc, 'idle').mockRejectedValueOnce(new Error('the round failed'))
+      const disconnects = run.cluster.disconnect.mock.calls.length
+      const error = recreated()
+
+      parts(run).group.stopRun(error)
+      await advanceUntil(() => run.crashes.length > 0)
+      const after = settled((async () => run.consumer.commitOffsets(offsets))())
+      await advanceUntil(() => after.done, 1000)
+
+      expect(rc.idle).toHaveBeenCalledTimes(1)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toBe(error)
+      expect(run.cluster.disconnect).toHaveBeenCalledTimes(disconnects + 1)
+      expect(after.error.message).toBe(notInitialized)
+    }, 30000)
+  })
+
   it("the crash report's failure is logged, not unhandled", async () => {
     const { logger, lines } = recordingLogger()
     const run = await start({ logger })
@@ -717,6 +881,68 @@ describe('Consumer > a run stopped for good with an error', () => {
     expect(run.crashes).toEqual([])
   }, 30000)
 
+  describe('a poll-expiry leave overtaken by stopRun', () => {
+    it('is not written when it reaches its write after stopRun', async () => {
+      const run = await start()
+      const { rc, group } = parts(run)
+      const beat = run.coordinator.consumerGroupHeartbeat.getMockImplementation()
+      const gate = deferred()
+      let reached = false
+      run.coordinator.consumerGroupHeartbeat.mockImplementation(async (request) => {
+        if (request.memberEpoch < 0 && !reached) {
+          reached = true
+          await gate.promise
+          const refused = request.guard?.()
+          if (refused) throw refused
+        }
+        return beat(request)
+      })
+      const reset = jest.spyOn(group, 'resetGenerationLocally')
+      const expiry = settled(rc.onPollExpired({ elapsedMs: 5000, isStatic: false }))
+      await advanceUntil(() => reached, 1000)
+
+      group.stopRun(recreated())
+      gate.resolve()
+      await advanceUntil(() => expiry.done, 1000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(expiry).toMatchObject({ done: true, value: undefined })
+      expect(leaves(run)).toEqual([])
+      expect(reset).not.toHaveBeenCalled()
+    }, 30000)
+
+    it('takes no effect from an answer that arrives after stopRun', async () => {
+      const run = await start()
+      const { rc, group } = parts(run)
+      const beat = run.coordinator.consumerGroupHeartbeat.getMockImplementation()
+      const gate = deferred()
+      let written = false
+      run.coordinator.consumerGroupHeartbeat.mockImplementation(async (request) => {
+        const reply = await beat(request)
+        if (request.memberEpoch < 0 && !written) {
+          written = true
+          await gate.promise
+        }
+        return reply
+      })
+      const reset = jest.spyOn(group, 'resetGenerationLocally')
+      const expiry = settled(rc.onPollExpired({ elapsedMs: 5000, isStatic: false }))
+      await advanceUntil(() => written, 1000)
+      const events = jest.fn()
+      run.consumer.on(run.consumer.events.HEARTBEAT, events)
+
+      group.stopRun(recreated())
+      gate.resolve()
+      await advanceUntil(() => expiry.done, 1000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(expiry).toMatchObject({ done: true, value: undefined })
+      expect(leaves(run)).toHaveLength(1)
+      expect(events).not.toHaveBeenCalled()
+      expect(reset).not.toHaveBeenCalled()
+    }, 30000)
+  })
+
   it('stopRun sends no LeaveGroup and does not call the close callback', async () => {
     const hook = { onPartitionsRevoked: jest.fn(), onPartitionsLost: jest.fn() }
     const run = await start({ hook })
@@ -908,6 +1134,96 @@ describe('Consumer > a run stopped for good with an error', () => {
       },
       30000
     )
+
+    it('a heartbeat refused at its write with the stop error does not mark the coordinator unknown', async () => {
+      const run = await startHeldClassic()
+      const { coordinator, group } = run
+      const membership = group.groupMembership
+      const gate = deferred()
+      const sent = coordinator.heartbeat.mock.calls.length
+      coordinator.heartbeat.mockImplementationOnce(async ({ guard }) => {
+        await gate.promise
+        const refused = guard?.()
+        if (refused) throw refused
+      })
+      await advanceUntil(() => coordinator.heartbeat.mock.calls.length > sent)
+      expect(coordinator.heartbeat).toHaveBeenCalledTimes(sent + 1)
+      expect(membership.coordinatorUnknown).toBe(false)
+      const events = jest.fn()
+      run.consumer.on(run.consumer.events.HEARTBEAT, events)
+
+      group.stopRun(new KafkaJSConnectionError('The coordinator connection was closed'))
+      gate.resolve()
+      await jest.advanceTimersByTimeAsync(10000)
+
+      expect(membership.coordinatorUnknown).toBe(false)
+      expect(events).not.toHaveBeenCalled()
+      expect(coordinator.heartbeat).toHaveBeenCalledTimes(sent + 1)
+      expect(run.crashes).toEqual([])
+    }, 30000)
+
+    describe('a poll-expiry LeaveGroup overtaken by stopRun', () => {
+      it('is not written when its coordinator wait ends after stopRun', async () => {
+        const run = await startOther('classic')
+        const { runner, group, coordinator } = run
+        const membership = group.groupMembership
+        const stop = runner.heartbeatManager.stop.bind(runner.heartbeatManager)
+        const live = membership.liveCoordinator.bind(membership)
+        const gate = deferred()
+        let armed = false
+        let looking = false
+        jest.spyOn(runner.heartbeatManager, 'stop').mockImplementationOnce(async () => {
+          await stop()
+          armed = true
+        })
+        jest.spyOn(membership, 'liveCoordinator').mockImplementation(async (operation) => {
+          if (armed && !looking) {
+            looking = true
+            await gate.promise
+          }
+          return live(operation)
+        })
+        const reset = jest.spyOn(group, 'resetGenerationLocally')
+        const expiry = settled(
+          runner.rebalanceCoordinator.onPollExpired({ elapsedMs: 5000, isStatic: false })
+        )
+        await advanceUntil(() => looking, 1000)
+
+        group.stopRun(recreated())
+        gate.resolve()
+        await advanceUntil(() => expiry.done, 1000)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(expiry).toMatchObject({ done: true, value: undefined })
+        expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+        expect(reset).not.toHaveBeenCalled()
+      }, 30000)
+
+      it('resets no generation when its answer arrives after stopRun', async () => {
+        const run = await startOther('classic')
+        const { runner, group, coordinator } = run
+        const gate = deferred()
+        let written = false
+        coordinator.leaveGroup.mockImplementationOnce(async () => {
+          written = true
+          await gate.promise
+        })
+        const reset = jest.spyOn(group, 'resetGenerationLocally')
+        const expiry = settled(
+          runner.rebalanceCoordinator.onPollExpired({ elapsedMs: 5000, isStatic: false })
+        )
+        await advanceUntil(() => written, 1000)
+
+        group.stopRun(recreated())
+        gate.resolve()
+        await advanceUntil(() => expiry.done, 1000)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(expiry).toMatchObject({ done: true, value: undefined })
+        expect(coordinator.leaveGroup).toHaveBeenCalledTimes(1)
+        expect(reset).not.toHaveBeenCalled()
+      }, 30000)
+    })
 
     it('stopRun during the initial join reports its own error and a later JoinGroup answer syncs nothing', async () => {
       const joined = deferred()
