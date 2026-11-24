@@ -16,7 +16,7 @@ const { parse } = require('../v0/response')
  *
  * Decoded into v1's shape — `{ throttleTime: 0, clientSideThrottleTime, errors: [{ topic,
  * partitionErrors: [{ partition, errorCode }] }] }`; the broker's throttle is reported as
- * `clientSideThrottleTime` (KIP-219). `parse` is v0's: it throws the first failed partition's error.
+ * `clientSideThrottleTime` (KIP-219). `parse` is v0's: it throws one failed partition's error, chosen independently of row order.
  * @see clients/src/main/resources/common/message/AddPartitionsToTxnResponse.json (Apache Kafka 4.3.1)
  *
  * @param {Buffer} rawData

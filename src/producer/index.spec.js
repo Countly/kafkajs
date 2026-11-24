@@ -77,7 +77,7 @@ describe('Producer', () => {
       producer.send({ acks: 1, topic: topicName, messages: [{ foo: 'bar' }] })
     ).rejects.toHaveProperty(
       'message',
-      `Invalid message without value for topic "${topicName}": {"foo":"bar"}`
+      `Invalid message without value for topic "${topicName}" at index 0`
     )
   })
 

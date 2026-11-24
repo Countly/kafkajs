@@ -448,7 +448,9 @@ class TokenCache {
 
   /**
    * Records a source's result. A JWT that has already expired is refused; a token whose lifetime
-   * is missing, zero or inside `clockSkew` is returned without being kept.
+   * is missing, zero or inside `clockSkew` is returned without being kept. The cache's own record,
+   * handed back by a source, is kept as it is only while it is still usable; otherwise it is
+   * checked again like a new result.
    * @param {TokenResult} result
    * @returns {TokenRecord}
    * @throws {KafkaJSSASLAuthenticationError} when the result has no token or has expired
@@ -457,7 +459,7 @@ class TokenCache {
     if (!isRecord(result) || typeof result.value !== 'string' || result.value === '') {
       throw failure('token', {}, true)
     }
-    if (result === this.token) return result
+    if (result === this.token && this.usable()) return result
     const now = Date.now()
     const claimed = expiryOf(result.value)
     if (claimed <= now) throw failure('expired', {}, true)
