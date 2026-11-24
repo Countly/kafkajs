@@ -5,8 +5,8 @@ name: Final soak smoke (diagnostic)
 # job takes about 35 minutes, a rehearsal about 3.5 hours. Diagnostic only: a hosted runner cannot
 # meet the quiet-host floors, so preflight records those checks without failing on them and the
 # artifact is marked diagnostic. It closes no evidence row and gates nothing; it is how the driver's live parts
-# get exercised against a real cluster. A push to a branch named p11/soak-smoke* runs it with every
-# default, since a dispatch-only workflow must first exist on the default branch.
+# get exercised against a real cluster. A push to a branch that matches the `push` trigger below runs it
+# with every default, since a dispatch-only workflow must first exist on the default branch.
 on:
   workflow_dispatch:
     inputs:
