@@ -347,7 +347,8 @@ describe('Consumer > a first round that fails after joining', () => {
           order.push('join')
           joins += 1
           if (joins > 1) return JOINED
-          // The broker has assigned the member id, and the follow-up join never answers.
+          // MEMBER_ID_REQUIRED: the broker assigned the member id, which the membership keeps as
+          // its pending id; the follow-up join then never answers.
           options?.onMemberIdRequired?.(MEMBER_ID)
           return new Promise(() => {})
         }),
@@ -370,6 +371,10 @@ describe('Consumer > a first round that fails after joining', () => {
     ])
     expect(member.leaves).toHaveLength(1)
     expect(member.leaves[0]).toMatchObject({ memberId: MEMBER_ID })
+    expect(member.coordinator.joinGroup.mock.calls.map(([request]) => request.memberId)).toEqual([
+      '',
+      MEMBER_ID,
+    ])
   })
 
   test('the cleanup stop runs once: a disconnect() racing the crash cleanup joins it', async () => {
