@@ -238,12 +238,12 @@ describe('Producer > deliveryTimeout', () => {
     })
   })
 
-  test("p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0 written once", async () => {
+  test("p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0's write guard accepts once", async () => {
     const written = []
     const cluster = createFakeCluster({
       partitions: 2,
       produce: async (request) => {
-        const refusal = request.guard?.(100)
+        const refusal = request.guard(100)
         if (refusal) throw refusal
         for (const { topic, partitions } of request.topicData)
           for (const { partition, firstSequence, messages } of partitions)

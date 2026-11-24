@@ -12083,7 +12083,7 @@
         "src/producer/__tests__/deliveryDefaults.spec.js \u203a Producer > delivery defaults the retries of a delivery retries of the client are kept as the producer\u2019s own",
         "src/producer/__tests__/deliveryDefaults.spec.js \u203a Producer > delivery defaults the retries of a delivery start 100 ms apart, within the jitter, and never wait more than 1 000 ms",
         "src/producer/__tests__/deliveryTimeout.spec.js \u203a Producer > deliveryTimeout kafka.producer({ deliveryTimeout }) bounds a send, ahead of the client's longer retry.maxTotalTime",
-        "src/producer/__tests__/deliveryTimeout.spec.js \u203a Producer > deliveryTimeout p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0 written once",
+        "src/producer/__tests__/deliveryTimeout.spec.js \u203a Producer > deliveryTimeout p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0's write guard accepts once",
         "src/producer/__tests__/deliveryTimeout.spec.js \u203a Producer > deliveryTimeout on a non-idempotent producer a send that keeps failing rejects with KafkaJSDeliveryTimeout once the deadline passes",
         "src/producer/__tests__/deliveryTimeout.spec.js \u203a Producer > deliveryTimeout on a non-idempotent producer retries exhausted before the deadline still reject with KafkaJSNumberOfRetriesExceeded",
         "src/producer/__tests__/deliveryTimeout.spec.js \u203a Producer > deliveryTimeout on a non-idempotent producer without deliveryTimeout, a deadline set as retry.maxTotalTime still bounds the send",
