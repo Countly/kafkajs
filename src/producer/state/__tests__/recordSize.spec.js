@@ -972,14 +972,21 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     }
   )
 
-  test('the missing-value check reads the copy, and its error names the copy', async () => {
+  test('missing-value validation uses the value read once into the copy', async () => {
     const { producer, admission } = await heldProducer()
-    const timestamp = Long.fromValue(5)
+    const reads = { count: 0 }
+    const record = { key: 'k' }
+    Object.defineProperty(record, 'value', {
+      enumerable: true,
+      get: () => {
+        reads.count += 1
+        return reads.count === 1 ? undefined : 'a later read'
+      },
+    })
 
-    const error = await producer
-      .send({ topic: TOPIC, messages: [{ key: 'k', timestamp }] })
-      .catch((e) => e)
+    const error = await producer.send({ topic: TOPIC, messages: [record] }).catch((e) => e)
 
+    expect(reads.count).toBe(1)
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
     expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 0`)
     expect(admission.reserved).toBe(0)
