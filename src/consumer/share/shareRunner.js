@@ -212,7 +212,7 @@ class ShareRunner {
    */
   connect() {
     if (this.disconnecting) {
-      if (this.closingRun !== null && handlerRunIdentity() === this.closingRun)
+      if (this.closingRun !== null && handlerRunIdentity() === this.closingRun.identity)
         return Promise.reject(
           new KafkaJSNonRetriableError(
             'connect() cannot wait for a close from a handler of the run being closed'
@@ -419,7 +419,9 @@ class ShareRunner {
    * Closes the run, if any, and then this client's sockets. The first valid call fixes the whole
    * deadline; later calls share its close and cannot extend it, and timeout zero revokes unsent
    * closing traffic synchronously. A later call also refuses every `connect()` still waiting for
-   * that close, since it was asked after them.
+   * that close, since it was asked after them. The close and the run it closes are published, and
+   * the first deadline given to that run, before anything can call application code, so a call
+   * made from a listener or log sink inside the close joins it.
    * @param {{timeout?: number}|*} [options] Options object; any other argument is ignored.
    * @returns {Promise<void>}
    * @throws {KafkaJSInvalidConfigurationError} For an invalid timeout, before any state changes.
@@ -428,28 +430,41 @@ class ShareRunner {
     const enteredAt = performance.now()
     const timeout = parseDisconnectTimeout(options)
     this.disconnectCalls++
-    const run = this.current
     if (this.disconnecting) {
-      run?.beginClose('disconnect', timeout, enteredAt)
+      const run = this.closingRun
+      if (run !== null && !run.finished) run.beginClose('disconnect', timeout, enteredAt)
       return this.disconnecting
     }
-    // Runs concurrently with the core close and never shortens or extends its budget.
-    const deadline = timeout === undefined ? Infinity : enteredAt + timeout
-    const finalTelemetry =
-      this.options.telemetry?.close({
-        deadline,
-        remaining: () =>
-          deadline === Infinity ? Infinity : Math.max(0, deadline - performance.now()),
-        zero: timeout === 0,
-      }) ?? null
+    const run = this.current
+    let resolve, reject
+    const promise = new Promise((...settle) => ([resolve, reject] = settle))
+    const closing = promise.finally(() => {
+      if (this.disconnecting !== closing) return
+      this.disconnecting = null
+      this.closingRun = null
+    })
+    this.disconnecting = closing
+    this.closingRun = run ?? null
     this.lifecycle++
     this.connecting = null
     this.stopGeneration++
-    this.restartOperation?.retire(new KafkaJSNonRetriableError('Share client was disconnected'))
-    const episode = run?.beginClose('disconnect', timeout, enteredAt)
-    this.closingRun = run?.identity ?? null
-    this.disconnecting = this.closeClient(episode, finalTelemetry)
-    return this.disconnecting
+    try {
+      const episode = run?.beginClose('disconnect', timeout, enteredAt)
+      // Runs concurrently with the core close and never shortens or extends its budget.
+      const deadline = timeout === undefined ? Infinity : enteredAt + timeout
+      const finalTelemetry =
+        this.options.telemetry?.close({
+          deadline,
+          remaining: () =>
+            deadline === Infinity ? Infinity : Math.max(0, deadline - performance.now()),
+          zero: timeout === 0,
+        }) ?? null
+      this.restartOperation?.retire(new KafkaJSNonRetriableError('Share client was disconnected'))
+      this.closeClient(episode, finalTelemetry).then(resolve, reject)
+    } catch (error) {
+      reject(error)
+    }
+    return closing
   }
 
   /**
@@ -460,19 +475,14 @@ class ShareRunner {
    */
   async closeClient(episode, finalTelemetry = null) {
     try {
-      try {
-        await episode?.done
-        await this.options.cluster.disconnect({ drainTimeout: 0 })
-      } finally {
-        if (finalTelemetry) await finalTelemetry
-      }
-      const wasConnected = this.connected
-      this.connected = false
-      if (wasConnected) this.emit(events.DISCONNECT)
+      await episode?.done
+      await this.options.cluster.disconnect({ drainTimeout: 0 })
     } finally {
-      this.disconnecting = null
-      this.closingRun = null
+      if (finalTelemetry) await finalTelemetry
     }
+    const wasConnected = this.connected
+    this.connected = false
+    if (wasConnected) this.emit(events.DISCONNECT)
   }
 
   /**

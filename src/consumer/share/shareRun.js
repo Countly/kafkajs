@@ -1027,7 +1027,8 @@ class ShareRun {
    * request synchronously, so no handler starts after them, and wait naturally for running
    * handlers until the handler boundary. A stop or disconnect that arrives while a fence or poll
    * recovery is closing ends the run once that recovery cleanup is done. Later calls reuse the
-   * episode, so a disconnect never recaptures a replacement run. A zero timeout on a close in
+   * episode, so a disconnect never recaptures a replacement run, and the first disconnect's budget
+   * is set before anything that can call application code. A zero timeout on a close in
    * progress revokes the episode, which retires its traffic operation in the same tick: a final
    * that was written and is unanswered settles lost and its exact socket closes at once.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
@@ -1057,9 +1058,9 @@ class ShareRun {
     episode.done = done.promise
     this.closing = episode
     this.admitting = false
+    if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
     for (const node of this.nodes.values())
       node.pacing.retire(new KafkaJSNonRetriableError('Share run is closing'))
-    if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
     this.close(episode).then(done.resolve, done.resolve)
     return episode
   }
