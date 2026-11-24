@@ -29,6 +29,13 @@ const holeAt = (items, index) => {
   return copy
 }
 
+/** @returns {unknown[]} a copy of `items` whose own index `index` is a hole the prototype fills */
+const inheritedAt = (items, index, inherited) => {
+  const copy = holeAt(items, index)
+  Object.setPrototypeOf(copy, Object.assign(Object.create(Array.prototype), { [index]: inherited }))
+  return copy
+}
+
 /** @returns {object[]} topic `t` with one partition entry */
 const oneTopic = (assignment) => [{ topic: 't', partitionAssignment: [assignment] }]
 
@@ -69,6 +76,63 @@ describe('Admin > alterPartitionReassignments > input', () => {
 
   test('refuses replicas with a hole before any request', async () => {
     await expectRefused(oneTopic({ partition: 0, replicas: holeAt([1, 0, 2], 1) }))
+  })
+
+  test('refuses replicas with a hole that their own iterator skips before any request', async () => {
+    const replicas = holeAt([1, 0, 2], 1)
+    replicas[Symbol.iterator] = function* () {
+      yield 1
+      yield 2
+    }
+    await expectRefused(oneTopic({ partition: 0, replicas }))
+  })
+
+  test.each([
+    [
+      'the topics',
+      inheritedAt([null], 0, {
+        topic: 't',
+        partitionAssignment: [{ partition: 0, replicas: [1] }],
+      }),
+    ],
+    [
+      'the partitions',
+      [
+        {
+          topic: 't',
+          partitionAssignment: inheritedAt([null], 0, { partition: 0, replicas: [1] }),
+        },
+      ],
+    ],
+    ['the replicas', oneTopic({ partition: 0, replicas: inheritedAt([1, 0], 1, 2) })],
+  ])(
+    'refuses an index of %s that only the prototype fills before any request',
+    async (_, topics) => {
+      await expectRefused(topics)
+    }
+  )
+
+  test('refuses a replica listed twice in an assignment, with a valid sibling, before any request', async () => {
+    const { admin, cluster } = adminOver()
+
+    await expect(
+      admin.alterPartitionReassignments({
+        topics: [
+          {
+            topic: 't',
+            partitionAssignment: [
+              { partition: 0, replicas: [1, 2] },
+              { partition: 1, replicas: [2, 3, 2] },
+            ],
+          },
+        ],
+      })
+    ).rejects.toMatchObject({
+      name: 'KafkaJSNonRetriableError',
+      message:
+        'Invalid replica assignment: replica 2 is listed more than once for topic: t on partition: 1',
+    })
+    expect(clusterCalls(cluster)).toBe(0)
   })
 
   test.each([
@@ -119,7 +183,64 @@ describe('Admin > alterPartitionReassignments > input', () => {
     expect(sent).toEqual([oneTopic({ partition: 0, replicas: [1, 2] })])
   })
 
-  test('sends a valid assignment, an empty replica list included', async () => {
+  test('reads the replicas getter of an entry once, when the call starts', async () => {
+    const { admin, sent } = adminOver()
+    let reads = 0
+    let replicas = [1, 2]
+    const assignment = {
+      partition: 0,
+      get replicas() {
+        reads += 1
+        return replicas
+      },
+    }
+
+    const call = admin.alterPartitionReassignments({
+      topics: [{ topic: 't', partitionAssignment: [assignment] }],
+    })
+    replicas = [3]
+    await call
+
+    expect(reads).toBe(1)
+    expect(sent).toEqual([oneTopic({ partition: 0, replicas: [1, 2] })])
+  })
+
+  test('reads each topic, partition and replica entry once', async () => {
+    const { admin, sent } = adminOver()
+    const reads = {}
+    const once = (name, first, later) => ({
+      enumerable: true,
+      get() {
+        reads[name] = (reads[name] || 0) + 1
+        return reads[name] === 1 ? first : later
+      },
+    })
+    const replicas = []
+    Object.defineProperty(replicas, 0, once('replica 0', 1, 7))
+    Object.defineProperty(replicas, 1, once('replica 1', 2, 7))
+    const assignment = Object.defineProperties(
+      {},
+      { partition: once('partition', 0, 5), replicas: once('replicas', replicas, [7]) }
+    )
+    const topic = Object.defineProperties(
+      {},
+      { topic: once('topic', 't', 'u'), partitionAssignment: once('assignments', [assignment], []) }
+    )
+
+    await admin.alterPartitionReassignments({ topics: [topic] })
+
+    expect(reads).toEqual({
+      topic: 1,
+      assignments: 1,
+      partition: 1,
+      replicas: 1,
+      'replica 0': 1,
+      'replica 1': 1,
+    })
+    expect(sent).toEqual([oneTopic({ partition: 0, replicas: [1, 2] })])
+  })
+
+  test('forwards a valid assignment and an empty replica list to the controller', async () => {
     const { admin, sent } = adminOver()
 
     await admin.alterPartitionReassignments({

@@ -100,6 +100,13 @@ describe('Admin > deleteTopicRecords > input', () => {
     ['an undefined entry', [undefined]],
     ['a string instead of an array', 'ab'],
     ['an array-like object', { length: 1, 0: { partition: 0, offset: '5' } }],
+    [
+      'an index that only the prototype fills',
+      Object.setPrototypeOf(
+        holeAt([null], 0),
+        Object.assign(Object.create(Array.prototype), { 0: { partition: 0, offset: '5' } })
+      ),
+    ],
   ])('refuses partitions with %s before any request', async (_, partitions) => {
     const { admin, cluster } = adminOver()
 
@@ -169,21 +176,67 @@ describe('Admin > deleteTopicRecords > input', () => {
     expect(sent).toEqual([[{ partition: 0, offset: '5' }]])
   })
 
-  test('reads the partition and offset of each entry once', async () => {
+  test('reads the partitions getter of the options once, when the call starts', async () => {
     const { admin, sent } = adminOver()
     let reads = 0
-    const entry = {
-      partition: 0,
-      get offset() {
+    let partitions = [{ partition: 0, offset: '5' }]
+    const options = {
+      topic: TOPIC,
+      get partitions() {
         reads += 1
-        return reads === 1 ? '5' : '-1'
+        return partitions
+      },
+    }
+
+    const call = admin.deleteTopicRecords(options)
+    partitions = [{ partition: 1, offset: '-1' }]
+    await call
+
+    expect(reads).toBe(1)
+    expect(sent).toEqual([[{ partition: 0, offset: '5' }]])
+  })
+
+  test('reads the partition and offset of each entry once', async () => {
+    const { admin, sent } = adminOver()
+    let partitionReads = 0
+    let offsetReads = 0
+    const entry = {
+      get partition() {
+        partitionReads += 1
+        return partitionReads === 1 ? 0 : 1
+      },
+      get offset() {
+        offsetReads += 1
+        return offsetReads === 1 ? '5' : '-1'
       },
     }
 
     await admin.deleteTopicRecords({ topic: TOPIC, partitions: [entry] })
 
-    expect(reads).toBe(1)
+    expect(partitionReads).toBe(1)
+    expect(offsetReads).toBe(1)
     expect(sent).toEqual([[{ partition: 0, offset: '5' }]])
+  })
+
+  test('refuses a call on a disconnected admin before reading its input', async () => {
+    const { admin, cluster } = adminOver()
+    cluster.disconnect = jest.fn(async () => {})
+    await admin.disconnect()
+    let reads = 0
+    const options = {
+      topic: TOPIC,
+      get partitions() {
+        reads += 1
+        return 'not an array'
+      },
+    }
+
+    await expect(admin.deleteTopicRecords(options)).rejects.toMatchObject({
+      name: 'KafkaJSNonRetriableError',
+      message: 'The admin is disconnected or disconnecting; call connect() to resume',
+    })
+    expect(reads).toBe(0)
+    expect(cluster.fetchTopicsOffset).not.toHaveBeenCalled()
   })
 
   test('warns for an offset below the low watermark beyond 2^53', async () => {
