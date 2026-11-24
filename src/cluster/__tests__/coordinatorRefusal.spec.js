@@ -1,3 +1,5 @@
+jest.mock('../../utils/shuffle', () => (brokers) => brokers)
+
 const Cluster = require('../index')
 const { KafkaJSConnectionError, KafkaJSGroupCoordinatorNotFound } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
@@ -13,13 +15,14 @@ const NOT_COORDINATOR = 16
  * coordinator. With `seedOnly`, the pool holds no broker table and the first behaviour is the seed.
  * @param {Array<'down'|'ok'|number>} behaviours
  * @param {{ seedOnly?: boolean }} [options]
- * @returns {{ cluster: Cluster, thrown: Error[] }} the cluster, and the errors the brokers'
- *   FindCoordinator answers threw, in the order they were thrown
+ * @returns {{ cluster: Cluster, thrown: Error[], outcomes: string[] }} the cluster, the errors
+ *   the brokers' FindCoordinator answers threw, and broker outcomes in observed order
  */
 const createCluster = (behaviours, { seedOnly = false } = {}) => {
   const cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retry: { retries: 0 } })
   const pool = cluster.brokerPool
   const thrown = []
+  const outcomes = []
   const brokers = behaviours.map((behaviour, index) => {
     const nodeId = index + 1
     return {
@@ -29,12 +32,14 @@ const createCluster = (behaviours, { seedOnly = false } = {}) => {
       connectionPool: { host: `kafka${nodeId}`, port: 9092, rack: null },
       findGroupCoordinator: async () => {
         if (behaviour === 'ok') {
+          outcomes.push(`broker ${nodeId} answered with the coordinator`)
           return {
             host: `kafka${nodeId}`,
             coordinator: { nodeId, host: `kafka${nodeId}`, port: 9092 },
           }
         }
         const error = createErrorFromCode(behaviour)
+        outcomes.push(`broker ${nodeId} answered ${error.code}`)
         thrown.push(error)
         throw error
       },
@@ -43,6 +48,7 @@ const createCluster = (behaviours, { seedOnly = false } = {}) => {
 
   pool.connectBroker = async (broker) => {
     if (broker.behaviour === 'down') {
+      outcomes.push(`broker ${broker.nodeId} failed to connect`)
       throw new KafkaJSConnectionError(
         `Connection error: connect ECONNREFUSED kafka${broker.nodeId}`
       )
@@ -54,7 +60,7 @@ const createCluster = (behaviours, { seedOnly = false } = {}) => {
   } else {
     pool.brokers = Object.fromEntries(brokers.map((broker) => [String(broker.nodeId), broker]))
   }
-  return { cluster, thrown }
+  return { cluster, thrown, outcomes }
 }
 
 /**
@@ -90,20 +96,25 @@ describe('Cluster > a coordinator lookup refused by a broker', () => {
   })
 
   test("a refusal followed by another broker's connection failure still throws not-found with the refusal as cause", async () => {
-    const { cluster, thrown } = createCluster([TRANSACTIONAL_ID_AUTHORIZATION_FAILED, 'down'])
+    const { cluster, thrown, outcomes } = createCluster([
+      TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+      'down',
+    ])
 
     const error = await lookUp(cluster)
 
+    expect(outcomes).toEqual(['broker 1 answered 53', 'broker 2 failed to connect'])
     expect(thrown).toHaveLength(1)
     expect(error).toBeInstanceOf(KafkaJSGroupCoordinatorNotFound)
     expect(error.cause).toBe(thrown[0])
   })
 
   test("a refusal followed by another broker's answer returns that coordinator", async () => {
-    const { cluster } = createCluster([TRANSACTIONAL_ID_AUTHORIZATION_FAILED, 'ok'])
+    const { cluster, outcomes } = createCluster([TRANSACTIONAL_ID_AUTHORIZATION_FAILED, 'ok'])
 
     const found = await lookUp(cluster)
 
+    expect(outcomes).toEqual(['broker 1 answered 53', 'broker 2 answered with the coordinator'])
     expect(found).toEqual({
       host: 'kafka2',
       coordinator: { nodeId: 2, host: 'kafka2', port: 9092 },

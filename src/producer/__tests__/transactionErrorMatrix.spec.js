@@ -470,6 +470,27 @@ describe('a coordinator lookup refused by an ACL', () => {
     })
   })
 
+  it('a direct InitProducerId refusal with code 53 lets the same producer start a later transaction', async () => {
+    await withProducer('tv1', async (cluster, producer) => {
+      answerLookups(cluster, () => 0)
+      cluster.answer('InitProducerId', fencedInit(53))
+
+      await expect(producer.transaction()).rejects.toMatchObject({
+        name: 'KafkaJSProtocolError',
+        code: 53,
+        retriable: false,
+      })
+      expect(framesOf(cluster, 'FindCoordinator')).toBe(1)
+      expect(framesOf(cluster, 'InitProducerId', true)).toBe(1)
+
+      cluster.answer('InitProducerId', () => ({ producerId: '1000', producerEpoch: 0 }))
+      const transaction = await producer.transaction()
+      expect(framesOf(cluster, 'InitProducerId', true)).toBe(2)
+      await transaction.send({ topic: TOPIC, messages: [{ value: 'recovered' }] })
+      await expect(transaction.commit()).resolves.toBeUndefined()
+    })
+  })
+
   it('TV1 sendOffsets whose transaction coordinator lookup is answered 53 arms FATAL_ERROR', async () => {
     await withProducer('tv1', async (cluster, producer) => {
       const transaction = await producer.transaction()

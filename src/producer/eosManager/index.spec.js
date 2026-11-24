@@ -1201,6 +1201,26 @@ describe('Epoch bump failure at transaction boundaries', () => {
     expect(manager.getProducerEpoch()).toBe(1)
     await manager.abort()
   })
+  test('a direct InitProducerId refusal with code 53 keeps the epoch bump owed', async () => {
+    const { manager, broker } = await fixture()
+    const refusal = createErrorFromCode(53)
+    broker.initProducerId.mockRejectedValueOnce(refusal).mockRejectedValueOnce(refusal)
+
+    await expect(manager.abort({ droppedSequences: true })).resolves.toBeUndefined()
+    await expect(manager.beginTransaction()).rejects.toMatchObject({
+      name: 'KafkaJSTransactionAbortableError',
+      cause: refusal,
+    })
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(manager.getProducerEpoch()).toBe(0)
+    expect(broker.initProducerId).toHaveBeenCalledTimes(3)
+
+    await manager.beginTransaction()
+    expect(manager.getProducerEpoch()).toBe(1)
+    expect(broker.initProducerId).toHaveBeenCalledTimes(4)
+    await manager.abort()
+  })
+
   test.each(['abort', 'begin'])('a fatal bump failure rejects at %s', async (boundary) => {
     const { manager, broker } = await fixture()
     if (boundary === 'begin') {
@@ -1409,6 +1429,25 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
       expect(broker.initProducerId).not.toHaveBeenCalled()
       expect(manager.stateManager.state()).toBe(options.begun ? 'READY' : 'UNINITIALIZED')
     })
+  })
+
+  test('a begin whose lifecycle closes before it handles a lookup refusal arms nothing', async () => {
+    const generation = new Generation()
+    const { manager, cluster, broker } = await build({
+      begun: true,
+      getGeneration: () => generation,
+    })
+    const closed = new KafkaJSProducerClosedError('The producer was closed', { outcome: 'unknown' })
+    cluster.findGroupCoordinator.mockRejectedValueOnce(createErrorFromCode(53))
+    // Close after the retry checks the open lifecycle, before begin handles its rejection.
+    jest.spyOn(generation, 'check').mockImplementationOnce(() => {
+      queueMicrotask(() => generation.close(closed))
+    })
+
+    await expect(manager.beginTransaction()).rejects.toBe(closed)
+
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(broker.initProducerId).not.toHaveBeenCalled()
   })
 
   test('a begin does not outlive a producer made unusable while it retries', async () => {
