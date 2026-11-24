@@ -225,7 +225,8 @@ class ScramCredentials {
           items: [...users.values()],
           keyOf: ({ user }) => user,
           retry: this.retry,
-          retryable: (row) => row.errorCode === 41 || row.errorCode === 7,
+          // Only a moved controller definitely refused a user: REQUEST_TIMED_OUT (7) is final.
+          retryable: (row) => row.errorCode === 41,
           callFailure,
           sanitize: () => null,
         },

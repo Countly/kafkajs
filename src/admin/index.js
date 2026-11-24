@@ -712,7 +712,9 @@ module.exports = ({
 
   /** Deletes names or canonical IDs with the existing void/throw contract.
    * ID responses must cover the attempted set before cleanup. Confirmed IDs leave the mutation
-   * set before follow-up metadata refresh; metadata retries share the invocation deadline.
+   * set before follow-up metadata refresh; metadata retries share the invocation deadline. The
+   * names are copied when the call starts, and for both forms the follow-up refresh has its own
+   * retries, so a failed refresh never sends the deletion again.
    * @param {object} options exclusive topics or topicIds, with optional broker timeout
    * @returns {Promise<void>} deletion and follow-up metadata refresh completed
    * @throws {Error} validation, protocol, discovery or invocation failure
@@ -795,27 +797,23 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topics array ${topics}`)
     }
 
-    if (topics.filter((topic) => typeof topic !== 'string').length > 0) {
+    const names = Array.prototype.slice.call(topics)
+    if (names.filter((topic) => typeof topic !== 'string').length > 0) {
       throw new KafkaJSNonRetriableError('Invalid topics array, the names must be a valid string')
     }
 
     const retrier = retrierOf(retry)
-    let pending = topics
+    let pending = names
 
-    return retrier(async (bail, retryCount, retryTime) => {
+    await retrier(async (bail, retryCount, retryTime) => {
       try {
         checked(await waitOf(async () => cluster.refreshMetadata()))
         const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
         checked(await waitOf(async () => broker.deleteTopics({ topics: pending, timeout })))
 
-        // Remove deleted topics
-
-        // Remove deleted topics
-        for (const topic of topics) {
+        for (const topic of names) {
           cluster.targetTopics.delete(topic)
         }
-
-        checked(await waitOf(async () => cluster.refreshMetadata()))
       } catch (e) {
         if (e.topicErrors) {
           // a name the broker did not list as failed was deleted: the next refresh must not ask for it
@@ -856,6 +854,14 @@ module.exports = ({
         }
 
         bail(e)
+      }
+    })
+    return retrierOf(retry)(async (bail) => {
+      try {
+        checked(await waitOf(() => cluster.refreshMetadata()))
+      } catch (error) {
+        if (error.type === 'NOT_CONTROLLER') throw error
+        bail(error)
       }
     })
   }

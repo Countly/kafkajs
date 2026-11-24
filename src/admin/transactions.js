@@ -5,6 +5,7 @@ const {
   KafkaJSNotImplemented,
   KafkaJSError,
   KafkaJSProtocolError,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
 const apiKeys = require('../protocol/requests/apiKeys')
@@ -120,11 +121,13 @@ class TransactionAdmin {
       : item.transactionalId
   }
 
-  /** Separates whole-call failures from unresolved item failures.
+  /** Separates whole-call failures from unresolved item failures. A written request without an
+   * answer (`KafkaJSUnknownOutcomeError`) is one: it never becomes an item row.
    * @param {Error} error failure @returns {boolean} whether the call must reject
    */
   callFailure(error) {
     return (
+      error instanceof KafkaJSUnknownOutcomeError ||
       error instanceof KafkaJSInvalidConfigurationError ||
       error instanceof KafkaJSInvariantViolation ||
       error instanceof KafkaJSServerDoesNotSupportApiKey ||
@@ -425,6 +428,10 @@ class TransactionAdmin {
   }
 
   /** Writes exactly one abort marker; an applied remote mutation cannot be recalled by expiry.
+   * Only a marker the partition's broker answered NOT_LEADER_OR_FOLLOWER (6) is sent again, after a
+   * metadata refresh; a failure before the marker was written is retried as before. Any other
+   * answer, REQUEST_TIMED_OUT (7) included, ends the call, and a marker without an answer rejects
+   * with `KafkaJSUnknownOutcomeError`.
    * @param {object} options topic, partition, producerId, producerEpoch and coordinatorEpoch
    * @returns {Promise<void>} completion @throws {Error} typed terminal protocol/identity/deadline failure
    */
@@ -479,7 +486,7 @@ class TransactionAdmin {
           refresh = true
           throw new KafkaJSError(error, { retriable: true, cause: error })
         }
-        if (error.code === 7 || (error.code === undefined && error.retriable === true)) throw error
+        if (error.code === undefined && error.retriable === true) throw error
         bail(error)
       }
     })

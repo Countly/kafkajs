@@ -2,6 +2,7 @@ const {
   KafkaJSAggregateError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSDeliveryTimeout,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
 
 /**
@@ -135,13 +136,14 @@ class AggregateOutcome {
    *   omitted when it resolved
    * @returns {boolean} true when every item went through; false when the only terminal children
    *   were benign
-   * @throws {Error} `outstanding` itself when no terminal child was kept; otherwise a
-   *   non-retriable `KafkaJSAggregateError` of the terminal children, followed by the children
-   *   `outstanding` left behind, so no terminal outcome is lost
+   * @throws {Error} `outstanding` itself when no terminal child was kept, or when it is a
+   *   `KafkaJSUnknownOutcomeError` (a written request without an answer ends the call as itself);
+   *   otherwise a non-retriable `KafkaJSAggregateError` of the terminal children, followed by the
+   *   children `outstanding` left behind, so no terminal outcome is lost
    */
   finish(outstanding) {
     if (outstanding) {
-      if (this.terminal.length === 0) {
+      if (this.terminal.length === 0 || outstanding instanceof KafkaJSUnknownOutcomeError) {
         throw outstanding
       }
       throw new KafkaJSAggregateError(this.message, [...this.terminal, ...childrenOf(outstanding)])

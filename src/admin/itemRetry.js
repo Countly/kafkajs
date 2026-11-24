@@ -1,6 +1,6 @@
 const { KafkaJSError, KafkaJSInvariantViolation, KafkaJSUnknownOutcomeError } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
-const { retrierOf, currentDeadline, checked } = require('./deadline')
+const { retrierOf, currentDeadline, checked, isResendRefusal } = require('./deadline')
 
 /** The result rows `run` made itself for cells that got no broker answer; a broker -1 is not one. */
 const localRows = new WeakSet()
@@ -104,7 +104,7 @@ class ItemRetry {
           if (error instanceof KafkaJSUnknownOutcomeError || this.callFailure(error))
             return bail(error)
           // A resend the replay latch refused ends the call with the rows of the answered attempt.
-          if (!this.deadline?.resendRefusals?.has(error)) localFailure = error
+          if (!isResendRefusal(error)) localFailure = error
           throw error
         }
         if (!Array.isArray(rows)) throw new KafkaJSInvariantViolation('Missing item results')

@@ -80,7 +80,9 @@ const replicasOf = (options, moving) => {
   })
 }
 
-/** Locates connection-wide capability/authentication refusals in an inherited retry wrapper.
+/** Locates connection-wide capability/authentication refusals in an inherited retry wrapper, and a
+ * written request without an answer (`KafkaJSUnknownOutcomeError`): each ends the whole call and
+ * never becomes a broker or replica row.
  *
  * @param {Error} error original or wrapped error
  *
@@ -92,6 +94,7 @@ const refusal = (error) => {
     seen.add(e)
     if (
       [
+        'KafkaJSUnknownOutcomeError',
         'KafkaJSServerDoesNotSupportApiKey',
         'KafkaJSSASLAuthenticationError',
         'KafkaJSInvalidConfigurationError',
@@ -245,7 +248,8 @@ class LogDirectoryAdmin {
             items,
             keyOf,
             retry: this.retry,
-            retryable: (row) => row.errorCode === 7,
+            // No answer code proves a move was not started, so no replica is sent again.
+            retryable: () => false,
             callFailure: (error) => refusal(error) !== null,
             sanitize: (x) => x,
           },

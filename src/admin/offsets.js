@@ -4,6 +4,7 @@ const {
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
   KafkaJSProtocolError,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
 const { createErrorFromCode, failure } = require('../protocol/error')
 const { ON_DECODED } = require('../broker/privateOptions')
@@ -93,15 +94,17 @@ const byTopic = (cells) => {
  * @returns {string} tuple identity
  */
 const cellKey = (cell) => JSON.stringify([cell.topic, cell.partition])
-/** Finds an original call-level refusal through inherited retry wrappers.
+/** Finds an original call-level refusal through inherited retry wrappers. A written request without
+ * an answer is one, and it is returned itself, never the transport or decode error it carries.
  * @param {Error} error local failure, possibly carrying a cause chain
- * @returns {Error|null} original validation, capability, auth or identity refusal
+ * @returns {Error|null} unknown outcome, or original validation, capability, auth or identity refusal
  */
 const failureOf = (error) => {
   const seen = new Set()
   for (let current = error; current && !seen.has(current); current = current.cause) {
     seen.add(current)
     if (
+      current instanceof KafkaJSUnknownOutcomeError ||
       current instanceof KafkaJSInvariantViolation ||
       [
         'KafkaJSInvalidConfigurationError',

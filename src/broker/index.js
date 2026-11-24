@@ -2912,8 +2912,12 @@ module.exports = class Broker {
    *
    * Inside an admin call, a request that changes broker state goes through the call's replay
    * latch (`AdminDeadline#latch`): its final pre-write check refuses it when an earlier written
-   * request of the same call carried one of its items, and the latch notes when it is written and
-   * answered. Other requests cost one check of the current admin scope.
+   * request of the same call carried one of its items without a definite refusal, and the latch
+   * notes when it is written and answered. When such a request was written and no decoded answer
+   * came back, it fails here with `KafkaJSUnknownOutcomeError` (its `cause` the transport or
+   * decode error), before any caller can turn the failure into something else; a deadline that
+   * already passed still wins with its `KafkaJSTimeout`. Other requests cost one check of the
+   * current admin scope.
    *
    * @private
    * @param {{ request: { apiKey: number } }} protocolRequest a built request, as produced by
@@ -2959,13 +2963,13 @@ module.exports = class Broker {
       generation = pool.generation
       return checked(await pool.send(protocolRequest, connection, guard ? { guard } : null, true))
     } catch (e) {
-      latch?.failed(e)
+      const failure = latch ? latch.failed(e) : e
       currentDeadline()?.check()
       attachFailureSource(e, { broker: this, generation })
       if (protocolRequest.request.apiKey !== apiKeys.ShareGroupHeartbeat)
         this.retireSibling(e, generation, pool)
 
-      throw e
+      throw failure
     }
   }
 

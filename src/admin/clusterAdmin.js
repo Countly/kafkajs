@@ -1,4 +1,4 @@
-const { retrierOf, checked, waitOf } = require('./deadline')
+const { retrierOf, checked, waitOf, isResendRefusal } = require('./deadline')
 const { itemRetry } = require('./itemRetry')
 const {
   KafkaJSInvalidConfigurationError,
@@ -6,6 +6,7 @@ const {
   KafkaJSSASLAuthenticationError,
   KafkaJSNotImplemented,
   KafkaJSServerDoesNotSupportApiKey,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
@@ -128,9 +129,10 @@ class ClusterAdmin {
     }
   }
 
-  /** Classifies call-level failures that must not be retried; item codes and retriable protocol errors (such as a moved controller) never enter this path. @param {Error} error original error @returns {boolean} whether whole call must reject */
+  /** Classifies call-level failures that must not be retried, a written request without an answer included; item codes and retriable protocol errors (such as a moved controller) never enter this path. @param {Error} error original error @returns {boolean} whether whole call must reject */
   callFailure(error) {
     return (
+      error instanceof KafkaJSUnknownOutcomeError ||
       error instanceof KafkaJSInvalidConfigurationError ||
       error instanceof KafkaJSSASLAuthenticationError ||
       error instanceof KafkaJSNotImplemented ||
@@ -139,7 +141,7 @@ class ClusterAdmin {
     )
   }
 
-  /** Runs item attempts through the shared retrier. A retriable protocol error that outlasts the retries rejects the call instead of leaving every item unresolved. @param {object} config item retry configuration @param {(pending: object[]) => Promise<object[]>} send one attempt for the pending items @returns {Promise<object[]>} caller-ordered item outcomes @throws {Error} deadline, call-level or exhausted protocol failure */
+  /** Runs item attempts through the shared retrier. A retriable protocol error that outlasts the retries, or whose resend the replay latch refused, rejects the call instead of leaving every item unresolved. @param {object} config item retry configuration @param {(pending: object[]) => Promise<object[]>} send one attempt for the pending items @returns {Promise<object[]>} caller-ordered item outcomes @throws {Error} deadline, call-level or exhausted protocol failure */
   async retryItems(config, send) {
     let refusal = null
     const rows = await itemRetry(config, async (pending) => {
@@ -148,7 +150,7 @@ class ClusterAdmin {
         refusal = null
         return result
       } catch (error) {
-        refusal = error.name === 'KafkaJSProtocolError' ? error : null
+        if (!isResendRefusal(error)) refusal = error.name === 'KafkaJSProtocolError' ? error : null
         throw error
       }
     })
@@ -156,7 +158,7 @@ class ClusterAdmin {
     return rows
   }
 
-  /** Elects requested partitions, or all once before narrowing retries. Successful mutations are never resent. Item rows return before relocation; a pending refresh runs only before another unresolved attempt under the inherited deadline. @param {object} [options] election type and topicPartitions @returns {Promise<object[]>} caller-ordered item outcomes @throws {Error} invalid input, deadline, capability or top-level failure */
+  /** Elects requested partitions, or all. Only a whole request the controller answered NOT_CONTROLLER (41) is sent again, after a refresh, as a failure before the request was written is; a partition's own code, 41 and REQUEST_TIMED_OUT (7) included, is its final result. @param {object} [options] election type and topicPartitions @returns {Promise<object[]>} caller-ordered item outcomes @throws {Error} invalid input, deadline, capability or top-level failure @throws {KafkaJSUnknownOutcomeError} when an election request got no answer */
   async electLeaders(options = {}) {
     this.options(options)
     const { electionType = 'preferred', topicPartitions = null } = options
@@ -164,7 +166,6 @@ class ClusterAdmin {
       throw new KafkaJSInvalidConfigurationError('Invalid electionType')
     let items = this.partitions(topicPartitions)
     if (items !== null && items.length === 0) return []
-    let refreshPending = false
     let first = null
     if (items === null) {
       const response = checked(
@@ -181,15 +182,11 @@ class ClusterAdmin {
           items,
           keyOf: (r) => JSON.stringify([r.topic, r.partition]),
           retry: this.retry,
-          retryable: (r) => r.errorCode === 7 || r.errorCode === 41,
+          retryable: () => false,
           callFailure: (e) => this.callFailure(e),
           sanitize: (m) => m,
         },
         async (pending) => {
-          if (refreshPending) {
-            checked(await waitOf(() => this.cluster.refreshMetadata()))
-            refreshPending = false
-          }
           let rows = first
           first = null
           if (rows === null) {
@@ -203,7 +200,6 @@ class ClusterAdmin {
               )
             )
           }
-          refreshPending = rows.some((r) => r.errorCode === 41)
           return rows
         }
       )
@@ -214,7 +210,7 @@ class ClusterAdmin {
     }))
   }
 
-  /** Updates unique features. A v2 success covers every requested feature atomically; v0/v1 must carry exact results. Rows return before relocation; failed lazy refreshes retain the requirement and affect only unresolved features under the inherited deadline. @param {object} options feature updates and validateOnly @returns {Promise<object[]>} caller-ordered feature outcomes @throws {Error} invalid input, deadline or call-level failure */
+  /** Updates unique features. A v2 success covers every requested feature atomically; v0/v1 must carry exact results. Only a whole request the controller answered NOT_CONTROLLER (41) is sent again, after a refresh, as a failure before the request was written is; a feature's own code is its final result, except that a `validateOnly` call, which changes nothing, asks again for features answered 7 or 41. @param {object} options feature updates and validateOnly @returns {Promise<object[]>} caller-ordered feature outcomes @throws {Error} invalid input, deadline or call-level failure @throws {KafkaJSUnknownOutcomeError} when an update request got no answer */
   async updateFeatures(options) {
     this.flags(options, ['validateOnly'])
     if (!Array.isArray(options.features) || !options.features.length)
@@ -241,6 +237,7 @@ class ClusterAdmin {
         upgradeType: f.upgradeType ?? 'upgrade',
       }
     })
+    const validateOnly = options.validateOnly ?? false
     let refreshPending = false
     const rows = checked(
       await this.retryItems(
@@ -248,7 +245,8 @@ class ClusterAdmin {
           items,
           keyOf: (r) => r.feature,
           retry: this.retry,
-          retryable: (r) => r.errorCode === 7 || r.errorCode === 41,
+          // A validation changes nothing, so its rows may be asked again.
+          retryable: (r) => validateOnly && (r.errorCode === 7 || r.errorCode === 41),
           callFailure: (e) => this.callFailure(e),
           sanitize: (m) => m,
         },
@@ -258,10 +256,7 @@ class ClusterAdmin {
             refreshPending = false
           }
           const response = checked(
-            await this.controller('updateFeatures', {
-              featureUpdates: pending,
-              validateOnly: options.validateOnly ?? false,
-            })
+            await this.controller('updateFeatures', { featureUpdates: pending, validateOnly })
           )
           const rows =
             response.results === null

@@ -5,6 +5,7 @@ const {
   KafkaJSInvariantViolation,
   KafkaJSProtocolError,
   KafkaJSShareGroupsNotSupportedError,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
 const shareCapability = require('../consumer/share/shareCapability')
 const { currentDeadline, checked, waitOf, retrierOf } = require('./deadline')
@@ -570,6 +571,7 @@ class ShareGroups {
    * @throws {KafkaJSProtocolError} the original group-level error, never a retrier wrapper
    * @throws {KafkaJSShareGroupsNotSupportedError} when the coordinator cannot run the request
    * @throws {KafkaJSInvariantViolation} for an answer that is not about this group
+   * @throws {KafkaJSUnknownOutcomeError} as it is, when a sent alteration or deletion got no answer
    * @throws {Error} transport failure or the call's deadline
    */
   async #offsets(groupId, key, method, request) {
@@ -612,6 +614,7 @@ class ShareGroups {
       })
     } catch (error) {
       currentDeadline()?.check()
+      if (error instanceof KafkaJSUnknownOutcomeError) throw error
       throw causeOf(error, [KafkaJSShareGroupsNotSupportedError, KafkaJSProtocolError]) || error
     }
   }

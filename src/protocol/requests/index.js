@@ -1,5 +1,6 @@
 const apiKeys = require('./apiKeys')
-const { MUTATING_APIS } = require('../../admin/unknownOutcome')
+const { MUTATING_APIS, owned } = require('../../admin/unknownOutcome')
+const { currentDeadline } = require('../../admin/deadline')
 const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('../../errors')
 
 /**
@@ -178,9 +179,10 @@ const selectVersion = (versions, apiKey, definition, maxVersions = {}) => {
  *
  * @param {import("../../../types").ApiVersions} versions the broker's advertised ranges
  * @param {{ [apiKey: number]: number }} [maxVersions] internal per-API ceiling
- * A request that changes broker state (`MUTATING_APIS`) keeps its builder's input as `args`, which
- * is never encoded: the admin replay check reads the items it carries from it. Other requests are
- * built unchanged.
+ * Inside an admin call, a request that changes broker state (`MUTATING_APIS`) is built from a
+ * private copy of its input (`owned`), kept as `args` and never encoded, so the admin replay check
+ * names exactly the items the encoder writes, whatever the caller changes later. Every other
+ * request is built unchanged.
  *
  * @returns {Lookup}
  * @throws {KafkaJSServerDoesNotSupportApiKey} from the returned selector, via `selectVersion`
@@ -193,8 +195,10 @@ const lookup =
     })
     if (!MUTATING_APIS.has(apiKey)) return build
     return (args) => {
-      const built = build(args)
-      built.args = args
+      if (!currentDeadline()?.latch) return build(args)
+      const own = owned(args)
+      const built = build(own)
+      built.args = own
       return built
     }
   }

@@ -97,10 +97,13 @@ class ClientQuotas {
     })
   }
 
-  /** Validates every quota operation before discovery; only unresolved entries are retried.
+  /** Validates every quota operation before discovery. A failure before the request was written is
+   * retried; an entry's answered code is its result, except that a `validateOnly` call asks again
+   * for entries answered REQUEST_TIMED_OUT (7).
    * @param {object} options entries and validateOnly
    * @returns {Promise<object[]>} caller-ordered entity results with typed errors as data
    * @throws {Error} invalid input, unsupported capability, invariant or API deadline
+   * @throws {KafkaJSUnknownOutcomeError} when a sent request got no answer
    */
   async alterClientQuotas(options = {}) {
     valid(options != null && typeof options === 'object' && !Array.isArray(options), 'options')
@@ -146,7 +149,9 @@ class ClientQuotas {
         items: [...wire.values()].map(({ entity }) => ({ entity })),
         keyOf,
         retry: this.retry,
-        retryable: (row) => row.errorCode === 7,
+        // No answer code proves a quota change was not applied, so only a validation, which
+        // changes nothing, asks again.
+        retryable: (row) => validateOnly && row.errorCode === 7,
         callFailure,
         sanitize: (message) => message,
       },
