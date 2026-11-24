@@ -182,36 +182,59 @@ describe('Consumer > CRASH contract', () => {
         cause: new Error('seen in a metadata answer'),
       })
 
+    // Nothing else in these runs arms a timer with this delay, so it identifies the restart timer.
+    const RESTART_DELAY = 4321
+
     /**
-     * Starts a consumer whose run dies at once with `error`, and returns what its crash reported.
+     * Starts a consumer whose run dies at once with `error`, and returns what its crash did.
      * @param {Error} error the run's failure
-     * @param {Function} restartOnFailure the user's restart callback
+     * @param {Function} [restartOnFailure] the user's restart callback, none by default
+     * @returns {Promise<{crashes: object[], restartsArmed: number, cleanups: object[],
+     *   connects: number}>} the CRASH payloads, the restart timers armed, the cluster disconnects
+     *   of the crash cleanup, and the connect attempts, all read before the final disconnect
      */
     const crashWith = async (error, restartOnFailure) => {
       const cluster = createFakeCluster()
-      const logger = createFakeLogger()
       const crashes = []
       const consumer = createConsumer({
         cluster,
         groupId: 'crash-recreated',
-        logger,
+        logger: createFakeLogger(),
         instrumentationEmitter: new InstrumentationEventEmitter(),
-        retry: { retries: 0, initialRetryTime: 20, restartOnFailure },
+        retry: { retries: 0, initialRetryTime: RESTART_DELAY, restartOnFailure },
       })
       consumer.on(consumer.events.CRASH, (e) => crashes.push(e.payload))
       jest.spyOn(cluster, 'connect').mockImplementation(async () => {
         throw error
       })
 
-      await consumer.subscribe({ topic: 'crash-topic' })
-      await consumer.run({ eachMessage: async () => {} })
-
-      // The restart timer is armed in the same synchronous step that emits CRASH.
-      const restartsArmed = logger.error.mock.calls.filter(([message]) =>
-        /^Restarting the consumer/.test(message)
-      )
+      const timers = jest.spyOn(global, 'setTimeout')
+      let restartsArmed
+      try {
+        await consumer.subscribe({ topic: 'crash-topic' })
+        await consumer.run({ eachMessage: async () => {} })
+        restartsArmed = timers.mock.calls.filter(([, delay]) => delay === RESTART_DELAY).length
+      } finally {
+        timers.mockRestore()
+      }
+      const cleanups = cluster.disconnect.mock.calls.map(([options]) => options)
+      const connects = cluster.connect.mock.calls.length
       await consumer.disconnect()
-      return { crashes, restartsArmed, connects: cluster.connect.mock.calls.length }
+      return { crashes, restartsArmed, cleanups, connects }
+    }
+
+    /**
+     * One CRASH for `error`, after a finished cleanup, with no restart reported or armed.
+     * @param {object} outcome what `crashWith` returned
+     * @param {Error} error the run's failure
+     */
+    const expectCrashedForGood = ({ crashes, restartsArmed, cleanups, connects }, error) => {
+      expect(crashes).toHaveLength(1)
+      expect(crashes[0].error).toBe(error)
+      expect(crashes[0].restart).toBe(false)
+      expect(cleanups).toEqual([{ preserveSetupState: true }])
+      expect(restartsArmed).toBe(0)
+      expect(connects).toBe(1)
     }
 
     it.each([
@@ -225,13 +248,7 @@ describe('Consumer > CRASH contract', () => {
     ])('is never restarted when restartOnFailure %s', async (_, restartOnFailure) => {
       const error = recreated()
 
-      const { crashes, restartsArmed, connects } = await crashWith(error, restartOnFailure)
-
-      expect(crashes).toHaveLength(1)
-      expect(crashes[0].error).toBe(error)
-      expect(crashes[0].restart).toBe(false)
-      expect(restartsArmed).toEqual([])
-      expect(connects).toBe(1)
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
     })
 
     it('is never restarted when the error is inside the cause chain of the crash', async () => {
@@ -240,16 +257,46 @@ describe('Consumer > CRASH contract', () => {
         retriable: true,
         cause: recreated(),
       })
+      const restartOnFailure = jest.fn(async () => true)
 
-      const { crashes, restartsArmed, connects } = await crashWith(
-        error,
-        jest.fn(async () => true)
-      )
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+    })
+
+    it('is never restarted when the error sits in a cause chain that loops', async () => {
+      const error = new KafkaJSError('the fetch round failed', {
+        retriable: true,
+        cause: recreated(),
+      })
+      error.cause.cause = error
+      const restartOnFailure = jest.fn(async () => true)
+
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+      expect(restartOnFailure).toHaveBeenCalledWith(error)
+    })
+
+    it('is never restarted when a plain object links the error into the chain', async () => {
+      const error = new KafkaJSError('the fetch round failed', {
+        retriable: true,
+        cause: { message: 'reported by another library', cause: recreated() },
+      })
+      const restartOnFailure = jest.fn(async () => true)
+
+      expectCrashedForGood(await crashWith(error, restartOnFailure), error)
+    })
+
+    it('leaves an unrelated crash whose cause chain loops to its own restart policy', async () => {
+      const inner = new KafkaJSError('the broker went away', { retriable: true })
+      const error = new KafkaJSNonRetriableError('the fetch round failed', { cause: inner })
+      inner.cause = error
+
+      const { crashes, restartsArmed, cleanups, connects } = await crashWith(error)
 
       expect(crashes).toHaveLength(1)
       expect(crashes[0].error).toBe(error)
-      expect(crashes[0].restart).toBe(false)
-      expect(restartsArmed).toEqual([])
+      // The deepest distinct cause is retriable, so the default policy restarts.
+      expect(crashes[0].restart).toBe(true)
+      expect(cleanups).toEqual([{ preserveSetupState: true }])
+      expect(restartsArmed).toBe(1)
       expect(connects).toBe(1)
     })
   })
