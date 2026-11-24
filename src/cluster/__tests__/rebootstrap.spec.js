@@ -962,6 +962,8 @@ describe('BrokerPool > rebootstrap', () => {
       })
       const pool = cluster.brokerPool
       const seedOf = stubSeed(pool, async () => ok)
+      const seedBuilds = jest.spyOn(pool, 'createSeedBroker')
+      const brokersCreated = jest.spyOn(pool, 'createBroker')
 
       const brokersUsed = []
       let attempt = 0
@@ -993,6 +995,9 @@ describe('BrokerPool > rebootstrap', () => {
       expect(brokersUsed).toHaveLength(1)
       expect(brokersUsed[0]).not.toBe(seedOf())
       expect(pool.brokers).toEqual({})
+      // The rebootstrap built the only new seed, and nothing built another broker.
+      expect(seedBuilds).toHaveBeenCalledTimes(1)
+      expect(brokersCreated).not.toHaveBeenCalled()
     })
   })
 })
