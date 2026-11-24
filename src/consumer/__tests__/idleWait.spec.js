@@ -1634,18 +1634,14 @@ describe('validation response continuation', () => {
     group.offsetManager = { clearPendingSeeks() {} }
     const { FetchPreparation } = require('../fetchPreparation')
     const prep = new FetchPreparation(group, group.idleWait, [], Infinity, group.ownership.token())
-    group.offsetManager.committedOffsets = () => ({ orders: { 0: '0', 1: '0' } })
+    group.offsetManager.committedOffsets = () => ({ orders: { 0: '10', 1: '10' } })
     group.offsetManager.heldOffsetAt = (topic, partition) =>
       group.offsetManager.committedOffsets()[topic][partition]
-    group.offsetManager.peekNextOffset = () => ({ toString: () => '0' })
+    group.offsetManager.peekNextOffset = () => ({ toString: () => '10' })
     group.offsetManager.lastConsumedEpoch = () => 1
     group.offsetManager.reposition = async () => true
     group.markChanged = () => {}
     group.logger.warn = jest.fn()
-    jest
-      .spyOn(group.positionValidator, 'complete')
-      .mockReturnValueOnce({ action: 'fatal' })
-      .mockReturnValueOnce({ action: 'truncated', divergingOffset: '0' })
     group.instrumentationEmitter = new InstrumentationEventEmitter()
     group.instrumentationEmitter.addListener(
       require('../instrumentationEvents').events.LOG_TRUNCATION,
@@ -1656,40 +1652,47 @@ describe('validation response continuation', () => {
     )
     const markAll = jest.spyOn(group, 'markAllValidated')
     const item = (partition) => {
-      group.positionValidator.request('orders', partition, {
-        offset: '0',
+      const { generation } = group.positionValidator.request('orders', partition, {
+        offset: '10',
         trackedEpoch: 1,
         currentLeaderEpoch: 2,
       })
       return {
         topic: 'orders',
         partition,
-        generation: 0,
+        generation,
         currentLeaderEpoch: 2,
         entry: group.positionValidator.entryOf('orders', partition),
       }
     }
-    await group
-      .applyValidationResponse(
+    await expect(
+      group.applyValidationResponse(
         [{ topic: 'orders', entries: [item(0), item(1)] }],
         {
           topics: [
             {
               topic: 'orders',
               partitions: [
-                { partition: 0, errorCode: 0 },
-                { partition: 1, errorCode: 0 },
+                { partition: 0, errorCode: -1 },
+                { partition: 1, errorCode: 0, endOffset: '5', leaderEpoch: 1 },
               ],
             },
           ],
         },
         prep
       )
-      .catch(() => {})
-    expect(group.positionValidator.complete).toHaveBeenCalledTimes(2)
+    ).rejects.toMatchObject({
+      type: 'CONSUMER_STOPPING',
+      message: 'The consumer is stopping',
+      retriable: false,
+    })
     expect(prep.fence.closed).toBe(true)
     expect(markAll).not.toHaveBeenCalled()
     expect(group.positionValidator.holdsFetch('orders', 0)).toBe(true)
+    expect(group.positionValidator.entryOf('orders', 0)).toMatchObject({
+      pending: null,
+      failures: 1,
+    })
     expect(group.positionValidator.validatedAgainst('orders', 0)).toBeUndefined()
     expect(group.positionValidator.validatedAgainst('orders', 1)).toBeUndefined()
     group.onStopRequested()

@@ -393,7 +393,7 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * `answer` receives each outgoing request's header and returns the response body to play back;
  * each response is framed with the header version that request's api key and version imply.
  * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
- * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
+ * @param {(header: { apiKey: number, apiVersion: number }) => Buffer|Promise<Buffer>} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
  * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
  */
@@ -425,11 +425,12 @@ const createFakeBroker = (answer, chunks) => {
             },
           }
         : state
+      const body = answer(header)
       respondWithFrame(
         responseState,
         header.correlationId,
         responseHeaderVersion(header.apiKey, header.apiVersion),
-        answer(header)
+        body instanceof Promise ? await body : body
       )
     }
   }
