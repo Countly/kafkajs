@@ -11,6 +11,10 @@ const gate = () => {
   return { promise, resolve }
 }
 
+/** Says which came first: the gate the test waits at, or the commit settling without reaching it. */
+const reached = (arrival, settlement) =>
+  Promise.race([arrival.then(() => 'arrived'), settlement.then(() => 'settled')])
+
 describe('Consumer > OffsetManager > getCoordinator', () => {
   let offsetManager, mockCluster, mockCoordinator, mockNewCoordinator
 
@@ -98,8 +102,8 @@ describe.each(['classic', 'consumer'])(
         cluster.findGroupCoordinator.mockResolvedValue(obsolete)
         const fence = new Generation()
         const pending = manager.commitOffsets(offsets, { fence }).catch((error) => error)
-        // A commit that settles before the refresh fails the assertions below instead of hanging.
-        await Promise.race([arrived.promise, pending])
+        // A commit that settles before the refresh fails here instead of hanging.
+        expect(await reached(arrived.promise, pending)).toBe('arrived')
         if (reason === 'ownership replacement') group.ownership.renew()
         else fence.close(new Error('commit caller retired'))
         const replacement = { nodeId: 'replacement', isConnected: () => true }
@@ -133,8 +137,8 @@ describe.each(['classic', 'consumer'])(
         })
         let refusal = null
         const pending = manager.commitOffsets(offsets, { guard: () => refusal }).catch((e) => e)
-        // A commit that settles before the lookup fails the assertions below instead of hanging.
-        await Promise.race([arrived.promise, pending])
+        // A commit that settles before the lookup fails here instead of hanging.
+        expect(await reached(arrived.promise, pending)).toBe('arrived')
         refusal = new Error('commit caller retired')
         const cached = manager.coordinator
         lookup.resolve()
