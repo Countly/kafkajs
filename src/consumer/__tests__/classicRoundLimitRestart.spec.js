@@ -124,7 +124,8 @@ const build = (
     committedOffsets: () => ({}),
     offsetOperations: () => new OffsetOperations(),
     defaultOffset: () => -2,
-    topicId: () => undefined,
+    // A topic without an id is never fetched.
+    topicId: () => '01020304-0506-0708-090a-0b0c0d0e0f10',
     leaderEpoch: () => -1,
     getNodeIds: () => [0],
     findTopicPartitionMetadata: () => [0, 1].map((partitionId) => ({ partitionId, leader: 0 })),
