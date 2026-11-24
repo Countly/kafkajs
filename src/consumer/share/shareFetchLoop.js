@@ -1500,11 +1500,7 @@ class ShareFetchLoop {
       return
     }
     if (!row.pendingHandlers || row.dispatched) return
-    const { records } = row.walk.deliver
-    row.ledger.complete(
-      records.map((record) => record.offset),
-      'release'
-    )
+    row.ledger.complete(row.ledger.offsets, 'release')
     row.pendingHandlers = false
   }
 

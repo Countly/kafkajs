@@ -456,7 +456,8 @@ module.exports = class Decoder {
    * Reads a signed INT32 varint (ZigZag), as a record writes its lengths and deltas.
    * @returns {number}
    * @throws {KafkaJSInvalidVarIntError} when the fifth byte still has its continuation bit: an INT32
-   *         takes at most 5 bytes, and a longer one would wrap the shift into a wrong value
+   *         takes at most 5 bytes, and a longer one would wrap the shift into a wrong value; or when
+   *         a fifth and last byte is above 0x0f, so it carries bits beyond 32
    * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
    */
   readVarInt() {
@@ -474,11 +475,22 @@ module.exports = class Decoder {
       i += 7
     } while (currentByte >= MOST_SIGNIFICANT_BIT)
 
+    // i is 35 when the fifth byte ended the varint
+    if (i === 35 && currentByte > 0x0f) {
+      throw new KafkaJSInvalidVarIntError('Invalid VarInt, the fifth byte carries bits beyond 32')
+    }
+
     return Decoder.decodeZigZag(result)
   }
 
-  // By default JavaScript's numbers are of type float64, performing bitwise operations converts the numbers to a signed 32-bit integer
-  // Unsigned Right Shift Operator >>> ensures the returned value is an unsigned 32-bit integer
+  /**
+   * Reads an unsigned INT32 varint, as flexible versions write compact lengths and tags. Bitwise
+   * operators work on signed 32-bit integers, so `>>> 0` returns the result unsigned.
+   * @returns {number}
+   * @throws {KafkaJSInvalidVarIntError} when the fifth byte still has its continuation bit, or is
+   *         above 0x0f and so carries bits beyond 32
+   * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
+   */
   readUVarInt() {
     let currentByte
     let result = 0
@@ -491,6 +503,9 @@ module.exports = class Decoder {
         throw new KafkaJSInvalidVarIntError('Invalid VarInt, must contain 5 bytes or less')
       }
       this.ensureReadable(1, 'readUVarInt')
+    }
+    if (i === 28 && currentByte > 0x0f) {
+      throw new KafkaJSInvalidVarIntError('Invalid VarInt, the fifth byte carries bits beyond 32')
     }
     result |= currentByte << i
     return result >>> 0
@@ -542,6 +557,14 @@ module.exports = class Decoder {
     return taggedFields
   }
 
+  /**
+   * Reads a signed INT64 varint (ZigZag), as a record writes its timestamp delta.
+   * @returns {Long}
+   * @throws {KafkaJSInvalidLongError} when the tenth byte still has its continuation bit, or is
+   *         above 0x01 and so carries bits beyond 64: `Long` is not wrapped to 64 bits, so the value
+   *         would leave the INT64 range
+   * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
+   */
   readVarLong() {
     let currentByte
     let result = Long.fromInt(0)
@@ -556,6 +579,11 @@ module.exports = class Decoder {
       result = result.add(Long.fromInt(currentByte & OTHER_BITS).shiftLeft(i))
       i += 7
     } while (currentByte >= MOST_SIGNIFICANT_BIT)
+
+    // i is 70 when the tenth byte ended the varint
+    if (i === 70 && currentByte > 0x01) {
+      throw new KafkaJSInvalidLongError('Invalid Long, the tenth byte carries bits beyond 64')
+    }
 
     return Decoder.decodeZigZag64(result)
   }
