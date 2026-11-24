@@ -36,6 +36,8 @@ const MIN_RECORD_BYTES = 7
 // The bytes of `maxDecompressedBatchBytes` that pay for one record object: the heap a decoded
 // record costs (208 to 321 bytes, measured) rounded up to a power of two.
 const RECORD_CEILING_BYTES = 512
+// The bytes of `maxDecompressedBatchBytes` that pay for one decoded header, by the same rule.
+const HEADER_CEILING_BYTES = 256
 
 const CONTROL_KEY_BYTES = 4
 const END_TRANSACTION_MARKER_TYPES = [0, 1]
@@ -204,14 +206,16 @@ const assertControlRecord = ({ key, value }, firstOffset) => {
  * @param {object} [options]
  * @param {boolean} [options.checkCrcs=true] verify the batch CRC32C (Java's `check.crcs`)
  * @param {number} [options.maxDecompressedBatchBytes] the most the batch may decompress to; it also
- *        sets the record ceiling, `max(1, floor(bytes / 512))` records
+ *        sets the record ceiling, `max(1, floor(bytes / 512))` records, and the header ceiling,
+ *        `max(1, floor(bytes / 256))` headers across all records of the batch
  * @returns {Promise<object>} the decoded record batch, including its records
  * @throws {KafkaJSPartialMessageError} on a truncated batch
  * @throws {KafkaJSCorruptRecordError} when the batch is all here and impossible or over a bound:
  *         its length or magic and its CRC (judged first, so a forged length cannot pass for a
  *         mismatch), its record count (judged after the CRC, so it also guards `checkCrcs: false`),
- *         a compressed body that is malformed or decompresses past the bound, a record that runs
- *         past the batch or holds a signed varint longer than 5 bytes (reason `length`, the
+ *         a compressed body that is malformed or decompresses past the bound, more headers than the
+ *         header ceiling (reason `count`, before the crossing record's headers are read), a record
+ *         that runs past the batch or holds a signed varint longer than 5 bytes (reason `length`, the
  *         primitive's error as `cause`), or a malformed control record. `nextOffset` is set once the
  *         header and, with `checkCrcs`, the CRC have been accepted
  */
@@ -323,13 +327,17 @@ module.exports = async (
   }
 }
 
+module.exports.RECORD_CEILING_BYTES = RECORD_CEILING_BYTES
+module.exports.HEADER_CEILING_BYTES = HEADER_CEILING_BYTES
+
 /**
  * Decodes the records section of a batch, decompressing it first when the batch is compressed.
  * The count is checked before anything is allocated for it, twice: against the record ceiling the
  * byte bound implies, before the body is decompressed, and against the bytes the records have,
  * `MIN_RECORD_BYTES` each, once they are known. The body is decompressed within the byte bound.
  * The result array is preallocated from the checked count, so its 8-byte slots take at most 8/7 of
- * the record bytes held and at most `maxDecompressedBatchBytes / 64` bytes.
+ * the record bytes held and at most `maxDecompressedBatchBytes / 64` bytes. One header budget,
+ * `max(1, floor(limit / HEADER_CEILING_BYTES))` headers, is shared by every record of the batch.
  * @param {object} batch
  * @param {object|null} batch.codec the compression codec for this batch, or null when uncompressed
  * @param {number} batch.attributes the batch attributes
@@ -341,8 +349,8 @@ module.exports = async (
  * @param {number} firstTimestampNumber `Number(firstTimestamp)`, computed once per batch
  * @returns {Promise<object[]>} the decoded records, in wire order
  * @throws {KafkaJSCorruptRecordError} with reason `count` for a negative count, one above the
- *         record ceiling or one the bytes cannot hold, and for a compressed body `decompressed-size`
- *         or `decompression`
+ *         record ceiling or one the bytes cannot hold, or more headers than the header ceiling, and
+ *         for a compressed body `decompressed-size` or `decompression`
  */
 const decodeRecords = async (
   { codec, attributes, count, limit },
@@ -384,10 +392,18 @@ const decodeRecords = async (
     )
   }
 
+  const headerLimit = Math.max(1, Math.floor(limit / HEADER_CEILING_BYTES))
+  const headerBudget = { remaining: headerLimit, limit: headerLimit }
   const records = new Array(count)
 
   for (let i = 0; i < count; i++) {
-    records[i] = decodeRecord(decoder, recordContext, firstOffsetNumber, firstTimestampNumber)
+    records[i] = decodeRecord(
+      decoder,
+      recordContext,
+      firstOffsetNumber,
+      firstTimestampNumber,
+      headerBudget
+    )
   }
 
   return records
@@ -399,11 +415,19 @@ const decodeRecords = async (
  * @param {object} recordContext the batch-level values shared by every record in the batch
  * @param {number} firstOffsetNumber `Number(firstOffset)`, computed once per batch
  * @param {number} firstTimestampNumber `Number(firstTimestamp)`, computed once per batch
+ * @param {{ remaining: number, limit: number }} headerBudget the batch's header budget
  * @returns {object} the decoded record
  * @throws {KafkaJSCorruptRecordError} with reason `length` for a record whose length is -1, the
- *         null of a varint length, which no record can have
+ *         null of a varint length, which no record can have, and reason `count` for a header
+ *         count above what `headerBudget` has left
  */
-const decodeRecord = (decoder, recordContext, firstOffsetNumber, firstTimestampNumber) => {
+const decodeRecord = (
+  decoder,
+  recordContext,
+  firstOffsetNumber,
+  firstTimestampNumber,
+  headerBudget
+) => {
   const recordBuffer = decoder.readVarIntBytes()
 
   if (recordBuffer === null) {
@@ -414,6 +438,7 @@ const decodeRecord = (decoder, recordContext, firstOffsetNumber, firstTimestampN
     new Decoder(recordBuffer),
     recordContext,
     firstOffsetNumber,
-    firstTimestampNumber
+    firstTimestampNumber,
+    headerBudget
   )
 }

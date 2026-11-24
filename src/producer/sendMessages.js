@@ -4,6 +4,7 @@ const createRetry = require('../retry')
 const {
   KafkaJSError,
   KafkaJSNonRetriableError,
+  KafkaJSInvalidConfigurationError,
   KafkaJSMetadataNotLoaded,
   KafkaJSInvariantViolation,
   KafkaJSDeliveryTimeout,
@@ -1891,7 +1892,9 @@ const createSendMessages = ({
    * from `send` after each await: a send that settled meanwhile has none, and the wait ends without
    * enqueuing anything. A failure that arrives after the send settled is ignored: it refreshes no
    * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure
-   * arms the transaction as `inTransaction` says.
+   * arms the transaction as `inTransaction` says, except a partition the partitioner returned
+   * that is not a partition id: that rejects the send with `KafkaJSInvalidConfigurationError`
+   * and leaves the transaction usable.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
@@ -1960,7 +1963,9 @@ const createSendMessages = ({
       send,
       fence
     )(pinned).catch((error) => {
-      throw send.settled || fence?.closed ? error : inTransaction(error)
+      throw send.settled || fence?.closed || error instanceof KafkaJSInvalidConfigurationError
+        ? error
+        : inTransaction(error)
     })
   }
 

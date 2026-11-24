@@ -1,5 +1,6 @@
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const { createModPartitioner } = require('testHelpers')
+const { KafkaJSInvalidConfigurationError } = require('../errors')
 
 describe('Producer > groupMessagesPerPartition', () => {
   let topic, partitionMetadata, messages, partitioner
@@ -117,5 +118,61 @@ describe('grouping semantics', () => {
     messages.forEach((message, i) => {
       expect(partitioner).toHaveBeenNthCalledWith(i + 1, { topic: 't', partitionMetadata, message })
     })
+  })
+
+  const group = (partitioner, messages = [{ value: 'a' }]) =>
+    groupMessagesPerPartition({ topic: 't', partitionMetadata, messages, partitioner })
+
+  it('rejects a partitioner result that is not a partition id from 0 to 2147483647', () => {
+    const hostile = {
+      toString() {
+        throw new Error('coerced with toString')
+      },
+      valueOf() {
+        throw new Error('coerced with valueOf')
+      },
+    }
+    const invalid = [
+      [Symbol('p'), 'symbol'],
+      [NaN, 'NaN'],
+      [1.5, '1.5'],
+      [-1, '-1'],
+      [2147483648, '2147483648'],
+      [1e21, '1e+21'],
+      ['1000000000000000000000', '"1000000000000000000000"'],
+      [undefined, 'undefined'],
+      [null, 'object'],
+      ['01', '"01"'],
+      ['x', '"x"'],
+      [{}, 'object'],
+      [hostile, 'object'],
+    ]
+
+    const errors = invalid.map(([value]) => {
+      try {
+        group(() => value)
+      } catch (error) {
+        return error
+      }
+      return undefined
+    })
+
+    errors.forEach((error) => expect(error).toBeInstanceOf(KafkaJSInvalidConfigurationError))
+    expect(errors.map(({ message }) => message)).toEqual(
+      invalid.map(([, shown]) => `Invalid partition ${shown} for topic "t"`)
+    )
+  })
+
+  it('accepts integer numbers and canonical decimal strings up to 2147483647', () => {
+    const valid = [0, 7, 2147483647, '0', '12', '2147483647']
+
+    const keys = valid.map((value) => Object.keys(group(() => value)))
+
+    expect(keys).toEqual(valid.map((value) => [String(value)]))
+  })
+
+  it('accepts an in-range integer above the partition count', () => {
+    expect(Object.keys(group(() => 3))).toEqual(['3'])
+    expect(Object.keys(group(() => 1000))).toEqual(['1000'])
   })
 })

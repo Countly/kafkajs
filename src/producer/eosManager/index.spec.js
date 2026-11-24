@@ -1201,6 +1201,26 @@ describe('Epoch bump failure at transaction boundaries', () => {
     expect(manager.getProducerEpoch()).toBe(1)
     await manager.abort()
   })
+  test('a direct InitProducerId refusal with code 53 keeps the epoch bump owed', async () => {
+    const { manager, broker } = await fixture()
+    const refusal = createErrorFromCode(53)
+    broker.initProducerId.mockRejectedValueOnce(refusal).mockRejectedValueOnce(refusal)
+
+    await expect(manager.abort({ droppedSequences: true })).resolves.toBeUndefined()
+    await expect(manager.beginTransaction()).rejects.toMatchObject({
+      name: 'KafkaJSTransactionAbortableError',
+      cause: refusal,
+    })
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(manager.getProducerEpoch()).toBe(0)
+    expect(broker.initProducerId).toHaveBeenCalledTimes(3)
+
+    await manager.beginTransaction()
+    expect(manager.getProducerEpoch()).toBe(1)
+    expect(broker.initProducerId).toHaveBeenCalledTimes(4)
+    await manager.abort()
+  })
+
   test.each(['abort', 'begin'])('a fatal bump failure rejects at %s', async (boundary) => {
     const { manager, broker } = await fixture()
     if (boundary === 'begin') {
@@ -1338,7 +1358,7 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
     })
 
     test.each([
-      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', () => createErrorFromCode(53)],
+      ['CLUSTER_AUTHORIZATION_FAILED', () => createErrorFromCode(31)],
       ['a TypeError', () => new TypeError('boom')],
       ...(method === 'beginTransaction'
         ? [['a coordinator that was not found', () => new KafkaJSGroupCoordinatorNotFound('none')]]
@@ -1356,7 +1376,7 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
 
     test('rejects at once, as it is, on an error that is not retriable after a reset', async () => {
       const { manager, cluster, broker } = await build(options)
-      const refused = createErrorFromCode(53)
+      const refused = createErrorFromCode(31)
       cluster.findGroupCoordinator.mockRejectedValueOnce(reset()).mockRejectedValueOnce(refused)
 
       await expect(manager[method]()).rejects.toBe(refused)
@@ -1364,6 +1384,25 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
       expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
       expect(broker.initProducerId).not.toHaveBeenCalled()
     })
+
+    test.each([0, 1])(
+      'arms FATAL_ERROR on TRANSACTIONAL_ID_AUTHORIZATION_FAILED after %i connection resets',
+      async (resets) => {
+        const { manager, cluster, broker } = await build(options)
+        const refused = createErrorFromCode(53)
+        failLookups(cluster, resets)
+        cluster.findGroupCoordinator.mockRejectedValueOnce(refused)
+
+        const error = await manager[method]().catch((e) => e)
+
+        expect(error).toBe(manager.stateManager.transaction.armedError())
+        expect(error.name).toBe('KafkaJSApplicationRecoverableError')
+        expect(error.cause).toBe(refused)
+        expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(resets + 1)
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+      }
+    )
 
     test('stops retrying when the producer lifecycle closes meanwhile, and writes nothing late', async () => {
       const generation = new Generation()
@@ -1390,6 +1429,25 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
       expect(broker.initProducerId).not.toHaveBeenCalled()
       expect(manager.stateManager.state()).toBe(options.begun ? 'READY' : 'UNINITIALIZED')
     })
+  })
+
+  test('a begin whose lifecycle closes before it handles a lookup refusal arms nothing', async () => {
+    const generation = new Generation()
+    const { manager, cluster, broker } = await build({
+      begun: true,
+      getGeneration: () => generation,
+    })
+    const closed = new KafkaJSProducerClosedError('The producer was closed', { outcome: 'unknown' })
+    cluster.findGroupCoordinator.mockRejectedValueOnce(createErrorFromCode(53))
+    // Close after the retry checks the open lifecycle, before begin handles its rejection.
+    jest.spyOn(generation, 'check').mockImplementationOnce(() => {
+      queueMicrotask(() => generation.close(closed))
+    })
+
+    await expect(manager.beginTransaction()).rejects.toBe(closed)
+
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(broker.initProducerId).not.toHaveBeenCalled()
   })
 
   test('a begin does not outlive a producer made unusable while it retries', async () => {

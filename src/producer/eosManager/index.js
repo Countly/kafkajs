@@ -11,6 +11,7 @@ const {
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProducerClosedError,
+  KafkaJSProtocolError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
@@ -64,6 +65,7 @@ const surfaceInTransaction = (error) => {
 
 const COMMIT_PENDING =
   'The transaction coordinator could not be found; the commit is pending, call commit() again'
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED = 53
 
 /**
  * The not-found links of failed coordinator lookups' cause chains. A retrier's re-wrap keeps such a
@@ -87,18 +89,32 @@ const causeChain = (error) => {
 
 /**
  * Records a failed coordinator lookup whose discovery ran out of its budget: a
- * `KafkaJSGroupCoordinatorNotFound` or a `KafkaJSBrokerNotFound` in its cause chain.
+ * `KafkaJSGroupCoordinatorNotFound` or a `KafkaJSBrokerNotFound` in its cause chain. A not-found
+ * error caused by a broker's non-retriable answer is a refusal, not a discovery that ran out, and
+ * is not recorded: the boundary classifies the answer instead.
  * @param {Error} error what the lookup rejected with
  * @returns {Error} the same error
  */
 const markLookupFailure = (error) => {
   for (const link of causeChain(error)) {
-    if (link instanceof KafkaJSGroupCoordinatorNotFound || link instanceof KafkaJSBrokerNotFound) {
+    const refused = link.cause instanceof KafkaJSProtocolError && link.cause.retriable === false
+    if (
+      (link instanceof KafkaJSGroupCoordinatorNotFound && !refused) ||
+      link instanceof KafkaJSBrokerNotFound
+    ) {
       exhaustedLookups.add(link)
     }
   }
   return error
 }
+
+/**
+ * @param {Error} error
+ * @returns {boolean} whether a coordinator lookup's cause chain holds
+ *   TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53)
+ */
+const refusesTransactionalId = (error) =>
+  causeChain(error).some((link) => link.code === TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
 
 /**
  * @param {Error} error
@@ -296,7 +312,8 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
  *   lifecycle. Each operation reads it once, when it starts, and never again after an await: its
  *   retries stop, and it opens no socket and changes no state, once that lifecycle is closed.
  * @param {(armed: Error) => void} [options.onFenced] private notice that an `InitProducerId` was
- *   fenced (47 or 90), called with the armed error this manager is about to reject with, so the
+ *   fenced (47 or 90) or its transactional id refused (53), called with the armed error this
+ *   manager is about to reject with, so the
  *   producer can make its other identity and its lifecycle fatal too
  * @returns {EosManager}
  */
@@ -475,6 +492,19 @@ const createEosManager = ({
   }
 
   /**
+   * Arms a transaction coordinator lookup refusal after checking that its lifecycle is still open.
+   * @param {Error} failure a lookup failure carrying TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
+   * @returns {import('../../errors').KafkaJSApplicationRecoverableError} the armed error
+   */
+  const armRefusedTransactionLookup = (failure, generation) => {
+    generation?.check()
+    stateManager.classify(failure, 'txn')
+    stateManager.arm(failure)
+    return stateManager.transaction.armedError()
+  }
+
+  /**
    * The transaction coordinator for an InitProducerId - a first one or an epoch bump - its lookup
    * retried as `retryTransactionCoordinator` does. A discovery that ran out rejects with a
    * retriable error before the state manager sees it, so it arms nothing: the producer stays as it
@@ -482,6 +512,7 @@ const createEosManager = ({
    * @param {import('../generation')} [generation] the lifecycle the caller captured
    * @returns {Promise<import('../../../types').Broker>} the coordinator
    * @throws {KafkaJSError} retriable, `cause` the discovery error, when discovery ran out
+   * @throws {import('../../errors').KafkaJSApplicationRecoverableError} on a refused lookup (53)
    * @throws {Error} any other failure, as `retryTransactionCoordinator` does
    */
   const lookUpTransactionCoordinator = async (generation) => {
@@ -489,6 +520,11 @@ const createEosManager = ({
       return await findTransactionCoordinator(generation)
     } catch (error) {
       return retryTransactionCoordinator(error, generation).catch((failure) => {
+        if (refusesTransactionalId(failure)) {
+          const armed = armRefusedTransactionLookup(failure, generation)
+          if (!stateManager.isInitialized()) onFenced?.(armed)
+          throw armed
+        }
         throw isDiscoveryExhausted(failure)
           ? discoveryUnavailable(
               'The transaction coordinator could not be found; no producer id was requested, try again',
@@ -815,7 +851,10 @@ const createEosManager = ({
      * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED,
      *   naming both remedies
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} initial fencing codes
-     *   47 or 90; the protocol error remains its cause and the producer stays fatal
+     *   47 or 90, or when the coordinator lookup is refused with 53; the error remains its cause
+     *   and the producer stays fatal
+     * @throws {import('../../errors').KafkaJSProtocolError} a direct TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+     *   (53) from InitProducerId; the producer can try again after the ACL is corrected
      * @throws {KafkaJSError} retriable, `cause` the discovery error, when the transaction
      *   coordinator could not be found; nothing is armed and the call can be made again
      */
@@ -897,6 +936,8 @@ const createEosManager = ({
      *   retries ran out, or `KafkaJSDeliveryTimeout` once `retry.maxTotalTime` did - or the
      *   re-initialization's; the producer stays `READY` (`FATAL_ERROR` when the re-initialization
      *   failed fatally)
+     * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed error, when the
+     *   lookup was refused with TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53); the producer is fatal
      */
     async beginTransaction() {
       const generation = getGeneration()
@@ -907,7 +948,10 @@ const createEosManager = ({
       try {
         coordinator = await findTransactionCoordinator(generation)
       } catch (error) {
-        coordinator = await retryTransactionCoordinator(error, generation)
+        coordinator = await retryTransactionCoordinator(error, generation).catch((failure) => {
+          if (!refusesTransactionalId(failure)) throw failure
+          throw armRefusedTransactionLookup(failure, generation)
+        })
       }
       generation?.check()
       if (stateManager.version.begin(coordinator).bumpRequired) {
