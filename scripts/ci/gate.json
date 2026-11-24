@@ -4945,6 +4945,7 @@
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Metadata answers across a rebootstrap a reply held across a rebootstrap installs nothing and the call rejects as retriable",
         "src/cluster/__tests__/obsoleteDrain.spec.js › Metadata answers across a rebootstrap a retry whose selection a rebootstrap overtook after the first request sends nothing more and rejects as retriable",
         "src/cluster/__tests__/obsoleteDrain.spec.js › Metadata answers across a rebootstrap a seed connect that fails after its seed was removed retries on a newly built seed without a rebootstrap",
+        "src/cluster/__tests__/obsoleteDrain.spec.js › Metadata answers across a rebootstrap a seed connect that succeeds after its seed was removed connects a newly built seed and writes its versions",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Metadata answers across a rebootstrap an old seed connect that fails after a rebootstrap does not rotate away from the new seed",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Metadata answers across a rebootstrap an old seed connect that succeeds after a rebootstrap does not write its versions",
         "src/cluster/__tests__/obsoleteDrain.spec.js › Metadata answers across a rebootstrap at settlement after a rebootstrap and a disconnect, a caller refusal rejects and otherwise the call resolves silently",

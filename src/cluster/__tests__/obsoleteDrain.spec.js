@@ -1408,6 +1408,37 @@ describe('Metadata answers across a rebootstrap', () => {
     expect(pool.recoveries).toBe(0)
   })
 
+  it('a seed connect that succeeds after its seed was removed connects a newly built seed and writes its versions', async () => {
+    const { pool, seed, builder } = build()
+    const stale = { 3: { minVersion: 0, maxVersion: 12 } }
+    const fresh = { 3: { minVersion: 0, maxVersion: 13 } }
+    pool.retryOptions = { retries: 1, initialRetryTime: 1, maxRetryTime: 1 }
+    const create = pool.createBroker
+    pool.createBroker = jest.fn((options) =>
+      Object.assign(create(options), { versions: fresh, connect: jest.fn(async () => {}) })
+    )
+    let succeed
+    seed.isConnected = () => false
+    seed.versions = stale
+    seed.connect = jest.fn(() => new Promise((resolve) => (succeed = resolve)))
+    const connecting = outcome(pool.connect())
+    await settled()
+    expect(seed.connect).toHaveBeenCalledTimes(1)
+
+    pool.removeBroker({ host: 'seed', port: 9092 })
+    expect(pool.seedBroker).toBeUndefined()
+    succeed()
+
+    expect(await connecting).toEqual({ value: undefined })
+    expect(builder.build).toHaveBeenCalledTimes(1)
+    expect(pool.createBroker).toHaveBeenCalledTimes(1)
+    const rebuilt = pool.createBroker.mock.results[0].value
+    expect(pool.seedBroker).toBe(rebuilt)
+    expect(rebuilt.connect).toHaveBeenCalledTimes(1)
+    expect(pool.versions).toBe(fresh)
+    expect(pool.recoveries).toBe(0)
+  })
+
   it('a node scan that a rebootstrap overtook does not run the all-brokers-unavailable rebootstrap', async () => {
     const { pool, builder } = build()
     delete pool.findConnectedBroker
