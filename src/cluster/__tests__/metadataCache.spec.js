@@ -571,6 +571,108 @@ describe('Cluster > MetadataCache', () => {
     })
   })
 
+  const noIdentity = 'rows that carry no identity, through %s'
+  describe.each(['update', 'updateTopicsById'])(noIdentity, (ingress) => {
+    const ID_C = '21222324-2526-2728-292a-2b2c2d2e2f30'
+    let wanted
+    let owned
+
+    const row = ({ topic = 'test-topic', topicId, topicErrorCode = 0 }) => ({
+      ...response({ topicId, leader: 2, leaderEpoch: 7 }).topicMetadata[0],
+      topic,
+      topicErrorCode,
+    })
+    const answer = (...rows) => ({ ...response(), topicMetadata: rows })
+    const apply = (metadata) => owned[ingress](metadata)
+    const state = () => ({
+      topics: [...owned.topics].map(([name, entry]) => [
+        name,
+        entry.topicId,
+        [...entry.partitions].map(([id, { leader, leaderEpoch }]) => [id, leader, leaderEpoch]),
+      ]),
+      topicIds: [...owned.topicIds],
+      pending: [...owned.pendingTopics],
+    })
+
+    beforeEach(() => {
+      wanted = new Set(['test-topic'])
+      owned = new MetadataCache({
+        logger: newLogger(),
+        instrumentationEmitter: emitter,
+        isWanted: (topic) => wanted.has(topic),
+      })
+      owned.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+    })
+
+    test('a row with a topic error and a usable id changes no id, reverse map, partitions or pending state', () => {
+      wanted.delete('test-topic')
+      const before = state()
+
+      apply(
+        answer(
+          row({ topicId: ID_B, topicErrorCode: 29 }),
+          row({ topic: 'ghost-topic', topicId: ID_C, topicErrorCode: 3 })
+        )
+      )
+
+      expect(state()).toEqual(before)
+      expect(owned.topics.get('test-topic').seenAt).toBe(owned.generation)
+      expect(events).toEqual([])
+    })
+
+    test('a row without a name changes nothing', () => {
+      const before = state()
+
+      apply(answer(row({ topic: null, topicId: ID_B })))
+
+      expect(state()).toEqual(before)
+      expect(owned.topics.has(null)).toBe(false)
+      expect(owned.topicName(ID_B)).toBeUndefined()
+    })
+
+    test('a row with the all-zero id keeps the cached id and adds no pending state', () => {
+      wanted.delete('test-topic')
+
+      apply(answer(row({ topicId: NO_TOPIC_ID })))
+
+      expect(owned.topicId('test-topic')).toEqual(ID_A)
+      expect(owned.topicName(ID_A)).toEqual('test-topic')
+      expect([...owned.pendingTopics]).toEqual([])
+      // Only identity needs a usable id: the healthy answer's leaders still apply.
+      expect(owned.leader('test-topic', 0)).toEqual(2)
+      expect(owned.leaderEpoch('test-topic', 0)).toEqual(7)
+      expect(events).toEqual([])
+    })
+
+    test('a healthy sibling in the same answer installs', () => {
+      apply(
+        answer(
+          row({ topic: 'ghost-topic', topicId: ID_B, topicErrorCode: 3 }),
+          row({ topic: 'sibling-topic', topicId: ID_C })
+        )
+      )
+
+      expect(owned.topicId('test-topic')).toEqual(ID_A)
+      expect(owned.topicId('sibling-topic')).toEqual(ID_C)
+      expect(owned.topicName(ID_C)).toEqual('sibling-topic')
+      expect(owned.leader('sibling-topic', 0)).toEqual(2)
+      expect(owned.leaderEpoch('sibling-topic', 0)).toEqual(7)
+      expect(owned.pendingTopics.has('sibling-topic')).toBe(ingress === 'updateTopicsById')
+    })
+
+    test('a healthy row without an id records its partitions but no id and no pending state', () => {
+      apply(answer(row({ topic: 'plain-topic', topicId: null })))
+
+      // Producer and share routing read leaders from the cache, so the partitions are kept; the
+      // row names no id, so an id lookup resolved nothing it must keep pending.
+      expect(owned.topics.get('plain-topic').topicId).toBeNull()
+      expect(owned.topicId('plain-topic')).toBeUndefined()
+      expect(owned.leader('plain-topic', 0)).toEqual(2)
+      expect(owned.leaderEpoch('plain-topic', 0)).toEqual(7)
+      expect([...owned.pendingTopics]).toEqual([])
+    })
+  })
+
   test('tolerates a null instrumentation emitter', () => {
     const quiet = new MetadataCache({ logger: newLogger(), instrumentationEmitter: null })
     quiet.update(response({ topicId: ID_A }))
