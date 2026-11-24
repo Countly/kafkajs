@@ -23056,9 +23056,11 @@
         "src/consumer/share/__tests__/shareConsumerModes.spec.js \u203a Share consumer handler decisions freezing a call whose acquisition was retired closes it without touching the ledger",
         "src/consumer/share/__tests__/shareConsumerModes.spec.js \u203a Share consumer handler decisions freezing a call that lost its authority promotes none of its choices",
         "src/consumer/share/__tests__/shareConsumerModes.spec.js \u203a Share consumer handler decisions freezing a call promotes its choice by the delivered record even after the handler changed the message offset",
+        "src/consumer/share/__tests__/shareConsumerModes.spec.js › public share handler contract eachBatch: acknowledging after sorting batch.messages descending applies each choice to its own record",
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler whose renewal lost its session still finals the other node and leaves",
         "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes expired handlers on both nodes a node whose final capture fails does not keep the other node from its final or the leave",
-        "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler that changed its message offset after acknowledging finals both nodes and leaves"
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js \u203a share handlers on parallel leader nodes a poll expiry over a handler that changed its message offset after acknowledging finals both nodes and leaves",
+        "src/consumer/share/__tests__/shareConsumerParallel.spec.js › share handlers on parallel leader nodes eachBatch arrays at a forced close reversing batch.messages after rejecting one record keeps only that reject in the forced-close final"
       ],
       "capMinutes": 85,
       "allowedSkips": [
