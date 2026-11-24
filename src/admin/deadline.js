@@ -1,7 +1,7 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
 const createRetry = require('../retry')
 const plainWaitFor = require('../utils/waitFor')
-const { responseSourceOf } = require('../network/failureSource')
+const { responseSourceOf } = require('../broker/failureSource')
 const { itemsOf, keyOf } = require('./unknownOutcome')
 const {
   KafkaJSTimeout,

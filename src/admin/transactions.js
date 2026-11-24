@@ -8,6 +8,7 @@ const {
 } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
 const apiKeys = require('../protocol/requests/apiKeys')
+const { ADMIN_MUTATION } = require('../broker/privateOptions')
 const { responseSourceOf } = require('../broker/failureSource')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
 const { itemRetry } = require('./itemRetry')
@@ -524,6 +525,7 @@ class TransactionAdmin {
                   broker.initProducerId({
                     transactionalId: item.transactionalId,
                     transactionTimeout,
+                    [ADMIN_MUTATION]: ADMIN_MUTATION,
                   })
                 )
               )

@@ -24,6 +24,8 @@ const acceptedIndex = (decoded) => {
 }
 
 module.exports = {
+  /** Admin ownership of InitProducerId and LeaveGroup. */
+  ADMIN_MUTATION: Symbol('adminMutation'),
   /** `offsetCommit` and `endTxn`: called once, immediately before the request is written to the socket. */
   ON_WRITE: Symbol('onWrite'),
   /**

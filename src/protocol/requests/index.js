@@ -1,4 +1,7 @@
 const apiKeys = require('./apiKeys')
+const { currentMutation } = require('../../admin/deadline')
+const { MUTATING_APIS, isMutation, owned } = require('../../admin/unknownOutcome')
+const { ADMIN_MUTATION } = require('../../broker/privateOptions')
 const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('../../errors')
 
 /**
@@ -184,6 +187,34 @@ const lookup =
   (versions, maxVersions = {}) =>
   (apiKey, definition) =>
     definition.protocol({ version: selectVersion(versions, apiKey, definition, maxVersions) })
+
+/** Wraps only mutation definitions so ordinary request lookups keep their existing path.
+ * @param {number} apiKey
+ * @param {RequestDefinitions} definition
+ * @returns {RequestDefinitions} a definition with an admin-aware builder
+ */
+const mutationDefinition = (apiKey, definition) => ({
+  ...definition,
+  protocol(options) {
+    const build = definition.protocol(options)
+    const shared = apiKey === apiKeys.InitProducerId || apiKey === apiKeys.LeaveGroup
+    return (args, ownership) => {
+      if ((shared && ownership !== ADMIN_MUTATION) ||
+          !currentMutation() || !isMutation(apiKey, options.version, args)) {
+        return build(args)
+      }
+      const input = owned(args)
+      const built = build(input)
+      built.args = input
+      return built
+    }
+  },
+})
+
+for (const [name, definition] of Object.entries(requests)) {
+  const apiKey = apiKeys[name]
+  if (MUTATING_APIS.has(apiKey)) requests[name] = mutationDefinition(apiKey, definition)
+}
 
 module.exports = {
   requests,

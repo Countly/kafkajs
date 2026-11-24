@@ -19,6 +19,7 @@ const {
 } = require('./deadline')
 const { createOffsets, OffsetAdmin } = require('./offsets')
 const createLogDirs = require('./logDirs')
+const { ADMIN_MUTATION } = require('../broker/privateOptions')
 const groupBy = require('../utils/groupBy')
 const Long = require('../utils/long')
 const { assertPartitionId, isPartitionId, printable } = require('../utils/partitionId')
@@ -2182,6 +2183,7 @@ module.exports = ({
     const request = {
       groupId,
       members: leaving.map((member) => ({ ...member, reason: sentReason })),
+      [ADMIN_MUTATION]: ADMIN_MUTATION,
     }
 
     return retrierOf(retry)(async (bail, retryCount, retryTime) => {
