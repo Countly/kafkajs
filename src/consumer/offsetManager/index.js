@@ -878,14 +878,14 @@ module.exports = class OffsetManager {
    * @param {import("../../../types").TopicPartition} topicPartition
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
    *   the caller's immutable preparation identity; see `seek`
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} whether the reset was applied
    */
   async setDefaultOffset({ topic, partition }, preparation) {
     if (this.topicConfigurations[topic].resetPolicy?.kind === 'by_duration') {
       return this.resetByDuration({ topic, partition }, preparation)
     }
     const defaultOffset = this.cluster.defaultOffset(this.topicConfigurations[topic])
-    await this.commitAndClear({ topic, partition, offset: defaultOffset }, preparation)
+    return this.commitAndClear({ topic, partition, offset: defaultOffset }, preparation)
   }
 
   /**

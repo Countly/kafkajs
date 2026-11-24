@@ -54,6 +54,7 @@ const SHORT_METADATA = 8
 
 const { FetchSessions } = require('./fetchSession')
 const PositionValidator = require('./positionValidator')
+const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const Outage = require('./outage')
 const RebalanceHooks = require('./rebalanceHooks')
 const {
@@ -465,8 +466,17 @@ module.exports = class ConsumerGroup {
      */
     this.validationUnusableLogged = new Set()
 
-    /** Set when a validation failed: the next round's metadata refresh is a full one. */
-    this.validationRefresh = false
+    /** A full refresh is owed after a validation failure, even if a refresh is already running. */
+    this.validationRefresh = null
+    this.refreshValidationMetadata = sharedPromiseTo(
+      async (fence) => {
+        const obligation = this.validationRefresh
+        await this.refreshCluster({ fence })
+        fence.check()
+        if (this.validationRefresh === obligation) this.validationRefresh = null
+      },
+      (fence) => fence
+    )
 
     /**
      * Position validation gets its own bounded retrier rather than the group's: the group's budget
@@ -2471,6 +2481,7 @@ module.exports = class ConsumerGroup {
       prepared.check()
       const { assignmentEpoch } = prepared
       requestClock = this.acquireClock
+      const requestRouting = this.routingVersion
       const resolved = this.resolveTopicIds(this.buildFetchRequests(prepared.parts))
       const { requests, missing } = resolved
       if (missing) {
@@ -2529,9 +2540,14 @@ module.exports = class ConsumerGroup {
       }
 
       let response
+      let staleWrite = null
       try {
         response = await broker.fetch({
-          guard: prepared.guard,
+          guard: () =>
+            prepared.guard() ||
+            (requestRouting !== this.routingVersion || requestClock !== this.acquireClock
+              ? (staleWrite ??= new KafkaJSNonRetriableError('The Fetch request became stale'))
+              : null),
           maxWaitTime: this.maxWaitTime,
           minBytes: this.minBytes,
           maxBytes: this.maxBytes,
@@ -2547,6 +2563,10 @@ module.exports = class ConsumerGroup {
           forgottenTopics: tracked?.wire.forgottenTopics,
         })
       } catch (error) {
+        if (staleWrite && error === staleWrite) {
+          tracked?.session.handleError(tracked.token)
+          return []
+        }
         // A retired run's failure may only reset the session whose epoch it left unknown: replica
         // hints and routing belong to the run that replaced it.
         if (tracked && run.fence.closed) {
@@ -2829,10 +2849,11 @@ module.exports = class ConsumerGroup {
    */
   async prepareFetch(nodeId, run, ownershipToken) {
     run.fence.check()
-    // A failed position validation asks for a full refresh, so its retry meets fresh leaders.
-    const ifNecessary = !this.validationRefresh
-    this.validationRefresh = false
-    await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary }))
+    await run.fence.wait(
+      this.validationRefresh
+        ? this.refreshValidationMetadata(run.fence)
+        : this.refreshCluster({ fence: run.fence, ifNecessary: true })
+    )
     run.fence.check()
     this.checkSubscriptionChange()
     this.groupMembership.recheckHeldTopics?.()
@@ -2841,6 +2862,9 @@ module.exports = class ConsumerGroup {
 
     let prepared = null
     for (let attempt = 1; attempt <= MAX_PREPARATION_ATTEMPTS; attempt++) {
+      while (this.validationRefresh) {
+        await run.fence.wait(this.refreshValidationMetadata(run.fence))
+      }
       // Captured before anything is awaited: this is the assignment the request is built from,
       // and it is what every batch this round produces is stamped with.
       const snapshot = this.captureFetchPreparation(nodeId, run, ownershipToken)
@@ -2848,6 +2872,9 @@ module.exports = class ConsumerGroup {
       try {
         snapshot.check()
         await run.fence.wait(this.seekOffsets(snapshot.parts, snapshot))
+        while (this.validationRefresh) {
+          await run.fence.wait(this.refreshValidationMetadata(run.fence))
+        }
         snapshot.check()
         await run.fence.wait(this.validatePositions(snapshot.parts, snapshot))
         snapshot.check()
@@ -2925,15 +2952,18 @@ module.exports = class ConsumerGroup {
             state.isAssigned(topic, partition) &&
             !state.isPaused(topic, partition) &&
             !state.isHeld(topic, partition) &&
-            !this.positionValidator.holdsFetch(topic, partition) &&
             (this.haltedPartitions.size === 0 ||
               !this.haltedPartitions.has(`${topic}|${partition}`)) &&
             !(this.hasSeekGates() && this.isSeekGated(topic, partition))
           ) {
+            const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+            if (this.positionValidator.holdsFetch(topic, partition, currentLeaderEpoch)) {
+              return requests
+            }
             requests.push({
               partition,
               fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-              currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+              currentLeaderEpoch,
               maxBytes: this.maxBytesPerPartition,
             })
           }
@@ -3341,15 +3371,14 @@ module.exports = class ConsumerGroup {
    * @param {number} partition
    * @param {{offset: string|null, reason: 'no-offset'|'offset-out-of-range', error: Error}} marker
    * @param {object|null} context the identity the refusal was raised under
-   * @returns {void}
+   * @returns {boolean} whether a current halt is installed
    */
   installReset(topic, partition, marker, context) {
-    if (
-      this.isResetContextCurrent(topic, partition, context) &&
-      this.acceptHalt(topic, partition, marker, context)
-    ) {
+    if (!this.isResetContextCurrent(topic, partition, context)) return false
+    if (this.acceptHalt(topic, partition, marker, context)) {
       this.reportHalt(topic, partition, marker)
     }
+    return this.haltedPartitions.has(`${topic}|${partition}`)
   }
 
   /**
@@ -4071,7 +4100,11 @@ module.exports = class ConsumerGroup {
           }
 
           if (action === 'awaiting') {
-            awaiting = awaiting || []
+            if (!awaiting) {
+              // A new validation can invalidate an already built Fetch without a route change.
+              this.acquireClock += 1
+              awaiting = []
+            }
             awaiting.push({
               topic,
               partition,
@@ -4137,7 +4170,7 @@ module.exports = class ConsumerGroup {
     const now = performance.now()
     const held = this.positionValidator.fail(items, now)
     if (held.length === 0) return
-    this.validationRefresh = true
+    this.validationRefresh = Symbol('validation refresh')
 
     for (const { topic, partition, entry, errorCode } of held) {
       if (entry.warnedAt !== undefined && now - entry.warnedAt < HELD_WARNING_INTERVAL) continue
@@ -4245,7 +4278,7 @@ module.exports = class ConsumerGroup {
 
     let pending = topics
     let authorization = null
-    let answered = false
+    let retryResponse
     const retrier = preparation
       ? createRetry({ retries: 2, maxRetryTime: 5000, fence: preparation.fence })
       : this.validationRetrier
@@ -4253,7 +4286,6 @@ module.exports = class ConsumerGroup {
     try {
       await retrier(async () => {
         preparation?.check()
-        answered = false
         const response = await broker.offsetForLeaderEpoch({
           topics: pending.map(({ topic, entries }) => ({
             topic,
@@ -4267,7 +4299,6 @@ module.exports = class ConsumerGroup {
         })
         preparation?.check()
 
-        answered = true
         const outcome = await this.applyValidationResponse(pending, response, preparation)
         pending = outcome.retry
         authorization ??= outcome.authorization
@@ -4276,20 +4307,20 @@ module.exports = class ConsumerGroup {
         if (pending.length > 0) {
           // `createRetry` only retries a thrown error, and the response codec deliberately does
           // not throw on a per-partition code.
-          throw new KafkaJSError('Position validation retriable')
+          throw (retryResponse ??= new KafkaJSError('Position validation retriable'))
         }
       })
     } catch (e) {
       preparation?.check()
-      if (e.name !== 'KafkaJSNumberOfRetriesExceeded') {
+      if (!authorization && e.name !== 'KafkaJSNumberOfRetriesExceeded') {
         throw e
       }
 
       // The offset and the tracked epoch stay as they are: the partition is asked again later.
-      // When the last attempt got no answer at all, its failure is what each warning names.
+      // For a broker response, each warning names its partition's code.
       this.holdUnvalidated(
         pending.flatMap(({ entries }) => entries),
-        answered ? undefined : e.message
+        retryResponse && e.cause === retryResponse ? undefined : e.message
       )
     }
 
@@ -4362,6 +4393,7 @@ module.exports = class ConsumerGroup {
               this.seekOffset.has(topic, entry.partition) ||
               this.isSoughtAfter(topic, entry.partition, entry.requestClock),
             generation: entry.generation,
+            requestEntry: entry.entry,
           }
         )
 
@@ -4380,9 +4412,8 @@ module.exports = class ConsumerGroup {
           entry.errorCode = reply.errorCode
           this.holdUnvalidated([entry])
         } else if (outcome.action === 'truncated' || outcome.action === 'reset') {
-          const decided = preparation && this.positionValidator.entryOf(topic, entry.partition)
           try {
-            await this.applyValidationOutcome(
+            const applied = await this.applyValidationOutcome(
               topic,
               entry.partition,
               offset,
@@ -4391,15 +4422,14 @@ module.exports = class ConsumerGroup {
               entry.requestClock
             )
             preparation?.check()
-            this.positionValidator.confirm(entry)
+            if (applied) this.positionValidator.confirm(entry)
+            else this.holdUnvalidated([entry], 'position change was not applied')
           } catch (e) {
             // The partition stays held, so the position it was told to leave is not fetched; the
             // next round decides it again. A refused preparation releases only the entry it
             // decided, never a replacement's.
             if (preparation?.guard()) {
-              this.positionValidator.release([
-                { topic, partition: entry.partition, entry: decided },
-              ])
+              this.positionValidator.release([entry])
               preparation.check()
             }
             this.holdUnvalidated([entry], e.message)
@@ -4418,18 +4448,15 @@ module.exports = class ConsumerGroup {
   /**
    * Moves every partition of these entries on without a reply, leaving their tracked epochs alone.
    *
-   * Each entry is marked under the generation it was requested with, so an entry belonging to a
-   * previous assignment is a no-op rather than a claim about the current one.
+   * Only the captured entries can be confirmed.
    *
    * @private
    * @param {{topic: string, entries: object[]}[]} topics
    * @returns {void}
    */
   markAllValidated(topics) {
-    for (const { topic, entries } of topics) {
-      for (const { partition, currentLeaderEpoch, generation } of entries) {
-        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
-      }
+    for (const { entries } of topics) {
+      for (const entry of entries) this.positionValidator.confirm(entry)
     }
   }
 
@@ -4445,7 +4472,7 @@ module.exports = class ConsumerGroup {
    *   work and checked before the repositioning is marked and announced
    * @param {number} [requestClock] the acquisition clock when the validation request was built;
    *   with a preparation, it is the identity a none refusal of an unknown divergence carries
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} whether reposition, reset or a halt was applied
    * @throws {Error} the preparation's refusal
    */
   async applyValidationOutcome(topic, partition, offset, outcome, preparation, requestClock) {
@@ -4467,9 +4494,12 @@ module.exports = class ConsumerGroup {
       // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
       // a queued seek would land one round late - and would overwrite a user seek queued in the
       // same window, since the queue is last-writer-wins per key.
-      await manager.reposition({ topic, partition, offset: outcome.divergingOffset }, bound)
+      const applied = await manager.reposition(
+        { topic, partition, offset: outcome.divergingOffset },
+        bound
+      )
       preparation?.check()
-      if (stale()) return
+      if (!applied || stale()) return false
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
@@ -4479,7 +4509,7 @@ module.exports = class ConsumerGroup {
         offset,
       })
       if (this.topicConfigurations[topic]?.resetPolicy?.kind === 'none') {
-        this.installReset(
+        const halted = this.installReset(
           topic,
           partition,
           {
@@ -4493,14 +4523,15 @@ module.exports = class ConsumerGroup {
           },
           preparation && this.fetchedResetContext(preparation, requestClock)
         )
+        if (!halted || stale()) return false
       } else {
-        await manager.setDefaultOffset({ topic, partition }, bound)
+        const applied = await manager.setDefaultOffset({ topic, partition }, bound)
         preparation?.check()
-        if (stale()) return
+        if (!applied || stale()) return false
         this.markChanged(topic, partition)
       }
     } else {
-      return
+      return false
     }
 
     this.instrumentationEmitter.emit(LOG_TRUNCATION, {
@@ -4510,6 +4541,7 @@ module.exports = class ConsumerGroup {
       divergingOffset: outcome.divergingOffset,
       leaderEpoch: outcome.leaderEpoch,
     })
+    return true
   }
 
   /**

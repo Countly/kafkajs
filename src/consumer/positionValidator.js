@@ -10,6 +10,7 @@ const UNKNOWN_EPOCH = -1
 /** The first retry backoff of a held partition, and its cap (Java's `retry.backoff` defaults). */
 const RETRY_BACKOFF_MS = 100
 const MAX_RETRY_BACKOFF_MS = 1000
+const APPLYING = Symbol('applying')
 
 /**
  * One state per assigned partition for KIP-320 position validation, and the outcome rules for a
@@ -26,15 +27,15 @@ const MAX_RETRY_BACKOFF_MS = 1000
  *   that arrives after the position moved can be recognised and dropped. It must never stay here
  *   without a request in flight: every exit is either performed by `complete()` or by the caller
  *   through `confirm()`, `fail()`, `release()`, `markValidated()`, `clear()` or `forgetTopic()`.
- * - **held** — no request in flight and not validated: the request failed (`fail()`), its reply was
- *   discarded, or a truncation or reset outcome is being applied. A held partition that failed
+ * - **applying** — a truncation or reset owns the entry until the operation settles.
+ * - **held** — the request or reposition failed (`fail()`), or the reply was discarded. A failure
  *   carries `failures`, `retryAt`, `failedAgainst` (the leader epoch it failed under),
  *   `heldSince` and `warnedAt`; it is asked again once `retryAt` passes, at once under a new
  *   leader epoch, and leaves the state on a seek (`forgetTopic()`) or a rebalance.
  * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against.
  *   The partition is re-examined only when the cached leader epoch differs from it.
  *
- * Awaiting and held partitions are kept out of every Fetch (`holdsFetch()`).
+ * Awaiting, applying and held partitions are kept out of every Fetch (`holdsFetch()`).
  *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
@@ -84,6 +85,15 @@ module.exports = class PositionValidator {
     const entry = this.entries.get(key)
 
     if (entry && entry.validatedAgainst === currentLeaderEpoch) {
+      return { action: 'unchanged', generation }
+    }
+
+    if (
+      currentLeaderEpoch === UNKNOWN_EPOCH &&
+      trackedEpoch !== UNKNOWN_EPOCH &&
+      entry &&
+      entry.validatedAgainst === undefined
+    ) {
       return { action: 'unchanged', generation }
     }
 
@@ -206,6 +216,7 @@ module.exports = class PositionValidator {
    * @param {boolean} reply.seekQueued whether a user seek is queued for this partition; the one
    *   guard the validator cannot evaluate itself
    * @param {number} reply.generation the generation `request()` returned for this partition
+   * @param {object} [reply.requestEntry] the entry captured before sending the request
    * @returns {{ action: 'discarded'|'validated'|'truncated'|'reset'|'retry'|'fatal', divergingOffset: string|null, leaderEpoch: number }}
    *   `divergingOffset` is the offset to resume from on `'truncated'`, `null` otherwise
    */
@@ -213,7 +224,7 @@ module.exports = class PositionValidator {
     topic,
     partition,
     currentPosition,
-    { errorCode, endOffset, leaderEpoch, seekQueued, generation }
+    { errorCode, endOffset, leaderEpoch, seekQueued, generation, requestEntry }
   ) {
     const key = this.getKey(topic, partition)
     const entry = this.entries.get(key)
@@ -222,7 +233,7 @@ module.exports = class PositionValidator {
       return this.discard(topic, partition, 'stale generation')
     }
 
-    if (!entry || !entry.pending) {
+    if (!entry?.pending || entry.pending === APPLYING || (requestEntry && requestEntry !== entry)) {
       return this.discard(topic, partition, 'not awaiting')
     }
 
@@ -248,12 +259,12 @@ module.exports = class PositionValidator {
     const end = Long.fromValue(endOffset)
 
     if (end.equals(UNKNOWN_EPOCH) || Long.fromValue(leaderEpoch).equals(UNKNOWN_EPOCH)) {
-      entry.pending = null
+      entry.pending = APPLYING
       return { action: 'reset', divergingOffset: null, leaderEpoch: UNKNOWN_EPOCH }
     }
 
     if (end.lessThan(Long.fromValue(currentPosition.offset))) {
-      entry.pending = null
+      entry.pending = APPLYING
       return { action: 'truncated', divergingOffset: end.toString(), leaderEpoch }
     }
 
@@ -304,12 +315,18 @@ module.exports = class PositionValidator {
   /**
    * @param {string} topic
    * @param {number} partition
-   * @returns {boolean} whether the partition must stay out of a Fetch: it is awaiting a reply or
-   *   held. A partition with no entry was never asked and is not held.
+   * @param {number} [currentLeaderEpoch] the epoch a new Fetch will send
+   * @returns {boolean} whether the partition is awaiting, applying, held or validated for a
+   *   different epoch. An absent entry does not hold Fetch.
    */
-  holdsFetch(topic, partition) {
+  holdsFetch(topic, partition, currentLeaderEpoch) {
     const entry = this.entries.get(this.getKey(topic, partition))
-    return entry !== undefined && entry.validatedAgainst === undefined
+    if (entry === undefined) return false
+    const { validatedAgainst } = entry
+    return (
+      validatedAgainst === undefined ||
+      (currentLeaderEpoch !== undefined && validatedAgainst !== currentLeaderEpoch)
+    )
   }
 
   /**
@@ -343,8 +360,8 @@ module.exports = class PositionValidator {
    * @returns {boolean} whether a request for this partition is in flight
    */
   isAwaiting(topic, partition) {
-    const entry = this.entries.get(this.getKey(topic, partition))
-    return Boolean(entry && entry.pending)
+    const pending = this.entries.get(this.getKey(topic, partition))?.pending
+    return Boolean(pending && pending !== APPLYING)
   }
 
   /**
