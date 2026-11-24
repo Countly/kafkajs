@@ -36,6 +36,8 @@ const MIN_RECORD_BYTES = 7
 // The bytes of `maxDecompressedBatchBytes` that pay for one record object: the heap a decoded
 // record costs (208 to 321 bytes, measured) rounded up to a power of two.
 const RECORD_CEILING_BYTES = 512
+// The bytes of `maxDecompressedBatchBytes` that pay for one decoded header, by the same rule.
+const HEADER_CEILING_BYTES = 128
 
 const CONTROL_KEY_BYTES = 4
 const END_TRANSACTION_MARKER_TYPES = [0, 1]
@@ -322,6 +324,9 @@ module.exports = async (
       : failure
   }
 }
+
+module.exports.RECORD_CEILING_BYTES = RECORD_CEILING_BYTES
+module.exports.HEADER_CEILING_BYTES = HEADER_CEILING_BYTES
 
 /**
  * Decodes the records section of a batch, decompressing it first when the batch is compressed.
