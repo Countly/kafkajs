@@ -183,7 +183,6 @@ class ClassicFaultEpisode {
     this.settled = []
     this.completed = []
     this.heldAnswer = null
-    this.heldCompletion = null
     this.cleanup = []
     this.trace = []
     this.deliveries = []
@@ -281,7 +280,6 @@ class ClassicFaultEpisode {
       this.cluster.kafkaOptions({
         logLevel: logLevel.NOTHING,
         requestTimeout,
-        enforceRequestTimeout: !this.heldHeartbeat,
         retry,
       })
     ).consumer({
@@ -551,46 +549,63 @@ class ClassicFaultEpisode {
   }
 
   /**
+   * @private
+   * @returns {string} the `host:port` the faulted request was written to
+   */
+  faultedBroker() {
+    const { host, port } = NODES.find(({ id }) => id === this.faulted.node)
+    return `${host}:${port}`
+  }
+
+  /**
+   * @returns {object[]} the request timeouts the client reported for the held heartbeat
+   */
+  heldTimeouts() {
+    const broker = this.faultedBroker()
+    return this.timeouts.filter(
+      (entry) =>
+        entry.apiName === 'Heartbeat' &&
+        entry.broker === broker &&
+        entry.correlationId === this.faulted.correlationId
+    )
+  }
+
+  /**
    * After a held heartbeat's answer was let go: waits, by what happens and not by wall time, until
-   * the cluster wrote that answer to the old request's own connection, the client completed that
-   * request, a replacement heartbeat on the same connection was completed too, and the wire was
-   * quiet. The row has no request timeout, so nothing can retire the old request but its answer.
+   * the cluster settled that answer on the old request's own connection, a replacement heartbeat
+   * on a later connection of the same node was completed, and the wire was quiet. The old run
+   * cannot end while its heartbeat waits, so only the request timeout retired the old request,
+   * and its connection, before the replacement joined.
    * @private
    * @returns {Promise<void>}
-   * @throws {Error} when the cluster dropped the answer because the connection was closed first, or
-   *   one of the steps does not happen in time
+   * @throws {Error} when one of the steps does not happen in time
    */
   async settleHeldHeartbeat() {
     const { node, generation, correlationId } = this.faulted
-    const { host, port } = NODES.find(({ id }) => id === node)
+    const broker = this.faultedBroker()
     const heldAnswer = (entry) =>
       entry.node === node &&
       entry.generation === generation &&
       entry.correlationId === correlationId
-    const completedAs = (id) =>
-      this.completed.find(
-        (entry) =>
-          entry.apiName === 'Heartbeat' &&
-          entry.broker === `${host}:${port}` &&
-          entry.correlationId === id &&
-          entry.at >= this.released
-      )
 
     await until(() => this.settled.some(heldAnswer), 'the held heartbeat answer to be settled')
     this.heldAnswer = this.settled.find(heldAnswer)
-    expect(this.heldAnswer.event).toBe('answered')
-    await until(() => completedAs(correlationId), 'the client to complete the held heartbeat')
-    this.heldCompletion = completedAs(correlationId)
     await until(
       () =>
         this.frames('Heartbeat').some(
           (frame) =>
             frame.seq >= this.sentBeforeRelease &&
             frame.node === node &&
-            frame.generation === generation &&
-            completedAs(frame.correlationId)
+            frame.generation > generation &&
+            this.completed.some(
+              (entry) =>
+                entry.apiName === 'Heartbeat' &&
+                entry.broker === broker &&
+                entry.correlationId === frame.correlationId &&
+                entry.at >= this.released
+            )
         ),
-      'a replacement heartbeat on the same connection to be completed'
+      'a replacement heartbeat on a later connection to be completed'
     )
     await this.quiet()
   }
@@ -606,6 +621,8 @@ class ClassicFaultEpisode {
   async recover() {
     const { api, fault } = this.row
     if (this.stale) {
+      if (this.heldHeartbeat)
+        await until(() => this.heldTimeouts().length > 0, 'the held heartbeat to time out')
       this.sentBeforeRelease = this.trace.length
       const late = typeof fault === 'number' ? answerWithCode(api, fault) : undefined
       this.gate.release(typeof late === 'function' ? late(this.gate.call) : late)
@@ -927,8 +944,9 @@ const expectGenerationClosed = (episode) => {
 /**
  * After a late answer for a replaced membership nothing may have been written: no rejoin, sync,
  * leave, lookup or commit, no crash and no new join since it was released; the replacement keeps
- * its scalars. A held heartbeat's answer must also have been written to its own connection and
- * completed by the client, with no request timeout, before a replacement heartbeat succeeded.
+ * its scalars. A held heartbeat must have timed out once before the release, closing its
+ * connection, so its answer was dropped on that connection unread, and a replacement heartbeat on a
+ * later connection must have been answered under the same member and generation.
  * @param {ClassicFaultEpisode} episode
  * @returns {void}
  */
@@ -944,10 +962,12 @@ const expectUnchanged = (episode) => {
   const later = episode.frames('Heartbeat').filter(({ seq }) => seq >= episode.sentBeforeRelease)
   if (episode.heldHeartbeat) {
     const { node, generation, correlationId } = episode.faulted
-    expect(episode.heldAnswer).toEqual({ event: 'answered', node, generation, correlationId })
-    expect(episode.heldCompletion).toMatchObject({ apiName: 'Heartbeat', correlationId })
-    expect(episode.timeouts).toEqual([])
+    expect(episode.heldAnswer).toEqual({ event: 'cancelled', node, generation, correlationId })
+    const timedOut = episode.heldTimeouts()
+    expect(timedOut).toHaveLength(1)
+    expect(timedOut[0].at).toBeLessThan(episode.released)
     expect(later.length).toBeGreaterThan(0)
+    for (const frame of later) expect(frame.generation).toBeGreaterThan(generation)
   }
   for (const frame of later)
     expect(frame.fields).toMatchObject({ memberId: MEMBER_ID, groupGenerationId: 1 })
