@@ -10064,6 +10064,8 @@
         "src/consumer/offsetManager/__tests__/commitOffsetsIfNecessary.spec.js \u203a Consumer > OffsetMananger > commitOffsetsIfNecessary when autoCommitInterval and autoCommitThreshold are undefined does not commit offsets",
         "src/consumer/offsetManager/__tests__/commitOffsetsIfNecessary.spec.js \u203a Consumer > OffsetMananger > commitOffsetsIfNecessary when autoCommitInterval is defined commits the offsets whenever the interval is reached",
         "src/consumer/offsetManager/__tests__/commitOffsetsIfNecessary.spec.js \u203a Consumer > OffsetMananger > commitOffsetsIfNecessary when autoCommitThreshold is defined commits the offsets whenever the threshold is reached",
+        "src/consumer/offsetManager/__tests__/commitOffsetsIfNecessary.spec.js \u203a Consumer > OffsetMananger > commitOffsetsIfNecessary when the system clock steps an interval commit is not brought forward by a forward wall step",
+        "src/consumer/offsetManager/__tests__/commitOffsetsIfNecessary.spec.js \u203a Consumer > OffsetMananger > commitOffsetsIfNecessary when the system clock steps an interval commit is not postponed by a backward wall step",
         "src/consumer/offsetManager/__tests__/committedLeaderEpoch.spec.js \u203a Consumer > committed leader epoch Batch#leaderEpochAt is O(1) for the last offset and linear overall for many lookups",
         "src/consumer/offsetManager/__tests__/committedLeaderEpoch.spec.js \u203a Consumer > committed leader epoch Batch#leaderEpochAt returns -1 for a batch emptied by log compaction, which advances past no record",
         "src/consumer/offsetManager/__tests__/committedLeaderEpoch.spec.js \u203a Consumer > committed leader epoch Batch#leaderEpochAt returns -1 for an offset no record in the batch carries",
