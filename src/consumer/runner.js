@@ -332,7 +332,8 @@ module.exports = class Runner extends EventEmitter {
       this.running = true
       await this.runInitialRound()
     } catch (e) {
-      this.running = false
+      // `running` stays true until `onCrash` is done, as in the fetch loop's crash path: the
+      // cleanup's `stop()` then runs in full, so a member that joined leaves the group.
       this.disarmFatal()
       if (this.stopRequested && e?.type === 'CONSUMER_STOPPING') return
 
@@ -349,11 +350,11 @@ module.exports = class Runner extends EventEmitter {
         })
         return
       } finally {
-        // A round that armed the manager before the chain threw leaves it running, and `stop()`
-        // returns early on the `running` this catch has already cleared - so nothing else would
-        // ever cancel it, and the handle is not unref'd. Latched rather than merely cancelled,
-        // so a settling reconciliation cannot arm it again. Last word deliberately: it runs after
-        // `onCrash` (and the disconnect/stop inside it), so a late re-arm is undone too.
+        // A crash handler that did not stop the run leaves it running and the manager armed, and
+        // the handle is not unref'd. Latched rather than merely cancelled, so a settling
+        // reconciliation cannot arm it again. Last word deliberately: it runs after `onCrash` (and
+        // the disconnect/stop inside it), so a late re-arm is undone too.
+        this.running = false
         this.heartbeatManager.shutdown()
         this.pollTimer.stop()
       }
