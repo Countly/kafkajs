@@ -652,9 +652,10 @@ describe('BrokerPool > rebootstrap', () => {
           { nodeId: 1, host: '127.0.0.1', port: 9099, rack: null },
         ],
       }
-      stubSeed(pool, async () => twoBrokerResponse)
-
       let triggered = false
+      // The rebuilt seed is asked again and answers with itself alone, so no stub pool becomes a Broker.
+      stubSeed(pool, async () => (triggered ? ok : twoBrokerResponse))
+
       const stubbedBuildConnectionPool = pool.buildConnectionPool.bind(pool)
       pool.buildConnectionPool = async (destination) => {
         if (destination && !triggered) {
