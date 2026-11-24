@@ -996,8 +996,14 @@ module.exports = ({
             if (!failed.has(topic)) cluster.targetTopics.delete(topic)
           }
         }
+        if (error.type === 'REQUEST_TIMED_OUT') {
+          logger.error(
+            'Could not delete topics, check if "delete.topic.enable" is set to "true" (the default value is "false") or increase the timeout',
+            { error: error.message, retryCount, retryTime }
+          )
+        }
         if (endsCall(error) || isAnsweredError(error) || error.topicErrors) return bail(error)
-        if (error.type === 'NOT_CONTROLLER') {
+        if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(error.type)) {
           logger.warn('Could not delete topics', { error: error.message, retryCount, retryTime })
           throw error
         }
