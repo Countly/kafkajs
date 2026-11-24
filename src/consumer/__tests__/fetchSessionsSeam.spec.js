@@ -70,6 +70,8 @@ const {
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
 const Runner = require('../runner')
+const createWorker = require('../worker')
+const createWorkerQueue = require('../workerQueue')
 
 let harness
 beforeAll(() => prepareRecordBatches())
@@ -987,19 +989,28 @@ describe('Fetch sessions through the consumer group', () => {
         )
         expect([batch0.partition, batch1.partition]).toEqual([0, 1])
 
-        const running = runner.handleBatch(batch0)
+        const handleBatch = jest.spyOn(runner, 'handleBatch')
+        const queue = createWorkerQueue({
+          workers: [createWorker({ handler: (batch) => runner.handleBatch(batch), workerId: 0 })],
+        })
+        const partitionsHandedOver = () =>
+          handleBatch.mock.calls.map(([{ partition }]) => partition)
+
+        const drained = queue.push(batch0, batch1)
         await until(() => handled.length === 1)
+        expect(partitionsHandedOver()).toEqual([0])
         harness.group.pause([{ topic: TOPIC, partitions: [1] }])
         openGate()
-        await running
-        await runner.handleBatch(batch1)
+        await drained
 
+        expect(partitionsHandedOver()).toEqual([0, 1])
         expect(handled).toEqual(['0:4'])
         expect(harness.offsetManager.positionOf(TOPIC, 0)).toBe('5')
         expect(harness.offsetManager.positionOf(TOPIC, 1)).toBe('4')
 
         await nextRound(harness.group, reply(sessionId, []))
         expect(harness.fetchRequestPartitions()).toEqual([0])
+        expect(shape(harness.fetchFrames().at(-1)).forgotten).toEqual(fetchSessions ? [1] : [])
 
         harness.group.resume([{ topic: TOPIC, partitions: [1] }])
         const resumed = await nextRound(
@@ -1007,11 +1018,15 @@ describe('Fetch sessions through the consumer group', () => {
           reply(sessionId, [{ partition: 1, records }])
         )
 
+        const resumedFrame = shape(harness.fetchFrames().at(-1))
+        expect(resumedFrame.topics).toContain(1)
+        expect(resumedFrame.forgotten).toEqual([])
         expect(
           harness.lastFetchRequest().find(({ partition }) => partition === 1).fetchOffset
         ).toBe('4')
         expect(summary(resumed)).toEqual([[1, '4', ['4']]])
-        await runner.handleBatch(resumed[0])
+        await queue.push(resumed[0])
+        expect(partitionsHandedOver()).toEqual([0, 1, 1])
         expect(handled).toEqual(['0:4', '1:4'])
         expect(harness.offsetManager.positionOf(TOPIC, 1)).toBe('5')
       }
