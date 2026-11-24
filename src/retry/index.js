@@ -81,7 +81,9 @@ const assertMaxTotalTime = (maxTotalTime) => {
  * A retriable one with no retries left rejects with `KafkaJSNumberOfRetriesExceeded`. With retries
  * left, if the wait about to be slept (`retryTime`) would end past the `maxTotalTime` deadline it
  * rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the thrown error as is. Otherwise the
- * next attempt is scheduled after `retryTime`. The deadline is taken once, when this is built.
+ * next attempt is scheduled after `retryTime`. The deadline is taken once, when this is built, and
+ * measured on `performance.now()`. An attempt whose wait ended past the deadline (a late timer) is
+ * not started; the call rejects the same way.
  * @param {{ retries: number, maxTotalTime?: number | null }} configs the merged retrier options
  * @param {{ next: (previous: number) => number }} backoff computes the delay after `retryTime`
  * @param {(value: any) => void} resolve
@@ -93,7 +95,14 @@ const assertMaxTotalTime = (maxTotalTime) => {
 const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
   let aborted = false
   const { retries, maxTotalTime } = configs
-  const deadline = maxTotalTime == null ? Infinity : Date.now() + maxTotalTime
+  const deadline = maxTotalTime == null ? Infinity : performance.now() + maxTotalTime
+  let lastError = null
+
+  const timedOut = (attempts, cause) =>
+    new KafkaJSDeliveryTimeout(
+      `Gave up after ${attempts} attempts: the next one would start after the ${maxTotalTime} ms deadline`,
+      { cause }
+    )
 
   const bail = (error) => {
     aborted = true
@@ -104,6 +113,7 @@ const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
     if (aborted) return
     const refusal = scope?.guard()
     if (refusal) return bail(refusal)
+    if (retryCount > 0 && performance.now() > deadline) return bail(timedOut(retryCount, lastError))
 
     const nextRetryTime = backoff.next(retryTime)
     const shouldRetry = retryCount < retries
@@ -119,18 +129,14 @@ const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
     fn(bail, retryCount, retryTime)
       .then(resolve)
       .catch((e) => {
+        lastError = e
         if (isErrorRetriable(e)) {
           if (!shouldRetry) {
             reject(
               new KafkaJSNumberOfRetriesExceeded(e, { retryCount, retryTime, cause: e.cause || e })
             )
-          } else if (Date.now() + retryTime > deadline) {
-            reject(
-              new KafkaJSDeliveryTimeout(
-                `Gave up after ${retryCount + 1} attempts: the next one would start after the ${maxTotalTime} ms deadline`,
-                { cause: e }
-              )
-            )
+          } else if (performance.now() + retryTime > deadline) {
+            reject(timedOut(retryCount + 1, e))
           } else {
             scheduleRetry()
           }
