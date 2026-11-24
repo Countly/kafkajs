@@ -6,10 +6,14 @@ const { ConsumerOperation } = require('../groupProtocol/interface')
  * It owns no transport.
  *
  * With `t0` the first valid disconnect call, `T` its timeout, `R = min(1000, floor(T / 4))` and
- * `D = t0 + T`, handlers are awaited until `H = D - R`. After that boundary every final and the
- * leave share one cap, `F = min(D, boundary + requestTimeout)`. Clock equality at `D` or `F`
+ * `D = t0 + T`, handlers are awaited until `H = D - R`. From the end of that wait, `B`, every final
+ * and the leave share one cap, `F = min(D, B + requestTimeout)`. Clock equality at `D` or `F`
  * forbids traffic. Time is read from the injected clock at every check, so a late timer cannot
  * authorize a write.
+ *
+ * The episode also keeps the node records it closes (`records`), the data bindings each of them
+ * held at the freeze (`bindings`, keyed by record) and the connections it closed, so every
+ * connection is closed at most once; `finish` releases all of them.
  */
 class ShareCloseEpisode {
   /**
@@ -17,24 +21,73 @@ class ShareCloseEpisode {
    * @param {object} options.run Original run object, never replaced after an await.
    * @param {number} options.requestTimeout Finite final-and-leave cap in milliseconds.
    * @param {() => number} [options.now] Monotonic milliseconds, normally `performance.now`.
+   * @param {object[]} [options.records] The node records the close works on, snapshotted at entry.
+   * @param {object} [options.logger] Logger whose `debug` reports a failed connection close.
    * @returns {ShareCloseEpisode} A natural-wait episode with no timer or wire authority yet.
    */
-  constructor({ run, requestTimeout, now = () => performance.now() }) {
+  constructor({ run, requestTimeout, now = () => performance.now(), records = [], logger }) {
     Object.defineProperty(this, 'identity', { value: Symbol('share-close') })
     this.run = run
     this.requestTimeout = requestTimeout
     this.now = now
+    this.logger = logger
     this.disconnectSet = false
     this.deadlineAt = Infinity
     this.handlerBoundary = Infinity
+    this.capStartedAt = null
     this.finalDeadline = Infinity
     this.frozen = false
     this.revoked = false
     this.leaveClaimed = false
     this.nodes = new Map()
+    this.records = records
+    this.expired = []
+    this.bindings = new Map()
+    this.closedConnections = new Set()
     this.operation = null
+    this.drainOperation = null
     this.deadlineOperation = null
     this.releaseDeadline = null
+  }
+
+  /**
+   * Starts the shared cap once, at the end of the handler wait: `F = min(D, at + requestTimeout)`.
+   * Later calls, including the one inside {@link ShareCloseEpisode#freeze}, keep the first cap.
+   * @param {number} at The episode time the handler wait ended.
+   * @returns {void}
+   */
+  startCap(at) {
+    if (this.capStartedAt !== null) return
+    this.capStartedAt = at
+    this.finalDeadline = Math.min(this.deadlineAt, at + this.requestTimeout)
+  }
+
+  /**
+   * @returns {number} The latest freeze time: `B` when the handler wait ran to its boundary `H`,
+   *   else `min(B + floor(requestTimeout / 2), H, D)`. Read again after a later disconnect.
+   */
+  drainBoundary() {
+    const begin = this.capStartedAt
+    if (begin >= this.handlerBoundary) return begin
+    return Math.min(
+      begin + Math.floor(this.requestTimeout / 2),
+      this.handlerBoundary,
+      this.deadlineAt
+    )
+  }
+
+  /**
+   * Closes one data or coordinator connection at most once per episode, so a connection already
+   * disconnecting, which still reports itself connected, is never disconnected or written again.
+   * @param {{disconnect: (options: {drainTimeout: number}) => Promise<*>}} connection The socket.
+   * @returns {void} The close runs in the background; a failure is logged at debug level.
+   */
+  closeConnection(connection) {
+    if (this.closedConnections.has(connection)) return
+    this.closedConnections.add(connection)
+    connection.disconnect({ drainTimeout: 0 }).catch((error) => {
+      this.logger?.debug('Share captured connection close failed', { error: error.message })
+    })
   }
 
   /**
@@ -59,11 +112,16 @@ class ShareCloseEpisode {
   /**
    * Gives the episode the one bounded operation that owns its finals and leave, so a revocation
    * can wake their waits at once instead of at the original deadline. An episode that is already
-   * revoked retires it immediately; an earlier disconnect deadline also owns a wake.
+   * revoked retires it immediately; an earlier disconnect deadline also owns a wake. A wake left
+   * from an earlier operation is finished first, so the new operation always gets its own.
    * @param {import('../groupProtocol/interface').ConsumerOperation} operation The traffic's operation.
    * @returns {void}
    */
   attach(operation) {
+    this.releaseDeadline?.()
+    this.deadlineOperation?.finish()
+    this.releaseDeadline = null
+    this.deadlineOperation = null
     this.operation = operation
     this.armDeadline()
   }
@@ -109,7 +167,8 @@ class ShareCloseEpisode {
   }
 
   /**
-   * Freezes one boundary and shares one final cap across every node and the leave.
+   * Freezes one boundary and shares one final cap across every node and the leave. The cap starts
+   * here unless the handler wait already started it.
    * @param {Array<{nodeId: number, current: () => boolean}>} nodes Captured idle node bindings;
    *   busy and unopened nodes are omitted. A later call cannot adopt replacement sessions.
    * @returns {void}
@@ -117,7 +176,7 @@ class ShareCloseEpisode {
   freeze(nodes) {
     if (this.frozen) return
     this.frozen = true
-    this.finalDeadline = Math.min(this.deadlineAt, this.now() + this.requestTimeout)
+    this.startCap(this.now())
     for (const node of nodes) this.nodes.set(node.nodeId, { binding: node, claimed: false })
   }
 
@@ -167,12 +226,19 @@ class ShareCloseEpisode {
   }
 
   /**
-   * Retires the record after its owner detached the captured transport and resources.
+   * Retires the record after its owner detached the captured transport and resources, and drops
+   * every node record, binding and connection it kept.
    * @returns {void}
    */
   finish() {
     this.revoked = true
     this.nodes.clear()
+    this.records = null
+    this.expired = []
+    this.bindings.clear()
+    this.closedConnections.clear()
+    this.drainOperation?.retire()
+    this.drainOperation = null
     this.releaseDeadline?.()
     this.deadlineOperation?.finish()
     this.deadlineOperation = null

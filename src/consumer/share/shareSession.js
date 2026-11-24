@@ -43,11 +43,22 @@ class ShareSession {
     this.closed = false
     this.resetStreak = 0
     this.binding = null
+    this.idlers = []
   }
 
   /** @returns {boolean} Whether a request runs or waits; a captured close skips a busy node. */
   get busy() {
     return this.active || this.queue.length > 0
+  }
+
+  /**
+   * @returns {Promise<void>} Resolves once no request runs or waits; at once when none does. A
+   *   request still running when the session retires settles through its operation, so this
+   *   resolves then as well.
+   */
+  whenIdle() {
+    if (!this.busy) return Promise.resolve()
+    return new Promise((resolve) => this.idlers.push(resolve))
   }
 
   /**
@@ -76,7 +87,10 @@ class ShareSession {
   drain() {
     if (this.active) return
     const entry = this.queue.shift()
-    if (!entry) return
+    if (!entry) {
+      for (const resolve of this.idlers.splice(0)) resolve()
+      return
+    }
     if (this.closed || entry.token !== this.token) {
       entry.reject(new KafkaJSNonRetriableError('Share session is no longer current'))
       this.drain()

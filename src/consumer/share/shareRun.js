@@ -78,6 +78,8 @@ class ShareRun {
     this.closing = null
     this.refusalError = null
     this.nodes = new Map()
+    this.detached = new Set()
+    this.handlers = new Map()
     this.assignment = new Map()
     this.applying = 0
     this.committed = []
@@ -435,9 +437,22 @@ class ShareRun {
     if (!this.admitting || this.retired || this.closing || this.stopRequested) return
     for (const [nodeId, rows] of wanted) {
       const node = this.nodes.get(nodeId)
-      if (node?.ended) this.nodes.delete(nodeId)
+      if (node?.ended) this.detach(node)
       if (!node || node.ended) this.startNode(nodeId, rows)
     }
+  }
+
+  /**
+   * Takes an ended node record out of the map while its drive may still run its last request, and
+   * keeps it in `detached` until that drive settled, so a close still drains and disposes it.
+   * @private
+   * @param {object} node The ended node record.
+   * @returns {void}
+   */
+  detach(node) {
+    this.nodes.delete(node.id)
+    this.detached.add(node)
+    node.drive.then(() => this.detached.delete(node))
   }
 
   /**
@@ -607,12 +622,17 @@ class ShareRun {
   }
 
   /**
+   * Publishes the reset and stops counting the handler calls whose acquisition it retired, so a
+   * stop does not wait for them.
    * @private
    * @param {object} node The node record.
    * @param {string} reason Why the session reset.
    * @returns {void}
    */
   onSessionReset(node, reason) {
+    for (const call of this.handlers.keys())
+      if (!call.authority.current()) this.handlers.delete(call)
+    this.notifyDrained()
     this.runner.emit(events.SESSION_RESET, {
       nodeId: node.id,
       reason,
@@ -841,7 +861,11 @@ class ShareRun {
 
   /**
    * Runs one handler call: poll accounting, the application call, lock-expiry observation, the
-   * policy completion, and the handler pacing or the omission verdict.
+   * policy completion, and the handler pacing or the omission verdict. The call is registered
+   * under the membership that issued its node for as long as it runs, and removes its own
+   * registration once, after its completion, whether it returned or threw; a stop waits only for
+   * registered calls. While a stop is requested no flush is sent here: the close final carries
+   * the decisions.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -852,28 +876,34 @@ class ShareRun {
    */
   async invoke(node, cohort, call, payload) {
     const pollCall = this.poll.begin(call)
+    this.handlers.set(call, node.issued)
     let failed = false
     let thrown
+    let verdict = null
     try {
-      if (pollCall === null) throw new KafkaJSNonRetriableError('Share run is no longer polling')
-      await this.handler(payload)
-    } catch (error) {
-      failed = true
-      thrown = error
+      try {
+        if (pollCall === null) throw new KafkaJSNonRetriableError('Share run is no longer polling')
+        await this.handler(payload)
+      } catch (error) {
+        failed = true
+        thrown = error
+      } finally {
+        this.poll.finish(pollCall)
+      }
+      if (!call.open || !call.authority.current()) {
+        call.complete(failed)
+        return
+      }
+      this.observeLateReturn(cohort, call)
+      verdict = call.complete(failed)
     } finally {
-      this.poll.finish(pollCall)
+      this.handlers.delete(call)
       this.notifyDrained()
     }
-    if (!call.open || !call.authority.current()) {
-      call.complete(failed)
-      return
-    }
-    this.observeLateReturn(cohort, call)
-    const verdict = call.complete(failed)
     if (failed) await this.afterFailure(node, cohort, call, thrown)
     else {
       node.retryTime = null
-      this.flushIfDue(node, cohort)
+      if (!this.stopRequested) this.flushIfDue(node, cohort)
       if (verdict) await this.afterOmission(node, cohort, verdict)
     }
   }
@@ -899,7 +929,8 @@ class ShareRun {
 
   /**
    * A throw: report it, flush the released work at once and pace the node's next request with
-   * the retry backoff. Consecutive failures grow the delay; a normal return resets it.
+   * the retry backoff. Consecutive failures grow the delay; a normal return resets it. During a
+   * stop the release is not flushed: it goes into the close final.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -918,11 +949,14 @@ class ShareRun {
       offsets: call.offsets(),
       error,
     })
-    outsideHandler(() =>
-      node.loop.acknowledge({ cohorts: [cohort] }).catch((failure) => {
-        this.options.logger.error('Share handler release flush failed', { error: failure.message })
-      })
-    )
+    if (!this.stopRequested)
+      outsideHandler(() =>
+        node.loop.acknowledge({ cohorts: [cohort] }).catch((failure) => {
+          this.options.logger.error('Share handler release flush failed', {
+            error: failure.message,
+          })
+        })
+      )
     node.retryTime =
       node.retryTime === null ? node.schedule.initial() : node.schedule.next(node.retryTime)
     await node.pacing.sleep(node.retryTime).catch(() => {})
@@ -983,10 +1017,21 @@ class ShareRun {
    * @returns {Promise<void>}
    */
   drained(captured) {
-    if (this.poll.drained(captured)) return Promise.resolve()
+    return this.settled(() => this.poll.drained(captured))
+  }
+
+  /**
+   * Resolves once `done` holds, checked again whenever a handler call returns, a session reset
+   * retires calls, or the run freezes or finishes.
+   * @private
+   * @param {() => boolean} done The condition.
+   * @returns {Promise<void>}
+   */
+  settled(done) {
+    if (done()) return Promise.resolve()
     return new Promise((resolve) => {
       const waiter = () => {
-        if (!this.poll.drained(captured)) return
+        if (!done()) return
         this.waiters.delete(waiter)
         resolve()
       }
@@ -1024,17 +1069,21 @@ class ShareRun {
   /**
    * Starts or joins this run's one close. Forced kinds (`crash`, `fence`, `poll`) freeze at once,
    * also when they escalate a natural close in progress; `stop` and `disconnect` latch the stop
-   * request synchronously, so no handler starts after them, and wait naturally for running
-   * handlers until the handler boundary. A stop or disconnect that arrives while a fence or poll
+   * request synchronously, so no handler starts after them, wait without limit (or until the
+   * handler boundary of a disconnect deadline) for running handlers, then drain in-flight node
+   * requests until the drain boundary. A stop or disconnect that arrives while a fence or poll
    * recovery is closing ends the run once that recovery cleanup is done. Later calls reuse the
    * episode, so a disconnect never recaptures a replacement run, and the first disconnect's budget
-   * is set before anything that can call application code. A zero timeout on a close in
-   * progress revokes the episode, which retires its traffic operation in the same tick: a final
-   * that was written and is unanswered settles lost and its exact socket closes at once.
+   * is set before anything that can call application code; a later deadline re-arms the handler
+   * wait and the drain. A zero timeout on a close in progress revokes the episode, which retires
+   * its drain and traffic operations in the same tick: a final that was written and is unanswered
+   * settles lost and its exact socket closes at once. The episode works on a snapshot of every
+   * current node record plus every detached record whose drive has not settled, taken here.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
    * @param {number} [timeout] Validated disconnect timeout, when this call supplies one.
    * @param {number} [startedAt] Original public entry time of that call.
-   * @returns {ShareCloseEpisode} The run's episode; `episode.done` settles when the close ended.
+   * @returns {ShareCloseEpisode} The run's episode; `episode.done` settles when the close ended,
+   *   and `episode.expired` lists the expired calls a poll close captured.
    */
   beginClose(kind, timeout, startedAt) {
     const forced = kind === 'crash' || kind === 'fence' || kind === 'poll'
@@ -1045,21 +1094,28 @@ class ShareRun {
         episode.disconnect(timeout, startedAt)
         episode.closeSockets = true
         this.armBoundary(episode)
+        this.armDrain(episode)
         if (episode.revoked) this.escalate(episode)
       }
       if (forced) this.escalate(episode)
       return episode
     }
-    episode = new ShareCloseEpisode({ run: this, requestTimeout: this.options.requestTimeout })
+    episode = new ShareCloseEpisode({
+      run: this,
+      requestTimeout: this.options.requestTimeout,
+      records: [...this.nodes.values(), ...this.detached],
+      logger: this.options.logger,
+    })
     episode.kind = kind
     episode.forced = forced
     episode.closeSockets = kind === 'disconnect' || kind === 'crash'
+    episode.expired = kind === 'poll' ? this.poll.captureExpired() : []
     const done = deferred()
     episode.done = done.promise
     this.closing = episode
     this.admitting = false
     if (kind === 'disconnect') episode.disconnect(timeout, startedAt)
-    for (const node of this.nodes.values())
+    for (const node of episode.records)
       node.pacing.retire(new KafkaJSNonRetriableError('Share run is closing'))
     this.close(episode).then(done.resolve, done.resolve)
     return episode
@@ -1068,7 +1124,8 @@ class ShareRun {
   /**
    * Moves a natural close to its forced boundary: eligible terminal work is frozen and ordinary
    * authority retired in this very tick, so an old callback that runs before the close's own
-   * continuation can no longer decide or renew. The close then proceeds to its traffic.
+   * continuation can no longer decide or renew. The handler wait and the drain end in the same
+   * tick, and the close then proceeds to its traffic.
    * @private
    * @param {ShareCloseEpisode} episode The run's natural episode.
    * @returns {void}
@@ -1076,6 +1133,8 @@ class ShareRun {
   escalate(episode) {
     this.freeze(episode)
     episode.boundary?.resolve()
+    episode.drainOperation?.retire()
+    episode.drainGate?.resolve()
   }
 
   /**
@@ -1086,11 +1145,11 @@ class ShareRun {
   async close(episode) {
     const { logger } = this.options
     try {
-      if (episode.forced || episode.revoked) this.freeze(episode)
-      else {
+      if (!episode.forced && !episode.revoked) {
         await this.waitHandlers(episode)
-        this.freeze(episode)
+        if (!episode.frozen && !episode.revoked) await this.drain(episode)
       }
+      this.freeze(episode)
       await this.closeTraffic(episode)
     } catch (error) {
       logger.error('Share close failed', { error: error.message })
@@ -1101,9 +1160,10 @@ class ShareRun {
   }
 
   /**
-   * Waits for every node to finish its round, until the handler boundary arrives. The boundary is
-   * read from the actual clock after every timer wake, and it is re-armed when a later disconnect
-   * supplies a deadline.
+   * Waits for the open handler calls of the current membership, until the handler boundary
+   * arrives. Calls a freeze or a session reset retired no longer count, and nothing else is
+   * awaited here: in-flight requests are the drain's. The boundary is read from the actual clock
+   * after every timer wake, and it is re-armed when a later disconnect supplies a deadline.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {Promise<void>}
@@ -1111,9 +1171,59 @@ class ShareRun {
   async waitHandlers(episode) {
     episode.boundary = deferred()
     this.armBoundary(episode)
-    const idle = Promise.all([...this.nodes.values()].map((node) => node.drive))
-    await Promise.race([idle, episode.boundary.promise])
+    await Promise.race([this.settled(() => !this.handlersOpen()), episode.boundary.promise])
     episode.boundaryOperation?.retire()
+  }
+
+  /**
+   * @private
+   * @returns {boolean} Whether a registered handler call of the current membership still runs.
+   */
+  handlersOpen() {
+    for (const [call, issued] of this.handlers)
+      if (issued === this.authorityToken && call.authority.current()) return true
+    return false
+  }
+
+  /**
+   * Starts the shared cap at the end of the handler wait, then waits until no node of the episode
+   * has a request running or queued in its session, or until the drain boundary. A node that is
+   * only pacing, looking up its broker or has no session is idle. An escalation or a zero timeout
+   * ends the drain in the same tick; a later disconnect deadline re-arms its boundary.
+   * @private
+   * @param {ShareCloseEpisode} episode The run's natural episode.
+   * @returns {Promise<void>}
+   */
+  async drain(episode) {
+    episode.startCap(episode.now())
+    episode.drainGate = deferred()
+    this.armDrain(episode)
+    const gate = episode.drainGate
+    const busy = () => episode.records.filter((node) => node.session?.busy)
+    const idle = (async () => {
+      for (let nodes = busy(); nodes.length && !gate.settled; nodes = busy())
+        await Promise.race([
+          Promise.all(nodes.map((node) => node.session.whenIdle())),
+          gate.promise,
+        ])
+    })()
+    await Promise.race([idle, gate.promise])
+    episode.drainOperation?.retire()
+    episode.drainOperation = null
+  }
+
+  /**
+   * Arms the drain's own wake at the episode's current drain boundary, replacing an earlier one.
+   * @private
+   * @param {ShareCloseEpisode} episode The run's episode.
+   * @returns {void}
+   */
+  armDrain(episode) {
+    episode.drainOperation?.retire()
+    episode.drainOperation = null
+    const gate = episode.drainGate
+    if (!gate || gate.settled) return
+    episode.drainOperation = this.wake(episode, gate, episode.drainBoundary())
   }
 
   /**
@@ -1124,14 +1234,25 @@ class ShareRun {
   armBoundary(episode) {
     episode.boundaryOperation?.retire()
     if (!episode.boundary || episode.handlerBoundary === Infinity) return
+    episode.boundaryOperation = this.wake(episode, episode.boundary, episode.handlerBoundary)
+  }
+
+  /**
+   * Resolves `gate` once the episode clock reaches `at`, reading the clock again after every timer
+   * wake, so a timer delivered early never ends a wait. At once when `at` already passed.
+   * @private
+   * @param {ShareCloseEpisode} episode The run's episode.
+   * @param {{resolve: () => void}} gate The wait to end.
+   * @param {number} at Episode time.
+   * @returns {ConsumerOperation} The operation that owns the timer; retiring it cancels the wake.
+   */
+  wake(episode, gate, at) {
     const operation = new ConsumerOperation({ now: episode.now })
-    episode.boundaryOperation = operation
     ;(async () => {
-      while (episode.now() < episode.handlerBoundary) {
-        await operation.sleep(episode.handlerBoundary - episode.now())
-      }
-      episode.boundary.resolve()
+      while (episode.now() < at) await operation.sleep(at - episode.now())
+      gate.resolve()
     })().catch(() => {})
+    return operation
   }
 
   /**
@@ -1147,6 +1268,15 @@ class ShareRun {
    * listener) that closes again joins it instead of capturing a second time. A capture or disposal
    * failure is kept as the raw thrown value, and read and logged only after every node retired, so
    * an error that throws when read cannot stop another node's capture or disposal.
+   *
+   * It works on the episode's records. Only a record still current in the map captures a final;
+   * a detached record is disposed like the others. The data bindings of every record (its
+   * established session and every written, unanswered request) are copied onto the episode before
+   * disposal clears them, disposal closes no socket, and each connection is then decided once:
+   * one carrying a captured final waits for that final; otherwise one a record could not capture
+   * is closed now, unless only a detached record holds it while a current record is bound to it.
+   * The calls the freeze closes leave the poll view, except the expired calls a poll close
+   * captured, and no longer count for a stop.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
@@ -1156,12 +1286,13 @@ class ShareRun {
     episode.freezing = true
     const failures = []
     this.captureCloseCoordinator(episode)
+    const { records } = episode
     const bindings = []
-    for (const node of this.nodes.values()) {
+    for (const node of records) {
       if (!node.loop) continue
       try {
         this.finalizeActive(node)
-        node.captured = node.loop.captureFinal()
+        node.captured = this.nodes.get(node.id) === node ? node.loop.captureFinal() : null
       } catch (error) {
         node.captured = null
         failures.push(['Share final capture failed', node.id, error])
@@ -1176,17 +1307,22 @@ class ShareRun {
     this.heartbeatRevision = null
     this.retireLookups()
     this.admitting = false
-    if (episode.kind === 'poll' || episode.kind === 'fence') this.manager.stop()
-    else {
+    this.handlers.clear()
+    if (episode.kind === 'poll' || episode.kind === 'fence') {
+      this.manager.stop()
+      this.poll.retain(episode.expired)
+    } else {
       this.manager.shutdown()
       this.poll.stop()
     }
-    for (const node of this.nodes.values()) {
+    for (const node of records) episode.bindings.set(node, this.dataBindings(node))
+    for (const node of records) {
       const discarded = node.loop !== null && !node.loop.disposed
       try {
         node.loop?.dispose(new KafkaJSNonRetriableError('Share run closed'), {
           reason: 'membership-lost',
           preserve: node.captured,
+          closeSockets: false,
         })
       } catch (error) {
         failures.push(['Share node disposal failed', node.id, error])
@@ -1196,8 +1332,62 @@ class ShareRun {
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
+    this.closeUncaptured(episode)
+    this.notifyDrained()
     for (const [message, nodeId, error] of failures)
       this.options.logger.error(message, { nodeId, error: describeThrown(error) })
+  }
+
+  /**
+   * @private
+   * @param {object} node A node record, read before its loop is disposed.
+   * @returns {object[]} The bindings of its established session and of every request it wrote
+   *   and has no answer for, each still on the socket it was bound to.
+   */
+  dataBindings(node) {
+    if (!node.loop) return []
+    const bindings = node.loop.writtenBindings()
+    const { binding, epoch } = node.session
+    if (binding && epoch !== 0 && !ShareSession.bindingLost(binding)) bindings.push(binding)
+    return bindings
+  }
+
+  /**
+   * @private
+   * @param {ShareCloseEpisode} episode The frozen episode.
+   * @returns {Map<object, object>} Each connection that carries a captured final, with its record.
+   */
+  finalConnections(episode) {
+    const held = new Map()
+    for (const node of episode.records)
+      if (node.captured) held.set(node.captured.binding.connection, node)
+    return held
+  }
+
+  /**
+   * Closes, at the freeze, the connection of every record that holds a session or a written
+   * request and captured no final, so the broker drops that session. A connection that carries a
+   * captured final is left to the cleanup, and a detached record never closes a connection a
+   * current record is bound to.
+   * @private
+   * @param {ShareCloseEpisode} episode The frozen episode.
+   * @returns {void}
+   */
+  closeUncaptured(episode) {
+    const held = this.finalConnections(episode)
+    const current = new Set()
+    for (const node of episode.records)
+      if (this.nodes.get(node.id) === node)
+        for (const { connection } of episode.bindings.get(node)) current.add(connection)
+    for (const node of episode.records) {
+      if (node.captured) continue
+      const detached = this.nodes.get(node.id) !== node
+      for (const binding of episode.bindings.get(node)) {
+        const { connection } = binding
+        if (held.has(connection) || (detached && current.has(connection))) continue
+        if (!ShareSession.bindingLost(binding)) episode.closeConnection(connection)
+      }
+    }
   }
 
   /**
@@ -1284,7 +1474,7 @@ class ShareRun {
    */
   async closeTraffic(episode) {
     const operation = new ConsumerOperation({
-      deadlineAt: episode.finalDeadline,
+      deadlineAt: Math.min(episode.deadlineAt, episode.finalDeadline),
       guard: () => episode.guard(),
       now: episode.now,
     })
@@ -1380,7 +1570,8 @@ class ShareRun {
    */
   async sendFinals(episode, operation) {
     const jobs = []
-    for (const node of this.nodes.values()) {
+    const close = (connection) => episode.closeConnection(connection)
+    for (const node of episode.records) {
       if (!node.captured) continue
       const binding = episode.nodes.get(node.id)?.binding
       episode.claimFinal(node.id)
@@ -1388,33 +1579,36 @@ class ShareRun {
         binding
           ? episode.refusal(binding)
           : (episode.guard() ?? new KafkaJSNonRetriableError('No captured binding'))
-      jobs.push(node.loop.finishNode({ closing: { guard, captured: node.captured, operation } }))
+      jobs.push(
+        node.loop.finishNode({ closing: { guard, captured: node.captured, operation, close } })
+      )
     }
     await Promise.allSettled(jobs)
   }
 
   /**
-   * Detaches only the exact captured connections that are still current, so a replacement
-   * socket is never closed. A clean stop whose traffic completed keeps its healthy connections.
+   * Closes, once per connection, every data connection of the episode's records whose session
+   * has no confirmed final, so no connection to an unfinished share session stays open. A
+   * connection that carries a captured final follows only that final's record. A clean stop keeps
+   * the connections of confirmed finals and the coordinator's; a disconnect, crash or revoked
+   * close closes every captured connection and the coordinator's. Only the exact captured
+   * generations that are still current are touched, so a replacement socket is never closed.
    * @private
    * @param {ShareCloseEpisode} episode The run's episode.
    * @returns {void}
    */
   teardown(episode) {
     const dirty = episode.closeSockets || episode.revoked
-    const close = (connection) =>
-      connection.disconnect({ drainTimeout: 0 }).catch((error) => {
-        this.options.logger.debug('Share captured connection close failed', {
-          error: error.message,
-        })
-      })
-    if (dirty) {
-      for (const node of this.nodes.values()) {
-        const binding = node.captured?.binding
-        if (binding && !ShareSession.bindingLost(binding)) close(binding.connection)
+    const held = this.finalConnections(episode)
+    for (const node of episode.records) {
+      if (!dirty && node.captured?.confirmed) continue
+      for (const binding of episode.bindings.get(node) ?? []) {
+        const owner = held.get(binding.connection)
+        if (owner && owner !== node) continue
+        if (!ShareSession.bindingLost(binding)) episode.closeConnection(binding.connection)
       }
-      if (this.coordinator?.current()) close(this.coordinator.connection)
     }
+    if (dirty && this.coordinator?.current()) episode.closeConnection(this.coordinator.connection)
     episode.boundaryOperation?.retire()
   }
 
@@ -1436,6 +1630,7 @@ class ShareRun {
       this.finishRun()
     } else if (recovery) {
       this.nodes.clear()
+      this.detached.clear()
       this.closing = null
       this.closed = false
       this.admitting = true
@@ -1470,6 +1665,8 @@ class ShareRun {
     this.operation.finish()
     this.assignment = new Map()
     this.nodes.clear()
+    this.detached.clear()
+    this.handlers.clear()
     this.firstJoin.settled || this.firstJoin.resolve()
     if (release && this.runner.current === this) this.runner.current = null
   }
@@ -1511,8 +1708,8 @@ class ShareRun {
    */
   async onPollExpired() {
     if (this.closing || this.retired || this.stopRequested) return
-    const captured = this.poll.captureExpired()
     const episode = this.beginClose('poll')
+    const captured = episode.expired
     await episode.done.catch(() => {})
     if (this.stopRequested || this.retired || this.crashed) return
     await this.membership.leavePromise
