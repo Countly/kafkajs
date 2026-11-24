@@ -4,27 +4,43 @@ const ConnectionPool = require('../network/connectionPool')
 /** `[host]:port` or `host:port`, the host holding no colon and no bracket in the second form. */
 const BROKER_ADDRESS = /^(?:\[([^\]]+)\]|([^:[\]]+)):(\d+)$/
 
+/** Characters of a host: letters, digits, `.`, `_`, `-` and `%`; inside brackets also `:`. */
+const HOST_CHARACTERS = /^[0-9A-Za-z._%-]+$/
+const BRACKETED_HOST_CHARACTERS = /^[0-9A-Za-z._%:-]+$/
+
 /**
  * Splits a bootstrap address into its host and port. An IPv6 literal must be bracketed
- * (`[::1]:9092`); the brackets are not part of the host handed to the socket factory.
+ * (`[::1]:9092`); the brackets are not part of the host handed to the socket factory. The host
+ * may use letters, digits, `.`, `_`, `-` and `%` (and `:` inside brackets), so user info or a URL
+ * is refused. Errors name the position in the list, never the address text.
  * @param {string} text the address as configured
+ * @param {number} index position of the address in the configured list
  * @returns {{ host: string, port: number }}
- * @throws {KafkaJSNonRetriableError} for an unbracketed IPv6 literal, or a port that is missing,
- *   not an integer, or outside 1 to 65535
+ * @throws {KafkaJSNonRetriableError} for an unbracketed IPv6 literal, a port that is missing,
+ *   not an integer, or outside 1 to 65535, or a host with a character outside the accepted set
  */
-const parseBroker = (text) => {
+const parseBroker = (text, index) => {
   const match = BROKER_ADDRESS.exec(text)
   const port = match ? Number(match[3]) : NaN
+  const host = match?.[1] ?? match?.[2]
+  let reason = null
 
   if (!match || port < 1 || port > 65535) {
-    const reason =
+    reason =
       !text.startsWith('[') && text.split(':').length > 2
         ? 'an IPv6 host must be written [::1]:9092'
         : 'expected host:port with a port from 1 to 65535'
-    throw new KafkaJSNonRetriableError(`Failed to connect: invalid broker "${text}", ${reason}`)
+  } else if (!(match[1] === undefined ? HOST_CHARACTERS : BRACKETED_HOST_CHARACTERS).test(host)) {
+    reason = "the host may use letters, digits, '.', '_', '-' and '%' (and ':' inside brackets)"
   }
 
-  return { host: match[1] ?? match[2], port }
+  if (reason) {
+    throw new KafkaJSNonRetriableError(
+      `Failed to connect: invalid broker at index ${index}, ${reason}`
+    )
+  }
+
+  return { host, port }
 }
 
 /**
@@ -103,7 +119,7 @@ module.exports = ({
             `Failed to connect: broker at index ${index} is invalid "${typeof broker}"`
           )
         }
-        parseBroker(broker)
+        parseBroker(broker, index)
       })
     }
   }
@@ -128,8 +144,8 @@ module.exports = ({
     validateBrokers(list)
 
     bootstrapEndpoints = new Set(
-      list.map((text) => {
-        const { host, port } = parseBroker(text)
+      list.map((text, at) => {
+        const { host, port } = parseBroker(text, at)
         return `${host}:${port}`
       })
     )
@@ -208,14 +224,15 @@ module.exports = ({
       const read = ++gatedReads
       const list = await getBrokers()
       if (read === gatedReads) gatedList = list
-      return [...new Set(list.map((text) => parseBroker(text).host))]
+      return [...new Set(list.map((text, at) => parseBroker(text, at).host))]
     },
     build: async ({ host, port, rack } = {}) => {
       if (!host) {
         const list = gatedList ?? (await getBrokers())
         gatedList = null
 
-        const seed = parseBroker(list[index++ % list.length])
+        const at = index++ % list.length
+        const seed = parseBroker(list[at], at)
         host = seed.host
         port = seed.port
       }
