@@ -392,7 +392,9 @@ describe('Producer > a partitioner that returns an invalid partition', () => {
       },
       { bufferMemory: 4096, maxBlockMs: 200 }
     )
-    const messages = [{ value: 'x'.repeat(3000) }]
+    // Charge: 1536 (send) + 21 + 64 + 1 (key) + 2 + 1500 (value) + 1 (headers) = 3125 of 4096;
+    // two such sends cannot be held at once, so an unreleased charge would fail the second one.
+    const messages = [{ value: 'x'.repeat(1500) }]
 
     await expect(producer.send({ topic: TOPIC, messages })).rejects.toBe(failure)
     await expect(producer.send({ topic: TOPIC, messages })).resolves.toHaveLength(1)
