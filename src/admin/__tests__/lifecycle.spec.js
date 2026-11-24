@@ -129,6 +129,41 @@ describe('admin lifecycle', () => {
     expect(cluster.disconnect).toHaveBeenCalledExactlyOnceWith()
   })
 
+  test('a natural close requested while a call reads its input waits for that call', async () => {
+    const answer = held()
+    const broker = { deleteRecords: jest.fn(async () => {}) }
+    const { admin, cluster } = fixture({
+      addTargetTopic: jest.fn(() => answer.promise),
+      refreshMetadataIfNecessary: jest.fn(async () => {}),
+      findTopicPartitionMetadata: jest.fn(() => [{ partitionId: 0 }]),
+      fetchTopicsOffset: jest.fn(async () => [
+        { topic: 'records', partitions: [{ partition: 0, offset: '0' }] },
+      ]),
+      findLeaderForPartitions: jest.fn((topic, partitions) => ({ 0: partitions })),
+      findBroker: jest.fn(async () => broker),
+    })
+    let close
+    const call = observe(
+      admin.deleteTopicRecords({
+        topic: 'records',
+        get partitions() {
+          close = observe(admin.disconnect())
+          return [{ partition: 0, offset: '5' }]
+        },
+      })
+    )
+    await until(() => cluster.addTargetTopic.mock.calls.length === 1)
+    await flush()
+    expect(close.state).toBe('pending')
+    expect(cluster.disconnect).not.toHaveBeenCalled()
+    answer.resolve()
+    await until(() => close.state !== 'pending')
+    expect(call.state).toBe('fulfilled')
+    expect(broker.deleteRecords).toHaveBeenCalledTimes(1)
+    expect(close.state).toBe('fulfilled')
+    expect(cluster.disconnect).toHaveBeenCalledExactlyOnceWith()
+  })
+
   test('the first concurrent close owns the deadline and cleanup Promise', async () => {
     const answer = held()
     const { admin, cluster } = fixture({ metadata: jest.fn(() => answer.promise) })
