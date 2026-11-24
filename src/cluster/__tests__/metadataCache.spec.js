@@ -571,18 +571,19 @@ describe('Cluster > MetadataCache', () => {
     })
   })
 
+  const ID_C = '21222324-2526-2728-292a-2b2c2d2e2f30'
+  const row = ({ topic = 'test-topic', topicId, topicErrorCode = 0 }) => ({
+    ...response({ topicId, leader: 2, leaderEpoch: 7 }).topicMetadata[0],
+    topic,
+    topicErrorCode,
+  })
+  const answer = (...rows) => ({ ...response(), topicMetadata: rows })
+
   const noIdentity = 'rows that carry no identity, through %s'
   describe.each(['update', 'updateTopicsById'])(noIdentity, (ingress) => {
-    const ID_C = '21222324-2526-2728-292a-2b2c2d2e2f30'
     let wanted
     let owned
 
-    const row = ({ topic = 'test-topic', topicId, topicErrorCode = 0 }) => ({
-      ...response({ topicId, leader: 2, leaderEpoch: 7 }).topicMetadata[0],
-      topic,
-      topicErrorCode,
-    })
-    const answer = (...rows) => ({ ...response(), topicMetadata: rows })
     const apply = (metadata) => owned[ingress](metadata)
     const state = () => ({
       topics: [...owned.topics].map(([name, entry]) => [
@@ -605,7 +606,6 @@ describe('Cluster > MetadataCache', () => {
     })
 
     test('a row with a topic error and a usable id changes no id, reverse map, partitions or pending state', () => {
-      wanted.delete('test-topic')
       const before = state()
 
       apply(
@@ -616,7 +616,6 @@ describe('Cluster > MetadataCache', () => {
       )
 
       expect(state()).toEqual(before)
-      expect(owned.topics.get('test-topic').seenAt).toBe(owned.generation)
       expect(events).toEqual([])
     })
 
@@ -670,6 +669,90 @@ describe('Cluster > MetadataCache', () => {
       expect(owned.leader('plain-topic', 0)).toEqual(2)
       expect(owned.leaderEpoch('plain-topic', 0)).toEqual(7)
       expect([...owned.pendingTopics]).toEqual([])
+    })
+  })
+
+  describe('a routed update whose row for a cached topic carries a topic error', () => {
+    let wanted
+    let owned
+
+    const errorRow = (topicId = ID_B) => answer(row({ topicId, topicErrorCode: 3 }))
+    const own = {
+      'a target': () => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+      },
+      'a pending id lookup': () => {
+        owned.updateTopicsById(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+      },
+    }
+
+    beforeEach(() => {
+      wanted = new Set()
+      owned = new MetadataCache({
+        logger: newLogger(),
+        instrumentationEmitter: emitter,
+        isWanted: (topic) => wanted.has(topic),
+      })
+    })
+
+    test('releases the decoded partitions of the answer it replaces', () => {
+      wanted.add('test-topic')
+      const first = response({ topicId: ID_A, leader: 1, leaderEpoch: 5 })
+      owned.update(first)
+
+      owned.update(errorRow())
+
+      expect(owned.topics.get('test-topic').partitions.get(0).decoded).toBeNull()
+      expect(owned.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 6 })).toBe(true)
+      expect(partition0(first)).toMatchObject({ leader: 1, leaderEpoch: 5 })
+      expect(owned.topicId('test-topic')).toEqual(ID_A)
+    })
+
+    test.each([false, true])(
+      'drops a name nothing owns when only error rows carry it (full: %s)',
+      (full) => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A }))
+        wanted.delete('test-topic')
+
+        owned.update(errorRow(), { full })
+
+        expect(owned.topics.has('test-topic')).toBe(false)
+        expect(owned.topicName(ID_A)).toBeUndefined()
+        expect([...owned.topicIds.keys()]).toEqual([])
+      }
+    )
+
+    test.each(Object.keys(own))(
+      'keeps the last identity of a name owned by %s across repeated full error rows, and a later healthy row under a new id is a recreation',
+      (owner) => {
+        own[owner]()
+
+        owned.update(errorRow(), { full: true })
+        owned.update(errorRow(NO_TOPIC_ID), { full: true })
+
+        expect(owned.topicId('test-topic')).toEqual(ID_A)
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+        expect(owned.leaderEpoch('test-topic', 0)).toEqual(5)
+        expect(events).toEqual([])
+
+        owned.update(answer(row({ topicId: ID_C })), { full: true })
+
+        expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_C }])
+        expect(owned.topicId('test-topic')).toEqual(ID_C)
+        expect(owned.topicName(ID_A)).toBeUndefined()
+      }
+    )
+
+    test('prunes an owned name carried by error rows once a full answer omits it', () => {
+      own['a target']()
+      owned.update(errorRow(), { full: true })
+
+      owned.update(answer(row({ topic: 'other-topic', topicId: ID_C })), { full: true })
+
+      expect(owned.topics.has('test-topic')).toBe(false)
+      expect(owned.topicName(ID_A)).toBeUndefined()
     })
   })
 
