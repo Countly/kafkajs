@@ -110,6 +110,18 @@ describe('written admin mutations', () => {
     ['ElectLeaders', 'electLeaders', {}, { electionType: 0 }],
     ['CreateDelegationToken', 'createDelegationToken', {}, {}],
     [
+      'RenewDelegationToken',
+      'renewDelegationToken',
+      { hmac: Buffer.from([1]) },
+      { hmac: Buffer.from([1]) },
+    ],
+    [
+      'ExpireDelegationToken',
+      'expireDelegationToken',
+      { hmac: Buffer.from([1]) },
+      { hmac: Buffer.from([1]) },
+    ],
+    [
       'DeleteRecords',
       'deleteTopicRecords',
       { topic: 't', partitions: [{ partition: 0, offset: '-1' }] },
@@ -493,4 +505,145 @@ describe('written admin mutations', () => {
       scripted.assertClean()
     }
   })
+
+  it('unowned InitProducerId and LeaveGroup keep ordinary transport errors inside an admin scope', async () => {
+    const { schedule, scripted } = fixture()
+    const broker = new Broker({
+      connectionPool: new ConnectionPool(
+        connectionOpts({
+          host: 'node0',
+          port: 9092,
+          socketFactory: scripted.socketFactory,
+        })
+      ),
+      nodeId: 0,
+      logger: newLogger(),
+    })
+    try {
+      await broker.connect()
+      await runWithDeadline('nested requests', 1000, async () => {
+        for (const [api, send] of [
+          [
+            'InitProducerId',
+            () => broker.initProducerId({ transactionalId: 'tx', transactionTimeout: 100 }),
+          ],
+          ['LeaveGroup', () => broker.leaveGroup({ groupId: 'g', memberId: 'member' })],
+        ]) {
+          const gate = schedule.hold({ api })
+          const result = send().catch((error) => error)
+          await Promise.race([gate.arrived(), result])
+          gate.fail(new Error('lost reply'))
+          expect(await result).toMatchObject({ retriable: true })
+          expect(await result).not.toBeInstanceOf(KafkaJSUnknownOutcomeError)
+          await send()
+          expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(2)
+        }
+      })
+    } finally {
+      await broker.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('a failed dial before the write leaves room for the retry to send once', async () => {
+    const { scripted } = fixture()
+    const broker = new Broker({
+      connectionPool: new ConnectionPool(
+        connectionOpts({
+          host: 'node0',
+          port: 9092,
+          socketFactory: scripted.socketFactory,
+        })
+      ),
+      nodeId: 0,
+      logger: newLogger(),
+    })
+    try {
+      await broker.connect()
+      await broker.disconnect()
+      scripted.down(0)
+      await runWithDeadline('createAcls', 1000, async () => {
+        await expect(broker.createAcls({ acl })).rejects.toMatchObject({ retriable: true })
+        expect(scripted.requests().filter((frame) => frame.api === 'CreateAcls')).toEqual([])
+        scripted.up(0)
+        await broker.createAcls({ acl })
+      })
+      expect(scripted.requests().filter((frame) => frame.api === 'CreateAcls')).toEqual([
+        expect.objectContaining({ fields: { creations: acl } }),
+      ])
+    } finally {
+      await broker.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it.each([
+    [0, false],
+    [0, true],
+    [1, false],
+    [1, true],
+  ])(
+    'a pre-write config failure cannot hide another broker’s lost reply with node %i and lost reply first %p',
+    async (failedNode, lostFirst) => {
+      const { admin, schedule, scripted } = fixture([node(0), node(1)], { retry: { retries: 0 } })
+      const api = 'AlterConfigs'
+      const lostNode = 1 - failedNode
+      const heldReply = schedule.hold({ api, node: lostNode })
+      const send = Broker.prototype.alterConfigs
+      let startDial
+      const dialAllowed = new Promise((resolve) => {
+        startDial = resolve
+      })
+      let dialFailed
+      const failed = new Promise((resolve) => {
+        dialFailed = resolve
+      })
+      const spy = jest
+        .spyOn(Broker.prototype, 'alterConfigs')
+        .mockImplementation(async function (options) {
+          if (this.nodeId !== failedNode) return send.call(this, options)
+          await dialAllowed
+          await this.disconnect()
+          scripted.down(failedNode)
+          try {
+            return await send.call(this, options)
+          } finally {
+            dialFailed()
+          }
+        })
+      const response = { resources: [] }
+      try {
+        await admin.connect()
+        const order = failedNode === 0 ? [lostNode, failedNode] : [failedNode, lostNode]
+        const resources = order.map((id) => ({
+          type: 4,
+          name: String(id),
+          configEntries: [],
+        }))
+        const result = admin.alterConfigs({ resources }).catch((error) => error)
+        await Promise.race([heldReply.arrived(), result])
+        if (lostFirst) {
+          heldReply.fail(new Error('lost reply'))
+          await new Promise(setImmediate)
+        }
+        startDial()
+        await failed
+        if (!lostFirst) heldReply.fail(new Error('lost reply'))
+        const error = await result
+        expect(error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+        expect(error.requests).toEqual([
+          { api, apiVersion: 2, nodeId: lostNode, items: [{ type: 4, name: String(lostNode) }] },
+        ])
+        expect(scripted.requests().filter((frame) => frame.api === api)).toEqual([
+          expect.objectContaining({ node: lostNode }),
+        ])
+      } finally {
+        startDial()
+        if (heldReply.settle) heldReply.release(response)
+        spy.mockRestore()
+        await admin.disconnect()
+        scripted.assertClean()
+      }
+    }
+  )
 })
