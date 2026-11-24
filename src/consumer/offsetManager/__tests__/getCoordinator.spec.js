@@ -98,7 +98,8 @@ describe.each(['classic', 'consumer'])(
         cluster.findGroupCoordinator.mockResolvedValue(obsolete)
         const fence = new Generation()
         const pending = manager.commitOffsets(offsets, { fence }).catch((error) => error)
-        await arrived.promise
+        // A commit that settles before the refresh fails the assertions below instead of hanging.
+        await Promise.race([arrived.promise, pending])
         if (reason === 'ownership replacement') group.ownership.renew()
         else fence.close(new Error('commit caller retired'))
         const replacement = { nodeId: 'replacement', isConnected: () => true }
@@ -132,7 +133,8 @@ describe.each(['classic', 'consumer'])(
         })
         let refusal = null
         const pending = manager.commitOffsets(offsets, { guard: () => refusal }).catch((e) => e)
-        await arrived.promise
+        // A commit that settles before the lookup fails the assertions below instead of hanging.
+        await Promise.race([arrived.promise, pending])
         refusal = new Error('commit caller retired')
         const cached = manager.coordinator
         lookup.resolve()
