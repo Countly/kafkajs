@@ -151,7 +151,7 @@ describe('Obsolete broker dispatch', () => {
     expect(pool.seedBroker.connectionPool.host).toBe('seed-1')
   })
 
-  it('rebootstrap deduplicates aliases and preserves a replacement installed during the build', async () => {
+  it('rebootstrap deduplicates aliases and retires a broker added during the seed build', async () => {
     const { pool, seed, builder } = build()
     const old = broker(1)
     const replacement = broker(1, 'new')
@@ -160,12 +160,12 @@ describe('Obsolete broker dispatch', () => {
       pool.brokers[1] = replacement
       return { host: 'next-seed', port: 9092 }
     })
-    old.disconnect.mockImplementation(() => new Promise(() => {}))
+    old.retire.mockImplementation(() => new Promise(() => {}))
     await within(pool.rebootstrap('required'))
     expect(old.retire).toHaveBeenCalledTimes(1)
     expect(seed.retire).toHaveBeenCalledTimes(1)
-    expect(pool.brokers[1]).toBe(replacement)
-    expect(pool.brokers[9]).toBeUndefined()
+    expect(replacement.retire).toHaveBeenCalledTimes(1)
+    expect(pool.brokers).toEqual({})
   })
 
   it('metadata replacement and removal install synchronously and do not await old drains', async () => {

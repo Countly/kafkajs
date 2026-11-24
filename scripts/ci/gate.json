@@ -4972,7 +4972,7 @@
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Obsolete broker dispatch metadata skips later builds after a concurrent seed replacement",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Obsolete broker dispatch metadata that gives the seed address to another id keeps both ids routed by address, the moved id first",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Obsolete broker dispatch metadata that gives the seed address to another id keeps both ids routed by address, the seed-address id first",
-        "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Obsolete broker dispatch rebootstrap deduplicates aliases and preserves a replacement installed during the build",
+        "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Obsolete broker dispatch rebootstrap deduplicates aliases and retires a broker added during the seed build",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Obsolete broker dispatch seed replacement installs before retirement and never awaits the drain",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Overlapping metadata refreshes install the endpoint of the topology published last, and discard the older pool",
         "src/cluster/__tests__/obsoleteDrain.spec.js \u203a Overlapping metadata refreshes install the endpoint published last when the older reply finds the node already moved",
