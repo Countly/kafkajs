@@ -270,7 +270,8 @@ notice and what, if anything, to do.
   unbounded when `enforceRequestTimeout` is false. For a hard shutdown limit, use
   `await producer.disconnect({ timeout: 10000 })`. At the deadline, never-written sends reject
   with `KafkaJSProducerClosedError` and `outcome: 'unsent'`; sends written at least once have
-  `outcome: 'unknown'`. An unknown commit stays pending and is never aborted by forced close.
+  `outcome: 'unknown'`, and so does a send only some of whose records were written before the
+  close. An unknown commit stays pending and is never aborted by forced close.
   Concurrent disconnects share the first call's timeout. A second call after close completed
   does nothing until an explicit `connect()`: it no longer sends an unknown commit again.
   After reconnect, resolve that commit explicitly with `commit()`, or replace the producer.
