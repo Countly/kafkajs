@@ -145,16 +145,13 @@ describe('Protocol > Requests > TxnOffsetCommit > v6', () => {
     expect(buffer.toString('hex')).toEqual(found.hex)
   })
 
-  test('keeps every topic of a request whose topics all hold no partition', async () => {
+  test('leaves every topic out of a request whose topics all hold no partition', async () => {
     const options = optionsOf(vector('groupMetadata'))
     const allEmpty = options.topics.map(({ topic }) => ({ topic, partitions: [] }))
 
     const { buffer } = await RequestV6Protocol({ ...options, topics: allEmpty }).encode()
 
-    expect(readBody(buffer).topics).toEqual([
-      { topicId: TOPIC_ID, partitions: [] },
-      { topicId: OTHER_TOPIC_ID, partitions: [] },
-    ])
+    expect(readBody(buffer).topics).toEqual([])
   })
 
   test.each([

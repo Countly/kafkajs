@@ -141,6 +141,25 @@ const succeed = (version) =>
         false
       )
 
+/**
+ * What a correct broker answers to a v6 request body: every topic that holds a partition, each
+ * partition as often and in the order the request carried it, all committed. A topic with no
+ * partition is neither committed nor answered (`KafkaApis.handleTxnOffsetCommitRequest` and
+ * `OffsetMetadataManager.commitTransactionalOffset`, Apache Kafka 4.4.0).
+ * @param {Buffer} body the request body, without its header
+ * @returns {Buffer}
+ */
+const brokerAnswer = (body) =>
+  answer(
+    readRequest(body, 6)
+      .topics.filter(({ partitions }) => partitions.length > 0)
+      .map(({ key, partitions }) => ({
+        key,
+        partitions: partitions.map(({ partition }) => ({ partition })),
+      })),
+    true
+  )
+
 /** A protocol error the broker would answer with `code`. */
 const protocolError = (code) => new KafkaJSProtocolError(createErrorFromCode(code))
 
@@ -444,20 +463,22 @@ describe('Broker > TxnOffsetCommit v6 and the combined version ceiling', () => {
     ])
   })
 
-  test('a call whose topics are all empty keeps them in the v6 request and expects each one back', async () => {
-    const { broker, requests } = offering({
+  test('a call whose topics all hold no partition sends none of them at v6 and takes the empty answer the broker gives', async () => {
+    const harness = offering({
       max: 6,
-      respond: () => answer([{ key: ID_A, partitions: [] }], true),
+      respond: () => brokerAnswer(harness.requests.at(-1).body),
     })
 
-    await broker.txnOffsetCommit({
+    const result = await harness.broker.txnOffsetCommit({
       ...ARGUMENTS,
       topics: [{ topic: 'topic-a', partitions: [] }],
       transactionVersion: 2,
       topicIds: ALL_IDS,
     })
 
-    expect(readRequest(requests[0].body, 6).topics).toEqual([{ key: ID_A, partitions: [] }])
+    expect(harness.requests[0].apiVersion).toEqual(6)
+    expect(readRequest(harness.requests[0].body, 6).topics).toEqual([])
+    expect(result.topics).toEqual([])
   })
 })
 
@@ -943,6 +964,47 @@ describe('Producer > transaction.sendOffsets over TxnOffsetCommit v6', () => {
 
       expect(published(cluster)).toEqual([
         { groupId: 'group-a', topic: 'topic-a', partition: '0', offset: '11' },
+        { groupId: 'group-a', topic: 'topic-a', partition: '1', offset: '7' },
+      ])
+    })
+
+    test('offsets that name a topic or a partition more than once go out once per partition, the last entry winning, and the transaction commits them', async () => {
+      const coordinator = groupCoordinatorAnswering(() =>
+        brokerAnswer(coordinator.requests.at(-1).body)
+      )
+      const { cluster, broker, transaction } = await openTransaction({
+        groupCoordinator: coordinator.broker,
+      })
+
+      await transaction.sendOffsets({
+        consumerGroupMetadata: GROUP_METADATA,
+        topics: [
+          { topic: 'topic-a', partitions: [{ partition: '0', offset: '11', leaderEpoch: 3 }] },
+          { topic: 'topic-a', partitions: [] },
+          {
+            topic: 'topic-a',
+            partitions: [
+              { partition: '1', offset: '7' },
+              { partition: '0', offset: '12', leaderEpoch: 4 },
+            ],
+          },
+        ],
+      })
+      await transaction.commit()
+
+      expect(coordinator.requests.map(({ apiVersion }) => apiVersion)).toEqual([6])
+      expect(readRequest(coordinator.requests[0].body, 6).topics).toEqual([
+        {
+          key: ID_A,
+          partitions: [
+            { partition: 0, offset: '12', leaderEpoch: 4, metadata: null },
+            { partition: 1, offset: '7', leaderEpoch: -1, metadata: null },
+          ],
+        },
+      ])
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
+      expect(published(cluster)).toEqual([
+        { groupId: 'group-a', topic: 'topic-a', partition: '0', offset: '12' },
         { groupId: 'group-a', topic: 'topic-a', partition: '1', offset: '7' },
       ])
     })

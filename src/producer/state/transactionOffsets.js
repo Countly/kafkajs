@@ -61,6 +61,8 @@ class TransactionOffsets {
   /**
    * Copies every wire field and takes the mutation fence synchronously, before any await.
    * Empty input owns no fence. Neither wire retries nor staging reads the caller's arrays.
+   * A topic or partition given more than once is copied once, in first-seen order, with the
+   * partition's last entry, as the broker would store it and as the Java client's map sends it.
    * @param {import('../../consumer/offsetManager/offsetOperations')} ledger
    * @param {string} groupId
    * @param {object[]} topics
@@ -68,16 +70,20 @@ class TransactionOffsets {
    * @throws {TypeError} for malformed offset arrays, before transmission
    */
   snapshot(ledger, groupId, topics) {
+    const byTopic = new Map()
+    topics.forEach(({ topic, partitions }) => {
+      const byPartition = byTopic.get(topic) ?? new Map()
+      byTopic.set(topic, byPartition)
+      partitions.forEach(({ partition, offset, leaderEpoch, metadata }) => {
+        byPartition.set(
+          Number(partition),
+          Object.freeze({ partition, offset, leaderEpoch, metadata })
+        )
+      })
+    })
     const copied = Object.freeze(
-      topics.map(({ topic, partitions }) =>
-        Object.freeze({
-          topic,
-          partitions: Object.freeze(
-            partitions.map(({ partition, offset, leaderEpoch, metadata }) =>
-              Object.freeze({ partition, offset, leaderEpoch, metadata })
-            )
-          ),
-        })
+      Array.from(byTopic, ([topic, byPartition]) =>
+        Object.freeze({ topic, partitions: Object.freeze([...byPartition.values()]) })
       )
     )
     const cells = copied.flatMap(({ topic, partitions }) =>
