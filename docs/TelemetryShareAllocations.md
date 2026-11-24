@@ -27,7 +27,7 @@ match the respective recorded new-large-object used bytes exactly. The remaining
 roughly 15.5 MB of new-space objects is consistent with repeated parsing of all
 sink rows. This is a strong source/size inference, not a measured allocation stack
 or an exact attribution of RSS. CI profiles must confirm the stacks and assess
-the change; no local workload execution is authorized.
+the change.
 
 ## Incremental, lossless sink parsing
 
