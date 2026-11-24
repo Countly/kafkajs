@@ -87,6 +87,8 @@ module.exports = class MetadataCache {
    * which is what stops one regex subscription or one `listTopics()` from seeding this cache with
    * every topic in the cluster forever.
    *
+   * A row with a topic error or no name writes nothing; it only marks a known entry as carried.
+   *
    * `TOPIC_RECREATED` is emitted last, once every entry above has been written, so a listener
    * that throws cannot leave the cache un-advanced and re-diffing the same recreation on every
    * later refresh - and `emit()` swallows such a throw anyway.
@@ -113,6 +115,12 @@ module.exports = class MetadataCache {
     for (const topicMetadata of metadata.topicMetadata) {
       const name = topicMetadata.topic
       let entry = this.topics.get(name)
+
+      if (!this.isHealthyRow(topicMetadata)) {
+        // Carried, so a full refresh does not prune what the cache knows; nothing else changes.
+        if (entry) entry.seenAt = this.generation
+        continue
+      }
 
       // Step 1 - topic-id diff, before any epoch comparison. A recreation drops this topic's
       // partition entries entirely, so the new incarnation's epoch 0 is accepted.
@@ -292,8 +300,9 @@ module.exports = class MetadataCache {
    * are not the ones the routing path reads - and never releases, prunes or re-stamps another
    * entry. A pair it accepts *is* written through to an existing `decoded`, exactly as
    * `applyLeaderHint` does, so the cached view and the routing view cannot diverge. Every name it
-   * records that the client does not target is marked pending, whether this call created its entry
-   * or an earlier refresh did, so a scoped refresh cannot drop it before its owner registers it.
+   * resolves to a usable id that the client does not target is marked pending, whether this call
+   * created its entry or an earlier refresh did, so a scoped refresh cannot drop it before its
+   * owner registers it. Rows with a topic error or no name are skipped, as in `update()`.
    *
    * @param {{ brokers: Array<{ nodeId: number }>, topicMetadata: Array<{ topic: string, topicId?: string|null, partitionMetadata: Array<{ partitionId: number, leader: number, leaderEpoch: number }> }> }} metadata decoded response; not mutated
    * @param {{isCurrent?: () => boolean}} [options] composed scope and target installation guard
@@ -306,6 +315,7 @@ module.exports = class MetadataCache {
     let changed = false
 
     for (const topicMetadata of metadata.topicMetadata) {
+      if (!this.isHealthyRow(topicMetadata)) continue
       const name = topicMetadata.topic
       let entry = this.topics.get(name)
       const recreation = this.diffTopicId(name, entry, topicMetadata.topicId)
@@ -320,9 +330,8 @@ module.exports = class MetadataCache {
         recreations.push(recreation)
       }
 
-      if (!this.isWanted(name)) this.pendingTopics.add(name)
-
       const usableId = this.usableTopicId(topicMetadata.topicId)
+      if (usableId != null && !this.isWanted(name)) this.pendingTopics.add(name)
       changed = changed || (usableId != null && usableId !== entry.topicId)
       entry.topicId = usableId ?? entry.topicId
 
@@ -410,6 +419,19 @@ module.exports = class MetadataCache {
    */
   usableTopicId(topicId) {
     return topicId != null && topicId !== NO_TOPIC_ID ? topicId : null
+  }
+
+  /**
+   * Whether a row may write to the cache: it names its topic and carries no topic-level error.
+   * An error row (unknown, deleted, unauthorized, still being created) can carry a stale or
+   * placeholder id, so it never writes an id, a reverse mapping, partitions or pending state.
+   *
+   * @private
+   * @param {{ topic: string|null, topicErrorCode?: number }} row
+   * @returns {boolean}
+   */
+  isHealthyRow({ topic, topicErrorCode }) {
+    return topic != null && !topicErrorCode
   }
 
   /**
