@@ -4,7 +4,9 @@ const { errorCodes, createErrorFromCode } = require('../protocol/error')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSConnectionError,
+  KafkaJSError,
   KafkaJSInvalidFrameError,
+  KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSRequestTimeoutError,
 } = require('../errors')
@@ -253,6 +255,64 @@ describe('Producer > sendMessages', () => {
     await send({ topicMessages: [{ topic, messages }] })
 
     expect(cluster.refreshMetadata).toHaveBeenCalled()
+  })
+
+  describe('what the latest failed partitioning attempt leaves on the send', () => {
+    const quickRetrier = () => retry({ retries: 2, initialRetryTime: 1, maxRetryTime: 1 })
+    const partitionOf = (send) =>
+      createSendMessages({
+        retrier: quickRetrier(),
+        logger: newLogger(),
+        cluster,
+        partitioner,
+        eosManager,
+      }).partition(send)
+
+    test('a failure in the partitioner marks the send as refused by it', async () => {
+      const thrown = new KafkaJSNonRetriableError('no route')
+      require('./groupMessagesPerPartition').mockImplementation(() => {
+        throw thrown
+      })
+      const send = { records: [{ topic, messages }] }
+
+      await expect(partitionOf(send)).rejects.toBe(thrown)
+
+      expect(send.refused).toBe(true)
+    })
+
+    test('a failure to find the topic metadata does not', async () => {
+      cluster.findTopicPartitionMetadata.mockImplementation(() => [])
+      const send = { records: [{ topic, messages }] }
+
+      await expect(partitionOf(send)).rejects.toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+
+      expect(send.refused).toBe(false)
+    })
+
+    test('an attempt that succeeds after a failure in the partitioner clears the mark', async () => {
+      require('./groupMessagesPerPartition').mockImplementationOnce(() => {
+        throw new KafkaJSError('no route yet')
+      })
+      const send = { records: [{ topic, messages }] }
+
+      await expect(partitionOf(send)).resolves.toHaveLength(3)
+
+      expect(send.refused).toBe(false)
+    })
+
+    test('a metadata failure after a failure in the partitioner clears the mark', async () => {
+      require('./groupMessagesPerPartition').mockImplementationOnce(() => {
+        throw new KafkaJSError('no route yet')
+      })
+      cluster.findTopicPartitionMetadata
+        .mockImplementationOnce(() => topicPartitionMetadata)
+        .mockImplementation(() => [])
+      const send = { records: [{ topic, messages }] }
+
+      await expect(partitionOf(send)).rejects.toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+
+      expect(send.refused).toBe(false)
+    })
   })
 
   test('a failing reconnect/refresh after a disconnect does not replace the original send error', async () => {
