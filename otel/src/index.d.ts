@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/// <reference types="node" />
+
 import type { Span } from '@opentelemetry/api'
 import {
   InstrumentationBase,
@@ -15,8 +17,11 @@ export interface KafkajsMessage {
   key?: Buffer | string | null
   value: Buffer | string | null
   partition?: number
-  headers?: Record<string, Buffer | string | (Buffer | string)[] | undefined>
-  timestamp?: string
+  /** Set on a consumed message. */
+  offset?: string
+  headers?: Record<string, Buffer | string | null | (Buffer | string | null)[] | undefined>
+  /** A consumed message's is a string; a producer hook sees what the application passed. */
+  timestamp?: string | number | Date | bigint
 }
 
 export interface MessageInfo<T = KafkajsMessage> {
@@ -34,10 +39,10 @@ export interface KafkaConsumerCustomAttributeFunction<T = KafkajsMessage> {
 
 export interface KafkaJsInstrumentationConfig extends InstrumentationConfig {
   /** hook for adding custom attributes before producer message is sent */
-  producerHook?: KafkaProducerCustomAttributeFunction
+  producerHook?: KafkaProducerCustomAttributeFunction | undefined
 
   /** hook for adding custom attributes before consumer message is processed */
-  consumerHook?: KafkaConsumerCustomAttributeFunction
+  consumerHook?: KafkaConsumerCustomAttributeFunction | undefined
 }
 
 /** OpenTelemetry instrumentation for `@countly/kafkajs` 3.x. */

@@ -136,6 +136,18 @@ message's `headers` (the caller's message object), and the consumer reads it bac
   a rejection with the same reason; and `commit()` resolves with whatever the client's `commit()`
   resolved with.
 
+## TypeScript
+
+The declarations (`src/index.d.ts`) reference Node.js's types, so `Buffer` resolves in a project
+with `"types": []`. Read these when upgrading from an earlier prerelease:
+
+- A hook's message headers can hold `null` values (a consumed header written with a null value);
+  guard them.
+- `message.timestamp` in a producer hook is what the application passed: a string, number, `Date`
+  or `bigint`. A consumed message's is a string, and its `offset` is set.
+- `producerHook` and `consumerHook` accept an explicit `undefined`, also under
+  `exactOptionalPropertyTypes`.
+
 ## Tests
 
 The upstream suite (`test/kafkajs.test.ts`) is ported to `node:test` block for block, with the
