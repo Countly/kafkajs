@@ -3,12 +3,15 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
-const SCRIPT = path.join(__dirname, '..', 'otelPackSmoke.sh')
+const ROOT = path.join(__dirname, '..', '..')
+const SCRIPT = path.join(ROOT, 'scripts', 'otelPackSmoke.sh')
 const OTEL_NAME = '@countly/opentelemetry-instrumentation-kafkajs'
 const MAIN_NAME = '@countly/kafkajs'
 
 // The fake npm records each call, and on `install` extracts every named tarball into node_modules
-// and records it in package-lock.json as a file dependency, as npm would install it.
+// and records it in package-lock.json as a file dependency, as npm would install it. A tarball
+// named `kafkajs@file:<path>` is installed as the alias \`kafkajs\`. Installing typescript leaves a
+// stub tsc that records its arguments.
 const FAKE_NPM = `#!/usr/bin/env node
 const fs = require('fs')
 const path = require('path')
@@ -17,22 +20,32 @@ const args = process.argv.slice(2)
 fs.appendFileSync(process.env.FAKE_CALLS, 'npm ' + JSON.stringify(args) + '\\n')
 if (args[0] === 'install') {
   const lock = { lockfileVersion: 3, packages: {} }
-  for (const tarball of args.filter((arg) => arg.endsWith('.tgz'))) {
+  for (const arg of args.filter((arg) => arg.endsWith('.tgz'))) {
+    const alias = arg.startsWith('kafkajs@file:')
+    const tarball = alias ? arg.slice('kafkajs@file:'.length) : arg
     const manifest = JSON.parse(execFileSync('tar', ['-xOzf', tarball, 'package/package.json']))
-    const target = path.join('node_modules', manifest.name)
+    const name = alias ? 'kafkajs' : manifest.name
+    const target = path.join('node_modules', name)
     fs.mkdirSync(target, { recursive: true })
     execFileSync('tar', ['-xzf', tarball, '-C', target, '--strip-components=1'])
-    lock.packages['node_modules/' + manifest.name] = { version: manifest.version, resolved: 'file:' + tarball }
+    lock.packages['node_modules/' + name] = { version: manifest.version, resolved: 'file:' + tarball }
   }
   fs.writeFileSync('package-lock.json', JSON.stringify(lock))
+  if (args.some((arg) => arg.startsWith('typescript@'))) {
+    fs.mkdirSync('node_modules/.bin', { recursive: true })
+    fs.writeFileSync('node_modules/.bin/tsc', '#!/bin/sh\\necho "tsc $*" >> "' + process.env.FAKE_CALLS + '"\\n', { mode: 0o755 })
+  }
 }
 `
 
-// The fake node records a smoke child and stands in for it; every other call runs the real node.
+// The fake node records a smoke child and stands in for it, and answers the synchronous-hooks
+// probe with true; every other call runs the real node.
 const FAKE_NODE = `#!/bin/bash
 for arg in "$@"; do
   case "$arg" in
-    otel-smoke.cjs|otel-smoke.mjs) echo "node $*" >> "$FAKE_CALLS"; exit 0 ;;
+    otel-smoke.cjs|otel-smoke.mjs|otel-static.mjs|otel-alias.cjs|otel-alias.mjs)
+      echo "node $*" >> "$FAKE_CALLS"; exit 0 ;;
+    --input-type=module) echo true; exit 0 ;;
   esac
 done
 exec "$REAL_NODE" "$@"
@@ -111,8 +124,9 @@ describe('scripts/otelPackSmoke.sh', () => {
     const npmCalls = recorded()
       .filter((line) => line.startsWith('npm '))
       .map((line) => JSON.parse(line.slice(4)))
-    expect(npmCalls).toHaveLength(1)
-    const [install] = npmCalls
+    // The project install, the TypeScript and types install, and the alias-only project install.
+    expect(npmCalls).toHaveLength(3)
+    const [install, types, aliasOnly] = npmCalls
     expect(install[0]).toBe('install')
     expect(install.filter((arg) => arg.endsWith('.tgz')).sort()).toEqual([main, otel].sort())
     expect(install.filter((arg) => !arg.startsWith('-') && !arg.endsWith('.tgz'))).toEqual([
@@ -120,10 +134,27 @@ describe('scripts/otelPackSmoke.sh', () => {
       expect.stringMatching(/^@opentelemetry\/api@\d+\.\d+\.\d+$/),
       expect.stringMatching(/^@opentelemetry\/sdk-trace@\d+\.\d+\.\d+$/),
     ])
+    const rootLock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'))
+    expect(types.filter((arg) => !arg.startsWith('-'))).toEqual([
+      'install',
+      `typescript@${rootLock.packages['node_modules/typescript'].version}`,
+      expect.stringMatching(/^@types\/node@\^\d+$/),
+    ])
+    expect(types).toContain('--no-save')
+    expect(aliasOnly.filter((arg) => arg.endsWith('.tgz')).sort()).toEqual(
+      [`kafkajs@file:${main}`, otel].sort()
+    )
+    expect(aliasOnly).toContain('--ignore-scripts')
+    const hook = '--experimental-loader=@opentelemetry/instrumentation/hook.mjs'
     expect(recorded().filter((line) => line.startsWith('node '))).toEqual([
       'node otel-smoke.cjs',
-      'node --experimental-loader=@opentelemetry/instrumentation/hook.mjs otel-smoke.mjs',
+      `node ${hook} otel-smoke.mjs`,
+      `node ${hook} --import ./otel-preload.mjs otel-static.mjs`,
+      'node otel-alias.cjs',
+      `node ${hook} otel-alias.mjs alias-esm-loader`,
+      'node --import ./otel-register.mjs otel-alias.mjs alias-esm-register',
     ])
+    expect(recorded().filter((line) => line.startsWith('tsc '))).toEqual(['tsc -p .'])
   })
 
   it('otelPackSmoke rejects one argument, three arguments or swapped package names', () => {
@@ -149,7 +180,7 @@ describe('scripts/otelPackSmoke.sh', () => {
     )
 
     expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
-    expect(recorded().filter((line) => line.startsWith('node '))).toHaveLength(2)
+    expect(recorded().filter((line) => line.startsWith('node '))).toHaveLength(6)
     expect(fs.readdirSync(path.join(workDir, 'tmp'))).toEqual([])
   })
 })
