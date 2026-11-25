@@ -727,9 +727,13 @@ const createFetchGroup = async ({
     }
 
     if (header.apiKey === apiKeys.OffsetForLeaderEpoch) {
-      const sent = decodeOffsetForLeaderEpochRequests(state.writes)
-      const requested = sent[sent.length - 1].topics[0].partitions.map(({ partition }) => partition)
-      return validationAnswer(requested)
+      // The frame being answered, not the last one written: leaders are asked concurrently.
+      const [frame] = decodeOffsetForLeaderEpochRequests(
+        state.writes.filter(
+          (write) => readRequestHeader(write).correlationId === header.correlationId
+        )
+      )
+      return validationAnswer(frame.topics[0].partitions.map(({ partition }) => partition))
     }
 
     return typeof nextResponse === 'function' ? nextResponse() : nextResponse
@@ -807,6 +811,7 @@ const createFetchGroup = async ({
     defaultOffset: () => '-2',
     topicId: () => TOPIC_ID,
     leaderEpoch: () => leaderEpoch,
+    cachedLeader: (_topic, partition) => leaders.get(partition),
     forgetLeaderEpoch: jest.fn(() => true),
     applyLeaderHint: jest.fn(async ({ topic, partition, leaderId, leaderEpoch: hintEpoch }) => {
       if (applyLeaderHintResolves && applyLeaderHintMovesLeaderTo != null) {

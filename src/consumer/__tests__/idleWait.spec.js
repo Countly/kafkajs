@@ -1651,6 +1651,8 @@ describe('validation response continuation', () => {
       }
     )
     const markAll = jest.spyOn(group, 'confirmAll')
+    group.cluster.leaderEpoch = () => 2
+    group.cluster.cachedLeader = () => 0
     const item = (partition) => {
       const { generation } = group.positionValidator.request('orders', partition, {
         offset: '10',
@@ -1662,6 +1664,7 @@ describe('validation response continuation', () => {
         partition,
         generation,
         currentLeaderEpoch: 2,
+        leaderId: 0,
         entry: group.positionValidator.entryOf('orders', partition),
       }
     }
