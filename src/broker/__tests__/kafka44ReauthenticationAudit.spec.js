@@ -245,6 +245,7 @@ describe('session start', () => {
     await broker.metadata()
 
     expect(cluster.requests().map(({ api }) => api)).toEqual([
+      'ApiVersions',
       'SaslHandshake',
       'SaslAuthenticate',
       'SaslHandshake',
@@ -270,6 +271,7 @@ describe('session start', () => {
       await broker.metadata()
 
       expect(cluster.requests().map(({ api }) => api)).toEqual([
+        'ApiVersions',
         'SaslHandshake',
         'SaslAuthenticate',
         'SaslAuthenticate',
@@ -289,6 +291,7 @@ describe('session start', () => {
     await broker.metadata()
 
     expect(cluster.requests().map(({ api }) => api)).toEqual([
+      'ApiVersions',
       'SaslHandshake',
       'SaslAuthenticate',
       'Metadata',
