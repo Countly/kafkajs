@@ -368,7 +368,10 @@ new KafkaJSError('Invalid partition metadata', { retriable: true })
 new KafkaJSError('The group is rebalancing')
 new KafkaJSError(new Error('💣'), { retriable: true })
 
-new KafkaJSOffsetOutOfRange(new Error(), { topic: topic, partition: 0 })
+new KafkaJSOffsetOutOfRange(Object.assign(new Error(), { type: 'OFFSET_OUT_OF_RANGE', code: 1 }), {
+  topic: topic,
+  partition: 0,
+})
 
 new KafkaJSNumberOfRetriesExceeded(new Error(), { retryCount: 0, retryTime: 0 })
 
@@ -389,16 +392,9 @@ new KafkaJSRequestTimeoutError('Request requestInfo timed out', {
 
 new KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', { topic: topic })
 
-const partitionMetadata: PartitionMetadata = {
-  partitionErrorCode: 0,
-  partitionId: 0,
-  leader: 2,
-  replicas: [2],
-  isr: [2],
-}
 new KafkaJSStaleTopicMetadataAssignment('Topic has been updated', {
   topic: topic,
-  unknownPartitions: [partitionMetadata],
+  unknownPartitions: [2],
 })
 
 new KafkaJSServerDoesNotSupportApiKey(
@@ -772,7 +768,7 @@ const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assign
   commitError.reason
 const commitCause: Error | undefined = commitError.cause
 const commitType: string | undefined = commitError.type
-const commitCode: number | undefined = commitError.code
+const commitCode: number | string | undefined = commitError.code
 const staleCommit = new KafkaJSCommitFailedError('x', { reason: 'stale-assignment' })
 const staleCause: Error | undefined = staleCommit.cause
 // @ts-expect-error not a reason
@@ -825,7 +821,7 @@ new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: false })
 new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: 'false' })
 
 // KafkaJSLockTimeout stays exported.
-new KafkaJSLockTimeout()
+new KafkaJSLockTimeout('lock')
 
 // The broker surface transactions use.
 const useBroker = async (broker: Broker) => {
@@ -1703,11 +1699,11 @@ deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
 void adminDeadlineConfig
 
 const inheritedNonRetriableErrors: KafkaJSNonRetriableError[] = [
-  new KafkaJSPartialMessageError(), new KafkaJSSASLAuthenticationError(),
-  new KafkaJSGroupCoordinatorNotFound(), new KafkaJSNotImplemented(),
-  new KafkaJSTimeout(), new KafkaJSUnsupportedMagicByteInMessageSet(),
+  new KafkaJSPartialMessageError('partial'), new KafkaJSSASLAuthenticationError('sasl'),
+  new KafkaJSGroupCoordinatorNotFound('coordinator'), new KafkaJSNotImplemented('todo'),
+  new KafkaJSTimeout('timeout'), new KafkaJSUnsupportedMagicByteInMessageSet('magic'),
 ]
-const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout()
+const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout('lock')
 const createTopicDetail: string | null = new KafkaJSCreateTopicError(new Error('stable'), 't', 'detail').errorMessage
 async function offsetIsolationOptions(admin: Admin) {
   await admin.fetchTopicOffsets('t', {isolationLevel: 'read_uncommitted', apiTimeout: 10})
@@ -2060,4 +2056,36 @@ import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
   new TopicRecreated('x', { topic: 'orders' })
   // @ts-expect-error the fields are read-only
   recreated.topicId = 'other'
+}
+
+// Error declarations match what the constructors read and what the fields hold.
+{
+  const protocolError = Object.assign(new Error('x'), { type: 'OFFSET_OUT_OF_RANGE', code: 1 })
+  new KafkaJSTimeout('timed out', { cause: new Error('socket') })
+  // @ts-expect-error the constructor reads the message
+  new KafkaJSTimeout()
+  new KafkaJSNonRetriableError('x', { cause: new Error('y') })
+  new KafkaJSError('x', { cause: new Error('y') })
+  new kafkajs.KafkaJSMetadataNotLoaded('x', { retriable: false, cause: new Error('y') })
+  // @ts-expect-error the constructor reads the message
+  new kafkajs.KafkaJSBrokerNotFound()
+  new KafkaJSProtocolError(protocolError, { retriable: false })
+  // @ts-expect-error a protocol error is built from a protocol error
+  new KafkaJSProtocolError('x')
+  // @ts-expect-error the topic and partition are required
+  new KafkaJSOffsetOutOfRange(protocolError)
+  // @ts-expect-error the retry counts are required
+  new KafkaJSNumberOfRetriesExceeded(new Error('x'))
+  const ids: number[] = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  new KafkaJSStaleTopicMetadataAssignment('x', { topic: 't', unknownPartitions: [1] })
+  // @ts-expect-error a wrapped Node.js error has a string code
+  const numericCode: number | undefined = ({} as KafkaJSError).code
+  const refused: boolean = ({} as KafkaJSConnectionError).code === 'ECONNREFUSED'
+  // @ts-expect-error the broker can be unknown
+  const known: string = ({} as KafkaJSConnectionError).broker
+  const closed: string = ({} as KafkaJSConnectionClosedError).broker
+  const first: number | undefined = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]?.partition
+  new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [] })
+  const groupMessage: string | null | undefined = ({} as kafkajs.KafkaJSDeleteGroupsErrorGroups).errorMessage
+  void [ids, numericCode, refused, known, closed, first, groupMessage]
 }
