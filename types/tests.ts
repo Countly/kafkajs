@@ -2076,7 +2076,12 @@ import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
   new KafkaJSOffsetOutOfRange(protocolError)
   // @ts-expect-error the retry counts are required
   new KafkaJSNumberOfRetriesExceeded(new Error('x'))
-  const ids: number[] = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  const ids: number[] | undefined = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  // @ts-expect-error the partitions are absent when no metadata was passed
+  const definiteIds: number[] = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  // @ts-expect-error the topic is absent when no metadata was passed
+  const definiteTopic: string = ({} as KafkaJSStaleTopicMetadataAssignment).topic
+  new KafkaJSStaleTopicMetadataAssignment('x')
   new KafkaJSStaleTopicMetadataAssignment('x', { topic: 't', unknownPartitions: [1] })
   // @ts-expect-error a wrapped Node.js error has a string code
   const numericCode: number | undefined = ({} as KafkaJSError).code
@@ -2086,6 +2091,44 @@ import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
   const closed: string = ({} as KafkaJSConnectionClosedError).broker
   const first: number | undefined = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]?.partition
   new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [] })
+  const row = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]
+  const rowOffset: string | undefined = row.offset
+  // @ts-expect-error the offset is undefined when the response row matched no request
+  const definiteOffset: string = row.offset
+  const rowError: KafkaJSError | null | undefined = row.error
+  // @ts-expect-error a row can carry no error
+  const definiteError: KafkaJSError = row.error
+  new kafkajs.KafkaJSDeleteTopicRecordsError({
+    topic: 't',
+    partitions: [{ partition: 0, offset: undefined, error: null }],
+  })
+  new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [{ partition: 0, offset: '1' }] })
   const groupMessage: string | null | undefined = ({} as kafkajs.KafkaJSDeleteGroupsErrorGroups).errorMessage
-  void [ids, numericCode, refused, known, closed, first, groupMessage]
+  new KafkaJSProtocolError({
+    type: 'OFFSET_OUT_OF_RANGE',
+    code: 1,
+    message: 'out of range',
+    retriable: false,
+    helpUrl: 'https://kafka.apache.org/',
+    category: 'invalidConfiguration',
+  })
+  new KafkaJSOffsetOutOfRange(
+    { type: 'OFFSET_OUT_OF_RANGE', code: 1, message: 'out of range', helpUrl: 'https://kafka.apache.org/' },
+    { topic: 't', partition: 0 }
+  )
+  void [
+    ids,
+    definiteIds,
+    definiteTopic,
+    numericCode,
+    refused,
+    known,
+    closed,
+    first,
+    rowOffset,
+    definiteOffset,
+    rowError,
+    definiteError,
+    groupMessage,
+  ]
 }
