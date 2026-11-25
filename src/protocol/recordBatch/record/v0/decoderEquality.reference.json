@@ -1124,6 +1124,8 @@
             "lastStartOffset": "0",
             "abortedTransactions": [],
             "preferredReadReplica": 0,
+            "nextBatchOffset": "3",
+            "nextBatchLeaderEpoch": 0,
             "messages": [
               {
                 "magicByte": 2,
@@ -1347,6 +1349,8 @@
             "highWatermark": "6",
             "lastStableOffset": "6",
             "abortedTransactions": [],
+            "nextBatchOffset": "6",
+            "nextBatchLeaderEpoch": 0,
             "messages": [
               {
                 "magicByte": 2,
