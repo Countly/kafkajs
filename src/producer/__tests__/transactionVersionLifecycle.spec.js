@@ -11,6 +11,7 @@ const { newLogger } = require('testHelpers')
 const TOPIC = 'topic-a'
 const TRANSACTIONAL_ID = 'transactional-a'
 const REQUEST_TIMED_OUT = 7
+const PRODUCER_FENCED = 90
 const ONGOING = /already an ongoing transaction/
 
 /** A promise and the functions that settle it. */
@@ -40,21 +41,39 @@ const features = (level, epoch = 1) => ({
 /**
  * A transactional producer over the fake cluster, whose one broker is also the transaction
  * coordinator and reports `transaction.version` at `level`. InitProducerId answers producer id
- * 1000 one epoch above the one it was sent; EndTxn answers with `endTxn`.
- * @param {{ level?: number, endTxn?: (request: object) => object }} [options]
+ * 1000 one epoch above the one it was sent; EndTxn answers with `endTxn`. With
+ * `fencesOpenTransaction`, an InitProducerId that arrives while a transaction holds a partition
+ * (from its AddPartitionsToTxn until its EndTxn) is answered PRODUCER_FENCED, as a coordinator
+ * fences the transaction of the producer that is re-initialized.
+ * @param {{ level?: number, endTxn?: (request: object) => object, fencesOpenTransaction?: boolean }} [options]
  */
-const createTransactionalProducer = ({ level = 2, endTxn } = {}) => {
+const createTransactionalProducer = ({ level = 2, endTxn, fencesOpenTransaction = false } = {}) => {
   const cluster = createFakeCluster({ partitions: 2 })
   const { broker } = cluster
+  let partitionAdded = false
   Object.assign(broker, features(level), { negotiatedVersion: () => 5 })
-  broker.initProducerId.mockImplementation(async ({ producerEpoch = -1 }) => ({
-    producerId: '1000',
-    producerEpoch: producerEpoch + 1,
-  }))
-  broker.endTxn.mockImplementation(
+  broker.initProducerId.mockImplementation(async ({ producerEpoch = -1 }) => {
+    if (fencesOpenTransaction && partitionAdded) {
+      throw new KafkaJSProtocolError(createErrorFromCode(PRODUCER_FENCED))
+    }
+    return { producerId: '1000', producerEpoch: producerEpoch + 1 }
+  })
+  const answerEndTxn =
     endTxn ||
-      (async ({ producerEpoch }) => ({ producerId: '1000', producerEpoch: producerEpoch + 1 }))
-  )
+    (async ({ producerEpoch }) => ({ producerId: '1000', producerEpoch: producerEpoch + 1 }))
+  if (fencesOpenTransaction) {
+    broker.addPartitionsToTxn.mockImplementation(async () => {
+      partitionAdded = true
+      return {}
+    })
+    broker.endTxn.mockImplementation(async (request) => {
+      const answered = await answerEndTxn(request)
+      partitionAdded = false
+      return answered
+    })
+  } else {
+    broker.endTxn.mockImplementation(answerEndTxn)
+  }
   const producer = createProducer({
     cluster,
     logger: newLogger(),
@@ -84,7 +103,7 @@ const createTransactionalProducer = ({ level = 2, endTxn } = {}) => {
 /**
  * A connected transactional producer that holds a producer id: one empty transaction began and
  * ended with no EndTxn, so the next `transaction()` has only its begin left to do.
- * @param {{ level?: number, endTxn?: (request: object) => object }} [options]
+ * @param {Parameters<typeof createTransactionalProducer>[0]} [options]
  */
 const connectedWithProducerId = async (options) => {
   const setup = createTransactionalProducer(options)
@@ -287,33 +306,38 @@ describe('Producer > transaction version lifecycle', () => {
   describe('one transaction() at a time', () => {
     test('a second transaction() while the first holds its lookup: the first begins, sends, is acknowledged and commits; the second is refused with the ongoing-transaction error and sends no FindCoordinator, no InitProducerId; producer id, epoch and transaction version unchanged; one EndTxn', async () => {
       const { cluster, broker, producer, transactionalInits, produced } =
-        await connectedWithProducerId({ level: 1 })
-      // Every lookup after the held one answers as a coordinator that has moved to version 2.
+        await connectedWithProducerId({ level: 1, fencesOpenTransaction: true })
+      // Until the first caller has its handle, a second begin lookup is held and then answers as a
+      // coordinator that has moved to version 2. The first caller's lookup answers at once.
       const moved = Object.assign(Object.create(broker), features(2, 2))
       const held = deferred()
       let lookups = 0
+      let firstBegan = false
       cluster.findGroupCoordinator.mockImplementation(() =>
-        ++lookups === 1 ? held.promise : Promise.resolve(moved)
+        ++lookups > 1 && !firstBegan ? held.promise : Promise.resolve(broker)
       )
 
-      const calls = Promise.allSettled([producer.transaction(), producer.transaction()])
-      await settle()
-      held.resolve(broker)
-      const [first, second] = await calls
-
-      expect([first.status, second.status]).toEqual(['fulfilled', 'rejected'])
-      expect(second.reason).toBeInstanceOf(KafkaJSNonRetriableError)
-      expect(second.reason.message).toMatch(ONGOING)
-      const records = await first.value.send({ topic: TOPIC, messages: [message] })
-      await first.value.commit()
+      const firstCall = producer.transaction()
+      const secondCall = producer.transaction().catch((error) => error)
+      const transaction = await firstCall
+      firstBegan = true
+      const records = await transaction.send({ topic: TOPIC, messages: [message] })
+      // The second begin's lookup is released only now: the first transaction holds a partition.
+      held.resolve(moved)
+      const refusal = await secondCall
+      await transaction.commit()
 
       expect(Array.isArray(records)).toBe(true)
+      expect(refusal).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(refusal.message).toMatch(ONGOING)
       // The first caller's begin, its AddPartitionsToTxn and its EndTxn: nothing for the second.
       expect(lookups).toBe(3)
       expect(transactionalInits()).toHaveLength(1)
       expect(produced()).toEqual([{ producerEpoch: 0, transactionVersion: 1, firstSequence: 0 }])
+      expect(broker.produce.mock.calls.map(([{ producerId }]) => producerId)).toEqual(['1000'])
       expect(broker.endTxn.mock.calls.map(([request]) => request)).toEqual([
         expect.objectContaining({
+          producerId: '1000',
           producerEpoch: 0,
           transactionResult: true,
           transactionVersion: 1,

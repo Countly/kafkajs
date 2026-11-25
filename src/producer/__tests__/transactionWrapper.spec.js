@@ -623,7 +623,7 @@ describe('Producer > the transaction wrapper', () => {
       await first.value.abort()
     })
 
-    test('of two first calls,the one whose InitProducerId retry ends after the other began also says so', async () => {
+    test("a second first call waits through the first caller's InitProducerId retry, then is refused with the ongoing-transaction error", async () => {
       const cluster = createFakeCluster({
         options: {
           retry: { retries: 2, initialRetryTime: 5, factor: 0, multiplier: 1, maxRetryTime: 5 },
