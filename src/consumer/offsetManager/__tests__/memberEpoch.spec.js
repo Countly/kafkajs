@@ -438,19 +438,38 @@ describe('Consumer > OffsetManager > STALE_MEMBER_EPOCH per call site', () => {
       throw staleEpoch()
     })
     const logger = { debug: jest.fn(), error: jest.fn(), warn: jest.fn(), info: jest.fn() }
-    const { manager } = build({ membershipProtocol: 'consumer', offsetCommit, logger })
-    manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
-    manager.lastCommit = -1
+    jest.useFakeTimers({ now: 1700000000000 })
 
-    await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
+    try {
+      const { manager } = build({ membershipProtocol: 'consumer', offsetCommit, logger })
+      manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '5' })
+      manager.autoCommitInterval = 100
 
-    expect(offsetCommit).toHaveBeenCalledTimes(1)
-    expect(manager.lastCommit).toBeGreaterThanOrEqual(0)
-    expect(logger.error).toHaveBeenCalledTimes(1)
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({ memberEpoch: manager.generationId })
-    )
+      await manager.commitOffsetsIfNecessary()
+      expect(offsetCommit).not.toHaveBeenCalled()
+
+      jest.advanceTimersByTime(100)
+      await expect(manager.commitOffsetsIfNecessary()).resolves.toBeUndefined()
+
+      expect(offsetCommit).toHaveBeenCalledTimes(1)
+      expect(manager.lastCommit).toBe(100)
+      expect(logger.error).toHaveBeenCalledTimes(1)
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ memberEpoch: manager.generationId })
+      )
+
+      jest.advanceTimersByTime(99)
+      await manager.commitOffsetsIfNecessary()
+      expect(offsetCommit).toHaveBeenCalledTimes(1)
+
+      jest.advanceTimersByTime(1)
+      await manager.commitOffsetsIfNecessary()
+      expect(offsetCommit).toHaveBeenCalledTimes(2)
+      expect(manager.lastCommit).toBe(200)
+    } finally {
+      jest.useRealTimers()
+    }
   })
 
   it('runs without a logger, because 23 shipped construction sites do not pass one', async () => {

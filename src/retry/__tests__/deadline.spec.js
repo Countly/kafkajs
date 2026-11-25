@@ -356,4 +356,168 @@ describe('Retry > the budget on a late or stepped clock', () => {
       expect(fn).toHaveBeenCalledTimes(2)
     }
   )
+
+  describe('at the deadline, on a fractional clock', () => {
+    /** The budget is 101 ms and the first wait is 100 ms, so 1 ms is left for the wait to overrun. */
+    const TIGHT = { ...LATE, maxTotalTime: 101 }
+    const timedOutAfterOne =
+      'Gave up after 1 attempts: the next one would start after the 101 ms deadline'
+
+    /**
+     * Starts a call whose first attempt fails and whose second would succeed, then shows the
+     * monotonic clock at `failedAt` ms before that failure is handled.
+     * @param {Function} retrier
+     * @param {number} failedAt
+     * @returns {{ fn: jest.Mock, first: Error, settled: Promise<{ value?: any, error?: Error }> }}
+     */
+    const failingAt = (retrier, failedAt) => {
+      const first = createErrorFromCode(REQUEST_TIMED_OUT)
+      const fn = scripted(first, 'done')
+      const settled = outcomeOf(retrier(TIGHT)(fn))
+      skipMonotonicTo(failedAt)
+      return { fn, first, settled }
+    }
+
+    /**
+     * Starts a call whose first attempt fails and whose second would succeed, lets the failure be
+     * handled, then shows the monotonic clock `lateBy` ms after the wait's end when the timer fires.
+     * @param {Function} retrier
+     * @param {number} lateBy
+     * @returns {Promise<{ fn: jest.Mock, first: Error, settled: Promise<{ value?: any, error?: Error }> }>}
+     */
+    const wokenLate = async (retrier, lateBy) => {
+      const first = createErrorFromCode(REQUEST_TIMED_OUT)
+      const fn = scripted(first, 'done')
+      const settled = outcomeOf(retrier(TIGHT)(fn))
+      await jest.advanceTimersByTimeAsync(0)
+      expect(jest.getTimerCount()).toBe(1)
+      skipMonotonicTo(lateBy)
+      await jest.advanceTimersByTimeAsync(100)
+      return { fn, first, settled }
+    }
+
+    test.each([PLAIN, FENCED])(
+      'a retry whose wait ends 0.5 ms before the deadline is scheduled (%s)',
+      async (_kind, retrier) => {
+        const { fn, settled } = failingAt(retrier, 0.5)
+
+        await jest.advanceTimersByTimeAsync(100)
+
+        expect(await settled).toEqual({ value: 'done' })
+        expect(fn).toHaveBeenCalledTimes(2)
+      }
+    )
+
+    test.each([PLAIN, FENCED])(
+      'a retry whose wait ends exactly at the deadline is scheduled (%s)',
+      async (_kind, retrier) => {
+        const { fn, settled } = failingAt(retrier, 1)
+
+        await jest.advanceTimersByTimeAsync(100)
+
+        expect(await settled).toEqual({ value: 'done' })
+        expect(fn).toHaveBeenCalledTimes(2)
+      }
+    )
+
+    test.each([PLAIN, FENCED])(
+      'a retry whose wait would end 0.5 ms past the deadline is not scheduled (%s)',
+      async (_kind, retrier) => {
+        const { fn, first, settled } = failingAt(retrier, 1.5)
+
+        await jest.advanceTimersByTimeAsync(0)
+
+        expect(jest.getTimerCount()).toBe(0)
+        const outcome = await settled
+        expect(fn).toHaveBeenCalledTimes(1)
+        expect(outcome.error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(outcome.error.message).toEqual(timedOutAfterOne)
+        expect(outcome.error.cause).toBe(first)
+      }
+    )
+
+    test.each([PLAIN, FENCED])(
+      'a retry whose timer fires 0.5 ms before the deadline still starts (%s)',
+      async (_kind, retrier) => {
+        const { fn, settled } = await wokenLate(retrier, 0.5)
+
+        expect(await settled).toEqual({ value: 'done' })
+        expect(fn).toHaveBeenCalledTimes(2)
+      }
+    )
+
+    test.each([PLAIN, FENCED])(
+      'a retry whose timer fires exactly at the deadline still starts (%s)',
+      async (_kind, retrier) => {
+        const { fn, settled } = await wokenLate(retrier, 1)
+
+        expect(await settled).toEqual({ value: 'done' })
+        expect(fn).toHaveBeenCalledTimes(2)
+      }
+    )
+
+    test.each([PLAIN, FENCED])(
+      'a retry whose timer fires 0.5 ms after the deadline is not started (%s)',
+      async (_kind, retrier) => {
+        const { fn, first, settled } = await wokenLate(retrier, 1.5)
+
+        const outcome = await settled
+        expect(fn).toHaveBeenCalledTimes(1)
+        expect(outcome.error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        expect(outcome.error.message).toEqual(timedOutAfterOne)
+        expect(outcome.error.cause).toBe(first)
+        expect(jest.getTimerCount()).toBe(0)
+      }
+    )
+  })
+
+  test('a fenced retry whose budget is spent after its timer fired and before its attempt is not started', async () => {
+    let registrations = 0
+    const spendBudgetOnThirdRegistration = {
+      register: () => {
+        registrations += 1
+        if (registrations === 3) Promise.resolve().then(() => skipMonotonicTo(1000))
+        return () => {}
+      },
+    }
+    const first = createErrorFromCode(REQUEST_TIMED_OUT)
+    const fn = scripted(first, 'done')
+    const settled = outcomeOf(createRetry({ ...LATE, fence: spendBudgetOnThirdRegistration })(fn))
+
+    await jest.advanceTimersByTimeAsync(0)
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(1)
+    await jest.advanceTimersByTimeAsync(100)
+
+    const outcome = await settled
+    expect(registrations).toBe(3)
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(outcome.error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(outcome.error.message).toEqual(
+      'Gave up after 1 attempts: the next one would start after the 500 ms deadline'
+    )
+    expect(outcome.error.cause).toBe(first)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test.each([
+    ['plain', PLAIN, undefined],
+    ['plain', PLAIN, null],
+    ['fenced', FENCED, undefined],
+    ['fenced', FENCED, null],
+  ])(
+    'a %s call with maxTotalTime %p never reads the monotonic clock',
+    async (_kind, [, retrier], maxTotalTime) => {
+      const now = jest.spyOn(performance, 'now')
+      const failure = createErrorFromCode(REQUEST_TIMED_OUT)
+      const fn = scripted(failure, failure, 'done')
+      const settled = outcomeOf(retrier({ ...LATE, maxTotalTime })(fn))
+
+      await jest.advanceTimersByTimeAsync(300)
+
+      expect(await settled).toEqual({ value: 'done' })
+      expect(fn).toHaveBeenCalledTimes(3)
+      expect(now).not.toHaveBeenCalled()
+    }
+  )
 })
