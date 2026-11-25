@@ -557,7 +557,9 @@ const useClusterLookups = (cluster, topic, partitionMetadata) => {
 }
 
 describe('Producer > the idempotent drain loop', () => {
+  // Spies first: a spy on a fake timer restored after the clock is gone would bring back a dead timer.
   afterEach(() => {
+    jest.restoreAllMocks()
     jest.useRealTimers()
   })
 
@@ -2721,10 +2723,6 @@ describe('Producer > the idempotent drain loop', () => {
         if (value instanceof Promise && nodeIds.includes(key)) maps.add(this)
         return set.call(this, key, value)
       })
-    })
-
-    afterEach(() => {
-      jest.restoreAllMocks()
     })
 
     test('a broker’s hand-off entry is gone once its requests settle', async () => {
