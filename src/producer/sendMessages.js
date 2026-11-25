@@ -1892,14 +1892,15 @@ const createSendMessages = ({
    * from `send` after each await: a send that settled meanwhile has none, and the wait ends without
    * enqueuing anything. A failure that arrives after the send settled is ignored: it refreshes no
    * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure
-   * arms the transaction as `inTransaction` says, except a failure of the partitioner itself: it
-   * threw, whatever it threw, or returned something that is not a partition id (that is a
+   * arms the transaction as `inTransaction` says, except a failure of the partitioner call itself:
+   * it threw, whatever it threw, or returned something that is not a partition id (that is a
    * `KafkaJSInvalidConfigurationError`). Such a send rejects with that error, or with the retry
-   * budget's or delivery deadline's error around a retriable one, and leaves the transaction usable:
-   * none of its records was queued. The latest failed attempt decides, and is kept on the send as
-   * `refused`, which the accumulator reads when the delivery deadline ends the send: a metadata
-   * failure after a partitioner failure arms as before. A falsy value the partitioner throws
-   * reaches the caller as an `Error` and not as itself; it arms nothing either.
+   * budget's or delivery deadline's error around a retriable one, refreshes no metadata and leaves
+   * the transaction usable: none of its records was queued. The grouping marks the send `refused`
+   * at that call, and each attempt clears the mark when it starts, so it covers only the backoff
+   * after a partitioner failure: the accumulator reads it when the delivery deadline ends the
+   * send, and a metadata failure or wait in a later attempt arms as before. A falsy value the
+   * partitioner throws reaches the caller as `Error('Aborted')`; it arms nothing either.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
@@ -1912,7 +1913,7 @@ const createSendMessages = ({
   const partition = (source, fence = getGeneration()) => {
     const send = Array.isArray(source) ? { records: source } : source
     const attempt = async (bail) => {
-      let grouping = false
+      send.refused = false
       try {
         fence?.check()
         await cluster.addMultipleTargetTopics(
@@ -1931,25 +1932,22 @@ const createSendMessages = ({
             throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
           }
 
-          grouping = true
           const grouped = groupMessagesPerPartition({
             topic,
             partitionMetadata,
             messages,
             partitioner,
+            send,
           })
-          grouping = false
           for (const id of keys(grouped)) {
             entries.push({ topic, partition: Number(id), messages: grouped[id] })
           }
         }
-        send.refused = false
         return entries
       } catch (e) {
         if (send.settled) return bail(e)
-        send.refused = grouping
         fence?.check()
-        if (refreshesMetadata(e)) {
+        if (!send.refused && refreshesMetadata(e)) {
           await Promise.resolve(cluster.refreshMetadata(...fenceArgs(fence))).catch(
             (refreshError) => {
               logger.debug(`Best-effort metadata refresh failed: ${refreshError.message}`)
@@ -1958,7 +1956,7 @@ const createSendMessages = ({
         }
         if (send.settled) return bail(e)
         fence?.check()
-        if (e.retriable) throw e
+        if (e?.retriable) throw e
         bail(e)
       }
     }

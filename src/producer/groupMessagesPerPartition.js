@@ -41,19 +41,29 @@ const shown = (partition) =>
  * @param {{ partitionId: number, leader: number }[]} params.partitionMetadata
  * @param {object[]} params.messages
  * @param {Function} params.partitioner
+ * @param {{ refused?: boolean }} [params.send] the send the records belong to: its `refused` is set
+ *   when the partitioner throws or returns an invalid partition, and only then
  * @returns {Object<string, object[]>} the records per partition id, in order; `{}` without metadata
  * @throws {KafkaJSInvalidConfigurationError} when the partitioner returns anything but a partition
  *   id, before any record of the call is used
+ * @throws {*} whatever the partitioner throws, as it is
  */
-module.exports = ({ topic, partitionMetadata, messages, partitioner }) => {
+module.exports = ({ topic, partitionMetadata, messages, partitioner, send }) => {
   if (partitionMetadata.length === 0) {
     return {}
   }
 
   const grouping = {}
   for (const message of messages) {
-    const partition = partitioner({ topic, partitionMetadata, message })
+    let partition
+    try {
+      partition = partitioner({ topic, partitionMetadata, message })
+    } catch (e) {
+      if (send) send.refused = true
+      throw e
+    }
     if (!valid(partition)) {
+      if (send) send.refused = true
       throw new KafkaJSInvalidConfigurationError(
         `Invalid partition ${shown(partition)} for topic "${topic}"`
       )
