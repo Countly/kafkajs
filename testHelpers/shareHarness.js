@@ -279,7 +279,11 @@ const harness = async ({
   ]),
 } = {}) => {
   const schedule = new Schedule()
-  const topology = [0, 1, 2].slice(0, nodes).map((id) => ({ id, host: `node${id}`, port: 9092 }))
+  const topology = Array.from({ length: nodes }, (_, id) => ({
+    id,
+    host: `node${id}`,
+    port: 9092,
+  }))
   const cluster = createScriptedCluster({ nodes: topology, profile: 'share', schedule })
   for (const api of ['ShareFetch', 'ShareAcknowledge'])
     cluster.answer(api, (fields) => echo(api, fields))
