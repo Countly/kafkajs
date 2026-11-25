@@ -2897,6 +2897,8 @@ export type KafkaJSProtocolErrorSource = {
   code: number
   message: string
   retriable?: boolean
+  helpUrl?: string
+  category?: KafkaJSErrorCategory
 }
 
 export class KafkaJSProtocolError extends KafkaJSError {
@@ -3261,8 +3263,10 @@ export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
 }
 
 export class KafkaJSStaleTopicMetadataAssignment extends KafkaJSError {
-  readonly topic: string
-  readonly unknownPartitions: number[]
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly topic?: string
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly unknownPartitions?: number[]
   constructor(e: Error | string, metadata?: KafkaJSStaleTopicMetadataAssignmentMetadata)
 }
 
@@ -3390,8 +3394,10 @@ export interface KafkaJSDeleteTopicRecordsErrorTopic {
 
 export interface KafkaJSDeleteTopicRecordsErrorPartition {
   partition: number
-  offset: string
-  error: KafkaJSError
+  /** The requested offset; undefined when the response row matched no requested partition */
+  offset: string | undefined
+  /** Rows are kept as passed, so a row can carry no error */
+  error?: KafkaJSError | null
 }
 
 export interface KafkaJSErrorMetadata {

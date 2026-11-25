@@ -1632,16 +1632,32 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   `new KafkaJSOffsetOutOfRange(e, { topic, partition })` and
   `new KafkaJSNumberOfRetriesExceeded(e, { retryCount, retryTime })` need their second argument:
   without it they threw `TypeError` in 2.2.4 and still do.
+- **`KafkaJSOffsetOutOfRange`'s first argument is a protocol error.** It was declared
+  `Error | string`; it is now the object `KafkaJSProtocolError` takes, with `type`, `code` and
+  `message`. Code that passed an `Error` and the metadata no longer compiles. Before:
+  `new KafkaJSOffsetOutOfRange(new Error('out of range'), { topic: 'orders', partition: 0 })`.
+  After: `new KafkaJSOffsetOutOfRange({ type: 'OFFSET_OUT_OF_RANGE', code: 1, message: 'out of range' }, { topic: 'orders', partition: 0 })`.
+  An `Error` that carries `type` and `code`, such as a caught protocol error, is accepted.
 - **`KafkaJSProtocolError` is built from a protocol error.** `new KafkaJSProtocolError(e)` takes an
-  object with `type`, `code` and `message` (for example a caught protocol error); built from a
-  string its `code` and `type` were `undefined`. Before: `new KafkaJSProtocolError('boom')`. After:
-  `new KafkaJSProtocolError({ type: 'UNKNOWN_SERVER_ERROR', code: -1, message: 'boom' })`.
+  object with `type`, `code` and `message` (for example a caught protocol error), and optionally
+  `retriable`, `helpUrl` and `category`; built from a string its `code` and `type` were
+  `undefined`. Before: `new KafkaJSProtocolError('boom')`. After:
+  `new KafkaJSProtocolError({ type: 'UNKNOWN', code: -1, message: 'boom' })`.
 - **`KafkaJSError.code` is `number | string`.** An error built from a Node.js system error carries
-  its string code (`'ECONNREFUSED'`), and `KafkaJSConnectionError.code` is that string. Narrow with
-  `typeof` before arithmetic. `KafkaJSConnectionError.broker` can be absent.
-- **`KafkaJSStaleTopicMetadataAssignment.unknownPartitions` is `number[]`.** So is the same field of
-  its constructor's metadata: the partition ids it has always held (the metadata was declared
-  `PartitionMetadata[]`).
+  its string code (`'ECONNREFUSED'`), and `KafkaJSConnectionError.code` is the optional string from
+  its metadata. Narrow with `typeof` before arithmetic. `KafkaJSConnectionError.broker` can be
+  absent.
+- **`KafkaJSStaleTopicMetadataAssignment.unknownPartitions` is `number[] | undefined`, and `topic`
+  is `string | undefined`.** The client's own errors carry both, but an error built without
+  metadata has neither, so guard the reads under `strictNullChecks`. The same field of the
+  constructor's metadata is `number[]`: the partition ids it has always held (the metadata was
+  declared `PartitionMetadata[]`).
+- **`KafkaJSDeleteTopicRecordsError` declares `partitions`, and its rows are nullable.**
+  `offset` is `string | undefined` (undefined when a response row matched no requested partition)
+  and `error` is `KafkaJSError | null | undefined` (the constructor keeps rows as passed). Guard
+  both reads. The `topic` of its constructor's metadata is optional and the error does not keep
+  it. A structural mock of the error, or a function typed to return it, must now supply
+  `partitions`.
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots
