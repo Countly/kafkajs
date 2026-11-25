@@ -82,8 +82,9 @@ const assertMaxTotalTime = (maxTotalTime) => {
  * left, if the wait about to be slept (`retryTime`) would end past the `maxTotalTime` deadline it
  * rejects with `KafkaJSDeliveryTimeout`, whose `cause` is the thrown error as is. Otherwise the
  * next attempt is scheduled after `retryTime`. The deadline is taken once, when this is built, and
- * measured on `performance.now()`. An attempt whose wait ended past the deadline (a late timer) is
- * not started; the call rejects the same way.
+ * measured on `performance.now()`, and never read for a call without `maxTotalTime`. An attempt
+ * whose wait ended past the deadline (a late timer) is not started; the call rejects the same way,
+ * its `cause` the error of the attempt before.
  * @param {{ retries: number, maxTotalTime?: number | null }} configs the merged retrier options
  * @param {{ next: (previous: number) => number }} backoff computes the delay after `retryTime`
  * @param {(value: any) => void} resolve
@@ -113,7 +114,8 @@ const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
     if (aborted) return
     const refusal = scope?.guard()
     if (refusal) return bail(refusal)
-    if (retryCount > 0 && performance.now() > deadline) return bail(timedOut(retryCount, lastError))
+    if (retryCount > 0 && deadline !== Infinity && performance.now() > deadline)
+      return bail(timedOut(retryCount, lastError))
 
     const nextRetryTime = backoff.next(retryTime)
     const shouldRetry = retryCount < retries
@@ -129,15 +131,15 @@ const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
     fn(bail, retryCount, retryTime)
       .then(resolve)
       .catch((e) => {
-        lastError = e
         if (isErrorRetriable(e)) {
           if (!shouldRetry) {
             reject(
               new KafkaJSNumberOfRetriesExceeded(e, { retryCount, retryTime, cause: e.cause || e })
             )
-          } else if (performance.now() + retryTime > deadline) {
+          } else if (deadline !== Infinity && performance.now() + retryTime > deadline) {
             reject(timedOut(retryCount + 1, e))
           } else {
+            if (deadline !== Infinity) lastError = e
             scheduleRetry()
           }
         } else {

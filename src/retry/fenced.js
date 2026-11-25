@@ -62,14 +62,22 @@ class FencedRetry {
     this.unregister = this.configs.fence.register((error) => this.finish(error))
   }
 
-  /** @param {number} retryTime @param {number} retryCount @returns {void} */
-  run(retryTime, retryCount) {
+  /**
+   * Starts one attempt. A retried attempt is refused, just before it would run, when the budget
+   * is spent by then.
+   * @param {number} retryTime @param {number} retryCount
+   * @param {Error} [lastError] the error of the attempt before, the cause of a refusal
+   * @returns {void}
+   */
+  run(retryTime, retryCount, lastError) {
     this.listen()
     if (this.done) return
     const nextRetryTime = this.backoff.next(retryTime)
     Promise.resolve()
       .then(() => {
         if (this.done) return
+        if (retryCount > 0 && this.deadline !== Infinity && performance.now() > this.deadline)
+          return this.finish(this.timedOut(retryCount, lastError))
         return this.fn((error) => this.finish(error || new Error('Aborted')), retryCount, retryTime)
       })
       .then(
@@ -86,16 +94,14 @@ class FencedRetry {
                 cause: error.cause || error,
               })
             )
-          if (performance.now() + retryTime > this.deadline)
+          if (this.deadline !== Infinity && performance.now() + retryTime > this.deadline)
             return this.finish(this.timedOut(retryCount + 1, error))
           this.listen()
           if (this.done) return
           this.timer = setTimeout(() => {
             this.timer = null
             this.unregister()
-            if (performance.now() > this.deadline)
-              return this.finish(this.timedOut(retryCount + 1, error))
-            this.run(nextRetryTime, retryCount + 1)
+            this.run(nextRetryTime, retryCount + 1, error)
           }, retryTime)
         }
       )
