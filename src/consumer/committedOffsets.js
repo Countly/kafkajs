@@ -34,8 +34,10 @@ class CommittedOffsetReader {
    *   that omits a requested cell without going through the broker's own answer check
    * @throws {KafkaJSNumberOfRetriesExceeded} when every attempt got an answer that does not cover
    *   the request (a retriable `KafkaJSError` from the broker's check, read again like any
-   *   retriable failure); it is not retriable and that error, naming the topic and partition, is its
-   *   `cause`
+   *   retriable failure); it is not retriable and that error is its `cause`. The error names the
+   *   topic, and the partition when the failure concerns one: besides a missing, unrequested or
+   *   repeated partition, the OffsetFetch selection read refuses a topic that fills more answer
+   *   entries than the request had for it (a limit no other user of the shared coverage check has)
    * @throws {Error} a broker or partition error once the retry budget is spent, or the operation's
    *   own refusal (a spent time budget ends the call with its own timeout instead)
    */

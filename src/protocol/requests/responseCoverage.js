@@ -13,7 +13,9 @@ const { KafkaJSError } = require('../../errors')
  * @property {boolean} [skipUnnamed=false] skip an answer entry whose topic is null instead of
  *   refusing it as unrequested
  * @property {'any'|'asSent'} [topicEntries='any'] `asSent` refuses a topic that fills more entries
- *   of the answer than the request had entries for it; `any` lets an answer split or merge entries
+ *   of the answer than the request had entries for it; `any` lets an answer split or merge entries.
+ *   Only the OffsetFetch topic-selection read sets `asSent`; Produce, OffsetCommit and ListOffsets
+ *   keep `any` and accept a split topic.
  */
 
 /**
