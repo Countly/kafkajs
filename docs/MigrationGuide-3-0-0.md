@@ -1622,6 +1622,26 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   table, which are strings; the declaration said `number[]`. Under `strict` a comparison such as
   `ids[0] === 1` is `TS2367` and `ids.includes(1)` is `TS2345`. Compare with `String(id)` or
   convert the element with `Number(id)`. The runtime is unchanged.
+- **Nine error constructors need a message.** `KafkaJSTimeout`, `KafkaJSLockTimeout`,
+  `KafkaJSNotImplemented`, `KafkaJSMetadataNotLoaded`, `KafkaJSBrokerNotFound`,
+  `KafkaJSPartialMessageError`, `KafkaJSSASLAuthenticationError`, `KafkaJSGroupCoordinatorNotFound`
+  and `KafkaJSUnsupportedMagicByteInMessageSet` are declared with the message they need:
+  `new KafkaJSTimeout()` threw a `TypeError` in 2.2.4 and still does, and is now a compile error.
+  Pass a message.
+- **`KafkaJSOffsetOutOfRange` and `KafkaJSNumberOfRetriesExceeded` need their metadata.**
+  `new KafkaJSOffsetOutOfRange(e, { topic, partition })` and
+  `new KafkaJSNumberOfRetriesExceeded(e, { retryCount, retryTime })` need their second argument:
+  without it they threw `TypeError` in 2.2.4 and still do.
+- **`KafkaJSProtocolError` is built from a protocol error.** `new KafkaJSProtocolError(e)` takes an
+  object with `type`, `code` and `message` (for example a caught protocol error); built from a
+  string its `code` and `type` were `undefined`. Before: `new KafkaJSProtocolError('boom')`. After:
+  `new KafkaJSProtocolError({ type: 'UNKNOWN_SERVER_ERROR', code: -1, message: 'boom' })`.
+- **`KafkaJSError.code` is `number | string`.** An error built from a Node.js system error carries
+  its string code (`'ECONNREFUSED'`), and `KafkaJSConnectionError.code` is that string. Narrow with
+  `typeof` before arithmetic. `KafkaJSConnectionError.broker` can be absent.
+- **`KafkaJSStaleTopicMetadataAssignment.unknownPartitions` is `number[]`.** So is the same field of
+  its constructor's metadata: the partition ids it has always held (the metadata was declared
+  `PartitionMetadata[]`).
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots
