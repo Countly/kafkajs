@@ -160,6 +160,21 @@ describe('Broker > offsetFetch answer coverage', () => {
       [0],
       [topic(TOPIC, TOPIC_ID, cell(0, '10'), cell(0, '9999'))],
     ],
+    [
+      'one topic answered in two entries',
+      [0, 1],
+      [topic(TOPIC, TOPIC_ID, cell(0)), topic(TOPIC, TOPIC_ID, cell(1))],
+    ],
+    [
+      'one topic answered in two entries, in reverse order',
+      [0, 1],
+      [topic(TOPIC, TOPIC_ID, cell(1)), topic(TOPIC, TOPIC_ID, cell(0))],
+    ],
+    [
+      'a requested topic answered again with no partitions',
+      [0, 1],
+      [ASKED, topic(TOPIC, TOPIC_ID)],
+    ],
   ])('%s is refused retriably', async (_, asked, entries) => {
     for (const version of VERSIONS) {
       await expect(
@@ -240,6 +255,29 @@ describe('Broker > offsetFetch answer coverage', () => {
       await expect(fetch(version, { entries })).rejects.toMatchObject({
         type: 'UNSTABLE_OFFSET_COMMIT',
       })
+    }
+  })
+
+  test('a topic the request named in two entries resolves when it is answered in two entries or in one', async () => {
+    const named = (version) =>
+      [0, 1].map((partition) => ({
+        topic: TOPIC,
+        ...(version === 10 ? { topicId: TOPIC_ID } : {}),
+        partitions: [{ partition }],
+      }))
+    const partitionsOf = (list) =>
+      list.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+    const answers = [
+      [topic(TOPIC, TOPIC_ID, cell(0)), topic(TOPIC, TOPIC_ID, cell(1))],
+      [topic(TOPIC, TOPIC_ID, cell(1)), topic(TOPIC, TOPIC_ID, cell(0))],
+      [ASKED],
+    ]
+    for (const version of VERSIONS) {
+      for (const entries of answers) {
+        const response = await fetch(version, { entries }, { topics: named(version) })
+
+        expect(partitionsOf(response.responses)).toEqual(partitionsOf(entries))
+      }
     }
   })
 
