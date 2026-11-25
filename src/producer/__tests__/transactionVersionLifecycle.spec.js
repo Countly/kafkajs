@@ -304,7 +304,7 @@ describe('Producer > transaction version lifecycle', () => {
   })
 
   describe('one transaction() at a time', () => {
-    test('a second transaction() while the first holds its lookup: the first begins, sends, is acknowledged and commits; the second is refused with the ongoing-transaction error and sends no FindCoordinator, no InitProducerId; producer id, epoch and transaction version unchanged; one EndTxn', async () => {
+    test('a second transaction() made before the first has its handle, whose lookup would answer as a version 2 coordinator if it were reached: the first begins, sends, is acknowledged and commits; the second is refused with the ongoing-transaction error and sends no FindCoordinator, no InitProducerId; producer id, epoch and transaction version unchanged; one EndTxn', async () => {
       const { cluster, broker, producer, transactionalInits, produced } =
         await connectedWithProducerId({ level: 1, fencesOpenTransaction: true })
       // Until the first caller has its handle, a second begin lookup is held and then answers as a
