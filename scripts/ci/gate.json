@@ -24634,6 +24634,7 @@
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a disconnect during the drain still cuts a hung final at its deadline",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a flush still queued after a node's drive ended keeps that node busy until the drain ends",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a broker fence during the handler wait skips the drain and the leave",
+        "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a due flush on a lost data socket prevents the next handler and reopens the session",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a stop from a lock expiry listener releases the live batch records before handler admission",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a close in the tick after eachMessage dropped an expired record releases the live record behind it in the final",
         "src/consumer/share/__tests__/shareConsumerCloseBound.spec.js › bounded share consumer stop a crash releases its resources before a pending restart decision and stop allows a fresh run",
