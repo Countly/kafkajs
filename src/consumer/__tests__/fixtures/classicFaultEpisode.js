@@ -16,6 +16,9 @@ const MEMBER_ID = 'member-1'
 const MEMBER_ID_REQUIRED = 79
 const WAIT_MS = 12000
 const QUIET_MS = 250
+const POLL_MS = 5
+/** Polls in a row that must see no new activity: each is its own event-loop turn. */
+const QUIET_POLLS = QUIET_MS / POLL_MS
 const BACKOFF_FLOOR_MS = 50
 const REQUEST_TIMEOUT_MS = 300
 const ROUND_TIMEOUT_MS = 400
@@ -102,7 +105,7 @@ const until = async (predicate, label, budget = WAIT_MS) => {
   const deadline = Date.now() + budget
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`Did not happen in time: ${label}`)
-    await pause(5)
+    await pause(POLL_MS)
   }
 }
 
@@ -176,6 +179,10 @@ class ClassicFaultEpisode {
   constructor(row) {
     this.row = Object.freeze({ ...row })
     this.stale = row.step === 'old-generation-answer'
+    this.heldHeartbeat = this.stale && row.api === 'Heartbeat'
+    this.settled = []
+    this.completed = []
+    this.heldAnswer = null
     this.cleanup = []
     this.trace = []
     this.deliveries = []
@@ -273,7 +280,6 @@ class ClassicFaultEpisode {
       this.cluster.kafkaOptions({
         logLevel: logLevel.NOTHING,
         requestTimeout,
-        enforceRequestTimeout: true,
         retry,
       })
     ).consumer({
@@ -296,6 +302,15 @@ class ClassicFaultEpisode {
       this.consumer.on(events.CRASH, record(this.crashes)),
       this.consumer.on(events.REQUEST_TIMEOUT, record(this.timeouts))
     )
+    if (this.heldHeartbeat) {
+      this.cleanup.push(
+        this.cluster.watch((event, { api, node, generation, correlationId }) => {
+          if (api === 'Heartbeat' && event !== 'request')
+            this.settled.push({ event, node, generation, correlationId })
+        }),
+        this.consumer.on(events.REQUEST, record(this.completed))
+      )
+    }
   }
 
   /**
@@ -513,11 +528,86 @@ class ClassicFaultEpisode {
   }
 
   /**
+   * Waits until the group did nothing for `QUIET_POLLS` polls in a row. Quiet is counted in
+   * event-loop turns, not wall time: a process the machine did not schedule runs no turn, so a
+   * stall cannot pass for quiet while the answer it delayed still waits in the queue.
    * @private
    * @returns {Promise<void>} when the group did nothing for a quiet interval
    */
   async quiet() {
-    await until(() => performance.now() - this.lastActivity() > QUIET_MS, 'a quiet wire')
+    let last = this.lastActivity()
+    let polls = 0
+    await until(() => {
+      const latest = this.lastActivity()
+      if (latest !== last) {
+        last = latest
+        polls = 0
+      }
+      polls += 1
+      return polls > QUIET_POLLS
+    }, 'a quiet wire')
+  }
+
+  /**
+   * @private
+   * @returns {string} the `host:port` the faulted request was written to
+   */
+  faultedBroker() {
+    const { host, port } = NODES.find(({ id }) => id === this.faulted.node)
+    return `${host}:${port}`
+  }
+
+  /**
+   * @returns {object[]} the request timeouts the client reported for the held heartbeat
+   */
+  heldTimeouts() {
+    const broker = this.faultedBroker()
+    return this.timeouts.filter(
+      (entry) =>
+        entry.apiName === 'Heartbeat' &&
+        entry.broker === broker &&
+        entry.correlationId === this.faulted.correlationId
+    )
+  }
+
+  /**
+   * After a held heartbeat's answer was let go: waits, by what happens and not by wall time, until
+   * the cluster settled that answer on the old request's own connection, a replacement heartbeat
+   * on a later connection of the same node was completed, and the wire was quiet. The old run
+   * cannot end while its heartbeat waits, so only the request timeout retired the old request,
+   * and its connection, before the replacement joined.
+   * @private
+   * @returns {Promise<void>}
+   * @throws {Error} when one of the steps does not happen in time
+   */
+  async settleHeldHeartbeat() {
+    const { node, generation, correlationId } = this.faulted
+    const broker = this.faultedBroker()
+    const heldAnswer = (entry) =>
+      entry.node === node &&
+      entry.generation === generation &&
+      entry.correlationId === correlationId
+
+    await until(() => this.settled.some(heldAnswer), 'the held heartbeat answer to be settled')
+    this.heldAnswer = this.settled.find(heldAnswer)
+    await until(
+      () =>
+        this.frames('Heartbeat').some(
+          (frame) =>
+            frame.seq >= this.sentBeforeRelease &&
+            frame.node === node &&
+            frame.generation > generation &&
+            this.completed.some(
+              (entry) =>
+                entry.apiName === 'Heartbeat' &&
+                entry.broker === broker &&
+                entry.correlationId === frame.correlationId &&
+                entry.at >= this.released
+            )
+        ),
+      'a replacement heartbeat on a later connection to be completed'
+    )
+    await this.quiet()
   }
 
   /**
@@ -531,11 +621,14 @@ class ClassicFaultEpisode {
   async recover() {
     const { api, fault } = this.row
     if (this.stale) {
+      if (this.heldHeartbeat)
+        await until(() => this.heldTimeouts().length > 0, 'the held heartbeat to time out')
       this.sentBeforeRelease = this.trace.length
       const late = typeof fault === 'number' ? answerWithCode(api, fault) : undefined
       this.gate.release(typeof late === 'function' ? late(this.gate.call) : late)
       this.released = performance.now()
-      await pause(QUIET_MS * 2)
+      if (this.heldHeartbeat) await this.settleHeldHeartbeat()
+      else await pause(QUIET_MS * 2)
       if (api === 'OffsetCommit') this.commitResult = await this.commitOutcome
       return
     }
@@ -851,7 +944,9 @@ const expectGenerationClosed = (episode) => {
 /**
  * After a late answer for a replaced membership nothing may have been written: no rejoin, sync,
  * leave, lookup or commit, no crash and no new join since it was released; the replacement keeps
- * its scalars.
+ * its scalars. A held heartbeat must have timed out once before the release, closing its
+ * connection, so its answer was dropped on that connection unread, and a replacement heartbeat on a
+ * later connection must have been answered under the same member and generation.
  * @param {ClassicFaultEpisode} episode
  * @returns {void}
  */
@@ -865,6 +960,15 @@ const expectUnchanged = (episode) => {
   expect(episode.joins.filter(({ at }) => at > episode.released)).toEqual([])
   for (const join of episode.joins) expect(join.memberId).toBe(MEMBER_ID)
   const later = episode.frames('Heartbeat').filter(({ seq }) => seq >= episode.sentBeforeRelease)
+  if (episode.heldHeartbeat) {
+    const { node, generation, correlationId } = episode.faulted
+    expect(episode.heldAnswer).toEqual({ event: 'cancelled', node, generation, correlationId })
+    const timedOut = episode.heldTimeouts()
+    expect(timedOut).toHaveLength(1)
+    expect(timedOut[0].at).toBeLessThan(episode.released)
+    expect(later.length).toBeGreaterThan(0)
+    for (const frame of later) expect(frame.generation).toBeGreaterThan(generation)
+  }
   for (const frame of later)
     expect(frame.fields).toMatchObject({ memberId: MEMBER_ID, groupGenerationId: 1 })
 }
