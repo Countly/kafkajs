@@ -18170,6 +18170,7 @@
         "src/protocol/requests/offsetFetch/v10/response.spec.js \u203a Protocol > Requests > OffsetFetch > v10 response hands a group-level error to parse, as v9 does for STALE_MEMBER_EPOCH",
         "src/protocol/requests/offsetFetch/v10/response.spec.js \u203a Protocol > Requests > OffsetFetch > v10 response keeps an empty metadata string empty and a long offset exact",
         "src/protocol/requests/offsetFetch/v10/response.spec.js \u203a Protocol > Requests > OffsetFetch > v10 response keeps an id the request did not carry, with a null topic, as an all-topics answer has",
+        "src/protocol/requests/offsetFetch/v10/response.spec.js \u203a Protocol > Requests > OffsetFetch > v10 response the single-group result keeps the answer's groupId",
         "src/protocol/requests/offsetFetch/v10/response.spec.js \u203a Protocol > Requests > OffsetFetch > v10 response throws an invariant violation for 0 groups",
         "src/protocol/requests/offsetFetch/v10/response.spec.js \u203a Protocol > Requests > OffsetFetch > v10 response throws an invariant violation for 2 groups",
         "src/protocol/requests/offsetFetch/v2/request.spec.js \u203a Protocol > Requests > OffsetFetch > v2 request",
