@@ -587,6 +587,30 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
     }
   }
 
+  /**
+   * The scripted OffsetFetch answer of a broker that holds one offset for every partition a read
+   * names, as a broker answers exactly the partitions it is asked about.
+   * @param {() => string} offset the held offset, read when the request arrives
+   * @param {object} [fields] further fields of each row
+   * @returns {(request: object) => object}
+   */
+  const heldAt =
+    (offset, fields = {}) =>
+    ({ groupId: asked, topics }) => ({
+      groupId: asked,
+      topics: topics.map((entry) => ({
+        topic: entry.topic,
+        partitions: entry.partitions.map(({ partition }) => ({
+          partition,
+          offset: offset(),
+          leaderEpoch: -1,
+          metadata: null,
+          errorCode: 0,
+          ...fields,
+        })),
+      })),
+    })
+
   // Allowed replay: no produced log records; broker commits are the independently scripted EndTxn
   // result; handler delivery can repeat only after an abort or lost outcome.
   describe.each(['tv1', 'tv2'])('Transactional offset publication on %s frames', (profile) => {
@@ -609,23 +633,10 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
       async (separate) => {
         wire = await openWire(profile, separate)
         const committed = '9'
-        wire.scripted.answer('OffsetFetch', () => ({
-          groupId,
-          topics: [
-            {
-              topic: TOPIC,
-              partitions: [
-                {
-                  partition: 0,
-                  offset: committed,
-                  leaderEpoch: 3,
-                  metadata: 'original',
-                  errorCode: 0,
-                },
-              ],
-            },
-          ],
-        }))
+        wire.scripted.answer(
+          'OffsetFetch',
+          heldAt(() => committed, { leaderEpoch: 3, metadata: 'original' })
+        )
         await wire.transaction.sendOffsets({
           consumerGroupId: groupId,
           topics: [
@@ -661,17 +672,10 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
     ])('%s has its own cache and broker oracle', async (outcome) => {
       wire = await openWire(profile)
       let brokerOffset = '0'
-      wire.scripted.answer('OffsetFetch', () => ({
-        groupId,
-        topics: [
-          {
-            topic: TOPIC,
-            partitions: [
-              { partition: 0, offset: brokerOffset, leaderEpoch: -1, metadata: null, errorCode: 0 },
-            ],
-          },
-        ],
-      }))
+      wire.scripted.answer(
+        'OffsetFetch',
+        heldAt(() => brokerOffset)
+      )
       const wanted = [{ topic: TOPIC, partitions: [{ partition: 0, offset: '9' }] }]
       await wire.transaction.sendOffsets({ consumerGroupId: groupId, topics: wanted })
       expect(wire.writes).toHaveLength(0)
@@ -860,23 +864,10 @@ describe.each(['tv1', 'tv2'])('Producer > transactional offsets on the wire (%s)
       async (mutate) => {
         wire = await openWire(profile)
         let brokerOffset = '0'
-        wire.scripted.answer('OffsetFetch', () => ({
-          groupId,
-          topics: [
-            {
-              topic: TOPIC,
-              partitions: [
-                {
-                  partition: 0,
-                  offset: brokerOffset,
-                  leaderEpoch: -1,
-                  metadata: null,
-                  errorCode: 0,
-                },
-              ],
-            },
-          ],
-        }))
+        wire.scripted.answer(
+          'OffsetFetch',
+          heldAt(() => brokerOffset)
+        )
         await wire.transaction.sendOffsets({
           consumerGroupId: groupId,
           topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '9' }] }],
