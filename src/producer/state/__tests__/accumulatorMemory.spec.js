@@ -29,14 +29,16 @@ const MEASUREMENT_TIMEOUT_MS = 45000
 
 /**
  * Measures a scenario's retained storage in a plain Node process, because Jest's own heap carries
- * the coverage counters and the async-hook bookkeeping of `--detectOpenHandles`.
+ * the coverage counters and the async-hook bookkeeping of `--detectOpenHandles`. The process runs
+ * `--jitless`: optimized code is compiled on background threads, so how much of it a reading holds
+ * depends on thread timing rather than on the records.
  * @param {'held'|'pinned'|'tracked'} scenario
  * @returns {{ shape: string, capacity: number, measured: number, counted: number, residual: number }[]}
  *   one sample per population, in bytes
  * @throws {Error} naming the cause when the process fails, times out or prints anything but JSON
  */
 const measuredInChild = (scenario) => {
-  const run = spawnSync(process.execPath, [RETAINED_STORAGE, scenario], {
+  const run = spawnSync(process.execPath, ['--jitless', RETAINED_STORAGE, scenario], {
     encoding: 'utf8',
     timeout: MEASUREMENT_TIMEOUT_MS,
     killSignal: 'SIGKILL',
