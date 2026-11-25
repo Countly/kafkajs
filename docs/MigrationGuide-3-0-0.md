@@ -1050,6 +1050,8 @@ Nothing to do; code that slept after `resume()` to ride out the wait can stop.
 
 - **An unreachable broker no longer stalls the other fetchers.** 2.2.4 stopped and restarted every fetcher each time a fetch lost its connection. 3.0.0 backs off and retries only that broker's fetcher while the others keep fetching. Outage limits, warnings and events are unchanged. Nothing to do. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
 
+Pausing some partitions of a topic that is paused as a whole, including from a handler's `pause()`, keeps the rest of the topic paused. 2.2.4 resumed the rest of the topic. Call `resume` for the topic to clear a topic-wide pause.
+
 If you paused a topic and an operator recreated it, pause it again after you see `consumer.cluster.topic_recreated`. Pausing a topic before it is assigned still works and lasts until the subscription changes.
 
 Admin offset-operation results and broker commits are unchanged. Idle local state can be released before `admin.disconnect()`; do not rely on an admin object retaining offsets from an earlier completed operation.
