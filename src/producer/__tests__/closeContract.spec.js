@@ -236,7 +236,8 @@ describe('forced producer close on the wire', () => {
       }
       expect(typeof second.produce.mock.calls[0][0].guard).toBe('function')
       expect(refusals).toHaveLength(1)
-      expect(refusals[0]).toBeInstanceOf(KafkaJSProducerClosedError)
+      expect(refusals[0]).toBeInstanceOf(Error)
+      expect(refusals[0].message).toBe('The Produce attempt was revoked')
     }
   )
 
@@ -269,7 +270,8 @@ describe('forced producer close on the wire', () => {
       }
       expect(typeof second.produce.mock.calls[0][0].guard).toBe('function')
       expect(refusals).toHaveLength(1)
-      expect(refusals[0]).toBeInstanceOf(KafkaJSProducerClosedError)
+      expect(refusals[0]).toBeInstanceOf(Error)
+      expect(refusals[0].message).toBe('The Produce attempt was revoked')
     }
   )
 
@@ -350,7 +352,8 @@ describe('forced producer close on the wire', () => {
       ])
       expect(refusals).toHaveLength(2)
       expect(refusals[0]).toBeNull()
-      expect(refusals[1]).toBeInstanceOf(KafkaJSProducerClosedError)
+      expect(refusals[1]).toBeInstanceOf(Error)
+      expect(refusals[1].message).toBe('The Produce attempt was revoked')
     }
   )
 })
