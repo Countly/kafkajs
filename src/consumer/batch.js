@@ -45,6 +45,14 @@ module.exports = class Batch {
      */
     this.assignmentEpoch = null
 
+    /**
+     * The leader epoch the Fetch request carried for this partition, stamped by
+     * `ConsumerGroup#handleFetchedPartition` and checked again when a worker admits the batch.
+     * `null` on a batch built outside a fetch.
+     * @type {number|null}
+     */
+    this.requestLeaderEpoch = null
+
     this.rawMessages = messages
     // Apparently fetch can return different offsets than the target offset provided to the fetch API.
     // Discard messages that are not in the requested offset

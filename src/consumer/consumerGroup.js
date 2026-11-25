@@ -55,6 +55,7 @@ const SHORT_METADATA = 8
 const { FetchSessions } = require('./fetchSession')
 const PositionValidator = require('./positionValidator')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
+const { runWithDeadline, currentDeadline } = require('../admin/deadline')
 const Outage = require('./outage')
 const RebalanceHooks = require('./rebalanceHooks')
 const {
@@ -149,6 +150,10 @@ const TOPIC_AUTHORIZATION_FAILED_CODE = 29
 
 /** At most one warning per held partition in this interval, after the first failure's. */
 const HELD_WARNING_INTERVAL = 60000
+
+/** The validation bound used when the request timeout is not a usable timer delay. */
+const DEFAULT_VALIDATION_TIMEOUT = 30000
+const MAX_TIMER_DELAY = 2147483647
 
 /**
  * How many times one `seekOffsets()` call resolves offsets again after a resolution dropped an
@@ -466,14 +471,48 @@ module.exports = class ConsumerGroup {
      */
     this.validationUnusableLogged = new Set()
 
-    /** A full refresh is owed after a validation failure, even if a refresh is already running. */
+    /**
+     * How long one leader's validation attempt, or the wait for the refresh a failure owes, may
+     * take: the request timeout, or 30 s when that is not a usable timer delay. It applies even
+     * when request timeouts are not enforced.
+     * @type {number}
+     */
+    this.validationTimeout =
+      Number.isFinite(requestTimeout) && requestTimeout > 0 && requestTimeout <= MAX_TIMER_DELAY
+        ? requestTimeout
+        : DEFAULT_VALIDATION_TIMEOUT
+
+    /**
+     * The OffsetForLeaderEpoch request each leader has not answered yet, for this run: no second
+     * one is sent to a leader while its first still holds a transport slot.
+     * @type {Map<number, Promise<object>>}
+     */
+    this.validationSends = new Map()
+
+    /**
+     * A full refresh is owed after a validation failure, even if a refresh is already running. It
+     * runs once at a time, bounded by `validationTimeout`, and never rejects: a failed refresh stays
+     * owed for a later preparation.
+     */
     this.validationRefresh = null
     this.refreshValidationMetadata = sharedPromiseTo(
       async (fence) => {
         const obligation = this.validationRefresh
-        await this.refreshCluster({ fence })
-        fence.check()
-        if (this.validationRefresh === obligation) this.validationRefresh = null
+        try {
+          await runWithDeadline(
+            'Metadata refresh for held positions',
+            this.validationTimeout,
+            () => this.refreshCluster({ fence }),
+            fence
+          )
+        } catch (error) {
+          this.logger.debug('Metadata refresh for held positions failed; it stays owed', {
+            groupId: this.groupId,
+            error: error.message,
+          })
+          return
+        }
+        if (!fence.closed && this.validationRefresh === obligation) this.validationRefresh = null
       },
       (fence) => fence
     )
@@ -801,6 +840,7 @@ module.exports = class ConsumerGroup {
     this.leaderUnionWatch?.clear()
     this.retireLeaderlessRefresh()
     this.idleWait.dispose()
+    this.validationSends.clear()
     this.subscriptionState.clearPauses()
     this.offsetManager?.clearPendingSeeks()
     return this.groupMembership.onStopRequested()
@@ -2822,6 +2862,10 @@ module.exports = class ConsumerGroup {
    * Every wait is released when the run's fence closes, and every continuation checks the
    * snapshot's guard, so a pending preparation never outlives a stop or restart.
    *
+   * A full refresh owed after a failed validation is started here and shared, but only a snapshot
+   * holding such a partition that is due to be asked again waits for it, at most
+   * `validationTimeout`; other snapshots proceed on the ordinary refresh.
+   *
    * @private
    * @param {number} nodeId the broker this round fetches from
    * @param {IdleWait} run the run that owns this call, captured at entry
@@ -2832,11 +2876,8 @@ module.exports = class ConsumerGroup {
    */
   async prepareFetch(nodeId, run, ownershipToken) {
     run.fence.check()
-    await run.fence.wait(
-      this.validationRefresh
-        ? this.refreshValidationMetadata(run.fence)
-        : this.refreshCluster({ fence: run.fence, ifNecessary: true })
-    )
+    if (this.validationRefresh) this.refreshValidationMetadata(run.fence)
+    await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary: true }))
     run.fence.check()
     this.checkSubscriptionChange()
     this.groupMembership.recheckHeldTopics?.()
@@ -2845,9 +2886,6 @@ module.exports = class ConsumerGroup {
 
     let prepared = null
     for (let attempt = 1; attempt <= MAX_PREPARATION_ATTEMPTS; attempt++) {
-      while (this.validationRefresh) {
-        await run.fence.wait(this.refreshValidationMetadata(run.fence))
-      }
       // Captured before anything is awaited: this is the assignment the request is built from,
       // and it is what every batch this round produces is stamped with.
       const snapshot = this.captureFetchPreparation(nodeId, run, ownershipToken)
@@ -2855,7 +2893,7 @@ module.exports = class ConsumerGroup {
       try {
         snapshot.check()
         await run.fence.wait(this.seekOffsets(snapshot.parts, snapshot))
-        while (this.validationRefresh) {
+        if (this.validationRefresh && this.hasDueHold(snapshot.parts)) {
           await run.fence.wait(this.refreshValidationMetadata(run.fence))
         }
         snapshot.check()
@@ -3075,30 +3113,29 @@ module.exports = class ConsumerGroup {
       })
     }
 
-    // An answer for a position the partition has left (another node's answer came first, or a
-    // reset cleared the offset) is not used at all: not delivered, not recovered from.
+    // An answer for a partition this request did not ask for, or for a position the partition has
+    // left (another node's answer came first, or a reset cleared the offset), is not used at all:
+    // not delivered, not recovered from.
     const requested = requestedPartitions?.get(partition)
-    if (
-      requested !== undefined &&
+    let staleReason = null
+    if (requested === undefined) {
+      staleReason = 'unrequested'
+    } else if (
       typeof this.offsetManager?.positionOf === 'function' &&
       this.offsetManager.positionOf(topicName, partition) !== String(requested.fetchOffset)
     ) {
-      this.logger.debug('Dropping fetched partition', {
-        topic: topicName,
-        partition,
-        reason: 'moved',
-      })
-      return false
+      staleReason = 'moved'
+    } else if (this.fetchHeld(topicName, partition, requested.currentLeaderEpoch)) {
+      // Nor is one whose leader epoch metadata has moved past, or that validation holds: it may
+      // come from a log the position was not checked against, so not even an error answer may
+      // reset or reroute the position.
+      staleReason = 'awaiting-validation'
     }
-
-    // Nor is one held since the request was built, or validated since against another epoch than
-    // the request carried: the answer may come from a leader the position was not checked with,
-    // and not even an error answer may reset or reroute a position that is being checked.
-    if (this.positionValidator.holdsFetch(topicName, partition, requested?.currentLeaderEpoch)) {
+    if (staleReason !== null) {
       this.logger.debug('Dropping fetched partition', {
         topic: topicName,
         partition,
-        reason: 'awaiting-validation',
+        reason: staleReason,
       })
       return false
     }
@@ -3114,12 +3151,15 @@ module.exports = class ConsumerGroup {
 
       if (action === 'offset-out-of-range') {
         // The existing recovery, for this partition only: drop the preferred replica if one is
-        // set, otherwise reset per the topic's own fromBeginning.
-        const requested = requestedPartitions.get(partition)
+        // set, otherwise reset per the topic's own fromBeginning. The reset stays bound to the
+        // epoch the request carried until it is applied.
+        const { currentLeaderEpoch } = requested
         await this.recoverFromOffsetOutOfRange(
-          { topic: topicName, partition, offset: requested && String(requested.fetchOffset) },
+          { topic: topicName, partition, offset: String(requested.fetchOffset) },
           context.fence,
-          this.fetchedResetContext(context.prepared, context.requestClock, context.topicId)
+          this.fetchedResetContext(context.prepared, context.requestClock, context.topicId, () =>
+            this.fetchHeld(topicName, partition, currentLeaderEpoch)
+          )
         )
       } else if (action === 'skip-and-forget-epoch') {
         // The client is ahead of this broker. Defending the cached epoch would make every retry
@@ -3197,11 +3237,28 @@ module.exports = class ConsumerGroup {
     const { corruption } = partitionData
     const halted = corruption != null && this.acceptHalt(topicName, partition, corruption, context)
 
-    const partitionRequestData = requestedPartitions.get(partition)
-
-    batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+    const batch = new Batch(topicName, requested.fetchOffset, partitionData)
+    batch.requestLeaderEpoch = requested.currentLeaderEpoch
+    batches.push(batch)
     if (halted) this.reportHalt(topicName, partition, corruption)
     return false
+  }
+
+  /**
+   * Whether a Fetch built for this partition at `leaderEpoch` has lost its authority: metadata now
+   * names another leader epoch, or position validation holds the partition for that epoch. Checked
+   * on each answered row before anything is used, and again before a fetched batch reaches the
+   * handler. Two map lookups; nothing is allocated.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} leaderEpoch the epoch the Fetch request carried
+   * @returns {boolean}
+   */
+  fetchHeld(topic, partition, leaderEpoch) {
+    return (
+      leaderEpoch !== this.cluster.leaderEpoch(topic, partition) ||
+      this.positionValidator.holdsFetch(topic, partition, leaderEpoch)
+    )
   }
 
   /**
@@ -3269,9 +3326,10 @@ module.exports = class ConsumerGroup {
    * @param {FetchPreparation} prepared the round's preparation
    * @param {number} requestClock the acquisition clock when the request was built
    * @param {string} [topicId] the id the answer or the request keyed the topic with
-   * @returns {object} the same shape `captureResetContext` returns
+   * @param {() => boolean} [superseded] whether the answer lost its leader-epoch authority since
+   * @returns {object} the same shape `captureResetContext` returns, with `superseded`
    */
-  fetchedResetContext(prepared, requestClock, topicId) {
+  fetchedResetContext(prepared, requestClock, topicId, superseded) {
     return {
       manager: prepared.manager,
       guard: prepared.guard,
@@ -3279,13 +3337,15 @@ module.exports = class ConsumerGroup {
       assignmentEpoch: prepared.assignmentEpoch,
       requestClock,
       topicId,
+      superseded,
     }
   }
 
   /**
    * Whether a captured reset context still describes this member's partition: the same manager,
-   * run and membership, the same assignment, and no seek, revoke, reacquisition or recreation of
-   * the partition since the context's clock. Offset equality plays no part.
+   * run and membership, the same assignment, no seek, revoke, reacquisition or recreation of the
+   * partition since the context's clock, and, when the context carries one, its leader-epoch
+   * authority (`superseded`). Offset equality plays no part.
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -3300,28 +3360,32 @@ module.exports = class ConsumerGroup {
       !this.ownership.refusal(context.token) &&
       this.assignmentEpoch === context.assignmentEpoch &&
       acquired !== undefined &&
-      !isChangedSince(acquired, context.requestClock)
+      !isChangedSince(acquired, context.requestClock) &&
+      !context.superseded?.()
     )
   }
 
   /**
    * The identity a position-changing effect of an answer runs under: the caller's preparation
    * (guard and fence), refused as well once the partition was acquired again, sought, reset or
-   * recreated after the request was built (`isChangedSince`), so an answer older than a seek
-   * changes nothing, however late inside its own work the seek arrives.
+   * recreated after the request was built (`isChangedSince`), or once the answer lost its
+   * leader-epoch authority (`superseded`), so an answer older than a seek or a leader change
+   * changes nothing, however late inside its own work the change arrives. The offset manager asks
+   * the guard before the write and before the local apply; a write already sent cannot be recalled.
    * @private
    * @param {string} topic
    * @param {number} partition
    * @param {number} requestClock the acquisition clock when the request was built
    * @param {{guard: () => Error|null, fence?: import('../producer/generation')}} [preparation]
+   * @param {() => boolean} [superseded]
    * @returns {{guard: () => Error|null, fence?: import('../producer/generation')}}
    */
-  boundToRequest(topic, partition, requestClock, preparation) {
+  boundToRequest(topic, partition, requestClock, preparation, superseded) {
     return {
       guard: () =>
         preparation?.guard() ||
-        (this.isRequestStale(topic, partition, requestClock)
-          ? new KafkaJSCommitFailedError('A seek superseded the answer', {
+        (this.isRequestStale(topic, partition, requestClock) || superseded?.()
+          ? new KafkaJSCommitFailedError('A newer position or leader superseded the answer', {
               reason: 'stale-assignment',
             })
           : null),
@@ -3643,7 +3707,9 @@ module.exports = class ConsumerGroup {
         context
       )
     } else {
-      const stale = () => context && this.isRequestStale(e.topic, e.partition, context.requestClock)
+      const stale = () =>
+        context &&
+        (this.isRequestStale(e.topic, e.partition, context.requestClock) || context.superseded?.())
       if (stale()) return
       this.logger.error('Offset out of range, resetting to default offset', {
         topic: e.topic,
@@ -3653,16 +3719,24 @@ module.exports = class ConsumerGroup {
       })
 
       const caller = fence ? { guard: fence.guard, fence } : undefined
-      await this.offsetManager.setDefaultOffset(
+      const applied = await this.offsetManager.setDefaultOffset(
         { topic: e.topic, partition: e.partition },
         ...(context
-          ? [this.boundToRequest(e.topic, e.partition, context.requestClock, caller)]
+          ? [
+              this.boundToRequest(
+                e.topic,
+                e.partition,
+                context.requestClock,
+                caller,
+                context.superseded
+              ),
+            ]
           : caller
             ? [caller]
             : [])
       )
       fence?.check()
-      if (stale()) return
+      if (!applied || stale()) return
       this.markChanged(e.topic, e.partition)
     }
   }
@@ -4007,14 +4081,15 @@ module.exports = class ConsumerGroup {
    * is awaiting a reply or held is absent from the request built afterwards, and this method never
    * returns leaving one awaiting.
    *
-   * Each leader is asked once per call, as the Java client does. A partition whose validation does
-   * not complete - a failed request, a retriable or unexpected answer, a failed reposition - is
-   * held: it keeps its position and tracked epoch, the next round's metadata refresh is a full one,
-   * and it is asked again once its backoff passes (at once under a new leader epoch). The first
-   * failure of a held partition is warned, then at most once a minute. Other partitions, other
-   * leaders' included, are validated and fetched throughout. Only an ACL refusal
-   * (`TOPIC_AUTHORIZATION_FAILED`) reaches the caller, after every leader was asked, as the same
-   * code on a Fetch does.
+   * Each leader is asked once per call, as the Java client does, all leaders at once, each attempt
+   * bounded by `validationTimeout` from before its broker lookup to the end of its outcomes. A
+   * partition whose validation does not complete - a failed or unanswered request, a retriable or
+   * unexpected answer, a failed reposition - is held: it keeps its position and tracked epoch, a
+   * full metadata refresh is owed, and it is asked again once its backoff passes (at once under a
+   * new leader epoch) with the refreshed metadata. The first failure of a held partition is warned,
+   * then at most once a minute. Partitions of other leaders keep their own outcomes. Only an ACL
+   * refusal (`TOPIC_AUTHORIZATION_FAILED`) reaches the caller, once, after every leader's attempt
+   * settled, as the same code on a Fetch does.
    *
    * Positions are read without seeding (`peekNextOffset`): validation observes a position and
    * never makes the committed offset count as resolved progress, which a seek being applied has
@@ -4054,6 +4129,14 @@ module.exports = class ConsumerGroup {
           // Asked before anything is read or allocated: the steady state of a round is that every
           // partition is already validated against this epoch, and that round must cost nothing.
           if (!this.positionValidator.needsValidation(topic, partition, currentLeaderEpoch, now)) {
+            continue
+          }
+
+          // A failed partition is asked again only with the metadata its failure asked for.
+          if (
+            this.validationRefresh &&
+            this.positionValidator.isHeldAfterFailure(topic, partition)
+          ) {
             continue
           }
 
@@ -4137,6 +4220,30 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Whether this snapshot holds a partition that failed validation and is due to be asked again,
+   * which is what makes a preparation wait for the refresh that failure owes. Called only while
+   * such a refresh is owed.
+   * @private
+   * @param {import("../../types").TopicPartitions[]} topicPartitions the snapshot's partitions
+   * @returns {boolean}
+   */
+  hasDueHold(topicPartitions) {
+    const now = performance.now()
+    return topicPartitions.some(({ topic, partitions }) =>
+      partitions.some(
+        (partition) =>
+          this.positionValidator.isHeldAfterFailure(topic, partition) &&
+          this.positionValidator.needsValidation(
+            topic,
+            partition,
+            this.cluster.leaderEpoch(topic, partition),
+            now
+          )
+      )
+    )
+  }
+
+  /**
    * Holds partitions whose validation did not complete (`PositionValidator#fail`), asks for a full
    * metadata refresh before the next round's validation, and warns about each one when it is
    * first held, then at most once per `HELD_WARNING_INTERVAL`. Reads the clock when the failure is
@@ -4177,17 +4284,18 @@ module.exports = class ConsumerGroup {
    *
    * Grouping is by **leader**, not by the node this round fetches from: a partition may be read
    * from a preferred replica while only its leader can answer for its epochs. It is by topic as
-   * well, because `Topic` is a map key on the request.
+   * well, because `Topic` is a map key on the request. Each item records the leader it is asked.
    *
-   * A leader whose request fails holds only its own partitions; the next leader is still asked.
+   * Every leader is asked at once, and each attempt settles on its own (`validateLeader`): a
+   * failed, slow or silent leader holds only its own partitions.
    *
    * @private
    * @param {{topic: string, partition: number, trackedEpoch: number, currentLeaderEpoch: number,
    *   generation: number, entry: object}[]} awaiting
    * @param {FetchPreparation} [preparation] the fetch round's identity, see `validatePositions`
    * @returns {Promise<void>}
-   * @throws {Error} the preparation's refusal, or the first `TOPIC_AUTHORIZATION_FAILED` answer
-   *   once every leader was asked
+   * @throws {Error} the preparation's refusal, or the first current `TOPIC_AUTHORIZATION_FAILED`
+   *   answer once every leader's attempt settled
    */
   async runValidationRequests(awaiting, preparation) {
     const entriesByTopic = new Map()
@@ -4209,59 +4317,93 @@ module.exports = class ConsumerGroup {
         const nodeId = Number(leader)
         const led = new Set(partitions)
         const topics = perLeader.get(nodeId) || []
-        topics.push({ topic, entries: entries.filter(({ partition }) => led.has(partition)) })
+        const ledEntries = entries.filter(({ partition }) => led.has(partition))
+        for (const item of ledEntries) item.leaderId = nodeId
+        topics.push({ topic, entries: ledEntries })
         perLeader.set(nodeId, topics)
       }
     }
 
-    let authorization = null
-    for (const [nodeId, topics] of perLeader) {
-      preparation?.check()
-      try {
-        const refused = await this.validateOnLeader(nodeId, topics, preparation)
-        authorization ??= refused
-      } catch (e) {
-        preparation?.check()
-        if (e.code === TOPIC_AUTHORIZATION_FAILED_CODE) authorization ??= e
-        const unanswered = topics.flatMap(({ entries }) => entries)
-        this.holdUnvalidated(
-          unanswered.filter(({ topic, partition }) =>
-            this.positionValidator.isAwaiting(topic, partition)
-          ),
-          e.message
-        )
-      }
-      preparation?.check()
-    }
+    const pass = { authorization: null }
+    await Promise.all(
+      [...perLeader].map(([nodeId, topics]) =>
+        this.validateLeader(nodeId, topics, preparation, pass)
+      )
+    )
+    preparation?.check()
+    if (pass.authorization) throw pass.authorization
+  }
 
-    if (authorization) throw authorization
+  /**
+   * One leader's attempt of a validation pass, bounded by `validationTimeout` from before its
+   * broker lookup through the application of its outcomes, and by the run. It never rejects: once
+   * it settled - answered, failed, refused or expired - every partition it left unresolved is held
+   * by entry identity. An expired attempt's late answer and effects are refused by the same bound.
+   * @private
+   * @param {number} nodeId the leader
+   * @param {{topic: string, entries: object[]}[]} topics its partitions
+   * @param {FetchPreparation} [preparation] the fetch round's identity
+   * @param {{authorization: Error|null}} pass the pass's shared record of a current
+   *   `TOPIC_AUTHORIZATION_FAILED` answer, which outlives this attempt's own bound
+   * @returns {Promise<void>}
+   */
+  async validateLeader(nodeId, topics, preparation, pass) {
+    let failure = null
+    try {
+      await runWithDeadline(
+        'Position validation',
+        this.validationTimeout,
+        () => this.validateOnLeader(nodeId, topics, preparation, pass),
+        preparation?.fence ?? null
+      )
+    } catch (e) {
+      failure = e
+      if (preparation?.guard()) return
+      if (e.code === TOPIC_AUTHORIZATION_FAILED_CODE) pass.authorization ??= e
+    }
+    if (preparation?.guard()) return
+    this.holdUnvalidated(
+      topics.flatMap(({ entries }) => entries),
+      failure?.message ?? 'no usable answer'
+    )
   }
 
   /**
    * Validates one leader's share of this round with one request. A partition the answer does not
    * settle is held and asked again in a later round, after a metadata refresh: resending it to
-   * the same leader at the same epoch could not succeed.
+   * the same leader at the same epoch could not succeed. A partition whose leader or leader epoch
+   * changed since it was asked is not asked or decided here (`supersede`): the next round asks it
+   * under the new metadata. No request is sent while this leader has not answered the previous one.
    *
    * Whether the leader can serve the API at all is decided from its advertised versions, never by
    * catching `KafkaJSServerDoesNotSupportApiKey`: that error is non-retriable and would reach the
    * fetch's own recovery, crashing the consumer once per round.
+   *
+   * Runs inside its attempt's bound (`validateLeader`), which every continuation checks.
    *
    * @private
    * @param {number} nodeId the leader of every partition in `topics`
    * @param {{topic: string, entries: object[]}[]} topics
    * @param {FetchPreparation} [preparation] the fetch round's identity: checked after the broker
    *   lookup and the reply, and forwarded to the request
-   * @returns {Promise<Error|null>} the first `TOPIC_AUTHORIZATION_FAILED` answer, for the caller to
-   *   raise once every leader was asked
-   * @throws {Error} the preparation's refusal, or the failure of the request itself
+   * @param {{authorization: Error|null}} pass see `validateLeader`
+   * @returns {Promise<void>}
+   * @throws {Error} the preparation's or the attempt's refusal, or the failure of the request
    */
-  async validateOnLeader(nodeId, topics, preparation) {
+  async validateOnLeader(nodeId, topics, preparation, pass) {
+    const attempt = currentDeadline()
+    const check = () => {
+      preparation?.check()
+      attempt?.check()
+    }
     const broker = await this.cluster.findBroker({ nodeId, fence: preparation?.fence })
-    preparation?.check()
+    check()
     const version = broker.negotiatedVersion(
       apiKeys.OffsetForLeaderEpoch,
       requests.OffsetForLeaderEpoch
     )
+    const current = this.retainCurrent(topics)
+    if (current.length === 0) return
 
     if (version == null) {
       if (!this.validationUnusableLogged.has(nodeId)) {
@@ -4273,12 +4415,15 @@ module.exports = class ConsumerGroup {
         })
       }
 
-      this.confirmAll(topics)
-      return null
+      this.confirmAll(current)
+      return
     }
 
-    const response = await broker.offsetForLeaderEpoch({
-      topics: topics.map(({ topic, entries }) => ({
+    if (this.validationSends.has(nodeId)) {
+      throw new KafkaJSNonRetriableError('An earlier position validation request is unanswered')
+    }
+    const sent = broker.offsetForLeaderEpoch({
+      topics: current.map(({ topic, entries }) => ({
         topic,
         partitions: entries.map(({ partition, currentLeaderEpoch, trackedEpoch }) => ({
           partition,
@@ -4288,18 +4433,75 @@ module.exports = class ConsumerGroup {
       })),
       guard: preparation?.guard,
     })
-    preparation?.check()
+    this.validationSends.set(nodeId, sent)
+    const answered = () => {
+      if (this.validationSends.get(nodeId) === sent) this.validationSends.delete(nodeId)
+    }
+    sent.then(answered, answered)
+    const response = await sent
+    check()
 
-    return this.applyValidationResponse(topics, response, preparation)
+    await this.applyValidationResponse(current, response, preparation, pass)
+  }
+
+  /**
+   * Keeps the items whose leader and leader epoch are still the ones they were asked under, and
+   * ends the attempt of every other one (`PositionValidator#supersede`).
+   * @private
+   * @param {{topic: string, entries: object[]}[]} topics
+   * @returns {{topic: string, entries: object[]}[]} the topics with a current item, those only
+   */
+  retainCurrent(topics) {
+    const current = []
+    for (const { topic, entries } of topics) {
+      const kept = entries.filter((item) => {
+        if (!this.leaderMoved(item)) return true
+        this.positionValidator.supersede(item)
+        return false
+      })
+      if (kept.length) current.push({ topic, entries: kept })
+    }
+    return current
+  }
+
+  /**
+   * Whether metadata now names another leader or leader epoch for the item's partition than the
+   * validation request was sent to. Two map lookups.
+   * @private
+   * @param {{topic: string, partition: number, leaderId: number, currentLeaderEpoch: number}} item
+   * @returns {boolean}
+   */
+  leaderMoved({ topic, partition, leaderId, currentLeaderEpoch }) {
+    return (
+      this.cluster.leaderEpoch(topic, partition) !== currentLeaderEpoch ||
+      this.cluster.cachedLeader(topic, partition) !== leaderId
+    )
+  }
+
+  /**
+   * Whether a validation outcome may no longer take effect: its attempt expired or was refused,
+   * its entry was replaced, or its leader or leader epoch moved.
+   * @private
+   * @param {{topic: string, partition: number, entry: object}} item
+   * @param {import('../admin/deadline').AdminDeadline} [attempt] the attempt's bound
+   * @returns {boolean}
+   */
+  validationSuperseded(item, attempt) {
+    return (
+      Boolean(attempt?.guard()) ||
+      this.positionValidator.entryOf(item.topic, item.partition) !== item.entry ||
+      this.leaderMoved(item)
+    )
   }
 
   /**
    * Classifies every partition of one OffsetForLeaderEpoch reply and applies its outcome.
    *
-   * Each partition is handled on its own: any error code holds only that partition, and
-   * `UNKNOWN_LEADER_EPOCH` also forgets the cached epoch, which the forced refresh brings back; a
-   * truncation or reset outcome holds it until its reposition is applied (`confirm`), and a failed
-   * reposition keeps it held.
+   * Each partition is handled on its own, and only while its leader and leader epoch are still the
+   * ones it was asked under: any error code holds only that partition, and `UNKNOWN_LEADER_EPOCH`
+   * also forgets the cached epoch, which the forced refresh brings back; a truncation or reset
+   * outcome holds it until its reposition is applied (`confirm`), and a failed reposition keeps it
+   * held.
    *
    * @private
    * @param {{topic: string, entries: object[]}[]} pending the partitions the request asked about
@@ -4307,13 +4509,16 @@ module.exports = class ConsumerGroup {
    * @param {FetchPreparation} [preparation] the fetch round's identity, checked before each
    *   partition's outcome is applied; a refusal is rethrown after the partition it interrupted is
    *   returned to unvalidated
-   * @returns {Promise<Error|null>} the first `TOPIC_AUTHORIZATION_FAILED` error, which the caller
-   *   raises once every leader was asked. A partition the reply does not mention is left to the
-   *   caller's awaiting sweep: the broker answered without it.
-   * @throws {Error} the preparation's refusal
+   * @param {{authorization: Error|null}} [pass] where the first current
+   *   `TOPIC_AUTHORIZATION_FAILED` error is recorded, for the caller to raise once every leader's
+   *   attempt settled
+   * @returns {Promise<Error|null>} that error. A partition the reply does not mention is left to
+   *   the caller's sweep: the broker answered without it.
+   * @throws {Error} the preparation's or the attempt's refusal
    */
-  async applyValidationResponse(pending, response, preparation) {
+  async applyValidationResponse(pending, response, preparation, pass = { authorization: null }) {
     const manager = preparation ? preparation.manager : this.offsetManager
+    const attempt = currentDeadline()
     const replies = new Map()
     for (const { topic, partitions } of response.topics) {
       for (const reply of partitions) {
@@ -4321,11 +4526,10 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    let authorization = null
-
     for (const { topic, entries } of pending) {
       for (const entry of entries) {
         preparation?.check()
+        attempt?.check()
         const reply = replies.get(`${topic}|${entry.partition}`)
 
         if (!reply) {
@@ -4353,6 +4557,7 @@ module.exports = class ConsumerGroup {
             seekQueued:
               this.seekOffset.has(topic, entry.partition) ||
               this.isSoughtAfter(topic, entry.partition, entry.requestClock),
+            leaderMoved: this.leaderMoved(entry),
             generation: entry.generation,
             requestEntry: entry.entry,
           }
@@ -4365,7 +4570,7 @@ module.exports = class ConsumerGroup {
             this.cluster.forgetLeaderEpoch(topic, entry.partition)
           }
           const error = createErrorFromCode(reply.errorCode)
-          if (reply.errorCode === TOPIC_AUTHORIZATION_FAILED_CODE) authorization ??= error
+          if (reply.errorCode === TOPIC_AUTHORIZATION_FAILED_CODE) pass.authorization ??= error
           this.holdUnvalidated([entry], error.message)
         } else if (outcome.action === 'truncated' || outcome.action === 'reset') {
           try {
@@ -4375,11 +4580,11 @@ module.exports = class ConsumerGroup {
               offset,
               outcome,
               preparation,
-              entry.requestClock
+              entry.requestClock,
+              entry
             )
             preparation?.check()
-            if (applied) this.positionValidator.confirm(entry)
-            else this.holdUnvalidated([entry], 'position change was not applied')
+            if (!applied) this.holdUnvalidated([entry], 'position change was not applied')
           } catch (e) {
             // The partition stays held, so the position it was told to leave is not fetched; the
             // next round decides it again. A refused preparation releases only the entry it
@@ -4394,7 +4599,7 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    return authorization
+    return pass.authorization
   }
 
   /**
@@ -4424,17 +4629,26 @@ module.exports = class ConsumerGroup {
    *   work and checked before the repositioning is marked and announced
    * @param {number} [requestClock] the acquisition clock when the validation request was built;
    *   with a preparation, it is the identity a none refusal of an unknown divergence carries
+   * @param {object} [item] the awaiting item the outcome belongs to. With it, the offset work and
+   *   the halt are also refused once its attempt expired, its entry was replaced or its leader or
+   *   leader epoch moved (`validationSuperseded`), and the item is confirmed in the same step as
+   *   the event, unless the event's listeners retired the run
    * @returns {Promise<boolean>} whether reposition, reset or a halt was applied
    * @throws {Error} the preparation's refusal
    */
-  async applyValidationOutcome(topic, partition, offset, outcome, preparation, requestClock) {
+  async applyValidationOutcome(topic, partition, offset, outcome, preparation, requestClock, item) {
     const manager = preparation?.manager ?? this.offsetManager
+    const attempt = currentDeadline()
+    const superseded = item && (() => this.validationSuperseded(item, attempt))
     const bound =
       requestClock === undefined
         ? preparation
-        : this.boundToRequest(topic, partition, requestClock, preparation)
+        : this.boundToRequest(topic, partition, requestClock, preparation, superseded)
+    // Checked before markChanged: the effect's own reposition moves the offset and its own
+    // markChanged advances the clock, so neither is a precondition once published.
     const stale = () =>
-      requestClock !== undefined && this.isRequestStale(topic, partition, requestClock)
+      (requestClock !== undefined && this.isRequestStale(topic, partition, requestClock)) ||
+      Boolean(superseded?.())
     if (outcome.action === 'truncated') {
       this.logger.warn('Log truncation detected, repositioning the partition', {
         groupId: this.groupId,
@@ -4473,7 +4687,7 @@ module.exports = class ConsumerGroup {
               reason: 'offset-out-of-range',
             }),
           },
-          preparation && this.fetchedResetContext(preparation, requestClock)
+          preparation && this.fetchedResetContext(preparation, requestClock, undefined, superseded)
         )
         if (!halted || stale()) return false
       } else {
@@ -4493,6 +4707,7 @@ module.exports = class ConsumerGroup {
       divergingOffset: outcome.divergingOffset,
       leaderEpoch: outcome.leaderEpoch,
     })
+    if (item && !preparation?.guard()) this.positionValidator.confirm(item)
     return true
   }
 

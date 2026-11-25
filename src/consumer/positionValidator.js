@@ -35,7 +35,9 @@ const APPLYING = Symbol('applying')
  * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against.
  *   The partition is re-examined only when the cached leader epoch differs from it.
  *
- * Awaiting, applying and held partitions are kept out of every Fetch (`holdsFetch()`).
+ * Awaiting, applying and held partitions are left out of every Fetch request that is built, and a
+ * Fetch answer or fetched batch for one is dropped (`holdsFetch()`). A request built before the
+ * hold can still reach the broker; only its answer is dropped.
  *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
@@ -187,15 +189,16 @@ module.exports = class PositionValidator {
   /**
    * Applies the reply to one partition of an OffsetForLeaderEpoch request.
    *
-   * Four guards decide whether the reply is still relevant, and a reply that fails any of them is
+   * Five guards decide whether the reply is still relevant, and a reply that fails any of them is
    * `'discarded'`: the assignment generation is stale, the partition is no longer awaiting, the
-   * position moved under the request, or a user seek has been queued for it meanwhile. A discard
-   * ends the request here, in this call — skipping the call instead would leave it awaiting with
-   * no request in flight, and it would never be fetched again. The two kinds of discard differ in
-   * what they write: a moved position or a queued seek leaves *that* key held with no backoff, so
-   * the next round asks again, while a stale generation or an absent key writes nothing at all, so
-   * a late reply cannot resurrect an entry the new assignment may not own, nor undo the validation
-   * of a partition the new assignment has since validated itself.
+   * position moved under the request, a user seek has been queued for it meanwhile, or metadata
+   * names another leader or leader epoch than the request asked. A discard ends the request here,
+   * in this call — skipping the call instead would leave it awaiting with no request in flight, and
+   * it would never be fetched again. The two kinds of discard differ in what they write: a moved
+   * position, a queued seek or a moved leader leaves *that* key held with no backoff, so the next
+   * round asks again, while a stale generation or an absent key writes nothing at all, so a late
+   * reply cannot resurrect an entry the new assignment may not own, nor undo the validation of a
+   * partition the new assignment has since validated itself.
    *
    * `'retry'` and `'fatal'` leave the state alone; the caller holds the partition with `fail()`
    * and asks again in a later round. `'truncated'` and `'reset'` leave the partition held, not
@@ -214,8 +217,10 @@ module.exports = class PositionValidator {
    *   epoch, -1 when undefined; compared as a 64-bit value, never as a string, so the decoded form
    *   of the int64 cannot change the outcome
    * @param {number} reply.leaderEpoch the epoch the broker answered with, -1 when undefined
-   * @param {boolean} reply.seekQueued whether a user seek is queued for this partition; the one
-   *   guard the validator cannot evaluate itself
+   * @param {boolean} reply.seekQueued whether a user seek is queued for this partition; a guard
+   *   the validator cannot evaluate itself
+   * @param {boolean} [reply.leaderMoved] whether metadata now names another leader or leader epoch
+   *   than the request was sent to; the other guard the validator cannot evaluate itself
    * @param {number} reply.generation the generation `request()` returned for this partition
    * @param {object} [reply.requestEntry] the entry captured before sending the request
    * @returns {{ action: 'discarded'|'validated'|'truncated'|'reset'|'retry'|'fatal', divergingOffset: string|null, leaderEpoch: number }}
@@ -225,7 +230,7 @@ module.exports = class PositionValidator {
     topic,
     partition,
     currentPosition,
-    { errorCode, endOffset, leaderEpoch, seekQueued, generation, requestEntry }
+    { errorCode, endOffset, leaderEpoch, seekQueued, leaderMoved, generation, requestEntry }
   ) {
     const key = this.getKey(topic, partition)
     const entry = this.entries.get(key)
@@ -243,9 +248,10 @@ module.exports = class PositionValidator {
       currentPosition.offset !== pending.offset ||
       currentPosition.trackedEpoch !== pending.trackedEpoch
 
-    if (seekQueued || positionMoved) {
+    if (seekQueued || positionMoved || leaderMoved) {
       entry.pending = null
-      return this.discard(topic, partition, seekQueued ? 'seek queued' : 'position moved')
+      const reason = seekQueued ? 'seek queued' : positionMoved ? 'position moved' : 'leader moved'
+      return this.discard(topic, partition, reason)
     }
 
     const action = validationPartitionAction(errorCode)
@@ -290,7 +296,8 @@ module.exports = class PositionValidator {
   /**
    * Holds the given partitions after their validation failed, so they are not fetched, and sets
    * each one's retry backoff: 100 ms after the first failure, doubling up to 1000 ms. Identity-
-   * guarded like `release()`: an entry validated, replaced or forgotten since is left alone.
+   * guarded like `release()`: an entry validated, replaced or forgotten since is left alone, and so
+   * is one whose attempt already ended (held, or discarded by `complete()` or `supersede()`).
    * @param {{topic: string, partition: number, entry: object, currentLeaderEpoch: number}[]} items
    *   awaiting items, each entry captured with `entryOf`
    * @param {number} now the monotonic time (`performance.now()`) the failure is recorded at
@@ -300,7 +307,7 @@ module.exports = class PositionValidator {
     const held = []
     for (const item of items) {
       const entry = this.entries.get(this.getKey(item.topic, item.partition))
-      if (entry === undefined || entry !== item.entry) continue
+      if (entry === undefined || entry !== item.entry || !entry.pending) continue
 
       entry.pending = null
       entry.failures += 1
@@ -311,6 +318,35 @@ module.exports = class PositionValidator {
       held.push(item)
     }
     return held
+  }
+
+  /**
+   * Ends an attempt whose leader or leader epoch was replaced before it could be used: the entry
+   * stays held with no backoff, so the next round asks under the new metadata. Identity-guarded
+   * like `confirm()`. Never deletes the entry, which would let the partition be fetched unchecked.
+   * @param {{topic: string, partition: number, entry: object}} item the awaiting item
+   * @returns {void}
+   */
+  supersede({ topic, partition, entry }) {
+    if (entry !== undefined && this.entries.get(this.getKey(topic, partition)) === entry) {
+      entry.pending = null
+    }
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {boolean} whether the partition is held after a failed validation (`fail()`) and not
+   *   asked again since; such a partition waits for the metadata refresh its failure owes
+   */
+  isHeldAfterFailure(topic, partition) {
+    const entry = this.entries.get(this.getKey(topic, partition))
+    return (
+      entry !== undefined &&
+      entry.validatedAgainst === undefined &&
+      !entry.pending &&
+      entry.retryAt !== undefined
+    )
   }
 
   /**

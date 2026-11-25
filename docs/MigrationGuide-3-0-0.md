@@ -655,8 +655,11 @@ says so, `groupProtocol: 'consumer'`.
 - **A partition is not fetched after a leader election until its position has been checked.** The
   truncation check ("Log truncation is detected and acted on.") is a gate rather than a
   background task: when a partition's leader epoch changes, that partition is held out of fetch
-  requests until the new leader has answered for it and any repositioning has been applied. Each
-  leader is asked once per round, and the check is not governed by your `retry` options. A
+  requests until the new leader has answered for it and any repositioning has been applied; an
+  answer to a Fetch sent before the hold, or before the leader epoch moved, is dropped. Each
+  leader is asked once per fetch attempt, all leaders at once, each bounded by `requestTimeout`
+  (also with `enforceRequestTimeout: false`), and the check is not governed by your `retry`
+  options. A
   partition whose check does not complete (the request fails, or the leader answers with a
   retriable or unexpected error) stays held, as in the Java client. The consumer refreshes its metadata before trying again. A
   partition becomes eligible for a check after a backoff of 100 ms, doubling up to 1 s, or as

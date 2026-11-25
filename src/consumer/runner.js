@@ -1752,6 +1752,23 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    // Nor is one whose leader epoch metadata moved past, or that position validation holds, while
+    // it waited: its records may come from a log the position was not checked against. The next
+    // round fetches it again from the position it holds.
+    if (
+      batch.requestLeaderEpoch != null &&
+      this.consumerGroup.fetchHeld?.(batch.topic, batch.partition, batch.requestLeaderEpoch)
+    ) {
+      this.logger.debug('Dropping a queued batch fetched under a superseded leader epoch', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topic: batch.topic,
+        partition: batch.partition,
+      })
+
+      return
+    }
+
     // A partition paused while its batch waited in the queue is not delivered; resume fetches it
     // again from the position it holds, which nothing here has moved.
     if (this.#paused(batch)) {
