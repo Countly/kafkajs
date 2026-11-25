@@ -166,6 +166,8 @@ describe('Broker > Fetch', () => {
                 divergingEpoch: null,
                 currentLeader: null,
                 snapshotId: null,
+                nextBatchOffset: expect.any(String),
+                nextBatchLeaderEpoch: expect.any(Number),
                 messages: [
                   {
                     magicByte: 2,
@@ -253,6 +255,8 @@ describe('Broker > Fetch', () => {
                 divergingEpoch: null,
                 currentLeader: null,
                 snapshotId: null,
+                nextBatchOffset: expect.any(String),
+                nextBatchLeaderEpoch: expect.any(Number),
                 messages: [
                   {
                     magicByte: 2,
@@ -340,6 +344,8 @@ describe('Broker > Fetch', () => {
                 divergingEpoch: null,
                 currentLeader: null,
                 snapshotId: null,
+                nextBatchOffset: expect.any(String),
+                nextBatchLeaderEpoch: expect.any(Number),
                 messages: [
                   {
                     magicByte: 2,
@@ -507,6 +513,8 @@ describe('Broker > Fetch', () => {
                   divergingEpoch: null,
                   currentLeader: null,
                   snapshotId: null,
+                  nextBatchOffset: expect.any(String),
+                  nextBatchLeaderEpoch: expect.any(Number),
                   messages: [
                     {
                       magicByte: 2,
@@ -636,6 +644,8 @@ describe('Broker > Fetch', () => {
                 divergingEpoch: null,
                 currentLeader: null,
                 snapshotId: null,
+                nextBatchOffset: expect.any(String),
+                nextBatchLeaderEpoch: expect.any(Number),
                 messages: [
                   {
                     magicByte: 2,
@@ -728,6 +738,8 @@ describe('Broker > Fetch', () => {
                   divergingEpoch: null,
                   currentLeader: null,
                   snapshotId: null,
+                  nextBatchOffset: expect.any(String),
+                  nextBatchLeaderEpoch: expect.any(Number),
                   messages: [
                     // Control record
                     {
