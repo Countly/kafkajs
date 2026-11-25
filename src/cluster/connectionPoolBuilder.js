@@ -5,8 +5,8 @@ const ConnectionPool = require('../network/connectionPool')
 const BROKER_ADDRESS = /^(?:\[([^\]]+)\]|([^:[\]]+)):(\d+)$/
 
 /** Characters of a host: letters, digits, `.`, `_`, `-` and `%`; inside brackets also `:`. */
-const HOST_CHARACTERS = /^[0-9A-Za-z._%-]+$/
-const BRACKETED_HOST_CHARACTERS = /^[0-9A-Za-z._%:-]+$/
+const HOST_CHARACTERS = /^[A-Za-z0-9._%-]+$/
+const BRACKETED_HOST_CHARACTERS = /^[A-Za-z0-9._%:-]+$/
 
 /**
  * Splits a bootstrap address into its host and port. An IPv6 literal must be bracketed
