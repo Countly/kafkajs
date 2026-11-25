@@ -57,7 +57,8 @@ const envelope = (...batches) => {
  * sent: the response fields, that partition's acquired ranges and leader, the whole second
  * partition and the node endpoints.
  * @param {object} decoded the decoded response
- * @returns {{ messages: object[], corruption?: object }} the first partition's Records result
+ * @returns {{ messages: object[], corruption?: object, nextBatchOffset?: string,
+ *   nextBatchLeaderEpoch?: number }} the first partition's Records result
  */
 const restOf = (decoded) => {
   const { responses, nodeEndpoints, ...scalars } = decoded
@@ -68,12 +69,13 @@ const restOf = (decoded) => {
   expect(responses[0].topicId).toBe(javaResponses[0].topicId)
   expect(responses[0].partitions).toHaveLength(2)
 
-  const [{ messages, corruption, ...first }, second] = responses[0].partitions
+  const [{ messages, corruption, nextBatchOffset, nextBatchLeaderEpoch, ...first }, second] =
+    responses[0].partitions
   const javaFirst = { ...javaResponses[0].partitions[0] }
   delete javaFirst.messages
   expect(first).toEqual(javaFirst)
   expect(plain(second)).toEqual(javaResponses[0].partitions[1])
-  return { messages, corruption }
+  return { messages, corruption, nextBatchOffset, nextBatchLeaderEpoch }
 }
 
 /** The marker of a halted partition: its reason and first offset, and nothing the codec invented. */
