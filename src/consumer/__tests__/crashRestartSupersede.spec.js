@@ -85,15 +85,35 @@ describe('Consumer > calls made while a crash is reported', () => {
    * delay.
    * @param {object} [options]
    * @param {number|null} [options.retryTime=LONG] the restart delay, or null to leave the default
-   * @param {() => void} [options.onCrash] called from inside the event
+   * @param {(payload: object) => void} [options.onCrash] called from inside the event
    */
   const listenToCrash = ({ retryTime = LONG, onCrash = () => {} } = {}) =>
     consumer.on(consumer.events.CRASH, ({ payload }) => {
       if (retryTime !== null) payload.error.retryTime = retryTime
       mark = timers.mock.calls.length
       crashes.push(payload)
-      onCrash()
+      onCrash(payload)
     })
+
+  /**
+   * Makes the crash error's restart delay a getter, so reading it runs `action` once, from inside
+   * the crash handler, and returns `LONG`.
+   * @param {{ error: Error }} payload the CRASH event's payload
+   * @param {() => void} action
+   */
+  const delayFrom = ({ error }, action) => {
+    let done = false
+    Object.defineProperty(error, 'retryTime', {
+      configurable: true,
+      get: () => {
+        if (!done) {
+          done = true
+          action()
+        }
+        return LONG
+      },
+    })
+  }
 
   /**
    * @param {() => void} action
@@ -339,8 +359,125 @@ describe('Consumer > calls made while a crash is reported', () => {
     await settle(50)
 
     const clearedTimers = clearSpy.mock.calls.map(([timer]) => timer)
+    const armed = restartTimers()
     expect(crashes).toHaveLength(1)
-    expect(restartTimers().every((timer) => clearedTimers.includes(timer))).toBe(true)
+    expect(armed).toHaveLength(1)
+    expect(clearedTimers).toContain(armed[0])
+    expect(joins()).toBe(2)
+    expect(runners).toHaveLength(2)
+  })
+
+  it('a run rejected for an invalid partitionsConsumedConcurrently while restartOnFailure decides leaves the restart in place', async () => {
+    let asked = false
+    let decide
+    const verdict = new Promise((resolve) => (decide = resolve))
+    build({
+      retry: {
+        restartOnFailure: () => {
+          asked = true
+          return verdict
+        },
+      },
+    })
+    listenToCrash({ retryTime: null })
+    await runUntilFetching()
+
+    failNextFetch()
+    await pump(() => asked, 'the restartOnFailure call')
+    keep(consumer.run({ ...handlers, partitionsConsumedConcurrently: -1 }))
+    await expect(finish(calls[0], 'invalid run')).rejects.toBeInstanceOf(RangeError)
+    decide(true)
+    await pump(() => crashes.length === 1, 'the CRASH event')
+    expect(crashes[0].restart).toBe(true)
+    await pump(() => joins() >= 2, 'the join of the automatic restart')
+    await settle(50)
+
+    expect(restartLines()).toBe(1)
+    expect(joins()).toBe(2)
+    expect(runners).toHaveLength(2)
+  })
+
+  it('a run rejected for an invalid partitionsConsumedConcurrently from the restart log leaves the restart timer armed', async () => {
+    build({
+      onLog: onRestartLog(() =>
+        keep(consumer.run({ ...handlers, partitionsConsumedConcurrently: -1 }))
+      ),
+    })
+    listenToCrash({ retryTime: null })
+    await runUntilFetching()
+
+    failNextFetch()
+    await pump(() => calls.length === 1, 'the invalid run from the restart log')
+    await expect(finish(calls[0], 'invalid run')).rejects.toBeInstanceOf(RangeError)
+    await pump(() => joins() >= 2, 'the join of the automatic restart')
+    await settle(50)
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].restart).toBe(true)
+    expect(restartLines()).toBe(1)
+    expect(joins()).toBe(2)
+    expect(runners).toHaveLength(2)
+  })
+
+  it('a run rejected for an invalid partitionsConsumedConcurrently while parked on the crash cleanup leaves the restart in place', async () => {
+    let release
+    build()
+    listenToCrash({ retryTime: null })
+    await runUntilFetching()
+    held = { promise: new Promise((resolve) => (release = resolve)) }
+
+    failNextFetch()
+    await pump(() => crashLogged, 'the Crash line')
+    keep(consumer.run({ ...handlers, partitionsConsumedConcurrently: -1 }))
+    release()
+    await expect(finish(calls[0], 'invalid run')).rejects.toBeInstanceOf(RangeError)
+    await pump(() => joins() >= 2, 'the join of the automatic restart')
+    await settle(50)
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].restart).toBe(true)
+    expect(restartLines()).toBe(1)
+    expect(joins()).toBe(2)
+    expect(runners).toHaveLength(2)
+  })
+
+  it('a stop made by the delay getter before the restart is published leaves no timer', async () => {
+    build()
+    listenToCrash({
+      retryTime: null,
+      onCrash: (payload) => delayFrom(payload, () => keep(consumer.stop())),
+    })
+    await runUntilFetching()
+
+    failNextFetch()
+    await pump(() => calls.length === 1, 'the stop from the delay getter')
+    await finish(calls[0], 'stop from the delay getter')
+    await settle(50)
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].restart).toBe(true)
+    expect(restartLines()).toBe(0)
+    expect(restartTimers()).toEqual([])
+    expect(joins()).toBe(1)
+  })
+
+  it('a run made by the delay getter before the restart is published supersedes the restart', async () => {
+    build()
+    listenToCrash({
+      retryTime: null,
+      onCrash: (payload) => delayFrom(payload, () => keep(consumer.run(handlers))),
+    })
+    await runUntilFetching()
+
+    failNextFetch()
+    await pump(() => joins() >= 2, 'the join of the run from the delay getter')
+    await finish(calls[0], 'run from the delay getter')
+    await settle(50)
+
+    expect(crashes).toHaveLength(1)
+    expect(crashes[0].restart).toBe(true)
+    expect(restartLines()).toBe(0)
+    expect(restartTimers()).toEqual([])
     expect(joins()).toBe(2)
     expect(runners).toHaveLength(2)
   })
