@@ -318,7 +318,7 @@ Example:
 ]
 ```
 
-The partition a partitioner returns must be an integer from 0 to 2147483647, as a number or as its canonical decimal string (`'12'`, not `'012'`). Anything else (a `Symbol`, `NaN`, a fraction, a negative number, a larger number, `undefined`, an object) rejects the whole `send()` with `KafkaJSInvalidConfigurationError` before any of its records is queued; inside a transaction the transaction stays usable. A valid partition above the number of partitions the producer knows waits for a metadata refresh, as before. Only the returned value is checked: a partitioner may ignore a record's own `partition`.
+The partition a partitioner returns must be an integer from 0 to 2147483647, as a number or as its canonical decimal string (`'12'`, not `'012'`). Anything else (a `Symbol`, `NaN`, a fraction, a negative number, a larger number, `undefined`, an object) rejects the whole `send()` with `KafkaJSInvalidConfigurationError` before any of its records is queued; inside a transaction the transaction stays usable. A partitioner that throws fails the same way: only that `send()` rejects, with what the partitioner threw (a retriable error is retried first, within the send's retry budget and delivery deadline), nothing of it is written, inside a transaction the transaction stays usable whatever was thrown, and the producer sends again. A valid partition above the number of partitions the producer knows waits for a metadata refresh, as before. Only the returned value is checked: a partitioner may ignore a record's own `partition`.
 
 To use your custom partitioner, use the option `createPartitioner` when creating the producer.
 

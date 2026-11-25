@@ -390,8 +390,9 @@ transaction in a way its error decides.
   (KIP-360) when the transaction was abort-only, as the Java client does, or when it cancelled a
   batch that had already been sent once; under either version it does so when its own `EndTxn`
   failed. A send refused before any record was queued — for its own arguments (an empty topic, a
-  message without a value, a record that cannot be encoded) or by a custom partitioner that threw —
-  leaves the transaction as it was.
+  message without a value, a record that cannot be encoded) or by a custom partitioner that threw
+  (whatever it threw, a KafkaJS error class included, also when the send ran out of retries or of
+  its delivery deadline while the partitioner kept failing) — leaves the transaction as it was.
   *What to do:* wrap the transaction in `try` and, on any error but a retriable one from `commit()`
   (see the item on a commit whose outcome is unknown), `abort()` first. A send rejects
   with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another

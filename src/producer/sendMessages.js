@@ -1892,9 +1892,14 @@ const createSendMessages = ({
    * from `send` after each await: a send that settled meanwhile has none, and the wait ends without
    * enqueuing anything. A failure that arrives after the send settled is ignored: it refreshes no
    * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure
-   * arms the transaction as `inTransaction` says, except a partition the partitioner returned
-   * that is not a partition id: that rejects the send with `KafkaJSInvalidConfigurationError`
-   * and leaves the transaction usable.
+   * arms the transaction as `inTransaction` says, except a failure of the partitioner itself: it
+   * threw, whatever it threw, or returned something that is not a partition id (that is a
+   * `KafkaJSInvalidConfigurationError`). Such a send rejects with that error, or with the retry
+   * budget's or delivery deadline's error around a retriable one, and leaves the transaction usable:
+   * none of its records was queued. The latest failed attempt decides, and is kept on the send as
+   * `refused`, which the accumulator reads when the delivery deadline ends the send: a metadata
+   * failure after a partitioner failure arms as before. A falsy value the partitioner throws
+   * reaches the caller as an `Error` and not as itself; it arms nothing either.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
@@ -1907,6 +1912,7 @@ const createSendMessages = ({
   const partition = (source, fence = getGeneration()) => {
     const send = Array.isArray(source) ? { records: source } : source
     const attempt = async (bail) => {
+      let grouping = false
       try {
         fence?.check()
         await cluster.addMultipleTargetTopics(
@@ -1925,19 +1931,23 @@ const createSendMessages = ({
             throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
           }
 
+          grouping = true
           const grouped = groupMessagesPerPartition({
             topic,
             partitionMetadata,
             messages,
             partitioner,
           })
+          grouping = false
           for (const id of keys(grouped)) {
             entries.push({ topic, partition: Number(id), messages: grouped[id] })
           }
         }
+        send.refused = false
         return entries
       } catch (e) {
         if (send.settled) return bail(e)
+        send.refused = grouping
         fence?.check()
         if (refreshesMetadata(e)) {
           await Promise.resolve(cluster.refreshMetadata(...fenceArgs(fence))).catch(
@@ -1963,7 +1973,10 @@ const createSendMessages = ({
       send,
       fence
     )(pinned).catch((error) => {
-      throw send.settled || fence?.closed || error instanceof KafkaJSInvalidConfigurationError
+      throw send.settled ||
+        fence?.closed ||
+        send.refused ||
+        error instanceof KafkaJSInvalidConfigurationError
         ? error
         : inTransaction(error)
     })
