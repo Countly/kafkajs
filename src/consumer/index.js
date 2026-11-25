@@ -1208,7 +1208,6 @@ module.exports = (params) => {
     const start = async (onCrash) => {
       const owned = acquireLife()
       const startGeneration = stopGeneration
-      logger.info('Starting', { groupId })
 
       registerDiscoveryScope()
       const discovering = declared.hasPatterns()
@@ -1300,6 +1299,8 @@ module.exports = (params) => {
         maxPrefetchBatches,
       })
 
+      // Logged once the run is published, so a run(), stop() or disconnect() from the sink finds it.
+      logger.info('Starting', { groupId })
       const startedRunner = runner
       const started = startedRunner.start()
       pendingStart = started.catch(() => {})
