@@ -20,8 +20,12 @@ export interface KafkajsMessage {
   /** Set on a consumed message. */
   offset?: string
   headers?: Record<string, Buffer | string | null | (Buffer | string | null)[] | undefined>
-  /** A consumed message's is a string; a producer hook sees what the application passed. */
-  timestamp?: string | number | Date | bigint
+  /**
+   * A consumed message's is a string; a producer hook sees what the application passed: a number,
+   * a numeric string, a `Date`, a `bigint`, a `Long` (an object with a `bigint` `value`), or
+   * `null` or `undefined` for none.
+   */
+  timestamp?: string | number | Date | bigint | { value: bigint } | null | undefined
 }
 
 export interface MessageInfo<T = KafkajsMessage> {

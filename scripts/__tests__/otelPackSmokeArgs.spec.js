@@ -8,16 +8,17 @@ const SCRIPT = path.join(ROOT, 'scripts', 'otelPackSmoke.sh')
 const OTEL_NAME = '@countly/opentelemetry-instrumentation-kafkajs'
 const MAIN_NAME = '@countly/kafkajs'
 
-// The fake npm records each call, and on `install` extracts every named tarball into node_modules
-// and records it in package-lock.json as a file dependency, as npm would install it. A tarball
-// named `kafkajs@file:<path>` is installed as the alias \`kafkajs\`. Installing typescript leaves a
-// stub tsc that records its arguments.
+// The fake npm records each call with its arguments and its project directory, and on `install`
+// extracts every named tarball into node_modules and records it in package-lock.json as a file
+// dependency, as npm would install it. A tarball named `kafkajs@file:<path>` is installed as the
+// alias \`kafkajs\`. Installing typescript leaves a stub tsc that records its arguments and fails
+// for the fixture named by FAKE_TSC_FAIL.
 const FAKE_NPM = `#!/usr/bin/env node
 const fs = require('fs')
 const path = require('path')
 const { execFileSync } = require('child_process')
 const args = process.argv.slice(2)
-fs.appendFileSync(process.env.FAKE_CALLS, 'npm ' + JSON.stringify(args) + '\\n')
+fs.appendFileSync(process.env.FAKE_CALLS, 'npm ' + JSON.stringify({ args, cwd: process.cwd() }) + '\\n')
 if (args[0] === 'install') {
   const lock = { lockfileVersion: 3, packages: {} }
   for (const arg of args.filter((arg) => arg.endsWith('.tgz'))) {
@@ -33,23 +34,40 @@ if (args[0] === 'install') {
   fs.writeFileSync('package-lock.json', JSON.stringify(lock))
   if (args.some((arg) => arg.startsWith('typescript@'))) {
     fs.mkdirSync('node_modules/.bin', { recursive: true })
-    fs.writeFileSync('node_modules/.bin/tsc', '#!/bin/sh\\necho "tsc $*" >> "' + process.env.FAKE_CALLS + '"\\n', { mode: 0o755 })
+    const tsc = '#!/bin/sh\\necho "tsc $*" >> "' + process.env.FAKE_CALLS + '"\\n' +
+      '[ "$*" = "-p tsconfig.$FAKE_TSC_FAIL.json" ] && exit 1\\nexit 0\\n'
+    fs.writeFileSync('node_modules/.bin/tsc', tsc, { mode: 0o755 })
   }
 }
 `
 
 // The fake node records a smoke child and stands in for it, and answers the synchronous-hooks
-// probe with true; every other call runs the real node.
+// probe with FAKE_PROBE and the exit status FAKE_PROBE_STATUS; every other call runs the real node.
 const FAKE_NODE = `#!/bin/bash
 for arg in "$@"; do
   case "$arg" in
     otel-smoke.cjs|otel-smoke.mjs|otel-static.mjs|otel-alias.cjs|otel-alias.mjs)
       echo "node $*" >> "$FAKE_CALLS"; exit 0 ;;
-    --input-type=module) echo true; exit 0 ;;
+    --input-type=module) printf '%s' "$FAKE_PROBE"; exit "$FAKE_PROBE_STATUS" ;;
   esac
 done
 exec "$REAL_NODE" "$@"
 `
+
+// One strict type fixture per declaration form, compiled apart, in the order the script runs them.
+const TYPE_FIXTURES = [
+  'buffer',
+  'offset',
+  'date',
+  'timestamp-long',
+  'timestamp-null',
+  'timestamp-undefined',
+  'null-header',
+  'header-read',
+  'producer-hook',
+  'consumer-hook',
+]
+const FIXTURE_COMPILES = TYPE_FIXTURES.map((name) => `tsc -p tsconfig.${name}.json`)
 
 describe('scripts/otelPackSmoke.sh', () => {
   let workDir
@@ -101,6 +119,9 @@ describe('scripts/otelPackSmoke.sh', () => {
         PATH: `${bin}${path.delimiter}${process.env.PATH}`,
         FAKE_CALLS: calls,
         REAL_NODE: process.execPath,
+        FAKE_PROBE: 'true',
+        FAKE_PROBE_STATUS: '0',
+        FAKE_TSC_FAIL: '',
         ...env,
       },
     })
@@ -115,19 +136,26 @@ describe('scripts/otelPackSmoke.sh', () => {
   /** @returns {string[]} the recorded fake npm and node calls */
   const recorded = () => fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean)
 
+  /** @returns {{ args: string[], cwd: string }[]} the recorded fake npm calls */
+  const npmRecorded = () =>
+    recorded()
+      .filter((line) => line.startsWith('npm '))
+      .map((line) => JSON.parse(line.slice(4)))
+
+  /** @returns {string[]} the recorded smoke children, as their command lines */
+  const nodeRecorded = () => recorded().filter((line) => line.startsWith('node '))
+
   it('otelPackSmoke installs exactly the two supplied tarballs and never runs npm pack', () => {
     const otel = packManifest(OTEL_NAME, '0.1.1')
     const main = packManifest(MAIN_NAME, '3.0.0-rc.0')
     const result = run(otel, main)
 
     expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
-    const npmCalls = recorded()
-      .filter((line) => line.startsWith('npm '))
-      .map((line) => JSON.parse(line.slice(4)))
     // The project install, the TypeScript and types install, and the alias-only project install.
-    expect(npmCalls).toHaveLength(3)
-    const [install, types, aliasOnly] = npmCalls
+    expect(npmRecorded()).toHaveLength(3)
+    const [install, types, aliasOnly] = npmRecorded().map(({ args }) => args)
     expect(install[0]).toBe('install')
+    expect(install).toContain('--save')
     expect(install.filter((arg) => arg.endsWith('.tgz')).sort()).toEqual([main, otel].sort())
     expect(install.filter((arg) => !arg.startsWith('-') && !arg.endsWith('.tgz'))).toEqual([
       'install',
@@ -154,7 +182,64 @@ describe('scripts/otelPackSmoke.sh', () => {
       `node ${hook} otel-alias.mjs alias-esm-loader`,
       'node --import ./otel-register.mjs otel-alias.mjs alias-esm-register',
     ])
-    expect(recorded().filter((line) => line.startsWith('tsc '))).toEqual(['tsc -p .'])
+    expect(recorded().filter((line) => line.startsWith('tsc '))).toEqual(FIXTURE_COMPILES)
+  })
+
+  it('otelPackSmoke installs its two projects as siblings with one npm cache inside the temporary directory', () => {
+    const result = run(packManifest(OTEL_NAME, '0.1.1'), packManifest(MAIN_NAME, '3.0.0-rc.0'))
+
+    expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: '' })
+    const [install, types, aliasOnly] = npmRecorded()
+    const work = path.dirname(install.cwd)
+    expect(path.basename(install.cwd)).toBe('scoped')
+    expect(types.cwd).toBe(install.cwd)
+    expect(aliasOnly.cwd).toBe(path.join(work, 'alias-only'))
+    for (const { args } of [install, types, aliasOnly]) {
+      expect(args).toContain(`--cache=${path.join(work, 'npm-cache')}`)
+    }
+    expect(types.args).toContain('--no-save')
+  })
+
+  it('otelPackSmoke skips the synchronous-hooks child when the probe answers false', () => {
+    const otel = packManifest(OTEL_NAME, '0.1.1')
+    const main = packManifest(MAIN_NAME, '3.0.0-rc.0')
+    const result = runWith([otel, main], { FAKE_PROBE: 'false' })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain(
+      'synchronous module hooks are not supported on this Node.js: skipped'
+    )
+    expect(nodeRecorded()).toHaveLength(5)
+    expect(nodeRecorded()).not.toContain(
+      'node --import ./otel-register.mjs otel-alias.mjs alias-esm-register'
+    )
+  })
+
+  it('otelPackSmoke fails when the synchronous-hooks probe prints anything but true or false or exits nonzero', () => {
+    const otel = packManifest(OTEL_NAME, '0.1.1')
+    const main = packManifest(MAIN_NAME, '3.0.0-rc.0')
+
+    for (const output of ['', 'undefined', 'maybe', 'true false']) {
+      const result = runWith([otel, main], { FAKE_PROBE: output })
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain(
+        `the synchronous-hooks probe printed '${output}', expected true or false`
+      )
+    }
+    const failed = runWith([otel, main], { FAKE_PROBE: 'true', FAKE_PROBE_STATUS: '3' })
+    expect(failed.status).toBe(3)
+    expect(nodeRecorded().filter((line) => line.includes('alias-esm-register'))).toEqual([])
+  })
+
+  it('otelPackSmoke compiles every type fixture on its own and names each one that fails', () => {
+    const otel = packManifest(OTEL_NAME, '0.1.1')
+    const main = packManifest(MAIN_NAME, '3.0.0-rc.0')
+    const result = runWith([otel, main], { FAKE_TSC_FAIL: 'offset' })
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('type fixtures failed: offset')
+    expect(recorded().filter((line) => line.startsWith('tsc '))).toEqual(FIXTURE_COMPILES)
+    expect(nodeRecorded().filter((line) => line.includes('otel-alias'))).toEqual([])
   })
 
   it('otelPackSmoke rejects one argument, three arguments or swapped package names', () => {

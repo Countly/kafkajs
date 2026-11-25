@@ -139,12 +139,14 @@ message's `headers` (the caller's message object), and the consumer reads it bac
 ## TypeScript
 
 The declarations (`src/index.d.ts`) reference Node.js's types, so `Buffer` resolves in a project
-with `"types": []`. Read these when upgrading from an earlier prerelease:
+with `"types": []`, provided `@types/node` is installed. Read these when upgrading from an earlier
+prerelease:
 
 - A hook's message headers can hold `null` values (a consumed header written with a null value);
   guard them.
-- `message.timestamp` in a producer hook is what the application passed: a string, number, `Date`
-  or `bigint`. A consumed message's is a string, and its `offset` is set.
+- `message.timestamp` in a producer hook is what the application passed: a string, number, `Date`,
+  `bigint`, a `Long` (an object whose `value` is a `bigint`), `null` or `undefined`. A consumed
+  message's is a string, and its `offset` is set.
 - `producerHook` and `consumerHook` accept an explicit `undefined`, also under
   `exactOptionalPropertyTypes`.
 
