@@ -16,6 +16,15 @@ const files = [
   'shareFetchResponse-v2-unknownTags.json',
 ]
 
+/**
+ * The offset after the one record batch of these vectors (base 9007199254740993, last offset delta
+ * 0, leader epoch -1, so no `nextBatchLeaderEpoch`), which the decoder adds to that partition.
+ */
+const NEXT_BATCH_OFFSET = {
+  'shareFetchResponse-v2-recordsAndErrors.json': '9007199254740994',
+  'shareFetchResponse-v2-unknownTags.json': '9007199254740994',
+}
+
 /** @param {*} value @returns {*} Stable literal record fields while retaining every enclosing response field. */
 const literal = (value) => {
   if (Array.isArray(value)) return value.map(literal)
@@ -52,7 +61,12 @@ describe('independent Java response bytes', () => {
       throttleTime: 0,
       clientSideThrottleTime: vector.fields.throttleTime,
     })
-    expect(literal(plain(decoded))).toEqual(vector.fields)
+    const expected = JSON.parse(JSON.stringify(vector.fields))
+    if (name in NEXT_BATCH_OFFSET) {
+      expected.responses[0].partitions[0].nextBatchOffset = NEXT_BATCH_OFFSET[name]
+      expect(decoded.responses[0].partitions[0]).not.toHaveProperty('nextBatchLeaderEpoch')
+    }
+    expect(literal(plain(decoded))).toEqual(expected)
     expect(await codec.parse(decoded)).toBe(decoded)
   })
   test.each(files)('rejects every truncated envelope of %s', async (name) => {
