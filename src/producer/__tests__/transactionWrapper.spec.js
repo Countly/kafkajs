@@ -448,28 +448,44 @@ describe('Producer > the transaction wrapper', () => {
       }
     )
 
-    test('a partitioner that throws null fails that send and leaves the transaction committable', async () => {
-      const nothing = null
-      const { broker, producer } = createTransactionalProducer({
-        createPartitioner:
-          () =>
-          ({ topic }) => {
-            if (topic === 'broken-topic') throw nothing
-            return 0
-          },
-      })
-      await producer.connect()
-      const transaction = await producer.transaction()
+    test.each([
+      ['null', null],
+      ['undefined', undefined],
+      ['0', 0],
+      ['an empty string', ''],
+      ['false', false],
+    ])(
+      'a partitioner that throws %s fails that send with an Error whose message is Aborted and leaves the transaction committable',
+      async (_, falsy) => {
+        let ran = 0
+        const { broker, producer } = createTransactionalProducer({
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic !== 'broken-topic') return 0
+              ran += 1
+              throw falsy
+            },
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
 
-      const error = await transaction.send({ topic: 'broken-topic', messages: ONE }).catch((e) => e)
-      await transaction.send({ topic: TOPIC, messages: ONE })
-      await transaction.commit()
+        const error = await transaction
+          .send({ topic: 'broken-topic', messages: ONE })
+          .catch((e) => e)
+        await transaction.send({ topic: TOPIC, messages: ONE })
+        await transaction.commit()
 
-      expect(error).toBeInstanceOf(Error)
-      expect(broker.endTxn).toHaveBeenCalledWith(
-        expect.objectContaining({ transactionResult: true })
-      )
-    })
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(KafkaJSError)
+        expect(error.message).toBe('Aborted')
+        expect(ran).toBe(1)
+        expect(broker.produce).toHaveBeenCalledTimes(1)
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: true })
+        )
+      }
+    )
 
     test.each([1, 2])(
       'a partitioner that throws after a metadata retry leaves the transaction committable at transaction version %i',

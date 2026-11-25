@@ -3,7 +3,12 @@ const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC, TOPIC_ID } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const Broker = require('../../broker')
-const { KafkaJSInvalidConfigurationError, KafkaJSNonRetriableError } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
+} = require('../../errors')
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 const until = async (predicate) => {
@@ -432,7 +437,7 @@ describe('Producer > a partitioner that throws', () => {
     ['a string', () => 'partitioner failed'],
   ]
   const PRODUCERS = [
-    ['in a plain producer', {}],
+    ['in a plain producer', { idempotent: false }],
     ['in an idempotent producer', { idempotent: true }],
   ]
 
@@ -465,7 +470,37 @@ describe('Producer > a partitioner that throws', () => {
   )
 
   test.each(PRODUCERS)(
-    'a send of two entries whose second one the partitioner throws for writes neither %s',
+    'a retriable error the partitioner keeps throwing %s ends as KafkaJSNumberOfRetriesExceeded, writes nothing and lets the next send through',
+    async (_, options) => {
+      const thrown = new KafkaJSError('no route yet')
+      let failed = 0
+      await start(
+        () =>
+          ({ message }) => {
+            if (message.value !== 'bad') return 0
+            failed += 1
+            throw thrown
+          },
+        options
+      )
+
+      const error = await producer
+        .send({ topic: TOPIC, messages: [{ value: 'bad' }] })
+        .catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(error.cause).toBe(thrown)
+      expect(failed).toBe(3)
+      expect(produced).not.toHaveBeenCalled()
+      await expect(
+        producer.send({ topic: TOPIC, messages: [{ value: 'good' }] })
+      ).resolves.toHaveLength(1)
+      expect(produced).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  test.each(PRODUCERS)(
+    'a send of two records whose second one the partitioner throws for writes neither %s',
     async (_, options) => {
       const thrown = new KafkaJSNonRetriableError('partitioner failed')
       await start(
