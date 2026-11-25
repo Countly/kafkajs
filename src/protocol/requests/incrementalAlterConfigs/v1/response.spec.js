@@ -1,4 +1,5 @@
 const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 const { decode, parse } = require('./response')
 
 const vector = (caseId) =>
@@ -40,6 +41,26 @@ describe('Protocol > Requests > IncrementalAlterConfigs > v1 response', () => {
 
     await expect(decode(Buffer.from(hex.slice(0, -8), 'hex'))).rejects.toMatchObject({
       name: 'KafkaJSPartialMessageError',
+    })
+  })
+
+  test('refuses a null Responses written as bytes', async () => {
+    // ThrottleTimeMs 0, Responses 00 (the compact null), body tags 00
+    const error = await decode(Buffer.from('000000000000', 'hex')).then(
+      () => null,
+      (rejection) => rejection
+    )
+
+    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(error.message).toContain('IncrementalAlterConfigsResponse.Responses')
+  })
+
+  test('decodes an empty Responses written as bytes', async () => {
+    // ThrottleTimeMs 0, Responses 01 (the compact empty array), body tags 00
+    await expect(decode(Buffer.from('000000000100', 'hex'))).resolves.toEqual({
+      throttleTime: 0,
+      clientSideThrottleTime: 0,
+      resources: [],
     })
   })
 
