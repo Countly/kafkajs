@@ -30,9 +30,14 @@ class CommittedOffsetReader {
    * @returns {Promise<{topic: string, partition: number, offset: string|null, metadata: string|null}[]>}
    *   rows in input order; an offset the group never committed is `null`, not `'-1'`, and its
    *   metadata is `null` too (the broker answers `''` for it)
-   * @throws {KafkaJSInvariantViolation} when the answer names another group or omits a requested cell
+   * @throws {KafkaJSInvariantViolation} when the answer names another group, or for a coordinator
+   *   that omits a requested cell without going through the broker's own answer check
+   * @throws {KafkaJSNumberOfRetriesExceeded} when every attempt got an answer that does not cover
+   *   the request (a retriable `KafkaJSError` from the broker's check, read again like any
+   *   retriable failure); it is not retriable and that error, naming the topic and partition, is its
+   *   `cause`
    * @throws {Error} a broker or partition error once the retry budget is spent, or the operation's
-   *   own refusal
+   *   own refusal (a spent time budget ends the call with its own timeout instead)
    */
   async read(entries, { operation } = {}) {
     const topics = []

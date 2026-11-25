@@ -1893,7 +1893,9 @@ module.exports = class Broker {
          * @throws {KafkaJSInvariantViolation} when requested and returned identities differ, or
          *   an all-topic answer repeats a topic or partition
          * @throws {KafkaJSError} retriable, when an answer to a topic selection leaves out a
-         *   requested partition, names one that was not requested, or names one twice
+         *   requested partition, names one that was not requested, names one twice, or spreads a
+         *   topic over more entries than the request had for it (a broker answers one entry per
+         *   requested entry, so the offset reads, which keep one entry per topic, never lose one)
          * @throws {Error} for an ordinary matching-group protocol failure
          */
         parse: async (data) => {
@@ -1911,7 +1913,7 @@ module.exports = class Broker {
           }
           const parsed = await response.parse(data)
           if (allTopics) validateTopics({ errorCode: 0, topics: data.responses }, null)
-          else requireCoverage('OffsetFetch', topics, data.responses)
+          else requireCoverage('OffsetFetch', topics, data.responses, { topicEntries: 'asSent' })
           return parsed
         },
       }
