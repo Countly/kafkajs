@@ -88,8 +88,31 @@ const unmocked = (method) => {
   return send
 }
 
+/**
+ * Lets fake time pass 1 ms at a time, with one real event-loop turn per step for the scripted
+ * sockets, until `promise` settles or `limitMs` of fake time is spent. A retry or reconnect
+ * backoff starts only after a scripted answer arrives, so one fixed advance can end before it.
+ * @param {Promise<unknown>} promise the call to wait for
+ * @param {number} [limitMs=2000] fake milliseconds at most
+ * @returns {Promise<void>}
+ */
+const untilSettled = async (promise, limitMs = 2000) => {
+  const state = { settled: false }
+  promise.then(
+    () => (state.settled = true),
+    () => (state.settled = true)
+  )
+  for (let spent = 0; !state.settled && spent < limitMs; spent += 1) {
+    await new Promise(setImmediate)
+    await jest.advanceTimersByTimeAsync(1)
+  }
+}
+
 describe('written admin mutations', () => {
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }))
+  // The scripted sockets deliver a close through queueMicrotask, which must stay real.
+  beforeEach(() =>
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+  )
   afterEach(() => {
     jest.restoreAllMocks()
     jest.useRealTimers()
@@ -262,7 +285,7 @@ describe('written admin mutations', () => {
       await admin.connect()
       await expect(admin.incrementalAlterConfigs(incremental)).resolves.toEqual(refused)
       const result = admin.incrementalAlterConfigs({ ...incremental, validateOnly: true })
-      await jest.advanceTimersByTimeAsync(50)
+      await untilSettled(result)
       await expect(result).resolves.toMatchObject({ resources: [{ errorCode: 0 }] })
       expect(
         scripted
@@ -334,6 +357,7 @@ describe('written admin mutations', () => {
         })
       else gates[0].fail(new Error('lost 0'))
       gates[1].fail(new Error('lost 1'))
+      await untilSettled(result)
       const error = await result
       expect(error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
       expect(error.requests.map(({ nodeId }) => nodeId).sort()).toEqual(unknownNodes)
@@ -468,6 +492,7 @@ describe('written admin mutations', () => {
         .catch((error) => error)
       await Promise.race([gate.arrived(), result])
       gate.fail(new Error('lost reply'))
+      await untilSettled(result)
       await expect(result).resolves.toMatchObject({
         name: 'KafkaJSUnknownOutcomeError',
         requests: [{ api, apiVersion: 5, nodeId: 0, items: ['lost'] }],
@@ -550,9 +575,12 @@ describe('written admin mutations', () => {
           const result = send().catch((error) => error)
           await Promise.race([gate.arrived(), result])
           gate.fail(new Error('lost reply'))
+          await untilSettled(result)
           expect(await result).toMatchObject({ retriable: true })
           expect(await result).not.toBeInstanceOf(KafkaJSUnknownOutcomeError)
-          await send()
+          const again = send()
+          await untilSettled(again)
+          await again
           expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(2)
         }
       })
@@ -580,10 +608,15 @@ describe('written admin mutations', () => {
       await broker.disconnect()
       scripted.down(0)
       await runWithDeadline('createAcls', 1000, async () => {
-        await expect(broker.createAcls({ acl })).rejects.toMatchObject({ retriable: true })
+        const refused = broker.createAcls({ acl })
+        await untilSettled(refused)
+        await expect(refused).rejects.toMatchObject({ retriable: true })
         expect(scripted.requests().filter((frame) => frame.api === 'CreateAcls')).toEqual([])
         scripted.up(0)
-        await broker.createAcls({ acl })
+        // The refused dial starts the node's reconnect backoff, which fake time must cover.
+        const retried = broker.createAcls({ acl })
+        await untilSettled(retried)
+        await retried
       })
       expect(scripted.requests().filter((frame) => frame.api === 'CreateAcls')).toEqual([
         expect.objectContaining({ fields: { creations: acl } }),
@@ -752,6 +785,7 @@ describe('written admin mutations', () => {
         startDial()
         await failed
         if (!lostFirst) heldReply.fail(new Error('lost reply'))
+        await untilSettled(result)
         const error = await result
         expect(error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
         expect(error.requests).toEqual([
@@ -794,7 +828,7 @@ describe('written admin mutations', () => {
           gate.release({
             topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 14 }] }],
           })
-        await jest.advanceTimersByTimeAsync(50)
+        await untilSettled(result)
         await expect(result).resolves.toBeUndefined()
         expect(
           scripted
@@ -895,7 +929,7 @@ describe('written admin mutations', () => {
           .map(({ node }) => node)
       ).toEqual([0])
       gate.release()
-      await jest.advanceTimersByTimeAsync(50)
+      await untilSettled(result)
       await expect(result).resolves.toBeUndefined()
       expect(
         scripted
@@ -952,7 +986,7 @@ describe('written admin mutations', () => {
       await Promise.race([Promise.all([gate.arrived(), firstDialFinished]), result])
       await jest.advanceTimersByTimeAsync(50)
       gate.release()
-      await jest.advanceTimersByTimeAsync(50)
+      await untilSettled(result)
       const error = await result
       expect(error).toMatchObject({ name: 'KafkaJSNonRetriableError', retriable: false })
       expect(error.cause).toMatchObject({ name: 'KafkaJSDeleteTopicRecordsError' })

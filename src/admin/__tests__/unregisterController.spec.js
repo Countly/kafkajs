@@ -75,7 +75,10 @@ const fixture = (brokers, options = {}) => {
 }
 
 describe('Admin > unregisterController', () => {
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }))
+  // The scripted sockets deliver a close through queueMicrotask, which must stay real.
+  beforeEach(() =>
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+  )
   afterEach(() => {
     expect(jest.getTimerCount()).toBe(0)
     jest.useRealTimers()
