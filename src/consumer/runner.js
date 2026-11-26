@@ -161,7 +161,7 @@ module.exports = class Runner extends EventEmitter {
     /** Whether a stop of this run has told the assigners to forget their state. */
     this.assignersCleared = false
     /**
-     * Whether this run has run and the assigners have not been cleared since. Once its stop
+     * Whether this classic run has run and the assigners have not been cleared since. Once its stop
      * settles this is the clear it leaves to the next run: a stop cut by its close deadline, or
      * one that found the run already retired, did not clear them.
      */
@@ -344,7 +344,7 @@ module.exports = class Runner extends EventEmitter {
       // `running` is set BEFORE the first round: the round guard is `stopRequested`, which only
       // `stop()` sets, and guarding on `running` would have made the initial round dead code.
       this.running = true
-      this.assignersOwed = true
+      this.assignersOwed = this.consumerGroup.kind === 'classic'
       await this.runInitialRound()
     } catch (e) {
       // `running` stays true until `onCrash` is done, as in the fetch loop's crash path: the
