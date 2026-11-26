@@ -101,7 +101,8 @@ export interface KafkaConfig extends ClientTelemetryConfig {
 export interface ISocketFactoryArgs {
   host: string
   port: number
-  ssl: tls.ConnectionOptions
+  /** The configured `ssl` as given: `true`, an options object, `false` or `null` (no TLS). */
+  ssl: tls.ConnectionOptions | boolean | null
   onConnect: () => void
 }
 
@@ -324,7 +325,8 @@ export interface Message {
   value: Buffer | string | null
   partition?: number
   headers?: IHeaders
-  timestamp?: string
+  /** Milliseconds since the epoch: a string, number, `Date` or `bigint`; a `Long` is accepted too. */
+  timestamp?: string | number | Date | bigint
 }
 
 export interface PartitionerArgs {
@@ -1373,25 +1375,33 @@ export type MemberMetadataInput = {
   rackId?: string | null
 }
 
-/** What `AssignerProtocol.MemberMetadata.decode` returns. */
+/** What `AssignerProtocol.MemberMetadata.decode` returns. `userData` is `null` when the member sent none. */
 export type MemberMetadata = {
   version: number
   topics: string[]
-  userData: Buffer
+  userData: Buffer | null
   ownedPartitions?: Array<{ topic: string; partitions: number[] }>
   generationId?: number
   rackId?: string | null
 }
 
+/** What `AssignerProtocol.MemberAssignment.decode` returns. `userData` is `null` when the member sent none. */
 export type MemberAssignment = {
   version: number
   assignment: Assignment
-  userData: Buffer
+  userData: Buffer | null
+}
+
+/** What `AssignerProtocol.MemberAssignment.encode` accepts. Omitting `userData` writes an empty byte string; `null` writes the wire null. */
+export type MemberAssignmentInput = {
+  version: number
+  assignment: Assignment
+  userData?: Buffer | null
 }
 
 export const AssignerProtocol: {
   MemberMetadata: ISerializer<MemberMetadataInput, MemberMetadata>
-  MemberAssignment: ISerializer<MemberAssignment>
+  MemberAssignment: ISerializer<MemberAssignmentInput, MemberAssignment>
 }
 
 export enum logLevel {
@@ -1403,7 +1413,8 @@ export enum logLevel {
 }
 
 export interface LogEntry {
-  namespace: string
+  /** `undefined` for the root logger; a namespaced logger sets it. */
+  namespace: string | undefined
   level: logLevel
   label: string
   log: LoggerEntryContent
@@ -1793,6 +1804,7 @@ export type ProducerEvents = {
   REQUEST_TIMEOUT: 'producer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'producer.network.authentication_failure'
+  /** Not emitted by this release. */
   LOCK_TIMEOUT: 'producer.network.lock_timeout'
   TOPIC_RECREATED: 'producer.cluster.topic_recreated'
   REBOOTSTRAP: 'producer.cluster.rebootstrap'
@@ -2178,7 +2190,10 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
   memberId: string | null
   /** Which membership protocol this round belongs to. */
   membershipProtocol: 'classic' | 'consumer'
-  /** Why the rebalance started. Absent when no reason was recorded. */
+  /**
+   * Why the rebalance started. Absent when no reason was recorded. The text passed to
+   * `enforceRebalance` is reported as given, so any string can occur.
+   */
   reason?:
     | 'rebalance-in-progress'
     | 'lost'
@@ -2188,6 +2203,9 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
     | 'coordinator-changed'
     | 'assignment-changed'
     | 'fenced'
+    | 'subscription-changed'
+    | 'enforced-rebalance'
+    | (string & {})
 }>
 /** Payload of `PARTITIONS_ASSIGNED`, `PARTITIONS_REVOKED` and `PARTITIONS_LOST`. */
 export type ConsumerPartitionsEvent = InstrumentationEvent<{
@@ -2203,7 +2221,8 @@ export type ConsumerPartitionsRevokedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsLostEvent = ConsumerPartitionsEvent
 export interface ConsumerPartitionHaltedBase {
   groupId: string | null
-  memberId: string
+  /** `null` while this member has no id, as on the partition events. */
+  memberId: string | null
   topic: string
   partition: number
 }
@@ -2648,10 +2667,7 @@ export type EachShareMessageHandler = (payload: EachShareMessagePayload) => Prom
 export type EachShareBatchHandler = (payload: EachShareBatchPayload) => Promise<void>
 
 /** Exactly one of the two handlers. */
-export type ShareConsumerRunConfig = {
-  eachMessage?: EachShareMessageHandler
-  eachBatch?: EachShareBatchHandler
-}
+export type ShareConsumerRunConfig = XOR<{ eachMessage: EachShareMessageHandler }, { eachBatch: EachShareBatchHandler }>
 
 export type ShareSubscribeTopics = {
   topics: string[]

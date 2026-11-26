@@ -434,7 +434,7 @@ describe('Producer > a send larger than one request', () => {
     expect(log.written).toHaveLength(2)
   })
 
-  test('a split send with one delivered chunk and one never sent rejects with that chunk’s own unsent timeout', async () => {
+  test('a split send with delivered chunks and a never-sent chunk rejects with outcome unknown, the chunk timeout as cause', async () => {
     const { log } = await start(
       { topics: [{ name: TOPIC, leaders: [0, 1] }], nodes: 2 },
       { idempotent: true, deliveryTimeout: 600, retry: { ...RETRY, retries: 1000 } },
@@ -447,7 +447,9 @@ describe('Producer > a send larger than one request', () => {
       .catch((failure) => failure)
 
     expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
-    expect(error.outcome).toBe('unsent')
+    expect(error.outcome).toBe('unknown')
+    expect(error.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(error.cause.outcome).toBe('unsent')
     expect(log.written.map(({ partition, records: count }) => [partition, count])).toEqual([
       [0, 10],
       [0, 2],

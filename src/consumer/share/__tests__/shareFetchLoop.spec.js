@@ -20,6 +20,7 @@ const {
 } = require('../../../../testHelpers/shareHarness')
 const { ConsumerOperation } = require('../../groupProtocol/interface')
 const {
+  KafkaJSError,
   KafkaJSInvariantViolation,
   KafkaJSProtocolError,
   KafkaJSShareAcknowledgementError,
@@ -1700,6 +1701,36 @@ describe('share node socket integration', () => {
       expect(failures(m)[0]).toMatchObject({ partition: 1 })
       expect(failures(m)[0].error.cause.message).toMatch(/repeated a partition/)
       expect(okResults(m)).toEqual([expect.objectContaining({ partition: 0 })])
+    })
+  })
+
+  describe('a request the transport refused before writing it', () => {
+    test('a session-refused ShareFetch settles its acquisitions not-sent and keeps the session', async () => {
+      h = await harness()
+      const [m] = h.members
+      m.want = [A0]
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['a'])])])
+      await m.loop.poll()
+      const refusal = new KafkaJSError(
+        'The SASL session was not valid when the request was due to be written; it was not sent',
+        { retriable: true }
+      )
+      jest.spyOn(m.broker, 'shareFetch').mockImplementationOnce(async (fields, { guard }) => {
+        const refused = guard()
+        if (refused) throw refused
+        throw refusal
+      })
+
+      const result = await m.loop.poll()
+
+      expect(result).toMatchObject({ reset: false, backoff: true, error: refusal })
+      expect(result.sentAt).toBeUndefined()
+      expect(failures(m).map(({ error }) => error.reason)).toEqual(['not-sent'])
+      expect(failures(m)[0]).toMatchObject({ partition: 0, firstOffset: '10', lastOffset: '10' })
+      expect(okResults(m)).toEqual([])
+      expect(m.resets).toEqual([])
+      expect(m.session.epoch).toBe(1)
+      expect(fetchFrames(h)).toHaveLength(1)
     })
   })
 
