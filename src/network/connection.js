@@ -892,7 +892,8 @@ module.exports = class Connection {
       .multiply(1000)
       .add(Long.fromValue(remainingNanosSince).divide(1000000))
 
-    const reauthenticateAt = millisSince.add(Math.max(margin, 0))
+    const withMargin = millisSince.add(margin)
+    const reauthenticateAt = withMargin.lessThan(millisSince) ? millisSince : withMargin
     return reauthenticateAt.greaterThanOrEqual(this.sessionLifetime)
   }
 
