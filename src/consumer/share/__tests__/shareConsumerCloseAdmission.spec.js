@@ -477,12 +477,12 @@ describe('share client admission while a close is in progress', () => {
       },
     })
     await done.promise
-    const runIdentities = entries.mock.calls
-      .map(([store]) => store)
-      .filter((store) => typeof store === 'symbol' && store.description === 'share run')
+    const { identity } = handled[0]
+    const runEntries = entries.mock.calls.filter(([store]) => store === identity)
     expect(handled.map(({ offset }) => offset)).toEqual(['0', '1', '2', '3'])
-    expect(runIdentities).toHaveLength(1)
-    expect(handled.every(({ identity }) => identity === runIdentities[0])).toBe(true)
+    expect(identity).toEqual({})
+    expect(runEntries).toHaveLength(1)
+    expect(handled.every((message) => message.identity === identity)).toBe(true)
   })
 
   test('a HANDLER_ERROR listener calling connect during a close waits for DISCONNECT and reconnects', async () => {
@@ -544,7 +544,8 @@ describe('share client admission while a close is in progress', () => {
     })
     await failed.promise
     await flush()
-    expect(typeof inside).toBe('symbol')
+    expect(inside).toEqual({})
+    expect(Object.isFrozen(inside)).toBe(true)
     expect(started).toEqual([
       { kind: 'renew', identity: undefined },
       { kind: 'flush', identity: undefined },

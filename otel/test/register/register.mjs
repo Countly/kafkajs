@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url'
 // on `globalThis` what happened, for the test beside it: `registered`, or the reason it could not.
 // Only an import-in-the-middle without `register-hooks.mjs` (absent, or before 3.1.0) or a Node.js
 // without synchronous hooks is a reason; any other failure, a registration included, fails the
-// process.
+// process. The tests beside it skip only for the Node.js reason: the locked import-in-the-middle
+// has the file, so its absence fails them.
 const REGISTER_HOOKS = 'import-in-the-middle/register-hooks.mjs'
 
 const hasRegisterHooks = () => {

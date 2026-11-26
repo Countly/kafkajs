@@ -83,7 +83,7 @@ class ShareRun {
     this.committed = []
     this.tap = null
     this.heartbeatRevision = Symbol('heartbeat')
-    this.identity = Symbol('share run')
+    this.identity = Object.freeze({})
     this.coordinator = null
     this.facade = null
     this.waiters = new Set()
@@ -1524,7 +1524,7 @@ class ShareRun {
 }
 
 /**
- * @returns {symbol|undefined} The identity of the run whose handler, or async work it started, is
+ * @returns {object|undefined} The identity of the run whose handler, or async work it started, is
  *   calling; undefined outside a share handler.
  */
 const handlerRunIdentity = () => handlerScope.getStore()
