@@ -1900,7 +1900,9 @@ const createSendMessages = ({
    * at that call, and each attempt clears the mark when it starts, so it covers only the backoff
    * after a partitioner failure: the accumulator reads it when the delivery deadline ends the
    * send, and a metadata failure or wait in a later attempt arms as before. A falsy value the
-   * partitioner throws reaches the caller as `Error('Aborted')`; it arms nothing either.
+   * partitioner throws reaches the caller as `Error('Aborted')`; it arms nothing either. Only a
+   * partitioner's `null` or `undefined` is bailed with here: the same value rejected by anything
+   * else is read as it always was.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
@@ -1956,7 +1958,8 @@ const createSendMessages = ({
         }
         if (send.settled) return bail(e)
         fence?.check()
-        if (e?.retriable) throw e
+        if (send.refused && e == null) return bail(e)
+        if (e.retriable) throw e
         bail(e)
       }
     }
