@@ -514,17 +514,23 @@ describe('Network > Connection > session at write', () => {
   test('the next send after a refusal re-authenticates before it encodes', async () => {
     const authenticate = mockAuthenticator()
     await open({ sasl })
-    await queuedBehindAnswer(produceRequest([0]), 1500)
+    const refused = await queuedBehindAnswer(produceRequest([0]), 1500)
     const plain = produceRequest([1])
     const encode = jest.fn(plain.request.encode)
 
     await connection.send({ ...plain, request: { ...plain.request, encode } })
 
+    expect(refused).toMatchObject(SESSION_REFUSAL)
     expect(authenticate).toHaveBeenCalledTimes(2)
     expect(authenticate.mock.invocationCallOrder[1]).toBeLessThan(
       encode.mock.invocationCallOrder[0]
     )
-    expect(writtenApis().slice(-2)).toEqual([apiKeys.SaslHandshake, apiKeys.Produce])
+    expect(writtenApis()).toEqual([
+      apiKeys.SaslHandshake,
+      apiKeys.Metadata,
+      apiKeys.SaslHandshake,
+      apiKeys.Produce,
+    ])
   })
 
   test('a request written within the session is not refused', async () => {

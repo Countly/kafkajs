@@ -408,12 +408,16 @@ describe('session at write', () => {
   /**
    * Sends to partition 0 and holds its answer, then queues a send to partition 1 behind it on the
    * same connection and lets the session end before the answer is delivered.
-   * @returns {Promise<{ first: { settled: boolean }, second: Promise<*>, secondState: { settled: boolean } }>}
+   * @returns {Promise<{ firstResult: *, second: Promise<*>, secondState: { settled: boolean } }>}
+   *   the first send's result or error, and the second send with its settlement
    */
   const queuedPastTheSession = async () => {
     await producer.connect()
     const held = cluster.holdReply({ api: 'Produce' })
-    const first = watch(producer.send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] }))
+    const firstSend = producer
+      .send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] })
+      .catch((error) => error)
+    const first = watch(firstSend)
     await until(() => written().includes('Produce:0'))
     const second = producer
       .send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
@@ -424,7 +428,7 @@ describe('session at write', () => {
 
     held.deliver()
     await until(() => first.settled)
-    return { second, secondState }
+    return { firstResult: await firstSend, second, secondState }
   }
 
   test('a session-refused produce is never recorded as written', async () => {
@@ -432,21 +436,23 @@ describe('session at write', () => {
       deliveryTimeout: 1500,
       retry: { initialRetryTime: 5000, maxRetryTime: 5000, factor: 0 },
     })
-    const { second, secondState } = await queuedPastTheSession()
+    const { firstResult, second, secondState } = await queuedPastTheSession()
 
     await jest.advanceTimersByTimeAsync(400)
     await until(() => secondState.settled)
 
+    expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
     expect(await second).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
     expect(written()).not.toContain('Produce:1')
   })
 
-  test('a session-refused produce is resent after re-authentication and appended once', async () => {
+  test('a session-refused produce is resent once, after re-authentication', async () => {
     start({ retry: { initialRetryTime: 10, maxRetryTime: 10, factor: 0 } })
-    const { second, secondState } = await queuedPastTheSession()
+    const { firstResult, second, secondState } = await queuedPastTheSession()
 
     await until(() => secondState.settled)
 
+    expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
     expect(await second).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
     const log = written()
     expect(log.filter((api) => api === 'Produce:1')).toHaveLength(1)
