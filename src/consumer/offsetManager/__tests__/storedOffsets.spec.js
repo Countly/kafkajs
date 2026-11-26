@@ -131,13 +131,13 @@ describe('Consumer > stored committed offsets', () => {
     expect(manager.heldOffsetAt(TOPIC, 0)).toBe('4')
   })
 
-  test('a stored offset of zero or above is used as stored', async () => {
-    const { manager, cache, lookup } = createMember('10')
+  test.each(['0', '10'])('a stored %s is used as stored', async (offset) => {
+    const { manager, cache, lookup } = createMember(offset)
 
     await manager.resolveOffsets()
 
     expect(lookup).not.toHaveBeenCalled()
-    expect(cache[TOPIC]).toEqual({ 0: '10' })
+    expect(cache[TOPIC]).toEqual({ 0: offset })
   })
 
   test('consumer.committed for a partition storing -500 rejects with the same error', async () => {
