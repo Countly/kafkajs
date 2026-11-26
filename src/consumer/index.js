@@ -964,8 +964,9 @@ module.exports = (params) => {
   let stopping = null
 
   /**
-   * Whether a stopped run's close deadline cut its stop before the assigners were told to forget
-   * their state; the next run tells them before its first join.
+   * Whether a stopped run ended without telling the assigners to forget their state, because its
+   * close deadline cut its stop or had passed before the stop began; the next run tells them
+   * before its first join.
    */
   let assignersOwed = false
 

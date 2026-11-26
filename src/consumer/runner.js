@@ -160,7 +160,11 @@ module.exports = class Runner extends EventEmitter {
     this.terminated = false
     /** Whether a stop of this run has told the assigners to forget their state. */
     this.assignersCleared = false
-    /** Whether this run's stop ended before that, leaving the clear to the next run. */
+    /**
+     * Whether this run has run and the assigners have not been cleared since. Once its stop
+     * settles this is the clear it leaves to the next run: a stop cut by its close deadline, or
+     * one that found the run already retired, did not clear them.
+     */
     this.assignersOwed = false
     /** @type {{ previous: Array<import('../../types').TopicPartitions>, invoked?: boolean }|null} */
     this.episode = null
@@ -340,6 +344,7 @@ module.exports = class Runner extends EventEmitter {
       // `running` is set BEFORE the first round: the round guard is `stopRequested`, which only
       // `stop()` sets, and guarding on `running` would have made the initial round dead code.
       this.running = true
+      this.assignersOwed = true
       await this.runInitialRound()
     } catch (e) {
       // `running` stays true until `onCrash` is done, as in the fetch loop's crash path: the
@@ -828,7 +833,9 @@ module.exports = class Runner extends EventEmitter {
    * assigners once to forget their state (an assigner's failure is logged), then leaves. Every
    * awaited stage runs under one operation: a close deadline ends the wait, skips
    * the stages that did not start and refuses the write of the ones that are queued. A stop
-   * requested before the run started only latches, so that start joins nothing.
+   * requested before the run started only latches, so that start joins nothing. A stop that finds
+   * the run retired by a close deadline that had already passed also only latches; the next run
+   * then clears the assigners, as after a stop that a deadline cuts.
    *
    * @param {{ leaveGroup?: boolean }} [options]
    * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] the close that owns
@@ -931,7 +938,6 @@ module.exports = class Runner extends EventEmitter {
     }
     // A terminal stop that ended these stages takes the stop over, under the same close.
     if (this.terminated) await this.drainTerminated(operation)
-    this.assignersOwed = !this.assignersCleared
   }
 
   /**
@@ -980,6 +986,7 @@ module.exports = class Runner extends EventEmitter {
   clearAssignersOnce() {
     if (this.assignersCleared) return
     this.assignersCleared = true
+    this.assignersOwed = false
     this.consumerGroup.clearAssignerState()
   }
 
