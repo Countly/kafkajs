@@ -2866,14 +2866,14 @@ export class KafkaJSError extends Error {
   readonly cause?: Error
   /** Protocol error type, carried through when the wrapped error had one */
   readonly type?: string
-  /** Protocol error code, carried through when the wrapped error had one */
-  readonly code?: number
+  /** A Kafka error code, or the code of a Node.js error it wraps, such as `'ECONNREFUSED'` */
+  readonly code?: number | string
 
   constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 export class KafkaJSNonRetriableError extends KafkaJSError {
-  constructor(e: Error | string)
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 /** A partition with the none policy needs an explicit starting position. */
@@ -2889,6 +2889,16 @@ export class KafkaJSNoOffsetError extends KafkaJSNonRetriableError {
       reason: KafkaJSNoOffsetError['reason']
     }
   )
+}
+
+/** What a protocol error is built from: a row of the protocol error table, or a caught protocol error. */
+export type KafkaJSProtocolErrorSource = {
+  type: string
+  code: number
+  message: string
+  retriable?: boolean
+  helpUrl?: string
+  category?: KafkaJSErrorCategory
 }
 
 export class KafkaJSProtocolError extends KafkaJSError {
@@ -2912,7 +2922,7 @@ export class KafkaJSProtocolError extends KafkaJSError {
     errorMessage?: string | null
     topicId?: string | null
   }>
-  constructor(e: Error | string)
+  constructor(e: KafkaJSProtocolErrorSource, options?: { retriable?: boolean })
 }
 
 /**
@@ -3156,7 +3166,7 @@ export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
   readonly topic: string
   readonly partition: number
-  constructor(e: Error | string, metadata?: KafkaJSOffsetOutOfRangeMetadata)
+  constructor(e: KafkaJSProtocolErrorSource, metadata: KafkaJSOffsetOutOfRangeMetadata)
 }
 
 /**
@@ -3188,7 +3198,7 @@ export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   readonly stack: string
   readonly retryCount: number
   readonly retryTime: number
-  constructor(e: Error | string, metadata?: KafkaJSNumberOfRetriesExceededMetadata)
+  constructor(e: Error | string, metadata: KafkaJSNumberOfRetriesExceededMetadata)
 }
 
 /**
@@ -3216,7 +3226,9 @@ export class KafkaJSInvalidLongError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSConnectionError extends KafkaJSError {
-  readonly broker: string
+  readonly broker?: string
+  /** The code of the Node.js error behind the failure, such as `'ECONNREFUSED'` */
+  readonly code?: string
   constructor(e: Error | string, metadata?: KafkaJSConnectionErrorMetadata)
 }
 
@@ -3226,6 +3238,7 @@ export class KafkaJSConnectionError extends KafkaJSError {
  * `broker` is `host:port`.
  */
 export class KafkaJSConnectionClosedError extends KafkaJSConnectionError {
+  readonly broker: string
   readonly host?: string
   readonly port?: number
   constructor(e: Error | string, options?: { host?: string; port?: number })
@@ -3241,7 +3254,7 @@ export class KafkaJSRequestTimeoutError extends KafkaJSError {
 }
 
 export class KafkaJSMetadataNotLoaded extends KafkaJSError {
-  constructor()
+  constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
@@ -3250,8 +3263,10 @@ export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
 }
 
 export class KafkaJSStaleTopicMetadataAssignment extends KafkaJSError {
-  readonly topic: string
-  readonly unknownPartitions: number
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly topic?: string
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly unknownPartitions?: number[]
   constructor(e: Error | string, metadata?: KafkaJSStaleTopicMetadataAssignmentMetadata)
 }
 
@@ -3312,7 +3327,7 @@ export class KafkaJSShareAcknowledgementError extends KafkaJSError {
 }
 
 export class KafkaJSBrokerNotFound extends KafkaJSError {
-  constructor()
+  constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 /** The consumer's fetch manager found no broker to fetch from. Retriable. */
@@ -3321,7 +3336,7 @@ export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
 }
 
 export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
   /**
    * @deprecated The Fetch decoder no longer sets it: a record-batch CRC32C mismatch (see
    * `checkCrcs`) is a `KafkaJSCorruptRecordError` with reason `checksum`.
@@ -3330,29 +3345,29 @@ export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
   /** The last failure a broker's FindCoordinator request ended with, when there was one. */
   lastError?: Error
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSNotImplemented extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSTimeout extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSLockTimeout extends KafkaJSTimeout {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSDeleteGroupsError extends KafkaJSError {
@@ -3361,28 +3376,33 @@ export class KafkaJSDeleteGroupsError extends KafkaJSError {
 }
 
 export class KafkaJSDeleteTopicRecordsError extends KafkaJSError {
+  readonly partitions: KafkaJSDeleteTopicRecordsErrorPartition[]
   constructor(metadata: KafkaJSDeleteTopicRecordsErrorTopic)
 }
 
 export interface KafkaJSDeleteGroupsErrorGroups {
   groupId: string
   errorCode: number
+  errorMessage?: string | null
   error: KafkaJSError
 }
 
 export interface KafkaJSDeleteTopicRecordsErrorTopic {
-  topic: string
+  topic?: string
   partitions: KafkaJSDeleteTopicRecordsErrorPartition[]
 }
 
 export interface KafkaJSDeleteTopicRecordsErrorPartition {
   partition: number
-  offset: string
-  error: KafkaJSError
+  /** The requested offset; undefined when the response row matched no requested partition */
+  offset: string | undefined
+  /** Rows are kept as passed, so a row can carry no error, or an explicit undefined */
+  error?: KafkaJSError | null | undefined
 }
 
 export interface KafkaJSErrorMetadata {
   retriable?: boolean
+  cause?: Error
   topic?: string
   partitionId?: number
   metadata?: PartitionMetadata
@@ -3420,7 +3440,7 @@ export interface KafkaJSTopicMetadataNotLoadedMetadata {
 
 export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
   topic: string
-  unknownPartitions: PartitionMetadata[]
+  unknownPartitions: number[]
 }
 
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
