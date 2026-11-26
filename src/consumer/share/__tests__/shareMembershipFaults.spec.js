@@ -3308,7 +3308,7 @@ class MembershipFaultCase extends FaultCase {
     )
     for (let n = 0; n < 4; n++) {
       const next = await this.holdBeat(STEADY)
-      const partitions = same || n % 2 === 0 ? [0, 1, 2] : [2, 0, 1, 1]
+      const partitions = same || n % 2 === 0 ? [0, 1, 2] : [2, 0, 1]
       next.release(assignmentAnswer(next.call, partitions, { unknown: true }))
       await flush()
       assert.equal(this.member.token, token)

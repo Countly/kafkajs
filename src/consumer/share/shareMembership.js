@@ -2,6 +2,7 @@ const HeartbeatBackoff = require('../groupProtocol/heartbeatBackoff')
 const { generateMemberId } = require('../groupProtocol/memberId')
 const { MEMBER_STATES: S, transition } = require('../groupProtocol/memberState')
 const { KafkaJSNonRetriableError } = require('../../errors')
+const { requireAssignment } = require('../../protocol/requests/responseCoverage')
 const {
   membershipAction,
   lookupFailure,
@@ -154,11 +155,16 @@ class ShareMembership {
   /**
    * Looks up the coordinator and sends under one captured token, checked at every await and again
    * by the Broker before the write. Fields are remembered only after a current, non-regressing,
-   * successful answer; every epoch-zero payload is full.
+   * successful answer; every epoch-zero payload is full. An answer with an epoch of 0 or below, or
+   * lower than the member holds, is logged and changes nothing; an interval of 0 or below keeps the
+   * current one. An assignment no coordinator writes (a null or repeated topic id, a negative or
+   * repeated partition) changes nothing and is retried under backoff with every field sent again;
+   * the coordinator that answered stays known, so a close during that backoff still leaves.
    * @private
    * @param {() => Error|null} ordinaryGuard The caller's captured ordinary authority.
    * @returns {Promise<void>}
-   * @throws {Error} The current membership failure, after its policy has been applied.
+   * @throws {Error} The current membership failure, after its policy has been applied; for a
+   *   refused assignment the `KafkaJSPartialMessageError` naming it.
    */
   async sendHeartbeat(ordinaryGuard) {
     const token = this.token
@@ -192,12 +198,34 @@ class ShareMembership {
       if (!current()) return
       this.coordinator = coordinator
     }
+    let action
     try {
       const response = await this.coordinator.shareGroupHeartbeat(payload, { guard })
       if (!current()) return
       if (response.errorCode) throw createErrorFromCode(response.errorCode)
-      if (response.memberEpoch < this.memberEpoch) return
-      if (payload.memberEpoch === 0 && response.memberEpoch > 0) {
+      // A regular answer carries an epoch of at least 1 and never a lower one; a leave goes
+      // through `leave()`, so -1 cannot answer this request.
+      if (response.memberEpoch <= 0 || response.memberEpoch < this.memberEpoch) {
+        this.logger.warn(
+          'Ignoring a share heartbeat answer whose member epoch this member cannot hold',
+          {
+            groupId: this.groupId,
+            memberEpoch: response.memberEpoch,
+            currentEpoch: this.memberEpoch,
+          }
+        )
+        return
+      }
+      if (response.assignment !== null) {
+        try {
+          requireAssignment('ShareGroupHeartbeat', response.assignment.topicPartitions, 'topicId')
+        } catch (error) {
+          // The coordinator answered, so it stays known and a close can still leave through it.
+          action = 'retry'
+          throw error
+        }
+      }
+      if (payload.memberEpoch === 0) {
         const previous = this.token
         this.token = Symbol('membership')
         this.targetRevision = Symbol('assignment')
@@ -209,17 +237,17 @@ class ShareMembership {
         if (this.closed || this.token !== accepted) return
       }
       this.memberEpoch = response.memberEpoch
-      this.interval = response.heartbeatIntervalMs
+      if (response.heartbeatIntervalMs > 0) this.interval = response.heartbeatIntervalMs
       this.sentTopics = topics
       this.sentRack = true
       this.backoff.reset()
-      if (this.memberEpoch > 0) this.state = transition(this.state, S.STABLE)
+      this.state = transition(this.state, S.STABLE)
       if (response.assignment !== null) this.adoptTarget(response.assignment.topicPartitions)
       this.publishAssignment()
       this.refreshUnresolved(ordinaryGuard)
     } catch (error) {
       if (!current()) return
-      throw this.onMembershipError(error, token)
+      throw this.onMembershipError(error, token, action)
     }
   }
 

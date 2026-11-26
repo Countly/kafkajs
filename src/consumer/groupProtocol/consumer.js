@@ -1363,7 +1363,9 @@ module.exports = class ConsumerGroupProtocol {
   }
 
   /**
-   * A successful heartbeat response: the interval, the epoch, and possibly a new target.
+   * A successful heartbeat response: the interval, the epoch, and possibly a new target. An answer
+   * with epoch 0 or below, or with an epoch lower than the member holds, changes nothing but a
+   * positive interval.
    * @private
    * @param {{ memberEpoch: number, heartbeatIntervalMs: number, assignment: Object|null }} response
    * @returns {void}
@@ -1384,6 +1386,20 @@ module.exports = class ConsumerGroupProtocol {
         state: this.state,
         memberEpoch: response.memberEpoch,
       })
+      return
+    }
+
+    // Epochs only grow within one membership, and only one heartbeat is in flight; a rejoin starts
+    // from 0, so this never refuses the first epoch of a new membership.
+    if (this.memberEpoch > 0 && response.memberEpoch < this.memberEpoch) {
+      this.logger.warn(
+        'Ignoring a heartbeat response with a lower member epoch than this member holds',
+        {
+          groupId: this.groupId,
+          memberEpoch: response.memberEpoch,
+          currentEpoch: this.memberEpoch,
+        }
+      )
       return
     }
 

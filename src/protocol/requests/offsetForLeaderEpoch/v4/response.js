@@ -34,7 +34,10 @@ const decodePartition = (decoder) => {
 const decodeTopic = (decoder) => {
   const topic = {
     topic: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartition),
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodePartition),
+      'OffsetForLeaderEpochResponse.Topics.Partitions'
+    ),
   }
 
   decoder.readTaggedFields()
@@ -44,11 +47,16 @@ const decodeTopic = (decoder) => {
 /**
  * @param {Buffer} rawData
  * @returns {Promise<object>}
+ * @throws {KafkaJSPartialMessageError} on a null `Topics` or `Partitions` array, which the message
+ *   definition does not allow
  */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const clientSideThrottleTime = decoder.readInt32()
-  const topics = decoder.readUVarIntArray(decodeTopic)
+  const topics = Decoder.requireArray(
+    decoder.readUVarIntArray(decodeTopic),
+    'OffsetForLeaderEpochResponse.Topics'
+  )
 
   decoder.readTaggedFields()
 
