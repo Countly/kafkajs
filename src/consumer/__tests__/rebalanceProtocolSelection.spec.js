@@ -221,7 +221,7 @@ describe('Consumer > JoinGroup protocol entry list', () => {
 })
 
 describe('Consumer > onAssignment', () => {
-  it('is invoked for every assigner that defines it, and cleared on leave and reset', async () => {
+  it('is invoked for every assigner that defines it, and cleared on reset but not by a leave, whose caller clears it', async () => {
     const onAssignment = jest.fn()
     const withCallback = assigner('with', ['eager'], { onAssignment })
     const without = assigner('without', ['eager'])
@@ -259,7 +259,8 @@ describe('Consumer > onAssignment', () => {
     onAssignment.mockClear()
     protocol.memberId = 'm1'
     await protocol.leave()
-    expect(onAssignment).toHaveBeenCalledWith(null, { generationId: -1, groupProtocol: null })
+    expect(protocol.memberId).toBeNull()
+    expect(onAssignment).not.toHaveBeenCalled()
   })
 })
 
@@ -354,7 +355,7 @@ describe('Consumer > applying a sync result', () => {
     )
   })
 
-  it('clears retained assigner state on demand, and on leaving the group', async () => {
+  it('clears retained assigner state on demand, and not again on leaving the group', async () => {
     const onAssignment = jest.fn()
     const group = ready(buildGroup([assigner('with', ['eager'], { onAssignment })]))
 
@@ -363,6 +364,7 @@ describe('Consumer > applying a sync result', () => {
 
     onAssignment.mockClear()
     await group.leave()
-    expect(onAssignment).toHaveBeenCalledWith(null, { generationId: -1, groupProtocol: null })
+    expect(group.memberId).toBeNull()
+    expect(onAssignment).not.toHaveBeenCalled()
   })
 })

@@ -211,6 +211,8 @@ module.exports = class OffsetManager {
    *                                offset-fetch retry abandons its deadline the moment this is
    *                                true, because the fetch loop it runs inside is one
    *                                `Runner#stop()` waits for.
+   * @param {(error: Error) => void} [options.stopRun] ends the consumer's run for good and reports
+   *                                `error` once as its crash. Defaults to a no-op.
    * @param {() => boolean} [options.isRebalancePending] whether a rebalance is waiting for the
    *                                current fetch round to end. The offset-fetch retry abandons its
    *                                deadline the moment this is true, so the member can rejoin.
@@ -269,6 +271,7 @@ module.exports = class OffsetManager {
     staleEpochTimeout = 300000,
     membership = null,
     isStopping = null,
+    stopRun = null,
     isRebalancePending = null,
     markPolled = null,
     captureResetContext = null,
@@ -316,6 +319,7 @@ module.exports = class OffsetManager {
         coordinator: this.coordinator,
       }))
     this.isStopping = isStopping || (() => false)
+    this.stopRun = stopRun || (() => {})
     this.isRebalancePending = isRebalancePending || (() => false)
     this.markPolled = markPolled || (() => {})
     this.captureResetContext = captureResetContext
@@ -1626,7 +1630,8 @@ module.exports = class OffsetManager {
    * broker; the caller still gets its refusal or error. A caller whose membership was lost or whose
    * run or operation ended records nothing. Emits
    * `COMMIT_OFFSETS` with a copy of the payload sent, down to each cell, once the request
-   * succeeds, and records after the emit, so a listener that replaces or edits the reported cells
+   * succeeds, unless the run ended for good meanwhile and the caller refuses,
+   * and records after the emit, so a listener that replaces or edits the reported cells
    * changes nothing recorded. The copy is made only when something listens: one object per topic
    * and per cell.
    *
@@ -1671,6 +1676,9 @@ module.exports = class OffsetManager {
           if (this.membershipProtocol === 'consumer') sent.groupGenerationId = this.generationId
         }
       }
+      // A run ended for good while the answer was on its way reports no commit.
+      const ended = this.ownership?.permanent && options?.guard?.()
+      if (ended) throw ended
       if (this.instrumentationEmitter.hasListeners(COMMIT_OFFSETS)) {
         this.instrumentationEmitter.emit(COMMIT_OFFSETS, {
           ...sent,

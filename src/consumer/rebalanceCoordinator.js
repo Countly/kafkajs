@@ -15,7 +15,7 @@ const {
   obsoleteOwnership,
   learnOwnershipLoss,
 } = require('./rebalanceErrorContract')
-const { COOPERATIVE } = require('./groupProtocol/interface')
+const { COOPERATIVE, ConsumerOperation } = require('./groupProtocol/interface')
 const {
   events: {
     REBALANCING,
@@ -332,7 +332,11 @@ module.exports = class RebalanceCoordinator {
           this.emitPartitions(PARTITIONS_LOST, previous)
         }
 
-        if (hooks) await this.prepareListenerRound({ round, kind, previous, rebuildOffsets })
+        if (hooks) {
+          await this.prepareListenerRound({ round, kind, previous, rebuildOffsets })
+          const stopped = round.guard()
+          if (stopped) throw stopped
+        }
 
         // Java's onJoinPrepare: the same rounds stop advertising ownership before they join, so
         // the JoinGroup carries no `OwnedPartitions` and no peer withholds a partition for a
@@ -830,7 +834,8 @@ module.exports = class RebalanceCoordinator {
    * it is in flight. The count of accepted joins is read before the leave for that reason: the leave
    * answers for the membership it was sent for, so once a round has joined there is nothing left to
    * reset and no verdict to raise, and resetting would void the new membership. The count, not the
-   * generation, because a rejoin can come back at the same generation or epoch. Otherwise the
+   * generation, because a rejoin can come back at the same generation or epoch. A stop that latched
+   * during the leave likewise leaves nothing to reset: the answer belongs to an ended run. Otherwise the
    * generation is reset, and a classic round still in flight owns the rejoin, so no LOST verdict is
    * raised. A consumer-protocol chain, waiting between rounds or joining, owns no rejoin of a
    * membership that carries a loss (see `lostRoundOwed`), so the LOST verdict is raised and the
@@ -875,8 +880,13 @@ module.exports = class RebalanceCoordinator {
     }
 
     await this.contain('heartbeat stop', () => this.heartbeatManager.stop())
+    if (this.runner.stopRequested || this.runner.fatal) return
 
     const joinsBefore = this.consumerGroup.joinCount
+    // Refuses the leave's write, its answer and everything after it once the run ended for good.
+    const leaving = new ConsumerOperation({
+      guard: () => this.runner.retirement ?? this.runner.fatal?.error ?? null,
+    })
 
     // KIP-848 members always tell the coordinator they are gone, static or not - the protocol picks
     // epoch -1 or -2 from `groupInstanceId`. KIP-345's "a static member sends nothing" rule is the
@@ -884,20 +894,29 @@ module.exports = class RebalanceCoordinator {
     // `STALE`, so it would never rejoin.
     // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
     if (this.consumerGroup.kind === 'consumer') {
-      await this.contain('poll leave', () => this.consumerGroup.leaveForPollExpiry())
+      await this.contain('poll leave', () => this.consumerGroup.leaveForPollExpiry(leaving))
     } else if (!isStatic) {
-      await this.contain('poll leave', () => this.consumerGroup.leave())
+      await this.contain('poll leave', () =>
+        this.consumerGroup.leave({ operation: leaving, fenced: true })
+      )
     }
 
-    if (this.consumerGroup.joinCount !== joinsBefore) {
+    // A stop latched meanwhile owns this run's teardown and its one assigner clear; the assigners
+    // may already serve the run started after it.
+    if (
+      leaving.guard() ||
+      this.runner.stopRequested ||
+      this.consumerGroup.joinCount !== joinsBefore
+    ) {
       return
     }
 
     await this.contain('generation reset', () => this.consumerGroup.resetGenerationLocally())
 
     // A running chain that still renews this membership owns the rejoin, and a second LOST would
-    // be an orphan in the slot after it. One that cannot - waiting or joining - gets the LOST.
-    if (this.isRebalancing() && !this.lostRoundOwed()) {
+    // be an orphan in the slot after it. One that cannot - waiting or joining - gets the LOST,
+    // unless the run ended or a fatal answer arrived during the reset.
+    if (leaving.guard() || (this.isRebalancing() && !this.lostRoundOwed())) {
       return
     }
 

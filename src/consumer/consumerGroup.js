@@ -796,10 +796,12 @@ module.exports = class ConsumerGroup {
   /**
    * The poll-expiry variant of `leave()`: no commit, no callbacks, response ignored. A no-op under
    * classic, whose poll-expiry path uses `leave()` or sends nothing at all.
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] refuses the leave's
+   *   write and its answer
    * @returns {Promise<void>}
    */
-  async leaveForPollExpiry() {
-    return this.groupMembership.leaveForPollExpiry()
+  async leaveForPollExpiry(operation) {
+    return this.groupMembership.leaveForPollExpiry(operation)
   }
 
   /**
@@ -889,6 +891,16 @@ module.exports = class ConsumerGroup {
    */
   retireCoordinatorLookup(error) {
     this.coordinatorLookup.retire(error)
+  }
+
+  /**
+   * Ends the current run for good and reports `error` once as its crash (see `Runner#terminate`).
+   * Does nothing without a run, or when the run already ended with an earlier cause.
+   * @param {Error} error the reason the run ends
+   * @returns {void}
+   */
+  stopRun(error) {
+    this.rebalanceCoordinator?.runner?.terminate(error)
   }
 
   /**
@@ -1233,6 +1245,7 @@ module.exports = class ConsumerGroup {
           return this.coordinatorLookup.find(fence)
         },
         isStopping: () => this.isStopping(),
+        stopRun: (error) => this.stopRun(error),
         seeks: {
           clock: () => this.acquireClock,
           changedSince: (since) =>
