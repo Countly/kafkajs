@@ -1082,7 +1082,8 @@ module.exports = class Connection {
    *                         so a caller may record the request as written only on that call.
    *                         On a SASL connection an ordinary request is also refused at that
    *                         instant, with a retriable `KafkaJSError`, while a SASL exchange runs or
-   *                         once the session has ended.
+   *                         once the session has ended; the guard is then called there without a
+   *                         frame length, and its own refusal wins.
    * @param {(() => Error|null)|null} [protocol.responseGuard=null] original setup/authentication
    *                         guard, checked after decode and parse before publishing side effects
    * @param {(() => void)|null} [protocol.onWrite=null] trusted private once-only commit immediately
@@ -1125,11 +1126,14 @@ module.exports = class Connection {
     try {
       expectResponse = !request.expectResponse || request.expectResponse()
       const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly })
-      // The frame-length call comes last: callers record a write in it.
+      // Callers record a write when given the frame length, so a refused session asks without it.
       const writeGuard =
         this.sasl && isAuthenticatedRequest(request)
-          ? (frameLength) =>
-              (guard && guard()) || this[PRIVATE.SESSION_REFUSAL]() || (guard && guard(frameLength))
+          ? (frameLength) => {
+              const refusal = this[PRIVATE.SESSION_REFUSAL]()
+              if (refusal) return (guard && guard()) || refusal
+              return guard && guard(frameLength)
+            }
           : guard
       const enqueue = (encoded) =>
         this[PRIVATE.ENQUEUE](
