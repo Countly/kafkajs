@@ -912,6 +912,7 @@ module.exports = class Connection {
 
   /**
    * Shares one bounded SASL episode on this socket; never adopts a replacement token.
+   * On success, counts the session from the write of the request that set its lifetime.
    * Holds idle preparation once per episode, including token-provider work. An old
    * episode cannot decrement preparation on the replacement connection.
    * @param {{ attempt?: SetupAttempt, requestGuard?: Function|null }} [options] original setup;
@@ -969,7 +970,7 @@ module.exports = class Connection {
         )
         const refusal = guard()
         if (refusal) throw refusal
-        this.authenticatedAt = process.hrtime()
+        this.authenticatedAt = authenticator.sessionStartedAt ?? process.hrtime()
         this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
         if (!attempt) budget.ready()
       } catch (error) {
