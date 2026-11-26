@@ -329,7 +329,7 @@ module.exports = class OffsetManager {
     this.autoCommit = autoCommit
     this.autoCommitInterval = autoCommitInterval
     this.autoCommitThreshold = autoCommitThreshold
-    this.lastCommit = Date.now()
+    this.lastCommit = performance.now()
 
     /** @type {Map<string, Map<number, {timestamp: number, ticket: object}>>} */
     this.pendingSeeks = new Map()
@@ -1351,7 +1351,7 @@ module.exports = class OffsetManager {
    *   ownership refusal nor a stale member epoch
    */
   async commitOffsetsIfNecessary(options) {
-    const now = Date.now()
+    const now = performance.now()
 
     const timeoutReached =
       this.autoCommitInterval != null && now >= this.lastCommit + this.autoCommitInterval
@@ -1535,7 +1535,7 @@ module.exports = class OffsetManager {
     if (selected && this.seeks?.changedSince(since)) topics = this.authorizedCells(topics, since)
 
     if (topics.length === 0) {
-      this.lastCommit = Date.now()
+      this.lastCommit = performance.now()
       return
     }
 
@@ -1551,7 +1551,7 @@ module.exports = class OffsetManager {
       await this.sendAndRecordCommit(payload, topics, { guard, fence, since })
       const refusal = guard?.()
       if (refusal) throw refusal
-      this.lastCommit = Date.now()
+      this.lastCommit = performance.now()
     } catch (e) {
       if (e instanceof KafkaJSCommitFailedError) {
         if (auto) {
@@ -1594,7 +1594,7 @@ module.exports = class OffsetManager {
             memberEpoch: sentEpoch,
           })
 
-          this.lastCommit = Date.now()
+          this.lastCommit = performance.now()
           return
         }
 

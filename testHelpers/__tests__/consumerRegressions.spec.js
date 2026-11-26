@@ -95,7 +95,7 @@ describe('consumer regression fixtures', () => {
       h.group.groupMembership.coordinator.heartbeat = async () => {}
       h.group.offsetManager.autoCommitInterval = 60000
       h.group.offsetManager.autoCommitThreshold = null
-      h.group.offsetManager.lastCommit = Date.now()
+      h.group.offsetManager.lastCommit = performance.now()
       h.group.offsetManager.committedOffsets()[TOPIC][0] = '0'
       h.setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
       const batches = await h.group.fetch(NODE_ID)
