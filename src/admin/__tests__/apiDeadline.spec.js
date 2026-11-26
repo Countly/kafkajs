@@ -1239,9 +1239,9 @@ describe('replay latch', () => {
 
   it('a refusal made before applying lets the call write only the refused items again', async () => {
     const { DeleteTopics, OffsetDelete } = require('../../protocol/requests/apiKeys')
-    const deletion = (topics) => ({
+    const deletion = (selection) => ({
       request: { apiKey: DeleteTopics, apiName: 'DeleteTopics', apiVersion: 6 },
-      args: { topics },
+      args: Array.isArray(selection) ? { topics: selection } : selection,
     })
     const offsets = {
       request: { apiKey: OffsetDelete, apiName: 'OffsetDelete', apiVersion: 0 },
@@ -1253,27 +1253,40 @@ describe('replay latch', () => {
       first.request.onWrite()
       first.request.onDecoded({
         topicErrors: [
-          { topic: 'a', errorCode: 0 },
-          { topic: 't', errorCode: 89 },
+          { topic: 'a', topicId: 'id-a', errorCode: 0 },
+          { topic: 't', topicId: 'id-t', errorCode: 89 },
         ],
       })
       const refusal = createErrorFromCode(89)
       expect(first.failed(refusal)).toBe(refusal)
       expect(isAnsweredError(refusal)).toBe(false)
       expect(writeOf(deletion(['a', 't']))).toThrow('an earlier request of this call')
-      const second = currentMutation().latch(deletion(['t']), 0)
-      second.request.onWrite()
-      second.request.onDecoded({ topicErrors: [{ topic: 't', errorCode: 0 }] })
       expect(writeOf(deletion(['t']))).toThrow('an earlier request of this call')
+      expect(writeOf(deletion({ topicIds: ['id-a', 'id-t'] }))).toThrow(
+        'an earlier request of this call'
+      )
+      const second = currentMutation().latch(deletion({ topicIds: ['id-t'] }), 0)
+      second.request.onWrite()
+      second.request.onDecoded({ topicErrors: [{ topic: 't', topicId: 'id-t', errorCode: 0 }] })
+      expect(writeOf(deletion({ topicIds: ['id-t'] }))).toThrow('an earlier request of this call')
     })
     await runWithDeadline('deleteTopics', 100, () => {
       const latch = currentMutation().latch(deletion(['t']), 0)
       latch.request.onWrite()
-      latch.request.onDecoded({ topicErrors: [{ topic: 't', errorCode: 89 }] })
+      latch.request.onDecoded({ topicErrors: [{ topic: 't', topicId: null, errorCode: 89 }] })
+      const refusal = createErrorFromCode(89)
+      expect(latch.failed(refusal)).toBe(refusal)
+      expect(isAnsweredError(refusal)).toBe(true)
+      expect(writeOf(deletion({ topicIds: ['id-t'] }))).toThrow('an earlier request of this call')
+    })
+    await runWithDeadline('deleteTopics', 100, () => {
+      const latch = currentMutation().latch(deletion(['t']), 0)
+      latch.request.onWrite()
+      latch.request.onDecoded({ topicErrors: [{ topic: 't', topicId: 'id-t', errorCode: 89 }] })
       const other = new KafkaJSError('not the refusal')
       expect(latch.failed(other)).toBe(other)
       expect(isAnsweredError(other)).toBe(true)
-      expect(writeOf(deletion(['t']))).toThrow('an earlier request of this call')
+      expect(writeOf(deletion({ topicIds: ['id-t'] }))).toThrow('an earlier request of this call')
     })
     await runWithDeadline('deleteOffsets', 100, () => {
       const loading = currentMutation().latch(offsets, 0)

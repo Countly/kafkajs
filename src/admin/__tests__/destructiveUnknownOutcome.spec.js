@@ -33,13 +33,27 @@ const quota = {
 const topicId = '00112233-4455-6677-8899-aabbccddeeff'
 const node = (id) => ({ id, host: 'node' + id, port: 9092 })
 
-/** An unthrottled DeleteTopics v6 answer with one row per named topic. */
-const topicRows = (codes) => ({
+/** An id other than the one Metadata advertises for topic `t`. */
+const otherTopicId = '10112233-4455-6677-8899-aabbccddeeff'
+
+/** An unthrottled DeleteTopics v6 answer with one row per named topic, with no id unless given. */
+const topicRows = (codes, ids = {}) => ({
   throttleTime: 0,
   topicErrors: Object.entries(codes).map(([topic, errorCode]) => ({
     topic,
-    topicId: null,
+    topicId: ids[topic] ?? null,
     errorCode,
+    errorMessage: null,
+  })),
+})
+
+/** Accepts every topic a DeleteTopics v6 request names, by name or by id. */
+const acceptTopics = ({ topics }) => ({
+  throttleTime: 0,
+  topicErrors: topics.map(({ topic, topicId: id }) => ({
+    topic,
+    topicId: id,
+    errorCode: 0,
     errorMessage: null,
   })),
 })
@@ -50,8 +64,8 @@ const refusedBeforeApplying = [
     api: 'DeleteTopics',
     method: 'deleteTopics',
     input: { topics: ['t'] },
-    refusal: topicRows({ t: 89 }),
-    accept: ({ topics }) => topicRows(Object.fromEntries(topics.map(({ topic }) => [topic, 0]))),
+    refusal: topicRows({ t: 89 }, { t: topicId }),
+    accept: acceptTopics,
     accepted: ({ value, error }) => {
       expect(error).toBeUndefined()
       expect(value).toBeUndefined()
@@ -404,7 +418,7 @@ describe('written admin mutations', () => {
     }
   )
 
-  it('a written DeleteTopics is sent again only for the topics the quota refused', async () => {
+  it('a written DeleteTopics is sent again only by the ids the quota refused', async () => {
     const schedule = new Schedule()
     const scripted = createScriptedCluster({
       profile: 'destructiveAdmin',
@@ -412,10 +426,8 @@ describe('written admin mutations', () => {
       nodes: [node(0)],
     })
     const api = 'DeleteTopics'
-    schedule.once({ api }, topicRows({ a: 0, t: 89 }))
-    scripted.answer(api, ({ topics }) =>
-      topicRows(Object.fromEntries(topics.map(({ topic }) => [topic, 0])))
-    )
+    schedule.once({ api }, topicRows({ a: 0, t: 89 }, { a: otherTopicId, t: topicId }))
+    scripted.answer(api, acceptTopics)
     const broker = new Broker({
       connectionPool: new ConnectionPool(
         connectionOpts({
@@ -433,19 +445,70 @@ describe('written admin mutations', () => {
         await expect(broker.deleteTopics({ topics: ['a', 't'] })).rejects.toMatchObject({
           code: 89,
         })
-        await expect(broker.deleteTopics({ topics: ['a', 't'] })).rejects.toThrow(
-          'an earlier request of this call'
-        )
-        await broker.deleteTopics({ topics: ['t'] })
+        for (const selection of [
+          { topics: ['a', 't'] },
+          { topics: ['t'] },
+          { topicIds: [otherTopicId, topicId] },
+        ]) {
+          await expect(broker.deleteTopics(selection)).rejects.toThrow(
+            'an earlier request of this call'
+          )
+        }
+        await broker.deleteTopics({ topicIds: [topicId] })
       })
       expect(
         scripted
           .requests()
           .filter((frame) => frame.api === api)
-          .map(({ fields }) => fields.topics.map(({ topic }) => topic))
-      ).toEqual([['a', 't'], ['t']])
+          .map(({ fields }) => fields.topics.map(({ topic, topicId: id }) => topic ?? id))
+      ).toEqual([['a', 't'], [topicId]])
     } finally {
       await broker.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteTopics sends a quota-refused name again by the refused id, never to a topic recreated under that name', async () => {
+    const { admin, schedule, scripted } = fixture()
+    const api = 'DeleteTopics'
+    schedule.once({ api }, topicRows({ t: 89 }, { t: otherTopicId }))
+    scripted.answer(api, acceptTopics)
+    try {
+      await admin.connect()
+      const result = admin.deleteTopics({ topics: ['t'] }).then(
+        (value) => ({ value }),
+        (error) => ({ error })
+      )
+      await untilSettled(result)
+      expect(await result).toEqual({ value: undefined })
+      const sent = scripted
+        .requests()
+        .filter((frame) => frame.api === api)
+        .map(({ fields }) => fields.topics)
+      expect(sent).toEqual([
+        [{ topic: 't', topicId: null }],
+        [{ topic: null, topicId: otherTopicId }],
+      ])
+      expect(sent.flat().some((row) => row.topicId === topicId)).toBe(false)
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteTopics keeps a quota refusal that carries no topic id as an answered rejection', async () => {
+    const { admin, schedule, scripted } = fixture()
+    const api = 'DeleteTopics'
+    schedule.once({ api }, topicRows({ t: 89 }))
+    scripted.answer(api, acceptTopics)
+    try {
+      await admin.connect()
+      const result = admin.deleteTopics({ topics: ['t'] }).catch((error) => error)
+      await untilSettled(result)
+      await expect(result).resolves.toMatchObject({ name: 'KafkaJSProtocolError', code: 89 })
+      expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(1)
+    } finally {
+      await admin.disconnect()
       scripted.assertClean()
     }
   })

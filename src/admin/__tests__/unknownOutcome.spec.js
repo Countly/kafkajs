@@ -45,27 +45,19 @@ it('only refusals made before applying let a call send again', () => {
   const rows = (...codes) => ({
     topicErrors: codes.map(([topic, errorCode]) => ({ topic, topicId: `id-${topic}`, errorCode })),
   })
-  const byName = { topics: ['a', 't'] }
-  expect(resendable(apiKeys.DeleteTopics, byName, rows(['a', 0], ['t', 89]))).toEqual(
-    new Set(['t'])
-  )
-  expect(
-    resendable(apiKeys.DeleteTopics, { topicIds: ['id-a', 'id-t'] }, rows(['a', 0], ['t', 89]))
-  ).toEqual(new Set(['id-t']))
-  expect(resendable(apiKeys.DeleteTopics, byName, rows(['a', 3], ['t', 89]))).toBeNull()
-  expect(resendable(apiKeys.DeleteTopics, byName, rows(['a', 0], ['t', 0]))).toBeNull()
+  expect(resendable(apiKeys.DeleteTopics, rows(['a', 0], ['t', 89]))).toEqual(new Set(['id-t']))
+  expect(resendable(apiKeys.DeleteTopics, rows(['a', 3], ['t', 89]))).toBeNull()
+  expect(resendable(apiKeys.DeleteTopics, rows(['a', 0], ['t', 0]))).toBeNull()
   for (const code of [7, 41]) {
-    expect(resendable(apiKeys.DeleteTopics, byName, rows(['t', code]))).toBeNull()
+    expect(resendable(apiKeys.DeleteTopics, rows(['t', code]))).toBeNull()
   }
   for (const api of ['OffsetDelete', 'LeaveGroup']) {
-    expect(resendable(apiKeys[api], {}, { errorCode: 14 })).toBe(true)
+    expect(resendable(apiKeys[api], { errorCode: 14 })).toBe(true)
     for (const errorCode of [0, 7, 15, 16, 41]) {
-      expect(resendable(apiKeys[api], {}, { errorCode })).toBeNull()
+      expect(resendable(apiKeys[api], { errorCode })).toBeNull()
     }
   }
-  expect(
-    resendable(apiKeys.LeaveGroup, {}, { errorCode: 0, members: [{ errorCode: 14 }] })
-  ).toBeNull()
+  expect(resendable(apiKeys.LeaveGroup, { errorCode: 0, members: [{ errorCode: 14 }] })).toBeNull()
   for (const api of [
     'DeleteGroups',
     'AlterShareGroupOffsets',
@@ -73,15 +65,29 @@ it('only refusals made before applying let a call send again', () => {
     'InitProducerId',
     'AlterPartitionReassignments',
   ]) {
-    expect(resendable(apiKeys[api], {}, { errorCode: 14 })).toBeNull()
-    expect(resendable(apiKeys[api], {}, { errorCode: 89 })).toBeNull()
+    expect(resendable(apiKeys[api], { errorCode: 14 })).toBeNull()
+    expect(resendable(apiKeys[api], { errorCode: 89 })).toBeNull()
   }
 
   expect(mayResend(true, {})).toBe(true)
-  expect(mayResend(null, byName)).toBe(false)
-  expect(mayResend(new Set(['t']), { topics: ['t'] })).toBe(true)
-  expect(mayResend(new Set(['t']), byName)).toBe(false)
-  expect(mayResend(new Set(['id-t']), { topicIds: ['id-t'] })).toBe(true)
+  expect(mayResend(null, { topicIds: ['id-t'] })).toBe(false)
+})
+
+it('a DeleteTopics quota refusal permits a resend only by the topic ids it refused', () => {
+  const refusal = (...rows) => ({
+    topicErrors: rows.map(([topic, topicId, errorCode]) => ({ topic, topicId, errorCode })),
+  })
+  const refused = resendable(apiKeys.DeleteTopics, refusal(['a', 'id-a', 0], ['t', 'id-t', 89]))
+  expect(refused).toEqual(new Set(['id-t']))
+  expect(mayResend(refused, { topicIds: ['id-t'] })).toBe(true)
+  expect(mayResend(refused, { topics: ['t'] })).toBe(false)
+  expect(mayResend(refused, { topicIds: ['id-t', 'id-a'] })).toBe(false)
+  expect(mayResend(refused, { topicIds: [] })).toBe(false)
+  for (const topicId of [null, undefined]) {
+    expect(resendable(apiKeys.DeleteTopics, refusal(['t', topicId, 89]))).toBeNull()
+  }
+  expect(resendable(apiKeys.DeleteTopics, refusal(['t', 'id-t', 0], ['t', 'id-x', 89]))).toBeNull()
+  expect(resendable(apiKeys.DeleteTopics, refusal(['a', 'id-t', 0], ['t', 'id-t', 89]))).toBeNull()
 })
 
 it('validateOnly exempts a request only when its version encodes the flag', () => {

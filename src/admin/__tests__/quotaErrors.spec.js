@@ -13,6 +13,10 @@ const NOT_CONTROLLER = 41
 // Explicit, so that an attempt count means the same under every run mode: three attempts in all.
 const RETRY = { retries: 2, initialRetryTime: 1, maxRetryTime: 1 }
 
+/** The topic id a v6 DeleteTopics answer gives each topic, and back. */
+const idOf = (topic) => `id-${topic}`
+const nameOfId = (id) => id.slice('id-'.length)
+
 /**
  * What each API's admin call sends and what it rejects with, so one table of cases serves the three.
  * `parse` is the newest decoder's own, so the error is the one a real answer raises.
@@ -32,8 +36,9 @@ const APIS = [
     method: 'deleteTopics',
     parse: deleteTopicsResponse.parse,
     call: (admin, names) => admin.deleteTopics({ topics: names }),
-    sent: ({ topics }) => topics,
+    sent: ({ topics, topicIds }) => topics ?? topicIds.map(nameOfId),
     refusal: (error) => error,
+    withIds: true,
   },
   {
     name: 'createPartitions',
@@ -50,12 +55,18 @@ const APIS = [
  * An admin whose controller answers each request with the next of `answers`, the last one for ever.
  * An answer is `[topic, errorCode]` rows run through the API's own `parse`.
  */
-const adminAnswering = ({ method, parse }, answers) => {
+const adminAnswering = ({ method, parse, withIds }, answers) => {
   const queue = [...answers]
   const broker = {
     [method]: jest.fn(async () => {
       const rows = queue.length > 1 ? queue.shift() : queue[0]
-      return parse({ topicErrors: rows.map(([topic, errorCode]) => ({ topic, errorCode })) })
+      return parse({
+        topicErrors: rows.map(([topic, errorCode]) => ({
+          topic,
+          errorCode,
+          ...(withIds && { topicId: idOf(topic) }),
+        })),
+      })
     }),
   }
   const cluster = {
@@ -130,6 +141,66 @@ describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
   })
 })
 
+describe('Admin > deleteTopics > a quota refuses topics by name', () => {
+  const api = APIS.find(({ name }) => name === 'deleteTopics')
+
+  test('sends the refused topics again by the ids the broker answered with, never by name', async () => {
+    const { admin, broker } = adminAnswering(api, [
+      [
+        ['a', 0],
+        ['b', THROTTLING_QUOTA_EXCEEDED],
+      ],
+      [['b', 0]],
+    ])
+
+    await api.call(admin, ['a', 'b'])
+
+    expect(
+      broker.deleteTopics.mock.calls.map(([{ topics, topicIds }]) => ({ topics, topicIds }))
+    ).toEqual([
+      { topics: ['a', 'b'], topicIds: undefined },
+      { topics: undefined, topicIds: [idOf('b')] },
+    ])
+  })
+
+  test('reports the refused topics by name when the retry budget is spent', async () => {
+    const { admin, broker } = adminAnswering(api, [[['a', THROTTLING_QUOTA_EXCEEDED]]])
+    // An answer to a request by id need not repeat the name.
+    broker.deleteTopics.mockImplementation(async ({ topics }) =>
+      deleteTopicsResponse.parse({
+        topicErrors: [
+          { topic: topics ? 'a' : null, topicId: idOf('a'), errorCode: THROTTLING_QUOTA_EXCEEDED },
+        ],
+      })
+    )
+
+    const error = await api.call(admin, ['a']).catch((e) => e)
+
+    expect(error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+    expect(error.cause.topicErrors).toEqual([
+      expect.objectContaining({
+        topic: 'a',
+        topicId: idOf('a'),
+        errorCode: THROTTLING_QUOTA_EXCEEDED,
+      }),
+    ])
+    expect(broker.deleteTopics).toHaveBeenCalledTimes(RETRY.retries + 1)
+  })
+
+  test('keeps a refusal that carries no topic id as final', async () => {
+    const { admin, broker } = adminAnswering({ ...api, withIds: false }, [
+      [['a', THROTTLING_QUOTA_EXCEEDED]],
+      [['a', 0]],
+    ])
+
+    await expect(api.call(admin, ['a'])).rejects.toMatchObject({
+      type: 'THROTTLING_QUOTA_EXCEEDED',
+    })
+
+    expect(broker.deleteTopics).toHaveBeenCalledTimes(1)
+  })
+})
+
 // createTopics sends the retriable topics again whatever else failed in the answer
 // (aggregateOutcome.spec.js), so only the two calls that do not are held to one attempt here.
 describe.each(APIS.filter(({ name }) => name !== 'createTopics'))(
@@ -170,13 +241,14 @@ const adminOverDeletingBroker = (answers, targets) => {
   const queue = [...answers]
   const deleted = new Set()
   const broker = {
-    deleteTopics: jest.fn(async ({ topics }) => {
+    deleteTopics: jest.fn(async ({ topics, topicIds }) => {
+      const asked = topics ?? topicIds.map(nameOfId)
       const rows = (queue.length > 1 ? queue.shift() : queue[0]).filter(([topic]) =>
-        topics.includes(topic)
+        asked.includes(topic)
       )
       rows.filter(([, errorCode]) => errorCode === 0).forEach(([topic]) => deleted.add(topic))
       return deleteTopicsResponse.parse({
-        topicErrors: rows.map(([topic, errorCode]) => ({ topic, errorCode })),
+        topicErrors: rows.map(([topic, errorCode]) => ({ topic, topicId: idOf(topic), errorCode })),
       })
     }),
     describeConfigs: jest.fn(async () => ({ resources: [] })),
@@ -200,7 +272,8 @@ const adminOverDeletingBroker = (answers, targets) => {
   return { admin, broker, cluster }
 }
 
-const sentTopics = (broker) => broker.deleteTopics.mock.calls.map(([{ topics }]) => topics)
+const sentTopics = (broker) =>
+  broker.deleteTopics.mock.calls.map(([{ topics, topicIds }]) => topics ?? topicIds.map(nameOfId))
 
 describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
   test('a quota refusal leaves the deleted topic out of the refresh, so the refused one is sent again', async () => {
