@@ -1804,24 +1804,24 @@ describe('Producer > the accumulator', () => {
     )
 
     test.each([
-      ['batches that share their options', [{}, {}]],
-      ['batches of different options', [{ timeout: 1 }, { timeout: 2 }]],
+      ['batches that share their options', [{}, {}], 1],
+      ['batches of different options', [{ timeout: 1 }, { timeout: 2 }], 2],
     ])(
       'flush() settles and every send it carried rejects with that failure, for %s',
-      async (_, optionSets) => {
+      async (_, optionSets, handOffs) => {
         jest.useFakeTimers({ now: 0 })
         const failure = new Error('send path failure')
-        const { accumulator } = createAccumulator({
-          sendPartitioned: () => {
-            throw failure
-          },
+        const sendPartitioned = jest.fn(() => {
+          throw failure
         })
+        const { accumulator } = createAccumulator({ sendPartitioned })
         const outcomes = optionSets.map((options, partition) =>
           append(accumulator, records(partition, 'a'), options).catch((error) => error)
         )
         await jest.advanceTimersByTimeAsync(0)
 
         await expect(settledWithin(accumulator.flush())).resolves.toBeUndefined()
+        expect(sendPartitioned).toHaveBeenCalledTimes(handOffs)
         const errors = await settledWithin(Promise.all(outcomes))
         expect(errors).toHaveLength(optionSets.length)
         errors.forEach((error) => expect(error).toBe(failure))

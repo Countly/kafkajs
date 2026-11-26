@@ -2,7 +2,12 @@ const ProducerStateManager = require('..')
 const { held } = require('../recordSize')
 const { interleavings } = require('../../../../testHelpers/schedule')
 const { createErrorFromCode } = require('../../../protocol/error')
-const { KafkaJSConnectionClosedError, KafkaJSDeliveryTimeout } = require('../../../errors')
+const {
+  KafkaJSConnectionClosedError,
+  KafkaJSDeliveryTimeout,
+  KafkaJSProducerClosedError,
+  KafkaJSRecordTooLargeError,
+} = require('../../../errors')
 const {
   bufferedProducer,
   collect,
@@ -868,13 +873,13 @@ describe('Producer > the buffer > a join that fails while planning', () => {
    * An accumulator over a 64 KiB buffer whose request budget's `chunkCapacity` can be told to throw
    * on one call (`append` asks once per topic, the join once per partition). Each record is its own
    * entry, at the partition it names. The send path records what each call carried, then answers
-   * and retires every batch.
+   * and retires every batch. A `budget` given replaces that request budget.
    */
-  const planningFailure = ({ batchSize, linger = 0 }) => {
+  const planningFailure = ({ batchSize, linger = 0, budget: given }) => {
     const admission = new Admission({ capacity: 65536, maxBlockMs: 0 })
     const failure = new RangeError('chunk capacity failed')
     const capacity = { calls: 0, failAt: 0 }
-    const budget = {
+    const budget = given ?? {
       maxRequestSize: Infinity,
       chunkCapacity: () => {
         capacity.calls += 1
@@ -1074,5 +1079,206 @@ describe('Producer > the buffer > a join that fails while planning', () => {
     const closed = watch(accumulator.close())
     await flushAll()
     expect(closed.state).toBe('fulfilled')
+  })
+
+  test('a synchronous throw from the send path while handing on an earlier batch retires that batch, leaving no debt, reservation or topic pin of it', async () => {
+    const { accumulator, admission, pins, requests, send, sendPartitioned } = planningFailure({
+      batchSize: 16384,
+      linger: LINGER,
+    })
+    const handOff = new Error('send path failure')
+    sendPartitioned.mockImplementationOnce(() => {
+      throw handOff
+    })
+
+    const earlier = send([{ topic: TOPIC, messages: [{ value: 'earlier', partition: 0 }] }])
+    await flushAll()
+    expect(admission.debts).toBe(1024)
+    expect(pins.get(TOPIC)).toBe(1)
+    const joining = send([{ topic: TOPIC, messages: [{ value: 'joining', partition: 0 }] }], 1)
+    await flushAll()
+
+    expect(sendPartitioned).toHaveBeenCalledTimes(1)
+    expect(earlier.state).toBe('rejected')
+    expect(earlier.value).toBe(handOff)
+    expect(joining.state).toBe('pending')
+    expect(admission.debts).toBe(1024)
+    expect(pins.get(TOPIC)).toBe(1)
+
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+    expect(requests).toEqual([{ acks: 1, batches: [{ key: `${TOPIC}/0`, values: ['joining'] }] }])
+    expect(joining.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    const closed = watch(accumulator.close())
+    await flushAll()
+    expect(closed.state).toBe('fulfilled')
+  })
+
+  test('a send path that takes an earlier batch and then rejects keeps its debt and topic pin until the send path retires it', async () => {
+    const { admission, pins, send, sendPartitioned } = planningFailure({
+      batchSize: 16384,
+      linger: LINGER,
+    })
+    const handOff = new Error('send path failure')
+    const taken = []
+    sendPartitioned.mockImplementationOnce(async ({ batches }) => {
+      taken.push(...batches)
+      throw handOff
+    })
+
+    const earlier = send([{ topic: TOPIC, messages: [{ value: 'earlier', partition: 0 }] }])
+    await flushAll()
+    const joining = send([{ topic: TOPIC, messages: [{ value: 'joining', partition: 0 }] }], 1)
+    await flushAll()
+
+    expect(earlier.value).toBe(handOff)
+    expect(taken).toHaveLength(1)
+    expect(admission.debts).toBe(2048)
+    expect(pins.get(TOPIC)).toBe(2)
+    taken[0].retire()
+    expect(admission.debts).toBe(1024)
+    expect(pins.get(TOPIC)).toBe(1)
+
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+    expect(joining.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+  })
+
+  test('a record above the chunk capacity at planning, though a larger capacity admitted it, is refused as too large with nothing handed on, charged or pinned', async () => {
+    const budget = {
+      maxRequestSize: 1000,
+      chunkCapacity: jest.fn().mockReturnValueOnce(1000).mockReturnValue(24),
+    }
+    const { accumulator, admission, pins, send, sendPartitioned } = planningFailure({
+      batchSize: 16384,
+      budget,
+    })
+
+    const sent = send([
+      {
+        topic: TOPIC,
+        messages: [
+          { value: 'a', partition: 0 },
+          { value: 'b', partition: 0 },
+        ],
+      },
+    ])
+    await flushAll()
+
+    expect(budget.chunkCapacity).toHaveBeenCalledTimes(2)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSRecordTooLargeError)
+    expect(sent.value).toMatchObject({
+      reason: 'maxRequestSize',
+      scope: 'record',
+      size: 25,
+      limit: 24,
+      topic: TOPIC,
+    })
+    expect(sendPartitioned).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    const closed = watch(accumulator.close())
+    await flushAll()
+    expect(closed.state).toBe('fulfilled')
+    expect(sendPartitioned).not.toHaveBeenCalled()
+  })
+})
+
+describe('Producer > the buffer > a custom partitioner that changes a record', () => {
+  const { createFakeCluster } = require('../../__tests__/fixtures/fakeCluster')
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  /**
+   * A producer without idempotence over two partitions, with `batchSize: 1` and `partitioner` as
+   * its custom partitioner, whose cluster counts the topic pins it holds.
+   */
+  const pinnedProducer = (partitioner) => {
+    const cluster = createFakeCluster({ partitions: 2 })
+    const pins = new Map()
+    cluster.holdTopic = (topic) => pins.set(topic, (pins.get(topic) ?? 0) + 1)
+    cluster.releaseTopic = (topic) =>
+      pins.get(topic) === 1 ? pins.delete(topic) : pins.set(topic, pins.get(topic) - 1)
+    const fixture = bufferedProducer({
+      cluster,
+      idempotent: false,
+      batchSize: 1,
+      createPartitioner: () => partitioner,
+    })
+    return { ...fixture, pins }
+  }
+
+  /** Sends `a` to partition 0 and `b` to partition 1, after `change(message)` ran on `b`. */
+  const byValue =
+    (change) =>
+    ({ message }) => {
+      if (message.value !== 'b') return 0
+      change(message)
+      return 1
+    }
+
+  test('a timestamp getter that throws on the second of two partitions with batchSize 1 rejects the send with its error, writes nothing and leaves nothing charged or pinned', async () => {
+    const failure = new RangeError('timestamp read failed')
+    const { producer, cluster, admission, pins } = pinnedProducer(
+      byValue((message) =>
+        Object.defineProperty(message, 'timestamp', {
+          get() {
+            throw failure
+          },
+        })
+      )
+    )
+    await producer.connect()
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value: 'a' }, { value: 'b' }] }))
+    await flushAll()
+
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBe(failure)
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+  })
+
+  test('a timestamp getter that disconnects the producer at once while the send joins refuses the send unsent, writes nothing and leaves nothing charged or pinned', async () => {
+    let disconnected = null
+    const { producer, cluster, admission, pins } = pinnedProducer(
+      byValue((message) =>
+        Object.defineProperty(message, 'timestamp', {
+          get() {
+            disconnected ??= producer.disconnect({ timeout: 0 })
+            return 1
+          },
+        })
+      )
+    )
+    await producer.connect()
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value: 'a' }, { value: 'b' }] }))
+    await flushAll()
+
+    expect(disconnected).toBeInstanceOf(Promise)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSProducerClosedError)
+    expect(sent.value.outcome).toBe('unsent')
+    await disconnected
+    await flushAll()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
   })
 })
