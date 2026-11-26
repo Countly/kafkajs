@@ -1852,7 +1852,10 @@ module.exports = class OffsetManager {
           this.owns(topic, partition) &&
           !preparation?.guard() &&
           !this.isStale(ticket, topic, partition, requestedIds)
-        const resolved = await new ResetResolver(this.cluster).resolve(
+        const resolved = await new ResetResolver(this.cluster, {
+          logger: this.logger,
+          groupId: this.groupId,
+        }).resolve(
           consumerOffsets,
           this.topicConfigurations,
           current,
