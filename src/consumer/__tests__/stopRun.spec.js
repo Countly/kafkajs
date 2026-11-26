@@ -1865,6 +1865,121 @@ describe('Consumer > a run stopped for good with an error', () => {
       ])
     }, 30000)
 
+    it('a clear owed by a classic run closed with a zero timeout is not taken by a manual-assignment run: the next classic run clears the assigners once, before its first JoinGroup', async () => {
+      let retained = null
+      let clears = 0
+      const clearsAtJoin = []
+      const retaining = {
+        ...eager(),
+        protocol: () => ({ name: 'eager', metadata: Buffer.from(JSON.stringify(retained)) }),
+        onAssignment: (assignment, { generationId }) => {
+          if (assignment === null) clears++
+          retained = assignment && { partitions: assignment.partitions, generationId }
+        },
+      }
+      const run = await startOther('classic', {
+        config: { partitionAssigners: [() => retaining] },
+      })
+      const { runner, coordinator, consumer } = run
+      await advanceUntil(() => retained !== null, 1000)
+      expect(retained).toMatchObject({ generationId: 1 })
+      const join = coordinator.joinGroup.getMockImplementation()
+      coordinator.joinGroup.mockImplementation(async (request) => {
+        clearsAtJoin.push(clears)
+        return join(request)
+      })
+
+      const closing = settled(consumer.disconnect({ timeout: 0 }))
+      await advanceUntil(() => closing.done, 2000)
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(runner.retirement).not.toBeNull()
+      expect(clears).toBe(0)
+
+      const runs = jest.spyOn(Runner.prototype, 'start')
+      const manual = settled(
+        (async () => {
+          await consumer.unsubscribe()
+          await consumer.assign([{ topic: 'topic-a', partitions: [0] }])
+          await consumer.run({ eachMessage: async () => {} })
+        })()
+      )
+      await advanceUntil(() => manual.done, 2000)
+      expect(manual).toMatchObject({ done: true, value: undefined })
+      const manualRunner = runs.mock.contexts[runs.mock.contexts.length - 1]
+      expect(manualRunner.consumerGroup.kind).toBe('manual')
+      expect(manualRunner.running).toBe(true)
+      expect(clears).toBe(0)
+
+      const switching = settled(
+        (async () => {
+          await consumer.unsubscribe()
+          await consumer.subscribe({ topic: 'topic-a' })
+        })()
+      )
+      await advanceUntil(() => switching.done, 2000)
+      expect(switching).toMatchObject({ done: true, value: undefined })
+      expect(clears).toBe(0)
+      expect(clearsAtJoin).toEqual([])
+
+      const joins = coordinator.joinGroup.mock.calls.length
+      const again = settled(consumer.run({ eachMessage: async () => {} }))
+      await advanceUntil(() => again.done && coordinator.joinGroup.mock.calls.length > joins, 2000)
+
+      expect(again).toMatchObject({ done: true, value: undefined })
+      expect(clearsAtJoin[0]).toBe(1)
+      expect(clears).toBe(1)
+      expect(coordinator.joinGroup.mock.calls[joins][0].groupProtocols).toEqual([
+        { name: 'eager', metadata: Buffer.from('null') },
+      ])
+    }, 30000)
+
+    it('a manual-assignment run closed with a zero timeout owes the assigners no clear: the next classic run joins without calling them with null', async () => {
+      let clears = 0
+      const clearsAtJoin = []
+      const counting = {
+        ...eager(),
+        onAssignment: (assignment) => {
+          if (assignment === null) clears++
+        },
+      }
+      const run = await startOther('manual', {
+        config: { partitionAssigners: [() => counting] },
+      })
+      const { runner, coordinator, consumer } = run
+      expect(runner.consumerGroup.kind).toBe('manual')
+      expect(runner.running).toBe(true)
+      const join = coordinator.joinGroup.getMockImplementation()
+      coordinator.joinGroup.mockImplementation(async (request) => {
+        clearsAtJoin.push(clears)
+        return join(request)
+      })
+
+      const closing = settled(consumer.disconnect({ timeout: 0 }))
+      await advanceUntil(() => closing.done, 2000)
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(runner.retirement).not.toBeNull()
+      expect(clears).toBe(0)
+
+      const switching = settled(
+        (async () => {
+          await consumer.unsubscribe()
+          await consumer.subscribe({ topic: 'topic-a' })
+        })()
+      )
+      await advanceUntil(() => switching.done, 2000)
+      expect(switching).toMatchObject({ done: true, value: undefined })
+
+      const again = settled(consumer.run({ eachMessage: async () => {} }))
+      await advanceUntil(() => again.done && coordinator.joinGroup.mock.calls.length > 0, 2000)
+
+      expect(again).toMatchObject({ done: true, value: undefined })
+      expect(clearsAtJoin[0]).toBe(0)
+      expect(clears).toBe(0)
+      expect(coordinator.joinGroup.mock.calls[0][0].groupProtocols).toEqual([
+        { name: 'eager', metadata: Buffer.alloc(0) },
+      ])
+    }, 30000)
+
     it('a stop called by the assigner while the next run clears it is honoured: that run sends no JoinGroup', async () => {
       let retained = null
       let interrupt = false
