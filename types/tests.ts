@@ -2270,3 +2270,89 @@ const useAdminResultShapes = async () => {
   ]
 }
 void useAdminResultShapes
+
+import * as net from 'net'
+import * as tls from 'tls'
+
+// Declarations of the consumer, producer, assigner and event surface match what the runtime does.
+namespace ConsumerProducerEventDeclarations {
+  const kafka = new kafkajs.Kafka({ brokers: [] })
+  const producer = kafka.producer()
+  const share = kafka.shareConsumer({ groupId: 'g' })
+  declare const bigTimestamp: bigint
+
+  // A rebalance reason can be one the client names, or the text given to `enforceRebalance`.
+  type Reason = kafkajs.ConsumerRebalancingEvent['payload']['reason']
+  const named: Reason = 'rebalance-in-progress'
+  const subscriptionChanged: Reason = 'subscription-changed'
+  const enforced: Reason = 'enforced-rebalance'
+  const custom: Reason = 'custom'
+  const absent: Reason = undefined
+  // @ts-expect-error a reason is text
+  const numeric: Reason = 5
+  void [named, subscriptionChanged, enforced, custom, absent, numeric]
+
+  // A decoded assigner buffer can carry no user data: Java members send none.
+  const metadata = AssignerProtocol.MemberMetadata.decode(Buffer.alloc(0))
+  // @ts-expect-error decoded userData can be null
+  void (metadata && metadata.userData.length)
+  void (metadata && metadata.userData && metadata.userData.length)
+  const assignment = AssignerProtocol.MemberAssignment.decode(Buffer.alloc(0))
+  // @ts-expect-error decoded userData can be null
+  void assignment?.userData.length
+  void assignment?.userData?.length
+  const nullableUserData: Buffer | null | undefined = assignment?.userData
+  void nullableUserData
+
+  // `MemberAssignment.encode` defaults the user data, and accepts the null the wire carries.
+  const encodedWithout: Buffer = AssignerProtocol.MemberAssignment.encode({ version: 1, assignment: {} })
+  const encodedNull: Buffer = AssignerProtocol.MemberAssignment.encode({ version: 1, assignment: { t: [0] }, userData: null })
+  const encodedBytes: Buffer = AssignerProtocol.MemberAssignment.encode({ version: 1, assignment: { t: [0] }, userData: Buffer.alloc(0) })
+  void [encodedWithout, encodedNull, encodedBytes]
+
+  // A record timestamp is a string, a number, a `Date` or a `bigint`, as `send` has always taken.
+  const sendTimestamps = async () => {
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: '1' }] })
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: Date.now() }] })
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: new Date() }] })
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: bigTimestamp }] })
+    // @ts-expect-error a timestamp is not a boolean
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: true }] })
+  }
+  void sendTimestamps
+
+  // A share consumer runs exactly one handler.
+  const runShare = async () => {
+    await share.run({ eachMessage: async () => {} })
+    await share.run({ eachBatch: async () => {} })
+    // @ts-expect-error exactly one handler
+    await share.run({})
+    // @ts-expect-error exactly one handler
+    await share.run({ eachMessage: async () => {}, eachBatch: async () => {} })
+  }
+  void runShare
+
+  // A socket factory gets `ssl` as configured: `true`, an options object, `false` or `null`.
+  const factory: kafkajs.ISocketFactory = (args) => {
+    const enabled: boolean = args.ssl === true
+    const disabled: boolean = args.ssl === false || args.ssl === null
+    const options: tls.ConnectionOptions | undefined = typeof args.ssl === 'object' && args.ssl ? args.ssl : undefined
+    void [enabled, disabled, options]
+    return new net.Socket()
+  }
+  void factory
+
+  // A halted partition can have no member id yet.
+  const halted = {} as kafkajs.ConsumerPartitionHaltedEventPayload
+  const haltedMember: string | null = halted.memberId
+  // @ts-expect-error a halted partition can have no member
+  const haltedId: string = halted.memberId
+  void [haltedMember, haltedId]
+
+  // The root logger has no namespace.
+  const entry = {} as kafkajs.LogEntry
+  const entryNamespace: string | undefined = entry.namespace
+  // @ts-expect-error the root logger has no namespace
+  const ns: string = entry.namespace
+  void [entryNamespace, ns]
+}

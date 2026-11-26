@@ -1685,6 +1685,29 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   whose consumer-protocol description failed has an empty group type. A function typed to take only
   the earlier group-type union can no longer be called with `group.groupType`; handle `''` (an
   exhaustive `switch` needs a `default`).
+- **`AssignerProtocol` decodes `userData` as `Buffer | null`.** A member that sent none, such as a
+  Java consumer, decodes to `null`; guard it under `strictNullChecks`. `MemberAssignment.encode` no
+  longer needs `userData` (it writes an empty byte string) and takes `null`, which writes the wire
+  null; its argument type is the new `MemberAssignmentInput`.
+- **`Message.timestamp` accepts a string, a number, a `Date` or a `bigint`.** `send()` took the
+  first three in 2.2.4 and takes the `bigint` in this release. Call sites are unaffected; code that *reads* it, such as a custom partitioner
+  (`PartitionerArgs.message`), must handle every form. Before: `Number(message.timestamp)`. After:
+  `message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp)`.
+- **A custom `socketFactory` receives `ssl` as configured: `true`, an options object, or
+  `null`/`false`.** Use `typeof args.ssl === 'object' && args.ssl` before passing it to
+  `tls.connect`.
+- **`LogEntry.namespace` is `string | undefined`.** It is `undefined` for the root logger; guard it
+  under `strictNullChecks`.
+- **If you used an earlier 3.0.0 prerelease: `ConsumerRebalancingEvent.payload.reason` is open.**
+  `'subscription-changed'` and `'enforced-rebalance'` were already reported, and the text passed to
+  `enforceRebalance` is reported as given, so an exhaustive `switch` over the earlier union needs a
+  `default`.
+- **If you used an earlier 3.0.0 prerelease: the `memberId` of `consumer.partition_halted` can be
+  `null`.** A member that has no id yet, or lost it, halts a partition with `null`; guard it under
+  `strictNullChecks`.
+- **If you used an earlier 3.0.0 prerelease: `ShareConsumerRunConfig` is exactly one handler.**
+  `run({})` and `run({ eachMessage, eachBatch })` are compile errors, as `run()` rejects them at run
+  time, and an `interface` can no longer `extends` the type (use an intersection type).
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots
