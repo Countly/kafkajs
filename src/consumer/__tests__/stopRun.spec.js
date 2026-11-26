@@ -1631,6 +1631,113 @@ describe('Consumer > a run stopped for good with an error', () => {
       )
     })
 
+    describe('a poll-expiry LeaveGroup overtaken by an ordinary stop', () => {
+      /** Holds the next LeaveGroup until `gate` opens; returns whether it was written. */
+      const holdLeave = (coordinator, gate) => {
+        let written = false
+        coordinator.leaveGroup.mockImplementationOnce(async () => {
+          written = true
+          await gate.promise
+        })
+        return () => written
+      }
+
+      it("answered after a restart leaves the next run's assigner state and membership untouched", async () => {
+        let retained = null
+        let clears = 0
+        const retaining = {
+          ...eager(),
+          onAssignment: (assignment, { generationId }) => {
+            if (assignment === null) clears++
+            retained = assignment && { generationId }
+          },
+        }
+        const run = await startOther('classic', {
+          config: { partitionAssigners: [() => retaining] },
+        })
+        const { runner, group, coordinator } = run
+        await advanceUntil(() => retained !== null, 1000)
+        expect(retained).toEqual({ generationId: 1 })
+        const gate = deferred()
+        const written = holdLeave(coordinator, gate)
+        const reset = jest.spyOn(group, 'resetGenerationLocally')
+        const expiry = settled(
+          runner.rebalanceCoordinator.onPollExpired({ elapsedMs: 5000, isStatic: false })
+        )
+        await advanceUntil(written, 1000)
+        expect(written()).toBe(true)
+
+        const stopping = settled(run.consumer.stop())
+        await advanceUntil(() => stopping.done, 2000)
+
+        expect(stopping).toMatchObject({ done: true, value: undefined })
+        expect(expiry.done).toBe(false)
+        expect(clears).toBe(1)
+        expect(retained).toBeNull()
+
+        const starts = jest.spyOn(Runner.prototype, 'start')
+        const again = settled(run.consumer.run({ eachMessage: async () => {} }))
+        await advanceUntil(() => again.done && retained !== null, 2000)
+
+        expect(again).toMatchObject({ done: true, value: undefined })
+        const next = starts.mock.contexts.at(-1)
+        expect(next).not.toBe(runner)
+        const installed = retained
+        expect(installed).toEqual({ generationId: 1 })
+        const membership = next.consumerGroup.groupMembership
+        expect(membership.memberId).toBe('member-1')
+        const joins = coordinator.joinGroup.mock.calls.length
+
+        gate.resolve()
+        await advanceUntil(() => expiry.done, 1000)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(expiry).toMatchObject({ done: true, value: undefined })
+        expect(reset).not.toHaveBeenCalled()
+        expect(clears).toBe(1)
+        expect(retained).toBe(installed)
+        expect(membership.memberId).toBe('member-1')
+        expect(membership.generationId).toBe(1)
+        expect(coordinator.joinGroup).toHaveBeenCalledTimes(joins)
+        expect(run.crashes).toEqual([])
+      }, 30000)
+
+      it('answered while the stop drains its handler leaves the one assigner clear to the stop', async () => {
+        const run = await startHeldClassic()
+        const { runner, group, coordinator } = run
+        let clears = 0
+        group.groupMembership.assigners[0].onAssignment = (assignment) => {
+          if (assignment === null) clears++
+        }
+        const gate = deferred()
+        const written = holdLeave(coordinator, gate)
+        const reset = jest.spyOn(group, 'resetGenerationLocally')
+        const expiry = settled(
+          runner.rebalanceCoordinator.onPollExpired({ elapsedMs: 5000, isStatic: false })
+        )
+        await advanceUntil(written, 1000)
+        expect(written()).toBe(true)
+
+        const stopping = settled(run.consumer.stop())
+        await advanceUntil(() => runner.stopRequested, 1000)
+        expect(runner.stopRequested).toBe(true)
+        gate.resolve()
+        await advanceUntil(() => expiry.done, 1000)
+
+        expect(expiry).toMatchObject({ done: true, value: undefined })
+        expect(stopping.done).toBe(false)
+        expect(reset).not.toHaveBeenCalled()
+        expect(clears).toBe(0)
+
+        run.held.resolve()
+        await advanceUntil(() => stopping.done, 2000)
+
+        expect(stopping).toMatchObject({ done: true, value: undefined })
+        expect(clears).toBe(1)
+        expect(run.crashes).toEqual([])
+      }, 30000)
+    })
+
     it('an ordinary stop whose assigner throws undefined while it is cleared settles and logs it', async () => {
       const { logger, lines } = errorLogger()
       const run = await startOther('classic', { config: { logger } })
