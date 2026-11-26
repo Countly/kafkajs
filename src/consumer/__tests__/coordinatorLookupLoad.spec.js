@@ -15,6 +15,7 @@ const {
   KafkaJSGroupCoordinatorNotFound,
   KafkaJSNonRetriableError,
 } = require('../../errors')
+const { TOPIC_ID } = require('./fixtures/fetchHarness')
 const { createPatternGroup } = require('./fixtures/patternGroup')
 const { newLogger } = require('testHelpers')
 
@@ -433,10 +434,19 @@ const settle = (work) =>
 const COMMIT = [{ topic: TOPIC, partition: 0, offset: '2' }]
 const UNKNOWN_MEMBER_ID = 25
 
-/** @returns {object} an OffsetCommit answer refusing the committed partition as a departed member */
-const unknownMemberAnswer = () => ({
+/**
+ * @param {'classic'|'consumer'} protocol the consumer protocol keys the answer by topic id, as a
+ *   broker answers the request it was sent
+ * @returns {object} an OffsetCommit answer refusing the committed partition as a departed member
+ */
+const unknownMemberAnswer = (protocol) => ({
   throttleTime: 0,
-  topics: [{ topic: TOPIC, partitions: [{ partition: 0, errorCode: UNKNOWN_MEMBER_ID }] }],
+  topics: [
+    {
+      ...(protocol === 'consumer' ? { topicId: TOPIC_ID } : { topic: TOPIC }),
+      partitions: [{ partition: 0, errorCode: UNKNOWN_MEMBER_ID }],
+    },
+  ],
 })
 const HEARTBEAT = { classic: 'Heartbeat', consumer: 'ConsumerGroupHeartbeat' }
 
@@ -764,7 +774,7 @@ describe.each(['classic', 'consumer'])(
       const outside = held.consumer.commitOffsets(COMMIT).catch((error) => error)
       await until(() => held.joined() >= 1, 'the commit joining the held lookup')
       const stopping = held.consumer.stop()
-      held.rig.cluster.schedule.once({ api: 'OffsetCommit' }, unknownMemberAnswer())
+      held.rig.cluster.schedule.once({ api: 'OffsetCommit' }, unknownMemberAnswer(protocol))
 
       held.release()
       const error = await outside
@@ -849,7 +859,7 @@ describe('Consumer > an outside commit written after a graceful stop, consumer p
 
   test('rejects with the membership loss once the coordinator has expired the member and refuses it with UNKNOWN_MEMBER_ID', async () => {
     const { outside } = await stoppedWithCommitPending()
-    held.rig.cluster.schedule.once({ api: 'OffsetCommit' }, unknownMemberAnswer())
+    held.rig.cluster.schedule.once({ api: 'OffsetCommit' }, unknownMemberAnswer('consumer'))
 
     held.release()
     const error = await outside
