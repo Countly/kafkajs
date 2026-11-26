@@ -72,8 +72,8 @@ const decodePartition = (decoder) => {
 /**
  * @param {Buffer} rawData
  * @param {{ topicNames?: Map<string, string> }} [options] topic id to topic name, bound per request
- * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, errorCode: number,
- *   responses: { topic: string|null, topicId?: string|null, partitions: object[] }[] }>}
+ * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, groupId: string,
+ *   errorCode: number, responses: { topic: string|null, topicId?: string|null, partitions: object[] }[] }>}
  * @throws {KafkaJSInvariantViolation} when the answer does not hold exactly one group
  */
 const decode = async (rawData, { topicNames = new Map() } = {}) => {
@@ -95,6 +95,7 @@ const decode = async (rawData, { topicNames = new Map() } = {}) => {
   return {
     throttleTime: 0,
     clientSideThrottleTime: throttleTime,
+    groupId: group.groupId,
     errorCode: group.errorCode,
     responses: group.topics,
   }
