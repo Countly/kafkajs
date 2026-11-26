@@ -165,7 +165,7 @@
     "probe:idempotent-authz": "COMPOSE_FILE=docker-compose.acl.yml npm run test:kafka -- \"node scripts/e2e/idempotentAuthzProbe.js\"",
     "probe:api-versions": "npm run test:kafka -- \"node scripts/e2e/apiVersionsProbe.js\"",
     "test:debug": "node --inspect-brk node_modules/.bin/jest --runInBand --watch",
-    "test:types": "tsc -p types/",
+    "test:types": "tsc -p types/ && tsc -p types/tsconfig.exact.json",
     "test:pack": "./scripts/packSmoke.sh",
     "test:otel": "./scripts/otelTest.sh",
     "compat:generate": "node scripts/compat/index.js generate",
