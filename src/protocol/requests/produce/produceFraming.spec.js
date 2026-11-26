@@ -269,6 +269,10 @@ describe('Protocol > Requests > Produce > the request-size plan and the frame', 
       expect(() => kafka('sizes').producer({})).not.toThrow()
     })
 
+    test('takes an explicit undefined as the default', () => {
+      expect(() => kafka('sizes').producer({ maxRequestSize: undefined })).not.toThrow()
+    })
+
     test.each([
       ['one byte below the minimum', minimumRequestSize('sizes', 'tx') - 1],
       ['above 2147483647', 2147483648],
@@ -276,6 +280,7 @@ describe('Protocol > Requests > Produce > the request-size plan and the frame', 
       ['not a number', '1048576'],
       ['NaN', NaN],
       ['Infinity', Infinity],
+      ['null', null],
     ])('refuses a maxRequestSize %s, naming the minimum', (_, maxRequestSize) => {
       expect(() => kafka('sizes').producer({ transactionalId: 'tx', maxRequestSize })).toThrow(
         KafkaJSInvalidConfigurationError
