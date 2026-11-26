@@ -154,7 +154,9 @@ class ShareMembership {
   /**
    * Looks up the coordinator and sends under one captured token, checked at every await and again
    * by the Broker before the write. Fields are remembered only after a current, non-regressing,
-   * successful answer; every epoch-zero payload is full.
+   * successful answer; every epoch-zero payload is full. An answer with an epoch of 0 or below, or
+   * lower than the member holds, is logged and changes nothing; an interval of 0 or below keeps the
+   * current one.
    * @private
    * @param {() => Error|null} ordinaryGuard The caller's captured ordinary authority.
    * @returns {Promise<void>}
@@ -196,8 +198,20 @@ class ShareMembership {
       const response = await this.coordinator.shareGroupHeartbeat(payload, { guard })
       if (!current()) return
       if (response.errorCode) throw createErrorFromCode(response.errorCode)
-      if (response.memberEpoch < this.memberEpoch) return
-      if (payload.memberEpoch === 0 && response.memberEpoch > 0) {
+      // A regular answer carries an epoch of at least 1 and never a lower one; a leave goes
+      // through `leave()`, so -1 cannot answer this request.
+      if (response.memberEpoch <= 0 || response.memberEpoch < this.memberEpoch) {
+        this.logger.warn(
+          'Ignoring a share heartbeat answer whose member epoch this member cannot hold',
+          {
+            groupId: this.groupId,
+            memberEpoch: response.memberEpoch,
+            currentEpoch: this.memberEpoch,
+          }
+        )
+        return
+      }
+      if (payload.memberEpoch === 0) {
         const previous = this.token
         this.token = Symbol('membership')
         this.targetRevision = Symbol('assignment')
@@ -209,11 +223,11 @@ class ShareMembership {
         if (this.closed || this.token !== accepted) return
       }
       this.memberEpoch = response.memberEpoch
-      this.interval = response.heartbeatIntervalMs
+      if (response.heartbeatIntervalMs > 0) this.interval = response.heartbeatIntervalMs
       this.sentTopics = topics
       this.sentRack = true
       this.backoff.reset()
-      if (this.memberEpoch > 0) this.state = transition(this.state, S.STABLE)
+      this.state = transition(this.state, S.STABLE)
       if (response.assignment !== null) this.adoptTarget(response.assignment.topicPartitions)
       this.publishAssignment()
       this.refreshUnresolved(ordinaryGuard)
