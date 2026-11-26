@@ -5,10 +5,6 @@ const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster'
 const { Schedule } = require('../../../testHelpers/schedule')
 const { runWithDeadline } = require('../deadline')
 const { connectionOpts, newLogger } = require('../../../testHelpers')
-// TEMPORARY DIAGNOSTIC: remove with testHelpers/diagTimers.js after one CI run.
-const diag = require('../../../testHelpers/diagTimers')
-const state = { scripted: null, logs: [], timers: null }
-jest.setTimeout(15000)
 
 const configs = {
   resources: [{ type: 2, name: 't', configEntries: [{ name: 'retention.ms', value: '10' }] }],
@@ -41,7 +37,6 @@ const node = (id) => ({ id, host: 'node' + id, port: 9092 })
 const fixture = (nodes = [node(0)], options = {}) => {
   const schedule = new Schedule()
   const scripted = createScriptedCluster({ profile: 'destructiveAdmin', schedule, nodes })
-  state.scripted = scripted
   scripted.answer('Metadata', () => ({
     brokers: nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
     controllerId: nodes[0].id,
@@ -77,14 +72,7 @@ const fixture = (nodes = [node(0)], options = {}) => {
     })),
   }))
   const retry = { retries: 1, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
-  const admin = new Kafka(
-    scripted.kafkaOptions({
-      retry,
-      logLevel: logLevel.DEBUG,
-      logCreator: diag.logInto(state.logs),
-      ...options,
-    })
-  ).admin()
+  const admin = new Kafka(scripted.kafkaOptions({ retry, ...options })).admin()
   return { admin, schedule, scripted }
 }
 
@@ -101,15 +89,8 @@ const unmocked = (method) => {
 }
 
 describe('written admin mutations', () => {
-  beforeEach(() => {
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] })
-    state.scripted = null
-    state.logs.length = 0
-    state.timers = diag.traceTimers()
-  })
-  afterEach(async () => {
-    await diag.report(state)
-    state.timers.restore()
+  beforeEach(() => jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }))
+  afterEach(() => {
     jest.restoreAllMocks()
     jest.useRealTimers()
   })
