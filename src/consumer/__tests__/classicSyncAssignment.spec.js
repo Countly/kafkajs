@@ -5,6 +5,7 @@ const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupA
 const ConsumerGroup = require('../consumerGroup')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { MemberAssignment } = require('../assignerProtocol')
+const { LEVELS } = require('../../loggers')
 const { newLogger } = require('testHelpers')
 
 const GROUP_ID = 'classic-answers-group'
@@ -66,11 +67,11 @@ describe('Consumer > classic group answers no coordinator sends', () => {
   /**
    * A classic consumer group whose coordinator is a real broker over a scripted socket. Each
    * JoinGroup and SyncGroup takes the next answer of its list.
-   * @param {{ joins: Buffer[], syncs: Buffer[], retries?: number }} script
+   * @param {{ joins: Buffer[], syncs: Buffer[], retries?: number, logger?: object }} script
    * @returns {{ group: ConsumerGroup, apis: () => number[], joinedAs: () => string[] }} `apis` is
    *   the API key of every request written, `joinedAs` the member id of every JoinGroup
    */
-  const exchange = ({ joins, syncs, retries = 1 }) => {
+  const exchange = ({ joins, syncs, retries = 1, logger = newLogger() }) => {
     const harness = createGroupApiBroker({
       versions: VERSIONS,
       respond: ({ apiKey }) => (apiKey === apiKeys.JoinGroup ? joins : syncs).shift(),
@@ -89,7 +90,7 @@ describe('Consumer > classic group answers no coordinator sends', () => {
       groupId: GROUP_ID,
       topics: [TOPIC],
       topicConfigurations: { [TOPIC]: {} },
-      logger: newLogger(),
+      logger,
       instrumentationEmitter: new InstrumentationEventEmitter(),
       assigners: [
         { name: PROTOCOL, protocol: () => ({ name: PROTOCOL, metadata: Buffer.alloc(0) }) },
@@ -141,15 +142,8 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     ['a one-byte assignment', Buffer.from([0])],
     ['an assignment that ends inside its topic list', Buffer.from('000100000001', 'hex')],
     ['an assignment with a null topic list', Buffer.from('0001ffffffff00000000', 'hex')],
-    [
-      'an assignment naming one topic in two rows',
-      rowsOf([
-        { topic: TOPIC, partitions: [0] },
-        { topic: TOPIC, partitions: [1] },
-      ]),
-    ],
     ['an assignment row with no topic', rowsOf([{ topic: null, partitions: [0] }])],
-    ['an assignment naming a partition twice', rowsOf([{ topic: TOPIC, partitions: [0, 0] }])],
+    ['an assignment row with an empty topic', rowsOf([{ topic: '', partitions: [0] }])],
     ['an assignment naming partition -1', rowsOf([{ topic: TOPIC, partitions: [-1] }])],
   ])('%s is refused and the member joins again', async (_, bytes) => {
     const { group, apis } = exchange({
@@ -160,6 +154,42 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     await expect(group.joinAndSync()).resolves.toMatchObject({ assignment: { [TOPIC]: [0, 1] } })
 
     expect(apis()).toEqual([JOIN, SYNC, JOIN, SYNC])
+  })
+
+  test('an assignment that repeats a topic row or a partition is used with each partition once, first place kept, and one warning names the repeats', async () => {
+    const lines = []
+    const { group, apis } = exchange({
+      joins: [joinAnswer()],
+      syncs: [
+        syncAnswer(
+          rowsOf([
+            { topic: TOPIC, partitions: [1, 0] },
+            { topic: TOPIC, partitions: [0, 2] },
+            { topic: 'topic-b', partitions: [3, 3] },
+          ])
+        ),
+      ],
+      logger: newLogger({ level: LEVELS.WARN, logCreator: () => (entry) => lines.push(entry) }),
+    })
+
+    const result = await group.joinAndSync()
+
+    expect(result.assignment).toEqual({ [TOPIC]: [1, 0, 2], 'topic-b': [3] })
+    expect(apis()).toEqual([JOIN, SYNC])
+    const warnings = lines.filter(({ log }) => /repeats/.test(log.message))
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatchObject({
+      level: LEVELS.WARN,
+      log: {
+        groupId: GROUP_ID,
+        memberId: MEMBER,
+        groupProtocol: PROTOCOL,
+        repeated: [
+          { topic: TOPIC, partition: 0 },
+          { topic: 'topic-b', partition: 3 },
+        ],
+      },
+    })
   })
 
   test('an assignment refused on every attempt fails the join once the retries run out, naming the refusal', async () => {
