@@ -843,15 +843,15 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
-   * Leaves the group with the reason `the consumer is being closed`, then forgets the member id and
-   * the assigners' retained state. Sends nothing without a member id.
+   * Leaves the group with the reason `the consumer is being closed`, then forgets the member id.
+   * Sends nothing without a member id. The assigners' retained state is the caller's to clear, once:
+   * a stop clears it before it leaves, and a poll-expiry leave by the generation reset after it.
    *
    * The forgetting is skipped when a join was accepted meanwhile. The request is awaited, so a
    * rebalance round can join during it - after a poll-interval overrun, the heartbeat failure that
-   * follows starts one - and the answer is about the old membership: clearing then would strip the
-   * new one of its member id, which silences every heartbeat, and of its assigners' state. The
-   * count of accepted joins decides, not the ids: a rejoin can return the same member id and the
-   * same generation.
+   * follows starts one - and the answer is about the old membership: forgetting then would strip
+   * the new one of its member id, which silences every heartbeat. The count of accepted joins
+   * decides, not the ids: a rejoin can return the same member id and the same generation.
    *
    * A static member's request carries both ids, so the coordinator checks the pair and removes the
    * instance's current member, or answers `FENCED_INSTANCE_ID` for a stale member id; Java's
@@ -894,12 +894,8 @@ module.exports = class ClassicGroupProtocol {
         }
       }
     } finally {
-      if (
-        !(fenced && operation.guard()) &&
-        this.joinCount === joinCount &&
+      if (!(fenced && operation.guard()) && this.joinCount === joinCount) {
         this.forgetMemberId(membershipRevision)
-      ) {
-        this.clearAssignerState()
       }
     }
   }

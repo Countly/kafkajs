@@ -824,8 +824,9 @@ module.exports = class Runner extends EventEmitter {
    * Every value but `undefined` goes to the group's own `leave`, which knows what it means for its
    * protocol.
    *
-   * After the close callback a classic member makes one eligible final automatic commit, then
-   * leaves. Every awaited stage runs under one operation: a close deadline ends the wait, skips
+   * After the close callback a classic member makes one eligible final automatic commit, tells the
+   * assigners once to forget their state (an assigner's failure is logged), then leaves. Every
+   * awaited stage runs under one operation: a close deadline ends the wait, skips
    * the stages that did not start and refuses the write of the ones that are queued. A stop
    * requested before the run started only latches, so that start joins nothing.
    *
@@ -858,6 +859,17 @@ module.exports = class Runner extends EventEmitter {
 
     const closing = this.rebalanceHooks ? this.closeEpisode() : null
     this.latchStop()
+    // A LeaveGroup that never reached the coordinator costs the whole session timeout before the
+    // group reassigns, so a failure is logged, not swallowed. A close deadline is the caller's own
+    // bound, reported by the close, not an error of the stop.
+    const failed = (e) => {
+      if (scope.guard()) return
+      this.logger.error('Error while stopping the consumer group', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        error: describeThrown(e),
+      })
+    }
 
     try {
       // The fetch layer goes first: with `running` already false every fetch returns [] without
@@ -883,7 +895,13 @@ module.exports = class Runner extends EventEmitter {
       await this.commitFinalOffsetsContained(scope)
       scope.check()
 
-      this.clearAssignersOnce()
+      // The stop's one clear: a classic leave forgets only the member id, and an assigner that
+      // throws here does not keep the member from leaving.
+      try {
+        this.clearAssignersOnce()
+      } catch (e) {
+        failed(e)
+      }
 
       // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member tells
       // the coordinator it is gone by default; the protocol picks epoch -1 or -2 from
@@ -903,17 +921,8 @@ module.exports = class Runner extends EventEmitter {
         )
       }
     } catch (e) {
-      // The shutdown continues either way - the runner is already stopped by this point - but a
-      // LeaveGroup that never reached the coordinator costs the whole session timeout before the
-      // group reassigns, so it must not be swallowed silently. A close deadline is the caller's
-      // own bound, reported by the close, not an error of the stop.
-      if (!scope.guard()) {
-        this.logger.error('Error while stopping the consumer group', {
-          groupId: this.consumerGroup.groupId,
-          memberId: this.consumerGroup.memberId,
-          error: describeThrown(e),
-        })
-      }
+      // The shutdown continues either way: the runner is already stopped by this point.
+      failed(e)
     } finally {
       this.disarmFatal()
       this.consumerGroup.retireAcquisitions?.()

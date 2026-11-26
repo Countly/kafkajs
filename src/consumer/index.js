@@ -1381,23 +1381,25 @@ module.exports = (params) => {
       // Logged once the run is published, so a run(), stop() or disconnect() from the sink finds it.
       logger.info('Starting', { groupId })
       const startedRunner = runner
-      // After the runner is published: an assigner that stops or disconnects the consumer from
-      // this callback latches that runner, so its start joins nothing.
-      if (assignersOwed) {
-        assignersOwed = false
-        try {
-          group.clearAssignerState()
-        } catch (e) {
-          logger.error('Error while clearing the assigner state', {
-            groupId,
-            error: describeThrown(e),
-          })
-        }
-      }
-      // Started outside any handler or callback store: the runner and the work it starts must not
-      // inherit the authority of whoever called run().
+      // Outside any handler or callback store: the owed assigner clear, the runner and the work they
+      // start must not inherit the authority of whoever called run().
       const started = handlerContext.run(null, () =>
-        RebalanceHooks.outside(() => startedRunner.start())
+        RebalanceHooks.outside(() => {
+          // After the runner is published: an assigner that stops or disconnects the consumer from
+          // this callback latches that runner, so its start joins nothing.
+          if (assignersOwed) {
+            assignersOwed = false
+            try {
+              group.clearAssignerState()
+            } catch (e) {
+              logger.error('Error while clearing the assigner state', {
+                groupId,
+                error: describeThrown(e),
+              })
+            }
+          }
+          return startedRunner.start()
+        })
       )
       pendingStart = started.catch(() => {})
       await started
