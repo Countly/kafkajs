@@ -68,7 +68,10 @@ const adminAnswering = ({ method, parse }, answers) => {
   return { admin, broker }
 }
 
-describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
+// deleteTopics writes its request at most once, so its quota refusal is final (see below).
+const RESENDING = APIS.filter(({ name }) => name !== 'deleteTopics')
+
+describe.each(RESENDING)('Admin > $name > a quota refuses topics', (api) => {
   test('sends again only the topics that were refused, and resolves when they go through', async () => {
     const { admin, broker } = adminAnswering(api, [
       [
@@ -118,7 +121,9 @@ describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
     expect(api.refusal(error.cause)).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
     expect(broker[api.method]).toHaveBeenCalledTimes(RETRY.retries + 1)
   })
+})
 
+describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
   test('does not take a connection failure for a refusal', async () => {
     const failure = new KafkaJSConnectionError('Connection error: ECONNRESET')
     const { admin, broker } = adminAnswering(api, [[['a', 0]]])

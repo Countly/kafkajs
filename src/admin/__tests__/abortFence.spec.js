@@ -3,6 +3,7 @@ const { createLogger, LEVELS } = require('../../loggers')
 const { createErrorFromCode } = require('../../protocol/error')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { attachResponseSource } = require('../../broker/failureSource')
+const { ADMIN_MUTATION } = require('../../broker/privateOptions')
 const {
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
@@ -417,6 +418,7 @@ test.each([1, 2147483647])(
     expect(f.broker.initProducerId).toHaveBeenCalledWith({
       transactionalId: 'a',
       transactionTimeout,
+      [ADMIN_MUTATION]: ADMIN_MUTATION,
     })
   }
 )

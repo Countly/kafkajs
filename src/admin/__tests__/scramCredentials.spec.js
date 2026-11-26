@@ -409,7 +409,7 @@ describe('SCRAM request capabilities and read retry', () => {
       expect(requests).toHaveLength(2)
     }
   )
-  test('a late routing failure preserves a completed SCRAM user', async () => {
+  test('a retriable SCRAM row is final: no second routing, and the completed user is kept', async () => {
     const local = new KafkaJSConnectionError('offline')
     const first = {
       alterUserScramCredentials: async () => ({
@@ -441,7 +441,7 @@ describe('SCRAM request capabilities and read retry', () => {
       ],
     })
     expect(rows[0]).toMatchObject({ errorCode: 0, error: null })
-    expect(rows[1].errorCode).toBe(-1)
-    expect(rows[1].error).toBe(local)
+    expect(rows[1]).toMatchObject({ user: 'b', errorCode: 7 })
+    expect(findControllerBroker).toHaveBeenCalledTimes(1)
   })
 })
