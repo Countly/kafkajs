@@ -501,13 +501,13 @@ describe('Retry > the budget on a late or stepped clock', () => {
   })
 
   test.each([
-    ['plain', PLAIN, undefined],
-    ['plain', PLAIN, null],
-    ['fenced', FENCED, undefined],
-    ['fenced', FENCED, null],
+    ['plain', undefined, PLAIN],
+    ['plain', null, PLAIN],
+    ['fenced', undefined, FENCED],
+    ['fenced', null, FENCED],
   ])(
     'a %s call with maxTotalTime %p never reads the monotonic clock',
-    async (_kind, [, retrier], maxTotalTime) => {
+    async (_kind, maxTotalTime, [, retrier]) => {
       const now = jest.spyOn(performance, 'now')
       const failure = createErrorFromCode(REQUEST_TIMED_OUT)
       const fn = scripted(failure, failure, 'done')
