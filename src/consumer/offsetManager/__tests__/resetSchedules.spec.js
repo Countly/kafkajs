@@ -1718,9 +1718,8 @@ describe('Consumer > OffsetManager > reset edges', () => {
     expect(manager.knownPartitions(TOPIC)).toEqual([3])
   })
 
-  test('forgetting an epoch or clearing offsets of a topic the manager never held is harmless', () => {
+  test('clearing offsets of a topic the manager never held is harmless', () => {
     const { manager, cache } = createScheduledOffsetManager()
-    manager.forgetConsumedEpoch('unheld', 0)
     delete cache[TOPIC]
     delete manager.resolvedOffsets[TOPIC]
     delete manager.resolvedEpochs[TOPIC]

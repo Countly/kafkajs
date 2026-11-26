@@ -110,7 +110,7 @@ module.exports = class PositionValidator {
    * @param {number} [generation] the generation `request()` returned for this partition; defaults
    *   to the current one, which is the caller that has no round to be stale against
    * @returns {boolean} whether it was recorded; `false` means the generation was stale and nothing
-   *   was written, which is also the caller's signal to leave the partition's tracked epoch alone
+   *   was written
    */
   markValidated(topic, partition, currentLeaderEpoch, generation = this.assignmentGeneration) {
     if (generation !== this.assignmentGeneration) {

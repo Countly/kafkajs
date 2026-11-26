@@ -4222,20 +4222,12 @@ module.exports = class ConsumerGroup {
         error: e.message,
       })
 
+      // The tracked epoch stays with the unchanged offset, as on every other exit that gives up,
+      // so the next leader epoch validates it and a commit still carries it.
       for (const { topic, entries } of pending) {
         for (const { partition, currentLeaderEpoch, generation } of entries) {
-          if (!this.positionValidator.isAwaiting(topic, partition)) {
-            continue
-          }
-
-          // The epoch is cleared and the offset left alone: the partition is fetched from where it
-          // is, unvalidated, and validates again once it consumes a record. Both only happen when
-          // the mark applied - on a stale generation this round's exhaustion says nothing about
-          // the partition the current assignment holds.
-          if (
+          if (this.positionValidator.isAwaiting(topic, partition)) {
             this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
-          ) {
-            this.offsetManager.forgetConsumedEpoch(topic, partition)
           }
         }
       }
@@ -4390,6 +4382,10 @@ module.exports = class ConsumerGroup {
   /**
    * Applies one validation outcome that concluded the log diverged, and announces it.
    *
+   * A truncation is marked changed and announced with `LOG_TRUNCATION` only when the reposition
+   * applied: one that a newer operation superseded, or that found the partition no longer owned,
+   * moved nothing.
+   *
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -4421,9 +4417,12 @@ module.exports = class ConsumerGroup {
       // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
       // a queued seek would land one round late - and would overwrite a user seek queued in the
       // same window, since the queue is last-writer-wins per key.
-      await manager.reposition({ topic, partition, offset: outcome.divergingOffset }, bound)
+      const applied = await manager.reposition(
+        { topic, partition, offset: outcome.divergingOffset },
+        bound
+      )
       preparation?.check()
-      if (stale()) return
+      if (!applied || stale()) return
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {

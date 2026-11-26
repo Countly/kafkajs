@@ -111,17 +111,6 @@ describe('Consumer > committed leader epoch', () => {
       expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
     })
 
-    it('forgetConsumedEpoch clears the epoch without moving the offset', () => {
-      const manager = createManager({})
-      manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '10', leaderEpoch: 4 })
-      const before = manager.nextOffset(TOPIC, 0).toString()
-
-      manager.forgetConsumedEpoch(TOPIC, 0)
-
-      expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
-      expect(manager.nextOffset(TOPIC, 0).toString()).toEqual(before)
-    })
-
     it('uncommittedOffsets carries the epoch, and the commit sends it', async () => {
       const offsetCommit = jest.fn(async () => ({}))
       const manager = createManager({ isConnected: () => true, offsetCommit })
