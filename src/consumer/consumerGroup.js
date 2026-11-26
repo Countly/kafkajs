@@ -4390,9 +4390,10 @@ module.exports = class ConsumerGroup {
   /**
    * Applies one validation outcome that concluded the log diverged, and announces it.
    *
-   * A truncation is marked changed and announced with `LOG_TRUNCATION` only when the reposition
-   * applied: one that a newer operation superseded, or that found the partition no longer owned,
-   * moved nothing.
+   * A truncation is marked changed and announced with `LOG_TRUNCATION` unless its reposition
+   * applied nothing and the partition has since left the validated position: it is no longer
+   * owned, or a seek, reset or other position change took the rewind's place. A reposition that
+   * applied nothing while the position is still the validated one is announced as before.
    *
    * @private
    * @param {string} topic
@@ -4415,7 +4416,7 @@ module.exports = class ConsumerGroup {
     const stale = () =>
       requestClock !== undefined && this.isRequestStale(topic, partition, requestClock)
     if (outcome.action === 'truncated') {
-      this.logger.warn('Log truncation detected, repositioning the partition', {
+      this.logger.warn('Log truncation detected, rewinding the partition to the divergence point', {
         groupId: this.groupId,
         topic,
         partition,
@@ -4430,7 +4431,10 @@ module.exports = class ConsumerGroup {
         bound
       )
       preparation?.check()
-      if (!applied || stale()) return
+      const overtaken =
+        !applied &&
+        (!manager.owns(topic, partition) || manager.positionOf(topic, partition) !== offset)
+      if (overtaken || stale()) return
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
