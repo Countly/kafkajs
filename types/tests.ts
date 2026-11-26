@@ -2143,8 +2143,13 @@ const useAdminResultShapes = async () => {
   const rowRemoving: number[] = row.partitions[0].removingReplicas
   const rowReplicas: number[] = row.partitions[0].replicas
   const ongoing: kafkajs.OngoingPartitionReassignment = { partition: 0, replicas: [1], addingReplicas: [], removingReplicas: [] }
-  // @ts-expect-error a row always carries both replica arrays
-  const noArrays: kafkajs.OngoingPartitionReassignment = { partition: 0, replicas: [1] }
+  // The objects carry both identity keys, so only the missing array decides each assignment.
+  const addingOmitted = { partition: 0, partitionIndex: 0, replicas: [1], removingReplicas: [] }
+  const removingOmitted = { partition: 0, partitionIndex: 0, replicas: [1], addingReplicas: [] }
+  // @ts-expect-error a row always carries addingReplicas
+  const noAdding: kafkajs.OngoingPartitionReassignment = addingOmitted
+  // @ts-expect-error a row always carries removingReplicas
+  const noRemoving: kafkajs.OngoingPartitionReassignment = removingOmitted
   const brokerReply = await resultShapeBroker.listPartitionReassignments({})
   const brokerCode: number = brokerReply.errorCode
   const brokerThrottle: number = brokerReply.throttleTime
@@ -2182,7 +2187,7 @@ const useAdminResultShapes = async () => {
   const aclsThrottle: number = acls.throttleTime
   // @ts-expect-error describeAcls never sets an error code
   const aclsCode: number = acls.errorCode
-  const aclsMessage: string | undefined = acls.errorMessage
+  const aclsMessage: undefined = acls.errorMessage
   const aclsResources: kafkajs.DescribeAclResource[] = acls.resources
 
   const deleted = await admin.deleteAcls({
@@ -2236,7 +2241,8 @@ const useAdminResultShapes = async () => {
     rowRemoving,
     rowReplicas,
     ongoing,
-    noArrays,
+    noAdding,
+    noRemoving,
     brokerCode,
     brokerThrottle,
     brokerClientThrottle,
