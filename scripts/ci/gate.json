@@ -11185,6 +11185,7 @@
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a request reaching the head while a re-authentication runs is refused unsent",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a request written within the session is not refused",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a session-refused frame never reaches the caller's frame-time guard call",
+        "src/network/__tests__/connectionSendOrder.spec.js › Network > Connection > session at write on a valid session the caller's guard is asked once at the write, with the frame length",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write the caller's frame-time refusal still applies on a valid session",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write the next send after a refusal re-authenticates before it encodes",
         "src/network/__tests__/connectionSetup.spec.js \u203a a caller deadline does not cancel shared physical setup",

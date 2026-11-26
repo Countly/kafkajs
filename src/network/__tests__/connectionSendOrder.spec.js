@@ -511,6 +511,17 @@ describe('Network > Connection > session at write', () => {
     expect(writtenApis()).toEqual([apiKeys.SaslHandshake])
   })
 
+  test("on a valid session the caller's guard is asked once at the write, with the frame length", async () => {
+    mockAuthenticator()
+    await open({ sasl })
+    const guard = jest.fn(() => null)
+
+    await connection.send({ ...produceRequest([0]), guard })
+
+    expect(guard.mock.calls).toEqual([[], [expect.any(Number)]])
+    expect(writtenApis()).toEqual([apiKeys.SaslHandshake, apiKeys.Produce])
+  })
+
   test('the next send after a refusal re-authenticates before it encodes', async () => {
     const authenticate = mockAuthenticator()
     await open({ sasl })
