@@ -44,6 +44,8 @@ module.exports = class PositionValidator {
     this.entries = new Map()
     this.assignmentGeneration = 0
     this.disabled = false
+    /** Advances on every change of an entry, so a cached answer about entries can tell it is stale. */
+    this.version = 0
   }
 
   /**
@@ -88,6 +90,7 @@ module.exports = class PositionValidator {
       validatedAgainst: undefined,
       pending: { offset, trackedEpoch, currentLeaderEpoch },
     })
+    this.version += 1
 
     return { action: 'awaiting', generation }
   }
@@ -121,6 +124,7 @@ module.exports = class PositionValidator {
       validatedAgainst: currentLeaderEpoch,
       pending: null,
     })
+    this.version += 1
 
     return true
   }
@@ -210,6 +214,7 @@ module.exports = class PositionValidator {
 
     if (seekQueued || positionMoved) {
       entry.pending = null
+      this.version += 1
       return this.discard(topic, partition, seekQueued ? 'seek queued' : 'position moved')
     }
 
@@ -258,6 +263,7 @@ module.exports = class PositionValidator {
       const key = this.getKey(topic, partition)
       if (this.entries.get(key) === entry) this.entries.delete(key)
     }
+    this.version += 1
   }
 
   /**
@@ -311,6 +317,7 @@ module.exports = class PositionValidator {
     for (const partition of partitions || []) {
       this.entries.delete(this.getKey(topic, partition))
     }
+    this.version += 1
   }
 
   /**
@@ -332,6 +339,7 @@ module.exports = class PositionValidator {
         this.entries.delete(this.getKey(topic, partition))
       }
     }
+    this.version += 1
   }
 
   /**
@@ -345,6 +353,7 @@ module.exports = class PositionValidator {
     this.entries.clear()
     this.disabled = false
     this.assignmentGeneration++
+    this.version += 1
   }
 
   /**

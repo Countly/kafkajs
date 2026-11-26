@@ -13,6 +13,7 @@ const {
   KafkaJSRebalanceNotConvergedError,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
 } = require('../errors')
+const Batch = require('./batch')
 const handlerContext = require('./handlerContext')
 const RebalanceHooks = require('./rebalanceHooks')
 
@@ -1379,6 +1380,10 @@ module.exports = class Runner extends EventEmitter {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
       return () => this.consumerGroup.resume([{ topic, partitions: [partition] }])
     }
+    // The validation rule is asked again whenever what it reads changed: the cached leader epoch,
+    // read on every message, or a validation entry.
+    let checkedVersion = null
+    let checkedEpoch = null
     for (const message of batch.messages) {
       if (
         !this.running ||
@@ -1386,6 +1391,13 @@ module.exports = class Runner extends EventEmitter {
         this.isBatchStale(batch)
       ) {
         break
+      }
+      const version = this.consumerGroup.validationVersion?.()
+      const epoch = this.consumerGroup.cluster?.leaderEpoch?.(topic, partition)
+      if (version !== checkedVersion || epoch !== checkedEpoch) {
+        if (!this.#validated(batch)) break
+        checkedVersion = version
+        checkedEpoch = epoch
       }
 
       try {
@@ -1738,6 +1750,22 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * Whether the batch's data may still be used: its partition is still at the leader epoch the
+   * Fetch was built at and still validated against it (`ConsumerGroup#validationAllows`). A batch
+   * built outside a fetch carries no fetch epoch, and a group without the rule (a test double;
+   * the consumer group always has it) admits everything.
+   * @param {import('./batch')} batch
+   * @returns {boolean}
+   */
+  #validated(batch) {
+    const epoch = Batch.fetchEpochOf(batch)
+    return (
+      epoch === undefined ||
+      this.consumerGroup.validationAllows?.(batch.topic, batch.partition, epoch) !== false
+    )
+  }
+
+  /**
    * Whether the batch's records were superseded after it was fetched: its topic was deleted and
    * recreated, so they belong to an incarnation this member no longer reads, its partition was
    * sought (`ConsumerGroup#seek`), so they are not at the position the application asked for, or
@@ -1888,6 +1916,19 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    // Likewise a batch whose leader epoch moved while it waited: the next round validates the
+    // position first and fetches it again from there.
+    if (!this.#validated(batch)) {
+      this.logger.debug('Dropping a queued batch fetched before a leader epoch change', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topic: batch.topic,
+        partition: batch.partition,
+      })
+
+      return
+    }
+
     /** @param {import('./batch')} batch */
     const onBatch = async (batch) => {
       const startBatchProcess = Date.now()
@@ -1941,9 +1982,9 @@ module.exports = class Runner extends EventEmitter {
       if (batch.isEmptyDueToFiltering()) {
         this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
-        // A START_BATCH_PROCESS listener can pause the partition: nothing is resolved, and
-        // END_BATCH_PROCESS still pairs with START.
-        if (this.#paused(batch)) {
+        // A START_BATCH_PROCESS listener can pause the partition or move its leader epoch:
+        // nothing is resolved, and END_BATCH_PROCESS still pairs with START.
+        if (this.#paused(batch) || !this.#validated(batch)) {
           this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
             ...payload,
             duration: Date.now() - startBatchProcess,
@@ -1982,12 +2023,17 @@ module.exports = class Runner extends EventEmitter {
         groupId: this.consumerGroup.groupId,
         runIdentity: this.consumerGroup.runIdentity,
       }
-      // A START_BATCH_PROCESS listener can seek or pause the partition: such a batch is not handed
-      // over, and END_BATCH_PROCESS still pairs with START.
+      // A START_BATCH_PROCESS listener can seek or pause the partition, or move its leader epoch:
+      // such a batch is not handed over, and END_BATCH_PROCESS still pairs with START.
       if (this.isSuperseded(batch)) {
         this.logger.debug('Not handing over a batch a seek superseded', { topic, partition })
       } else if (this.#paused(batch)) {
         this.logger.debug('Not handing over a batch of a partition a listener paused', {
+          topic,
+          partition,
+        })
+      } else if (!this.#validated(batch)) {
+        this.logger.debug('Not handing over a batch fetched before a leader epoch change', {
           topic,
           partition,
         })

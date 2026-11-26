@@ -20,6 +20,7 @@ module.exports = class Batch {
   #nextBatchOffset
   #nextBatchLeaderEpoch
   #advances
+  #fetchEpoch
 
   /**
    * @param {string} topic
@@ -28,8 +29,11 @@ module.exports = class Batch {
    *   `nextBatchLeaderEpoch` (the offset after the last complete record batch and that batch's
    *   leader epoch) let a batch with no record at or after `fetchedOffset` move the position to the
    *   end of that record batch
+   * @param {number} [fetchEpoch] the leader epoch the Fetch was built at; absent for a batch built
+   *   outside a fetch
    */
-  constructor(topic, fetchedOffset, partitionData) {
+  constructor(topic, fetchedOffset, partitionData, fetchEpoch) {
+    this.#fetchEpoch = fetchEpoch
     this.fetchedOffset = fetchedOffset
     const longFetchedOffset = Long.fromValue(this.fetchedOffset)
     const { abortedTransactions, messages } = partitionData
@@ -72,6 +76,16 @@ module.exports = class Batch {
   }
 
   /**
+   * The leader epoch the Fetch that produced `batch` was built at. Kept off the batch's own
+   * properties, so the `eachBatch` payload does not show it.
+   * @param {Batch} batch
+   * @returns {number|undefined} `undefined` for a batch built outside a fetch
+   */
+  static fetchEpochOf(batch) {
+    return batch.#fetchEpoch
+  }
+
+  /**
    * The leader epoch of the record at `offset`, or `-1` when no record in this batch carries it.
    *
    * Searches `messagesWithinOffset` rather than `messages`, because `messages` excludes control
@@ -83,18 +97,37 @@ module.exports = class Batch {
    * batch), and an index is built lazily only for a lookup that is not the last entry, so a
    * handler resolving many offsets is linear overall rather than quadratic.
    *
-   * @param {string} offset The offset exactly as the decoder produced it. Offsets are compared as
-   *   strings, so a numeric or `Long` offset answers -1 rather than the epoch it carries; that
-   *   degrades safely (unknown disables validation, it never reports a stale epoch).
+   * @param {string|number|import('../utils/long')} offset compared by value: the decimal string
+   *   the decoder produces is looked up as it is, and any other spelling (a number, a `Long`, a
+   *   string with leading zeros) is turned into that string once when the first lookup misses. A
+   *   value that is not an offset answers -1.
    * @returns {number}
    */
   leaderEpochAt(offset) {
+    const epoch = this.#epochAt(offset)
+    if (epoch !== undefined) return epoch
+
+    let canonical
+    try {
+      canonical = Long.fromValue(offset).toString()
+    } catch {
+      return -1
+    }
+    return canonical === offset ? -1 : (this.#epochAt(canonical) ?? -1)
+  }
+
+  /**
+   * @param {unknown} offset an offset in the decoder's decimal spelling, matched exactly
+   * @returns {number|undefined} the epoch of that record (-1 when it carries none), or `undefined`
+   *   when no record of this batch has that spelling
+   */
+  #epochAt(offset) {
     const messages = this.messagesWithinOffset
 
     if (messages.length === 0) {
       return this.#advances && offset === this.lastOffset()
         ? (this.#nextBatchLeaderEpoch ?? -1)
-        : -1
+        : undefined
     }
 
     const last = messages[messages.length - 1]
@@ -109,8 +142,7 @@ module.exports = class Batch {
       }
     }
 
-    const epoch = this.leaderEpochIndex.get(offset)
-    return epoch === undefined ? -1 : epoch
+    return this.leaderEpochIndex.get(offset)
   }
 
   isEmpty() {

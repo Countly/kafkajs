@@ -350,8 +350,8 @@ function oracleReadReplicas(topic, partitions, routing) {
 }
 
 /**
- * The request builder this client shipped before, with its whole-assignment active set, kept
- * verbatim as the oracle.
+ * The request builder this client shipped before, with its whole-assignment active set, kept as
+ * the oracle; only its validation filter follows the current rule (`admissionEntry`).
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
  * @returns {object[]}
@@ -368,10 +368,12 @@ function oracleBuildFetchRequests(topicPartitions) {
       topic,
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
+        const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+        const admittedUnder = this.admissionEntry(topic, partition, currentLeaderEpoch)
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          !this.positionValidator.isAwaiting(topic, partition) &&
+          admittedUnder !== undefined &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -379,8 +381,9 @@ function oracleBuildFetchRequests(topicPartitions) {
           requests.push({
             partition,
             fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-            currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+            currentLeaderEpoch,
             maxBytes: this.maxBytesPerPartition,
+            admittedUnder,
           })
         }
         return requests
@@ -493,7 +496,13 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        positionValidator: { isAwaiting: coin(2) },
+        // Unvalidated, validated at the cached epoch, or validated at an older one.
+        positionValidator: {
+          entryOf: (topic, partition) =>
+            coin(2)(topic, partition)
+              ? undefined
+              : { validatedAgainst: (partition % 3) - (coin(4)(topic, partition) ? 1 : 0) },
+        },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
@@ -518,12 +527,13 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     const cluster = { findTopicPartitionMetadata: () => rows, leaderEpoch: () => 0 }
     const state = new SubscriptionState()
     state.assign([{ topic: 't', partitions: [0, 1, 2] }])
+    const validated = { validatedAgainst: 0 }
     const group = derivationGroup({
       cluster,
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { entryOf: () => validated },
     })
     const route = () => group.filterPartitionsByNode(1, state.assigned())[0].partitions
     const fetched = () =>
@@ -551,7 +561,15 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     expect(group.buildFetchRequests([{ topic: 't', partitions: [0, 1] }])).toEqual([
       {
         topic: 't',
-        partitions: [{ partition: 1, fetchOffset: '0', currentLeaderEpoch: 0, maxBytes: 1024 }],
+        partitions: [
+          {
+            partition: 1,
+            fetchOffset: '0',
+            currentLeaderEpoch: 0,
+            maxBytes: 1024,
+            admittedUnder: validated,
+          },
+        ],
       },
     ])
   })
@@ -590,7 +608,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { entryOf: () => ({ validatedAgainst: 0 }) },
       cluster: { leaderEpoch: () => 0 },
     })
     const parts = assignment.map(({ topic }) => ({

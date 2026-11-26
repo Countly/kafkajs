@@ -2889,6 +2889,45 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * The one rule for using fetched data: data fetched at leader epoch `epoch` may be requested,
+   * accepted or handed to a handler only while the cached leader epoch is still `epoch` and the
+   * partition's position is validated against it. Epochs compare as numbers; -1 (unknown) is a
+   * value like any other, and a partition with no validation entry is never admitted.
+   *
+   * The entry returned is the admission identity: a request records it, and its answer is used
+   * only while the partition is still validated under that same entry, so an answer built before
+   * a validation that was redone at the same epoch is not.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} epoch the leader epoch the data was, or is about to be, fetched at
+   * @returns {object|undefined} the validator entry the data is admitted under, or `undefined`
+   */
+  admissionEntry(topic, partition, epoch) {
+    if (this.cluster.leaderEpoch(topic, partition) !== epoch) return undefined
+    const entry = this.positionValidator.entryOf(topic, partition)
+    return entry !== undefined && entry.validatedAgainst === epoch ? entry : undefined
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} epoch the leader epoch the data was fetched at
+   * @returns {boolean} whether data fetched at `epoch` may still be used, see `admissionEntry`
+   */
+  validationAllows(topic, partition, epoch) {
+    return this.admissionEntry(topic, partition, epoch) !== undefined
+  }
+
+  /**
+   * A count that grows on every change of a validation entry. With the cached leader epoch, it is
+   * everything `validationAllows` reads: while neither changed, its answer has not changed.
+   * @returns {number}
+   */
+  validationVersion() {
+    return this.positionValidator.version
+  }
+
+  /**
    * Builds this round's request entries from the node-filtered assignment.
    *
    * Three filters decide what is asked for. A partition with no committed offset is left out
@@ -2896,9 +2935,12 @@ module.exports = class ConsumerGroup {
    * (`OffsetManager#clearOffsets`), and a concurrent round would otherwise fetch from an offset
    * that is being rebuilt - see https://github.com/tulios/kafkajs/pull/570 for the concurrency
    * that exposed it and https://github.com/tulios/kafkajs/pull/578 for the filter. A paused
-   * partition is left out, and so is one whose position another fetcher is validating: its
+   * partition is left out, and so is one that `admissionEntry` does not admit at its cached leader
+   * epoch: one being validated, or one whose epoch moved after this round validated it. Its
    * position is the thing being checked, so fetching from it would read from an offset this
-   * client is not yet sure still exists. A halted partition is left out until its halt is cleared;
+   * client is not yet sure still exists; the next round validates it first. Each entry records the
+   * epoch it is built at and the validation entry it is admitted under (`admittedUnder`). A
+   * halted partition is left out until its halt is cleared;
    * the check is skipped while nothing is halted, which is the steady state.
    *
    * Pause and hold state is checked per requested partition, so the cost follows the node's
@@ -2907,8 +2949,8 @@ module.exports = class ConsumerGroup {
    * @private
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
    * @returns {{topic: string, partitions: {partition: number, fetchOffset: string,
-   *   currentLeaderEpoch: number, maxBytes: number}[]}[]} one entry per topic with something to
-   *   fetch; a topic whose partitions were all filtered out is absent
+   *   currentLeaderEpoch: number, maxBytes: number, admittedUnder: object}[]}[]} one entry per
+   *   topic with something to fetch; a topic whose partitions were all filtered out is absent
    */
   buildFetchRequests(topicPartitions) {
     const manager = this.offsetManager
@@ -2921,11 +2963,17 @@ module.exports = class ConsumerGroup {
         partitions: partitions.reduce((requests, partition) => {
           const baseline = manager.heldOffsetAt(topic, partition)
           if (
-            baseline != null &&
-            state.isAssigned(topic, partition) &&
-            !state.isPaused(topic, partition) &&
-            !state.isHeld(topic, partition) &&
-            !this.positionValidator.isAwaiting(topic, partition) &&
+            baseline == null ||
+            !state.isAssigned(topic, partition) ||
+            state.isPaused(topic, partition) ||
+            state.isHeld(topic, partition)
+          ) {
+            return requests
+          }
+          const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+          const admittedUnder = this.admissionEntry(topic, partition, currentLeaderEpoch)
+          if (
+            admittedUnder !== undefined &&
             (this.haltedPartitions.size === 0 ||
               !this.haltedPartitions.has(`${topic}|${partition}`)) &&
             !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -2933,8 +2981,9 @@ module.exports = class ConsumerGroup {
             requests.push({
               partition,
               fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-              currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+              currentLeaderEpoch,
               maxBytes: this.maxBytesPerPartition,
+              admittedUnder,
             })
           }
           return requests
@@ -3032,8 +3081,9 @@ module.exports = class ConsumerGroup {
    * @param {object} context this topic's state for the round
    * @param {string} context.topicName
    * @param {string} [context.topicId] the id the answer or the request keyed the topic with
-   * @param {Map<number, {fetchOffset: string}>} context.requestedPartitions this topic's request
-   *   entries by partition
+   * @param {Map<number, {fetchOffset: string, currentLeaderEpoch: number, admittedUnder: object}>}
+   *   [context.requestedPartitions] this topic's request entries by partition, absent when the
+   *   request did not carry the topic
    * @param {object} context.preferredReadReplicas this topic's preferred-replica map, written here
    * @param {object[]} [context.nodeEndpoints] the response's KIP-951 endpoints, if any
    * @param {import('./batch')[]} context.batches the round's batches, appended to
@@ -3062,18 +3112,33 @@ module.exports = class ConsumerGroup {
       })
     }
 
-    // An answer for a position the partition has left (another node's answer came first, or a
-    // reset cleared the offset) is not used at all: not delivered, not recovered from.
+    // A row is used only under the request entry it answers, before any of its effects: a row the
+    // request did not carry, an answer for a position the partition has left (another node's
+    // answer came first, or a reset cleared the offset), and an answer the validation rule no
+    // longer admits (its leader epoch moved, or the partition was validated again since the
+    // request was built) are not delivered and not recovered from.
     const requested = requestedPartitions?.get(partition)
-    if (
-      requested !== undefined &&
+    let dropped = null
+    if (requested === undefined) {
+      dropped = 'unrequested'
+    } else if (
       typeof this.offsetManager?.positionOf === 'function' &&
       this.offsetManager.positionOf(topicName, partition) !== String(requested.fetchOffset)
     ) {
+      dropped = 'moved'
+    } else if (
+      this.admissionEntry(topicName, partition, requested.currentLeaderEpoch) !==
+      requested.admittedUnder
+    ) {
+      dropped = this.validationAllows(topicName, partition, requested.currentLeaderEpoch)
+        ? 'readmitted'
+        : 'validation'
+    }
+    if (dropped !== null) {
       this.logger.debug('Dropping fetched partition', {
         topic: topicName,
         partition,
-        reason: 'moved',
+        reason: dropped,
       })
       return false
     }
@@ -3090,9 +3155,8 @@ module.exports = class ConsumerGroup {
       if (action === 'offset-out-of-range') {
         // The existing recovery, for this partition only: drop the preferred replica if one is
         // set, otherwise reset per the topic's own fromBeginning.
-        const requested = requestedPartitions.get(partition)
         await this.recoverFromOffsetOutOfRange(
-          { topic: topicName, partition, offset: requested && String(requested.fetchOffset) },
+          { topic: topicName, partition, offset: String(requested.fetchOffset) },
           context.fence,
           this.fetchedResetContext(context.prepared, context.requestClock, context.topicId)
         )
@@ -3127,8 +3191,7 @@ module.exports = class ConsumerGroup {
 
     const dropReason = fetchedPartitionDropReason(
       this.seekOffset.size !== 0 && this.seekOffset.has(topicName, partition),
-      this.subscriptionState.isPaused(topicName, partition),
-      this.positionValidator.isAwaiting(topicName, partition)
+      this.subscriptionState.isPaused(topicName, partition)
     )
 
     if (dropReason != null) {
@@ -3173,9 +3236,9 @@ module.exports = class ConsumerGroup {
     const { corruption } = partitionData
     const halted = corruption != null && this.acceptHalt(topicName, partition, corruption, context)
 
-    const partitionRequestData = requestedPartitions.get(partition)
-
-    batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
+    batches.push(
+      new Batch(topicName, requested.fetchOffset, partitionData, requested.currentLeaderEpoch)
+    )
     if (halted) this.reportHalt(topicName, partition, corruption)
     return false
   }
