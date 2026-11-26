@@ -3,6 +3,7 @@ const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
+const { readSyncAssignment } = require('../assignmentRows')
 const {
   KafkaJSNonRetriableError,
   KafkaJSConnectionError,
@@ -616,6 +617,8 @@ module.exports = class ClassicGroupProtocol {
    *   or when every member shares the leader's subscription
    * @throws {KafkaJSNonRetriableError} when the coordinator picked an assignor this member does
    *   not have
+   * @throws {KafkaJSError} retriable, type `MALFORMED_GROUP_ANSWER`, for assignment bytes this
+   *   member cannot use (`readSyncAssignment`); repeated partitions are kept once, with a warning
    */
   async sync({ topics, topicsSubscribed, beforeSync, round }) {
     let assignment = []
@@ -707,12 +710,14 @@ module.exports = class ClassicGroupProtocol {
       )
     )
 
-    const decoded = MemberAssignment.decode(memberAssignment)
-    return {
-      assignment: decoded != null ? decoded.assignment : {},
-      userData: decoded != null ? decoded.userData : null,
-      unionSnapshot,
+    const { assignment: own, userData, repeated } = readSyncAssignment(memberAssignment)
+    if (repeated.length > 0) {
+      this.logger.warn(
+        'The assignment from the group leader repeats partitions; each is used once',
+        { groupId, memberId, groupProtocol, repeated }
+      )
     }
+    return { assignment: own, userData, unionSnapshot }
   }
 
   /**

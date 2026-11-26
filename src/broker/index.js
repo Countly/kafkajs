@@ -7,7 +7,7 @@ const { partitionResults } = require('../protocol/requests/produce/partitionResu
 const { requireCoverage } = require('../protocol/requests/responseCoverage')
 const { validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
-const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
+const { assertSameProtocol, assertJoinAnswer } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSCommitFailedError,
   KafkaJSConnectionClosedError,
@@ -1514,6 +1514,9 @@ module.exports = class Broker {
    * @returns {Promise}
    * @throws {KafkaJSProtocolError} INCONSISTENT_GROUP_PROTOCOL when the coordinator reports a
    *   protocol type (JoinGroup v7 and later) other than `protocolType`; a null report is accepted
+   * @throws {KafkaJSError} retriable, type `MALFORMED_GROUP_ANSWER`, for a success no coordinator
+   *   sends: no member id, a negative generation, a protocol not in `groupProtocols`, or a leader's
+   *   member list with an id missing, repeated or without the leader (`assertJoinAnswer`)
    * @param {object} [options] private request scope
    * @param {() => Error|null} [options.guard] checked through both member-ID handshake sends
    * @param {(memberId: string) => void} [options.onMemberIdRequired] called synchronously with the
@@ -1561,6 +1564,7 @@ module.exports = class Broker {
     }
 
     assertSameProtocol(response.protocolType, protocolType)
+    assertJoinAnswer(response, groupProtocols)
     return response
   }
 

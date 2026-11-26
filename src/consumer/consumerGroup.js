@@ -81,6 +81,7 @@ const {
 } = require('./fetchErrorContract')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
+const { isMalformedGroupAnswer } = require('../protocol/requests/groupProtocolCheck')
 const ClassicGroupProtocol = require('./groupProtocol/classic')
 const ConsumerGroupProtocol = require('./groupProtocol/consumer')
 const ManualGroupProtocol = require('./groupProtocol/manual')
@@ -1711,7 +1712,9 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error.
+   * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error and
+   * on a refused answer no coordinator sends (`MALFORMED_GROUP_ANSWER`), which counts against the
+   * retries like any other.
    * @private
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
    * @throws {Error} what the retrier gave up with
@@ -1771,6 +1774,16 @@ module.exports = class ConsumerGroup {
         // the round's own expiry is terminal for this chain.
         if (e.type === 'JOIN_DEADLINE_EXCEEDED') {
           throw new KafkaJSError(e)
+        }
+
+        // A JoinGroup or SyncGroup answer no coordinator sends was refused before it changed
+        // anything; join again, as after a rebalance.
+        if (isMalformedGroupAnswer(e)) {
+          this.logger.warn('Refused a group answer, joining again', {
+            groupId: this.groupId,
+            error: e.message,
+          })
+          throw e
         }
 
         bail(e)
