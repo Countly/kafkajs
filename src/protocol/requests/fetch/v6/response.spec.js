@@ -31,6 +31,8 @@ describe('Protocol > Requests > Fetch > v6', () => {
               abortedTransactions: [],
               lastStableOffset: '3',
               lastStartOffset: '0',
+              nextBatchOffset: expect.any(String),
+              nextBatchLeaderEpoch: expect.any(Number),
               messages: [
                 {
                   offset: '0',
