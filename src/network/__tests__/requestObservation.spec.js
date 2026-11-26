@@ -432,7 +432,7 @@ describe('Network > request observation', () => {
       expect(seen).toEqual([{ 'test-topic': [0] }])
     })
 
-    test('a v10 reply naming a topic id the request did not carry accepts no cell', async () => {
+    test('a v10 reply naming a topic id the request did not carry is refused before the observer sees it', async () => {
       const hex = V10_OK.hex.replace(TOPIC_ID.replace(/-/g, ''), OTHER_ID.replace(/-/g, ''))
       harness = createGroupApiBroker({
         versions: { [apiKeys.OffsetCommit]: { minVersion: 0, maxVersion: 10 } },
@@ -440,12 +440,14 @@ describe('Network > request observation', () => {
       })
       const seen = []
 
-      await harness.broker.offsetCommit(commit({ topic: 'test-topic', topicId: TOPIC_ID }), {
-        [ON_DECODED]: (decoded) => seen.push(indexed(decoded)),
-      })
+      await expect(
+        harness.broker.offsetCommit(commit({ topic: 'test-topic', topicId: TOPIC_ID }), {
+          [ON_DECODED]: (decoded) => seen.push(indexed(decoded)),
+        })
+      ).rejects.toMatchObject({ retriable: true })
 
       expect(harness.requests.map(({ apiVersion }) => apiVersion)).toEqual([10])
-      expect(seen).toEqual([{ null: [0] }])
+      expect(seen).toEqual([])
     })
 
     test.each([
@@ -470,6 +472,57 @@ describe('Network > request observation', () => {
         { null: [0] },
       ],
       [{ responses: [] }, {}],
+      [
+        {
+          responses: [
+            {
+              topic: 'test-topic',
+              partitions: [
+                { partition: 0, errorCode: 0 },
+                { partition: 0, errorCode: 12 },
+              ],
+            },
+          ],
+        },
+        { 'test-topic': [] },
+      ],
+      [
+        {
+          responses: [
+            {
+              topic: 'test-topic',
+              partitions: [
+                { partition: 0, errorCode: 12 },
+                { partition: 0, errorCode: 0 },
+              ],
+            },
+          ],
+        },
+        { 'test-topic': [] },
+      ],
+      [
+        {
+          responses: [
+            { topic: 'test-topic', partitions: [{ partition: 0, errorCode: 0 }] },
+            { topic: 'test-topic', partitions: [{ partition: 0, errorCode: 12 }] },
+          ],
+        },
+        { 'test-topic': [] },
+      ],
+      [
+        {
+          responses: [
+            {
+              topic: 'test-topic',
+              partitions: [
+                { partition: 0, errorCode: 0 },
+                { partition: 0, errorCode: 0 },
+              ],
+            },
+          ],
+        },
+        { 'test-topic': [0] },
+      ],
     ])('acceptedIndex(%j) is %j', (decoded, accepted) => {
       expect(indexed(decoded)).toEqual(accepted)
     })
