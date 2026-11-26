@@ -2407,9 +2407,13 @@ describe.each([
     expect(runner.inFlightHandlers).toBeGreaterThan(0)
     member.finish()
     await until(() => runner.inFlightHandlers === 0, 'all records completing in both batches')
-    expect(member.context.mock.calls).toHaveLength(2)
-    expect(member.context.mock.calls.map(([store]) => store.partition).sort()).toEqual([0, 1])
-    expect(member.context.mock.calls.every(([store]) => !('messages' in store))).toBe(true)
+    // The run's start clears the store once; every other entry is one handler batch.
+    const entries = member.context.mock.calls.map(([store]) => store)
+    const batches = entries.filter((store) => store !== null)
+    expect(entries.filter((store) => store === null)).toHaveLength(1)
+    expect(batches).toHaveLength(2)
+    expect(batches.map((store) => store.partition).sort()).toEqual([0, 1])
+    expect(batches.every((store) => !('messages' in store))).toBe(true)
   })
   it.each(kind === 'consumer' ? [null, 25, 110, 30, 42, 111, 112, 128] : [null, 25, 110, 82])(
     'ignores the old heartbeat answer %s after an actual replacement join',

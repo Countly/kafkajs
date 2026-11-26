@@ -575,6 +575,16 @@ class SharePollView {
   }
 
   /**
+   * Stops tracking every call except `kept`: a close froze them, so a call that never returns can
+   * no longer expire a later membership.
+   * @param {object[]} kept Identities from `captureExpired` that a recovery still waits for.
+   * @returns {void}
+   */
+  retain(kept) {
+    for (const call of this.calls.keys()) if (!kept.includes(call)) this.calls.delete(call)
+  }
+
+  /**
    * @param {object[]} captured Identities from `captureExpired`.
    * @returns {boolean} Whether every one finished or was abandoned.
    */

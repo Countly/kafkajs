@@ -31,6 +31,7 @@ const CODECS = [
   ['describeConfigs/v4', ['Results']],
   ['describeGroups/v5', ['Groups', 'Groups.Members']],
   ['describeGroups/v6', ['Groups', 'Groups.Members']],
+  ['incrementalAlterConfigs/v1', ['Responses']],
   ['listOffsets/v6', TOPICS],
   ['listOffsets/v9', TOPICS],
   ['offsetCommit/v8', TOPICS],

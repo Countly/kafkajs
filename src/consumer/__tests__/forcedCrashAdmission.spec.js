@@ -176,7 +176,7 @@ describe('Consumer > starting again from inside a forced crash does not wait for
 })
 
 describe('Consumer > a run that ends before its fatal deadline leaves that deadline disarmed', () => {
-  it('a first round that fails after a background heartbeat answered fatally crashes with its own error, and the fatal deadline later neither delivers the loss callback nor reports a second CRASH', async () => {
+  it('a first round that fails after a background heartbeat answered fatally crashes with its own error and closes with one loss callback and no commit or leave, and the fatal deadline later reports no second CRASH', async () => {
     const order = []
     const failure = new Error('first round failed')
     const fatal = deferred()
@@ -186,7 +186,7 @@ describe('Consumer > a run that ends before its fatal deadline leaves that deadl
       await fatal.promise
       throw failure
     })
-    const { consumer, state, crashes } = buildConsumer({ maxPollInterval: 4000 })
+    const { consumer, state, crashes, log } = buildConsumer({ maxPollInterval: 4000 })
     let armed = false
     state.answer = (req) => {
       if (req.memberEpoch === 0) return target(1, { 'topic-a': [0] })
@@ -213,7 +213,11 @@ describe('Consumer > a run that ends before its fatal deadline leaves that deadl
     await advanceUntil(() => end.done, 500)
 
     expect(crashes.map(({ error }) => error)).toEqual([failure])
-    expect(order).toEqual([])
+    // The crash cleanup's close delivers the loss once, as the fetch loop's crash path does; the
+    // membership is gone, so it commits nothing and sends no leave heartbeat (epoch -1 or -2).
+    expect(order).toEqual(['loss'])
+    expect(log.filter((entry) => entry.kind === 'commit')).toEqual([])
+    expect(log.filter((entry) => entry.kind === 'heartbeat' && entry.epoch < 0)).toEqual([])
     expect(end).toEqual({ done: true, value: undefined })
   })
 

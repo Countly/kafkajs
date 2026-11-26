@@ -268,4 +268,44 @@ describe('security administration capability and retained outcomes', () => {
       }).describeClientQuotas({ components: [] })
     ).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
   })
+  test('describeClientQuotas refuses an answer with a null quota key', async () => {
+    const answer = Buffer.from(
+      [
+        '00000000', // ThrottleTimeMs
+        '0000', // ErrorCode
+        '00', // ErrorMessage, null
+        '02', // Entries, one
+        '02', // Entity, one
+        '0575736572', // EntityType "user"
+        '00', // EntityName, null
+        '00', // Entity tags
+        '02', // Values, one
+        '00', // Key, the compact null the message definition does not allow
+        '3ff0000000000000', // Value 1.0
+        '00', // Values tags
+        '00', // Entries tags
+        '00', // body tags
+      ].join(''),
+      'hex'
+    )
+    const scripted = createScriptedCluster({
+      nodes: [{ id: 0, host: 'node0', port: 9092 }],
+      profile: 'securityAdmin',
+      advertise: { DescribeClientQuotas: [1, 1] },
+    })
+    scripted.answer('DescribeClientQuotas', () => answer)
+    const admin = new Kafka(scripted.kafkaOptions({ retry: { retries: 0 } })).admin()
+    try {
+      await admin.connect()
+      await expect(
+        admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'any' }] })
+      ).rejects.toMatchObject({
+        name: 'KafkaJSPartialMessageError',
+        message: expect.stringContaining('DescribeClientQuotasResponse.Entries.Values.Key'),
+      })
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
 })

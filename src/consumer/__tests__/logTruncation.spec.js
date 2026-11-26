@@ -432,10 +432,14 @@ describe('Consumer > position validation', () => {
     // Two fetchers can compute the leader map at different moments and both claim a partition, so
     // a partition can be awaiting a reply this fetch round never asked for. That is the state
     // stubbed here: a single-fetcher round cannot produce it, because the gate blocks first.
-    const { group, fetchRequestPartitions } = await createGroup({ partitions: [0, 1] })
+    const { group, setResponse, fetchRequestPartitions } = await createGroup({
+      partitions: [0, 1],
+    })
     jest
       .spyOn(group.positionValidator, 'isAwaiting')
       .mockImplementation((topic, partition) => partition === 0)
+    // A broker answers only the partitions a full request carried.
+    setResponse(fetchResponse([{ partition: 1, errorCode: 0 }]))
 
     await group.fetch(NODE_ID)
 

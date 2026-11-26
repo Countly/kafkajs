@@ -229,10 +229,10 @@ const whereASendPathFailureGoes = ({ linger, batchSize }) => {
 
 /**
  * A producer over the fake cluster - one broker leading every partition, InitProducerId answered
- * with producer id 1000, transaction version 2 - whose accumulator takes its defaults unless
- * `linger` or `batchSize` is given.
+ * with producer id 1000, transaction version `level` (2 unless given) - whose accumulator takes
+ * its defaults unless `linger` or `batchSize` is given.
  */
-const createLingeringProducer = ({ produce, partitions = 2, ...options } = {}) => {
+const createLingeringProducer = ({ produce, partitions = 2, level = 2, ...options } = {}) => {
   const cluster = createFakeCluster({
     partitions,
     produce: (request) => {
@@ -242,7 +242,7 @@ const createLingeringProducer = ({ produce, partitions = 2, ...options } = {}) =
     },
   })
   Object.assign(cluster.broker, {
-    finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: 2 } },
+    finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: level } },
     finalizedFeaturesEpoch: 1,
   })
   cluster.broker.endTxn.mockImplementation(async ({ producerEpoch }) => ({
@@ -3061,6 +3061,210 @@ describe('Producer > the accumulator', () => {
         await expect(settledWithin(transaction.commit())).rejects.toBe(error)
       })
 
+      describe('a send the delivery deadline ends before it is partitioned', () => {
+        const RETRY_EVERY_100 = {
+          retries: 100,
+          initialRetryTime: 100,
+          maxRetryTime: 100,
+          factor: 0,
+        }
+        const RETRY_EVERY_10 = { retries: 100, initialRetryTime: 10, maxRetryTime: 10, factor: 0 }
+
+        /** A partitioner that throws a retriable error for 'broken-topic' and picks 0 otherwise. */
+        const failingFor =
+          () =>
+          ({ topic }) => {
+            if (topic === 'broken-topic') throw new KafkaJSError('no route yet')
+            return 0
+          }
+
+        /**
+         * Makes the second wait of a send to 'broken-topic' for its topic's metadata never end, until
+         * the returned `release` is called.
+         * @param {object} cluster
+         * @param {number} [hangAt=2] which wait for 'broken-topic' hangs
+         * @returns {{ release: () => void }}
+         */
+        const hangingWait = (cluster, hangAt = 2) => {
+          const hung = deferred()
+          let waits = 0
+          cluster.addMultipleTargetTopics.mockImplementation(async (topics) => {
+            topics.forEach((topic) => cluster.targetTopics.add(topic))
+            if (topics.includes('broken-topic') && (waits += 1) === hangAt) await hung.promise
+          })
+          return { release: hung.resolve }
+        }
+
+        test.each([1, 2])(
+          'a partitioner that keeps failing until the retries reach the deadline leaves the transaction committable at transaction version %i',
+          async (level) => {
+            const { cluster, producer, produced } = transactionalProducer({
+              level,
+              linger: 5,
+              deliveryTimeout: 250,
+              retry: RETRY_EVERY_100,
+              createPartitioner: failingFor,
+            })
+            await producer.connect()
+            const transaction = await producer.transaction()
+
+            const error = await settledWithin(
+              transaction
+                .send({ topic: 'broken-topic', messages: [{ value: 'a' }] })
+                .catch((e) => e),
+              250
+            )
+
+            expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+            expect(error.cause).toBeInstanceOf(KafkaJSError)
+            transaction.send({ topic: TOPIC, messages: [{ value: 'b' }] })
+            await settledWithin(transaction.commit())
+
+            expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b']])
+            expect(cluster.broker.endTxn).toHaveBeenCalledWith(
+              expect.objectContaining({ transactionResult: true })
+            )
+          }
+        )
+
+        /**
+         * Sends to 'broken-topic' with a 300 ms delivery deadline and a fixed 100 ms retry delay:
+         * the partitioner fails at 0, 100 and 200 ms, and at 300 ms the send's deadline, armed
+         * first, comes due together with the next retry. Checks that the deadline, not the retry,
+         * ends the send, as an unsent timeout with no retry error around it.
+         * @param {number} level the transaction version
+         */
+        const expireInBackoff = async (level) => {
+          let failed = 0
+          const { cluster, producer, produced } = transactionalProducer({
+            level,
+            linger: 5,
+            deliveryTimeout: 300,
+            retry: RETRY_EVERY_100,
+            createPartitioner:
+              () =>
+              ({ topic }) => {
+                if (topic !== 'broken-topic') return 0
+                failed += 1
+                throw new KafkaJSError('no route yet')
+              },
+          })
+          await producer.connect()
+          const transaction = await producer.transaction()
+
+          const sent = transaction
+            .send({ topic: 'broken-topic', messages: [{ value: 'a' }] })
+            .catch((e) => e)
+          const settled = settledFlag(sent)
+          await jest.advanceTimersByTimeAsync(299)
+          expect(failed).toBe(3)
+          expect(settled()).toBe(false)
+          const error = await settledWithin(sent, 1)
+          await jest.advanceTimersByTimeAsync(0)
+
+          expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+          expect(error.outcome).toBe('unsent')
+          expect(error.cause).toBeUndefined()
+          expect(failed).toBe(3)
+          expect(produced()).toEqual([])
+          return { cluster, producer, produced, transaction }
+        }
+
+        test.each([1, 2])(
+          'the deadline ending a send in the backoff after its partitioner failed, before the next retry runs, leaves the transaction committable at transaction version %i',
+          async (level) => {
+            const { cluster, produced, transaction } = await expireInBackoff(level)
+
+            transaction.send({ topic: TOPIC, messages: [{ value: 'b' }] })
+            await settledWithin(transaction.commit())
+
+            expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b']])
+            expect(cluster.broker.endTxn).toHaveBeenCalledWith(
+              expect.objectContaining({ transactionResult: true })
+            )
+          }
+        )
+
+        test.each([1, 2])(
+          'the deadline ending a send in the backoff after its partitioner failed leaves the transaction abortable: abort() ends it and the next transaction commits at transaction version %i',
+          async (level) => {
+            const { cluster, producer, produced, transaction } = await expireInBackoff(level)
+
+            await settledWithin(transaction.send({ topic: TOPIC, messages: [{ value: 'b' }] }), 5)
+            await expect(settledWithin(transaction.abort())).resolves.toBeUndefined()
+            const second = await producer.transaction()
+            await settledWithin(second.send({ topic: TOPIC, messages: [{ value: 'c' }] }), 5)
+            await expect(settledWithin(second.commit())).resolves.toBeUndefined()
+
+            expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b'], ['c']])
+            expect(
+              cluster.broker.endTxn.mock.calls.map(([{ transactionResult }]) => transactionResult)
+            ).toEqual([false, true])
+          }
+        )
+
+        test.each([1, 2])(
+          'the deadline ending a send that waits for its metadata again after its partitioner failed makes the transaction abort-only at transaction version %i',
+          async (level) => {
+            const { cluster, producer } = transactionalProducer({
+              level,
+              linger: 5,
+              deliveryTimeout: 300,
+              retry: RETRY_EVERY_10,
+              createPartitioner: failingFor,
+            })
+            const { release } = hangingWait(cluster)
+            await producer.connect()
+            const transaction = await producer.transaction()
+
+            const error = await settledWithin(
+              transaction
+                .send({ topic: 'broken-topic', messages: [{ value: 'a' }] })
+                .catch((e) => e),
+              300
+            )
+
+            expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+            await expect(settledWithin(transaction.commit())).rejects.toBeInstanceOf(
+              KafkaJSTransactionAbortableError
+            )
+            expect(cluster.broker.endTxn).not.toHaveBeenCalled()
+            release()
+            await jest.advanceTimersByTimeAsync(0)
+          }
+        )
+
+        test.each([1, 2])(
+          'the deadline ending a send that never got its metadata still makes the transaction abort-only at transaction version %i',
+          async (level) => {
+            const { cluster, producer } = transactionalProducer({
+              level,
+              linger: 5,
+              deliveryTimeout: 300,
+              retry: RETRY_EVERY_10,
+            })
+            const { release } = hangingWait(cluster, 1)
+            await producer.connect()
+            const transaction = await producer.transaction()
+
+            const error = await settledWithin(
+              transaction
+                .send({ topic: 'broken-topic', messages: [{ value: 'a' }] })
+                .catch((e) => e),
+              300
+            )
+
+            expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+            await expect(settledWithin(transaction.commit())).rejects.toBeInstanceOf(
+              KafkaJSTransactionAbortableError
+            )
+            expect(cluster.broker.endTxn).not.toHaveBeenCalled()
+            release()
+            await jest.advanceTimersByTimeAsync(0)
+          }
+        )
+      })
+
       test('after a commit settles, the next transaction’s sends linger again', async () => {
         const { producer, produced } = transactionalProducer()
         await producer.connect()
@@ -3318,6 +3522,68 @@ describe('Producer > the accumulator > the topics a send holds', () => {
     const sent = append(accumulator, records(0, 'a'))
 
     await expect(settledWithin(sent, LINGER)).resolves.toHaveLength(1)
+  })
+})
+
+describe('Producer > the accumulator > a send its partitioner refused', () => {
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0 })
+  })
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  /**
+   * An accumulator with a 1000 ms delivery deadline whose assignment marks each send as refused by
+   * its partitioner, as a failed partitioner call does, and returns only when the case says;
+   * `expired` hands back `armed` for whatever it is given.
+   */
+  const refusing = () => {
+    const assigned = deferred()
+    const armed = new KafkaJSError('armed')
+    const expired = jest.fn(() => armed)
+    const accumulator = new Accumulator({
+      linger: 0,
+      batchSize: BATCH_SIZE,
+      deadline: 1000,
+      expired,
+      partition: (send) => {
+        send.refused = true
+        return assigned.promise
+      },
+      sendPartitioned: async () => [],
+    })
+    return { accumulator, assigned, armed, expired }
+  }
+
+  test('its delivery deadline rejects it with the timeout itself and calls no expired', async () => {
+    const { accumulator, assigned, expired } = refusing()
+    const sent = append(accumulator, records(0, 'a')).catch((e) => e)
+
+    const error = await settledWithin(sent, 1000)
+
+    expect(error).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
+    expect(expired).not.toHaveBeenCalled()
+    assigned.resolve([])
+    await jest.advanceTimersByTimeAsync(0)
+    expect(accumulator.unsettled()).toEqual([])
+  })
+
+  test('a forced close rejects it through expired, as every send waiting for its partitions', async () => {
+    const { accumulator, assigned, armed, expired } = refusing()
+    const sent = append(accumulator, records(0, 'a')).catch((e) => e)
+    await jest.advanceTimersByTimeAsync(0)
+
+    accumulator.forceClose()
+
+    expect(await settledWithin(sent)).toBe(armed)
+    expect(expired).toHaveBeenCalledTimes(1)
+    expect(expired).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'KafkaJSProducerClosedError', outcome: 'unsent' })
+    )
+    assigned.resolve([])
+    await jest.advanceTimersByTimeAsync(0)
+    expect(accumulator.unsettled()).toEqual([])
   })
 })
 
