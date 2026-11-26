@@ -25,7 +25,39 @@ const cell = (partition, offset) => ({
   errorCode: 0,
 })
 
+/**
+ * @param {number} partition
+ * @param {string} offset
+ * @returns {object} one partition row of an OffsetFetch answer, as the codec decodes it
+ */
+const decoded = (partition, offset) => ({
+  partition,
+  offset,
+  committedLeaderEpoch: -1,
+  metadata: null,
+  errorCode: 0,
+})
+
 const offsetFetches = ({ requests }) => requests.filter((r) => r.apiKey === apiKeys.OffsetFetch)
+
+const flush = () => new Promise(setImmediate)
+
+/**
+ * Replaces the manager's coordinator with one that holds every OffsetFetch until the case answers.
+ * @param {OffsetManager} manager
+ * @returns {((rows: object[]) => void)[]} one answer per request, in send order; each resolves its
+ *   request with `rows` for `TOPIC`
+ */
+const holdOffsetFetches = (manager) => {
+  const answers = []
+  manager.getCoordinator = async () => ({
+    offsetFetch: () =>
+      new Promise((resolve) => {
+        answers.push((rows) => resolve({ responses: [{ topic: TOPIC, partitions: rows }] }))
+      }),
+  })
+  return answers
+}
 
 describe('Consumer > stored committed offsets', () => {
   const harnesses = []
@@ -56,13 +88,14 @@ describe('Consumer > stored committed offsets', () => {
   }
 
   /**
-   * A manager over partition 0 of `TOPIC` whose coordinator stores `offset` and whose reset policy
-   * is earliest.
+   * A manager over `partitions` of `TOPIC` whose coordinator stores `offset` for partition 0 and
+   * whose reset policy is earliest.
    * @param {string} offset the stored offset
+   * @param {number[]} [partitions] the assigned partitions
    * @returns {{ manager: OffsetManager, cache: object, lookup: jest.Mock, harness: object }}
    *   `lookup` is called for every ListOffsets lookup the manager starts
    */
-  const createMember = (offset) => {
+  const createMember = (offset, partitions = [0]) => {
     const harness = coordinatorStoring(offset)
     const cache = dictionary()
     const operations = new OffsetOperations()
@@ -77,7 +110,7 @@ describe('Consumer > stored committed offsets', () => {
         fetchTopicsOffset: lookup,
       },
       coordinator: harness.broker,
-      memberAssignment: { [TOPIC]: [0] },
+      memberAssignment: { [TOPIC]: partitions },
       autoCommit: false,
       autoCommitInterval: null,
       autoCommitThreshold: null,
@@ -120,6 +153,44 @@ describe('Consumer > stored committed offsets', () => {
     expect(lookup).not.toHaveBeenCalled()
     expect(cache[TOPIC]?.[0]).toBeUndefined()
     expect(manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
+  })
+
+  test('a second read that answers -500 after a first read set the position to 10 leaves the position at 10, with no error', async () => {
+    const { manager, cache, lookup } = createMember('10')
+    const answers = holdOffsetFetches(manager)
+    const first = manager.resolveOffsets()
+    const second = manager.resolveOffsets()
+    await flush()
+    expect(answers).toHaveLength(2)
+
+    answers[0]([decoded(0, '10')])
+    await expect(first).resolves.toBe(true)
+    expect(manager.heldOffsetAt(TOPIC, 0)).toBe('10')
+
+    answers[1]([decoded(0, '-500')])
+    await expect(second).resolves.toBe(true)
+
+    expect(cache[TOPIC]).toEqual({ 0: '10' })
+    expect(manager.heldOffsetAt(TOPIC, 0)).toBe('10')
+    expect(lookup).not.toHaveBeenCalled()
+  })
+
+  test('an answer storing 10 for one partition and -500 for another rejects without setting either position', async () => {
+    const { manager, cache, lookup } = createMember('10', [0, 1])
+    const answers = holdOffsetFetches(manager)
+    const resolving = manager.resolveOffsets()
+    await flush()
+
+    answers[0]([decoded(0, '10'), decoded(1, '-500')])
+
+    await expect(resolving).rejects.toMatchObject({
+      name: 'KafkaJSNonRetriableError',
+      message: expect.stringMatching(/stores offset -500 for partition 1 of topic test-topic/),
+    })
+    expect(cache[TOPIC]?.[0]).toBeUndefined()
+    expect(manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
+    expect(manager.heldOffsetAt(TOPIC, 1)).toBeUndefined()
+    expect(lookup).not.toHaveBeenCalled()
   })
 
   test.each(['-1', '-2'])('a stored %s goes through the reset policy as before', async (offset) => {

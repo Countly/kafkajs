@@ -10648,6 +10648,8 @@
         "src/consumer/offsetManager/__tests__/offsetReadCoverage.spec.js \u203a Consumer > offset reads whose answer does not cover the request an answer that repeats a partition with different offsets rejects and sets no position",
         "src/consumer/offsetManager/__tests__/offsetReadCoverage.spec.js \u203a Consumer > offset reads whose answer does not cover the request an answer that splits the assigned topic into two entries rejects before any lookup, position or cache write",
         "src/consumer/offsetManager/__tests__/storedOffsets.spec.js \u203a Consumer > stored committed offsets a stored -500 rejects the offset resolution with a non-retriable error naming the partition, and no further OffsetFetch is sent",
+        "src/consumer/offsetManager/__tests__/storedOffsets.spec.js › Consumer > stored committed offsets a second read that answers -500 after a first read set the position to 10 leaves the position at 10, with no error",
+        "src/consumer/offsetManager/__tests__/storedOffsets.spec.js › Consumer > stored committed offsets an answer storing 10 for one partition and -500 for another rejects without setting either position",
         "src/consumer/offsetManager/__tests__/storedOffsets.spec.js \u203a Consumer > stored committed offsets a stored -1 goes through the reset policy as before",
         "src/consumer/offsetManager/__tests__/storedOffsets.spec.js \u203a Consumer > stored committed offsets a stored -2 goes through the reset policy as before",
         "src/consumer/offsetManager/__tests__/storedOffsets.spec.js \u203a Consumer > stored committed offsets a stored 0 is used as stored",
