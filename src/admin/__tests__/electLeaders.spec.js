@@ -42,55 +42,30 @@ test('public cluster methods are functions', () => {
   for (const name of ['electLeaders', 'describeFeatures', 'updateFeatures', 'listConfigResources'])
     expect(typeof admin[name]).toBe('function')
 })
-test('election successes and terminal errors leave the retry subset', async () => {
+test('election returns success and both broker errors after one send', async () => {
   const f = fixture()
-  f.broker.electLeaders = jest
-    .fn()
-    .mockResolvedValueOnce(answer([0, 80, 7]))
-    .mockResolvedValueOnce({
-      replicaElectionResults: [
-        {
-          topic: 'orders',
-          partitionResult: [{ partitionId: 2, errorCode: 84, errorMessage: null }],
-        },
-      ],
-    })
+  f.broker.electLeaders = jest.fn(async () => answer([0, 80, 7]))
   const rows = await f.admin.electLeaders({ topicPartitions: selection })
-  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 80, 84])
+  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 80, 7])
   expect(rows[0].partitions[1].error.type).toBe('PREFERRED_LEADER_NOT_AVAILABLE')
-  expect(rows[0].partitions[2].error.type).toBe('ELECTION_NOT_NEEDED')
-  expect(f.broker.electLeaders.mock.calls[1][0].topicPartitions).toEqual([
-    { topic: 'orders', partitions: [2] },
-  ])
+  expect(rows[0].partitions[2].error.type).toBe('REQUEST_TIMED_OUT')
+  expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
 })
 test('controller errors relocate once before retry', async () => {
   const f = fixture()
-  f.broker.electLeaders = jest
-    .fn()
-    .mockRejectedValueOnce(createErrorFromCode(41))
-    .mockResolvedValueOnce(answer([0, 0, 0]))
+  f.cluster.findControllerBroker.mockRejectedValueOnce(createErrorFromCode(41))
+  f.broker.electLeaders = jest.fn(async () => answer([0, 0, 0]))
   await f.admin.electLeaders({ topicPartitions: selection })
   expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
   expect(f.cluster.findControllerBroker).toHaveBeenCalledTimes(2)
+  expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
 })
-test('all partitions starts with null and narrows only unresolved identities', async () => {
+test('all partitions sends null once and reports the returned rows', async () => {
   const f = fixture()
-  f.broker.electLeaders = jest
-    .fn()
-    .mockResolvedValueOnce(answer([0, 80, 7]))
-    .mockResolvedValueOnce({
-      replicaElectionResults: [
-        {
-          topic: 'orders',
-          partitionResult: [{ partitionId: 2, errorCode: 0, errorMessage: null }],
-        },
-      ],
-    })
-  await f.admin.electLeaders({ topicPartitions: null })
-  expect(f.broker.electLeaders.mock.calls.map((c) => c[0].topicPartitions)).toEqual([
-    null,
-    [{ topic: 'orders', partitions: [2] }],
-  ])
+  f.broker.electLeaders = jest.fn(async () => answer([0, 80, 7]))
+  const rows = await f.admin.electLeaders({ topicPartitions: null })
+  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 80, 7])
+  expect(f.broker.electLeaders.mock.calls.map((c) => c[0].topicPartitions)).toEqual([null])
 })
 test('empty all-partition answer is a valid empty result', async () => {
   const f = fixture()
@@ -104,18 +79,16 @@ test.each([31, 41])('exhausted top-level code %i throws', async (code) => {
   })
   await expect(f.admin.electLeaders({ topicPartitions: selection })).rejects.toMatchObject({ code })
 })
-test('item exhaustion after a transport failure preserves completed outcomes', async () => {
+test('item exhaustion after transport failures before the write leaves every partition unresolved', async () => {
   const f = fixture()
   const original = new KafkaJSConnectionError('lost')
-  f.broker.electLeaders = jest
-    .fn()
-    .mockResolvedValueOnce(answer([0, 80, 7]))
-    .mockRejectedValue(original)
+  f.broker.electLeaders = jest.fn().mockRejectedValue(original)
   const rows = await f.admin.electLeaders({ topicPartitions: selection })
-  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 80, -1])
-  expect(rows[0].partitions[2].error).toMatchObject({ name: 'KafkaJSConnectionError' })
-  expect(f.broker.electLeaders.mock.calls[1][0].topicPartitions).toEqual([
-    { topic: 'orders', partitions: [2] },
+  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([-1, -1, -1])
+  expect(rows[0].partitions[2].error).toBe(original)
+  expect(f.broker.electLeaders.mock.calls.map(([options]) => options.topicPartitions)).toEqual([
+    selection,
+    selection,
   ])
 })
 test.each([
@@ -226,43 +199,14 @@ test('authentication refusal before election work rejects with the original erro
   expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
 })
 
-test('the first all-partition controller response relocates before the narrowed retry', async () => {
+test('an all-partition election reports a moved-controller row without relocation', async () => {
   const f = fixture()
-  const moved = {
-    electLeaders: jest.fn(async () => ({
-      replicaElectionResults: [
-        {
-          topic: 'orders',
-          partitionResult: [{ partitionId: 1, errorCode: 0, errorMessage: null }],
-        },
-      ],
-    })),
-  }
-  let controller = f.broker
-  f.cluster.findControllerBroker.mockImplementation(async () => controller)
-  f.cluster.refreshMetadata.mockImplementation(async () => {
-    controller = moved
-  })
-  f.broker.electLeaders = jest.fn(async ({ topicPartitions }) =>
-    topicPartitions === null
-      ? answer([0, 41])
-      : {
-          replicaElectionResults: [
-            {
-              topic: 'orders',
-              partitionResult: [{ partitionId: 1, errorCode: 41, errorMessage: null }],
-            },
-          ],
-        }
-  )
+  f.broker.electLeaders = jest.fn(async () => answer([0, 41]))
   const rows = await f.admin.electLeaders({ topicPartitions: null })
-  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 0])
-  expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+  expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 41])
+  expect(f.cluster.refreshMetadata).not.toHaveBeenCalled()
   expect(f.broker.electLeaders.mock.calls).toEqual([
     [{ electionType: 'preferred', topicPartitions: null }],
-  ])
-  expect(moved.electLeaders.mock.calls).toEqual([
-    [{ electionType: 'preferred', topicPartitions: [{ topic: 'orders', partitions: [1] }] }],
   ])
 })
 
@@ -309,7 +253,7 @@ test('the shared topic-partition type has one public declaration', () => {
 })
 
 test.each([null, [{ topic: 'orders', partitions: [0, 1] }]])(
-  'a transient controller refresh failure preserves election successes for %j',
+  'election rows need no controller refresh for %j',
   async (topicPartitions) => {
     const f = fixture({}, { ...retry, retries: 2 })
     const original = new KafkaJSConnectionError('refresh failed')
@@ -328,32 +272,26 @@ test.each([null, [{ topic: 'orders', partitions: [0, 1] }]])(
         })),
       }))
     const rows = await f.admin.electLeaders({ topicPartitions })
-    expect(f.broker.electLeaders.mock.calls[1][0].topicPartitions).toEqual([
-      { topic: 'orders', partitions: [1] },
-    ])
-    expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 0])
-    expect(f.broker.electLeaders).toHaveBeenCalledTimes(2)
+    expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 41])
+    expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
     expect(f.broker.electLeaders.mock.calls[0][0].topicPartitions).toEqual(topicPartitions)
-    expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(2)
-    expect(f.cluster.refreshMetadata.mock.invocationCallOrder[1]).toBeLessThan(
-      f.broker.electLeaders.mock.invocationCallOrder[1]
-    )
+    expect(f.cluster.refreshMetadata).not.toHaveBeenCalled()
   }
 )
 
 test.each([null, [{ topic: 'orders', partitions: [0, 1] }]])(
-  'an exhausted controller refresh failure preserves election successes for %j',
+  'a failing refresh cannot replace an election row for %j',
   async (topicPartitions) => {
     const f = fixture()
     const original = new KafkaJSConnectionError('refresh failed')
     f.cluster.refreshMetadata.mockRejectedValue(original)
     f.broker.electLeaders = jest.fn(async () => answer([0, 41]))
     const rows = await f.admin.electLeaders({ topicPartitions })
-    expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, -1])
+    expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 41])
     expect(rows[0].partitions[0].error).toBeNull()
-    expect(rows[0].partitions[1].error).toBe(original)
+    expect(rows[0].partitions[1].error.code).toBe(41)
     expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
-    expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    expect(f.cluster.refreshMetadata).not.toHaveBeenCalled()
   }
 )
 
@@ -373,35 +311,35 @@ test.each([null, [{ topic: 'orders', partitions: [0, 1] }]])(
 )
 
 test.each(['KafkaJSSASLAuthenticationError', 'KafkaJSServerDoesNotSupportApiKey'])(
-  'controller refresh %s rejects the mutation call with the original error',
+  'controller refresh %s cannot replace an answered partition',
   async (name) => {
     const f = fixture()
     const ErrorClass = require('../../errors')[name]
     const original = new ErrorClass('refresh refused')
     f.cluster.refreshMetadata.mockRejectedValue(original)
     f.broker.electLeaders = jest.fn(async () => answer([0, 41]))
-    await expect(
-      f.admin.electLeaders({
-        topicPartitions: [{ topic: 'orders', partitions: [0, 1] }],
-      })
-    ).rejects.toBe(original)
+    const rows = await f.admin.electLeaders({
+      topicPartitions: [{ topic: 'orders', partitions: [0, 1] }],
+    })
+    expect(rows[0].partitions.map((p) => p.errorCode)).toEqual([0, 41])
     expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
-    expect(f.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    expect(f.cluster.refreshMetadata).not.toHaveBeenCalled()
   }
 )
 
-test('deadline during controller refresh forbids another mutation request', async () => {
+test('deadline during a controller refresh before the write forbids the election request', async () => {
   jest.useFakeTimers()
   const baseline = jest.getTimerCount()
   let release
   const f = fixture()
+  f.cluster.findControllerBroker.mockRejectedValueOnce(createErrorFromCode(41))
   f.cluster.refreshMetadata.mockImplementation(
     () =>
       new Promise((resolve) => {
         release = resolve
       })
   )
-  f.broker.electLeaders = jest.fn(async () => answer([0, 41]))
+  f.broker.electLeaders = jest.fn(async () => answer([0, 0]))
   const result = f.admin
     .electLeaders({
       ...{ topicPartitions: [{ topic: 'orders', partitions: [0, 1] }] },
@@ -416,7 +354,7 @@ test('deadline during controller refresh forbids another mutation request', asyn
     release()
     await Promise.resolve()
     await Promise.resolve()
-    expect(f.broker.electLeaders).toHaveBeenCalledTimes(1)
+    expect(f.broker.electLeaders).not.toHaveBeenCalled()
     expect(jest.getTimerCount()).toBe(baseline)
   } finally {
     release?.()

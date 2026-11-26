@@ -228,7 +228,7 @@ class ScramCredentials {
           items: [...users.values()],
           keyOf: ({ user }) => user,
           retry: this.retry,
-          retryable: (row) => row.errorCode === 41 || row.errorCode === 7,
+          retryable: () => false,
           callFailure,
           sanitize: () => null,
         },

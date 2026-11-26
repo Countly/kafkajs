@@ -71,22 +71,14 @@ describe('legacy admin call patterns', () => {
 })
 
 describe('delete-records partial broker retries', () => {
-  it('keeps successful brokers out of retries and reports only the refused partition', async () => {
+  it('reports the refused partition without resending to either broker', async () => {
     const topic = 't'
     const brokers = [0, 1].map((nodeId) => ({
       deleteRecords: jest.fn(async () => {
         if (nodeId === 1) {
           throw new KafkaJSDeleteTopicRecordsError({
             topic,
-            partitions: [
-              {
-                partition: 1,
-                offset: '5',
-                error: createErrorFromCode(
-                  brokers[1].deleteRecords.mock.calls.length === 1 ? 6 : 1
-                ),
-              },
-            ],
+            partitions: [{ partition: 1, offset: '5', error: createErrorFromCode(6) }],
           })
         }
       }),
@@ -125,11 +117,11 @@ describe('delete-records partial broker retries', () => {
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
     expect(error.cause).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
     expect(error.cause.partitions).toEqual([
-      { partition: 1, offset: '5', error: expect.objectContaining({ code: 1 }) },
+      { partition: 1, offset: '5', error: expect.objectContaining({ code: 6 }) },
     ])
     expect(brokers[0].deleteRecords).toHaveBeenCalledTimes(1)
-    expect(brokers[1].deleteRecords).toHaveBeenCalledTimes(2)
-    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+    expect(brokers[1].deleteRecords).toHaveBeenCalledTimes(1)
+    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
 })
 

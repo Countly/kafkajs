@@ -3,6 +3,7 @@ const {
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSDeliveryTimeout,
 } = require('../errors')
+const { endsCall, isAnsweredError } = require('./deadline')
 
 /**
  * Whether a failure names the items it is about: an aggregate with a list of children, at least
@@ -141,7 +142,7 @@ class AggregateOutcome {
    */
   finish(outstanding) {
     if (outstanding) {
-      if (this.terminal.length === 0) {
+      if (endsCall(outstanding) || isAnsweredError(outstanding) || this.terminal.length === 0) {
         throw outstanding
       }
       throw new KafkaJSAggregateError(this.message, [...this.terminal, ...childrenOf(outstanding)])
