@@ -24681,6 +24681,7 @@
         "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery reports a fenced membership after error 25 without leaving",
         "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery reports a fenced membership after error 110 without leaving",
         "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery reports an unknown coordinator without adopting another membership",
+        "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery sends one leave on the accepted coordinator when disconnect finds the heartbeat backing off after a refused assignment",
         "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery retires a held coordinator lookup before an omitted leave finishes its final",
         "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery discards an ordinary heartbeat answer held over a coordinator-unknown close",
         "src/consumer/share/__tests__/shareConsumerCoordinatorClose.spec.js \u203a share disconnect after coordinator transport recovery rejoins after a poll close omits leave for an unknown coordinator",
