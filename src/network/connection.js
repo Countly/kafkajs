@@ -877,6 +877,7 @@ module.exports = class Connection {
 
   /**
    * Whether less than `margin` milliseconds remain of the session; never for an unlimited one.
+   * A negative margin counts as 0, so a session the write would refuse is always renewed first.
    * @private
    * @param {number} margin milliseconds that must still remain
    * @returns {boolean}
@@ -891,7 +892,7 @@ module.exports = class Connection {
       .multiply(1000)
       .add(Long.fromValue(remainingNanosSince).divide(1000000))
 
-    const reauthenticateAt = millisSince.add(margin)
+    const reauthenticateAt = millisSince.add(Math.max(margin, 0))
     return reauthenticateAt.greaterThanOrEqual(this.sessionLifetime)
   }
 
