@@ -296,6 +296,102 @@ describe('A manual consumer over a scripted broker', () => {
     expect(fetched.fields.requireStable).toBe(true)
   })
 
+  describe('committed when the OffsetFetch answer does not cover the request', () => {
+    const asked = [0, 1].map((partition) => ({ topic: TOPIC, partition }))
+
+    /**
+     * @param {number} partition
+     * @param {string} offset
+     * @returns {object} one partition row of a scripted OffsetFetch answer
+     */
+    const row = (partition, offset) => ({
+      partition,
+      offset,
+      leaderEpoch: -1,
+      metadata: '',
+      errorCode: 0,
+    })
+
+    /**
+     * Answers the n-th OffsetFetch with `answers[n]`, the last one repeating.
+     * @param {object} cluster the scripted cluster
+     * @param {object[][]} answers the topic entries of each answer
+     * @returns {void}
+     */
+    const answerWith = (cluster, answers) => {
+      let sent = 0
+      cluster.answer('OffsetFetch', ({ groupId }) => ({
+        groupId,
+        topics: answers[Math.min(sent++, answers.length - 1)],
+      }))
+    }
+
+    /** @returns {Promise<{ cluster: object, consumer: object }>} a connected consumer that retries twice */
+    const observer = async () => {
+      wire = await scripted()
+      const consumer = track(
+        wire.kafka.consumer({ groupId: 'observer-group', retry: { retries: 2 } })
+      )
+      await consumer.connect()
+      return { cluster: wire.cluster, consumer }
+    }
+
+    test('an answer that leaves out a requested partition on every attempt rejects with the retries exceeded and the coverage error as cause', async () => {
+      const { cluster, consumer } = await observer()
+      answerWith(cluster, [[{ topic: TOPIC, partitions: [row(0, '10')] }]])
+
+      await expect(consumer.committed(asked)).rejects.toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        retriable: false,
+        retryCount: 2,
+        cause: expect.objectContaining({
+          name: 'KafkaJSError',
+          retriable: true,
+          message: expect.stringContaining(`does not name partition 1 of topic ${TOPIC}`),
+        }),
+      })
+      expect(frames(cluster, 'OffsetFetch')).toHaveLength(3)
+    })
+
+    test('an answer that splits the requested topic into two entries on every attempt rejects with the retries exceeded and the entry-count error as cause', async () => {
+      const { cluster, consumer } = await observer()
+      answerWith(cluster, [
+        [
+          { topic: TOPIC, partitions: [row(0, '10')] },
+          { topic: TOPIC, partitions: [row(1, '11')] },
+        ],
+      ])
+
+      await expect(consumer.committed(asked)).rejects.toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        retriable: false,
+        retryCount: 2,
+        cause: expect.objectContaining({
+          name: 'KafkaJSError',
+          retriable: true,
+          message: expect.stringContaining(
+            `names topic ${TOPIC} in more entries than the request did`
+          ),
+        }),
+      })
+      expect(frames(cluster, 'OffsetFetch')).toHaveLength(3)
+    })
+
+    test('an answer that covers the request on a later attempt resolves with its offsets in input order', async () => {
+      const { cluster, consumer } = await observer()
+      answerWith(cluster, [
+        [{ topic: TOPIC, partitions: [row(0, '10')] }],
+        [{ topic: TOPIC, partitions: [row(1, '11'), row(0, '10')] }],
+      ])
+
+      expect(await consumer.committed(asked)).toEqual([
+        { topic: TOPIC, partition: 0, offset: '10', metadata: '' },
+        { topic: TOPIC, partition: 1, offset: '11', metadata: '' },
+      ])
+      expect(frames(cluster, 'OffsetFetch')).toHaveLength(2)
+    })
+  })
+
   test('exposes sorted defensive getters and follows the mode transitions', async () => {
     wire = await scripted()
     const { kafka } = wire
