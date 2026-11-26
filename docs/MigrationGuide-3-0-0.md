@@ -1420,6 +1420,7 @@ now logged.
 - **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons and the OAUTHBEARER error-challenge reason, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
 - **A login the connection ended is reported as the connection's error.** When the connection is lost, a request timeout closes it, or the setup is cancelled while a built-in mechanism (PLAIN, SCRAM, OAUTHBEARER, AWS, GSSAPI's Kafka exchange stages) is exchanging SASL messages, the mechanism now rethrows that connection error or cancellation with its own `retriable` flag instead of a `KafkaJSSASLAuthenticationError`, and logs no authentication failure for it. With the stock socket factory the client already retried these outages, so recovery behaviour is unchanged; what changes is the error and log a mechanism produces at that boundary. Any other exchange failure, including an error a custom socket throws, is still a sanitized `KafkaJSSASLAuthenticationError`. *What to do:* nothing for ordinary use. Read `KafkaJSSASLAuthenticationError` as "the login failed for a reason other than the transport" and investigate it (broker rejection, credentials or token, SCRAM server signature, Kerberos context) rather than assuming a wrong password. Unlike the Java client, which retries some transient Kerberos errors, a GSSAPI native failure stays terminal here.
 - **A rejected OAUTHBEARER token fails the login.** When a broker refuses a SASL OAUTHBEARER token it answers with an error challenge (RFC 7628 section 3.2.3) in a response that carries no error code. kafkajs 2.2.4 ignored it, so `connect()` resolved and the next request failed with a `KafkaJSProtocolError` (`ILLEGAL_SASL_STATE`) or a closed connection; at re-authentication the refresh looked successful and in-flight work then failed. The client now answers the challenge with a single `0x01` byte, as the Java client and franz-go do, so `connect()` and re-authentication reject with a non-retriable `KafkaJSSASLAuthenticationError` and the authentication blackout applies. A valid token is unchanged and sends no extra request. *What to do:* if code detected a bad or expired token by catching the later protocol error, catch `KafkaJSSASLAuthenticationError` from connect instead, and make the `oauthBearerProvider` return a fresh token. Custom `authenticationProvider` mechanisms are not changed.
+- **A request is not written on an ended or re-authenticating SASL session.** A request still waiting in a connection's queue (behind `maxInFlightRequests` or a broker throttle) when its SASL session ends, or when a re-authentication of that connection starts, is refused at the moment it would be written with a retriable `KafkaJSError` (`The SASL session was not valid when the request was due to be written; it was not sent`). The frame was never written, so the broker did not see it; a retrier sends it again, and the next attempt re-authenticates first. kafkajs 2.2.4 wrote it, and the broker closed the connection, failing every request in flight on it. With no retries left the call fails with the retriable error wrapped in `KafkaJSNumberOfRetriesExceeded`; a producer delivery timeout reports `outcome: 'unsent'` only when no earlier attempt of the batch was written (otherwise `'unknown'`), and inside a transaction the exhausted batch makes the transaction abortable, as any exhausted retriable error does. *What to do:* nothing with retries enabled. With `retry.retries: 0`, expect this retriable error at a session boundary. The refused request itself was not sent, but a call that sends several requests (a producer `send()` to more than one broker, for example) may already have written others, so decide whether to repeat the call as for any other failed send: without the idempotent producer a repeated send can write records twice.
 
 - **`KafkaJSFetcherRebalanceError` is kept for compatibility and is no longer thrown.**
 
@@ -1685,6 +1686,29 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   whose consumer-protocol description failed has an empty group type. A function typed to take only
   the earlier group-type union can no longer be called with `group.groupType`; handle `''` (an
   exhaustive `switch` needs a `default`).
+- **`AssignerProtocol` decodes `userData` as `Buffer | null`.** A member that sent none, such as a
+  Java consumer, decodes to `null`; guard it under `strictNullChecks`. `MemberAssignment.encode` no
+  longer needs `userData` (it writes an empty byte string) and takes `null`, which writes the wire
+  null; its argument type is the new `MemberAssignmentInput`.
+- **`Message.timestamp` accepts a string, a number, a `Date` or a `bigint`.** `send()` took the
+  first three in 2.2.4 and takes the `bigint` in this release. Call sites are unaffected; code that *reads* it, such as a custom partitioner
+  (`PartitionerArgs.message`), must handle every form. Before: `Number(message.timestamp)`. After:
+  `message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp)`.
+- **A custom `socketFactory` receives `ssl` as configured: `true`, an options object, or
+  `null`/`false`.** Use `typeof args.ssl === 'object' && args.ssl` before passing it to
+  `tls.connect`.
+- **`LogEntry.namespace` is `string | undefined`.** It is `undefined` for the root logger; guard it
+  under `strictNullChecks`.
+- **If you used an earlier 3.0.0 prerelease: `ConsumerRebalancingEvent.payload.reason` is open.**
+  `'subscription-changed'` and `'enforced-rebalance'` were already reported, and the text passed to
+  `enforceRebalance` is reported as given, so an exhaustive `switch` over the earlier union needs a
+  `default`.
+- **If you used an earlier 3.0.0 prerelease: the `memberId` of `consumer.partition_halted` can be
+  `null`.** A member that has no id yet, or lost it, halts a partition with `null`; guard it under
+  `strictNullChecks`.
+- **If you used an earlier 3.0.0 prerelease: `ShareConsumerRunConfig` is exactly one handler.**
+  `run({})` and `run({ eachMessage, eachBatch })` are compile errors, as `run()` rejects them at run
+  time, and an `interface` can no longer `extends` the type (use an intersection type).
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots

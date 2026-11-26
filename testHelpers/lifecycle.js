@@ -2142,10 +2142,10 @@ class PublicTelemetryRound {
     const stamp = connection.authenticatedAt
     this.patch(
       Connection.prototype,
-      symbolOf(Connection.prototype, 'private:Connection:shouldReauthenticate'),
+      'isAuthenticated',
       (original) =>
         function () {
-          return (this === connection && this.authenticatedAt === stamp) || original.call(this)
+          return !(this === connection && this.authenticatedAt === stamp) && original.call(this)
         }
     )
   }
