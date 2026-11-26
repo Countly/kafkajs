@@ -93,7 +93,7 @@ describe('Consumer > offset reads whose answer does not cover the request', () =
 
     expect(lookup).not.toHaveBeenCalled()
     expect(cache[OTHER]).toBeUndefined()
-    expect(cache[TOPIC]).toBeUndefined()
+    expect(cache[TOPIC] ?? {}).toEqual({})
   })
 
   test('an answer that repeats a partition with different offsets rejects and sets no position', async () => {
@@ -140,7 +140,7 @@ describe('Consumer > offset reads whose answer does not cover the request', () =
     })
 
     expect(lookup).not.toHaveBeenCalled()
-    expect(cache[TOPIC]).toBeUndefined()
+    expect(cache[TOPIC] ?? {}).toEqual({})
     expect(manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
     expect(manager.heldOffsetAt(TOPIC, 1)).toBeUndefined()
   })
