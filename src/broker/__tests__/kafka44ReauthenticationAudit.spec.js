@@ -307,8 +307,10 @@ describe('session at write', () => {
   let cluster
   let producer
 
+  // A linger-0 batch is handed on through queueMicrotask, so it stays real: a faked one would
+  // hold the second send until fake time moves past the end of the session.
   beforeEach(() => {
-    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
   })
 
   afterEach(async () => {
@@ -324,6 +326,7 @@ describe('session at write', () => {
         cluster?.assertClean()
       } finally {
         producer = cluster = undefined
+        jest.restoreAllMocks()
         jest.useRealTimers()
       }
     }
@@ -405,13 +408,33 @@ describe('session at write', () => {
       .filter((entry) => entry.partition === partition)
       .map(({ batches }) => batches[0])
 
+  const SESSION_REFUSAL =
+    'The SASL session was not valid when the request was due to be written; it was not sent'
+
   /**
-   * Sends to partition 0 and holds its answer, then queues a send to partition 1 behind it on the
-   * same connection and lets the session end before the answer is delivered.
+   * @param {number} partition
+   * @returns {Promise[]} what each `Broker#produce` call whose request carried `partition` returned
+   */
+  const produceCallsFor = (partition) => {
+    const { calls, results } = Broker.prototype.produce.mock
+    return results
+      .filter((_, index) =>
+        calls[index][0].topicData.some(({ partitions }) =>
+          partitions.some((entry) => entry.partition === partition)
+        )
+      )
+      .map(({ value }) => value)
+  }
+
+  /**
+   * Sends to partition 0 and holds its answer, then sends to partition 1 while the session is
+   * valid, waits without moving fake time until that request waits in the connection's queue
+   * behind the held one, and lets the session end before the answer is delivered.
    * @returns {Promise<{ firstResult: *, second: Promise<*>, secondState: { settled: boolean } }>}
    *   the first send's result or error, and the second send with its settlement
    */
   const queuedPastTheSession = async () => {
+    jest.spyOn(Broker.prototype, 'produce')
     await producer.connect()
     const held = cluster.holdReply({ api: 'Produce' })
     const firstSend = producer
@@ -419,10 +442,21 @@ describe('session at write', () => {
       .catch((error) => error)
     const first = watch(firstSend)
     await until(() => written().includes('Produce:0'))
+    const queueSizes = []
+    producer.on(producer.events.REQUEST_QUEUE_SIZE, ({ payload }) => {
+      queueSizes.push(payload.queueSize)
+    })
     const second = producer
       .send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
       .catch((error) => error)
     const secondState = watch(second)
+    for (let i = 0; i < 100 && !queueSizes.includes(1); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(queueSizes).toContain(1)
+    expect(Date.now()).toBeLessThan(1000)
+    expect(produceCallsFor(1)).toHaveLength(1)
+
     await jest.advanceTimersByTimeAsync(1200)
     expect(written()).not.toContain('Produce:1')
 
@@ -442,7 +476,14 @@ describe('session at write', () => {
     await until(() => secondState.settled)
 
     expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
-    expect(await second).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
+    const [refused, ...resent] = produceCallsFor(1)
+    await expect(refused).rejects.toMatchObject({ message: SESSION_REFUSAL, retriable: true })
+    expect(resent).toEqual([])
+    expect(await second).toMatchObject({
+      name: 'KafkaJSDeliveryTimeout',
+      outcome: 'unsent',
+      cause: expect.objectContaining({ message: SESSION_REFUSAL }),
+    })
     expect(written()).not.toContain('Produce:1')
   })
 
@@ -454,6 +495,9 @@ describe('session at write', () => {
 
     expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
     expect(await second).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
+    const [refused, ...resent] = produceCallsFor(1)
+    await expect(refused).rejects.toMatchObject({ message: SESSION_REFUSAL, retriable: true })
+    expect(resent).toHaveLength(1)
     const log = written()
     expect(log.filter((api) => api === 'Produce:1')).toHaveLength(1)
     expect(log.slice(log.indexOf('Produce:0'), log.indexOf('Produce:1'))).toEqual(
