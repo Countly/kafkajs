@@ -1663,6 +1663,17 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   both reads. The `topic` of its constructor's metadata is optional and the error does not keep
   it. A structural mock of the error, or a function typed to return it, must now supply
   `partitions`.
+- **`listPartitionReassignments()` rows carry the keys they have always had.** A topic has `name`
+  (not `topic`) and a partition has `partition` (not `partitionIndex`); `addingReplicas` and
+  `removingReplicas` are always present, so a mock must set them. The broker method's result also
+  declares `throttleTime`, `clientSideThrottleTime` and `errorCode`.
+- **Fields that were never set are typed `undefined`.** `throttleTime` on `describeConfigs()`,
+  `describeAcls()` and `deleteAcls()` results, and `errorCode` and `errorMessage` on
+  `describeAcls()`, were never set. Drop them from mocks.
+- **Config values, a resource's `errorMessage` and ACL error messages can be `null`.** A sensitive or
+  unset config has no value; guard them under `strictNullChecks`.
+- **`admin.createPartitions()` is typed `Promise<void>`.** It has always resolved without a value;
+  `const created: boolean = await admin.createPartitions(...)` no longer compiles.
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots

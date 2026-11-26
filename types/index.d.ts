@@ -770,7 +770,8 @@ export interface ResourceConfigQuery {
 
 export interface ConfigEntries {
   configName: string
-  configValue: string
+  /** `null` for a sensitive config, and for one that has no value. */
+  configValue: string | null
   isDefault: boolean
   configSource: ConfigSource
   isSensitive: boolean
@@ -784,7 +785,7 @@ export interface ConfigEntries {
 
 export interface ConfigSynonyms {
   configName: string
-  configValue: string
+  configValue: string | null
   configSource: ConfigSource
 }
 
@@ -792,11 +793,13 @@ export interface DescribeConfigResponse {
   resources: {
     configEntries: ConfigEntries[]
     errorCode: number
-    errorMessage: string
+    /** `null` when the resource has no error. */
+    errorMessage: string | null
     resourceName: string
     resourceType: ConfigResourceTypes
   }[]
-  throttleTime: number
+  /** @deprecated Never set. */
+  throttleTime?: undefined
 }
 
 export interface IResourceConfigEntry {
@@ -945,9 +948,12 @@ export type DescribeAclResource = AclResource & {
 }
 
 export interface DescribeAclResponse {
-  throttleTime: number
-  errorCode: number
-  errorMessage?: string
+  /** @deprecated Never set. */
+  throttleTime?: undefined
+  /** @deprecated Never set. */
+  errorCode?: undefined
+  /** @deprecated Never set. */
+  errorMessage?: undefined
   resources: DescribeAclResource[]
 }
 
@@ -963,7 +969,7 @@ export interface AclFilter {
 
 export interface MatchingAcl {
   errorCode: number
-  errorMessage?: string
+  errorMessage?: string | null
   resourceType: AclResourceTypes
   resourceName: string
   resourcePatternType: ResourcePatternTypes
@@ -975,12 +981,13 @@ export interface MatchingAcl {
 
 export interface DeleteAclFilterResponses {
   errorCode: number
-  errorMessage?: string
+  errorMessage?: string | null
   matchingAcls: MatchingAcl[]
 }
 
 export interface DeleteAclResponse {
-  throttleTime: number
+  /** @deprecated Never set. */
+  throttleTime?: undefined
   filterResponses: DeleteAclFilterResponses[]
 }
 
@@ -989,15 +996,15 @@ export interface ListPartitionReassignmentsResponse {
 }
 
 export interface OngoingTopicReassignment {
-  topic: string
+  name: string
   partitions: OngoingPartitionReassignment[]
 }
 
 export interface OngoingPartitionReassignment {
-  partitionIndex: number
+  partition: number
   replicas: number[]
-  addingReplicas?: number[]
-  removingReplicas?: number[]
+  addingReplicas: number[]
+  removingReplicas: number[]
 }
 
 /** Producer state observed on a partition replica; int64 fields are decimal strings. */
@@ -1085,7 +1092,7 @@ listTopics(): Promise<string[]>
     validateOnly?: boolean
     timeout?: number
     topicPartitions: ITopicPartitionConfig[]
-  }) & ApiTimeoutOption): Promise<boolean>
+  }) & ApiTimeoutOption): Promise<void>
   /**
    * With `useDescribeTopicPartitions` and at least one topic the topics are read through
    * DescribeTopicPartitions (KIP-966); without topics, or on a broker that lacks the API, through
@@ -1120,11 +1127,12 @@ listTopics(): Promise<string[]>
   describeReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number;currentLogDir:string|null;futureLogDir:string|null;currentOffsetLag:string|null;futureOffsetLag:string|null} & AdminItemResult>>
   fetchTopicOffsets(topic: string, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry & { high: string; low: string }>>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
+  /** `timestamp` is milliseconds, a decimal string of milliseconds, or a named offset spec. */
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName | `${number}`, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
 fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
   /** Elects preferred or unclean leaders; retries only unresolved partitions. */
   electLeaders(
-    options: {
+    options?: {
       electionType?: 'preferred' | 'unclean'
       topicPartitions?: TopicPartitionList | null
     } & ApiTimeoutOption,
@@ -1239,7 +1247,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
     allowReplicationFactorChange?: boolean
   }) & ApiTimeoutOption): Promise<void>
   listPartitionReassignments(request: ({
-    topics?: TopicPartitions[]
+    topics?: TopicPartitions[] | null
     timeout?: number
   }) & ApiTimeoutOption): Promise<ListPartitionReassignmentsResponse>
   /** Security administration; apiTimeout inherits the original call budget.
@@ -1247,7 +1255,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
    * @returns the documented token, item results or quota entities
    * @throws typed validation, capability, call-level broker or deadline error
    */
-  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip'; matchType: 'exact' | 'default' | 'any'; match?: string }>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
+  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip' } & ({ matchType: 'exact'; match: string } | { matchType: 'default' | 'any'; match?: undefined })>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
     entity: Array<{ entityType: string; entityName: string | null }>; values: Record<string, number>
   }>>
   /** Security administration; apiTimeout inherits the original call budget.
@@ -1614,9 +1622,9 @@ export type Broker = {
     allowReplicationFactorChange?: boolean
   }): Promise<any>
   listPartitionReassignments(request: {
-    topics?: TopicPartitions[]
+    topics?: TopicPartitions[] | null
     timeout?: number
-  }): Promise<ListPartitionReassignmentsResponse>
+  }): Promise<ListPartitionReassignmentsResponse & { throttleTime: number; clientSideThrottleTime: number; errorCode: number }>
   /** `includeDocumentation` is sent from DescribeConfigs v3 and ignored by older versions. */
   describeConfigs(request: {
     resources: ResourceConfigQuery[]
@@ -1950,7 +1958,8 @@ export type GroupDescription = {
   /** Group-level error for this id; `0` when the description succeeded. */
   errorCode: number
   errorMessage?: string | null
-  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown'
+  /** `''` when a consumer-protocol group's description failed, so its type is unknown. */
+  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | ''
   /** Consumer groups only; `null` for a classic group. */
   groupEpoch?: number | null
   assignmentEpoch?: number | null
