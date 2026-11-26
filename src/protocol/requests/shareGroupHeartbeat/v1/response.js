@@ -1,5 +1,4 @@
 const { ShareDecoder: Decoder } = require('../../shareFetch/codec')
-const { requireAssignment } = require('../../responseCoverage')
 
 /** @param {Decoder} decoder @param {object} [options] @returns {object} Decoded structure. */
 const decodeTopicPartitions = (decoder, options) => {
@@ -40,17 +39,13 @@ const decodeBody = (decoder, options) => {
  * @param {Buffer} rawData Message body after the response header.
  * @param {{checkCrcs?: boolean}} [options] Inherited record decoder options.
  * @returns {Promise<object>} Exact field domains; int64 offsets/lag remain decimal strings.
- * @throws {KafkaJSPartialMessageError} on malformed or truncated fields, and on an assignment no
- *   coordinator writes: a null or repeated topic id, or a negative or repeated partition. The
- *   epoch and interval are not checked here: a successful leave answers epoch -1 and interval 0.
+ * @throws {KafkaJSPartialMessageError} on malformed or truncated fields. The assignment's values
+ *   are not checked here: the share membership refuses one no coordinator writes and retries.
  */
 const decode = async (rawData, options = {}) => {
   const decoder = new Decoder(rawData)
   const { throttleTimeMs, ...data } = await decodeBody(decoder, options)
   decoder.finish()
-  if (data.assignment !== null) {
-    requireAssignment('ShareGroupHeartbeat', data.assignment.topicPartitions, 'topicId')
-  }
   return { throttleTime: 0, clientSideThrottleTime: throttleTimeMs, ...data }
 }
 /** @param {object} data @returns {Promise<object>} Broker error codes remain data for their owning classifier. */

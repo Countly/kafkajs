@@ -2,6 +2,7 @@ const HeartbeatBackoff = require('../groupProtocol/heartbeatBackoff')
 const { generateMemberId } = require('../groupProtocol/memberId')
 const { MEMBER_STATES: S, transition } = require('../groupProtocol/memberState')
 const { KafkaJSNonRetriableError } = require('../../errors')
+const { requireAssignment } = require('../../protocol/requests/responseCoverage')
 const {
   membershipAction,
   lookupFailure,
@@ -156,11 +157,14 @@ class ShareMembership {
    * by the Broker before the write. Fields are remembered only after a current, non-regressing,
    * successful answer; every epoch-zero payload is full. An answer with an epoch of 0 or below, or
    * lower than the member holds, is logged and changes nothing; an interval of 0 or below keeps the
-   * current one.
+   * current one. An assignment no coordinator writes (a null or repeated topic id, a negative or
+   * repeated partition) changes nothing and is retried under backoff with the coordinator looked up
+   * again, as a lost answer is.
    * @private
    * @param {() => Error|null} ordinaryGuard The caller's captured ordinary authority.
    * @returns {Promise<void>}
-   * @throws {Error} The current membership failure, after its policy has been applied.
+   * @throws {Error} The current membership failure, after its policy has been applied; for a
+   *   refused assignment the `KafkaJSPartialMessageError` naming it.
    */
   async sendHeartbeat(ordinaryGuard) {
     const token = this.token
@@ -194,6 +198,7 @@ class ShareMembership {
       if (!current()) return
       this.coordinator = coordinator
     }
+    let action
     try {
       const response = await this.coordinator.shareGroupHeartbeat(payload, { guard })
       if (!current()) return
@@ -210,6 +215,15 @@ class ShareMembership {
           }
         )
         return
+      }
+      if (response.assignment !== null) {
+        try {
+          requireAssignment('ShareGroupHeartbeat', response.assignment.topicPartitions, 'topicId')
+        } catch (error) {
+          // The next answer can be valid, so this is retried as a lost answer is.
+          action = 'coordinator'
+          throw error
+        }
       }
       if (payload.memberEpoch === 0) {
         const previous = this.token
@@ -233,7 +247,7 @@ class ShareMembership {
       this.refreshUnresolved(ordinaryGuard)
     } catch (error) {
       if (!current()) return
-      throw this.onMembershipError(error, token)
+      throw this.onMembershipError(error, token, action)
     }
   }
 
