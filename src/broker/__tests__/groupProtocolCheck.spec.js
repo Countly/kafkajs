@@ -22,12 +22,12 @@ const JOIN = {
 }
 const SYNC = { groupId: 'test-group', generationId: 5, memberId: 'm', groupAssignment: [] }
 
-/** A JoinGroup v8 answer, as the hex the harness frames. */
+/** A JoinGroup v8 answer to a follower, as the hex the harness frames. */
 const joinAnswer = ({
   protocolType = 'consumer',
   protocolName = 'p',
   errorCode = 0,
-  leader = 'm',
+  leader = 'someone-else',
   memberId = 'm',
 } = {}) => ({
   hex: new Encoder()
@@ -126,7 +126,7 @@ describe('Broker > the protocol the coordinator reports', () => {
         .writeInt16(0)
         .writeInt32(5)
         .writeUVarIntString('p')
-        .writeUVarIntString('m')
+        .writeUVarIntString('someone-else')
         .writeUVarIntString('m')
         .writeUVarIntArray([])
         .writeTaggedFields()
@@ -292,11 +292,6 @@ describe('Broker > the protocol the coordinator reports', () => {
           [5, true],
         ],
         [
-          'stays at v4 when the join answer names no protocol name',
-          { protocolType: 'consumer', protocolName: null },
-          [4, false],
-        ],
-        [
           'stays at v4 when the join answer names no protocol type',
           { protocolType: null, protocolName: 'RoundRobinAssigner' },
           [4, false],
@@ -325,6 +320,24 @@ describe('Broker > the protocol the coordinator reports', () => {
           [apiKeys.JoinGroup, 8, null],
           [apiKeys.SyncGroup, version, syncBytes(withProtocol)],
         ])
+      })
+
+      test('refuses a join answer that names no protocol, before any SyncGroup', async () => {
+        harness = createGroupApiBroker({
+          versions: {
+            [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: 9 },
+            [apiKeys.SyncGroup]: { minVersion: 0, maxVersion: 5 },
+          },
+          respond: ({ apiKey, apiVersion }) =>
+            apiKey === apiKeys.JoinGroup
+              ? Buffer.from(joinAnswer({ protocolName: null }).hex, 'hex')
+              : emptySyncAnswer(apiVersion),
+        })
+
+        await expect(
+          rebalance(protocolFor({ findGroupCoordinator: async () => harness.broker }))
+        ).rejects.toMatchObject({ retriable: true, type: 'MALFORMED_GROUP_ANSWER' })
+        expect(harness.requests.map(({ apiKey }) => apiKey)).toEqual([apiKeys.JoinGroup])
       })
     })
   })

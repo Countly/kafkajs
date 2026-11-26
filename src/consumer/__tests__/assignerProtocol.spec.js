@@ -1,3 +1,4 @@
+const Encoder = require('../../protocol/encoder')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 
 const FIXTURE_ROUND_ROBIN_METADATA = Buffer.from(
@@ -51,6 +52,29 @@ describe('Consumer > assignerProtocol', () => {
 
     test('decode empty assignment', () => {
       expect(MemberAssignment.decode(Buffer.from([]))).toBe(null)
+    })
+
+    test('decode keeps its output for a repeated topic (the last row wins), a null topic list and a one-byte buffer', () => {
+      const repeated = new Encoder()
+        .writeInt16(1)
+        .writeArray([
+          new Encoder().writeString('topic-test').writeArray([0]),
+          new Encoder().writeString('topic-test').writeArray([1]),
+        ])
+        .writeBytes(Buffer.alloc(0)).buffer
+      const nullTopics = new Encoder().writeInt16(1).writeInt32(-1).writeBytes(null).buffer
+
+      expect(MemberAssignment.decode(repeated)).toEqual({
+        version: 1,
+        assignment: { 'topic-test': [1] },
+        userData: Buffer.alloc(0),
+      })
+      expect(MemberAssignment.decode(nullTopics)).toEqual({
+        version: 1,
+        assignment: {},
+        userData: null,
+      })
+      expect(MemberAssignment.decode(Buffer.from([0]))).toBe(null)
     })
   })
 })
