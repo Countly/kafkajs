@@ -495,12 +495,18 @@ const halvesOf = (settler) => {
  * share holding its first record, whatever order the answers came in. The send counts as one
  * more share until `joined()`, so no share can settle it while its records are still joining.
  * Settling it ends its holder's place in the flush inventory (`PendingSend#untrack`).
+ * It rejects with `outcome: 'unsent'` only when every share failed unsent. When its first error says
+ * `'unsent'` but another share was delivered or failed otherwise, it rejects with a new error of the
+ * same class, `outcome: 'unknown'`, the first error as `cause`; that error is never changed, as
+ * other sends may share it.
  */
 class AppendedSend {
   #pending = 1
   /** @type {?object[]} created by the first metadata, so a held send keeps no array */
   #metadata = null
   #error = null
+  /** whether a share was delivered or failed with an outcome other than `'unsent'` */
+  #written = false
   #resolve
   #reject
   #holder
@@ -538,6 +544,7 @@ class AppendedSend {
       this.#metadata ??= []
       this.#metadata.push(metadata)
     }
+    this.#written = true
     this.#settleOne()
   }
 
@@ -548,6 +555,7 @@ class AppendedSend {
    */
   failed(error) {
     this.#error = this.#error || error
+    if (error?.outcome !== 'unsent') this.#written = true
     this.#settleOne()
   }
 
@@ -558,8 +566,12 @@ class AppendedSend {
       return
     }
 
-    if (this.#error !== null) {
-      this.#reject(this.#error)
+    const error = this.#error
+    if (error !== null && error.outcome === 'unsent' && this.#written) {
+      const message = `Some records of this send may have been written: ${error.message}`
+      this.#reject(new error.constructor(message, { cause: error, outcome: 'unknown' }))
+    } else if (error !== null) {
+      this.#reject(error)
     } else {
       this.#resolve((this.#metadata ?? []).sort(byTopicThenPartition))
     }
