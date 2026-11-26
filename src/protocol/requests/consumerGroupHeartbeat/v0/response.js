@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
 const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../../../error')
 const { KafkaJSProtocolError, KafkaJSPartialMessageError } = require('../../../../errors')
+const { requireAssignment } = require('../../responseCoverage')
 
 /**
  * The one-byte presence markers Kafka's generator writes for a nullable, non-tagged struct field:
@@ -18,7 +19,10 @@ const PRESENT_STRUCT = 1
 const decodeTopicPartitions = (decoder) => {
   const entry = {
     topicId: decoder.readUuid(),
-    partitions: decoder.readUVarIntArray((partition) => partition.readInt32()),
+    partitions: Decoder.requireArray(
+      decoder.readUVarIntArray((partition) => partition.readInt32()),
+      'ConsumerGroupHeartbeatResponse.Assignment.TopicPartitions.Partitions'
+    ),
   }
 
   decoder.readTaggedFields()
@@ -30,7 +34,9 @@ const decodeTopicPartitions = (decoder) => {
  * @returns {{ topicPartitions: object[] }|null} null when the broker sent the null marker; an
  *   assignment with no partitions is a present, empty target and is NOT null
  * @throws {KafkaJSPartialMessageError} on any marker byte other than 1 or -1 - reading on would
- *   decode the rest of the response from the wrong offset and report plausible nonsense
+ *   decode the rest of the response from the wrong offset and report plausible nonsense - and on
+ *   an assignment no coordinator writes: a null array, a null or repeated topic id, or a negative
+ *   or repeated partition
  */
 const decodeAssignment = (decoder) => {
   const marker = decoder.readInt8()
@@ -45,8 +51,14 @@ const decodeAssignment = (decoder) => {
     )
   }
 
-  const assignment = { topicPartitions: decoder.readUVarIntArray(decodeTopicPartitions) }
+  const assignment = {
+    topicPartitions: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeTopicPartitions),
+      'ConsumerGroupHeartbeatResponse.Assignment.TopicPartitions'
+    ),
+  }
   decoder.readTaggedFields()
+  requireAssignment('ConsumerGroupHeartbeat', assignment.topicPartitions, 'topicId')
   return assignment
 }
 
@@ -80,7 +92,8 @@ const decodeAssignment = (decoder) => {
  *   value is reported as `clientSideThrottleTime` (KIP-219), as every quota-aware codec here does
  * @throws {KafkaJSProtocolError} on UNSUPPORTED_VERSION, so a version mismatch is reported by the
  *   decode rather than travelling on as data
- * @throws {KafkaJSPartialMessageError} on an illegal `Assignment` presence marker
+ * @throws {KafkaJSPartialMessageError} on an illegal `Assignment` presence marker, and on an
+ *   assignment no coordinator writes (`decodeAssignment`)
  */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)

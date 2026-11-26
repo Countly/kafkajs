@@ -264,7 +264,7 @@ describe('public share event contract', () => {
     const answers = [
       [
         { topicId: B, partitions: [0] },
-        { topicId: A, partitions: [1, 0, 1] },
+        { topicId: A, partitions: [1, 0] },
       ],
       [
         { topicId: A, partitions: [0, 1] },
@@ -314,6 +314,56 @@ describe('public share event contract', () => {
       { topic: 'topic-a', partitions: [1] },
       { topic: 'topic-b', partitions: [0] },
     ])
+  })
+
+  test('publishes nothing for an answer with a malformed assignment, retries, and adopts the next valid answer', async () => {
+    h = shareClient({ interval: 5 })
+    const seen = record(['ASSIGNMENT_CHANGED', 'HEARTBEAT', 'CRASH'])
+    const epochs = () => seen.HEARTBEAT.map(({ payload }) => payload.memberEpoch)
+    const beats = [0, 1].map(() =>
+      h.hold({ api: 'ShareGroupHeartbeat', match: ({ fields }) => fields.memberEpoch > 0 })
+    )
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(epochs()).toEqual([1])
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(1)
+
+    const refused = await beats[0].arrived()
+    beats[0].release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: refused.fields.memberId,
+      memberEpoch: 1,
+      heartbeatIntervalMs: 5,
+      assignment: { topicPartitions: [{ topicId: A, partitions: [0, 0] }] },
+    })
+    await until(() => beats[1].call !== null, 'the heartbeat after the refused answer')
+    expect(epochs()).toEqual([1])
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(1)
+    expect(seen.CRASH).toEqual([])
+    expect(beats[1].call.fields).toMatchObject({
+      memberEpoch: 1,
+      subscribedTopicNames: ['topic-a'],
+    })
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+
+    beats[1].release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: beats[1].call.fields.memberId,
+      memberEpoch: 2,
+      heartbeatIntervalMs: 5,
+      assignment: { topicPartitions: [] },
+    })
+    await until(() => epochs().length === 2, 'the heartbeat of epoch 2')
+    expect(epochs()).toEqual([1, 2])
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(2)
+    expect(seen.ASSIGNMENT_CHANGED[1].payload).toMatchObject({
+      memberEpoch: 2,
+      assignment: [],
+      removed: [{ topic: 'topic-a', partitions: [0] }],
+    })
+    expect(seen.CRASH).toEqual([])
   })
 
   test.each(['stop', 'disconnect'])(

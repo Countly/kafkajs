@@ -1,5 +1,24 @@
 const { decode, parse } = require('./response')
 const { decode: decodeV3 } = require('../v3/response')
+const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
+
+/**
+ * @param {Encoder[]|null} topics encoded topic entries, or null for the null array
+ * @returns {Buffer} a v4 response body with throttle time 0
+ */
+const answer = (topics) =>
+  new Encoder().writeInt32(0).writeUVarIntArray(topics, 'object').writeTaggedFields().buffer
+
+/**
+ * @param {Encoder[]|null} partitions encoded partition entries, or null for the null array
+ * @returns {Encoder} one topic entry named `test-topic`
+ */
+const topicEntry = (partitions) =>
+  new Encoder()
+    .writeUVarIntString('test-topic')
+    .writeUVarIntArray(partitions, 'object')
+    .writeTaggedFields()
 
 describe('Protocol > Requests > OffsetForLeaderEpoch > v4', () => {
   test('decodes to the same shape v3 produces', async () => {
@@ -26,5 +45,19 @@ describe('Protocol > Requests > OffsetForLeaderEpoch > v4', () => {
         partitions: [{ errorCode: 0, partition: 0, leaderEpoch: 5, endOffset: '120' }],
       },
     ])
+  })
+
+  test.each([
+    ['Topics', () => answer(null)],
+    ['Partitions', () => answer([topicEntry(null)])],
+  ])('refuses a null %s array as a malformed answer', async (_, body) => {
+    await expect(decode(body())).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  })
+
+  test('decodes empty Topics and Partitions arrays as before', async () => {
+    await expect(decode(answer([]))).resolves.toMatchObject({ topics: [] })
+    await expect(decode(answer([topicEntry([])]))).resolves.toMatchObject({
+      topics: [{ topic: 'test-topic', partitions: [] }],
+    })
   })
 })

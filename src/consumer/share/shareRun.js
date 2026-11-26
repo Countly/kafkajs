@@ -280,7 +280,9 @@ class ShareRun {
   }
 
   /**
-   * Sends or shares one membership heartbeat, then publishes what that answer committed, once.
+   * Sends or shares one membership heartbeat, then publishes what that answer committed, once. A
+   * heartbeat that failed publishes nothing of its answer, such as one whose assignment the
+   * membership refused.
    * @returns {Promise<void>}
    * @throws {Error} The classified failure of a current heartbeat, as `ShareMembership#heartbeat`.
    */
@@ -293,6 +295,9 @@ class ShareRun {
     this.applying++
     try {
       await this.membership.heartbeat({ guard })
+    } catch (error) {
+      this.tap = null
+      throw error
     } finally {
       this.applying--
       if (this.applying === 0) this.publishCommitted()
