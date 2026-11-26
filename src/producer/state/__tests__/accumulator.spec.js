@@ -3388,6 +3388,7 @@ describe('Producer > the accumulator', () => {
       })
 
       test('inside a transaction a session refusal that exhausts retries arms KafkaJSTransactionAbortableError', async () => {
+        jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
         const { cluster, producer } = createLingeringProducer({
           transactionalId: 'transactional-a',
           linger: 0,
