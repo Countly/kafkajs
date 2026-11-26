@@ -3,7 +3,11 @@ const { Kafka } = require('../../../index')
 const { newLogger } = require('testHelpers')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
 const ConnectionPool = require('../../network/connectionPool')
-const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
+const {
+  createScriptedCluster,
+  groupScript,
+  producerScript,
+} = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const Broker = require('../index')
 const { DIGESTS, SCRAM } = require('../saslAuthenticator/scram')
@@ -295,6 +299,167 @@ describe('session start', () => {
       'SaslHandshake',
       'SaslAuthenticate',
       'Metadata',
+    ])
+  })
+})
+
+describe('session at write', () => {
+  let cluster
+  let producer
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+  })
+
+  afterEach(async () => {
+    try {
+      cluster?.cancelReplyHolds()
+      for (let i = 0; i < 50; i += 1) {
+        await jest.advanceTimersByTimeAsync(20)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    } finally {
+      try {
+        if (producer) await producer.disconnect()
+        cluster?.assertClean()
+      } finally {
+        producer = cluster = undefined
+        jest.useRealTimers()
+      }
+    }
+  })
+
+  /**
+   * An idempotent producer, one request in flight per connection, over a broker whose SASL
+   * sessions last one second and whose topic has two partitions.
+   * @param {object} producerOptions extra producer options
+   * @returns {void}
+   */
+  const start = (producerOptions) => {
+    cluster = producerScript(
+      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile: 'sasl' }),
+      { partitions: 2 }
+    )
+      .answer('SaslHandshake', () => ({ enabledMechanisms: ['PLAIN'] }))
+      .answer('SaslAuthenticate', () => ({
+        errorCode: 0,
+        errorMessage: null,
+        authBytes: Buffer.alloc(0),
+        sessionLifetimeMs: '1000',
+      }))
+    producer = new Kafka(
+      cluster.kafkaOptions({
+        sasl: { mechanism: 'plain', username: 'user', password: 'secret' },
+        reauthenticationThreshold: 0,
+        requestTimeout: 1500,
+        enforceRequestTimeout: false,
+      })
+    ).producer({ idempotent: true, maxInFlightRequests: 1, linger: 0, ...producerOptions })
+  }
+
+  /**
+   * Moves fake time a millisecond at a time until `predicate` holds, failing after 200 ms.
+   * @param {() => boolean} predicate
+   * @returns {Promise<void>}
+   */
+  const until = async (predicate) => {
+    for (let i = 0; i < 200 && !predicate(); i += 1) {
+      await jest.advanceTimersByTimeAsync(1)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(predicate()).toBe(true)
+  }
+
+  /**
+   * @param {Promise} promise
+   * @returns {{ settled: boolean }} set once `promise` settles; its rejection is handled
+   */
+  const watch = (promise) => {
+    const state = { settled: false }
+    promise.then(
+      () => (state.settled = true),
+      () => (state.settled = true)
+    )
+    return state
+  }
+
+  /** @returns {string[]} each request written, a Produce named with the partitions it carries */
+  const written = () =>
+    cluster
+      .requests()
+      .map(({ api, fields }) =>
+        api === 'Produce'
+          ? `Produce:${fields.topics.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))}`
+          : api
+      )
+
+  /**
+   * @param {number} partition
+   * @returns {object[]} the record batch of `partition` in each Produce request that carried it
+   */
+  const batchesOf = (partition) =>
+    cluster
+      .requests()
+      .filter(({ api }) => api === 'Produce')
+      .flatMap(({ fields }) => fields.topics.flatMap(({ partitions }) => partitions))
+      .filter((entry) => entry.partition === partition)
+      .map(({ batches }) => batches[0])
+
+  /**
+   * Sends to partition 0 and holds its answer, then queues a send to partition 1 behind it on the
+   * same connection and lets the session end before the answer is delivered.
+   * @returns {Promise<{ first: { settled: boolean }, second: Promise<*>, secondState: { settled: boolean } }>}
+   */
+  const queuedPastTheSession = async () => {
+    await producer.connect()
+    const held = cluster.holdReply({ api: 'Produce' })
+    const first = watch(producer.send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] }))
+    await until(() => written().includes('Produce:0'))
+    const second = producer
+      .send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
+      .catch((error) => error)
+    const secondState = watch(second)
+    await jest.advanceTimersByTimeAsync(1200)
+    expect(written()).not.toContain('Produce:1')
+
+    held.deliver()
+    await until(() => first.settled)
+    return { second, secondState }
+  }
+
+  test('a session-refused produce is never recorded as written', async () => {
+    start({
+      deliveryTimeout: 1500,
+      retry: { initialRetryTime: 5000, maxRetryTime: 5000, factor: 0 },
+    })
+    const { second, secondState } = await queuedPastTheSession()
+
+    await jest.advanceTimersByTimeAsync(400)
+    await until(() => secondState.settled)
+
+    expect(await second).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
+    expect(written()).not.toContain('Produce:1')
+  })
+
+  test('a session-refused produce is resent after re-authentication and appended once', async () => {
+    start({ retry: { initialRetryTime: 10, maxRetryTime: 10, factor: 0 } })
+    const { second, secondState } = await queuedPastTheSession()
+
+    await until(() => secondState.settled)
+
+    expect(await second).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
+    const log = written()
+    expect(log.filter((api) => api === 'Produce:1')).toHaveLength(1)
+    expect(log.slice(log.indexOf('Produce:0'), log.indexOf('Produce:1'))).toEqual(
+      expect.arrayContaining(['SaslHandshake', 'SaslAuthenticate'])
+    )
+    const [stamp] = batchesOf(0)
+    expect(batchesOf(1)).toEqual([
+      expect.objectContaining({
+        producerId: stamp.producerId,
+        producerEpoch: stamp.producerEpoch,
+        baseSequence: 0,
+      }),
     ])
   })
 })

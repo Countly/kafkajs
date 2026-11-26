@@ -5,7 +5,13 @@ const Connection = require('../connection')
 const { requests } = require('../../protocol/requests')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const Encoder = require('../../protocol/encoder')
-const { newLogger, createFakeSocketFactory, readRequestHeader } = require('testHelpers')
+const { KafkaJSError } = require('../../errors')
+const {
+  newLogger,
+  createFakeSocketFactory,
+  readRequestHeader,
+  respondWithFrame,
+} = require('testHelpers')
 
 /** A promise and the function that resolves it. */
 const deferred = () => {
@@ -282,5 +288,262 @@ describe('Network > Connection > send order', () => {
       expect(error).toMatchObject({ name: 'KafkaJSConnectionError', message: 'Not connected' })
     }
     expect(state.writes).toHaveLength(0)
+  })
+})
+
+describe('Network > Connection > session at write', () => {
+  const SESSION_LIFETIME = '1000'
+  const SESSION_REFUSAL = {
+    name: 'KafkaJSError',
+    retriable: true,
+    message:
+      'The SASL session was not valid when the request was due to be written; it was not sent',
+  }
+  const sasl = { mechanism: 'plain', username: 'user', password: 'secret' }
+  let connection
+  let state
+
+  beforeEach(() => {
+    SASLAuthenticator.mockReset()
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+  })
+
+  afterEach(async () => {
+    try {
+      await connection?.disconnect({ drainTimeout: 0 })
+    } finally {
+      connection = null
+      state = null
+      jest.useRealTimers()
+    }
+  })
+
+  /** A SaslHandshake frame that expects no answer, as the mocked authenticator's exchange. */
+  const handshakeRequest = () => ({
+    request: {
+      apiKey: apiKeys.SaslHandshake,
+      apiVersion: 1,
+      apiName: 'SaslHandshake',
+      expectResponse: () => false,
+      encode: async () => new Encoder().writeString('PLAIN'),
+    },
+    response: {},
+  })
+
+  /**
+   * A Metadata request that expects an answer; its codec reports `throttle` ms of throttling.
+   * @param {number} [throttle=0]
+   */
+  const answeredRequest = (throttle = 0) => ({
+    request: {
+      apiKey: apiKeys.Metadata,
+      apiVersion: 1,
+      apiName: 'Metadata',
+      encode: async () => new Encoder().writeInt32(-1),
+    },
+    response: {
+      decode: async () => ({ clientSideThrottleTime: throttle }),
+      parse: async (decoded) => decoded,
+    },
+  })
+
+  /**
+   * Mocks an authenticator that writes one SaslHandshake frame and grants a one-second session.
+   * @param {Array<Promise<void>|undefined>} [holds] what each successive authentication waits for
+   *   before its frame
+   * @returns {jest.Mock} called once at the start of each authentication
+   */
+  const mockAuthenticator = (holds = []) => {
+    const authenticate = jest.fn()
+    SASLAuthenticator.mockImplementation((owner) => ({
+      authenticate: async () => {
+        authenticate()
+        await holds[authenticate.mock.calls.length - 1]
+        await owner.send(handshakeRequest())
+      },
+      sessionLifetime: SESSION_LIFETIME,
+    }))
+    return authenticate
+  }
+
+  /**
+   * Connects over a fake socket with one request in flight at most and no re-authentication margin.
+   * @param {object} [options] extra `Connection` options
+   */
+  const open = async (options = {}) => {
+    ;({ connection, state } = await connectedConnection({
+      maxInFlightRequests: 1,
+      reauthenticationThreshold: 0,
+      ...options,
+    }))
+  }
+
+  /** @returns {number[]} the API key of every frame written, in order */
+  const writtenApis = () => state.writes.map((frame) => readRequestHeader(frame).apiKey)
+
+  /** Answers the newest Metadata frame written. */
+  const answerMetadata = () => {
+    const { correlationId } = state.writes
+      .map((frame) => readRequestHeader(frame))
+      .filter(({ apiKey }) => apiKey === apiKeys.Metadata)
+      .pop()
+    respondWithFrame(state, correlationId, 0, Buffer.from('ack'))
+  }
+
+  /**
+   * Writes an unanswered Metadata request, queues `queued` behind it at the in-flight limit, lets
+   * `elapse` ms pass, then answers the Metadata request so the queued one reaches the head.
+   * @param {object} queued what to send second
+   * @param {number} elapse fake milliseconds between queueing and the answer
+   * @param {() => void} [beforeAnswer] runs just before the answer
+   * @returns {Promise<*>} the queued request's result, or the error it rejected with
+   */
+  const queuedBehindAnswer = async (queued, elapse, beforeAnswer = () => {}) => {
+    const first = connection.send(answeredRequest())
+    await settle()
+    const outcome = connection.send(queued).catch((error) => error)
+    await settle()
+    expect(connection.requestQueue.pending).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(elapse)
+    beforeAnswer()
+    answerMetadata()
+    await first
+    return outcome
+  }
+
+  test('a request held by the in-flight limit past the session deadline is refused unsent', async () => {
+    mockAuthenticator()
+    await open({ sasl })
+
+    const outcome = await queuedBehindAnswer(produceRequest([0]), 1500)
+
+    expect(outcome).toBeInstanceOf(KafkaJSError)
+    expect(outcome).toMatchObject(SESSION_REFUSAL)
+    expect(writtenApis()).toEqual([apiKeys.SaslHandshake, apiKeys.Metadata])
+  })
+
+  test('a request held by throttling past the session deadline is refused unsent', async () => {
+    mockAuthenticator()
+    await open({ sasl })
+    const throttled = connection.send(answeredRequest(1500))
+    await settle()
+    answerMetadata()
+    await throttled
+    const outcome = connection.send(produceRequest([0])).catch((error) => error)
+    await settle()
+    expect(connection.requestQueue.pending).toHaveLength(1)
+
+    await jest.advanceTimersByTimeAsync(1500)
+
+    expect(await outcome).toMatchObject(SESSION_REFUSAL)
+    expect(writtenApis()).toEqual([apiKeys.SaslHandshake, apiKeys.Metadata])
+  })
+
+  test('a request reaching the head while a re-authentication runs is refused unsent', async () => {
+    const reauthentication = deferred()
+    const authenticate = mockAuthenticator([undefined, reauthentication.promise])
+    await open({ sasl, reauthenticationThreshold: 500 })
+    const first = connection.send(answeredRequest())
+    await settle()
+    const held = connection.send(produceRequest([0])).catch((error) => error)
+    await settle()
+    expect(connection.requestQueue.pending).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(600)
+    const next = connection.send(produceRequest([1]))
+    await settle()
+    expect(authenticate).toHaveBeenCalledTimes(2)
+
+    answerMetadata()
+    await first
+    reauthentication.resolve()
+    await next
+
+    expect(await held).toMatchObject(SESSION_REFUSAL)
+    expect(writtenApis()).toEqual([
+      apiKeys.SaslHandshake,
+      apiKeys.Metadata,
+      apiKeys.SaslHandshake,
+      apiKeys.Produce,
+    ])
+  })
+
+  test("a session-refused frame never reaches the caller's frame-time guard call", async () => {
+    mockAuthenticator()
+    await open({ sasl })
+    let committed = false
+    const guard = jest.fn((frameLength) => {
+      if (frameLength !== undefined) committed = true
+      return null
+    })
+
+    const outcome = await queuedBehindAnswer({ ...produceRequest([0]), guard }, 1500)
+
+    expect(outcome).toMatchObject(SESSION_REFUSAL)
+    expect(committed).toBe(false)
+    expect(guard.mock.calls).toEqual([[], []])
+  })
+
+  test('a caller refusal that needs no frame length still wins over the session refusal', async () => {
+    mockAuthenticator()
+    await open({ sasl })
+    const own = new KafkaJSError('refused by the caller', { retriable: false })
+    let refusing = false
+    const guard = jest.fn((frameLength) => (refusing && frameLength === undefined ? own : null))
+
+    const outcome = await queuedBehindAnswer({ ...produceRequest([0]), guard }, 1500, () => {
+      refusing = true
+    })
+
+    expect(outcome).toBe(own)
+    expect(guard.mock.calls).toEqual([[], []])
+  })
+
+  test("the caller's frame-time refusal still applies on a valid session", async () => {
+    mockAuthenticator()
+    await open({ sasl })
+    const own = new KafkaJSError('refused at the frame', { retriable: false })
+    const guard = jest.fn((frameLength) => (frameLength === undefined ? null : own))
+
+    const outcome = await connection.send({ ...produceRequest([0]), guard }).catch((e) => e)
+
+    expect(outcome).toBe(own)
+    expect(guard).toHaveBeenLastCalledWith(expect.any(Number))
+    expect(writtenApis()).toEqual([apiKeys.SaslHandshake])
+  })
+
+  test('the next send after a refusal re-authenticates before it encodes', async () => {
+    const authenticate = mockAuthenticator()
+    await open({ sasl })
+    await queuedBehindAnswer(produceRequest([0]), 1500)
+    const plain = produceRequest([1])
+    const encode = jest.fn(plain.request.encode)
+
+    await connection.send({ ...plain, request: { ...plain.request, encode } })
+
+    expect(authenticate).toHaveBeenCalledTimes(2)
+    expect(authenticate.mock.invocationCallOrder[1]).toBeLessThan(
+      encode.mock.invocationCallOrder[0]
+    )
+    expect(writtenApis().slice(-2)).toEqual([apiKeys.SaslHandshake, apiKeys.Produce])
+  })
+
+  test('a request written within the session is not refused', async () => {
+    mockAuthenticator()
+    await open({ sasl })
+
+    const outcome = await queuedBehindAnswer(produceRequest([0]), 500)
+
+    expect(outcome).toBeUndefined()
+    expect(writtenApis()).toEqual([apiKeys.SaslHandshake, apiKeys.Metadata, apiKeys.Produce])
+  })
+
+  test('a connection without SASL never refuses for the session', async () => {
+    await open()
+
+    const outcome = await queuedBehindAnswer(produceRequest([0]), 1500)
+
+    expect(outcome).toBeUndefined()
+    expect(SASLAuthenticator).not.toHaveBeenCalled()
+    expect(writtenApis()).toEqual([apiKeys.Metadata, apiKeys.Produce])
   })
 })
