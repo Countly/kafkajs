@@ -4444,11 +4444,12 @@ module.exports = class ConsumerGroup {
         bound
       )
       preparation?.check()
-      const position = manager.positionOf(topic, partition)
       // Compared by value: a participant may have published the same offset in another spelling.
-      const overtaken =
-        !applied &&
-        (!manager.owns(topic, partition) || position == null || BigInt(position) !== BigInt(offset))
+      const moved = () => {
+        const position = manager.positionOf(topic, partition)
+        return position == null || BigInt(position) !== BigInt(offset)
+      }
+      const overtaken = !applied && (!manager.owns(topic, partition) || moved())
       if (overtaken || stale()) return
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
