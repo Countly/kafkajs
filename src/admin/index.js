@@ -900,6 +900,10 @@ module.exports = ({
   /** Deletes names or canonical IDs with the existing void/throw contract.
    * ID responses must cover the attempted set before cleanup. Confirmed IDs leave the mutation
    * set before follow-up metadata refresh; metadata retries share the invocation deadline.
+   * When every topic the controller answered with an error was refused by its mutation quota
+   * (`THROTTLING_QUOTA_EXCEEDED`), only those topics are sent again within the `retry` budget; any
+   * other answered error is final and a written request with no answer rejects with
+   * `KafkaJSUnknownOutcomeError`.
    * @param {object} options exclusive topics or topicIds, with optional broker timeout
    * @returns {Promise<void>} deletion and follow-up metadata refresh completed
    * @throws {Error} validation, protocol, discovery or invocation failure
@@ -922,6 +926,7 @@ module.exports = ({
       const ids = topicIds.map((id) => id.toLowerCase())
       if (new Set(ids).size !== ids.length)
         throw new KafkaJSInvalidConfigurationError('Duplicate topicIds')
+      let pending = ids
       const knownNames = new Map()
       const forget = (confirmed) => {
         for (const id of confirmed) {
@@ -933,13 +938,15 @@ module.exports = ({
       await retrierOf(retry)(async (bail) => {
         try {
           checked(await waitOf(() => cluster.refreshMetadata()))
-          for (const id of ids) {
+          for (const id of pending) {
             const name = cluster.metadataCache?.topicName(id)
             if (name !== undefined && !knownNames.has(id)) knownNames.set(id, name)
           }
           const broker = checked(await waitOf(() => cluster.findControllerBroker()))
-          checked(await waitOf(() => broker.deleteTopics({ topicIds: ids, timeout })))
-          forget(ids)
+          checked(await waitOf(() => broker.deleteTopics({ topicIds: pending, timeout })))
+          const confirmed = pending
+          pending = []
+          forget(confirmed)
         } catch (error) {
           const failures = error.topicErrors?.map((row) => ({
             ...row,
@@ -948,9 +955,19 @@ module.exports = ({
           if (failures) error.topicErrors = failures
           if (failures) {
             const failed = new Set(failures.map((row) => row.topicId))
-            forget(ids.filter((id) => !failed.has(id)))
+            forget(pending.filter((id) => !failed.has(id)))
           }
-          if (endsCall(error) || isAnsweredError(error) || failures) return bail(error)
+          if (endsCall(error) || isAnsweredError(error)) return bail(error)
+          if (
+            failures?.length > 0 &&
+            failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
+          ) {
+            const refused = new Set(failures.map((row) => row.topicId))
+            pending = pending.filter((id) => refused.has(id))
+            if (pending.length === 0) return bail(error)
+            throw error
+          }
+          if (failures) return bail(error)
           if (error.type === 'NOT_CONTROLLER') {
             checked(await waitOf(() => cluster.refreshMetadata()))
             throw error
@@ -976,17 +993,29 @@ module.exports = ({
     }
 
     const names = topics.slice()
+    let pending = names
     await retrierOf(retry)(async (bail, retryCount, retryTime) => {
       try {
         checked(await waitOf(() => cluster.refreshMetadata()))
         const broker = checked(await waitOf(() => cluster.findControllerBroker()))
-        checked(await waitOf(() => broker.deleteTopics({ topics: names, timeout })))
+        checked(await waitOf(() => broker.deleteTopics({ topics: pending, timeout })))
       } catch (error) {
         if (error.topicErrors) {
           const failed = new Set(error.topicErrors.map(({ topic }) => topic))
-          for (const topic of names) {
+          for (const topic of pending) {
             if (!failed.has(topic)) cluster.targetTopics.delete(topic)
           }
+        }
+        const refused = !endsCall(error) && !isAnsweredError(error) && throttledTopics(error)
+        if (refused) {
+          pending = pending.filter((topic) => refused.has(topic))
+          if (pending.length === 0) return bail(error)
+          logger.warn('A quota refused topic deletions', {
+            topics: [...refused],
+            retryCount,
+            retryTime,
+          })
+          throw error
         }
         if (error.type === 'REQUEST_TIMED_OUT') {
           logger.error(
@@ -2091,9 +2120,10 @@ module.exports = ({
    * instance id and dynamic ones by member id, and a group with no member resolves `[]` without a
    * request; a group of another protocol type (a Connect group, say) is refused, as Java does.
    * With `members` given, each `{ groupInstanceId }` names a static member; a repeated
-   * instance id is sent once. The request goes to the group coordinator, and a coordinator that is
-   * not the right one, not available or still loading the group is asked again on the `retry`
-   * budget; any other top-level error rejects. A member that could not be removed is a result, not
+   * instance id is sent once. The request goes to the group coordinator. A coordinator lookup that
+   * fails, and a coordinator that answers it is still loading the group, are tried again on the
+   * `retry` budget; any other top-level answer rejects, and a written request with no answer
+   * rejects with `KafkaJSUnknownOutcomeError`. A member that could not be removed is a result, not
    * an error: a group that does not exist answers every member `UNKNOWN_MEMBER_ID`.
    *
    * @param {Object} options

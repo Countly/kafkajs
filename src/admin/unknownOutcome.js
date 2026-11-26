@@ -99,6 +99,45 @@ const itemsOf = ({ request, args }, nodeId) => {
 const keyOf = (item) => JSON.stringify(item)
 
 /**
+ * Codes a broker answers before it applies or schedules anything for the refused items: the
+ * controller mutation quota for DeleteTopics, and a group coordinator still loading for
+ * OffsetDelete and LeaveGroup. Only these answers let a call send the refused items again.
+ */
+const REFUSED_BEFORE_APPLYING = new Map([
+  [apiKeys.DeleteTopics, 89],
+  [apiKeys.OffsetDelete, 14],
+  [apiKeys.LeaveGroup, 14],
+])
+
+/**
+ * What a decoded answer lets the same call send again.
+ * @param {number} apiKey @param {object} args request arguments @param {object} decoded answer
+ * @returns {Set<string>|true|null} the refused topic names or ids of a DeleteTopics answer whose
+ *   every failed topic was refused by the quota, true for a whole request the coordinator refused
+ *   while loading, or null when nothing may be sent again
+ */
+const resendable = (apiKey, args, decoded) => {
+  const code = REFUSED_BEFORE_APPLYING.get(apiKey)
+  if (code === undefined || !decoded) return null
+  if (apiKey !== apiKeys.DeleteTopics) return decoded.errorCode === code ? true : null
+  const failed = (decoded.topicErrors ?? []).filter(({ errorCode }) => errorCode !== 0)
+  if (failed.length === 0 || failed.some(({ errorCode }) => errorCode !== code)) return null
+  return new Set(failed.map((row) => (args.topicIds ? row.topicId : row.topic)))
+}
+
+/**
+ * @param {Set<string>|true|null} refused what an earlier answer let this call send again
+ * @param {object} args the new request's arguments
+ * @returns {boolean} whether the new request carries only items that answer refused
+ */
+const mayResend = (refused, args) => {
+  if (refused === true) return true
+  if (!(refused instanceof Set)) return false
+  const names = args.topicIds ?? args.topics
+  return Array.isArray(names) && names.every((name) => refused.has(name))
+}
+
+/**
  * Copies plain request data, reading each property once and preserving shared references.
  * Other values are passed to the encoder as supplied.
  * @param {any} value @param {Map<object, object>} [copies] copies already made
@@ -128,4 +167,14 @@ const owned = (value, copies = new Map()) => {
   return copy
 }
 
-module.exports = { SINGLE_SEND, MUTATING_APIS, isMutation, itemsOf, keyOf, owned }
+module.exports = {
+  SINGLE_SEND,
+  MUTATING_APIS,
+  REFUSED_BEFORE_APPLYING,
+  isMutation,
+  itemsOf,
+  keyOf,
+  owned,
+  resendable,
+  mayResend,
+}

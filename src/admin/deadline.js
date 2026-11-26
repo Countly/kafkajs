@@ -2,7 +2,13 @@ const { AsyncLocalStorage } = require('node:async_hooks')
 const createRetry = require('../retry')
 const plainWaitFor = require('../utils/waitFor')
 const { responseSourceOf } = require('../broker/failureSource')
-const { itemsOf, keyOf } = require('./unknownOutcome')
+const {
+  itemsOf,
+  keyOf,
+  resendable,
+  mayResend,
+  REFUSED_BEFORE_APPLYING,
+} = require('./unknownOutcome')
 const {
   KafkaJSTimeout,
   KafkaJSInvalidConfigurationError,
@@ -59,7 +65,13 @@ class MutationHistory {
     const items = itemsOf(protocolRequest, nodeId)
     const description = { api, apiVersion, nodeId, items }
     const keys = items?.map(keyOf)
-    const record = { description, decoded: false, cause: undefined, failure: undefined }
+    const record = {
+      description,
+      decoded: false,
+      resendable: null,
+      cause: undefined,
+      failure: undefined,
+    }
     let written = false
     return {
       request: {
@@ -76,7 +88,7 @@ class MutationHistory {
           const blocked =
             history.unnamed ||
             (keys ? keys.map((key) => history.byKey.get(key)).find(Boolean) : history.first)
-          if (blocked) {
+          if (blocked && !mayResend(blocked.resendable, protocolRequest.args)) {
             if (!blocked.decoded) {
               blocked.failure ??= unknownOutcome(this.method, [blocked.description], blocked.cause)
               throw blocked.failure
@@ -99,6 +111,7 @@ class MutationHistory {
         },
         onDecoded: (response) => {
           record.decoded = true
+          record.resendable = resendable(apiKey, protocolRequest.args, response)
           protocolRequest.onDecoded?.(response)
         },
       },
@@ -112,6 +125,8 @@ class MutationHistory {
           (responseSourceOf(error) === apiKey && error instanceof KafkaJSProtocolError)
         ) {
           record.decoded = true
+          if (record.resendable && error.code === REFUSED_BEFORE_APPLYING.get(apiKey)) return error
+          record.resendable = null
           answered.add(error)
           return error
         }
