@@ -390,7 +390,7 @@ describe('Consumer > Fetch answers that do not match the request', () => {
   })
 })
 
-describe('Broker > a full Fetch request that names one partition twice', () => {
+describe('Broker > a full Fetch request answered for one partition', () => {
   /**
    * A real `Broker` on the fake socket whose every Fetch is answered with `body`.
    * @param {number} version the Fetch maximum the fake broker advertises
@@ -406,29 +406,50 @@ describe('Broker > a full Fetch request that names one partition twice', () => {
     return broker
   }
 
-  /** @param {number} version @returns {object} a full request naming partition 0 twice */
-  const request = (version) => ({
+  /**
+   * @param {number} version
+   * @param {number} named how many times the request names partition 0
+   * @returns {object} a full request naming partition 0 `named` times
+   */
+  const request = (version, named) => ({
     topics: [
       {
         topic: TOPIC,
-        partitions: [
-          { partition: 0, fetchOffset: '0', maxBytes: 1048576 },
-          { partition: 0, fetchOffset: '0', maxBytes: 1048576 },
-        ],
+        partitions: Array.from({ length: named }, () => ({
+          partition: 0,
+          fetchOffset: '0',
+          maxBytes: 1048576,
+        })),
       },
     ],
     topicIds: version >= 13 ? new Map([[TOPIC, TOPIC_ID]]) : undefined,
   })
 
-  test.each([12, 16])(
-    'two answer rows for it reject the request retriably (Fetch v%i)',
-    async (version) => {
-      const broker = await connect(
-        version,
-        answer([{ ...keyOf(version, TOPIC), partitions: [{ partition: 0 }, { partition: 0 }] }])
-      )
+  /** @param {number} version @param {number} rows @returns {Promise<object>} a broker answering `rows` rows for partition 0 */
+  const answering = (version, rows) =>
+    connect(
+      version,
+      answer([
+        {
+          ...keyOf(version, TOPIC),
+          partitions: Array.from({ length: rows }, () => ({ partition: 0 })),
+        },
+      ])
+    )
 
-      await expect(broker.fetch(request(version))).rejects.toMatchObject({
+  /** @param {object} response @returns {Array} topic name and partition ids of each entry */
+  const shape = ({ responses }) =>
+    responses.map(({ topicName, partitions }) => [
+      topicName,
+      partitions.map(({ partition }) => partition),
+    ])
+
+  test.each([12, 16])(
+    'a request that names it once is refused retriably when two rows answer it (Fetch v%i)',
+    async (version) => {
+      const broker = await answering(version, 2)
+
+      await expect(broker.fetch(request(version, 1))).rejects.toMatchObject({
         name: 'KafkaJSError',
         retriable: true,
         message: `Fetch response names partition 0 of topic ${TOPIC} twice`,
@@ -436,21 +457,36 @@ describe('Broker > a full Fetch request that names one partition twice', () => {
     }
   )
 
-  test.each([12, 16])('one answer row for it is returned (Fetch v%i)', async (version) => {
-    const broker = await connect(
-      version,
-      answer([{ ...keyOf(version, TOPIC), partitions: [{ partition: 0 }] }])
-    )
+  test.each([12, 16])(
+    'a request that names it twice is answered by one row (Fetch v%i)',
+    async (version) => {
+      const broker = await answering(version, 1)
 
-    const { responses } = await broker.fetch(request(version))
+      expect(shape(await broker.fetch(request(version, 2)))).toEqual([[TOPIC, [0]]])
+    }
+  )
 
-    expect(
-      responses.map(({ topicName, partitions }) => [
-        topicName,
-        partitions.map(({ partition }) => partition),
-      ])
-    ).toEqual([[TOPIC, [0]]])
-  })
+  test.each([12, 16])(
+    'a request that names it twice is answered by two rows (Fetch v%i)',
+    async (version) => {
+      const broker = await answering(version, 2)
+
+      expect(shape(await broker.fetch(request(version, 2)))).toEqual([[TOPIC, [0, 0]]])
+    }
+  )
+
+  test.each([12, 16])(
+    'a request that names it twice is refused retriably when three rows answer it (Fetch v%i)',
+    async (version) => {
+      const broker = await answering(version, 3)
+
+      await expect(broker.fetch(request(version, 2))).rejects.toMatchObject({
+        name: 'KafkaJSError',
+        retriable: true,
+        message: `Fetch response names partition 0 of topic ${TOPIC} twice`,
+      })
+    }
+  )
 })
 
 describe('Consumer > Fetch session ids that cannot answer the request', () => {
