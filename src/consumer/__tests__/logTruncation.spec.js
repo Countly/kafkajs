@@ -299,17 +299,66 @@ describe('Consumer > position validation', () => {
       ])
     })
 
-    test('retriable exhausted: the epoch is cleared, the offset is not moved, the partition is fetched', async () => {
-      const { group, offsetManager } = await createGroup({
-        validationScenario: 'retriable-exhausted',
-        position: '120',
+    test('truncated: a reposition that applies nothing emits no LOG_TRUNCATION and marks nothing changed, while one that applies emits exactly one', async () => {
+      const events = []
+      const { group, offsetManager, offsetCommit } = await createGroup({
+        validationScenario: 'truncated',
+        autoCommit: true,
+        partitions: [0, 1],
       })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+      const markChanged = jest.spyOn(group, 'markChanged')
+      const reposition = jest.spyOn(offsetManager, 'reposition')
+      // Partition 0's commit is answered after a seek to the earliest offset was applied to the
+      // same partition. That newer operation supersedes the reposition, which resolves false.
+      offsetCommit.mockImplementationOnce(async () => {
+        await offsetManager.seek({ topic: TOPIC, partition: 0, offset: '-2' })
+        return { topics: [] }
+      })
+
+      await group.validatePositions([{ topic: TOPIC, partitions: [0, 1] }])
+
+      expect(reposition.mock.calls.map(([{ partition }]) => partition)).toEqual([0, 1])
+      await expect(reposition.mock.results[0].value).resolves.toBe(false)
+      await expect(reposition.mock.results[1].value).resolves.toBe(true)
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 1, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(markChanged.mock.calls).toEqual([[TOPIC, 1]])
+    })
+
+    test('retriable exhausted: the epoch and the offset stay, the partition is fetched, and the next leader epoch validates the kept epoch', async () => {
+      const events = []
+      const { group, cluster, offsetManager, requests, validationRequests, setValidationResponse } =
+        await createGroup({ validationScenario: 'retriable-exhausted', position: '120' })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
 
       const batches = await group.fetch(NODE_ID)
 
-      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
+      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(4)
       expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('120')
       expect(batches).toHaveLength(1)
+      expect(validationCount(requests)).toEqual(3)
+
+      // The spent budget is not a loop: the same leader epoch is not asked about again.
+      await group.fetch(NODE_ID)
+      expect(validationCount(requests)).toEqual(3)
+
+      cluster.leaderEpoch = () => 6
+      setValidationResponse((partitions) =>
+        offsetForLeaderEpochResponse(
+          partitions.map((partition) => ({ partition, endOffset: '100' }))
+        )
+      )
+      await group.fetch(NODE_ID)
+
+      expect(validationRequests()[3].topics[0].partitions).toEqual([
+        { partition: 0, currentLeaderEpoch: 6, leaderEpoch: 4 },
+      ])
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('100')
     })
   })
 
