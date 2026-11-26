@@ -4403,6 +4403,11 @@ module.exports = class ConsumerGroup {
   /**
    * Applies one validation outcome that concluded the log diverged, and announces it.
    *
+   * A truncation is marked changed and announced with `LOG_TRUNCATION` unless its reposition
+   * applied nothing and the partition has since left the validated position: it is no longer
+   * owned, or a seek, reset or other position change took the rewind's place. A reposition that
+   * applied nothing while the position is still the validated one is announced as before.
+   *
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -4424,7 +4429,7 @@ module.exports = class ConsumerGroup {
     const stale = () =>
       requestClock !== undefined && this.isRequestStale(topic, partition, requestClock)
     if (outcome.action === 'truncated') {
-      this.logger.warn('Log truncation detected, repositioning the partition', {
+      this.logger.warn('Log truncation detected, rewinding the partition to the divergence point', {
         groupId: this.groupId,
         topic,
         partition,
@@ -4434,9 +4439,18 @@ module.exports = class ConsumerGroup {
       // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
       // a queued seek would land one round late - and would overwrite a user seek queued in the
       // same window, since the queue is last-writer-wins per key.
-      await manager.reposition({ topic, partition, offset: outcome.divergingOffset }, bound)
+      const applied = await manager.reposition(
+        { topic, partition, offset: outcome.divergingOffset },
+        bound
+      )
       preparation?.check()
-      if (stale()) return
+      // Compared by value: a participant may have published the same offset in another spelling.
+      const moved = () => {
+        const position = manager.positionOf(topic, partition)
+        return position == null || BigInt(position) !== BigInt(offset)
+      }
+      const overtaken = !applied && (!manager.owns(topic, partition) || moved())
+      if (overtaken || stale()) return
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
