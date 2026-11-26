@@ -1790,6 +1790,9 @@ module.exports = class OffsetManager {
    *                              or the topic was recreated while a request was in flight, `true`
    *                              otherwise (a cell a sibling had already resolved is not a drop)
    * @throws {Error} the preparation's refusal; the ticket ends either way
+   * @throws {KafkaJSNonRetriableError} when a current cell's answer stores an offset below -2 that
+   *   no owed reset, sentinel seek or local position replaces (`refuseUnusableStoredOffsets`);
+   *   a stale answer is dropped first, as any stale answer is
    */
   async resolveOffsets(preparation) {
     this.refuse(preparation)
@@ -1843,6 +1846,7 @@ module.exports = class OffsetManager {
       this.markPendingSeeks(consumerOffsets)
       const derived = this.derivedCells(consumerOffsets)
       this.adoptLocalPositions(consumerOffsets)
+      refuseUnusableStoredOffsets(this.groupId, consumerOffsets)
       const epochSeeds = this.collectEpochSeeds(consumerOffsets)
 
       let offsets = consumerOffsets
@@ -2335,8 +2339,6 @@ module.exports = class OffsetManager {
    * @throws {Error} the last error, once the deadline passes, the consumer is stopping, a
    *   rebalance is pending, or - for a stale epoch - the member has no epoch; or the
    *   preparation's refusal
-   * @throws {KafkaJSNonRetriableError} at once, without a re-send, when a code-0 row stores an
-   *   offset below -2 (`refuseUnusableStoredOffsets`)
    */
   async fetchCommittedOffsets(topics, preparation) {
     if (this.groupId === undefined) {
@@ -2372,15 +2374,13 @@ module.exports = class OffsetManager {
           : undefined
 
       try {
-        const answer = await coordinator.offsetFetch({
+        return await coordinator.offsetFetch({
           groupId: this.groupId,
           topics: this.withTopicIds(topics),
           ...memberFields,
           requireStable: true,
           ...(preparation && { guard: preparation.guard }),
         })
-        refuseUnusableStoredOffsets(this.groupId, answer.responses)
-        return answer
       } catch (e) {
         this.refuse(preparation)
         const unstable = e.type === UNSTABLE_OFFSET_COMMIT
