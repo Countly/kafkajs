@@ -2260,8 +2260,9 @@ module.exports = class Runner extends EventEmitter {
    * the group to rejoin, as the same answer to a heartbeat does.
    * @param {Object} offsets the offsets to commit
    * @param {object} [batch] the original handler batch, absent for detached calls
-   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
-   *   public call's private deadline scope
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation, invocation?: object|null }} [context]
+   *   the public call's private deadline scope, and the calling rebalance callback's invocation
+   *   (`null` for none; the ambient one by default)
    * @returns {Promise<void>|undefined} settles once the offsets are committed; `undefined` for an
    *   empty list on a runner that is not running
    * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|import('../errors').KafkaJSCommitFailedError|import('../errors').KafkaJSNonRetriableError|Error}
@@ -2269,12 +2270,15 @@ module.exports = class Runner extends EventEmitter {
    *   or a crash cleanup, or an admitted call fails after the run stopped;
    *   `KafkaJSNonRetriableError` when it starts before the run is running
    */
-  commitOffsets(offsets, batch = handlerContext.current() ?? null, { operation } = {}) {
+  commitOffsets(
+    offsets,
+    batch = handlerContext.current() ?? null,
+    { operation, invocation = RebalanceHooks.current() } = {}
+  ) {
     const ownership = this.consumerGroup.ownership
     // A commit from a rebalance callback keeps that invocation's membership, expiry and original
     // acquisition cells through its retries and the sender; it never adopts what is current at
     // transmission.
-    const invocation = RebalanceHooks.current()
     const token = invocation ? invocation.context.membership : ownership?.token()
     const release = ownership?.retain(token)
     // A close callback commits while the stop runs; its invocation guard still expires it.
