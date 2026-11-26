@@ -22,6 +22,29 @@ const isLegacy = (buffer, offset) => {
   return magic === 0 || magic === 1
 }
 
+const INT64_MAX = 9223372036854775807n
+const NO_PROGRESS = {}
+
+/**
+ * Where a partition's position goes after the last complete batch, from its header alone.
+ * @param {{ firstOffset: string, lastOffsetDelta: number, partitionLeaderEpoch: number }} [last] the
+ *   last complete batch decoded
+ * @returns {{ nextBatchOffset?: string, nextBatchLeaderEpoch?: number }} the offset after that batch
+ *   and its leader epoch; empty without a batch, for a negative `lastOffsetDelta`, and when the
+ *   offset would not fit a signed 64-bit integer. The epoch is absent when the batch has none
+ */
+const nextBatchOf = (last) => {
+  if (last === undefined || last.lastOffsetDelta < 0) return NO_PROGRESS
+
+  const next = BigInt(last.firstOffset) + BigInt(last.lastOffsetDelta) + 1n
+  if (next > INT64_MAX) return NO_PROGRESS
+
+  const nextBatchOffset = next.toString()
+  return last.partitionLeaderEpoch >= 0
+    ? { nextBatchOffset, nextBatchLeaderEpoch: last.partitionLeaderEpoch }
+    : { nextBatchOffset }
+}
+
 /**
  * Decodes the `RECORDS` portion of a Fetch response partition.
  *
@@ -40,21 +63,29 @@ const isLegacy = (buffer, offset) => {
  *        length + 1, 0 meaning null) rather than as an INT32 length. Fetch v12+ is flexible; every
  *        earlier version keeps the INT32. Only the size read changes — the record-batch loop, the
  *        CRC check and the partial-tail tolerance are shared.
- * @returns {Promise<{ messages: object[], corruption?: { reason: string, offset: string,
- *          error: KafkaJSCorruptRecordError } }>} the decoded records, and `corruption` naming the
- *          first corrupt complete batch when there was one; the property is absent otherwise, so a
- *          codec can spread the result into a partition without changing its shape
+ * @returns {Promise<{ messages: object[], nextBatchOffset?: string, nextBatchLeaderEpoch?: number,
+ *          corruption?: { reason: string, offset: string, error: KafkaJSCorruptRecordError } }>}
+ *          the decoded records; `nextBatchOffset` and `nextBatchLeaderEpoch`, the offset after the
+ *          last complete magic 2 batch and its leader epoch, which a batch emptied by compaction
+ *          still carries (see {@link nextBatchOf}); and `corruption` naming the first corrupt
+ *          complete batch when there was one. Each property is absent otherwise, so a codec can
+ *          spread the result into a partition without changing its shape
  * @throws {KafkaJSCorruptRecordError} for a legacy (magic 0 or 1) message set whose compressed
  *         message is corrupt or decompresses past `maxDecompressedBatchBytes`: a legacy set carries
  *         no marker, so the response is rejected
+ * @throws {KafkaJSPartialMessageError} when the records block claims more bytes than the answer
+ *         holds, so a malformed answer is not read as an empty fetch. A null, zero or negative
+ *         length still means no records, as in the Java client. This is the block's own length: a
+ *         batch cut inside a correctly sized block is still tolerated, as above
  */
 const decodeMessages = async (decoder, options = {}) => {
   const messagesSize = options.compact ? decoder.readUVarInt() - 1 : decoder.readInt32()
 
-  if (messagesSize <= 0 || !decoder.canReadBytes(messagesSize)) {
+  if (messagesSize <= 0) {
     return { messages: [] }
   }
 
+  decoder.ensureReadable(messagesSize, 'FetchResponse.Records')
   const messagesBuffer = decoder.readBytes(messagesSize)
   const messagesDecoder = new Decoder(messagesBuffer)
 
@@ -63,10 +94,12 @@ const decodeMessages = async (decoder, options = {}) => {
   }
 
   const messages = []
+  let last
 
   while (messagesDecoder.canReadBytes(1) && !isLegacy(messagesBuffer, messagesDecoder.offset)) {
     try {
       const recordBatch = await RecordBatchDecoder(messagesDecoder, options)
+      last = recordBatch
       // push(...records) throws a RangeError above about 125 000 records
       for (const message of recordBatch.records) {
         messages.push(message)
@@ -80,14 +113,18 @@ const decodeMessages = async (decoder, options = {}) => {
       }
 
       if (e instanceof KafkaJSCorruptRecordError) {
-        return { messages, corruption: { reason: e.reason, offset: e.offset, error: e } }
+        return {
+          messages,
+          ...nextBatchOf(last),
+          corruption: { reason: e.reason, offset: e.offset, error: e },
+        }
       }
 
       throw e
     }
   }
 
-  return { messages }
+  return { messages, ...nextBatchOf(last) }
 }
 
 module.exports = decodeMessages

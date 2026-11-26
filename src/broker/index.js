@@ -9,19 +9,22 @@ const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
-const { partitionResults, exactRows } = require('../protocol/requests/produce/partitionResults')
+const { partitionResults } = require('../protocol/requests/produce/partitionResults')
+const { requireCoverage } = require('../protocol/requests/responseCoverage')
+const { validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSCommitFailedError,
   KafkaJSConnectionClosedError,
+  KafkaJSError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSTransactionAbortableError,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
-const { ADMIN_MUTATION, ON_WRITE, ON_DECODED } = require('./privateOptions')
+const { ADMIN_MUTATION, ON_WRITE, ON_DECODED, UNCHECKED_ROWS } = require('./privateOptions')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -30,6 +33,28 @@ const shuffle = require('../utils/shuffle')
 // above it, whatever the broker advertises.
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
+
+// How a full Fetch answer is held to its request: a pair may be missing (a broker may leave a
+// partition out), never unrequested, and never answered more often than the request named it. A
+// request repeats a pair only through a custom assigner that assigns a partition twice or a direct
+// broker call. Keyed by id, an entry whose id the request did not carry has a null name and is
+// left to the caller. Built once: the check runs on every full answer, and an answer in request
+// order costs no allocation.
+const BY_NAME = Object.freeze({ rowTopic: 'topicName', missing: 'allow' })
+const BY_ID = Object.freeze({ ...BY_NAME, skipUnnamed: true })
+
+/**
+ * Whether a Fetch answer's session id can answer a session request (KIP-227): a full one (epoch 0)
+ * opens a session or none, so the id is never negative; an incremental one keeps its session or
+ * ends it with 0. An answer below v7 carries no id.
+ * @param {number|undefined} answered the answer's session id
+ * @param {number} sessionId the request's session id
+ * @param {number} sessionEpoch the request's epoch, 0 or above
+ * @returns {boolean}
+ */
+const answersSession = (answered, sessionId, sessionEpoch) =>
+  answered === undefined ||
+  (sessionEpoch === 0 ? answered >= 0 : answered === 0 || answered === sessionId)
 
 // The last OffsetCommit and OffsetFetch version keyed by topic name. A request that carries no
 // topic ids cannot be sent above it, whatever the broker advertises.
@@ -1039,7 +1064,14 @@ module.exports = class Broker {
         ...protocolRequest,
         response: {
           decode: protocolRequest.response.decode,
-          parse: (data) => exactRows(partitionResults(data), topicData),
+          parse: (data) => {
+            requireCoverage('Produce', topicData, data.topics, {
+              rowTopic: 'topicName',
+              repeats: 'refuse',
+              missing: 'allow',
+            })
+            return partitionResults(data)
+          },
         },
       },
       guard
@@ -1095,6 +1127,14 @@ module.exports = class Broker {
    *   id this request did not ask for (a broker bug) comes back as `topicName: null` with its
    *   `topicId` intact; deciding what to do about that belongs to the caller, which is why nothing
    *   is logged here.
+   * @throws {import('../errors').KafkaJSError} retriable, when the answer to a full request
+   *   (`sessionEpoch` -1 or 0) names a partition or topic the request did not carry, or names a
+   *   partition more often than the request named it (a request repeats a pair only through a
+   *   custom assigner that assigns a partition twice or a direct broker call); partitions it leaves
+   *   out are allowed. An answer in request order is checked without allocating.
+   *   Also retriable, when the answer to a session request (`sessionEpoch` 0 or above) and without
+   *   a top-level error carries a session id that cannot answer it: negative on a full request, or
+   *   on an incremental one neither the request's id nor 0.
    */
   async fetch({
     replicaId,
@@ -1172,7 +1212,22 @@ module.exports = class Broker {
 
     // `lookupRequest` returns a builder, so the negotiated version is only observable on the
     // request it built. Below v13 the response is already keyed by name and nothing is allocated.
+    // A full answer is checked against what was sent; an incremental one carries only what
+    // changed, and its session checks it. A session id that cannot answer a session request fails
+    // it here, like a mismatched answer, so the caller's retry budget bounds a broker that repeats it.
+    if (
+      sessionEpoch >= 0 &&
+      !response.errorCode &&
+      !answersSession(response.sessionId, sessionId, sessionEpoch)
+    ) {
+      throw new KafkaJSError(
+        `Fetch response carries session id ${response.sessionId}, which cannot answer session ${sessionId} at epoch ${sessionEpoch}`,
+        { retriable: true }
+      )
+    }
+    const full = sessionEpoch <= 0
     if (topicIds == null || built.request.apiVersion <= FETCH_TOPIC_NAMES_MAX_VERSION) {
+      if (full) requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, BY_NAME)
       return response
     }
 
@@ -1197,6 +1252,7 @@ module.exports = class Broker {
       delete entry.topicId
     }
 
+    if (full) requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, BY_ID)
     return response
   }
 
@@ -1642,6 +1698,10 @@ module.exports = class Broker {
    * @param {number} [request.maxVersion=9] explicit opt-in ceiling; ordinary reads retain v9
    * @param {number} [request.timeout] remote-read broker timeout on v10+
    * @returns {Promise}
+   * @throws {import('../errors').KafkaJSError} retriable, when the answer leaves out a requested
+   *   partition, names a topic or partition that was not requested, names one twice, or gives an
+   *   offset below -1 (-1 is a lookup that found no record). A partition error the broker reports
+   *   is thrown as that error instead
    */
   async listOffsets({
     replicaId,
@@ -1679,6 +1739,18 @@ module.exports = class Broker {
       response.partitions = response.partitions.map(({ offsets, ...partitionData }) => {
         return offsets ? { ...partitionData, offset: offsets.pop() } : partitionData
       })
+    }
+
+    requireCoverage('ListOffsets', topics, result.responses)
+    for (const { topic, partitions } of result.responses) {
+      for (const { partition, offset } of partitions) {
+        if (offset !== '-1' && offset[0] === '-') {
+          throw new KafkaJSError(
+            `ListOffsets response gives partition ${partition} of topic ${topic} the offset ${offset}, which is below -1`,
+            { retriable: true }
+          )
+        }
+      }
     }
 
     return result
@@ -1746,8 +1818,14 @@ module.exports = class Broker {
    *   of the write after it counts as possibly written
    * @param {(decoded: object) => void} [options[ON_DECODED]] internal (`./privateOptions`): called
    *   once with the decoded reply, before a caller refusal, the throttle or parse can end the
-   *   request
+   *   request. A reply that does not cover the request never reaches it (see `@throws`)
+   * @param {boolean} [options[UNCHECKED_ROWS]] internal (`./privateOptions`): the caller checks
+   *   every row of the answer itself, so the reply is not held to the request
    * @returns {Promise}
+   * @throws {import('../errors').KafkaJSError} retriable, when the answer leaves out a partition of
+   *   the request, names one it did not carry, or names a partition more often than the request
+   *   did. Raised in decode, before the decoded-reply hook, the throttle and parse, so nothing in
+   *   such an answer is taken as committed
    */
   async offsetCommit(
     { groupId, groupGenerationId, memberId, groupInstanceId, retentionTime, topics },
@@ -1772,6 +1850,17 @@ module.exports = class Broker {
     })
     if (options?.[ON_WRITE]) protocolRequest.onWrite = options[ON_WRITE]
     if (options?.[ON_DECODED]) protocolRequest.onDecoded = options[ON_DECODED]
+    if (!options?.[UNCHECKED_ROWS]) {
+      const own = protocolRequest.response
+      protocolRequest.response = {
+        ...own,
+        decode: async (rawData) => {
+          const decoded = await own.decode(rawData)
+          requireCoverage('OffsetCommit', topics, decoded.responses)
+          return decoded
+        },
+      }
+    }
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
@@ -1805,6 +1894,12 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
    *   consumer's preparation round; an error it returns rejects this one request before it is written
    * @returns {Promise}
+   * @throws {import('../errors').KafkaJSInvariantViolation} when the answer is for another group
+   *   (v8 and up), or an answer to an all-topic read repeats a topic or partition
+   * @throws {import('../errors').KafkaJSError} retriable, when an answer to a topic selection
+   *   leaves out a requested partition, names a topic or partition that was not requested, or names
+   *   one twice. A group or partition error the broker reports is thrown as that error instead.
+   *   A `returnErrors` read keeps its own identity check and `groups` are checked by the decoder
    */
   async offsetFetch({
     groupId,
@@ -1844,15 +1939,23 @@ module.exports = class Broker {
         { apiKey: apiKeys.OffsetFetch, apiName: 'OffsetFetch' }
       )
     }
-    if (groups === undefined && apiVersion <= 9) {
+    if (groups === undefined) {
       const response = protocolRequest.response
+      const allTopics = topics == null || (topics.length === 0 && apiVersion >= 6)
       protocolRequest.response = {
         ...response,
         /**
-         * Refuses a foreign group's answer before ordinary protocol error parsing.
+         * Refuses a foreign group's answer before ordinary protocol error parsing, and an answer
+         * whose rows do not match the request after it, so a broker's own error is never replaced
+         * by a coverage error.
          * @param {object} data decoded response retaining its single group identity
          * @returns {Promise<object>} the ordinary parsed response
-         * @throws {KafkaJSInvariantViolation} when requested and returned identities differ
+         * @throws {KafkaJSInvariantViolation} when requested and returned identities differ, or
+         *   an all-topic answer repeats a topic or partition
+         * @throws {KafkaJSError} retriable, when an answer to a topic selection leaves out a
+         *   requested partition, names one that was not requested, names one twice, or spreads a
+         *   topic over more entries than the request had for it (a broker answers one entry per
+         *   requested entry, so the offset reads, which keep one entry per topic, never lose one)
          * @throws {Error} for an ordinary matching-group protocol failure
          */
         parse: async (data) => {
@@ -1861,12 +1964,17 @@ module.exports = class Broker {
               `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
             )
           }
-          if (returnErrors)
-            require('../protocol/requests/offsetFetch/responseIdentity').validateTopics(
+          if (returnErrors) {
+            validateTopics(
               { errorCode: data.errorCode ?? 0, topics: data.responses },
               topics?.length ? topics : null
             )
-          return returnErrors ? data : response.parse(data)
+            return data
+          }
+          const parsed = await response.parse(data)
+          if (allTopics) validateTopics({ errorCode: 0, topics: data.responses }, null)
+          else requireCoverage('OffsetFetch', topics, data.responses, { topicEntries: 'asSent' })
+          return parsed
         },
       }
     }

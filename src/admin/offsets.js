@@ -6,7 +6,7 @@ const {
   KafkaJSProtocolError,
 } = require('../errors')
 const { createErrorFromCode, failure } = require('../protocol/error')
-const { ON_DECODED } = require('../broker/privateOptions')
+const { ON_DECODED, UNCHECKED_ROWS } = require('../broker/privateOptions')
 const { itemRetry, isLocal } = require('./itemRetry')
 const { checked, waitOf, currentDeadline, endsCall, isAnsweredError } = require('./deadline')
 const { exact, validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
@@ -286,7 +286,8 @@ class OffsetAdmin {
         coordinator ||= checked(await waitOf(() => this.cluster.findGroupCoordinator({ groupId })))
         const target = coordinator
         let decoded = null
-        const options = { [ON_DECODED]: (reply) => (decoded = reply) }
+        // `itemRetry` refuses a missing, repeated or foreign row itself, as an invariant violation.
+        const options = { [ON_DECODED]: (reply) => (decoded = reply), [UNCHECKED_ROWS]: true }
         const request = {
           groupId,
           groupGenerationId: -1,

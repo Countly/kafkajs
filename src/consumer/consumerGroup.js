@@ -3049,6 +3049,22 @@ module.exports = class ConsumerGroup {
       })
     }
 
+    // An answer for a position the partition has left (another node's answer came first, or a
+    // reset cleared the offset) is not used at all: not delivered, not recovered from.
+    const requested = requestedPartitions?.get(partition)
+    if (
+      requested !== undefined &&
+      typeof this.offsetManager?.positionOf === 'function' &&
+      this.offsetManager.positionOf(topicName, partition) !== String(requested.fetchOffset)
+    ) {
+      this.logger.debug('Dropping fetched partition', {
+        topic: topicName,
+        partition,
+        reason: 'moved',
+      })
+      return false
+    }
+
     if (failure(errorCode)) {
       const action = partitionFetchAction(errorCode)
 
@@ -3716,13 +3732,15 @@ module.exports = class ConsumerGroup {
    * With a public-call `operation`, its one deadline and identity guard are carried the same way: its
    * close ends the reads and delays, and an expired call publishes and answers nothing.
    * @param {{topic: string, partition: number}} entry validated public partition
-   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context]
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation, invocation?: object|null }} [context]
+   *   `invocation` is the calling rebalance callback's invocation, `null` for none; the ambient one
+   *   by default
    * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets;
    *   a committed offset the cache holds as a `Long` (a deliberate commit) is read as its decimal
    * @throws {Error} on ownership retirement, reset refusal, the operation's refusal or unresolved
    *   bounded resolution
    */
-  async position(entry, { operation } = {}) {
+  async position(entry, { operation, invocation = RebalanceHooks.current() } = {}) {
     ManualGroupProtocol.validateTopicPartition(entry)
     const { topic, partition } = entry
     const key = `${topic}|${partition}`
@@ -3731,11 +3749,10 @@ module.exports = class ConsumerGroup {
     const epoch = this.assignmentEpoch
     const token = this.ownership.token()
     const topicId = this.cluster.topicId(topic)
-    const invocation = RebalanceHooks.current()
     const current = () =>
       acquiredAt !== undefined &&
       manager &&
-      (invocation !== undefined || !this.isStopping()) &&
+      (invocation || !this.isStopping()) &&
       this.offsetManager === manager &&
       this.assignmentEpoch === epoch &&
       this.acquired.get(key)?.acquiredAt === acquiredAt &&
@@ -3760,7 +3777,7 @@ module.exports = class ConsumerGroup {
       if (error) throw error
     }
     check()
-    const quiescent = invocation !== undefined && this.isStopping()
+    const quiescent = Boolean(invocation) && this.isStopping()
     for (let pass = 0; pass < MAX_RESOLUTION_PASSES;) {
       if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
       check()

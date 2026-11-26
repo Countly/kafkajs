@@ -368,7 +368,10 @@ new KafkaJSError('Invalid partition metadata', { retriable: true })
 new KafkaJSError('The group is rebalancing')
 new KafkaJSError(new Error('💣'), { retriable: true })
 
-new KafkaJSOffsetOutOfRange(new Error(), { topic: topic, partition: 0 })
+new KafkaJSOffsetOutOfRange(Object.assign(new Error(), { type: 'OFFSET_OUT_OF_RANGE', code: 1 }), {
+  topic: topic,
+  partition: 0,
+})
 
 new KafkaJSNumberOfRetriesExceeded(new Error(), { retryCount: 0, retryTime: 0 })
 
@@ -389,16 +392,9 @@ new KafkaJSRequestTimeoutError('Request requestInfo timed out', {
 
 new KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', { topic: topic })
 
-const partitionMetadata: PartitionMetadata = {
-  partitionErrorCode: 0,
-  partitionId: 0,
-  leader: 2,
-  replicas: [2],
-  isr: [2],
-}
 new KafkaJSStaleTopicMetadataAssignment('Topic has been updated', {
   topic: topic,
-  unknownPartitions: [partitionMetadata],
+  unknownPartitions: [2],
 })
 
 new KafkaJSServerDoesNotSupportApiKey(
@@ -772,7 +768,7 @@ const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assign
   commitError.reason
 const commitCause: Error | undefined = commitError.cause
 const commitType: string | undefined = commitError.type
-const commitCode: number | undefined = commitError.code
+const commitCode: number | string | undefined = commitError.code
 const staleCommit = new KafkaJSCommitFailedError('x', { reason: 'stale-assignment' })
 const staleCause: Error | undefined = staleCommit.cause
 // @ts-expect-error not a reason
@@ -825,7 +821,7 @@ new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: false })
 new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: 'false' })
 
 // KafkaJSLockTimeout stays exported.
-new KafkaJSLockTimeout()
+new KafkaJSLockTimeout('lock')
 
 // The broker surface transactions use.
 const useBroker = async (broker: Broker) => {
@@ -1703,11 +1699,11 @@ deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
 void adminDeadlineConfig
 
 const inheritedNonRetriableErrors: KafkaJSNonRetriableError[] = [
-  new KafkaJSPartialMessageError(), new KafkaJSSASLAuthenticationError(),
-  new KafkaJSGroupCoordinatorNotFound(), new KafkaJSNotImplemented(),
-  new KafkaJSTimeout(), new KafkaJSUnsupportedMagicByteInMessageSet(),
+  new KafkaJSPartialMessageError('partial'), new KafkaJSSASLAuthenticationError('sasl'),
+  new KafkaJSGroupCoordinatorNotFound('coordinator'), new KafkaJSNotImplemented('todo'),
+  new KafkaJSTimeout('timeout'), new KafkaJSUnsupportedMagicByteInMessageSet('magic'),
 ]
-const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout()
+const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout('lock')
 const createTopicDetail: string | null = new KafkaJSCreateTopicError(new Error('stable'), 't', 'detail').errorMessage
 async function offsetIsolationOptions(admin: Admin) {
   await admin.fetchTopicOffsets('t', {isolationLevel: 'read_uncommitted', apiTimeout: 10})
@@ -2084,3 +2080,216 @@ import {
   const other: 'applied' = lost.outcome
   void other
 }
+
+// Error declarations match what the constructors read and what the fields hold.
+{
+  const protocolError = Object.assign(new Error('x'), { type: 'OFFSET_OUT_OF_RANGE', code: 1 })
+  new KafkaJSTimeout('timed out', { cause: new Error('socket') })
+  // @ts-expect-error the constructor reads the message
+  new KafkaJSTimeout()
+  new KafkaJSNonRetriableError('x', { cause: new Error('y') })
+  new KafkaJSError('x', { cause: new Error('y') })
+  new kafkajs.KafkaJSMetadataNotLoaded('x', { retriable: false, cause: new Error('y') })
+  // @ts-expect-error the constructor reads the message
+  new kafkajs.KafkaJSBrokerNotFound()
+  new KafkaJSProtocolError(protocolError, { retriable: false })
+  // @ts-expect-error a protocol error is built from a protocol error
+  new KafkaJSProtocolError('x')
+  // @ts-expect-error the topic and partition are required
+  new KafkaJSOffsetOutOfRange(protocolError)
+  // @ts-expect-error the retry counts are required
+  new KafkaJSNumberOfRetriesExceeded(new Error('x'))
+  const ids: number[] | undefined = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  // @ts-expect-error the partitions are absent when no metadata was passed
+  const definiteIds: number[] = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  // @ts-expect-error the topic is absent when no metadata was passed
+  const definiteTopic: string = ({} as KafkaJSStaleTopicMetadataAssignment).topic
+  new KafkaJSStaleTopicMetadataAssignment('x')
+  new KafkaJSStaleTopicMetadataAssignment('x', { topic: 't', unknownPartitions: [1] })
+  // @ts-expect-error a wrapped Node.js error has a string code
+  const numericCode: number | undefined = ({} as KafkaJSError).code
+  const refused: boolean = ({} as KafkaJSConnectionError).code === 'ECONNREFUSED'
+  // @ts-expect-error the broker can be unknown
+  const known: string = ({} as KafkaJSConnectionError).broker
+  const closed: string = ({} as KafkaJSConnectionClosedError).broker
+  const first: number | undefined = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]?.partition
+  new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [] })
+  const row = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]
+  const rowOffset: string | undefined = row.offset
+  // @ts-expect-error the offset is undefined when the response row matched no request
+  const definiteOffset: string = row.offset
+  const rowError: KafkaJSError | null | undefined = row.error
+  // @ts-expect-error a row can carry no error
+  const definiteError: KafkaJSError = row.error
+  new kafkajs.KafkaJSDeleteTopicRecordsError({
+    topic: 't',
+    partitions: [{ partition: 0, offset: undefined, error: null }],
+  })
+  new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [{ partition: 0, offset: '1' }] })
+  const groupMessage: string | null | undefined = ({} as kafkajs.KafkaJSDeleteGroupsErrorGroups).errorMessage
+  new KafkaJSProtocolError({
+    type: 'OFFSET_OUT_OF_RANGE',
+    code: 1,
+    message: 'out of range',
+    retriable: false,
+    helpUrl: 'https://kafka.apache.org/',
+    category: 'invalidConfiguration',
+  })
+  new KafkaJSOffsetOutOfRange(
+    { type: 'OFFSET_OUT_OF_RANGE', code: 1, message: 'out of range', helpUrl: 'https://kafka.apache.org/' },
+    { topic: 't', partition: 0 }
+  )
+  void [
+    ids,
+    definiteIds,
+    definiteTopic,
+    numericCode,
+    refused,
+    known,
+    closed,
+    first,
+    rowOffset,
+    definiteOffset,
+    rowError,
+    definiteError,
+    groupMessage,
+  ]
+}
+
+// Admin results are declared with the fields the calls return.
+declare const resultShapeBroker: kafkajs.Broker
+const useAdminResultShapes = async () => {
+  const row = (await admin.listPartitionReassignments({})).topics[0]
+  const rowName: string = row.name
+  const rowPartition: number = row.partitions[0].partition
+  const rowAdding: number[] = row.partitions[0].addingReplicas
+  const rowRemoving: number[] = row.partitions[0].removingReplicas
+  const rowReplicas: number[] = row.partitions[0].replicas
+  const ongoing: kafkajs.OngoingPartitionReassignment = { partition: 0, replicas: [1], addingReplicas: [], removingReplicas: [] }
+  // The objects carry both identity keys, so only the missing array decides each assignment.
+  const addingOmitted = { partition: 0, partitionIndex: 0, replicas: [1], removingReplicas: [] }
+  const removingOmitted = { partition: 0, partitionIndex: 0, replicas: [1], addingReplicas: [] }
+  // @ts-expect-error a row always carries addingReplicas
+  const noAdding: kafkajs.OngoingPartitionReassignment = addingOmitted
+  // @ts-expect-error a row always carries removingReplicas
+  const noRemoving: kafkajs.OngoingPartitionReassignment = removingOmitted
+  const brokerReply = await resultShapeBroker.listPartitionReassignments({})
+  const brokerCode: number = brokerReply.errorCode
+  const brokerThrottle: number = brokerReply.throttleTime
+  const brokerClientThrottle: number = brokerReply.clientSideThrottleTime
+  const brokerTopics: kafkajs.OngoingTopicReassignment[] = brokerReply.topics
+  await resultShapeBroker.listPartitionReassignments({ topics: null })
+  await admin.listPartitionReassignments({ topics: null })
+  await admin.listPartitionReassignments({ topics: [{ topic, partitions: [0] }] })
+
+  const described = await admin.describeConfigs({
+    includeSynonyms: true,
+    resources: [{ type: ConfigResourceTypes.TOPIC, name: topic }],
+  })
+  const entry = described.resources[0].configEntries[0]
+  // @ts-expect-error a sensitive or unset config has no value
+  const entryText: string = entry.configValue
+  const entryValue: string | null = entry.configValue
+  // @ts-expect-error a synonym of an unset config has no value
+  const synonymText: string = entry.configSynonyms[0].configValue
+  const synonymValue: string | null = entry.configSynonyms[0].configValue
+  // @ts-expect-error a resource without an error has no message
+  const resourceText: string = described.resources[0].errorMessage
+  const resourceMessage: string | null = described.resources[0].errorMessage
+  // @ts-expect-error describeConfigs never sets the throttle time
+  const describedThrottle: number = described.throttleTime
+  const describedThrottleUnset: undefined = described.throttleTime
+
+  const acls = await admin.describeAcls({
+    resourceType: AclResourceTypes.TOPIC,
+    resourcePatternType: ResourcePatternTypes.LITERAL,
+    operation: AclOperationTypes.ANY,
+    permissionType: AclPermissionTypes.ALLOW,
+  })
+  // @ts-expect-error describeAcls never sets the throttle time
+  const aclsThrottle: number = acls.throttleTime
+  // @ts-expect-error describeAcls never sets an error code
+  const aclsCode: number = acls.errorCode
+  const aclsMessage: undefined = acls.errorMessage
+  const aclsResources: kafkajs.DescribeAclResource[] = acls.resources
+
+  const deleted = await admin.deleteAcls({
+    filters: [
+      {
+        resourceType: AclResourceTypes.TOPIC,
+        resourcePatternType: ResourcePatternTypes.LITERAL,
+        operation: AclOperationTypes.ANY,
+        permissionType: AclPermissionTypes.ALLOW,
+      },
+    ],
+  })
+  // @ts-expect-error deleteAcls never sets the throttle time
+  const deletedThrottle: number = deleted.throttleTime
+  // @ts-expect-error a filter without an error has no message
+  const filterText: string | undefined = deleted.filterResponses[0].errorMessage
+  const filterMessage: string | null | undefined = deleted.filterResponses[0].errorMessage
+  // @ts-expect-error a matching ACL without an error has no message
+  const matchingText: string | undefined = deleted.filterResponses[0].matchingAcls[0].errorMessage
+  const matchingMessage: string | null | undefined = deleted.filterResponses[0].matchingAcls[0].errorMessage
+
+  // @ts-expect-error createPartitions resolves nothing
+  const created: boolean = await admin.createPartitions({ topicPartitions: [] })
+  const createdNothing: void = await admin.createPartitions({ topicPartitions: [] })
+
+  await admin.electLeaders()
+  await admin.electLeaders({ electionType: 'unclean' })
+  await admin.fetchTopicOffsetsByTimestamp(topic, '1700000000000')
+  await admin.fetchTopicOffsetsByTimestamp(topic, '-1', { isolationLevel: 'read_committed' })
+  await admin.fetchTopicOffsetsByTimestamp(topic, 'maxTimestamp')
+
+  // @ts-expect-error an 'any' match takes no name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'any', match: 'x' }] })
+  // @ts-expect-error a 'default' match takes no name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'default', match: 'x' }] })
+  // @ts-expect-error an exact match needs a name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'exact' }] })
+  await admin.describeClientQuotas({
+    components: [
+      { entityType: 'user', matchType: 'exact', match: 'u' },
+      { entityType: 'client-id', matchType: 'default' },
+      { entityType: 'ip', matchType: 'any' },
+    ],
+  })
+
+  const errored: GroupDescription['groupType'] = ''
+  void [
+    rowName,
+    rowPartition,
+    rowAdding,
+    rowRemoving,
+    rowReplicas,
+    ongoing,
+    noAdding,
+    noRemoving,
+    brokerCode,
+    brokerThrottle,
+    brokerClientThrottle,
+    brokerTopics,
+    entryText,
+    entryValue,
+    synonymText,
+    synonymValue,
+    resourceText,
+    resourceMessage,
+    describedThrottle,
+    describedThrottleUnset,
+    aclsThrottle,
+    aclsCode,
+    aclsMessage,
+    aclsResources,
+    deletedThrottle,
+    filterText,
+    filterMessage,
+    matchingText,
+    matchingMessage,
+    created,
+    createdNothing,
+    errored,
+  ]
+}
+void useAdminResultShapes

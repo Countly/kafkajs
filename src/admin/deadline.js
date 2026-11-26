@@ -538,12 +538,14 @@ const waitOf = (work) => currentDeadline()?.wait(work) ?? work()
 
 /**
  * Runs shared physical setup or observer notifications outside caller ownership.
- * The caller's continuation retains its original scope.
+ * The caller's continuation retains its original scope. The store is masked rather than the
+ * instance disabled, so a nested invocation entered synchronously by `work` cannot bring the
+ * caller's scope back before `work` returns.
  * @template T
  * @param {() => T|Promise<T>} work shared setup or observers with an independent lifetime
  * @returns {Promise<T>|T} shared work's result
  */
-const sharedSetup = (work) => context.exit(work)
+const sharedSetup = (work) => context.run(undefined, work)
 
 /** the consumer's captured consumer operation adapted only at the GroupDescriptions boundary. */
 class ConsumerDescriptionScope {

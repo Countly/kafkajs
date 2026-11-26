@@ -9,6 +9,7 @@ const {
   echo,
   fetchAnswer,
   flush,
+  installSessionModel,
   part,
   shareClient,
   until,
@@ -948,6 +949,79 @@ describe('share handlers on parallel leader nodes', () => {
     await beat(5)
     expect(leaves()).toHaveLength(1)
   })
+
+  test.each(['stop', 'disconnect'])(
+    'a handler of the crashed run cannot %s the client during the restart delay',
+    async (method) => {
+      const supervision = jest.spyOn(ShareRunner.prototype, 'superviseCrash')
+      const restartOnFailure = jest.fn(async () => true)
+      await start({ nodes: 2, topics: TWO_NODES, share: { retry: { restartOnFailure } } })
+      const model = installSessionModel(h)
+      const disconnected = jest.fn()
+      h.consumer.on(h.consumer.events.DISCONNECT, disconnected)
+      let offset = 0
+      h.cluster.answer('ShareFetch', (fields, call) => {
+        if (call.node === 0 && fields.shareSessionEpoch === 0)
+          return fetchAnswer([acquire(0, offset++, ['a'])])
+        return echo('ShareFetch', fields)
+      })
+      const crashing = h.hold({ api: 'ShareFetch', node: 1 })
+      const gate = deferred()
+      const completed = deferred()
+      const completions = []
+      holds.push({ release: () => gate.resolve(), completions })
+      const handled = []
+      let late
+      let settled = false
+      await run({
+        eachMessage: async ({ message }) => {
+          handled.push(message.offset)
+          if (handled.length !== 1) return
+          completions.push(completed.promise)
+          try {
+            await gate.promise
+            late = h.consumer[method]().then(
+              () => {
+                settled = true
+              },
+              (error) => {
+                settled = true
+                return error
+              }
+            )
+          } finally {
+            completed.resolve()
+          }
+        },
+      })
+      await until(() => handled.length === 1, 'the held handler')
+      await crashing.arrived()
+      crashing.release(fetchAnswer([part({ partition: 1, code: 2 })]))
+      await until(
+        () => supervision.mock.contexts[0]?.restartOperation != null,
+        'the armed restart delay'
+      )
+      expect(h.seen.crashes).toEqual([
+        expect.objectContaining({ error: expect.objectContaining({ code: 2 }), restart: true }),
+      ])
+      const delayedAt = Date.now()
+      gate.resolve()
+      await until(() => settled, `the old handler's ${method} settles`)
+      expect(await late).toBeUndefined()
+      expect(Date.now()).toBe(delayedAt)
+      expect(joins()).toHaveLength(1)
+      expect(handled).toEqual(['0'])
+
+      await advance(50)
+      await flush()
+      expect(joins()).toHaveLength(2)
+      await until(() => handled.length === 2, 'the restarted run delivers')
+      expect(handled).toEqual(['0', '1'])
+      expect(model.session(0, joins()[1].fields.memberId)).toMatchObject({ node: 0 })
+      expect(h.seen.stops).toEqual([])
+      expect(disconnected).not.toHaveBeenCalled()
+    }
+  )
 
   test('cannot rearm a crashed old run when its held handler returns after the restart', async () => {
     const supervision = jest.spyOn(ShareRunner.prototype, 'superviseCrash')

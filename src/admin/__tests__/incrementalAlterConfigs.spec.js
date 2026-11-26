@@ -429,6 +429,21 @@ describe('Admin > incrementalAlterConfigs > on the wire', () => {
     )
   })
 
+  test('refuses an answer whose Responses list is null', async () => {
+    // ThrottleTimeMs 0, Responses 00 (the compact null), body tags 00
+    const admin = adminOverBroker('000000000000')
+
+    await expect(
+      admin.incrementalAlterConfigs({ resources: [topicResource()] })
+    ).rejects.toMatchObject({
+      name: 'KafkaJSUnknownOutcomeError',
+      cause: expect.objectContaining({
+        name: 'KafkaJSPartialMessageError',
+        message: expect.stringContaining('IncrementalAlterConfigsResponse.Responses'),
+      }),
+    })
+  })
+
   test('resolves the per-resource results the broker answered', async () => {
     const admin = adminOverBroker(vector('Response', 'error').hex)
     const resources = [topicResource(), topicResource({ name: 'other-topic' })]

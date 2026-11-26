@@ -770,7 +770,8 @@ export interface ResourceConfigQuery {
 
 export interface ConfigEntries {
   configName: string
-  configValue: string
+  /** `null` for a sensitive config, and for one that has no value. */
+  configValue: string | null
   isDefault: boolean
   configSource: ConfigSource
   isSensitive: boolean
@@ -784,7 +785,7 @@ export interface ConfigEntries {
 
 export interface ConfigSynonyms {
   configName: string
-  configValue: string
+  configValue: string | null
   configSource: ConfigSource
 }
 
@@ -792,11 +793,13 @@ export interface DescribeConfigResponse {
   resources: {
     configEntries: ConfigEntries[]
     errorCode: number
-    errorMessage: string
+    /** `null` when the resource has no error. */
+    errorMessage: string | null
     resourceName: string
     resourceType: ConfigResourceTypes
   }[]
-  throttleTime: number
+  /** @deprecated Never set. */
+  throttleTime?: undefined
 }
 
 export interface IResourceConfigEntry {
@@ -945,9 +948,12 @@ export type DescribeAclResource = AclResource & {
 }
 
 export interface DescribeAclResponse {
-  throttleTime: number
-  errorCode: number
-  errorMessage?: string
+  /** @deprecated Never set. */
+  throttleTime?: undefined
+  /** @deprecated Never set. */
+  errorCode?: undefined
+  /** @deprecated Never set. */
+  errorMessage?: undefined
   resources: DescribeAclResource[]
 }
 
@@ -963,7 +969,7 @@ export interface AclFilter {
 
 export interface MatchingAcl {
   errorCode: number
-  errorMessage?: string
+  errorMessage?: string | null
   resourceType: AclResourceTypes
   resourceName: string
   resourcePatternType: ResourcePatternTypes
@@ -975,12 +981,13 @@ export interface MatchingAcl {
 
 export interface DeleteAclFilterResponses {
   errorCode: number
-  errorMessage?: string
+  errorMessage?: string | null
   matchingAcls: MatchingAcl[]
 }
 
 export interface DeleteAclResponse {
-  throttleTime: number
+  /** @deprecated Never set. */
+  throttleTime?: undefined
   filterResponses: DeleteAclFilterResponses[]
 }
 
@@ -989,15 +996,15 @@ export interface ListPartitionReassignmentsResponse {
 }
 
 export interface OngoingTopicReassignment {
-  topic: string
+  name: string
   partitions: OngoingPartitionReassignment[]
 }
 
 export interface OngoingPartitionReassignment {
-  partitionIndex: number
+  partition: number
   replicas: number[]
-  addingReplicas?: number[]
-  removingReplicas?: number[]
+  addingReplicas: number[]
+  removingReplicas: number[]
 }
 
 /** Producer state observed on a partition replica; int64 fields are decimal strings. */
@@ -1085,7 +1092,7 @@ listTopics(): Promise<string[]>
     validateOnly?: boolean
     timeout?: number
     topicPartitions: ITopicPartitionConfig[]
-  }) & ApiTimeoutOption): Promise<boolean>
+  }) & ApiTimeoutOption): Promise<void>
   /**
    * With `useDescribeTopicPartitions` and at least one topic the topics are read through
    * DescribeTopicPartitions (KIP-966); without topics, or on a broker that lacks the API, through
@@ -1120,11 +1127,12 @@ listTopics(): Promise<string[]>
   describeReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number;currentLogDir:string|null;futureLogDir:string|null;currentOffsetLag:string|null;futureOffsetLag:string|null} & AdminItemResult>>
   fetchTopicOffsets(topic: string, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry & { high: string; low: string }>>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
+  /** `timestamp` is milliseconds, a decimal string of milliseconds, or a named offset spec. */
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName | `${number}`, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
 fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
   /** Elects preferred or unclean leaders; retries only unresolved partitions. */
   electLeaders(
-    options: {
+    options?: {
       electionType?: 'preferred' | 'unclean'
       topicPartitions?: TopicPartitionList | null
     } & ApiTimeoutOption,
@@ -1239,7 +1247,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
     allowReplicationFactorChange?: boolean
   }) & ApiTimeoutOption): Promise<void>
   listPartitionReassignments(request: ({
-    topics?: TopicPartitions[]
+    topics?: TopicPartitions[] | null
     timeout?: number
   }) & ApiTimeoutOption): Promise<ListPartitionReassignmentsResponse>
   /** Security administration; apiTimeout inherits the original call budget.
@@ -1247,7 +1255,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
    * @returns the documented token, item results or quota entities
    * @throws typed validation, capability, call-level broker or deadline error
    */
-  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip'; matchType: 'exact' | 'default' | 'any'; match?: string }>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
+  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip' } & ({ matchType: 'exact'; match: string } | { matchType: 'default' | 'any'; match?: undefined })>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
     entity: Array<{ entityType: string; entityName: string | null }>; values: Record<string, number>
   }>>
   /** Security administration; apiTimeout inherits the original call budget.
@@ -1614,9 +1622,9 @@ export type Broker = {
     allowReplicationFactorChange?: boolean
   }): Promise<any>
   listPartitionReassignments(request: {
-    topics?: TopicPartitions[]
+    topics?: TopicPartitions[] | null
     timeout?: number
-  }): Promise<ListPartitionReassignmentsResponse>
+  }): Promise<ListPartitionReassignmentsResponse & { throttleTime: number; clientSideThrottleTime: number; errorCode: number }>
   /** `includeDocumentation` is sent from DescribeConfigs v3 and ignored by older versions. */
   describeConfigs(request: {
     resources: ResourceConfigQuery[]
@@ -1950,7 +1958,8 @@ export type GroupDescription = {
   /** Group-level error for this id; `0` when the description succeeded. */
   errorCode: number
   errorMessage?: string | null
-  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown'
+  /** `''` when a consumer-protocol group's description failed, so its type is unknown. */
+  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | ''
   /** Consumer groups only; `null` for a classic group. */
   groupEpoch?: number | null
   assignmentEpoch?: number | null
@@ -2866,14 +2875,14 @@ export class KafkaJSError extends Error {
   readonly cause?: Error
   /** Protocol error type, carried through when the wrapped error had one */
   readonly type?: string
-  /** Protocol error code, carried through when the wrapped error had one */
-  readonly code?: number
+  /** A Kafka error code, or the code of a Node.js error it wraps, such as `'ECONNREFUSED'` */
+  readonly code?: number | string
 
   constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 export class KafkaJSNonRetriableError extends KafkaJSError {
-  constructor(e: Error | string)
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 /** A partition with the none policy needs an explicit starting position. */
@@ -2889,6 +2898,16 @@ export class KafkaJSNoOffsetError extends KafkaJSNonRetriableError {
       reason: KafkaJSNoOffsetError['reason']
     }
   )
+}
+
+/** What a protocol error is built from: a row of the protocol error table, or a caught protocol error. */
+export type KafkaJSProtocolErrorSource = {
+  type: string
+  code: number
+  message: string
+  retriable?: boolean
+  helpUrl?: string
+  category?: KafkaJSErrorCategory
 }
 
 export class KafkaJSProtocolError extends KafkaJSError {
@@ -2912,7 +2931,7 @@ export class KafkaJSProtocolError extends KafkaJSError {
     errorMessage?: string | null
     topicId?: string | null
   }>
-  constructor(e: Error | string)
+  constructor(e: KafkaJSProtocolErrorSource, options?: { retriable?: boolean })
 }
 
 /**
@@ -3156,7 +3175,7 @@ export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
   readonly topic: string
   readonly partition: number
-  constructor(e: Error | string, metadata?: KafkaJSOffsetOutOfRangeMetadata)
+  constructor(e: KafkaJSProtocolErrorSource, metadata: KafkaJSOffsetOutOfRangeMetadata)
 }
 
 /**
@@ -3188,7 +3207,7 @@ export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   readonly stack: string
   readonly retryCount: number
   readonly retryTime: number
-  constructor(e: Error | string, metadata?: KafkaJSNumberOfRetriesExceededMetadata)
+  constructor(e: Error | string, metadata: KafkaJSNumberOfRetriesExceededMetadata)
 }
 
 /**
@@ -3216,7 +3235,9 @@ export class KafkaJSInvalidLongError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSConnectionError extends KafkaJSError {
-  readonly broker: string
+  readonly broker?: string
+  /** The code of the Node.js error behind the failure, such as `'ECONNREFUSED'` */
+  readonly code?: string
   constructor(e: Error | string, metadata?: KafkaJSConnectionErrorMetadata)
 }
 
@@ -3226,6 +3247,7 @@ export class KafkaJSConnectionError extends KafkaJSError {
  * `broker` is `host:port`.
  */
 export class KafkaJSConnectionClosedError extends KafkaJSConnectionError {
+  readonly broker: string
   readonly host?: string
   readonly port?: number
   constructor(e: Error | string, options?: { host?: string; port?: number })
@@ -3241,7 +3263,7 @@ export class KafkaJSRequestTimeoutError extends KafkaJSError {
 }
 
 export class KafkaJSMetadataNotLoaded extends KafkaJSError {
-  constructor()
+  constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
@@ -3250,8 +3272,10 @@ export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
 }
 
 export class KafkaJSStaleTopicMetadataAssignment extends KafkaJSError {
-  readonly topic: string
-  readonly unknownPartitions: number
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly topic?: string
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly unknownPartitions?: number[]
   constructor(e: Error | string, metadata?: KafkaJSStaleTopicMetadataAssignmentMetadata)
 }
 
@@ -3312,7 +3336,7 @@ export class KafkaJSShareAcknowledgementError extends KafkaJSError {
 }
 
 export class KafkaJSBrokerNotFound extends KafkaJSError {
-  constructor()
+  constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 /** The consumer's fetch manager found no broker to fetch from. Retriable. */
@@ -3321,7 +3345,7 @@ export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
 }
 
 export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
   /**
    * @deprecated The Fetch decoder no longer sets it: a record-batch CRC32C mismatch (see
    * `checkCrcs`) is a `KafkaJSCorruptRecordError` with reason `checksum`.
@@ -3330,21 +3354,21 @@ export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
   /** The last failure a broker's FindCoordinator request ended with, when there was one. */
   lastError?: Error
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSNotImplemented extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSTimeout extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 /** One written request that changes broker state and got no answer, and the items it carried. */
@@ -3372,11 +3396,11 @@ export class KafkaJSUnknownOutcomeError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSLockTimeout extends KafkaJSTimeout {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSDeleteGroupsError extends KafkaJSError {
@@ -3385,28 +3409,33 @@ export class KafkaJSDeleteGroupsError extends KafkaJSError {
 }
 
 export class KafkaJSDeleteTopicRecordsError extends KafkaJSError {
+  readonly partitions: KafkaJSDeleteTopicRecordsErrorPartition[]
   constructor(metadata: KafkaJSDeleteTopicRecordsErrorTopic)
 }
 
 export interface KafkaJSDeleteGroupsErrorGroups {
   groupId: string
   errorCode: number
+  errorMessage?: string | null
   error: KafkaJSError
 }
 
 export interface KafkaJSDeleteTopicRecordsErrorTopic {
-  topic: string
+  topic?: string
   partitions: KafkaJSDeleteTopicRecordsErrorPartition[]
 }
 
 export interface KafkaJSDeleteTopicRecordsErrorPartition {
   partition: number
-  offset: string
-  error: KafkaJSError
+  /** The requested offset; undefined when the response row matched no requested partition */
+  offset: string | undefined
+  /** Rows are kept as passed, so a row can carry no error, or an explicit undefined */
+  error?: KafkaJSError | null | undefined
 }
 
 export interface KafkaJSErrorMetadata {
   retriable?: boolean
+  cause?: Error
   topic?: string
   partitionId?: number
   metadata?: PartitionMetadata
@@ -3444,7 +3473,7 @@ export interface KafkaJSTopicMetadataNotLoadedMetadata {
 
 export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
   topic: string
-  unknownPartitions: PartitionMetadata[]
+  unknownPartitions: number[]
 }
 
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {

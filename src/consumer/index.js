@@ -3,6 +3,7 @@ const describeThrown = require('../network/describeThrown')
 const { failureSourceOf } = require('../broker/failureSource')
 const Long = require('../utils/long')
 const dictionary = require('../utils/dictionary')
+const seq = require('../utils/seq')
 const { initialRetryTime } = require('../retry/defaults')
 const ConsumerGroup = require('./consumerGroup')
 const ManualGroupProtocol = require('./groupProtocol/manual')
@@ -355,6 +356,12 @@ module.exports = (params) => {
   // while it was still deciding whether to restart (e.g. a slow restartOnFailure callback).
   let stopGeneration = 0
   /**
+   * Counts admitted `run()` calls, so a crash report can tell that an explicit run was admitted
+   * while it was reported: that run supersedes the automatic restart. A call refused as already
+   * running is not counted.
+   */
+  let runRequests = 0
+  /**
    * The one pending automatic restart after a crash: its timer and the lifetime that crashed. The
    * object is the restart's identity, so a restart that was cancelled or superseded can tell. It
    * acquires nothing, so cancelling it has nothing of the restart to release.
@@ -452,16 +459,43 @@ module.exports = (params) => {
   }
 
   /**
+   * The run identities and rebalance callback tables of this consumer's runs, current and retired.
+   * The handler and callback stores are shared by every client in the process, so a store another
+   * consumer set is ignored here and its calls count as calls from outside.
+   * @type {WeakSet<object>}
+   */
+  const ownRuns = new WeakSet()
+
+  /**
+   * @returns {object|null} the calling handler's batch identity, when one of this consumer's runs
+   *   set it; `null` otherwise, never `undefined`, so a default argument cannot read the store again
+   */
+  const ownHandler = () => {
+    const identity = handlerContext.current()
+    return identity && ownRuns.has(identity.runIdentity) ? identity : null
+  }
+
+  /**
+   * @returns {object|null} the calling rebalance callback's invocation, when one of this consumer's
+   *   runs made it; `null` otherwise, never `undefined`
+   */
+  const ownHook = () => {
+    const record = RebalanceHooks.current()
+    return record && ownRuns.has(record.owner) ? record : null
+  }
+
+  /**
    * Refuses a call made from a handler of a run that has since been retired, or from a rebalance
    * callback invocation that is settled, expired or retired, before it can read or change a
-   * replacement run's state. Detached callers, the current run's handlers and a current callback pass.
+   * replacement run's state. Detached callers, the current run's handlers, a current callback and
+   * every handler or callback of another consumer pass.
    * @throws {Error} `CONSUMER_STOPPING` or the callback's own refusal
    * @returns {void}
    */
   const refuseRetiredCaller = () => {
-    const refusal = RebalanceHooks.refusal()
+    const refusal = RebalanceHooks.refusal(ownHook())
     if (refusal) throw refusal
-    const identity = handlerContext.current()?.runIdentity
+    const identity = ownHandler()?.runIdentity
     if (identity && !identity.isCurrent()) throw consumerStoppingError()
   }
 
@@ -478,8 +512,8 @@ module.exports = (params) => {
    * @returns {ConsumerOperation} the call's scope
    */
   const beginCall = (calls, bounded = true) => {
-    const invocation = RebalanceHooks.current()
-    const identity = handlerContext.current()?.runIdentity
+    const invocation = ownHook()
+    const identity = ownHandler()?.runIdentity
     const maxTotalTime = bounded ? retry?.maxTotalTime : undefined
     const operation = new ConsumerOperation({
       deadlineAt: Math.min(
@@ -681,7 +715,7 @@ module.exports = (params) => {
    */
   const earlierClose = () => {
     const earlier = closing ?? crashCleanup
-    if (!earlier || RebalanceHooks.current() || handlerContext.current()) return null
+    if (!earlier || ownHook() || ownHandler()) return null
     const asked = closeRequests
     return earlier.promise.catch(() => {}).then(() => asked)
   }
@@ -900,7 +934,7 @@ module.exports = (params) => {
     // Option getters are user code and may have retired the calling run meanwhile.
     refuseRetiredCaller()
     const cleanup = closeShared(parsed)
-    if (RebalanceHooks.current()) return acceptFromHook(cleanup)
+    if (ownHook()) return acceptFromHook(cleanup)
     return cleanup
   }
 
@@ -982,7 +1016,7 @@ module.exports = (params) => {
     }
     noteStop()
     const cleanup = stopShared()
-    if (!RebalanceHooks.current()) return cleanup
+    if (!ownHook()) return cleanup
     acceptFromHook(cleanup)
     return Promise.resolve()
   }
@@ -1058,7 +1092,7 @@ module.exports = (params) => {
    */
   const refuseFromHook = (api) => {
     refuseRetiredCaller()
-    if (RebalanceHooks.current()) {
+    if (ownHook()) {
       throw new KafkaJSNonRetriableError(
         `consumer#${api} cannot be called from a rebalance callback`
       )
@@ -1191,10 +1225,14 @@ module.exports = (params) => {
       manual ? 'manual' : groupProtocol,
       hasGroup
     )
-    // An explicit run supersedes a pending automatic restart, even one waiting on the same close.
-    if (!consumerGroup) cancelRestart()
+    // The worker pool's own RangeError for an invalid count, before this call changes any state.
+    seq(concurrency)
     const waiting = earlierClose()
-    if (waiting) refuseLaterClose(await waiting)
+    if (waiting) {
+      // An explicit run supersedes a pending automatic restart, even one waiting on the same close.
+      if (!consumerGroup) cancelRestart()
+      refuseLaterClose(await waiting)
+    }
     acquireLife()
 
     if (consumerGroup) {
@@ -1205,10 +1243,17 @@ module.exports = (params) => {
     /** The classic member id a crash by a round's join deadline hands to the restart. */
     let retainedMemberId = null
 
-    const start = async (onCrash) => {
+    /**
+     * Builds and publishes a run, then starts it. An explicit run is admitted only once its group
+     * and runner are built: it then supersedes the crash being reported and any restart published
+     * meanwhile, and a construction that throws leaves the consumer and its pending restart as they were.
+     * @param {Function} onCrash the crash handler the run reports to
+     * @param {boolean} [explicit=false] whether a public `run()` starts it
+     * @returns {Promise<void>}
+     */
+    const start = async (onCrash, explicit = false) => {
       const owned = acquireLife()
       const startGeneration = stopGeneration
-      logger.info('Starting', { groupId })
 
       registerDiscoveryScope()
       const discovering = declared.hasPatterns()
@@ -1217,12 +1262,12 @@ module.exports = (params) => {
       runSlot = token
       selectionRevision++
       const runIdentity = { isCurrent: () => runSlot === token }
-      let group = null
+      ownRuns.add(runIdentity)
       // Taken before the first await, so a crash restart cannot replay a queued seek.
       const seeks = [...queuedSeeks.values()]
       queuedSeeks.clear()
 
-      group = consumerGroup = new ConsumerGroup({
+      const group = new ConsumerGroup({
         logger: rootLogger,
         topics: manual
           ? manual.partitions.map(({ topic }) => topic)
@@ -1276,15 +1321,15 @@ module.exports = (params) => {
         obligations: owned.obligations,
         rebalanceListener: listener,
       })
-      retainedMemberId = null
-      for (const seekEntry of seeks) consumerGroup.seek(seekEntry)
+      if (group.rebalanceHooks) ownRuns.add(group.rebalanceHooks)
+      for (const seekEntry of seeks) group.seek(seekEntry)
 
       // A background chain and the fetch loop can both await one failed chain: the run reports
       // its crash once, so the crash policy and its restart decision run once.
       let crashReport = null
-      runner = new Runner({
+      const created = new Runner({
         logger: rootLogger,
-        consumerGroup,
+        consumerGroup: group,
         instrumentationEmitter,
         heartbeatInterval: groupTimeouts.heartbeatInterval,
         maxPollInterval: groupTimeouts.pollDeadline,
@@ -1299,9 +1344,22 @@ module.exports = (params) => {
         concurrency,
         maxPrefetchBatches,
       })
+      consumerGroup = group
+      runner = created
+      retainedMemberId = null
+      if (explicit) {
+        runRequests++
+        cancelRestart()
+      }
 
+      // Logged once the run is published, so a run(), stop() or disconnect() from the sink finds it.
+      logger.info('Starting', { groupId })
       const startedRunner = runner
-      const started = startedRunner.start()
+      // Started outside any handler or callback store: the runner and the work it starts must not
+      // inherit the authority of whoever called run().
+      const started = handlerContext.run(null, () =>
+        RebalanceHooks.outside(() => startedRunner.start())
+      )
       pendingStart = started.catch(() => {})
       await started
       if (
@@ -1337,7 +1395,10 @@ module.exports = (params) => {
      * Reports a run's crash: cleans the run up, decides on a restart (the error's retriability,
      * `restartOnFailure`, and the fatal membership errors that override it), emits `CRASH` and arms
      * the restart. A stop or disconnect asked at any time after the run started - before this
-     * handler ran included - cancels the restart.
+     * handler ran included - cancels the restart, and so does an explicit `run()` admitted while the
+     * crash is reported, even from its log line or its CRASH listener: that run owns the consumer.
+     * The restart is published before its delay is read and its log line, so a call made from
+     * either finds it.
      * @param {Error} e what the run failed with
      * @param {ControlLifetime} owned the lifetime the run belongs to
      * @param {number} startGeneration `stopGeneration` when the run started
@@ -1363,6 +1424,7 @@ module.exports = (params) => {
       let joining = null
       const { deepest: originalCause, recreated } = walkCauses(e)
       const crashStopGeneration = startGeneration + 1
+      const runsBefore = runRequests
 
       // Cleaning up must never suppress the CRASH event: it is the only supervision signal a
       // user gets, because consumer.run() has already resolved by the time the runner dies.
@@ -1446,32 +1508,46 @@ module.exports = (params) => {
         shouldRestart = false
       }
 
+      // An explicit run() admitted while this crash was reported supersedes the automatic restart.
+      if (runRequests !== runsBefore) shouldRestart = false
+
       instrumentationEmitter.emit(CRASH, {
         error: e,
         groupId: groupId ?? null,
         restart: shouldRestart,
       })
 
-      if (shouldRestart && !owned.forced) {
-        const retryTime = e.retryTime || (retry && retry.initialRetryTime) || initialRetryTime
-        logger.error(`Restarting the consumer in ${retryTime}ms`, {
-          retryCount: e.retryCount,
-          retryTime,
-          groupId,
-        })
-
+      if (shouldRestart && !owned.forced && runRequests === runsBefore) {
         const pending = { timer: null, crashed: owned }
-        // Created outside any handler or callback store: the restart must not inherit its authority.
-        pending.timer = handlerContext.run(null, () =>
-          RebalanceHooks.outside(() =>
-            setTimeout(() => restartAfterCrash(onCrash, pending), retryTime)
-          )
-        )
+        // Published before the delay is read and before its log line, so a call made from a getter
+        // on the error or from the log sink cancels or supersedes it.
         restart = pending
+        try {
+          const retryTime = e.retryTime || (retry && retry.initialRetryTime) || initialRetryTime
+          // Converted as the timer would, so nothing after the last check can run user code.
+          const delay = retryTime * 1
+          if (restart !== pending) return
+          logger.error(`Restarting the consumer in ${retryTime}ms`, {
+            retryCount: e.retryCount,
+            retryTime,
+            groupId,
+          })
+          if (restart !== pending) return
+
+          // Created outside any handler or callback store: the restart must not inherit its authority.
+          pending.timer = handlerContext.run(null, () =>
+            RebalanceHooks.outside(() =>
+              setTimeout(() => restartAfterCrash(onCrash, pending), delay)
+            )
+          )
+        } catch (error) {
+          if (restart === pending) cancelRestart()
+          throw error
+        }
       }
     }
 
-    await start(onCrash)
+    await start(onCrash, true)
   }
 
   /**
@@ -1563,7 +1639,9 @@ module.exports = (params) => {
     }
     const committing = runner
 
-    return withinCall((operation) => committing.commitOffsets(offsets, undefined, { operation }))
+    return withinCall((operation) =>
+      committing.commitOffsets(offsets, ownHandler(), { operation, invocation: ownHook() })
+    )
   }
 
   /**
@@ -1977,7 +2055,7 @@ module.exports = (params) => {
         },
       })
     )
-    if (RebalanceHooks.current()) return acceptFromHook(cleanup)
+    if (ownHook()) return acceptFromHook(cleanup)
     return cleanup
   }
 
@@ -2022,7 +2100,10 @@ module.exports = (params) => {
       )
     }
     return withinCall((operation) =>
-      group.position({ topic: entry.topic, partition: entry.partition }, { operation })
+      group.position(
+        { topic: entry.topic, partition: entry.partition },
+        { operation, invocation: ownHook() }
+      )
     )
   }
 
