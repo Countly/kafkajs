@@ -849,3 +849,230 @@ describe('Producer > the buffer > every order of answer, expiry, abort and disco
     await producer.disconnect()
   })
 })
+
+describe('Producer > the buffer > a join that fails while planning', () => {
+  const Accumulator = require('../accumulator')
+  const { Admission } = require('../admission')
+  const OTHER_TOPIC = 'topic-b'
+  const LINGER = 5
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  /**
+   * An accumulator over a 64 KiB buffer whose request budget's `chunkCapacity` can be told to throw
+   * on one call (`append` asks once per topic, the join once per partition). Each record is its own
+   * entry, at the partition it names. The send path records what each call carried, then answers
+   * and retires every batch.
+   */
+  const planningFailure = ({ batchSize, linger = 0 }) => {
+    const admission = new Admission({ capacity: 65536, maxBlockMs: 0 })
+    const failure = new RangeError('chunk capacity failed')
+    const capacity = { calls: 0, failAt: 0 }
+    const budget = {
+      maxRequestSize: Infinity,
+      chunkCapacity: () => {
+        capacity.calls += 1
+        if (capacity.calls === capacity.failAt) throw failure
+        return Infinity
+      },
+    }
+    const pins = new Map()
+    const requests = []
+    const sendPartitioned = jest.fn(async ({ acks, batches }) => {
+      requests.push({
+        acks,
+        batches: batches.map(({ key, messages }) => ({
+          key,
+          values: messages.map(({ value }) => value),
+        })),
+      })
+      for (const batch of batches) {
+        const metadata = {
+          topicName: batch.topic,
+          partition: batch.partition,
+          errorCode: 0,
+          baseOffset: '0',
+        }
+        batch.settlers.forEach((settler) => settler.resolve(metadata))
+        batch.retire()
+      }
+    })
+    const accumulator = new Accumulator({
+      linger,
+      batchSize,
+      admission,
+      budget,
+      partition: async ({ records }) =>
+        records.flatMap(({ topic, messages }) =>
+          messages.map((message) => ({ topic, partition: message.partition, messages: [message] }))
+        ),
+      sendPartitioned,
+      pinner: {
+        holdTopic: (topic) => pins.set(topic, (pins.get(topic) ?? 0) + 1),
+        releaseTopic: (topic) =>
+          pins.get(topic) === 1 ? pins.delete(topic) : pins.set(topic, pins.get(topic) - 1),
+      },
+    })
+    /** Makes the `n`th `chunkCapacity` call from now throw; 0 for none. */
+    const failCall = (n) => {
+      capacity.calls = 0
+      capacity.failAt = n
+    }
+    /** A watched send of `topicMessages`. */
+    const send = (topicMessages, acks = -1) => watch(accumulator.append({ acks, topicMessages }))
+    return { accumulator, admission, failure, failCall, pins, requests, send, sendPartitioned }
+  }
+
+  const twoPartitions = () => [
+    {
+      topic: TOPIC,
+      messages: [
+        { value: 'a', partition: 0 },
+        { value: 'b', partition: 1 },
+      ],
+    },
+  ]
+
+  const twoTopics = () => [
+    { topic: TOPIC, messages: [{ value: 'a', partition: 0 }] },
+    { topic: OTHER_TOPIC, messages: [{ value: 'b', partition: 0 }] },
+  ]
+
+  test.each([
+    ['one topic with two partitions, at the third capacity call', twoPartitions, 3],
+    ['two topics with one partition each, at the fourth capacity call', twoTopics, 4],
+  ])(
+    '%s: a failure planning the second partition leaves no debt, reservation, waiting bytes or topic pin after the rejection and close',
+    async (_, topicMessages, failAt) => {
+      const { accumulator, admission, failure, failCall, pins, send, sendPartitioned } =
+        planningFailure({ batchSize: 1 })
+
+      failCall(failAt)
+      const sent = send(topicMessages())
+      await flushAll()
+      expect(sent.state).toBe('rejected')
+      expect(sent.value).toBe(failure)
+
+      const closed = watch(accumulator.close())
+      await flushAll()
+      expect(closed.state).toBe('fulfilled')
+      expect(sendPartitioned).not.toHaveBeenCalled()
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+      expect([...pins]).toEqual([])
+    }
+  )
+
+  test('the same failure repeated 100 times still leaves room for a good send', async () => {
+    const { accumulator, admission, failure, failCall, pins, send } = planningFailure({
+      batchSize: 1,
+    })
+
+    for (let i = 0; i < 100; i += 1) {
+      failCall(3)
+      const sent = send(twoPartitions())
+      await flushAll()
+      expect(sent.value).toBe(failure)
+    }
+    failCall(0)
+    const good = send(twoPartitions())
+    await flushAll()
+
+    expect(good.state).toBe('fulfilled')
+    expect(good.value).toEqual([
+      { topicName: TOPIC, partition: 0, errorCode: 0, baseOffset: '0' },
+      { topicName: TOPIC, partition: 1, errorCode: 0, baseOffset: '0' },
+    ])
+    const closed = watch(accumulator.close())
+    await flushAll()
+    expect(closed.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+  })
+
+  test('a failed join leaves no pending batch, so a later send to that partition carries only its own records', async () => {
+    const { accumulator, admission, failure, failCall, requests, send } = planningFailure({
+      batchSize: 16384,
+    })
+
+    failCall(3)
+    const failed = send(twoPartitions())
+    await flushAll()
+    expect(failed.value).toBe(failure)
+    failCall(0)
+    const good = send([{ topic: TOPIC, messages: [{ value: 'good', partition: 0 }] }])
+    await flushAll()
+    const closed = watch(accumulator.close())
+    await flushAll()
+
+    expect(requests).toEqual([{ acks: -1, batches: [{ key: `${TOPIC}/0`, values: ['good'] }] }])
+    expect(good.value).toEqual([{ topicName: TOPIC, partition: 0, errorCode: 0, baseOffset: '0' }])
+    expect(closed.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test("a failed join after an earlier send began the partition's batch leaves that earlier send's records and settlement unchanged", async () => {
+    const { accumulator, admission, failure, failCall, requests, send } = planningFailure({
+      batchSize: 16384,
+      linger: LINGER,
+    })
+
+    failCall(0)
+    const earlier = send([{ topic: TOPIC, messages: [{ value: 'earlier', partition: 0 }] }])
+    await flushAll()
+    expect(requests).toEqual([])
+    failCall(3)
+    const failed = send(twoPartitions())
+    await flushAll()
+    expect(failed.value).toBe(failure)
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+
+    expect(requests).toEqual([{ acks: -1, batches: [{ key: `${TOPIC}/0`, values: ['earlier'] }] }])
+    expect(earlier.state).toBe('fulfilled')
+    expect(earlier.value).toEqual([
+      { topicName: TOPIC, partition: 0, errorCode: 0, baseOffset: '0' },
+    ])
+    const closed = watch(accumulator.close())
+    await flushAll()
+    expect(closed.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test("a synchronous throw from the send path while handing on an earlier batch rejects that batch's sends and leaves the joining send intact", async () => {
+    const { accumulator, requests, send, sendPartitioned } = planningFailure({
+      batchSize: 16384,
+      linger: LINGER,
+    })
+    const handOff = new Error('send path failure')
+    sendPartitioned.mockImplementationOnce(() => {
+      throw handOff
+    })
+
+    const earlier = send([{ topic: TOPIC, messages: [{ value: 'earlier', partition: 0 }] }])
+    await flushAll()
+    const joining = send([{ topic: TOPIC, messages: [{ value: 'joining', partition: 0 }] }], 1)
+    await flushAll()
+
+    expect(sendPartitioned).toHaveBeenCalledTimes(1)
+    expect(sendPartitioned.mock.calls[0][0].acks).toBe(-1)
+    expect(earlier.state).toBe('rejected')
+    expect(earlier.value).toBe(handOff)
+    expect(joining.state).toBe('pending')
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+
+    expect(requests).toEqual([{ acks: 1, batches: [{ key: `${TOPIC}/0`, values: ['joining'] }] }])
+    expect(joining.value).toEqual([
+      { topicName: TOPIC, partition: 0, errorCode: 0, baseOffset: '0' },
+    ])
+    const closed = watch(accumulator.close())
+    await flushAll()
+    expect(closed.state).toBe('fulfilled')
+  })
+})
