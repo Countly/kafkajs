@@ -242,6 +242,7 @@ describe('share disconnect after coordinator transport recovery', () => {
     expect(run.membership.backoff.pending(performance.now())).toBe(true)
     expect(run.membership.token).toBe(original.token)
     const lookups = h.frames(10).length
+    const socket = original.binding.connection.socket
     handler.resolve()
     await h.consumer.disconnect({ timeout: 400 })
     expect(leaves()).toHaveLength(1)
@@ -250,7 +251,7 @@ describe('share disconnect after coordinator transport recovery', () => {
       memberId: original.memberId,
       memberEpoch: -1,
     })
-    expect(socketOf(leaves()[0])).toBe(original.binding.connection.socket)
+    expect(socketOf(leaves()[0])).toBe(socket)
     expect(leaves()[0].answeredOrder).toBeGreaterThan(leaves()[0].order)
     expect(h.frames(10)).toHaveLength(lookups)
     expect(warning).not.toHaveBeenCalledWith('Share leave skipped', expect.anything())
