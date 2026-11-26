@@ -533,6 +533,35 @@ describe('Network > Connection > session at write', () => {
     ])
   })
 
+  test('a negative re-authentication margin still re-authenticates on the next send after a refusal', async () => {
+    const authenticate = mockAuthenticator()
+    await open({ sasl, reauthenticationThreshold: -5000 })
+    const refused = await queuedBehindAnswer(produceRequest([0]), 1500)
+
+    const retried = await connection.send(produceRequest([1])).catch((error) => error)
+
+    expect(refused).toMatchObject(SESSION_REFUSAL)
+    expect(retried).toBeUndefined()
+    expect(authenticate).toHaveBeenCalledTimes(2)
+    expect(writtenApis()).toEqual([
+      apiKeys.SaslHandshake,
+      apiKeys.Metadata,
+      apiKeys.SaslHandshake,
+      apiKeys.Produce,
+    ])
+  })
+
+  test('a negative re-authentication margin does not re-authenticate within the session', async () => {
+    const authenticate = mockAuthenticator()
+    await open({ sasl, reauthenticationThreshold: -5000 })
+
+    const outcome = await queuedBehindAnswer(produceRequest([0]), 500)
+
+    expect(outcome).toBeUndefined()
+    expect(authenticate).toHaveBeenCalledTimes(1)
+    expect(writtenApis()).toEqual([apiKeys.SaslHandshake, apiKeys.Metadata, apiKeys.Produce])
+  })
+
   test('a request written within the session is not refused', async () => {
     mockAuthenticator()
     await open({ sasl })

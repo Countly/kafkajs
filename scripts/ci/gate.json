@@ -11178,6 +11178,8 @@
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > send order what authentication itself sends is not held behind the requests waiting for it",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a caller refusal that needs no frame length still wins over the session refusal",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a connection without SASL never refuses for the session",
+        "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a negative re-authentication margin does not re-authenticate within the session",
+        "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a negative re-authentication margin still re-authenticates on the next send after a refusal",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a request held by the in-flight limit past the session deadline is refused unsent",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a request held by throttling past the session deadline is refused unsent",
         "src/network/__tests__/connectionSendOrder.spec.js \u203a Network > Connection > session at write a request reaching the head while a re-authentication runs is refused unsent",
