@@ -84,6 +84,11 @@ const MAX_OFFSET = 2n ** 63n - 1n
 const CONSUMER_PROTOCOL_TYPE = 'consumer'
 const UNANSWERED_MEMBER_CODE = -1
 const THROTTLING_QUOTA_EXCEEDED_CODE = 89
+/**
+ * Failures a deleteTopics attempt tries again when it wrote nothing: the controller moved, or a
+ * target topic is missing from metadata for now. Both the by-name and the by-id attempt use it.
+ */
+const DELETE_TOPICS_RETRIED = new Set(['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'])
 
 /** What the coordinator logs as the reason a member was removed, when the caller gives none. */
 const DEFAULT_REMOVE_REASON = 'member was removed by an admin'
@@ -970,12 +975,9 @@ module.exports = ({
         if (state.pending.length === 0) return bail(error)
         throw error
       }
-      if (failures) return bail(error)
-      if (error.type === 'NOT_CONTROLLER') {
-        checked(await waitOf(() => cluster.refreshMetadata()))
-        throw error
-      }
-      bail(error)
+      if (failures || !DELETE_TOPICS_RETRIED.has(error.type)) return bail(error)
+      if (error.type === 'NOT_CONTROLLER') checked(await waitOf(() => cluster.refreshMetadata()))
+      throw error
     }
   }
 
@@ -1062,7 +1064,7 @@ module.exports = ({
           )
         }
         if (endsCall(error) || isAnsweredError(error) || error.topicErrors) return bail(error)
-        if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(error.type)) {
+        if (DELETE_TOPICS_RETRIED.has(error.type)) {
           logger.warn('Could not delete topics', { error: error.message, retryCount, retryTime })
           throw error
         }
