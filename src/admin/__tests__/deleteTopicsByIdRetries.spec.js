@@ -37,6 +37,17 @@ describe('delete topics by id retries', () => {
     expect(cluster.refreshMetadata).toHaveBeenCalledTimes(4)
   })
 
+  test('an UNKNOWN_TOPIC_OR_PARTITION refresh failure before the delete is retried', async () => {
+    const { admin, broker, cluster } = fixture()
+    cluster.refreshMetadata.mockRejectedValueOnce(createErrorFromCode(3))
+
+    await admin.deleteTopics({ topicIds: [first] })
+
+    expect(broker.deleteTopics.mock.calls.map(([request]) => request.topicIds)).toEqual([[first]])
+    // the failed refresh, the second attempt's refresh, and one after the delete
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(3)
+  })
+
   test('a quota refusal that names no pending id is not retried', async () => {
     const { admin, broker } = fixture()
     const refusal = Object.assign(createErrorFromCode(89), {

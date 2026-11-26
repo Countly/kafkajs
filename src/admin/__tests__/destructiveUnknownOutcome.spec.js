@@ -47,6 +47,61 @@ const topicRows = (codes, ids = {}) => ({
   })),
 })
 
+/** The id Metadata advertises for topic `u`. */
+const uTopicId = '20112233-4455-6677-8899-aabbccddeeff'
+
+/**
+ * Answers Metadata for the topics a request asks for, of `t` and `u`, both led by node 0. While
+ * `world.missing` is above zero, an answer that asks for `u` reports it unknown (code 3, no id, no
+ * partitions), as a broker does between the deletion of `u` and its recreation, and counts down;
+ * `world.served` counts those answers.
+ * @param {{ missing: number, served: number }} world
+ * @returns {Function} the Metadata answerer
+ */
+const metadataWithU =
+  (world) =>
+  ({ topics }) => {
+    const names = topics?.length ? topics.map(({ name }) => name) : ['t', 'u']
+    const missing = world.missing > 0 && names.includes('u')
+    if (missing) {
+      world.missing--
+      world.served++
+    }
+    return {
+      brokers: [{ nodeId: 0, host: 'node0', port: 9092, rack: null }],
+      controllerId: 0,
+      topics: names.map((name) =>
+        missing && name === 'u'
+          ? {
+              name,
+              topicId: null,
+              errorCode: 3,
+              isInternal: false,
+              topicAuthorizedOperations: -2147483648,
+              partitions: [],
+            }
+          : {
+              name,
+              topicId: name === 't' ? topicId : uTopicId,
+              errorCode: 0,
+              isInternal: false,
+              topicAuthorizedOperations: -2147483648,
+              partitions: [
+                {
+                  partitionIndex: 0,
+                  errorCode: 0,
+                  leaderId: 0,
+                  leaderEpoch: 1,
+                  replicas: [0],
+                  isr: [0],
+                  offlineReplicas: [],
+                },
+              ],
+            }
+      ),
+    }
+  }
+
 /** Accepts every topic a DeleteTopics v6 request names, by name or by id. */
 const acceptTopics = ({ topics }) => ({
   throttleTime: 0,
@@ -507,6 +562,146 @@ describe('written admin mutations', () => {
       await untilSettled(result)
       await expect(result).resolves.toMatchObject({ name: 'KafkaJSProtocolError', code: 89 })
       expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(1)
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  /**
+   * An admin whose Metadata answers come from `world`, and whose first DeleteTopics answer refuses
+   * `t` by the quota with the id Metadata gives `t`; from that answer on, the next `missing`
+   * Metadata answers report the admin's other target topic `u` unknown.
+   * @param {number} missing Metadata answers after the refusal that report `u` unknown
+   * @param {object} retry the admin's retry options
+   * @returns {object} the fixture and its Metadata world
+   */
+  const quotaRefusalThenMissingU = (missing, retry) => {
+    const parts = fixture([node(0)], { retry })
+    const world = { missing: 0, served: 0 }
+    parts.scripted.answer('Metadata', metadataWithU(world))
+    parts.schedule.once({ api: 'DeleteTopics' }, () => {
+      world.missing = missing
+      return topicRows({ t: 89 }, { t: topicId })
+    })
+    return { ...parts, world }
+  }
+
+  /**
+   * Connects and fetches the offsets of `u`, so `u` is one of the admin's target topics.
+   * @returns {Promise<number>} the number of requests written so far
+   */
+  const targetU = async (admin, scripted) => {
+    await admin.connect()
+    const offsets = admin.fetchTopicOffsets('u')
+    await untilSettled(offsets)
+    await offsets
+    return scripted.requests().length
+  }
+
+  /** @returns {object[][]} the topics of each DeleteTopics frame written after `before` requests */
+  const deletionsAfter = (scripted, before) =>
+    scripted
+      .requests()
+      .slice(before)
+      .filter(({ api }) => api === 'DeleteTopics')
+      .map(({ fields }) => fields.topics)
+
+  it('DeleteTopics retries an unknown-topic metadata failure before the id resend of a quota-refused name', async () => {
+    const retry = { retries: 2, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
+    const { admin, scripted, world } = quotaRefusalThenMissingU(1, retry)
+    scripted.answer('DeleteTopics', acceptTopics)
+    try {
+      const before = await targetU(admin, scripted)
+      const result = admin.deleteTopics({ topics: ['t'] }).then(
+        (value) => ({ value }),
+        (error) => ({ error })
+      )
+      await untilSettled(result)
+      expect(await result).toEqual({ value: undefined })
+      expect(world.served).toBe(1)
+      expect(
+        scripted
+          .requests()
+          .slice(before)
+          .map(({ api }) => api)
+          .filter((api) => api === 'Metadata' || api === 'DeleteTopics')
+      ).toEqual(['Metadata', 'DeleteTopics', 'Metadata', 'Metadata', 'DeleteTopics', 'Metadata'])
+      expect(deletionsAfter(scripted, before)).toEqual([
+        [{ topic: 't', topicId: null }],
+        [{ topic: null, topicId }],
+      ])
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteTopics keeps an answered error to the id resend of a quota-refused name final', async () => {
+    const retry = { retries: 3, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
+    const { admin, scripted, world } = quotaRefusalThenMissingU(1, retry)
+    scripted.answer('DeleteTopics', ({ topics }) => ({
+      throttleTime: 0,
+      topicErrors: topics.map(({ topic, topicId: id }) => ({
+        topic,
+        topicId: id,
+        errorCode: 100,
+        errorMessage: null,
+      })),
+    }))
+    try {
+      const before = await targetU(admin, scripted)
+      const result = admin.deleteTopics({ topics: ['t'] }).catch((error) => error)
+      await untilSettled(result)
+      await expect(result).resolves.toMatchObject({
+        name: 'KafkaJSProtocolError',
+        code: 100,
+        topicErrors: [expect.objectContaining({ topic: 't', topicId, errorCode: 100 })],
+      })
+      await jest.advanceTimersByTimeAsync(100)
+      expect(world.served).toBe(1)
+      expect(deletionsAfter(scripted, before)).toEqual([
+        [{ topic: 't', topicId: null }],
+        [{ topic: null, topicId }],
+      ])
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteTopics ends unknown-topic metadata failures before the id resend at the retry budget', async () => {
+    const retry = { retries: 2, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
+    const { admin, scripted, world } = quotaRefusalThenMissingU(Infinity, retry)
+    scripted.answer('DeleteTopics', acceptTopics)
+    try {
+      const before = await targetU(admin, scripted)
+      const result = admin.deleteTopics({ topics: ['t'] }).catch((error) => error)
+      await untilSettled(result)
+      await expect(result).resolves.toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: { type: 'UNKNOWN_TOPIC_OR_PARTITION' },
+      })
+      expect(world.served).toBe(2)
+      expect(deletionsAfter(scripted, before)).toEqual([[{ topic: 't', topicId: null }]])
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('DeleteTopics ends unknown-topic metadata failures before the id resend at the call deadline', async () => {
+    const retry = { retries: 20, initialRetryTime: 30, maxRetryTime: 30, factor: 0 }
+    const { admin, scripted, world } = quotaRefusalThenMissingU(Infinity, retry)
+    scripted.answer('DeleteTopics', acceptTopics)
+    try {
+      const before = await targetU(admin, scripted)
+      const result = admin.deleteTopics({ topics: ['t'], apiTimeout: 100 }).catch((error) => error)
+      await untilSettled(result)
+      await expect(result).resolves.toBeInstanceOf(KafkaJSTimeout)
+      await jest.advanceTimersByTimeAsync(2000)
+      expect(world.served).toBeGreaterThanOrEqual(2)
+      expect(deletionsAfter(scripted, before)).toEqual([[{ topic: 't', topicId: null }]])
     } finally {
       await admin.disconnect()
       scripted.assertClean()

@@ -36,7 +36,7 @@ const APIS = [
     method: 'deleteTopics',
     parse: deleteTopicsResponse.parse,
     call: (admin, names) => admin.deleteTopics({ topics: names }),
-    sent: ({ topics, topicIds }) => topics ?? topicIds.map(nameOfId),
+    sent: ({ topics, topicIds }) => topics ?? { topicIds },
     refusal: (error) => error,
     withIds: true,
   },
@@ -50,6 +50,9 @@ const APIS = [
     refusal: (error) => error,
   },
 ]
+
+/** What `api` sends again for the refused `names`: deleteTopics sends them by the ids answered. */
+const resent = (api, names) => (api.withIds ? { topicIds: names.map(idOf) } : names)
 
 /**
  * An admin whose controller answers each request with the next of `answers`, the last one for ever.
@@ -93,7 +96,7 @@ describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
 
     expect(broker[api.method].mock.calls.map(([request]) => api.sent(request))).toEqual([
       ['a', 'b'],
-      ['a'],
+      resent(api, ['a']),
     ])
   })
 
@@ -115,8 +118,8 @@ describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
 
     expect(broker[api.method].mock.calls.map(([request]) => api.sent(request))).toEqual([
       ['a', 'b', 'c'],
-      ['a', 'b'],
-      ['b'],
+      resent(api, ['a', 'b']),
+      resent(api, ['b']),
     ])
   })
 
@@ -184,7 +187,11 @@ describe('Admin > deleteTopics > a quota refuses topics by name', () => {
         errorCode: THROTTLING_QUOTA_EXCEEDED,
       }),
     ])
-    expect(broker.deleteTopics).toHaveBeenCalledTimes(RETRY.retries + 1)
+    expect(broker.deleteTopics.mock.calls.map(([request]) => api.sent(request))).toEqual([
+      ['a'],
+      { topicIds: [idOf('a')] },
+      { topicIds: [idOf('a')] },
+    ])
   })
 
   test('keeps a refusal that carries no topic id as final', async () => {
@@ -273,7 +280,7 @@ const adminOverDeletingBroker = (answers, targets) => {
 }
 
 const sentTopics = (broker) =>
-  broker.deleteTopics.mock.calls.map(([{ topics, topicIds }]) => topics ?? topicIds.map(nameOfId))
+  broker.deleteTopics.mock.calls.map(([{ topics, topicIds }]) => topics ?? { topicIds })
 
 describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
   test('a quota refusal leaves the deleted topic out of the refresh, so the refused one is sent again', async () => {
@@ -290,7 +297,7 @@ describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
 
     await admin.deleteTopics({ topics: ['gone', 'kept'] })
 
-    expect(sentTopics(broker)).toEqual([['gone', 'kept'], ['kept']])
+    expect(sentTopics(broker)).toEqual([['gone', 'kept'], { topicIds: [idOf('kept')] }])
     expect(cluster.targetTopics.size).toBe(0)
   })
 
@@ -309,7 +316,11 @@ describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
     const error = await admin.deleteTopics({ topics: ['gone', 'kept'] }).catch((e) => e)
 
     expect(error.cause).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
-    expect(sentTopics(broker)).toEqual([['gone', 'kept'], ['kept'], ['kept']])
+    expect(sentTopics(broker)).toEqual([
+      ['gone', 'kept'],
+      { topicIds: [idOf('kept')] },
+      { topicIds: [idOf('kept')] },
+    ])
     expect([...cluster.targetTopics]).toEqual(['kept'])
     await expect(
       admin.describeConfigs({ resources: [{ type: TOPIC, name: 'kept' }] })
