@@ -12,7 +12,7 @@ const TOPIC = 'test-topic'
 const TOPIC_ID = 'id-of-the-topic'
 const GROUP = 'test-group'
 const WARNING =
-  "Stored committed offset is not a valid offset and is treated as no committed offset, so the reset policy applies. Set the offset with admin.setOffsets or admin.resetOffsets, or subscribe with offsetReset 'none' to halt the partition instead"
+  "Stored committed offset is not a valid offset and is treated as no committed offset, so the reset policy applies: 'latest' starts at the end of the log and skips earlier unread records, 'earliest' starts at the beginning, 'none' halts the partition. To choose the position, call admin.setOffsets with the group inactive, or consumer.seek() on the running consumer; admin.resetOffsets only reapplies the reset policy"
 
 /**
  * @param {number} partition
