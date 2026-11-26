@@ -551,6 +551,46 @@ describe('Producer > the transaction wrapper', () => {
       }
     )
 
+    test.each([1, 2])(
+      'a nullish rejection from the metadata wait after a partitioner retry is not taken for a partitioner failure: the producer becomes unusable at transaction version %i',
+      async (level) => {
+        let ran = 0
+        const { cluster, broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'flaky-topic') {
+                ran += 1
+                throw new KafkaJSError('no route yet')
+              }
+              return 0
+            },
+        })
+        const added = cluster.addMultipleTargetTopics.getMockImplementation()
+        const nothing = null
+        let waits = 0
+        cluster.addMultipleTargetTopics.mockImplementation(async (topics) => {
+          if (topics.includes('flaky-topic') && (waits += 1) === 2) throw nothing
+          return added(topics)
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        const error = await transaction
+          .send({ topic: 'flaky-topic', messages: ONE })
+          .catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(error.cause).toMatchObject({ name: 'TypeError' })
+        expect(ran).toBe(1)
+        await expect(transaction.commit()).rejects.toBeInstanceOf(
+          KafkaJSApplicationRecoverableError
+        )
+        expect(broker.endTxn).not.toHaveBeenCalled()
+      }
+    )
+
     test('a send whose topic never gets metadata still makes the transaction abort-only', async () => {
       const { cluster, producer } = createTransactionalProducer()
       const found = cluster.findTopicPartitionMetadata

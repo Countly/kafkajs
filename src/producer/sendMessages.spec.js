@@ -392,6 +392,58 @@ describe('Producer > sendMessages', () => {
         expect(cluster.refreshMetadata).not.toHaveBeenCalled()
       }
     )
+
+    test('control: a metadata failure that is retried ends as KafkaJSNumberOfRetriesExceeded after every attempt, and each attempt refreshes metadata', async () => {
+      cluster.findTopicPartitionMetadata.mockImplementation(() => [])
+      const send = { records: [{ topic, messages }] }
+
+      const error = await partitionOf(send).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(error.cause).toBeInstanceOf(KafkaJSMetadataNotLoaded)
+      expect(cluster.findTopicPartitionMetadata).toHaveBeenCalledTimes(3)
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(3)
+    })
+
+    test.each([
+      ['null', null],
+      ['undefined', undefined],
+    ])(
+      'a partitioner that throws %s rejects with an Error whose message is Aborted and is not retried',
+      async (_, falsy) => {
+        realGrouping()
+        const failing = failingFirst(falsy)
+
+        const error = await partitionOf({ records: [{ topic, messages: ONE }] }, failing).catch(
+          (e) => e
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(KafkaJSError)
+        expect(error.message).toBe('Aborted')
+        expect(failing).toHaveBeenCalledTimes(1)
+        expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+      }
+    )
+
+    test('a nullish rejection from the metadata wait in a retry after a failure in the partitioner is reported as a KafkaJSNonRetriableError around a TypeError, not as Aborted', async () => {
+      realGrouping()
+      const failing = failingFirst(new KafkaJSError('no route yet'))
+      const nothing = null
+      cluster.addMultipleTargetTopics
+        .mockImplementationOnce(async () => {})
+        .mockImplementationOnce(async () => {
+          throw nothing
+        })
+      const send = { records: [{ topic, messages: ONE }] }
+
+      const error = await partitionOf(send, failing).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(error.cause).toMatchObject({ name: 'TypeError' })
+      expect(failing).toHaveBeenCalledTimes(1)
+      expect(cluster.addMultipleTargetTopics).toHaveBeenCalledTimes(2)
+    })
   })
 
   test('a failing reconnect/refresh after a disconnect does not replace the original send error', async () => {
