@@ -358,6 +358,34 @@ describe('Consumer > position validation', () => {
       expect(markChanged.mock.calls).toEqual([[TOPIC, 0]])
     })
 
+    test('truncated: a newer publication of the same offset in another spelling still emits LOG_TRUNCATION and marks the partition changed', async () => {
+      const events = []
+      const { group, offsetManager, offsetCommit } = await createGroup({
+        validationScenario: 'truncated',
+        autoCommit: true,
+      })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+      const markChanged = jest.spyOn(group, 'markChanged')
+      const reposition = jest.spyOn(offsetManager, 'reposition')
+      offsetCommit.mockImplementationOnce(async () => {
+        const ledger = offsetManager.operations
+        const ticket = ledger.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+        ledger.publish(ticket, TOPIC, 0, '0120')
+        ledger.apply(ticket, TOPIC, 0)
+        ledger.end(ticket)
+        return { topics: [] }
+      })
+
+      await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+      await expect(reposition.mock.results[0].value).resolves.toBe(false)
+      expect(BigInt(offsetManager.positionOf(TOPIC, 0))).toEqual(120n)
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(markChanged.mock.calls).toEqual([[TOPIC, 0]])
+    })
+
     test('retriable exhausted: the epoch is cleared, the offset is not moved, the partition is fetched', async () => {
       const { group, offsetManager } = await createGroup({
         validationScenario: 'retriable-exhausted',
