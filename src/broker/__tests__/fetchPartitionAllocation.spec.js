@@ -33,10 +33,13 @@ describe('Broker > Fetch', () => {
     connection = createConnectionPool()
     // `Broker#fetch` now negotiates versions on its own send path (per-socket re-negotiation),
     // which sends a real ApiVersions request against the live cluster; only the Fetch itself
-    // (built from `fetchRequestMock`'s fake, unencodable request) is stubbed out.
+    // (built from `fetchRequestMock`'s fake, unencodable request) is stubbed out, answered with
+    // an empty Fetch answer.
     const realSend = connection.send.bind(connection)
     connection.send = jest.fn((protocolRequest) =>
-      protocolRequest.request.apiKey === apiKeys.ApiVersions ? realSend(protocolRequest) : undefined
+      protocolRequest.request.apiKey === apiKeys.ApiVersions
+        ? realSend(protocolRequest)
+        : { responses: [] }
     )
     broker = new Broker({
       connectionPool: connection,
