@@ -7,7 +7,6 @@ const OffsetOperations = require('./offsetOperations')
 const { fencedDelay } = require('../fetchPreparation')
 const { isStaleBatch } = require('../handlerContext')
 const ResetObligations = require('./resetObligations')
-const { isUnusableStoredOffset, unusableStoredOffsetError } = require('./storedOffsets')
 const { ResetResolver } = require('../offsetReset')
 const {
   KafkaJSError,
@@ -1790,9 +1789,6 @@ module.exports = class OffsetManager {
    *                              or the topic was recreated while a request was in flight, `true`
    *                              otherwise (a cell a sibling had already resolved is not a drop)
    * @throws {Error} the preparation's refusal; the ticket ends either way
-   * @throws {KafkaJSNonRetriableError} when an answer would set a cell's position from a stored
-   *   offset below -2 that no owed reset, sentinel seek or local position replaces; an answer that
-   *   cannot set the position is ignored as any such answer is (`applyResolution`)
    */
   async resolveOffsets(preparation) {
     this.refuse(preparation)
@@ -1846,11 +1842,9 @@ module.exports = class OffsetManager {
       this.markPendingSeeks(consumerOffsets)
       const derived = this.derivedCells(consumerOffsets)
       this.adoptLocalPositions(consumerOffsets)
-      const unusable = this.unusableStoredCells(consumerOffsets)
       const epochSeeds = this.collectEpochSeeds(consumerOffsets)
 
       let offsets = consumerOffsets
-      let refusals = NO_REFUSALS
       if (
         consumerOffsets.some(({ partitions }) => partitions.some((p) => isInvalidOffset(p.offset)))
       ) {
@@ -1874,22 +1868,13 @@ module.exports = class OffsetManager {
             offset: isInvalidOffset(offset) ? undefined : offset,
           })),
         }))
-        refusals = resolved.refusals
+        this.holdResetRefusals(resolved.refusals, requestedIds)
         const total = consumerOffsets.reduce((sum, t) => sum + t.partitions.length, 0)
         const handled = offsets.reduce((sum, t) => sum + t.partitions.length, 0)
-        complete = complete && handled + refusals.length === total
+        complete = complete && handled + resolved.refusals.length === total
       }
 
-      const applied = this.applyResolution(
-        ticket,
-        offsets,
-        epochSeeds,
-        requestedIds,
-        derived,
-        unusable
-      )
-      this.holdResetRefusals(refusals, requestedIds)
-      return applied && complete
+      return this.applyResolution(ticket, offsets, epochSeeds, requestedIds, derived) && complete
     } finally {
       this.operations.end(ticket)
     }
@@ -2207,11 +2192,6 @@ module.exports = class OffsetManager {
    * The resolution's single final step, synchronous after both awaits: writes each answered cell
    * that is still current and unresolved, retains recreation debt until a concrete commit,
    * deletes obligations every assigned partition has durably discharged, and seeds epochs.
-   *
-   * Every cell is decided before any is written. An unusable stored offset is refused only for a
-   * cell this step would write, so an answer that cannot set the position (stale, or for a cell a
-   * sibling already positioned) is ignored as before; a refusal leaves every cell, epoch and
-   * obligation of the answer as it was.
    * @private
    * @param {object} ticket the resolution's read ticket
    * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} offsets
@@ -2221,25 +2201,16 @@ module.exports = class OffsetManager {
    *   policy, a sentinel seek or a local position rather than from a commit. Those stay private to
    *   this manager (`holdResetPosition`); only a commit the coordinator answered reaches the
    *   group's shared cache. Defaults to none.
-   * @param {Map<string, string>} [unusable] the stored offset of each `topic|partition` cell whose
-   *   answer still stores an unusable offset (`unusableStoredCells`). Defaults to none.
    * @returns {boolean} `false` when a cell was dropped as stale
-   * @throws {KafkaJSNonRetriableError} when a cell this step would write is in `unusable`
    */
-  applyResolution(
-    ticket,
-    offsets,
-    epochSeeds,
-    requestedIds,
-    derived = new Set(),
-    unusable = new Map()
-  ) {
+  applyResolution(ticket, offsets, epochSeeds, requestedIds, derived = new Set()) {
     this.committedOffsets()
     let complete = true
-    const writes = []
 
     for (const { topic, partitions } of offsets) {
-      const cells = []
+      this.operations.topicCells(topic)
+      const written = []
+
       for (const { partition, offset } of partitions) {
         if (this.isStale(ticket, topic, partition, requestedIds)) {
           complete = false
@@ -2247,24 +2218,13 @@ module.exports = class OffsetManager {
           isInvalidOffset(this.heldOffsetAt(topic, partition)) ||
           this.pendingSeekTimestamp(topic, partition) !== undefined
         ) {
-          const stored = unusable.get(`${topic}|${partition}`)
-          if (stored !== undefined) {
-            throw unusableStoredOffsetError(this.groupId, topic, partition, stored)
-          }
-          cells.push({ partition, offset })
+          if (derived.has(`${topic}|${partition}`)) this.holdResetPosition(topic, partition, offset)
+          else this.operations.fill(topic, partition, offset)
+          written.push(partition)
         }
       }
-      writes.push({ topic, cells })
-    }
 
-    for (const { topic, cells } of writes) {
-      this.operations.topicCells(topic)
-      for (const { partition, offset } of cells) {
-        if (derived.has(`${topic}|${partition}`)) this.holdResetPosition(topic, partition, offset)
-        else this.operations.fill(topic, partition, offset)
-      }
-
-      for (const { partition } of cells) {
+      for (const partition of written) {
         if (!isInvalidOffset(this.heldOffsetAt(topic, partition))) {
           this.settleSentinel(topic, partition)
         }
@@ -2623,24 +2583,6 @@ module.exports = class OffsetManager {
     for (const { topic, partitions } of entries) {
       for (const { partition, offset } of partitions) {
         if (isInvalidOffset(offset)) cells.add(`${topic}|${partition}`)
-      }
-    }
-    return cells
-  }
-
-  /**
-   * The cells of an OffsetFetch answer that still store an unusable offset
-   * (`isUnusableStoredOffset`) once owed resets, sentinel seeks and local positions have replaced
-   * theirs. Only `applyResolution` decides whether one is refused.
-   * @private
-   * @param {{topic: string, partitions: {partition: number, offset: string}[]}[]} entries
-   * @returns {Map<string, string>} the stored offset by `topic|partition`
-   */
-  unusableStoredCells(entries) {
-    const cells = new Map()
-    for (const { topic, partitions } of entries) {
-      for (const { partition, offset } of partitions) {
-        if (isUnusableStoredOffset(offset)) cells.set(`${topic}|${partition}`, offset)
       }
     }
     return cells
