@@ -3,6 +3,7 @@ const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
+const { decodeApplied } = require('../assignmentRows')
 const {
   KafkaJSNonRetriableError,
   KafkaJSConnectionError,
@@ -707,7 +708,12 @@ module.exports = class ClassicGroupProtocol {
       )
     )
 
-    const decoded = MemberAssignment.decode(memberAssignment)
+    const decoded = decodeApplied(memberAssignment, this.logger, {
+      groupId,
+      memberId,
+      generationId,
+      groupProtocol,
+    })
     return {
       assignment: decoded != null ? decoded.assignment : {},
       userData: decoded != null ? decoded.userData : null,

@@ -1,4 +1,5 @@
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
+const encodeRows = require('./fixtures/encodeRows')
 
 const FIXTURE_ROUND_ROBIN_METADATA = Buffer.from(
   require('./fixtures/roundRobinAssigner/memberMetadata.json')
@@ -51,6 +52,32 @@ describe('Consumer > assignerProtocol', () => {
 
     test('decode empty assignment', () => {
       expect(MemberAssignment.decode(Buffer.from([]))).toBe(null)
+    })
+
+    test('decode gives a topic named in two rows the partitions of both rows, repeats kept', () => {
+      const buffer = encodeRows(
+        [
+          { topic: 'a', partitions: [0, 3] },
+          { topic: 'b', partitions: [5] },
+          { topic: 'a', partitions: [3, 1] },
+        ],
+        Buffer.from('user')
+      )
+
+      const decoded = MemberAssignment.decode(buffer)
+
+      expect(decoded).toEqual({
+        version: 0,
+        assignment: { a: [0, 3, 3, 1], b: [5] },
+        userData: Buffer.from('user'),
+      })
+      expect(Object.keys(decoded.assignment)).toEqual(['a', 'b'])
+    })
+
+    test('decode keeps a partition named twice in one row, as encode writes it', () => {
+      const buffer = MemberAssignment.encode({ version: 1, assignment: { a: [1, 1, 0] } })
+
+      expect(MemberAssignment.decode(buffer).assignment).toEqual({ a: [1, 1, 0] })
     })
   })
 })
