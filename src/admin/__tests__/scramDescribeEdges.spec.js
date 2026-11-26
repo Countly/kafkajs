@@ -59,6 +59,25 @@ describe('SCRAM credential description edges', () => {
     ])
   })
 
+  test('a credentials row that failed locally has an empty credentials list', async () => {
+    const unreachable = new Error('unreachable')
+    const cluster = { findConnectedBroker: jest.fn().mockRejectedValue(unreachable) }
+
+    const rows = await createAdmin({ cluster, logger, retry }).describeUserScramCredentials({
+      users: ['alice'],
+    })
+
+    expect(rows).toEqual([
+      {
+        user: 'alice',
+        errorCode: -1,
+        errorMessage: null,
+        error: unreachable,
+        credentials: [],
+      },
+    ])
+  })
+
   test.each([
     ['results that are not an array', undefined],
     ['an empty user name', [userRow('')]],
