@@ -733,9 +733,8 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
      * runs to the end, consuming the reset, before `slow`'s answer for the old incarnation lands.
      * @param {string|undefined} initialId the topic id the cache holds when `slow` starts
      * @param {(context: object) => void} [afterSibling] runs once the sibling is done
-     * @param {string} [staleOffset] the offset `slow`'s late answer stores
      */
-    const raceSibling = async (initialId, afterSibling = () => {}, staleOffset = '99') => {
+    const raceSibling = async (initialId, afterSibling = () => {}) => {
       const context = build(initialId)
       const { manager, requests, recreate } = context
       const slow = manager.resolveOffsets()
@@ -748,25 +747,10 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       await fast
       afterSibling(context)
 
-      requests[0].answer(staleOffset)
+      requests[0].answer('99')
       await slow
       return context
     }
-
-    test.each([
-      ['while the id was unknown', undefined],
-      ['under the old id', OLD_ID],
-    ])(
-      'an old-incarnation answer sent %s that stores -500 is dropped like any stale answer, with no error',
-      async (_, id) => {
-        const { manager, committed, pending } = await raceSibling(id, undefined, '-500')
-
-        expect(pending.size).toBe(1)
-        expect(committed[TOPIC]).toEqual({})
-        expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('0')
-        expect(manager.nextOffset(TOPIC, 0).toString()).toEqual('0')
-      }
-    )
 
     test('an answer sent while the id was unknown does not overwrite the position the sibling reset', async () => {
       const { manager, committed, pending } = await raceSibling(undefined)
@@ -976,21 +960,6 @@ describe('Consumer > OffsetManager > resolveOffsets across a topic recreation', 
       requests[0].answer('99')
       await round
 
-      expect(committed[TOPIC]).toEqual({})
-      expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('5')
-      expect(pending.size).toBe(1)
-    })
-
-    test('a pending reset also replaces a stored -500, with no error', async () => {
-      const { manager, requests, pending, committed, cluster } = build(id, '5')
-      pending.set(TOPIC, OLD_ID)
-      const round = manager.resolveOffsets()
-      await flush()
-
-      requests[0].answer('-500')
-      await round
-
-      expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
       expect(committed[TOPIC]).toEqual({})
       expect(manager.heldOffsetAt(TOPIC, 0)).toEqual('5')
       expect(pending.size).toBe(1)

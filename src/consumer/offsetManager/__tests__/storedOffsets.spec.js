@@ -11,6 +11,8 @@ const offsetFetchV9 = require('../../../../testHelpers/wire/offsetFetchV9')
 const TOPIC = 'test-topic'
 const TOPIC_ID = 'id-of-the-topic'
 const GROUP = 'test-group'
+const WARNING =
+  "Stored committed offset is not a valid offset and is treated as no committed offset, so the reset policy applies. Set the offset with admin.setOffsets or admin.resetOffsets, or subscribe with offsetReset 'none' to halt the partition instead"
 
 /**
  * @param {number} partition
@@ -88,14 +90,15 @@ describe('Consumer > stored committed offsets', () => {
   }
 
   /**
-   * A manager over `partitions` of `TOPIC` whose coordinator stores `offset` for partition 0 and
-   * whose reset policy is earliest.
+   * A manager over `partitions` of `TOPIC` whose coordinator stores `offset` for partition 0.
    * @param {string} offset the stored offset
-   * @param {number[]} [partitions] the assigned partitions
-   * @returns {{ manager: OffsetManager, cache: object, lookup: jest.Mock, harness: object }}
-   *   `lookup` is called for every ListOffsets lookup the manager starts
+   * @param {object} [options]
+   * @param {number[]} [options.partitions] the assigned partitions
+   * @param {string} [options.policy] the topic's reset policy
+   * @returns {{ manager: OffsetManager, cache: object, lookup: jest.Mock, harness: object,
+   *   logger: object }} `lookup` is called for every ListOffsets lookup the manager starts
    */
-  const createMember = (offset, partitions = [0]) => {
+  const createMember = (offset, { partitions = [0], policy = 'earliest' } = {}) => {
     const harness = coordinatorStoring(offset)
     const cache = dictionary()
     const operations = new OffsetOperations()
@@ -103,6 +106,7 @@ describe('Consumer > stored committed offsets', () => {
     const lookup = jest.fn(async () => [
       { topic: TOPIC, partitions: [{ partition: 0, offset: '4' }] },
     ])
+    const logger = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() }
     const manager = new OffsetManager({
       cluster: {
         committedOffsets: () => cache,
@@ -114,17 +118,18 @@ describe('Consumer > stored committed offsets', () => {
       autoCommit: false,
       autoCommitInterval: null,
       autoCommitThreshold: null,
-      topicConfigurations: { [TOPIC]: { resetPolicy: { kind: 'earliest' } } },
+      topicConfigurations: { [TOPIC]: { resetPolicy: { kind: policy } } },
       instrumentationEmitter: new InstrumentationEventEmitter(),
       groupId: GROUP,
       generationId: 1,
       memberId: 'member-1',
       operations,
       obligations,
+      logger,
     })
     manager.getCoordinator = async () => harness.broker
     obligations.attachTo(operations)
-    return { manager, cache, lookup, harness }
+    return { manager, cache, lookup, harness, logger }
   }
 
   /**
@@ -138,69 +143,84 @@ describe('Consumer > stored committed offsets', () => {
     return { reader: new CommittedOffsetReader({ cluster, groupId: GROUP, retry: {} }), harness }
   }
 
-  test('a stored -500 rejects the offset resolution with a non-retriable error naming the partition, and no further OffsetFetch is sent', async () => {
-    const { manager, cache, lookup, harness } = createMember('-500')
+  test.each([
+    ['earliest', true],
+    ['latest', false],
+  ])(
+    'a stored -500 under %s is treated as no committed offset: the reset policy positions the partition and no further OffsetFetch is sent',
+    async (policy, fromBeginning) => {
+      const { manager, cache, lookup, harness } = createMember('-500', { policy })
 
-    await expect(manager.resolveOffsets()).rejects.toMatchObject({
-      name: 'KafkaJSNonRetriableError',
-      retriable: false,
-      message: expect.stringMatching(
-        /Group "test-group" stores offset -500 for partition 0 of topic test-topic.*admin\.setOffsets/
-      ),
-    })
+      await expect(manager.resolveOffsets()).resolves.toBe(true)
 
-    expect(offsetFetches(harness)).toHaveLength(1)
-    expect(lookup).not.toHaveBeenCalled()
-    expect(cache[TOPIC]?.[0]).toBeUndefined()
-    expect(manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
-  })
+      expect(lookup).toHaveBeenCalledTimes(1)
+      expect(lookup).toHaveBeenCalledWith([
+        { topic: TOPIC, partitions: [{ partition: 0 }], fromBeginning },
+      ])
+      expect(manager.heldOffsetAt(TOPIC, 0)).toBe('4')
+      expect(cache[TOPIC]?.[0]).toBeUndefined()
 
-  test('a second read that answers -500 after a first read set the position to 10 leaves the position at 10, with no error', async () => {
-    const { manager, cache, lookup } = createMember('10')
-    const answers = holdOffsetFetches(manager)
-    const first = manager.resolveOffsets()
-    const second = manager.resolveOffsets()
-    await flush()
-    expect(answers).toHaveLength(2)
+      await expect(manager.resolveOffsets()).resolves.toBe(true)
+      expect(offsetFetches(harness)).toHaveLength(1)
+      expect(lookup).toHaveBeenCalledTimes(1)
+    }
+  )
 
-    answers[0]([decoded(0, '10')])
-    await expect(first).resolves.toBe(true)
-    expect(manager.heldOffsetAt(TOPIC, 0)).toBe('10')
-
-    answers[1]([decoded(0, '-500')])
-    await expect(second).resolves.toBe(true)
-
-    expect(cache[TOPIC]).toEqual({ 0: '10' })
-    expect(manager.heldOffsetAt(TOPIC, 0)).toBe('10')
-    expect(lookup).not.toHaveBeenCalled()
-  })
-
-  test('an answer storing 10 for one partition and -500 for another rejects without setting either position', async () => {
-    const { manager, cache, lookup } = createMember('10', [0, 1])
+  test('a stored -500 under none halts that partition without a lookup while a sibling keeps its stored offset', async () => {
+    const { manager, cache, lookup } = createMember('-500', { partitions: [0, 1], policy: 'none' })
     const answers = holdOffsetFetches(manager)
     const resolving = manager.resolveOffsets()
     await flush()
 
-    answers[0]([decoded(0, '10'), decoded(1, '-500')])
+    answers[0]([decoded(0, '-500'), decoded(1, '10')])
+    await expect(resolving).resolves.toBe(true)
 
-    await expect(resolving).rejects.toMatchObject({
-      name: 'KafkaJSNonRetriableError',
-      message: expect.stringMatching(/stores offset -500 for partition 1 of topic test-topic/),
-    })
-    expect(cache[TOPIC]?.[0]).toBeUndefined()
-    expect(manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
-    expect(manager.heldOffsetAt(TOPIC, 1)).toBeUndefined()
     expect(lookup).not.toHaveBeenCalled()
+    expect(cache[TOPIC]).toEqual({ 1: '10' })
+    expect(manager.heldOffsetAt(TOPIC, 0)).toBeUndefined()
+    expect(
+      manager.takeResetRefusals().map(({ topic, partition, offset, reason }) => ({
+        topic,
+        partition,
+        offset,
+        reason,
+      }))
+    ).toEqual([{ topic: TOPIC, partition: 0, offset: null, reason: 'no-offset' }])
+
+    const again = manager.resolveOffsets()
+    await flush()
+    expect(answers).toHaveLength(1)
+    await expect(again).resolves.toBe(true)
   })
 
-  test.each(['-1', '-2'])('a stored %s goes through the reset policy as before', async (offset) => {
-    const { manager, lookup } = createMember(offset)
+  test('a stored -500 logs one warning naming the group, partition, stored value and policy for one resolution', async () => {
+    const { manager, logger } = createMember('-500')
 
     await manager.resolveOffsets()
+    await manager.resolveOffsets()
 
-    expect(lookup).toHaveBeenCalledTimes(1)
-    expect(manager.heldOffsetAt(TOPIC, 0)).toBe('4')
+    expect(logger.warn).toHaveBeenCalledTimes(1)
+    expect(logger.warn).toHaveBeenCalledWith(WARNING, {
+      groupId: GROUP,
+      topic: TOPIC,
+      partition: 0,
+      storedOffset: '-500',
+      resetPolicy: 'earliest',
+    })
   })
+
+  test.each(['-1', '-2'])(
+    'a stored %s goes through the reset policy as before, with no warning',
+    async (offset) => {
+      const { manager, lookup, logger } = createMember(offset)
+
+      await manager.resolveOffsets()
+
+      expect(lookup).toHaveBeenCalledTimes(1)
+      expect(manager.heldOffsetAt(TOPIC, 0)).toBe('4')
+      expect(logger.warn).not.toHaveBeenCalled()
+    }
+  )
 
   test.each(['0', '10'])('a stored %s is used as stored', async (offset) => {
     const { manager, cache, lookup } = createMember(offset)
@@ -211,20 +231,7 @@ describe('Consumer > stored committed offsets', () => {
     expect(cache[TOPIC]).toEqual({ 0: offset })
   })
 
-  test('consumer.committed for a partition storing -500 rejects with the same error', async () => {
-    const { reader, harness } = createReader('-500')
-
-    await expect(reader.read([{ topic: TOPIC, partition: 0 }])).rejects.toMatchObject({
-      name: 'KafkaJSNonRetriableError',
-      retriable: false,
-      message: expect.stringMatching(
-        /Group "test-group" stores offset -500 for partition 0 of topic test-topic/
-      ),
-    })
-    expect(offsetFetches(harness)).toHaveLength(1)
-  })
-
-  test.each(['-1', '-2'])(
+  test.each(['-500', '-1', '-2'])(
     'consumer.committed reports a stored %s as an offset the group never committed',
     async (offset) => {
       const { reader } = createReader(offset)
