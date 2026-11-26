@@ -347,6 +347,63 @@ const offsetForLeaderEpochResponse = (partitions) =>
     .writeTaggedFields().buffer
 
 /**
+ * A leader's epoch cache and log end, answering OffsetForLeaderEpoch the way the broker does:
+ * `LeaderEpochFileCache#endOffsetFor` (Apache Kafka 4.0.0 and 4.4.0), whose "no answer" the log
+ * turns into a row with the message defaults (`LeaderEpoch` -1, `EndOffset` -1).
+ *
+ * - the requested epoch is -1, or the cache is empty, or the epoch is above the latest: -1 / -1;
+ * - the latest epoch: that epoch and the log end;
+ * - a lower epoch: the largest cached epoch at or below it and the start of the next cached one;
+ * - below the first cached epoch: the requested epoch itself and the first cached start.
+ *
+ * @param {{ epochs: [number, number|string][], logEnd: number|string }} log `[epoch, start]`
+ *   pairs with rising epochs and non-decreasing starts, and the log end offset
+ * @returns {{ endOffsetFor: (requestedEpoch: number) => { leaderEpoch: number, endOffset: string },
+ *   answer: (partitions: number[], request: { partitions: { partition: number,
+ *     leaderEpoch: number }[] }) => Buffer }} `answer` fits `setValidationResponse`
+ * @throws {Error} for a cache no broker could hold
+ */
+const scriptedEpochLog = ({ epochs, logEnd }) => {
+  const cache = epochs.map(([epoch, start]) => ({ epoch, start: BigInt(start) }))
+  const end = BigInt(logEnd)
+  cache.forEach(({ epoch, start }, i) => {
+    const previous = cache[i - 1]
+    if (previous && (epoch <= previous.epoch || start < previous.start)) {
+      throw new Error(`epoch ${epoch} at ${start} does not follow epoch ${previous.epoch}`)
+    }
+    if (start > end) throw new Error(`epoch ${epoch} starts at ${start}, past the log end ${end}`)
+  })
+
+  const undefinedAnswer = { leaderEpoch: -1, endOffset: '-1' }
+  const endOffsetFor = (requestedEpoch) => {
+    const latest = cache[cache.length - 1]
+    if (requestedEpoch === -1) return undefinedAnswer
+    if (latest && latest.epoch === requestedEpoch) {
+      return { leaderEpoch: requestedEpoch, endOffset: end.toString() }
+    }
+
+    const higher = cache.find(({ epoch }) => epoch > requestedEpoch)
+    if (!higher) return undefinedAnswer
+    const floor = cache.findLast(({ epoch }) => epoch <= requestedEpoch)
+    return {
+      leaderEpoch: floor ? floor.epoch : requestedEpoch,
+      endOffset: higher.start.toString(),
+    }
+  }
+
+  return {
+    endOffsetFor,
+    answer: (_partitions, { partitions }) =>
+      offsetForLeaderEpochResponse(
+        partitions.map(({ partition, leaderEpoch }) => ({
+          partition,
+          ...endOffsetFor(leaderEpoch),
+        }))
+      ),
+  }
+}
+
+/**
  * Decodes every OffsetForLeaderEpoch frame written to the fake socket, oldest first, so a spec can
  * assert both how many attempts went out and which partitions each one carried.
  *
@@ -392,8 +449,14 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * Builds a real `Broker` wired to a real `Connection` over the fake socket from `testHelpers`.
  * `answer` receives each outgoing request's header and returns the response body to play back;
  * each response is framed with the header version that request's api key and version imply.
+ *
+ * A Buffer is played back at once. A thenable is a withheld answer: it is played back on the
+ * socket the request was written to when it resolves, unless that socket was destroyed by then,
+ * and later requests are answered meanwhile. A broker answers one connection in order; overtaking
+ * here stands in for the separate connection the real pool gives Fetch. A rejected thenable
+ * answers nothing.
  * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
- * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
+ * @param {(header: { apiKey: number, apiVersion: number }) => Buffer|PromiseLike<Buffer>} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
  * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
  */
@@ -411,26 +474,48 @@ const createFakeBroker = (answer, chunks) => {
     enforceRequestTimeout: false,
   })
 
+  /**
+   * Plays one response back through `target.socket`, split by `chunks` when given.
+   * @param {{ socket: object }} target
+   * @param {{ apiKey: number, apiVersion: number, correlationId: number }} header
+   * @param {Buffer} body
+   * @returns {void}
+   */
+  const reply = (target, header, body) => {
+    const responseState = chunks
+      ? {
+          socket: {
+            emit: (_event, frame) => {
+              for (const chunk of chunks(frame, header)) target.socket.emit('data', chunk)
+            },
+          },
+        }
+      : target
+    respondWithFrame(
+      responseState,
+      header.correlationId,
+      responseHeaderVersion(header.apiKey, header.apiVersion),
+      body
+    )
+  }
+
   let answered = 0
   const pump = async () => {
     while (answered < state.writes.length) {
       const header = readRequestHeader(state.writes[answered])
       answered += 1
-      const responseState = chunks
-        ? {
-            socket: {
-              emit: (_event, frame) => {
-                for (const chunk of chunks(frame, header)) state.socket.emit('data', chunk)
-              },
-            },
-          }
-        : state
-      respondWithFrame(
-        responseState,
-        header.correlationId,
-        responseHeaderVersion(header.apiKey, header.apiVersion),
-        answer(header)
-      )
+      const body = answer(header)
+      if (typeof body?.then === 'function') {
+        const { socket } = state
+        body.then(
+          (settled) => {
+            if (!socket.destroyed) reply({ socket }, header, settled)
+          },
+          () => {}
+        )
+      } else {
+        reply(state, header, body)
+      }
     }
   }
 
@@ -616,7 +701,13 @@ const buildConsumerGroup = ({
  * between the request being built and the response being walked.
  *
  * The same broker answers OffsetForLeaderEpoch from the validation options below, or from the
- * function `setValidationResponse` installs, which receives the partitions the frame asked for.
+ * function `setValidationResponse` installs. That function receives the partitions the frame asked
+ * for, then `{ nodeId, partitions }`: the node answering and the frame's decoded rows, each with
+ * the requested `leaderEpoch`. It may return a promise to withhold the answer (see
+ * `createFakeBroker`); `scriptedEpochLog(...).answer` fits it.
+ *
+ * `holdBrokerLookup(nodeId)` makes every later `cluster.findBroker` for that node wait until the
+ * returned release function is called; nothing else ends that wait.
  *
  * `joinAndSync` is stubbed (and returned) because the contract under test is that a partition
  * error never reaches it; leaving the real one in place would attempt a real join. `sync()` still
@@ -640,7 +731,15 @@ const buildConsumerGroup = ({
  * @param {number} [options.committedEpoch] the tracked leader epoch every partition starts with;
  *   `-1`, the default, means "unknown", which is what keeps a spec that is not about validation
  *   free of OffsetForLeaderEpoch traffic
- * @param {number} [options.leaderEpoch] what `cluster.leaderEpoch` answers
+ * @param {number} [options.leaderEpoch] what `cluster.leaderEpoch` answers, and the epoch the
+ *   metadata cache starts at
+ * @param {boolean} [options.liveRouting] when true, `cluster.leaderEpoch` reads the metadata
+ *   cache, so `installRouting` and an applied leader hint move the epoch the group sees, and
+ *   `cluster.forgetLeaderEpoch` forgets it there; by default the epoch stays `leaderEpoch` and the
+ *   forget only records the call
+ * @param {boolean} [options.validationBrokers] when true, `cluster.findBroker` answers each node
+ *   id with its own fake broker and connection (node `NODE_ID` keeps the shared one), so each
+ *   leader has its own request queue; every broker answers with the same scripts
  * @param {string} [options.endOffset] the `EndOffset` the OffsetForLeaderEpoch reply carries
  * @param {number} [options.validationErrorCode] the per-partition code that reply carries
  * @param {boolean} [options.validationThrows] make the OffsetForLeaderEpoch answer throw
@@ -659,9 +758,13 @@ const buildConsumerGroup = ({
  *   offsetManager: OffsetManager, offsetCommit: jest.SpyInstance, joinAndSync: jest.SpyInstance,
  *   requestRejoin: jest.Mock,
  *   setResponse: (body: Buffer|(() => Buffer)) => void,
- *   setValidationResponse: (fn: (partitions: number[]) => Buffer) => void,
+ *   setValidationResponse: (fn: (partitions: number[], request: { nodeId: number,
+ *     partitions: { partition: number, currentLeaderEpoch: number, leaderEpoch: number }[] })
+ *     => Buffer|PromiseLike<Buffer>) => void,
+ *   holdBrokerLookup: (nodeId: number) => () => void,
  *   findBrokerCalls: {nodeId: number}[], sync: () => Promise<void>,
  *   requests: () => object[], validationRequests: () => object[],
+ *   validationRequestsTo: (nodeId: number) => object[], writesTo: (nodeId: number) => Buffer[],
  *   fetchRequestPartitions: () => number[], fetchRequestOffsets: () => string[],
  *   lastFetchRequest: () => object[],
  *   lastFetchApiVersion: () => number, lastFetchHeaderFields: () => object,
@@ -680,6 +783,8 @@ const createFetchGroup = async ({
   position = '0',
   committedEpoch = -1,
   leaderEpoch = 5,
+  liveRouting = false,
+  validationBrokers = false,
   endOffset = '20',
   validationErrorCode = 0,
   validationThrows = false,
@@ -720,20 +825,69 @@ const createFetchGroup = async ({
     validationAnswer = fn
   }
 
-  const { broker, state } = createFakeBroker((header) => {
-    if (header.apiKey === apiKeys.ApiVersions) {
-      return apiVersionsBody(fetchMaxVersion, advertiseOffsetForLeaderEpoch)
-    }
+  /**
+   * One fake broker answering for `nodeId` with the shared scripts.
+   * @param {number} nodeId
+   * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
+   */
+  const createNodeBroker = (nodeId) => {
+    const node = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) {
+        return apiVersionsBody(fetchMaxVersion, advertiseOffsetForLeaderEpoch)
+      }
 
-    if (header.apiKey === apiKeys.OffsetForLeaderEpoch) {
-      const sent = decodeOffsetForLeaderEpochRequests(state.writes)
-      const requested = sent[sent.length - 1].topics[0].partitions.map(({ partition }) => partition)
-      return validationAnswer(requested)
-    }
+      if (header.apiKey === apiKeys.OffsetForLeaderEpoch) {
+        const sent = decodeOffsetForLeaderEpochRequests(node.state.writes)
+        const rows = sent[sent.length - 1].topics[0].partitions
+        return validationAnswer(
+          rows.map(({ partition }) => partition),
+          { nodeId, partitions: rows }
+        )
+      }
 
-    return typeof nextResponse === 'function' ? nextResponse() : nextResponse
-  })
+      return typeof nextResponse === 'function' ? nextResponse() : nextResponse
+    })
+    return node
+  }
+
+  const { broker, state } = createNodeBroker(NODE_ID)
   await broker.connect()
+
+  /** @type {Map<number, { broker: Broker, state: { writes: Buffer[] }, ready: Promise<void> }>} */
+  const nodeBrokers = new Map([[NODE_ID, { broker, state, ready: Promise.resolve() }]])
+  /** @type {Map<number, Promise<void>>} */
+  const heldLookups = new Map()
+  /**
+   * Holds every later `cluster.findBroker` for `nodeId` until the returned function is called.
+   * @param {number} nodeId
+   * @returns {() => void} the release
+   */
+  const holdBrokerLookup = (nodeId) => {
+    let release
+    heldLookups.set(nodeId, new Promise((resolve) => (release = resolve)))
+    return () => {
+      heldLookups.delete(nodeId)
+      release()
+    }
+  }
+  /**
+   * The broker `cluster.findBroker` answers for `nodeId`: the shared one, or with
+   * `validationBrokers` that node's own, created and connected on first use.
+   * @param {number} nodeId
+   * @returns {Promise<Broker>}
+   */
+  const brokerFor = async (nodeId) => {
+    if (!validationBrokers) return broker
+    let node = nodeBrokers.get(nodeId)
+    if (!node) {
+      const created = createNodeBroker(nodeId)
+      node = { ...created, ready: created.broker.connect() }
+      nodeBrokers.set(nodeId, node)
+    }
+    await node.ready
+    return node.broker
+  }
+  const writesTo = (nodeId) => nodeBrokers.get(nodeId)?.state.writes ?? []
 
   const leaders = new Map(
     partitions.map((partition) => [
@@ -792,7 +946,11 @@ const createFetchGroup = async ({
     refreshMetadata: jest.fn(async () => {}),
     findBroker: async (args) => {
       findBrokerCalls.push(args)
-      return broker
+      // The default path resolves in the same turns it always did.
+      if (!validationBrokers && heldLookups.size === 0) return broker
+      const nodeId = Number(args.nodeId)
+      while (heldLookups.has(nodeId)) await heldLookups.get(nodeId)
+      return brokerFor(nodeId)
     },
     findGroupCoordinator: async () => coordinator,
     findTopicPartitionMetadata: () =>
@@ -805,8 +963,15 @@ const createFetchGroup = async ({
     committedOffsets: () => ({}),
     defaultOffset: () => '-2',
     topicId: () => TOPIC_ID,
-    leaderEpoch: () => leaderEpoch,
-    forgetLeaderEpoch: jest.fn(() => true),
+    leaderEpoch: liveRouting
+      ? (topic, partition) => metadataCache.leaderEpoch(topic, partition)
+      : () => leaderEpoch,
+    cachedLeader: (topic, partition) => metadataCache.leader(topic, partition),
+    forgetLeaderEpoch: jest.fn(
+      liveRouting
+        ? (topic, partition) => metadataCache.forgetLeaderEpoch(topic, partition)
+        : () => true
+    ),
     applyLeaderHint: jest.fn(async ({ topic, partition, leaderId, leaderEpoch: hintEpoch }) => {
       if (applyLeaderHintResolves && applyLeaderHintMovesLeaderTo != null) {
         leaders.set(partition, applyLeaderHintMovesLeaderTo)
@@ -877,7 +1042,12 @@ const createFetchGroup = async ({
     requestRejoin,
     setResponse,
     setValidationResponse,
+    holdBrokerLookup,
     findBrokerCalls,
+    /** Every frame written to `nodeId`'s broker, oldest first; empty before its first lookup. */
+    writesTo,
+    /** Every OffsetForLeaderEpoch frame written to `nodeId`'s broker, decoded, oldest first. */
+    validationRequestsTo: (nodeId) => decodeOffsetForLeaderEpochRequests(writesTo(nodeId)),
     /** Drives the real join/sync sequence, and the apply that used to live inside it. */
     sync: async () => {
       const result = await realJoinAndSync()
@@ -943,5 +1113,6 @@ module.exports = {
   createFakeCoordinator,
   fetchResponse,
   offsetForLeaderEpochResponse,
+  scriptedEpochLog,
   createFetchGroup,
 }
