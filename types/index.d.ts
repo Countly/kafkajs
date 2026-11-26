@@ -3396,8 +3396,8 @@ export interface KafkaJSDeleteTopicRecordsErrorPartition {
   partition: number
   /** The requested offset; undefined when the response row matched no requested partition */
   offset: string | undefined
-  /** Rows are kept as passed, so a row can carry no error */
-  error?: KafkaJSError | null
+  /** Rows are kept as passed, so a row can carry no error, or an explicit undefined */
+  error?: KafkaJSError | null | undefined
 }
 
 export interface KafkaJSErrorMetadata {
