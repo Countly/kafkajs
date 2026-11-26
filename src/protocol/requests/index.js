@@ -191,12 +191,14 @@ const lookup =
 /** Wraps only mutation definitions so ordinary request lookups keep their existing path.
  * @param {number} apiKey
  * @param {RequestDefinitions} definition
- * @returns {RequestDefinitions} a definition with an admin-aware builder
+ * @returns {RequestDefinitions} a definition with an admin-aware builder; like the wrapped one,
+ *   its `protocol` returns undefined for a version this client does not implement
  */
 const mutationDefinition = (apiKey, definition) => ({
   ...definition,
   protocol(options) {
     const build = definition.protocol(options)
+    if (!build) return build
     const shared = apiKey === apiKeys.InitProducerId || apiKey === apiKeys.LeaveGroup
     return (args, ownership) => {
       if (
