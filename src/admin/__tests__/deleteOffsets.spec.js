@@ -198,11 +198,10 @@ describe('offset invocation ownership', () => {
     expect(jest.getTimerCount()).toBe(0)
     jest.useRealTimers()
   })
-  // A decoded deleteOffsets answer is final, so only the read has a retry stage after a send.
   it.each(
     ['deleteOffsets', 'fetchOffsetsForGroups'].flatMap((method) =>
-      (method === 'deleteOffsets' ? ['lookup', 'send'] : ['lookup', 'send', 'retry']).flatMap(
-        (stage) => [false, true].map((withheld) => ({ method, stage, withheld }))
+      ['lookup', 'send', 'retry'].flatMap((stage) =>
+        [false, true].map((withheld) => ({ method, stage, withheld }))
       )
     )
   )(

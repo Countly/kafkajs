@@ -33,6 +33,77 @@ const quota = {
 const topicId = '00112233-4455-6677-8899-aabbccddeeff'
 const node = (id) => ({ id, host: 'node' + id, port: 9092 })
 
+/** An unthrottled DeleteTopics v6 answer with one row per named topic. */
+const topicRows = (codes) => ({
+  throttleTime: 0,
+  topicErrors: Object.entries(codes).map(([topic, errorCode]) => ({
+    topic,
+    topicId: null,
+    errorCode,
+    errorMessage: null,
+  })),
+})
+
+/** Calls whose broker answers a refusal before it applies or schedules anything. */
+const refusedBeforeApplying = [
+  {
+    api: 'DeleteTopics',
+    method: 'deleteTopics',
+    input: { topics: ['t'] },
+    refusal: topicRows({ t: 89 }),
+    accept: ({ topics }) => topicRows(Object.fromEntries(topics.map(({ topic }) => [topic, 0]))),
+    accepted: ({ value, error }) => {
+      expect(error).toBeUndefined()
+      expect(value).toBeUndefined()
+    },
+    exhausted: ({ error }) =>
+      expect(error).toMatchObject({ name: 'KafkaJSNumberOfRetriesExceeded', cause: { code: 89 } }),
+  },
+  {
+    api: 'OffsetDelete',
+    method: 'deleteOffsets',
+    input: { groupId: 'g', topics: [{ topic: 't', partitions: [0] }] },
+    refusal: { errorCode: 14, topics: [] },
+    accept: ({ topics }) => ({
+      errorCode: 0,
+      topics: topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+      })),
+    }),
+    accepted: ({ value, error }) => {
+      expect(error).toBeUndefined()
+      expect(value.topics[0].partitions.map((p) => [p.partition, p.errorCode])).toEqual([[0, 0]])
+    },
+    exhausted: ({ value, error }) => {
+      expect(error).toBeUndefined()
+      expect(value.topics[0].partitions.map((p) => [p.partition, p.errorCode])).toEqual([[0, 14]])
+    },
+  },
+  {
+    api: 'LeaveGroup',
+    method: 'removeMembersFromConsumerGroup',
+    input: { groupId: 'g', members: [{ groupInstanceId: 'instance' }] },
+    refusal: { errorCode: 14, members: [] },
+    accept: ({ members }) => ({
+      errorCode: 0,
+      members: members.map(({ memberId, groupInstanceId }) => ({
+        memberId,
+        groupInstanceId,
+        errorCode: 0,
+      })),
+    }),
+    accepted: ({ value, error }) => {
+      expect(error).toBeUndefined()
+      expect(value).toEqual([
+        { memberId: '', groupInstanceId: 'instance', errorCode: 0, error: null },
+      ])
+    },
+    exhausted: ({ error }) =>
+      expect(error).toMatchObject({ name: 'KafkaJSNumberOfRetriesExceeded', cause: { code: 14 } }),
+  },
+]
+
 /** Tests a public invocation over real brokers and fake sockets. */
 const fixture = (nodes = [node(0)], options = {}) => {
   const schedule = new Schedule()
@@ -250,28 +321,134 @@ describe('written admin mutations', () => {
     }
   )
 
-  it.each([3, 41, 89])(
-    'DeleteTopics keeps broker code %i as an answered rejection',
-    async (code) => {
+  it.each([3, 41])('DeleteTopics keeps broker code %i as an answered rejection', async (code) => {
+    const { admin, schedule, scripted } = fixture()
+    schedule.once(
+      { api: 'DeleteTopics' },
+      {
+        topicErrors: [{ topic: 't', topicId, errorCode: code, errorMessage: null }],
+      }
+    )
+    try {
+      await admin.connect()
+      const result = admin.deleteTopics({ topics: ['t'] }).catch((error) => error)
+      await jest.advanceTimersByTimeAsync(50)
+      await expect(result).resolves.toMatchObject({ code })
+      expect(scripted.requests().filter(({ api }) => api === 'DeleteTopics')).toHaveLength(1)
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it.each(refusedBeforeApplying)(
+    '$api is sent again after a refusal made before applying, and the call succeeds',
+    async ({ api, method, input, refusal, accept, accepted }) => {
       const { admin, schedule, scripted } = fixture()
-      schedule.once(
-        { api: 'DeleteTopics' },
-        {
-          topicErrors: [{ topic: 't', topicId, errorCode: code, errorMessage: null }],
-        }
-      )
+      schedule.once({ api }, refusal)
+      scripted.answer(api, accept)
       try {
         await admin.connect()
-        const result = admin.deleteTopics({ topics: ['t'] }).catch((error) => error)
-        await jest.advanceTimersByTimeAsync(50)
-        await expect(result).resolves.toMatchObject({ code })
-        expect(scripted.requests().filter(({ api }) => api === 'DeleteTopics')).toHaveLength(1)
+        const result = admin[method](input).then(
+          (value) => ({ value }),
+          (error) => ({ error })
+        )
+        await untilSettled(result)
+        accepted(await result)
+        expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(2)
       } finally {
         await admin.disconnect()
         scripted.assertClean()
       }
     }
   )
+
+  it.each(refusedBeforeApplying)(
+    '$api stops sending a refusal made before applying at the retry budget',
+    async ({ api, method, input, refusal, exhausted }) => {
+      const { admin, scripted } = fixture()
+      scripted.answer(api, () => refusal)
+      try {
+        await admin.connect()
+        const result = admin[method](input).then(
+          (value) => ({ value }),
+          (error) => ({ error })
+        )
+        await untilSettled(result)
+        exhausted(await result)
+        expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(2)
+      } finally {
+        await admin.disconnect()
+        scripted.assertClean()
+      }
+    }
+  )
+
+  it.each(refusedBeforeApplying)(
+    '$api stops sending a refusal made before applying at the call deadline',
+    async ({ api, method, input, refusal }) => {
+      const retry = { retries: 5, initialRetryTime: 1000, maxRetryTime: 1000, factor: 0 }
+      const { admin, scripted } = fixture([node(0)], { retry })
+      scripted.answer(api, () => refusal)
+      try {
+        await admin.connect()
+        const result = admin[method]({ ...input, apiTimeout: 100 }).catch((error) => error)
+        await untilSettled(result)
+        await expect(result).resolves.toBeInstanceOf(KafkaJSTimeout)
+        await jest.advanceTimersByTimeAsync(2000)
+        expect(scripted.requests().filter((frame) => frame.api === api)).toHaveLength(1)
+      } finally {
+        await admin.disconnect()
+        scripted.assertClean()
+      }
+    }
+  )
+
+  it('a written DeleteTopics is sent again only for the topics the quota refused', async () => {
+    const schedule = new Schedule()
+    const scripted = createScriptedCluster({
+      profile: 'destructiveAdmin',
+      schedule,
+      nodes: [node(0)],
+    })
+    const api = 'DeleteTopics'
+    schedule.once({ api }, topicRows({ a: 0, t: 89 }))
+    scripted.answer(api, ({ topics }) =>
+      topicRows(Object.fromEntries(topics.map(({ topic }) => [topic, 0])))
+    )
+    const broker = new Broker({
+      connectionPool: new ConnectionPool(
+        connectionOpts({
+          host: 'node0',
+          port: 9092,
+          socketFactory: scripted.socketFactory,
+        })
+      ),
+      logger: newLogger(),
+      nodeId: 0,
+    })
+    try {
+      await broker.connect()
+      await runWithDeadline(api, 1000, async () => {
+        await expect(broker.deleteTopics({ topics: ['a', 't'] })).rejects.toMatchObject({
+          code: 89,
+        })
+        await expect(broker.deleteTopics({ topics: ['a', 't'] })).rejects.toThrow(
+          'an earlier request of this call'
+        )
+        await broker.deleteTopics({ topics: ['t'] })
+      })
+      expect(
+        scripted
+          .requests()
+          .filter((frame) => frame.api === api)
+          .map(({ fields }) => fields.topics.map(({ topic }) => topic))
+      ).toEqual([['a', 't'], ['t']])
+    } finally {
+      await broker.disconnect()
+      scripted.assertClean()
+    }
+  })
 
   it('IncrementalAlterConfigs returns a controller error for a mutation and retries validation', async () => {
     const { admin, schedule, scripted } = fixture()

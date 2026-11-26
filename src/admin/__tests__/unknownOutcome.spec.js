@@ -1,5 +1,12 @@
 const apiKeys = require('../../protocol/requests/apiKeys')
-const { itemsOf, isMutation, owned, SINGLE_SEND } = require('../unknownOutcome')
+const {
+  itemsOf,
+  isMutation,
+  owned,
+  SINGLE_SEND,
+  resendable,
+  mayResend,
+} = require('../unknownOutcome')
 
 /** Builds just enough of the private request to test identity extraction. */
 const items = (api, args) => itemsOf({ request: { apiKey: apiKeys[api] }, args: owned(args) }, 7)
@@ -32,6 +39,49 @@ it('a class-instance entry, an ill-formed string or an out-of-width integer make
   expect(
     items('DeleteRecords', { topics: [{ topic: 't', partitions: [{ partition: 2147483648 }] }] })
   ).toBeNull()
+})
+
+it('only refusals made before applying let a call send again', () => {
+  const rows = (...codes) => ({
+    topicErrors: codes.map(([topic, errorCode]) => ({ topic, topicId: `id-${topic}`, errorCode })),
+  })
+  const byName = { topics: ['a', 't'] }
+  expect(resendable(apiKeys.DeleteTopics, byName, rows(['a', 0], ['t', 89]))).toEqual(
+    new Set(['t'])
+  )
+  expect(
+    resendable(apiKeys.DeleteTopics, { topicIds: ['id-a', 'id-t'] }, rows(['a', 0], ['t', 89]))
+  ).toEqual(new Set(['id-t']))
+  expect(resendable(apiKeys.DeleteTopics, byName, rows(['a', 3], ['t', 89]))).toBeNull()
+  expect(resendable(apiKeys.DeleteTopics, byName, rows(['a', 0], ['t', 0]))).toBeNull()
+  for (const code of [7, 41]) {
+    expect(resendable(apiKeys.DeleteTopics, byName, rows(['t', code]))).toBeNull()
+  }
+  for (const api of ['OffsetDelete', 'LeaveGroup']) {
+    expect(resendable(apiKeys[api], {}, { errorCode: 14 })).toBe(true)
+    for (const errorCode of [0, 7, 15, 16, 41]) {
+      expect(resendable(apiKeys[api], {}, { errorCode })).toBeNull()
+    }
+  }
+  expect(
+    resendable(apiKeys.LeaveGroup, {}, { errorCode: 0, members: [{ errorCode: 14 }] })
+  ).toBeNull()
+  for (const api of [
+    'DeleteGroups',
+    'AlterShareGroupOffsets',
+    'DeleteShareGroupOffsets',
+    'InitProducerId',
+    'AlterPartitionReassignments',
+  ]) {
+    expect(resendable(apiKeys[api], {}, { errorCode: 14 })).toBeNull()
+    expect(resendable(apiKeys[api], {}, { errorCode: 89 })).toBeNull()
+  }
+
+  expect(mayResend(true, {})).toBe(true)
+  expect(mayResend(null, byName)).toBe(false)
+  expect(mayResend(new Set(['t']), { topics: ['t'] })).toBe(true)
+  expect(mayResend(new Set(['t']), byName)).toBe(false)
+  expect(mayResend(new Set(['id-t']), { topicIds: ['id-t'] })).toBe(true)
 })
 
 it('validateOnly exempts a request only when its version encodes the flag', () => {

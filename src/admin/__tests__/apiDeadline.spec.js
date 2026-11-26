@@ -1237,6 +1237,55 @@ describe('replay latch', () => {
     })
   })
 
+  it('a refusal made before applying lets the call write only the refused items again', async () => {
+    const { DeleteTopics, OffsetDelete } = require('../../protocol/requests/apiKeys')
+    const deletion = (topics) => ({
+      request: { apiKey: DeleteTopics, apiName: 'DeleteTopics', apiVersion: 6 },
+      args: { topics },
+    })
+    const offsets = {
+      request: { apiKey: OffsetDelete, apiName: 'OffsetDelete', apiVersion: 0 },
+      args: { groupId: 'g' },
+    }
+    const writeOf = (built) => () => currentMutation().latch(built, 0).request.onWrite()
+    await runWithDeadline('deleteTopics', 100, () => {
+      const first = currentMutation().latch(deletion(['a', 't']), 0)
+      first.request.onWrite()
+      first.request.onDecoded({
+        topicErrors: [
+          { topic: 'a', errorCode: 0 },
+          { topic: 't', errorCode: 89 },
+        ],
+      })
+      const refusal = createErrorFromCode(89)
+      expect(first.failed(refusal)).toBe(refusal)
+      expect(isAnsweredError(refusal)).toBe(false)
+      expect(writeOf(deletion(['a', 't']))).toThrow('an earlier request of this call')
+      const second = currentMutation().latch(deletion(['t']), 0)
+      second.request.onWrite()
+      second.request.onDecoded({ topicErrors: [{ topic: 't', errorCode: 0 }] })
+      expect(writeOf(deletion(['t']))).toThrow('an earlier request of this call')
+    })
+    await runWithDeadline('deleteTopics', 100, () => {
+      const latch = currentMutation().latch(deletion(['t']), 0)
+      latch.request.onWrite()
+      latch.request.onDecoded({ topicErrors: [{ topic: 't', errorCode: 89 }] })
+      const other = new KafkaJSError('not the refusal')
+      expect(latch.failed(other)).toBe(other)
+      expect(isAnsweredError(other)).toBe(true)
+      expect(writeOf(deletion(['t']))).toThrow('an earlier request of this call')
+    })
+    await runWithDeadline('deleteOffsets', 100, () => {
+      const loading = currentMutation().latch(offsets, 0)
+      loading.request.onWrite()
+      loading.request.onDecoded({ errorCode: 14, topics: [] })
+      const moved = currentMutation().latch(offsets, 0)
+      moved.request.onWrite()
+      moved.request.onDecoded({ errorCode: 16, topics: [] })
+      expect(writeOf(offsets)).toThrow('an earlier request of this call')
+    })
+  })
+
   it('a send that fails before its write leaves no record and the retry sends once', async () => {
     const error = new KafkaJSError('dial failed')
     await runWithDeadline('deleteGroups', 100, () => {

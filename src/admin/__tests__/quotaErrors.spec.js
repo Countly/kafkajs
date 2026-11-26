@@ -68,10 +68,7 @@ const adminAnswering = ({ method, parse }, answers) => {
   return { admin, broker }
 }
 
-// deleteTopics writes its request at most once, so its quota refusal is final (see below).
-const RESENDING = APIS.filter(({ name }) => name !== 'deleteTopics')
-
-describe.each(RESENDING)('Admin > $name > a quota refuses topics', (api) => {
+describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
   test('sends again only the topics that were refused, and resolves when they go through', async () => {
     const { admin, broker } = adminAnswering(api, [
       [
@@ -121,9 +118,7 @@ describe.each(RESENDING)('Admin > $name > a quota refuses topics', (api) => {
     expect(api.refusal(error.cause)).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
     expect(broker[api.method]).toHaveBeenCalledTimes(RETRY.retries + 1)
   })
-})
 
-describe.each(APIS)('Admin > $name > a quota refuses topics', (api) => {
   test('does not take a connection failure for a refusal', async () => {
     const failure = new KafkaJSConnectionError('Connection error: ECONNRESET')
     const { admin, broker } = adminAnswering(api, [[['a', 0]]])
@@ -208,40 +203,40 @@ const adminOverDeletingBroker = (answers, targets) => {
 const sentTopics = (broker) => broker.deleteTopics.mock.calls.map(([{ topics }]) => topics)
 
 describe('Admin > deleteTopics > the broker deletes part of a batch', () => {
-  test('a quota refusal drops the deleted target without resending', async () => {
+  test('a quota refusal leaves the deleted topic out of the refresh, so the refused one is sent again', async () => {
     const { admin, broker, cluster } = adminOverDeletingBroker(
       [
         [
           ['gone', 0],
           ['kept', THROTTLING_QUOTA_EXCEEDED],
         ],
+        [['kept', 0]],
       ],
       ['gone']
     )
 
-    await expect(admin.deleteTopics({ topics: ['gone', 'kept'] })).rejects.toMatchObject({
-      type: 'THROTTLING_QUOTA_EXCEEDED',
-    })
+    await admin.deleteTopics({ topics: ['gone', 'kept'] })
 
-    expect(sentTopics(broker)).toEqual([['gone', 'kept']])
-    expect([...cluster.targetTopics]).toEqual([])
+    expect(sentTopics(broker)).toEqual([['gone', 'kept'], ['kept']])
+    expect(cluster.targetTopics.size).toBe(0)
   })
 
-  test('a quota reply preserves refused topics for later reads', async () => {
+  test('a quota refusal that outlives the retry budget keeps the refused topic as a target and drops the deleted one', async () => {
     const { admin, broker, cluster } = adminOverDeletingBroker(
       [
         [
           ['gone', 0],
           ['kept', THROTTLING_QUOTA_EXCEEDED],
         ],
+        [['kept', THROTTLING_QUOTA_EXCEEDED]],
       ],
       ['gone', 'kept']
     )
 
     const error = await admin.deleteTopics({ topics: ['gone', 'kept'] }).catch((e) => e)
 
-    expect(error).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
-    expect(sentTopics(broker)).toEqual([['gone', 'kept']])
+    expect(error.cause).toMatchObject({ type: 'THROTTLING_QUOTA_EXCEEDED' })
+    expect(sentTopics(broker)).toEqual([['gone', 'kept'], ['kept'], ['kept']])
     expect([...cluster.targetTopics]).toEqual(['kept'])
     await expect(
       admin.describeConfigs({ resources: [{ type: TOPIC, name: 'kept' }] })

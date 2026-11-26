@@ -294,6 +294,31 @@ describe('Admin > removeMembersFromConsumerGroup', () => {
       }
     )
 
+    test('14, a coordinator still loading the group, is asked again', async () => {
+      const leaveGroup = jest
+        .fn()
+        .mockRejectedValueOnce(createErrorFromCode(14))
+        .mockResolvedValue({ members: [left('', 'a')] })
+      const { admin, cluster } = build({ leaveGroup })
+
+      await expect(admin.removeMembersFromConsumerGroup(request)).resolves.toEqual([
+        { memberId: '', groupInstanceId: 'a', errorCode: 0, error: null },
+      ])
+      expect(leaveGroup).toHaveBeenCalledTimes(2)
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    })
+
+    test('a coordinator that stays loading rejects with the retry budget, naming the cause', async () => {
+      const leaveGroup = jest.fn().mockRejectedValue(createErrorFromCode(14))
+      const { admin } = build({ leaveGroup })
+
+      await expect(admin.removeMembersFromConsumerGroup(request)).rejects.toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: expect.objectContaining({ code: 14 }),
+      })
+      expect(leaveGroup).toHaveBeenCalledTimes(RETRY.retries + 1)
+    })
+
     test('an exhausted coordinator lookup preserves the cause', async () => {
       const leaveGroup = jest.fn()
       const { admin, cluster } = build({ leaveGroup })
