@@ -1,6 +1,10 @@
 const createAdmin = require('../../../../admin')
 const { createGroupApiBroker } = require('../../../../broker/__tests__/fixtures/groupApiHarness')
-const { KafkaJSPartialMessageError, KafkaJSProtocolError } = require('../../../../errors')
+const {
+  KafkaJSPartialMessageError,
+  KafkaJSProtocolError,
+  KafkaJSUnknownOutcomeError,
+} = require('../../../../errors')
 const { newLogger } = require('testHelpers')
 const { decode, parse } = require('./response')
 
@@ -84,7 +88,10 @@ describe('Protocol > Requests > CreateAcls > v3 response', () => {
 
       expect(version).toBe(3)
       expect(value).toBeUndefined()
-      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      // The request was written, so an answer that cannot be read leaves the outcome unknown.
+      expect(error).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+      expect(error.cause).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect(error.cause.message).toContain('CreateAclsResponse.Results')
     })
   })
 })

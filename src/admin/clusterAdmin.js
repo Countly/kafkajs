@@ -1,4 +1,4 @@
-const { retrierOf, checked, waitOf } = require('./deadline')
+const { retrierOf, checked, waitOf, endsCall, isAnsweredError } = require('./deadline')
 const { itemRetry } = require('./itemRetry')
 const {
   KafkaJSInvalidConfigurationError,
@@ -123,7 +123,9 @@ class ClusterAdmin {
       const broker = checked(await waitOf(() => this.cluster.findControllerBroker()))
       return checked(await waitOf(() => broker[method](options)))
     } catch (error) {
-      if (error.code === 41) checked(await waitOf(() => this.cluster.refreshMetadata()))
+      if (!isAnsweredError(error) && error.code === 41) {
+        checked(await waitOf(() => this.cluster.refreshMetadata()))
+      }
       throw error
     }
   }
@@ -148,6 +150,7 @@ class ClusterAdmin {
         refusal = null
         return result
       } catch (error) {
+        if (endsCall(error) || isAnsweredError(error)) throw error
         refusal = error.name === 'KafkaJSProtocolError' ? error : null
         throw error
       }
@@ -181,7 +184,7 @@ class ClusterAdmin {
           items,
           keyOf: (r) => JSON.stringify([r.topic, r.partition]),
           retry: this.retry,
-          retryable: (r) => r.errorCode === 7 || r.errorCode === 41,
+          retryable: () => false,
           callFailure: (e) => this.callFailure(e),
           sanitize: (m) => m,
         },
@@ -248,7 +251,8 @@ class ClusterAdmin {
           items,
           keyOf: (r) => r.feature,
           retry: this.retry,
-          retryable: (r) => r.errorCode === 7 || r.errorCode === 41,
+          retryable: (r) =>
+            options.validateOnly === true && (r.errorCode === 7 || r.errorCode === 41),
           callFailure: (e) => this.callFailure(e),
           sanitize: (m) => m,
         },
