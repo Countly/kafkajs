@@ -1107,7 +1107,7 @@ For share membership use admin.describeShareGroups. Existing admin.describeGroup
 
 - **Token-admin diagnostics.** Token-admin response data and failure payloads are filtered before logging, including when buffer diagnostics are enabled. Use the stable error class, type/code and broker fields for diagnosis. The authorized caller still receives the token HMAC as a Buffer; do not depend on raw diagnostic payloads.
 
-deleteOffsets returns partition errorCode/error results; group-level refusals reject. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
+deleteOffsets resolves with one row per requested partition and never throws for a row's own error, so check every row's errorCode (or error) before treating the offsets as deleted. Only the group-level refusals GROUP_AUTHORIZATION_FAILED (30), GROUP_ID_NOT_FOUND (69), INVALID_GROUP_ID (24) and NON_EMPTY_GROUP (68) reject. Any other whole-response error is copied onto every requested partition: COORDINATOR_LOAD_IN_PROGRESS (14) is first sent again to the same coordinator within the retry budget and the call's deadline, and the rows carry 14 if it outlasts them; COORDINATOR_NOT_AVAILABLE (15) and NOT_COORDINATOR (16) are returned at once on every partition, with no new coordinator lookup, where earlier 3.0.0 prereleases looked the coordinator up again and retried. A resolved call is therefore not proof of deletion. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
 
 Group visibility and the admin client.
 
@@ -1157,13 +1157,17 @@ Group visibility and the admin client.
   resource whose name is the empty string. That name now stands for the cluster-wide default broker
   config, and all three config methods send it to the controller. Every other resource type still
   needs a non-empty name. *What to do:* nothing.
-- **`createTopics` and `createPartitions` retry a quota refusal.** On a cluster with
-  controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
-  request it used to slow down, because the client negotiates newer versions of these APIs. The
-  client waits the throttle time the broker reports and sends only the refused topics again within
-  the `retry` budget, so a call that succeeded under 2.2.4 still succeeds, a little later; one that
-  outlives the budget rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota
-  error. *What to do:* nothing.
+- **`createTopics`, `deleteTopics` and `createPartitions` retry a quota refusal.** On a cluster
+  with controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
+  request it used to slow down, because the client negotiates CreateTopics v7, DeleteTopics v6 and
+  CreatePartitions v3, where 2.2.4 sent v3, v1 and v1, which the broker throttled but did not
+  refuse. The broker checks the quota before it records anything for a topic, so the client waits
+  the throttle time the broker reports and sends only the refused topics again within the `retry`
+  budget and the call's deadline; a topic the broker accepted is never sent again. A call that
+  succeeded under 2.2.4 still succeeds, a little later; one that outlives the budget rejects with
+  `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota error. `deleteTopics` and
+  `createPartitions` retry only when every topic that failed in the answer was refused by the
+  quota. *What to do:* nothing.
 - **Admin and broker results gain keys.** Nothing was renamed or removed; code that compares whole
   objects sees more keys. `admin.fetchTopicMetadata()` topics gain `topicId` (`null` when the broker
   sends none) and `isInternal`, on the Metadata path and on the new `useDescribeTopicPartitions`
@@ -1194,8 +1198,16 @@ Group visibility and the admin client.
   Its `requests` lists the unresolved requests and their items where available. The mutation
   may already have applied. The call's own deadline (`KafkaJSTimeout`) and close errors take
   precedence. An unknown outcome takes precedence over ordinary result rows.
-- A broker error after sending is final, including moved-controller, coordinator, leader, quota
-  and request-timeout errors. Pre-write failures keep their existing retry policy.
+- A broker error after sending is final, including moved-controller, coordinator, leader and
+  request-timeout errors, with two exceptions where the broker refuses before it applies anything:
+  `deleteTopics` sends again only the topics a controller-mutation quota refused
+  (`THROTTLING_QUOTA_EXCEEDED`, when every topic that failed was refused that way), and
+  `deleteOffsets` and `removeMembersFromConsumerGroup` send again a request the group coordinator
+  answered with `COORDINATOR_LOAD_IN_PROGRESS`. Both stay within the `retry` budget and the call's
+  deadline. `NOT_COORDINATOR` and `COORDINATOR_NOT_AVAILABLE` stay final for these calls, and a
+  loading coordinator stays final for `deleteGroups`, `alterShareGroupOffsets` and
+  `deleteShareGroupOffsets`, whose broker can report it after part of the change ran. Pre-write
+  failures keep their existing retry policy.
 - In kafkajs 2.2.4, `deleteTopics`, `deleteTopicRecords`, `alterConfigs`, `createAcls`,
   `deleteAcls` and `alterPartitionReassignments` retried some such errors (`NOT_CONTROLLER`,
   `UNKNOWN_TOPIC_OR_PARTITION` from `deleteTopics`, retriable partition errors from

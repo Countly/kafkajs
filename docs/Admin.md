@@ -25,7 +25,11 @@ client. See [Known issues](MigrationGuide-3-0-0.md#known-issues).
 ## Unanswered mutations
 
 Each public admin call sends a mutating request at most once per item. Broker errors after
-sending are final and keep the method's existing error or result shape. If a reply is missing
+sending are final and keep the method's existing error or result shape, except two refusals the
+broker makes before it applies anything, which are sent again within the `retry` budget and the
+call's deadline: topics `deleteTopics` had refused by a controller-mutation quota
+(`THROTTLING_QUOTA_EXCEEDED`), and a `deleteOffsets` or `removeMembersFromConsumerGroup` request
+the group coordinator answered with `COORDINATOR_LOAD_IN_PROGRESS`. If a reply is missing
 or cannot be decoded, the call rejects with `KafkaJSUnknownOutcomeError` even if other requests
 returned rows. The `requests` field names the APIs, versions, brokers and, where available,
 items of unresolved writes. Check the broker state before repeating the call.
@@ -164,7 +168,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | deleteShareGroups | equivalent | deleteGroups | no separate method; the existing call takes the group id and apiTimeout |
 | deleteStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | deleteStreamsGroups | excluded | Streams-group administration excluded | not implemented |
-| deleteTopics | implemented | deleteTopics | name or topic ID; quota refusals are final; timeoutMs maps to apiTimeout |
+| deleteTopics | implemented | deleteTopics | name or topic ID; quota-refused topics are sent again within the retry budget; timeoutMs maps to apiTimeout |
 | describeAcls | implemented | describeAcls | ordinary method fields and apiTimeout; no semantic option is silently dropped |
 | describeClassicGroups | equivalent | describeGroups | includeAuthorizedOperations; same classic group description facade |
 | describeClientQuotas | implemented | describeClientQuotas | components; strict |
@@ -367,7 +371,7 @@ await admin.createPartitions({
 
 ### Throttled requests
 
-A controller-mutation quota can return `THROTTLING_QUOTA_EXCEEDED` (89) and a throttle time. `createTopics` and `createPartitions` keep their quota retries within the call's retry budget. A quota error from `deleteTopics` is final. The connection honors the broker's throttle time before sending another request. An admin call's `apiTimeout` bounds the whole invocation.
+A controller-mutation quota can return `THROTTLING_QUOTA_EXCEEDED` (89) and a throttle time. The controller checks the quota before it records anything for a topic, so `createTopics`, `createPartitions` and `deleteTopics` (DeleteTopics v6) send only the refused topics again within the call's retry budget; `deleteTopics` and `createPartitions` do so only when every topic that failed in the answer was refused by the quota. kafkajs 2.2.4 sent DeleteTopics v1, which a broker with quotas throttles but does not refuse. The connection honors the broker's throttle time before sending another request. An admin call's `apiTimeout` bounds the whole invocation.
 
 ## <a name="fetch-topic-metadata"></a> Fetch topic metadata
 
@@ -588,7 +592,7 @@ for (const topic of result.topics) {
 }
 ```
 
-`deleteOffsets` deletes the requested committed offsets through the group coordinator using OffsetDelete v0. It returns one partition result per requested partition in caller order; partition errors are data. Group authorization failure, invalid/missing group or non-empty-group refusal rejects with `KafkaJSProtocolError`. A coordinator lookup that fails because the coordinator is loading or moved is retried within the configured retry budget before the request is sent; once it is sent, the partition results in the answer, coordinator errors included, are final and the request is not sent again. The group/topic/partition mutation lists must be nonempty and unique. A timed-out deletion may already have reached the coordinator; the deadline does not prove that it was not applied.
+`deleteOffsets` deletes the requested committed offsets through the group coordinator using OffsetDelete v0. It resolves with one partition result per requested partition in caller order; partition errors are data, so check every row's `errorCode` before treating the offsets as deleted. Only a group-level refusal rejects with `KafkaJSProtocolError`: group authorization failure (30), missing group (69), invalid group (24) or non-empty group (68). Any other whole-response error is copied onto every requested partition. A coordinator lookup that fails because the coordinator is loading or moved is retried within the configured retry budget before the request is sent. Once it is sent, a whole-response `COORDINATOR_LOAD_IN_PROGRESS` (14), which the coordinator returns before it runs the deletion, sends the request again to the same coordinator within the retry budget and the call's deadline, and the rows carry 14 if it outlasts them; `COORDINATOR_NOT_AVAILABLE` (15), `NOT_COORDINATOR` (16) and every partition error are final on the rows, with no new lookup. The group/topic/partition mutation lists must be nonempty and unique. A timed-out deletion may already have reached the coordinator; the deadline does not prove that it was not applied.
 
 ## <a name="reset-offsets"></a> Reset consumer group offsets
 
@@ -1251,7 +1255,7 @@ const results = await admin.removeMembersFromConsumerGroup({ groupId: 'orders', 
 const failed = results.filter(({ error }) => error)
 ```
 
-When finding the coordinator fails because it is not the right one, is not available or is still loading the group, the lookup is retried on the admin's `retry` budget before the request is sent. Once the request is sent, an error in the coordinator's answer rejects without another request, and a missing answer rejects with `KafkaJSUnknownOutcomeError`; any other error before sending rejects.
+When finding the coordinator fails because it is not the right one, is not available or is still loading the group, the lookup is retried on the admin's `retry` budget before the request is sent. Once the request is sent, a coordinator that answers `COORDINATOR_LOAD_IN_PROGRESS`, which it returns before it removes anyone, is asked again on the same budget and the call's deadline; any other error in the coordinator's answer rejects without another request, and a missing answer rejects with `KafkaJSUnknownOutcomeError`; any other error before sending rejects.
 
 ## <a name="delete-topic-records"></a> Delete Topic Records
 
@@ -1552,7 +1556,7 @@ const quotas = await admin.describeClientQuotas({ components: [{ entityType: 'us
 
 `alterUserScramCredentials({ upsertions, deletions, apiTimeout })` requires at least one change. An upsertion is `{ user, mechanism, iterations, password, salt? }`; a deletion is `{ user, mechanism }`. Mechanisms are `SCRAM-SHA-256` or `SCRAM-SHA-512`, iterations are integers from 4096 to 16384, and password is a nonempty string. Salt is an optional Buffer of 1..1024 bytes; the default is 32 random bytes. Each user/mechanism pair appears once across both lists.
 
-The client derives the salted password locally, sends the salt and derived bytes rather than plaintext, and erases its owned working buffers after the call. A supplied salt Buffer is copied and remains caller-owned. Credential data and raw broker echoes are omitted from logs and result messages; diagnose from the typed error and protocol code. Results are one entry per affected user, in first-request order. Each user's row in the answer is final, `NOT_CONTROLLER` included; a controller lookup or connection failure before the request is sent is retried for the unresolved users. A later route or setup failure retains completed users and attaches the original typed local error with code -1 only to unresolved users. Capability, validation, invariant and deadline refusals still reject the whole call. The bootstrap `scripts/createScramCredentials.sh` remains available.
+The client derives the salted password locally, sends the salt and derived bytes rather than plaintext, and erases its owned working buffers after the call. A supplied salt Buffer is copied and remains caller-owned. Credential data and raw broker echoes are omitted from logs and result messages; diagnose from the typed error and protocol code. Results are one entry per affected user, in first-request order. Each user's row in the answer is final, `NOT_CONTROLLER` included; a controller lookup or connection failure before the request is sent is retried for the unresolved users. A route or setup failure that ends those retries, which also comes before this single request is written, retains completed users and attaches the original typed local error with code -1 only to unresolved users. Capability, validation, invariant and deadline refusals still reject the whole call. The bootstrap `scripts/createScramCredentials.sh` remains available.
 
 ```js
 await admin.alterUserScramCredentials({
