@@ -28,7 +28,8 @@ Each public admin call sends a mutating request at most once per item. Broker er
 sending are final and keep the method's existing error or result shape, except two refusals the
 broker makes before it applies anything, which are sent again within the `retry` budget and the
 call's deadline: topics `deleteTopics` had refused by a controller-mutation quota
-(`THROTTLING_QUOTA_EXCEEDED`), and a `deleteOffsets` or `removeMembersFromConsumerGroup` request
+(`THROTTLING_QUOTA_EXCEEDED`), sent again by the topic ID the answer gave for each, and a
+`deleteOffsets` or `removeMembersFromConsumerGroup` request
 the group coordinator answered with `COORDINATOR_LOAD_IN_PROGRESS`. If a reply is missing
 or cannot be decoded, the call rejects with `KafkaJSUnknownOutcomeError` even if other requests
 returned rows. The `requests` field names the APIs, versions, brokers and, where available,
@@ -337,7 +338,7 @@ Topic deletion is disabled by default in Apache Kafka versions prior to `1.0.0`.
 delete.topic.enable=true
 ```
 
-Delete by topic ID with `deleteTopics({ topicIds: [topicId], timeout })`. Exactly one of `topics` and `topicIds` is required. IDs must be unique canonical UUID strings and cannot be the zero UUID; letter case is normalized. ID deletion needs DeleteTopics v6. Both forms resolve with no value on success and keep the existing thrown-error contract. Failed ID entries retain `topicId`; their legacy string `topic` field is the broker's name when present, otherwise the canonical ID. Every response must cover exactly the IDs attempted before results are accepted. A broker answer, a quota refusal included, is final: the request is not sent again. A failure during the follow-up metadata refresh propagates without resending a confirmed deletion. `timeout` remains the broker timeout and `apiTimeout` bounds the whole call.
+Delete by topic ID with `deleteTopics({ topicIds: [topicId], timeout })`. Exactly one of `topics` and `topicIds` is required. IDs must be unique canonical UUID strings and cannot be the zero UUID; letter case is normalized. ID deletion needs DeleteTopics v6. Both forms resolve with no value on success and keep the existing thrown-error contract. Failed ID entries retain `topicId`; their legacy string `topic` field is the broker's name when present, otherwise the canonical ID. Every response must cover exactly the IDs attempted before results are accepted. A broker answer is final and the request is not sent again, with one exception: when every topic the controller answered with an error was refused by its mutation quota (`THROTTLING_QUOTA_EXCEEDED`), only those IDs are sent again, after the broker's throttle time, within the `retry` budget and the call's deadline, and the IDs the broker accepted never are. A deletion by name that a quota refuses continues the same way, by the IDs the answer gave for the refused names; a refusal row without an ID (DeleteTopics v5 and older, or a null ID) is final. A failure during the follow-up metadata refresh propagates without resending a confirmed deletion. `timeout` remains the broker timeout and `apiTimeout` bounds the whole call.
 
 ## <a name="create-partitions"></a> Create partitions
 
@@ -371,7 +372,7 @@ await admin.createPartitions({
 
 ### Throttled requests
 
-A controller-mutation quota can return `THROTTLING_QUOTA_EXCEEDED` (89) and a throttle time. The controller checks the quota before it records anything for a topic, so `createTopics`, `createPartitions` and `deleteTopics` (DeleteTopics v6) send only the refused topics again within the call's retry budget; `deleteTopics` and `createPartitions` do so only when every topic that failed in the answer was refused by the quota. kafkajs 2.2.4 sent DeleteTopics v1, which a broker with quotas throttles but does not refuse. The connection honors the broker's throttle time before sending another request. An admin call's `apiTimeout` bounds the whole invocation.
+A controller-mutation quota can return `THROTTLING_QUOTA_EXCEEDED` (89) and a throttle time. The controller checks the quota before it records anything for a topic, so `createTopics`, `createPartitions` and `deleteTopics` (DeleteTopics v6) send only the refused topics again within the call's retry budget; `deleteTopics` and `createPartitions` do so only when every topic that failed in the answer was refused by the quota. `deleteTopics` sends a refused topic again by the topic ID the answer gave for it, even when the call named it, so a topic deleted and recreated under that name meanwhile is not touched; a refusal that gives no ID is final. kafkajs 2.2.4 sent DeleteTopics v1, which a broker with quotas throttles but does not refuse. The connection honors the broker's throttle time before sending another request. An admin call's `apiTimeout` bounds the whole invocation.
 
 ## <a name="fetch-topic-metadata"></a> Fetch topic metadata
 
@@ -592,7 +593,7 @@ for (const topic of result.topics) {
 }
 ```
 
-`deleteOffsets` deletes the requested committed offsets through the group coordinator using OffsetDelete v0. It resolves with one partition result per requested partition in caller order; partition errors are data, so check every row's `errorCode` before treating the offsets as deleted. Only a group-level refusal rejects with `KafkaJSProtocolError`: group authorization failure (30), missing group (69), invalid group (24) or non-empty group (68). Any other whole-response error is copied onto every requested partition. A coordinator lookup that fails because the coordinator is loading or moved is retried within the configured retry budget before the request is sent. Once it is sent, a whole-response `COORDINATOR_LOAD_IN_PROGRESS` (14), which the coordinator returns before it runs the deletion, sends the request again to the same coordinator within the retry budget and the call's deadline, and the rows carry 14 if it outlasts them; `COORDINATOR_NOT_AVAILABLE` (15), `NOT_COORDINATOR` (16) and every partition error are final on the rows, with no new lookup. The group/topic/partition mutation lists must be nonempty and unique. A timed-out deletion may already have reached the coordinator; the deadline does not prove that it was not applied.
+`deleteOffsets` deletes the requested committed offsets through the group coordinator using OffsetDelete v0. It resolves with one partition result per requested partition in caller order; partition errors are data, so check every row's `errorCode` before treating the offsets as deleted. Only a group-level refusal rejects with `KafkaJSProtocolError`: group authorization failure (30), missing group (69), invalid group (24) or non-empty group (68). Any other whole-response error is copied onto every requested partition. A coordinator lookup that fails because the coordinator is loading or moved is retried within the configured retry budget before the request is sent. Once it is sent, a whole-response `COORDINATOR_LOAD_IN_PROGRESS` (14), which the coordinator returns before it runs the deletion, sends the request again to the same coordinator within the retry budget and the call's deadline. If the retry budget is spent first, the call resolves with code 14 on every requested partition; if the call's deadline passes first, it rejects with `KafkaJSTimeout`. `COORDINATOR_NOT_AVAILABLE` (15), `NOT_COORDINATOR` (16) and every partition error are final on the rows, with no new lookup. The group/topic/partition mutation lists must be nonempty and unique. A timed-out deletion may already have reached the coordinator; the deadline does not prove that it was not applied.
 
 ## <a name="reset-offsets"></a> Reset consumer group offsets
 
@@ -1255,7 +1256,7 @@ const results = await admin.removeMembersFromConsumerGroup({ groupId: 'orders', 
 const failed = results.filter(({ error }) => error)
 ```
 
-When finding the coordinator fails because it is not the right one, is not available or is still loading the group, the lookup is retried on the admin's `retry` budget before the request is sent. Once the request is sent, a coordinator that answers `COORDINATOR_LOAD_IN_PROGRESS`, which it returns before it removes anyone, is asked again on the same budget and the call's deadline; any other error in the coordinator's answer rejects without another request, and a missing answer rejects with `KafkaJSUnknownOutcomeError`; any other error before sending rejects.
+When finding the coordinator fails because it is not the right one, is not available or is still loading the group, the lookup is retried on the admin's `retry` budget before the request is sent. Once the request is sent, a coordinator that answers with a top-level `COORDINATOR_LOAD_IN_PROGRESS`, which it returns before it removes anyone, is asked again on the same budget and the call's deadline; any other top-level error in the coordinator's answer rejects without another request (member errors are returned as result rows), and a missing answer rejects with `KafkaJSUnknownOutcomeError`; any other error before sending rejects.
 
 ## <a name="delete-topic-records"></a> Delete Topic Records
 

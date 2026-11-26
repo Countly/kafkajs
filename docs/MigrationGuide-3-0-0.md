@@ -1107,7 +1107,7 @@ For share membership use admin.describeShareGroups. Existing admin.describeGroup
 
 - **Token-admin diagnostics.** Token-admin response data and failure payloads are filtered before logging, including when buffer diagnostics are enabled. Use the stable error class, type/code and broker fields for diagnosis. The authorized caller still receives the token HMAC as a Buffer; do not depend on raw diagnostic payloads.
 
-deleteOffsets resolves with one row per requested partition and never throws for a row's own error, so check every row's errorCode (or error) before treating the offsets as deleted. Only the group-level refusals GROUP_AUTHORIZATION_FAILED (30), GROUP_ID_NOT_FOUND (69), INVALID_GROUP_ID (24) and NON_EMPTY_GROUP (68) reject. Any other whole-response error is copied onto every requested partition: COORDINATOR_LOAD_IN_PROGRESS (14) is first sent again to the same coordinator within the retry budget and the call's deadline, and the rows carry 14 if it outlasts them; COORDINATOR_NOT_AVAILABLE (15) and NOT_COORDINATOR (16) are returned at once on every partition, with no new coordinator lookup, where earlier 3.0.0 prereleases looked the coordinator up again and retried. A resolved call is therefore not proof of deletion. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
+deleteOffsets resolves with one row per requested partition and never throws for a row's own error, so check every row's errorCode (or error) before treating the offsets as deleted. Only the group-level refusals GROUP_AUTHORIZATION_FAILED (30), GROUP_ID_NOT_FOUND (69), INVALID_GROUP_ID (24) and NON_EMPTY_GROUP (68) reject. Any other whole-response error is copied onto every requested partition: COORDINATOR_LOAD_IN_PROGRESS (14) is first sent again to the same coordinator within the retry budget and the call's deadline: if the retry budget is spent first, the rows carry 14, and if the call's deadline passes first, the call rejects with KafkaJSTimeout; COORDINATOR_NOT_AVAILABLE (15) and NOT_COORDINATOR (16) are returned at once on every partition, with no new coordinator lookup, where earlier 3.0.0 prereleases looked the coordinator up again and retried. A resolved call is therefore not proof of deletion. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
 
 Group visibility and the admin client.
 
@@ -1167,7 +1167,10 @@ Group visibility and the admin client.
   succeeded under 2.2.4 still succeeds, a little later; one that outlives the budget rejects with
   `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota error. `deleteTopics` and
   `createPartitions` retry only when every topic that failed in the answer was refused by the
-  quota. *What to do:* nothing.
+  quota. `deleteTopics` sends a refused topic again by the topic ID the answer gave for it, also
+  when the call named it, so a topic deleted and recreated under that name during the wait is not
+  deleted; a refusal without an ID (DeleteTopics v5 and older, or a null ID) is final. Errors
+  still name the topics you passed. *What to do:* nothing.
 - **Admin and broker results gain keys.** Nothing was renamed or removed; code that compares whole
   objects sees more keys. `admin.fetchTopicMetadata()` topics gain `topicId` (`null` when the broker
   sends none) and `isInternal`, on the Metadata path and on the new `useDescribeTopicPartitions`
@@ -1193,15 +1196,16 @@ Group visibility and the admin client.
   `fetchTopicMetadata()` with no topics now returns such a partition with its `partitionErrorCode`
   and `leader: -1` instead of waiting. *What to do:* code that used `fetchTopicMetadata()` to wait
   for leaders should name the topics: a named request still waits.
-- **Admin mutations write each item at most once per call.** If the broker's answer is missing
+- **A written admin mutation with no usable answer is never sent again.** If the broker's answer is missing
   or cannot be decoded, the call rejects with `KafkaJSUnknownOutcomeError` (`retriable: false`).
   Its `requests` lists the unresolved requests and their items where available. The mutation
   may already have applied. The call's own deadline (`KafkaJSTimeout`) and close errors take
   precedence. An unknown outcome takes precedence over ordinary result rows.
 - A broker error after sending is final, including moved-controller, coordinator, leader and
   request-timeout errors, with two exceptions where the broker refuses before it applies anything:
-  `deleteTopics` sends again only the topics a controller-mutation quota refused
-  (`THROTTLING_QUOTA_EXCEEDED`, when every topic that failed was refused that way), and
+  `deleteTopics` sends again, by topic ID, only the topics a controller-mutation quota refused
+  (`THROTTLING_QUOTA_EXCEEDED`, when every topic that failed was refused that way and the answer
+  gives each one's ID), and
   `deleteOffsets` and `removeMembersFromConsumerGroup` send again a request the group coordinator
   answered with `COORDINATOR_LOAD_IN_PROGRESS`. Both stay within the `retry` budget and the call's
   deadline. `NOT_COORDINATOR` and `COORDINATOR_NOT_AVAILABLE` stay final for these calls, and a
