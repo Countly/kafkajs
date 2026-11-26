@@ -327,6 +327,11 @@ const createProducer = ({
    *   `disconnect()` aborts a transaction left open through it
    */
   let lastTransaction = null
+  /**
+   * @type {Promise<void>|null} the `transaction()` call that is initializing the producer id and
+   *   beginning its transaction: the one owner at a time, which later calls wait for
+   */
+  let beginning = null
 
   /**
    * Refuses work if either identity is fatal, preserving the armed object and its cause.
@@ -434,6 +439,12 @@ const createProducer = ({
    * `sendOffsets`, `abort()` and `producer.transaction()` throw a `KafkaJSNonRetriableError` saying
    * so. A `commit()` called while another is under way joins it, as the Java producer hands a
    * repeated `commitTransaction()` the result already pending.
+   *
+   * Calls begin one at a time. A call made while another initializes the producer id or finds the
+   * transaction coordinator waits for it, then is refused with the ongoing-transaction error if that
+   * call began a transaction, before it sends any request or moves the transaction version; if that
+   * call failed, one of the waiting calls becomes the next to begin. A waiting call whose producer
+   * closed meanwhile is refused with the close error.
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050%3A+Consistent+error+handling+for+Transactions
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @returns {Promise<Transaction>}
@@ -498,22 +509,38 @@ const createProducer = ({
       })
     const { stateManager } = transactionalEosManager
 
+    // A call that waited checks its lifecycle again; one that did not keeps the order it always had.
+    if (beginning !== null) {
+      // eslint-disable-next-line no-unmodified-loop-condition -- the owner clears it while this awaits
+      while (beginning !== null) {
+        await beginning.catch(() => {})
+      }
+      lifecycle.check()
+    }
     if (transactionalEosManager.isInTransaction()) {
       throw ongoingTransactionError()
     }
 
+    const current = (async () => {
+      try {
+        // We only initialize the producer id once
+        if (!transactionalEosManager.isInitialized()) {
+          await transactionalEosManager.initProducerId()
+        }
+        await transactionalEosManager.beginTransaction()
+      } catch (error) {
+        // Another transaction() began while this one was initializing or finding the coordinator.
+        if (transactionalEosManager.isInTransaction()) {
+          throw ongoingTransactionError()
+        }
+        throw error
+      }
+    })()
+    beginning = current
     try {
-      // We only initialize the producer id once
-      if (!transactionalEosManager.isInitialized()) {
-        await transactionalEosManager.initProducerId()
-      }
-      await transactionalEosManager.beginTransaction()
-    } catch (error) {
-      // Another transaction() began while this one was initializing or finding the coordinator.
-      if (transactionalEosManager.isInTransaction()) {
-        throw ongoingTransactionError()
-      }
-      throw error
+      await current
+    } finally {
+      if (beginning === current) beginning = null
     }
     // IN_TRANSACTION has no edge to READY. Begin sent no EndTxn and published no facade,
     // so step ABORTING then READY before the close error. abort() would write.

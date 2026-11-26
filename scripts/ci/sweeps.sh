@@ -182,6 +182,23 @@ check label "$(printf '%s\n%s\n%s\n' "$baseline" "$NEW_LABELS" "$SELF_LABELS")"
 stale_exceptions label-new "$NEW_LABELS" "$out/label.hits"
 hits test-only-export -n -E 'forTest|testOnly|__test' -- 'src/*.js' ':!*.spec.js' ':!*__tests__*' ':!*/fixtures/*'
 check test-only-export ''
+# A consumer reads the process-wide handler and rebalance-callback stores only through the helpers that check
+# the store is its own; the runner's defaults and the producer's transactional enlistment are enumerated.
+hits ambient-store -n -E 'handlerContext\.current\b|RebalanceHooks\.current\b|RebalanceHooks\.refusal\(\)|\{[^}]*\bcurrent\b[^}]*\} = require\([^)]*(handlerContext|rebalanceHooks)' -- 'src/*.js' ':!*.spec.js' ':!*__tests__*' ':!*/fixtures/*'
+AMBIENT_STORE=$(cat <<'LIST'
+src/consumer/index.js:    const identity = handlerContext.current()
+src/consumer/index.js:    const record = RebalanceHooks.current()
+src/consumer/runner.js:  commitRefusal(token = this.consumerGroup.ownership?.token(), batch = handlerContext.current()) {
+src/consumer/runner.js:  autoCommitOffsets(batch = handlerContext.current() ?? null, round = null) {
+src/consumer/runner.js:  autoCommitOffsetsIfNecessary(batch = handlerContext.current() ?? null) {
+src/consumer/runner.js:    batch = handlerContext.current() ?? null,
+src/consumer/runner.js:    { operation, invocation = RebalanceHooks.current() } = {}
+src/consumer/consumerGroup.js:  async position(entry, { operation, invocation = RebalanceHooks.current() } = {}) {
+src/producer/eosManager/index.js:      const identity = handlerContext.current()
+LIST
+)
+check ambient-store "$AMBIENT_STORE"
+stale_exceptions ambient-store "$AMBIENT_STORE" "$out/ambient-store.hits"
 hits focused-or-failing -n -E '\b(it|test|describe)\.(failing|only)\(|\bf(it|describe)\(' -- src scripts testHelpers otel/test
 # Private JavaScript methods are not focused Jest calls.
 PRIVATE_METHODS=$(printf '%b\n' "$(cat <<'LIST'

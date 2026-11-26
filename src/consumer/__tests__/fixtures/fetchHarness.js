@@ -935,6 +935,7 @@ module.exports = {
   TOPIC,
   TOPIC_ID,
   prepareRecordBatches,
+  buildRecordBatch,
   apiVersionsBody,
   decodeFetchRequest,
   decodeOffsetForLeaderEpochRequests,

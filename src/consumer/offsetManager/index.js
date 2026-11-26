@@ -398,6 +398,22 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * The position a Fetch built now would ask this partition for, as a decimal string: what
+   * `nextOffset` returns, read without seeding and without throwing for a topic this manager no
+   * longer holds. Read once per fetched partition, to tell an answer for the position asked for
+   * from one for a position the partition has left.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {string|null} the resolved offset, else the committed one, `'0'` when that is invalid,
+   *   and `null` when the partition holds neither
+   */
+  positionOf(topic, partition) {
+    const offset = this.resolvedOffsets[topic]?.[partition] || this.heldOffsetAt(topic, partition)
+    if (offset == null) return null
+    return isInvalidOffset(offset) ? '0' : String(offset)
+  }
+
+  /**
    * The offset this partition has resolved to, exactly as stored.
    *
    * A pure read, on the fetch hot path: no seeding (unlike `nextOffset`, which writes
@@ -1844,7 +1860,10 @@ module.exports = class OffsetManager {
           this.owns(topic, partition) &&
           !preparation?.guard() &&
           !this.isStale(ticket, topic, partition, requestedIds)
-        const resolved = await new ResetResolver(this.cluster).resolve(
+        const resolved = await new ResetResolver(this.cluster, {
+          logger: this.logger,
+          groupId: this.groupId,
+        }).resolve(
           consumerOffsets,
           this.topicConfigurations,
           current,

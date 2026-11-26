@@ -479,6 +479,12 @@ describe('Network > generation failure boundaries', () => {
     'a guard that %s a frozen error at checkpoint %i keeps that rejection and a usable connection',
     async (mode, checkpoint) => {
       const { broker, cluster } = await stalledBroker()
+      cluster.answer('OffsetCommit', ({ topics }) => ({
+        topics: topics.map(({ topic, partitions }) => ({
+          topic,
+          partitions: partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        })),
+      }))
       const refusal = Object.freeze(new Error('membership lost'))
       let calls = 0
       const guard = () => {

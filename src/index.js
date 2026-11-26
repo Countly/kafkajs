@@ -367,14 +367,16 @@ const validateBuffer = ({ bufferMemory, maxBlockMs }) => {
 /**
  * Checks a producer's `maxRequestSize`: an integer from the smallest Produce request this
  * producer's identifiers allow (its framing, one batch header and one empty record) to 2147483647.
- * @param {number|undefined} maxRequestSize absent keeps the default
+ * @param {number|undefined} maxRequestSize absent keeps the default; `null` is refused like any
+ *   other value that is not an integer
  * @param {string|null|undefined} clientId
  * @param {string|null|undefined} transactionalId
  * @returns {void}
  * @throws {KafkaJSInvalidConfigurationError} naming the minimum
  */
 const validateMaxRequestSize = (maxRequestSize, clientId, transactionalId) => {
-  const value = maxRequestSize ?? createProducer.defaults.maxRequestSize
+  const value =
+    maxRequestSize === undefined ? createProducer.defaults.maxRequestSize : maxRequestSize
   const minimum = minimumRequestSize(clientId, transactionalId)
   if (!(Number.isInteger(value) && value >= minimum && value <= INT_32_MAX_VALUE)) {
     throw new KafkaJSInvalidConfigurationError(

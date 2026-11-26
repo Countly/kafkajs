@@ -1,4 +1,9 @@
 const { KafkaJSNonRetriableError, KafkaJSNoOffsetError } = require('../errors')
+const isInvalidOffset = require('./offsetManager/isInvalidOffset')
+
+const UNUSABLE_OFFSET =
+  "Stored committed offset is not a valid offset and is treated as no committed offset, so the reset policy applies: 'latest' starts at the end of the log and skips earlier unread records, 'earliest' starts at the beginning, 'none' halts the partition. To choose the position, call admin.setOffsets with the group inactive, or consumer.seek() on the running consumer; admin.resetOffsets only reapplies the reset policy"
+
 const invalid = (value) =>
   new KafkaJSNonRetriableError(
     `Invalid value \`${String(value)}\` for configuration auto.offset.reset. The value must be either 'earliest', 'latest', 'none' or of the format 'by_duration:<PnDTnHnMn.nS.>'.`
@@ -69,16 +74,24 @@ function resetTimestamp(policy, now = Date.now()) {
 class ResetResolver {
   /**
    * @param {object} cluster existing cluster with fetchTopicsOffset
+   * @param {object} [options]
+   * @param {import('../../types').Logger} [options.logger] receives the warning for a stored
+   *   offset below -2
+   * @param {string} [options.groupId] the group named in that warning
    * @returns {ResetResolver} resolution-only adapter
    * @throws Never.
    */
-  constructor(cluster) {
+  constructor(cluster, { logger, groupId } = {}) {
     this.cluster = cluster
+    this.logger = logger
+    this.groupId = groupId
   }
 
   /**
    * Resolves invalid offsets, excluding none refusals from all ListOffsets calls.
-   * Explicit pending sentinel seeks override the subscription policy. A timestamp
+   * Any negative stored offset is "no committed offset", as in kafkajs 2.2.4 and the Java client;
+   * one below -2 (not a value `admin.resetOffsets` writes) is logged as a warning when a current
+   * cell takes the reset policy. Explicit pending sentinel seeks override the subscription policy. A timestamp
    * miss gets one latest fallback; stale work cannot issue that follow-up.
    * @param {object[]} entries current OffsetFetch entries after owed-reset marking
    * @param {object} configurations topic settings with resetPolicy
@@ -104,9 +117,18 @@ class ResetResolver {
       for (const entry of partitions) {
         const { partition, offset } = entry
         if (!current(topic, partition)) continue
-        if (offset != null && offset !== '-1' && offset !== '-2') {
+        if (offset != null && !isInvalidOffset(offset)) {
           kept.push(entry)
           continue
+        }
+        if (offset != null && offset !== '-1' && offset !== '-2') {
+          this.logger?.warn(UNUSABLE_OFFSET, {
+            groupId: this.groupId,
+            topic,
+            partition,
+            storedOffset: offset,
+            resetPolicy: policy.kind,
+          })
         }
         const explicit = pending(topic, partition)
         if (policy.kind === 'none' && explicit === undefined) {
