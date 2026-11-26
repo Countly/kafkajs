@@ -557,7 +557,9 @@ const useClusterLookups = (cluster, topic, partitionMetadata) => {
 }
 
 describe('Producer > the idempotent drain loop', () => {
+  // Spies first: a spy on a fake timer restored after the clock is gone would bring back a dead timer.
   afterEach(() => {
+    jest.restoreAllMocks()
     jest.useRealTimers()
   })
 
@@ -2706,6 +2708,82 @@ describe('Producer > the idempotent drain loop', () => {
 
       expect((await sending).message).toEqual('aborted')
       expect(jest.getTimerCount()).toBe(0)
+    })
+  })
+
+  describe('per-broker hand-off state', () => {
+    const nodeIds = Array.from({ length: 10 }, (_, index) => String(index + 1))
+    let maps
+
+    // The hand-off map is private: it is found by the writes of a promise under a node id.
+    beforeEach(() => {
+      maps = new Set()
+      const set = Map.prototype.set
+      jest.spyOn(Map.prototype, 'set').mockImplementation(function (key, value) {
+        if (value instanceof Promise && nodeIds.includes(key)) maps.add(this)
+        return set.call(this, key, value)
+      })
+    })
+
+    test('a broker’s hand-off entry is gone once its requests settle', async () => {
+      const layout = {
+        [TOPIC]: Object.fromEntries(nodeIds.map((id, partition) => [partition, Number(id)])),
+      }
+      const harness = createHarness({ layout })
+      await harness.start()
+
+      await harness.send([
+        { topic: TOPIC, messages: nodeIds.flatMap((_, partition) => records(partition)) },
+      ])
+      await settle()
+
+      expect(new Set(harness.produced.map(({ nodeId }) => nodeId)).size).toBe(10)
+      expect(maps.size).toBe(1)
+      expect([...maps][0].size).toBe(0)
+    })
+
+    test('a newer hand-off to the same broker is kept until it settles, and requests keep their order', async () => {
+      const harness = createHarness({ layout: { [TOPIC]: { 0: 1, 1: 1 } } })
+      await harness.start()
+      const firstFound = deferred()
+      const secondFound = deferred()
+      const findBroker = harness.cluster.findBroker.getMockImplementation()
+      harness.cluster.findBroker
+        .mockImplementationOnce(async (node) => {
+          await firstFound.promise
+          return findBroker(node)
+        })
+        .mockImplementationOnce(async (node) => {
+          await secondFound.promise
+          return findBroker(node)
+        })
+        .mockImplementation(findBroker)
+
+      const first = harness.send([{ topic: TOPIC, messages: records(0) }])
+      await settle()
+      const second = harness.send([{ topic: TOPIC, messages: records(1) }], { compression: 1 })
+      await settle()
+
+      expect(harness.produced).toEqual([])
+      expect(maps.size).toBe(1)
+      const handoffs = [...maps][0]
+      expect([...handoffs.keys()]).toEqual(['1'])
+
+      firstFound.resolve()
+      await settle()
+
+      expect(harness.sent().map(({ partitions }) => partitions)).toEqual([['topic-a/0@0']])
+      expect([...handoffs.keys()]).toEqual(['1'])
+
+      secondFound.resolve()
+      await Promise.all([first, second])
+      await settle()
+
+      expect(harness.sent().map(({ partitions }) => partitions)).toEqual([
+        ['topic-a/0@0'],
+        ['topic-a/1@0'],
+      ])
+      expect(handoffs.size).toBe(0)
     })
   })
 

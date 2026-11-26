@@ -163,7 +163,11 @@ describe('a close that is still running when a replacement connects', () => {
 
   it('a handler of the run being closed does not wait for its own close', async () => {
     const stopped = gate()
-    jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
+    let runIdentity
+    jest.spyOn(Runner.prototype, 'start').mockImplementation(function () {
+      runIdentity = this.consumerGroup.runIdentity
+      return Promise.resolve()
+    })
     jest.spyOn(Runner.prototype, 'stop').mockImplementation(() => stopped.promise)
     const { cluster } = scriptedCluster()
     const consumer = build(cluster)
@@ -172,15 +176,26 @@ describe('a close that is still running when a replacement connects', () => {
     await consumer.run({ eachMessage: async () => {} })
     const closing = consumer.disconnect()
     await flush()
-    const inHandler = handlerContext.run(
-      { topic: 't', partition: 0, assignmentEpoch: 1, acquireClock: 1, ownershipKey: 'k' },
-      () => consumer.connect()
-    )
+    const inHandler = handlerContext
+      .run(
+        {
+          topic: 't',
+          partition: 0,
+          assignmentEpoch: 1,
+          acquireClock: 1,
+          ownershipKey: 'k',
+          runIdentity,
+        },
+        () => consumer.connect()
+      )
+      .then(
+        () => 'connected',
+        (error) => error
+      )
     const outcome = await Promise.race([inHandler, pause(200).then(() => 'waited')])
-    expect(outcome).toBeUndefined()
+    expect(outcome).toMatchObject({ type: 'CONSUMER_STOPPING' })
     stopped.resolve()
     await closing
-    await inHandler
   })
 })
 

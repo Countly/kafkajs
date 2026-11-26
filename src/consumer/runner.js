@@ -332,7 +332,8 @@ module.exports = class Runner extends EventEmitter {
       this.running = true
       await this.runInitialRound()
     } catch (e) {
-      this.running = false
+      // `running` stays true until `onCrash` is done, as in the fetch loop's crash path: the
+      // cleanup's `stop()` then runs in full, so a member that joined leaves the group.
       this.disarmFatal()
       if (this.stopRequested && e?.type === 'CONSUMER_STOPPING') return
 
@@ -349,11 +350,11 @@ module.exports = class Runner extends EventEmitter {
         })
         return
       } finally {
-        // A round that armed the manager before the chain threw leaves it running, and `stop()`
-        // returns early on the `running` this catch has already cleared - so nothing else would
-        // ever cancel it, and the handle is not unref'd. Latched rather than merely cancelled,
-        // so a settling reconciliation cannot arm it again. Last word deliberately: it runs after
-        // `onCrash` (and the disconnect/stop inside it), so a late re-arm is undone too.
+        // A crash handler that did not stop the run leaves it running and the manager armed, and
+        // the handle is not unref'd. Latched rather than merely cancelled, so a settling
+        // reconciliation cannot arm it again. Last word deliberately: it runs after `onCrash` (and
+        // the disconnect/stop inside it), so a late re-arm is undone too.
+        this.running = false
         this.heartbeatManager.shutdown()
         this.pollTimer.stop()
       }
@@ -1605,6 +1606,16 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
+   * Whether the batch's partition is paused now. A group without `isPaused` (a test double; the
+   * consumer group always has it) reads as not paused.
+   * @param {import('./batch')} batch
+   * @returns {boolean}
+   */
+  #paused(batch) {
+    return this.consumerGroup.isPaused?.(batch.topic, batch.partition) === true
+  }
+
+  /**
    * Whether the batch's records were superseded after it was fetched: its topic was deleted and
    * recreated, so they belong to an incarnation this member no longer reads, its partition was
    * sought (`ConsumerGroup#seek`), so they are not at the position the application asked for, or
@@ -1742,6 +1753,19 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
+    // A partition paused while its batch waited in the queue is not delivered; resume fetches it
+    // again from the position it holds, which nothing here has moved.
+    if (this.#paused(batch)) {
+      this.logger.debug('Dropping a queued batch for a paused partition', {
+        groupId: this.consumerGroup.groupId,
+        memberId: this.consumerGroup.memberId,
+        topic: batch.topic,
+        partition: batch.partition,
+      })
+
+      return
+    }
+
     /** @param {import('./batch')} batch */
     const onBatch = async (batch) => {
       const startBatchProcess = Date.now()
@@ -1795,6 +1819,16 @@ module.exports = class Runner extends EventEmitter {
       if (batch.isEmptyDueToFiltering()) {
         this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
+        // A START_BATCH_PROCESS listener can pause the partition: nothing is resolved, and
+        // END_BATCH_PROCESS still pairs with START.
+        if (this.#paused(batch)) {
+          this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
+            ...payload,
+            duration: Date.now() - startBatchProcess,
+          })
+          return
+        }
+
         const lastOffset = batch.lastOffset()
         this.resolveBatchOffset(batch, lastOffset, batch.leaderEpochAt(lastOffset))
         await this.autoCommitOffsetsIfNecessary(null)
@@ -1826,10 +1860,15 @@ module.exports = class Runner extends EventEmitter {
         groupId: this.consumerGroup.groupId,
         runIdentity: this.consumerGroup.runIdentity,
       }
-      // A START_BATCH_PROCESS listener can seek the partition: such a batch is not handed over,
-      // and END_BATCH_PROCESS still pairs with START.
+      // A START_BATCH_PROCESS listener can seek or pause the partition: such a batch is not handed
+      // over, and END_BATCH_PROCESS still pairs with START.
       if (this.isSuperseded(batch)) {
         this.logger.debug('Not handing over a batch a seek superseded', { topic, partition })
+      } else if (this.#paused(batch)) {
+        this.logger.debug('Not handing over a batch of a partition a listener paused', {
+          topic,
+          partition,
+        })
       } else if (this.eachMessage) {
         await handlerContext.run(identity, () => this.processEachMessage(batch))
       } else if (this.eachBatch) {
@@ -2221,8 +2260,9 @@ module.exports = class Runner extends EventEmitter {
    * the group to rejoin, as the same answer to a heartbeat does.
    * @param {Object} offsets the offsets to commit
    * @param {object} [batch] the original handler batch, absent for detached calls
-   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context] the
-   *   public call's private deadline scope
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation, invocation?: object|null }} [context]
+   *   the public call's private deadline scope, and the calling rebalance callback's invocation
+   *   (`null` for none; the ambient one by default)
    * @returns {Promise<void>|undefined} settles once the offsets are committed; `undefined` for an
    *   empty list on a runner that is not running
    * @throws {import('../errors').KafkaJSDeliveryTimeout|import('../errors').KafkaJSNumberOfRetriesExceeded|import('../errors').KafkaJSCommitFailedError|import('../errors').KafkaJSNonRetriableError|Error}
@@ -2230,12 +2270,15 @@ module.exports = class Runner extends EventEmitter {
    *   or a crash cleanup, or an admitted call fails after the run stopped;
    *   `KafkaJSNonRetriableError` when it starts before the run is running
    */
-  commitOffsets(offsets, batch = handlerContext.current() ?? null, { operation } = {}) {
+  commitOffsets(
+    offsets,
+    batch = handlerContext.current() ?? null,
+    { operation, invocation = RebalanceHooks.current() } = {}
+  ) {
     const ownership = this.consumerGroup.ownership
     // A commit from a rebalance callback keeps that invocation's membership, expiry and original
     // acquisition cells through its retries and the sender; it never adopts what is current at
     // transmission.
-    const invocation = RebalanceHooks.current()
     const token = invocation ? invocation.context.membership : ownership?.token()
     const release = ownership?.retain(token)
     // A close callback commits while the stop runs; its invocation guard still expires it.

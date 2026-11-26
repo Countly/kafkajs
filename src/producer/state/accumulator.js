@@ -789,6 +789,11 @@ class PendingSend {
     this.resolve = null
     /** @type {?{ acks: number, timeout?: number, compression?: number }} its request options */
     this.options = null
+    /**
+     * whether the partitioner call of its current partitioning attempt failed, which queued
+     * nothing; set at that call, cleared when an attempt starts
+     */
+    this.refused = false
   }
 
   /**
@@ -1034,7 +1039,8 @@ class Accumulator {
    *   when it is reached, and a held batch goes out then
    * @param {(error: Error) => Error} [options.expired] called with the error of a send that
    *   expired before it joined a batch, or that the buffer refused, to arm a transaction; returns
-   *   the error to reject with
+   *   the error to reject with. Not called for a send whose deadline passed while it waited to
+   *   retry a failed partitioner call (`PendingSend#refused`): it rejects with the timeout as it is
    * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} [options.pinner]
    *   the producer cluster's topic pins: each send pins its topics until its shell is released
    * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's
@@ -1469,7 +1475,7 @@ class Accumulator {
       send !== undefined && send.deadline.dueAt <= now;
       send = this.#holders.peek()
     ) {
-      this.#settleHolder(send, this.#timedOut(send))
+      this.#settleHolder(send, this.#timedOut(send), send.refused)
     }
 
     const next = this.#holders.peek()
@@ -1477,17 +1483,19 @@ class Accumulator {
   }
 
   /**
-   * Ends a registered send's wait with `error`, through `expired`; its shell stays charged until
-   * its pins end.
+   * Ends a registered send's wait with `error`, through `expired` unless `refused`. Its shell stays
+   * charged until its pins end.
    * @param {PendingSend} send
    * @param {Error} error
+   * @param {boolean} [refused=false] the deadline passed while the send waited to retry a failed
+   *   partitioner call: the timeout stands as it is and arms nothing. A forced close never passes it
    * @returns {void}
    */
-  #settleHolder(send, error) {
+  #settleHolder(send, error, refused = false) {
     const { reject } = send
     this.#leave(send)
     send.release()
-    reject(this.#expired(error))
+    reject(refused ? error : this.#expired(error))
     send.untrack()
     this.#end()
     this.#order.passed(send)

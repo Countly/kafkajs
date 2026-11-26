@@ -750,6 +750,8 @@ The `name` of a resource is a topic name, a group id, a client-metrics subscript
 
 `includeDocumentation: true` asks the broker for the documentation of each entry, which it leaves out otherwise (`documentation` is `null`). Every entry also carries `configType`, the type of its value: a number, see `ConfigTypes` (`BOOLEAN`, `STRING`, `INT`, `SHORT`, `LONG`, `DOUBLE`, `LIST`, `CLASS` or `PASSWORD`). Both keys need DescribeConfigs v3, which every Kafka 4.x broker offers. The documentation makes the response large, so ask for it only when you show it.
 
+A `configValue` is `null` for a sensitive config and for one that has no value, and a resource's `errorMessage` is `null` unless the broker sent one.
+
 Example response:
 
 ```javascript
@@ -771,8 +773,7 @@ Example response:
             resourceName: 'topic-name',
             resourceType: 2
         }
-    ],
-    throttleTime: 0
+    ]
 }
 ```
 
@@ -1461,14 +1462,14 @@ Resulting ListPartitionReassignmentsResponse Structure:
 OngoingTopicReassignment Structure:
 ```typescript
 {
-  topic: <String>,
+  name: <String>,
   partitions: <OngoingPartitionReassignment[]>
 }
 ```
 OngoingPartitionReassignment Structure:
 ```typescript
 {
-  partitionIndex: <Number>,
+  partition: <Number>,
   replicas: <Number[]>, // The current replica set
   addingReplicas: <Number[]> // The set of replicas being added
   removingReplicas: <Number[]> // The set of replicas being removed
@@ -1534,7 +1535,7 @@ const quotas = await admin.describeClientQuotas({ components: [{ entityType: 'us
 
 ## SCRAM credentials
 
-`describeUserScramCredentials({ users, apiTimeout }?)` returns per-user credential mechanisms/iteration counts and typed result errors. Omitted or null users selects all; an explicit empty list returns no results without a request. The request's own top-level broker error rejects the call. After users are known, a later route or setup failure retains completed users and gives unresolved users code -1 with the original typed local error. Passwords and derived credentials are never returned.
+`describeUserScramCredentials({ users, apiTimeout }?)` returns per-user credential mechanisms/iteration counts and typed result errors. Omitted or null users selects all; an explicit empty list returns no results without a request. The request's own top-level broker error rejects the call. After users are known, a later route or setup failure retains completed users and gives unresolved users code -1 with the original typed local error and an empty `credentials` list. Passwords and derived credentials are never returned.
 
 `alterUserScramCredentials({ upsertions, deletions, apiTimeout })` requires at least one change. An upsertion is `{ user, mechanism, iterations, password, salt? }`; a deletion is `{ user, mechanism }`. Mechanisms are `SCRAM-SHA-256` or `SCRAM-SHA-512`, iterations are integers from 4096 to 16384, and password is a nonempty string. Salt is an optional Buffer of 1..1024 bytes; the default is 32 random bytes. Each user/mechanism pair appears once across both lists.
 

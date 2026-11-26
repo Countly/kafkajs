@@ -15,6 +15,8 @@ const { failure, createErrorFromCode } = require('../../../error')
  *       removing_replicas => INT32
  */
 
+const PARTITION_FIELD = 'ListPartitionReassignmentsResponse.Topics.Partitions'
+
 const decodeReplicas = (decoder) => {
   return decoder.readInt32()
 }
@@ -22,9 +24,18 @@ const decodeReplicas = (decoder) => {
 const decodePartitions = (decoder) => {
   const partition = {
     partition: decoder.readInt32(),
-    replicas: decoder.readUVarIntArray(decodeReplicas),
-    addingReplicas: decoder.readUVarIntArray(decodeReplicas),
-    removingReplicas: decoder.readUVarIntArray(decodeReplicas),
+    replicas: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeReplicas),
+      `${PARTITION_FIELD}.Replicas`
+    ),
+    addingReplicas: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeReplicas),
+      `${PARTITION_FIELD}.AddingReplicas`
+    ),
+    removingReplicas: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeReplicas),
+      `${PARTITION_FIELD}.RemovingReplicas`
+    ),
   }
 
   // Read tagged fields
@@ -34,8 +45,11 @@ const decodePartitions = (decoder) => {
 
 const decodeTopics = (decoder) => {
   const topic = {
-    name: decoder.readUVarIntString(),
-    partitions: decoder.readUVarIntArray(decodePartitions),
+    name: Decoder.requireValue(
+      decoder.readUVarIntString(),
+      'ListPartitionReassignmentsResponse.Topics.Name'
+    ),
+    partitions: Decoder.requireArray(decoder.readUVarIntArray(decodePartitions), PARTITION_FIELD),
   }
 
   // Read tagged fields
@@ -53,7 +67,10 @@ const decode = async (rawData) => {
     throttleTime: 0,
     clientSideThrottleTime: throttleTime,
     errorCode,
-    topics: decoder.readUVarIntArray(decodeTopics),
+    topics: Decoder.requireArray(
+      decoder.readUVarIntArray(decodeTopics),
+      'ListPartitionReassignmentsResponse.Topics'
+    ),
   }
 }
 

@@ -1552,27 +1552,25 @@
       "id": "E/E04",
       "area": "E",
       "target": "src/consumer/offsetReset.js",
-      "line": 112,
+      "line": 134,
       "operator": "patch",
       "original": "        if (policy.kind === 'none' && explicit === undefined) {",
       "mutated": "        if (false && policy.kind === 'none' && explicit === undefined) {",
       "spec": "src/consumer/__tests__/offsetResetHalt.spec.js",
       "title": "none refuses an unresolved partition without ListOffsets and keeps a committed sibling",
-      "commandClass": "unit",
-      "patchSha": "e34108f320295695d9b6b57e6aa5a85bec397eec7d77e554bc676f8a62410686"
+      "commandClass": "unit"
     },
     {
       "id": "E/E05",
       "area": "E",
       "target": "src/consumer/offsetReset.js",
-      "line": 106,
+      "line": 119,
       "operator": "patch",
       "original": "        if (!current(topic, partition)) continue",
       "mutated": "        if (false && !current(topic, partition)) continue",
       "spec": "src/consumer/__tests__/offsetResetHalt.spec.js",
       "title": "a stale none resolution produces no refusal or position",
-      "commandClass": "unit",
-      "patchSha": "12d6537458e00ca9e341784e561db16a8264364ae5be5a018e2d59772ecdc1f0"
+      "commandClass": "unit"
     },
     {
       "id": "E/E06",

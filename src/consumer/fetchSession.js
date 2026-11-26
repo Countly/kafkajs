@@ -90,7 +90,9 @@ class FetchSession {
 
   /**
    * Accepts Java's full/incremental response table, including delivery with ID zero.
-   * Unknown/duplicate partitions invalidate the entire response before delivery.
+   * Unknown/duplicate partitions invalidate the entire response before delivery, and so does a
+   * session id the request cannot have been answered with: a negative one on a full request, or on
+   * an incremental one any id other than this session's or 0 (the broker closed the session).
    * @param {{session:FetchSession,seq:number}} token original request identity
    * @param {object} response normalized broker response with full-map topic names
    * @returns {boolean} whether the response may be processed
@@ -116,6 +118,8 @@ class FetchSession {
     }
     const throttled = response.throttleTime > 0 || response.clientSideThrottleTime > 0
     if (full && (seen.size !== this.partitions.size || (!seen.size && throttled))) invalid = true
+    const { sessionId } = response
+    if (full ? sessionId < 0 : sessionId !== 0 && sessionId !== this.sessionId) invalid = true
     if (invalid) {
       this.reset(full)
       return false

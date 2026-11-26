@@ -47,6 +47,50 @@ describe('ConnectionPool', () => {
   })
 })
 
+describe('ConnectionPool authentication blackout', () => {
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  it('a new authentication failure drops the expired pauses of other addresses', () => {
+    jest.useFakeTimers({ now: 0 })
+    const blackout = new Map()
+    for (let index = 0; index < 200; index++) {
+      blackout.set(`broker-${index}:9092`, { until: 500, errorMessage: 'x' })
+    }
+    const pool = new ConnectionPool(
+      connectionOpts({ host: 'failing', port: 9092, authenticationBlackout: blackout })
+    )
+    jest.advanceTimersByTime(1000)
+
+    pool.recordAuthenticationFailure('m')
+
+    expect([...blackout.keys()]).toEqual(['failing:9092'])
+    expect(blackout.get('failing:9092')).toEqual({ until: 2000, errorMessage: 'm' })
+  })
+
+  it('a pause that has not ended survives another address’s failure and a pool rebuild', () => {
+    jest.useFakeTimers({ now: 0 })
+    const blackout = new Map()
+    const options = { port: 9092, authenticationBlackout: blackout }
+    new ConnectionPool(connectionOpts({ ...options, host: 'first' })).recordAuthenticationFailure(
+      'first failed'
+    )
+    jest.advanceTimersByTime(500)
+
+    new ConnectionPool(connectionOpts({ ...options, host: 'second' })).recordAuthenticationFailure(
+      'second failed'
+    )
+    const rebuilt = new ConnectionPool(connectionOpts({ ...options, host: 'first' }))
+
+    expect([...blackout.keys()]).toEqual(['first:9092', 'second:9092'])
+    expect(rebuilt.authenticationBlackoutEntry()).toEqual({
+      remainingMs: 500,
+      errorMessage: 'first failed',
+    })
+  })
+})
+
 describe('ConnectionPool structural invariant', () => {
   it.each([1, 2, 3])('sums every connection generation for %i entries', (size) => {
     const pool = new ConnectionPool(connectionOpts())
