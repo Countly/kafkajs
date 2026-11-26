@@ -16,6 +16,7 @@ const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger, secureRandom, waitFor } = require('testHelpers')
 const sleep = require('../../utils/sleep')
 const {
+  KafkaJSError,
   KafkaJSProtocolError,
   KafkaJSNotImplemented,
   KafkaJSNumberOfRetriesExceeded,
@@ -473,6 +474,21 @@ describe('Consumer > Runner', () => {
 
     await waitFor(() => onCrash.mock.calls.length > 0)
     expect(onCrash).toHaveBeenCalledWith(notImplementedError)
+  })
+
+  it('crashes once the retries are spent when every Fetch round is refused with a retriable error', async () => {
+    runner = createTestRunner({ retry: { retries: 2, initialRetryTime: 1, maxRetryTime: 5 } })
+    const refusal = new KafkaJSError(
+      'Fetch response carries session id 43, which cannot answer session 42 at epoch 1',
+      { retriable: true }
+    )
+    consumerGroup.fetch.mockImplementation(() => Promise.reject(refusal))
+
+    await runner.start()
+
+    await waitFor(() => onCrash.mock.calls.length > 0)
+    expect(onCrash.mock.calls[0][0]).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+    expect(onCrash.mock.calls[0][0]).toMatchObject({ message: refusal.message, cause: refusal })
   })
 
   it('retries a fetch loop failure in place after the client retry.maxTotalTime has passed', async () => {
