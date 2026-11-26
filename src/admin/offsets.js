@@ -8,7 +8,7 @@ const {
 const { createErrorFromCode, failure } = require('../protocol/error')
 const { ON_DECODED, UNCHECKED_ROWS } = require('../broker/privateOptions')
 const { itemRetry, isLocal } = require('./itemRetry')
-const { checked, waitOf, currentDeadline } = require('./deadline')
+const { checked, waitOf, currentDeadline, endsCall, isAnsweredError } = require('./deadline')
 const { exact, validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
@@ -190,7 +190,8 @@ class OffsetAdmin {
     this.retry = retry
   }
 
-  /** Deletes offsets with per-partition results and retries only unresolved cells.
+  /** Deletes offsets with per-partition results. A coordinator still loading the group (a
+   * whole-response 14) is asked again within the retry budget; every other answer is final.
    * @param {object} options groupId, topics and inherited apiTimeout
    * @returns {Promise<{topics:object[]}>} caller-ordered partition outcomes
    * @throws {Error} invalid input, API deadline, group refusal or before-work capability/auth
@@ -206,12 +207,13 @@ class OffsetAdmin {
     let coordinator
     let worked = false
     let groupFailure
+    const loading = new WeakSet()
     const rows = await itemRetry(
       {
         items,
         keyOf: cellKey,
         retry: this.retry,
-        retryable: (row) => [14, 15, 16].includes(row.errorCode),
+        retryable: (row) => loading.has(row),
         callFailure: (error) =>
           [30, 69, 24, 68].includes(error?.code) ||
           (!worked && callFailure(error)) ||
@@ -230,7 +232,9 @@ class OffsetAdmin {
         }
         if (response.errorCode !== 0) {
           if ([15, 16].includes(response.errorCode)) coordinator = null
-          return pending.map((item) => ({ ...item, errorCode: response.errorCode }))
+          const rows = pending.map((item) => ({ ...item, errorCode: response.errorCode }))
+          if (response.errorCode === 14) for (const row of rows) loading.add(row)
+          return rows
         }
         validateTopics({ errorCode: 0, topics: response.topics }, byTopic(pending))
         const rows = response.topics.flatMap(({ topic, partitions }) =>
@@ -240,6 +244,8 @@ class OffsetAdmin {
         return rows
       }
     ).catch((error) => {
+      checked(null)
+      if (endsCall(error) || isAnsweredError(error)) throw error
       if (groupFailure && error.code === groupFailure.code) throw groupFailure
       throw failureOf(error) ?? error
     })

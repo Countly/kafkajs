@@ -39,10 +39,10 @@ describe('admin retry ownership', () => {
     for (const method of sites.slice(0, 18)) {
       expect([method, counts.get(method)]).toEqual([
         method,
-        method === 'deleteTopics' ? 3 : method === 'fetchTopicOffsetsByTimestamp' ? 2 : 1,
+        method === 'deleteTopics' ? 4 : method === 'fetchTopicOffsetsByTimestamp' ? 2 : 1,
       ])
     }
-    expect([...counts.values()].reduce((sum, count) => sum + count, 0)).toBe(21)
+    expect([...counts.values()].reduce((sum, count) => sum + count, 0)).toBe(22)
     expect(groups.match(/this\.#retrier\(context\)\(async/g)).toHaveLength(2)
     for (const method of sites.slice(0, 18))
       expect(index).toMatch(new RegExp(`const ${method} = async`))

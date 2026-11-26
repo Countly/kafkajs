@@ -72,7 +72,7 @@ const adminAnswering = (method, answers, retry = RETRY) => {
   }
   const admin = createAdmin({ logger: newLogger(), retry, cluster })
 
-  return { admin, broker }
+  return { admin, broker, cluster }
 }
 
 const child = (code, extra = {}) => Object.assign(createErrorFromCode(code), extra)
@@ -598,7 +598,7 @@ describe('Admin > alterPartitionReassignments > an answer that names only some p
   const sentPartitions = (broker) =>
     broker.alterPartitionReassignments.mock.calls.map(([{ topics: sent }]) => sent)
 
-  test('sends again only the partitions that can still go through, with their replicas, and drops a topic with none left', async () => {
+  test('sends the request once and rejects with every partition error it answered, retriable ones included', async () => {
     const { admin, broker } = adminAnswering('alterPartitionReassignments', [
       partitionsAnswer(
         ['t1', 0, REQUEST_TIMED_OUT],
@@ -610,27 +610,14 @@ describe('Admin > alterPartitionReassignments > an answer that names only some p
 
     const error = await alter(admin).catch((e) => e)
 
-    expect(sentPartitions(broker)).toEqual([
-      topics,
-      [{ topic: 't1', partitionAssignment: [{ partition: 0, replicas: [1, 2] }] }],
-    ])
+    expect(sentPartitions(broker)).toEqual([topics])
     expect(error).toBeInstanceOf(KafkaJSAggregateError)
     expect(error.errors.map(({ topic, partition, type }) => [topic, partition, type])).toEqual([
+      ['t1', 0, 'REQUEST_TIMED_OUT'],
       ['t1', 1, 'NO_REASSIGNMENT_IN_PROGRESS'],
     ])
     expect(error.retriable).toBe(false)
     expect(JSON.stringify(topics)).toBe(snapshot)
-  })
-
-  test('resolves with nothing once every partition went through, whatever the attempt', async () => {
-    const { admin, broker } = adminAnswering('alterPartitionReassignments', [
-      partitionsAnswer(['t1', 0, REQUEST_TIMED_OUT], ['t1', 1, OK], ['t2', 0, OK]),
-      partitionsAnswer(['t1', 0, OK]),
-    ])
-
-    await expect(alter(admin)).resolves.toBeUndefined()
-
-    expect(sentPartitions(broker).map((sent) => sent.length)).toEqual([2, 1])
   })
 
   test('does not send a topic whose partitionAssignment is empty', async () => {
@@ -659,17 +646,16 @@ describe('Admin > alterPartitionReassignments > an answer that names only some p
     expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(1)
   })
 
-  test('repeats the same pending partitions after a controller change', async () => {
-    const { admin, broker } = adminAnswering('alterPartitionReassignments', [
-      partitionsAnswer(['t1', 0, REQUEST_TIMED_OUT], ['t1', 1, OK], ['t2', 0, OK]),
-      wholeRequestAnswer(NOT_CONTROLLER),
-      partitionsAnswer(['t1', 0, OK]),
+  test('retries a controller lookup that fails before the write, then sends the request once', async () => {
+    const { admin, broker, cluster } = adminAnswering('alterPartitionReassignments', [
+      partitionsAnswer(['t1', 0, OK], ['t1', 1, OK], ['t2', 0, OK]),
     ])
+    cluster.findControllerBroker.mockRejectedValueOnce(createErrorFromCode(NOT_CONTROLLER))
 
     await expect(alter(admin)).resolves.toBeUndefined()
 
-    const only = [{ topic: 't1', partitionAssignment: [{ partition: 0, replicas: [1, 2] }] }]
-    expect(sentPartitions(broker)).toEqual([topics, only, only])
+    expect(cluster.findControllerBroker).toHaveBeenCalledTimes(2)
+    expect(sentPartitions(broker)).toEqual([topics])
   })
 
   test('ends with a failure of the whole request unchanged when no partition was refused for good', async () => {
@@ -684,20 +670,22 @@ describe('Admin > alterPartitionReassignments > an answer that names only some p
     expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(1)
   })
 
-  test('ends with the retrier’s own error, the aggregate as its cause, when a retriable partition never clears', async () => {
+  test('rejects with the answered aggregate itself, after one request, when every refused partition is retriable', async () => {
     const { admin, broker } = adminAnswering('alterPartitionReassignments', [
       partitionsAnswer(['t1', 0, UNKNOWN_TOPIC_OR_PARTITION], ['t1', 1, OK], ['t2', 0, OK]),
+      partitionsAnswer(['t1', 0, OK]),
     ])
 
     const error = await alter(admin).catch((e) => e)
 
-    expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
-    expect(error.cause).toBeInstanceOf(KafkaJSAggregateError)
-    expect(error.cause.message).toBe('Errors altering partition reassignments')
-    expect(
-      error.cause.errors.map(({ topic, partition, type }) => [topic, partition, type])
-    ).toEqual([['t1', 0, 'UNKNOWN_TOPIC_OR_PARTITION']])
-    expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(RETRY.retries + 1)
+    expect(error).toBeInstanceOf(KafkaJSAggregateError)
+    expect(error).not.toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+    expect(error.message).toBe('Errors altering partition reassignments')
+    expect(error.retriable).toBe(true)
+    expect(error.errors.map(({ topic, partition, type }) => [topic, partition, type])).toEqual([
+      ['t1', 0, 'UNKNOWN_TOPIC_OR_PARTITION'],
+    ])
+    expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(1)
   })
 
   test('ends at once, unchanged, with an aggregate that lists no failure', async () => {
@@ -719,7 +707,7 @@ describe('Admin > alterPartitionReassignments > an answer that names only some p
     const error = await alter(admin).catch((e) => e)
 
     expect(error).toBeInstanceOf(KafkaJSAggregateError)
-    expect(error.errors.map(({ partition }) => partition)).toEqual([1, 0])
+    expect(error.errors.map(({ partition }) => partition)).toEqual([0, 1])
     expect(error.retriable).toBe(false)
     expect(broker.alterPartitionReassignments).toHaveBeenCalledTimes(1)
   })

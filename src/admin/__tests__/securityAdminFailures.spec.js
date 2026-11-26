@@ -20,7 +20,6 @@ const retry = { retries: 1, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
 const methods = [
   ['alterClientQuotas', apiKeys.AlterClientQuotas],
   ['describeUserScramCredentials', apiKeys.DescribeUserScramCredentials],
-  ['alterUserScramCredentials', apiKeys.AlterUserScramCredentials],
 ]
 const sources = [
   ['ApiVersions code 31', 31, apiKeys.ApiVersions],
@@ -31,6 +30,7 @@ const entity = (entityName) => [{ entityType: 'user', entityName }]
 const input = (method) => {
   if (method === 'alterClientQuotas')
     return {
+      validateOnly: true,
       entries: ['a', 'b'].map((user) => ({
         entity: entity(user),
         ops: [{ key: 'producer_byte_rate', value: 1 }],
@@ -370,4 +370,22 @@ test('a genuine SCRAM describe top-level response still rejects after peer compl
   expect(responseSourceOf(original)).toBe(apiKeys.DescribeUserScramCredentials)
   expect(identities(method, broker[method].mock.calls[0][0])).toEqual(['b'])
   expect(f.requests).toEqual([['a', 'b']])
+})
+
+test('SCRAM alteration retries a pre-write route failure and keeps decoded rows', async () => {
+  jest.useFakeTimers()
+  try {
+    const method = 'alterUserScramCredentials'
+    const f = fixture(method)
+    f.route.mockRejectedValueOnce(createErrorFromCode(15))
+    const result = f.admin[method](input(method))
+    await jest.advanceTimersByTimeAsync(10)
+    const rows = await result
+    expectResults(method, rows, [0, 7])
+    expect(f.requests).toEqual([['a', 'b']])
+    expect(f.route).toHaveBeenCalledTimes(2)
+    expectScope(f.scopes)
+  } finally {
+    jest.useRealTimers()
+  }
 })

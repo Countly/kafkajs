@@ -39,7 +39,7 @@ describe('delete group offsets', () => {
       createAdmin({ cluster, logger, retry }).deleteOffsets({ groupId: 'g', topics })
     ).rejects.toMatchObject({ name: 'KafkaJSProtocolError', code: errorCode })
   })
-  it('relocates only the unresolved partition and preserves completed data', async () => {
+  it('keeps a coordinator error with the completed partition in one answer', async () => {
     const first = {
       offsetDelete: jest.fn(async () => ({
         errorCode: 0,
@@ -67,12 +67,10 @@ describe('delete group offsets', () => {
       groupId: 'g',
       topics,
     })
-    expect(result.topics[0].partitions.map((p) => p.errorCode)).toEqual([0, 0])
-    expect(second.offsetDelete).toHaveBeenCalledWith({
-      groupId: 'g',
-      topics: [{ topic: 't', partitions: [{ partition: 1 }] }],
-    })
-    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(result.topics[0].partitions.map((p) => p.errorCode)).toEqual([0, 16])
+    expect(first.offsetDelete).toHaveBeenCalledTimes(1)
+    expect(second.offsetDelete).not.toHaveBeenCalled()
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
   })
   it.each(['', null, 'bad\0name'])('refuses invalid group %p before discovery', async (groupId) => {
     const cluster = { findGroupCoordinator: jest.fn() }
