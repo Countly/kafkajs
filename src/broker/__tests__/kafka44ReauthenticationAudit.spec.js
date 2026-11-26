@@ -432,15 +432,6 @@ describe('session at write', () => {
   }
 
   test('a session-refused produce is never recorded as written', async () => {
-    const ids = (topics) => topics.flatMap(({ partitions }) => partitions.map((p) => p.partition))
-    const produceCalls = []
-    const originalProduce = Broker.prototype.produce
-    const produceSpy = jest
-      .spyOn(Broker.prototype, 'produce')
-      .mockImplementation(function (request) {
-        produceCalls.push([Date.now(), ids(request.topicData)])
-        return originalProduce.call(this, request)
-      })
     start({
       deliveryTimeout: 1500,
       retry: { initialRetryTime: 5000, maxRetryTime: 5000, factor: 0 },
@@ -449,25 +440,6 @@ describe('session at write', () => {
 
     await jest.advanceTimersByTimeAsync(400)
     await until(() => secondState.settled)
-    const outcome = await second
-    console.log(
-      'DIAG',
-      JSON.stringify({
-        now: Date.now(),
-        produceCalls,
-        requests: cluster
-          .requests()
-          .map((r) => [
-            r.api === 'Produce' && r.fields ? `Produce:${ids(r.fields.topics)}` : r.api,
-            r.generation,
-            r.order,
-            r.answeredOrder,
-          ]),
-        message: outcome?.message,
-        cause: outcome?.cause && `${outcome.cause.name}: ${outcome.cause.message}`,
-      })
-    )
-    produceSpy.mockRestore()
 
     expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
     expect(await second).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
