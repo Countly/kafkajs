@@ -1161,11 +1161,14 @@ Group visibility and the admin client.
   with controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
   request it used to slow down, because the client negotiates CreateTopics v7, DeleteTopics v6 and
   CreatePartitions v3, where 2.2.4 sent v3, v1 and v1, which the broker throttled but did not
-  refuse. The broker checks the quota before it records anything for a topic, so the client waits
-  the throttle time the broker reports and sends only the refused topics again within the `retry`
-  budget and the call's deadline; a topic the broker accepted is never sent again. A call that
-  succeeded under 2.2.4 still succeeds, a little later; one that outlives the budget rejects with
-  `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota error. `deleteTopics` and
+  refuse. The broker checks the quota before it records anything for a topic, so the client sends
+  only the refused topics again within the `retry` budget and the call's deadline; a topic the
+  broker accepted is never sent again. The connection that received the refusal holds its next
+  request for the throttle time the broker reports; a retry that goes to another broker's
+  connection is not held by it. A call that succeeded under 2.2.4 still succeeds, a little later;
+  one that outlives the budget rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the
+  quota error (`KafkaJSDeliveryTimeout` when a configured `retry.maxTotalTime` would end before the
+  next attempt). `deleteTopics` and
   `createPartitions` retry only when every topic that failed in the answer was refused by the
   quota. `deleteTopics` sends a refused topic again by the topic ID the answer gave for it, also
   when the call named it, so a topic deleted and recreated under that name during the wait is not
@@ -1207,11 +1210,13 @@ Group visibility and the admin client.
   (`THROTTLING_QUOTA_EXCEEDED`, when every topic that failed was refused that way and the answer
   gives each one's ID), and
   `deleteOffsets` and `removeMembersFromConsumerGroup` send again a request the group coordinator
-  answered with `COORDINATOR_LOAD_IN_PROGRESS`. Both stay within the `retry` budget and the call's
+  answered with a top-level `COORDINATOR_LOAD_IN_PROGRESS`. Both stay within the `retry` budget and the call's
   deadline. `NOT_COORDINATOR` and `COORDINATOR_NOT_AVAILABLE` stay final for these calls, and a
   loading coordinator stays final for `deleteGroups`, `alterShareGroupOffsets` and
   `deleteShareGroupOffsets`, whose broker can report it after part of the change ran. Pre-write
-  failures keep their existing retry policy.
+  failures keep their existing retry policy; for `deleteTopics` that covers the metadata refresh
+  and controller lookup before an ID resend too, where `NOT_CONTROLLER` and
+  `UNKNOWN_TOPIC_OR_PARTITION` are retried.
 - In kafkajs 2.2.4, `deleteTopics`, `deleteTopicRecords`, `alterConfigs`, `createAcls`,
   `deleteAcls` and `alterPartitionReassignments` retried some such errors (`NOT_CONTROLLER`,
   `UNKNOWN_TOPIC_OR_PARTITION` from `deleteTopics`, retriable partition errors from
