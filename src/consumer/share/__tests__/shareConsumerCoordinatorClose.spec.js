@@ -227,7 +227,7 @@ describe('share disconnect after coordinator transport recovery', () => {
   })
 
   test('sends one leave on the accepted coordinator when disconnect finds the heartbeat backing off after a refused assignment', async () => {
-    const original = await begin()
+    const original = await begin(0, true)
     h.script('ShareGroupHeartbeat', [
       ({ memberId }) => ({
         errorCode: 0,
