@@ -665,7 +665,9 @@ says so, `groupProtocol: 'consumer'`.
   backoff — and is not governed by your `retry` options; if it has not resolved by then, the round
   fetches that partition unvalidated rather than stalling. Partitions whose epoch did not change are
   fetched throughout. In practice this is a latency change measured in milliseconds, visible only
-  around leader elections and at the first fetch of a new assignment, and never a stall.
+  around leader elections and at the first fetch of a new assignment. Each of its requests waits
+  for an answer up to `requestTimeout`, like any other request, and without a limit when
+  `enforceRequestTimeout` is false.
 
 - **`maxPollInterval` must be an integer from 1 to 2147483647; other values throw when the consumer
   is created.**
