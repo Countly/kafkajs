@@ -76,9 +76,24 @@ const fixture = (nodes = [node(0)], options = {}) => {
   return { admin, schedule, scripted }
 }
 
+/**
+ * The real Broker method, so a spy wraps it and never a spy a timed-out test left behind.
+ * @param {string} method Broker method name
+ * @returns {Function} the unmocked method
+ * @throws {Error} when the method is still mocked
+ */
+const unmocked = (method) => {
+  const send = Broker.prototype[method]
+  if (jest.isMockFunction(send)) throw new Error(`Broker.prototype.${method} is still mocked`)
+  return send
+}
+
 describe('written admin mutations', () => {
   beforeEach(() => jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }))
-  afterEach(() => jest.useRealTimers())
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+  })
 
   it.each([
     [
@@ -702,7 +717,7 @@ describe('written admin mutations', () => {
         logDirs: { brokerId: lostNode, topic: 't', partition: lostNode },
       }
       const heldReply = schedule.hold({ api, node: lostNode })
-      const send = Broker.prototype[brokerMethod]
+      const send = unmocked(brokerMethod)
       let startDial
       const dialAllowed = new Promise((resolve) => {
         startDial = resolve
@@ -847,7 +862,7 @@ describe('written admin mutations', () => {
     })
     scripted.answer(api, answer)
     const gate = schedule.hold({ api, node: 0 })
-    const send = Broker.prototype.deleteRecords
+    const send = unmocked('deleteRecords')
     let ready
     const firstDialFinished = new Promise((resolve) => {
       ready = resolve
@@ -910,7 +925,7 @@ describe('written admin mutations', () => {
       })),
     }))
     const gate = schedule.hold({ api, node: 0 })
-    const send = Broker.prototype.deleteRecords
+    const send = unmocked('deleteRecords')
     let ready
     const firstDialFinished = new Promise((resolve) => {
       ready = resolve
