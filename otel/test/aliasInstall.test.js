@@ -7,6 +7,8 @@ const { promisify } = require('node:util')
 
 const otelRoot = path.join(__dirname, '..')
 const aliasDir = path.join(otelRoot, 'node_modules', 'kafkajs')
+// What test/register/register.mjs records when this Node.js cannot register synchronous hooks.
+const NO_NODE_HOOKS = 'this Node.js has no synchronous module hooks'
 
 // Runs in a fresh process with this sub-package as its working directory. It loads the client by
 // the alias name only, stubs the producer's `send` the way `kafkajs.test.js` does (no broker),
@@ -46,6 +48,7 @@ const main = async () => {
 
   process.stdout.write(JSON.stringify({
     wrappedAtLoad,
+    syncHooks: globalThis[Symbol.for('kafkajs-otel-test.syncHooks')],
     sent,
     spans: getTestSpans().map((span) => ({
       name: span.name,
@@ -122,5 +125,19 @@ describe('the client installed under the npm alias kafkajs', () => {
     assertInstrumented(
       await runChild(['--experimental-loader=@opentelemetry/instrumentation/hook.mjs'], 'esm')
     )
+  })
+
+  it('ESM import of the aliased kafkajs is instrumented under register-hooks', async (t) => {
+    const report = await runChild(
+      ['--import', path.join(otelRoot, 'test/register/register.mjs')],
+      'esm'
+    )
+
+    if (report.syncHooks === NO_NODE_HOOKS) {
+      t.skip(report.syncHooks)
+      return
+    }
+    assert.equal(report.syncHooks, 'registered')
+    assertInstrumented(report)
   })
 })

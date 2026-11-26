@@ -3049,6 +3049,22 @@ module.exports = class ConsumerGroup {
       })
     }
 
+    // An answer for a position the partition has left (another node's answer came first, or a
+    // reset cleared the offset) is not used at all: not delivered, not recovered from.
+    const requested = requestedPartitions?.get(partition)
+    if (
+      requested !== undefined &&
+      typeof this.offsetManager?.positionOf === 'function' &&
+      this.offsetManager.positionOf(topicName, partition) !== String(requested.fetchOffset)
+    ) {
+      this.logger.debug('Dropping fetched partition', {
+        topic: topicName,
+        partition,
+        reason: 'moved',
+      })
+      return false
+    }
+
     if (failure(errorCode)) {
       const action = partitionFetchAction(errorCode)
 

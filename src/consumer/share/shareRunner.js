@@ -89,6 +89,8 @@ class ShareRunner {
     this.disconnectCalls = 0
     this.restartOperation = null
     this.lifecycle = 0
+    /** @type {WeakSet<object>} Identifies this client's runs, including ended ones. */
+    this.runs = new WeakSet()
   }
 
   /**
@@ -206,11 +208,12 @@ class ShareRunner {
    * @returns {Promise<void>}
    * @throws {KafkaJSShareGroupsNotSupportedError} When the cluster cannot run share groups; the
    *   newly opened connections are closed and no `connect` event is published.
-   * @throws {KafkaJSNonRetriableError} When called from a handler of the run being closed, when
-   *   another `disconnect()` was called while this call waited for a close, or when a close
+   * @throws {KafkaJSNonRetriableError} From a handler of an ended run or of the run being closed,
+   *   when another `disconnect()` was called while this call waited for a close, or when a close
    *   retired this attempt.
    */
   connect() {
+    if (this.calledFromEndedRun()) return Promise.reject(this.endedRunRefusal('connect'))
     if (this.disconnecting) {
       if (this.closingRun !== null && handlerRunIdentity() === this.closingRun.identity)
         return Promise.reject(
@@ -286,10 +289,12 @@ class ShareRunner {
    * @param {{topics: string[]}} input Distinct non-empty topic names.
    * @returns {Promise<void>}
    * @throws {KafkaJSInvalidConfigurationError} For any other shape, a regex or a rejected key.
-   * @throws {KafkaJSNonRetriableError} While a run, a close or another subscribe is active.
+   * @throws {KafkaJSNonRetriableError} From a handler of an ended run or while a run, a close or
+   *   another subscribe is active.
    */
   async subscribe(input) {
     const names = this.parseSubscription(input)
+    if (this.calledFromEndedRun()) throw this.endedRunRefusal('subscribe')
     if (this.current || this.subscribing || this.disconnecting) {
       throw new KafkaJSNonRetriableError(
         'subscribe() cannot replace the subscription while a run, a close or another subscribe is active'
@@ -353,7 +358,8 @@ class ShareRunner {
    * @returns {Promise<void>} Settles after the first accepted join; resolves void when stop ends
    *   a retriable pending join; rejects with the original fatal join error.
    * @throws {KafkaJSInvalidConfigurationError} Without exactly one handler function.
-   * @throws {KafkaJSNonRetriableError} Without a subscription, or while a run or close is active.
+   * @throws {KafkaJSNonRetriableError} From a handler of an ended run, without a subscription,
+   *   or while a run or close is active.
    */
   async run(config) {
     const eachMessage = config?.eachMessage
@@ -368,6 +374,7 @@ class ShareRunner {
         'run requires exactly one of eachMessage or eachBatch'
       )
     }
+    if (this.calledFromEndedRun()) throw this.endedRunRefusal('run')
     if (this.subscription.length === 0)
       throw new KafkaJSNonRetriableError('subscribe() must be called before run()')
     if (this.current || this.subscribing || this.disconnecting) {
@@ -384,7 +391,7 @@ class ShareRunner {
     }
     if (!run.stopRequested && this.current === run) {
       if (!this.disconnecting) this.options.telemetry?.resume()
-      run.start()
+      outsideHandler(() => run.start())
     }
     return run.firstJoin.promise
   }
@@ -398,16 +405,42 @@ class ShareRunner {
   newRun(handler, batch) {
     const run = new ShareRun({ runner: this, handler, batch })
     this.current = run
+    this.runs.add(run.identity)
     this.latestLockDuration = null
     return run
   }
 
   /**
+   * @private
+   * @returns {boolean} Whether this client's calling handler has lost its run, including when
+   *   that run is still current during a crash restart delay.
+   */
+  calledFromEndedRun() {
+    const identity = handlerRunIdentity()
+    if (identity === undefined || !this.runs.has(identity)) return false
+    const run = this.current
+    return identity !== run?.identity || run.crashed || run.closed
+  }
+
+  /**
+   * @private
+   * @param {string} api Public method name.
+   * @returns {KafkaJSNonRetriableError} Refusal for a caller from this client's ended run.
+   */
+  endedRunRefusal(api) {
+    return new KafkaJSNonRetriableError(
+      `${api}() cannot be called from a handler of a run that has ended`
+    )
+  }
+
+  /**
    * Stops the current run: running handlers finish, then captured finals and one leave go out.
    * A handler must call this without awaiting it.
-   * @returns {Promise<void>} Resolves when the close ended; at once without a run.
+   * @returns {Promise<void>} Resolves when the close ended, or at once without a run or from a
+   *   handler of an ended run.
    */
   stop() {
+    if (this.calledFromEndedRun()) return Promise.resolve()
     const run = this.current
     if (!run) return Promise.resolve()
     this.stopGeneration++
@@ -423,12 +456,14 @@ class ShareRunner {
    * the first deadline given to that run, before anything can call application code, so a call
    * made from a listener or log sink inside the close joins it.
    * @param {{timeout?: number}|*} [options] Options object; any other argument is ignored.
-   * @returns {Promise<void>}
+   * @returns {Promise<void>} From a handler of an ended run, resolves after validation without
+   *   closing the client.
    * @throws {KafkaJSInvalidConfigurationError} For an invalid timeout, before any state changes.
    */
   async disconnect(options) {
     const enteredAt = performance.now()
     const timeout = parseDisconnectTimeout(options)
+    if (this.calledFromEndedRun()) return
     this.disconnectCalls++
     if (this.disconnecting) {
       const run = this.closingRun
@@ -552,7 +587,7 @@ class ShareRunner {
       return
     }
     this.options.telemetry?.resume()
-    this.newRun(run.handler, run.batch).start()
+    outsideHandler(() => this.newRun(run.handler, run.batch).start())
   }
 
   /**

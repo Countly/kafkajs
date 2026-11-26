@@ -54,7 +54,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
   package's version. Operators watching a broker's `clientSoftwareName`/`clientSoftwareVersion`
   metrics or request logs will see this name where kafkajs 2.2.4 previously showed `unknown`.
 - **A closed connection's socket is destroyed, not ended.** A connection that closes (a timeout, a replaced or retired broker, `disconnect()`) now calls `socket.destroy()` where 2.2.4 called `socket.end()`. The default socket factory is unaffected. *What to do:* if you pass a custom `socketFactory` that returns a partial `net.Socket`, give it a `destroy()` method.
-- **Write IPv6 bootstrap hosts in brackets.** `brokers: ['[::1]:9092']` now works; `'::1:9092'` and an address without a valid port (1 to 65535) fail the first connect with `KafkaJSNonRetriableError` naming the address. *What to do:* bracket IPv6 literals and check the port of every entry of `brokers`, because every entry is now checked, not only the one in use.
+- **Write IPv6 bootstrap hosts in brackets.** `brokers: ['[::1]:9092']` now works; `'::1:9092'` and an address without a valid port (1 to 65535) fail the first connect with `KafkaJSNonRetriableError` naming the entry's position in the list, not the address text. A host may use only letters, digits, `.`, `_`, `-` and `%` (and `:` inside the brackets of an IPv6 literal), so a URL or an address with user info (`user@host:9092`) is refused before any connection is made. Write an internationalized host name in its ASCII (punycode) form. *What to do:* bracket IPv6 literals and check the host and port of every entry of `brokers`, because every entry is now checked, not only the one in use.
 
 - **Connection readiness timeout.** An omitted `connectionTimeout` now starts at 10000 ms and grows after consecutive physical setup failures at that address, with ±20% jitter, to `connectionTimeoutMax` (30000 ms). A successful ready resets it. A blackholed node therefore takes about 10, 20, 30, 30 and 30 seconds across five attempts, plus reconnect waits, about two minutes in total. A refused or reset connection still fails immediately. *What to do:* set `connectionTimeout: 1000` to restore exactly the old flat timeout value, or set an explicit base alone to another flat value. Setting `connectionTimeoutMax` opts into growth. The wider readiness boundary still applies.
 - **The readiness boundary.** The setup timeout covers TCP, TLS, ApiVersions and SASL. A stalled ApiVersions or SASL phase can now fail before `requestTimeout`, and the retriable connection error identifies the phase and node timeout. A directly opened Fetch socket's setup budget ends at TCP/TLS; its authentication uses the SASL cap. *What to do:* raise `connectionTimeout` or `connectionTimeoutMax` when successful readiness legitimately needs more time.
@@ -1024,6 +1024,7 @@ With consumer group protocol, after a fatal heartbeat the consumer waits for in-
   See [Prefetching](Consuming.md#prefetching).
 - **A seek or commit made while the consumer is still resolving its initial offsets now wins.** It is no longer overwritten by the older answer. Nothing to change in code; the documented guarantees of `docs/Consuming.md` now hold. If you relied on the older answer overwriting your seek or commit, do the seek or commit again.
 - **A seek fences the batches fetched before it.** After `consumer.seek()`, a handler still working on an older batch of that partition, and any work it started, can no longer resolve or commit its offsets, also when the seek fails. Explicit commits from it (`commitOffsetsIfNecessary(offsets)`, `consumer.commitOffsets()`) reject with `KafkaJSCommitFailedError` with `reason: 'stale-assignment'`; treat that as "this batch's offsets are obsolete", not as a rebalance, and do not retry it from the same handler. A seek does not stop a handler that is already running; a seek made from a `consumer.start_batch_process` listener keeps that batch from the handler. `isStale()` now stays true for a batch fetched before a seek of its partition (2.2.4: only while the seek was queued); a rebalance alone does not make it true. As in kafkajs 2.2.4, a seek whose commit fails is not applied and not retried; in version 3 the partition then stays exactly where it was (position, committed offset, halt), the failure rejects `position()` and the fetch loop logs one warning or handles it as any fetch error. *What to do:* await `position()` after `seek()` when the seek must take effect, and call `seek()` again if it rejects. Two seeks of one partition are applied one after the other: the second waits until the first one's commit has been answered, timed out or closed with its connection. If you deliberately committed an older batch's offsets after seeking, commit them from code outside the handler instead. A commit already sent before the seek can still land on the broker, so drain or cancel outstanding work before seeking if that matters.
+- **Batch events for a record batch emptied by compaction, and a new optional field in the low-level Fetch result.** When every record of the batches a Fetch returned is gone or below the fetch offset, but the last complete record batch ends beyond it, the consumer now resolves to that record batch's last offset instead of staying put (or moving one offset per fetch). `consumer.start_batch_process` and `consumer.end_batch_process` therefore fire for some batches that were silent in 2.2.4, with `batchSize` 0 and the record batch's last offset as `lastOffset` (and a different `offsetLag`); such a batch is never passed to `eachBatch`. A listener that counts these events or reads `lastOffset` should expect the extra events. A direct `broker.fetch()` caller, or a custom partition assigner that does, sees the optional partition properties `nextBatchOffset` and `nextBatchLeaderEpoch` on a decoded partition that ends in a complete record batch; a partition without a complete record batch does not have them.
 - **`consumer.commit_offsets` listeners get a copy.** The event payload is the request as sent and the listener's own copy down to each offset cell. kafkajs 2.2.4 handed out the cells it then cached, so a listener that changed an offset in place changed where the consumer read next. Do not rely on changing the payload.
 - **Pass an integer partition id to `consumer.seek()` and `admin.setOffsets()`.** kafkajs 2.2.4 silently ignored a seek with a partition such as the string `'0'`, `-1` or `1.5`; version 3 throws `KafkaJSNonRetriableError` before changing any consumer state (`admin.setOffsets` rejects before it sends any request).
 - **Sentinel seeks select an explicit boundary.** `consumer.seek({ topic, partition, offset: '-2' })` selects earliest and `offset: '-1'` selects latest on the next resolution, regardless of the subscription's `fromBeginning` setting or `autoCommit`. The following fetch uses the concrete offset returned by ListOffsets. Sentinel seeks change the local position and do not commit a negative sentinel. Concrete-offset seeks retain their existing commit behavior. *What to do:* choose the sentinel for the boundary you intend; do not rely on the subscription default to reinterpret it. If you need a durable group offset change, commit the intended concrete offset explicitly. `admin.setOffsets()` and `admin.resetOffsets()` are not affected: they still store `-1` and `-2` as the group offset. A sentinel commit the coordinator rejects now rejects the `setOffsets` or `resetOffsets` call with that error; 2.2.4 resolved the call without storing the offset.
@@ -1046,6 +1047,8 @@ Nothing to do; code that slept after `resume()` to ride out the wait can stop.
 - **A broker joining or leaving no longer pauses the other fetchers.** 2.2.4 stopped every fetcher, waited for all in-flight long polls and recreated them. 3.0.0 keeps the fetchers of surviving brokers running, starts a new broker's fetcher at once, and stops only a departed broker's fetcher. Nothing to do; there is at most one fetcher, and one Fetch in flight, per broker. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
 
 - **An unreachable broker no longer stalls the other fetchers.** 2.2.4 stopped and restarted every fetcher each time a fetch lost its connection. 3.0.0 backs off and retries only that broker's fetcher while the others keep fetching. Outage limits, warnings and events are unchanged. Nothing to do. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
+
+Pausing some partitions of a topic that is paused as a whole, including from a handler's `pause()`, keeps the rest of the topic paused. 2.2.4 resumed the rest of the topic. Call `resume` for the topic to clear a topic-wide pause.
 
 If you paused a topic and an operator recreated it, pause it again after you see `consumer.cluster.topic_recreated`. Pausing a topic before it is assigned still works and lasts until the subscription changes.
 
@@ -1622,6 +1625,42 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   table, which are strings; the declaration said `number[]`. Under `strict` a comparison such as
   `ids[0] === 1` is `TS2367` and `ids.includes(1)` is `TS2345`. Compare with `String(id)` or
   convert the element with `Number(id)`. The runtime is unchanged.
+- **Nine error constructors need a message.** `KafkaJSTimeout`, `KafkaJSLockTimeout`,
+  `KafkaJSNotImplemented`, `KafkaJSMetadataNotLoaded`, `KafkaJSBrokerNotFound`,
+  `KafkaJSPartialMessageError`, `KafkaJSSASLAuthenticationError`, `KafkaJSGroupCoordinatorNotFound`
+  and `KafkaJSUnsupportedMagicByteInMessageSet` are declared with the message they need:
+  `new KafkaJSTimeout()` threw a `TypeError` in 2.2.4 and still does, and is now a compile error.
+  Pass a message.
+- **`KafkaJSOffsetOutOfRange` and `KafkaJSNumberOfRetriesExceeded` need their metadata.**
+  `new KafkaJSOffsetOutOfRange(e, { topic, partition })` and
+  `new KafkaJSNumberOfRetriesExceeded(e, { retryCount, retryTime })` need their second argument:
+  without it they threw `TypeError` in 2.2.4 and still do.
+- **`KafkaJSOffsetOutOfRange`'s first argument is a protocol error.** It was declared
+  `Error | string`; it is now the object `KafkaJSProtocolError` takes, with `type`, `code` and
+  `message`. Code that passed an `Error` and the metadata no longer compiles. Before:
+  `new KafkaJSOffsetOutOfRange(new Error('out of range'), { topic: 'orders', partition: 0 })`.
+  After: `new KafkaJSOffsetOutOfRange({ type: 'OFFSET_OUT_OF_RANGE', code: 1, message: 'out of range' }, { topic: 'orders', partition: 0 })`.
+  An `Error` that carries `type` and `code`, such as a caught protocol error, is accepted.
+- **`KafkaJSProtocolError` is built from a protocol error.** `new KafkaJSProtocolError(e)` takes an
+  object with `type`, `code` and `message` (for example a caught protocol error), and optionally
+  `retriable`, `helpUrl` and `category`; built from a string its `code` and `type` were
+  `undefined`. Before: `new KafkaJSProtocolError('boom')`. After:
+  `new KafkaJSProtocolError({ type: 'UNKNOWN', code: -1, message: 'boom' })`.
+- **`KafkaJSError.code` is `number | string`.** An error built from a Node.js system error carries
+  its string code (`'ECONNREFUSED'`), and `KafkaJSConnectionError.code` is the optional string from
+  its metadata. Narrow with `typeof` before arithmetic. `KafkaJSConnectionError.broker` can be
+  absent.
+- **`KafkaJSStaleTopicMetadataAssignment.unknownPartitions` is `number[] | undefined`, and `topic`
+  is `string | undefined`.** The client's own errors carry both, but an error built without
+  metadata has neither, so guard the reads under `strictNullChecks`. The same field of the
+  constructor's metadata is `number[]`: the partition ids it has always held (the metadata was
+  declared `PartitionMetadata[]`).
+- **`KafkaJSDeleteTopicRecordsError` declares `partitions`, and its rows are nullable.**
+  `offset` is `string | undefined` (undefined when a response row matched no requested partition)
+  and `error` is `KafkaJSError | null | undefined` (the constructor keeps rows as passed). Guard
+  both reads. The `topic` of its constructor's metadata is optional and the error does not keep
+  it. A structural mock of the error, or a function typed to return it, must now supply
+  `partitions`.
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots

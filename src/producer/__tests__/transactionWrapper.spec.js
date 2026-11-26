@@ -605,7 +605,25 @@ describe('Producer > the transaction wrapper', () => {
       await expect(producer.transaction()).rejects.toThrow(/already an ongoing transaction/)
     })
 
-    test('of two first calls, the one whose InitProducerId retry ends after the other began also says so', async () => {
+    test('two concurrent producer.transaction() calls on a ready producer: one handle, one ongoing-transaction refusal', async () => {
+      const { producer } = createTransactionalProducer()
+      await producer.connect()
+      await (await producer.transaction()).abort()
+
+      const [first, second] = await Promise.allSettled([
+        producer.transaction(),
+        producer.transaction(),
+      ])
+
+      expect(first.status).toEqual('fulfilled')
+      expect(first.value.isActive()).toBe(true)
+      expect(second.status).toEqual('rejected')
+      expect(second.reason).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(second.reason.message).toMatch(/already an ongoing transaction/)
+      await first.value.abort()
+    })
+
+    test("a second first call waits through the first caller's InitProducerId retry, then is refused with the ongoing-transaction error", async () => {
       const cluster = createFakeCluster({
         options: {
           retry: { retries: 2, initialRetryTime: 5, factor: 0, multiplier: 1, maxRetryTime: 5 },

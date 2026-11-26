@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "exactOptionalPropertyTypes": true
+  },
+  "files": [
+    "index.d.ts",
+    "tests.exact.ts"
+  ]
+}

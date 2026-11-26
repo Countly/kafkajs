@@ -581,7 +581,7 @@ class DrainLoop {
   #queues = new Map()
   /** @type {Map<string, number>} Produce requests sent to a broker and not yet answered */
   #outstanding = new Map()
-  /** @type {Map<string, Promise<void>>} per broker, settles once the last request was handed on */
+  /** @type {Map<string, Promise<void>>} per broker with a hand-off not yet settled; an entry leaves when its last hand-off settles */
   #handoffs = new Map()
   /** @type {Promise<void>[]} leader hints to apply before the next drain */
   #hints = []
@@ -1169,7 +1169,11 @@ class DrainLoop {
     const handed = (this.#handoffs.get(nodeId) ?? RESOLVED).then(() =>
       this.#handOff(nodeId, batches, attempt)
     )
-    this.#handoffs.set(nodeId, handed.then(ignore, ignore))
+    const tail = handed.then(ignore, ignore)
+    this.#handoffs.set(nodeId, tail)
+    tail.then(() => {
+      if (this.#handoffs.get(nodeId) === tail) this.#handoffs.delete(nodeId)
+    })
     handed
       .then(({ answer }) => answer)
       .then(
