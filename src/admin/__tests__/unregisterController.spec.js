@@ -74,9 +74,21 @@ const fixture = (brokers, options = {}) => {
   return { cluster, admin: createAdmin({ logger, cluster, retry, ...options }) }
 }
 
+// TEMPORARY DIAGNOSTIC: remove with testHelpers/diagTimers.js after one CI run.
+const diag = require('../../../testHelpers/diagTimers')
+let timers
+
 describe('Admin > unregisterController', () => {
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }))
+  beforeEach(() => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] })
+    timers = diag.traceTimers()
+  })
   afterEach(() => {
+    if (jest.getTimerCount() !== 0) {
+      const name = expect.getState().currentTestName
+      console.log('DIAG ' + JSON.stringify({ name, timers: timers.live() }))
+    }
+    timers.restore()
     expect(jest.getTimerCount()).toBe(0)
     jest.useRealTimers()
   })
