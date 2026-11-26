@@ -4222,12 +4222,20 @@ module.exports = class ConsumerGroup {
         error: e.message,
       })
 
-      // The tracked epoch stays with the unchanged offset, as on every other exit that gives up,
-      // so the next leader epoch validates it and a commit still carries it.
       for (const { topic, entries } of pending) {
         for (const { partition, currentLeaderEpoch, generation } of entries) {
-          if (this.positionValidator.isAwaiting(topic, partition)) {
+          if (!this.positionValidator.isAwaiting(topic, partition)) {
+            continue
+          }
+
+          // The epoch is cleared and the offset left alone: the partition is fetched from where it
+          // is, unvalidated, and validates again once it consumes a record. Both only happen when
+          // the mark applied - on a stale generation this round's exhaustion says nothing about
+          // the partition the current assignment holds.
+          if (
             this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+          ) {
+            this.offsetManager.forgetConsumedEpoch(topic, partition)
           }
         }
       }

@@ -809,6 +809,25 @@ module.exports = class OffsetManager {
   }
 
   /**
+   * Forgets the tracked epoch **without touching the offset** - the only writer that does.
+   *
+   * It exists for the one transition that needs it: position validation gave up on a partition
+   * (its bounded retries were exhausted), so the partition must be fetched again unvalidated, from
+   * the same offset. `resolveOffset` would advance the offset, and every other clearing path
+   * (`seek`, `setDefaultOffset`, `clearOffsets`, `clearAllOffsets`, `resetOffsetsForTopic`) drops
+   * the committed offset too.
+   *
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  forgetConsumedEpoch(topic, partition) {
+    if (this.resolvedEpochs[topic]) {
+      this.resolvedEpochs[topic][partition] = -1
+    }
+  }
+
+  /**
    * The sum, over every resolved partition of the assignment, of how far it resolved beyond its
    * held committed offset: what `autoCommitThreshold` is compared with after every message.
    *

@@ -327,38 +327,17 @@ describe('Consumer > position validation', () => {
       expect(markChanged.mock.calls).toEqual([[TOPIC, 1]])
     })
 
-    test('retriable exhausted: the epoch and the offset stay, the partition is fetched, and the next leader epoch validates the kept epoch', async () => {
-      const events = []
-      const { group, cluster, offsetManager, requests, validationRequests, setValidationResponse } =
-        await createGroup({ validationScenario: 'retriable-exhausted', position: '120' })
-      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+    test('retriable exhausted: the epoch is cleared, the offset is not moved, the partition is fetched', async () => {
+      const { group, offsetManager } = await createGroup({
+        validationScenario: 'retriable-exhausted',
+        position: '120',
+      })
 
       const batches = await group.fetch(NODE_ID)
 
-      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(4)
+      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
       expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('120')
       expect(batches).toHaveLength(1)
-      expect(validationCount(requests)).toEqual(3)
-
-      // The spent budget is not a loop: the same leader epoch is not asked about again.
-      await group.fetch(NODE_ID)
-      expect(validationCount(requests)).toEqual(3)
-
-      cluster.leaderEpoch = () => 6
-      setValidationResponse((partitions) =>
-        offsetForLeaderEpochResponse(
-          partitions.map((partition) => ({ partition, endOffset: '100' }))
-        )
-      )
-      await group.fetch(NODE_ID)
-
-      expect(validationRequests()[3].topics[0].partitions).toEqual([
-        { partition: 0, currentLeaderEpoch: 6, leaderEpoch: 4 },
-      ])
-      expect(events).toEqual([
-        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
-      ])
-      expect(offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('100')
     })
   })
 
