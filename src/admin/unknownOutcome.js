@@ -109,32 +109,45 @@ const REFUSED_BEFORE_APPLYING = new Map([
   [apiKeys.LeaveGroup, 14],
 ])
 
+/** @param {unknown[]} values @returns {boolean} whether no value repeats */
+const distinct = (values) => new Set(values).size === values.length
+
 /**
- * What a decoded answer lets the same call send again.
- * @param {number} apiKey @param {object} args request arguments @param {object} decoded answer
- * @returns {Set<string>|true|null} the refused topic names or ids of a DeleteTopics answer whose
- *   every failed topic was refused by the quota, true for a whole request the coordinator refused
+ * What a decoded answer lets the same call send again. A DeleteTopics refusal is bound to the
+ * topic ids the answer gives, never to names, so a topic recreated under a refused name is not
+ * reached; an answer whose rows lack an id, or repeat an id or a name, permits nothing.
+ * @param {number} apiKey @param {object} decoded answer
+ * @returns {Set<string>|true|null} the refused topic ids of a DeleteTopics answer whose every
+ *   failed topic was refused by the quota, true for a whole request the coordinator refused
  *   while loading, or null when nothing may be sent again
  */
-const resendable = (apiKey, args, decoded) => {
+const resendable = (apiKey, decoded) => {
   const code = REFUSED_BEFORE_APPLYING.get(apiKey)
   if (code === undefined || !decoded) return null
   if (apiKey !== apiKeys.DeleteTopics) return decoded.errorCode === code ? true : null
-  const failed = (decoded.topicErrors ?? []).filter(({ errorCode }) => errorCode !== 0)
-  if (failed.length === 0 || failed.some(({ errorCode }) => errorCode !== code)) return null
-  return new Set(failed.map((row) => (args.topicIds ? row.topicId : row.topic)))
+  const rows = decoded.topicErrors ?? []
+  const failed = rows.filter(({ errorCode }) => errorCode !== 0)
+  if (
+    failed.length === 0 ||
+    failed.some(({ errorCode, topicId }) => errorCode !== code || typeof topicId !== 'string') ||
+    !distinct(rows.map(({ topicId }) => topicId).filter((id) => id != null)) ||
+    !distinct(rows.map(({ topic }) => topic).filter((name) => name != null))
+  )
+    return null
+  return new Set(failed.map(({ topicId }) => topicId))
 }
 
 /**
  * @param {Set<string>|true|null} refused what an earlier answer let this call send again
  * @param {object} args the new request's arguments
- * @returns {boolean} whether the new request carries only items that answer refused
+ * @returns {boolean} whether the new request carries only items that answer refused: for
+ *   DeleteTopics, a nonempty list of refused topic ids and no names
  */
 const mayResend = (refused, args) => {
   if (refused === true) return true
   if (!(refused instanceof Set)) return false
-  const names = args.topicIds ?? args.topics
-  return Array.isArray(names) && names.every((name) => refused.has(name))
+  const ids = args.topicIds
+  return Array.isArray(ids) && ids.length > 0 && ids.every((id) => refused.has(id))
 }
 
 /**

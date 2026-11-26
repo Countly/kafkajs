@@ -111,7 +111,7 @@ class MutationHistory {
         },
         onDecoded: (response) => {
           record.decoded = true
-          record.resendable = resendable(apiKey, protocolRequest.args, response)
+          record.resendable = resendable(apiKey, response)
           protocolRequest.onDecoded?.(response)
         },
       },

@@ -443,6 +443,26 @@ const throttledTopics = ({ topicErrors }) =>
     : null
 
 /**
+ * Binds a by-name DeleteTopics quota refusal to the topic ids the answer gave, so a later attempt
+ * reaches only the topics the controller refused, never a topic recreated under the same name.
+ * @param {Error} error what `Broker#deleteTopics` rejected with, carrying the failed `topicErrors`
+ * @param {string[]} names the names the request carried
+ * @returns {Map<string, string>|null} refused id to name, or null unless every failed row was
+ *   refused by the quota and names one requested topic and its id, each once
+ */
+const quotaRefusedIds = ({ topicErrors }, names) => {
+  const refused = throttledTopics({ topicErrors })
+  if (!refused || refused.size !== topicErrors.length) return null
+  const requested = new Set(names)
+  const ids = new Map()
+  for (const { topic, topicId } of topicErrors) {
+    if (!requested.has(topic) || typeof topicId !== 'string' || ids.has(topicId)) return null
+    ids.set(topicId, topic)
+  }
+  return ids
+}
+
+/**
  * Whether a config resource names something: a non-empty string, except for BROKER, whose empty
  * name stands for the cluster-wide default broker config.
  * @param {{ type: number, name: unknown }} resource
@@ -897,12 +917,77 @@ module.exports = ({
     })
   }
 
+  /**
+   * One DeleteTopics attempt by id, inside a `deleteTopics` retrier. A confirmed id leaves the
+   * pending set and, while metadata still maps its name to it, the admin's target topics. When
+   * every topic the controller answered with an error was refused by its mutation quota, the
+   * pending set narrows to those ids and the retrier sends them again; any other answered error
+   * ends the call.
+   * @param {{pending: string[], knownNames: Map<string, string>, names: Map<string, string>}} state
+   *   ids still to delete, their names as last known, and the caller's name for each id of a
+   *   by-name call (its errors name topics as the caller did)
+   * @param {number} [timeout] broker timeout
+   * @param {Function} bail ends the retries with its error
+   * @returns {Promise<void>}
+   * @throws {Error} a failure the retrier may try again
+   */
+  const deleteTopicIdsOnce = async (state, timeout, bail) => {
+    const forget = (confirmed) => {
+      for (const id of confirmed) {
+        const name = state.knownNames.get(id)
+        if (name !== undefined && cluster.metadataCache?.topicId(name) === id)
+          cluster.targetTopics.delete(name)
+      }
+    }
+    try {
+      checked(await waitOf(() => cluster.refreshMetadata()))
+      for (const id of state.pending) {
+        const name = cluster.metadataCache?.topicName(id)
+        if (name !== undefined && !state.knownNames.has(id)) state.knownNames.set(id, name)
+      }
+      const broker = checked(await waitOf(() => cluster.findControllerBroker()))
+      checked(await waitOf(() => broker.deleteTopics({ topicIds: state.pending, timeout })))
+      const confirmed = state.pending
+      state.pending = []
+      forget(confirmed)
+    } catch (error) {
+      const failures = error.topicErrors?.map((row) => ({
+        ...row,
+        topic: state.names.get(row.topicId) ?? row.topic ?? row.topicId,
+      }))
+      if (failures) error.topicErrors = failures
+      if (failures) {
+        const failed = new Set(failures.map((row) => row.topicId))
+        forget(state.pending.filter((id) => !failed.has(id)))
+      }
+      if (endsCall(error) || isAnsweredError(error)) return bail(error)
+      if (
+        failures?.length > 0 &&
+        failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
+      ) {
+        const refused = new Set(failures.map((row) => row.topicId))
+        state.pending = state.pending.filter((id) => refused.has(id))
+        if (state.pending.length === 0) return bail(error)
+        throw error
+      }
+      if (failures) return bail(error)
+      if (error.type === 'NOT_CONTROLLER') {
+        checked(await waitOf(() => cluster.refreshMetadata()))
+        throw error
+      }
+      bail(error)
+    }
+  }
+
   /** Deletes names or canonical IDs with the existing void/throw contract.
    * ID responses must cover the attempted set before cleanup. Confirmed IDs leave the mutation
    * set before follow-up metadata refresh; metadata retries share the invocation deadline.
    * When every topic the controller answered with an error was refused by its mutation quota
-   * (`THROTTLING_QUOTA_EXCEEDED`), only those topics are sent again within the `retry` budget; any
-   * other answered error is final and a written request with no answer rejects with
+   * (`THROTTLING_QUOTA_EXCEEDED`), only those topics are sent again within the `retry` budget, by
+   * topic id: a by-name call sends a refused topic again by the id the answer gave for it, so a
+   * topic recreated under that name meanwhile is not deleted, and a refusal that gives no usable id
+   * (DeleteTopics v5 and older, or a null id) is final. Errors still name the topics the caller
+   * passed. Any other answered error is final and a written request with no answer rejects with
    * `KafkaJSUnknownOutcomeError`.
    * @param {object} options exclusive topics or topicIds, with optional broker timeout
    * @returns {Promise<void>} deletion and follow-up metadata refresh completed
@@ -926,55 +1011,8 @@ module.exports = ({
       const ids = topicIds.map((id) => id.toLowerCase())
       if (new Set(ids).size !== ids.length)
         throw new KafkaJSInvalidConfigurationError('Duplicate topicIds')
-      let pending = ids
-      const knownNames = new Map()
-      const forget = (confirmed) => {
-        for (const id of confirmed) {
-          const name = knownNames.get(id)
-          if (name !== undefined && cluster.metadataCache?.topicId(name) === id)
-            cluster.targetTopics.delete(name)
-        }
-      }
-      await retrierOf(retry)(async (bail) => {
-        try {
-          checked(await waitOf(() => cluster.refreshMetadata()))
-          for (const id of pending) {
-            const name = cluster.metadataCache?.topicName(id)
-            if (name !== undefined && !knownNames.has(id)) knownNames.set(id, name)
-          }
-          const broker = checked(await waitOf(() => cluster.findControllerBroker()))
-          checked(await waitOf(() => broker.deleteTopics({ topicIds: pending, timeout })))
-          const confirmed = pending
-          pending = []
-          forget(confirmed)
-        } catch (error) {
-          const failures = error.topicErrors?.map((row) => ({
-            ...row,
-            topic: row.topic ?? row.topicId,
-          }))
-          if (failures) error.topicErrors = failures
-          if (failures) {
-            const failed = new Set(failures.map((row) => row.topicId))
-            forget(pending.filter((id) => !failed.has(id)))
-          }
-          if (endsCall(error) || isAnsweredError(error)) return bail(error)
-          if (
-            failures?.length > 0 &&
-            failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
-          ) {
-            const refused = new Set(failures.map((row) => row.topicId))
-            pending = pending.filter((id) => refused.has(id))
-            if (pending.length === 0) return bail(error)
-            throw error
-          }
-          if (failures) return bail(error)
-          if (error.type === 'NOT_CONTROLLER') {
-            checked(await waitOf(() => cluster.refreshMetadata()))
-            throw error
-          }
-          bail(error)
-        }
-      })
+      const byId = { pending: ids, knownNames: new Map(), names: new Map() }
+      await retrierOf(retry)((bail) => deleteTopicIdsOnce(byId, timeout, bail))
       return retrierOf(retry)(async (bail) => {
         try {
           checked(await waitOf(() => cluster.refreshMetadata()))
@@ -993,25 +1031,25 @@ module.exports = ({
     }
 
     const names = topics.slice()
-    let pending = names
+    let byId = null
     await retrierOf(retry)(async (bail, retryCount, retryTime) => {
+      if (byId) return deleteTopicIdsOnce(byId, timeout, bail)
       try {
         checked(await waitOf(() => cluster.refreshMetadata()))
         const broker = checked(await waitOf(() => cluster.findControllerBroker()))
-        checked(await waitOf(() => broker.deleteTopics({ topics: pending, timeout })))
+        checked(await waitOf(() => broker.deleteTopics({ topics: names, timeout })))
       } catch (error) {
         if (error.topicErrors) {
           const failed = new Set(error.topicErrors.map(({ topic }) => topic))
-          for (const topic of pending) {
+          for (const topic of names) {
             if (!failed.has(topic)) cluster.targetTopics.delete(topic)
           }
         }
-        const refused = !endsCall(error) && !isAnsweredError(error) && throttledTopics(error)
+        const refused = !endsCall(error) && !isAnsweredError(error) && quotaRefusedIds(error, names)
         if (refused) {
-          pending = pending.filter((topic) => refused.has(topic))
-          if (pending.length === 0) return bail(error)
+          byId = { pending: [...refused.keys()], knownNames: new Map(refused), names: refused }
           logger.warn('A quota refused topic deletions', {
-            topics: [...refused],
+            topics: [...refused.values()],
             retryCount,
             retryTime,
           })
