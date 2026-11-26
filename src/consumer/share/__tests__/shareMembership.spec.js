@@ -654,9 +654,17 @@ describe('share membership', () => {
     expect(logger.warn).not.toHaveBeenCalled()
     expect(f.onFatal).not.toHaveBeenCalled()
   })
-  test('an answer with an all-zero topic id beside a valid one is refused as malformed, not as a TypeError, and never becomes the target', async () => {
-    f = await fixture()
+  test('an answer with an all-zero topic id beside a valid one is refused and retried: nothing adopted or published, the heartbeat backs off, and the next valid answer is adopted', async () => {
+    f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+    let now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    f.response.assignment = { topicPartitions: [{ topicId: A, partitions: [0] }] }
     await f.member.heartbeat()
+    const target = f.member.target
+    const revision = f.member.targetRevision
+    expect(f.onAssignment).toHaveBeenCalledTimes(1)
+
+    f.response.memberEpoch = 2
     f.response.assignment = {
       topicPartitions: [
         { topicId: null, partitions: [0] },
@@ -664,12 +672,40 @@ describe('share membership', () => {
       ],
     }
     const error = await rejected(f.member.heartbeat())
-    expect(error).not.toBeInstanceOf(TypeError)
-    expect(error.cause).toBeInstanceOf(KafkaJSPartialMessageError)
-    expect(f.member.state).toBe('FATAL')
-    expect(f.onFatal).toHaveBeenCalledTimes(1)
+    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(f.member.snapshot()).toMatchObject({
+      memberEpoch: 1,
+      state: 'STABLE',
+      assignment: [{ topicId: A, topic: '__proto__', partitions: [0] }],
+      unresolved: [],
+    })
+    expect(f.member.target).toBe(target)
+    expect(f.member.targetRevision).toBe(revision)
+    expect(f.onAssignment).toHaveBeenCalledTimes(1)
     expect(f.cluster.refreshMetadataForTopicIds).not.toHaveBeenCalled()
-    expect(f.member.snapshot()).toMatchObject({ assignment: [], unresolved: [] })
+    expect(f.member.heartbeatInterval()).toBe(100)
+
+    now = 99
+    await f.member.heartbeat()
+    expect(f.frames()).toHaveLength(2)
+
+    now = 100
+    f.response.assignment = { topicPartitions: [{ topicId: A, partitions: [0, 1] }] }
+    await f.member.heartbeat()
+    expect(f.frames()).toHaveLength(3)
+    expect(f.frames()[2]).toMatchObject({
+      memberEpoch: 1,
+      rackId: 'rack',
+      subscribedTopicNames: ['__proto__'],
+    })
+    expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(f.member.snapshot()).toMatchObject({
+      memberEpoch: 2,
+      state: 'STABLE',
+      assignment: [{ topicId: A, topic: '__proto__', partitions: [0, 1] }],
+    })
+    expect(f.onAssignment).toHaveBeenCalledTimes(2)
+    expect(f.onFatal).not.toHaveBeenCalled()
   })
   test('keeps retrying unresolved IDs under its own elapsed backoff without blocking heartbeats', async () => {
     f = await fixture({

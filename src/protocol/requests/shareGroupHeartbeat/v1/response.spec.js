@@ -71,10 +71,10 @@ describe('assignment shape', () => {
     ],
     ['a negative partition', [{ topicId: A, partitions: [-1] }]],
     ['a partition twice in one row', [{ topicId: A, partitions: [2, 2] }]],
-  ])('refuses %s as a malformed answer', async (_, topicPartitions) => {
-    await expect(
-      codec.decode(wire.buildResponse({ assignment: { topicPartitions } }))
-    ).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  ])('decodes %s as sent, leaving its refusal to the membership', async (_, topicPartitions) => {
+    const decoded = await codec.decode(wire.buildResponse({ assignment: { topicPartitions } }))
+
+    expect(plain(decoded.assignment)).toEqual({ topicPartitions })
   })
 
   test('decodes a successful leave answer: code 0, epoch -1, interval 0, no assignment', async () => {

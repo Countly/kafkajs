@@ -1040,21 +1040,33 @@ describe('Consumer > the consumer protocol reconciliation', () => {
   })
 
   it('does not adopt a code-0 answer with a lower epoch than the member holds: the epoch, the assignment and the next request keep the current epoch', async () => {
-    const { group, log, trip } = build({
-      script: [assignment(5, [0, 1]), assignment(2, [0]), idle(5)],
-    })
+    let now = Date.now()
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const { group, log, trip } = build({
+        script: [assignment(5, [0, 1]), assignment(2, [0]), idle(5)],
+      })
+      const epochs = () =>
+        log.filter(({ kind }) => kind === 'heartbeat').map(({ request }) => request.memberEpoch)
 
-    await trip()
-    await trip()
+      await trip()
+      await trip()
 
-    expect(group.memberEpoch).toEqual(5)
-    expect(group.assigned()).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
+      expect(epochs()).toEqual([0, 5])
+      expect(group.memberEpoch).toEqual(5)
+      expect(group.assigned()).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
 
-    await trip()
-    const epochs = log
-      .filter(({ kind }) => kind === 'heartbeat')
-      .map(({ request }) => request.memberEpoch)
-    expect(epochs).toEqual([0, 5, 5])
+      now += 4999
+      await trip()
+      expect(epochs()).toEqual([0, 5])
+
+      now += 1
+      await trip()
+      expect(epochs()).toEqual([0, 5, 5])
+      expect(group.memberEpoch).toEqual(5)
+    } finally {
+      clock.mockRestore()
+    }
   })
 
   it('adopts the epoch of a rejoin after a fencing, also when it is lower than the epoch the member was fenced at', async () => {
