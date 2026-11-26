@@ -1,9 +1,11 @@
 const Subscription = require('../subscription')
+const createConsumer = require('../index')
 const Cluster = require('../../cluster')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { buildRequest } = require('../groupProtocol/heartbeatState')
 const ConsumerGroupProtocol = require('../groupProtocol/consumer')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const { KafkaJSConnectionError } = require('../../errors')
 const { createPatternGroup } = require('./fixtures/patternGroup')
 const { Kafka, logLevel } = require('../../../index')
 const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
@@ -360,6 +362,55 @@ describe('discovery refreshes and their scope', () => {
     expect([...cluster.targetTopics]).toEqual(['keep'])
     expect(cluster.metadataCache.topics.has('drop')).toBe(false)
     expect(broker.metadata).toHaveBeenCalledTimes(1)
+  })
+
+  test('a pattern subscribe() overtaken by a rebootstrap rejects retriably and keeps its previous declaration', async () => {
+    const held = gate()
+    const { cluster, broker } = clusterWith([metadata(['orders-1']), held.promise])
+    const pool = cluster.brokerPool
+    const next = {
+      nodeId: 1,
+      allowAutoTopicCreation: true,
+      connectionPool: { host: 'localhost', port: 9092, rack: null },
+      metadata: jest.fn(async () => metadata(['orders-1', 'payments-1'])),
+    }
+    pool.findConnectedBroker = async () => pool.seedBroker
+    pool.createSeedBroker = async () => {
+      pool.seedBroker = next
+      return next
+    }
+    const consumer = createConsumer({ cluster, groupId: 'pattern-group', logger: newLogger() })
+    try {
+      await consumer.subscribe({ topics: [/^orders-/] })
+      const declared = pool.consumerMetadataScope
+      expect(declared.desired.names).toEqual(['orders-1'])
+
+      const subscribing = consumer.subscribe({ topics: [/^payments-/] }).then(
+        () => null,
+        (error) => error
+      )
+      await new Promise(setImmediate)
+      expect(broker.metadata).toHaveBeenCalledTimes(2)
+      await pool.rebootstrap('required')
+      held.release(metadata(['orders-1', 'payments-old']))
+      const error = await subscribing
+
+      expect(error).toBeInstanceOf(KafkaJSConnectionError)
+      expect(error.retriable).toBe(true)
+      expect(error.message).toBe('Metadata refresh was overtaken by a rebootstrap')
+      expect(declared.patterns.map(({ pattern }) => pattern.source)).toEqual(['^orders-'])
+      expect(declared.desired.names).toEqual(['orders-1'])
+
+      await expect(consumer.subscribe({ topics: [/^payments-/] })).resolves.toBeUndefined()
+      expect(next.metadata).toHaveBeenCalledTimes(1)
+      expect(declared.patterns.map(({ pattern }) => pattern.source)).toEqual([
+        '^orders-',
+        '^payments-',
+      ])
+      expect(declared.desired.names).toEqual(['orders-1', 'payments-1'])
+    } finally {
+      held.release(metadata([]))
+    }
   })
 
   describe('concurrent refreshes join only within one subscription key', () => {
