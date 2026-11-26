@@ -119,20 +119,26 @@ const hasRecords = (topicMessages) => {
 }
 
 /**
- * @param {object[]} messages
- * @returns {number} the bytes of their keys and values, the accumulator's estimate of a batch
+ * Sets a chunk's `bytes`, the bytes of its keys and values (the accumulator's estimate of a
+ * batch), and `shares`, its records' shares in the producer's buffer, in one walk.
+ * @param {{ messages: object[], bytes?: number, shares?: number }} chunk
+ * @returns {void}
  */
-const sizeOf = (messages) => {
+const measure = (chunk) => {
   let bytes = 0
-  for (const { key, value } of messages) {
+  let shares = 0
+  for (const message of chunk.messages) {
+    const { key, value } = message
     if (key != null) {
       bytes += Buffer.byteLength(key)
     }
     if (value != null) {
       bytes += Buffer.byteLength(value)
     }
+    shares += share(message)
   }
-  return bytes
+  chunk.bytes = bytes
+  chunk.shares = shares
 }
 
 /**
@@ -1524,12 +1530,16 @@ class Accumulator {
    * full and goes out in this hand-off, and no batch grows past `batchSize` or the chunk capacity.
    * Each batch takes the shares of the send's records it carries (see `PendingSend#share`), and a
    * batch created here debits its own charge from the buffer, without waiting.
+   * Every chunk is planned and measured first (`#plan`), which changes nothing, so a send that
+   * fails there leaves no batch, share, debit or timer behind. Applying the plan only adds records
+   * to batches, arms timers and hands earlier batches on, which `#send` never lets throw.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
    * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
    * @param {PendingSend} holder the send whose records these are
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
    */
   #join(entries, { acks, timeout, compression, createdAt }, holder) {
+    const plan = this.#plan(entries, compression)
     let send
     const appended = new Promise((resolve, reject) => {
       send = new AppendedSend(holder, resolve, reject)
@@ -1541,11 +1551,7 @@ class Accumulator {
     const full = []
     /** @type {PendingBatch[]} the other batches carrying its records, still pending */
     const joined = []
-    for (const { topic, partition, messages } of entries) {
-      const capacity = this.#budget.chunkCapacity(topic, compression)
-      const bytes = recordsBytes(messages)
-      const chunks =
-        bytes <= capacity ? [{ messages, wire: bytes, origin: 0 }] : chunksOf(messages, capacity)
+    for (const { topic, partition, capacity, chunks } of plan) {
       chunks.forEach((chunk, index) => {
         const batch = this.#add(topic, partition, chunk, capacity, holder, send, {
           options,
@@ -1589,12 +1595,39 @@ class Accumulator {
   }
 
   /**
-   * Adds one chunk of a send's records to its partition's pending batch, or to a new one when the
-   * pending batch has other options or would pass `batchSize` or `capacity`, which hands that one
-   * on first.
+   * The chunks a send's assigned records join, measured before any batch changes: per entry the
+   * chunk capacity of its topic and codec and its records cut into chunks that fit it (see
+   * `chunksOf`), per chunk the bytes and shares `#add` charges (see `measure`).
+   * @param {{ topic: string, partition: number, messages: object[] }[]} entries
+   * @param {number} [compression]
+   * @returns {{ topic: string, partition: number, capacity: number, chunks: { messages: object[],
+   *   wire: number, origin: number, bytes: number, shares: number }[] }[]}
+   */
+  #plan(entries, compression) {
+    const plan = []
+    for (const { topic, partition, messages } of entries) {
+      const capacity = this.#budget.chunkCapacity(topic, compression)
+      const wireBytes = recordsBytes(messages)
+      const chunks =
+        wireBytes <= capacity
+          ? [{ messages, wire: wireBytes, origin: 0 }]
+          : chunksOf(messages, capacity)
+      for (const chunk of chunks) {
+        measure(chunk)
+      }
+      plan.push({ topic, partition, capacity, chunks })
+    }
+    return plan
+  }
+
+  /**
+   * Adds one planned chunk of a send's records to its partition's pending batch, or to a new one
+   * when the pending batch has other options or would pass `batchSize` or `capacity`, which hands
+   * that one on first.
    * @param {string} topic
    * @param {number} partition
-   * @param {{ messages: object[], wire: number, origin: number }} chunk
+   * @param {{ messages: object[], wire: number, origin: number, bytes: number, shares: number }}
+   *   chunk measured by `#plan`
    * @param {number} capacity the chunk capacity of the topic and codec
    * @param {PendingSend} holder
    * @param {AppendedSend} send
@@ -1602,10 +1635,10 @@ class Accumulator {
    *   createdAt: number, dueAt: number }} shape
    * @returns {PendingBatch} the batch now carrying the chunk, still pending
    */
-  #add(topic, partition, { messages, wire: wireBytes, origin }, capacity, holder, send, shape) {
+  #add(topic, partition, chunk, capacity, holder, send, shape) {
+    const { messages, wire: wireBytes, origin, bytes, shares } = chunk
     const { options, acks, timeout, compression, createdAt, dueAt } = shape
     const key = `${topic}/${partition}`
-    const bytes = sizeOf(messages)
     let batch = this.#pending.get(key)
     if (
       batch !== undefined &&
@@ -1652,10 +1685,8 @@ class Accumulator {
       this.#rearm(batch)
     }
     batch.settlers.push(new Settler(send, batch.messages.length, origin))
-    let shares = 0
     for (const message of messages) {
       batch.messages.push(withEncodableTimestamp(message))
-      shares += share(message)
     }
     batch.bytes += bytes
     batch.wire += wireBytes
@@ -1891,35 +1922,30 @@ class Accumulator {
    * options - every hand-off of a send that asked for one set of them - go to the send path as
    * they are, with no grouping.
    * @param {PendingBatch[]} batches
-   * @returns {Promise<unknown>} settles once they all have; never rejects, unless the send path
-   *   throws before it answers, which rejects the promise the hand-off sites leave unawaited
+   * @returns {Promise<unknown>} settles once they all have; never rejects
    */
   #sendGrouped(batches) {
-    try {
-      if (batches.length === 0) {
-        return Promise.resolve()
-      }
-      let shared = true
-      for (let i = 1; i < batches.length && shared; i++) {
-        shared = batches[i].options === batches[0].options
-      }
-      if (shared) {
-        return this.#send(batches)
-      }
-      /** @type {Map<string, PendingBatch[]>} */
-      const groups = new Map()
-      for (const batch of batches) {
-        const group = groups.get(batch.options)
-        if (group === undefined) {
-          groups.set(batch.options, [batch])
-        } else {
-          group.push(batch)
-        }
-      }
-      return Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
-    } catch (error) {
-      return Promise.reject(error)
+    if (batches.length === 0) {
+      return Promise.resolve()
     }
+    let shared = true
+    for (let i = 1; i < batches.length && shared; i++) {
+      shared = batches[i].options === batches[0].options
+    }
+    if (shared) {
+      return this.#send(batches)
+    }
+    /** @type {Map<string, PendingBatch[]>} */
+    const groups = new Map()
+    for (const batch of batches) {
+      const group = groups.get(batch.options)
+      if (group === undefined) {
+        groups.set(batch.options, [batch])
+      } else {
+        group.push(batch)
+      }
+    }
+    return Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
   }
 
   /**
@@ -1934,8 +1960,9 @@ class Accumulator {
 
   /**
    * Sends batches that share their options, each with one more settler that counts it as unsettled
-   * until it settles. A failure of the call itself - one that settled no batch - rejects every
-   * settler that is still waiting.
+   * until it settles. A failure of the call itself - one that settled no batch, whether the send
+   * path threw or rejected - rejects every settler that is still waiting, so a hand-off never
+   * throws into the join or timer that made it.
    * @param {PendingBatch[]} batches
    * @returns {Promise<void>} never rejects
    */
@@ -1951,7 +1978,13 @@ class Accumulator {
       )
     }
     const [{ acks, timeout, compression }] = batches
-    return this.#sendPartitioned({ acks, timeout, compression, batches }).then(
+    let sent
+    try {
+      sent = this.#sendPartitioned({ acks, timeout, compression, batches })
+    } catch (error) {
+      sent = Promise.reject(error)
+    }
+    return sent.then(
       () => {},
       (error) => {
         for (const batch of batches) {
