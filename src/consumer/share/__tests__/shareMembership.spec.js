@@ -698,7 +698,7 @@ describe('share membership', () => {
       rackId: 'rack',
       subscribedTopicNames: ['__proto__'],
     })
-    expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
     expect(f.member.snapshot()).toMatchObject({
       memberEpoch: 2,
       state: 'STABLE',

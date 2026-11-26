@@ -158,8 +158,8 @@ class ShareMembership {
    * successful answer; every epoch-zero payload is full. An answer with an epoch of 0 or below, or
    * lower than the member holds, is logged and changes nothing; an interval of 0 or below keeps the
    * current one. An assignment no coordinator writes (a null or repeated topic id, a negative or
-   * repeated partition) changes nothing and is retried under backoff with the coordinator looked up
-   * again, as a lost answer is.
+   * repeated partition) changes nothing and is retried under backoff with every field sent again;
+   * the coordinator that answered stays known, so a close during that backoff still leaves.
    * @private
    * @param {() => Error|null} ordinaryGuard The caller's captured ordinary authority.
    * @returns {Promise<void>}
@@ -220,8 +220,8 @@ class ShareMembership {
         try {
           requireAssignment('ShareGroupHeartbeat', response.assignment.topicPartitions, 'topicId')
         } catch (error) {
-          // The next answer can be valid, so this is retried as a lost answer is.
-          action = 'coordinator'
+          // The coordinator answered, so it stays known and a close can still leave through it.
+          action = 'retry'
           throw error
         }
       }
