@@ -61,6 +61,30 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'|'telemetry', Array<[string, number]>>}
  */
 const PROFILES = {
+  destructiveAdmin: [
+    ...DEFAULT,
+    ['DeleteRecords', 2],
+    ['DeleteGroups', 3],
+    ['AlterConfigs', 2],
+    ['IncrementalAlterConfigs', 1],
+    ['CreateAcls', 3],
+    ['DeleteAcls', 3],
+    ['DeleteTopics', 6],
+    ['OffsetDelete', 0],
+    ['AlterShareGroupOffsets', 0],
+    ['DeleteShareGroupOffsets', 0],
+    ['WriteTxnMarkers', 2],
+    ['AlterReplicaLogDirs', 2],
+    ['AlterClientQuotas', 1],
+    ['AlterUserScramCredentials', 0],
+    ['UpdateFeatures', 2],
+    ['ElectLeaders', 2],
+    ['AlterPartitionReassignments', 1],
+    ['CreateDelegationToken', 3],
+    ['RenewDelegationToken', 2],
+    ['ExpireDelegationToken', 2],
+    ['UnregisterController', 0],
+  ],
   share: [
     ['ApiVersions', 4],
     ['Metadata', 13],
@@ -808,7 +832,7 @@ class ScriptedCluster {
    *   and under `share` the finalized `share.version` at level 1 with feature epoch 7
    */
   apiVersionsAnswer() {
-    if (this.profile === 'share') {
+    if (this.profile === 'share' || this.profile === 'destructiveAdmin') {
       return {
         apiKeys: this.apiVersionsTable(),
         finalizedFeaturesEpoch: 7,
@@ -1316,7 +1340,9 @@ class ScriptedCluster {
     const body = Buffer.isBuffer(answer)
       ? answer
       : pair.buildResponse({
-          ...(this.profile === 'share' && { throttleTime: 0 }),
+          ...((this.profile === 'share' || this.profile === 'destructiveAdmin') && {
+            throttleTime: 0,
+          }),
           ...answer,
         })
     record.answeredOrder = this.clock++

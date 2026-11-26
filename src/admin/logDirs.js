@@ -2,7 +2,14 @@ const path = require('node:path')
 const { KafkaJSInvalidConfigurationError, KafkaJSInvariantViolation } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
 const { itemRetry } = require('./itemRetry')
-const { checked, waitOf, currentDeadline } = require('./deadline')
+const {
+  checked,
+  waitOf,
+  currentDeadline,
+  endsCall,
+  isAnsweredError,
+  settleMutations,
+} = require('./deadline')
 
 /** Refuses invalid new input before any discovery or state publication.
  *
@@ -238,14 +245,14 @@ class LogDirectoryAdmin {
       if (!groups.has(r.brokerId)) groups.set(r.brokerId, [])
       groups.get(r.brokerId).push(r)
     }
-    const outcomes = await Promise.allSettled(
+    const rows = await settleMutations(
       [...groups].map(([brokerId, items]) =>
         itemRetry(
           {
             items,
             keyOf,
             retry: this.retry,
-            retryable: (row) => row.errorCode === 7,
+            retryable: () => false,
             callFailure: (error) => refusal(error) !== null,
             sanitize: (x) => x,
           },
@@ -274,25 +281,22 @@ class LogDirectoryAdmin {
               t.partitions.map((p) => ({ brokerId, topic: t.topic, ...p }))
             )
           }
-        )
+        ).catch((error) => {
+          checked(null)
+          if (endsCall(error) || isAnsweredError(error)) throw error
+          const refused = refusal(error)
+          if (refused) throw refused
+          if (error instanceof KafkaJSInvariantViolation) throw error
+          return items.map((item) => ({
+            ...item,
+            errorCode: -1,
+            error,
+            errorMessage: error.message,
+          }))
+        })
       )
     )
-    const all = new Map()
-    const entries = [...groups]
-    outcomes.forEach((o, i) => {
-      if (o.status === 'rejected') {
-        currentDeadline()?.check()
-        if (refusal(o.reason)) throw refusal(o.reason)
-        if (o.reason instanceof KafkaJSInvariantViolation) throw o.reason
-        for (const r of entries[i][1])
-          all.set(keyOf(r), {
-            ...r,
-            errorCode: -1,
-            error: o.reason,
-            errorMessage: o.reason.message,
-          })
-      } else for (const r of o.value) all.set(keyOf(r), r)
-    })
+    const all = new Map(rows.flat().map((row) => [keyOf(row), row]))
     return replicas.map((r) => {
       const { logDir, ...row } = all.get(keyOf(r))
       return row

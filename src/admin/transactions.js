@@ -8,10 +8,11 @@ const {
 } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
 const apiKeys = require('../protocol/requests/apiKeys')
+const { ADMIN_MUTATION } = require('../broker/privateOptions')
 const { responseSourceOf } = require('../broker/failureSource')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
 const { itemRetry } = require('./itemRetry')
-const { checked, waitOf, retrierOf, currentDeadline } = require('./deadline')
+const { checked, waitOf, retrierOf, currentDeadline, endsCall } = require('./deadline')
 
 /** Transaction administration, independent of producer state and retry generations. */
 class TransactionAdmin {
@@ -142,7 +143,7 @@ class TransactionAdmin {
    */
   failed(item, error, reply = false) {
     checked(null)
-    if (this.callFailure(error)) throw error
+    if (endsCall(error) || this.callFailure(error)) throw error
     return {
       ...item,
       errorCode: reply ? error.code : -1,
@@ -472,7 +473,7 @@ class TransactionAdmin {
         const code = response.markers[0].topics[0].partitions[0].errorCode
         if (!Number.isInteger(code))
           throw new KafkaJSInvariantViolation('Invalid abort marker error code')
-        if (code !== 0) throw createErrorFromCode(code)
+        if (code !== 0) return bail(createErrorFromCode(code))
       } catch (error) {
         checked(null)
         if (error.code === 6) {
@@ -504,10 +505,7 @@ class TransactionAdmin {
     try {
       return await this.items(
         items,
-        (row) => {
-          if (row.errorCode === 15 || row.errorCode === 16) routes.delete(row.transactionalId)
-          return [14, 15, 16, 51].includes(row.errorCode)
-        },
+        () => false,
         async (pending) => {
           const rows = []
           for (const item of pending) {
@@ -524,6 +522,7 @@ class TransactionAdmin {
                   broker.initProducerId({
                     transactionalId: item.transactionalId,
                     transactionTimeout,
+                    [ADMIN_MUTATION]: ADMIN_MUTATION,
                   })
                 )
               )

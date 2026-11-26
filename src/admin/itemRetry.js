@@ -1,6 +1,6 @@
 const { KafkaJSError, KafkaJSInvariantViolation } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
-const { retrierOf, currentDeadline, checked } = require('./deadline')
+const { retrierOf, currentDeadline, checked, endsCall, isAnsweredError } = require('./deadline')
 
 /** The result rows `run` made itself for cells that got no broker answer; a broker -1 is not one. */
 const localRows = new WeakSet()
@@ -63,14 +63,16 @@ class ItemRetry {
    */
   accept(item, row) {
     this.deadline?.check()
+    if (endsCall(row.error)) throw row.error
+    const answered = isAnsweredError(row.error)
     const error =
       row.errorCode === 0
         ? null
-        : row.errorCode === -1 && row.error instanceof Error
+        : answered || (row.errorCode === -1 && row.error instanceof Error)
           ? row.error
           : createErrorFromCode(row.errorCode)
     const result = { ...item, ...row, error, errorMessage: this.sanitize(row.errorMessage ?? null) }
-    if (error && this.retryable(row, item)) {
+    if (error && !answered && this.retryable(row, item)) {
       this.last.set(this.keyOf(item), result)
       return new KafkaJSError(error, { retriable: true, cause: error })
     }
@@ -100,7 +102,9 @@ class ItemRetry {
           rows = checked(await send([...attempted.values()]))
           localFailure = null
         } catch (error) {
-          if (this.callFailure(error)) return bail(error)
+          this.deadline?.check()
+          if (endsCall(error) || this.callFailure(error) || isAnsweredError(error))
+            return bail(error)
           localFailure = error
           throw error
         }
@@ -123,7 +127,13 @@ class ItemRetry {
       })
     } catch (error) {
       this.deadline?.check()
-      if (this.callFailure(error) || error instanceof KafkaJSInvariantViolation) throw error
+      if (
+        endsCall(error) ||
+        this.callFailure(error) ||
+        isAnsweredError(error) ||
+        error instanceof KafkaJSInvariantViolation
+      )
+        throw error
       if (
         (error.cause && this.callFailure(error.cause)) ||
         error.cause instanceof KafkaJSInvariantViolation
