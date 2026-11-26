@@ -7,6 +7,7 @@ const createRequest = require('../protocol/request')
 const Decoder = require('../protocol/decoder')
 const { NETWORK_AUTHENTICATION_FAILURE } = require('./instrumentationEvents')
 const {
+  KafkaJSError,
   KafkaJSConnectionError,
   KafkaJSNonRetriableError,
   KafkaJSConnectionClosedError,
@@ -119,6 +120,7 @@ const loggedPayload = (policy, payload, showBuffers, showContent) => {
 
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
+  SESSION_REFUSAL: Symbol('private:Connection:sessionRefusal'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
   PREPARE: Symbol('private:Connection:prepare'),
   ENQUEUE: Symbol('private:Connection:enqueue'),
@@ -867,13 +869,19 @@ module.exports = class Connection {
    * @returns {boolean}
    */
   isAuthenticated() {
-    return this.authenticatedAt != null && !this[PRIVATE.SHOULD_REAUTHENTICATE]()
+    return (
+      this.authenticatedAt != null &&
+      !this[PRIVATE.SHOULD_REAUTHENTICATE](this.reauthenticationThreshold)
+    )
   }
 
-  /***
+  /**
+   * Whether less than `margin` milliseconds remain of the session; never for an unlimited one.
    * @private
+   * @param {number} margin milliseconds that must still remain
+   * @returns {boolean}
    */
-  [PRIVATE.SHOULD_REAUTHENTICATE]() {
+  [PRIVATE.SHOULD_REAUTHENTICATE](margin) {
     if (this.sessionLifetime.equals(Long.ZERO)) {
       return false
     }
@@ -883,8 +891,24 @@ module.exports = class Connection {
       .multiply(1000)
       .add(Long.fromValue(remainingNanosSince).divide(1000000))
 
-    const reauthenticateAt = millisSince.add(this.reauthenticationThreshold)
+    const reauthenticateAt = millisSince.add(margin)
     return reauthenticateAt.greaterThanOrEqual(this.sessionLifetime)
+  }
+
+  /**
+   * Why an ordinary request must not be written on this SASL connection now: a SASL exchange is
+   * running, no session is established, or the session has ended. Reads the monotonic clock at
+   * the moment of the call, so a request held in the queue is judged when it is due to be written.
+   * @private
+   * @returns {KafkaJSError|null} a retriable refusal, or null when the request may be written
+   */
+  [PRIVATE.SESSION_REFUSAL]() {
+    if (this.authEpisode || this.authenticatedAt == null || this[PRIVATE.SHOULD_REAUTHENTICATE](0))
+      return new KafkaJSError(
+        'The SASL session was not valid when the request was due to be written; it was not sent',
+        { retriable: true }
+      )
+    return null
   }
 
   /** Completes readiness once; idle tracking extends this single boundary.
@@ -1051,7 +1075,12 @@ module.exports = class Connection {
    * @param {(frameLength?: number) => Error|null} [protocol.guard=null] A pre-write check. It runs once the request is
    *                         encoded and again at the instant of transmission; an error it returns
    *                         rejects this one request, which is then written nowhere, takes no
-   *                         in-flight slot and leaves the connection open.
+   *                         in-flight slot and leaves the connection open. It receives the frame
+   *                         length only at the instant of transmission, after every other refusal,
+   *                         so a caller may record the request as written only on that call.
+   *                         On a SASL connection an ordinary request is also refused at that
+   *                         instant, with a retriable `KafkaJSError`, while a SASL exchange runs or
+   *                         once the session has ended.
    * @param {(() => Error|null)|null} [protocol.responseGuard=null] original setup/authentication
    *                         guard, checked after decode and parse before publishing side effects
    * @param {(() => void)|null} [protocol.onWrite=null] trusted private once-only commit immediately
@@ -1094,12 +1123,18 @@ module.exports = class Connection {
     try {
       expectResponse = !request.expectResponse || request.expectResponse()
       const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly })
+      // The frame-length call comes last: callers record a write in it.
+      const writeGuard =
+        this.sasl && isAuthenticatedRequest(request)
+          ? (frameLength) =>
+              (guard && guard()) || this[PRIVATE.SESSION_REFUSAL]() || (guard && guard(frameLength))
+          : guard
       const enqueue = (encoded) =>
         this[PRIVATE.ENQUEUE](
           encoded,
           requestTimeout,
           attempt,
-          guard,
+          writeGuard,
           telemetrySink,
           telemetrySlot,
           onWrite
