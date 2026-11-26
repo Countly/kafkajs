@@ -1027,7 +1027,7 @@ describe('stop during an unresolved preparation', () => {
             topics: [
               {
                 topic: TOPIC,
-                partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 4, endOffset: '4' }],
+                partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 3, endOffset: '4' }],
               },
             ],
           },
@@ -1115,7 +1115,7 @@ describe('stop during an unresolved preparation', () => {
               topics: [
                 {
                   topic: TOPIC,
-                  partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 4, endOffset: '20' }],
+                  partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 3, endOffset: '20' }],
                 },
               ],
             }
