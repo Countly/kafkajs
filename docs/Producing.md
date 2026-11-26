@@ -318,6 +318,14 @@ Example:
 ]
 ```
 
+The partition a partitioner returns must be an integer from 0 to 2147483647, as a number or as its canonical decimal string (`'12'`, not `'012'`). Anything else (a `Symbol`, `NaN`, a fraction, a negative number, a larger number, `undefined`, an object) rejects the whole `send()` with `KafkaJSInvalidConfigurationError` before any of its records is queued; inside a transaction the transaction stays usable. A partitioner that throws fails the same way: only that `send()` rejects, nothing of it is written, inside a transaction the transaction stays usable whatever was thrown, and the producer sends again. What the `send()` rejects with depends on what was thrown:
+
+- A truthy thrown value whose `retriable` property is absent or falsy (an `Error`, a `KafkaJSNonRetriableError` or a subclass, a string, an object): that value itself, at once.
+- A value whose `retriable` property is truthy (any other `KafkaJSError`, such as a `KafkaJSConnectionError`): the producer's retry rules apply to it, and the partitioner is called again after the retry backoff, with no metadata refresh. A `TypeError`, `RangeError`, `ReferenceError` or `SyntaxError` is never retried: it rejects at once, wrapped in a `KafkaJSNonRetriableError`. When the retries run out, `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the thrown error (or that error's own `cause`, when it has one). When the next retry would start after the delivery deadline, `KafkaJSDeliveryTimeout` whose `cause` is the thrown error. When the deadline passes while the send waits for that retry, `KafkaJSDeliveryTimeout` with `outcome: 'unsent'` and no `cause`.
+- A falsy value (`null`, `undefined`, `0`, `''`, `false`): an `Error` whose message is `'Aborted'`, not the value itself.
+
+A later failure of a retry that does not come from the partitioner is handled as it is for any send, not as a partitioner failure. Inside a transaction, metadata that cannot be loaded before the retries run out, or a delivery deadline that passes while the retry waits for metadata, makes the transaction abort-only. A valid partition above the number of partitions the producer knows waits for a metadata refresh, as before. Only the returned value is checked: a partitioner may ignore a record's own `partition`.
+
 To use your custom partitioner, use the option `createPartitioner` when creating the producer.
 
 ```javascript

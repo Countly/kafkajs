@@ -383,12 +383,14 @@ const waitOf = (work) => currentDeadline()?.wait(work) ?? work()
 
 /**
  * Runs shared physical setup or observer notifications outside caller ownership.
- * The caller's continuation retains its original scope.
+ * The caller's continuation retains its original scope. The store is masked rather than the
+ * instance disabled, so a nested invocation entered synchronously by `work` cannot bring the
+ * caller's scope back before `work` returns.
  * @template T
  * @param {() => T|Promise<T>} work shared setup or observers with an independent lifetime
  * @returns {Promise<T>|T} shared work's result
  */
-const sharedSetup = (work) => context.exit(work)
+const sharedSetup = (work) => context.run(undefined, work)
 
 /** the consumer's captured consumer operation adapted only at the GroupDescriptions boundary. */
 class ConsumerDescriptionScope {
@@ -517,19 +519,23 @@ const withAdminGuard = (guard, deadline = currentDeadline()) =>
  * @param {object} optionsAt method to index of its public options argument
  * @param {number} defaultTimeout validated AdminConfig budget
  * @param {import('./lifecycle')} [lifecycle] admission and shared close owner
+ * @param {Object<string, (...args: any[]) => any[]>} [inputs] per method, reads and checks the
+ *   call's arguments when the call is admitted and returns the copy the method runs with
  * @returns {object} wrapped admin surface
  * @throws {KafkaJSInvalidConfigurationError} per-call invalid apiTimeout, before method work
  */
-const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle) => {
+const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle, inputs = {}) => {
   for (const [method, index] of Object.entries(optionsAt)) {
     const work = methods[method]
     if (typeof work !== 'function') throw new Error(`Missing admin operation ${method}`)
+    const inputOf = inputs[method]
     methods[method] = async (...args) => {
       const startedAt = performance.now()
       const timeoutMs = validateApiTimeout(args[index]?.apiTimeout, defaultTimeout)
-      const run = (generation) =>
-        runWithDeadline(method, timeoutMs, () => work(...args), generation, startedAt)
-      return lifecycle ? lifecycle.run(run) : run(null)
+      const admit = inputOf && (() => inputOf(...args))
+      const run = (generation, admitted = args) =>
+        runWithDeadline(method, timeoutMs, () => work(...admitted), generation, startedAt)
+      return lifecycle ? lifecycle.run(run, admit) : run(null, admit?.())
     }
   }
   return methods

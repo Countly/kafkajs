@@ -20,6 +20,7 @@ const {
   KafkaJSMetadataNotLoaded,
   KafkaJSTopicMetadataNotLoaded,
   KafkaJSGroupCoordinatorNotFound,
+  KafkaJSProtocolError,
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
@@ -1776,12 +1777,14 @@ module.exports = class Cluster {
    * @returns {Promise<Object>}
    * @throws {KafkaJSBrokerNotFound} when the seed broker's connection failed or timed out
    * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered; its `lastError` is the
-   *   last failure a broker's FindCoordinator request ended with (for example the broker's error
-   *   answer), so a caller can tell an authorization refusal from an unavailable coordinator
+   *   last failure a broker's FindCoordinator request ended with, and its `cause` the first
+   *   non-retriable error answer (an authorization refusal, for example), which also replaces a
+   *   later broker's connection failure
    * @throws {Error} the lifecycle's close error
    */
   async findGroupCoordinatorMetadata({ groupId, coordinatorType, fence }) {
     let lastError
+    let refusal
     const findCoordinator = async ({ nodeId, broker }) => {
       return await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         try {
@@ -1808,6 +1811,9 @@ module.exports = class Cluster {
             error: e,
           })
           lastError = e
+          if (refusal === undefined && e instanceof KafkaJSProtocolError && e.retriable === false) {
+            refusal = e
+          }
 
           if (e.type === 'GROUP_COORDINATOR_NOT_AVAILABLE') {
             this.logger.debug('Group coordinator not available, retrying...', {
@@ -1826,7 +1832,12 @@ module.exports = class Cluster {
 
     let brokerMetadata
     if (this.brokerPool.getNodeIds().length > 0) {
-      brokerMetadata = await this.brokerPool.withBroker(findCoordinator, ...fenceArgs(fence))
+      brokerMetadata = await this.brokerPool
+        .withBroker(findCoordinator, ...fenceArgs(fence))
+        .catch((e) => {
+          if (refusal === undefined || !isConnectionFailure(e)) throw e
+          return null
+        })
     } else {
       const broker = await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
       brokerMetadata = await findCoordinator({
@@ -1848,7 +1859,9 @@ module.exports = class Cluster {
       return brokerMetadata
     }
 
-    const notFound = new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+    const notFound = new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator', {
+      cause: refusal,
+    })
     notFound.lastError = lastError
     throw notFound
   }

@@ -750,6 +750,8 @@ The `name` of a resource is a topic name, a group id, a client-metrics subscript
 
 `includeDocumentation: true` asks the broker for the documentation of each entry, which it leaves out otherwise (`documentation` is `null`). Every entry also carries `configType`, the type of its value: a number, see `ConfigTypes` (`BOOLEAN`, `STRING`, `INT`, `SHORT`, `LONG`, `DOUBLE`, `LIST`, `CLASS` or `PASSWORD`). Both keys need DescribeConfigs v3, which every Kafka 4.x broker offers. The documentation makes the response large, so ask for it only when you show it.
 
+A `configValue` is `null` for a sensitive config and for one that has no value, and a resource's `errorMessage` is `null` unless the broker sent one.
+
 Example response:
 
 ```javascript
@@ -771,8 +773,7 @@ Example response:
             resourceName: 'topic-name',
             resourceType: 2
         }
-    ],
-    throttleTime: 0
+    ]
 }
 ```
 
@@ -1245,6 +1246,8 @@ Delete records for a selected topic. This will delete all records from the earli
 
 Note that you cannot delete records in an arbitrary range (it will always be from the earliest available offset)
 
+Each partition must be an integer from 0 to 2^31 - 1, listed once, and each offset from 0 to 2^63 - 1, or exactly `-1`, given as a decimal integer string (an optional sign, then digits only), a safe integer number, a bigint or this package's own `Long`. Anything else, such as a value outside the signed 64-bit range, `-2`, a fraction, `'NaN'`, a hex string, a string with spaces, a Long-like object from kafkajs 2.2.4 or another copy of this package (pass `String(offset.value)` instead) or a hole in the list, is refused with a `KafkaJSNonRetriableError` before any request. The list is read and copied when `deleteTopicRecords()` is called, before it returns: a change made to it afterwards does not reach the request.
+
 The topic's offsets are read first, by a metadata request that names the topic: a partition without a leader is waited for within the `retry` budget, and one that stays without a leader fails the call as it fails `fetchTopicOffsets`, with a `KafkaJSNonRetriableError` whose `type` is `LEADER_NOT_AVAILABLE`, before anything is deleted. Each partition's request then goes to the leader the metadata names. A request that fails with a retriable error, such as a lost connection, is retried within the `retry` budget, at the same broker, and a broker that already deleted its partitions is not asked again; once the budget is spent the call rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the last error. A partition the topic does not have rejects at once with `KafkaJSDeleteTopicRecordsError`, before anything is deleted, once that offsets read has succeeded: on a topic that stays without a leader, the offsets read fails first, with the `KafkaJSNonRetriableError` above.
 
 This call returns `Promise<void>`: full success resolves to `undefined` only after all requested partitions succeed. A partial broker refusal retains the existing error shape: the typed `KafkaJSDeleteTopicRecordsError` in the error/cause chain lists only failing partitions and their errors. A non-retriable broker refusal keeps its `KafkaJSNonRetriableError` wrapper; exhausted retries keep `KafkaJSNumberOfRetriesExceeded`. A successful broker is not sent again on retries. This method returns no low watermarks; read them with `fetchTopicOffsets`.
@@ -1426,6 +1429,8 @@ PartitionReassignment Structure:
 }
 ```
 
+Each partition and each replica must be an integer from 0 to 2^31 - 1. A partition listed twice for a topic, a replica listed twice for a partition, a `null` or missing entry, a hole in any of the lists and `replicas` that are not an array are refused with a `KafkaJSNonRetriableError` before any request, so no partition of the call is reassigned. An empty `replicas` array is sent as it is; Kafka refuses it. The topics are read and copied when `alterPartitionReassignments()` is called, before it returns: a change made to them afterwards does not reach the request.
+
 When some partitions are refused and others are not, the retries send only the partitions the broker said could still go through, each with the replicas you gave, and a topic whose partitions all went through is not sent again. A partition refused for good rejects the call with a `KafkaJSAggregateError`, as described under [Create topics](#create-topics). A topic whose `partitionAssignment` is empty is not sent.
 
 `allowReplicationFactorChange` defaults to true. Set it to false to reject a replication-factor change while allowing other reassignments. False requires AlterPartitionReassignments v1; a v0 broker rejects the option before sending. The method keeps its void success and thrown aggregate errors, retaining terminal children and retrying only the retriable subset.
@@ -1457,14 +1462,14 @@ Resulting ListPartitionReassignmentsResponse Structure:
 OngoingTopicReassignment Structure:
 ```typescript
 {
-  topic: <String>,
+  name: <String>,
   partitions: <OngoingPartitionReassignment[]>
 }
 ```
 OngoingPartitionReassignment Structure:
 ```typescript
 {
-  partitionIndex: <Number>,
+  partition: <Number>,
   replicas: <Number[]>, // The current replica set
   addingReplicas: <Number[]> // The set of replicas being added
   removingReplicas: <Number[]> // The set of replicas being removed
@@ -1530,7 +1535,7 @@ const quotas = await admin.describeClientQuotas({ components: [{ entityType: 'us
 
 ## SCRAM credentials
 
-`describeUserScramCredentials({ users, apiTimeout }?)` returns per-user credential mechanisms/iteration counts and typed result errors. Omitted or null users selects all; an explicit empty list returns no results without a request. The request's own top-level broker error rejects the call. After users are known, a later route or setup failure retains completed users and gives unresolved users code -1 with the original typed local error. Passwords and derived credentials are never returned.
+`describeUserScramCredentials({ users, apiTimeout }?)` returns per-user credential mechanisms/iteration counts and typed result errors. Omitted or null users selects all; an explicit empty list returns no results without a request. The request's own top-level broker error rejects the call. After users are known, a later route or setup failure retains completed users and gives unresolved users code -1 with the original typed local error and an empty `credentials` list. Passwords and derived credentials are never returned.
 
 `alterUserScramCredentials({ upsertions, deletions, apiTimeout })` requires at least one change. An upsertion is `{ user, mechanism, iterations, password, salt? }`; a deletion is `{ user, mechanism }`. Mechanisms are `SCRAM-SHA-256` or `SCRAM-SHA-512`, iterations are integers from 4096 to 16384, and password is a nonempty string. Salt is an optional Buffer of 1..1024 bytes; the default is 32 random bytes. Each user/mechanism pair appears once across both lists.
 

@@ -91,6 +91,47 @@ describe('pause across a rebalance on the real apply paths', () => {
     })
   })
 
+  describe('a partition pause under a topic pause', () => {
+    const MODES = [
+      ['classic eager', 'classic', { rebuildOffsets: true }],
+      ['classic cooperative', 'classic', { rebuildOffsets: false }],
+      ['consumer protocol', 'consumer', { rebuildOffsets: false }],
+    ]
+
+    /** Joins with partitions 0 and 1, pauses the topic, then pauses p0 as a handler's pause() does. */
+    const pauseTopicThenPartition = async (groupProtocol, options) => {
+      h = await createFetchGroup({ partitions: [0, 1], groupProtocol })
+      h.group.partitionsPerSubscribedTopic = h.group.generatePartitionsPerSubscribedTopic()
+      await apply([0, 1], options)
+      h.group.pause([{ topic: TOPIC }])
+      h.group.pause([{ topic: TOPIC, partitions: [0] }])
+    }
+
+    it.each(MODES)(
+      "%s: a handler's pause() of p0 under a topic pause leaves neither p0 nor p1 in the next Fetch",
+      async (_, groupProtocol, options) => {
+        await pauseTopicThenPartition(groupProtocol, options)
+        expect(fetched(h.group)).toEqual([])
+
+        await apply([], options)
+        await apply([0, 1], options)
+        expect(h.group.paused()).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
+        expect(fetched(h.group)).toEqual([])
+      }
+    )
+
+    it.each(MODES)(
+      '%s: resume of the topic after that brings both back in the next Fetch',
+      async (_, groupProtocol, options) => {
+        await pauseTopicThenPartition(groupProtocol, options)
+        h.group.resume([{ topic: TOPIC }])
+
+        expect(h.group.paused()).toEqual([])
+        expect(fetched(h.group)).toEqual([0, 1])
+      }
+    )
+  })
+
   it('pause intent survives ordinary rebalances but ends with its incarnation', async () => {
     for (const [groupProtocol, options] of [
       ['classic', { rebuildOffsets: true }],

@@ -63,8 +63,8 @@ const fixtureMessage = (batchContext) => ({
 const decodeInstallingBeforeBuild = (batchContext, install) => {
   const decoder = new Decoder(Buffer.from(require('../../fixtures/v0_record.json')))
   const readHeaders = decoder.readVarIntArrayBytesBounded
-  decoder.readVarIntArrayBytesBounded = (reader) => {
-    const headers = readHeaders.call(decoder, reader)
+  decoder.readVarIntArrayBytesBounded = (reader, budget) => {
+    const headers = readHeaders.call(decoder, reader, budget)
     install()
     return headers
   }

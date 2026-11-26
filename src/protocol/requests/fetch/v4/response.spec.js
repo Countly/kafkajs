@@ -32,6 +32,8 @@ describe('Protocol > Requests > Fetch > v4', () => {
               highWatermark: '3',
               abortedTransactions: [],
               lastStableOffset: '3',
+              nextBatchOffset: expect.any(String),
+              nextBatchLeaderEpoch: expect.any(Number),
               messages: [
                 {
                   offset: '0',
@@ -91,6 +93,8 @@ describe('Protocol > Requests > Fetch > v4', () => {
               highWatermark: '6',
               lastStableOffset: '6',
               abortedTransactions: [],
+              nextBatchOffset: expect.any(String),
+              nextBatchLeaderEpoch: expect.any(Number),
               messages: [
                 {
                   magicByte: 2,
@@ -223,6 +227,8 @@ describe('Protocol > Requests > Fetch > v4', () => {
               highWatermark: '6',
               lastStableOffset: '6',
               abortedTransactions: [],
+              nextBatchOffset: expect.any(String),
+              nextBatchLeaderEpoch: expect.any(Number),
               messages: [
                 {
                   magicByte: 2,

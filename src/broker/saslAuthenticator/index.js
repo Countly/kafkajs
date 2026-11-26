@@ -35,6 +35,8 @@ module.exports = class SASLAuthenticator {
     this.connection = connection
     this.logger = logger
     this.sessionLifetime = UNLIMITED_SESSION_LIFETIME
+    /** @type {[number, number]|null} when the request whose answer set the lifetime was written */
+    this.sessionStartedAt = null
 
     const lookupRequest = lookup(versions)
     this.saslHandshake = lookupRequest(apiKeys.SaslHandshake, requests.SaslHandshake)
@@ -79,12 +81,19 @@ module.exports = class SASLAuthenticator {
       )
     }
 
+    /**
+     * Exchanges one mechanism payload and pairs the returned lifetime with its request write.
+     * @param {{ request: { encode: Function }, response?: { decode: Function, parse: Function } }} exchange
+     * @returns {Promise<unknown>} the parsed mechanism response, if requested
+     * @throws {Error} the invocation refusal or exchange failure
+     */
     const saslAuthenticate = async ({ request, response }) => {
       check()
       const requestAuthBytes = await request.encode()
       check()
 
       let authResponse
+      let writtenAt = null
       try {
         authResponse = await this.connection.send({
           ...this.protocolAuthentication({
@@ -93,6 +102,10 @@ module.exports = class SASLAuthenticator {
           }),
           guard: this.guard,
           responseGuard: this.guard,
+          /** Captures the write time on the connection's session clock. @returns {void} */
+          onWrite: () => {
+            writtenAt = process.hrtime()
+          },
         })
       } catch (e) {
         // Only the raw protocol error still carries the code; mechanisms re-wrap it. The
@@ -111,6 +124,7 @@ module.exports = class SASLAuthenticator {
       // This is not present in SaslAuthenticateV0, so we default to `"0"`
       check()
       this.sessionLifetime = authResponse.sessionLifetimeMs || UNLIMITED_SESSION_LIFETIME
+      this.sessionStartedAt = writtenAt
 
       if (!response) {
         return

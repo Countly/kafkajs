@@ -35,6 +35,8 @@ describe('Protocol > Requests > Fetch > v11', () => {
               lastStableOffset: '3',
               lastStartOffset: '0',
               preferredReadReplica: 0,
+              nextBatchOffset: expect.any(String),
+              nextBatchLeaderEpoch: expect.any(Number),
               messages: [
                 {
                   offset: '0',

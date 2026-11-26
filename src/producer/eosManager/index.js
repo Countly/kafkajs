@@ -11,10 +11,11 @@ const {
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProducerClosedError,
+  KafkaJSProtocolError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
-const { usableTopicIds } = require('../../protocol/requests/topicIds')
+const { isUsableTopicId, usableTopicIds } = require('../../protocol/requests/topicIds')
 const ProducerStateManager = require('../state')
 const { transactionStateFor } = require('../state/errorClassifier')
 const assert = require('assert')
@@ -64,6 +65,7 @@ const surfaceInTransaction = (error) => {
 
 const COMMIT_PENDING =
   'The transaction coordinator could not be found; the commit is pending, call commit() again'
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED = 53
 
 /**
  * The not-found links of failed coordinator lookups' cause chains. A retrier's re-wrap keeps such a
@@ -87,18 +89,32 @@ const causeChain = (error) => {
 
 /**
  * Records a failed coordinator lookup whose discovery ran out of its budget: a
- * `KafkaJSGroupCoordinatorNotFound` or a `KafkaJSBrokerNotFound` in its cause chain.
+ * `KafkaJSGroupCoordinatorNotFound` or a `KafkaJSBrokerNotFound` in its cause chain. A not-found
+ * error caused by a broker's non-retriable answer is a refusal, not a discovery that ran out, and
+ * is not recorded: the boundary classifies the answer instead.
  * @param {Error} error what the lookup rejected with
  * @returns {Error} the same error
  */
 const markLookupFailure = (error) => {
   for (const link of causeChain(error)) {
-    if (link instanceof KafkaJSGroupCoordinatorNotFound || link instanceof KafkaJSBrokerNotFound) {
+    const refused = link.cause instanceof KafkaJSProtocolError && link.cause.retriable === false
+    if (
+      (link instanceof KafkaJSGroupCoordinatorNotFound && !refused) ||
+      link instanceof KafkaJSBrokerNotFound
+    ) {
       exhaustedLookups.add(link)
     }
   }
   return error
 }
+
+/**
+ * @param {Error} error
+ * @returns {boolean} whether a coordinator lookup's cause chain holds
+ *   TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53)
+ */
+const refusesTransactionalId = (error) =>
+  causeChain(error).some((link) => link.code === TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
 
 /**
  * @param {Error} error
@@ -150,6 +166,9 @@ const nothingToAbort = (error, confirmed) => !confirmed && error.type === 'INVAL
  */
 const hasPartitions = (topics) => topics.some(({ partitions }) => partitions.length > 0)
 
+/** The captured ids of a call that names no topic; never written to. */
+const NO_TOPIC_IDS = new Map()
+
 /**
  * The error a commit whose `EndTxn` outcome is unknown rejects with: the last retriable error of a
  * request whose retries ran out, or whose `retry.maxTotalTime` passed, unwrapped from the retrier's
@@ -186,6 +205,46 @@ const supersededInputError = (input) =>
       ),
     }
   )
+
+/**
+ * The refusal of offsets once the producer can no longer verify the topic they were given for: its
+ * id in the producer's metadata changed, appeared or disappeared since `sendOffsets` was called. A
+ * changed id is a recreation; an id that appeared or disappeared may be one too, or only metadata
+ * the producer had not loaded yet or has since cleared (a rebootstrap, idle pruning).
+ * @param {string} topic
+ * @param {string|null} captured the id read when `sendOffsets` was called, null for none
+ * @param {string|null} current the id the producer's metadata holds now, null for none
+ * @returns {KafkaJSTransactionAbortableError}
+ */
+const topicIdChangedError = (topic, captured, current) =>
+  new KafkaJSTransactionAbortableError(
+    `The producer can no longer verify that topic "${topic}" is the topic the offsets were given for: its id was ${captured ?? 'unknown'} when sendOffsets was called and is ${current ?? 'unknown'} now; call abort() on the transaction and process the records again in a new one`,
+    {
+      cause: new KafkaJSCommitFailedError(
+        `Topic "${topic}" had id ${captured ?? 'unknown'} when the offsets were given and has ${current ?? 'unknown'} now`,
+        { reason: 'stale-assignment' }
+      ),
+    }
+  )
+
+/**
+ * @param {string|null|undefined} id
+ * @returns {string|null} the id, or null for a missing, null or all-zero one
+ */
+const comparableTopicId = (id) => (isUsableTopicId(id) ? id : null)
+
+/**
+ * @param {ReadonlyArray<{ topic: string }>} topics offsets as `sendOffsets` copied them
+ * @param {(name: string) => string|null|undefined} idOf the producer's metadata
+ * @returns {Map<string, string|null>} each topic name to its id, null for a topic with none
+ */
+const captureTopicIds = (topics, idOf) => {
+  const ids = new Map()
+  for (const { topic } of topics) {
+    if (!ids.has(topic)) ids.set(topic, comparableTopicId(idOf(topic)))
+  }
+  return ids
+}
 
 /**
  * @param {ReadonlyArray<{ topic: string, partitions: ReadonlyArray<{ partition: number|string }> }>} topics
@@ -253,7 +312,8 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
  *   lifecycle. Each operation reads it once, when it starts, and never again after an await: its
  *   retries stop, and it opens no socket and changes no state, once that lifecycle is closed.
  * @param {(armed: Error) => void} [options.onFenced] private notice that an `InitProducerId` was
- *   fenced (47 or 90), called with the armed error this manager is about to reject with, so the
+ *   fenced (47 or 90) or its transactional id refused (53), called with the armed error this
+ *   manager is about to reject with, so the
  *   producer can make its other identity and its lifecycle fatal too
  * @returns {EosManager}
  */
@@ -295,16 +355,32 @@ const createEosManager = ({
   }
 
   /**
+   * @param {Map<string, string|null>} captured the topic ids a `sendOffsets` call read when it was
+   *   made, null for a topic with none
+   * @returns {KafkaJSTransactionAbortableError|null} the refusal once the producer's metadata
+   *   holds another id for one of those topics: a different one, one where there was none, or none
+   */
+  const topicIdRefusal = (captured) => {
+    for (const [topic, id] of captured) {
+      const current = comparableTopicId(cluster.topicId(topic))
+      if (current !== id) return topicIdChangedError(topic, id, current)
+    }
+    return null
+  }
+
+  /**
    * The private options of an AddOffsetsToTxn or TxnOffsetCommit attempt: the lifecycle's guard,
-   * and, while the transaction holds input dependencies, their refusal too, so a request is not
-   * written once an input was superseded.
+   * and, while the transaction holds input dependencies or the offsets name topics, their refusals
+   * too, so a request is not written once an input was superseded or a topic's id changed.
    * @param {import('../generation')} [generation]
+   * @param {Map<string, string|null>} [captured] the topic ids the offsets were given for; only a
+   *   TxnOffsetCommit attempt passes them
    * @returns {{ guard?: (frameLength?: number) => Error|null }}
    */
-  const offsetGuardOf = (generation) =>
-    stateManager.offsets.inputs === null
+  const offsetGuardOf = (generation, captured = NO_TOPIC_IDS) =>
+    stateManager.offsets.inputs === null && captured.size === 0
       ? guardOf(generation)
-      : { guard: () => generation?.guard() || inputRefusal() }
+      : { guard: () => generation?.guard() || inputRefusal() || topicIdRefusal(captured) }
 
   /**
    * Runs immediately before a commit EndTxn that carries input dependencies is written: refuses
@@ -321,11 +397,12 @@ const createEosManager = ({
 
   /**
    * Re-reads the metadata the producer's cluster tracks after the broker answered UNKNOWN_TOPIC_ID,
-   * so the next attempt reads the id a recreated topic has now from the cache `cluster.topicId`
-   * reads. It never creates a topic and registers none: an offset commit's topics are not targets
-   * of this producer, and one that became a target here would stay eligible for automatic creation
-   * in every later refresh. A topic whose id the cache holds is already a target, so it is
-   * refreshed with the rest. The refresh is guarded, so it shares no promise with the send path's
+   * so that, for a topic the producer already targets, the next attempt's check sees the id it has
+   * now in the cache `cluster.topicId` reads, and refuses the attempt when it changed. It never
+   * creates a topic and registers none: an offset topic that became a target here would stay
+   * eligible for automatic creation in every later refresh. An offset topic the producer does not
+   * target is not refreshed, so its cached id, if any, stays as it was. The refresh is guarded, so
+   * it shares no promise with the send path's
    * refreshes, which may create a topic. Best effort: a failed refresh leaves the original error
    * to the retrier, but a closed lifecycle ends the attempt with its close error and publishes
    * nothing.
@@ -415,6 +492,19 @@ const createEosManager = ({
   }
 
   /**
+   * Arms a transaction coordinator lookup refusal after checking that its lifecycle is still open.
+   * @param {Error} failure a lookup failure carrying TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+   * @param {import('../generation')} [generation] the lifecycle the caller captured
+   * @returns {import('../../errors').KafkaJSApplicationRecoverableError} the armed error
+   */
+  const armRefusedTransactionLookup = (failure, generation) => {
+    generation?.check()
+    stateManager.classify(failure, 'txn')
+    stateManager.arm(failure)
+    return stateManager.transaction.armedError()
+  }
+
+  /**
    * The transaction coordinator for an InitProducerId - a first one or an epoch bump - its lookup
    * retried as `retryTransactionCoordinator` does. A discovery that ran out rejects with a
    * retriable error before the state manager sees it, so it arms nothing: the producer stays as it
@@ -422,6 +512,7 @@ const createEosManager = ({
    * @param {import('../generation')} [generation] the lifecycle the caller captured
    * @returns {Promise<import('../../../types').Broker>} the coordinator
    * @throws {KafkaJSError} retriable, `cause` the discovery error, when discovery ran out
+   * @throws {import('../../errors').KafkaJSApplicationRecoverableError} on a refused lookup (53)
    * @throws {Error} any other failure, as `retryTransactionCoordinator` does
    */
   const lookUpTransactionCoordinator = async (generation) => {
@@ -429,6 +520,11 @@ const createEosManager = ({
       return await findTransactionCoordinator(generation)
     } catch (error) {
       return retryTransactionCoordinator(error, generation).catch((failure) => {
+        if (refusesTransactionalId(failure)) {
+          const armed = armRefusedTransactionLookup(failure, generation)
+          if (!stateManager.isInitialized()) onFenced?.(armed)
+          throw armed
+        }
         throw isDiscoveryExhausted(failure)
           ? discoveryUnavailable(
               'The transaction coordinator could not be found; no producer id was requested, try again',
@@ -755,7 +851,10 @@ const createEosManager = ({
      * @throws {import('../../errors').KafkaJSInvalidConfigurationError} CLUSTER_AUTHORIZATION_FAILED,
      *   naming both remedies
      * @throws {import('../../errors').KafkaJSApplicationRecoverableError} initial fencing codes
-     *   47 or 90; the protocol error remains its cause and the producer stays fatal
+     *   47 or 90, or when the coordinator lookup is refused with 53; the error remains its cause
+     *   and the producer stays fatal
+     * @throws {import('../../errors').KafkaJSProtocolError} a direct TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+     *   (53) from InitProducerId; the producer can try again after the ACL is corrected
      * @throws {KafkaJSError} retriable, `cause` the discovery error, when the transaction
      *   coordinator could not be found; nothing is armed and the call can be made again
      */
@@ -837,6 +936,8 @@ const createEosManager = ({
      *   retries ran out, or `KafkaJSDeliveryTimeout` once `retry.maxTotalTime` did - or the
      *   re-initialization's; the producer stays `READY` (`FATAL_ERROR` when the re-initialization
      *   failed fatally)
+     * @throws {import('../../errors').KafkaJSApplicationRecoverableError} the armed error, when the
+     *   lookup was refused with TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53); the producer is fatal
      */
     async beginTransaction() {
       const generation = getGeneration()
@@ -847,7 +948,10 @@ const createEosManager = ({
       try {
         coordinator = await findTransactionCoordinator(generation)
       } catch (error) {
-        coordinator = await retryTransactionCoordinator(error, generation)
+        coordinator = await retryTransactionCoordinator(error, generation).catch((failure) => {
+          if (!refusesTransactionalId(failure)) throw failure
+          throw armRefusedTransactionLookup(failure, generation)
+        })
       }
       generation?.check()
       if (stateManager.version.begin(coordinator).bumpRequired) {
@@ -1090,8 +1194,20 @@ const createEosManager = ({
      * arms the state its category calls for - a stale generation or member (ILLEGAL_GENERATION,
      * UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID, STALE_MEMBER_EPOCH) arms `ABORTABLE_ERROR`: abort, let
      * the consumer rejoin, reprocess - and rejects with it. So does a v6 answer that cannot be
-     * matched to its request, and a transaction or group coordinator that could not be found. An UNKNOWN_TOPIC_ID answer (v6) refreshes the metadata the cluster
-     * tracks before the retry, and never creates a topic.
+     * matched to its request, and a transaction or group coordinator that could not be found. An
+     * UNKNOWN_TOPIC_ID answer (v6) refreshes the metadata the cluster tracks before the retry, and
+     * never creates a topic.
+     *
+     * Each topic's id is read from the producer's metadata when the method is called, and every
+     * attempt sends those ids, never ids read later. Before each write the call is refused when the
+     * metadata holds another id for a topic than it did then: a different one, one where there was
+     * none, or none where there was one. The producer then can no longer verify that the offsets
+     * land on the topic they were given for; a cleared cache refuses too. Under transaction version
+     * 1, or while a topic had no id at the call, the request is keyed by name and only this
+     * client-side check applies; it cannot see a recreation the metadata has not loaded. The first
+     * attempt fixes the key: a retry of one keyed by name stays keyed by name, and one that would
+     * go out by name after an attempt keyed by id (v6), to a coordinator that offers v5 at most, is
+     * refused before it is written.
      *
      * Under version 2 offsets holding no partition are skipped, as the Java producer skips them:
      * nothing is sent and the transaction is not marked started, since the broker starts none for
@@ -1118,6 +1234,10 @@ const createEosManager = ({
      *   superseded (a seek, a topic recreation, the end of its acquisition); nothing more of the
      *   call is sent. Called from a consumer handler with offsets of its own group and partition,
      *   the call ties the transaction to that batch until the commit EndTxn is written
+     * @throws {import('../../errors').KafkaJSTransactionAbortableError} armed, `cause` a
+     *   `KafkaJSCommitFailedError` (`stale-assignment`), when a topic's id in the producer's
+     *   metadata differs from the one read at the call, or an id-bearing request would be retried
+     *   keyed by name; that attempt is not written
      *
      * @typedef {Object} OffsetCommitTopic
      * @property {string} topic
@@ -1142,6 +1262,12 @@ const createEosManager = ({
         groupId,
         topics
       )
+      const captured = captureTopicIds(snapshot.topics, (name) => cluster.topicId(name))
+      const topicIds = usableTopicIds(
+        snapshot.topics.map(({ topic }) => topic),
+        (name) => captured.get(name)
+      )
+      const topicIdBinding = { keyedBy: null }
       const identity = handlerContext.current()
       if (
         identity?.acquisition !== undefined &&
@@ -1205,10 +1331,8 @@ const createEosManager = ({
           await retrierFor(generation)(async (bail, retryCount, retryTime) => {
             try {
               generation?.check()
-              const topicIds = usableTopicIds(
-                snapshot.topics.map(({ topic }) => topic),
-                (name) => cluster.topicId(name)
-              )
+              const changed = topicIdRefusal(captured)
+              if (changed) throw changed
               await groupCoordinator.txnOffsetCommit({
                 transactionalId,
                 producerId: stateManager.producerId,
@@ -1219,8 +1343,8 @@ const createEosManager = ({
                 memberId,
                 groupInstanceId,
                 transactionVersion,
-                ...(topicIds ? { topicIds } : {}),
-                ...offsetGuardOf(generation),
+                ...(topicIds ? { topicIds, topicIdBinding } : {}),
+                ...offsetGuardOf(generation, captured),
               })
             } catch (e) {
               generation?.check()
