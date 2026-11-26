@@ -1,5 +1,6 @@
 const Encoder = require('../protocol/encoder')
 const Decoder = require('../protocol/decoder')
+const { readRows, unionRows } = require('./assignmentRows')
 
 /**
  * `ConsumerProtocolSubscription`, versions 0-3. `validVersions 0-3`, `flexibleVersions none`.
@@ -124,27 +125,18 @@ const MemberAssignment = {
   },
 
   /**
+   * Reads the wire as written: a partition named twice stays twice, and a topic written in more
+   * than one row gets the partitions of every row, in row order.
    * @param {Buffer} buffer
-   * @returns {Object|null}
+   * @returns {Object|null} null when the buffer carries no version header
    */
   decode(buffer) {
-    const decoder = new Decoder(buffer)
-    const decodePartitions = (d) => d.readInt32()
-    const decodeAssignment = (d) => ({
-      topic: d.readString(),
-      partitions: d.readArray(decodePartitions),
-    })
-    if (!decoder.canReadInt16()) {
+    const read = readRows(buffer)
+    if (read === null) {
       return null
     }
 
-    return {
-      version: decoder.readInt16(),
-      assignment: Object.fromEntries(
-        decoder.readArray(decodeAssignment).map(({ topic, partitions }) => [topic, partitions])
-      ),
-      userData: decoder.readBytes(),
-    }
+    return { version: read.version, assignment: unionRows(read.rows), userData: read.userData }
   },
 }
 
