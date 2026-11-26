@@ -1,5 +1,6 @@
 const createRetry = require('../retry')
 const { KafkaJSInvariantViolation, isStaleCoordinator } = require('../errors')
+const { refuseUnusableStoredOffsets } = require('./offsetManager/storedOffsets')
 
 /**
  * Reads a group's committed offsets from its coordinator as an observation: stable reads
@@ -38,6 +39,8 @@ class CommittedOffsetReader {
    *   topic, and the partition when the failure concerns one: besides a missing, unrequested or
    *   repeated partition, the OffsetFetch selection read refuses a topic that fills more answer
    *   entries than the request had for it (a limit no other user of the shared coverage check has)
+   * @throws {KafkaJSNonRetriableError} when a code-0 row stores an offset below -2, which is
+   *   neither a commit nor the `-1`/`-2` "no offset" markers (`refuseUnusableStoredOffsets`)
    * @throws {Error} a broker or partition error once the retry budget is spent, or the operation's
    *   own refusal (a spent time budget ends the call with its own timeout instead)
    */
@@ -79,6 +82,7 @@ class CommittedOffsetReader {
       ? operation.retry(attempt, this.retryOptions)
       : this.retrier(attempt))
 
+    refuseUnusableStoredOffsets(this.groupId, responses)
     const cells = new Map()
     for (const { topic, partitions } of responses) {
       for (const cell of partitions) cells.set(`${topic}|${cell.partition}`, cell)

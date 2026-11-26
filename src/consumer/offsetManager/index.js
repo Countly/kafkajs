@@ -7,6 +7,7 @@ const OffsetOperations = require('./offsetOperations')
 const { fencedDelay } = require('../fetchPreparation')
 const { isStaleBatch } = require('../handlerContext')
 const ResetObligations = require('./resetObligations')
+const { refuseUnusableStoredOffsets } = require('./storedOffsets')
 const { ResetResolver } = require('../offsetReset')
 const {
   KafkaJSError,
@@ -2334,6 +2335,8 @@ module.exports = class OffsetManager {
    * @throws {Error} the last error, once the deadline passes, the consumer is stopping, a
    *   rebalance is pending, or - for a stale epoch - the member has no epoch; or the
    *   preparation's refusal
+   * @throws {KafkaJSNonRetriableError} at once, without a re-send, when a code-0 row stores an
+   *   offset below -2 (`refuseUnusableStoredOffsets`)
    */
   async fetchCommittedOffsets(topics, preparation) {
     if (this.groupId === undefined) {
@@ -2369,13 +2372,15 @@ module.exports = class OffsetManager {
           : undefined
 
       try {
-        return await coordinator.offsetFetch({
+        const answer = await coordinator.offsetFetch({
           groupId: this.groupId,
           topics: this.withTopicIds(topics),
           ...memberFields,
           requireStable: true,
           ...(preparation && { guard: preparation.guard }),
         })
+        refuseUnusableStoredOffsets(this.groupId, answer.responses)
+        return answer
       } catch (e) {
         this.refuse(preparation)
         const unstable = e.type === UNSTABLE_OFFSET_COMMIT
