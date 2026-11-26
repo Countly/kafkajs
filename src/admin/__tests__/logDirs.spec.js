@@ -151,7 +151,7 @@ describe('log directory administration', () => {
       futureLogDir: null,
     })
   })
-  it('keeps log-dir-not-found terminal while retrying only a timed-out replica', async () => {
+  it('keeps both log-dir-not-found and timeout rows after one request', async () => {
     const broker = {
       alterReplicaLogDirs: jest
         .fn()
@@ -174,11 +174,12 @@ describe('log directory administration', () => {
     const { admin } = fixture(new Map([[1, broker]]))
     const replicas = [0, 1, 2].map((p) => ({ ...replica(p), logDir: '/data/b' }))
     const rows = await admin.alterReplicaLogDirs({ replicas })
-    expect(rows.map((r) => r.errorCode)).toEqual([57, 0, 0])
+    expect(rows.map((r) => r.errorCode)).toEqual([57, 7, 0])
     expect(rows[0].error).toMatchObject({ type: 'LOG_DIR_NOT_FOUND' })
-    expect(broker.alterReplicaLogDirs.mock.calls[1][0]).toEqual({
-      dirs: [{ path: '/data/b', topics: [{ topic: 't', partitions: [1] }] }],
+    expect(broker.alterReplicaLogDirs).toHaveBeenCalledWith({
+      dirs: [{ path: '/data/b', topics: [{ topic: 't', partitions: [0, 1, 2] }] }],
     })
+    expect(broker.alterReplicaLogDirs).toHaveBeenCalledTimes(1)
     expect(replicas).toEqual([0, 1, 2].map((p) => ({ ...replica(p), logDir: '/data/b' })))
   })
   it('rejects a missing alteration response identity instead of inferring success', async () => {
@@ -685,11 +686,11 @@ describe('directory retry and monotonic expiry', () => {
     async (method) => {
       jest.useFakeTimers()
       try {
-        const send = jest.fn(async () =>
-          method === 'alterReplicaLogDirs'
-            ? { topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 7 }] }] }
-            : { errorCode: 7, logDirs: [] }
-        )
+        // an alteration answer is final, so its retry follows a failure before the request
+        const send = jest.fn(async () => {
+          if (method === 'alterReplicaLogDirs') throw new Error('connection refused')
+          return { errorCode: 7, logDirs: [] }
+        })
         const { cluster } = fixture(
           new Map([[1, { describeLogDirs: send, alterReplicaLogDirs: send }]])
         )
@@ -715,28 +716,31 @@ describe('directory retry and monotonic expiry', () => {
       }
     }
   )
-  it.each(['describeLogDirs', 'alterReplicaLogDirs'])(
-    'keeps latest transport failure after %s request timeout',
-    async (method) => {
-      const failure = new Error('latest transport error')
-      const send = jest
-        .fn()
-        .mockResolvedValueOnce(
-          method === 'describeLogDirs'
-            ? { errorCode: 7, logDirs: [] }
-            : { topics: [{ topic: 't', partitions: [{ partition: 0, errorCode: 7 }] }] }
-        )
-        .mockRejectedValueOnce(failure)
-      const { admin } = fixture(new Map([[1, { [method]: send }]]))
-      const options =
-        method === 'describeLogDirs'
-          ? { brokers: [1] }
-          : { replicas: [{ ...replica(), logDir: '/data/b' }] }
-      const rows = await admin[method](options)
-      expect(rows[0].errorCode).toBe(-1)
-      expect(rows[0].error).toBe(failure)
-    }
-  )
+  it('keeps latest transport failure after describeLogDirs request timeout', async () => {
+    const failure = new Error('latest transport error')
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({ errorCode: 7, logDirs: [] })
+      .mockRejectedValueOnce(failure)
+    const { admin } = fixture(new Map([[1, { describeLogDirs: send }]]))
+    const rows = await admin.describeLogDirs({ brokers: [1] })
+    expect(rows[0].errorCode).toBe(-1)
+    expect(rows[0].error).toBe(failure)
+  })
+  it('keeps the latest failure before any alterReplicaLogDirs request is written', async () => {
+    const failure = new Error('latest transport error')
+    const send = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('first transport error'))
+      .mockRejectedValueOnce(failure)
+    const { admin } = fixture(new Map([[1, { alterReplicaLogDirs: send }]]))
+    const rows = await admin.alterReplicaLogDirs({
+      replicas: [{ ...replica(), logDir: '/data/b' }],
+    })
+    expect(rows[0].errorCode).toBe(-1)
+    expect(rows[0].error).toBe(failure)
+    expect(send).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('directory selection validation', () => {

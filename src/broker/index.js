@@ -1,4 +1,10 @@
-const { currentDeadline, checked, withAdminGuard, sharedSetup } = require('../admin/deadline')
+const {
+  currentDeadline,
+  currentMutation,
+  checked,
+  withAdminGuard,
+  sharedSetup,
+} = require('../admin/deadline')
 const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
@@ -18,7 +24,7 @@ const {
   KafkaJSTransactionAbortableError,
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
-const { ON_WRITE, ON_DECODED, UNCHECKED_ROWS } = require('./privateOptions')
+const { ADMIN_MUTATION, ON_WRITE, ON_DECODED, UNCHECKED_ROWS } = require('./privateOptions')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -1591,11 +1597,19 @@ module.exports = class Broker {
    *   decoded answer at v3 and later (v0 to v2 answer `{ throttleTime, errorCode }`)
    * @throws {KafkaJSProtocolError} the first member's error (single form), or any top-level error
    */
-  async leaveGroup({ groupId, memberId, groupInstanceId, reason, members, guard }) {
+  async leaveGroup({
+    groupId,
+    memberId,
+    groupInstanceId,
+    reason,
+    members,
+    guard,
+    [ADMIN_MUTATION]: ownership,
+  }) {
     this.throwIfRefused(guard)
     const leaveGroup = this.lookupRequest(apiKeys.LeaveGroup, requests.LeaveGroup)
     return await this[PRIVATE.SEND_REQUEST](
-      leaveGroup({ groupId, memberId, groupInstanceId, reason, members }),
+      leaveGroup({ groupId, memberId, groupInstanceId, reason, members }, ownership),
       guard
     )
   }
@@ -2372,16 +2386,12 @@ module.exports = class Broker {
     producerId = -1,
     producerEpoch = -1,
     guard,
+    [ADMIN_MUTATION]: ownership,
   }) {
     this.throwIfRefused(guard)
     const initProducerId = this.lookupRequest(apiKeys.InitProducerId, requests.InitProducerId)
     return await this[PRIVATE.SEND_REQUEST](
-      initProducerId({
-        transactionalId,
-        transactionTimeout,
-        producerId,
-        producerEpoch,
-      }),
+      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch }, ownership),
       guard
     )
   }
@@ -3070,8 +3080,16 @@ module.exports = class Broker {
    */
   async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
     const setupGuard = guard
-    guard = withAdminGuard(guard)
-    currentDeadline()?.check()
+    const deadline = currentDeadline()
+    guard = withAdminGuard(guard, deadline ?? null)
+    let latch
+    if (deadline) {
+      deadline.check()
+      if (Object.hasOwn(protocolRequest, 'args')) {
+        latch = currentMutation()?.latch(protocolRequest, this.nodeId)
+        if (latch) protocolRequest = latch.request
+      }
+    }
     const pool = this.connectionPool
     let generation = pool.generation
     try {
@@ -3107,7 +3125,7 @@ module.exports = class Broker {
       if (protocolRequest.request.apiKey !== apiKeys.ShareGroupHeartbeat)
         this.retireSibling(e, generation, pool)
 
-      throw e
+      throw latch ? latch.failed(e) : e
     }
   }
 

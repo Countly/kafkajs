@@ -212,7 +212,7 @@ describe('Admin > deleteTopicRecords', () => {
     ])
   })
 
-  test('in case of retriable error, tries again from the last successful partition (does not re-process successful partition twice)', async () => {
+  test('a retriable partition answer is final and the successful partition is sent once', async () => {
     // tries to delete from partition 0 AND partition 1 -> tries to call broker.deleteRecords twice
     const recordsToDelete = [
       { partition: 0, offset: '7' },
@@ -231,16 +231,18 @@ describe('Admin > deleteTopicRecords', () => {
       })
     ) // fail once
 
-    await admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+    const error = await admin
+      .deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+      .catch((e) => e)
 
-    // broker call #1 succeeds, broker call #2 fails, call #3 should be the last one (skips broker #1, and only retries #2)
-    expect(brokerSpy).toHaveBeenCalledTimes(3)
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause.partitions).toEqual([expect.objectContaining({ partition: 1 })])
+    expect(brokerSpy).toHaveBeenCalledTimes(2)
     expect(brokerSpy.mock.calls[1]).not.toEqual(brokerSpy.mock.calls[0])
-    expect(brokerSpy.mock.calls[2]).toEqual(brokerSpy.mock.calls[1])
   })
 
   for (const error of STALE_METADATA_ERRORS) {
-    test(`${error.type || error.name} refresh stale metadata and tries again`, async () => {
+    test(`${error.type || error.name} reports the broker error without another send`, async () => {
       brokerSpy.mockRejectedValueOnce(
         new KafkaJSDeleteTopicRecordsError({
           partitions: [
@@ -254,10 +256,14 @@ describe('Admin > deleteTopicRecords', () => {
       )
 
       const recordsToDelete = [{ partition: 1, offset: '5' }]
-      await admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+      const failure = await admin
+        .deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+        .catch((e) => e)
 
-      expect(brokerSpy).toHaveBeenCalledTimes(2)
-      expect(metadataSpy).toHaveBeenCalled()
+      expect(failure).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(failure.cause.partitions).toEqual([{ partition: 1, offset: '5', error }])
+      expect(brokerSpy).toHaveBeenCalledTimes(1)
+      expect(metadataSpy).not.toHaveBeenCalled()
     })
   }
 
@@ -369,7 +375,7 @@ describe('Admin > deleteTopicRecords', () => {
     ])
   })
 
-  test('if at least 1 broker error is non-retriable, will not attempt to retry', async () => {
+  test('merges failures from two brokers without resending either', async () => {
     const recordsToDelete = [
       { partition: 0, offset: '7' },
       { partition: 1, offset: '5' },
@@ -438,7 +444,7 @@ describe('Admin > deleteTopicRecords', () => {
     ])
   })
 
-  test('if all broker errors are retriable, will retry the request', async () => {
+  test('merges retriable broker answers without resending', async () => {
     const recordsToDelete = [
       { partition: 0, offset: '7' },
       { partition: 1, offset: '5' },
@@ -466,27 +472,20 @@ describe('Admin > deleteTopicRecords', () => {
       })
     )
 
-    await admin.deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
-    expect(brokerSpy).toHaveBeenCalledTimes(4)
-    expect(
-      await cluster.fetchTopicsOffset([
-        {
-          topic: topicName,
-          partitions: [{ partition: 0 }, { partition: 1 }],
-          fromBeginning: true,
-        },
+    const error = await admin
+      .deleteTopicRecords({ topic: topicName, partitions: recordsToDelete })
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause.partitions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ partition: 0, offset: '7' }),
+        expect.objectContaining({ partition: 1, offset: '5' }),
       ])
-    ).toEqual([
-      {
-        topic: topicName,
-        partitions: expect.arrayContaining([
-          { partition: 0, offset: '7' },
-          { partition: 1, offset: '5' },
-        ]),
-      },
-    ])
+    )
+    expect(brokerSpy).toHaveBeenCalledTimes(2)
   })
-  test('keeps successful brokers out of retries and reports only the refused partition', async () => {
+  test('reports the refused partition without resending to either broker', async () => {
     const calls = new Map()
     jest.spyOn(cluster, 'fetchTopicsOffset').mockImplementation(async () => [
       {
@@ -504,9 +503,7 @@ describe('Admin > deleteTopicRecords', () => {
         if (nodeId === 1)
           throw new KafkaJSDeleteTopicRecordsError({
             topic: topicName,
-            partitions: [
-              { partition: 1, offset: '5', error: createErrorFromCode(calls.get(1) === 1 ? 6 : 1) },
-            ],
+            partitions: [{ partition: 1, offset: '5', error: createErrorFromCode(6) }],
           })
       }),
     }))
@@ -525,9 +522,9 @@ describe('Admin > deleteTopicRecords', () => {
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
     expect(error.cause).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
     expect(error.cause.partitions).toEqual([
-      { partition: 1, offset: '5', error: expect.objectContaining({ code: 1 }) },
+      { partition: 1, offset: '5', error: expect.objectContaining({ code: 6 }) },
     ])
     expect(calls.get(0)).toBe(1)
-    expect(calls.get(1)).toBeGreaterThan(1)
+    expect(calls.get(1)).toBe(1)
   })
 })

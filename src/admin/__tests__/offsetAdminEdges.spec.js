@@ -49,7 +49,7 @@ describe('delete group offsets edges', () => {
     expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
   })
 
-  test('a whole-response NOT_COORDINATOR answer looks the coordinator up again', async () => {
+  test('a whole-response NOT_COORDINATOR answer is final for every partition, with no second lookup', async () => {
     const moved = {
       offsetDelete: jest.fn(async () => ({ errorCode: 16, topics: [] })),
     }
@@ -76,12 +76,12 @@ describe('delete group offsets edges', () => {
       topics: [{ topic: 't', partitions: [0, 1] }],
     })
 
-    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
     expect(moved.offsetDelete).toHaveBeenCalledTimes(1)
-    expect(current.offsetDelete).toHaveBeenCalledTimes(1)
+    expect(current.offsetDelete).not.toHaveBeenCalled()
     expect(result.topics[0].partitions.map((p) => [p.partition, p.errorCode])).toEqual([
-      [0, 0],
-      [1, 0],
+      [0, 16],
+      [1, 16],
     ])
   })
 })
