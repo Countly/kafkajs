@@ -97,6 +97,16 @@ describe('Cluster > BrokerPool > an ILLEGAL_SASL_STATE rebuild inside an authent
     expect(node.connectionPool).toBe(firstPool)
   })
 
+  test('a disconnect drops every pause the pools of the cluster share', async () => {
+    brokerPool.brokers[0].connectionPool.recordAuthenticationFailure('first failed')
+    brokerPool.brokers[1].connectionPool.recordAuthenticationFailure('second failed')
+    expect(brokerPool.authenticationBlackout.size).toBe(2)
+
+    await brokerPool.disconnect()
+
+    expect(brokerPool.authenticationBlackout.size).toBe(0)
+  })
+
   test('without a blackout the rebuilt pool connects again', async () => {
     const node = brokerPool.brokers[0]
     const firstPool = node.connectionPool
