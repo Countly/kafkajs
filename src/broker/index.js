@@ -31,8 +31,45 @@ const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 // How a full Fetch answer is held to its request: a pair may be missing (a broker may leave a
 // partition out), never unrequested or repeated. Keyed by id, an entry whose id the request did not
 // carry has a null name and is left to the caller. Built once: the check runs on every full answer.
+// Counting a pair as often as it was sent keeps an in-order answer free of allocation, and equals
+// refusing a repeat unless the request itself repeats a pair; then the `_ONCE` rules apply.
 const BY_NAME = Object.freeze({ rowTopic: 'topicName', missing: 'allow' })
 const BY_ID = Object.freeze({ ...BY_NAME, skipUnnamed: true })
+const BY_NAME_ONCE = Object.freeze({ ...BY_NAME, repeats: 'refuse' })
+const BY_ID_ONCE = Object.freeze({ ...BY_ID, repeats: 'refuse' })
+
+/**
+ * Whether a full Fetch request names one (topic, partition) pair more than once. The broker keys
+ * its answer by pair and answers such a pair once, so a second row for it is refused.
+ * @param {{ topic: string, partitions: { partition: number }[] }[]} topics
+ * @returns {boolean}
+ */
+const repeatsAPair = (topics) => {
+  const seen = new Map()
+  for (const { topic, partitions } of topics) {
+    let ids = seen.get(topic)
+    if (ids === undefined) seen.set(topic, (ids = new Set()))
+    for (const { partition } of partitions) {
+      const id = Number(partition)
+      if (ids.has(id)) return true
+      ids.add(id)
+    }
+  }
+  return false
+}
+
+/**
+ * Whether a Fetch answer's session id can answer a session request (KIP-227): a full one (epoch 0)
+ * opens a session or none, so the id is never negative; an incremental one keeps its session or
+ * ends it with 0. An answer below v7 carries no id.
+ * @param {number|undefined} answered the answer's session id
+ * @param {number} sessionId the request's session id
+ * @param {number} sessionEpoch the request's epoch, 0 or above
+ * @returns {boolean}
+ */
+const answersSession = (answered, sessionId, sessionEpoch) =>
+  answered === undefined ||
+  (sessionEpoch === 0 ? answered >= 0 : answered === 0 || answered === sessionId)
 
 // The last OffsetCommit and OffsetFetch version keyed by topic name. A request that carries no
 // topic ids cannot be sent above it, whatever the broker advertises.
@@ -1107,8 +1144,10 @@ module.exports = class Broker {
    *   is logged here.
    * @throws {import('../errors').KafkaJSError} retriable, when the answer to a full request
    *   (`sessionEpoch` -1 or 0) names a partition or topic the request did not carry, or a
-   *   partition twice; partitions it leaves out are allowed. An answer in request order is checked
-   *   without allocating.
+   *   partition twice (also one the request named twice); partitions it leaves out are allowed.
+   *   Also retriable, when the answer to a session request (`sessionEpoch` 0 or above) and without
+   *   a top-level error carries a session id that cannot answer it: negative on a full request, or
+   *   on an incremental one neither the request's id nor 0.
    */
   async fetch({
     replicaId,
@@ -1138,7 +1177,9 @@ module.exports = class Broker {
     const fetch = this.lookupRequestWithMax(apiKeys.Fetch, requests.Fetch, cap)
 
     let consolidatedTopicPartitions = topics
+    let repeated = false
     if (sessionEpoch <= 0) {
+      repeated = repeatsAPair(topics)
       // Shuffle topic-partitions to ensure fair response allocation across partitions (KIP-74)
       const flattenedTopicPartitions = topics.reduce((topicPartitions, { topic, partitions }) => {
         partitions.forEach((partition) => {
@@ -1187,10 +1228,24 @@ module.exports = class Broker {
     // `lookupRequest` returns a builder, so the negotiated version is only observable on the
     // request it built. Below v13 the response is already keyed by name and nothing is allocated.
     // A full answer is checked against what was sent; an incremental one carries only what
-    // changed, and its session checks it.
+    // changed, and its session checks it. A session id that cannot answer a session request fails
+    // it here, like a mismatched answer, so the caller's retry budget bounds a broker that repeats it.
+    if (
+      sessionEpoch >= 0 &&
+      !response.errorCode &&
+      !answersSession(response.sessionId, sessionId, sessionEpoch)
+    ) {
+      throw new KafkaJSError(
+        `Fetch response carries session id ${response.sessionId}, which cannot answer session ${sessionId} at epoch ${sessionEpoch}`,
+        { retriable: true }
+      )
+    }
     const full = sessionEpoch <= 0
     if (topicIds == null || built.request.apiVersion <= FETCH_TOPIC_NAMES_MAX_VERSION) {
-      if (full) requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, BY_NAME)
+      if (full) {
+        const rule = repeated ? BY_NAME_ONCE : BY_NAME
+        requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, rule)
+      }
       return response
     }
 
@@ -1215,7 +1270,10 @@ module.exports = class Broker {
       delete entry.topicId
     }
 
-    if (full) requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, BY_ID)
+    if (full) {
+      const rule = repeated ? BY_ID_ONCE : BY_ID
+      requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, rule)
+    }
     return response
   }
 
