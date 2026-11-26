@@ -1,9 +1,14 @@
 const { createLogger } = require('../../loggers')
+const BrokerPool = require('../../cluster/brokerPool')
+const { KafkaJSConnectionError } = require('../../errors')
+const { newLogger } = require('testHelpers')
 const {
   GROUP_AUTHORIZATION_FAILED,
   fenced,
   groupAuthorization,
   protocolError,
+  target,
+  buildConsumer,
   advanceUntil,
   deferred,
   settled,
@@ -444,5 +449,119 @@ describe('Consumer > crash supervision', () => {
       expect(inCauseChain(observed.run.crashes[0].error, handlerFailure)).toBe(false)
       expect(observed.policy).toHaveBeenCalledTimes(1)
     }, 60000)
+  })
+
+  describe('a startup that a rebootstrap overtakes', () => {
+    /** @param {string} clusterId @returns {object} a Metadata answer of that cluster */
+    const answer = (clusterId) => ({
+      throttleTime: 0,
+      clusterId,
+      controllerId: 0,
+      brokers: [],
+      topicMetadata: [],
+    })
+
+    /**
+     * Starts a run whose startup refresh goes through a real broker pool. The pool's seed holds that
+     * answer; a rebootstrap then installs a seed of another cluster, and `settleStale` settles the
+     * held answer. The run's later refreshes reach the new seed.
+     * @param {(reply: {resolve: Function, reject: Function}) => void} settleStale
+     * @returns {Promise<object>} the crashes, trace, pool, new seed and a close function
+     */
+    const overtakenStartup = async (settleStale) => {
+      const { consumer, cluster, state, log, crashes } = buildConsumer({
+        retry: { retries: 0, initialRetryTime: 300 },
+      })
+      const pool = new BrokerPool({
+        connectionPoolBuilder: {},
+        logger: newLogger(),
+        retry: { retries: 0 },
+      })
+      const seed = (host, metadata) => ({
+        nodeId: 0,
+        isConnected: () => true,
+        connectionPool: { host, port: 9092, rack: null },
+        retire: async () => {},
+        metadata,
+      })
+      let stale
+      const oldSeed = seed(
+        'old',
+        jest.fn(() => new Promise((resolve, reject) => (stale = { resolve, reject })))
+      )
+      const newSeed = seed(
+        'new',
+        jest.fn(async () => answer('new'))
+      )
+      pool.seedBroker = oldSeed
+      pool.findConnectedBroker = async () => pool.seedBroker
+      pool.createSeedBroker = async () => {
+        pool.seedBroker = newSeed
+        pool.closeObsolete(oldSeed)
+        return newSeed
+      }
+      cluster.refreshMetadataIfNecessary = jest.fn((options) =>
+        pool.refreshMetadataIfNecessary([], options)
+      )
+      state.answer = (request) =>
+        request.memberEpoch === 0
+          ? target(1, { 'topic-a': [0] })
+          : target(request.memberEpoch, null)
+
+      await consumer.subscribe({ topic: 'topic-a' })
+      settled(consumer.run({ eachMessage: async () => {} }))
+      await advanceUntil(() => oldSeed.metadata.mock.calls.length > 0)
+      expect(oldSeed.metadata).toHaveBeenCalledTimes(1)
+      await pool.rebootstrap('required')
+      settleStale(stale)
+      await advanceUntil(() => crashes.length > 0)
+      await advanceUntil(() => log.some(({ kind }) => kind === 'heartbeat'))
+      return {
+        crashes,
+        log,
+        pool,
+        newSeed,
+        close: async () => {
+          settled(consumer.disconnect({ timeout: 0 }))
+          await jest.advanceTimersByTimeAsync(10)
+        },
+      }
+    }
+
+    /** @param {object} crash a CRASH payload @returns {void} */
+    const expectOvertakenRestart = ({ error, restart }) => {
+      expect(error).toBeInstanceOf(KafkaJSConnectionError)
+      expect(error.message).toBe('Metadata refresh was overtaken by a rebootstrap')
+      expect(error.retriable).toBe(true)
+      expect(error.cause).toBeUndefined()
+      expect(restart).toBe(true)
+    }
+
+    it('a consumer start overtaken by a rebootstrap crashes with a retriable error and restarts by default', async () => {
+      const run = await overtakenStartup(({ resolve }) => resolve(answer('old')))
+      try {
+        expect(run.crashes).toHaveLength(1)
+        expectOvertakenRestart(run.crashes[0])
+        // The restarted run read the new cluster's metadata, then joined.
+        expect(run.newSeed.metadata).toHaveBeenCalled()
+        expect(run.pool.metadata.clusterId).toBe('new')
+        expect(run.log.some(({ kind }) => kind === 'heartbeat')).toBe(true)
+      } finally {
+        await run.close()
+      }
+    }, 30000)
+
+    it('an overtaken startup restarts even when the stale failure was non-retriable', async () => {
+      const failure = Object.assign(new Error('stale failure'), { retriable: false })
+      const run = await overtakenStartup(({ reject }) => reject(failure))
+      try {
+        expect(run.crashes).toHaveLength(1)
+        expectOvertakenRestart(run.crashes[0])
+        expect(inCauseChain(run.crashes[0].error, failure)).toBe(false)
+        expect(run.log.some(({ kind }) => kind === 'heartbeat')).toBe(true)
+      } finally {
+        await run.close()
+      }
+    }, 30000)
   })
 })

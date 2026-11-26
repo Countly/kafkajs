@@ -269,6 +269,8 @@ module.exports = class BrokerPool {
     this.metadataExpireAt = null
     /** Counts `disconnect()` calls: a refresh started before one installs nothing after it. */
     this.disconnects = 0
+    /** Counts committed rebootstraps: a refresh sent before one installs nothing after it. */
+    this.recoveries = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
@@ -283,7 +285,10 @@ module.exports = class BrokerPool {
     this.metadataClusterCheck = metadataClusterCheck ?? true
     this.metadataRecoveryRebootstrapTriggerMs = metadataRecoveryRebootstrapTriggerMs ?? 300000
 
-    /** Failures `onApiVersionsFailure` already recovered from, so a surrounding catch skips them. */
+    /**
+     * Failures `onApiVersionsFailure` already recovered from, and the synthetic refusals of
+     * overtaken refreshes, so a surrounding catch starts no recovery from them.
+     */
     this.recoveredFailures = new WeakSet()
 
     /** Set at the first failed metadata attempt following a success; cleared on any success. */
@@ -319,15 +324,20 @@ module.exports = class BrokerPool {
         if (!ownsRouting() || this.seedBroker !== installed) {
           throw new KafkaJSConnectionError('Recovery routing was superseded')
         }
+        this.recoveries++
         this.metadata = null
         this.metadataExpireAt = null
-        this.metadataCache.clear()
+        for (const broker of values(table)) brokers.add(broker)
         for (const broker of brokers) {
           if (broker !== seed && broker !== installed) this.closeObsolete(broker)
         }
+        this.setupMetadataEndpoints.clear()
+        this.retainSetupEndpoints()
         this.lastRebootstrapAt = Date.now()
         this.metadataUnavailableSince = null
         this.rebootstrapArmed = false
+        // Routing listeners wake only once nothing of the old cluster is left to route to.
+        this.metadataCache.clear()
         this.logger.warn('Rebootstrapping the client from the configured broker list', { reason })
         this.emit(CLUSTER_REBOOTSTRAP, { reason })
       },
@@ -344,8 +354,10 @@ module.exports = class BrokerPool {
    * authentication attempt. The negotiated `versions` table is kept for the same reason it is
    * kept across a reconnect - it belongs to the broker software, not to the metadata.
    *
-   * A replacement seed is installed before the captured old identities are detached and
-   * retired. Aliases are deduplicated and replacements installed during the build survive.
+   * A replacement seed is installed before the old identities are detached and retired: those
+   * captured before the build and every broker of the table, including one added during the
+   * build. Setup endpoints are cleared, and routing listeners are woken only after that. A metadata
+   * refresh sent before the rebootstrap installs nothing after it and rejects as retriable.
    * Draining proceeds in the background under the configured obsolete-resource bound.
    *
    * Concurrent callers join one in-flight rebootstrap, except that a producer lifecycle's call
@@ -852,7 +864,10 @@ module.exports = class BrokerPool {
    * replace (or, for `removeBroker`, unset) `this.seedBroker` between two scheduled attempts, so
    * a reference captured before the retrier would connect an object nothing else uses. A missing
    * seed is reported as a retriable connection error rather than dereferenced - the retrier
-   * treats a `TypeError` as unrecoverable and would turn a transient window into a crash.
+   * treats a `TypeError` as unrecoverable and would turn a transient window into a crash. A seed
+   * replaced while it connected neither rotates the list nor writes its versions; the next attempt
+   * connects today's seed. When the seed's removal left the slot empty, with no disconnect or
+   * rebootstrap since, the next address is built into it.
    *
    * @public
    * @param {object} [options]
@@ -889,6 +904,12 @@ module.exports = class BrokerPool {
       fence?.check()
       checked(null)
       const seedBroker = this.seedBroker
+      const disconnects = this.disconnects
+      const recoveries = this.recoveries
+      // This seed still holds the slot, or its removal emptied the slot in the same generation.
+      const ownsSeed = () =>
+        this.seedBroker === seedBroker ||
+        (!this.seedBroker && this.disconnects === disconnects && this.recoveries === recoveries)
 
       if (!seedBroker) {
         throw new KafkaJSConnectionError('No seed broker available, the client is rebootstrapping')
@@ -898,7 +919,6 @@ module.exports = class BrokerPool {
         await seedBroker.connect(...guardArgs(fence))
         fence?.check()
         checked(null)
-        this.versions = seedBroker.versions
       } catch (caught) {
         fence?.check()
         checked(null)
@@ -906,8 +926,8 @@ module.exports = class BrokerPool {
           ? caught
           : new KafkaJSNonRetriableError(describeThrown(caught), { cause: caught })
         if (isConnectionFailure(e) || describeThrown(e, 'type') === 'ILLEGAL_SASL_STATE') {
-          // Connection builder will always rotate the seed broker
-          await this.createSeedBroker({ fence })
+          // Connection builder rotates the seed broker, unless another seed was installed meanwhile
+          if (ownsSeed()) await this.createSeedBroker({ fence, isCurrent: ownsSeed })
           try {
             this.logger.error(
               `Failed to connect to seed broker, trying another broker from the list: ${describeThrown(e)}`,
@@ -921,8 +941,14 @@ module.exports = class BrokerPool {
         }
 
         if (describeThrown(e, 'retriable') === 'true') throw e
-        bail(e)
+        return bail(e)
       }
+      // The seed was replaced or removed while it connected: the next attempt uses today's seed.
+      if (this.seedBroker !== seedBroker) {
+        if (ownsSeed()) await this.createSeedBroker({ fence, isCurrent: ownsSeed })
+        throw new KafkaJSConnectionError('Seed broker was replaced')
+      }
+      this.versions = seedBroker.versions
     })
   }
 
@@ -1033,9 +1059,11 @@ module.exports = class BrokerPool {
    * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
-   * and rebuilds the seed, so re-resolving both on every iteration is what keeps a later attempt
-   * from calling a disconnected object or building a duplicate `Broker` for the seed's own node
-   * id via a stale `seedHost`/`seedPort` pair. `findConnectedBroker()`'s own throw is `bail()`ed
+   * and rebuilds the seed, so re-resolving both on every iteration is what keeps an attempt from
+   * calling a disconnected object or building a duplicate `Broker` for the seed's own node id via
+   * a stale `seedHost`/`seedPort` pair. A rebootstrap during the first selection lets the request
+   * go to a current broker; once a request was sent, a rebootstrap stops the refresh, which
+   * rejects as retriable instead of trying again. `findConnectedBroker()`'s own throw is `bail()`ed
    * immediately rather than left for the retrier to reclassify - the retrier's generic
    * catch-and-wrap would otherwise turn e.g. a `KafkaJSSASLAuthenticationError` into a
    * `KafkaJSNonRetriableError` and replace its `retryCount`/`retryTime`, breaking callers (the
@@ -1073,7 +1101,8 @@ module.exports = class BrokerPool {
               this.consumerMetadataScope?.shareKey() ?? null,
               names || [],
             ]),
-      () => this.disconnects
+      () => this.disconnects,
+      () => this.recoveries
     )
     return this.metadataDiscovery(topics, options)
   }
@@ -1107,9 +1136,11 @@ module.exports = class BrokerPool {
     if (!isCurrent()) return
     const modeGeneration = this.consumerMetadataGeneration ?? 0
     const disconnects = this.disconnects
+    let recoveries = this.recoveries
     const ticket = metadataScope?.captureMetadata()
     const applicable = () =>
       this.disconnects === disconnects &&
+      this.recoveries === recoveries &&
       !fence?.closed &&
       !guard?.() &&
       (this.consumerMetadataGeneration ?? 0) === modeGeneration &&
@@ -1129,6 +1160,7 @@ module.exports = class BrokerPool {
       ...((accept || establishment) && { retainTopicErrors: true }),
     }
     const requestArgs = Object.keys(requestOptions).length ? [requestOptions] : []
+    let dispatched = false
     try {
       await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         if (!applicable()) return
@@ -1139,6 +1171,16 @@ module.exports = class BrokerPool {
           check()
         } catch (err) {
           return bail(err)
+        }
+        if (this.recoveries !== recoveries) {
+          // A rebootstrap during the first selection: nothing was sent yet, so a current broker
+          // asks anew. A refresh that already sent a request is overtaken.
+          const current =
+            broker &&
+            !broker.retired &&
+            (broker === this.seedBroker || values(this.brokers).includes(broker))
+          if (dispatched || !current) return bail(this.overtaken())
+          recoveries = this.recoveries
         }
         fence?.check()
         checked(null)
@@ -1153,6 +1195,7 @@ module.exports = class BrokerPool {
         const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
+          dispatched = true
           const response = await broker.metadata(topics, ...requestArgs)
           fence?.check()
           check()
@@ -1270,7 +1313,7 @@ module.exports = class BrokerPool {
         } catch (e) {
           fence?.check()
           if (guard?.()) return bail(e)
-          if (!applicable()) return
+          if (!applicable() && !this.recoveredFailures.has(e)) return
           if (
             e.type === 'LEADER_NOT_AVAILABLE' ||
             ((allowAutoTopicCreation ?? broker.allowAutoTopicCreation) &&
@@ -1283,14 +1326,36 @@ module.exports = class BrokerPool {
         }
       })
 
+      if (this.recoveries !== recoveries) {
+        check()
+        if (this.disconnects !== disconnects) return
+        throw this.overtaken()
+      }
       if (applicable()) this.onMetadataSuccess()
     } catch (e) {
       check()
       if (guard?.()) throw e
+      if (this.disconnects !== disconnects) return
+      if (this.recoveries !== recoveries) {
+        throw this.recoveredFailures.has(e) ? e : this.overtaken()
+      }
       if (!applicable()) return
       if (!fence?.closed) await this.onMetadataFailure(e, { fence })
       throw e
     }
+  }
+
+  /**
+   * The refusal of a refresh a rebootstrap overtook. It has no cause, so a stale non-retriable
+   * failure cannot make a consumer's restart decision non-retriable. It counts as recovered, so no
+   * catch starts another recovery from it.
+   * @private
+   * @returns {KafkaJSConnectionError} retriable
+   */
+  overtaken() {
+    const error = new KafkaJSConnectionError('Metadata refresh was overtaken by a rebootstrap')
+    this.recoveredFailures.add(error)
+    return error
   }
 
   /**
@@ -1701,6 +1766,7 @@ module.exports = class BrokerPool {
     // blacked-out credentials alone (the cluster is reachable; only this client's credentials are
     // bad), so a single non-auth failure is what allows it to fire at all.
     let allFailuresWereAuthentication = nodeIds.length > 0
+    const recoveries = this.recoveries
     for (const nodeId of nodeIds) {
       fence?.check()
       checked(null)
@@ -1709,6 +1775,8 @@ module.exports = class BrokerPool {
       } catch (e) {
         fence?.check()
         checked(null)
+        // A 129 its own recovery already handled reaches the caller as it is.
+        if (this.recoveredFailures.has(e)) throw e
         if (!isAuthenticationFailure(e)) {
           allFailuresWereAuthentication = false
         }
@@ -1724,7 +1792,10 @@ module.exports = class BrokerPool {
     // retrier iteration), and at least one failure that was not purely an authentication failure.
     fence?.check()
     checked(null)
-    if (this.shouldRebootstrapOnAllBrokersUnavailable(nodeIds, allFailuresWereAuthentication)) {
+    if (
+      this.recoveries === recoveries &&
+      this.shouldRebootstrapOnAllBrokersUnavailable(nodeIds, allFailuresWereAuthentication)
+    ) {
       await this.rebootstrap('all-brokers-unavailable', { fence })
       fence?.check()
       checked(null)
