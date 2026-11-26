@@ -5,6 +5,7 @@ const encodeProduce = require('../../protocol/requests/produce/v12/request')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSError,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
@@ -68,7 +69,7 @@ const answer = ({ topicData }, errorCode = 0) => ({
  * A transactional producer over the fake cluster, its coordinator at transaction version
  * `level`; every Produce goes through `produce`.
  * @param {{ level?: number, produce?: (request: object) => Promise<object>, retry?: object,
- *   partitions?: number, linger?: number }} [options]
+ *   partitions?: number, linger?: number, createPartitioner?: Function }} [options]
  */
 const createTransactionalProducer = ({
   level = 2,
@@ -76,6 +77,7 @@ const createTransactionalProducer = ({
   retry = RETRY,
   partitions = 1,
   linger,
+  createPartitioner,
 } = {}) => {
   const cluster = createFakeCluster({
     partitions,
@@ -101,9 +103,37 @@ const createTransactionalProducer = ({
     transactionalId: TRANSACTIONAL_ID,
     retry,
     linger,
+    createPartitioner,
   })
   return { cluster, broker, producer }
 }
+
+/** A refusal class of the application's own, below `KafkaJSNonRetriableError`. */
+class PartitionerRefused extends KafkaJSNonRetriableError {}
+
+/**
+ * What a partitioner may throw, each built anew by `make`; `retried` says whether the send runs the
+ * partitioner again before it gives up. Every row at both transaction versions.
+ */
+const THROWN_AT_LEVELS = [
+  { name: 'a KafkaJSNonRetriableError', make: () => new KafkaJSNonRetriableError('no route') },
+  {
+    name: 'a subclass of KafkaJSNonRetriableError',
+    make: () => new PartitionerRefused('no route'),
+  },
+  {
+    name: 'a retriable KafkaJSError',
+    make: () => new KafkaJSError('no route yet'),
+    retried: true,
+  },
+  {
+    name: 'an Error marked retriable',
+    make: () => Object.assign(new Error('no route yet'), { retriable: true }),
+    retried: true,
+  },
+  { name: 'a string', make: () => 'no route' },
+  { name: 'an object that is not an Error', make: () => ({ reason: 'no route' }) },
+].flatMap((row) => [1, 2].map((level) => ({ retried: false, ...row, level })))
 
 /** A transaction that began and was aborted: every method of it says it has ended. */
 const endedTransaction = async (producer) => {
@@ -278,7 +308,7 @@ describe('Producer > the transaction wrapper', () => {
       await expect(producer.transaction()).rejects.toBe(commitError)
     })
 
-    test('a partitioner that throws leaves the transaction committable: only a client error arms it', async () => {
+    test('a partitioner that throws a TypeError leaves the transaction committable', async () => {
       const cluster = createFakeCluster()
       Object.assign(cluster.broker, {
         finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: 2 } },
@@ -309,6 +339,273 @@ describe('Producer > the transaction wrapper', () => {
       expect(cluster.broker.endTxn).toHaveBeenCalledWith(
         expect.objectContaining({ transactionResult: true })
       )
+    })
+
+    test.each(THROWN_AT_LEVELS)(
+      'a partitioner that throws $name leaves the transaction committable at transaction version $level',
+      async ({ make, retried, level }) => {
+        const thrown = make()
+        let ran = 0
+        const { broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'broken-topic') {
+                ran += 1
+                throw thrown
+              }
+              return 0
+            },
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        const error = await transaction
+          .send({ topic: 'broken-topic', messages: ONE })
+          .catch((e) => e)
+
+        if (retried) {
+          expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+          expect(error.cause).toBe(thrown)
+          expect(ran).toBeGreaterThan(1)
+        } else {
+          expect(error).toBe(thrown)
+          expect(ran).toBe(1)
+        }
+        expect(broker.produce).not.toHaveBeenCalled()
+        await transaction.send({ topic: TOPIC, messages: ONE })
+        await transaction.commit()
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: true })
+        )
+      }
+    )
+
+    test.each([1, 2])(
+      'a partitioner that throws leaves the transaction abortable: abort() ends it and the next transaction commits at transaction version %i',
+      async (level) => {
+        const thrown = new KafkaJSNonRetriableError('no route')
+        const { broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'broken-topic') throw thrown
+              return 0
+            },
+        })
+        await producer.connect()
+        const first = await producer.transaction()
+
+        await expect(first.send({ topic: 'broken-topic', messages: ONE })).rejects.toBe(thrown)
+        await first.send({ topic: TOPIC, messages: ONE })
+        await expect(first.abort()).resolves.toBeUndefined()
+        const second = await producer.transaction()
+        await second.send({ topic: TOPIC, messages: ONE })
+        await expect(second.commit()).resolves.toBeUndefined()
+
+        expect(
+          broker.endTxn.mock.calls.map(([{ transactionResult }]) => transactionResult)
+        ).toEqual([false, true])
+      }
+    )
+
+    test.each([1, 2])(
+      'a send of two topics whose second one the partitioner throws for writes neither and leaves the transaction committable at transaction version %i',
+      async (level) => {
+        const thrown = new KafkaJSNonRetriableError('no route')
+        const { broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'broken-topic') throw thrown
+              return 0
+            },
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        await expect(
+          transaction.sendBatch({
+            topicMessages: [
+              { topic: TOPIC, messages: ONE },
+              { topic: 'broken-topic', messages: ONE },
+            ],
+          })
+        ).rejects.toBe(thrown)
+        expect(broker.produce).not.toHaveBeenCalled()
+        await transaction.send({ topic: TOPIC, messages: ONE })
+        await transaction.commit()
+
+        expect(
+          broker.produce.mock.calls.map(([{ topicData }]) => topicData.map(({ topic }) => topic))
+        ).toEqual([[TOPIC]])
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: true })
+        )
+      }
+    )
+
+    test.each([
+      ['null', null],
+      ['undefined', undefined],
+      ['0', 0],
+      ['an empty string', ''],
+      ['false', false],
+    ])(
+      'a partitioner that throws %s fails that send with an Error whose message is Aborted and leaves the transaction committable',
+      async (_, falsy) => {
+        let ran = 0
+        const { broker, producer } = createTransactionalProducer({
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic !== 'broken-topic') return 0
+              ran += 1
+              throw falsy
+            },
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        const error = await transaction
+          .send({ topic: 'broken-topic', messages: ONE })
+          .catch((e) => e)
+        await transaction.send({ topic: TOPIC, messages: ONE })
+        await transaction.commit()
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(KafkaJSError)
+        expect(error.message).toBe('Aborted')
+        expect(ran).toBe(1)
+        expect(broker.produce).toHaveBeenCalledTimes(1)
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: true })
+        )
+      }
+    )
+
+    test.each([1, 2])(
+      'a partitioner that throws after a metadata retry leaves the transaction committable at transaction version %i',
+      async (level) => {
+        const thrown = new KafkaJSNonRetriableError('no route')
+        const { cluster, broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'flaky-topic') throw thrown
+              return 0
+            },
+        })
+        const found = cluster.findTopicPartitionMetadata
+        let lookups = 0
+        cluster.findTopicPartitionMetadata = (topic) =>
+          topic === 'flaky-topic' && lookups++ === 0 ? [] : found(topic)
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        await expect(transaction.send({ topic: 'flaky-topic', messages: ONE })).rejects.toBe(thrown)
+        expect(lookups).toBe(2)
+        await transaction.send({ topic: TOPIC, messages: ONE })
+        await transaction.commit()
+
+        expect(broker.endTxn).toHaveBeenCalledWith(
+          expect.objectContaining({ transactionResult: true })
+        )
+      }
+    )
+
+    test.each([1, 2])(
+      'a metadata failure after a partitioner retry still makes the transaction abort-only at transaction version %i',
+      async (level) => {
+        let ran = 0
+        const { cluster, broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'flaky-topic') {
+                ran += 1
+                throw new KafkaJSError('no route yet')
+              }
+              return 0
+            },
+        })
+        const found = cluster.findTopicPartitionMetadata
+        cluster.findTopicPartitionMetadata = (topic) =>
+          topic === 'flaky-topic' && ran > 0 ? [] : found(topic)
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        const error = await transaction
+          .send({ topic: 'flaky-topic', messages: ONE })
+          .catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+        expect(ran).toBe(1)
+        await expect(transaction.commit()).rejects.toBe(error)
+        expect(broker.endTxn).not.toHaveBeenCalled()
+      }
+    )
+
+    test.each([1, 2])(
+      'a nullish rejection from the metadata wait after a partitioner retry is not taken for a partitioner failure: the producer becomes unusable at transaction version %i',
+      async (level) => {
+        let ran = 0
+        const { cluster, broker, producer } = createTransactionalProducer({
+          level,
+          createPartitioner:
+            () =>
+            ({ topic }) => {
+              if (topic === 'flaky-topic') {
+                ran += 1
+                throw new KafkaJSError('no route yet')
+              }
+              return 0
+            },
+        })
+        const added = cluster.addMultipleTargetTopics.getMockImplementation()
+        const nothing = null
+        let waits = 0
+        cluster.addMultipleTargetTopics.mockImplementation(async (topics) => {
+          if (topics.includes('flaky-topic') && (waits += 1) === 2) throw nothing
+          return added(topics)
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+
+        const error = await transaction
+          .send({ topic: 'flaky-topic', messages: ONE })
+          .catch((e) => e)
+
+        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(error.cause).toMatchObject({ name: 'TypeError' })
+        expect(ran).toBe(1)
+        await expect(transaction.commit()).rejects.toBeInstanceOf(
+          KafkaJSApplicationRecoverableError
+        )
+        expect(broker.endTxn).not.toHaveBeenCalled()
+      }
+    )
+
+    test('a send whose topic never gets metadata still makes the transaction abort-only', async () => {
+      const { cluster, producer } = createTransactionalProducer()
+      const found = cluster.findTopicPartitionMetadata
+      cluster.findTopicPartitionMetadata = (topic) =>
+        topic === 'missing-topic' ? [] : found(topic)
+      await producer.connect()
+      const transaction = await producer.transaction()
+
+      const sendError = await transaction
+        .send({ topic: 'missing-topic', messages: ONE })
+        .catch((e) => e)
+
+      expect(sendError).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      await expect(transaction.commit()).rejects.toBeInstanceOf(KafkaJSTransactionAbortableError)
+      await expect(transaction.abort()).resolves.toBeUndefined()
     })
   })
 

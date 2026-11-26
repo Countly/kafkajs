@@ -2,8 +2,53 @@ const Decoder = require('../../../decoder')
 const Encoder = require('../../../encoder')
 const decodeMessages = require('./decodeMessages')
 const { batch, record } = require('../__tests__/fixtures/recordBatchBytes')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 
 describe('Protocol > Requests > Fetch > v4 > decodeMessages', () => {
+  describe('the length of the records block', () => {
+    const decodeClassic = (hex) => decodeMessages(new Decoder(Buffer.from(hex, 'hex')))
+    const decodeCompact = (hex) =>
+      decodeMessages(new Decoder(Buffer.from(hex, 'hex')), { compact: true })
+
+    test('refuses a records block that claims more bytes than the answer holds', async () => {
+      // classic 00000064 and compact 65 both claim 100 bytes
+      await expect(decodeClassic('00000064')).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+      await expect(decodeCompact('65')).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+      // ten bytes follow, still fewer than claimed
+      await expect(decodeClassic('00000064' + '00'.repeat(10))).rejects.toMatchObject({
+        name: 'KafkaJSPartialMessageError',
+        message: expect.stringContaining('FetchResponse.Records'),
+      })
+      await expect(decodeCompact('65' + '00'.repeat(10))).rejects.toMatchObject({
+        name: 'KafkaJSPartialMessageError',
+        message: expect.stringContaining('FetchResponse.Records'),
+      })
+    })
+
+    test('reads a negative, zero or null records length as no records', async () => {
+      // classic: -1 (null), -2 (negative), 0; compact: 00 (null), 01 (zero)
+      for (const hex of ['ffffffff', 'fffffffe', '00000000']) {
+        await expect(decodeClassic(hex)).resolves.toEqual({ messages: [] })
+      }
+      for (const hex of ['00', '01']) {
+        await expect(decodeCompact(hex)).resolves.toEqual({ messages: [] })
+      }
+    })
+
+    test('keeps a partial final batch inside a correctly sized block', async () => {
+      const complete = batch({ baseOffset: 0n, records: [record({ offsetDelta: 0 })] })
+      const cut = batch({ baseOffset: 1n, records: [record({ offsetDelta: 0 })] }).subarray(0, 30)
+      const body = Buffer.concat([complete, cut])
+      const size = Buffer.alloc(4)
+      size.writeInt32BE(body.length)
+
+      const decoded = await decodeMessages(new Decoder(Buffer.concat([size, body])))
+
+      expect(decoded.messages).toHaveLength(1)
+      expect(decoded.nextBatchOffset).toBe('1')
+    })
+  })
+
   test('a compact null records block decodes as no messages', async () => {
     const decoder = new Decoder(new Encoder().writeUVarInt(0).buffer)
     await expect(decodeMessages(decoder, { compact: true })).resolves.toEqual({ messages: [] })

@@ -92,6 +92,27 @@ module.exports = class Decoder {
     return array
   }
 
+  /**
+   * Refuses a null string or bytes value that the message definition does not allow to be null at
+   * the version being read. The string and bytes readers return null for the null length, and a
+   * required field read as null would reach the caller as the text `null` or a crash.
+   * @template T
+   * @param {T|null} value what a string or bytes reader returned
+   * @param {string} field the response field, as `<Message>.<Path>` in the Apache message
+   *   definition, for the error
+   * @returns {T} `value`
+   * @throws {KafkaJSPartialMessageError} when `value` is null
+   */
+  static requireValue(value, field) {
+    if (value === null) {
+      throw new KafkaJSPartialMessageError(
+        `${field} is null, but the message definition does not allow null there`
+      )
+    }
+
+    return value
+  }
+
   constructor(buffer) {
     this.buffer = buffer
     this.offset = 0

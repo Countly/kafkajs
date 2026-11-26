@@ -69,7 +69,10 @@ const decodeEntriesEntity = (decoder) => {
  */
 const decodeEntriesValues = (decoder) => {
   const values = {
-    key: decoder.readUVarIntString(),
+    key: Decoder.requireValue(
+      decoder.readUVarIntString(),
+      'DescribeClientQuotasResponse.Entries.Values.Key'
+    ),
     value: decoder.readDouble(),
   }
 

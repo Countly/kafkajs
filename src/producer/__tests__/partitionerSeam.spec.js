@@ -3,7 +3,12 @@ const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC, TOPIC_ID } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const Broker = require('../../broker')
-const { KafkaJSInvalidConfigurationError } = require('../../errors')
+const {
+  KafkaJSError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
+} = require('../../errors')
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 const until = async (predicate) => {
@@ -399,4 +404,127 @@ describe('Producer > a partitioner that returns an invalid partition', () => {
     await expect(producer.send({ topic: TOPIC, messages })).rejects.toBe(failure)
     await expect(producer.send({ topic: TOPIC, messages })).resolves.toHaveLength(1)
   })
+})
+
+describe('Producer > a partitioner that throws', () => {
+  let producer, cluster, produced
+
+  /** A producer over a scripted cluster whose topic has one partition; `produced` counts Produce requests. */
+  const start = async (createPartitioner, options) => {
+    cluster = producerScript(
+      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }] })
+    )
+    produced = jest.spyOn(Broker.prototype, 'produce')
+    producer = new Kafka(cluster.kafkaOptions()).producer({
+      linger: 0,
+      retry: { retries: 2, initialRetryTime: 1, maxRetryTime: 2 },
+      createPartitioner,
+      ...options,
+    })
+    await producer.connect()
+  }
+
+  afterEach(async () => {
+    if (producer) await producer.disconnect()
+    if (cluster) cluster.assertClean()
+    jest.restoreAllMocks()
+    producer = cluster = produced = null
+  })
+
+  const THROWN = [
+    ['an Error', () => new Error('partitioner failed')],
+    ['a KafkaJSNonRetriableError', () => new KafkaJSNonRetriableError('partitioner failed')],
+    ['a string', () => 'partitioner failed'],
+  ]
+  const PRODUCERS = [
+    ['in a plain producer', { idempotent: false }],
+    ['in an idempotent producer', { idempotent: true }],
+  ]
+
+  test.each(
+    PRODUCERS.flatMap(([producerName, options]) =>
+      THROWN.map(([name, make]) => ({ producerName, options, name, make }))
+    )
+  )(
+    '$name $producerName rejects that send with it, writes nothing and lets the next send through',
+    async ({ options, make }) => {
+      const thrown = make()
+      await start(
+        () =>
+          ({ message }) => {
+            if (message.value === 'bad') throw thrown
+            return 0
+          },
+        options
+      )
+
+      await expect(producer.send({ topic: TOPIC, messages: [{ value: 'bad' }] })).rejects.toBe(
+        thrown
+      )
+      expect(produced).not.toHaveBeenCalled()
+      await expect(
+        producer.send({ topic: TOPIC, messages: [{ value: 'good' }] })
+      ).resolves.toHaveLength(1)
+      expect(produced).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  test.each(PRODUCERS)(
+    'a retriable error the partitioner keeps throwing %s ends as KafkaJSNumberOfRetriesExceeded, writes nothing and lets the next send through',
+    async (_, options) => {
+      const thrown = new KafkaJSError('no route yet')
+      let failed = 0
+      await start(
+        () =>
+          ({ message }) => {
+            if (message.value !== 'bad') return 0
+            failed += 1
+            throw thrown
+          },
+        options
+      )
+
+      const error = await producer
+        .send({ topic: TOPIC, messages: [{ value: 'bad' }] })
+        .catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(error.cause).toBe(thrown)
+      expect(failed).toBe(3)
+      expect(produced).not.toHaveBeenCalled()
+      await expect(
+        producer.send({ topic: TOPIC, messages: [{ value: 'good' }] })
+      ).resolves.toHaveLength(1)
+      expect(produced).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  test.each(PRODUCERS)(
+    'a send of two records whose second one the partitioner throws for writes neither %s',
+    async (_, options) => {
+      const thrown = new KafkaJSNonRetriableError('partitioner failed')
+      await start(
+        () =>
+          ({ message }) => {
+            if (message.value === 'bad') throw thrown
+            return 0
+          },
+        options
+      )
+
+      await expect(
+        producer.sendBatch({
+          topicMessages: [
+            { topic: TOPIC, messages: [{ value: 'good' }] },
+            { topic: TOPIC, messages: [{ value: 'bad' }] },
+          ],
+        })
+      ).rejects.toBe(thrown)
+      expect(produced).not.toHaveBeenCalled()
+      await expect(
+        producer.send({ topic: TOPIC, messages: [{ value: 'later' }] })
+      ).resolves.toHaveLength(1)
+      expect(produced).toHaveBeenCalledTimes(1)
+    }
+  )
 })

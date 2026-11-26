@@ -73,14 +73,19 @@ const nextBatchOf = (last) => {
  * @throws {KafkaJSCorruptRecordError} for a legacy (magic 0 or 1) message set whose compressed
  *         message is corrupt or decompresses past `maxDecompressedBatchBytes`: a legacy set carries
  *         no marker, so the response is rejected
+ * @throws {KafkaJSPartialMessageError} when the records block claims more bytes than the answer
+ *         holds, so a malformed answer is not read as an empty fetch. A null, zero or negative
+ *         length still means no records, as in the Java client. This is the block's own length: a
+ *         batch cut inside a correctly sized block is still tolerated, as above
  */
 const decodeMessages = async (decoder, options = {}) => {
   const messagesSize = options.compact ? decoder.readUVarInt() - 1 : decoder.readInt32()
 
-  if (messagesSize <= 0 || !decoder.canReadBytes(messagesSize)) {
+  if (messagesSize <= 0) {
     return { messages: [] }
   }
 
+  decoder.ensureReadable(messagesSize, 'FetchResponse.Records')
   const messagesBuffer = decoder.readBytes(messagesSize)
   const messagesDecoder = new Decoder(messagesBuffer)
 

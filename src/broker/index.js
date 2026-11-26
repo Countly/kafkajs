@@ -5,11 +5,13 @@ const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const { requireCoverage } = require('../protocol/requests/responseCoverage')
+const { validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSCommitFailedError,
   KafkaJSConnectionClosedError,
+  KafkaJSError,
   KafkaJSInvariantViolation,
   KafkaJSNonRetriableError,
   KafkaJSServerDoesNotSupportApiKey,
@@ -1636,6 +1638,10 @@ module.exports = class Broker {
    * @param {number} [request.maxVersion=9] explicit opt-in ceiling; ordinary reads retain v9
    * @param {number} [request.timeout] remote-read broker timeout on v10+
    * @returns {Promise}
+   * @throws {import('../errors').KafkaJSError} retriable, when the answer leaves out a requested
+   *   partition, names a topic or partition that was not requested, names one twice, or gives an
+   *   offset below -1 (-1 is a lookup that found no record). A partition error the broker reports
+   *   is thrown as that error instead
    */
   async listOffsets({
     replicaId,
@@ -1673,6 +1679,18 @@ module.exports = class Broker {
       response.partitions = response.partitions.map(({ offsets, ...partitionData }) => {
         return offsets ? { ...partitionData, offset: offsets.pop() } : partitionData
       })
+    }
+
+    requireCoverage('ListOffsets', topics, result.responses)
+    for (const { topic, partitions } of result.responses) {
+      for (const { partition, offset } of partitions) {
+        if (offset !== '-1' && offset[0] === '-') {
+          throw new KafkaJSError(
+            `ListOffsets response gives partition ${partition} of topic ${topic} the offset ${offset}, which is below -1`,
+            { retriable: true }
+          )
+        }
+      }
     }
 
     return result
@@ -1816,6 +1834,12 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
    *   consumer's preparation round; an error it returns rejects this one request before it is written
    * @returns {Promise}
+   * @throws {import('../errors').KafkaJSInvariantViolation} when the answer is for another group
+   *   (v8 and up), or an answer to an all-topic read repeats a topic or partition
+   * @throws {import('../errors').KafkaJSError} retriable, when an answer to a topic selection
+   *   leaves out a requested partition, names a topic or partition that was not requested, or names
+   *   one twice. A group or partition error the broker reports is thrown as that error instead.
+   *   A `returnErrors` read keeps its own identity check and `groups` are checked by the decoder
    */
   async offsetFetch({
     groupId,
@@ -1855,15 +1879,23 @@ module.exports = class Broker {
         { apiKey: apiKeys.OffsetFetch, apiName: 'OffsetFetch' }
       )
     }
-    if (groups === undefined && apiVersion <= 9) {
+    if (groups === undefined) {
       const response = protocolRequest.response
+      const allTopics = topics == null || (topics.length === 0 && apiVersion >= 6)
       protocolRequest.response = {
         ...response,
         /**
-         * Refuses a foreign group's answer before ordinary protocol error parsing.
+         * Refuses a foreign group's answer before ordinary protocol error parsing, and an answer
+         * whose rows do not match the request after it, so a broker's own error is never replaced
+         * by a coverage error.
          * @param {object} data decoded response retaining its single group identity
          * @returns {Promise<object>} the ordinary parsed response
-         * @throws {KafkaJSInvariantViolation} when requested and returned identities differ
+         * @throws {KafkaJSInvariantViolation} when requested and returned identities differ, or
+         *   an all-topic answer repeats a topic or partition
+         * @throws {KafkaJSError} retriable, when an answer to a topic selection leaves out a
+         *   requested partition, names one that was not requested, names one twice, or spreads a
+         *   topic over more entries than the request had for it (a broker answers one entry per
+         *   requested entry, so the offset reads, which keep one entry per topic, never lose one)
          * @throws {Error} for an ordinary matching-group protocol failure
          */
         parse: async (data) => {
@@ -1872,12 +1904,17 @@ module.exports = class Broker {
               `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
             )
           }
-          if (returnErrors)
-            require('../protocol/requests/offsetFetch/responseIdentity').validateTopics(
+          if (returnErrors) {
+            validateTopics(
               { errorCode: data.errorCode ?? 0, topics: data.responses },
               topics?.length ? topics : null
             )
-          return returnErrors ? data : response.parse(data)
+            return data
+          }
+          const parsed = await response.parse(data)
+          if (allTopics) validateTopics({ errorCode: 0, topics: data.responses }, null)
+          else requireCoverage('OffsetFetch', topics, data.responses, { topicEntries: 'asSent' })
+          return parsed
         },
       }
     }
