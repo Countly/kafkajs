@@ -2,6 +2,7 @@ const { currentDeadline, checked, withAdminGuard, sharedSetup } = require('../ad
 const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
+const Encoder = require('../protocol/encoder')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
 const { requireCoverage } = require('../protocol/requests/responseCoverage')
@@ -1970,7 +1971,7 @@ module.exports = class Broker {
          * @throws {Error} for an ordinary matching-group protocol failure
          */
         parse: async (data) => {
-          if (apiVersion >= 8 && data.groupId !== groupId) {
+          if (apiVersion >= 8 && !Encoder.isEchoOf(data.groupId, groupId)) {
             throw new KafkaJSInvariantViolation(
               `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
             )

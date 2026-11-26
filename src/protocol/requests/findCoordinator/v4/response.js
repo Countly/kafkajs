@@ -1,4 +1,5 @@
 const Decoder = require('../../../decoder')
+const Encoder = require('../../../encoder')
 const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../../../error')
 const { KafkaJSError, KafkaJSPartialMessageError } = require('../../../../errors')
 
@@ -36,7 +37,8 @@ const decodeCoordinator = (decoder) => {
  * @param {Buffer} rawData
  * @param {object} [expected]
  * @param {string} [expected.key] the key the request asked for. A broker echoes it on every
- *   answer, errors included, so any other key is refused; left out, the key is not checked
+ *   answer, errors included, as the request wrote it (a lone surrogate comes back as U+FFFD), so
+ *   any other key is refused; left out, the key is not checked
  * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, errorCode: number,
  *   errorMessage: string|null, coordinator: { nodeId: number, host: string, port: number } }>}
  * @throws {KafkaJSPartialMessageError} unless the answer holds exactly one coordinator
@@ -60,7 +62,7 @@ const decode = async (rawData, { key } = {}) => {
   const [{ key: answeredKey, nodeId, host, port, errorCode, errorMessage }] = coordinators
   failIfVersionNotSupported(errorCode)
 
-  if (key !== undefined && answeredKey !== key) {
+  if (key !== undefined && !Encoder.isEchoOf(answeredKey, key)) {
     throw new KafkaJSError(
       `FindCoordinator response is for key ${answeredKey}, not the requested key ${key}`,
       { retriable: true }
