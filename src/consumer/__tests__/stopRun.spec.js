@@ -1827,6 +1827,44 @@ describe('Consumer > a run stopped for good with an error', () => {
       ])
     }, 30000)
 
+    it('a close with a zero timeout retires the run before its stop and the assigners are cleared once, before the first JoinGroup of the next run', async () => {
+      let retained = null
+      let clears = 0
+      const retaining = {
+        ...eager(),
+        protocol: () => ({ name: 'eager', metadata: Buffer.from(JSON.stringify(retained)) }),
+        onAssignment: (assignment, { generationId }) => {
+          if (assignment === null) clears++
+          retained = assignment && { partitions: assignment.partitions, generationId }
+        },
+      }
+      const run = await startOther('classic', {
+        config: { partitionAssigners: [() => retaining] },
+      })
+      const { runner, coordinator } = run
+      await advanceUntil(() => retained !== null, 1000)
+      expect(retained).toMatchObject({ generationId: 1 })
+
+      const closing = settled(run.consumer.disconnect({ timeout: 0 }))
+      await advanceUntil(() => closing.done, 2000)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(runner.retirement).not.toBeNull()
+      expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+      expect(clears).toBe(0)
+      expect(retained).toMatchObject({ generationId: 1 })
+
+      const joins = coordinator.joinGroup.mock.calls.length
+      const again = settled(run.consumer.run({ eachMessage: async () => {} }))
+      await advanceUntil(() => again.done && coordinator.joinGroup.mock.calls.length > joins, 2000)
+
+      expect(again).toMatchObject({ done: true, value: undefined })
+      expect(clears).toBe(1)
+      expect(coordinator.joinGroup.mock.calls[joins][0].groupProtocols).toEqual([
+        { name: 'eager', metadata: Buffer.from('null') },
+      ])
+    }, 30000)
+
     it('a stop called by the assigner while the next run clears it is honoured: that run sends no JoinGroup', async () => {
       let retained = null
       let interrupt = false
