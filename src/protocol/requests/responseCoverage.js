@@ -1,4 +1,6 @@
-const { KafkaJSError } = require('../../errors')
+const { KafkaJSError, KafkaJSPartialMessageError } = require('../../errors')
+
+const MAX_PARTITION = 2147483647
 
 /**
  * How one API's answer is held to its request. Produce uses `repeats: 'refuse'` and
@@ -200,4 +202,44 @@ const requirePairs = (
   }
 }
 
-module.exports = { requireCoverage }
+/**
+ * Refuses an assignment no coordinator writes. Kafka builds every assignment from a map of topic
+ * to a set of partitions, so each topic appears once and each partition once in its row, and a
+ * topic id is never the all-zero UUID (which the decoder reads as null).
+ * @param {string} api the API's name, for the message
+ * @param {object[]} entries the assignment's rows, each with `partitions: number[]`
+ * @param {string} key the field naming each row's topic: `topicId` or `topic`
+ * @returns {void}
+ * @throws {KafkaJSPartialMessageError} for a null or empty topic, a topic in two rows, or a
+ *   partition that is not an integer 0..2147483647 or appears twice in its row
+ */
+const requireAssignment = (api, entries, key) => {
+  const topics = new Set()
+  for (const entry of entries) {
+    const topic = entry[key]
+    if (typeof topic !== 'string' || topic === '') {
+      throw new KafkaJSPartialMessageError(`${api} assignment has a row with no topic`)
+    }
+    if (topics.has(topic)) {
+      throw new KafkaJSPartialMessageError(`${api} assignment names topic ${topic} twice`)
+    }
+    topics.add(topic)
+
+    const partitions = new Set()
+    for (const partition of entry.partitions) {
+      if (!Number.isInteger(partition) || partition < 0 || partition > MAX_PARTITION) {
+        throw new KafkaJSPartialMessageError(
+          `${api} assignment names partition ${partition} of topic ${topic}`
+        )
+      }
+      if (partitions.has(partition)) {
+        throw new KafkaJSPartialMessageError(
+          `${api} assignment names partition ${partition} of topic ${topic} twice`
+        )
+      }
+      partitions.add(partition)
+    }
+  }
+}
+
+module.exports = { requireCoverage, requireAssignment }

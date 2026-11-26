@@ -330,12 +330,14 @@ describe('Crash cleanup lifetime', () => {
 })
 
 describe('A disconnect during crash cleanup', () => {
-  afterEach(() => jest.restoreAllMocks())
+  afterEach(() => {
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
 
   /**
-   * Starts a run whose crash stop is held on `stop` and whose first cluster disconnect (the
-   * crash's own) is held on `transport`, then crashes it. Records DISCONNECT, CRASH and the
-   * close's resolution in `order`.
+   * Starts a run with its stop held on `stop` and, optionally, its first cluster disconnect held
+   * on `transport`. Records DISCONNECT and CRASH in `order`.
    */
   const crashing = async ({ buildOptions = {}, retry = {}, holdTransport = false } = {}) => {
     const stop = gate()
@@ -343,10 +345,11 @@ describe('A disconnect during crash cleanup', () => {
     const start = jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
     jest.spyOn(Runner.prototype, 'stop').mockImplementation(() => stop.promise)
     const cluster = createCluster({ topicIds: { [TOPIC]: ID_B } })
-    let calls = 0
-    cluster.disconnect = async () => {
-      if (++calls === 1 && holdTransport) await transport.promise
-    }
+    cluster.disconnect = jest
+      .fn(async () => {})
+      .mockImplementationOnce(async () => {
+        if (holdTransport) await transport.promise
+      })
     const consumer = build(cluster, {
       retry: { retries: 0, initialRetryTime: 5, restartOnFailure: async () => true, ...retry },
       ...buildOptions,
@@ -371,11 +374,14 @@ describe('A disconnect during crash cleanup', () => {
   test.each([
     ['a cluster with nothing to drain', {}],
     ['a cluster the consumer does not own', { buildOptions: { ownsCluster: false } }],
-    ['the crash cluster disconnect held', { holdTransport: true }],
+    ['the cluster disconnect held', { holdTransport: true }],
   ])(
     'a plain disconnect whose stop a crash joins resolves only after the crashed run has dispatched its DISCONNECT and released its registry entries, with %s',
     async (_label, options) => {
+      jest.useFakeTimers()
       const run = await crashing(options)
+      expect(run.runner.consumerGroup.obligations.size()).toBe(1)
+      expect(run.cluster.listenerCount()).toBe(1)
       const closing = run.consumer.disconnect().then(() => {
         run.order.push('closed')
         return {
@@ -386,11 +392,22 @@ describe('A disconnect during crash cleanup', () => {
       })
       const crashed = run.runner.onCrash(crashError())
       run.stop.release()
-      await pause(30)
+      await jest.advanceTimersByTimeAsync(0)
+      const beforeRelease = [...run.order]
+      const disconnectsBeforeRelease = run.cluster.disconnect.mock.calls.length
       run.transport.release()
 
-      expect(await closing).toEqual({ disconnects: 2, obligations: 0, listeners: 0 })
+      if (options.holdTransport) {
+        expect(disconnectsBeforeRelease).toBe(1)
+        expect(beforeRelease).toEqual([])
+      }
+      expect(await closing).toEqual({ disconnects: 1, obligations: 0, listeners: 0 })
       await crashed
+      expect(Runner.prototype.stop).toHaveBeenCalledTimes(1)
+      expect(run.cluster.disconnect.mock.calls).toEqual(
+        options.buildOptions?.ownsCluster === false ? [] : [[]]
+      )
+      expect(run.order.filter((entry) => entry === 'DISCONNECT')).toEqual(['DISCONNECT'])
       expect(run.crashes.map(({ restart }) => restart)).toEqual([false])
     }
   )

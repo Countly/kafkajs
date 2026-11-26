@@ -749,6 +749,78 @@ describe('Consumer > classic group protocol > a heartbeat that loses its coordin
   })
 })
 
+describe('Consumer > classic group protocol > a heartbeat answered after its caller refuses', () => {
+  const {
+    events: { HEARTBEAT },
+  } = require('../instrumentationEvents')
+
+  /**
+   * A joined member whose heartbeat is written and held until the test answers it; `refuse` makes
+   * the caller's guard refuse from then on.
+   */
+  const heldHeartbeat = async () => {
+    const held = {}
+    const coordinator = {
+      heartbeat: jest.fn(
+        () =>
+          new Promise((resolve, reject) => {
+            Object.assign(held, { resolve, reject })
+          })
+      ),
+      isConnected: () => true,
+    }
+    const instrumentationEmitter = new InstrumentationEventEmitter()
+    const events = jest.fn()
+    instrumentationEmitter.addListener(HEARTBEAT, events)
+    const protocol = buildProtocol({
+      cluster: { findGroupCoordinator: jest.fn(async () => coordinator) },
+      instrumentationEmitter,
+    })
+    await protocol.connect()
+    Object.assign(protocol, { memberId: 'seam-member', generationId: 1, lastRequest: 0 })
+    let refusal = null
+    const call = protocol.heartbeat({ interval: 0, guard: () => refusal })
+    call.catch(() => {})
+    for (let i = 0; i < 20 && coordinator.heartbeat.mock.calls.length === 0; i++) {
+      await Promise.resolve()
+    }
+    expect(coordinator.heartbeat).toHaveBeenCalledTimes(1)
+    return {
+      protocol,
+      call,
+      events,
+      held,
+      refuse: (error) => {
+        refusal = error
+      },
+    }
+  }
+
+  it('a success answered after the refusal emits no HEARTBEAT and keeps the last request time', async () => {
+    const { protocol, call, events, held, refuse } = await heldHeartbeat()
+    const stopped = new Error('stopped')
+
+    refuse(stopped)
+    held.resolve()
+
+    await expect(call).rejects.toBe(stopped)
+    expect(events).not.toHaveBeenCalled()
+    expect(protocol.lastRequest).toBe(0)
+  })
+
+  it('a coordinator error answered after the refusal leaves the coordinator known', async () => {
+    const { protocol, call, events, held, refuse } = await heldHeartbeat()
+    const stopped = new Error('stopped')
+
+    refuse(stopped)
+    held.reject(createErrorFromCode(15))
+
+    await expect(call).rejects.toBe(stopped)
+    expect(protocol.coordinatorUnknown).toBe(false)
+    expect(events).not.toHaveBeenCalled()
+  })
+})
+
 describe('Consumer > classic group protocol > the idle heartbeat probe', () => {
   const ConsumerProtocol = require('../groupProtocol/consumer')
   const INTERVAL = 3000

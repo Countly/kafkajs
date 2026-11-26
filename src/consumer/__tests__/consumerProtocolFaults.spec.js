@@ -1405,11 +1405,11 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
       throw staleEpoch()
     })
     const { manager } = staleEpochHarness({ epoch: 7, offsetCommit })
-    manager.lastCommit = 0
+    manager.lastCommit = -1
     await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
     await new Promise((resolve) => setTimeout(resolve, 150))
     expect(offsetCommit).toHaveBeenCalledTimes(1)
-    expect(manager.lastCommit).toBeGreaterThan(0)
+    expect(manager.lastCommit).toBeGreaterThanOrEqual(0)
   })
 
   test('rejects a stale-epoch explicit commit', async () => {
@@ -1528,6 +1528,92 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
       } finally {
         jest.useRealTimers()
       }
+    }
+  )
+})
+
+const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
+const apiKeys = require('../../protocol/requests/apiKeys')
+const heartbeatWire = require('../../../testHelpers/wire/consumerGroupHeartbeatV1')
+const { KafkaJSPartialMessageError } = require('../../errors')
+
+describe('Consumer > malformed heartbeat answers through the real decoder', () => {
+  let harness
+
+  afterEach(async () => {
+    if (harness) await harness.pool.destroy()
+    harness = null
+  })
+
+  /**
+   * @param {Buffer[]} answers encoded ConsumerGroupHeartbeat answers, one per request, in order
+   * @param {string} [state] the member state `build` starts in
+   * @returns {object} `build`'s membership, sending through a real Broker and Connection
+   */
+  const member = (answers, state = 'RECONCILING') => {
+    harness = createGroupApiBroker({
+      versions: { [apiKeys.ConsumerGroupHeartbeat]: { minVersion: 0, maxVersion: 1 } },
+      respond: () => answers.shift(),
+    })
+    const h = build(state, new Error('not sent'))
+    h.p.coordinator = harness.broker
+    h.cluster.findGroupCoordinator.mockResolvedValue(harness.broker)
+    return h
+  }
+
+  /** @param {object} assignment @returns {Buffer} a code-0 answer at epoch 7 */
+  const answerWith = (assignment) => heartbeatWire.buildResponse({ memberEpoch: 7, assignment })
+
+  test('an assignment with a partition twice is refused: the target is unchanged, the heartbeat backs off, and the next valid answer is adopted', async () => {
+    const h = member([
+      answerWith({ topicPartitions: [{ topicId: ID, partitions: [0, 0] }] }),
+      answerWith({ topicPartitions: [{ topicId: ID, partitions: [0, 1] }] }),
+    ])
+
+    await expect(h.p.sendHeartbeat({})).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(h.p.target.byTopicId.get(ID)).toEqual([0])
+    expect(h.p.memberEpoch).toBe(7)
+    expect(h.p.state).toBe('RECONCILING')
+    expect(h.p.coordinator).toBeNull()
+    expect(h.p.backoff.pending(Date.now())).toBe(true)
+
+    await h.p.sendHeartbeat({})
+    expect(harness.requests).toHaveLength(2)
+    expect(h.p.target.byTopicId.get(ID)).toEqual([0, 1])
+  })
+
+  test('a null Partitions array is refused as a malformed answer, not a TypeError, and leaves the target', async () => {
+    const h = member([answerWith({ topicPartitions: [{ topicId: ID, partitions: null }] })])
+
+    await expect(h.p.sendHeartbeat({})).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(h.p.target.byTopicId.get(ID)).toEqual([0])
+    expect(h.p.backoff.pending(Date.now())).toBe(true)
+  })
+
+  test.each([
+    ['dynamic', null, -1],
+    ['static', 'instance-a', -2],
+  ])(
+    'a %s leave answered code 0 with its own negative epoch and interval 0 ends as before, with no warning',
+    async (_kind, groupInstanceId, leaveEpoch) => {
+      const h = member(
+        [
+          heartbeatWire.buildResponse({
+            memberEpoch: leaveEpoch,
+            heartbeatIntervalMs: 0,
+            assignment: null,
+          }),
+        ],
+        'PREPARE_LEAVING'
+      )
+      h.p.groupInstanceId = groupInstanceId
+
+      await h.p.sendLeaveHeartbeat()
+
+      expect(harness.requests).toHaveLength(1)
+      expect(h.p.state).toBe('UNSUBSCRIBED')
+      expect(h.p.memberEpoch).toBe(leaveEpoch)
+      expect(h.log.warn).not.toHaveBeenCalled()
     }
   )
 })

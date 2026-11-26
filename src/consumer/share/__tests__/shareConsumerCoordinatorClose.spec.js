@@ -1,5 +1,6 @@
 const { ShareRun } = require('../shareRun')
 const { createErrorFromCode } = require('../shareErrorContract')
+const { KafkaJSPartialMessageError } = require('../../../errors')
 const {
   A,
   ShareClock,
@@ -223,6 +224,37 @@ describe('share disconnect after coordinator transport recovery', () => {
       'Share leave skipped',
       expect.objectContaining({ reason: 'coordinator-unknown' })
     )
+  })
+
+  test('sends one leave on the accepted coordinator when disconnect finds the heartbeat backing off after a refused assignment', async () => {
+    const original = await begin(0, true)
+    h.script('ShareGroupHeartbeat', [
+      ({ memberId }) => ({
+        errorCode: 0,
+        errorMessage: null,
+        memberId,
+        memberEpoch: original.memberEpoch,
+        heartbeatIntervalMs: 600000,
+        assignment: { topicPartitions: [{ topicId: A, partitions: [0, 0] }] },
+      }),
+    ])
+    await expect(run.heartbeat()).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(run.membership.backoff.pending(performance.now())).toBe(true)
+    expect(run.membership.token).toBe(original.token)
+    const lookups = h.frames(10).length
+    const socket = original.binding.connection.socket
+    handler.resolve()
+    await h.consumer.disconnect({ timeout: 400 })
+    expect(leaves()).toHaveLength(1)
+    expect(leaves()[0].fields).toMatchObject({
+      groupId: 'group',
+      memberId: original.memberId,
+      memberEpoch: -1,
+    })
+    expect(socketOf(leaves()[0])).toBe(socket)
+    expect(leaves()[0].answeredOrder).toBeGreaterThan(leaves()[0].order)
+    expect(h.frames(10)).toHaveLength(lookups)
+    expect(warning).not.toHaveBeenCalledWith('Share leave skipped', expect.anything())
   })
 
   test('retires a held coordinator lookup before an omitted leave finishes its final', async () => {
