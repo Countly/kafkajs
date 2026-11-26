@@ -55,14 +55,14 @@ const partitionRow = ({ partition, errorCode = 0, records = null, preferredReadR
  * A flexible Fetch response body with any topic entries, each keyed by `topicId` (v13+) or by
  * `topicName` (v12; `null` writes a null name).
  * @param {{ topicName?: string|null, topicId?: string, partitions: object[] }[]} topics
- * @param {{ topLevel?: number, throttleTime?: number }} [options]
+ * @param {{ topLevel?: number, throttleTime?: number, sessionId?: number }} [options]
  * @returns {Buffer}
  */
-const answer = (topics, { topLevel = 0, throttleTime = 0 } = {}) =>
+const answer = (topics, { topLevel = 0, throttleTime = 0, sessionId = 0 } = {}) =>
   new Encoder()
     .writeInt32(throttleTime)
     .writeInt16(topLevel)
-    .writeInt32(0) // sessionId
+    .writeInt32(sessionId)
     .writeUVarIntArray(
       topics.map(({ topicName, topicId, partitions }) =>
         (topicId ? new Encoder().writeUuid(topicId) : new Encoder().writeUVarIntString(topicName))
@@ -75,14 +75,21 @@ const answer = (topics, { topLevel = 0, throttleTime = 0 } = {}) =>
 /**
  * A `ConsumerGroup` whose join is skipped (assignment and positions primed at offset 0) over a
  * real `Broker` on the fake socket, so the Fetch request, its answer and the consumer's handling
- * of it are all real. Sessionless, as by default.
+ * of it are all real. Sessionless unless `fetchSessions` is set.
  * @param {object} options
  * @param {number} options.fetchMaxVersion the Fetch maximum the fake broker advertises
  * @param {string[]} [options.topics] topics the group is assigned
  * @param {number[]} [options.partitions] partitions assigned per topic
+ * @param {boolean} [options.fetchSessions=false] the group's `fetchSessions` option
  * @param {(header: {apiVersion: number}) => Buffer} options.respond the Fetch answer
  */
-const createGroup = async ({ fetchMaxVersion, topics = [TOPIC], partitions = [0], respond }) => {
+const createGroup = async ({
+  fetchMaxVersion,
+  topics = [TOPIC],
+  partitions = [0],
+  fetchSessions = false,
+  respond,
+}) => {
   const { broker, state } = createFakeBroker((header) =>
     header.apiKey === apiKeys.ApiVersions
       ? apiVersionsBody(fetchMaxVersion, false)
@@ -133,6 +140,7 @@ const createGroup = async ({ fetchMaxVersion, topics = [TOPIC], partitions = [0]
     rackId: '',
     checkCrcs: true,
     metadataMaxAge: 300000,
+    fetchSessions,
   })
 
   group.subscriptionState.assign(topics.map((topic) => ({ topic, partitions })))
@@ -379,5 +387,165 @@ describe('Consumer > Fetch answers that do not match the request', () => {
     const batches = await group.fetch(NODE_ID)
 
     expect(batches.map(({ topic, partition }) => `${topic}|${partition}`)).toEqual([`${TOPIC}|1`])
+  })
+})
+
+describe('Broker > a full Fetch request that names one partition twice', () => {
+  /**
+   * A real `Broker` on the fake socket whose every Fetch is answered with `body`.
+   * @param {number} version the Fetch maximum the fake broker advertises
+   * @param {Buffer} body
+   * @returns {Promise<object>} the connected broker
+   */
+  const connect = async (version, body) => {
+    const { broker } = createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(version, false) : body
+    )
+    await broker.connect()
+    brokers.push(broker)
+    return broker
+  }
+
+  /** @param {number} version @returns {object} a full request naming partition 0 twice */
+  const request = (version) => ({
+    topics: [
+      {
+        topic: TOPIC,
+        partitions: [
+          { partition: 0, fetchOffset: '0', maxBytes: 1048576 },
+          { partition: 0, fetchOffset: '0', maxBytes: 1048576 },
+        ],
+      },
+    ],
+    topicIds: version >= 13 ? new Map([[TOPIC, TOPIC_ID]]) : undefined,
+  })
+
+  test.each([12, 16])(
+    'two answer rows for it reject the request retriably (Fetch v%i)',
+    async (version) => {
+      const broker = await connect(
+        version,
+        answer([{ ...keyOf(version, TOPIC), partitions: [{ partition: 0 }, { partition: 0 }] }])
+      )
+
+      await expect(broker.fetch(request(version))).rejects.toMatchObject({
+        name: 'KafkaJSError',
+        retriable: true,
+        message: `Fetch response names partition 0 of topic ${TOPIC} twice`,
+      })
+    }
+  )
+
+  test.each([12, 16])('one answer row for it is returned (Fetch v%i)', async (version) => {
+    const broker = await connect(
+      version,
+      answer([{ ...keyOf(version, TOPIC), partitions: [{ partition: 0 }] }])
+    )
+
+    const { responses } = await broker.fetch(request(version))
+
+    expect(
+      responses.map(({ topicName, partitions }) => [
+        topicName,
+        partitions.map(({ partition }) => partition),
+      ])
+    ).toEqual([[TOPIC, [0]]])
+  })
+})
+
+describe('Consumer > Fetch session ids that cannot answer the request', () => {
+  /**
+   * A group with fetch sessions on whose Fetch answers are played back in order.
+   * @param {Buffer[]} answers
+   */
+  const sessionGroup = (answers) =>
+    createGroup({ fetchMaxVersion: 16, fetchSessions: true, respond: () => answers.shift() })
+
+  /** @param {object} [extra] @returns {object[]} one entry answering partition 0 */
+  const row = (extra = {}) => [{ topicId: TOPIC_ID, partitions: [{ partition: 0, ...extra }] }]
+
+  /** @param {object[]} batches @returns {string[]} */
+  const delivered = (batches) => batches.map(({ topic, partition }) => `${topic}|${partition}`)
+
+  test("an incremental answer carrying another session's id rejects the round retriably; the next request reopens the session in full and its answer is delivered", async () => {
+    const { group, lastFetchRequest } = await sessionGroup([
+      answer(row(), { sessionId: 42 }),
+      answer([], { sessionId: 43 }),
+      answer(row({ records: RECORDS }), { sessionId: 44 }),
+    ])
+    await group.fetch(NODE_ID)
+
+    await expect(group.fetch(NODE_ID)).rejects.toMatchObject({
+      name: 'KafkaJSError',
+      retriable: true,
+      message: 'Fetch response carries session id 43, which cannot answer session 42 at epoch 1',
+    })
+    expect(lastFetchRequest()).toMatchObject({ sessionId: 42, sessionEpoch: 1 })
+
+    const batches = await group.fetch(NODE_ID)
+
+    expect(lastFetchRequest()).toMatchObject({ sessionId: 42, sessionEpoch: 0 })
+    expect(delivered(batches)).toEqual([`${TOPIC}|0`])
+  })
+
+  test('a full answer with a negative session id rejects the round retriably; the next full request is answered and delivered', async () => {
+    const { group, lastFetchRequest } = await sessionGroup([
+      answer(row(), { sessionId: -1 }),
+      answer(row({ records: RECORDS }), { sessionId: 7 }),
+    ])
+
+    await expect(group.fetch(NODE_ID)).rejects.toMatchObject({
+      name: 'KafkaJSError',
+      retriable: true,
+      message: 'Fetch response carries session id -1, which cannot answer session 0 at epoch 0',
+    })
+
+    const batches = await group.fetch(NODE_ID)
+
+    expect(lastFetchRequest()).toMatchObject({ sessionId: 0, sessionEpoch: 0 })
+    expect(delivered(batches)).toEqual([`${TOPIC}|0`])
+  })
+
+  test('an incremental answer with id 0 ends the session without failing the round; the next request is full', async () => {
+    const { group, lastFetchRequest } = await sessionGroup([
+      answer(row(), { sessionId: 42 }),
+      answer([], { sessionId: 0 }),
+      answer(row(), { sessionId: 0 }),
+    ])
+    await group.fetch(NODE_ID)
+
+    await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+    await group.fetch(NODE_ID)
+
+    expect(lastFetchRequest()).toMatchObject({ sessionId: 0, sessionEpoch: 0 })
+  })
+
+  test.each([70, 71])(
+    "a top-level code %i carrying another session's id resets the session without failing the round",
+    async (code) => {
+      const { group, lastFetchRequest } = await sessionGroup([
+        answer(row(), { sessionId: 42 }),
+        answer([], { topLevel: code, sessionId: 43 }),
+        answer(row(), { sessionId: 42 }),
+      ])
+      await group.fetch(NODE_ID)
+
+      await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+      await group.fetch(NODE_ID)
+
+      expect(lastFetchRequest()).toMatchObject({
+        sessionId: code === 70 ? 0 : 42,
+        sessionEpoch: 0,
+      })
+    }
+  )
+
+  test('a sessionless answer is read whatever session id it carries', async () => {
+    const { group } = await createGroup({
+      fetchMaxVersion: 16,
+      respond: () => answer(row({ records: RECORDS }), { sessionId: -1 }),
+    })
+
+    expect(delivered(await group.fetch(NODE_ID))).toEqual([`${TOPIC}|0`])
   })
 })
