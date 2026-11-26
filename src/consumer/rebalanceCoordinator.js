@@ -834,7 +834,8 @@ module.exports = class RebalanceCoordinator {
    * it is in flight. The count of accepted joins is read before the leave for that reason: the leave
    * answers for the membership it was sent for, so once a round has joined there is nothing left to
    * reset and no verdict to raise, and resetting would void the new membership. The count, not the
-   * generation, because a rejoin can come back at the same generation or epoch. Otherwise the
+   * generation, because a rejoin can come back at the same generation or epoch. A stop that latched
+   * during the leave likewise leaves nothing to reset: the answer belongs to an ended run. Otherwise the
    * generation is reset, and a classic round still in flight owns the rejoin, so no LOST verdict is
    * raised. A consumer-protocol chain, waiting between rounds or joining, owns no rejoin of a
    * membership that carries a loss (see `lostRoundOwed`), so the LOST verdict is raised and the
@@ -900,7 +901,13 @@ module.exports = class RebalanceCoordinator {
       )
     }
 
-    if (leaving.guard() || this.consumerGroup.joinCount !== joinsBefore) {
+    // A stop latched meanwhile owns this run's teardown and its one assigner clear; the assigners
+    // may already serve the run started after it.
+    if (
+      leaving.guard() ||
+      this.runner.stopRequested ||
+      this.consumerGroup.joinCount !== joinsBefore
+    ) {
       return
     }
 
