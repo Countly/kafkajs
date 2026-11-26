@@ -3,6 +3,7 @@ const Broker = require('../../../broker')
 const ConnectionPool = require('../../../network/connectionPool')
 const Cluster = require('../../../cluster')
 const { createErrorFromCode } = require('../../../protocol/error')
+const { KafkaJSPartialMessageError } = require('../../../errors')
 const { ShareMembership, SharePollView } = require('../shareMembership')
 const { newLogger } = require('testHelpers')
 const { createScriptedCluster } = require('../../../../testHelpers/scriptedCluster')
@@ -608,6 +609,67 @@ describe('share membership', () => {
       assignment: [],
     })
     expect(f.member.heartbeatInterval()).toBe(1000)
+  })
+  test('a join answered code 0 with epoch 0 and an assignment adopts nothing: still joining, no target, nothing published', async () => {
+    f = await fixture()
+    const warn = jest.spyOn(f.member.logger, 'warn')
+    f.response.memberEpoch = 0
+    f.response.assignment = { topicPartitions: [{ topicId: A, partitions: [1] }] }
+    await f.member.heartbeat()
+    expect(f.member.snapshot()).toMatchObject({
+      memberEpoch: 0,
+      state: 'JOINING',
+      assignment: [],
+      unresolved: [],
+    })
+    expect(f.member.target).toEqual([])
+    expect(f.onAssignment).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledWith(
+      'Ignoring a share heartbeat answer whose member epoch this member cannot hold',
+      { groupId: 'group', memberEpoch: 0, currentEpoch: 0 }
+    )
+  })
+  test.each([0, -1])(
+    'a regular answer with interval %s keeps the current interval',
+    async (interval) => {
+      f = await fixture()
+      f.response.heartbeatIntervalMs = 2700
+      await f.member.heartbeat()
+      f.response.heartbeatIntervalMs = interval
+      await f.member.heartbeat()
+      expect(f.member.heartbeatInterval()).toBe(2700)
+      expect(f.member.snapshot()).toMatchObject({ memberEpoch: 1, state: 'STABLE' })
+    }
+  )
+  test('leave() answered code 0, epoch -1 and interval 0 completes as before', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() }
+    f = await fixture({ logger })
+    await f.member.heartbeat()
+    f.response.memberEpoch = -1
+    f.response.heartbeatIntervalMs = 0
+    await f.member.leave()
+    expect(f.frames().map((x) => x.memberEpoch)).toEqual([0, -1])
+    expect(f.member.state).toBe('UNSUBSCRIBED')
+    expect(logger.error).not.toHaveBeenCalled()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(f.onFatal).not.toHaveBeenCalled()
+  })
+  test('an answer with an all-zero topic id beside a valid one is refused as malformed, not as a TypeError, and never becomes the target', async () => {
+    f = await fixture()
+    await f.member.heartbeat()
+    f.response.assignment = {
+      topicPartitions: [
+        { topicId: null, partitions: [0] },
+        { topicId: B, partitions: [1] },
+      ],
+    }
+    const error = await rejected(f.member.heartbeat())
+    expect(error).not.toBeInstanceOf(TypeError)
+    expect(error.cause).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(f.member.state).toBe('FATAL')
+    expect(f.onFatal).toHaveBeenCalledTimes(1)
+    expect(f.cluster.refreshMetadataForTopicIds).not.toHaveBeenCalled()
+    expect(f.member.snapshot()).toMatchObject({ assignment: [], unresolved: [] })
   })
   test('keeps retrying unresolved IDs under its own elapsed backoff without blocking heartbeats', async () => {
     f = await fixture({

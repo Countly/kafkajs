@@ -426,13 +426,7 @@ describe('public share connection contract', () => {
     })
     await first.arrived()
     first.release()
-    await clock.advanceUntil(
-      () => second.call !== null,
-      'the heartbeat after the epoch-zero reply',
-      {
-        step: 1,
-      }
-    )
+    await clock.advanceUntil(() => second.call !== null, 'the heartbeat after the epoch-zero reply')
     await flush()
     expect(settled).toBe(false)
     expect(seen.joins).toEqual([])

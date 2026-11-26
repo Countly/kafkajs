@@ -1,7 +1,43 @@
 const { decode, parse } = require('./response')
+const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 
 const vector = (caseId) =>
   require(`../fixtures/java/consumerGroupHeartbeatResponse-v0-${caseId}.json`)
+
+const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
+const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
+
+/**
+ * A successful answer encoded byte by byte, so arrays the shared wire helpers cannot write - a
+ * null `TopicPartitions` - can be sent. A null `topicId` is written as the all-zero UUID.
+ * @param {{ memberEpoch?: number, heartbeatIntervalMs?: number, assignment: object|null }} fields
+ * @returns {Buffer} the response body
+ */
+const answer = ({ memberEpoch = 3, heartbeatIntervalMs = 5000, assignment }) => {
+  const body = new Encoder()
+    .writeInt32(0)
+    .writeInt16(0)
+    .writeUVarIntString(null)
+    .writeUVarIntString('member')
+    .writeInt32(memberEpoch)
+    .writeInt32(heartbeatIntervalMs)
+  if (assignment === null) {
+    body.writeInt8(-1)
+  } else {
+    const rows =
+      assignment.topicPartitions === null
+        ? null
+        : assignment.topicPartitions.map(({ topicId, partitions }) =>
+            new Encoder()
+              .writeUuid(topicId)
+              .writeUVarIntArray(partitions, 'int32')
+              .writeTaggedFields()
+          )
+    body.writeInt8(1).writeUVarIntArray(rows, 'object').writeTaggedFields()
+  }
+  return body.writeTaggedFields().buffer
+}
 
 describe('Protocol > Requests > ConsumerGroupHeartbeat > v0', () => {
   test.each(['assignment', 'emptyAssignment', 'nullAssignment', 'fencedError'])(
@@ -103,6 +139,63 @@ describe('Protocol > Requests > ConsumerGroupHeartbeat > v0', () => {
     })
     await expect(parse(data)).rejects.toMatchObject({
       message: expect.stringContaining('The member epoch is fenced by the group coordinator'),
+    })
+  })
+
+  describe('assignment shape', () => {
+    test.each([
+      ['a null TopicPartitions array', { topicPartitions: null }],
+      ['a null Partitions array', { topicPartitions: [{ topicId: ID_A, partitions: null }] }],
+      [
+        'a partition twice in one row',
+        { topicPartitions: [{ topicId: ID_A, partitions: [0, 0] }] },
+      ],
+      ['a negative partition', { topicPartitions: [{ topicId: ID_A, partitions: [-1] }] }],
+      [
+        'one topic id in two rows',
+        {
+          topicPartitions: [
+            { topicId: ID_A, partitions: [0] },
+            { topicId: ID_A, partitions: [1] },
+          ],
+        },
+      ],
+      ['the all-zero topic id', { topicPartitions: [{ topicId: null, partitions: [0] }] }],
+    ])('refuses %s as a malformed answer', async (_, assignment) => {
+      await expect(decode(answer({ assignment }))).rejects.toBeInstanceOf(
+        KafkaJSPartialMessageError
+      )
+    })
+
+    test.each([
+      ['an empty assignment', { topicPartitions: [] }],
+      ['a null assignment', null],
+      [
+        'distinct topics, one with no partitions',
+        {
+          topicPartitions: [
+            { topicId: ID_A, partitions: [2, 0] },
+            { topicId: ID_B, partitions: [] },
+          ],
+        },
+      ],
+    ])('decodes %s as before', async (_, assignment) => {
+      const data = await decode(answer({ assignment }))
+
+      expect(data.assignment).toEqual(assignment)
+    })
+
+    test('decodes a leave answer with epoch -1, interval 0 and no assignment as before', async () => {
+      const data = await decode(
+        answer({ memberEpoch: -1, heartbeatIntervalMs: 0, assignment: null })
+      )
+
+      expect(data).toMatchObject({
+        errorCode: 0,
+        memberEpoch: -1,
+        heartbeatIntervalMs: 0,
+        assignment: null,
+      })
     })
   })
 })

@@ -49,6 +49,59 @@ describe('independent Java response bytes', () => {
   })
 })
 
+describe('assignment shape', () => {
+  const wire = require('../../../../../testHelpers/wire/shareGroupHeartbeatV1')
+  const A = '01020304-0506-0708-090a-0b0c0d0e0f10'
+  const B = '11121314-1516-1718-191a-1b1c1d1e1f20'
+
+  test.each([
+    [
+      'the all-zero topic id beside a valid one',
+      [
+        { topicId: null, partitions: [0] },
+        { topicId: A, partitions: [1] },
+      ],
+    ],
+    [
+      'one topic id in two rows',
+      [
+        { topicId: A, partitions: [0] },
+        { topicId: A, partitions: [1] },
+      ],
+    ],
+    ['a negative partition', [{ topicId: A, partitions: [-1] }]],
+    ['a partition twice in one row', [{ topicId: A, partitions: [2, 2] }]],
+  ])('refuses %s as a malformed answer', async (_, topicPartitions) => {
+    await expect(
+      codec.decode(wire.buildResponse({ assignment: { topicPartitions } }))
+    ).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  })
+
+  test('decodes a successful leave answer: code 0, epoch -1, interval 0, no assignment', async () => {
+    const decoded = await codec.decode(
+      wire.buildResponse({ memberEpoch: -1, heartbeatIntervalMs: 0, assignment: null })
+    )
+
+    expect(decoded).toMatchObject({
+      errorCode: 0,
+      memberEpoch: -1,
+      heartbeatIntervalMs: 0,
+      assignment: null,
+    })
+  })
+
+  test('decodes distinct topics, one with no partitions', async () => {
+    const topicPartitions = [
+      { topicId: A, partitions: [2, 0] },
+      { topicId: B, partitions: [] },
+    ]
+
+    const decoded = await codec.decode(wire.buildResponse({ assignment: { topicPartitions } }))
+
+    expect(plain(decoded.assignment)).toEqual({ topicPartitions })
+  })
+})
+
 test.each([-2, 0, 2])('refuses invalid assignment presence %s', async (marker) => {
   const source = require('../fixtures/java/shareGroupHeartbeatResponse-v1-assigned.json')
   const bytes = Buffer.from(source.hex, 'hex')
