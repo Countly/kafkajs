@@ -19,12 +19,14 @@ const VERSIONS = {
 }
 
 /**
- * A successful JoinGroup answer to a follower.
+ * A successful JoinGroup answer to a follower. It asks for no throttling: the next request would
+ * otherwise be written after the harness has answered what was sent.
  * @param {object} [fields] over the follower's
  * @returns {Buffer}
  */
 const joinAnswer = (fields = {}) =>
   joinGroupV8.buildResponse({
+    throttleTime: 0,
     protocolType: 'consumer',
     groupProtocol: PROTOCOL,
     generationId: 1,
@@ -107,7 +109,8 @@ describe('Consumer > classic group answers no coordinator sends', () => {
       isolationLevel: 0,
       rackId: '',
       checkCrcs: true,
-      groupInstanceId: null,
+      // Static, so the coordinator answers the first join itself instead of MEMBER_ID_REQUIRED.
+      groupInstanceId: 'instance-1',
       metadataMaxAge: 300000,
     })
     return {

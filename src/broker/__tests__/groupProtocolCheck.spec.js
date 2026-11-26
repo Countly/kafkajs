@@ -96,7 +96,7 @@ describe('Broker > the protocol the coordinator reports', () => {
     test('checks the answer to the retry that a MEMBER_ID_REQUIRED answer asks for, too', async () => {
       const answers = [
         joinAnswer({ errorCode: 79, memberId: 'made-up' }),
-        joinAnswer({ protocolType: 'connect' }),
+        joinAnswer({ protocolType: 'connect', memberId: 'made-up' }),
       ]
       harness = createGroupApiBroker({
         versions: { [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: 8 } },

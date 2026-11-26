@@ -317,7 +317,8 @@ describe('Consumer > classic member id retention', () => {
   describe('over the production Broker and Connection', () => {
     /**
      * A real round and handshake whose only substitute is the socket: the first JoinGroup is
-     * answered MEMBER_ID_REQUIRED, the second succeeds.
+     * answered MEMBER_ID_REQUIRED with the new id alone, as a coordinator does; the second makes
+     * the only member `A` the leader, listing itself.
      * @param {boolean} retire whether the membership is retired just before the first answer
      * @returns {Promise<{ result: Error|null, frames: number }>} the join's outcome and the number
      *   of JoinGroup frames written
@@ -346,15 +347,32 @@ describe('Consumer > classic member id retention', () => {
             protocol.leave({ leaveGroup: false })
             expect(round.guard()).toBeNull()
           }
+          if (frames === 1) {
+            return new Encoder()
+              .writeInt32(0)
+              .writeInt16(79)
+              .writeInt32(-1)
+              .writeUVarIntString(null)
+              .writeUVarIntString(null)
+              .writeUVarIntString('')
+              .writeUVarIntString('A')
+              .writeUVarIntArray([])
+              .writeTaggedFields().buffer
+          }
+          const leader = new Encoder()
+            .writeUVarIntString('A')
+            .writeUVarIntString(null)
+            .writeUVarIntBytes(METADATA)
+            .writeTaggedFields()
           return new Encoder()
             .writeInt32(0)
-            .writeInt16(frames === 1 ? 79 : 0)
+            .writeInt16(0)
             .writeInt32(5)
             .writeUVarIntString('consumer')
             .writeUVarIntString('RoundRobinAssigner')
             .writeUVarIntString('A')
             .writeUVarIntString('A')
-            .writeUVarIntArray([])
+            .writeUVarIntArray([leader])
             .writeTaggedFields().buffer
         },
       })
