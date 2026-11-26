@@ -96,7 +96,9 @@ describe('Broker > offsets keyed by topic id', () => {
   })
 
   test('is all or nothing: one entry without an id keeps the whole request at v9', async () => {
-    await commit([entry(TOPIC_ID), { topic: 'other', partitions: PARTITIONS }])
+    await expect(
+      commit([entry(TOPIC_ID), { topic: 'other', partitions: PARTITIONS }])
+    ).rejects.toMatchObject({ retriable: true })
 
     expect(versionSent()).toEqual([9])
   })
