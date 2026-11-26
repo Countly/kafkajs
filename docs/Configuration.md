@@ -138,7 +138,7 @@ Note that the broker may be configured to reject your authentication attempt if 
 | option                    | description                                                                                                                                                                             | default |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | authenticationTimeout | Whole SASL exchange cap in ms, including a token callback or signer; integer 1..2147483647, legacy numeric string accepted. During setup the remaining readiness budget also applies. | `10000` |
-| reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of the session lifetime, counted from when the final SASL request was written to the socket. | `10000` |
+| reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of the session lifetime, counted from when the final SASL request was written to the socket. A negative value counts as `0`: the session is renewed once it has ended. | `10000` |
 
 ### PLAIN/SCRAM Example
 
