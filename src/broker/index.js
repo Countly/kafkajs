@@ -28,6 +28,12 @@ const shuffle = require('../utils/shuffle')
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
 
+// How a full Fetch answer is held to its request: a pair may be missing (a broker may leave a
+// partition out), never unrequested or repeated. Keyed by id, an entry whose id the request did not
+// carry has a null name and is left to the caller. Built once: the check runs on every full answer.
+const BY_NAME = Object.freeze({ rowTopic: 'topicName', missing: 'allow' })
+const BY_ID = Object.freeze({ ...BY_NAME, skipUnnamed: true })
+
 // The last OffsetCommit and OffsetFetch version keyed by topic name. A request that carries no
 // topic ids cannot be sent above it, whatever the broker advertises.
 // @see clients/src/main/resources/common/message/OffsetCommitRequest.json (Apache Kafka 4.3.1)
@@ -1099,6 +1105,10 @@ module.exports = class Broker {
    *   id this request did not ask for (a broker bug) comes back as `topicName: null` with its
    *   `topicId` intact; deciding what to do about that belongs to the caller, which is why nothing
    *   is logged here.
+   * @throws {import('../errors').KafkaJSError} retriable, when the answer to a full request
+   *   (`sessionEpoch` -1 or 0) names a partition or topic the request did not carry, or a
+   *   partition twice; partitions it leaves out are allowed. An answer in request order is checked
+   *   without allocating.
    */
   async fetch({
     replicaId,
@@ -1176,7 +1186,11 @@ module.exports = class Broker {
 
     // `lookupRequest` returns a builder, so the negotiated version is only observable on the
     // request it built. Below v13 the response is already keyed by name and nothing is allocated.
+    // A full answer is checked against what was sent; an incremental one carries only what
+    // changed, and its session checks it.
+    const full = sessionEpoch <= 0
     if (topicIds == null || built.request.apiVersion <= FETCH_TOPIC_NAMES_MAX_VERSION) {
+      if (full) requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, BY_NAME)
       return response
     }
 
@@ -1201,6 +1215,7 @@ module.exports = class Broker {
       delete entry.topicId
     }
 
+    if (full) requireCoverage('Fetch', consolidatedTopicPartitions, response.responses, BY_ID)
     return response
   }
 
