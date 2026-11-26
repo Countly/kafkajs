@@ -3330,6 +3330,85 @@ describe('Producer > the accumulator', () => {
         expect(jest.getTimerCount()).toBe(0)
       })
     })
+
+    describe('a Produce request the connection refused for its SASL session', () => {
+      const SESSION_REFUSAL =
+        'The SASL session was not valid when the request was due to be written; it was not sent'
+
+      /**
+       * Fails every later Produce request as the connection's session refusal does: before the
+       * attempt's guard is called with a frame length, so nothing is recorded as written.
+       * @param {object} cluster
+       * @returns {void}
+       */
+      const refuseForTheSession = (cluster) =>
+        cluster.broker.produce.mockImplementation(async () => {
+          throw new KafkaJSError(SESSION_REFUSAL, { retriable: true })
+        })
+
+      test('with no retries left a session refusal fails the send', async () => {
+        const { cluster, producer } = createLingeringProducer({
+          idempotent: false,
+          retry: { retries: 0 },
+        })
+        refuseForTheSession(cluster)
+        await producer.connect()
+
+        const error = await settledWithin(
+          producer.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e),
+          100
+        )
+
+        expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+        expect(error.message).toContain(SESSION_REFUSAL)
+        expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+      })
+
+      test('a batch written once and then refused for the session reports unknown', async () => {
+        const { cluster, producer } = createLingeringProducer({
+          idempotent: false,
+          deliveryTimeout: 300,
+          retry: { retries: 100, initialRetryTime: 10, maxRetryTime: 10, factor: 0 },
+          produce: async () => {
+            throw new KafkaJSError('The broker did not answer')
+          },
+        })
+        const writesThenFails = cluster.broker.produce.getMockImplementation()
+        refuseForTheSession(cluster)
+        cluster.broker.produce.mockImplementationOnce(writesThenFails)
+        await producer.connect()
+
+        const error = await settledWithin(
+          producer.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e),
+          320
+        )
+
+        expect(error).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unknown' })
+        expect(cluster.broker.produce.mock.calls.length).toBeGreaterThan(1)
+      })
+
+      test('inside a transaction a session refusal that exhausts retries arms KafkaJSTransactionAbortableError', async () => {
+        jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
+        const { cluster, producer } = createLingeringProducer({
+          transactionalId: 'transactional-a',
+          linger: 0,
+          retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 1, factor: 0 },
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+        refuseForTheSession(cluster)
+
+        const error = await settledWithin(
+          transaction.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e),
+          100
+        )
+
+        expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+        expect(error.cause).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+        expect(cluster.broker.produce).toHaveBeenCalledTimes(2)
+        await expect(settledWithin(transaction.commit())).rejects.toBe(error)
+      })
+    })
   })
 
   describe('on the wire', () => {
