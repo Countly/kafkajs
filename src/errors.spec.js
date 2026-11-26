@@ -658,6 +658,24 @@ describe('KafkaJSInvalidFrameError', () => {
   })
 })
 
+describe('KafkaJSInvariantViolation', () => {
+  test('names a string with a lone surrogate in its message and its help link', () => {
+    const error = new errors.KafkaJSInvariantViolation('requested group "team-\uD800"')
+
+    expect(error.name).toBe('KafkaJSInvariantViolation')
+    expect(error.message).toBe(
+      'Invariant violated: requested group "team-\uD800". This is likely a bug and should be reported.'
+    )
+    expect(error.helpUrl).toContain('team-%EF%BF%BD%22')
+  })
+
+  test('puts an ordinary string in its help link as it is', () => {
+    const error = new errors.KafkaJSInvariantViolation('requested group "grüppe"')
+
+    expect(error.helpUrl).toContain('gr%C3%BCppe%22')
+  })
+})
+
 describe('KafkaJSCorruptRecordError', () => {
   test('is non-retriable and carries the rule the batch broke and where it starts', () => {
     const cause = new Error('while decoding')

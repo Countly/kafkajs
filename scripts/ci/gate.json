@@ -10990,6 +10990,8 @@
         "src/errors.spec.js \u203a KafkaJSCorruptRecordError takes the reason decompression",
         "src/errors.spec.js \u203a KafkaJSInvalidFrameError has a null size and no cause unless given them",
         "src/errors.spec.js \u203a KafkaJSInvalidFrameError is a retriable connection error that names the rule the frame broke",
+        "src/errors.spec.js \u203a KafkaJSInvariantViolation names a string with a lone surrogate in its message and its help link",
+        "src/errors.spec.js \u203a KafkaJSInvariantViolation puts an ordinary string in its help link as it is",
         "src/errors.spec.js \u203a KafkaJSNoOffsetError carries the no-offset reason",
         "src/errors.spec.js \u203a KafkaJSNoOffsetError carries the offset-out-of-range reason",
         "src/errors.spec.js \u203a KafkaJSNoOffsetError is exported from the package entry as the same class",
