@@ -1676,6 +1676,15 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   unset config has no value; guard them under `strictNullChecks`.
 - **`admin.createPartitions()` is typed `Promise<void>`.** It has always resolved without a value;
   `const created: boolean = await admin.createPartitions(...)` no longer compiles.
+- **If you used an earlier 3.0.0 prerelease: a client quota component takes `match` only for the
+  `'exact'` match type.** The three accepted shapes are `matchType: 'exact'` with a `match`, and
+  `matchType: 'default'` or `'any'` without one. A wrapper that builds a component from a
+  `matchType` of the whole union and an independent optional `match` fails to compile; build the
+  three cases separately.
+- **If you used an earlier 3.0.0 prerelease: `GroupDescription.groupType` can be `''`.** A group
+  whose consumer-protocol description failed has an empty group type. A function typed to take only
+  the earlier group-type union can no longer be called with `group.groupType`; handle `''` (an
+  exhaustive `switch` needs a `default`).
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots
