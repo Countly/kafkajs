@@ -251,6 +251,7 @@ async function start({
   fault = groupAuthorization,
   initial,
   onZero,
+  autoCommitThreshold,
 } = {}) {
   const coordinators = []
   const runRound = RebalanceCoordinator.prototype.runRound
@@ -289,6 +290,7 @@ async function start({
       eachMessage: eachMessage && ((payload) => eachMessage(payload, held)),
       eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
       ...(hook && { rebalanceListener: hook }),
+      ...(autoCommitThreshold && { autoCommitThreshold }),
     })
   )
   await advanceUntil(() => started.done)

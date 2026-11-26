@@ -633,6 +633,8 @@ module.exports = class ConsumerGroupProtocol {
       const refusal = round?.guard()
       if (refusal) throw refusal
     }
+    const stopped = round?.guard()
+    if (stopped) throw stopped
     // Growth may have left names pending: what is applied and acknowledged is what remains.
     resolved = this.resolveFromCache(this.target)
     this.recordResolution(resolved)
@@ -885,13 +887,15 @@ module.exports = class ConsumerGroupProtocol {
    * @returns {(() => boolean) & { member: () => boolean }} true only while this member may use the
    *   captured target; `member()` true while the captured membership still holds a target, whatever
    *   became of the target revision and the scope (a fencing, a fatal error and a leave clear the
-   *   target, a leave only after its commit, hence the state check)
+   *   target, a leave only after its commit, hence the state check), and the run was not ended
+   *   for good
    */
   targetGuard() {
     const membership = this.membershipRevision
     const target = this.targetRevision
     const scope = this.subscription?.captureScope()
     const member = () =>
+      !this.ownership?.permanent &&
       membership === this.membershipRevision &&
       this.target != null &&
       !isNotInGroup(this.state) &&
@@ -1186,16 +1190,19 @@ module.exports = class ConsumerGroupProtocol {
    *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null,
-   *   onAccepted?: () => void }} options `guard` is the caller's pre-write and effect refusal; it
-   *   never reaches the request. `onAccepted` runs once on an accepted success that is not a leave
+   *   onAccepted?: () => void, fenced?: boolean }} options `guard` is the caller's pre-write and
+   *   effect refusal; it never reaches the request. `onAccepted` runs once on an accepted success
+   *   that is not a leave. `fenced`: a leave `guard` refused also completes nothing
    * @returns {Promise<boolean>} true only for a success answered to the membership the member still
    *   holds (never for a leave); false when nothing was sent or the answer had no effect
    * @throws {Error} the classified error, for every path except a leave, whose errors are swallowed
    */
-  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard, onAccepted }) {
+  async sendHeartbeat({ sendAllFields = false, leaveEpoch = null, guard, onAccepted, fenced }) {
     const ownershipToken = this.ownership?.token()
     const membershipAtRequest = this.membershipRevision
     const current = () => membershipAtRequest === this.membershipRevision && !guard?.()
+    // A leave finishes whatever its close now says; a fenced one only while its caller allows.
+    const leaveOwned = () => !(fenced && guard?.())
     const refusal =
       leaveEpoch == null
         ? () =>
@@ -1212,6 +1219,7 @@ module.exports = class ConsumerGroupProtocol {
         this.logger.debug('Leaving without a heartbeat: no coordinator is known', {
           groupId: this.groupId,
         })
+        if (!leaveOwned()) return false
         this.onRequestGenerated({ leaveEpoch, stateAtRequest: this.state })
         return false
       }
@@ -1246,9 +1254,10 @@ module.exports = class ConsumerGroupProtocol {
           ...(refusal && { guard: refusal }),
         })
       } catch (error) {
-        // A leave's failure is its own to finish whatever its close operation now says.
         const owned =
-          leaveEpoch == null ? current() : membershipAtRequest === this.membershipRevision
+          leaveEpoch == null
+            ? current()
+            : membershipAtRequest === this.membershipRevision && leaveOwned()
         if (!owned) return false
         stampOwnership(error, this.ownership?.token())
         this.sentFields.reset()
@@ -1288,7 +1297,7 @@ module.exports = class ConsumerGroupProtocol {
       onAccepted?.()
       return true
     } finally {
-      if (leaveEpoch != null || current()) {
+      if (leaveEpoch != null ? leaveOwned() : current()) {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest, assignmentAtRequest })
       }
     }
@@ -1870,30 +1879,34 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * The poll-expiry variant: no commit, no partition events, the response ignored, and the member
    * parks in a state that sends nothing until the recovering round rejoins it.
+   * @param {import('./interface').ConsumerOperation} [operation] refuses the leave's write and its
+   *   answer
    * @returns {Promise<void>}
    */
-  async leaveForPollExpiry() {
+  async leaveForPollExpiry(operation) {
     if (isNotInGroup(this.state)) return
 
     if (isLeavingGroup(this.state)) {
       return this.joinInFlightLeave()
     }
 
-    return this.trackLeave(this.performPollExpiryLeave())
+    return this.trackLeave(this.performPollExpiryLeave(operation))
   }
 
   /**
    * The poll-expiry leave itself, once the guards have let it start.
    * @private
+   * @param {import('./interface').ConsumerOperation} [operation] refuses the leave's write and its
+   *   answer
    * @returns {Promise<void>}
    */
-  async performPollExpiryLeave() {
+  async performPollExpiryLeave(operation) {
     this.clearFirstMembership()
     this.pollTimerExpired = true
     this.transitionTo(PREPARE_LEAVING)
     this.ownedPartitions = []
 
-    await this.sendLeaveHeartbeat()
+    await this.sendLeaveHeartbeat(undefined, operation, true)
   }
 
   /**
@@ -1904,9 +1917,10 @@ module.exports = class ConsumerGroupProtocol {
    * @private
    * @param {boolean} [leaveGroup] the caller's choice, `undefined` for the default
    * @param {import('./interface').ConsumerOperation} [operation] the close that owns this leave
+   * @param {boolean} [fenced] once `operation` refuses, the answer completes nothing
    * @returns {Promise<void>}
    */
-  async sendLeaveHeartbeat(leaveGroup, operation) {
+  async sendLeaveHeartbeat(leaveGroup, operation, fenced) {
     this.#membershipAccepted = false
     this.ownedPartitions = []
     this.clearTarget()
@@ -1935,6 +1949,7 @@ module.exports = class ConsumerGroupProtocol {
       sendAllFields: false,
       leaveEpoch: this.memberEpoch,
       guard: operation?.guard,
+      fenced,
     })
   }
 

@@ -272,7 +272,8 @@ notice and what, if anything, to do.
   unbounded when `enforceRequestTimeout` is false. For a hard shutdown limit, use
   `await producer.disconnect({ timeout: 10000 })`. At the deadline, never-written sends reject
   with `KafkaJSProducerClosedError` and `outcome: 'unsent'`; sends written at least once have
-  `outcome: 'unknown'`. An unknown commit stays pending and is never aborted by forced close.
+  `outcome: 'unknown'`, and so does a send only some of whose records were written before the
+  close. An unknown commit stays pending and is never aborted by forced close.
   Concurrent disconnects share the first call's timeout. A second call after close completed
   does nothing until an explicit `connect()`: it no longer sends an unknown commit again.
   After reconnect, resolve that commit explicitly with `commit()`, or replace the producer.
@@ -1421,6 +1422,7 @@ now logged.
 - **A request timeout now closes its connection.** Code that retries `KafkaJSRequestTimeoutError` also sees `KafkaJSConnectionClosedError` for requests that were healthy on the same connection; both are retriable. A mutation written before the close has an unknown outcome, exactly as after any timeout (an idempotent producer resends it in order, a transaction commit stays unknown). There is no setting that keeps a connection open after a timeout; `enforceRequestTimeout: false` removes the timeout and with it the close.
 - **Obsolete connections drain for at most `requestTimeout`.** Nothing to do. With `enforceRequestTimeout: false` a request that never answered used to stall recovery indefinitely. A JoinGroup or long-poll Fetch with a per-API allowance above `requestTimeout` fails at the bound on an obsolete connection and is retried. Public `disconnect()` remains reusable and now also waits at most `requestTimeout` for requests in flight (the rest fail with a retriable `KafkaJSConnectionClosedError`); a retired broker object cannot reconnect. A mutation already transmitted before the connection closes still has an unknown outcome.
 - **A producer delivery timeout can include transmission evidence.** `KafkaJSDeliveryTimeout.outcome` is optional and is `'unsent'` or `'unknown'`; its absence says nothing about delivery. Earlier written attempts keep the outcome unknown even if a later reply was retriable. The timeout copies the last cause's `type` and `code` when available, so existing protocol-type checks can inspect them. Other error classes do not acquire an outcome, and a `retry.maxTotalTime` timeout outside a producer still omits it.
+- **`retry.maxTotalTime` is measured on a monotonic clock, and a retry whose timer fires after the deadline is not made.** The option is new in 3.0.0; 2.2.4 has no total-time budget. The time is elapsed monotonic time in fractions of a millisecond, so a change of the system clock does not move the deadline, and it is checked when an attempt fails and again when the retry timer fires. A retry whose timer fires after the deadline is not made: the call rejects with `KafkaJSDeliveryTimeout`, with the same class, message form (`Gave up after N attempts: the next one would start after the X ms deadline`, N the attempts made), `cause` (the error of the last attempt made), `retriable: false` and fields as when the next wait would end past the deadline. The check cannot tell a frozen process from a timer that is a few milliseconds late, so near the deadline an ordinary call can lose its last attempt: one whose delay was planned to end before the deadline is not made when Node delivers its timer after the deadline. Node delivers a timer from 0 to a few milliseconds after its delay (more on a busy event loop), so only an attempt planned to start within that margin of the deadline is affected: an otherwise successful final retry can become a `KafkaJSDeliveryTimeout` when ordinary event-loop delay puts its start after the deadline, and the call rejects at the moment the expired retry would have started. The comparison has no whole-millisecond rounding, so fractional timing can move the retry scheduling boundary by less than 1 ms in either direction. Host suspension may be excluded, depending on the monotonic clock. Calls without `retry.maxTotalTime` do not read the clock. *What to do:* if you rely on a last attempt close to the deadline, leave more room (raise `maxTotalTime` or lower the delays).
 - `KafkaJSCorruptRecordError` has three new `reason` values, `checksum`, `decompressed-size` and `decompression`, and the optional `nextOffset` (where `consumer.seek` goes to skip the batch; present only for a validated batch boundary), `codec` and `limit`. `KafkaJSPartialMessageError#crcMismatch` is deprecated and no longer set: a checksum mismatch is a `KafkaJSCorruptRecordError`.
 - **A forced producer close reports `KafkaJSProducerClosedError` with transmission evidence.** `outcome` is `'unsent'` for work that was never written and `'unknown'` for anything written at least once, which may still have been applied by the broker. The error is non-retriable and its `category` is `abortable`. A class without an `outcome`, or the absence of an error, proves nothing about delivery.
 
@@ -1429,6 +1431,7 @@ now logged.
 - **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons and the OAUTHBEARER error-challenge reason, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
 - **A login the connection ended is reported as the connection's error.** When the connection is lost, a request timeout closes it, or the setup is cancelled while a built-in mechanism (PLAIN, SCRAM, OAUTHBEARER, AWS, GSSAPI's Kafka exchange stages) is exchanging SASL messages, the mechanism now rethrows that connection error or cancellation with its own `retriable` flag instead of a `KafkaJSSASLAuthenticationError`, and logs no authentication failure for it. With the stock socket factory the client already retried these outages, so recovery behaviour is unchanged; what changes is the error and log a mechanism produces at that boundary. Any other exchange failure, including an error a custom socket throws, is still a sanitized `KafkaJSSASLAuthenticationError`. *What to do:* nothing for ordinary use. Read `KafkaJSSASLAuthenticationError` as "the login failed for a reason other than the transport" and investigate it (broker rejection, credentials or token, SCRAM server signature, Kerberos context) rather than assuming a wrong password. Unlike the Java client, which retries some transient Kerberos errors, a GSSAPI native failure stays terminal here.
 - **A rejected OAUTHBEARER token fails the login.** When a broker refuses a SASL OAUTHBEARER token it answers with an error challenge (RFC 7628 section 3.2.3) in a response that carries no error code. kafkajs 2.2.4 ignored it, so `connect()` resolved and the next request failed with a `KafkaJSProtocolError` (`ILLEGAL_SASL_STATE`) or a closed connection; at re-authentication the refresh looked successful and in-flight work then failed. The client now answers the challenge with a single `0x01` byte, as the Java client and franz-go do, so `connect()` and re-authentication reject with a non-retriable `KafkaJSSASLAuthenticationError` and the authentication blackout applies. A valid token is unchanged and sends no extra request. *What to do:* if code detected a bad or expired token by catching the later protocol error, catch `KafkaJSSASLAuthenticationError` from connect instead, and make the `oauthBearerProvider` return a fresh token. Custom `authenticationProvider` mechanisms are not changed.
+- **A request is not written on an ended or re-authenticating SASL session.** A request still waiting in a connection's queue (behind `maxInFlightRequests` or a broker throttle) when its SASL session ends, or when a re-authentication of that connection starts, is refused at the moment it would be written with a retriable `KafkaJSError` (`The SASL session was not valid when the request was due to be written; it was not sent`). The frame was never written, so the broker did not see it; a retrier sends it again, and the next attempt re-authenticates first. kafkajs 2.2.4 wrote it, and the broker closed the connection, failing every request in flight on it. With no retries left the call fails with the retriable error wrapped in `KafkaJSNumberOfRetriesExceeded`; a producer delivery timeout reports `outcome: 'unsent'` only when no earlier attempt of the batch was written (otherwise `'unknown'`), and inside a transaction the exhausted batch makes the transaction abortable, as any exhausted retriable error does. *What to do:* nothing with retries enabled. With `retry.retries: 0`, expect this retriable error at a session boundary. The refused request itself was not sent, but a call that sends several requests (a producer `send()` to more than one broker, for example) may already have written others, so decide whether to repeat the call as for any other failed send: without the idempotent producer a repeated send can write records twice.
 
 - **`KafkaJSFetcherRebalanceError` is kept for compatibility and is no longer thrown.**
 
@@ -1497,14 +1500,15 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
   running. A rebootstrap does not wait for the connections it replaces: they take no new request
-  and drain in the background for at most `requestTimeout`, a request still outstanding when its
-  connection closes fails with `KafkaJSConnectionClosedError` and goes through the caller's normal
-  retry path against the rebuilt cluster, and a `disconnect()` closes those draining connections
-  too: without a close timeout it can wait for what is left of their `requestTimeout`, a shorter
-  timeout closes them sooner, and a failure closing them can reject the `disconnect()` as a failure
-  on a current connection can (see [Metadata recovery](Configuration.md#metadata-recovery)). On an
-  idempotent
-  producer (the default) the retry carries the same producer id and sequence numbers, so the broker
+  and drain in the background for at most `requestTimeout`. A request already written to an old
+  connection can still complete, and can still succeed, during that drain; a request still
+  outstanding when its connection closes fails with `KafkaJSConnectionClosedError` and goes through
+  the caller's normal retry path against the rebuilt cluster. A `disconnect()` closes those
+  draining connections too: without a close timeout it can wait for what is left of their
+  `requestTimeout`, a shorter timeout closes them sooner, and a failure closing them can reject the
+  `disconnect()` as a failure on a current connection can (see
+  [Metadata recovery](Configuration.md#metadata-recovery)). On an idempotent producer (the default)
+  a retry against the same cluster carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose
   response was lost when the connection closed, is sent again on the retry and can duplicate those
@@ -1516,6 +1520,16 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   different cluster: a consumer keeps its old positions and may fetch the new cluster at those
   offsets before it rejoins its group or is reassigned, and with `assign()` for as long as it keeps
   them (see [Metadata recovery](Configuration.md#metadata-recovery)).
+
+  *New during a rebootstrap:* a metadata refresh that a rebootstrap overtakes rejects with a
+  retriable `KafkaJSConnectionError`, unless the caller refused first (a lifecycle close or a
+  deadline, whose own error wins) or a `REBOOTSTRAP_REQUIRED` answer to the refresh's own requests
+  started the rebootstrap (that error is kept). This can reach `consumer.subscribe()` (it rejects; with a
+  pattern it keeps the previous subscription; call it again), `consumer.run()` startup (the run
+  crashes with this retriable error and restarts by the restart policy, also with
+  `retry: { retries: 0 }`), admin calls (many reject at once; call them again) and producer sends
+  (retried within their retry settings). kafkajs 2.2.4 never rebootstraps and never shows this
+  error; `metadataRecoveryStrategy: 'none'` removes it.
 
 - **Negotiated protocol versions moved up.** Against a Kafka 4.1 or 4.3 broker the client now
   negotiates: Metadata **v13** (was v6), Produce **v13** (was v7; **v11** when a topic's id is not
@@ -1799,12 +1813,24 @@ These issues are known in 3.0.0. A fix for each is planned for a later release.
   do:* read each topic once, awaited, before you read topics in parallel, or await the calls in
   sequence.
 - **A metadata answer can arrive without its brokers.** This applies to every client. When the
-  seed broker is replaced while a metadata request is in flight (a rebootstrap, or a connection
-  failure that removed the seed broker), the answer's topic metadata is installed, but the brokers
-  it lists that the client did not already know, or knew at another address, are not added. The
-  next request to such a broker fails with the transient `KafkaJSBrokerNotFound` error
+  seed broker is replaced by a connection failure while a metadata request is in flight, or while
+  an answer's new brokers are still being connected, the answer's topic metadata is installed and
+  routing listeners are told before those brokers are in the broker table. If a rebootstrap
+  happens while those brokers are being connected, the refresh stops and rejects, but the answer's
+  topic metadata events and dropped producer topics are not undone. A metadata answer that arrives
+  after a rebootstrap installs nothing and its refresh rejects with a retriable
+  `KafkaJSConnectionError`. The next request to a broker the answer listed but the client did not
+  already know, or knew at another address, fails with the transient `KafkaJSBrokerNotFound` error
   `Broker N not found in the cached metadata`, and the client refreshes its metadata. A call with
   retries left recovers on its next attempt; a call with no retries left fails with that error.
+
+- **Metadata answers other than a refresh are not fenced across a rebootstrap.** Coordinator
+  lookups, lookups by topic id, `assign()`, offset lookups and the leader hints carried in Produce
+  and Fetch answers can still act on an answer from before a rebootstrap until the next metadata
+  refresh replaces it. If the old cluster is still reachable, such an answer can send a later
+  request there, and a write or offset commit that succeeds there stays. A broker chosen just
+  before a rebootstrap can be handed to a caller; its request may fail with a retriable connection
+  error or may still succeed on the old cluster.
 
 ### Coming from the Java or Go client
 

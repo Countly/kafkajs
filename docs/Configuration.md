@@ -138,7 +138,7 @@ Note that the broker may be configured to reject your authentication attempt if 
 | option                    | description                                                                                                                                                                             | default |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | authenticationTimeout | Whole SASL exchange cap in ms, including a token callback or signer; integer 1..2147483647, legacy numeric string accepted. During setup the remaining readiness budget also applies. | `10000` |
-| reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of the session lifetime, counted from when the final SASL request was written to the socket. | `10000` |
+| reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of the session lifetime, counted from when the final SASL request was written to the socket. A negative value counts as `0`: the session is renewed once it has ended. | `10000` |
 
 ### PLAIN/SCRAM Example
 
@@ -581,13 +581,38 @@ until it is stale) and then hits one transient failure, such as a rolling restar
 election, does **not** rebootstrap; it only rebootstraps once the failures are back-to-back for
 the whole window.
 
-A rebootstrap does not wait for the connections it replaces. They take no new request and drain in
-the background: a request already in flight completes on its old socket when the broker answers
-within `requestTimeout`, and is rejected with `KafkaJSConnectionClosedError` when the connection
-closes first. The *next* request the caller makes goes through the caller's normal retry path (the
-producer's or consumer's own `retry` configuration) against the rebuilt cluster — it is not itself
-a source of message loss, but a producer created with `idempotent: false` can duplicate records the
-broker had already appended when a produce is retried.
+A rebootstrap replaces the seed broker, then in one step forgets the cached metadata and the broker
+table, starts closing every old connection in the background without waiting for it, and resets
+the recovery clock. The replaced connections take no new request and drain in the background: a
+request already written to an old connection can still complete, and can still succeed, when the
+broker answers within `requestTimeout`, and is rejected with `KafkaJSConnectionClosedError` when the
+connection closes first. The *next* request the caller makes goes through the caller's normal retry
+path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster — it is
+not itself a source of message loss, but a producer created with `idempotent: false` can duplicate
+records the broker had already appended when a produce is retried.
+
+A metadata answer or failure that arrives after the rebootstrap, for a refresh sent
+before it, changes no cached metadata, no broker table and no recovery clock, starts no further
+rebootstrap, and the refresh rejects with a retriable `KafkaJSConnectionError` ("Metadata refresh
+was overtaken by a rebootstrap"). Two exceptions keep their own error: a caller that refused first
+(a lifecycle close or a deadline), and a `REBOOTSTRAP_REQUIRED` answer to the refresh's own
+requests that started the rebootstrap. A refresh whose answer was accepted just before the rebootstrap
+stops installing at the rebootstrap and rejects the same way, but what it already did before (for
+example a `TOPIC_RECREATED` event or a dropped producer topic) stays done. A refresh started after a
+rebootstrap never shares a request with one started before it. The client does not resend the
+overtaken request itself. A consumer whose startup is overtaken crashes with this retriable error
+and restarts by its restart policy. Many admin calls and `consumer.subscribe()` reject with it at
+once, so call them again (a `subscribe()` with a pattern keeps its previous subscription). Producer
+sends retry it within their retry settings, so with `retry: { retries: 0 }` the send fails and must
+be made again. A producer created with `idempotent: false` can still duplicate records when a send
+that was already appended is retried.
+
+Not covered in 3.0.0: coordinator lookups, lookups by topic id, `assign()`, offset lookups and the
+leader hints carried in Produce and Fetch answers can still act on an answer from before a
+rebootstrap until the next metadata refresh replaces it. If the old cluster is still reachable,
+such an answer can send a later request there, and a write or offset commit that succeeds there
+stays. A broker chosen just before a rebootstrap can be handed to a caller; its request may fail
+with a retriable connection error or may still succeed on the old cluster.
 
 Each replaced connection drains on its own for at most `requestTimeout`, counted from when it was
 replaced. The same holds for the connections a metadata refresh replaces: a broker whose address
@@ -604,10 +629,10 @@ close, an admin client's `disconnect()` without a timeout and the share consumer
 reject with it, and a producer's `disconnect()` or an admin `disconnect({ timeout })` logs it and
 resolves.
 
-SASL authentication state
-(the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
-authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
-reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.
+SASL authentication state (the blackout applied after a rejected credential) is preserved across a
+rebootstrap, and a SASL authentication failure is never a rebootstrap trigger — a rejected
+credential means the broker is reachable and fine, only this client's credentials are bad, which no
+rebootstrap can fix.
 
 A rebootstrap trusts the configured broker list. If that list now leads to a different Kafka
 cluster, the client installs the new cluster's metadata without noticing the change, and a consumer

@@ -372,8 +372,10 @@ module.exports = (params) => {
    * The cleanup of the crash being reported, published before its first diagnostic and settled
    * once its stop, cluster disconnect and forced `loss` callback are done, before the restart
    * decision. Every public close joins it, so it returns only after that cleanup's transport and
-   * registry work.
-   * @type {{ promise: Promise<void>, loss?: import('./runner').ForcedLoss }|null}
+   * registry work. `teardown` is its cluster disconnect once started; a later close leaves
+   * DISCONNECT to it.
+   * @type {{ promise: Promise<void>, loss?: import('./runner').ForcedLoss,
+   *   teardown?: Promise<void> }|null}
    */
   let crashCleanup = null
 
@@ -754,15 +756,19 @@ module.exports = (params) => {
    * Stops the runner and disconnects the cluster, for `disconnect()` and for the crash handler.
    * A user disconnect ends the consumer, so its reset obligations are emptied. A crash restart
    * unlinks them and keeps them: the topics still owe those resets to the group it builds next.
+   * A close and a crash cleanup that overlap emit one DISCONNECT: a close admitted before the
+   * crash cleanup's disconnect starts owns the disconnect, and a later close only bounds it.
    * @param {{ leaveGroup?: boolean }} [stopOptions]
-   * @param {{ keepResets?: boolean, preserveSetupState?: boolean }} [shutDownOptions] `true` for the crash handler
-   * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent, it waits
-   *   naturally
-   * @returns {Promise<void>}
+   * @param {{ keepResets?: boolean, preserveSetupState?: boolean, cleanup?: object }}
+   *   [shutDownOptions] `true` and the crash's cleanup record for the crash handler
+   * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent for the
+   *   crash handler, which waits naturally
+   * @returns {Promise<{ promise: Promise<void> }|undefined>} for the crash handler, the close it
+   *   left the disconnect to, which its report then waits for
    */
   const shutDown = async (
     stopOptions,
-    { keepResets = false, preserveSetupState = false } = {},
+    { keepResets = false, preserveSetupState = false, cleanup } = {},
     operation
   ) => {
     if (keepResets) telemetry?.suspend()
@@ -771,12 +777,18 @@ module.exports = (params) => {
 
     try {
       if (operation) {
-        await closeWithin(operation, stopOptions, owned)
+        if (!(await closeWithin(operation, stopOptions, owned))) return
       } else {
         await stopShared(stopOptions)
-        logger.debug('consumer has stopped, disconnecting', { groupId })
-        if (ownsCluster)
-          await cluster.disconnect(...(preserveSetupState ? [{ preserveSetupState }] : []))
+        if (closing) return closing
+        // Published before its diagnostic and transport run, so a close they start joins it.
+        const teardown = Promise.resolve().then(async () => {
+          logger.debug('consumer has stopped, disconnecting', { groupId })
+          if (ownsCluster)
+            await cluster.disconnect(...(preserveSetupState ? [{ preserveSetupState }] : []))
+        })
+        cleanup.teardown = teardown
+        await teardown
       }
       instrumentationEmitter.emit(DISCONNECT)
     } catch (e) {
@@ -802,10 +814,14 @@ module.exports = (params) => {
    * @param {ConsumerOperation} operation the close scope
    * @param {{ leaveGroup?: boolean }} [stopOptions]
    * @param {ControlLifetime} owned the lifetime this close ends; its calls and connect are retired
-   * @returns {Promise<void>} rejects only for an ordinary failure of a close that was not forced
+   * @returns {Promise<boolean>} whether this close owns the DISCONNECT: false when a crash
+   *   cleanup it overlaps had already started its disconnect and that disconnect succeeded;
+   *   rejects only for an ordinary failure of a close that was not forced
    */
   const closeWithin = async (operation, stopOptions, owned) => {
     const captured = runner
+    // A disconnect the crash cleanup already started owns DISCONNECT; this close only bounds it.
+    const joined = crashCleanup?.teardown
     /** @type {Promise<void>[]} every cluster disconnect this close made, in order */
     const transport = []
     let lastDrain = null
@@ -841,6 +857,9 @@ module.exports = (params) => {
       if (failure && !forced) throw failure.reason
       if (failure)
         logger.warn('Disconnecting the cluster failed', { error: describeThrown(failure.reason) })
+      // That disconnect emitted DISCONNECT only if it succeeded; it has settled by now.
+      const crashFailed = await joined?.then(() => false).catch(() => true)
+      return !joined || crashFailed
     } finally {
       unregister()
     }
@@ -945,6 +964,12 @@ module.exports = (params) => {
   let stopping = null
 
   /**
+   * Whether a stopped run's close deadline cut its stop before the assigners were told to forget
+   * their state; the next run tells them before its first join.
+   */
+  let assignersOwed = false
+
+  /**
    * The one stop of the current run, shared by every caller. It is published before its body
    * runs, so a caller reentering from a log sink or a listener joins it, and it is keyed by the
    * run it stops: a replacement run gets its own stop.
@@ -980,6 +1005,7 @@ module.exports = (params) => {
     try {
       if (target) {
         await target.stop(options, operation)
+        if (target.assignersOwed) assignersOwed = true
         if (runner === target) {
           runner = null
           consumerGroup = null
@@ -1355,10 +1381,25 @@ module.exports = (params) => {
       // Logged once the run is published, so a run(), stop() or disconnect() from the sink finds it.
       logger.info('Starting', { groupId })
       const startedRunner = runner
-      // Started outside any handler or callback store: the runner and the work it starts must not
-      // inherit the authority of whoever called run().
+      // Outside any handler or callback store: the owed assigner clear, the runner and the work they
+      // start must not inherit the authority of whoever called run().
       const started = handlerContext.run(null, () =>
-        RebalanceHooks.outside(() => startedRunner.start())
+        RebalanceHooks.outside(() => {
+          // After the runner is published: an assigner that stops or disconnects the consumer from
+          // this callback latches that runner, so its start joins nothing.
+          if (assignersOwed) {
+            assignersOwed = false
+            try {
+              group.clearAssignerState()
+            } catch (e) {
+              logger.error('Error while clearing the assigner state', {
+                groupId,
+                error: describeThrown(e),
+              })
+            }
+          }
+          return startedRunner.start()
+        })
       )
       pendingStart = started.catch(() => {})
       await started
@@ -1403,10 +1444,12 @@ module.exports = (params) => {
      * @param {ControlLifetime} owned the lifetime the run belongs to
      * @param {number} startGeneration `stopGeneration` when the run started
      * @param {{ forced?: boolean, loss?: import('./runner').ForcedLoss }} [claim] `forced` when a
-     *   fatal deadline retired the run while a handler may still run: such a crash joins a close
-     *   already in progress instead of tearing down beside it, and never restarts. Its cleanup also
-     *   waits for `loss`, the close callback the claim delivered, which the first close's deadline
-     *   retires early.
+     *   fatal deadline retired the run while a handler may still run: such a crash never restarts.
+     *   Every crash joins a close already in progress instead of tearing down beside it, and
+     *   leaves the disconnect to a close admitted while it stops; either way it is reported only
+     *   after that close. Its cleanup also waits for
+     *   `loss`, the close callback the claim delivered, which the first close's deadline retires
+     *   early.
      * @returns {Promise<void>}
      */
     const onCrash = async (e, owned, startGeneration, { forced = false, loss } = {}) => {
@@ -1450,10 +1493,15 @@ module.exports = (params) => {
         if (e.name === 'KafkaJSConnectionClosedError') {
           cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
         }
-        // Read after the diagnostic: a forced crash joins a close admitted before or during it, for
-        // one stop and one teardown. That close joins this cleanup, so it is awaited only after.
-        joining = forced ? closing : null
-        if (!joining) await shutDown(undefined, { keepResets: true, preserveSetupState: true })
+        // Read after the diagnostic: a crash joins a close admitted before or during it, for one
+        // stop and one teardown. That close joins this cleanup, so it is awaited only after.
+        joining = closing
+        if (!joining)
+          joining = await shutDown(undefined, {
+            keepResets: true,
+            preserveSetupState: true,
+            cleanup: cleaned,
+          })
       } catch {
       } finally {
         if (loss) await loss.promise.catch(() => {})

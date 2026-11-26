@@ -1405,11 +1405,11 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
       throw staleEpoch()
     })
     const { manager } = staleEpochHarness({ epoch: 7, offsetCommit })
-    manager.lastCommit = 0
+    manager.lastCommit = -1
     await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
     await new Promise((resolve) => setTimeout(resolve, 150))
     expect(offsetCommit).toHaveBeenCalledTimes(1)
-    expect(manager.lastCommit).toBeGreaterThan(0)
+    expect(manager.lastCommit).toBeGreaterThanOrEqual(0)
   })
 
   test('rejects a stale-epoch explicit commit', async () => {

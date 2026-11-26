@@ -164,6 +164,9 @@ module.exports = class ClassicGroupProtocol {
           if (refusal) throw refusal
           await coordinator.heartbeat(guard ? { ...payload, guard } : payload)
         } catch (e) {
+          // A refusal, also the one this write was refused with, is the caller's, not the broker's.
+          const late = guard?.()
+          if (late) throw late
           if (losesCoordinator(e)) {
             this.coordinatorUnknown = true
           }
@@ -175,6 +178,9 @@ module.exports = class ClassicGroupProtocol {
           )
         }
 
+        // A caller that refused while the answer was in flight takes no effect from it.
+        const late = guard?.()
+        if (late) throw late
         this.instrumentationEmitter.emit(HEARTBEAT, payload)
         this.lastRequest = Date.now()
       }
@@ -820,25 +826,32 @@ module.exports = class ClassicGroupProtocol {
    * loses its generation: retained state from a generation that no longer exists would otherwise
    * be used to compute the next assignment.
    * @returns {void}
+   * @throws {*} the first assigner's failure, whatever value it threw, once every assigner was told
    */
   clearAssignerState() {
+    let failed = false
+    let failure
     for (const assigner of this.assigners) {
-      if (assigner.onAssignment) {
-        assigner.onAssignment(null, { generationId: -1, groupProtocol: null })
+      try {
+        assigner.onAssignment?.(null, { generationId: -1, groupProtocol: null })
+      } catch (error) {
+        if (!failed) failure = error
+        failed = true
       }
     }
+    if (failed) throw failure
   }
 
   /**
-   * Leaves the group with the reason `the consumer is being closed`, then forgets the member id and
-   * the assigners' retained state. Sends nothing without a member id.
+   * Leaves the group with the reason `the consumer is being closed`, then forgets the member id.
+   * Sends nothing without a member id. The assigners' retained state is the caller's to clear, once:
+   * a stop clears it before it leaves, and a poll-expiry leave by the generation reset after it.
    *
    * The forgetting is skipped when a join was accepted meanwhile. The request is awaited, so a
    * rebalance round can join during it - after a poll-interval overrun, the heartbeat failure that
-   * follows starts one - and the answer is about the old membership: clearing then would strip the
-   * new one of its member id, which silences every heartbeat, and of its assigners' state. The
-   * count of accepted joins decides, not the ids: a rejoin can return the same member id and the
-   * same generation.
+   * follows starts one - and the answer is about the old membership: forgetting then would strip
+   * the new one of its member id, which silences every heartbeat. The count of accepted joins
+   * decides, not the ids: a rejoin can return the same member id and the same generation.
    *
    * A static member's request carries both ids, so the coordinator checks the pair and removes the
    * instance's current member, or answers `FENCED_INSTANCE_ID` for a stale member id; Java's
@@ -850,15 +863,17 @@ module.exports = class ClassicGroupProtocol {
    * its connection is closed.
    * The member id, joined or pending, is forgotten whether the request succeeds, fails or is not
    * sent, unless a newer membership replaced it while the request was in flight.
-   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation }} [options]
-   *   `false` sends no request and only forgets the member id; `true` and `undefined` send it
-   *   (nothing calls this for a static member that leaves by default). The close `operation`, when
-   *   given, bounds the coordinator lookup and refuses the write once it expires.
+   * @param {{ leaveGroup?: boolean, operation?: import('./interface').ConsumerOperation,
+   *   fenced?: boolean }} [options] `leaveGroup: false` sends no request and only forgets the
+   *   member id; `true` and `undefined` send it (nothing calls this for a static member that leaves
+   *   by default). The close `operation`, when given, bounds the coordinator lookup and refuses
+   *   the write once it expires. `fenced`: once that operation refuses, nothing is forgotten
+   *   either, because the run that asked has ended (a poll-expiry leave)
    * @returns {Promise<void>}
    * @throws {import('../../errors').KafkaJSProtocolError} the coordinator's error for this member
    * @throws {Error} the operation's refusal
    */
-  async leave({ leaveGroup, operation } = {}) {
+  async leave({ leaveGroup, operation, fenced = false } = {}) {
     const { groupId, groupInstanceId, joinCount, membershipRevision } = this
     const memberId = this.memberId || this.pendingMemberId
 
@@ -879,8 +894,8 @@ module.exports = class ClassicGroupProtocol {
         }
       }
     } finally {
-      if (this.joinCount === joinCount && this.forgetMemberId(membershipRevision)) {
-        this.clearAssignerState()
+      if (!(fenced && operation.guard()) && this.joinCount === joinCount) {
+        this.forgetMemberId(membershipRevision)
       }
     }
   }

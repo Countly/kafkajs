@@ -67,7 +67,7 @@ describe('Consumer > a close joining crash cleanup on a real broker pool', () =>
     expect(coordinator.isConnected()).toBe(false)
     expect(held.call).not.toBeNull()
     expect(disconnect.mock.calls).toEqual([[{ preserveSetupState: true }], [{ drainTimeout: 0 }]])
-    expect(events.filter((name) => name === 'DISCONNECT')).toHaveLength(2)
+    expect(events.filter((name) => name === 'DISCONNECT')).toHaveLength(1)
 
     await until(() => events.includes('CRASH'), 'the crash report')
     expect(events.filter((name) => name === 'CRASH')).toHaveLength(1)

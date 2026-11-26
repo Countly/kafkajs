@@ -1460,6 +1460,108 @@ describe('Producer > the accumulator', () => {
       await expect(settledWithin(sent)).rejects.toBe(failures[0])
     })
 
+    /**
+     * A send path that settles each batch by its partition: `resolve` partitions get metadata
+     * (undefined for `acks: 0`), the others are rejected with `errors[partition]`.
+     */
+    const settleBy =
+      ({ resolve = [], errors = {} }) =>
+      async ({ acks, batches }) => {
+        for (const { partition, settlers } of batches) {
+          const metadata = acks === 0 ? undefined : { partition, baseOffset: '0' }
+          for (const settler of settlers) {
+            if (resolve.includes(partition)) settler.resolve(metadata)
+            else settler.reject(errors[partition])
+          }
+        }
+      }
+
+    test('a send with one acknowledged batch and one never-written batch rejects with outcome unknown and the batch error as cause', async () => {
+      const unsent = new KafkaJSDeliveryTimeout('deadline', { outcome: 'unsent' })
+      const { accumulator } = createAccumulator({
+        sendPartitioned: jest.fn(settleBy({ resolve: [0], errors: { 1: unsent } })),
+      })
+
+      const sent = append(accumulator, [...records(0, 'a'), ...records(1, 'b')])
+      const error = await settledWithin(sent, LINGER).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(error).not.toBe(unsent)
+      expect(error).toMatchObject({
+        name: 'KafkaJSDeliveryTimeout',
+        outcome: 'unknown',
+        message: 'Some records of this send may have been written: deadline',
+      })
+      expect(error.cause).toBe(unsent)
+      expect(unsent.outcome).toBe('unsent')
+    })
+
+    test('a send whose every batch failed unsent keeps outcome unsent', async () => {
+      const errors = {
+        0: new KafkaJSDeliveryTimeout('first', { outcome: 'unsent' }),
+        1: new KafkaJSDeliveryTimeout('second', { outcome: 'unsent' }),
+      }
+      const { accumulator } = createAccumulator({ sendPartitioned: jest.fn(settleBy({ errors })) })
+
+      const sent = append(accumulator, [...records(0, 'a'), ...records(1, 'b')])
+
+      await expect(settledWithin(sent, LINGER)).rejects.toBe(errors[0])
+      expect(errors[0].outcome).toBe('unsent')
+    })
+
+    test('two sends sharing a never-written batch: only the one with an acknowledged batch gets a relabelled error, and the batch error is unchanged', async () => {
+      const unsent = new KafkaJSDeliveryTimeout('deadline', { outcome: 'unsent' })
+      const settle = settleBy({ resolve: [1], errors: { 0: unsent } })
+      const shared = []
+      const sendPartitioned = jest.fn((request) => {
+        for (const { partition, messages } of request.batches) {
+          if (partition === 0) shared.push(messages.map(({ value }) => value))
+        }
+        return settle(request)
+      })
+      const { accumulator } = createAccumulator({ sendPartitioned })
+
+      const written = append(accumulator, [...records(0, 'a'), ...records(1, 'b')])
+      const unwritten = append(accumulator, records(0, 'c'))
+      const [partly, never] = await settledWithin(
+        Promise.all([written.catch((e) => e), unwritten.catch((e) => e)]),
+        LINGER
+      )
+
+      expect(shared).toEqual([['a-0', 'c-0']])
+      expect(partly).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(partly).toMatchObject({ outcome: 'unknown' })
+      expect(partly.cause).toBe(unsent)
+      expect(never).toBe(unsent)
+      expect(unsent.outcome).toBe('unsent')
+    })
+
+    test('an acks 0 batch counts as written', async () => {
+      const unsent = new KafkaJSDeliveryTimeout('deadline', { outcome: 'unsent' })
+      const { accumulator } = createAccumulator({
+        sendPartitioned: jest.fn(settleBy({ resolve: [0], errors: { 1: unsent } })),
+      })
+
+      const sent = append(accumulator, [...records(0, 'a'), ...records(1, 'b')], { acks: 0 })
+      const error = await settledWithin(sent, LINGER).catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(error).toMatchObject({ outcome: 'unknown' })
+      expect(error.cause).toBe(unsent)
+    })
+
+    test('a send whose only failed batch has no relabel rejects with that batch error object itself', async () => {
+      const refused = new KafkaJSNonRetriableError('refused')
+      const { accumulator } = createAccumulator({
+        sendPartitioned: jest.fn(settleBy({ resolve: [0], errors: { 1: refused } })),
+      })
+
+      const sent = append(accumulator, [...records(0, 'a'), ...records(1, 'b')])
+
+      await expect(settledWithin(sent, LINGER)).rejects.toBe(refused)
+      expect('outcome' in refused).toBe(false)
+    })
+
     test('a send is settled once, whatever its batch’s settlers are told afterwards', async () => {
       const later = deferred()
       const sendPartitioned = jest.fn(async ({ batches }) => {
@@ -3328,6 +3430,85 @@ describe('Producer > the accumulator', () => {
         expect(disconnected()).toBe(true)
         expect(cluster.disconnect).toHaveBeenCalledTimes(1)
         expect(jest.getTimerCount()).toBe(0)
+      })
+    })
+
+    describe('a Produce request the connection refused for its SASL session', () => {
+      const SESSION_REFUSAL =
+        'The SASL session was not valid when the request was due to be written; it was not sent'
+
+      /**
+       * Fails every later Produce request as the connection's session refusal does: before the
+       * attempt's guard is called with a frame length, so nothing is recorded as written.
+       * @param {object} cluster
+       * @returns {void}
+       */
+      const refuseForTheSession = (cluster) =>
+        cluster.broker.produce.mockImplementation(async () => {
+          throw new KafkaJSError(SESSION_REFUSAL, { retriable: true })
+        })
+
+      test('with no retries left a session refusal fails the send', async () => {
+        const { cluster, producer } = createLingeringProducer({
+          idempotent: false,
+          retry: { retries: 0 },
+        })
+        refuseForTheSession(cluster)
+        await producer.connect()
+
+        const error = await settledWithin(
+          producer.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e),
+          100
+        )
+
+        expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+        expect(error.message).toContain(SESSION_REFUSAL)
+        expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+      })
+
+      test('a batch written once and then refused for the session reports unknown', async () => {
+        const { cluster, producer } = createLingeringProducer({
+          idempotent: false,
+          deliveryTimeout: 300,
+          retry: { retries: 100, initialRetryTime: 10, maxRetryTime: 10, factor: 0 },
+          produce: async () => {
+            throw new KafkaJSError('The broker did not answer')
+          },
+        })
+        const writesThenFails = cluster.broker.produce.getMockImplementation()
+        refuseForTheSession(cluster)
+        cluster.broker.produce.mockImplementationOnce(writesThenFails)
+        await producer.connect()
+
+        const error = await settledWithin(
+          producer.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e),
+          320
+        )
+
+        expect(error).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unknown' })
+        expect(cluster.broker.produce.mock.calls.length).toBeGreaterThan(1)
+      })
+
+      test('inside a transaction a session refusal that exhausts retries arms KafkaJSTransactionAbortableError', async () => {
+        jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
+        const { cluster, producer } = createLingeringProducer({
+          transactionalId: 'transactional-a',
+          linger: 0,
+          retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 1, factor: 0 },
+        })
+        await producer.connect()
+        const transaction = await producer.transaction()
+        refuseForTheSession(cluster)
+
+        const error = await settledWithin(
+          transaction.send({ topic: TOPIC, messages: [{ value: 'a' }] }).catch((e) => e),
+          100
+        )
+
+        expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+        expect(error.cause).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+        expect(cluster.broker.produce).toHaveBeenCalledTimes(2)
+        await expect(settledWithin(transaction.commit())).rejects.toBe(error)
       })
     })
   })

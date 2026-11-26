@@ -29,7 +29,7 @@ describe('Consumer > OffsetMananger > commitOffsetsIfNecessary', () => {
           committedOffsets[topic][partition] = offsetManager.resolvedOffsets[topic][partition]
         }
       }
-      offsetManager.lastCommit = Date.now()
+      offsetManager.lastCommit = performance.now()
     }
   })
 
@@ -50,7 +50,7 @@ describe('Consumer > OffsetMananger > commitOffsetsIfNecessary', () => {
       offsetManager.autoCommitThreshold = undefined
       offsetManager.countResolvedOffsets = jest.fn(() => Long.fromValue(0))
       offsetManager.commitOffsets.mockImplementation(() => {
-        offsetManager.lastCommit = Date.now()
+        offsetManager.lastCommit = performance.now()
       })
 
       await offsetManager.commitOffsetsIfNecessary()
@@ -102,6 +102,44 @@ describe('Consumer > OffsetMananger > commitOffsetsIfNecessary', () => {
       offsetManager.resolveOffset({ topic: 'topic1', partition: 0, offset: '3' })
       await sleep(15)
 
+      await offsetManager.commitOffsetsIfNecessary()
+      expect(offsetManager.commitOffsets).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('when the system clock steps', () => {
+    beforeEach(() => {
+      jest.useFakeTimers({ now: 0 })
+      offsetManager = new OffsetManager({
+        memberAssignment: { topic1: [0] },
+        cluster: { committedOffsets: jest.fn(() => ({})) },
+      })
+      offsetManager.commitOffsets = jest.fn()
+      offsetManager.autoCommitInterval = 1000
+      offsetManager.autoCommitThreshold = undefined
+      offsetManager.countResolvedOffsets = jest.fn(() => Long.fromValue(0))
+    })
+
+    afterEach(() => {
+      jest.useRealTimers()
+    })
+
+    it('an interval commit is not postponed by a backward wall step', async () => {
+      jest.setSystemTime(-600000)
+      jest.advanceTimersByTime(1000)
+
+      await offsetManager.commitOffsetsIfNecessary()
+
+      expect(offsetManager.commitOffsets).toHaveBeenCalledTimes(1)
+    })
+
+    it('an interval commit is not brought forward by a forward wall step', async () => {
+      jest.setSystemTime(600000)
+
+      await offsetManager.commitOffsetsIfNecessary()
+      expect(offsetManager.commitOffsets).not.toHaveBeenCalled()
+
+      jest.advanceTimersByTime(1000)
       await offsetManager.commitOffsetsIfNecessary()
       expect(offsetManager.commitOffsets).toHaveBeenCalledTimes(1)
     })
