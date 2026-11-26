@@ -31,14 +31,24 @@ const HEARTBEAT_ANSWER = {
   assignment: { topicPartitions: [{ topicId: TOPIC_ID, partitions: [0, 1] }] },
 }
 
-/** An assigner the coordinator double names as the group's protocol. */
-const assigner = (cooperative) => () => ({
+/**
+ * An assigner the coordinator double names as the group's protocol.
+ * @param {boolean} cooperative
+ * @param {Function} [onAssignment] the assigner's `onAssignment`, when it has one
+ */
+const assigner = (cooperative, onAssignment) => () => ({
   name: 'a',
   version: 0,
   supportedProtocols: () => (cooperative ? [COOPERATIVE, EAGER] : [EAGER]),
   protocol: () => ({ name: 'a', metadata: Buffer.alloc(0) }),
   assign: async () => [],
+  ...(onAssignment && { onAssignment }),
 })
+
+/** Logs `cleared` when the assigner is told to forget its state. */
+const recordClear = (assignment, order) => {
+  if (assignment === null) order.push('cleared')
+}
 
 /** Every consumer a case builds, disconnected after it so no timer outlives the case. */
 const built = []
@@ -90,6 +100,8 @@ const advanceUntilSettled = async (promise, limitMs) => {
  * @param {Function} [options.findGroupCoordinator] replaces the coordinator lookup
  * @param {(joined: () => boolean) => Function} [options.refreshMetadata] a metadata refresh made
  *   from the number of joins already sent
+ * @param {(assignment: object|null, order: string[]) => void} [options.onAssignment] classic only:
+ *   the assigner's `onAssignment`, given `order` as well
  * @returns {{ consumer: object, cluster: object, coordinator: object, order: string[],
  *   leaves: object[], crashes: object[], eachMessage: jest.Mock, runner: () => object }}
  *   `order` logs `join`, `leave`, `disconnect` and `crash` as they happen, plus `assigned` and
@@ -107,6 +119,7 @@ const rig = ({
   coordinator: replacement,
   findGroupCoordinator,
   refreshMetadata,
+  onAssignment,
 } = {}) => {
   const order = []
   const leaves = []
@@ -168,7 +181,15 @@ const rig = ({
     maxPollInterval,
     ...(protocol === 'consumer'
       ? { groupProtocol: 'consumer' }
-      : { partitionAssigners: [assigner(cooperative)], sessionTimeout: 30000 }),
+      : {
+          partitionAssigners: [
+            assigner(
+              cooperative,
+              onAssignment && ((assignment) => onAssignment(assignment, order))
+            ),
+          ],
+          sessionTimeout: 30000,
+        }),
   })
   built.push(consumer)
   consumer.on(events.DISCONNECT, () => order.push('disconnect'))
@@ -258,6 +279,55 @@ describe('Consumer > a first round that fails after joining', () => {
       expectCleanedUp(member)
     }
   )
+
+  test.each([
+    ['eager', false],
+    ['cooperative', true],
+  ])(
+    'classic dynamic member (%s), onPartitionsAssigned throws once: the assigners are cleared once, after onPartitionsRevoked and before the one LeaveGroup and DISCONNECT',
+    async (_, cooperative) => {
+      const member = rig({ cooperative, onAssignment: recordClear })
+
+      await run(member)
+
+      expect(member.order).toEqual([
+        'join',
+        'assigned',
+        'revoked',
+        'cleared',
+        'leave',
+        'disconnect',
+        'crash',
+      ])
+      expect(member.leaves).toHaveLength(1)
+      expect(member.crashes).toHaveLength(1)
+    }
+  )
+
+  test('classic dynamic member, onPartitionsAssigned throws once and the assigner throws while it is cleared: the LeaveGroup is still sent once, before DISCONNECT', async () => {
+    const member = rig({
+      onAssignment: (assignment, order) => {
+        recordClear(assignment, order)
+        if (assignment === null) throw new Error('the assigner failed')
+      },
+    })
+
+    await run(member)
+
+    expect(member.order).toEqual([
+      'join',
+      'assigned',
+      'revoked',
+      'cleared',
+      'leave',
+      'disconnect',
+      'crash',
+    ])
+    expect(member.leaves).toHaveLength(1)
+    expect(member.leaves[0]).toMatchObject({ memberId: MEMBER_ID, reason: LEAVE_REASON })
+    expect(member.crashes).toHaveLength(1)
+    expect(member.crashes[0].restart).toBe(false)
+  })
 
   test('consumer-protocol dynamic member, same failure: one heartbeat with member epoch -1 before DISCONNECT', async () => {
     const member = rig({ protocol: 'consumer' })

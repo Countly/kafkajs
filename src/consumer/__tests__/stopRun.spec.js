@@ -1648,6 +1648,23 @@ describe('Consumer > a run stopped for good with an error', () => {
       ).toEqual([{ message: 'Error while stopping the consumer group', error: 'undefined' }])
     }, 30000)
 
+    it('an ordinary dynamic stop clears the assigners once, before its LeaveGroup', async () => {
+      const run = await startOther('classic')
+      const order = []
+      run.group.groupMembership.assigners[0].onAssignment = (assignment) => {
+        if (assignment === null) order.push('cleared')
+      }
+      run.coordinator.leaveGroup.mockImplementation(async () => {
+        order.push('leave')
+      })
+
+      const stopping = settled(run.consumer.stop())
+      await advanceUntil(() => stopping.done, 2000)
+
+      expect(stopping).toMatchObject({ done: true, value: undefined })
+      expect(order).toEqual(['cleared', 'leave'])
+    }, 30000)
+
     it('a bounded close whose deadline passes after its accepted final commit clears the assigners before the first JoinGroup of the next run', async () => {
       let retained = null
       const retaining = {
@@ -1748,6 +1765,76 @@ describe('Consumer > a run stopped for good with an error', () => {
       expect(again).toMatchObject({ done: true, value: undefined })
       expect(coordinator.joinGroup).toHaveBeenCalledTimes(joins)
       expect(retained).toBeNull()
+    }, 30000)
+
+    it("an assigner clear owed to a run started inside another consumer's rebalance callback runs outside it: that consumer's disconnect from the assigner waits for its close", async () => {
+      let retained = null
+      let other = null
+      let fromAssigner = null
+      const retaining = {
+        ...eager(),
+        protocol: () => ({ name: 'eager', metadata: Buffer.from(JSON.stringify(retained)) }),
+        onAssignment: (assignment, { generationId }) => {
+          retained = assignment && { partitions: assignment.partitions, generationId }
+          if (assignment === null && other && !fromAssigner)
+            fromAssigner = settled(other.consumer.disconnect())
+        },
+      }
+      const delivered = []
+      const run = await startOther('classic', {
+        config: { partitionAssigners: [() => retaining] },
+        eachMessage: async ({ message }) => delivered.push(message.offset),
+      })
+      await advanceUntil(() => delivered.length === 1)
+      const { runner, coordinator } = run
+      const commitFinal = runner.commitFinalOffsetsContained.bind(runner)
+      jest.spyOn(runner, 'commitFinalOffsetsContained').mockImplementationOnce(async (scope) => {
+        await commitFinal(scope)
+        await new Promise((resolve) => setTimeout(resolve, 600))
+      })
+
+      const closing = settled(run.consumer.disconnect({ timeout: 500 }))
+      await advanceUntil(() => closing.done, 2000)
+
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(retained).toMatchObject({ generationId: 1 })
+
+      other = buildConsumer({ maxPollInterval: 4000, rebalanceTimeout: 3000 })
+      other.state.answer = (req) =>
+        req.memberEpoch === 0 ? target(1, { 'topic-a': [0] }) : target(req.memberEpoch, null)
+      const otherClosed = deferred()
+      other.state.disconnecting = otherClosed.promise
+      await other.consumer.subscribe({ topic: 'topic-a' })
+      const joins = coordinator.joinGroup.mock.calls.length
+      let again = null
+      const otherRun = settled(
+        other.consumer.run({
+          eachMessage: async () => {},
+          rebalanceListener: {
+            onPartitionsAssigned: async () => {
+              if (again) return
+              const starting = run.consumer.run({ eachMessage: async () => {} })
+              again = settled(starting)
+              await starting.catch(() => {})
+            },
+          },
+        })
+      )
+      const otherDisconnecting = () => other.log.some(({ kind }) => kind === 'disconnect')
+      await advanceUntil(() => otherRun.done && again?.done && otherDisconnecting(), 3000)
+      await jest.advanceTimersByTimeAsync(100)
+
+      expect(again).toMatchObject({ done: true, value: undefined })
+      expect(coordinator.joinGroup.mock.calls[joins][0].groupProtocols).toEqual([
+        { name: 'eager', metadata: Buffer.from('null') },
+      ])
+      expect(otherDisconnecting()).toBe(true)
+      expect(fromAssigner).toMatchObject({ done: false })
+
+      otherClosed.resolve()
+      await advanceUntil(() => fromAssigner.done, 1000)
+
+      expect(fromAssigner).toMatchObject({ done: true, value: undefined })
     }, 30000)
 
     it('stopRun during the initial join reports its own error and a later JoinGroup answer syncs nothing', async () => {
