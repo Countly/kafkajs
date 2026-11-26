@@ -12,6 +12,10 @@ const { KafkaJSError } = require('../../errors')
  * @property {'refuse'|'allow'} [missing='refuse'] whether a pair the request carried may be absent
  * @property {boolean} [skipUnnamed=false] skip an answer entry whose topic is null instead of
  *   refusing it as unrequested
+ * @property {'any'|'asSent'} [topicEntries='any'] `asSent` refuses a topic that fills more entries
+ *   of the answer than the request had entries for it; `any` lets an answer split or merge entries.
+ *   Only the OffsetFetch topic-selection read sets `asSent`; Produce, OffsetCommit and ListOffsets
+ *   keep `any` and accept a split topic.
  */
 
 /**
@@ -73,12 +77,52 @@ const matchesInOrder = (sent, rows, rowTopic, rowPartition) => {
 }
 
 /**
+ * @param {object[]} rows the answer's entries
+ * @param {string} rowTopic
+ * @returns {boolean} whether two neighbouring entries name the same topic
+ */
+const hasNeighbourOfSameTopic = (rows, rowTopic) => {
+  for (let r = 1; r < rows.length; r++) {
+    if (rows[r][rowTopic] === rows[r - 1][rowTopic]) return true
+  }
+  return false
+}
+
+/**
+ * Refuses an answer that spreads a topic over more entries than the request had entries for it.
+ * Run after the pairs are checked, so every topic here was requested.
+ * @param {string} api
+ * @param {{ topic: string }[]} sent the request's entries
+ * @param {object[]} rows the answer's entries
+ * @param {CoverageRule} rule
+ * @returns {void}
+ * @throws {import('../../errors').KafkaJSError} retriable
+ */
+const requireTopicEntries = (api, sent, rows, { rowTopic = 'topic', skipUnnamed = false }) => {
+  const left = new Map()
+  for (const { topic } of sent) left.set(topic, (left.get(topic) ?? 0) + 1)
+
+  for (const row of rows) {
+    const topic = row[rowTopic]
+    if (topic == null && skipUnnamed) continue
+    const remaining = left.get(topic)
+    if (!(remaining > 0)) {
+      throw refusal(`${api} response names topic ${topic} in more entries than the request did`)
+    }
+    left.set(topic, remaining - 1)
+  }
+}
+
+/**
  * Checks the rows of an answer against the request it answers, before the answer changes any
  * state. A row for a topic or partition the request did not carry is refused, also when its topic
  * entry lists no partitions; a pair answered more often than `repeats` allows is refused; and with
- * `missing: 'refuse'` so is a pair the answer leaves out. Repeated topic entries of the request are
- * merged and partition ids compare as numbers. An answer that names the request's pairs in the
- * request's order passes without allocating (`repeats: 'asSent'` only); any other answer is counted.
+ * `missing: 'refuse'` so is a pair the answer leaves out. With `topicEntries: 'asSent'` a topic may
+ * not fill more entries of the answer than the request had entries for it, so a reader that keeps
+ * one entry per topic never loses one. Repeated topic entries of the request are merged and
+ * partition ids compare as numbers. An answer that names the request's pairs in the request's order
+ * passes without allocating (`repeats: 'asSent'` only, and with `topicEntries: 'asSent'` only when
+ * no two neighbouring entries share a topic); any other answer is counted.
  * @param {string} api the API's name, for the message
  * @param {{ topic: string, partitions: { partition: number|string }[] }[]} sent the request's entries
  * @param {{ partitions: object[] }[]} rows the answer's entries
@@ -86,7 +130,26 @@ const matchesInOrder = (sent, rows, rowTopic, rowPartition) => {
  * @returns {void}
  * @throws {import('../../errors').KafkaJSError} retriable, naming the API, topic and partition
  */
-const requireCoverage = (
+const requireCoverage = (api, sent, rows, rule = {}) => {
+  const { rowTopic = 'topic', rowPartition = 'partition', repeats = 'asSent' } = rule
+  const inOrder = repeats === 'asSent' && matchesInOrder(sent, rows, rowTopic, rowPartition)
+  if (!inOrder) requirePairs(api, sent, rows, rule)
+  if (rule.topicEntries === 'asSent' && !(inOrder && !hasNeighbourOfSameTopic(rows, rowTopic))) {
+    requireTopicEntries(api, sent, rows, rule)
+  }
+}
+
+/**
+ * The counted check of `requireCoverage`: every pair of the answer against every pair of the
+ * request.
+ * @param {string} api
+ * @param {{ topic: string, partitions: { partition: number|string }[] }[]} sent
+ * @param {{ partitions: object[] }[]} rows
+ * @param {CoverageRule} rule
+ * @returns {void}
+ * @throws {import('../../errors').KafkaJSError} retriable
+ */
+const requirePairs = (
   api,
   sent,
   rows,
@@ -96,10 +159,8 @@ const requireCoverage = (
     repeats = 'asSent',
     missing = 'refuse',
     skipUnnamed = false,
-  } = {}
+  }
 ) => {
-  if (repeats === 'asSent' && matchesInOrder(sent, rows, rowTopic, rowPartition)) return
-
   const left = new Map()
   for (const { topic, partitions } of sent) {
     let counts = left.get(topic)
