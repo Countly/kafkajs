@@ -2132,3 +2132,135 @@ import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
     groupMessage,
   ]
 }
+
+// Admin results are declared with the fields the calls return.
+declare const resultShapeBroker: kafkajs.Broker
+const useAdminResultShapes = async () => {
+  const row = (await admin.listPartitionReassignments({})).topics[0]
+  const rowName: string = row.name
+  const rowPartition: number = row.partitions[0].partition
+  const rowAdding: number[] = row.partitions[0].addingReplicas
+  const rowRemoving: number[] = row.partitions[0].removingReplicas
+  const rowReplicas: number[] = row.partitions[0].replicas
+  const ongoing: kafkajs.OngoingPartitionReassignment = { partition: 0, replicas: [1], addingReplicas: [], removingReplicas: [] }
+  // @ts-expect-error a row always carries both replica arrays
+  const noArrays: kafkajs.OngoingPartitionReassignment = { partition: 0, replicas: [1] }
+  const brokerReply = await resultShapeBroker.listPartitionReassignments({})
+  const brokerCode: number = brokerReply.errorCode
+  const brokerThrottle: number = brokerReply.throttleTime
+  const brokerClientThrottle: number = brokerReply.clientSideThrottleTime
+  const brokerTopics: kafkajs.OngoingTopicReassignment[] = brokerReply.topics
+  await resultShapeBroker.listPartitionReassignments({ topics: null })
+  await admin.listPartitionReassignments({ topics: null })
+  await admin.listPartitionReassignments({ topics: [{ topic, partitions: [0] }] })
+
+  const described = await admin.describeConfigs({
+    includeSynonyms: true,
+    resources: [{ type: ConfigResourceTypes.TOPIC, name: topic }],
+  })
+  const entry = described.resources[0].configEntries[0]
+  // @ts-expect-error a sensitive or unset config has no value
+  const entryText: string = entry.configValue
+  const entryValue: string | null = entry.configValue
+  // @ts-expect-error a synonym of an unset config has no value
+  const synonymText: string = entry.configSynonyms[0].configValue
+  const synonymValue: string | null = entry.configSynonyms[0].configValue
+  // @ts-expect-error a resource without an error has no message
+  const resourceText: string = described.resources[0].errorMessage
+  const resourceMessage: string | null = described.resources[0].errorMessage
+  // @ts-expect-error describeConfigs never sets the throttle time
+  const describedThrottle: number = described.throttleTime
+  const describedThrottleUnset: undefined = described.throttleTime
+
+  const acls = await admin.describeAcls({
+    resourceType: AclResourceTypes.TOPIC,
+    resourcePatternType: ResourcePatternTypes.LITERAL,
+    operation: AclOperationTypes.ANY,
+    permissionType: AclPermissionTypes.ALLOW,
+  })
+  // @ts-expect-error describeAcls never sets the throttle time
+  const aclsThrottle: number = acls.throttleTime
+  // @ts-expect-error describeAcls never sets an error code
+  const aclsCode: number = acls.errorCode
+  const aclsMessage: string | undefined = acls.errorMessage
+  const aclsResources: kafkajs.DescribeAclResource[] = acls.resources
+
+  const deleted = await admin.deleteAcls({
+    filters: [
+      {
+        resourceType: AclResourceTypes.TOPIC,
+        resourcePatternType: ResourcePatternTypes.LITERAL,
+        operation: AclOperationTypes.ANY,
+        permissionType: AclPermissionTypes.ALLOW,
+      },
+    ],
+  })
+  // @ts-expect-error deleteAcls never sets the throttle time
+  const deletedThrottle: number = deleted.throttleTime
+  // @ts-expect-error a filter without an error has no message
+  const filterText: string | undefined = deleted.filterResponses[0].errorMessage
+  const filterMessage: string | null | undefined = deleted.filterResponses[0].errorMessage
+  // @ts-expect-error a matching ACL without an error has no message
+  const matchingText: string | undefined = deleted.filterResponses[0].matchingAcls[0].errorMessage
+  const matchingMessage: string | null | undefined = deleted.filterResponses[0].matchingAcls[0].errorMessage
+
+  // @ts-expect-error createPartitions resolves nothing
+  const created: boolean = await admin.createPartitions({ topicPartitions: [] })
+  const createdNothing: void = await admin.createPartitions({ topicPartitions: [] })
+
+  await admin.electLeaders()
+  await admin.electLeaders({ electionType: 'unclean' })
+  await admin.fetchTopicOffsetsByTimestamp(topic, '1700000000000')
+  await admin.fetchTopicOffsetsByTimestamp(topic, '-1', { isolationLevel: 'read_committed' })
+  await admin.fetchTopicOffsetsByTimestamp(topic, 'maxTimestamp')
+
+  // @ts-expect-error an 'any' match takes no name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'any', match: 'x' }] })
+  // @ts-expect-error a 'default' match takes no name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'default', match: 'x' }] })
+  // @ts-expect-error an exact match needs a name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'exact' }] })
+  await admin.describeClientQuotas({
+    components: [
+      { entityType: 'user', matchType: 'exact', match: 'u' },
+      { entityType: 'client-id', matchType: 'default' },
+      { entityType: 'ip', matchType: 'any' },
+    ],
+  })
+
+  const errored: GroupDescription['groupType'] = ''
+  void [
+    rowName,
+    rowPartition,
+    rowAdding,
+    rowRemoving,
+    rowReplicas,
+    ongoing,
+    noArrays,
+    brokerCode,
+    brokerThrottle,
+    brokerClientThrottle,
+    brokerTopics,
+    entryText,
+    entryValue,
+    synonymText,
+    synonymValue,
+    resourceText,
+    resourceMessage,
+    describedThrottle,
+    describedThrottleUnset,
+    aclsThrottle,
+    aclsCode,
+    aclsMessage,
+    aclsResources,
+    deletedThrottle,
+    filterText,
+    filterMessage,
+    matchingText,
+    matchingMessage,
+    created,
+    createdNothing,
+    errored,
+  ]
+}
+void useAdminResultShapes

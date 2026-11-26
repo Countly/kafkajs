@@ -4113,6 +4113,7 @@
         "src/admin/__tests__/scramCredentials.spec.js \u203a SCRAM request capabilities and read retry read retries only pending users, retaining caller order for [\"a\", \"b\"]",
         "src/admin/__tests__/scramCredentials.spec.js \u203a SCRAM request capabilities and read retry read retries only pending users, retaining caller order for undefined",
         "src/admin/__tests__/scramDescribeEdges.spec.js \u203a SCRAM credential alteration edges called without options it names the missing credential changes",
+        "src/admin/__tests__/scramDescribeEdges.spec.js \u203a SCRAM credential description edges a credentials row that failed locally has an empty credentials list",
         "src/admin/__tests__/scramDescribeEdges.spec.js \u203a SCRAM credential description edges a non-retriable failure of the all-users read is not retried",
         "src/admin/__tests__/scramDescribeEdges.spec.js \u203a SCRAM credential description edges a retriable failure of the all-users read is retried",
         "src/admin/__tests__/scramDescribeEdges.spec.js \u203a SCRAM credential description edges rejects a named-user answer with a mechanism listed twice",
