@@ -17,7 +17,7 @@ const {
   CORPUS_LAYOUT,
   countFullGcs,
   trackGcs,
-  customPartitioner,
+  customRouting,
 } = require('../clientCompare')
 
 const SCRIPT = path.join(__dirname, '..', 'clientCompare.js')
@@ -147,11 +147,13 @@ const fakeKafka = ({
     clearInterval: (timer) => state.clearedIntervals.push(timer),
     trackGcs: () => {
       state.allGcs.started++
-      state.allGcs.from = elapsedNs
       return {
-        stop: () => {
+        open: (at) => {
+          state.allGcs.from = at
+        },
+        stop: (at) => {
           state.allGcs.stopped++
-          state.allGcs.to = elapsedNs
+          state.allGcs.to = at
         },
         result: async () => {
           state.allGcs.resulted++
@@ -1018,10 +1020,58 @@ describe('Benchmarks > clientCompare', () => {
       const [{ createPartitioner }] = custom.state.producerConfigs
       const place = createPartitioner()
       const metadata = { partitionMetadata: Array(3).fill({}) }
-      expect(createPartitioner).toBe(customPartitioner)
       expect(Array.from({ length: 7 }, () => place(metadata))).toEqual([0, 1, 2, 0, 1, 2, 0])
-      expect(createPartitioner()(metadata)).toBe(0)
+      expect(createPartitioner()(metadata)).toBe(1)
       expect(plain.state.producerConfigs).toEqual([{}])
+    })
+
+    test('customRouting keeps one count for every partitioner it creates and starts it again at reset', () => {
+      const routing = customRouting()
+      const first = routing.createPartitioner()
+      const second = routing.createPartitioner()
+      const metadata = { partitionMetadata: Array(4).fill({}) }
+
+      expect([first(metadata), second(metadata), first(metadata)]).toEqual([0, 1, 2])
+      routing.reset()
+      expect([second(metadata), first(metadata)]).toEqual([0, 1])
+    })
+
+    test('the custom routing of the measured window starts at partition 0 whatever the warm-up sent, so two packages route the same records alike', async () => {
+      const routed = async (sendMs) => {
+        const kafka = fakeKafka({ sendMs })
+        const routes = []
+        const create = kafka.client.Kafka.prototype.producer
+        kafka.client.Kafka.prototype.producer = function producer(config) {
+          const created = create.call(this, config)
+          const place = config.createPartitioner()
+          const send = created.send
+          created.send = (request) => {
+            const metadata = { partitionMetadata: Array(12).fill({}) }
+            routes.push(request.messages.map(() => place(metadata)))
+            return send(request)
+          }
+          return created
+        }
+        await runWith(
+          'produce-throughput',
+          { messages: null, durationMs: 30000, partitions: 12, batch: 5, partitioner: 'custom' },
+          kafka
+        )
+        return { routes, warmupSends: Math.floor(5000 / sendMs) }
+      }
+
+      const many = await routed(100)
+      const few = await routed(250)
+
+      const windowOf = ({ routes, warmupSends }) =>
+        routes.slice(1 + warmupSends, 1 + warmupSends + 3)
+      expect(many.warmupSends).not.toBe(few.warmupSends)
+      expect(windowOf(many)).toEqual([
+        [0, 1, 2, 3, 4],
+        [5, 6, 7, 8, 9],
+        [10, 11, 0, 1, 2],
+      ])
+      expect(windowOf(few)).toEqual(windowOf(many))
     })
 
     test('produce-throughput with --probe on reports the send-call time, peak memory and collections of the measured window only', async () => {
@@ -1051,8 +1101,15 @@ describe('Benchmarks > clientCompare', () => {
       expect(state.allGcs).toMatchObject({ started: 1, stopped: 1, resulted: 1, closed: 1 })
     })
 
-    test('the collections of a probed run are counted over the window the rate is measured over', async () => {
+    test('the collections of a probed run are counted over the exact clock readings that bound the rate window', async () => {
       const kafka = fakeKafka()
+      const reads = []
+      const read = kafka.timing.now
+      kafka.timing.now = () => {
+        const reading = read() + BigInt(reads.length) * 1000000n
+        reads.push(reading)
+        return reading
+      }
 
       const { metrics, state } = await runWith(
         'produce-throughput',
@@ -1060,7 +1117,11 @@ describe('Benchmarks > clientCompare', () => {
         kafka
       )
 
-      expect(state.allGcs.from).toBe(1000n * 1000000n)
+      // Every read advances this clock by 1 ms: the leader wait, the window start, two reads for
+      // each of the three timed calls, and the window end.
+      expect(reads).toHaveLength(9)
+      expect(state.allGcs.from).toBe(reads[1])
+      expect(state.allGcs.to).toBe(reads[8])
       expect(Number(state.allGcs.to - state.allGcs.from) / 1e6).toBe(metrics.elapsedMs)
     })
 
@@ -1110,7 +1171,7 @@ describe('Benchmarks > clientCompare', () => {
       expect(result.metrics.sendCallMicrosP99).toBeLessThan(5050)
     })
 
-    test('a run without --probe reads no clock per send, starts no memory sampling or collection observer, and reports none of their metrics', async () => {
+    test('a run without --probe adds no clock read per send, starts no memory sampling or collection observer, and reports none of their metrics', async () => {
       const clockReads = async (messages, probe) => {
         const kafka = fakeKafka()
         let reads = 0
@@ -1438,7 +1499,10 @@ describe('Benchmarks > clientCompare', () => {
         return { Observer, observers }
       }
 
-      test('counts every collection kind that started in the window, with its pause, including entries that arrive in the drain, and not ones before the start or after the end', async () => {
+      /** The monotonic reading, in ns, that stands for `ms` on the performance clock in these tests. */
+      const hr = (ms) => BigInt(ms + 5000) * 1000000n
+
+      test('counts every collection kind that started between the two marks, with its pause, whether its entry came before, during or after the window, and not one that started in the gap before the start mark or after the end mark', async () => {
         const { Observer, observers } = controlled()
         const { MAJOR, MINOR, INCREMENTAL, WEAKCB } = {
           MAJOR: constants.NODE_PERFORMANCE_GC_MAJOR,
@@ -1448,33 +1512,38 @@ describe('Benchmarks > clientCompare', () => {
         }
         let clock = 10
         const drain = async () => {
-          observer.deliver(entry(15, 3, INCREMENTAL))
-          observer.buffered.push(entry(18, 1, WEAKCB), entry(25, 7, MAJOR))
+          observer.deliver(entry(13, 5, MAJOR), entry(26, 3, WEAKCB))
+          observer.buffered.push(entry(28, 1, MINOR), entry(31, 7, MAJOR))
         }
-        const tracker = trackGcs({ Observer, now: () => clock, drain })
+        const tracker = trackGcs({ Observer, now: () => clock, hrtime: () => hr(clock), drain })
         const [observer] = observers
-        observer.deliver(entry(5, 9, MAJOR), entry(12, 2, MINOR))
+        observer.deliver(entry(12, 9, MAJOR))
         clock = 20
+        tracker.open(hr(20))
+        observer.deliver(entry(19, 4, MAJOR), entry(21, 2, MAJOR), entry(24, 6, INCREMENTAL))
+        clock = 30
+        tracker.stop(hr(30))
 
         const result = await tracker.result()
 
         expect(new Set([MAJOR, MINOR, INCREMENTAL, WEAKCB]).size).toBe(4)
         expect(observer.options).toEqual({ entryTypes: ['gc'] })
-        expect(result).toEqual({ count: 3, pauseMs: 6 })
+        expect(result).toEqual({ count: 4, pauseMs: 12 })
         expect(observer.disconnects).toBe(1)
       })
 
-      test('ends its window at stop, not at result: a collection that started after stop is not counted, whenever its entry arrives', async () => {
+      test('ends its window at the stop mark, not at result: a collection that started after it is not counted, whenever its entry arrives', async () => {
         const { Observer, observers } = controlled()
         let clock = 10
         const drain = async () => {
           observer.deliver(entry(18, 4), entry(26, 8))
         }
-        const tracker = trackGcs({ Observer, now: () => clock, drain })
+        const tracker = trackGcs({ Observer, now: () => clock, hrtime: () => hr(clock), drain })
         const [observer] = observers
+        tracker.open(hr(10))
         observer.deliver(entry(11, 1))
         clock = 20
-        tracker.stop()
+        tracker.stop(hr(20))
         clock = 50
         observer.deliver(entry(19, 2), entry(30, 100))
 
@@ -1483,10 +1552,11 @@ describe('Benchmarks > clientCompare', () => {
         expect(result).toEqual({ count: 3, pauseMs: 7 })
       })
 
-      test('reports no collections and no pause for a window without any, and disconnects its observer once whether it ended or was only closed', async () => {
+      test('counts nothing before its window is opened, and disconnects its observer once whether it ended or was only closed', async () => {
         const { Observer, observers } = controlled()
-        const ended = trackGcs({ Observer, now: () => 0, drain: async () => {} })
-        const closed = trackGcs({ Observer, now: () => 0, drain: async () => {} })
+        const ended = trackGcs({ Observer, now: () => 0, hrtime: () => 0n, drain: async () => {} })
+        const closed = trackGcs({ Observer, now: () => 0, hrtime: () => 0n, drain: async () => {} })
+        observers[0].deliver(entry(1, 5))
 
         expect(await ended.result()).toEqual({ count: 0, pauseMs: 0 })
         ended.close()

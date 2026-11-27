@@ -3,7 +3,8 @@ const path = require('node:path')
 const yaml = require('js-yaml')
 const adapter = require('../adapters/clientCompare')
 const manifest = require('../manifest.json')
-const { RecordBatch } = require('../../../src/protocol/recordBatch/v0')
+const { RequestBudget, encodedBound } = require('../../../src/producer/state/recordSize')
+const { Types } = require('../../../src/protocol/message/compression')
 const Record = require('../../../src/protocol/recordBatch/record/v0')
 
 const ROOT = path.join(__dirname, '..', '..', '..')
@@ -195,25 +196,28 @@ describe('Benchmark report clientCompare adapter', () => {
       })
     })
 
-    test("a send of every produce-throughput row, encoded with the producer's own record and batch encoders at the longest key, all its headers and the widest spread, fits the default request and topic limit", async () => {
-      // The producer's default maxRequestSize and the topic's default max.message.bytes are 1 MiB.
-      // The envelope (request header, client id, topic name, partition index) is bounded by 1 KiB.
-      const LIMIT = 1048576
-      const ENVELOPE = 1024
-      const PARTITION_ENTRY = 8
+    test("a send of every produce-throughput row, with records at their real encoded size at the longest key and all their headers, fits one request under the producer's request budget (framing, topic name, a batch header and partition framing for every partition it can reach, the built-in codec's worst case) at the default 1 MiB limit", () => {
       const produceRows = compareRows.filter(
         (row) => valueOf(row.command, '--workload') === 'produce-throughput'
       )
-      const batchOverhead = (await RecordBatch({ records: [] })).buffer.length
-      const sized = {}
+      const codecs = { lz4: Types.LZ4, gzip: Types.GZIP }
+      const budget = new RequestBudget({
+        maxRequestSize: 1048576,
+        clientId: 'bench-compare-produce-throughput',
+      })
+      const topic = `bench-compare-produce-throughput-${process.pid}-${Date.now()}`
+      const planned = {}
 
       expect(produceRows.length).toBeGreaterThan(0)
+      expect(encodedBound(Types.GZIP, 1000)).toBeGreaterThan(1000)
+      expect(encodedBound(Types.LZ4, 1000)).toBeGreaterThan(1000)
       for (const row of produceRows) {
         const size = Number(valueOf(row.command, '--size') ?? 200)
         const headerCount = Number(valueOf(row.command, '--headers') ?? 0)
         const partitions = Number(valueOf(row.command, '--partitions') ?? 3)
-        const unawaited = valueOf(row.command, '--unawaited')
-        const perSend = Number(unawaited ?? valueOf(row.command, '--batch') ?? 500)
+        const perSend = Number(
+          valueOf(row.command, '--unawaited') ?? valueOf(row.command, '--batch') ?? 500
+        )
         const headers = Object.fromEntries(
           Array.from({ length: headerCount }, (_, i) => [`h${i}`, `v${i}`])
         )
@@ -225,12 +229,13 @@ describe('Benchmark report clientCompare adapter', () => {
           headers,
         })
         const spread = Math.min(partitions, perSend)
-        const bytes =
-          ENVELOPE + perSend * record.buffer.length + spread * (batchOverhead + PARTITION_ENTRY)
-        sized[row.name] = bytes <= LIMIT
+        const wire = Math.ceil(perSend / spread) * record.buffer.length
+        const compression = codecs[valueOf(row.command, '--compression')]
+        const batch = budget.batchBytes({ compression, messages: [], wire })
+        planned[row.name] = budget.topicBytes(topic) + spread * batch <= budget.maxRequestBytes
       }
 
-      expect(sized).toEqual(Object.fromEntries(produceRows.map(({ name }) => [name, true])))
+      expect(planned).toEqual(Object.fromEntries(produceRows.map(({ name }) => [name, true])))
     })
 
     test('the 15 KiB and 17 KiB rows put their values 1 KiB under and over 16 KiB', () => {
