@@ -116,16 +116,33 @@ const shape = (frame) => ({
 })
 
 /**
- * A Fetch group with sessions on whose cluster keeps one committed-offsets map, as the real
- * cluster does, so an offset manager the group builds itself reads the same positions.
+ * A Fetch group with sessions on, every partition committed at offset 5. An offset manager the
+ * group builds at an eager install or a withhold evicts its cells from the shared cache and reads
+ * them from the coordinator, so the coordinator answers OffsetFetch as a broker holding offset 5
+ * for every partition would.
  * @param {object} [options] `createFetchGroup` options
  * @returns {Promise<object>} the harness
  */
-const opened = async (options = {}) => {
-  const h = await createFetchGroup({ fetchSessions: true, position: '5', ...options })
-  const partitions = options.partitions || [0]
-  const committed = { [TOPIC]: Object.fromEntries(partitions.map((p) => [p, '5'])) }
-  h.cluster.committedOffsets = () => committed
+const opened = async (options = {}) =>
+  answeringOffsetFetch(await createFetchGroup({ fetchSessions: true, position: '5', ...options }))
+
+/**
+ * @param {object} h a harness whose coordinator is given the OffsetFetch answer
+ * @returns {Promise<object>} the harness
+ */
+const answeringOffsetFetch = async (h) => {
+  const coordinator = await h.cluster.findGroupCoordinator()
+  coordinator.offsetFetch = jest.fn(async ({ topics }) => ({
+    responses: topics.map(({ topic, partitions }) => ({
+      topic,
+      partitions: partitions.map(({ partition }) => ({
+        partition,
+        offset: '5',
+        metadata: null,
+        errorCode: 0,
+      })),
+    })),
+  }))
   return h
 }
 
@@ -792,11 +809,13 @@ describe('fetching while withheld', () => {
   })
 
   test('a healed Fetch never joins the leaderless refresh its closed authority started (withhold driven directly)', async () => {
-    h = await createFetchGroup({
-      partitions: [0],
-      partitionLeaders: { 0: -1 },
-      retry: { initialRetryTime: 0, retries: 0 },
-    })
+    h = await answeringOffsetFetch(
+      await createFetchGroup({
+        partitions: [0],
+        partitionLeaders: { 0: -1 },
+        retry: { initialRetryTime: 0, retries: 0 },
+      })
+    )
     const options = []
     const releases = []
     h.cluster.refreshMetadata.mockImplementation((given) => {
@@ -877,7 +896,9 @@ describe('seeks across a withhold', () => {
 })
 
 /**
- * A real offset manager and ownership over one held OffsetCommit per call.
+ * A real offset manager and ownership over one held OffsetCommit per call. A new manager evicts
+ * its assigned cells from the shared committed cache, so the cell of `t[0]` starts empty and only
+ * a recorded commit fills it.
  * @returns {object} manager, ownership, held answers, committed cache, events and losses
  */
 const commitSetup = () => {
@@ -887,7 +908,7 @@ const commitSetup = () => {
     isConnected: () => true,
     offsetCommit: jest.fn(() => new Promise((resolve, reject) => held.push({ resolve, reject }))),
   }
-  const committed = { t: { 0: '0' } }
+  const committed = {}
   const emitter = new InstrumentationEventEmitter()
   const events = []
   emitter.addListener(COMMIT_OFFSETS, (event) => events.push(event))
@@ -964,7 +985,7 @@ describe('commits across a withhold', () => {
     c.held[0].resolve({ topics: [] })
     expect(await sending).toMatchObject({ reason: 'assignment-refused' })
     expect(c.events).toEqual([])
-    expect(c.manager.committedOffsets().t[0]).toBe('0')
+    expect(c.manager.committedOffsets().t[0]).toBeUndefined()
   })
 
   test('a loss answered to a commit written before the withhold is learned and the caller still gets assignment-refused (withhold driven directly)', async () => {
@@ -991,7 +1012,7 @@ describe('commits across a withhold', () => {
     c.held[0].resolve({ topics: [] })
     expect(await sending).toMatchObject({ reason: 'assignment-refused' })
     expect(c.events).toEqual([])
-    expect(c.manager.committedOffsets().t[0]).toBe('0')
+    expect(c.manager.committedOffsets().t[0]).toBeUndefined()
   })
 })
 
@@ -1110,6 +1131,6 @@ describe('ordinary installs, losses and commits stay as they were', () => {
     c.held[0].resolve({ topics: [] })
     expect(await sending).toMatchObject({ reason: 'membership-lost' })
     expect(c.events).toHaveLength(1)
-    expect(c.manager.committedOffsets().t[0]).toBe('0')
+    expect(c.manager.committedOffsets().t[0]).toBeUndefined()
   })
 })
