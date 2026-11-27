@@ -16,6 +16,7 @@ const {
 
 const INSTANCE = 'instance-1'
 const FENCED_INSTANCE_ID = 82
+const REBALANCE_IN_PROGRESS = 27
 
 beforeEach(() => jest.useFakeTimers({ doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] }))
 afterEach(async () => {
@@ -910,6 +911,71 @@ describe('Consumer > how a classic run ends', () => {
         if (reported === 'the recreation') expect(run.crashes[0].error).toBe(error)
         expect(policy).toHaveBeenCalledTimes(reported === null ? 0 : 1)
         expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+  })
+
+  describe('a background rejoin round of a cooperative member whose JoinGroup fails', () => {
+    /** An assigner under the protocol name the JoinGroup double answers, cooperative only. */
+    const cooperative = () => ({
+      name: 'eager',
+      version: 0,
+      supportedProtocols: () => ['cooperative'],
+      protocol: () => ({ name: 'eager', metadata: Buffer.alloc(0) }),
+      assign: async () => [],
+    })
+
+    it.each([
+      ['absent', false],
+      ['returning true', true],
+    ])(
+      'with restartOnFailure %s cleans up as stop() does and reports the JoinGroup error itself, unwrapped, with restart %s',
+      async (policyName, restart) => {
+        const policy = policyName === 'absent' ? undefined : jest.fn(async () => true)
+        const failed = failure(false)
+        const run = await begin({
+          config: { heartbeatInterval: 500, partitionAssigners: [cooperative] },
+          retry: { ...RETRY, ...(policy && { restartOnFailure: policy }) },
+        })
+        await advanceUntil(() => run.delivered.length === 2)
+        await jest.advanceTimersByTimeAsync(200)
+        expect(run.group.rebalanceProtocol()).toBe('cooperative')
+        expect(trail(run)).toEqual([])
+        const rebalancing = jest.fn()
+        run.consumer.on(run.consumer.events.REBALANCING, rebalancing)
+
+        run.coordinator.joinGroup.mockImplementationOnce(async () => {
+          throw failed
+        })
+        run.coordinator.heartbeat.mockImplementationOnce(async () => {
+          throw protocolError(REBALANCE_IN_PROGRESS)
+        })
+        await advanceUntil(() => run.crashes.length > 0, 2000)
+
+        expect(rebalancing).toHaveBeenCalledTimes(1)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+        expect(trail(run)).toEqual([
+          'final commit',
+          'commit topic-a|0 42',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          `CRASH restart ${restart}`,
+        ])
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error).toBe(failed)
+        expect(run.cluster.disconnect.mock.calls).toEqual([[{ preserveSetupState: true }]])
+        if (policy) expect(policy).toHaveBeenCalledTimes(1)
+
+        await expectRestart(run, restart)
+        if (restart) {
+          await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 2, 2000)
+          expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+          await closeClean(run)
+        } else {
+          expect(jest.getTimerCount()).toBe(0)
+        }
       },
       30000
     )
