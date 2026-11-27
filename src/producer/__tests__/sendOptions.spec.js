@@ -20,6 +20,8 @@ const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const VALUE = 'send-option-row'
 const MESSAGES = [{ value: VALUE, timestamp: 1000 }]
 const ORIGINAL_CODECS = { ...CompressionCodecs }
+/** The real admission, taken before any spy replaces it, for spies that log and call through. */
+const ADMIT = Admission.prototype.acquire
 const CODECS = { 1: gzip, 2: snappy, 3: lz4, 4: zstd }
 /** Short, fixed backoffs: a retried batch waits 10 ms. */
 const RETRY = { retries: 10, initialRetryTime: 10, maxRetryTime: 10, factor: 0 }
@@ -483,7 +485,7 @@ describe('Producer > send options', () => {
    * @returns {Promise<Error>} the refusal
    */
   const expectRefused = async (make, type = KafkaJSInvalidConfigurationError) => {
-    rig = await Rig.start({ deliveryTimeout: 2000 })
+    rig = await Rig.start()
     const error = await rig.producer.send({ topic: TOPIC, messages: MESSAGES, ...make() }).then(
       () => null,
       (failure) => failure
@@ -650,10 +652,9 @@ describe('Producer > send options', () => {
     test('the registry is read once at the key and once at the canonical key, before admission', async () => {
       const log = []
       rig = await Rig.start()
-      const admit = Admission.prototype.acquire
       acquire.mockImplementation(function (...args) {
         log.push('admission')
-        return admit.apply(this, args)
+        return ADMIT.apply(this, args)
       })
       const factory = ORIGINAL_CODECS[CompressionTypes.GZIP]
       for (const key of ['9', '1']) {
@@ -748,15 +749,14 @@ describe('Producer > send options', () => {
 
     /** Logs each admission into `log`, calling through. */
     const logAdmission = (log) => {
-      const admit = Admission.prototype.acquire
       acquire.mockImplementation(function (...args) {
         log.push('admission')
-        return admit.apply(this, args)
+        return ADMIT.apply(this, args)
       })
     }
 
     test('startedAt is taken before the first option is read: a getter that spends the delivery deadline makes the send time out unsent', async () => {
-      rig = await Rig.start({ deliveryTimeout: 1000 })
+      rig = await Rig.start({ deliveryTimeout: 5000 })
       const now = Date.now
       let shift = 0
       jest.spyOn(Date, 'now').mockImplementation(() => now() + shift)
@@ -764,7 +764,7 @@ describe('Producer > send options', () => {
       const error = await rig.producer
         .send({
           get acks() {
-            shift += 5000
+            shift += 10000
             return -1
           },
           topic: TOPIC,
