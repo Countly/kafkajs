@@ -16,6 +16,7 @@ const {
 
 const INSTANCE = 'instance-1'
 const FENCED_INSTANCE_ID = 82
+const REBALANCE_IN_PROGRESS = 27
 
 beforeEach(() => jest.useFakeTimers({ doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] }))
 afterEach(async () => {
@@ -913,6 +914,43 @@ describe('Consumer > how a classic run ends', () => {
       },
       30000
     )
+  })
+
+  describe('a REBALANCE_IN_PROGRESS heartbeat answer while the handler runs', () => {
+    it('then a non-retriable failure of that handler is taken by the eager rejoin: no CRASH, and the record is redelivered', async () => {
+      const error = failure(false)
+      const policy = jest.fn(async () => false)
+      const run = await begin({
+        config: { heartbeatInterval: 500 },
+        retry: { ...RETRY, restartOnFailure: policy },
+        eachMessage: async ({ message }, held, call) => {
+          if (message.offset !== '41' || call !== 2) return
+          await held.promise
+          throw error
+        },
+      })
+      await advanceUntil(() => run.delivered.length === 2)
+      const sent = run.coordinator.heartbeat.mock.calls.length
+      run.coordinator.heartbeat.mockImplementationOnce(async () => {
+        throw protocolError(REBALANCE_IN_PROGRESS)
+      })
+      await advanceUntil(() => run.coordinator.heartbeat.mock.calls.length > sent, 2000)
+      await jest.advanceTimersByTimeAsync(100)
+      expect(run.coordinator.heartbeat.mock.calls.length).toBeGreaterThan(sent)
+      expect(trail(run)).toEqual([])
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+
+      run.held.resolve()
+      await advanceUntil(() => run.delivered.length === 3, 2000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(trail(run)).toEqual(['commit topic-a|0 41'])
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+      expect(run.delivered).toEqual(['0|40', '0|41', '0|41'])
+      expect(run.crashes).toEqual([])
+      expect(policy).not.toHaveBeenCalled()
+      await closeClean(run)
+    }, 30000)
   })
 
   describe('other rows of a classic run', () => {
