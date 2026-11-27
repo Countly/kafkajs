@@ -4063,6 +4063,7 @@ module.exports = class ConsumerGroup {
               partition,
               trackedEpoch,
               currentLeaderEpoch,
+              leader: this.cluster.cachedLeader?.(topic, partition),
               generation,
               requestClock: this.acquireClock,
               entry: this.positionValidator.entryOf(topic, partition),
@@ -4321,31 +4322,15 @@ module.exports = class ConsumerGroup {
           retriable.push(entry)
         } else if (outcome.action === 'fatal') {
           fatal = true
-        } else {
-          const decided = preparation && this.positionValidator.entryOf(topic, entry.partition)
+        } else if (outcome.action === 'truncated' || outcome.action === 'reset') {
           try {
-            await this.applyValidationOutcome(
-              topic,
-              entry.partition,
-              offset,
-              outcome,
-              preparation,
-              entry.requestClock
-            )
-            preparation?.check()
+            this.publishValidationOutcome(entry, offset, outcome, preparation)
           } catch (e) {
-            // `complete()` already recorded the partition as validated, so leaving it there would
-            // hide a divergence for good: the next round would answer 'unchanged' and the position
-            // it was told to leave would stand, with no event and no second attempt. Returning the
-            // key to unvalidated is what makes the next round decide it again. A refused
-            // preparation releases only the entry it decided, never a replacement's.
-            if (preparation) {
-              const released = [{ topic, partition: entry.partition, entry: decided }]
-              this.positionValidator.release(released)
-              preparation.check()
-            } else {
-              this.positionValidator.forgetTopic(topic, [entry.partition])
-            }
+            // The entry is still the request's own, awaiting: returning it to unvalidated is what
+            // makes the next round decide the partition again. A replacement is left alone.
+            this.positionValidator.release([
+              { topic, partition: entry.partition, entry: entry.entry },
+            ])
             this.logger.warn('Could not apply a position validation outcome, retrying next round', {
               groupId: this.groupId,
               memberId: this.memberId,
@@ -4354,6 +4339,7 @@ module.exports = class ConsumerGroup {
               error: e.message,
             })
           }
+          preparation?.check()
         }
       }
 
@@ -4385,8 +4371,9 @@ module.exports = class ConsumerGroup {
   /**
    * Moves every partition of these entries on without a reply, leaving their tracked epochs alone.
    *
-   * Each entry is marked under the generation it was requested with, so an entry belonging to a
-   * previous assignment is a no-op rather than a claim about the current one.
+   * Only a partition whose validator entry is still the one its request created, and still
+   * awaiting, is marked, under the generation it was requested with: an entry that was published,
+   * released after a refused rewind, replaced or belongs to a previous assignment is left alone.
    *
    * @private
    * @param {{topic: string, entries: object[]}[]} topics
@@ -4394,40 +4381,90 @@ module.exports = class ConsumerGroup {
    */
   markAllValidated(topics) {
     for (const { topic, entries } of topics) {
-      for (const { partition, currentLeaderEpoch, generation } of entries) {
-        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+      for (const { partition, currentLeaderEpoch, generation, entry } of entries) {
+        const current = this.positionValidator.entryOf(topic, partition)
+        if (current === entry && current?.pending) {
+          this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+        }
       }
     }
   }
 
   /**
-   * Applies one validation outcome that concluded the log diverged, and announces it.
+   * Publishes one validation outcome that found the log diverged, in one synchronous step, and
+   * writes no offset commit: the normal commit path (auto-commit, or the application's own
+   * commit) persists the new position later, as after a seek.
    *
-   * A truncation is marked changed and announced with `LOG_TRUNCATION` unless its reposition
-   * applied nothing and the partition has since left the validated position: it is no longer
-   * owned, or a seek, reset or other position change took the rewind's place. A reposition that
-   * applied nothing while the position is still the validated one is announced as before.
+   * The answer takes effect only while it still speaks for the partition, which is compared before
+   * anything is written: the round's identity holds; the validator entry is the one this request
+   * created; the cached leader and leader epoch are the ones the request carried; the partition is
+   * still owned; no seek of it is queued or being applied; and it was not sought, reset, acquired
+   * again or recreated since the request. Otherwise the entry returns to unvalidated, so the next
+   * round asks again, and nothing else changes.
+   *
+   * When it applies, the effect is installed first: a known divergence moves the position to it
+   * with the epoch the leader answered (`OffsetManager#seekLocally`); an unknown one drops the
+   * position for a local reset that the next resolution resolves by the topic's policy, ignoring
+   * the committed offset (`OffsetManager#resetLocally`); under `none` the partition halts. Then the
+   * partition is validated against the requested leader epoch and stamped as sought
+   * (`markSought`), which fences every batch fetched, offset resolved and commit selected before
+   * it. Only then do the halt event, the warning and `LOG_TRUNCATION` run, so a listener sees the
+   * new position with its fence, and a seek it makes replaces the effect.
    *
    * @private
-   * @param {string} topic
-   * @param {number} partition
-   * @param {string} offset the position that was validated
-   * @param {{action: string, divergingOffset: string|null, leaderEpoch: number}} outcome
-   * @param {FetchPreparation} [preparation] the fetch round's identity: forwarded to the offset
-   *   work and checked before the repositioning is marked and announced
-   * @param {number} [requestClock] the acquisition clock when the validation request was built;
-   *   with a preparation, it is the identity a none refusal of an unknown divergence carries
-   * @returns {Promise<void>}
-   * @throws {Error} the preparation's refusal
+   * @param {{topic: string, partition: number, entry: object, currentLeaderEpoch: number,
+   *   leader?: number, generation: number, requestClock: number}} item the request record
+   *   `validatePositions` built
+   * @param {string} offset the position the outcome was decided for
+   * @param {{action: 'truncated'|'reset', divergingOffset: string|null, leaderEpoch: number}} outcome
+   * @param {FetchPreparation} [preparation] the fetch round's identity
+   * @returns {boolean} whether the effect was installed
    */
-  async applyValidationOutcome(topic, partition, offset, outcome, preparation, requestClock) {
+  publishValidationOutcome(item, offset, outcome, preparation) {
+    const { topic, partition, entry, currentLeaderEpoch, leader, generation, requestClock } = item
     const manager = preparation?.manager ?? this.offsetManager
-    const bound =
-      requestClock === undefined
-        ? preparation
-        : this.boundToRequest(topic, partition, requestClock, preparation)
-    const stale = () =>
-      requestClock !== undefined && this.isRequestStale(topic, partition, requestClock)
+    const halt =
+      outcome.action === 'reset' && this.topicConfigurations[topic]?.resetPolicy?.kind === 'none'
+        ? {
+            offset,
+            reason: 'offset-out-of-range',
+            error: new KafkaJSNoOffsetError('Log truncated at an unknown point; seek to resume', {
+              topic,
+              partition,
+              reason: 'offset-out-of-range',
+            }),
+          }
+        : null
+    const context = halt && preparation ? this.fetchedResetContext(preparation, requestClock) : null
+
+    if (
+      preparation?.guard() ||
+      this.positionValidator.entryOf(topic, partition) !== entry ||
+      !entry?.pending ||
+      this.cluster.leaderEpoch(topic, partition) !== currentLeaderEpoch ||
+      this.cluster.cachedLeader?.(topic, partition) !== leader ||
+      !manager.owns(topic, partition) ||
+      this.isRequestStale(topic, partition, requestClock) ||
+      (this.hasSeekGates() && this.isSeekGated(topic, partition)) ||
+      (halt &&
+        !(
+          this.isResetContextCurrent(topic, partition, context) &&
+          this.acceptHalt(topic, partition, halt, context)
+        ))
+    ) {
+      this.positionValidator.release([{ topic, partition, entry }])
+      return false
+    }
+
+    if (outcome.action === 'truncated') {
+      manager.seekLocally(topic, partition, outcome.divergingOffset, outcome.leaderEpoch)
+    } else if (!halt) {
+      manager.resetLocally(topic, partition)
+    }
+    this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+    this.markSought(topic, partition)
+
+    if (halt) this.reportHalt(topic, partition, halt)
     if (outcome.action === 'truncated') {
       this.logger.warn('Log truncation detected, rewinding the partition to the divergence point', {
         groupId: this.groupId,
@@ -4436,54 +4473,14 @@ module.exports = class ConsumerGroup {
         offset,
         divergingOffset: outcome.divergingOffset,
       })
-      // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
-      // a queued seek would land one round late - and would overwrite a user seek queued in the
-      // same window, since the queue is last-writer-wins per key.
-      const applied = await manager.reposition(
-        { topic, partition, offset: outcome.divergingOffset },
-        bound
-      )
-      preparation?.check()
-      // Compared by value: a participant may have published the same offset in another spelling.
-      const moved = () => {
-        const position = manager.positionOf(topic, partition)
-        return position == null || BigInt(position) !== BigInt(offset)
-      }
-      const overtaken = !applied && (!manager.owns(topic, partition) || moved())
-      if (overtaken || stale()) return
-      this.markChanged(topic, partition)
-    } else if (outcome.action === 'reset') {
+    } else {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
         groupId: this.groupId,
         topic,
         partition,
         offset,
       })
-      if (this.topicConfigurations[topic]?.resetPolicy?.kind === 'none') {
-        this.installReset(
-          topic,
-          partition,
-          {
-            offset,
-            reason: 'offset-out-of-range',
-            error: new KafkaJSNoOffsetError('Log truncated at an unknown point; seek to resume', {
-              topic,
-              partition,
-              reason: 'offset-out-of-range',
-            }),
-          },
-          preparation && this.fetchedResetContext(preparation, requestClock)
-        )
-      } else {
-        await manager.setDefaultOffset({ topic, partition }, bound)
-        preparation?.check()
-        if (stale()) return
-        this.markChanged(topic, partition)
-      }
-    } else {
-      return
     }
-
     this.instrumentationEmitter.emit(LOG_TRUNCATION, {
       topic,
       partition,
@@ -4491,6 +4488,7 @@ module.exports = class ConsumerGroup {
       divergingOffset: outcome.divergingOffset,
       leaderEpoch: outcome.leaderEpoch,
     })
+    return true
   }
 
   /**

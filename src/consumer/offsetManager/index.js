@@ -1031,16 +1031,7 @@ module.exports = class OffsetManager {
     }
 
     if (offset === '-2' || offset === '-1') {
-      const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
-      this.clearOffsets({ topic, partition })
-      this.operations.fence(ticket, topic, partition)
-      let partitions = this.pendingSeeks.get(topic)
-      if (!partitions) {
-        partitions = new Map()
-        this.pendingSeeks.set(topic, partitions)
-      }
-      partitions.set(partition, { timestamp: Number(offset), ticket })
-      this.retireResetRefusals(topic, partition)
+      this.holdPendingSeek(topic, partition, Number(offset))
       return true
     }
 
@@ -1050,30 +1041,45 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Moves an assigned partition to a concrete offset as request-bound reset work (a log
-   * truncation's divergence point), not as a user seek: with auto-commit the offset is committed
-   * and the cell cleared, so the position is read again (`commitAndClear`); without, it is applied
-   * locally as a seek is.
-   * @param {import("../../../types").TopicPartitionOffset} topicPartitionOffset
-   * @param {{guard: () => Error|null, fence: object}} [preparation] the request's identity
-   * @returns {Promise<boolean>} whether it was applied; `false` for a partition not assigned to
-   *   this member, after a lost membership, or when a newer operation superseded it
-   * @throws {Error} whatever the commit raised, or the preparation's refusal
+   * Drops a partition's position for a reset the next offset resolution resolves by the topic's
+   * reset policy (earliest, latest, or a duration with its latest fallback), ignoring the
+   * coordinator's committed offset, as a pending `'-1'`/`'-2'` seek does. Commits nothing and
+   * fences this manager's older work on the cell at once. Used by position validation when the
+   * divergence point is unknown; the caller has checked that it owns the partition.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
    */
-  async reposition({ topic, partition, offset }, preparation) {
-    this.refuse(preparation)
-    if (this.ownership?.refusal(this.ownership.token())) return false
-    if (!this.memberAssignment[topic]?.includes(partition)) return false
-    if (!this.autoCommit || this.groupId === undefined)
-      return this.seekLocally(topic, partition, offset)
-    const applied = await this.commitAndClear({ topic, partition, offset }, preparation)
-    if (applied) this.retireResetRefusals(topic, partition)
-    return applied
+  resetLocally(topic, partition) {
+    this.holdPendingSeek(topic, partition, null)
   }
 
   /**
-   * Applies a concrete offset without a commit: the position and its private fallback, with an
-   * unknown epoch; the pending sentinel and reset refusal of the cell end. It writes nothing
+   * Replaces a cell's position with a pending reset intent under a mutation ticket that stays open
+   * until the intent is resolved, cancelled or replaced: the committed offset, position and epoch
+   * are forgotten, older work on the cell is fenced, and its held reset refusal ends.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number|null} timestamp `-2` (earliest), `-1` (latest), or `null` for the topic's policy
+   * @returns {void}
+   */
+  holdPendingSeek(topic, partition, timestamp) {
+    const ticket = this.operations.begin([{ topic, partition }], { mutation: true })
+    this.clearOffsets({ topic, partition })
+    this.operations.fence(ticket, topic, partition)
+    let partitions = this.pendingSeeks.get(topic)
+    if (!partitions) {
+      partitions = new Map()
+      this.pendingSeeks.set(topic, partitions)
+    }
+    partitions.set(partition, { timestamp, ticket })
+    this.retireResetRefusals(topic, partition)
+  }
+
+  /**
+   * Applies a concrete offset without a commit: the position and its private fallback, with the
+   * given epoch; the pending sentinel and reset refusal of the cell end. It writes nothing
    * shared, so it fences only this manager's own older work on the cell (an owner barrier: its
    * resolutions and duration resets), never another participant's or a commit, whose accepted
    * value still reaches the committed cache.
@@ -1081,11 +1087,13 @@ module.exports = class OffsetManager {
    * @param {string} topic
    * @param {number} partition
    * @param {string} offset
+   * @param {number} [epoch=-1] the tracked epoch of the new position: -1 for a seek, the epoch the
+   *   leader answered for a position validation rewind
    * @returns {true}
    */
-  seekLocally(topic, partition, offset) {
+  seekLocally(topic, partition, offset, epoch = -1) {
     this.clearPendingSeek(topic, partition)
-    this.installSeekPosition(topic, partition, offset, { local: true })
+    this.installSeekPosition(topic, partition, offset, { local: true, epoch })
     this.operations.touchOwned(this, topic, partition)
     this.retireResetRefusals(topic, partition)
     return true
@@ -1208,25 +1216,26 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * Makes a sought offset this manager's position, with an unknown epoch, and its private
-   * fallback baseline: `heldOffsetAt` reads it while the shared cell holds no valid commit, so an
-   * eviction alone neither loses the position nor makes it look uncommitted. Replaced or dropped
-   * by this manager's own later commit, read fill, reset, seek or retirement. A local seek's
-   * fallback (`local`) is no commit: a default commit still sends its position.
+   * Makes a sought offset this manager's position, with the given epoch (unknown by default), and
+   * its private fallback baseline: `heldOffsetAt` reads it while the shared cell holds no valid
+   * commit, so an eviction alone neither loses the position nor makes it look uncommitted.
+   * Replaced or dropped by this manager's own later commit, read fill, reset, seek or retirement.
+   * A local seek's fallback (`local`) is no commit: a default commit still sends its position.
    * @private
    * @param {string} topic
    * @param {number} partition
    * @param {string} offset the sought offset
-   * @param {{local?: boolean}} [options] whether the seek was applied without a commit
+   * @param {{local?: boolean, epoch?: number}} [options] whether the seek was applied without a
+   *   commit, and the position's tracked epoch: -1 for a seek, which names a position rather than
+   *   a consumed record; a position validation rewind keeps the epoch the leader answered
    * @returns {void}
    */
-  installSeekPosition(topic, partition, offset, { local = false } = {}) {
+  installSeekPosition(topic, partition, offset, { local = false, epoch = -1 } = {}) {
     this.resolveOffset({
       topic,
       partition,
       offset: Long.fromValue(offset).subtract(1).toString(),
-      // A seek names a position, not a record: nothing has been consumed at it yet.
-      leaderEpoch: -1,
+      leaderEpoch: epoch,
     })
     const positions = this.resetPositions[topic]
     if (positions && this.owns(topic, partition)) {
@@ -1868,7 +1877,7 @@ module.exports = class OffsetManager {
           this.topicConfigurations,
           current,
           (topic, partition) => contexts?.get(`${topic}|${partition}`) ?? null,
-          (topic, partition) => this.pendingSeekTimestamp(topic, partition),
+          (topic, partition) => this.pendingSeekTimestamp(topic, partition) ?? undefined,
           preparation
         )
         this.refuse(preparation)
@@ -1892,12 +1901,14 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * The timestamp of a still-current explicit sentinel seek. A retained mutation ticket lets
-   * a newer commit, seek or barrier cancel the intent even between resolution attempts.
+   * The timestamp of a still-current pending reset intent: an explicit sentinel seek, or a local
+   * reset by policy (`resetLocally`). A retained mutation ticket lets a newer commit, seek or
+   * barrier cancel the intent even between resolution attempts.
    * @private
    * @param {string} topic
    * @param {number} partition
-   * @returns {number|undefined} -2 or -1, or undefined when no current seek remains
+   * @returns {number|null|undefined} -2 or -1 for a sentinel seek, null for a reset by the topic's
+   *   policy, or undefined when no current intent remains
    * @throws Never.
    */
   pendingSeekTimestamp(topic, partition) {

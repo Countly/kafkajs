@@ -609,10 +609,20 @@ says so, `groupProtocol: 'consumer'`.
 
 - **Log truncation is detected and acted on.** After a leader change the consumer now checks that
   its position still exists on the new leader, using the leader epoch of the last record it
-  consumed. If the log diverged, the partition moves to the first offset known to diverge; if the
-  divergence point cannot be determined, the partition resets per its `fromBeginning` setting —
-  which, like the existing out-of-range reset, commits that offset to the coordinator even when
-  `autoCommit: false`. Both cases log a warning and emit a new instrumentation event,
+  consumed. If the log diverged, the partition moves to the first offset known to diverge, with the
+  leader epoch the new leader answered; if the divergence point cannot be determined, the
+  partition follows its reset policy (`none` halts it; earliest, latest and `by_duration` resolve
+  a new position at the next fetch round, ignoring the committed offset). The check writes no
+  offset commit: the new position reaches the coordinator with the next automatic commit or your
+  own commit, and with `autoCommit: false` nothing is saved until you commit. A default commit
+  compares offsets only, so a rewind to the offset already committed sends nothing, and a position
+  from a reset is sent only once a record after it has been consumed. If the consumer stops or
+  crashes before that commit, the next assignment starts from the last committed offset, checks it
+  again and repeats the rewind or reset, so some records can be delivered twice. A batch fetched
+  before the new position is fenced as after a seek: it is not handed to a handler, `eachMessage`
+  stops before its next message, `isStale()` is true and its offsets are not resolved or committed.
+  Both cases log a warning, once the new position, reset or halt is in place, and emit a new
+  instrumentation event,
   `consumer.events.LOG_TRUNCATION`, whose payload is
   `{ topic, partition, offset, divergingOffset, leaderEpoch }`: `offset` is where the consumer was
   when the divergence was found, and `divergingOffset` is where it resumes — `null` in the reset

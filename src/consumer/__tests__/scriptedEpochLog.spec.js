@@ -1,0 +1,549 @@
+const apiKeys = require('../../protocol/requests/apiKeys')
+const { decode } = require('../../protocol/requests/offsetForLeaderEpoch/v4/response')
+const { readRequestHeader } = require('testHelpers')
+const {
+  NODE_ID,
+  TOPIC,
+  apiVersionsBody,
+  createFakeBroker,
+  createFetchGroup,
+  offsetForLeaderEpochResponse,
+  scriptedEpochLog,
+} = require('./fixtures/fetchHarness')
+
+/**
+ * The broker's answer to OffsetForLeaderEpoch comes from `LeaderEpochFileCache#endOffsetFor`
+ * (storage/src/main/java/org/apache/kafka/storage/internals/epoch/LeaderEpochFileCache.java).
+ * When it finds nothing (end offset -1), `UnifiedLog#endOffsetForEpoch` returns no value
+ * (core/.../log/UnifiedLog.scala 4.0.0:944-951; storage/.../log/UnifiedLog.java 4.4.0:1316-1325)
+ * and `Partition#lastOffsetForLeaderEpoch` sets only the partition and code NONE
+ * (core/.../cluster/Partition.scala 4.0.0:1729-1731, 4.4.0:1598-1600), so the row carries the
+ * message defaults: LeaderEpoch -1, EndOffset -1 (OffsetForLeaderEpochResponse.json).
+ */
+const CACHE = {
+  epochs: [
+    [3, 20],
+    [5, 40],
+    [8, 100],
+  ],
+  logEnd: 150,
+}
+const FOLLOWER = { ...CACHE, leader: false }
+const FOLLOWER_AHEAD = { ...FOLLOWER, leaderEpoch: 9 }
+const EMPTY_LEADER = { epochs: [], logEnd: 0, leaderEpoch: 5 }
+const UNDEFINED = { leaderEpoch: -1, endOffset: '-1' }
+const FENCED = { errorCode: 74, ...UNDEFINED }
+const UNKNOWN = { errorCode: 75, ...UNDEFINED }
+const NOT_LEADER = { errorCode: 6, ...UNDEFINED }
+
+/**
+ * @param {number} leaderEpoch
+ * @param {string} endOffset
+ * @returns {{ errorCode: 0, leaderEpoch: number, endOffset: string }} a successful lookup row
+ */
+const lookupRow = (leaderEpoch, endOffset) => ({ errorCode: 0, leaderEpoch, endOffset })
+
+/**
+ * A request for one topic, in the shape the consumer group sends.
+ * @param {number} partition
+ * @param {number} leaderEpoch the epoch asked about
+ * @param {number} [currentLeaderEpoch] the epoch the client believes the leader is at
+ * @returns {{ topics: object[] }}
+ */
+const validationRequest = (partition, leaderEpoch, currentLeaderEpoch = 9) => ({
+  topics: [{ topic: TOPIC, partitions: [{ partition, currentLeaderEpoch, leaderEpoch }] }],
+})
+
+const harnesses = []
+
+/**
+ * `createFetchGroup`, torn down after the test whatever its outcome.
+ * @param {object} [options] the harness options
+ * @returns {Promise<object>} the harness
+ */
+const fetchGroup = async (options) => {
+  const harness = await createFetchGroup(options)
+  harnesses.push(harness)
+  return harness
+}
+
+afterEach(async () => {
+  await Promise.all(harnesses.splice(0).map((harness) => harness.teardown()))
+})
+
+/** @returns {Promise<void>} once every queued immediate has run */
+const nextTurn = () => new Promise(setImmediate)
+
+describe('Test harness > scripted OffsetForLeaderEpoch answers', () => {
+  // Source lines are LeaderEpochFileCache.java at 4.0.0 / 4.4.0.
+  test.each([
+    // the latest cached epoch: that epoch and the log end (4.0.0:293-298, 4.4.0:292-297)
+    ['the current epoch', 8, CACHE, { leaderEpoch: 8, endOffset: '150' }],
+    // same branch for a leader that wrote nothing in its epoch yet (start = log end)
+    [
+      'the current epoch before any record of it',
+      8,
+      {
+        epochs: [
+          [3, 20],
+          [8, 150],
+        ],
+        logEnd: 150,
+      },
+      { leaderEpoch: 8, endOffset: '150' },
+    ],
+    // floor and next start (4.0.0:300,306,314-317; 4.4.0:299,305,313-316)
+    [
+      'an epoch present in the cache below the current one',
+      5,
+      CACHE,
+      { leaderEpoch: 5, endOffset: '100' },
+    ],
+    ['an epoch between two cached epochs', 6, CACHE, { leaderEpoch: 5, endOffset: '100' }],
+    // no floor: the requested epoch and the first cached start (4.0.0:307-313, 4.4.0:306-312)
+    ['an epoch below the first cached one', 2, CACHE, { leaderEpoch: 2, endOffset: '20' }],
+    // no higher entry: undefined (4.0.0:300-304, 4.4.0:299-303)
+    ['an epoch above the current one', 9, CACHE, UNDEFINED],
+    // no latest epoch and no higher entry: undefined (4.0.0:293,300-304; 4.4.0:292,299-303)
+    ['any epoch of an empty cache', 5, { epochs: [], logEnd: 0 }, UNDEFINED],
+    // the undefined epoch itself (4.0.0:289-292, 4.4.0:288-291)
+    ['the undefined epoch', -1, CACHE, UNDEFINED],
+  ])('scriptedEpochLog answers %s as the broker does', (_case, requested, log, expected) => {
+    expect(scriptedEpochLog(log).endOffsetFor(requested)).toEqual(expected)
+  })
+
+  // ReplicaManager#lastOffsetForLeaderEpoch treats a current epoch of -1 as absent and asks only
+  // the leader (ReplicaManager.scala 4.0.0:2593-2602, 4.4.0:2266-2275). The epoch check
+  // (Partition.scala checkCurrentLeaderEpoch 4.0.0:509-522, 4.4.0:369-382) runs before the leader
+  // check (getLocalLog 4.0.0:524-541, 4.4.0:384-401), and an error row carries only partition and
+  // code (lastOffsetForLeaderEpoch 4.0.0:1716-1738, 4.4.0:1585-1607).
+  test.each([
+    ['a current epoch below the broker one', CACHE, 7, 5, FENCED],
+    ['a current epoch above the broker one', CACHE, 9, 5, UNKNOWN],
+    ['a follower at the current epoch', FOLLOWER, 8, 5, NOT_LEADER],
+    ['a follower whose epoch is ahead of its cache', FOLLOWER_AHEAD, 9, 5, NOT_LEADER],
+    ['a current epoch below a follower one, checked before leadership', FOLLOWER, 7, 5, FENCED],
+    ['a current epoch above a follower one, checked before leadership', FOLLOWER, 9, 5, UNKNOWN],
+    ['no current epoch at a follower', FOLLOWER, -1, 5, NOT_LEADER],
+    ['no current epoch at the leader', CACHE, -1, 5, lookupRow(5, '100')],
+    ['the latest epoch', CACHE, 8, 8, lookupRow(8, '150')],
+    ['a cached epoch below the latest', CACHE, 8, 5, lookupRow(5, '100')],
+    ['an epoch between cached epochs', CACHE, 8, 6, lookupRow(5, '100')],
+    ['an epoch below the first cached one', CACHE, 8, 2, lookupRow(2, '20')],
+    ['an epoch above the latest', CACHE, 8, 9, lookupRow(-1, '-1')],
+    ['an empty cache', EMPTY_LEADER, 5, 5, lookupRow(-1, '-1')],
+    ['the undefined epoch', CACHE, 8, -1, lookupRow(-1, '-1')],
+  ])(
+    'the encoded answer to %s carries the code and fields the broker sends',
+    async (_case, log, currentLeaderEpoch, leaderEpoch, expected) => {
+      const body = scriptedEpochLog(log).answer([3], {
+        nodeId: NODE_ID,
+        partitions: [{ partition: 3, currentLeaderEpoch, leaderEpoch }],
+      })
+
+      expect((await decode(body)).topics).toEqual([
+        { topic: TOPIC, partitions: [{ partition: 3, ...expected }] },
+      ])
+    }
+  )
+
+  test('scriptedEpochLog writes one row per requested partition, each for the epoch it asked about', async () => {
+    const body = scriptedEpochLog(CACHE).answer([0, 1, 2], {
+      nodeId: NODE_ID,
+      partitions: [
+        { partition: 0, currentLeaderEpoch: 8, leaderEpoch: 5 },
+        { partition: 1, currentLeaderEpoch: 8, leaderEpoch: 2 },
+        { partition: 2, currentLeaderEpoch: 8, leaderEpoch: 9 },
+      ],
+    })
+
+    expect((await decode(body)).topics).toEqual([
+      {
+        topic: TOPIC,
+        partitions: [
+          { errorCode: 0, partition: 0, leaderEpoch: 5, endOffset: '100' },
+          { errorCode: 0, partition: 1, leaderEpoch: 2, endOffset: '20' },
+          { errorCode: 0, partition: 2, leaderEpoch: -1, endOffset: '-1' },
+        ],
+      },
+    ])
+  })
+
+  test('scriptedEpochLog refuses to answer a row without a current leader epoch', () => {
+    const { answer } = scriptedEpochLog(CACHE)
+
+    expect(() => answer([0], { partitions: [{ partition: 0, leaderEpoch: 5 }] })).toThrow(
+      /partition 0 carries no current leader epoch/
+    )
+  })
+
+  test.each([
+    [
+      'epochs that do not rise',
+      [
+        [5, 0],
+        [5, 10],
+      ],
+      20,
+    ],
+    [
+      'starts that fall',
+      [
+        [3, 10],
+        [5, 0],
+      ],
+      20,
+    ],
+    [
+      'a start past the log end',
+      [
+        [3, 0],
+        [5, 30],
+      ],
+      20,
+    ],
+  ])('scriptedEpochLog refuses a cache with %s', (_case, epochs, logEnd) => {
+    expect(() => scriptedEpochLog({ epochs, logEnd })).toThrow(/epoch 5/)
+  })
+
+  // LeaderEpochFileCache#assign refuses a negative epoch or start and removes every entry at or
+  // above the new epoch or start (4.0.0:125-139,151-154; 4.4.0:124-138,150-153). A leader assigns
+  // its epoch at its log end on election (Partition.scala 4.0.0:775-788, 4.4.0:636-649).
+  test.each([
+    [
+      'an epoch that starts where the one before it started, which the broker removes',
+      {
+        epochs: [
+          [3, 20],
+          [5, 40],
+          [6, 40],
+        ],
+        logEnd: 50,
+      },
+      /epoch 6 at 40 does not follow epoch 5/,
+    ],
+    [
+      'a negative cached epoch',
+      {
+        epochs: [
+          [-1, 0],
+          [5, 10],
+        ],
+        logEnd: 20,
+      },
+      /epoch -1 at 0 is negative/,
+    ],
+    ['a negative cached start', { epochs: [[5, -1]], logEnd: 20 }, /epoch 5 at -1 is negative/],
+    [
+      'a leader whose epoch is not its latest cached one',
+      {
+        epochs: [
+          [3, 0],
+          [5, 10],
+        ],
+        logEnd: 20,
+        leaderEpoch: 6,
+      },
+      /leader epoch 6/,
+    ],
+    [
+      'a follower whose epoch is below its latest cached one',
+      {
+        epochs: [
+          [3, 0],
+          [5, 10],
+        ],
+        logEnd: 20,
+        leader: false,
+        leaderEpoch: 4,
+      },
+      /leader epoch 4/,
+    ],
+    ['a negative leader epoch', { epochs: [], logEnd: 0, leaderEpoch: -1 }, /leader epoch -1/],
+  ])('scriptedEpochLog refuses %s', (_case, log, message) => {
+    expect(() => scriptedEpochLog(log)).toThrow(message)
+  })
+})
+
+describe('Test harness > withheld broker answers', () => {
+  test('a withheld answer lets a later answer on the same connection through, and arrives when released', async () => {
+    let release
+    const withheld = new Promise((resolve) => (release = resolve))
+    let validations = 0
+    const { broker } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      validations += 1
+      return validations === 1
+        ? withheld
+        : offsetForLeaderEpochResponse([{ partition: 1, leaderEpoch: 4, endOffset: '30' }])
+    })
+    await broker.connect()
+
+    try {
+      const first = broker.offsetForLeaderEpoch(validationRequest(0, 4))
+      const firstSettled = jest.fn()
+      first.then(firstSettled, () => {})
+
+      const second = await broker.offsetForLeaderEpoch(validationRequest(1, 4))
+      expect(second.topics[0].partitions).toEqual([
+        { errorCode: 0, partition: 1, leaderEpoch: 4, endOffset: '30' },
+      ])
+      expect(validations).toBe(2)
+      expect(firstSettled).not.toHaveBeenCalled()
+
+      release(offsetForLeaderEpochResponse([{ partition: 0, leaderEpoch: 4, endOffset: '20' }]))
+      expect((await first).topics[0].partitions).toEqual([
+        { errorCode: 0, partition: 0, leaderEpoch: 4, endOffset: '20' },
+      ])
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  test('createFakeBroker hands each answer the frame it answers, even when requests are queued together', async () => {
+    const answered = []
+    const { broker } = createFakeBroker((header, frame) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      answered.push({ header: header.correlationId, frame: readRequestHeader(frame).correlationId })
+      return offsetForLeaderEpochResponse([{ partition: 0 }])
+    })
+    await broker.connect()
+
+    try {
+      await Promise.all([
+        broker.offsetForLeaderEpoch(validationRequest(0, 4)),
+        broker.offsetForLeaderEpoch(validationRequest(1, 4)),
+      ])
+
+      expect(answered).toHaveLength(2)
+      expect(answered[0].header).not.toBe(answered[1].header)
+      for (const { header, frame } of answered) expect(frame).toBe(header)
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  test('a rejected withheld answer closes the connection, so its request fails instead of waiting', async () => {
+    const { broker } = createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions
+        ? apiVersionsBody(18)
+        : Promise.reject(new Error('answer cancelled'))
+    )
+    await broker.connect()
+
+    try {
+      await expect(broker.offsetForLeaderEpoch(validationRequest(0, 4))).rejects.toMatchObject({
+        name: 'KafkaJSConnectionClosedError',
+      })
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+})
+
+describe('Test harness > fetch group routing', () => {
+  test('by default the group sees a constant leader epoch and a forget only records the call', async () => {
+    const { cluster, installRouting } = await fetchGroup({ knownNodes: [0, 1] })
+
+    installRouting({ 0: 1 })
+    expect(cluster.leaderEpoch(TOPIC, 0)).toBe(5)
+    expect(cluster.cachedLeader(TOPIC, 0)).toBe(1)
+    expect(cluster.forgetLeaderEpoch(TOPIC, 0)).toBe(true)
+    expect(cluster.leaderEpoch(TOPIC, 0)).toBe(5)
+  })
+
+  test('with liveRouting the group sees the epoch the metadata cache holds, and a forget clears it there', async () => {
+    const { cluster, installRouting, metadataCache } = await fetchGroup({
+      knownNodes: [0, 1],
+      liveRouting: true,
+    })
+    expect(cluster.leaderEpoch(TOPIC, 0)).toBe(5)
+
+    installRouting({ 0: 1 })
+    expect(cluster.leaderEpoch(TOPIC, 0)).toBe(6)
+    expect(cluster.cachedLeader(TOPIC, 0)).toBe(1)
+
+    await cluster.applyLeaderHint({ topic: TOPIC, partition: 0, leaderId: 0, leaderEpoch: 9 })
+    expect(cluster.leaderEpoch(TOPIC, 0)).toBe(9)
+    expect(cluster.cachedLeader(TOPIC, 0)).toBe(0)
+
+    expect(cluster.forgetLeaderEpoch(TOPIC, 0)).toBe(true)
+    expect(cluster.forgetLeaderEpoch).toHaveBeenCalledWith(TOPIC, 0)
+    expect(cluster.leaderEpoch(TOPIC, 0)).toBe(-1)
+    expect(metadataCache.leaderEpoch(TOPIC, 0)).toBe(-1)
+  })
+
+  test('with liveRouting an accepted leader hint moves routing, validation and Fetch to the new leader', async () => {
+    const h = await fetchGroup({
+      knownNodes: [0, 1],
+      partitionLeaders: { 0: 1 },
+      liveRouting: true,
+      validationBrokers: true,
+      committedEpoch: 4,
+      position: '10',
+    })
+    // Node 0 leads at epoch 9, which it entered at offset 20.
+    h.setValidationResponse(
+      scriptedEpochLog({
+        epochs: [
+          [4, 0],
+          [9, 20],
+        ],
+        logEnd: 20,
+      }).answer
+    )
+    expect(h.cluster.findLeaderForPartitions(TOPIC, [0])).toEqual({ 1: [0] })
+
+    await expect(
+      h.cluster.applyLeaderHint({ topic: TOPIC, partition: 0, leaderId: 0, leaderEpoch: 9 })
+    ).resolves.toBe(true)
+    expect(h.cluster.findLeaderForPartitions(TOPIC, [0])).toEqual({ 0: [0] })
+    expect(h.cluster.findTopicPartitionMetadata(TOPIC)).toEqual([{ partitionId: 0, leader: 0 }])
+
+    await h.group.fetch(0)
+
+    expect(h.validationRequestsTo(1)).toEqual([])
+    expect(h.validationRequestsTo(0)).toEqual([
+      {
+        replicaId: -1,
+        topics: [
+          { topic: TOPIC, partitions: [{ partition: 0, currentLeaderEpoch: 9, leaderEpoch: 4 }] },
+        ],
+      },
+    ])
+    expect(h.fetchRequestPartitions()).toEqual([0])
+  })
+
+  test('with validationBrokers each node answers on its own connection and is told which node it is', async () => {
+    const { cluster, setValidationResponse, validationRequestsTo, writesTo } = await fetchGroup({
+      partitions: [0, 1],
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    const asked = []
+    setValidationResponse((partitions, { nodeId, partitions: rows }) => {
+      asked.push({ nodeId, partitions, epochs: rows.map(({ leaderEpoch }) => leaderEpoch) })
+      return offsetForLeaderEpochResponse(partitions.map((partition) => ({ partition })))
+    })
+
+    const node0 = await cluster.findBroker({ nodeId: 0 })
+    const node1 = await cluster.findBroker({ nodeId: 1 })
+    expect(node1).not.toBe(node0)
+    expect(await cluster.findBroker({ nodeId: 1 })).toBe(node1)
+
+    await node1.offsetForLeaderEpoch(validationRequest(1, 3))
+
+    expect(asked).toEqual([{ nodeId: 1, partitions: [1], epochs: [3] }])
+    expect(validationRequestsTo(1)).toEqual([
+      {
+        replicaId: -1,
+        topics: [
+          { topic: TOPIC, partitions: [{ partition: 1, currentLeaderEpoch: 9, leaderEpoch: 3 }] },
+        ],
+      },
+    ])
+    expect(validationRequestsTo(0)).toEqual([])
+    expect(writesTo(2)).toEqual([])
+  })
+
+  test('validation requests queued together each receive the rows of their own frame', async () => {
+    const { broker, setValidationResponse, validationRequests } = await fetchGroup({
+      partitions: [0, 1],
+    })
+    setValidationResponse((_partitions, { partitions: rows }) =>
+      offsetForLeaderEpochResponse(
+        rows.map(({ partition, leaderEpoch }) => ({
+          partition,
+          leaderEpoch,
+          endOffset: String(10 + partition),
+        }))
+      )
+    )
+
+    const [first, second] = await Promise.all([
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)),
+      broker.offsetForLeaderEpoch(validationRequest(1, 3)),
+    ])
+
+    expect(validationRequests()).toHaveLength(2)
+    expect(first.topics[0].partitions).toEqual([
+      { errorCode: 0, partition: 0, leaderEpoch: 4, endOffset: '10' },
+    ])
+    expect(second.topics[0].partitions).toEqual([
+      { errorCode: 0, partition: 1, leaderEpoch: 3, endOffset: '11' },
+    ])
+  })
+
+  test('a held broker lookup waits until released while other nodes are found', async () => {
+    const { cluster, holdBrokerLookup } = await fetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    const release = holdBrokerLookup(1)
+    const found = jest.fn()
+    const held = cluster.findBroker({ nodeId: 1 }).then(found)
+
+    await cluster.findBroker({ nodeId: 0 })
+    await nextTurn()
+    expect(found).not.toHaveBeenCalled()
+
+    release()
+    await held
+    expect(found).toHaveBeenCalledTimes(1)
+    expect(found.mock.calls[0][0]).not.toBe(await cluster.findBroker({ nodeId: 0 }))
+  })
+
+  test('a lookup held twice on one node waits for both releases', async () => {
+    const { cluster, holdBrokerLookup } = await fetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    // Node 1's broker is connected first, so a lookup let through resolves within a turn.
+    await cluster.findBroker({ nodeId: 1 })
+    const releaseFirst = holdBrokerLookup(1)
+    const found = jest.fn()
+    const held = cluster.findBroker({ nodeId: 1 }).then(found)
+    const releaseSecond = holdBrokerLookup(1)
+
+    releaseFirst()
+    await nextTurn()
+    expect(found).not.toHaveBeenCalled()
+
+    releaseSecond()
+    await held
+    expect(found).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('Test harness > fetch group teardown', () => {
+  test('teardown fails a validation request whose answer is withheld', async () => {
+    const { broker, setValidationResponse, validationRequests, teardown } = await fetchGroup()
+    setValidationResponse(() => new Promise(() => {}))
+
+    const outcome = broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+      () => 'answered',
+      (error) => error.name
+    )
+    while (validationRequests().length === 0) await nextTurn()
+
+    await teardown()
+
+    expect(await outcome).toBe('KafkaJSConnectionClosedError')
+  })
+
+  test('teardown ends a held broker lookup with an error', async () => {
+    const { cluster, holdBrokerLookup, teardown } = await fetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    holdBrokerLookup(1)
+    const lookup = cluster.findBroker({ nodeId: 1 }).then(
+      () => 'found',
+      (error) => error.message
+    )
+
+    await teardown()
+
+    expect(await lookup).toBe('fetch harness torn down')
+  })
+})

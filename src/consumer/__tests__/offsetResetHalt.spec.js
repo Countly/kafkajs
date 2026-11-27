@@ -349,8 +349,14 @@ test('none retries an out-of-range follower once before halting the leader resul
   expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
 })
 
-test('none halts unknown divergence without a reset request', async () => {
+/**
+ * A none group whose partitions are awaiting a validation answer at leader epoch 5, with the round
+ * identity and the request record `validatePositions` would have built for each.
+ * @returns {object} the `noneGroup` fixture plus `preparation` and `itemFor(partition)`
+ */
+const validatingNoneGroup = () => {
   const ctx = noneGroup({ committed: '3' })
+  ctx.cluster.leaderEpoch = () => 5
   const preparation = {
     manager: ctx.manager,
     guard: () => null,
@@ -358,17 +364,35 @@ test('none halts unknown divergence without a reset request', async () => {
     ownershipToken: ctx.group.ownership.token(),
     assignmentEpoch: ctx.group.assignmentEpoch,
   }
+  const validator = ctx.group.positionValidator
+  const itemFor = (partition) => {
+    const { generation } = validator.request(TOPIC, partition, {
+      offset: '7',
+      trackedEpoch: 3,
+      currentLeaderEpoch: 5,
+    })
+    return {
+      topic: TOPIC,
+      partition,
+      trackedEpoch: 3,
+      currentLeaderEpoch: 5,
+      generation,
+      requestClock: 2,
+      entry: validator.entryOf(TOPIC, partition),
+    }
+  }
+  return { ...ctx, preparation, itemFor }
+}
+
+test('none halts unknown divergence without a reset request', async () => {
+  const ctx = validatingNoneGroup()
   const setDefault = jest.spyOn(ctx.manager, 'setDefaultOffset')
-  const apply = ctx.manager.reposition
-  const refusals = []
-  const seek = jest.spyOn(ctx.manager, 'reposition').mockImplementation(function (entry, bound) {
-    refusals.push(bound.guard())
-    return apply.call(this, entry, bound)
-  })
   const truncations = []
   ctx.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (event) => truncations.push(event))
-  const unknown = { action: 'reset', divergingOffset: null, leaderEpoch: 3 }
-  await ctx.group.applyValidationOutcome(TOPIC, 0, '7', unknown, preparation, 2)
+  const unknown = { action: 'reset', divergingOffset: null, leaderEpoch: -1 }
+  expect(ctx.group.publishValidationOutcome(ctx.itemFor(0), '7', unknown, ctx.preparation)).toBe(
+    true
+  )
   expect(ctx.group.haltedPartitions.get(KEY)).toMatchObject({
     offset: '7',
     reason: 'offset-out-of-range',
@@ -379,13 +403,32 @@ test('none halts unknown divergence without a reset request', async () => {
   expect(truncations).toHaveLength(1)
 
   const known = { action: 'truncated', divergingOffset: '4', leaderEpoch: 3 }
-  await ctx.group.applyValidationOutcome(TOPIC, 1, '7', known, preparation, 2)
-  expect(seek).toHaveBeenCalledWith(
-    { topic: TOPIC, partition: 1, offset: '4' },
-    { guard: expect.any(Function), fence: undefined }
-  )
-  expect(refusals).toEqual([null])
+  expect(ctx.group.publishValidationOutcome(ctx.itemFor(1), '7', known, ctx.preparation)).toBe(true)
+  expect(ctx.manager.positionOf(TOPIC, 1)).toBe('4')
+  expect(ctx.manager.lastConsumedEpoch(TOPIC, 1)).toBe(3)
+  expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
   expect(ctx.halts).toHaveLength(1)
+})
+
+test('a PARTITION_HALTED listener that seeks a partition halted for an unknown divergence under none replaces the halt', async () => {
+  const ctx = validatingNoneGroup()
+  const truncations = []
+  ctx.group.instrumentationEmitter.addListener(PARTITION_HALTED, () =>
+    ctx.group.seek({ topic: TOPIC, partition: 0, offset: '5' })
+  )
+  ctx.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (event) => truncations.push(event))
+  const unknown = { action: 'reset', divergingOffset: null, leaderEpoch: -1 }
+
+  expect(ctx.group.publishValidationOutcome(ctx.itemFor(0), '7', unknown, ctx.preparation)).toBe(
+    true
+  )
+  expect(ctx.halts).toHaveLength(1)
+  expect(truncations).toHaveLength(1)
+  await ctx.group.seekOffsets([{ topic: TOPIC, partitions: [0] }])
+
+  expect(ctx.group.haltedPartitions.has(KEY)).toBe(false)
+  expect(ctx.manager.nextOffset(TOPIC, 0).toString()).toBe('5')
+  expect(ctx.coordinator.offsetCommit).not.toHaveBeenCalled()
 })
 
 test('seek recovers a none halt without installing automatic progress', async () => {
