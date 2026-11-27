@@ -1714,31 +1714,39 @@ module.exports = class ConsumerGroup {
 
   /**
    * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error and
-   * on a refused answer no coordinator sends (`MALFORMED_GROUP_ANSWER`), which counts against the
-   * retries like any other. When the retries or `retry.maxTotalTime` run out on such an answer,
-   * the failure is a non-retriable `KafkaJSPartialMessageError` naming the group, the member and
-   * the refusal: the leader or coordinator that wrote it would answer a restarted member the same.
+   * on a refused group answer (`MALFORMED_GROUP_ANSWER`), which counts against the retries like
+   * any other. A join that ends while the last answer it received was refused - the retries or
+   * `retry.maxTotalTime` run out, or the round's deadline passes in the backoff or in a later
+   * attempt that got no answer - fails with a non-retriable `KafkaJSPartialMessageError` naming the
+   * group, the member and the refusal: the leader or coordinator that wrote it may answer a
+   * restarted member the same. A stop, or a round another one replaced, ends it as before, and so
+   * does a join whose last answer was not refused.
    * @private
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
    * @throws {Error} what the retrier gave up with
    * @param {object} round original round; retries create attempts without renewing its time
    */
   async joinAndSyncAttempt(round) {
+    const last = { refused: null }
     try {
-      return await this.joinAndSyncRetried(round)
+      return await this.joinAndSyncRetried(round, last)
     } catch (error) {
-      const refused = error?.name === 'KafkaJSDeliveryTimeout' ? error.cause : error
+      // Only the round's own deadline, or nothing, may have ended it: a stop and a replacement win.
+      const ended = round.guard()
       if (
-        (error?.name === 'KafkaJSNumberOfRetriesExceeded' ||
-          error?.name === 'KafkaJSDeliveryTimeout') &&
-        isMalformedGroupAnswer(refused)
+        last.refused === null ||
+        this.isStopping() ||
+        this.idleWait !== round.run ||
+        round.run.disposed ||
+        this.roundContext !== round ||
+        (ended !== null && ended.type !== 'JOIN_DEADLINE_EXCEEDED')
       ) {
-        // No cause: the crash policy restarts on a retriable cause, and the refusal is one.
-        throw new KafkaJSPartialMessageError(
-          `Group ${this.groupId} member ${this.memberId || '(no id yet)'}: the join retries ran out on an answer no coordinator sends: ${refused.message}`
-        )
+        throw error
       }
-      throw error
+      // No cause: the crash policy restarts on a retriable cause, and the refusal is one.
+      throw new KafkaJSPartialMessageError(
+        `Group ${this.groupId} member ${this.memberId || '(no id yet)'}: the join ended on a refused group answer: ${last.refused.message}`
+      )
     }
   }
 
@@ -1746,9 +1754,11 @@ module.exports = class ConsumerGroup {
    * The join retrier itself, for `joinAndSyncAttempt`.
    * @private
    * @param {object} round
+   * @param {{ refused: Error|null }} last the refusal of the last answer received, null when that
+   *   answer was not refused
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>}
    */
-  joinAndSyncRetried(round) {
+  joinAndSyncRetried(round, last) {
     return this.retrier(async (bail) => {
       const { membershipRevision } = this.groupMembership
       const attempt = round.attempt()
@@ -1775,6 +1785,9 @@ module.exports = class ConsumerGroup {
         )
       } catch (e) {
         const refusal = attempt.guard()
+        // The round's own end is no answer: it keeps the last refusal.
+        if (isMalformedGroupAnswer(e)) last.refused = e
+        else if (!refusal) last.refused = null
         if (refusal || isHeartbeatFatal(e)) return bail(e)
         if (isRebalancing(e)) {
           throw new KafkaJSError(e)
@@ -1804,10 +1817,10 @@ module.exports = class ConsumerGroup {
           throw new KafkaJSError(e)
         }
 
-        // A JoinGroup or SyncGroup answer no coordinator sends was refused before it changed
+        // A JoinGroup or SyncGroup answer this member cannot use was refused before it changed
         // anything; join again while retries are left, as after a rebalance.
         if (isMalformedGroupAnswer(e)) {
-          this.logger.warn('Refused a group answer no coordinator sends', {
+          this.logger.warn('Refused a group answer this member cannot use', {
             groupId: this.groupId,
             memberId: this.memberId,
             error: e.message,

@@ -121,4 +121,32 @@ const readSyncAssignment = (bytes) => {
   }
 }
 
-module.exports = { readAssignmentRows, readSyncAssignment }
+/**
+ * Every partition a reader of these assignment bytes may apply: each row read before the bytes
+ * end or break, every row of a repeated topic, a null list as none. This covers what
+ * `readSyncAssignment` applies, what `MemberAssignment.decode` and older kafkajs readers apply
+ * (the last row of a topic, null lists as empty), and the rows they read before a later field
+ * fails, so a leader can check ownership before it sends bytes other members decode their own way.
+ * @param {Buffer|null} bytes
+ * @returns {{ topic: string|null, partition: number }[]} in row order, repeats included
+ */
+const claimedPartitions = (bytes) => {
+  const claimed = []
+  if (!Buffer.isBuffer(bytes)) return claimed
+  const decoder = new Decoder(bytes)
+  try {
+    if (!decoder.canReadInt16()) return claimed
+    decoder.readInt16()
+    // Each row takes at least six bytes, so a count larger than the bytes ends at their end.
+    const count = decoder.readInt32()
+    for (let row = 0; row < count; row++) {
+      const { topic, partitions } = readRow(decoder)
+      for (const partition of partitions ?? []) claimed.push({ topic, partition })
+    }
+  } catch (error) {
+    if (!(error instanceof KafkaJSPartialMessageError)) throw error
+  }
+  return claimed
+}
+
+module.exports = { readAssignmentRows, readSyncAssignment, claimedPartitions }

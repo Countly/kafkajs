@@ -3,8 +3,8 @@ const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { MemberMetadata } = require('../assignerProtocol')
-const { readSyncAssignment } = require('../assignmentRows')
-const { isMalformedGroupAnswer } = require('../../protocol/requests/groupProtocolCheck')
+const { readSyncAssignment, claimedPartitions } = require('../assignmentRows')
+const Encoder = require('../../protocol/encoder')
 const {
   KafkaJSNonRetriableError,
   KafkaJSConnectionError,
@@ -45,20 +45,6 @@ const losesCoordinator = (error) =>
   error instanceof KafkaJSConnectionError ||
   error instanceof KafkaJSRequestTimeoutError ||
   isStaleCoordinator(error)
-
-/**
- * The partitions a member applies from assignment bytes, read as SyncGroup reads them.
- * @param {Buffer} bytes
- * @returns {Object<string, number[]>} nothing for bytes the member refuses
- */
-const applied = (bytes) => {
-  try {
-    return readSyncAssignment(bytes).assignment
-  } catch (error) {
-    if (isMalformedGroupAnswer(error)) return {}
-    throw error
-  }
-}
 
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
@@ -658,7 +644,8 @@ module.exports = class ClassicGroupProtocol {
         memberId,
         topics,
       })
-      const assigner = this.assigners.find(({ name }) => name === groupProtocol)
+      // The coordinator echoes the name as JoinGroup wrote it.
+      const assigner = this.assigners.find(({ name }) => Encoder.isEchoOf(groupProtocol, name))
 
       if (!assigner) {
         throw new KafkaJSNonRetriableError(
@@ -746,9 +733,9 @@ module.exports = class ClassicGroupProtocol {
    *
    * A member whose subscription carries no owned partitions - a v0 subscription, or one this
    * member cannot decode - contributes nothing to the ownership set, so an unknown owner is never
-   * treated as a conflict. Each assigned buffer is read as SyncGroup applies it
-   * (`readSyncAssignment`): every row of a repeated topic counts, and bytes a member refuses
-   * assign it nothing.
+   * treated as a conflict. Each assigned buffer counts every partition any member's reader may
+   * apply from it (`claimedPartitions`), including members on an older client that read bytes this
+   * client refuses.
    *
    * @param {{ members: Array<{memberId: string, memberMetadata: Buffer}>,
    *   assignment: Array<{memberId: string, memberAssignment: Buffer}> }} round
@@ -768,15 +755,13 @@ module.exports = class ClassicGroupProtocol {
     }
 
     for (const { memberId, memberAssignment } of assignment) {
-      for (const [topic, partitions] of Object.entries(applied(memberAssignment))) {
-        for (const partition of partitions) {
-          const owner = ownerOf.get(`${topic}|${partition}`)
+      for (const { topic, partition } of claimedPartitions(memberAssignment)) {
+        const owner = ownerOf.get(`${topic}|${partition}`)
 
-          if (owner !== undefined && owner !== memberId) {
-            throw new KafkaJSNonRetriableError(
-              `Cooperative rebalance would assign ${topic}-${partition} to ${memberId} while ${owner} still owns it; use the cooperative-sticky assigner or an assignor that withholds moved partitions`
-            )
-          }
+        if (owner !== undefined && owner !== memberId) {
+          throw new KafkaJSNonRetriableError(
+            `Cooperative rebalance would assign ${topic}-${partition} to ${memberId} while ${owner} still owns it; use the cooperative-sticky assigner or an assignor that withholds moved partitions`
+          )
         }
       }
     }

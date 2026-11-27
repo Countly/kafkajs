@@ -1,5 +1,6 @@
 const { createErrorFromCode } = require('../error')
 const { KafkaJSError } = require('../../errors')
+const Encoder = require('../encoder')
 
 const INCONSISTENT_GROUP_PROTOCOL = 23
 const MALFORMED_GROUP_ANSWER = 'MALFORMED_GROUP_ANSWER'
@@ -22,7 +23,8 @@ const assertSameProtocol = (received, sent) => {
 }
 
 /**
- * The refusal of a JoinGroup or SyncGroup answer no coordinator sends. Retriable, with the type
+ * The refusal of a JoinGroup answer no coordinator sends, or of a SyncGroup assignment this member
+ * cannot use (the coordinator relays the leader's bytes unread). Retriable, with the type
  * `MALFORMED_GROUP_ANSWER`, so the consumer's join retrier joins again instead of using it.
  * @param {string} message names the API and what is wrong
  * @returns {KafkaJSError}
@@ -41,8 +43,9 @@ const isMalformedGroupAnswer = (error) => error?.type === MALFORMED_GROUP_ANSWER
 
 /**
  * Refuses a successful JoinGroup answer no Kafka 4.x coordinator sends: it always names a member
- * id, a generation of 0 or more and one of the protocols the member offered, and gives the leader
- * every member, itself included, once each. Followers get no member list, so theirs is not read.
+ * id, a generation of 0 or more and one of the protocols the member offered, as the request wrote
+ * its name, and gives the leader every member, itself included, once each. Followers get no member
+ * list, so theirs is not read.
  * @see https://github.com/apache/kafka/blob/4.4.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
  * @param {{ memberId: string|null, generationId: number, groupProtocol: string|null,
  *   leaderId: string|null, members: { memberId: string|null }[] }} answer the decoded answer
@@ -60,7 +63,7 @@ const assertJoinAnswer = (
   if (!Number.isInteger(generationId) || generationId < 0) {
     throw malformedGroupAnswer(`JoinGroup response names generation ${generationId}`)
   }
-  if (!offered.some(({ name }) => name === groupProtocol)) {
+  if (!offered.some(({ name }) => Encoder.isEchoOf(groupProtocol, name))) {
     throw malformedGroupAnswer(
       `JoinGroup response names protocol ${groupProtocol}, which this member did not offer`
     )
