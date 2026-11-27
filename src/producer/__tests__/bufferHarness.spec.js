@@ -117,11 +117,9 @@ describe('Producer > fixtures > bufferHarness', () => {
     expect(sent.read()).toBe(sent.read())
   })
 
-  test('takeSent fixes every batch at the call: later changes to any batch list, record or buffer are not read', async () => {
-    const buffer = Buffer.from('first')
-    const second = { value: 'second', timestamp: 2 }
-    const head = [{ value: buffer, timestamp: 1 }]
-    const tail = [second]
+  test('takeSent fixes every batch’s record list at the call: later changes to either list are not read', async () => {
+    const head = [{ value: Buffer.from('first'), timestamp: 1 }]
+    const tail = [{ value: 'second', timestamp: 2 }]
     const sent = takeSent({
       topicData: [
         {
@@ -133,10 +131,9 @@ describe('Producer > fixtures > bufferHarness', () => {
         },
       ],
     })
-    buffer.fill('x')
-    head.push({ value: 'later' })
-    second.value = 'changed'
+    head.push({ value: 'later', timestamp: 3 })
     tail.length = 0
+    tail.push({ value: 'replaced', timestamp: 4 })
 
     const read = await sent.read()
 
@@ -148,6 +145,36 @@ describe('Producer > fixtures > bufferHarness', () => {
       ['first'],
       ['second'],
     ])
+  })
+
+  test('takeSent at the call runs none of the built-ins the producer specs spy on, nor the clock', () => {
+    const spies = [
+      jest.spyOn(Array.prototype, 'every'),
+      jest.spyOn(Array.prototype, 'flatMap'),
+      jest.spyOn(Array.prototype, 'shift'),
+      jest.spyOn(Promise, 'all'),
+      jest.spyOn(Date, 'now'),
+    ]
+    const calls = []
+    try {
+      takeSent({
+        topicData: [
+          {
+            topic: 'topic-a',
+            partitions: [
+              { partition: 0, messages: [{ value: 'a' }, { value: 'b' }] },
+              { partition: 1, messages: [{ value: 'c' }] },
+            ],
+          },
+        ],
+      })
+      takeSent({ batches: [{ topic: 'topic-a', partition: 0, messages: [{ value: 'd' }] }] })
+      for (let at = 0; at < spies.length; at++) calls[at] = spies[at].mock.calls.length
+    } finally {
+      for (let at = 0; at < spies.length; at++) spies[at].mockRestore()
+    }
+
+    expect(calls).toEqual([0, 0, 0, 0, 0])
   })
 
   test('readBatch refuses a batch with one payload byte changed under its CRC', async () => {

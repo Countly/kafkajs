@@ -30,25 +30,43 @@ const owned = (messages) => messages
  */
 
 /**
+ * A batch's place and its own copy of its record list.
+ * @param {string} topic
+ * @param {{ partition: number, firstSequence?: number, messages: object[] }} batch
+ * @returns {{ topic: string, partition: number, firstSequence: number|undefined,
+ *   messages: object[] }}
+ */
+const placed = (topic, { partition, firstSequence, messages }) => {
+  const copy = new Array(messages.length)
+  for (let at = 0; at < messages.length; at++) copy[at] = messages[at]
+  return { topic, partition, firstSequence, messages: copy }
+}
+
+/**
  * The batches a request carries, read synchronously, in request order, each with its own copy of
  * its record list. The one place a fixture reads a request's records, for a fake broker or probe
- * that decides or labels by them at the instant the request arrives.
+ * that decides or labels by them at the instant the request arrives. It is plain loops and
+ * property reads, no built-in method, so a spec that spies on one sees only the producer's calls.
  * @param {SentRequest} request
  * @returns {{ topic: string, partition: number, firstSequence: number|undefined,
  *   messages: object[] }[]}
  */
-const batchesOf = (request) =>
-  (
-    request.batches ??
-    request.topicData.flatMap(({ topic, partitions }) =>
-      partitions.map((entry) => ({ topic, ...entry }))
-    )
-  ).map(({ topic, partition, firstSequence, messages }) => ({
-    topic,
-    partition,
-    firstSequence,
-    messages: [...messages],
-  }))
+const batchesOf = (request) => {
+  const taken = []
+  if (request.batches) {
+    for (let at = 0; at < request.batches.length; at++) {
+      taken[taken.length] = placed(request.batches[at].topic, request.batches[at])
+    }
+    return taken
+  }
+  for (let at = 0; at < request.topicData.length; at++) {
+    const { topic, partitions } = request.topicData[at]
+    for (let index = 0; index < partitions.length; index++) {
+      taken[taken.length] = placed(topic, partitions[index])
+    }
+  }
+  return taken
+}
 
 /**
  * Reads one record batch with the consumer's batch decoder, CRC included.
@@ -75,16 +93,18 @@ const readBatch = async (buffer) => {
 
 /**
  * Takes what a request carries at this instant without waiting: each batch's place, the request's
- * first sequence and record count, and the batch's bytes, written at once by the producer's batch
- * writer. Only `read()` decodes, so a fake broker or probe that takes a request decides, records
- * and answers at the same instant as one that reads nothing, and a later change to the request or
- * its records is not seen.
+ * first sequence, its record count and its own copy of the record list (`batchesOf`), and nothing
+ * else. Writing and decoding run only in `read()`, so a fake broker or probe that takes a request
+ * decides, records and answers at the same instant, and calls the same built-ins, as one that
+ * reads nothing. A later change to a batch's record list is not seen; the records themselves are
+ * the producer's own and are read when `read()` runs, so a test does not change them after the
+ * call.
  *
  * What a read checks is the record content: keys, values, headers, timestamps, order and offsets,
- * through a CRC-checked decode, and that the bytes hold `count` records. The batch is written
- * uncompressed with the default producer id and epoch and no transaction flag, so it says nothing
- * of the request's envelope, compression, producer identity or transaction attribute; tests check
- * those on the request or the wire.
+ * written by the producer's batch writer and read through a CRC-checked decode, and that the bytes
+ * hold `count` records. The batch is written uncompressed with the default producer id and epoch
+ * and no transaction flag, so it says nothing of the request's envelope, compression, producer
+ * identity or transaction attribute; tests check those on the request or the wire.
  * @param {SentRequest} request
  * @returns {{ batches: { topic: string, partition: number, firstSequence: number|undefined,
  *   count: number }[], read: () => Promise<ReadBatch[]> }} `read` settles once and rejects with
@@ -92,28 +112,28 @@ const readBatch = async (buffer) => {
  */
 const takeSent = (request) => {
   const taken = batchesOf(request)
-  const written = taken.map(({ messages, firstSequence }) =>
-    buildRecordBatch({ compression: Compression.None, messages, firstSequence })
-  )
-  written.forEach((batch) => batch.catch(() => {}))
-  const batches = taken.map(({ topic, partition, firstSequence, messages }) => ({
-    topic,
-    partition,
-    firstSequence,
-    count: messages.length,
-  }))
+  const batches = new Array(taken.length)
+  for (let at = 0; at < taken.length; at++) {
+    const { topic, partition, firstSequence, messages } = taken[at]
+    batches[at] = { topic, partition, firstSequence, count: messages.length }
+  }
   let reading = null
   const read = () =>
     (reading ??= Promise.all(
-      written.map(async (batch, at) => {
+      taken.map(async ({ messages, firstSequence }, at) => {
         const { topic, partition, count } = batches[at]
-        const { firstSequence, records } = await readBatch((await batch).buffer)
+        const { buffer } = await buildRecordBatch({
+          compression: Compression.None,
+          messages,
+          firstSequence,
+        })
+        const { firstSequence: written, records } = await readBatch(buffer)
         if (records.length !== count) {
           throw new Error(
             `${topic}/${partition} held ${count} records, its bytes ${records.length}`
           )
         }
-        return { topic, partition, firstSequence, records }
+        return { topic, partition, firstSequence: written, records }
       })
     ))
   return { batches, read }
