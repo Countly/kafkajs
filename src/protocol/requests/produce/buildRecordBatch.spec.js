@@ -1,8 +1,10 @@
 const buildRecordBatch = require('./buildRecordBatch')
 const recordBatchDecoder = require('../../recordBatch/v0/decoder')
 const Decoder = require('../../decoder')
+const Encoder = require('../../encoder')
 const Long = require('../../../utils/long')
-const { Types: Compression } = require('../../message/compression')
+const { Types: Compression, Codecs } = require('../../message/compression')
+const { KafkaJSInvalidConfigurationError, KafkaJSNonRetriableError } = require('../../../errors')
 
 const FIRST_TIMESTAMP_OFFSET = 27
 const MAX_TIMESTAMP_OFFSET = 35
@@ -176,7 +178,6 @@ describe('Protocol > Requests > Produce > buildRecordBatch > timestamps beyond 2
     ['a Long', Long.fromValue('9007199254740993'), 2n ** 53n + 1n],
     ['a number', 2 ** 60, 2n ** 60n],
     ['a BigInt of the int64 maximum', 2n ** 63n - 1n, 2n ** 63n - 1n],
-    ['a numeric string in exponent form', '1e16', 10n ** 16n],
   ])('%s is written exactly', async (_, timestamp, expected) => {
     expect(await encode([{ value: 'v', timestamp }])).toEqual({
       first: expected,
@@ -243,14 +244,23 @@ describe('Protocol > Requests > Produce > buildRecordBatch > timestamps beyond 2
     })
   })
 
-  test('a timestamp that is not a number stays encodable beside one above 2^53', async () => {
-    const { timestamps } = await encode([
-      { value: 'v', timestamp: '9007199254740993' },
-      { value: 'v', timestamp: 'abc' },
-    ])
+  test.each([
+    ['a timestamp that is not a number', 'abc'],
+    ['a numeric string in exponent form', '1e16'],
+    ['a negative timestamp', -5],
+    ['a timestamp above the int64 maximum', '9223372036854775808'],
+  ])(
+    '%s beside one above 2^53 is refused, naming its index, as the producer refuses it',
+    async (_, timestamp) => {
+      const encoding = encode([
+        { value: 'v', timestamp: '9007199254740993' },
+        { value: 'v', timestamp },
+      ])
 
-    expect(timestamps[0]).toEqual(9007199254740993n)
-  })
+      await expect(encoding).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
+      await expect(encoding).rejects.toThrow('Invalid message at index 1: its timestamp must be')
+    }
+  )
 
   test('a batch of safe timestamps is encoded to the same bytes as before', async () => {
     const { buffer } = await buildRecordBatch({
@@ -317,5 +327,300 @@ describe('Protocol > Requests > Produce > buildRecordBatch > timestamps at the i
     ])
 
     expect(batch).toEqual({ first: 0n, max: INT64_MAX, timestamps: [INT64_MAX, 0n] })
+  })
+})
+
+describe('Protocol > Requests > Produce > buildRecordBatch > records read once into owned bytes', () => {
+  const CHANGED = 'A Buffer changed size while its send was being read'
+  const saved = { ...Codecs }
+
+  beforeEach(() => {
+    jest.spyOn(Date, 'now').mockReturnValue(SEND_TIME)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+    Object.assign(Codecs, saved)
+  })
+
+  /**
+   * @param {object[]} messages
+   * @param {object} [options] over an uncompressed batch of no producer
+   * @returns {Promise<Buffer>} the batch bytes
+   */
+  const build = async (messages, options = {}) =>
+    (
+      await buildRecordBatch({
+        compression: Compression.None,
+        producerId: Long.fromValue(-1),
+        producerEpoch: 0,
+        ...options,
+        messages,
+      })
+    ).buffer
+
+  /**
+   * @param {object[]} messages
+   * @returns {Promise<object[]>} the records of their batch, as the consumer reads them back
+   */
+  const records = async (messages) =>
+    (await recordBatchDecoder(new Decoder(await build(messages)))).records
+
+  /** A Buffer over `length` bytes of `store` from `offset`, of a fixed length. */
+  const bufferOver = (store, offset, length) => {
+    const view = new Uint8Array(store, offset, length)
+    Object.setPrototypeOf(view, Buffer.prototype)
+    return view
+  }
+
+  /** A resizable store of 8 bytes holding 1 to 8, and a fixed Buffer over its bytes 4 to 7. */
+  const resizable = () => {
+    const store = new ArrayBuffer(8, { maxByteLength: 16 })
+    new Uint8Array(store).set([1, 2, 3, 4, 5, 6, 7, 8])
+    return { store, view: bufferOver(store, 4, 4) }
+  }
+
+  /** Registers `codec` in place of Snappy. */
+  const register = (codec) => {
+    Codecs[Compression.Snappy] = () => codec
+  }
+
+  test('100 records with 3 headers each build no Encoder and allocate exactly two stores', async () => {
+    const messages = Array.from({ length: 100 }, (_, i) => ({
+      key: `k${i}`,
+      value: `v${i}`,
+      headers: { a: '1', b: Buffer.from('2'), c: '3' },
+    }))
+    const encoders = jest.spyOn(Encoder, 'nextPowerOfTwo')
+    const zeroed = jest.spyOn(Buffer, 'alloc')
+    const stores = jest.spyOn(Buffer, 'allocUnsafeSlow')
+
+    await build(messages)
+
+    expect(encoders).not.toHaveBeenCalled()
+    expect(zeroed).not.toHaveBeenCalled()
+    expect(stores).toHaveBeenCalledTimes(2)
+  })
+
+  test('a compressed batch adds one store, the records section the codec is handed', async () => {
+    register({ compress: async (encoder) => encoder.buffer })
+    const stores = jest.spyOn(Buffer, 'allocUnsafeSlow')
+
+    await build([{ value: 'v' }, { value: 'w' }], { compression: Compression.Snappy })
+
+    expect(stores).toHaveBeenCalledTimes(3)
+  })
+
+  test('a timestamp object beside one above 2^53 is converted once, and both are written exactly', async () => {
+    const valueOf = jest.fn(() => 1700000000000)
+
+    const read = await records([
+      { value: 'a', timestamp: { valueOf } },
+      { value: 'b', timestamp: '9007199254740993' },
+    ])
+
+    expect(valueOf).toHaveBeenCalledTimes(1)
+    expect(read.map(({ timestamp }) => timestamp)).toEqual(['1700000000000', '9007199254740993'])
+  })
+
+  test.each([
+    ['a transferred Buffer', 4],
+    ['a transferred empty Buffer', 0],
+  ])('%s is refused, typed', async (_, length) => {
+    const store = new ArrayBuffer(length)
+    const value = bufferOver(store, 0, length)
+    structuredClone(store, { transfer: [store] })
+
+    const building = build([{ value }])
+
+    await expect(building).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(building).rejects.toThrow(CHANGED)
+  })
+
+  test('a Buffer out of bounds of its resizable store, shrunk before the call, is refused', async () => {
+    const { store, view } = resizable()
+    store.resize(2)
+
+    const building = build([{ key: view, value: 'v' }])
+
+    await expect(building).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(building).rejects.toThrow(CHANGED)
+  })
+
+  test("a later record's getter that shrinks an earlier Buffer's store out of bounds refuses the batch", async () => {
+    const { store, view } = resizable()
+    const later = {
+      value: 'x',
+      get timestamp() {
+        store.resize(2)
+        return undefined
+      },
+    }
+
+    const building = build([{ value: view }, later])
+
+    await expect(building).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(building).rejects.toThrow(CHANGED)
+  })
+
+  test('a store shrunk and regrown in bounds by a later getter, then overwritten at the same length, is written as visible', async () => {
+    const { store, view } = resizable()
+    const regrows = {
+      value: 'x',
+      get timestamp() {
+        store.resize(2)
+        store.resize(8)
+        return undefined
+      },
+    }
+    const overwrites = {
+      value: 'y',
+      get timestamp() {
+        new Uint8Array(store).set([9, 9, 9], 5)
+        return undefined
+      },
+    }
+
+    const [record] = await records([{ value: view }, regrows, overwrites])
+
+    expect(record.value).toEqual(Buffer.from([0, 9, 9, 9]))
+  })
+
+  test('a Buffer over a SharedArrayBuffer, and one over a growable store grown during the call, are written', async () => {
+    const shared = new SharedArrayBuffer(4)
+    new Uint8Array(shared).set([1, 2, 3, 4])
+    const growable = new SharedArrayBuffer(4, { maxByteLength: 16 })
+    new Uint8Array(growable).set([5, 6, 7, 8])
+    const grows = {
+      value: 'x',
+      get timestamp() {
+        growable.grow(16)
+        return undefined
+      },
+    }
+
+    const [first, second] = await records([
+      { value: bufferOver(shared, 0, 4) },
+      { value: bufferOver(growable, 0, 4) },
+      grows,
+    ])
+
+    expect(first.value).toEqual(Buffer.from([1, 2, 3, 4]))
+    expect(second.value).toEqual(Buffer.from([5, 6, 7, 8]))
+  })
+
+  test('a valid empty Buffer is written empty', async () => {
+    const [record] = await records([{ value: Buffer.alloc(0) }])
+
+    expect(record.value).toEqual(Buffer.alloc(0))
+  })
+
+  test('a non-enumerable field and an inherited one are read once and written; an own undefined shadows the prototype', async () => {
+    const reads = { key: 0, value: 0 }
+    const message = Object.create({
+      get key() {
+        reads.key += 1
+        return 'inherited key'
+      },
+      timestamp: 5,
+    })
+    Object.defineProperty(message, 'value', {
+      enumerable: false,
+      get() {
+        reads.value += 1
+        return 'hidden value'
+      },
+    })
+    message.timestamp = undefined
+
+    const [record] = await records([message])
+
+    expect(reads).toEqual({ key: 1, value: 1 })
+    expect(record.key).toEqual(Buffer.from('inherited key'))
+    expect(record.value).toEqual(Buffer.from('hidden value'))
+    expect(record.timestamp).toBe(String(SEND_TIME))
+  })
+
+  test("a Buffer's own copy, length and buffer never run: its real bytes are written", async () => {
+    const value = Buffer.from('real')
+    const touched = jest.fn(() => {
+      throw new Error('touched')
+    })
+    Object.defineProperty(value, 'copy', { value: touched })
+    Object.defineProperty(value, 'length', { get: touched })
+    Object.defineProperty(value, 'buffer', { get: touched })
+
+    const [record] = await records([{ value }])
+
+    expect(touched).not.toHaveBeenCalled()
+    expect(record.value).toEqual(Buffer.from('real'))
+  })
+
+  test('a codec is handed a fresh, unpooled records section of exactly the records, with its level', async () => {
+    const handed = []
+    register({
+      compress: async (encoder, options) => {
+        handed.push({ size: encoder.size(), buf: encoder.buf, options })
+        return Buffer.from(encoder.buffer)
+      },
+    })
+
+    await build([{ key: 'k', value: 'v' }], {
+      compression: Compression.Snappy,
+      compressionLevel: 4,
+    })
+
+    const [{ size, buf, options }] = handed
+    expect(options).toEqual({ level: 4 })
+    expect(buf.length).toBe(size)
+    expect(buf.byteOffset).toBe(0)
+    expect(buf.buffer.byteLength).toBe(size)
+  })
+
+  test("a codec's output with its own length, copy and buffer is written by its real bytes; none of them runs", async () => {
+    const touched = jest.fn(() => {
+      throw new Error('touched')
+    })
+    register({
+      compress: async () => {
+        const output = Buffer.from('compressed')
+        Object.defineProperty(output, 'length', { get: touched })
+        Object.defineProperty(output, 'copy', { value: touched })
+        Object.defineProperty(output, 'buffer', { get: touched })
+        return output
+      },
+    })
+
+    const batch = await build([{ value: 'v' }], { compression: Compression.Snappy })
+
+    expect(touched).not.toHaveBeenCalled()
+    expect(batch.length).toBe(61 + 10)
+    expect(batch.subarray(61).toString()).toBe('compressed')
+  })
+
+  test('a codec answering a Uint8Array that is not a Buffer refuses the batch, typed', async () => {
+    register({ compress: async () => new Uint8Array(3) })
+
+    const building = build([{ value: 'v' }], { compression: Compression.Snappy })
+
+    await expect(building).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(building).rejects.toThrow('The compression codec did not return a Buffer')
+  })
+
+  test('a codec answering a Buffer whose store it transferred refuses the batch, typed', async () => {
+    register({
+      compress: async () => {
+        const output = Buffer.alloc(4, 1)
+        structuredClone(output.buffer, { transfer: [output.buffer] })
+        return output
+      },
+    })
+
+    const building = build([{ value: 'v' }], { compression: Compression.Snappy })
+
+    await expect(building).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(building).rejects.toThrow(
+      'The compression codec returned a Buffer that cannot be read'
+    )
   })
 })

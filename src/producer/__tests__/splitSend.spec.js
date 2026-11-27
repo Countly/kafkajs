@@ -6,6 +6,10 @@ const {
   KafkaJSRecordTooLargeError,
 } = require('../../errors')
 const Broker = require('../../broker')
+const Connection = require('../../network/connection')
+const Encoder = require('../../protocol/encoder')
+const createRequest = require('../../protocol/request')
+const { oracleRecordBatch } = require('../../protocol/requests/produce/fixtures/recordBatchOracle')
 const Accumulator = require('../state/accumulator')
 const PartitionSequencer = require('../state/partitionSequencer')
 const { RequestBudget } = require('../state/recordSize')
@@ -23,6 +27,29 @@ const PATHS = [
 
 const idOf = (index) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
 const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+/**
+ * The frame length of the Produce request `request` asked for, built independently by the record
+ * encoders: the request's own version codec over batches `oracleRecordBatch` builds, framed with
+ * the request header and its length prefix.
+ * @param {object} request the arguments `Broker#produce` was called with
+ * @param {{ apiVersion: number, clientId: string }} sent the version and client id it was sent with
+ * @returns {Promise<number>}
+ */
+const oracleFrameLength = async (request, { apiVersion, clientId }) => {
+  const batchBuilder = '../../protocol/requests/produce/buildRecordBatch'
+  let produce
+  jest.isolateModules(() => {
+    jest.doMock(
+      batchBuilder,
+      () => async (options) => new Encoder().writeBuffer(await oracleRecordBatch(options))
+    )
+    produce = require(`../../protocol/requests/produce/v${apiVersion}/request`)
+  })
+  jest.dontMock(batchBuilder)
+  const frame = await createRequest({ correlationId: 1, clientId, request: produce(request) })
+  return frame.size()
+}
 
 /** Waits, a turn at a time, for `predicate`, and fails the test when it never holds. */
 const until = async (predicate, turns = 2000) => {
@@ -371,6 +398,75 @@ describe('Producer > a send larger than one request', () => {
       expect(error).toMatchObject({ reason: 'maxRequestSize', scope: 'record', limit: CAP })
       expect(log.written.reduce((sum, { records: count }) => sum + count, 0)).toBe(4)
       expect(calls.length).toBeLessThanOrEqual(2 * 6 - 1)
+    }
+  )
+
+  test.each(PATHS)(
+    'one record an expanding codec takes past the cap fails with the size error, its size the frame the record encoders build for that request, and nothing is written, %s',
+    async (_, path) => {
+      const calls = attempts()
+      const sends = []
+      const send = Connection.prototype.send
+      jest.spyOn(Connection.prototype, 'send').mockImplementation(function (options) {
+        if (options.request.apiKey === 0) {
+          sends.push({ apiVersion: options.request.apiVersion, clientId: this.clientId })
+        }
+        return send.call(this, options)
+      })
+      CompressionCodecs[CompressionTypes.Snappy] = () => ({
+        compress: async ({ buffer }) => Buffer.concat([buffer, Buffer.alloc(buffer.length)]),
+        decompress: async (buffer) => buffer,
+      })
+      const { frames } = await start({ topics: [{ name: TOPIC, leaders: [0] }] }, path)
+
+      const error = await producer
+        .send({
+          topic: TOPIC,
+          compression: CompressionTypes.Snappy,
+          messages: [{ value: 'x'.repeat(600000), partition: 0, timestamp: 1700000000000 }],
+        })
+        .catch((failure) => failure)
+
+      expect(error).toBeInstanceOf(KafkaJSRecordTooLargeError)
+      expect(error).toMatchObject({ reason: 'maxRequestSize', scope: 'record', limit: CAP })
+      expect(error.size).toBe(await oracleFrameLength(calls[0], sends[0]))
+      expect(error.size).toBeGreaterThan(CAP)
+      expect(frames).toEqual([])
+    }
+  )
+
+  test.each(PATHS)(
+    'a batch of several never-written records an expanding codec takes past the cap is split, the oversized attempt is never written, and every record is delivered once, %s',
+    async (_, path) => {
+      const calls = attempts()
+      CompressionCodecs[CompressionTypes.Snappy] = () => ({
+        compress: async ({ buffer }) => Buffer.concat([buffer, Buffer.alloc(buffer.length)]),
+        decompress: async (buffer) => buffer,
+      })
+      const { frames, log } = await start(
+        { topics: [{ name: TOPIC, leaders: [0] }] },
+        {
+          ...path,
+          batchSize: 4 * CAP,
+        }
+      )
+      const messages = Array.from({ length: 4 }, (_, i) => ({
+        value: `${i}:`.padEnd(200000, 'x'),
+        partition: 0,
+      }))
+
+      const metadata = await producer.send({
+        topic: TOPIC,
+        compression: CompressionTypes.Snappy,
+        messages,
+      })
+
+      expect(calls[0].topicData[0].partitions[0].messages).toHaveLength(4)
+      expect(calls.length).toBeGreaterThan(frames.length)
+      expect(Math.max(...frames)).toBeLessThanOrEqual(CAP)
+      expect(log.written.map(({ records: count }) => count).reduce((a, b) => a + b, 0)).toBe(4)
+      expect(log.written.every(({ errorCode }) => errorCode === 0)).toBe(true)
+      expect(metadata).toEqual([expect.objectContaining({ partition: 0, baseOffset: '0' })])
     }
   )
 

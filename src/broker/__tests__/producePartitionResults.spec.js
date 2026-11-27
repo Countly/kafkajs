@@ -2,6 +2,7 @@ const Encoder = require('../../protocol/encoder')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { KafkaJSProtocolError } = require('../../errors')
 const { createGroupApiBroker } = require('./fixtures/groupApiHarness')
+const produceV11 = require('../../../testHelpers/wire/produceV11')
 
 /** The KIP-951 vector: `test-topic` partition 0 answered NOT_LEADER with a leader hint. */
 const NOT_LEADER = Buffer.from(
@@ -297,5 +298,103 @@ describe('Broker > produce > per-partition results', () => {
         })
       }
     })
+  })
+})
+
+describe('Broker > produce > records taken over during the call', () => {
+  const harnesses = []
+
+  afterEach(async () => {
+    jest.restoreAllMocks()
+    await Promise.all(harnesses.splice(0).map(({ pool }) => pool.destroy()))
+  })
+
+  test('changing a record, its Buffer, its arrays or its topic after the call changes nothing written or checked, and its records are dropped once encoded', async () => {
+    const harness = createGroupApiBroker({
+      versions: { [apiKeys.Produce]: { minVersion: 3, maxVersion: 11 } },
+      respond: () =>
+        responseFor([
+          { partition: 0, errorCode: 0, baseOffset: 100, logStartOffset: 0 },
+          { partition: 1, errorCode: 0, baseOffset: 7, logStartOffset: 0 },
+        ]),
+    })
+    harnesses.push(harness)
+    const value = Buffer.from('AAAA')
+    const first = [{ key: 'kept', value, timestamp: 1700000000000 }]
+    const second = [{ value: 'also kept', timestamp: 1700000000000 }]
+    const sent = [
+      {
+        topic: 'test-topic',
+        partitions: [
+          { partition: 0, firstSequence: 0, messages: first },
+          { partition: 1, firstSequence: 0, messages: second },
+        ],
+      },
+    ]
+
+    const built = []
+    const lookup = harness.broker.lookupRequestWithMax.bind(harness.broker)
+    jest.spyOn(harness.broker, 'lookupRequestWithMax').mockImplementation((...args) => {
+      const build = lookup(...args)
+      return (options) => {
+        built.push(options)
+        return build(options)
+      }
+    })
+
+    const produced = harness.broker.produce({
+      acks: -1,
+      timeout: 30000,
+      topicData: sent,
+      perPartitionResults: true,
+    })
+    value.fill(0x5a)
+    first[0].key = 'changed'
+    first.push({ value: 'added' })
+    second[0].value = 'changed too'
+    sent[0].partitions.pop()
+    sent[0].topic = 'other-topic'
+    const results = await produced
+
+    const { body } = harness.requests[0]
+    const { topics } = produceV11.readRequest(body)
+    expect(
+      topics.map(({ topic, partitions }) => ({
+        topic,
+        partitions: partitions.map(({ partition, batches }) => ({
+          partition,
+          records: batches.map(({ recordCount }) => recordCount),
+        })),
+      }))
+    ).toEqual([
+      {
+        topic: 'test-topic',
+        partitions: [
+          { partition: 0, records: [1] },
+          { partition: 1, records: [1] },
+        ],
+      },
+    ])
+    for (const kept of ['AAAA', 'kept', 'also kept']) {
+      expect(body.includes(Buffer.from(kept))).toBe(true)
+    }
+    for (const changed of ['ZZZZ', 'changed', 'added', 'other-topic']) {
+      expect(body.includes(Buffer.from(changed))).toBe(false)
+    }
+    expect(results.map(({ partition, error }) => ({ partition, error }))).toEqual([
+      { partition: 0, error: null },
+      { partition: 1, error: null },
+    ])
+    const [{ topicData: request }] = built
+    expect(request).not.toBe(sent)
+    expect(request).toEqual([
+      {
+        topic: 'test-topic',
+        partitions: [
+          { partition: 0, firstSequence: 0, messages: null },
+          { partition: 1, firstSequence: 0, messages: null },
+        ],
+      },
+    ])
   })
 })
