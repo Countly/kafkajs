@@ -1075,30 +1075,49 @@ describe('Admin > describeGroups > routing', () => {
       // answers it as unknown while the owner answers it described.
       describe('when the broker answers one written id in several rows', () => {
         const miss = (groupId) => withMessage(consumerGroupRow(groupId), GROUP_ID_NOT_FOUND, 'no')
-        const shardFanOut = ({ groupIds }) => ({
-          groups: [
-            consumerGroupRow(groupIds[0]),
-            miss(groupIds[1]),
-            miss(groupIds[0]),
-            consumerGroupRow(groupIds[1]),
-          ],
+        // A row the way a broker sends one that names a code and no group: no members.
+        const errorRow = (groupId, errorCode, errorMessage) => ({
+          ...consumerGroupRow(groupId),
+          errorCode,
+          errorMessage,
+          groupState: '',
+          assignorName: null,
+          members: [],
         })
+        // Kafka 4.0.0: each shard answers every id it was given; one owns each group.
+        const shardRows = (ownerFirst) => (groupIds) => {
+          const [team, other] = groupIds
+          const teamShard = [consumerGroupRow(team), miss(other)]
+          const otherShard = [miss(team), consumerGroupRow(other)]
+          return ownerFirst ? [...teamShard, ...otherShard] : [...otherShard, ...teamShard]
+        }
 
         it.each([
-          ['the lone surrogate given first', [SURROGATE, LITERAL, 'other']],
-          ['the literal given first', [LITERAL, SURROGATE, 'other']],
-        ])('answers from the described row, not the misses, with %s', async (_label, ids) => {
-          const describeGroups = jest.fn(classicEcho)
-          const consumerGroupDescribe = jest.fn(shardFanOut)
+          ['the lone surrogate given first, the owner of the group answering first', true, false],
+          ['the literal given first, the owner of the group answering first', false, false],
+          ['the lone surrogate given first, the other shard answering first', true, true],
+          ['the literal given first, the other shard answering first', false, true],
+        ])(
+          'answers from the described row, not the misses, with %s',
+          async (_label, surrogateFirst, otherShardFirst) => {
+            const spellings = surrogateFirst ? [SURROGATE, LITERAL] : [LITERAL, SURROGATE]
+            const ids = [...spellings, 'other']
+            const describeGroups = jest.fn(classicEcho)
+            const consumerGroupDescribe = jest.fn(async ({ groupIds }) => ({
+              groups: shardRows(!otherShardFirst)(groupIds),
+            }))
 
-          const groups = await run({ consumerGroupDescribe, describeGroups }, ids)
+            const groups = await run({ consumerGroupDescribe, describeGroups }, ids)
 
-          expect(summary(groups)).toEqual(ids.map((groupId) => [groupId, 0, 'consumer']))
-          expect(describeGroups).not.toHaveBeenCalled()
-          expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
-            ['team-�', 'other'],
-          ])
-        })
+            expect(summary(groups).sort()).toEqual(
+              ids.map((groupId) => [groupId, 0, 'consumer']).sort()
+            )
+            expect(describeGroups).not.toHaveBeenCalled()
+            expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+              ['team-�', 'other'],
+            ])
+          }
+        )
 
         it('prefers a described row to an error row for the same written id', async () => {
           const consumerGroupDescribe = async ({ groupIds }) => ({
@@ -1117,55 +1136,74 @@ describe('Admin > describeGroups > routing', () => {
         })
 
         it('prefers an error row to a miss for the same written id, without asking the classic API', async () => {
+          // A group the caller may describe but whose assigned topic it may not: the owner answers
+          // the topic error in place of the group, and the other shard still answers it unknown.
+          const TOPIC_AUTHORIZATION_FAILED = 29
           const describeGroups = jest.fn(classicEcho)
           const consumerGroupDescribe = async ({ groupIds }) => ({
             groups: [
               miss(groupIds[0]),
-              withMessage(consumerGroupRow(groupIds[0]), GROUP_AUTHORIZATION_FAILED, 'no access'),
+              errorRow(groupIds[0], TOPIC_AUTHORIZATION_FAILED, 'no access'),
             ],
           })
 
           const groups = await run({ consumerGroupDescribe, describeGroups }, [LITERAL, SURROGATE])
 
           expect(summary(groups)).toEqual([
-            [LITERAL, GROUP_AUTHORIZATION_FAILED, ''],
-            [SURROGATE, GROUP_AUTHORIZATION_FAILED, ''],
+            [LITERAL, TOPIC_AUTHORIZATION_FAILED, ''],
+            [SURROGATE, TOPIC_AUTHORIZATION_FAILED, ''],
           ])
           expect(describeGroups).not.toHaveBeenCalled()
         })
 
-        it('asks the classic API once for a written id every row of which is a miss', async () => {
-          const describeGroups = jest.fn(classicEcho)
-          const consumerGroupDescribe = async ({ groupIds }) => ({
-            groups: [miss(groupIds[0]), miss(groupIds[0])],
-          })
+        it.each([
+          ['one row from Kafka 4.4.0', [], (team) => [miss(team)]],
+          [
+            'a row from each shard of Kafka 4.0.0',
+            ['other'],
+            (team, other) => [miss(team), miss(other), miss(team), consumerGroupRow(other)],
+          ],
+        ])(
+          'asks the classic API once for a written id every row of which is a miss, with %s',
+          async (_label, more, rows) => {
+            const describeGroups = jest.fn(classicEcho)
+            const consumerGroupDescribe = async ({ groupIds }) => ({ groups: rows(...groupIds) })
 
-          const groups = await run({ consumerGroupDescribe, describeGroups }, [
-            SURROGATE,
-            LITERAL,
-            SURROGATE,
-          ])
+            const groups = await run({ consumerGroupDescribe, describeGroups }, [
+              SURROGATE,
+              LITERAL,
+              SURROGATE,
+              ...more,
+            ])
 
-          expect(describeGroups.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
-            ['team-�'],
-          ])
-          expect(summary(groups)).toEqual([
-            [SURROGATE, 0, 'classic'],
-            [LITERAL, 0, 'classic'],
-          ])
-        })
+            expect(describeGroups.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+              ['team-�'],
+            ])
+            expect(summary(groups).filter(([groupId]) => groupId !== 'other')).toEqual([
+              [SURROGATE, 0, 'classic'],
+              [LITERAL, 0, 'classic'],
+            ])
+          }
+        )
       })
 
-      it('answers every occurrence from one snapshot when the coordinator moves between attempts', async () => {
+      it('answers every occurrence from one snapshot when its coordinator moves, asking again only for it', async () => {
         let moved = false
         const consumerGroupDescribe = jest.fn(async ({ groupIds }) => {
           if (!moved) {
             moved = true
             return {
-              groups: groupIds.map((groupId) => ({
-                ...consumerGroupRow(groupId),
-                errorCode: NOT_COORDINATOR,
-              })),
+              groups: groupIds.map((groupId) =>
+                echoOf(groupId) === 'team-�'
+                  ? {
+                      ...consumerGroupRow(groupId),
+                      errorCode: NOT_COORDINATOR,
+                      groupState: '',
+                      assignorName: null,
+                      members: [],
+                    }
+                  : consumerGroupRow(groupId)
+              ),
             }
           }
           return consumerEcho({ groupIds })
@@ -1179,16 +1217,15 @@ describe('Admin > describeGroups > routing', () => {
 
         const { groups } = await admin.describeGroups([SURROGATE, LITERAL, SURROGATE, 'other'])
 
-        const [first, ...retried] = consumerGroupDescribe.mock.calls.map(([r]) =>
-          r.groupIds.map(echoOf)
-        )
-        expect(first).toEqual(['team-�', 'other'])
-        expect(retried.sort()).toEqual([['other'], ['team-�']])
+        expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+          ['team-�', 'other'],
+          ['team-�'],
+        ])
         expect(summary(groups)).toEqual([
+          ['other', 0, 'consumer'],
           [SURROGATE, 0, 'consumer'],
           [LITERAL, 0, 'consumer'],
           [SURROGATE, 0, 'consumer'],
-          ['other', 0, 'consumer'],
         ])
       })
 
@@ -1276,6 +1313,27 @@ describe('Admin > describeGroups > routing', () => {
       expect(projected(names, 'other', row, true)[0]).toBe(row)
     })
 
+    it('gives each row projected from one outcome its own nested arrays, objects and buffers', () => {
+      const { WireNames } = require('../wireNames')
+      const names = new WireNames([SURROGATE, LITERAL])
+      const row = {
+        groupId: LITERAL,
+        members: [
+          { assignment: [{ topic: 't', partitions: [1] }], memberAssignment: Buffer.from([1, 2]) },
+        ],
+      }
+
+      const [renamed, original] = projected(names, LITERAL, row, true)
+
+      expect(renamed.members).not.toBe(original.members)
+      expect(renamed.members[0]).not.toBe(original.members[0])
+      expect(renamed.members[0].assignment[0].partitions).not.toBe(
+        original.members[0].assignment[0].partitions
+      )
+      expect(renamed.members[0].memberAssignment).not.toBe(original.members[0].memberAssignment)
+      expect(renamed.members[0].memberAssignment).toEqual(Buffer.from([1, 2]))
+    })
+
     it('keeps the names as they were when the caller changes the array afterwards', () => {
       const { WireNames } = require('../wireNames')
       const given = [SURROGATE, 'x']
@@ -1286,6 +1344,222 @@ describe('Admin > describeGroups > routing', () => {
 
       expect(names.ids).toEqual([LITERAL, 'x'])
       expect(names.names).toEqual([SURROGATE, 'x'])
+    })
+  })
+
+  describe('a group id given more than once', () => {
+    const SURROGATE = 'team-\uD800'
+    const LITERAL = 'team-�'
+    const consumerEcho = ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
+    })
+    const unknownToConsumers = ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => ({
+        ...consumerGroupRow(echoOf(groupId)),
+        errorCode: GROUP_ID_NOT_FOUND,
+        errorMessage: null,
+      })),
+    })
+    const classicEcho = ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => classicGroupRow(echoOf(groupId))),
+    })
+    const describeWith = async (stubs, ids) => {
+      const cluster = stubCluster({ describeGroups: jest.fn(), ...stubs })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+      return (await admin.describeGroups(ids)).groups
+    }
+    /**
+     * Changes every array, object and Buffer inside `value` at every depth, so a row that shares any
+     * nested data with another shows it, whatever fields a description gains.
+     */
+    const mutateEverything = (value) => {
+      if (Buffer.isBuffer(value)) {
+        value.fill(0xff)
+      } else if (Array.isArray(value)) {
+        value.forEach(mutateEverything)
+        value.length = 0
+      } else if (value !== null && typeof value === 'object') {
+        for (const key of Object.keys(value)) {
+          if (value[key] !== null && typeof value[key] === 'object') mutateEverything(value[key])
+          else value[key] = 'mutated'
+        }
+        value.added = 'mutated'
+      }
+    }
+    /** Mutates one row of a call and compares each other row with a row of an untouched call. */
+    const expectIndependent = async (stubs, ids, untouchedIds) => {
+      const [untouched] = await describeWith(stubs, untouchedIds)
+      for (let mutated = 0; mutated < ids.length; mutated++) {
+        const rows = await describeWith(stubs, ids)
+        mutateEverything(rows[mutated])
+        expect(rows[mutated]).not.toEqual({ ...untouched, groupId: rows[mutated].groupId })
+        rows.forEach((row, index) => {
+          if (index !== mutated) expect(row).toEqual({ ...untouched, groupId: row.groupId })
+        })
+      }
+    }
+
+    it('gives each row of a consumer group its own members, assignments and buffers', async () => {
+      await expectIndependent({ consumerGroupDescribe: consumerEcho }, ['g', 'g'], ['g'])
+    })
+
+    it('gives each row of a classic group its own members, assignments and buffers', async () => {
+      await expectIndependent(
+        { consumerGroupDescribe: unknownToConsumers, describeGroups: classicEcho },
+        [SURROGATE, LITERAL],
+        [LITERAL]
+      )
+    })
+
+    it('gives each occurrence of a spelling given twice next to another spelling its own data', async () => {
+      await expectIndependent(
+        { consumerGroupDescribe: consumerEcho },
+        [SURROGATE, LITERAL, SURROGATE],
+        [LITERAL]
+      )
+    })
+
+    it('returns the one row of a single id as the broker row was shaped, buffers included', async () => {
+      const foreign = Buffer.from('not-a-consumer-assignment')
+      const describeGroups = async ({ groupIds }) => ({
+        groups: groupIds.map((groupId) => ({
+          ...classicGroupRow(groupId),
+          protocolType: 'connect',
+          members: [{ ...classicGroupRow(groupId).members[0], memberAssignment: foreign }],
+        })),
+      })
+
+      const [row] = await describeWith(
+        { consumerGroupDescribe: unknownToConsumers, describeGroups },
+        ['g']
+      )
+
+      expect(row.members[0].memberAssignment).toBe(foreign)
+    })
+  })
+
+  describe('when some ids of a batch resolve and others are asked again', () => {
+    const described = (groupId, memberId) => {
+      const row = consumerGroupRow(groupId)
+      return { ...row, members: [{ ...row.members[0], memberId }] }
+    }
+    // The way a broker sends a row that names a code and no group: no members.
+    const codeRow = (groupId, errorCode) => ({
+      ...consumerGroupRow(groupId),
+      errorCode,
+      groupState: '',
+      assignorName: null,
+      members: [],
+    })
+    const stubbed = ({ first, found, asked, describeGroups = jest.fn(), moves = [] }) => {
+      let answered = 0
+      return stubCluster({
+        consumerGroupDescribe: async ({ groupIds }) => {
+          asked.push([...groupIds])
+          answered += 1
+          return { groups: answered === 1 ? first : groupIds.map((id) => described(id, 'again')) }
+        },
+        describeGroups,
+        onFindCoordinator: (groupId) => found.push(groupId),
+        nodeIdFor: (groupId) => (answered > 0 && moves.includes(groupId) ? 1 : 0),
+      })
+    }
+
+    it.each([
+      ['a 16 row alone', (g1, g2) => [described(g1, 'first'), codeRow(g2, NOT_COORDINATOR)]],
+      [
+        'a 16 row and, from the other shard of Kafka 4.0.0, a 69 row for the same id',
+        (g1, g2) => [
+          described(g1, 'first'),
+          { ...codeRow(g2, GROUP_ID_NOT_FOUND), errorMessage: 'no' },
+          { ...codeRow(g1, GROUP_ID_NOT_FOUND), errorMessage: 'no' },
+          codeRow(g2, NOT_COORDINATOR),
+        ],
+      ],
+    ])(
+      'keeps the group a coordinator described and asks again only for the one whose coordinator moved, with %s',
+      async (_label, rows) => {
+        const found = []
+        const asked = []
+        const describeGroups = jest.fn(async ({ groupIds }) => ({
+          groups: groupIds.map(classicGroupRow),
+        }))
+        const cluster = stubbed({
+          first: rows('g1', 'g2'),
+          found,
+          asked,
+          describeGroups,
+          moves: ['g2'],
+        })
+        const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+        const { groups } = await admin.describeGroups(['g1', 'g2'])
+
+        expect(asked).toEqual([['g1', 'g2'], ['g2']])
+        expect(found).toEqual(['g1', 'g2', 'g2'])
+        expect(describeGroups).not.toHaveBeenCalled()
+        expect(
+          groups.map(({ groupId, errorCode, members }) => [groupId, errorCode, members[0].memberId])
+        ).toEqual([
+          ['g1', 0, 'first'],
+          ['g2', 0, 'again'],
+        ])
+      }
+    )
+
+    it('asks again only for the ids still unresolved when one is loading and another has moved', async () => {
+      const found = []
+      const asked = []
+      const cluster = stubbed({
+        first: [
+          codeRow('g1', COORDINATOR_LOAD_IN_PROGRESS),
+          codeRow('g2', NOT_COORDINATOR),
+          described('g3', 'first'),
+        ],
+        found,
+        asked,
+        moves: ['g2'],
+      })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['g1', 'g2', 'g3'])
+
+      expect(asked[0]).toEqual(['g1', 'g2', 'g3'])
+      expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
+      expect(found).toEqual(['g1', 'g2', 'g3', 'g2'])
+      expect(
+        groups.map(({ groupId, errorCode, members }) => [groupId, errorCode, members[0].memberId])
+      ).toEqual([
+        ['g3', 0, 'first'],
+        ['g1', 0, 'again'],
+        ['g2', 0, 'again'],
+      ])
+    })
+
+    it('does not ask a healthy coordinator again when another coordinator fails', async () => {
+      const asked = []
+      let failed = false
+      const cluster = stubCluster({
+        consumerGroupDescribe: async ({ groupIds }) => {
+          asked.push([...groupIds])
+          if (groupIds.includes('g2') && !failed) {
+            failed = true
+            throw new Error('the connection went away')
+          }
+          return { groups: groupIds.map((groupId) => consumerGroupRow(groupId)) }
+        },
+        describeGroups: jest.fn(),
+        nodeIdFor: (groupId) => (groupId === 'g2' ? 1 : 0),
+      })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['g1', 'g2'])
+
+      expect(asked.sort()).toEqual([['g1'], ['g2'], ['g2']])
+      expect(groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
+        ['g1', 0],
+        ['g2', 0],
+      ])
     })
   })
 
