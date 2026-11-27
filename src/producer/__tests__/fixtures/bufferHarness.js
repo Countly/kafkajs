@@ -4,6 +4,73 @@ const createProducer = require('../../index')
 const { Admission } = require('../../state/admission')
 const { createFakeCluster } = require('./fakeCluster')
 const { createLogger, LEVELS } = require('../../../loggers')
+const Decoder = require('../../../protocol/decoder')
+const decodeRecordBatch = require('../../../protocol/recordBatch/v0/decoder')
+const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
+const { Types: Compression } = require('../../../protocol/message/compression')
+
+/**
+ * A batch's records, for a test that builds a batch itself, in the form batches hold them.
+ * @param {object[]} messages the records as a caller passes them to `send()`
+ * @returns {object[]} the records a batch's `messages` field holds
+ */
+const owned = (messages) => messages
+
+/**
+ * The records a broker reads from a request: every batch is written by the producer's batch writer
+ * and read back by the consumer's batch decoder. Every batch's records are taken before the first
+ * await, so a later change to the request is not seen. The writer runs uncompressed: compression
+ * changes the bytes on the wire, not the records read back.
+ * @param {{ topicData?: { topic: string, partitions: { partition: number, firstSequence?: number,
+ *   messages: object[] }[] }[], batches?: { topic: string, partition: number,
+ *   firstSequence?: number, messages: object[] }[] }} request a Produce request (`topicData`) or an
+ *   accumulator hand-off (`batches`)
+ * @returns {Promise<{ topic: string, partition: number, firstSequence: number, records: {
+ *   key: Buffer|null, value: Buffer|null, headers: object, timestamp: string, offset: string }[]
+ *   }[]>} one entry per batch, in request order; `offset` is the record's position in its batch
+ */
+const sentRecords = async (request) => {
+  const batches =
+    request.batches ??
+    request.topicData.flatMap(({ topic, partitions }) =>
+      partitions.map(({ partition, firstSequence, messages }) => ({
+        topic,
+        partition,
+        firstSequence,
+        messages,
+      }))
+    )
+  const taken = batches.map(({ topic, partition, firstSequence, messages }) => ({
+    topic,
+    partition,
+    firstSequence,
+    messages: [...messages],
+  }))
+  return Promise.all(
+    taken.map(async ({ topic, partition, firstSequence, messages }) => {
+      const { buffer } = await buildRecordBatch({
+        compression: Compression.None,
+        messages,
+        firstSequence,
+      })
+      const batch = await decodeRecordBatch(new Decoder(buffer), {
+        maxDecompressedBatchBytes: Number.MAX_SAFE_INTEGER,
+      })
+      return {
+        topic,
+        partition,
+        firstSequence: batch.firstSequence,
+        records: batch.records.map(({ key, value, headers, timestamp, offset }) => ({
+          key,
+          value,
+          headers,
+          timestamp,
+          offset,
+        })),
+      }
+    })
+  )
+}
 
 /**
  * Creates a promise whose owner can resolve or reject it explicitly.
@@ -180,6 +247,8 @@ const transactionalProducer = async (options = {}) => {
 }
 
 module.exports = {
+  owned,
+  sentRecords,
   succeeded,
   transactionalProducer,
   deferred,

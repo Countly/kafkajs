@@ -4,6 +4,7 @@ const Kafka = require('../../index')
 const Cluster = require('../../cluster')
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { sentRecords } = require('./fixtures/bufferHarness')
 const { createErrorFromCode } = require('../../protocol/error')
 const { createLogger, LEVELS } = require('../../loggers')
 const {
@@ -245,9 +246,18 @@ describe('Producer > deliveryTimeout', () => {
       produce: async (request) => {
         const refusal = request.guard(100)
         if (refusal) throw refusal
+        const read = await sentRecords(request)
+        let index = 0
         for (const { topic, partitions } of request.topicData)
-          for (const { partition, firstSequence, messages } of partitions)
-            written.push({ topic, partition, firstSequence, values: messages.map((m) => m.value) })
+          for (const { partition, firstSequence } of partitions) {
+            const { records } = read[index++]
+            written.push({
+              topic,
+              partition,
+              firstSequence,
+              values: records.map(({ value }) => value.toString()),
+            })
+          }
         return {
           topics: request.topicData.map(({ topic, partitions }) => ({
             topicName: topic,

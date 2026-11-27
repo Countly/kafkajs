@@ -59,7 +59,7 @@ const {
   pollTolerating,
   pollUntil,
 } = require('./fixtures/bounded')
-const { bufferedProducer, deferred, watch } = require('./fixtures/bufferHarness')
+const { bufferedProducer, deferred, owned, watch } = require('./fixtures/bufferHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
 const { heartbeatInBatch } = require('./fixtures/memberHeartbeat')
 const { droppedFrom } = require('./fixtures/liveTransactions')
@@ -706,7 +706,7 @@ describe('Producer > the live scenarios harness', () => {
           payload: 0,
           pinner: cluster,
         }
-        const chunk = { messages: [{}], owners: [] }
+        const chunk = { messages: owned([{}]), owners: [] }
         Cluster.prototype.holdTopic.call(cluster, topic)
         accumulator.track(send)
         chunk.ownership = new BatchOwnership(admission, chunk, false)
@@ -1521,7 +1521,7 @@ describe('Producer > the live scenarios harness', () => {
         const topicData = [
           {
             topic: 't',
-            partitions: [{ partition: 0, firstSequence: 3, messages: [{ value: 'x' }] }],
+            partitions: [{ partition: 0, firstSequence: 3, messages: owned([{ value: 'x' }]) }],
           },
         ]
         await Broker.prototype.produce({ producerId: 9n, producerEpoch: 1, acks: -1, topicData })

@@ -16,6 +16,7 @@ const {
   plainTextBrokers,
 } = require('../../../../testHelpers')
 const { NEVER, STOP_GRACE_MS, bounded, delay, liveRun } = require('./bounded')
+const { sentRecords } = require('./bufferHarness')
 
 /** The most one probe record carries, an independent conservative bound. */
 const MAX_PROBE_RECORD_BYTES = 32768
@@ -230,8 +231,9 @@ class CleanupStack {
  * @property {number} producerEpoch
  * @property {number} acks
  * @property {Array<{ topic: string, partition: number, firstSequence: number|undefined,
- *   records: number, first: string }>} partitions the batches it carried; `first` is the start of
- *   the first record's value
+ *   records: number|null, first: string|null }>} partitions the batches it carried, read as a
+ *   broker reads them before the call returns (`null` until then); `first` is the start of the
+ *   first record's value
  * @property {Array<{ topic: string, partition: number, errorCode: number, baseOffset: string }>|null} results
  *   the broker's answer, absent while pending and when the call failed
  * @property {Error|null} error what the call threw
@@ -259,7 +261,7 @@ class ProduceLedger {
     const ledger = this
     const { produce } = Broker.prototype
     this.spy = jest.spyOn(Broker.prototype, 'produce').mockImplementation(async function (request) {
-      const call = ledger.begin(request)
+      const { call, read } = ledger.begin(request)
       try {
         const results = await produce.call(this, request)
         call.results = Array.isArray(results)
@@ -274,6 +276,8 @@ class ProduceLedger {
       } catch (error) {
         call.error = error
         throw error
+      } finally {
+        await read
       }
     })
     return this
@@ -289,8 +293,10 @@ class ProduceLedger {
   }
 
   /**
+   * Records a call at once; its batches' record counts and first values are filled from the
+   * records a broker reads, which `read` settles.
    * @param {object} request the arguments of `Broker#produce`
-   * @returns {ProduceCall}
+   * @returns {{ call: ProduceCall, read: Promise<void> }}
    */
   begin(request) {
     const call = {
@@ -299,19 +305,27 @@ class ProduceLedger {
       producerEpoch: request.producerEpoch,
       acks: request.acks,
       partitions: request.topicData.flatMap(({ topic, partitions }) =>
-        partitions.map(({ partition, firstSequence, messages }) => ({
+        partitions.map(({ partition, firstSequence }) => ({
           topic,
           partition,
           firstSequence,
-          records: messages.length,
-          first: String(messages[0]?.value).slice(0, 40),
+          records: null,
+          first: null,
         }))
       ),
       results: null,
       error: null,
     }
     this.calls.push(call)
-    return call
+    const read = sentRecords(request).then((batches) =>
+      batches.forEach(({ records }, index) =>
+        Object.assign(call.partitions[index], {
+          records: records.length,
+          first: String(records[0]?.value).slice(0, 40),
+        })
+      )
+    )
+    return { call, read }
   }
 
   /**

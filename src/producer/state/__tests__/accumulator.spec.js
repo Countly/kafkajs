@@ -11,6 +11,7 @@ const apiKeys = require('../../../protocol/requests/apiKeys')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { parse: parseProduce } = require('../../../protocol/requests/produce/partitionResults')
 const { createFakeCluster } = require('../../__tests__/fixtures/fakeCluster')
+const { sentRecords } = require('../../__tests__/fixtures/bufferHarness')
 const { createGroupApiBroker } = require('../../../broker/__tests__/fixtures/groupApiHarness')
 const {
   KafkaJSApplicationRecoverableError,
@@ -115,6 +116,15 @@ const microtasks = async () => {
   }
 }
 
+/** A record's value as a broker reads it, as text; `null` for a null value. */
+const textOf = ({ value }) => (value === null ? null : value.toString())
+
+/** Every hand-off's values, its batches' records in order, as a broker reads them. */
+const valuesOf = async (calls) =>
+  (await Promise.all(calls.map(sentRecords))).map((batches) =>
+    batches.flatMap(({ records }) => records.map(textOf))
+  )
+
 /** `count` one-record messages for `partition`, values `<prefix>-<n>`. */
 const records = (partition, prefix, count = 1) =>
   Array.from({ length: count }, (_, index) => ({ partition, value: `${prefix}-${index}` }))
@@ -165,11 +175,11 @@ const createAccumulator = ({
     leaderOf,
     deadline,
   })
-  /** The values of each call's batches. */
-  const sent = () =>
-    calls.map(({ batches }) =>
-      batches.map(({ topic, partition: id, messages }) => ({
-        [`${topic}/${id}`]: messages.map(({ value }) => value),
+  /** The values of each call's batches, as a broker reads them. */
+  const sent = async () =>
+    (await Promise.all(calls.map(sentRecords))).map((batches) =>
+      batches.map(({ topic, partition: id, records }) => ({
+        [`${topic}/${id}`]: records.map(textOf),
       }))
     )
   return { accumulator, calls, sent, partition }
@@ -256,20 +266,23 @@ const createLingeringProducer = ({ produce, partitions = 2, level = 2, ...option
     retry: { retries: 3, initialRetryTime: 10, maxRetryTime: 40, factor: 0 },
     ...options,
   })
-  /** What each Produce request carried. */
-  const produced = () =>
-    cluster.broker.produce.mock.calls.map(([request]) => ({
+  /** What each Produce request carried, its values as a broker reads them. */
+  const produced = async () => {
+    const requests = cluster.broker.produce.mock.calls.map(([request]) => request)
+    const read = await Promise.all(requests.map(sentRecords))
+    return requests.map((request, index) => ({
       acks: request.acks,
       compression: request.compression,
       producerId: request.producerId,
-      partitions: request.topicData.flatMap(({ partitions: written }) =>
-        written.map(({ partition, firstSequence, messages }) => ({
+      partitions: request.topicData
+        .flatMap(({ partitions: written }) => written)
+        .map(({ partition, firstSequence }, at) => ({
           partition,
           firstSequence,
-          values: messages.map(({ value }) => value),
-        }))
-      ),
+          values: read[index][at].records.map(textOf),
+        })),
     }))
+  }
   return { cluster, producer, produced }
 }
 
@@ -342,12 +355,12 @@ describe('Producer > the accumulator', () => {
       const second = append(accumulator, records(0, 'b'))
       const third = append(accumulator, records(0, 'c'))
       await jest.advanceTimersByTimeAsync(LINGER - 1)
-      expect(sent()).toEqual([])
+      expect(await sent()).toEqual([])
       expect(jest.getTimerCount()).toBe(1)
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0', 'a-1', 'b-0', 'c-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0', 'a-1', 'b-0', 'c-0'] }]])
       const results = await settledWithin(Promise.all([first, second, third]))
       expect(results.map(([{ baseOffset }]) => baseOffset)).toEqual(['100', '102', '103'])
       expect(jest.getTimerCount()).toBe(0)
@@ -361,7 +374,7 @@ describe('Producer > the accumulator', () => {
       append(accumulator, records(0, 'b'))
       await jest.advanceTimersByTimeAsync(2)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0', 'b-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0', 'b-0'] }]])
     })
 
     test('each partition lingers on its own timer, and none is left once every batch went out', async () => {
@@ -373,11 +386,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(0)
       expect(jest.getTimerCount()).toBe(2)
       await jest.advanceTimersByTimeAsync(2)
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
 
       await jest.advanceTimersByTimeAsync(3)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }], [{ [`${TOPIC}/1`]: ['b-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }], [{ [`${TOPIC}/1`]: ['b-0'] }]])
       expect(jest.getTimerCount()).toBe(0)
     })
 
@@ -388,7 +401,7 @@ describe('Producer > the accumulator', () => {
       append(accumulator, [{ partition: 0, value: 'v2-' }])
       await jest.advanceTimersByTimeAsync(0)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['v1', 'v2-'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['v1', 'v2-'] }]])
       expect(jest.getTimerCount()).toBe(0)
     })
 
@@ -398,11 +411,11 @@ describe('Producer > the accumulator', () => {
       append(accumulator, [{ partition: 0, value: 'aaaa' }])
       append(accumulator, [{ partition: 0, value: 'bbbb' }])
       await jest.advanceTimersByTimeAsync(0)
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['aaaa'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['aaaa'] }]])
 
       await jest.advanceTimersByTimeAsync(LINGER)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['aaaa'] }], [{ [`${TOPIC}/0`]: ['bbbb'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['aaaa'] }], [{ [`${TOPIC}/0`]: ['bbbb'] }]])
     })
 
     test('a send larger than batchSize goes out on its own and is never split', async () => {
@@ -412,7 +425,7 @@ describe('Producer > the accumulator', () => {
       append(accumulator, records(0, 'large', 3))
       await jest.advanceTimersByTimeAsync(0)
 
-      expect(sent()).toEqual([
+      expect(await sent()).toEqual([
         [{ [`${TOPIC}/0`]: ['a'] }],
         [{ [`${TOPIC}/0`]: ['large-0', 'large-1', 'large-2'] }],
       ])
@@ -430,11 +443,11 @@ describe('Producer > the accumulator', () => {
         append(accumulator, records(0, 'a'))
         append(accumulator, records(0, 'b'), options)
         await jest.advanceTimersByTimeAsync(0)
-        expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
+        expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
 
         await jest.advanceTimersByTimeAsync(LINGER)
 
-        expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }], [{ [`${TOPIC}/0`]: ['b-0'] }]])
+        expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }], [{ [`${TOPIC}/0`]: ['b-0'] }]])
         expect(calls[1]).toEqual(
           expect.objectContaining({ acks: -1, timeout: 30000, compression: 0, ...options })
         )
@@ -503,7 +516,7 @@ describe('Producer > the accumulator', () => {
       ])
       await jest.advanceTimersByTimeAsync(0)
 
-      expect(sent()).toEqual([
+      expect(await sent()).toEqual([
         [{ [`${TOPIC}/0`]: ['a'] }],
         [
           { [`${TOPIC}/0`]: ['bbbbbb'] },
@@ -523,12 +536,12 @@ describe('Producer > the accumulator', () => {
         { partition: 2, value: 'c' },
       ])
       await jest.advanceTimersByTimeAsync(0)
-      expect(sent()).toEqual([[{ [`${TOPIC}/1`]: ['bbbbbb'] }, { [`${TOPIC}/2`]: ['c'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/1`]: ['bbbbbb'] }, { [`${TOPIC}/2`]: ['c'] }]])
       expect(jest.getTimerCount()).toBe(1)
 
       await jest.advanceTimersByTimeAsync(LINGER)
 
-      expect(sent()).toEqual([
+      expect(await sent()).toEqual([
         [{ [`${TOPIC}/1`]: ['bbbbbb'] }, { [`${TOPIC}/2`]: ['c'] }],
         [{ [`${TOPIC}/0`]: ['a'] }],
       ])
@@ -546,7 +559,7 @@ describe('Producer > the accumulator', () => {
         const sending = append(accumulator, records(0, 'a'))
         await microtasks()
 
-        expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
+        expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
         expect(jest.getTimerCount()).toBe(0)
         await expect(sending).resolves.toEqual([expect.objectContaining({ baseOffset: '100' })])
       })
@@ -558,7 +571,7 @@ describe('Producer > the accumulator', () => {
         append(accumulator, records(1, 'b'))
         await microtasks()
 
-        expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }]])
+        expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }]])
         expect(jest.getTimerCount()).toBe(0)
       })
 
@@ -579,7 +592,7 @@ describe('Producer > the accumulator', () => {
           all.mockRestore()
         }
         expect(calls).toHaveLength(1)
-        expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }]])
+        expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }]])
       })
 
       test('flush() with nothing pending settles at once and calls the send path never', async () => {
@@ -605,10 +618,7 @@ describe('Producer > the accumulator', () => {
             settlers.forEach((settler) => settler.resolve({ partition, baseOffset: '0' }))
           )
         })
-        const values = () =>
-          calls.map(({ batches }) =>
-            batches.flatMap(({ messages }) => messages.map(({ value }) => value))
-          )
+        const values = () => valuesOf(calls)
         return { answer, sendPartitioned, values }
       }
 
@@ -622,13 +632,13 @@ describe('Producer > the accumulator', () => {
         await jest.advanceTimersByTimeAsync(LINGER * 3)
         append(accumulator, records(0, 'c'))
         await jest.advanceTimersByTimeAsync(0)
-        expect(values()).toEqual([['a-0']])
+        expect(await values()).toEqual([['a-0']])
         expect(jest.getTimerCount()).toBe(0)
 
         answer.resolve()
         await jest.advanceTimersByTimeAsync(0)
 
-        expect(values()).toEqual([['a-0'], ['b-0', 'c-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0', 'c-0']])
       })
 
       test('with linger: 0, the sends behind a partition’s batch in flight merge into one batch, arming no timer', async () => {
@@ -646,13 +656,13 @@ describe('Producer > the accumulator', () => {
         await microtasks()
         append(accumulator, records(0, 'c'))
         await microtasks()
-        expect(values()).toEqual([['a-0']])
+        expect(await values()).toEqual([['a-0']])
         expect(jest.getTimerCount()).toBe(0)
 
         answer.resolve()
         await microtasks()
 
-        expect(values()).toEqual([['a-0'], ['b-0', 'c-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0', 'c-0']])
         expect(jest.getTimerCount()).toBe(0)
       })
 
@@ -671,7 +681,7 @@ describe('Producer > the accumulator', () => {
         append(accumulator, [{ partition: 0, value: 'ccc' }])
         await jest.advanceTimersByTimeAsync(0)
 
-        expect(values()).toEqual([['a'], ['bbb', 'ccc']])
+        expect(await values()).toEqual([['a'], ['bbb', 'ccc']])
       })
 
       test('a partition with no batch in flight is not held', async () => {
@@ -683,7 +693,7 @@ describe('Producer > the accumulator', () => {
         append(accumulator, records(1, 'b'))
         await jest.advanceTimersByTimeAsync(LINGER)
 
-        expect(values()).toEqual([['a-0'], ['b-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0']])
       })
 
       test('a held batch with a delivery deadline goes on at that deadline, its partition’s batch still in flight', async () => {
@@ -698,11 +708,11 @@ describe('Producer > the accumulator', () => {
         await jest.advanceTimersByTimeAsync(LINGER + 1)
         append(accumulator, records(0, 'b'))
         await jest.advanceTimersByTimeAsync(49)
-        expect(values()).toEqual([['a-0']])
+        expect(await values()).toEqual([['a-0']])
 
         await jest.advanceTimersByTimeAsync(1)
 
-        expect(values()).toEqual([['a-0'], ['b-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0']])
         expect(sendPartitioned.mock.calls[1][0].batches[0].createdAt).toBe(LINGER + 1)
         expect(jest.getTimerCount()).toBe(0)
       })
@@ -721,10 +731,10 @@ describe('Producer > the accumulator', () => {
         await jest.advanceTimersByTimeAsync(LINGER + 1)
         append(accumulator, records(0, 'c'), { startedAt: 0 })
         await jest.advanceTimersByTimeAsync(37)
-        expect(values()).toEqual([['a-0']])
+        expect(await values()).toEqual([['a-0']])
         await jest.advanceTimersByTimeAsync(1)
 
-        expect(values()).toEqual([['a-0'], ['b-0', 'c-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0', 'c-0']])
         expect(jest.getTimerCount()).toBe(0)
       })
 
@@ -743,10 +753,7 @@ describe('Producer > the accumulator', () => {
             throw new KafkaJSError('after the fact')
           }
         })
-        const values = () =>
-          calls.map(({ batches }) =>
-            batches.flatMap(({ messages }) => messages.map(({ value }) => value))
-          )
+        const values = () => valuesOf(calls)
         const { accumulator } = createAccumulator({
           sendPartitioned,
           holds: () => true,
@@ -759,12 +766,12 @@ describe('Producer > the accumulator', () => {
         await jest.advanceTimersByTimeAsync(LINGER * 2)
         append(accumulator, [{ partition: 0, value: 'cccc' }])
         await jest.advanceTimersByTimeAsync(LINGER * 2)
-        expect(values()).toEqual([['a'], ['bbb']])
+        expect(await values()).toEqual([['a'], ['bbb']])
 
         answer.resolve()
         await jest.advanceTimersByTimeAsync(0)
 
-        expect(values()).toEqual([['a'], ['bbb'], ['cccc']])
+        expect(await values()).toEqual([['a'], ['bbb'], ['cccc']])
       })
 
       test('the partitions one answer releases go out together', async () => {
@@ -775,12 +782,12 @@ describe('Producer > the accumulator', () => {
         await jest.advanceTimersByTimeAsync(LINGER + 1)
         append(accumulator, [...records(0, 'c'), ...records(1, 'd')])
         await jest.advanceTimersByTimeAsync(LINGER * 2)
-        expect(values()).toEqual([['a-0', 'b-0']])
+        expect(await values()).toEqual([['a-0', 'b-0']])
 
         answer.resolve()
         await jest.advanceTimersByTimeAsync(0)
 
-        expect(values()).toEqual([
+        expect(await values()).toEqual([
           ['a-0', 'b-0'],
           ['c-0', 'd-0'],
         ])
@@ -798,10 +805,7 @@ describe('Producer > the accumulator', () => {
             settlers.forEach((settler) => settler.resolve({ partition, baseOffset: '0' }))
           )
         })
-        const values = () =>
-          calls.map(({ batches }) =>
-            batches.flatMap(({ messages }) => messages.map(({ value }) => value))
-          )
+        const values = () => valuesOf(calls)
         const { accumulator } = createAccumulator({ sendPartitioned, holds: () => true })
 
         append(accumulator, records(0, 'a'))
@@ -812,12 +816,12 @@ describe('Producer > the accumulator', () => {
         await jest.advanceTimersByTimeAsync(0)
         append(accumulator, records(0, 'c'))
         await jest.advanceTimersByTimeAsync(LINGER + 1)
-        expect(values()).toEqual([['a-0'], ['b-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0']])
 
         answers[1]()
         await jest.advanceTimersByTimeAsync(0)
 
-        expect(values()).toEqual([['a-0'], ['b-0'], ['c-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0'], ['c-0']])
         answers[2]()
       })
 
@@ -841,7 +845,7 @@ describe('Producer > the accumulator', () => {
         append(accumulator, records(0, 'c'))
         await jest.advanceTimersByTimeAsync(50)
 
-        expect(values()).toEqual([['a-0'], ['b-0'], ['c-0']])
+        expect(await values()).toEqual([['a-0'], ['b-0'], ['c-0']])
       })
     })
 
@@ -874,7 +878,7 @@ describe('Producer > the accumulator', () => {
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(0)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/1`]: ['b-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/1`]: ['b-0'] }]])
       expect(jest.getTimerCount()).toBe(1)
     })
 
@@ -925,7 +929,7 @@ describe('Producer > the accumulator', () => {
 
       const flushed = settledFlag(accumulator.flush())
 
-      expect(sent()).toEqual([
+      expect(await sent()).toEqual([
         [{ [`${TOPIC}/0`]: ['a-0'] }, { [`${TOPIC}/1`]: ['b-0'] }],
         [{ [`${OTHER_TOPIC}/0`]: ['c-0'] }],
       ])
@@ -1027,8 +1031,10 @@ describe('Producer > the accumulator', () => {
           settlers.forEach((settler) => settler.resolve({ partition, baseOffset: '0' }))
         )
       })
-      const values = () =>
-        calls.map(({ batches }) => batches.map(({ messages }) => messages[0].value))
+      const values = async () =>
+        (await Promise.all(calls.map(sentRecords))).map((batches) =>
+          batches.map(({ records }) => textOf(records[0]))
+        )
       return { answer, sendPartitioned, values }
     }
 
@@ -1042,11 +1048,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
-      expect(sent()).toEqual([])
+      expect(await sent()).toEqual([])
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')]])
       expect(jest.getTimerCount()).toBe(0)
     })
 
@@ -1060,12 +1066,12 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')]])
       expect(jest.getTimerCount()).toBe(1)
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
     })
 
     test.each([
@@ -1082,11 +1088,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'), options)
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')]])
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
     })
 
     test('six partitions on three brokers, sent 1 ms apart, leave in three hand-offs', async () => {
@@ -1101,7 +1107,7 @@ describe('Producer > the accumulator', () => {
       }
       await jest.advanceTimersByTimeAsync(MERGE_LINGER)
 
-      expect(sent()).toEqual([
+      expect(await sent()).toEqual([
         [batchOf(0, 'p0-0'), batchOf(3, 'p3-0')],
         [batchOf(1, 'p1-0'), batchOf(4, 'p4-0')],
         [batchOf(2, 'p2-0'), batchOf(5, 'p5-0')],
@@ -1122,11 +1128,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(2, 'c'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
-      expect(sent()).toEqual([])
+      expect(await sent()).toEqual([])
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0'), batchOf(2, 'c-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0'), batchOf(2, 'c-0')]])
       expect(jest.getTimerCount()).toBe(0)
     })
 
@@ -1141,11 +1147,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(2, 'c'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')], [batchOf(2, 'c-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')], [batchOf(2, 'c-0')]])
     })
 
     test('a held batch whose linger has run out when another expires takes no other batch with it', async () => {
@@ -1158,7 +1164,7 @@ describe('Producer > the accumulator', () => {
       })
       append(accumulator, records(1, 'x'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER)
-      expect(values()).toEqual([['x-0']])
+      expect(await values()).toEqual([['x-0']])
 
       // w and y fall due together; y is held behind x, and z, led by y's broker, is not due
       append(accumulator, records(0, 'w'))
@@ -1166,14 +1172,14 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(2, 'z'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(values()).toEqual([['x-0'], ['w-0']])
+      expect(await values()).toEqual([['x-0'], ['w-0']])
 
       await jest.advanceTimersByTimeAsync(1)
-      expect(values()).toEqual([['x-0'], ['w-0'], ['z-0']])
+      expect(await values()).toEqual([['x-0'], ['w-0'], ['z-0']])
 
       answer.resolve()
       await jest.advanceTimersByTimeAsync(0)
-      expect(values()).toEqual([['x-0'], ['w-0'], ['z-0'], ['y-0']])
+      expect(await values()).toEqual([['x-0'], ['w-0'], ['z-0'], ['y-0']])
     })
 
     test('a merged partition starts a fresh batch on its own linger', async () => {
@@ -1185,14 +1191,14 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(sent()).toHaveLength(1)
+      expect(await sent()).toHaveLength(1)
 
       append(accumulator, records(1, 'c'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(sent()).toHaveLength(1)
+      expect(await sent()).toHaveLength(1)
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')], [batchOf(1, 'c-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')], [batchOf(1, 'c-0')]])
     })
 
     test('without a leaderOf, batches never merge', async () => {
@@ -1203,7 +1209,7 @@ describe('Producer > the accumulator', () => {
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
     })
 
     test('batches of two topics one broker leads leave together, and a batch of another broker stays', async () => {
@@ -1219,7 +1225,7 @@ describe('Producer > the accumulator', () => {
       appendTo(accumulator, TOPIC, 1, 'd')
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 3)
 
-      expect(sent()).toEqual([
+      expect(await sent()).toEqual([
         [batchOf(0, 'a-0'), batchOf(0, 'b-0', OTHER_TOPIC), batchOf(1, 'd-0')],
       ])
       expect(leaderOf.mock.calls).toEqual([
@@ -1231,7 +1237,7 @@ describe('Producer > the accumulator', () => {
 
       await jest.advanceTimersByTimeAsync(2)
 
-      expect(sent()[1]).toEqual([batchOf(1, 'c-0', OTHER_TOPIC)])
+      expect((await sent())[1]).toEqual([batchOf(1, 'c-0', OTHER_TOPIC)])
     })
 
     test('the leader of a waiting batch is read once, when its timer is armed, and the merge goes by that answer', async () => {
@@ -1251,7 +1257,7 @@ describe('Producer > the accumulator', () => {
         [TOPIC, 0],
         [TOPIC, 1],
       ])
-      expect(sent()).toEqual([[batchOf(0, 'a-0'), { [`${TOPIC}/1`]: ['b-0', 'c-0'] }]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0'), { [`${TOPIC}/1`]: ['b-0', 'c-0'] }]])
     })
 
     test.each([
@@ -1265,7 +1271,7 @@ describe('Producer > the accumulator', () => {
       append(accumulator, records(0, 'a'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')]])
       expect(leaderOf).not.toHaveBeenCalled()
     })
 
@@ -1279,7 +1285,7 @@ describe('Producer > the accumulator', () => {
       })
       append(accumulator, records(1, 'x'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER)
-      expect(values()).toEqual([['x-0']])
+      expect(await values()).toEqual([['x-0']])
 
       append(accumulator, records(0, 'a'))
       await jest.advanceTimersByTimeAsync(1)
@@ -1287,13 +1293,13 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
 
       // partition 0's linger ran out: partition 1 is led by the same broker but is held
-      expect(values()).toEqual([['x-0'], ['a-0']])
+      expect(await values()).toEqual([['x-0'], ['a-0']])
       expect(jest.getTimerCount()).toBe(1)
 
       answer.resolve()
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(values()).toEqual([['x-0'], ['a-0'], ['y-0']])
+      expect(await values()).toEqual([['x-0'], ['a-0'], ['y-0']])
     })
 
     test('a held batch whose linger runs out does not send its broker’s other batches early', async () => {
@@ -1312,14 +1318,14 @@ describe('Producer > the accumulator', () => {
 
       // y's linger runs out at 100 while x is still in flight: a muted partition makes nothing ready
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 10 + 5)
-      expect(values()).toEqual([['x-0']])
+      expect(await values()).toEqual([['x-0']])
 
       await jest.advanceTimersByTimeAsync(MERGE_LINGER)
-      expect(values()).toEqual([['x-0'], ['z-0']])
+      expect(await values()).toEqual([['x-0'], ['z-0']])
 
       answer.resolve()
       await jest.advanceTimersByTimeAsync(0)
-      expect(values()).toEqual([['x-0'], ['z-0'], ['y-0']])
+      expect(await values()).toEqual([['x-0'], ['z-0'], ['y-0']])
     })
 
     test.each([
@@ -1344,7 +1350,7 @@ describe('Producer > the accumulator', () => {
 
         await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
 
-        expect(values()).toEqual([['x-0'], order.map((name) => `${name}-0`)])
+        expect(await values()).toEqual([['x-0'], order.map((name) => `${name}-0`)])
         answer.resolve()
       }
     )
@@ -1368,11 +1374,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(sent()).toEqual([[batchOf(0, 'a-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')]])
 
       await jest.advanceTimersByTimeAsync(1)
 
-      expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+      expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
     })
 
     test.each([
@@ -1395,7 +1401,7 @@ describe('Producer > the accumulator', () => {
         const second = append(accumulator, records(1, 'b'))
         await jest.advanceTimersByTimeAsync(MERGE_LINGER)
 
-        expect(sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
+        expect(await sent()).toEqual([[batchOf(0, 'a-0')], [batchOf(1, 'b-0')]])
         await expect(Promise.all([first, second])).resolves.toHaveLength(2)
       }
     )
@@ -1514,9 +1520,8 @@ describe('Producer > the accumulator', () => {
       const settle = settleBy({ resolve: [1], errors: { 0: unsent } })
       const shared = []
       const sendPartitioned = jest.fn((request) => {
-        for (const { partition, messages } of request.batches) {
-          if (partition === 0) shared.push(messages.map(({ value }) => value))
-        }
+        const batches = request.batches.filter(({ partition }) => partition === 0)
+        shared.push(sentRecords({ batches }))
         return settle(request)
       })
       const { accumulator } = createAccumulator({ sendPartitioned })
@@ -1528,7 +1533,8 @@ describe('Producer > the accumulator', () => {
         LINGER
       )
 
-      expect(shared).toEqual([['a-0', 'c-0']])
+      const read = (await Promise.all(shared)).flat()
+      expect(read.map(({ records }) => records.map(textOf))).toEqual([['a-0', 'c-0']])
       expect(partly).toBeInstanceOf(KafkaJSDeliveryTimeout)
       expect(partly).toMatchObject({ outcome: 'unknown' })
       expect(partly.cause).toBe(unsent)
@@ -1656,7 +1662,7 @@ describe('Producer > the accumulator', () => {
       })
       await jest.advanceTimersByTimeAsync(LINGER)
 
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
       await expect(sending).resolves.toEqual([expect.objectContaining({ topicName: TOPIC })])
     })
   })
@@ -1701,7 +1707,7 @@ describe('Producer > the accumulator', () => {
       await expect(settledWithin(good)).resolves.toEqual([
         expect.objectContaining({ baseOffset: '100' }),
       ])
-      expect(sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
+      expect(await sent()).toEqual([[{ [`${TOPIC}/0`]: ['a-0'] }]])
     })
 
     test('a send whose records are gone by the end of the check resolves [] at once, queueing nothing', async () => {
@@ -1876,16 +1882,18 @@ describe('Producer > the accumulator', () => {
           producer.send({ topic: TOPIC, messages: [{ value }] })
         )
         await jest.advanceTimersByTimeAsync(4)
-        expect(produced()).toEqual([])
+        expect(await produced()).toEqual([])
         await settledWithin(Promise.all(sends), 1)
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a', 'b']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+          ['a', 'b'],
+        ])
 
         const full = producer.send({ topic: TOPIC, messages: [{ value: 'x'.repeat(16383) }] })
         await jest.advanceTimersByTimeAsync(0)
-        expect(produced()).toHaveLength(1)
+        expect(await produced()).toHaveLength(1)
         producer.send({ topic: TOPIC, messages: [{ value: 'y' }] })
         await jest.advanceTimersByTimeAsync(0)
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
           ['a', 'b'],
           ['x'.repeat(16383), 'y'],
         ])
@@ -1900,7 +1908,7 @@ describe('Producer > the accumulator', () => {
         const sent = producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })
         await microtasks()
 
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
         expect(jest.getTimerCount()).toBe(0)
         await expect(sent).resolves.toEqual([expect.objectContaining({ partition: 0 })])
       })
@@ -1932,7 +1940,7 @@ describe('Producer > the accumulator', () => {
 
           await expect(settledWithin(sent)).resolves.toHaveLength(3)
           expect(
-            produced().map(({ partitions }) => partitions.map(({ partition }) => partition))
+            (await produced()).map(({ partitions }) => partitions.map(({ partition }) => partition))
           ).toEqual([[0, 1, 2]])
         }
       )
@@ -1946,7 +1954,9 @@ describe('Producer > the accumulator', () => {
         )
         const results = await settledWithin(Promise.all(sends), LINGER)
 
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a', 'b', 'c']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+          ['a', 'b', 'c'],
+        ])
         expect(results.map(([{ baseOffset }]) => baseOffset)).toEqual(['0', '1', '2'])
       })
 
@@ -1966,9 +1976,9 @@ describe('Producer > the accumulator', () => {
         const second = producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
         await settledWithin(Promise.all([first, second]), LINGER)
 
-        expect(produced().map(({ partitions }) => partitions.map(({ values }) => values))).toEqual([
-          [['a'], ['b']],
-        ])
+        expect(
+          (await produced()).map(({ partitions }) => partitions.map(({ values }) => values))
+        ).toEqual([[['a'], ['b']]])
       })
 
       test('partitions led by different brokers go in separate requests, by what the cluster has cached', async () => {
@@ -1988,10 +1998,9 @@ describe('Producer > the accumulator', () => {
         const second = producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
         await settledWithin(Promise.all([first, second]), LINGER)
 
-        expect(produced().map(({ partitions }) => partitions.map(({ values }) => values))).toEqual([
-          [['a']],
-          [['b']],
-        ])
+        expect(
+          (await produced()).map(({ partitions }) => partitions.map(({ values }) => values))
+        ).toEqual([[['a']], [['b']]])
         expect(cluster.cachedLeader.mock.calls).toEqual([
           [TOPIC, 0],
           [TOPIC, 1],
@@ -2013,7 +2022,9 @@ describe('Producer > the accumulator', () => {
           ])
         )
 
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['ab', 'cd']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+          ['ab', 'cd'],
+        ])
       })
 
       test('a send with a different compression sends the pending batch first and starts a new one', async () => {
@@ -2025,13 +2036,19 @@ describe('Producer > the accumulator', () => {
         producer.send({ topic: TOPIC, messages: [{ value: 'b' }], compression: GZIP })
         await jest.advanceTimersByTimeAsync(0)
         expect(
-          produced().map(({ compression, partitions }) => [compression, partitions[0].values])
+          (await produced()).map(({ compression, partitions }) => [
+            compression,
+            partitions[0].values,
+          ])
         ).toEqual([[undefined, ['a']]])
 
         await jest.advanceTimersByTimeAsync(LINGER)
 
         expect(
-          produced().map(({ compression, partitions }) => [compression, partitions[0].values])
+          (await produced()).map(({ compression, partitions }) => [
+            compression,
+            partitions[0].values,
+          ])
         ).toEqual([
           [undefined, ['a']],
           [GZIP, ['b']],
@@ -2071,7 +2088,7 @@ describe('Producer > the accumulator', () => {
             `The producer is disconnecting; therefore, it can't safely accept messages anymore`
           )
         )
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
         expect(cluster.disconnect).not.toHaveBeenCalled()
         expect(disconnected()).toBe(false)
 
@@ -2122,10 +2139,10 @@ describe('Producer > the accumulator', () => {
 
         const sent = producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })
         await jest.advanceTimersByTimeAsync(0)
-        expect(produced()).toEqual([])
+        expect(await produced()).toEqual([])
 
         await expect(settledWithin(sent, LINGER)).resolves.toHaveLength(1)
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
       })
 
       test('a send still being assigned partitions when disconnect() starts is answered before the producer disconnects', async () => {
@@ -2147,7 +2164,7 @@ describe('Producer > the accumulator', () => {
         const disconnected = settledFlag(producer.disconnect())
         held.resolve()
         await jest.advanceTimersByTimeAsync(0)
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
         expect(cluster.disconnect).not.toHaveBeenCalled()
 
         answered.resolve()
@@ -2320,8 +2337,8 @@ describe('Producer > the accumulator', () => {
         }
       }
 
-      const partitionsSent = (produced) =>
-        produced().map(({ partitions }) => partitions.map(({ partition }) => partition))
+      const partitionsSent = async (produced) =>
+        (await produced()).map(({ partitions }) => partitions.map(({ partition }) => partition))
 
       test('a partition answered with a non-retriable error rejects only the sends its batch carries', async () => {
         const { producer, produced } = createLingeringProducer({
@@ -2344,7 +2361,7 @@ describe('Producer > the accumulator', () => {
         ])
         expect(await a).toBeInstanceOf(KafkaJSProtocolError)
         expect(await a).toMatchObject({ code: MESSAGE_TOO_LARGE, partition: 0 })
-        expect(partitionsSent(produced)).toEqual([[0, 1]])
+        expect(await partitionsSent(produced)).toEqual([[0, 1]])
       })
 
       test('only a partition answered with a retriable error is sent again; one answered OK is written once', async () => {
@@ -2368,7 +2385,7 @@ describe('Producer > the accumulator', () => {
           [expect.objectContaining({ partition: 0 })],
           [expect.objectContaining({ partition: 1 })],
         ])
-        expect(partitionsSent(produced)).toEqual([[0, 1], [0], [0]])
+        expect(await partitionsSent(produced)).toEqual([[0, 1], [0], [0]])
       })
 
       test('a partition missing from the answer is sent again', async () => {
@@ -2399,7 +2416,7 @@ describe('Producer > the accumulator', () => {
           [expect.objectContaining({ partition: 0 })],
           [expect.objectContaining({ partition: 1, baseOffset: '0' })],
         ])
-        expect(partitionsSent(produced)).toEqual([[0, 1], [1]])
+        expect(await partitionsSent(produced)).toEqual([[0, 1], [1]])
       })
 
       test('a broker that cannot be reached leaves only its own partitions for the next attempt', async () => {
@@ -2431,7 +2448,7 @@ describe('Producer > the accumulator', () => {
           expect.objectContaining({ partition: 0 }),
         ])
         expect(await settledWithin(b, 200)).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
-        expect(partitionsSent(produced)).toEqual([[0]])
+        expect(await partitionsSent(produced)).toEqual([[0]])
         expect(
           cluster.findBroker.mock.calls.filter(([{ nodeId }]) => Number(nodeId) === 1)
         ).toHaveLength(4)
@@ -2471,7 +2488,7 @@ describe('Producer > the accumulator', () => {
         expect(b).toBe(refused)
         expect(a).toEqual([expect.objectContaining({ partition: 0 })])
         expect(c).toEqual([expect.objectContaining({ partition: 2 })])
-        expect(partitionsSent(produced)).toEqual([[0, 2], [2]])
+        expect(await partitionsSent(produced)).toEqual([[0, 2], [2]])
         expect(cluster.findBroker).toHaveBeenCalledTimes(4)
       })
 
@@ -2499,7 +2516,7 @@ describe('Producer > the accumulator', () => {
             topicData.map(({ topic }) => topic)
           )
         ).toEqual([[TOPIC], [OTHER_TOPIC]])
-        expect(produced()).toHaveLength(2)
+        expect(await produced()).toHaveLength(2)
       })
 
       test('the delivery deadline counts from the send, through the wait for its metadata', async () => {
@@ -2584,8 +2601,8 @@ describe('Producer > the accumulator', () => {
             .send({ topic: TOPIC, messages: [{ partition, value: `p${partition}` }] })
             .catch((e) => e)
 
-        const partitionsSent = (produced) =>
-          produced().map(({ partitions }) => partitions.map(({ partition }) => partition))
+        const partitionsSent = async (produced) =>
+          (await produced()).map(({ partitions }) => partitions.map(({ partition }) => partition))
 
         const lateMessage = (partition) =>
           `Gave up on ${TOPIC} partition ${partition} before sending it: its ${DEADLINE} ms delivery deadline passed`
@@ -2606,7 +2623,7 @@ describe('Producer > the accumulator', () => {
           expect(late).toBeInstanceOf(KafkaJSDeliveryTimeout)
           expect(late.message).toEqual(lateMessage(0))
           expect(sent).toEqual([expect.objectContaining({ partition: 1 })])
-          expect(partitionsSent(produced)).toEqual([[1]])
+          expect(await partitionsSent(produced)).toEqual([[1]])
         })
 
         test('a batch for another broker is left to its own linger and is sent', async () => {
@@ -2627,12 +2644,12 @@ describe('Producer > the accumulator', () => {
             expect.objectContaining({ message: lateMessage(0) })
           )
           expect(youngerSettled()).toBe(false)
-          expect(partitionsSent(produced)).toEqual([])
+          expect(await partitionsSent(produced)).toEqual([])
 
           expect(await settledWithin(younger, 1)).toEqual([
             expect.objectContaining({ partition: 1 }),
           ])
-          expect(partitionsSent(produced)).toEqual([[1]])
+          expect(await partitionsSent(produced)).toEqual([[1]])
         })
 
         test('two batches that are both due go out together when only the older is past its deadline', async () => {
@@ -2653,7 +2670,7 @@ describe('Producer > the accumulator', () => {
           expect(late).toBeInstanceOf(KafkaJSDeliveryTimeout)
           expect(late.message).toEqual(lateMessage(0))
           expect(sent).toEqual([expect.objectContaining({ partition: 1 })])
-          expect(partitionsSent(produced)).toEqual([[1]])
+          expect(await partitionsSent(produced)).toEqual([[1]])
         })
 
         test('the batches that are sent each retry until their own delivery deadline', async () => {
@@ -2703,7 +2720,7 @@ describe('Producer > the accumulator', () => {
 
         await expect(settledWithin(sent, 100)).resolves.toHaveLength(1)
         expect(lookups).toBe(2)
-        expect(produced()).toHaveLength(1)
+        expect(await produced()).toHaveLength(1)
       })
 
       test('a hand-off whose topic has lost its metadata waits for it within its retries', async () => {
@@ -2721,7 +2738,7 @@ describe('Producer > the accumulator', () => {
         ])
         expect(lookups).toBe(3)
         expect(cluster.refreshMetadata).toHaveBeenCalled()
-        expect(produced()).toHaveLength(1)
+        expect(await produced()).toHaveLength(1)
       })
 
       test('a send whose records an older batch carries rejects once every partition it wrote to has settled', async () => {
@@ -2757,7 +2774,7 @@ describe('Producer > the accumulator', () => {
 
         expect(await settledWithin(b, 1)).toMatchObject({ code: MESSAGE_TOO_LARGE })
         expect(
-          produced().map(({ partitions }) =>
+          (await produced()).map(({ partitions }) =>
             partitions.map(({ partition, values }) => [partition, values])
           )
         ).toEqual([[[0, ['a', 'b0']]], [[1, ['b1']]]])
@@ -2792,7 +2809,7 @@ describe('Producer > the accumulator', () => {
         expect(await settledWithin(a)).toMatchObject({ code: MESSAGE_TOO_LARGE })
         expect(await settledWithin(b)).toMatchObject({ code: MESSAGE_TOO_LARGE })
         expect(
-          produced().map(({ partitions }) =>
+          (await produced()).map(({ partitions }) =>
             partitions.map(({ partition, values }) => [partition, values])
           )
         ).toEqual([
@@ -2814,7 +2831,7 @@ describe('Producer > the accumulator', () => {
       await settledWithin(Promise.all(sends), LINGER)
 
       expect(cluster.broker.initProducerId).not.toHaveBeenCalled()
-      expect(produced()).toEqual([
+      expect(await produced()).toEqual([
         {
           acks: -1,
           producerId: -1,
@@ -2854,15 +2871,15 @@ describe('Producer > the accumulator', () => {
         sends.push(producer.send({ topic: TOPIC, messages: [{ value }] }))
         await jest.advanceTimersByTimeAsync(LINGER + 1)
       }
-      const values = () => produced().map(({ partitions }) => partitions[0].values)
-      expect(values()).toEqual(whileHeld)
+      const values = async () => (await produced()).map(({ partitions }) => partitions[0].values)
+      expect(await values()).toEqual(whileHeld)
 
       answers.splice(0).forEach((answer) => answer())
       await jest.advanceTimersByTimeAsync(0)
       answers.splice(0).forEach((answer) => answer())
 
       await settledWithin(Promise.all(sends))
-      expect(values()).toEqual(expected)
+      expect(await values()).toEqual(expected)
     })
 
     test('a send with a different acks sends the pending batch first and starts a new one', async () => {
@@ -2873,13 +2890,15 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(0)
       producer.send({ topic: TOPIC, messages: [{ value: 'b' }], acks: -1 })
       await jest.advanceTimersByTimeAsync(0)
-      expect(produced().map(({ acks, partitions }) => [acks, partitions[0].values])).toEqual([
-        [1, ['a']],
-      ])
+      expect(
+        (await produced()).map(({ acks, partitions }) => [acks, partitions[0].values])
+      ).toEqual([[1, ['a']]])
 
       await jest.advanceTimersByTimeAsync(LINGER)
 
-      expect(produced().map(({ acks, partitions }) => [acks, partitions[0].values])).toEqual([
+      expect(
+        (await produced()).map(({ acks, partitions }) => [acks, partitions[0].values])
+      ).toEqual([
         [1, ['a']],
         [-1, ['b']],
       ])
@@ -2894,7 +2913,7 @@ describe('Producer > the accumulator', () => {
       const downgraded = producer.send({ topic: TOPIC, messages: [{ value: 'b' }], acks: 1 })
       await settledWithin(Promise.all([lingering, downgraded]), LINGER)
 
-      expect(produced()).toEqual([
+      expect(await produced()).toEqual([
         {
           acks: -1,
           producerId: '1000',
@@ -2923,7 +2942,7 @@ describe('Producer > the accumulator', () => {
       await settledWithin(Promise.all([late, downgraded]), LINGER)
 
       expect(
-        produced().map(({ acks, producerId, partitions }) => [
+        (await produced()).map(({ acks, producerId, partitions }) => [
           acks,
           producerId,
           partitions[0].values,
@@ -2952,10 +2971,10 @@ describe('Producer > the accumulator', () => {
       'an on-wire expiry, set by %s, releases a queued batch before its own deadline',
       async (_, deadline) => {
         const answer = deferred()
-        const { producer, produced } = createLingeringProducer({
+        const { cluster, producer, produced } = createLingeringProducer({
           ...deadline,
           produce: async (request) => {
-            if (produced().length === 1) {
+            if (cluster.broker.produce.mock.calls.length === 1) {
               await answer.promise
             }
             return accepted(request)
@@ -2979,7 +2998,10 @@ describe('Producer > the accumulator', () => {
           await jest.advanceTimersByTimeAsync(10)
           expect(Date.now()).toBeLessThan(320)
           expect(await settledWithin(held)).toEqual([expect.objectContaining({ partition: 0 })])
-          expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a'], ['b']])
+          expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+            ['a'],
+            ['b'],
+          ])
         } finally {
           answer.resolve()
           await jest.advanceTimersByTimeAsync(1000)
@@ -3023,7 +3045,7 @@ describe('Producer > the accumulator', () => {
         await settledWithin(transaction.commit())
 
         await expect(sent).resolves.toEqual([expect.objectContaining({ partition: 0 })])
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
         expect(cluster.broker.endTxn).toHaveBeenCalledWith(
           expect.objectContaining({ transactionResult: true })
         )
@@ -3041,7 +3063,10 @@ describe('Producer > the accumulator', () => {
         await settledWithin(transaction.commit())
 
         await expect(Promise.all(sends)).resolves.toHaveLength(2)
-        expect(produced().flatMap(({ partitions }) => partitions[0].values)).toEqual(['a', 'b'])
+        expect((await produced()).flatMap(({ partitions }) => partitions[0].values)).toEqual([
+          'a',
+          'b',
+        ])
         expect(jest.getTimerCount()).toBe(0)
       })
 
@@ -3105,7 +3130,7 @@ describe('Producer > the accumulator', () => {
           await microtasks()
 
           expect(
-            produced().map(({ partitions }) => partitions.map(({ partition }) => partition))
+            (await produced()).map(({ partitions }) => partitions.map(({ partition }) => partition))
           ).toEqual([[0, 1]])
           const ended = settledFlag(transaction[ending]())
           await jest.advanceTimersByTimeAsync(0)
@@ -3137,7 +3162,7 @@ describe('Producer > the accumulator', () => {
         transaction.send({ topic: TOPIC, messages: [{ value: 'b' }] })
         await settledWithin(transaction.commit())
 
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['b']])
         expect(cluster.broker.endTxn).toHaveBeenCalledWith(
           expect.objectContaining({ transactionResult: true })
         )
@@ -3222,7 +3247,9 @@ describe('Producer > the accumulator', () => {
             transaction.send({ topic: TOPIC, messages: [{ value: 'b' }] })
             await settledWithin(transaction.commit())
 
-            expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b']])
+            expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+              ['b'],
+            ])
             expect(cluster.broker.endTxn).toHaveBeenCalledWith(
               expect.objectContaining({ transactionResult: true })
             )
@@ -3268,7 +3295,7 @@ describe('Producer > the accumulator', () => {
           expect(error.outcome).toBe('unsent')
           expect(error.cause).toBeUndefined()
           expect(failed).toBe(3)
-          expect(produced()).toEqual([])
+          expect(await produced()).toEqual([])
           return { cluster, producer, produced, transaction }
         }
 
@@ -3280,7 +3307,9 @@ describe('Producer > the accumulator', () => {
             transaction.send({ topic: TOPIC, messages: [{ value: 'b' }] })
             await settledWithin(transaction.commit())
 
-            expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b']])
+            expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+              ['b'],
+            ])
             expect(cluster.broker.endTxn).toHaveBeenCalledWith(
               expect.objectContaining({ transactionResult: true })
             )
@@ -3298,7 +3327,10 @@ describe('Producer > the accumulator', () => {
             await settledWithin(second.send({ topic: TOPIC, messages: [{ value: 'c' }] }), 5)
             await expect(settledWithin(second.commit())).resolves.toBeUndefined()
 
-            expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['b'], ['c']])
+            expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
+              ['b'],
+              ['c'],
+            ])
             expect(
               cluster.broker.endTxn.mock.calls.map(([{ transactionResult }]) => transactionResult)
             ).toEqual([false, true])
@@ -3377,12 +3409,12 @@ describe('Producer > the accumulator', () => {
         const second = await producer.transaction()
         const lingering = second.send({ topic: TOPIC, messages: [{ value: 'b' }] })
         await jest.advanceTimersByTimeAsync(0)
-        const values = () => produced().map(({ partitions }) => partitions[0].values)
-        expect(values()).toEqual([['a']])
+        const values = async () => (await produced()).map(({ partitions }) => partitions[0].values)
+        expect(await values()).toEqual([['a']])
 
         await settledWithin(second.commit())
         await lingering
-        expect(values()).toEqual([['a'], ['b']])
+        expect(await values()).toEqual([['a'], ['b']])
       })
 
       test('disconnect() also sends the transaction’s lingering batches', async () => {
@@ -3395,7 +3427,7 @@ describe('Producer > the accumulator', () => {
         await settledWithin(producer.disconnect())
 
         await expect(sent).resolves.toEqual([expect.objectContaining({ partition: 0 })])
-        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
         expect(jest.getTimerCount()).toBe(0)
       })
 

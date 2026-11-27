@@ -10,6 +10,7 @@ const {
   deferred,
   flushAll,
   quiescent,
+  sentRecords,
   succeeded,
   transactionalProducer,
   watch,
@@ -587,7 +588,7 @@ describe('Producer > the buffer > release at the terminal owner', () => {
     await flushAll()
 
     expect(calls).toHaveLength(1)
-    expect(calls[0].request.topicData[0].partitions[0].messages).toHaveLength(3)
+    expect((await sentRecords(calls[0].request))[0].records).toHaveLength(3)
     expect([admission.reserved, admission.debts]).toEqual([1536 + 2 * share, 2 * 1024])
     calls[0].answer()
     await flushAll()

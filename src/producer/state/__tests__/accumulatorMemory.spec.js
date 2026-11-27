@@ -10,6 +10,7 @@ const {
   succeeded,
   flushAll,
   quiescent,
+  sentRecords,
   transactionalProducer,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
@@ -87,7 +88,10 @@ describe('Producer > the buffer > the bound on held records', () => {
         expect(admission.waitingBytes).toBeLessThanOrEqual(capacity)
         expect(admission.waitingBytes).toBeGreaterThan(0)
         expect(admission.debts).toBeLessThanOrEqual(1024 * batches.length)
-        const heldRecords = batches.reduce((sum, batch) => sum + batch.messages.length, 0)
+        const heldRecords = (await sentRecords({ batches })).reduce(
+          (sum, { records }) => sum + records.length,
+          0
+        )
         expect(heldRecords).toBeLessThanOrEqual(Math.floor((2 * capacity) / 88))
       } finally {
         outcomes = await drain(population)
@@ -128,7 +132,8 @@ describe('Producer > the buffer > the bound on held records', () => {
     })
     await flushAll()
 
-    expect(batches.map(({ messages }) => messages.length)).toEqual([3, 3, 3, 1])
+    const chunks = await sentRecords({ batches })
+    expect(chunks.map(({ records }) => records.length)).toEqual([3, 3, 3, 1])
     const last = batches.pop()
     await drain({ batches, sends: [] })
     expect(admission.reserved).toBe(1536 + 525 + 64)

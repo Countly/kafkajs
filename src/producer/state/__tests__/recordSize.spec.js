@@ -17,6 +17,7 @@ const {
   deferred,
   flushAll,
   quiescent,
+  sentRecords,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
 
@@ -609,7 +610,8 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
 
   /**
    * A producer whose metadata wait is held until `release()`, and whose fake broker encodes each
-   * Produce batch with the record encoder, as the real broker would, and keeps the bytes.
+   * Produce batch with the record encoder, as the real broker would, and keeps the bytes and the
+   * records a broker reads from them.
    */
   const heldProducer = async (options = {}) => {
     const fixture = bufferedProducer({ capacity: 4 * 1048576, ...options })
@@ -617,6 +619,8 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const written = []
     fixture.cluster.refreshMetadataIfNecessary.mockImplementation(() => gate.promise)
     fixture.cluster.broker.produce.mockImplementation(async ({ topicData }) => {
+      const read = sentRecords({ topicData })
+      let index = 0
       for (const { partitions } of topicData) {
         for (const { messages } of partitions) {
           const batch = await buildRecordBatch({
@@ -626,7 +630,8 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
             producerEpoch: 0,
             firstSequence: 0,
           })
-          written.push({ messages, bytes: batch.buffer })
+          const { records } = (await read)[index++]
+          written.push({ messages, records, bytes: batch.buffer })
         }
       }
       return topicData.flatMap(({ topic, partitions }) =>
@@ -689,15 +694,22 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
 
     expect(sent.state).toBe('fulfilled')
-    const [{ messages, bytes }] = written
-    expect(messages).toEqual([
+    const [{ records, bytes }] = written
+    expect(records).toEqual([
       {
-        key: 'k',
-        value: 'before',
-        headers: { h: 'x', list: ['a', 'b'] },
+        key: Buffer.from('k'),
+        value: Buffer.from('before'),
+        headers: { h: Buffer.from('x'), list: [Buffer.from('a'), Buffer.from('b')] },
         timestamp: '1700000000123',
+        offset: '0',
       },
-      { value: 'other', timestamp: '1700000000456' },
+      {
+        key: null,
+        value: Buffer.from('other'),
+        headers: {},
+        timestamp: '1700000000456',
+        offset: '1',
+      },
     ])
     expect(firstTimestampOf(bytes)).toBe(1700000000123n)
     expect(bytes.includes(Buffer.from('before'))).toBe(true)

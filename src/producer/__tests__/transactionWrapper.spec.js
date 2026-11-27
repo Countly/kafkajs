@@ -1,5 +1,6 @@
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { sentRecords } = require('./fixtures/bufferHarness')
 const PartitionSequencer = require('../state/partitionSequencer')
 const encodeProduce = require('../../protocol/requests/produce/v12/request')
 const { createErrorFromCode } = require('../../protocol/error')
@@ -1123,36 +1124,43 @@ describe('Producer > the transaction wrapper', () => {
           level,
           linger: 0,
           retry: { retries: 2, initialRetryTime: 5000, maxRetryTime: 5000 },
-          produce: async ({ topicData, producerEpoch }) => ({
-            topics: topicData.map(({ topic, partitions: sent }) => ({
-              topicName: topic,
-              partitions: sent.map(({ partition, firstSequence, messages }) => {
-                const key = `${topic}/${partition}`
-                const last = partitions.get(key)
-                let errorCode = 0
-                if (refuse) {
-                  errorCode = NOT_LEADER_OR_FOLLOWER
-                } else if (
-                  last !== undefined &&
-                  (producerEpoch !== last.epoch ? firstSequence !== 0 : firstSequence !== last.next)
-                ) {
-                  errorCode = OUT_OF_ORDER_SEQUENCE_NUMBER
-                } else {
-                  partitions.set(key, {
-                    epoch: producerEpoch,
-                    next: firstSequence + messages.length,
-                  })
-                }
-                return {
-                  partition,
-                  errorCode,
-                  baseOffset: errorCode === 0 ? '0' : '-1',
-                  logAppendTime: '-1',
-                  logStartOffset: '0',
-                }
-              }),
-            })),
-          }),
+          produce: async (request) => {
+            const { topicData, producerEpoch } = request
+            const counts = (await sentRecords(request)).map(({ records }) => records.length)
+            return {
+              topics: topicData.map(({ topic, partitions: sent }) => ({
+                topicName: topic,
+                partitions: sent.map(({ partition, firstSequence }) => {
+                  const count = counts.shift()
+                  const key = `${topic}/${partition}`
+                  const last = partitions.get(key)
+                  let errorCode = 0
+                  if (refuse) {
+                    errorCode = NOT_LEADER_OR_FOLLOWER
+                  } else if (
+                    last !== undefined &&
+                    (producerEpoch !== last.epoch
+                      ? firstSequence !== 0
+                      : firstSequence !== last.next)
+                  ) {
+                    errorCode = OUT_OF_ORDER_SEQUENCE_NUMBER
+                  } else {
+                    partitions.set(key, {
+                      epoch: producerEpoch,
+                      next: firstSequence + count,
+                    })
+                  }
+                  return {
+                    partition,
+                    errorCode,
+                    baseOffset: errorCode === 0 ? '0' : '-1',
+                    logAppendTime: '-1',
+                    logStartOffset: '0',
+                  }
+                }),
+              })),
+            }
+          },
         })
         if (noNewEpoch) {
           broker.endTxn.mockImplementation(async () => ({}))

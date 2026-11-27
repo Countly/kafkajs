@@ -1,5 +1,6 @@
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { sentRecords } = require('./fixtures/bufferHarness')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSNumberOfRetriesExceeded,
@@ -58,16 +59,16 @@ const createLossyCluster = (lost) => {
 
   const cluster = createFakeCluster({
     produce: async (request) => {
-      for (const { partitions } of request.topicData) {
-        for (const batch of partitions) {
-          const stamp = `${request.producerId}/${request.producerEpoch}/${batch.firstSequence}`
-          stamps.push(stamp)
-          if (!seen.has(stamp)) {
-            seen.add(stamp)
-            written.push(...batch.messages.map(({ value }) => value))
-          }
+      const read = await sentRecords(request)
+      const batches = request.topicData.flatMap(({ partitions }) => partitions)
+      batches.forEach((batch, index) => {
+        const stamp = `${request.producerId}/${request.producerEpoch}/${batch.firstSequence}`
+        stamps.push(stamp)
+        if (!seen.has(stamp)) {
+          seen.add(stamp)
+          written.push(...read[index].records.map(({ value }) => value.toString()))
         }
-      }
+      })
 
       if (++requests <= lost) {
         throw new KafkaJSConnectionClosedError('acknowledgement lost', { broker: 'fake' })
