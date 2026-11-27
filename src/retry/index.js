@@ -197,6 +197,15 @@ const createRetry = (opts = {}) => {
 createRetry.backoff = createBackoff
 
 /**
+ * Whether the retrier retries `error`: anything but `retriable: false` or a programming error
+ * (`RangeError`, `ReferenceError`, `SyntaxError`, `TypeError`). For a caller that settles several
+ * failures of one attempt and must throw the one the retrier would stop on first.
+ * @param {Error} error
+ * @returns {boolean}
+ */
+createRetry.isRetriable = isErrorRetriable
+
+/**
  * The values the retrier gives an option the caller leaves unset - the test defaults under
  * `NODE_ENV=test`, as for the retrier itself. Read-only.
  * @type {Readonly<{ maxRetryTime: number, initialRetryTime: number, factor: number,

@@ -1,4 +1,5 @@
 const Encoder = require('../protocol/encoder')
+const { KafkaJSInvariantViolation } = require('../errors')
 
 /**
  * An independent copy of plain data: arrays, plain objects and Buffers are copied at every depth,
@@ -30,11 +31,12 @@ const copyOf = (value) => {
  * outcome to the caller's spellings with `project`.
  *
  * A call whose names are all well formed and distinct builds no per-name lookups and renames no
- * row: it holds one copy of the array and one Set that finds the repeats, and `project` hands the
- * row back as it is. The per-name lookups of `project` are built when it is first used with
- * a repeated or rewritten name.
+ * row: it holds one copy of the array and one Set of the written names (which also finds the
+ * repeats), and `project` hands the row back as it is. The per-name lookups of `project` are built
+ * when it is first used with a repeated or rewritten name.
  */
 class WireNames {
+  #written
   #occurrences = null
   #spellings = null
 
@@ -48,11 +50,11 @@ class WireNames {
     const changed = this.names.some((name) => Encoder.sentForm(name) !== name)
     /** @type {string[]} the written form of each name, parallel to `names` */
     this.wire = changed ? this.names.map((name) => Encoder.sentForm(name)) : this.names
-    const distinct = new Set(this.wire)
+    this.#written = new Set(this.wire)
     /** @type {boolean} whether every name is written as it is and no name is repeated */
-    this.plain = !changed && distinct.size === this.names.length
+    this.plain = !changed && this.#written.size === this.names.length
     /** @type {string[]} each written name once, in the order it first appears */
-    this.ids = this.plain ? this.wire : [...distinct]
+    this.ids = this.plain ? this.wire : [...this.#written]
   }
 
   /**
@@ -78,14 +80,18 @@ class WireNames {
    * appears. A row already under the caller's spelling is added as it is, the first time only; every
    * other row is an independent copy of it (nested arrays, objects and Buffers included) under that
    * spelling, so changing one row never changes another and no spelling is renamed to another.
-   * A row for a name the caller did not give is added as it is.
    * @param {object[]} out receives the rows
    * @param {string} wireId the written name the row answers
    * @param {{ groupId: string }} row the one outcome for `wireId`; not changed
    * @param {boolean} repeats whether a name given twice gets two rows
    * @returns {void}
+   * @throws {KafkaJSInvariantViolation} when no name of the call is written as `wireId`: a caller
+   *   takes a row only for a name its request carried, so such a row is never published
    */
   project(out, wireId, row, repeats) {
+    if (!this.#written.has(wireId)) {
+      throw new KafkaJSInvariantViolation('An answer was projected for a name the call did not ask')
+    }
     let callers
     if (!this.plain) {
       this.#index()

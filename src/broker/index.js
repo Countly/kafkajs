@@ -2040,17 +2040,40 @@ module.exports = class Broker {
    * @param {boolean} [request.includeAuthorizedOperations=false] requires v3+; ignored below it
    * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
    *   caller's operation; it never reaches the request
+   * @param {object} [options]
+   * @param {boolean} [options[UNCHECKED_ROWS]] internal (`./privateOptions`): the caller reads every
+   *   row itself, so no row's code fails the request. Each row is checked alone by this version's
+   *   own rule instead, and a row that rule refuses comes back with the error it would have thrown
+   *   as `error` (a copy of the row; the others are returned as decoded)
    * @returns {Promise<object>} the decoded response
-   * @throws {KafkaJSProtocolError} on any group-level error code other than `GROUP_ID_NOT_FOUND`
+   * @throws {KafkaJSProtocolError} without `UNCHECKED_ROWS`, on any group-level error code other
+   *   than `GROUP_ID_NOT_FOUND` from v6, or any group-level error code below v6
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
    */
-  async describeGroups({ groupIds, includeAuthorizedOperations = false, guard }) {
+  async describeGroups({ groupIds, includeAuthorizedOperations = false, guard }, options = null) {
     this.throwIfRefused(guard)
     const describeGroups = this.lookupRequest(apiKeys.DescribeGroups, requests.DescribeGroups)
-    return await this[PRIVATE.SEND_REQUEST](
-      describeGroups({ groupIds, includeAuthorizedOperations }),
-      guard
-    )
+    const protocolRequest = describeGroups({ groupIds, includeAuthorizedOperations })
+    if (options?.[UNCHECKED_ROWS]) {
+      const { parse } = protocolRequest.response
+      protocolRequest.response = {
+        ...protocolRequest.response,
+        parse: async (data) => ({
+          ...data,
+          groups: await Promise.all(
+            data.groups.map(async (group) => {
+              try {
+                await parse({ ...data, groups: [group] })
+                return group
+              } catch (error) {
+                return { ...group, error }
+              }
+            })
+          ),
+        }),
+      }
+    }
+    return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
   }
 
   /**
