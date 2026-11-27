@@ -898,7 +898,7 @@ describe('Admin > describeGroups > routing', () => {
       })
     })
 
-    it('is sent like two identical ids when another id in the call has the same bytes, and answered under each id', async () => {
+    it('is sent once, like an identical id given twice, when another id in the call has the same bytes, and answered under each id', async () => {
       const run = async (ids) => {
         const consumerGroupDescribe = jest.fn(async ({ groupIds }) => ({
           groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
@@ -915,8 +915,8 @@ describe('Admin > describeGroups > routing', () => {
       const identical = await run(['a', 'a'])
       const sameBytes = await run(['a\uD800', 'a\uD801'])
 
-      expect(sameBytes.sent).toEqual([['a�', 'a�']])
-      expect(sameBytes.sent[0]).toHaveLength(identical.sent[0].length)
+      expect(identical.sent).toEqual([['a']])
+      expect(sameBytes.sent).toEqual([['a�']])
       expect(sameBytes.groups).toHaveLength(identical.groups.length)
       expect(sameBytes.groups.map(({ groupId }) => groupId)).toEqual(['a\uD800', 'a\uD801'])
     })
@@ -948,7 +948,7 @@ describe('Admin > describeGroups > routing', () => {
           [LITERAL, 0, 'consumer'],
         ])
         expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
-          ['team-�', 'team-�'],
+          ['team-�'],
         ])
       })
 
@@ -1047,6 +1047,167 @@ describe('Admin > describeGroups > routing', () => {
         expect(classic.map(({ groupId }) => groupId)).toEqual([SURROGATE, LITERAL])
       })
 
+      it('sends and looks up a written id once, whatever spellings and repeats the caller gave', async () => {
+        const consumerGroupDescribe = jest.fn(consumerEcho)
+        const looked = []
+        const cluster = stubCluster({
+          consumerGroupDescribe,
+          describeGroups: jest.fn(),
+          onFindCoordinator: (groupId) => looked.push(groupId),
+        })
+        const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+        const { groups } = await admin.describeGroups([SURROGATE, LITERAL, SURROGATE, 'other'])
+
+        expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+          ['team-�', 'other'],
+        ])
+        expect(looked.map(echoOf)).toEqual(['team-�', 'other'])
+        expect(groups.map(({ groupId }) => groupId)).toEqual([
+          SURROGATE,
+          LITERAL,
+          SURROGATE,
+          'other',
+        ])
+      })
+
+      // Kafka 4.0.0 hands each offsets shard the whole id list, so a shard that does not own a group
+      // answers it as unknown while the owner answers it described.
+      describe('when the broker answers one written id in several rows', () => {
+        const miss = (groupId) => withMessage(consumerGroupRow(groupId), GROUP_ID_NOT_FOUND, 'no')
+        const shardFanOut = ({ groupIds }) => ({
+          groups: [
+            consumerGroupRow(groupIds[0]),
+            miss(groupIds[1]),
+            miss(groupIds[0]),
+            consumerGroupRow(groupIds[1]),
+          ],
+        })
+
+        it.each([
+          ['the lone surrogate given first', [SURROGATE, LITERAL, 'other']],
+          ['the literal given first', [LITERAL, SURROGATE, 'other']],
+        ])('answers from the described row, not the misses, with %s', async (_label, ids) => {
+          const describeGroups = jest.fn(classicEcho)
+          const consumerGroupDescribe = jest.fn(shardFanOut)
+
+          const groups = await run({ consumerGroupDescribe, describeGroups }, ids)
+
+          expect(summary(groups)).toEqual(ids.map((groupId) => [groupId, 0, 'consumer']))
+          expect(describeGroups).not.toHaveBeenCalled()
+          expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+            ['team-�', 'other'],
+          ])
+        })
+
+        it('prefers a described row to an error row for the same written id', async () => {
+          const consumerGroupDescribe = async ({ groupIds }) => ({
+            groups: [
+              withMessage(consumerGroupRow(groupIds[0]), GROUP_AUTHORIZATION_FAILED, 'no access'),
+              consumerGroupRow(groupIds[0]),
+            ],
+          })
+
+          const groups = await run({ consumerGroupDescribe }, [SURROGATE, LITERAL])
+
+          expect(summary(groups)).toEqual([
+            [SURROGATE, 0, 'consumer'],
+            [LITERAL, 0, 'consumer'],
+          ])
+        })
+
+        it('prefers an error row to a miss for the same written id, without asking the classic API', async () => {
+          const describeGroups = jest.fn(classicEcho)
+          const consumerGroupDescribe = async ({ groupIds }) => ({
+            groups: [
+              miss(groupIds[0]),
+              withMessage(consumerGroupRow(groupIds[0]), GROUP_AUTHORIZATION_FAILED, 'no access'),
+            ],
+          })
+
+          const groups = await run({ consumerGroupDescribe, describeGroups }, [LITERAL, SURROGATE])
+
+          expect(summary(groups)).toEqual([
+            [LITERAL, GROUP_AUTHORIZATION_FAILED, ''],
+            [SURROGATE, GROUP_AUTHORIZATION_FAILED, ''],
+          ])
+          expect(describeGroups).not.toHaveBeenCalled()
+        })
+
+        it('asks the classic API once for a written id every row of which is a miss', async () => {
+          const describeGroups = jest.fn(classicEcho)
+          const consumerGroupDescribe = async ({ groupIds }) => ({
+            groups: [miss(groupIds[0]), miss(groupIds[0])],
+          })
+
+          const groups = await run({ consumerGroupDescribe, describeGroups }, [
+            SURROGATE,
+            LITERAL,
+            SURROGATE,
+          ])
+
+          expect(describeGroups.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+            ['team-�'],
+          ])
+          expect(summary(groups)).toEqual([
+            [SURROGATE, 0, 'classic'],
+            [LITERAL, 0, 'classic'],
+          ])
+        })
+      })
+
+      it('answers every occurrence from one snapshot when the coordinator moves between attempts', async () => {
+        let moved = false
+        const consumerGroupDescribe = jest.fn(async ({ groupIds }) => {
+          if (!moved) {
+            moved = true
+            return {
+              groups: groupIds.map((groupId) => ({
+                ...consumerGroupRow(groupId),
+                errorCode: NOT_COORDINATOR,
+              })),
+            }
+          }
+          return consumerEcho({ groupIds })
+        })
+        const cluster = stubCluster({
+          consumerGroupDescribe,
+          describeGroups: jest.fn(),
+          nodeIdFor: (groupId) => (moved && echoOf(groupId) === 'team-�' ? 1 : 0),
+        })
+        const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+        const { groups } = await admin.describeGroups([SURROGATE, LITERAL, SURROGATE, 'other'])
+
+        const [first, ...retried] = consumerGroupDescribe.mock.calls.map(([r]) =>
+          r.groupIds.map(echoOf)
+        )
+        expect(first).toEqual(['team-�', 'other'])
+        expect(retried.sort()).toEqual([['other'], ['team-�']])
+        expect(summary(groups)).toEqual([
+          [SURROGATE, 0, 'consumer'],
+          [LITERAL, 0, 'consumer'],
+          [SURROGATE, 0, 'consumer'],
+          ['other', 0, 'consumer'],
+        ])
+      })
+
+      it('sends an identical id given twice once and returns two rows from a consumer group and one from a classic group', async () => {
+        const consumerGroupDescribe = jest.fn(consumerEcho)
+        const describeGroups = jest.fn(classicEcho)
+
+        const consumer = await run({ consumerGroupDescribe }, ['g', 'g'])
+        const classic = await run({ consumerGroupDescribe: notConsumerGroup, describeGroups }, [
+          'g',
+          'g',
+        ])
+
+        expect(consumer.map(({ groupId }) => groupId)).toEqual(['g', 'g'])
+        expect(classic.map(({ groupId }) => groupId)).toEqual(['g'])
+        expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds)).toEqual([['g']])
+        expect(describeGroups.mock.calls.map(([r]) => r.groupIds)).toEqual([['g']])
+      })
+
       it('returns the rows of two ordinary ids as the broker named them', async () => {
         const consumerGroupDescribe = jest.fn(consumerEcho)
 
@@ -1057,6 +1218,74 @@ describe('Admin > describeGroups > routing', () => {
           ['g2', 0, 'consumer'],
         ])
       })
+    })
+  })
+
+  describe('WireNames', () => {
+    const SURROGATE = 'team-\uD800'
+    const LITERAL = 'team-�'
+    const projected = (names, wireId, row, repeats) => {
+      const out = []
+      names.project(out, wireId, row, repeats)
+      return out
+    }
+
+    it('lists distinct names as they are, and hands a row back as it is, when no name changes or repeats', () => {
+      const { WireNames } = require('../wireNames')
+      const names = new WireNames(['a', 'b'])
+      const row = { groupId: 'a', state: 'Stable' }
+
+      const out = projected(names, 'a', row, true)
+
+      expect(names.ids).toEqual(['a', 'b'])
+      expect(names.wire).toEqual(['a', 'b'])
+      expect(out).toHaveLength(1)
+      expect(out[0]).toBe(row)
+    })
+
+    it('lists each written name once, in the order it first appears', () => {
+      const { WireNames } = require('../wireNames')
+
+      const names = new WireNames([SURROGATE, 'x', LITERAL, SURROGATE])
+
+      expect(names.ids).toEqual([LITERAL, 'x'])
+      expect(names.wire).toEqual([LITERAL, 'x', LITERAL, LITERAL])
+    })
+
+    it('gives a row to every occurrence, or to every distinct spelling, never renaming the literal one', () => {
+      const { WireNames } = require('../wireNames')
+      const names = new WireNames([SURROGATE, LITERAL, SURROGATE])
+      const row = { groupId: LITERAL, state: 'Stable' }
+
+      const occurrences = projected(names, LITERAL, row, true)
+      const spellings = projected(names, LITERAL, row, false)
+
+      expect(occurrences.map(({ groupId }) => groupId)).toEqual([SURROGATE, LITERAL, SURROGATE])
+      expect(spellings.map(({ groupId }) => groupId)).toEqual([SURROGATE, LITERAL])
+      expect(occurrences[1]).toBe(row)
+      expect(occurrences[0]).toEqual({ ...row, groupId: SURROGATE })
+      expect(row.groupId).toBe(LITERAL)
+    })
+
+    it('hands a row of a name the caller did not give back as it is', () => {
+      const { WireNames } = require('../wireNames')
+      const names = new WireNames([SURROGATE, SURROGATE])
+      const row = { groupId: 'other' }
+
+      expect(projected(names, 'other', row, true)).toEqual([row])
+      expect(projected(names, 'other', row, true)[0]).toBe(row)
+    })
+
+    it('keeps the names as they were when the caller changes the array afterwards', () => {
+      const { WireNames } = require('../wireNames')
+      const given = [SURROGATE, 'x']
+      const names = new WireNames(given)
+
+      given.push('late')
+      given[1] = 'changed'
+
+      expect(names.ids).toEqual([LITERAL, 'x'])
+      expect(names.names).toEqual([SURROGATE, 'x'])
     })
   })
 
