@@ -19776,6 +19776,7 @@
         "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory destroy a second destroy emits nothing more",
         "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory destroy marks the socket destroyed at once and emits close, once, a microtask later",
         "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory destroy before the socket connects cancels its connect callback, as a destroyed net.Socket never connects",
+        "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory destroy after the socket connected uses no handle of its connect callback, which the socket no longer holds",
         "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory destroy still records a write that comes after it, so a test can see it",
         "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory destroy with an error emits error and then close with hadError true",
         "testHelpers/__tests__/fakeSocket.spec.js \u203a createFakeSocketFactory hands every socket the endpoint the product dialled, and keeps each one",

@@ -114,6 +114,29 @@ describe('createFakeSocketFactory', () => {
       expect(onConnect).not.toHaveBeenCalled()
     })
 
+    test('after the socket connected uses no handle of its connect callback, which the socket no longer holds', async () => {
+      const { factory } = createFakeSocketFactory()
+      const scheduled = new Set()
+      const schedule = global.setImmediate
+      const setImmediateSpy = jest.spyOn(global, 'setImmediate').mockImplementation((...args) => {
+        const handle = schedule(...args)
+        scheduled.add(handle)
+        return handle
+      })
+      const clearImmediateSpy = jest.spyOn(global, 'clearImmediate')
+
+      try {
+        const socket = await dial(factory)
+        socket.destroy()
+
+        expect(scheduled.size).toBeGreaterThan(0)
+        expect(clearImmediateSpy.mock.calls.filter(([handle]) => scheduled.has(handle))).toEqual([])
+      } finally {
+        setImmediateSpy.mockRestore()
+        clearImmediateSpy.mockRestore()
+      }
+    })
+
     test('still records a write that comes after it, so a test can see it', async () => {
       const { factory, state } = createFakeSocketFactory()
       const socket = await dial(factory)
