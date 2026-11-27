@@ -851,9 +851,14 @@ describe('Admin > describeGroups > routing', () => {
 
     it('is not asked again after its coordinator answered while a sibling coordinator moves', async () => {
       let moved = false
+      let siblingRefused = false
       const describeGroups = jest.fn(async (request) => {
-        if (request.groupIds.includes('team-b') && !moved) {
+        if (!moved) {
           moved = true
+          throw createErrorFromCode(NOT_COORDINATOR)
+        }
+        if (request.groupIds.length === 1 && request.groupIds[0] === 'team-b' && !siblingRefused) {
+          siblingRefused = true
           throw createErrorFromCode(NOT_COORDINATOR)
         }
         return classicEcho(request)
@@ -861,7 +866,7 @@ describe('Admin > describeGroups > routing', () => {
       const cluster = stubCluster({
         consumerGroupDescribe: notConsumerGroup,
         describeGroups,
-        nodeIdFor: (groupId) => (groupId === 'team-b' ? 1 : 0),
+        nodeIdFor: (groupId) => (moved && groupId === 'team-b' ? 1 : 0),
       })
       const admin = createAdmin({ logger: newLogger(), retry, cluster })
 
@@ -869,6 +874,7 @@ describe('Admin > describeGroups > routing', () => {
 
       expect(groups.map(({ groupId }) => groupId).sort()).toEqual(['team-b', 'team-\uD800'])
       expect(describeGroups.mock.calls.map(([request]) => request.groupIds.map(echoOf))).toEqual([
+        ['team-�', 'team-b'],
         ['team-�'],
         ['team-b'],
         ['team-b'],
