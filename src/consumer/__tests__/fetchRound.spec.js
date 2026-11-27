@@ -505,14 +505,16 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
         // Unvalidated, validated at the cached epoch, or validated at an older one; under the
-        // cached routing stamp or an earlier one.
+        // cached routing stamp, or an earlier one (always for an older epoch, as in the cache:
+        // every epoch change gives a new stamp).
         positionValidator: {
           entryOf: (topic, partition) =>
             coin(2)(topic, partition)
               ? undefined
               : {
                   validatedAgainst: (partition % 3) - (coin(4)(topic, partition) ? 1 : 0),
-                  routing: (partition % 2) - (coin(5)(topic, partition) ? 1 : 0),
+                  routing:
+                    coin(4)(topic, partition) || coin(5)(topic, partition) ? -1 : partition % 2,
                 },
         },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
@@ -719,13 +721,23 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
           })
         }),
       }))
-    rig.setResponse(
-      fetchResponse(partitions.map((partition) => ({ partition, errorCode: 0, records: true })))
+    // Answered in the reverse of the frame's (shuffled) order, so the in-order coverage check
+    // fails on its first row and the counted check runs.
+    rig.setResponse(() =>
+      fetchResponse(
+        rig
+          .fetchRequestPartitions()
+          .reverse()
+          .map((partition) => ({ partition, errorCode: 0, records: true }))
+      )
     )
 
     const batches = await rig.group.fetch(NODE_ID)
 
     expect(batches).toHaveLength(300)
-    expect(reads.count).toBeLessThanOrEqual(5 * partitions.length)
+    // Per request entry: the admission check where the frame is written, the encoder, the counted
+    // coverage check and the one index the answer's rows are looked up in; plus the in-order
+    // coverage check's first comparison.
+    expect(reads.count).toBe(4 * partitions.length + 1)
   })
 })
