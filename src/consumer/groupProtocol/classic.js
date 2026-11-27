@@ -822,9 +822,10 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
-   * Tells every assigner to forget what it retained. Called when this member leaves the group or
-   * loses its generation: retained state from a generation that no longer exists would otherwise
-   * be used to compute the next assignment.
+   * Tells every assigner to forget what it retained. Called once by the stop of a running classic
+   * run (or, when a close deadline prevented that, at the next classic run's startup) and when a
+   * poll-interval expiry resets the generation: retained state from a generation that no longer
+   * exists would otherwise be used to compute the next assignment.
    * @returns {void}
    * @throws {*} the first assigner's failure, whatever value it threw, once every assigner was told
    */
