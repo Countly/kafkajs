@@ -1774,5 +1774,20 @@ describe('Consumer > answers from before a leader epoch change', () => {
         await h.teardown()
       }
     })
+
+    test('a cluster that cannot report partition routing fails the round loudly instead of fetching nothing', async () => {
+      const h = await createGroup()
+      onFakeTime()
+      try {
+        h.cluster.onPartitionRouted = undefined
+
+        await expect(h.group.fetch(NODE_ID)).rejects.toThrow(TypeError)
+        expect(h.group.positionValidator.entryOf(TOPIC, 0)).toBeUndefined()
+        expect(h.fetchFrames()).toEqual([])
+      } finally {
+        jest.useRealTimers()
+        await h.teardown()
+      }
+    })
   })
 })
