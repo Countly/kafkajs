@@ -15,7 +15,8 @@
  * Usage: node scripts/benchmarks/report.js --runs 3 --fork-dir <dir> --baseline-dir <dir> --out <dir>
  *          [--only <name>[,<name>...]]
  * `--fork-dir` and `--baseline-dir` are npm install prefixes: the fork's packed tarball and
- * kafkajs@2.2.4. `--only` runs just the named manifest entries; an empty value runs them all.
+ * kafkajs@2.2.4. `--only` runs just the named manifest entries; an empty value runs them all
+ * except those marked `namedOnly`, which run only when named.
  * Exit codes: 0 a report was written, 2 a bad argument (an unknown `--only` name included).
  */
 const fs = require('node:fs')
@@ -544,8 +545,9 @@ const main = (
   fs.mkdirSync(rawDir, { recursive: true })
   const setup = setupFailure(env.BENCH_SETUP)
   const results = manifest.entries.map((entry) => {
-    if (args.only && !args.only.includes(entry.name)) {
-      return { rows: [entryRow(entry, 'not selected', 'left out by --only')], details: [] }
+    if (args.only ? !args.only.includes(entry.name) : entry.namedOnly) {
+      const reason = args.only ? 'left out by --only' : 'runs only when named with --only'
+      return { rows: [entryRow(entry, 'not selected', reason)], details: [] }
     }
     log(entry.name)
     if (setup) return setupRow(entry, setup, env.BENCH_SETUP, rawDir)

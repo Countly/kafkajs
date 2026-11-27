@@ -34,7 +34,8 @@ const SHARE_NODES = { shareThroughput: [24], 'shareThroughput-eachMessage': [22,
 
 /**
  * @typedef {{ name: string, command: string[], broker: boolean, adapter?: string,
- *   contracts?: string[] }} Entry a manifest entry
+ *   contracts?: string[], namedOnly?: boolean }} Entry a manifest entry; a `namedOnly` entry runs
+ *   only when the dispatch names it, so an empty selection leaves it out
  * @typedef {{ key: string, job: string, rows: string[], label?: string }} Unit one job's report:
  *   `key` names its artifacts (`report-<key>`, `bench-<key>`), `label` tells apart units of one row
  */
@@ -68,7 +69,8 @@ const consumerUnit = (name) => {
  * Plans a dispatch: which rows run, in which job.
  * Selecting the consumer audit without any consumer row it audits selects all of those rows, so
  * the audit never reads evidence that no job produced.
- * @param {string} input comma-separated manifest row names; empty selects every row
+ * @param {string} input comma-separated manifest row names; empty selects every row that is not
+ *   `namedOnly`
  * @param {{ entries: Entry[] }} [manifest]
  * @returns {{ selected: string[], ordinary: string[], share: object[], snappy: object[],
  *   consumer: object[], audit: object[], telemetry: object[], units: Unit[] }}
@@ -84,8 +86,8 @@ const plan = (input, manifest = defaultManifest) => {
   const by = (job) => manifest.entries.filter((entry) => ownerOf(entry) === job)
   const picked = (job) =>
     by(job)
+      .filter((entry) => (wanted.length ? wanted.includes(entry.name) : !entry.namedOnly))
       .map(({ name }) => name)
-      .filter((name) => !wanted.length || wanted.includes(name))
 
   const audit = picked('consumer-audit')
   const audited = (names) => names.filter((name) => CONSUMER_ROWS[name].contracts.length)
@@ -239,7 +241,7 @@ const collect = (
         })
     return { key: unit.key, job: unit.job, result, reported: true, meta: report.meta }
   })
-  for (const { name } of manifest.entries)
+  for (const { name, namedOnly } of manifest.entries)
     if (!planned.selected.includes(name))
       rows.push({
         benchmark: name,
@@ -248,7 +250,10 @@ const collect = (
         unit: '-',
         runs: 0,
         status: 'not selected',
-        reason: 'left out by the rows input',
+        reason:
+          namedOnly && !input?.trim()
+            ? 'runs only when named in the rows input'
+            : 'left out by the rows input',
       })
   const joined = {
     ...meta,

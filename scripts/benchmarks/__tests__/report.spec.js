@@ -693,6 +693,31 @@ describe('Benchmarks > report', () => {
       expect(report.meta).not.toHaveProperty('only')
       expect(report.rows.every(({ status }) => status === 'valid')).toBe(true)
     })
+
+    test('an empty --only leaves a namedOnly row out with its reason, and naming it runs it', () => {
+      const manifest = {
+        version: 1,
+        entries: [single({ name: 'a' }), single({ name: 'b', namedOnly: true })],
+        excluded: [],
+      }
+      const { spawn } = stub(() => json({ v: 5 }))
+      const named = path.join(out, 'named')
+      const rowsOf = (dir) =>
+        JSON.parse(fs.readFileSync(path.join(dir, 'bench-report.json'), 'utf8')).rows.map(
+          ({ benchmark, status, reason }) => [benchmark, status, reason]
+        )
+
+      expect(main(argv(), { spawn, manifest, log })).toBe(0)
+      expect(rowsOf(out)).toEqual([
+        ['a', 'valid', undefined],
+        ['b', 'not selected', 'runs only when named with --only'],
+      ])
+      expect(main([...argv(named), '--only', 'b'], { spawn, manifest, log })).toBe(0)
+      expect(rowsOf(named)).toEqual([
+        ['a', 'not selected', 'left out by --only'],
+        ['b', 'valid', undefined],
+      ])
+    })
   })
   describe('statuses, evidence and adapters', () => {
     const STATUSES = ['valid', 'inconclusive', 'invalid', 'error', 'omitted']

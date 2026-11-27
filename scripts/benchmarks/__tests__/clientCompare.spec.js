@@ -16,6 +16,8 @@ const {
   CORPUS_PRODUCER_SETTINGS,
   CORPUS_LAYOUT,
   countFullGcs,
+  trackGcs,
+  customPartitioner,
 } = require('../clientCompare')
 
 const SCRIPT = path.join(__dirname, '..', 'clientCompare.js')
@@ -66,6 +68,7 @@ const fakeKafka = ({
   failSend = false,
   failConnect,
   failRun = false,
+  failAfter,
   manualDelivery = false,
   sendMs,
   metadata = [],
@@ -94,6 +97,9 @@ const fakeKafka = ({
     listeners: [],
     delay: { enabledAt: [], disabledAt: [] },
     gc: { startedAt: [], stoppedAt: [], countedAt: [], closedAt: [] },
+    allGcs: { started: 0, resulted: 0, closed: 0 },
+    intervals: [],
+    clearedIntervals: [],
   }
   let elapsedNs = 0n
   let ready
@@ -127,6 +133,26 @@ const fakeKafka = ({
           return 3
         },
         close: () => state.gc.closedAt.push(state.callbacks),
+      }
+    },
+    memoryUsage: () => ({
+      rss: 1000 + 10 * state.sends.length,
+      arrayBuffers: 50 + state.sends.length,
+    }),
+    setInterval: (callback, delay) => {
+      const timer = Symbol('interval')
+      state.intervals.push({ timer, callback, delay })
+      return timer
+    },
+    clearInterval: (timer) => state.clearedIntervals.push(timer),
+    trackGcs: () => {
+      state.allGcs.started++
+      return {
+        result: async () => {
+          state.allGcs.resulted++
+          return { count: 3, pauseMs: 1.5 }
+        },
+        close: () => state.allGcs.closed++,
       }
     },
     eventLoopDelay: () => ({
@@ -205,7 +231,7 @@ const fakeKafka = ({
       return {
         connect: () => connect('producer'),
         send: async ({ topic, messages, compression }) => {
-          if (failSend) throw new Error('send failed')
+          if (failSend || state.sends.length === failAfter) throw new Error('send failed')
           const durationMs = sendMs ?? (state.sends.length === 0 ? 1000 : state.sends.length)
           state.compressions.push(compression)
           elapsedNs += BigInt(durationMs) * 1000000n
@@ -485,7 +511,7 @@ describe('Benchmarks > clientCompare', () => {
       }
     })
 
-    test('parseArgs reads --batch, --concurrency, --keys, --value-type and --max-request-bytes on the produce workloads, gzip as a compression, and leaves the flags absent otherwise', () => {
+    test('parseArgs reads --batch, --unawaited, --keys, --headers, --partitioner and --value-type on the produce workloads, gzip as a compression, and leaves the flags absent otherwise', () => {
       const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
 
       expect(
@@ -494,49 +520,61 @@ describe('Benchmarks > clientCompare', () => {
           'produce-throughput',
           '--batch',
           '8',
-          '--concurrency',
-          '4',
           '--keys',
-          '1024',
+          'index',
+          '--headers',
+          '20',
+          '--partitioner',
+          'custom',
           '--value-type',
           'string',
-          '--max-request-bytes',
-          '2097152',
           '--compression',
           'gzip'
         )
       ).toMatchObject({
         batch: 8,
-        concurrency: 4,
-        keys: 1024,
+        keys: 'index',
+        headers: 20,
+        partitioner: 'custom',
         valueType: 'string',
-        maxRequestBytes: 2097152,
         compression: 'gzip',
       })
-      expect(
-        parse('--workload', 'produce-latency', '--value-type', 'buffer', '--max-request-bytes', '9')
-      ).toMatchObject({ valueType: 'buffer', maxRequestBytes: 9 })
+      expect(parse('--workload', 'produce-throughput', '--unawaited', '100')).toMatchObject({
+        unawaited: 100,
+      })
+      expect(parse('--workload', 'produce-latency', '--value-type', 'buffer')).toMatchObject({
+        valueType: 'buffer',
+      })
       const plain = parse('--workload', 'produce-throughput')
-      for (const key of ['batch', 'concurrency', 'keys', 'valueType', 'maxRequestBytes']) {
+      for (const key of ['batch', 'unawaited', 'keys', 'headers', 'partitioner', 'valueType']) {
         expect([key, plain[key]]).toEqual([key, undefined])
       }
     })
 
-    test('parseArgs refuses --batch, --concurrency and --keys outside produce-throughput, the other new flags on consume, and a bad value type or count', () => {
+    test('parseArgs refuses the shape flags outside produce-throughput, a bad key mode, partitioner, value type or count, --batch with --unawaited, and a custom partitioner with --settings same', () => {
       const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
 
       for (const bad of [
         ['--workload', 'consume-throughput', '--batch', '8'],
-        ['--workload', 'consume-throughput', '--concurrency', '2'],
-        ['--workload', 'consume-throughput', '--keys', '2'],
+        ['--workload', 'consume-throughput', '--unawaited', '2'],
+        ['--workload', 'consume-throughput', '--keys', 'index'],
+        ['--workload', 'consume-throughput', '--headers', '2'],
+        ['--workload', 'consume-throughput', '--partitioner', 'custom'],
         ['--workload', 'consume-throughput', '--value-type', 'string'],
-        ['--workload', 'consume-throughput', '--max-request-bytes', '1048576'],
         ['--workload', 'produce-latency', '--batch', '8'],
-        ['--workload', 'produce-latency', '--concurrency', '8'],
-        ['--workload', 'produce-latency', '--keys', '8'],
+        ['--workload', 'produce-latency', '--unawaited', '8'],
+        ['--workload', 'produce-latency', '--keys', 'index'],
+        ['--workload', 'produce-latency', '--headers', '8'],
+        ['--workload', 'produce-latency', '--partitioner', 'custom'],
         ['--workload', 'produce-throughput', '--value-type', 'bytes'],
+        ['--workload', 'produce-throughput', '--keys', '1024'],
+        ['--workload', 'produce-throughput', '--partitioner', 'random'],
         ['--workload', 'produce-throughput', '--batch', '0'],
-        ['--workload', 'produce-throughput', '--keys', '1.5'],
+        ['--workload', 'produce-throughput', '--headers', '1.5'],
+        ['--workload', 'produce-throughput', '--batch', '8', '--unawaited', '8'],
+        ['--workload', 'produce-throughput', '--partitioner', 'custom', '--settings', 'same'],
+        ['--workload', 'produce-throughput', '--max-request-bytes', '1048576'],
+        ['--workload', 'produce-throughput', '--concurrency', '4'],
       ]) {
         expect(() => parse(...bad)).toThrow(/usage/)
       }
@@ -602,6 +640,12 @@ describe('Benchmarks > clientCompare', () => {
         messagesPerSecond: 200000,
         measuredMessages: 1200,
         cpuMicrosPerMessage: 1500 / 1200,
+        sendCallMicrosP50: expect.any(Number),
+        sendCallMicrosP99: expect.any(Number),
+        peakRssBytes: 1040,
+        peakArrayBuffers: 54,
+        gcCountPer10kMessages: 25,
+        gcPauseMsPer10kMessages: 12.5,
         settings: { defaults: null },
       })
     })
@@ -753,6 +797,12 @@ describe('Benchmarks > clientCompare', () => {
         measuredMessages: 150000,
         messagesPerSecond: 5000,
         cpuMicrosPerMessage: 1500 / 150000,
+        sendCallMicrosP50: expect.any(Number),
+        sendCallMicrosP99: expect.any(Number),
+        peakRssBytes: 4510,
+        peakArrayBuffers: 401,
+        gcCountPer10kMessages: 0.2,
+        gcPauseMsPer10kMessages: 0.1,
         settings: { defaults: null },
       })
     })
@@ -769,22 +819,37 @@ describe('Benchmarks > clientCompare', () => {
       expect(metrics.messagesPerSecond).toBeCloseTo(80, 6)
     })
 
-    test('produce-throughput with --concurrency keeps that many sends in flight, and the window counts every lane', async () => {
+    test('produce-throughput with --unawaited issues that many one-record sends before awaiting any, and counts every one', async () => {
       const kafka = fakeKafka({ sendMs: 100 })
       const flight = trackInFlight(kafka)
 
       const { metrics, state } = await runWith(
         'produce-throughput',
-        { messages: null, durationMs: 30000, batch: 1, concurrency: 4 },
+        { messages: null, durationMs: 30000, unawaited: 4 },
         kafka
       )
 
       expect(flight.peak).toBe(4)
-      expect(state.sends).toEqual([1, ...Array(350).fill(1)])
+      expect(state.sends).toEqual([1, ...Array(52 + 300).fill(1)])
       expect(metrics).toMatchObject({ elapsedMs: 30000, measuredMessages: 300 })
     })
 
-    test('produce-throughput sends one send at a time unless --concurrency says otherwise', async () => {
+    test('produce-throughput with --unawaited and a message count sends rounds of that many and a shorter last round', async () => {
+      const kafka = fakeKafka()
+      const flight = trackInFlight(kafka)
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 10, unawaited: 4 },
+        kafka
+      )
+
+      expect(flight.peak).toBe(4)
+      expect(state.sends).toEqual(Array(11).fill(1))
+      expect(metrics.measuredMessages).toBe(10)
+    })
+
+    test('produce-throughput sends one send at a time unless --unawaited says otherwise', async () => {
       const kafka = fakeKafka({ sendMs: 100 })
       const flight = trackInFlight(kafka)
 
@@ -793,13 +858,13 @@ describe('Benchmarks > clientCompare', () => {
       expect(flight.peak).toBe(1)
     })
 
-    test('produce-throughput with --keys gives message n the key key-<n % keys> across sends, and no key without it', async () => {
+    test('produce-throughput with --keys gives message n the key String(n) across sends, and no key without it', async () => {
       const keyed = await runWith(
         'produce-throughput',
-        { messages: null, durationMs: 30000, batch: 3, keys: 4 },
+        { messages: null, durationMs: 30000, batch: 3, keys: 'index' },
         fakeKafka({ sendMs: 100 })
       )
-      const sized = await runWith('produce-throughput', { messages: 25, batch: 7, keys: 10 })
+      const sized = await runWith('produce-throughput', { messages: 25, batch: 7, keys: 'index' })
       const plain = await runWith('produce-throughput', { messages: 5 })
 
       const logOf = ({ state }) => state.topics.values().next().value
@@ -807,14 +872,66 @@ describe('Benchmarks > clientCompare', () => {
       expect('key' in warmup).toBe(false)
       expect(records).toHaveLength(350 * 3)
       expect(records.map(({ key }) => key)).toEqual(
-        Array.from({ length: records.length }, (_, n) => `key-${n % 4}`)
+        Array.from({ length: records.length }, (_, n) => String(n))
       )
       expect(sized.state.sends).toEqual([1, 7, 7, 7, 4])
       expect(logOf(sized).map(({ key }) => key)).toEqual([
         undefined,
-        ...Array.from({ length: 25 }, (_, n) => `key-${n % 10}`),
+        ...Array.from({ length: 25 }, (_, n) => String(n)),
       ])
       expect(logOf(plain).some((record) => 'key' in record)).toBe(false)
+    })
+
+    test('produce-throughput with --headers gives every record of the run that many string headers', async () => {
+      const { state } = await runWith('produce-throughput', { messages: 5, headers: 3 })
+
+      const [warmup, ...records] = state.topics.values().next().value
+      expect('headers' in warmup).toBe(false)
+      expect(records).toHaveLength(5)
+      for (const { headers } of records) expect(headers).toEqual({ h0: 'v0', h1: 'v1', h2: 'v2' })
+    })
+
+    test('--partitioner custom gives the producer a plain partitioner that places record n in partition n % partitions, and the default gives it none', async () => {
+      const custom = await runWith('produce-throughput', { messages: 5, partitioner: 'custom' })
+      const plain = await runWith('produce-throughput', { messages: 5 })
+
+      const [{ createPartitioner }] = custom.state.producerConfigs
+      const place = createPartitioner()
+      const metadata = { partitionMetadata: Array(3).fill({}) }
+      expect(createPartitioner).toBe(customPartitioner)
+      expect(Array.from({ length: 7 }, () => place(metadata))).toEqual([0, 1, 2, 0, 1, 2, 0])
+      expect(createPartitioner()(metadata)).toBe(0)
+      expect(plain.state.producerConfigs).toEqual([{}])
+    })
+
+    test('produce-throughput reports the send-call time, peak memory and collections of the measured window only', async () => {
+      const kafka = fakeKafka()
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 1200, durationMs: null },
+        kafka
+      )
+
+      // The warm-up send takes 1000 ms on this fake and the three measured sends 1, 2 and 3 ms.
+      expect(metrics.sendCallMicrosP50).toBeGreaterThanOrEqual(2000)
+      expect(metrics.sendCallMicrosP50).toBeLessThan(2010)
+      expect(metrics.sendCallMicrosP99).toBeGreaterThanOrEqual(3000)
+      expect(metrics.sendCallMicrosP99).toBeLessThan(3010)
+      expect(state.intervals.map(({ delay }) => delay)).toEqual([100])
+      expect(state.clearedIntervals).toEqual([state.intervals[0].timer])
+      expect(state.allGcs).toEqual({ started: 1, resulted: 1, closed: 1 })
+    })
+
+    test('a produce run that fails inside its window stops sampling memory and recording collections', async () => {
+      const kafka = fakeKafka({ failAfter: 2 })
+
+      await expect(
+        runWith('produce-throughput', { messages: 1200, durationMs: null }, kafka)
+      ).rejects.toThrow('send failed')
+
+      expect(kafka.state.clearedIntervals).toEqual([kafka.state.intervals[0].timer])
+      expect(kafka.state.allGcs).toEqual({ started: 1, resulted: 0, closed: 1 })
     })
 
     test('produce-latency with --duration-ms times single sends only after the warm-up', async () => {
@@ -1060,6 +1177,73 @@ describe('Benchmarks > clientCompare', () => {
       })
     })
 
+    describe('trackGcs', () => {
+      const entry = (startTime, duration) => ({ startTime, duration })
+      /** A `gc` observer the test drives, as in `countFullGcs`'s tests. */
+      const controlled = () => {
+        const observers = []
+        class Observer {
+          constructor(callback) {
+            this.callback = callback
+            this.buffered = []
+            this.disconnects = 0
+            observers.push(this)
+          }
+
+          observe(options) {
+            this.options = options
+          }
+
+          takeRecords() {
+            const taken = this.buffered
+            this.buffered = []
+            return taken
+          }
+
+          disconnect() {
+            this.disconnects++
+          }
+
+          deliver(...entries) {
+            this.callback({ getEntries: () => entries })
+          }
+        }
+        return { Observer, observers }
+      }
+
+      test('counts every collection kind that started in the window, with its pause, including entries that arrive in the drain, and not ones before the start or after the end', async () => {
+        const { Observer, observers } = controlled()
+        let clock = 10
+        const drain = async () => {
+          observer.deliver(entry(15, 3))
+          observer.buffered.push(entry(18, 1), entry(25, 7))
+        }
+        const tracker = trackGcs({ Observer, now: () => clock, drain })
+        const [observer] = observers
+        observer.deliver(entry(5, 9), entry(12, 2))
+        clock = 20
+
+        const result = await tracker.result()
+
+        expect(observer.options).toEqual({ entryTypes: ['gc'] })
+        expect(result).toEqual({ count: 3, pauseMs: 6 })
+        expect(observer.disconnects).toBe(1)
+      })
+
+      test('reports no collections and no pause for a window without any, and disconnects its observer once whether it ended or was only closed', async () => {
+        const { Observer, observers } = controlled()
+        const ended = trackGcs({ Observer, now: () => 0, drain: async () => {} })
+        const closed = trackGcs({ Observer, now: () => 0, drain: async () => {} })
+
+        expect(await ended.result()).toEqual({ count: 0, pauseMs: 0 })
+        ended.close()
+        closed.close()
+        closed.close()
+
+        expect(observers.map(({ disconnects }) => disconnects)).toEqual([1, 1])
+      })
+    })
+
     test('consume-throughput fails before consuming when a partition does not hold the records its layout puts there', async () => {
       const exact = [
         { partition: 0, offset: '2', high: '2', low: '0' },
@@ -1201,50 +1385,39 @@ describe('Benchmarks > clientCompare', () => {
       expect(logOf(asBuffer).every(({ value }) => Buffer.isBuffer(value))).toBe(true)
     })
 
-    test('produce workloads with --max-request-bytes create the topic with that max.message.bytes and give the producer that maxRequestSize, and set neither without it', async () => {
-      const limited = await runWith('produce-throughput', { messages: 5, maxRequestBytes: 2097152 })
-      const same = await runWith('produce-latency', {
-        messages: 2,
-        settings: 'same',
-        maxRequestBytes: 4096,
-      })
-      const plain = await runWith('produce-throughput', { messages: 5 })
-
-      expect(limited.state.createdTopics[0].configEntries).toEqual([
-        { name: 'file.delete.delay.ms', value: '1000' },
-        { name: 'max.message.bytes', value: '2097152' },
-      ])
-      expect(limited.state.producerConfigs).toEqual([{ maxRequestSize: 2097152 }])
-      expect(same.state.producerConfigs).toEqual([
-        { ...SAME_PRODUCER_SETTINGS, createPartitioner: legacyPartitioner, maxRequestSize: 4096 },
-      ])
-      expect(plain.state.createdTopics[0].configEntries).toEqual([
-        { name: 'file.delete.delay.ms', value: '1000' },
-      ])
-      expect(plain.state.producerConfigs).toEqual([{}])
-    })
-
     test('a run reports its shape flags as shape, and no shape when none was given', async () => {
       const plain = await runWith('produce-throughput', { messages: 5 })
       const shaped = await runWith('produce-throughput', {
         messages: 5,
         batch: 2,
-        concurrency: 3,
-        keys: 4,
+        keys: 'index',
+        headers: 3,
+        partitioner: 'custom',
         valueType: 'string',
-        maxRequestBytes: 4096,
       })
-      const partial = await runWith('produce-throughput', { messages: 5, batch: 2 })
+      const unawaited = await runWith('produce-throughput', { messages: 5, unawaited: 2 })
 
       expect(Object.hasOwn(plain.metrics, 'shape')).toBe(false)
       expect(shaped.metrics.shape).toEqual({
         batch: 2,
-        concurrency: 3,
-        keys: 4,
+        keys: 'index',
+        headers: 3,
+        partitioner: 'custom',
         valueType: 'string',
-        maxRequestBytes: 4096,
       })
-      expect(partial.metrics.shape).toEqual({ batch: 2 })
+      expect(unawaited.metrics.shape).toEqual({ unawaited: 2 })
+    })
+
+    test('a run creates its topic with no setting beyond quick file deletion, whatever its shape', async () => {
+      const { state } = await runWith('produce-throughput', {
+        messages: 5,
+        batch: 2,
+        keys: 'index',
+      })
+
+      expect(state.createdTopics[0].configEntries).toEqual([
+        { name: 'file.delete.delay.ms', value: '1000' },
+      ])
     })
 
     test('the corpus holds at most 64 MiB: a 1 MiB record size gives 64 values of that size', () => {

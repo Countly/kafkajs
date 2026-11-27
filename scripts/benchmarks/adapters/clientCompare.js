@@ -84,7 +84,7 @@ const plannedSeconds = ({ command, arms, profile }, runs = RUNS) => {
  * @param {object} output one run's JSON line
  * @param {string} workload the row's `--workload`
  * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 or gzip codec, the
- *   workload's shape (records per send, sends in flight, keys, value type, request size limit),
+ *   workload's shape (records per send, unawaited sends, keys, headers, partitioner, value type),
  *   Fetch version, passes and corpus layout
  */
 const notesOf = (output, workload) => {
