@@ -726,17 +726,22 @@ describe('Consumer > classic group answers refused until the join retries run ou
   }
 
   /**
-   * Advances fake time in 10 ms steps until `done()` holds, for at most `budget` ms of fake time
-   * and 20 s of real time, so a case whose loop spins reaches its assertions and prints its
+   * Advances fake time in `step` ms steps until `done()` holds, for at most `budget` ms of fake
+   * time and 20 s of real time, so a case whose loop spins reaches its assertions and prints its
    * journal instead of timing out.
    * @param {() => boolean} done
    * @param {number} [budget]
+   * @param {number} [step]
    * @returns {Promise<void>}
    */
-  const until = async (done, budget = 2000) => {
+  const until = async (done, budget = 2000, step = 10) => {
     const realDeadline = realClock.now() + 20000
-    for (let spent = 0; !done() && spent < budget && realClock.now() < realDeadline; spent += 10) {
-      await jest.advanceTimersByTimeAsync(10)
+    for (
+      let spent = 0;
+      !done() && spent < budget && realClock.now() < realDeadline;
+      spent += step
+    ) {
+      await jest.advanceTimersByTimeAsync(step)
     }
   }
 
@@ -804,9 +809,11 @@ describe('Consumer > classic group answers refused until the join retries run ou
     await until(() => false, 2000)
     const healthyJoins = healthy.coordinator.joinGroup.mock.calls.length
     const healthyFetches = fetchesOf(group, HEALTHY)
-    await until(() => false, expected.observeMs)
+    const observedFrom = Date.now()
+    await until(() => false, expected.observeMs, 100)
 
     expect({
+      observedMs: Date.now() - observedFrom,
       refusedJoins: refused.coordinator.joinGroup.mock.calls.length,
       refusedCrashes: refused.crashes.length,
       healthyJoins: healthy.coordinator.joinGroup.mock.calls.length,
@@ -814,6 +821,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
       healthyFetchedMore: fetchesOf(group, HEALTHY) > healthyFetches,
       seen: seen(group),
     }).toEqual({
+      observedMs: expected.observeMs,
       refusedJoins: expected.joins,
       refusedCrashes: 1,
       healthyJoins,
