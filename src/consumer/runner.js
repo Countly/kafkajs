@@ -46,7 +46,7 @@ const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.f
 
 /**
  * Whether a batch's data may still be used, from its admission (`Batch.admissionOf`): the
- * validation entry its Fetch was admitted under still admits. The validator and the run's routing
+ * validation entry its Fetch was admitted under still admits. The validator and the group's routing
  * listener clear that field synchronously when the entry is replaced or dropped, which a new leader
  * or leader epoch, a leader that moved away and back, and a validation redone at the same epoch all
  * do (`ConsumerGroup#admissionEntry`). A batch built outside a fetch has no admission and is used.
@@ -1912,11 +1912,12 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    // Likewise a batch no longer admitted under the validation it was fetched under (its leader or
-    // leader epoch moved, or it was validated again while it waited): the next round validates the
+    // Likewise a batch whose admission lapsed while it waited: the validation entry it was fetched
+    // under was dropped or replaced (a change of its partition's leader or leader epoch, a leader
+    // that moved away and back, a check redone at the same epoch). The next round validates the
     // position first and fetches it again from there.
     if (!admits(Batch.admissionOf(batch))) {
-      this.logger.debug('Dropping a queued batch fetched before a leader epoch change', {
+      this.logger.debug('Dropping a queued batch whose admission lapsed', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
         topic: batch.topic,
@@ -1979,8 +1980,9 @@ module.exports = class Runner extends EventEmitter {
       if (batch.isEmptyDueToFiltering()) {
         this.instrumentationEmitter.emit(START_BATCH_PROCESS, payload)
 
-        // A START_BATCH_PROCESS listener can pause the partition or move its leader epoch:
-        // nothing is resolved, and END_BATCH_PROCESS still pairs with START.
+        // A START_BATCH_PROCESS listener can pause the partition or cause a routing change that
+        // ends the batch's admission: nothing is resolved, and END_BATCH_PROCESS still pairs with
+        // START.
         if (this.#paused(batch) || !admits(Batch.admissionOf(batch))) {
           this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
             ...payload,
@@ -2020,8 +2022,9 @@ module.exports = class Runner extends EventEmitter {
         groupId: this.consumerGroup.groupId,
         runIdentity: this.consumerGroup.runIdentity,
       }
-      // A START_BATCH_PROCESS listener can seek or pause the partition, or move its leader epoch:
-      // such a batch is not handed over, and END_BATCH_PROCESS still pairs with START.
+      // A START_BATCH_PROCESS listener can seek or pause the partition, or cause a routing change
+      // that ends the batch's admission: such a batch is not handed over, and END_BATCH_PROCESS
+      // still pairs with START.
       if (this.isSuperseded(batch)) {
         this.logger.debug('Not handing over a batch a seek superseded', { topic, partition })
       } else if (this.#paused(batch)) {
@@ -2030,7 +2033,7 @@ module.exports = class Runner extends EventEmitter {
           partition,
         })
       } else if (!admits(Batch.admissionOf(batch))) {
-        this.logger.debug('Not handing over a batch fetched before a leader epoch change', {
+        this.logger.debug('Not handing over a batch whose admission lapsed', {
           topic,
           partition,
         })

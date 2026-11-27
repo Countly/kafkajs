@@ -56,9 +56,7 @@ module.exports = class MetadataCache {
      * Entries are mutated in place and reused across refreshes - only a first sighting, a topic
      * recreation or `clear()` allocates.
      *
-     * `stamp` is the partition's routing stamp, see `routingStamp()`.
-     *
-     * @type {Map<string, { topicId: string|null, seenAt: number, decodedReleased: boolean, partitions: Map<number, { leader: number, leaderEpoch: number, stamp: number, decoded: object|null }> }>}
+     * @type {Map<string, { topicId: string|null, seenAt: number, decodedReleased: boolean, partitions: Map<number, { leader: number, leaderEpoch: number, decoded: object|null }> }>}
      */
     this.topics = new Map()
     /** @type {Map<string, string>} topic id -> topic name */
@@ -72,8 +70,6 @@ module.exports = class MetadataCache {
     this.pendingTopics = new Set()
     /** Incremented once per `update()`; stamped onto every topic that response carried. */
     this.generation = 0
-    /** The last routing stamp handed out; never reset, so no stamp is ever handed out twice. */
-    this.routingClock = 0
     /** @type {Set<() => void>} synchronous internal listeners, independent of instrumentation */
     this.routingListeners = new Set()
     /** @type {Set<(topic?: string, partition?: number) => void>} see `onPartitionRouted` */
@@ -599,12 +595,12 @@ module.exports = class MetadataCache {
   }
 
   /**
-   * Accepts a leader/epoch pair for one cached partition. When the pair changed, the partition gets
-   * a new routing stamp and the partition listeners hear of it.
+   * Accepts a leader/epoch pair for one cached partition. When the pair changed, the partition
+   * listeners hear of it.
    * @private
    * @param {string} topic
    * @param {number} partition
-   * @param {{ leader: number, leaderEpoch: number, stamp: number }} cached
+   * @param {{ leader: number, leaderEpoch: number }} cached
    * @param {number} leader
    * @param {number} leaderEpoch
    * @returns {boolean} whether the pair changed
@@ -613,14 +609,12 @@ module.exports = class MetadataCache {
     if (cached.leader === leader && cached.leaderEpoch === leaderEpoch) return false
     cached.leader = leader
     cached.leaderEpoch = leaderEpoch
-    cached.stamp = ++this.routingClock
     this.publishPartitionRouted(topic, partition)
     return true
   }
 
   /**
-   * Records a partition the topic's entry does not hold yet, with a fresh routing stamp, and tells
-   * the partition listeners.
+   * Records a partition the topic's entry does not hold yet, and tells the partition listeners.
    * @private
    * @param {{ partitions: Map<number, object> }} entry the topic's entry
    * @param {string} topic
@@ -632,26 +626,9 @@ module.exports = class MetadataCache {
     entry.partitions.set(partition.partitionId, {
       leader: partition.leader,
       leaderEpoch: partition.leaderEpoch,
-      stamp: ++this.routingClock,
       decoded,
     })
     this.publishPartitionRouted(topic, partition.partitionId)
-  }
-
-  /**
-   * A number that changes whenever the cache accepts a different leader or leader epoch for the
-   * partition, or forgets or first learns the partition, and on nothing else: a refresh that
-   * repeats the cached pair, or one the monotonic rule rejects, keeps it. Stamps are never reused,
-   * so a partition that moves away and back to the same leader and epoch does not get its earlier
-   * stamp back.
-   * @param {string} topic
-   * @param {number} partition
-   * @returns {number} the stamp, or 0 for a partition the cache does not hold
-   */
-  routingStamp(topic, partition) {
-    const entry = this.topics.get(topic)
-    const cached = entry && entry.partitions.get(partition)
-    return cached ? cached.stamp : 0
   }
 
   /**

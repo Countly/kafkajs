@@ -453,6 +453,8 @@ module.exports = class ConsumerGroup {
 
     /** @type {PositionValidator} */
     this.positionValidator = new PositionValidator({ logger: this.logger })
+    /** @type {(() => void)|null} ends the routing subscription `watchRouting` made, if any */
+    this.unwatchRouting = null
 
     /**
      * Brokers already logged as unable to serve position validation, so the notice is one per
@@ -726,14 +728,8 @@ module.exports = class ConsumerGroup {
    * disposed consumer leaves none behind.
    * A cluster without `onRoutingChange` publishes nothing: such a run is woken only by its own
    * lifecycle events.
-   *
-   * Each accepted change of one partition's leader or leader epoch revokes that partition's
-   * validation entry at once (`PositionValidator#revoke`), so data fetched under it stops being
-   * admitted before anything else runs. A change while no run is open is caught by the next
-   * round's validation scan, which compares the partition's routing stamp before any request is
-   * built.
    * @private
-   * @returns {IdleWait} an open run with its routing subscriptions registered on its fence
+   * @returns {IdleWait} an open run with its routing subscription registered on its fence
    */
   createRun() {
     const run = new IdleWait()
@@ -741,12 +737,29 @@ module.exports = class ConsumerGroup {
       if (!run.fence.closed) this.routingChanged()
     })
     if (unsubscribe) run.fence.register(unsubscribe)
-    const unrouted = this.cluster.onPartitionRouted?.((topic, partition) => {
-      if (!run.fence.closed) this.positionValidator.revoke(topic, partition)
-    })
-    if (unrouted) run.fence.register(unrouted)
     run.fence.register(this.operations.onRelease(() => run.wake()))
     return run
+  }
+
+  /**
+   * Subscribes the group to the routing of single partitions (`Cluster#onPartitionRouted`), once,
+   * before its first position validation records anything: from then on each change the metadata
+   * cache accepts for a partition (another leader or leader epoch, the partition learned or
+   * forgotten) revokes that partition's validation entry at once (`PositionValidator#revoke`), so
+   * data fetched under it stops being admitted before anything else runs. This is the only way an
+   * admission ends on a routing change. Entries are recorded only by validation, so none exists
+   * unwatched; `onStopRequested` ends the subscription, after which nothing is fetched or
+   * delivered, and a stopped group does not subscribe again.
+   * @private
+   * @returns {true}
+   */
+  watchRouting() {
+    if (this.unwatchRouting === null && !this.idleWait.fence.closed) {
+      this.unwatchRouting = this.cluster.onPartitionRouted((topic, partition) =>
+        this.positionValidator.revoke(topic, partition)
+      )
+    }
+    return true
   }
 
   /**
@@ -801,6 +814,7 @@ module.exports = class ConsumerGroup {
     this.leaderUnionWatch?.clear()
     this.retireLeaderlessRefresh()
     this.idleWait.dispose()
+    this.unwatchRouting?.()
     this.subscriptionState.clearPauses()
     this.offsetManager?.clearPendingSeeks()
     return this.groupMembership.onStopRequested()
@@ -2930,9 +2944,10 @@ module.exports = class ConsumerGroup {
    * accepted or handed to a handler only under a validation entry that still admits
    * (`PositionValidator`): one recorded as validated against the cached leader epoch and not
    * replaced or dropped since. The validator clears an entry's `admitted` field synchronously
-   * whenever it replaces or drops it, and the run drops a partition's entry at every accepted change
-   * of its leader or leader epoch (`createRun`), so a leader that moved away and back to the same
-   * epoch, a new epoch on the same leader, and a validation redone at the same epoch all end it.
+   * whenever it replaces or drops it, and the group drops a partition's entry at every accepted
+   * change of its leader or leader epoch (`watchRouting`), so a leader that moved away and back to
+   * the same epoch, a new epoch on the same leader, and a validation redone at the same epoch all
+   * end it.
    *
    * The entry is the admission identity: a request and its batch record it and fetch at its
    * `validatedAgainst` epoch, and every later check reads only its `admitted` field.
@@ -4182,6 +4197,7 @@ module.exports = class ConsumerGroup {
   async validatePositions(topicPartitions, preparation) {
     let awaiting
     let unregister
+    let watching = false
     const manager = preparation ? preparation.manager : this.offsetManager
 
     try {
@@ -4194,14 +4210,13 @@ module.exports = class ConsumerGroup {
             continue
           }
 
+          // Before the first epoch is read and anything is recorded against it.
+          watching ||= this.watchRouting()
           const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
-          const routing = this.cluster.routingStamp?.(topic, partition)
 
           // Asked before anything is read or allocated: the steady state of a round is that every
           // partition is already validated against this epoch, and that round must cost nothing.
-          if (
-            !this.positionValidator.needsValidation(topic, partition, currentLeaderEpoch, routing)
-          ) {
+          if (!this.positionValidator.needsValidation(topic, partition, currentLeaderEpoch)) {
             continue
           }
 
@@ -4221,7 +4236,6 @@ module.exports = class ConsumerGroup {
             offset: manager.peekNextOffset(topic, partition).toString(),
             trackedEpoch,
             currentLeaderEpoch,
-            routing,
           })
 
           if (action === 'unchanged') {
@@ -4241,7 +4255,6 @@ module.exports = class ConsumerGroup {
               partition,
               trackedEpoch,
               currentLeaderEpoch,
-              routing,
               generation,
               requestClock: this.acquireClock,
               entry: this.positionValidator.entryOf(topic, partition),
@@ -4275,22 +4288,9 @@ module.exports = class ConsumerGroup {
         // Only an entry still this round's own and still awaiting: one a routing change or another
         // round replaced carries a different epoch than the one captured here, and one whose
         // answer was applied or discarded is settled already.
-        for (const {
-          topic,
-          partition,
-          currentLeaderEpoch,
-          generation,
-          routing,
-          entry,
-        } of awaiting || []) {
+        for (const { topic, partition, currentLeaderEpoch, generation, entry } of awaiting || []) {
           if (this.positionValidator.isAwaitingWith(topic, partition, entry)) {
-            this.positionValidator.markValidated(
-              topic,
-              partition,
-              currentLeaderEpoch,
-              generation,
-              routing
-            )
+            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
           }
         }
       }
@@ -4431,7 +4431,7 @@ module.exports = class ConsumerGroup {
       })
 
       for (const { topic, entries } of pending) {
-        for (const { partition, currentLeaderEpoch, generation, routing, entry } of entries) {
+        for (const { partition, currentLeaderEpoch, generation, entry } of entries) {
           if (!this.positionValidator.isAwaitingWith(topic, partition, entry)) {
             continue
           }
@@ -4441,13 +4441,7 @@ module.exports = class ConsumerGroup {
           // the mark applied - on a stale generation this round's exhaustion says nothing about
           // the partition the current assignment holds.
           if (
-            this.positionValidator.markValidated(
-              topic,
-              partition,
-              currentLeaderEpoch,
-              generation,
-              routing
-            )
+            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
           ) {
             this.offsetManager.forgetConsumedEpoch(topic, partition)
           }
@@ -4480,7 +4474,8 @@ module.exports = class ConsumerGroup {
     }
 
     const retry = []
-    let fatal = false
+    /** @type {{topic: string, partition: number, entry: object}[]} */
+    const fatal = []
 
     for (const { topic, entries } of pending) {
       const retriable = []
@@ -4493,14 +4488,10 @@ module.exports = class ConsumerGroup {
           continue
         }
 
-        // An answer belongs to the attempt that asked it and to the routing it was asked under.
-        // When a routing change dropped the attempt's entry, another attempt replaced it, or the
-        // partition's routing stamp moved, it applies nothing, and only this attempt's own entry
-        // is let go; the next round asks again.
-        if (
-          this.positionValidator.entryOf(topic, entry.partition) !== entry.entry ||
-          this.cluster.routingStamp?.(topic, entry.partition) !== entry.routing
-        ) {
+        // An answer belongs to the attempt that asked it. When a routing change dropped the
+        // attempt's entry (`watchRouting`) or another attempt replaced it, it applies nothing, and
+        // only this attempt's own entry is let go; the next round asks again.
+        if (this.positionValidator.entryOf(topic, entry.partition) !== entry.entry) {
           this.positionValidator.release([
             { topic, partition: entry.partition, entry: entry.entry },
           ])
@@ -4535,7 +4526,7 @@ module.exports = class ConsumerGroup {
         if (outcome.action === 'retry') {
           retriable.push(entry)
         } else if (outcome.action === 'fatal') {
-          fatal = true
+          fatal.push({ topic, partition: entry.partition, entry: entry.entry })
         } else {
           const decided = preparation && this.positionValidator.entryOf(topic, entry.partition)
           try {
@@ -4577,7 +4568,15 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    if (fatal) {
+    // A non-retriable answer switches validation off only while its own attempt is still the
+    // partition's awaiting entry here, where the switch happens: a sibling's outcome may have been
+    // awaited since it was classified, and a routing change, a rebalance or another attempt in that
+    // time took its authority away. Such an answer applies nothing; the next round asks again.
+    if (
+      fatal.some(({ topic, partition, entry }) =>
+        this.positionValidator.isAwaitingWith(topic, partition, entry)
+      )
+    ) {
       // Once per assignment, and only from the call that flips validation off: `disable()` makes
       // `request()` answer without a reply from here on and `validateOnLeader` returns early for
       // every remaining leader of this round, but fetchers run one per node and two of them can
@@ -4612,15 +4611,9 @@ module.exports = class ConsumerGroup {
    */
   markAllValidated(topics) {
     for (const { topic, entries } of topics) {
-      for (const { partition, currentLeaderEpoch, generation, routing, entry } of entries) {
+      for (const { partition, currentLeaderEpoch, generation, entry } of entries) {
         if (!this.positionValidator.isAwaitingWith(topic, partition, entry)) continue
-        this.positionValidator.markValidated(
-          topic,
-          partition,
-          currentLeaderEpoch,
-          generation,
-          routing
-        )
+        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
       }
     }
   }
