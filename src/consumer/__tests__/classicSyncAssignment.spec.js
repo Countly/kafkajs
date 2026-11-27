@@ -463,7 +463,10 @@ describe('Consumer > classic group answers refused until the join retries run ou
   const REBALANCE_IN_PROGRESS = 27
   const consumers = []
 
-  beforeEach(() => jest.useFakeTimers())
+  // Real setImmediate and nextTick, as for the other first-round crash cleanups: a fetcher's
+  // empty round yields through setImmediate, and a faked one runs at the same fake instant again
+  // and again, so the pump would never reach the backoff of the member being refused.
+  beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] }))
   afterEach(async () => {
     const stopping = Promise.all(consumers.splice(0).map((c) => c.disconnect().catch(() => {})))
     await jest.advanceTimersByTimeAsync(1000)
@@ -478,16 +481,19 @@ describe('Consumer > classic group answers refused until the join retries run ou
 
   /**
    * One classic group behind a coordinator double its members share. A JoinGroup with an empty
-   * member id is a new entry, and every other member is asked to rejoin through its next
-   * heartbeat, as a coordinator rebalances a group a member enters.
+   * member id is a new entry and a LeaveGroup an exit; either asks every other member to rejoin
+   * through its next heartbeat, as a coordinator rebalances a group a member enters or leaves.
    * @returns {{ members: string[], rejoin: Set<string>, fetches: string[] }} `fetches` names the
    *   member of every partition fetched
    */
   const createGroup = () => ({ members: [], rejoin: new Set(), fetches: [] })
 
   /**
-   * A real classic consumer of `group`. Its JoinGroup answers pass the Broker's own check, so an
-   * answer it refuses is refused as on the wire, and every SyncGroup answers `assignment`.
+   * A real classic consumer of `group`, over a double of the Broker's group calls. A dynamic
+   * member's first JoinGroup goes through the MEMBER_ID_REQUIRED handshake the Broker performs
+   * (`onMemberIdRequired` with the new id, then the answer), a static one gets its id at once.
+   * The answers pass the Broker's own check, so an answer it refuses is refused as on the wire,
+   * and every SyncGroup answers `assignment`.
    * @param {object} group from `createGroup`
    * @param {string} memberId the id the coordinator gives this member
    * @param {{ assignment: Buffer, join?: object, retry?: object, groupInstanceId?: string|null }} options
@@ -501,6 +507,9 @@ describe('Consumer > classic group answers refused until the join retries run ou
   ) => {
     const crashes = []
     let generation = 0
+    const rebalanceOthers = () => {
+      for (const other of group.members) if (other !== memberId) group.rejoin.add(other)
+    }
     const coordinator = {
       isConnected: () => true,
       nodeId: 0,
@@ -517,9 +526,10 @@ describe('Consumer > classic group answers refused until the join retries run ou
           })),
         })),
       })),
-      joinGroup: jest.fn(async (request) => {
+      joinGroup: jest.fn(async (request, options) => {
         if (request.memberId === '') {
-          for (const other of group.members) if (other !== memberId) group.rejoin.add(other)
+          if (!request.groupInstanceId) options?.onMemberIdRequired?.(memberId)
+          rebalanceOthers()
         }
         const answer = {
           generationId: ++generation,
@@ -539,7 +549,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
           throw new KafkaJSProtocolError(createErrorFromCode(REBALANCE_IN_PROGRESS))
         }
       }),
-      leaveGroup: jest.fn(async () => {}),
+      leaveGroup: jest.fn(async () => rebalanceOthers()),
     }
     const broker = {
       fetch: jest.fn(async ({ topics }) => {
@@ -635,12 +645,15 @@ describe('Consumer > classic group answers refused until the join retries run ou
       })
       await start(healthy)
       await until(() => fetchesOf(group, HEALTHY) > 0)
+      expect(fetchesOf(group, HEALTHY)).toBeGreaterThan(0)
       await start(refused)
       await until(() => refused.crashes.length > 0, 10000)
 
       // retries: 2 is three attempts, each a JoinGroup and a refused SyncGroup.
       expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
       expect(refused.coordinator.syncGroup).toHaveBeenCalledTimes(3)
+      // The crash cleanup leaves for a dynamic member; a static one keeps its slot.
+      expect(refused.coordinator.leaveGroup).toHaveBeenCalledTimes(groupInstanceId ? 0 : 1)
       expect(refused.crashes).toHaveLength(1)
       const [{ error, groupId, restart }] = refused.crashes
       expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
