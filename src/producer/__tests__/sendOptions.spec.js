@@ -805,13 +805,14 @@ describe('Producer > send options', () => {
           }
         })
 
-        const state = await outcome(
+        // Awaited, not polled by turns: the retry waits on its real-time backoff timer.
+        await expect(
           rig.producer.send(
             recorded(log, CompressionTypes.GZIP, { topic: TOPIC, messages: MESSAGES })
           )
-        )
+        ).resolves.toEqual([expect.objectContaining({ topicName: TOPIC })])
 
-        expect(state.status).toBe('fulfilled')
+        expect(answered).toBe(2)
         expect(rig.produced()).toHaveLength(2)
         expect(log).toEqual(READS)
       }
