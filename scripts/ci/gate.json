@@ -8605,6 +8605,7 @@
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > answers from before a leader epoch change the routing a dropped row carries a dropped row of a recreated topic applies no hint",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > answers from before a leader epoch change the routing a dropped row carries a dropped row whose hint is older than the cached epoch leaves the cached leader and epoch alone",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a discarded validation reply does not strand the partition",
+        "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a reply discarded because the position moved under it validates nothing: no request is built until a fresh answer applies",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a fetched partition that entered validation meanwhile is dropped, not delivered",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a leader that does not advertise OffsetForLeaderEpoch is never asked",
         "src/consumer/__tests__/logTruncation.spec.js \u203a Consumer > position validation a non-retriable validation error disables validation for the assignment, and sync re-arms it",

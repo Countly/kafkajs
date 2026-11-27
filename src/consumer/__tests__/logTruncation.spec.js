@@ -262,6 +262,38 @@ describe('Consumer > position validation', () => {
     expect(await group.fetch(NODE_ID)).toHaveLength(1)
   })
 
+  test('a reply discarded because the position moved under it validates nothing: no request is built until a fresh answer applies', async () => {
+    const { group, offsetManager, requests, setValidationResponse } = await createGroup()
+    let answers = 0
+    setValidationResponse((partitions) => {
+      answers += 1
+      // A handler publishes a new position while the first check is being answered.
+      if (answers === 1) {
+        offsetManager.resolveOffset({ topic: TOPIC, partition: 0, offset: '14', leaderEpoch: 4 })
+      }
+      return offsetForLeaderEpochResponse(
+        partitions.map((partition) => ({ partition, endOffset: '20' }))
+      )
+    })
+
+    await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+    expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
+    expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+    expect(group.admissionEntry(TOPIC, 0)).toBeUndefined()
+    expect(group.buildFetchRequests([{ topic: TOPIC, partitions: [0] }])).toEqual([])
+
+    await group.fetch(NODE_ID)
+
+    // The round checks the moved position again, and only then fetches.
+    const order = apiKeysOf(requests)
+    expect(validationCount(requests)).toBe(2)
+    expect(order.lastIndexOf(apiKeys.OffsetForLeaderEpoch)).toBeLessThan(
+      order.indexOf(apiKeys.Fetch)
+    )
+    expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBe(5)
+  })
+
   describe('outcomes', () => {
     test('validated: the position stands', async () => {
       const { group, offsetManager } = await createGroup({ validationScenario: 'validated' })
