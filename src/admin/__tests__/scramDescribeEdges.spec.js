@@ -256,6 +256,53 @@ describe('SCRAM credential alteration of a user name with a lone surrogate', () 
     expect(sent.map(echoOf)).toEqual(['a�', 'a�'])
   })
 
+  // The controller answers one result per user, so two mechanisms of one written name are one result.
+  test('answers once under a literal U+FFFD name given before a lone-surrogate name with the same bytes', async () => {
+    const { admin, sent } = controller()
+
+    const rows = await admin.alterUserScramCredentials({
+      deletions: [remove('a�'), remove('a\uD800', SHA512)],
+    })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a�', 0]])
+    expect(sent.map(echoOf)).toEqual(['a�', 'a�'])
+  })
+
+  test('answers once under a lone-surrogate name given before a literal U+FFFD name with the same bytes', async () => {
+    const { admin } = controller()
+
+    const rows = await admin.alterUserScramCredentials({
+      deletions: [remove('a\uD800'), remove('a�', SHA512)],
+    })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a\uD800', 0]])
+  })
+
+  test('keeps the first spelling on the user-level error for names with the same bytes, in either order', async () => {
+    const literalFirst = await controller(41).admin.alterUserScramCredentials({
+      deletions: [remove('a�'), remove('a\uD800', SHA512)],
+    })
+    const surrogateFirst = await controller(41).admin.alterUserScramCredentials({
+      deletions: [remove('a\uD800'), remove('a�', SHA512)],
+    })
+
+    expect(literalFirst.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a�', 41]])
+    expect(surrogateFirst.map(({ user, errorCode }) => [user, errorCode])).toEqual([
+      ['a\uD800', 41],
+    ])
+  })
+
+  test('answers once for two mechanisms of one ordinary user, under that name', async () => {
+    const { admin, sent } = controller()
+
+    const rows = await admin.alterUserScramCredentials({
+      deletions: [remove('alice'), remove('alice', SHA512)],
+    })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['alice', 0]])
+    expect(sent).toEqual(['alice', 'alice'])
+  })
+
   test.each([['bob'], ['team-��']])('is still refused an answer row for %s', async (answered) => {
     const broker = {
       alterUserScramCredentials: async () => ({ results: [{ user: answered, errorCode: 0 }] }),

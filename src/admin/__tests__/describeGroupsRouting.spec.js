@@ -898,7 +898,7 @@ describe('Admin > describeGroups > routing', () => {
       })
     })
 
-    it('is sent and answered like two identical ids when another id in the call has the same bytes', async () => {
+    it('is sent like two identical ids when another id in the call has the same bytes, and answered under each id', async () => {
       const run = async (ids) => {
         const consumerGroupDescribe = jest.fn(async ({ groupIds }) => ({
           groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
@@ -918,7 +918,145 @@ describe('Admin > describeGroups > routing', () => {
       expect(sameBytes.sent).toEqual([['a�', 'a�']])
       expect(sameBytes.sent[0]).toHaveLength(identical.sent[0].length)
       expect(sameBytes.groups).toHaveLength(identical.groups.length)
-      expect(sameBytes.groups.map(({ groupId }) => groupId)).toEqual(['a\uD800', 'a\uD800'])
+      expect(sameBytes.groups.map(({ groupId }) => groupId)).toEqual(['a\uD800', 'a\uD801'])
+    })
+
+    // The group's name is `team-` and U+FFFD; the caller names it with that character and also with a
+    // lone surrogate, which is written as the same bytes.
+    describe('next to a literal U+FFFD spelling of the same group', () => {
+      const SURROGATE = 'team-\uD800'
+      const LITERAL = 'team-�'
+      const withMessage = (row, errorCode, errorMessage) => ({ ...row, errorCode, errorMessage })
+      const consumerEcho = ({ groupIds }) => ({
+        groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
+      })
+      const run = async ({ consumerGroupDescribe, describeGroups = jest.fn() }, ids) => {
+        const cluster = stubCluster({ consumerGroupDescribe, describeGroups })
+        const admin = createAdmin({ logger: newLogger(), retry, cluster })
+        return (await admin.describeGroups(ids)).groups
+      }
+      const summary = (groups) =>
+        groups.map(({ groupId, errorCode, groupType }) => [groupId, errorCode, groupType])
+
+      it('answers a consumer group under each spelling, the lone surrogate given first', async () => {
+        const consumerGroupDescribe = jest.fn(consumerEcho)
+
+        const groups = await run({ consumerGroupDescribe }, [SURROGATE, LITERAL])
+
+        expect(summary(groups)).toEqual([
+          [SURROGATE, 0, 'consumer'],
+          [LITERAL, 0, 'consumer'],
+        ])
+        expect(consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+          ['team-�', 'team-�'],
+        ])
+      })
+
+      it('answers a consumer group under each spelling, the literal given first', async () => {
+        const groups = await run({ consumerGroupDescribe: consumerEcho }, [LITERAL, SURROGATE])
+
+        expect(summary(groups)).toEqual([
+          [LITERAL, 0, 'consumer'],
+          [SURROGATE, 0, 'consumer'],
+        ])
+      })
+
+      it('returns the error the coordinator reported under each spelling, in either order', async () => {
+        const denied = ({ groupIds }) => ({
+          groups: groupIds.map((groupId) =>
+            withMessage(consumerGroupRow(echoOf(groupId)), GROUP_AUTHORIZATION_FAILED, 'no access')
+          ),
+        })
+
+        const surrogateFirst = await run({ consumerGroupDescribe: denied }, [SURROGATE, LITERAL])
+        const literalFirst = await run({ consumerGroupDescribe: denied }, [LITERAL, SURROGATE])
+
+        expect(
+          surrogateFirst.map(({ groupId, errorCode, errorMessage }) => [
+            groupId,
+            errorCode,
+            errorMessage,
+          ])
+        ).toEqual([
+          [SURROGATE, GROUP_AUTHORIZATION_FAILED, 'no access'],
+          [LITERAL, GROUP_AUTHORIZATION_FAILED, 'no access'],
+        ])
+        expect(literalFirst.map(({ groupId }) => groupId)).toEqual([LITERAL, SURROGATE])
+      })
+
+      it('answers a classic group under each spelling from the one row it was asked once for', async () => {
+        const describeGroups = jest.fn(classicEcho)
+        const classic = (ids) =>
+          run({ consumerGroupDescribe: notConsumerGroup, describeGroups }, ids)
+
+        const surrogateFirst = await classic([SURROGATE, LITERAL])
+        const literalFirst = await classic([LITERAL, SURROGATE])
+
+        expect(summary(surrogateFirst)).toEqual([
+          [SURROGATE, 0, 'classic'],
+          [LITERAL, 0, 'classic'],
+        ])
+        expect(literalFirst.map(({ groupId }) => groupId)).toEqual([LITERAL, SURROGATE])
+        expect(describeGroups.mock.calls.map(([r]) => r.groupIds.map(echoOf))).toEqual([
+          ['team-�'],
+          ['team-�'],
+        ])
+      })
+
+      it('returns the unknown-group message of the newer API under each spelling when both APIs miss', async () => {
+        const unknown = ({ groupIds }) => ({
+          groups: groupIds.map((groupId) =>
+            withMessage(consumerGroupRow(echoOf(groupId)), GROUP_ID_NOT_FOUND, 'not consumer')
+          ),
+        })
+        const describeGroups = ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => ({
+            ...classicGroupRow(echoOf(groupId)),
+            errorCode: GROUP_ID_NOT_FOUND,
+          })),
+        })
+
+        const literalFirst = await run({ consumerGroupDescribe: unknown, describeGroups }, [
+          LITERAL,
+          SURROGATE,
+        ])
+
+        expect(
+          literalFirst.map(({ groupId, errorCode, errorMessage }) => [
+            groupId,
+            errorCode,
+            errorMessage,
+          ])
+        ).toEqual([
+          [LITERAL, GROUP_ID_NOT_FOUND, 'not consumer'],
+          [SURROGATE, GROUP_ID_NOT_FOUND, 'not consumer'],
+        ])
+      })
+
+      it('keeps a spelling given twice as two rows from a consumer group and as one from a classic group', async () => {
+        const twice = [SURROGATE, LITERAL, SURROGATE]
+        const describeGroups = jest.fn(classicEcho)
+
+        const consumer = await run({ consumerGroupDescribe: consumerEcho }, twice)
+        const classic = await run(
+          { consumerGroupDescribe: notConsumerGroup, describeGroups },
+          twice
+        )
+
+        expect(consumer.map(({ groupId }) => groupId)).toEqual(twice)
+        expect(classic.map(({ groupId }) => groupId)).toEqual([SURROGATE, LITERAL])
+      })
+
+      it('returns the rows of two ordinary ids as the broker named them', async () => {
+        const consumerGroupDescribe = jest.fn(consumerEcho)
+
+        const groups = await run({ consumerGroupDescribe }, ['g1', 'g2'])
+
+        expect(summary(groups)).toEqual([
+          ['g1', 0, 'consumer'],
+          ['g2', 0, 'consumer'],
+        ])
+      })
     })
   })
 
