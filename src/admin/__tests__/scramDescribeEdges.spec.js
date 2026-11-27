@@ -122,6 +122,169 @@ describe('SCRAM credential description edges', () => {
   })
 })
 
+// A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+describe('SCRAM credential description of a user name with a lone surrogate', () => {
+  const echoOf = (name) => Buffer.from(name, 'utf8').toString('utf8')
+  /** A broker that names each user as the bytes it read, with `overrides` on each row. */
+  const echoing = (overrides = {}) => {
+    const asked = []
+    const broker = {
+      describeUserScramCredentials: jest.fn(async ({ users }) => {
+        asked.push(...users.map(({ name }) => name))
+        return { results: users.map(({ name }) => ({ ...userRow(echoOf(name)), ...overrides })) }
+      }),
+    }
+    const cluster = { findConnectedBroker: jest.fn(async () => broker) }
+    return { asked, broker, cluster, admin: createAdmin({ cluster, logger, retry }) }
+  }
+
+  test('is answered under the name the caller gave when the broker echoes the bytes sent', async () => {
+    const { admin, asked } = echoing()
+
+    const rows = await admin.describeUserScramCredentials({ users: ['team-\uD800', 'alice'] })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([
+      ['team-\uD800', 0],
+      ['alice', 0],
+    ])
+    expect(rows[0].credentials).toEqual([{ mechanism: 'SCRAM-SHA-256', iterations: 4096 }])
+    expect(asked.map(echoOf)).toEqual(['team-�', 'alice'])
+  })
+
+  test('keeps the error row the broker answered, under the name the caller gave', async () => {
+    const { admin, broker } = echoing({ errorCode: 91, credentialInfos: [] })
+
+    const rows = await admin.describeUserScramCredentials({ users: ['team-\uD800'] })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['team-\uD800', 91]])
+    expect(broker.describeUserScramCredentials).toHaveBeenCalledTimes(1)
+  })
+
+  test('is refused, like a repeated name, when another user has the same bytes', async () => {
+    const { admin, cluster } = echoing()
+
+    const error = await rejection(
+      admin.describeUserScramCredentials({ users: ['a\uD800', 'a\uD801'] })
+    )
+
+    expect(error).toBeInstanceOf(KafkaJSInvalidConfigurationError)
+    expect(cluster.findConnectedBroker).not.toHaveBeenCalled()
+  })
+
+  test.each([['bob'], ['team-��']])('is still refused an answer row for %s', async (answered) => {
+    const { admin } = adminAnswering([userRow(answered)])
+
+    const error = await rejection(admin.describeUserScramCredentials({ users: ['team-\uD800'] }))
+
+    expect(error).toBeInstanceOf(KafkaJSInvariantViolation)
+  })
+
+  test('answers an ordinary Unicode user name under that name', async () => {
+    const name = 'über-\u{1F600}'
+    const { admin, asked } = echoing()
+
+    const rows = await admin.describeUserScramCredentials({ users: [name] })
+
+    expect(rows.map(({ user }) => user)).toEqual([name])
+    expect(asked).toEqual([name])
+  })
+})
+
+describe('SCRAM credential alteration of a user name with a lone surrogate', () => {
+  const echoOf = (name) => Buffer.from(name, 'utf8').toString('utf8')
+  const SHA512 = 'SCRAM-SHA-512'
+  const remove = (user, mechanism = 'SCRAM-SHA-256') => ({ user, mechanism })
+  /** A controller that names each user as the bytes it read, with `errorCode` on each row. */
+  const controller = (errorCode = 0) => {
+    const sent = []
+    const broker = {
+      alterUserScramCredentials: jest.fn(async ({ deletions }) => {
+        sent.push(...deletions.map(({ name }) => name))
+        const users = [...new Set(deletions.map(({ name }) => name))]
+        return { results: users.map((user) => ({ user: echoOf(user), errorCode })) }
+      }),
+    }
+    const cluster = {
+      refreshMetadata: jest.fn(async () => {}),
+      findControllerBroker: jest.fn(async () => broker),
+    }
+    return { sent, broker, cluster, admin: createAdmin({ cluster, logger, retry }) }
+  }
+
+  test('is answered under the name the caller gave when the controller echoes the bytes sent', async () => {
+    const { admin, sent } = controller()
+
+    const rows = await admin.alterUserScramCredentials({
+      deletions: [remove('team-\uD800'), remove('alice')],
+    })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([
+      ['team-\uD800', 0],
+      ['alice', 0],
+    ])
+    expect(sent.map(echoOf)).toEqual(['team-�', 'alice'])
+  })
+
+  test('keeps the error row the controller answered, under the name the caller gave', async () => {
+    const { admin, broker } = controller(41)
+
+    const rows = await admin.alterUserScramCredentials({ deletions: [remove('team-\uD800')] })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['team-\uD800', 41]])
+    expect(broker.alterUserScramCredentials).toHaveBeenCalledTimes(1)
+  })
+
+  test('is refused, like a repeated credential, when another user with the same mechanism has the same bytes', async () => {
+    const { admin, cluster } = controller()
+
+    const error = await rejection(
+      admin.alterUserScramCredentials({ deletions: [remove('a\uD800'), remove('a\uD801')] })
+    )
+
+    expect(error).toBeInstanceOf(KafkaJSInvalidConfigurationError)
+    expect(cluster.findControllerBroker).not.toHaveBeenCalled()
+  })
+
+  test('answers once for two mechanisms of users with the same bytes, as for one user', async () => {
+    const { admin, sent } = controller()
+
+    const rows = await admin.alterUserScramCredentials({
+      deletions: [remove('a\uD800'), remove('a\uD801', SHA512)],
+    })
+
+    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a\uD800', 0]])
+    expect(sent.map(echoOf)).toEqual(['a�', 'a�'])
+  })
+
+  test.each([['bob'], ['team-��']])('is still refused an answer row for %s', async (answered) => {
+    const broker = {
+      alterUserScramCredentials: async () => ({ results: [{ user: answered, errorCode: 0 }] }),
+    }
+    const cluster = {
+      refreshMetadata: jest.fn(async () => {}),
+      findControllerBroker: jest.fn(async () => broker),
+    }
+
+    const error = await rejection(
+      createAdmin({ cluster, logger, retry }).alterUserScramCredentials({
+        deletions: [remove('team-\uD800')],
+      })
+    )
+
+    expect(error).toBeInstanceOf(KafkaJSInvariantViolation)
+  })
+
+  test('answers an ordinary Unicode user name under that name', async () => {
+    const name = 'über-\u{1F600}'
+    const { admin, sent } = controller()
+
+    const rows = await admin.alterUserScramCredentials({ deletions: [remove(name)] })
+
+    expect(rows.map(({ user }) => user)).toEqual([name])
+    expect(sent).toEqual([name])
+  })
+})
+
 describe('SCRAM credential alteration edges', () => {
   test('called without options it names the missing credential changes', async () => {
     const cluster = { refreshMetadata: jest.fn(), findControllerBroker: jest.fn() }

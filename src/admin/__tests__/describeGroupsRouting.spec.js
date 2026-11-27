@@ -1,6 +1,5 @@
 const { createGroupDescriptions } = require('../groupDescriptions')
 const { createErrorFromCode } = require('../../protocol/error')
-const { KafkaJSNonRetriableError } = require('../../errors')
 const createAdmin = require('../index')
 const { MemberAssignment } = require('../../consumer/assignerProtocol')
 const { newLogger } = require('testHelpers')
@@ -899,15 +898,27 @@ describe('Admin > describeGroups > routing', () => {
       })
     })
 
-    it('is refused when another id in the call has the same bytes, before any request', async () => {
-      const consumerGroupDescribe = jest.fn()
-      const cluster = stubCluster({ consumerGroupDescribe, describeGroups: jest.fn() })
-      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+    it('is sent and answered like two identical ids when another id in the call has the same bytes', async () => {
+      const run = async (ids) => {
+        const consumerGroupDescribe = jest.fn(async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
+        }))
+        const cluster = stubCluster({ consumerGroupDescribe, describeGroups: jest.fn() })
+        const admin = createAdmin({ logger: newLogger(), retry, cluster })
+        const { groups } = await admin.describeGroups(ids)
+        return {
+          groups,
+          sent: consumerGroupDescribe.mock.calls.map(([r]) => r.groupIds.map(echoOf)),
+        }
+      }
 
-      await expect(admin.describeGroups(['a\uD800', 'a\uD801'])).rejects.toBeInstanceOf(
-        KafkaJSNonRetriableError
-      )
-      expect(consumerGroupDescribe).not.toHaveBeenCalled()
+      const identical = await run(['a', 'a'])
+      const sameBytes = await run(['a\uD800', 'a\uD801'])
+
+      expect(sameBytes.sent).toEqual([['a�', 'a�']])
+      expect(sameBytes.sent[0]).toHaveLength(identical.sent[0].length)
+      expect(sameBytes.groups).toHaveLength(identical.groups.length)
+      expect(sameBytes.groups.map(({ groupId }) => groupId)).toEqual(['a\uD800', 'a\uD800'])
     })
   })
 
