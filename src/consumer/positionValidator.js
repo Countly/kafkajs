@@ -22,8 +22,8 @@ const UNKNOWN_EPOCH = -1
  * - **awaiting** — a request is in flight; the position it was built from is captured so a reply
  *   that arrives after the position moved can be recognised and dropped. An awaiting partition is
  *   kept out of the fetch request by the caller, so it must never stay here without a request in
- *   flight: every exit is either performed by `complete()` (validated, truncated, reset,
- *   discarded) or by the caller through `markValidated()`, `clear()` or `forgetTopic()`.
+ *   flight: every exit is either performed by `complete()` (validated, discarded) or by the caller
+ *   through `markValidated()`, `release()`, `clear()` or `forgetTopic()`.
  * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against.
  *   The partition is re-examined only when the cached leader epoch differs from it.
  *
@@ -166,6 +166,9 @@ module.exports = class PositionValidator {
    * `'retry'` is not an exit from `awaiting`: it says the request should be reissued, and the
    * partition is left in flight. `'fatal'` likewise leaves the state alone — the caller disables
    * validation for the rest of the assignment and moves the partition on with `markValidated()`.
+   * `'truncated'` and `'reset'` leave the partition awaiting too: the caller marks it validated in
+   * the same step that installs the rewind, reset or halt, or releases it when that is refused, so
+   * a verdict is never admissible before its effect.
    *
    * @param {string} topic
    * @param {number} partition
@@ -224,15 +227,16 @@ module.exports = class PositionValidator {
 
     const end = Long.fromValue(endOffset)
 
-    this.markValidated(topic, partition, pending.currentLeaderEpoch)
-
     if (end.equals(UNKNOWN_EPOCH) || Long.fromValue(leaderEpoch).equals(UNKNOWN_EPOCH)) {
       return { action: 'reset', divergingOffset: null, leaderEpoch: UNKNOWN_EPOCH }
     }
 
-    return end.lessThan(Long.fromValue(currentPosition.offset))
-      ? { action: 'truncated', divergingOffset: end.toString(), leaderEpoch }
-      : { action: 'validated', divergingOffset: null, leaderEpoch }
+    if (end.lessThan(Long.fromValue(currentPosition.offset))) {
+      return { action: 'truncated', divergingOffset: end.toString(), leaderEpoch }
+    }
+
+    this.markValidated(topic, partition, pending.currentLeaderEpoch)
+    return { action: 'validated', divergingOffset: null, leaderEpoch }
   }
 
   /**

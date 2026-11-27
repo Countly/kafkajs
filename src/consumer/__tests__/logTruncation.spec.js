@@ -721,7 +721,7 @@ const handlerGate = () => {
  * @returns {jest.SpyInstance[]}
  */
 const commitPaths = (offsetManager) =>
-  ['reposition', 'setDefaultOffset', 'commitAndClear', 'commitSeek', 'publishSeek'].map((name) =>
+  ['setDefaultOffset', 'commitAndClear', 'commitSeek', 'publishSeek'].map((name) =>
     jest.spyOn(offsetManager, name)
   )
 
