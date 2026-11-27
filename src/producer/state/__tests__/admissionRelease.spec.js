@@ -5,6 +5,7 @@ const { createErrorFromCode } = require('../../../protocol/error')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSDeliveryTimeout,
+  KafkaJSInvalidConfigurationError,
   KafkaJSProducerClosedError,
   KafkaJSRecordTooLargeError,
 } = require('../../../errors')
@@ -1200,11 +1201,15 @@ describe('Producer > the buffer > a custom partitioner that changes a record', (
     jest.useRealTimers()
   })
 
+  /** How long a batch waits for more records in the tests that share one. */
+  const LINGER = 5
+
   /**
    * A producer without idempotence over two partitions, with `batchSize: 1` and `partitioner` as
-   * its custom partitioner, whose cluster counts the topic pins it holds.
+   * its custom partitioner, whose cluster counts the topic pins it holds. `options` override the
+   * producer's.
    */
-  const pinnedProducer = (partitioner) => {
+  const pinnedProducer = (partitioner, options = {}) => {
     const cluster = createFakeCluster({ partitions: 2 })
     const pins = new Map()
     cluster.holdTopic = (topic) => pins.set(topic, (pins.get(topic) ?? 0) + 1)
@@ -1215,8 +1220,57 @@ describe('Producer > the buffer > a custom partitioner that changes a record', (
       idempotent: false,
       batchSize: 1,
       createPartitioner: () => partitioner,
+      ...options,
     })
     return { ...fixture, pins }
+  }
+
+  /** Sends every record to partition 0, after `change(message)` ran on each but `a`. */
+  const sameBatch =
+    (change) =>
+    ({ message }) => {
+      if (message.value !== 'a') change(message)
+      return 0
+    }
+
+  /** The values of the records a Produce request carries, in order. */
+  const valuesOf = ({ topicData }) =>
+    topicData.flatMap(({ partitions }) =>
+      partitions.flatMap(({ messages }) => messages.map(({ value }) => value))
+    )
+
+  /**
+   * Sends `a`, which waits `LINGER` ms in its batch, then `b` with a header, whose record the
+   * partitioner changes with `change` and puts in the same batch.
+   */
+  const shareBatch = async (change) => {
+    const fixture = pinnedProducer(sameBatch(change), { linger: LINGER, batchSize: 16384 })
+    await fixture.producer.connect()
+    const earlier = watch(fixture.producer.send({ topic: TOPIC, messages: [{ value: 'a' }] }))
+    await flushAll()
+    const changed = watch(
+      fixture.producer.send({ topic: TOPIC, messages: [{ value: 'b', headers: { h: 'ok' } }] })
+    )
+    await flushAll()
+    return { ...fixture, earlier, changed }
+  }
+
+  /**
+   * Lets the earlier send's batch go out, and checks that it carried that send alone and that
+   * nothing stays charged or pinned.
+   */
+  const expectEarlierWrittenAlone = async ({ producer, cluster, admission, pins, earlier }) => {
+    expect(earlier.state).toBe('pending')
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+
+    expect(earlier.state).toBe('fulfilled')
+    expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+    expect(valuesOf(cluster.broker.produce.mock.calls[0][0])).toEqual(['a'])
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
   }
 
   /** Sends `a` to partition 0 and `b` to partition 1, after `change(message)` ran on `b`. */
@@ -1280,5 +1334,201 @@ describe('Producer > the buffer > a custom partitioner that changes a record', (
     expect(cluster.broker.produce).not.toHaveBeenCalled()
     expect(countersOf(admission)).toEqual(quiescent(admission))
     expect([...pins]).toEqual([])
+  })
+
+  test.each([
+    [
+      'a header value replaced by a number',
+      'headers',
+      (message) => {
+        message.headers.h = 42
+      },
+    ],
+    [
+      'headers replaced by null',
+      'headers',
+      (message) => {
+        message.headers = null
+      },
+    ],
+    [
+      'a header value set to null',
+      'headers',
+      (message) => {
+        message.headers.h = null
+      },
+    ],
+    [
+      'a header value set to undefined',
+      'headers',
+      (message) => {
+        message.headers.h = undefined
+      },
+    ],
+    [
+      'a header value nested in two arrays',
+      'headers',
+      (message) => {
+        message.headers.h = [['x']]
+      },
+    ],
+    [
+      'a key replaced by a number',
+      'key',
+      (message) => {
+        message.key = 42
+      },
+    ],
+    [
+      'a value replaced by an object',
+      'value',
+      (message) => {
+        message.value = {}
+      },
+    ],
+    [
+      'a timestamp whose conversion throws',
+      'timestamp',
+      (message) => {
+        message.timestamp = {
+          [Symbol.toPrimitive]() {
+            throw new RangeError('timestamp conversion failed')
+          },
+        }
+      },
+    ],
+    [
+      'a negative timestamp',
+      'timestamp',
+      (message) => {
+        message.timestamp = -1
+      },
+    ],
+  ])(
+    '%s by the partitioner refuses that send alone, and the earlier send sharing its batch is written without it',
+    async (_, field, change) => {
+      const fixture = await shareBatch(change)
+
+      expect(fixture.changed.state).toBe('rejected')
+      expect(fixture.changed.value).toBeInstanceOf(KafkaJSInvalidConfigurationError)
+      expect(fixture.changed.value.message).toContain(
+        `Invalid message for topic "${TOPIC}": its ${field} must be`
+      )
+      await expectEarlierWrittenAlone(fixture)
+    }
+  )
+
+  test('a value the partitioner makes larger than its send was charged refuses that send alone, and the earlier send sharing its batch is written without it', async () => {
+    const larger = 'x'.repeat(4096)
+    const fixture = await shareBatch((message) => {
+      message.value = larger
+    })
+
+    expect(fixture.changed.state).toBe('rejected')
+    expect(fixture.changed.value).toBeInstanceOf(KafkaJSInvalidConfigurationError)
+    expect(fixture.changed.value.message).toBe(
+      `The records of a send changed after it was charged: they need ${
+        1536 + held({ value: larger, headers: { h: 'ok' } })
+      } bytes of bufferMemory, and the send was charged ${
+        1536 + held({ value: 'b', headers: { h: 'ok' } })
+      }`
+    )
+    await expectEarlierWrittenAlone(fixture)
+  })
+
+  test('a Buffer the partitioner puts in place of a longer string is charged while its request is in flight as its batch carries it, and released at the answer', async () => {
+    const replacement = Buffer.alloc(4096, 'r')
+    const { producer, cluster, admission, pins } = pinnedProducer(
+      sameBatch((message) => {
+        message.value = replacement
+      }),
+      { batchSize: 16384 }
+    )
+    const calls = holdProduce(cluster)
+    await producer.connect()
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value: 'b'.repeat(8192) }] }))
+    await flushAll()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].request.topicData[0].partitions[0].messages[0].value).toBe(replacement)
+    expect(admission.reserved).toBe(1536 + held({ value: replacement }))
+    calls[0].answer()
+    await flushAll()
+
+    expect(sent.state).toBe('fulfilled')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
+  })
+
+  test('a record whose value the partitioner removes is still sent, as a tombstone', async () => {
+    const { producer, cluster, admission, pins } = pinnedProducer(
+      sameBatch((message) => {
+        delete message.value
+      })
+    )
+    await producer.connect()
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ key: 'k', value: 'b' }] }))
+    await flushAll()
+
+    expect(sent.state).toBe('fulfilled')
+    const [record] = cluster.broker.produce.mock.calls[0][0].topicData[0].partitions[0].messages
+    expect(record.key).toBe('k')
+    expect('value' in record).toBe(false)
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
+  })
+
+  test('a send option whose conversion disconnects the producer refuses the send unsent before any batch forms, and writes or charges nothing', async () => {
+    let disconnected = null
+    const { producer, cluster, admission, pins } = pinnedProducer(() => 0)
+    const debit = jest.spyOn(admission, 'debit')
+    const timeout = {
+      [Symbol.toPrimitive]() {
+        disconnected ??= producer.disconnect({ timeout: 0 })
+        return 1000
+      },
+    }
+    await producer.connect()
+
+    const sent = watch(producer.send({ topic: TOPIC, timeout, messages: [{ value: 'a' }] }))
+    await flushAll()
+
+    expect(disconnected).toBeInstanceOf(Promise)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSProducerClosedError)
+    expect(sent.value.outcome).toBe('unsent')
+    expect(debit).not.toHaveBeenCalled()
+    await disconnected
+    await flushAll()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+  })
+
+  test('a send option whose conversion throws rejects the send with that error, and writes or charges nothing', async () => {
+    const failure = new RangeError('timeout conversion failed')
+    const { producer, cluster, admission, pins } = pinnedProducer(() => 0)
+    const debit = jest.spyOn(admission, 'debit')
+    const timeout = {
+      [Symbol.toPrimitive]() {
+        throw failure
+      },
+    }
+    await producer.connect()
+
+    const sent = watch(producer.send({ topic: TOPIC, timeout, messages: [{ value: 'a' }] }))
+    await flushAll()
+
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBe(failure)
+    expect(debit).not.toHaveBeenCalled()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
   })
 })
