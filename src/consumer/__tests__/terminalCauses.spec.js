@@ -225,10 +225,15 @@ describe('Consumer > how a classic run ends', () => {
         const run = await begin({
           instance: kind === 'a static',
           run: { autoCommit },
-          eachMessage: async ({ message }) => {
-            if (message.offset === '41') throw error
+          eachMessage: async ({ message }, held) => {
+            if (message.offset !== '41') return
+            await held.promise
+            throw error
           },
         })
+        await advanceUntil(() => run.delivered.length === 2)
+        expect(trail(run)).toEqual([])
+        run.held.resolve()
         await advanceUntil(() => run.crashes.length > 0)
         await jest.advanceTimersByTimeAsync(1000)
 
@@ -424,11 +429,16 @@ describe('Consumer > how a classic run ends', () => {
               },
             }),
           },
-          eachMessage: async ({ message }, _held, call) => {
-            if (message.offset === '41' && call === 2) throw error
+          eachMessage: async ({ message }, held, call) => {
+            if (message.offset !== '41' || call !== 2) return
+            await held.promise
+            throw error
           },
         })
         seen.run = run
+        await advanceUntil(() => run.delivered.length === 2)
+        expect(trail(run)).toEqual([])
+        run.held.resolve()
         await advanceUntil(() => run.crashes.length > 0)
 
         expect(trail(run)).toEqual([...CLEANUP, `CRASH restart ${restart}`])
@@ -590,10 +600,15 @@ describe('Consumer > how a classic run ends', () => {
         const run = await begin({
           retry: RETRY,
           closeCallback: () => callback.promise,
-          eachMessage: async ({ message }, _held, call) => {
-            if (message.offset === '41' && call === 2) throw error
+          eachMessage: async ({ message }, held, call) => {
+            if (message.offset !== '41' || call !== 2) return
+            await held.promise
+            throw error
           },
         })
+        await advanceUntil(() => run.delivered.length === 2)
+        expect(trail(run)).toEqual([])
+        run.held.resolve()
         await advanceUntil(() => trail(run).includes('revoked callback'))
         expect(trail(run)).toEqual(['commit topic-a|0 41', 'revoked callback'])
 
@@ -736,11 +751,14 @@ describe('Consumer > how a classic run ends', () => {
         config: { maxPollInterval: 4000, heartbeatInterval: 500 },
         retry: { ...RETRY, retries: 1, restartOnFailure: policy },
         records: { 'topic-a|0': [40] },
-        eachMessage: async () => {
+        eachMessage: async (_payload, held) => {
+          await held.promise
           await new Promise((resolve) => setTimeout(resolve, 6000))
           throw error
         },
       })
+      expect(trail(run)).toEqual([])
+      run.held.resolve()
       await advanceUntil(() => run.delivered.length === 2, 15000)
 
       expect(run.crashes).toEqual([])
@@ -1071,6 +1089,71 @@ describe('Consumer > how a classic run ends', () => {
       expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
       expect(jest.getTimerCount()).toBe(0)
     }, 30000)
+  })
+
+  describe('a background rejoin round of a cooperative member whose JoinGroup fails', () => {
+    /** An assigner under the protocol name the JoinGroup double answers, cooperative only. */
+    const cooperative = () => ({
+      name: 'eager',
+      version: 0,
+      supportedProtocols: () => ['cooperative'],
+      protocol: () => ({ name: 'eager', metadata: Buffer.alloc(0) }),
+      assign: async () => [],
+    })
+
+    it.each([
+      ['absent', false],
+      ['returning true', true],
+    ])(
+      'with restartOnFailure %s cleans up as stop() does and reports the JoinGroup error itself, unwrapped, with restart %s',
+      async (policyName, restart) => {
+        const policy = policyName === 'absent' ? undefined : jest.fn(async () => true)
+        const failed = failure(false)
+        const run = await begin({
+          config: { heartbeatInterval: 500, partitionAssigners: [cooperative] },
+          retry: { ...RETRY, ...(policy && { restartOnFailure: policy }) },
+        })
+        await advanceUntil(() => run.delivered.length === 2)
+        await jest.advanceTimersByTimeAsync(200)
+        expect(run.group.rebalanceProtocol()).toBe('cooperative')
+        expect(trail(run)).toEqual([])
+        const rebalancing = jest.fn()
+        run.consumer.on(run.consumer.events.REBALANCING, rebalancing)
+
+        run.coordinator.joinGroup.mockImplementationOnce(async () => {
+          throw failed
+        })
+        run.coordinator.heartbeat.mockImplementationOnce(async () => {
+          throw protocolError(REBALANCE_IN_PROGRESS)
+        })
+        await advanceUntil(() => run.crashes.length > 0, 2000)
+
+        expect(rebalancing).toHaveBeenCalledTimes(1)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+        expect(trail(run)).toEqual([
+          'final commit',
+          'commit topic-a|0 42',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          `CRASH restart ${restart}`,
+        ])
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error).toBe(failed)
+        expect(run.cluster.disconnect.mock.calls).toEqual([[{ preserveSetupState: true }]])
+        if (policy) expect(policy).toHaveBeenCalledTimes(1)
+
+        await expectRestart(run, restart)
+        if (restart) {
+          await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 2, 2000)
+          expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+          await closeClean(run)
+        } else {
+          expect(jest.getTimerCount()).toBe(0)
+        }
+      },
+      30000
+    )
   })
 
   describe('other rows of a classic run', () => {
