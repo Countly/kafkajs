@@ -1387,10 +1387,11 @@ module.exports = class Runner extends EventEmitter {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
       return () => this.consumerGroup.resume([{ topic, partitions: [partition] }])
     }
-    // The validation rule is asked again whenever what it reads changed: the cached leader epoch,
-    // read on every message, or a validation entry.
+    // The admission rule is asked again whenever what it reads changed: the partition's routing
+    // stamp (it changes with the cached leader or leader epoch), read on every message, or a
+    // validation entry.
     let checkedVersion = null
-    let checkedEpoch = null
+    let checkedRouting = null
     for (const message of batch.messages) {
       if (
         !this.running ||
@@ -1400,11 +1401,11 @@ module.exports = class Runner extends EventEmitter {
         break
       }
       const version = this.consumerGroup.validationVersion?.()
-      const epoch = this.consumerGroup.cluster?.leaderEpoch?.(topic, partition)
-      if (version !== checkedVersion || epoch !== checkedEpoch) {
-        if (!this.#validated(batch)) break
+      const routing = this.consumerGroup.cluster?.routingStamp?.(topic, partition)
+      if (version !== checkedVersion || routing !== checkedRouting) {
+        if (!this.#admitted(batch)) break
         checkedVersion = version
-        checkedEpoch = epoch
+        checkedRouting = routing
       }
 
       try {
@@ -1757,18 +1758,22 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether the batch's data may still be used: its partition is still at the leader epoch the
-   * Fetch was built at and still validated against it (`ConsumerGroup#validationAllows`). A batch
-   * built outside a fetch carries no fetch epoch, and a group without the rule (a test double;
-   * the consumer group always has it) admits everything.
+   * Whether the batch's data may still be used: at the leader epoch its Fetch was built at, its
+   * partition is still admitted under the same validation entry the Fetch was admitted under
+   * (`ConsumerGroup#admissionEntry`), so a new leader epoch, a leader that moved away and back, or
+   * a validation redone at the same epoch all stop it. A batch built outside a fetch carries no
+   * fetch epoch, and a group without the rule (a test double; the consumer group always has it)
+   * admits everything.
    * @param {import('./batch')} batch
    * @returns {boolean}
    */
-  #validated(batch) {
-    const epoch = Batch.fetchEpochOf(batch)
+  #admitted(batch) {
+    const admission = Batch.admissionOf(batch)
+    const group = this.consumerGroup
     return (
-      epoch === undefined ||
-      this.consumerGroup.validationAllows?.(batch.topic, batch.partition, epoch) !== false
+      admission === undefined ||
+      typeof group.admissionEntry !== 'function' ||
+      group.admissionEntry(batch.topic, batch.partition, admission.epoch) === admission.entry
     )
   }
 
@@ -1923,9 +1928,10 @@ module.exports = class Runner extends EventEmitter {
       return
     }
 
-    // Likewise a batch whose leader epoch moved while it waited: the next round validates the
+    // Likewise a batch no longer admitted under the validation it was fetched under (its leader or
+    // leader epoch moved, or it was validated again while it waited): the next round validates the
     // position first and fetches it again from there.
-    if (!this.#validated(batch)) {
+    if (!this.#admitted(batch)) {
       this.logger.debug('Dropping a queued batch fetched before a leader epoch change', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
@@ -1991,7 +1997,7 @@ module.exports = class Runner extends EventEmitter {
 
         // A START_BATCH_PROCESS listener can pause the partition or move its leader epoch:
         // nothing is resolved, and END_BATCH_PROCESS still pairs with START.
-        if (this.#paused(batch) || !this.#validated(batch)) {
+        if (this.#paused(batch) || !this.#admitted(batch)) {
           this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
             ...payload,
             duration: Date.now() - startBatchProcess,
@@ -2039,7 +2045,7 @@ module.exports = class Runner extends EventEmitter {
           topic,
           partition,
         })
-      } else if (!this.#validated(batch)) {
+      } else if (!this.#admitted(batch)) {
         this.logger.debug('Not handing over a batch fetched before a leader epoch change', {
           topic,
           partition,

@@ -1533,6 +1533,18 @@ module.exports = class Cluster {
   }
 
   /**
+   * The routing stamp of one partition (`MetadataCache#routingStamp`): it changes whenever the
+   * cached leader or leader epoch changes, and is never handed out twice. Internal seam for the
+   * consumer's fetch path; not on the public Cluster surface.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number}
+   */
+  routingStamp(topic, partition) {
+    return this.metadataCache.routingStamp(topic, partition)
+  }
+
+  /**
    * The cached leader of one partition, as of the last Metadata response or accepted leader hint:
    * a map lookup, never a refresh. Internal seam for the producer's accumulator; not on the public
    * Cluster surface.

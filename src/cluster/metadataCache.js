@@ -56,7 +56,9 @@ module.exports = class MetadataCache {
      * Entries are mutated in place and reused across refreshes - only a first sighting, a topic
      * recreation or `clear()` allocates.
      *
-     * @type {Map<string, { topicId: string|null, seenAt: number, decodedReleased: boolean, partitions: Map<number, { leader: number, leaderEpoch: number, decoded: object|null }> }>}
+     * `stamp` is the partition's routing stamp, see `routingStamp()`.
+     *
+     * @type {Map<string, { topicId: string|null, seenAt: number, decodedReleased: boolean, partitions: Map<number, { leader: number, leaderEpoch: number, stamp: number, decoded: object|null }> }>}
      */
     this.topics = new Map()
     /** @type {Map<string, string>} topic id -> topic name */
@@ -70,6 +72,8 @@ module.exports = class MetadataCache {
     this.pendingTopics = new Set()
     /** Incremented once per `update()`; stamped onto every topic that response carried. */
     this.generation = 0
+    /** The last routing stamp handed out; never reset, so no stamp is ever handed out twice. */
+    this.routingClock = 0
     /** @type {Set<() => void>} synchronous internal listeners, independent of instrumentation */
     this.routingListeners = new Set()
   }
@@ -155,6 +159,7 @@ module.exports = class MetadataCache {
           entry.partitions.set(partition.partitionId, {
             leader: partition.leader,
             leaderEpoch: partition.leaderEpoch,
+            stamp: ++this.routingClock,
             decoded: partition,
           })
           continue
@@ -172,8 +177,7 @@ module.exports = class MetadataCache {
           partition.leader = cached.leader
           partition.leaderEpoch = cached.leaderEpoch
         } else {
-          cached.leader = partition.leader
-          cached.leaderEpoch = partition.leaderEpoch
+          this.route(cached, partition.leader, partition.leaderEpoch)
         }
 
         // Re-seated in both branches: the previous response's object is about to be discarded.
@@ -352,6 +356,7 @@ module.exports = class MetadataCache {
           entry.partitions.set(partition.partitionId, {
             leader: partition.leader,
             leaderEpoch: partition.leaderEpoch,
+            stamp: ++this.routingClock,
             decoded: null,
           })
           changed = true
@@ -362,12 +367,7 @@ module.exports = class MetadataCache {
           continue
         }
 
-        changed =
-          changed ||
-          cached.leader !== partition.leader ||
-          cached.leaderEpoch !== partition.leaderEpoch
-        cached.leader = partition.leader
-        cached.leaderEpoch = partition.leaderEpoch
+        changed = this.route(cached, partition.leader, partition.leaderEpoch) || changed
 
         if (cached.decoded) {
           cached.decoded.leader = partition.leader
@@ -505,8 +505,7 @@ module.exports = class MetadataCache {
       return false
     }
 
-    cached.leader = leaderId
-    cached.leaderEpoch = leaderEpoch
+    this.route(cached, leaderId, leaderEpoch)
 
     if (cached.decoded) {
       cached.decoded.leader = leaderId
@@ -541,7 +540,7 @@ module.exports = class MetadataCache {
       return false
     }
 
-    cached.leaderEpoch = UNKNOWN_EPOCH
+    this.route(cached, cached.leader, UNKNOWN_EPOCH)
 
     // `decoded` is null for a topic released by `releaseTopicsAbsentFrom`; guarded exactly as
     // `applyLeaderHint` guards it.
@@ -551,6 +550,39 @@ module.exports = class MetadataCache {
 
     this.publishRoutingChange()
     return true
+  }
+
+  /**
+   * Accepts a leader/epoch pair for one cached partition, and gives the partition a new routing
+   * stamp when the pair changed.
+   * @private
+   * @param {{ leader: number, leaderEpoch: number, stamp: number }} cached
+   * @param {number} leader
+   * @param {number} leaderEpoch
+   * @returns {boolean} whether the pair changed
+   */
+  route(cached, leader, leaderEpoch) {
+    if (cached.leader === leader && cached.leaderEpoch === leaderEpoch) return false
+    cached.leader = leader
+    cached.leaderEpoch = leaderEpoch
+    cached.stamp = ++this.routingClock
+    return true
+  }
+
+  /**
+   * A number that changes whenever the cache accepts a different leader or leader epoch for the
+   * partition, or forgets or first learns the partition, and on nothing else: a refresh that
+   * repeats the cached pair, or one the monotonic rule rejects, keeps it. Stamps are never reused,
+   * so a partition that moves away and back to the same leader and epoch does not get its earlier
+   * stamp back.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {number} the stamp, or 0 for a partition the cache does not hold
+   */
+  routingStamp(topic, partition) {
+    const entry = this.topics.get(topic)
+    const cached = entry && entry.partitions.get(partition)
+    return cached ? cached.stamp : 0
   }
 
   /**

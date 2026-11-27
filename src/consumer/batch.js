@@ -11,6 +11,9 @@ const epochOf = (message) => {
   return typeof epoch === 'number' ? epoch : -1
 }
 
+/** The strings `Long.fromString` reads as 0 although they are not offsets. */
+const NOT_FINITE = new Set(['NaN', 'Infinity', '+Infinity', '-Infinity'])
+
 /**
  * A batch collects messages returned from a single fetch call.
  *
@@ -21,6 +24,7 @@ module.exports = class Batch {
   #nextBatchLeaderEpoch
   #advances
   #fetchEpoch
+  #admittedUnder
 
   /**
    * @param {string} topic
@@ -31,9 +35,12 @@ module.exports = class Batch {
    *   end of that record batch
    * @param {number} [fetchEpoch] the leader epoch the Fetch was built at; absent for a batch built
    *   outside a fetch
+   * @param {object} [admittedUnder] the validation entry the Fetch was admitted under
+   *   (`ConsumerGroup#admissionEntry`)
    */
-  constructor(topic, fetchedOffset, partitionData, fetchEpoch) {
+  constructor(topic, fetchedOffset, partitionData, fetchEpoch, admittedUnder) {
     this.#fetchEpoch = fetchEpoch
+    this.#admittedUnder = admittedUnder
     this.fetchedOffset = fetchedOffset
     const longFetchedOffset = Long.fromValue(this.fetchedOffset)
     const { abortedTransactions, messages } = partitionData
@@ -76,13 +83,16 @@ module.exports = class Batch {
   }
 
   /**
-   * The leader epoch the Fetch that produced `batch` was built at. Kept off the batch's own
-   * properties, so the `eachBatch` payload does not show it.
-   * @param {Batch} batch
-   * @returns {number|undefined} `undefined` for a batch built outside a fetch
+   * The admission the Fetch that produced `batch` was built under: its leader epoch and the
+   * validation entry it was admitted under. Kept off the batch's own properties, so the
+   * `eachBatch` payload does not show it.
+   * @param {object} batch
+   * @returns {{epoch: number, entry: object|undefined}|undefined} `undefined` for a batch built
+   *   outside a fetch, including an object that is not a `Batch`
    */
-  static fetchEpochOf(batch) {
-    return batch.#fetchEpoch
+  static admissionOf(batch) {
+    if (!(#fetchEpoch in batch) || batch.#fetchEpoch === undefined) return undefined
+    return { epoch: batch.#fetchEpoch, entry: batch.#admittedUnder }
   }
 
   /**
@@ -100,12 +110,15 @@ module.exports = class Batch {
    * @param {string|number|import('../utils/long')} offset compared by value: the decimal string
    *   the decoder produces is looked up as it is, and any other spelling (a number, a `Long`, a
    *   string with leading zeros) is turned into that string once when the first lookup misses. A
-   *   value that is not an offset answers -1.
+   *   value that is not an offset answers -1, including `NaN`, `Infinity` and their strings, which
+   *   `Long.fromValue` would read as 0.
    * @returns {number}
    */
   leaderEpochAt(offset) {
     const epoch = this.#epochAt(offset)
     if (epoch !== undefined) return epoch
+
+    if (typeof offset === 'number' ? !Number.isFinite(offset) : NOT_FINITE.has(offset)) return -1
 
     let canonical
     try {

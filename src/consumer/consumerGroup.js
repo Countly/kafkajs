@@ -2531,10 +2531,19 @@ module.exports = class ConsumerGroup {
         }
       }
 
+      // Checked once more where the frame is written (the guard is given the frame length only
+      // there): a partition whose admission lapsed while the request waited for its broker, its
+      // authentication or a full queue keeps the whole frame off the wire. Bytes already written
+      // are judged at receipt instead.
+      let lapsed = null
+      const guard = (frameLength) =>
+        prepared.guard() ||
+        (frameLength === undefined ? null : (lapsed = this.lapsedAdmission(requests)))
+
       let response
       try {
         response = await broker.fetch({
-          guard: prepared.guard,
+          guard,
           maxWaitTime: this.maxWaitTime,
           minBytes: this.minBytes,
           maxBytes: this.maxBytes,
@@ -2554,6 +2563,11 @@ module.exports = class ConsumerGroup {
         // hints and routing belong to the run that replaced it.
         if (tracked && run.fence.closed) {
           tracked.session.handleError(tracked.token)
+          return []
+        }
+        // Written nowhere: the session starts over, and the next round validates and builds again.
+        if (error === lapsed) {
+          tracked?.session.handleError(tracked.token)
           return []
         }
         // A stale session's failure belongs to a node or run that moved on: it recovers nothing.
@@ -2890,12 +2904,15 @@ module.exports = class ConsumerGroup {
 
   /**
    * The one rule for using fetched data: data fetched at leader epoch `epoch` may be requested,
-   * accepted or handed to a handler only while the cached leader epoch is still `epoch` and the
-   * partition's position is validated against it. Epochs compare as numbers; -1 (unknown) is a
-   * value like any other, and a partition with no validation entry is never admitted.
+   * written to the wire, accepted or handed to a handler only while the cached leader epoch is
+   * still `epoch` and the partition's position is validated against it under the partition's
+   * current routing stamp (`Cluster#routingStamp`), which changes on every accepted leader or
+   * epoch change: a partition whose leader moved away and back to the same epoch is not admitted
+   * by its earlier validation. Epochs compare as numbers; -1 (unknown) is a value like any other,
+   * and a partition with no validation entry is never admitted.
    *
-   * The entry returned is the admission identity: a request records it, and its answer is used
-   * only while the partition is still validated under that same entry, so an answer built before
+   * The entry returned is the admission identity: a request and its batch record it, and they are
+   * used only while the partition is still validated under that same entry, so data fetched before
    * a validation that was redone at the same epoch is not.
    * @param {string} topic
    * @param {number} partition
@@ -2905,7 +2922,34 @@ module.exports = class ConsumerGroup {
   admissionEntry(topic, partition, epoch) {
     if (this.cluster.leaderEpoch(topic, partition) !== epoch) return undefined
     const entry = this.positionValidator.entryOf(topic, partition)
-    return entry !== undefined && entry.validatedAgainst === epoch ? entry : undefined
+    return entry !== undefined &&
+      entry.validatedAgainst === epoch &&
+      entry.routing === this.cluster.routingStamp?.(topic, partition)
+      ? entry
+      : undefined
+  }
+
+  /**
+   * Checks the round's whole logical request against `admissionEntry` at the moment its frame is
+   * about to be written, including the partitions a Fetch session carries without sending them.
+   * @private
+   * @param {{topic: string, partitions: {partition: number, currentLeaderEpoch: number,
+   *   admittedUnder: object}[]}[]} requests the round's request entries
+   * @returns {KafkaJSError|null} the refusal when a partition is no longer admitted under the
+   *   entry it was built with, so the frame is not written; null otherwise
+   */
+  lapsedAdmission(requests) {
+    for (const { topic, partitions } of requests) {
+      for (const { partition, currentLeaderEpoch, admittedUnder } of partitions) {
+        if (this.admissionEntry(topic, partition, currentLeaderEpoch) !== admittedUnder) {
+          return new KafkaJSError(
+            `Fetch not sent: ${topic} partition ${partition} changed leader epoch or validation after the request was built`,
+            { retriable: true }
+          )
+        }
+      }
+    }
+    return null
   }
 
   /**
@@ -3116,7 +3160,8 @@ module.exports = class ConsumerGroup {
     // request did not carry, an answer for a position the partition has left (another node's
     // answer came first, or a reset cleared the offset), and an answer the validation rule no
     // longer admits (its leader epoch moved, or the partition was validated again since the
-    // request was built) are not delivered and not recovered from.
+    // request was built) are not delivered and not recovered from. The one thing such a row
+    // still says is where the leader is now: see `routeFromDroppedRow`.
     const requested = requestedPartitions?.get(partition)
     let dropped = null
     if (requested === undefined) {
@@ -3140,7 +3185,7 @@ module.exports = class ConsumerGroup {
         partition,
         reason: dropped,
       })
-      return false
+      return requested !== undefined && (await this.routeFromDroppedRow(partitionData, context))
     }
 
     if (failure(errorCode)) {
@@ -3237,10 +3282,48 @@ module.exports = class ConsumerGroup {
     const halted = corruption != null && this.acceptHalt(topicName, partition, corruption, context)
 
     batches.push(
-      new Batch(topicName, requested.fetchOffset, partitionData, requested.currentLeaderEpoch)
+      new Batch(
+        topicName,
+        requested.fetchOffset,
+        partitionData,
+        requested.currentLeaderEpoch,
+        requested.admittedUnder
+      )
     )
     if (halted) this.reportHalt(topicName, partition, corruption)
     return false
+  }
+
+  /**
+   * The routing a dropped Fetch row still carries. Its data, error count, reset, replica and
+   * epoch effects are gone with it, but a `NOT_LEADER_OR_FOLLOWER`, `FENCED_LEADER_EPOCH` or other
+   * stale-metadata code says the request went to the wrong place, and from Fetch v16 the broker
+   * names the current leader. A leader hint of the topic incarnation the cache knows is applied
+   * through the cache's monotonic rule, so a hint older than what the cache holds changes nothing;
+   * a row whose hint was not applied asks for the metadata refresh, as a current row does.
+   * @private
+   * @param {object} partitionData the dropped row
+   * @param {object} context this topic's state for the round, see `handleFetchedPartition`
+   * @returns {Promise<boolean>} whether the row asks for a metadata refresh
+   * @throws {Error} the fence's close error
+   */
+  async routeFromDroppedRow({ partition, errorCode, currentLeader }, context) {
+    const { topicName } = context
+    if (
+      !failure(errorCode) ||
+      partitionFetchAction(errorCode) !== 'stale-metadata' ||
+      context.topicId !== this.cluster.topicId(topicName)
+    ) {
+      return false
+    }
+    const applied = await this.applyFetchLeaderHint(
+      topicName,
+      partition,
+      currentLeader,
+      context.nodeEndpoints,
+      context.fence
+    )
+    return !applied
   }
 
   /**
@@ -4084,10 +4167,13 @@ module.exports = class ConsumerGroup {
           }
 
           const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+          const routing = this.cluster.routingStamp?.(topic, partition)
 
           // Asked before anything is read or allocated: the steady state of a round is that every
           // partition is already validated against this epoch, and that round must cost nothing.
-          if (!this.positionValidator.needsValidation(topic, partition, currentLeaderEpoch)) {
+          if (
+            !this.positionValidator.needsValidation(topic, partition, currentLeaderEpoch, routing)
+          ) {
             continue
           }
 
@@ -4107,6 +4193,7 @@ module.exports = class ConsumerGroup {
             offset: manager.peekNextOffset(topic, partition).toString(),
             trackedEpoch,
             currentLeaderEpoch,
+            routing,
           })
 
           if (action === 'unchanged') {
@@ -4126,6 +4213,7 @@ module.exports = class ConsumerGroup {
               partition,
               trackedEpoch,
               currentLeaderEpoch,
+              routing,
               generation,
               requestClock: this.acquireClock,
               entry: this.positionValidator.entryOf(topic, partition),
@@ -4156,9 +4244,16 @@ module.exports = class ConsumerGroup {
       if (preparation?.guard()) {
         this.positionValidator.release(awaiting || [])
       } else {
-        for (const { topic, partition, currentLeaderEpoch, generation } of awaiting || []) {
+        for (const { topic, partition, currentLeaderEpoch, generation, routing } of awaiting ||
+          []) {
           if (this.positionValidator.isAwaiting(topic, partition)) {
-            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+            this.positionValidator.markValidated(
+              topic,
+              partition,
+              currentLeaderEpoch,
+              generation,
+              routing
+            )
           }
         }
       }
@@ -4299,7 +4394,7 @@ module.exports = class ConsumerGroup {
       })
 
       for (const { topic, entries } of pending) {
-        for (const { partition, currentLeaderEpoch, generation } of entries) {
+        for (const { partition, currentLeaderEpoch, generation, routing } of entries) {
           if (!this.positionValidator.isAwaiting(topic, partition)) {
             continue
           }
@@ -4309,7 +4404,13 @@ module.exports = class ConsumerGroup {
           // the mark applied - on a stale generation this round's exhaustion says nothing about
           // the partition the current assignment holds.
           if (
-            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+            this.positionValidator.markValidated(
+              topic,
+              partition,
+              currentLeaderEpoch,
+              generation,
+              routing
+            )
           ) {
             this.offsetManager.forgetConsumedEpoch(topic, partition)
           }
@@ -4457,8 +4558,14 @@ module.exports = class ConsumerGroup {
    */
   markAllValidated(topics) {
     for (const { topic, entries } of topics) {
-      for (const { partition, currentLeaderEpoch, generation } of entries) {
-        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+      for (const { partition, currentLeaderEpoch, generation, routing } of entries) {
+        this.positionValidator.markValidated(
+          topic,
+          partition,
+          currentLeaderEpoch,
+          generation,
+          routing
+        )
       }
     }
   }

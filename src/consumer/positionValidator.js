@@ -24,8 +24,11 @@ const UNKNOWN_EPOCH = -1
  *   kept out of the fetch request by the caller, so it must never stay here without a request in
  *   flight: every exit is either performed by `complete()` (validated, truncated, reset,
  *   discarded) or by the caller through `markValidated()`, `clear()` or `forgetTopic()`.
- * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against.
- *   The partition is re-examined only when the cached leader epoch differs from it.
+ * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against,
+ *   and `routing` the partition's routing stamp (`MetadataCache#routingStamp`) when the check was
+ *   asked for. The partition is re-examined only when the cached leader epoch or the routing stamp
+ *   differs from them, so a partition whose leader moved away and back to the same epoch is checked
+ *   again.
  *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
@@ -68,27 +71,29 @@ module.exports = class PositionValidator {
    * @param {string} position.offset the offset this round is about to fetch
    * @param {number} position.trackedEpoch the leader epoch of the last consumed record, -1 when unknown
    * @param {number} position.currentLeaderEpoch the cached leader epoch, -1 when unknown
+   * @param {number} [position.routing] the partition's routing stamp, read with the epoch
    * @returns {{ action: 'unchanged'|'awaiting'|'validated', generation: number }} the assignment
    *   generation observed here, which `complete()` has to be given back so that a reply from a
    *   previous assignment cannot be applied to this one
    */
-  request(topic, partition, { offset, trackedEpoch, currentLeaderEpoch }) {
+  request(topic, partition, { offset, trackedEpoch, currentLeaderEpoch, routing }) {
     const generation = this.assignmentGeneration
     const key = this.getKey(topic, partition)
     const entry = this.entries.get(key)
 
-    if (entry && entry.validatedAgainst === currentLeaderEpoch) {
+    if (entry && entry.validatedAgainst === currentLeaderEpoch && entry.routing === routing) {
       return { action: 'unchanged', generation }
     }
 
     if (this.disabled || trackedEpoch === UNKNOWN_EPOCH || currentLeaderEpoch === UNKNOWN_EPOCH) {
-      this.markValidated(topic, partition, currentLeaderEpoch)
+      this.markValidated(topic, partition, currentLeaderEpoch, generation, routing)
       return { action: 'validated', generation }
     }
 
     this.entries.set(key, {
       validatedAgainst: undefined,
-      pending: { offset, trackedEpoch, currentLeaderEpoch },
+      routing: undefined,
+      pending: { offset, trackedEpoch, currentLeaderEpoch, routing },
     })
     this.version += 1
 
@@ -112,16 +117,24 @@ module.exports = class PositionValidator {
    * @param {number} currentLeaderEpoch
    * @param {number} [generation] the generation `request()` returned for this partition; defaults
    *   to the current one, which is the caller that has no round to be stale against
+   * @param {number} [routing] the routing stamp read with `currentLeaderEpoch`
    * @returns {boolean} whether it was recorded; `false` means the generation was stale and nothing
    *   was written, which is also the caller's signal to leave the partition's tracked epoch alone
    */
-  markValidated(topic, partition, currentLeaderEpoch, generation = this.assignmentGeneration) {
+  markValidated(
+    topic,
+    partition,
+    currentLeaderEpoch,
+    generation = this.assignmentGeneration,
+    routing = undefined
+  ) {
     if (generation !== this.assignmentGeneration) {
       return false
     }
 
     this.entries.set(this.getKey(topic, partition), {
       validatedAgainst: currentLeaderEpoch,
+      routing,
       pending: null,
     })
     this.version += 1
@@ -140,18 +153,21 @@ module.exports = class PositionValidator {
    * @param {string} topic
    * @param {number} partition
    * @param {number} currentLeaderEpoch the cached leader epoch
+   * @param {number} [routing] the partition's routing stamp, read with the epoch
    * @returns {boolean} true when the partition is unvalidated or was validated against a different
-   *   epoch; false when it is already validated against this epoch, or a request is in flight for
-   *   it (whoever put it there owns its exit)
+   *   epoch or routing stamp; false when it is already validated against both, or a request is in
+   *   flight for it (whoever put it there owns its exit)
    */
-  needsValidation(topic, partition, currentLeaderEpoch) {
+  needsValidation(topic, partition, currentLeaderEpoch, routing) {
     const entry = this.entries.get(this.getKey(topic, partition))
 
     if (!entry) {
       return true
     }
 
-    return entry.pending ? false : entry.validatedAgainst !== currentLeaderEpoch
+    return entry.pending
+      ? false
+      : entry.validatedAgainst !== currentLeaderEpoch || entry.routing !== routing
   }
 
   /**
@@ -229,7 +245,7 @@ module.exports = class PositionValidator {
 
     const end = Long.fromValue(endOffset)
 
-    this.markValidated(topic, partition, pending.currentLeaderEpoch)
+    this.markValidated(topic, partition, pending.currentLeaderEpoch, generation, pending.routing)
 
     if (end.equals(UNKNOWN_EPOCH) || Long.fromValue(leaderEpoch).equals(UNKNOWN_EPOCH)) {
       return { action: 'reset', divergingOffset: null, leaderEpoch: UNKNOWN_EPOCH }
