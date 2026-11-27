@@ -25,6 +25,108 @@ const TOPIC = 'test-topic'
 const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 
 /**
+ * The fixtures one test created, released together when the test ends. Only the self-tests of
+ * the harness build one directly; a spec calls `trackFixtures`.
+ */
+class FixtureTracker {
+  constructor() {
+    /** @type {{ creator: string, release: () => void|Promise<void>, released: () => boolean }[]} */
+    this.entries = []
+  }
+
+  /**
+   * @param {string} creator the creator's name, for the messages
+   * @param {() => void|Promise<void>} release ends the fixture; may run more than once
+   * @param {() => boolean} released whether the fixture really is released, read after `release`
+   * @returns {void}
+   */
+  add(creator, release, released) {
+    this.entries.push({ creator, release, released })
+  }
+
+  /**
+   * Releases every fixture, the last created first, one at a time. A fixture a release creates
+   * is released too. Every release runs even when an earlier one failed.
+   * @returns {Promise<void>}
+   * @throws {Error} the first failure: a release that threw, else a fixture still not released
+   *   after its release returned, which names its creator
+   */
+  async releaseAll() {
+    const done = new Set()
+    let failure = null
+    for (;;) {
+      const pending = this.entries.filter((entry) => !done.has(entry)).reverse()
+      if (pending.length === 0) break
+      for (const entry of pending) {
+        done.add(entry)
+        try {
+          await entry.release()
+          if (!entry.released()) {
+            throw new Error(`${entry.creator}: the fixture is not released after its teardown`)
+          }
+        } catch (error) {
+          failure ??= { error }
+        }
+      }
+    }
+    if (failure) throw failure.error
+  }
+}
+
+/** @type {FixtureTracker|null} the tracker of the test running now; null outside a tracked test */
+let activeTracker = null
+let trackerInstalled = false
+
+/**
+ * The running test's tracker, for a creator that is about to build a fixture.
+ * @param {string} creator the creator's name
+ * @returns {FixtureTracker}
+ * @throws {Error} naming `creator` when no tracked test is running: nothing would release the fixture
+ */
+const trackerFor = (creator) => {
+  if (!activeTracker) {
+    throw new Error(
+      `${creator}() ran outside a tracked test, so nothing would tear its fixture down: call ` +
+        'trackFixtures() once at the top of the spec and create fixtures inside its tests and ' +
+        'beforeEach hooks, never at module load or in beforeAll'
+    )
+  }
+  return activeTracker
+}
+
+/**
+ * The one way a spec gets its fixtures torn down: call it once at the top of the spec file, where
+ * Jest allows hooks. Every fixture the creators below build during a test is then torn down in
+ * `afterEach`, the last created first, whatever the test's outcome, and a teardown failure fails
+ * the test. A creator that runs when no tracked test is running (the spec never called this, or
+ * the call is at module load or in `beforeAll`) throws naming itself.
+ *
+ * Hooks of one block run in the order they are declared, so declare it before a `beforeEach` that
+ * creates a fixture, and after a top-level `afterEach` that restores real timers: a socket's
+ * `close` event travels through `queueMicrotask`, which fake timers hold back.
+ *
+ * @param {{ beforeEach: Function, afterEach: Function }} [hooks] the Jest hooks; only the
+ *   harness self-tests pass their own
+ * @returns {void}
+ * @throws {Error} when called a second time in one spec file
+ */
+const trackFixtures = ({ beforeEach: before = beforeEach, afterEach: after = afterEach } = {}) => {
+  if (trackerInstalled) throw new Error('trackFixtures() was called twice in one spec file')
+  trackerInstalled = true
+  before(() => {
+    activeTracker = new FixtureTracker()
+  })
+  after(async () => {
+    const finished = activeTracker
+    try {
+      await finished?.releaseAll()
+    } finally {
+      activeTracker = null
+    }
+  })
+}
+
+/**
  * One real record batch, built by the production encoder so that `decodeMessages` reads it the
  * way it reads a broker's. A stand-in buffer would fail the magic-byte read inside the decoder.
  * @type {Buffer}
@@ -601,7 +703,8 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * The fake broker owns every playback it schedules. `close()` cancels the ones still queued and
  * stops it answering: a frame written afterwards is recorded and never answered, and a withheld
  * answer settling afterwards neither answers nor fails its request, which stays in flight until
- * the connection closes. Close it before the test ends, so no answer runs after its test.
+ * the connection closes. No answer may run after its test, so `createFakeBroker` closes it when
+ * the test ends.
  *
  * A Buffer is played back at once. A thenable is a withheld answer: it is played back when it
  * resolves, and later requests are answered meanwhile. A broker answers one connection in order;
@@ -619,9 +722,10 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
  *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
- * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void }}
+ * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void,
+ *   isClosed: () => boolean }}
  */
-const createFakeBroker = (answer, chunks) => {
+const buildFakeBroker = (answer, chunks) => {
   const { factory: socketFactory, state } = createFakeSocketFactory()
   /** @type {Set<NodeJS.Immediate>} playbacks scheduled and not yet run */
   const playbacks = new Set()
@@ -767,7 +871,49 @@ const createFakeBroker = (answer, chunks) => {
     playbacks.clear()
   }
 
-  return { broker: new Broker({ connectionPool, logger: newLogger() }), state, close }
+  return {
+    broker: new Broker({ connectionPool, logger: newLogger() }),
+    state,
+    close,
+    isClosed: () => closed,
+  }
+}
+
+/**
+ * Registers a fake broker with the running test, which closes it and disconnects its connection
+ * when it ends.
+ * @param {string} creator the public creator's name, for the messages
+ * @param {FixtureTracker} tracker
+ * @param {{ broker: Broker, close: () => void, isClosed: () => boolean }} fake
+ * @returns {void}
+ */
+const trackFakeBroker = (creator, tracker, { broker, close, isClosed }) => {
+  tracker.add(
+    creator,
+    async () => {
+      close()
+      await broker.disconnect({ drainTimeout: 0 })
+    },
+    isClosed
+  )
+}
+
+/**
+ * A fake broker (see `buildFakeBroker`), owned by the running test: it closes and disconnects when
+ * the test ends. Needs `trackFixtures()` in the spec.
+ * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
+ *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
+ * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
+ * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void }} `close` stops the
+ *   answering earlier than the end of the test
+ * @throws {Error} naming this creator when no tracked test is running
+ */
+const createFakeBroker = (answer, chunks) => {
+  const tracker = trackerFor('createFakeBroker')
+  const fake = buildFakeBroker(answer, chunks)
+  trackFakeBroker('createFakeBroker', tracker, fake)
+  const { broker, state, close } = fake
+  return { broker, state, close }
 }
 
 /**
@@ -824,15 +970,23 @@ const membershipApiVersionsBody = () => {
  * stripped, which is what a golden frame comparison needs: the correlation id and the client id
  * live in the header and move with call order, while the body is the thing the codec produced.
  *
+ * The broker closes and disconnects when the test ends, like any fake broker (needs
+ * `trackFixtures()` in the spec).
+ *
  * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
- * @returns {Promise<{ broker: Broker, state: { writes: Buffer[] },
+ * @returns {Promise<{ broker: Broker, state: { writes: Buffer[] }, close: () => void,
  *   bodyOf: (apiKey: number) => { apiKey: number, apiVersion: number, body: Buffer } }>}
- * @throws {Error} from `bodyOf` when no request was written for the requested api key
+ *   `close` stops the answering earlier than the end of the test
+ * @throws {Error} naming this creator when no tracked test is running; from `bodyOf` when no
+ *   request was written for the requested api key
  */
 const createFakeCoordinator = async (answer) => {
-  const { broker, state } = createFakeBroker((header) =>
+  const tracker = trackerFor('createFakeCoordinator')
+  const fake = buildFakeBroker((header) =>
     header.apiKey === apiKeys.ApiVersions ? membershipApiVersionsBody() : answer(header)
   )
+  trackFakeBroker('createFakeCoordinator', tracker, fake)
+  const { broker, state, close } = fake
 
   await broker.connect()
 
@@ -854,7 +1008,7 @@ const createFakeCoordinator = async (answer) => {
     throw new Error(`no request written for apiKey ${apiKey}`)
   }
 
-  return { broker, state, bodyOf }
+  return { broker, state, close, bodyOf }
 }
 
 /**
@@ -954,6 +1108,10 @@ const buildConsumerGroup = ({
  * error never reaches it; leaving the real one in place would attempt a real join. `sync()` still
  * drives the real sequence, against the stubbed coordinator.
  *
+ * The fixture belongs to the running test: its tracker (`trackFixtures()` in the spec) calls
+ * `teardown()` when the test ends, so a spec never has to. A spec may call `teardown()` earlier
+ * to end the fixture inside the test; the cleanup runs once.
+ *
  * @param {object} [options]
  * @param {number[]} [options.partitions] the assigned partitions, all led by `NODE_ID` initially
  * @param {number[]} [options.knownNodes] node ids `cluster.hasNode` answers `true` for
@@ -1015,6 +1173,7 @@ const buildConsumerGroup = ({
  *   lastFetchRequest: () => object[],
  *   lastFetchApiVersion: () => number, lastFetchHeaderFields: () => object,
  *   fetchFrames: () => object[], writes: () => Buffer[] }>}
+ * @throws {Error} naming this creator when no tracked test is running
  */
 const createFetchGroup = async ({
   partitions = [0],
@@ -1043,6 +1202,7 @@ const createFetchGroup = async ({
   requestTimeout,
   rackId = '',
 } = {}) => {
+  const tracker = trackerFor('createFetchGroup')
   let nextResponse = fetchResponse(
     partitions.map((partition) => ({ partition, errorCode: 0 })),
     { apiVersion: fetchMaxVersion }
@@ -1071,12 +1231,14 @@ const createFetchGroup = async ({
   }
 
   /**
-   * One fake broker answering for `nodeId` with the shared scripts.
+   * One fake broker answering for `nodeId` with the shared scripts. The fixture's teardown closes
+   * it, so it is not tracked on its own.
    * @param {number} nodeId
-   * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
+   * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void,
+   *   isClosed: () => boolean }}
    */
   const createNodeBroker = (nodeId) => {
-    return createFakeBroker((header, frame) => {
+    return buildFakeBroker((header, frame) => {
       if (header.apiKey === apiKeys.ApiVersions) {
         return apiVersionsBody(fetchMaxVersion, advertiseOffsetForLeaderEpoch)
       }
@@ -1093,15 +1255,49 @@ const createFetchGroup = async ({
     })
   }
 
-  const { broker, state, close } = createNodeBroker(NODE_ID)
-  await broker.connect()
+  const { broker, state, close, isClosed } = createNodeBroker(NODE_ID)
 
   /** @type {Map<number, { broker: Broker, state: { writes: Buffer[] }, close: () => void,
-   *   ready: Promise<void> }>} */
-  const nodeBrokers = new Map([[NODE_ID, { broker, state, close, ready: Promise.resolve() }]])
+   *   isClosed: () => boolean, ready: Promise<void> }>} */
+  const nodeBrokers = new Map([
+    [NODE_ID, { broker, state, close, isClosed, ready: Promise.resolve() }],
+  ])
   /** @type {Map<number, Set<{ released: Promise<void>, release: () => void }>>} */
   const heldLookups = new Map()
   let tornDown = false
+  let cleaned = false
+  /** @type {Promise<void>|null} */
+  let tearingDown = null
+  /**
+   * Ends the fixture: every held or later broker lookup rejects; each node's fake broker stops
+   * answering, with no answer left queued for a later turn, once the node has finished connecting
+   * (a connected node at once); and every node's connection closes at once, failing the requests
+   * still waiting for an answer. The test's tracker runs it when the test ends, so a failed
+   * assertion cannot leave a withheld answer or a held lookup pending, and no answer runs after the
+   * test; a spec may call it earlier. The cleanup runs once; every caller waits for that same
+   * cleanup.
+   * @returns {Promise<void>}
+   */
+  const teardown = () =>
+    (tearingDown ??= (async () => {
+      tornDown = true
+      for (const holds of [...heldLookups.values()]) {
+        for (const hold of [...holds]) hold.release()
+      }
+      await Promise.all(
+        [...nodeBrokers.values()].map(async (node) => {
+          // A connecting node needs its ApiVersions answer to finish; closing it earlier would
+          // leave its connect pending.
+          await node.ready.catch(() => {})
+          node.close()
+          await node.broker.disconnect({ drainTimeout: 0 })
+        })
+      )
+      cleaned = nodeBrokers.size > 0 && [...nodeBrokers.values()].every((node) => node.isClosed())
+    })())
+  tracker.add('createFetchGroup', teardown, () => cleaned)
+  await broker.connect()
+
   /**
    * Holds every `cluster.findBroker` for `nodeId` until the returned function is called. Holds on
    * one node stack: a lookup waits until every one of them is released.
@@ -1302,34 +1498,6 @@ const createFetchGroup = async ({
   const requestRejoin = jest.fn()
   group.attach({ rebalanceCoordinator: { requestRejoin }, heartbeatManager: null })
 
-  /** @type {Promise<void>|null} */
-  let tearingDown = null
-  /**
-   * Ends the fixture: every held or later broker lookup rejects; each node's fake broker stops
-   * answering, with no answer left queued for a later turn, once the node has finished connecting
-   * (a connected node at once); and every node's connection closes at once, failing the requests
-   * still waiting for an answer. For `finally` and `afterEach`, so a failed assertion cannot leave
-   * a withheld answer or a held lookup pending, and no answer runs after the test. The cleanup
-   * runs once; every caller waits for that same cleanup.
-   * @returns {Promise<void>}
-   */
-  const teardown = () =>
-    (tearingDown ??= (async () => {
-      tornDown = true
-      for (const holds of [...heldLookups.values()]) {
-        for (const hold of [...holds]) hold.release()
-      }
-      await Promise.all(
-        [...nodeBrokers.values()].map(async (node) => {
-          // A connecting node needs its ApiVersions answer to finish; closing it earlier would
-          // leave its connect pending.
-          await node.ready.catch(() => {})
-          node.close()
-          await node.broker.disconnect({ drainTimeout: 0 })
-        })
-      )
-    })())
-
   return {
     teardown,
     group,
@@ -1407,6 +1575,8 @@ module.exports = {
   NODE_ID,
   TOPIC,
   TOPIC_ID,
+  FixtureTracker,
+  trackFixtures,
   prepareRecordBatches,
   buildRecordBatch,
   apiVersionsBody,

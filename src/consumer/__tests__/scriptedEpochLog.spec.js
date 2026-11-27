@@ -8,6 +8,7 @@ const {
   apiVersionsBody,
   createFakeBroker,
   createFetchGroup,
+  trackFixtures,
   decodeOffsetForLeaderEpochRequests,
   offsetForLeaderEpochRawResponse,
   offsetForLeaderEpochResponse,
@@ -58,22 +59,7 @@ const validationRequest = (partition, leaderEpoch, currentLeaderEpoch = 9) => ({
   topics: [{ topic: TOPIC, partitions: [{ partition, currentLeaderEpoch, leaderEpoch }] }],
 })
 
-const harnesses = []
-
-/**
- * `createFetchGroup`, torn down after the test whatever its outcome.
- * @param {object} [options] the harness options
- * @returns {Promise<object>} the harness
- */
-const fetchGroup = async (options) => {
-  const harness = await createFetchGroup(options)
-  harnesses.push(harness)
-  return harness
-}
-
-afterEach(async () => {
-  await Promise.all(harnesses.splice(0).map((harness) => harness.teardown()))
-})
+trackFixtures()
 
 /** @returns {Promise<void>} once every queued immediate has run */
 const nextTurn = () => new Promise(setImmediate)
@@ -575,7 +561,7 @@ describe('Test harness > withheld broker answers', () => {
 
 describe('Test harness > fetch group routing', () => {
   test('by default the group sees a constant leader epoch and a forget only records the call', async () => {
-    const { cluster, installRouting } = await fetchGroup({ knownNodes: [0, 1] })
+    const { cluster, installRouting } = await createFetchGroup({ knownNodes: [0, 1] })
 
     installRouting({ 0: 1 })
     expect(cluster.leaderEpoch(TOPIC, 0)).toBe(5)
@@ -585,7 +571,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('with liveRouting the group sees the epoch the metadata cache holds, and a forget clears it there', async () => {
-    const { cluster, installRouting, metadataCache } = await fetchGroup({
+    const { cluster, installRouting, metadataCache } = await createFetchGroup({
       knownNodes: [0, 1],
       liveRouting: true,
     })
@@ -606,7 +592,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('with liveRouting an accepted leader hint moves routing, validation and Fetch to the new leader', async () => {
-    const h = await fetchGroup({
+    const h = await createFetchGroup({
       knownNodes: [0, 1],
       partitionLeaders: { 0: 1 },
       liveRouting: true,
@@ -647,11 +633,12 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('with validationBrokers each node answers on its own connection and is told which node it is', async () => {
-    const { cluster, setValidationResponse, validationRequestsTo, writesTo } = await fetchGroup({
-      partitions: [0, 1],
-      knownNodes: [0, 1],
-      validationBrokers: true,
-    })
+    const { cluster, setValidationResponse, validationRequestsTo, writesTo } =
+      await createFetchGroup({
+        partitions: [0, 1],
+        knownNodes: [0, 1],
+        validationBrokers: true,
+      })
     const asked = []
     setValidationResponse((partitions, { nodeId, partitions: rows }) => {
       asked.push({ nodeId, partitions, epochs: rows.map(({ leaderEpoch }) => leaderEpoch) })
@@ -679,7 +666,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('validation requests queued together each receive the rows of their own frame', async () => {
-    const { broker, setValidationResponse, validationRequests } = await fetchGroup({
+    const { broker, setValidationResponse, validationRequests } = await createFetchGroup({
       partitions: [0, 1],
     })
     setValidationResponse((_partitions, { partitions: rows }) =>
@@ -707,7 +694,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('a held broker lookup waits until released while other nodes are found', async () => {
-    const { cluster, holdBrokerLookup } = await fetchGroup({
+    const { cluster, holdBrokerLookup } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -726,7 +713,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('a lookup held twice on one node waits for both releases', async () => {
-    const { cluster, holdBrokerLookup } = await fetchGroup({
+    const { cluster, holdBrokerLookup } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -749,7 +736,7 @@ describe('Test harness > fetch group routing', () => {
 
 describe('Test harness > fetch group teardown', () => {
   test('teardown fails a validation request whose answer is withheld', async () => {
-    const { broker, setValidationResponse, validationRequests, teardown } = await fetchGroup()
+    const { broker, setValidationResponse, validationRequests, teardown } = await createFetchGroup()
     setValidationResponse(() => new Promise(() => {}))
 
     const outcome = broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
@@ -764,7 +751,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('teardown cancels the answer of a frame written in the same turn, so no answer runs after it', async () => {
-    const { broker, setValidationResponse, validationRequests, teardown } = await fetchGroup()
+    const { broker, setValidationResponse, validationRequests, teardown } = await createFetchGroup()
     await broker.offsetForLeaderEpoch(validationRequest(0, 4))
     const answer = jest.fn(() => new Promise(() => {}))
     setValidationResponse(answer)
@@ -785,7 +772,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('teardown ends a held broker lookup with an error', async () => {
-    const { cluster, holdBrokerLookup, teardown } = await fetchGroup({
+    const { cluster, holdBrokerLookup, teardown } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -801,7 +788,10 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('teardown refuses a lookup whose node was still connecting', async () => {
-    const { cluster, teardown } = await fetchGroup({ knownNodes: [0, 1], validationBrokers: true })
+    const { cluster, teardown } = await createFetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
     // Node 1's broker is created by this lookup and connects over later turns.
     const lookup = cluster.findBroker({ nodeId: 1 }).then(
       () => 'found',
@@ -814,7 +804,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('concurrent teardown callers wait for the same cleanup, which runs once', async () => {
-    const { broker, cluster, teardown } = await fetchGroup({
+    const { broker, cluster, teardown } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
