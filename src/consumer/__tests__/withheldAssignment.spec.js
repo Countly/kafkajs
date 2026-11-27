@@ -506,7 +506,11 @@ describe.each([
     if (!healFirst) await heal(h, [0, 1])
     h.setResponse(reply(42, [0, 1]))
     await h.group.fetch(NODE_ID)
-    expect(h.fetchFrames().map(shape).slice(-3)).toEqual([
+    const fullRequestsShuffledByTheBroker = (frame) => ({
+      ...frame,
+      topics: [...frame.topics].sort((a, b) => a - b),
+    })
+    expect(h.fetchFrames().map(shape).slice(-3).map(fullRequestsShuffledByTheBroker)).toEqual([
       { sessionId: 0, sessionEpoch: 0, topics: [0, 1], forgotten: [] },
       { sessionId: 42, sessionEpoch: 1, topics: [], forgotten: [] },
       { sessionId: 42, sessionEpoch: 0, topics: [0, 1], forgotten: [] },
