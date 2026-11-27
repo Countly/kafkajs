@@ -101,6 +101,19 @@ describe('createFakeSocketFactory', () => {
       expect(closed).toHaveBeenCalledTimes(1)
     })
 
+    test('before the socket connects cancels its connect callback, as a destroyed net.Socket never connects', async () => {
+      const { factory } = createFakeSocketFactory()
+      const onConnect = jest.fn()
+      const socket = factory({ host: '10.0.0.1', port: 9092, onConnect })
+
+      socket.destroy()
+      await new Promise(setImmediate)
+      await new Promise(setImmediate)
+
+      expect(socket.destroyed).toBe(true)
+      expect(onConnect).not.toHaveBeenCalled()
+    })
+
     test('still records a write that comes after it, so a test can see it', async () => {
       const { factory, state } = createFakeSocketFactory()
       const socket = await dial(factory)

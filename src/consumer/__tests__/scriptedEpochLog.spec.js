@@ -77,6 +77,17 @@ afterEach(async () => {
 /** @returns {Promise<void>} once every queued immediate has run */
 const nextTurn = () => new Promise(setImmediate)
 
+/**
+ * Lets promise reactions run without any timer or immediate, as under a frozen clock.
+ * @returns {Promise<void>}
+ */
+const reactions = async () => {
+  for (let hop = 0; hop < 1000; hop += 1) await Promise.resolve()
+}
+
+/** The clock of the frozen-clock cases: timers and immediates faked, promise jobs real. */
+const freezeClock = () => jest.useFakeTimers({ doNotFake: ['nextTick', 'queueMicrotask'] })
+
 describe('Test harness > scripted OffsetForLeaderEpoch answers', () => {
   // Source lines are LeaderEpochFileCache.java at 4.0.0 / 4.4.0.
   test.each([
@@ -538,8 +549,12 @@ describe('Test harness > withheld broker answers', () => {
       await broker.disconnect({ drainTimeout: 0 })
     }
   })
+})
 
-  test('a closed fake broker answers nothing: not a frame queued before the close, a frame written after it, or a withheld answer released after it', async () => {
+describe('Test harness > fake broker close', () => {
+  afterEach(() => jest.useRealTimers())
+
+  test('close fails a request whose answer is withheld at once, answers no frame written before or after it, and ignores the withheld answer released after it', async () => {
     const withheld = withheldAnswer()
     const asked = []
     const { broker, state, close } = createFakeBroker((header) => {
@@ -550,24 +565,214 @@ describe('Test harness > withheld broker answers', () => {
     await broker.connect()
 
     try {
-      const first = jest.fn()
-      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(first, first)
+      const outcome = jest.fn()
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => outcome('answered'),
+        (error) => outcome(error.name)
+      )
       while (asked.length === 0) await nextTurn()
-      const [frame] = state.writes.slice(-1)
+      const [socket] = state.sockets
+      const [frame] = socket.writes.slice(-1)
 
       // Written in the same turn as the close: its answer is queued for a later turn.
-      state.socket.write(frame)
-      close()
-      state.socket.write(frame)
+      socket.write(frame)
+      await close()
+      socket.write(frame)
       withheld.resolve(offsetForLeaderEpochResponse([{ partition: 0 }]))
       await nextTurn()
       await nextTurn()
 
+      expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
       expect(asked).toHaveLength(1)
-      expect(state.writes.slice(-3)).toEqual([frame, frame, frame])
-      expect(first).not.toHaveBeenCalled()
+      expect(socket.destroyed).toBe(true)
+      expect(socket.writes.slice(-3)).toEqual([frame, frame, frame])
+      // Nothing is left in flight, so an ordinary disconnect has nothing to wait for.
+      await broker.disconnect()
     } finally {
+      await close()
+    }
+  })
+
+  test('a closed fake broker refuses a later connect and request before it opens a socket or writes anything', async () => {
+    const { broker, state, close } = createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions
+        ? apiVersionsBody(18)
+        : offsetForLeaderEpochResponse([{ partition: 0 }])
+    )
+    await broker.connect()
+
+    try {
+      await close()
+      const writes = state.writes.length
+      const connected = jest.fn()
+      const requested = jest.fn()
+      broker.connect().then(
+        () => connected('connected'),
+        (error) => connected(error.name, error.message)
+      )
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => requested('answered'),
+        (error) => requested(error.name, error.message)
+      )
+      await nextTurn()
+      await nextTurn()
+
+      expect(connected.mock.calls).toEqual([
+        ['KafkaJSConnectionError', 'The fake broker was closed'],
+      ])
+      expect(requested.mock.calls).toEqual([
+        ['KafkaJSConnectionError', 'The fake broker was closed'],
+      ])
+      expect(state.writes).toHaveLength(writes)
+      expect(state.sockets).toHaveLength(1)
+      expect(state.sockets[0].destroyed).toBe(true)
+    } finally {
+      await close()
+    }
+  })
+
+  test('an ordinary disconnect cancels the answer queued on its socket, and the fake broker answers again on the next socket', async () => {
+    const answered = []
+    const { broker, state, close } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      answered.push(header.correlationId)
+      return offsetForLeaderEpochResponse([{ partition: 0 }])
+    })
+    await broker.connect()
+
+    try {
+      await broker.offsetForLeaderEpoch(validationRequest(0, 4))
+      const [socket] = state.sockets
+      const [frame] = socket.writes.slice(-1)
+
+      // Its answer is queued for a later turn, after the socket is gone.
+      socket.write(frame)
       await broker.disconnect({ drainTimeout: 0 })
+      await nextTurn()
+      await nextTurn()
+
+      expect(socket.destroyed).toBe(true)
+      expect(answered).toHaveLength(1)
+
+      const after = await broker.offsetForLeaderEpoch(validationRequest(0, 4))
+      expect(after.topics[0].partitions).toEqual([
+        { errorCode: 0, partition: 0, leaderEpoch: 4, endOffset: '20' },
+      ])
+      expect(state.sockets).toHaveLength(2)
+      expect(answered).toHaveLength(2)
+    } finally {
+      await close()
+    }
+  })
+
+  test('a frame the fake broker cannot read closes its connection and fails the request in flight on it', async () => {
+    const asked = []
+    const { broker, state, close } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return new Promise(() => {})
+    })
+    await broker.connect()
+
+    try {
+      const outcome = jest.fn()
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => outcome('answered'),
+        (error) => outcome(error.name, error.message)
+      )
+      while (asked.length === 0) await nextTurn()
+      const [socket] = state.sockets
+
+      socket.write(Buffer.alloc(2))
+      await nextTurn()
+      await nextTurn()
+
+      expect(socket.destroyed).toBe(true)
+      expect(outcome.mock.calls).toEqual([
+        [
+          'KafkaJSConnectionError',
+          'Connection error: The fake broker could not read a request frame',
+        ],
+      ])
+    } finally {
+      await close()
+    }
+  })
+
+  test('close aborts a connect still waiting for its socket and refuses the connect queued behind it, with the clock frozen', async () => {
+    freezeClock()
+    const answer = jest.fn(() => apiVersionsBody(18))
+    const { broker, state, close } = createFakeBroker(answer)
+    const first = jest.fn()
+    const second = jest.fn()
+    broker.connect().then(
+      () => first('connected'),
+      (error) => first(error.name, error.message)
+    )
+    broker.connect().then(
+      () => second('connected'),
+      (error) => second(error.name, error.message)
+    )
+
+    try {
+      await reactions()
+      expect(state.sockets).toHaveLength(1)
+
+      const closed = jest.fn()
+      Promise.resolve(close()).then(closed)
+      await reactions()
+
+      expect(closed).toHaveBeenCalledTimes(1)
+      expect(first.mock.calls).toEqual([
+        ['KafkaJSConnectionError', 'Connection closed while connecting'],
+      ])
+      expect(second.mock.calls).toEqual([['KafkaJSConnectionError', 'The fake broker was closed']])
+      expect(state.sockets[0].destroyed).toBe(true)
+
+      jest.advanceTimersByTime(0)
+      await reactions()
+      expect(state.sockets).toHaveLength(1)
+      expect(state.writes).toEqual([])
+      expect(answer).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+
+  test('close aborts a connect whose ApiVersions answer is still queued, and that answer never plays back, with the clock frozen', async () => {
+    freezeClock()
+    const answer = jest.fn(() => apiVersionsBody(18))
+    const { broker, state, close } = createFakeBroker(answer)
+    const outcome = jest.fn()
+    broker.connect().then(
+      () => outcome('connected'),
+      (error) => outcome(error.name)
+    )
+
+    try {
+      await reactions()
+      // The socket connects, and ApiVersions is written with its answer queued for a later turn.
+      jest.advanceTimersByTime(0)
+      await reactions()
+      expect(state.writes.map((write) => readRequestHeader(write).apiKey)).toEqual([
+        apiKeys.ApiVersions,
+      ])
+      expect(answer).not.toHaveBeenCalled()
+
+      const closed = jest.fn()
+      Promise.resolve(close()).then(closed)
+      await reactions()
+
+      expect(closed).toHaveBeenCalledTimes(1)
+      expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+      expect(state.sockets[0].destroyed).toBe(true)
+
+      jest.advanceTimersByTime(0)
+      await reactions()
+      expect(answer).not.toHaveBeenCalled()
+      expect(state.sockets).toHaveLength(1)
+    } finally {
+      await close()
     }
   })
 })
@@ -810,6 +1015,42 @@ describe('Test harness > fetch group teardown', () => {
     await teardown()
 
     expect(await lookup).toBe('fetch harness torn down')
+  })
+
+  test('teardown aborts a node still waiting for its socket without waiting for its handshake, with the clock frozen', async () => {
+    const { cluster, teardown, socketsTo, writesTo } = await fetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    freezeClock()
+
+    try {
+      const lookup = jest.fn()
+      cluster.findBroker({ nodeId: 1 }).then(
+        () => lookup('found'),
+        (error) => lookup(error.message)
+      )
+      await reactions()
+
+      const done = jest.fn()
+      teardown().then(done)
+      await reactions()
+
+      expect(done).toHaveBeenCalledTimes(1)
+      expect(lookup.mock.calls).toEqual([['fetch harness torn down']])
+      expect(socketsTo(1)).toHaveLength(1)
+      expect([...socketsTo(0), ...socketsTo(1)].map(({ destroyed }) => destroyed)).toEqual([
+        true,
+        true,
+      ])
+
+      jest.advanceTimersByTime(0)
+      await reactions()
+      expect(writesTo(1)).toEqual([])
+      expect(socketsTo(1)).toHaveLength(1)
+    } finally {
+      jest.useRealTimers()
+    }
   })
 
   test('concurrent teardown callers wait for the same cleanup, which runs once', async () => {
