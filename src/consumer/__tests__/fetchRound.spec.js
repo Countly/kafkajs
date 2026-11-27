@@ -352,8 +352,8 @@ function oracleReadReplicas(topic, partitions, routing) {
 /**
  * The request builder this client shipped before, with its whole-assignment active set, kept as
  * the oracle. Its validation filter is the admission rule written out from its definition, not a
- * call to the group's own: an entry validated at the cached leader epoch under the cached routing
- * stamp.
+ * call to the group's own: an entry that still admits, fetched at the epoch it was validated
+ * against.
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
  * @returns {object[]}
@@ -370,14 +370,9 @@ function oracleBuildFetchRequests(topicPartitions) {
       topic,
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
-        const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
         const entry = this.positionValidator.entryOf(topic, partition)
-        const admittedUnder =
-          entry !== undefined &&
-          entry.validatedAgainst === currentLeaderEpoch &&
-          entry.routing === this.cluster.routingStamp?.(topic, partition)
-            ? entry
-            : undefined
+        const admittedUnder = entry?.admitted === true ? entry : undefined
+        const currentLeaderEpoch = admittedUnder?.validatedAgainst
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
@@ -504,26 +499,21 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        // Unvalidated, validated at the cached epoch, or validated at an older one; under the
-        // cached routing stamp, or an earlier one (always for an older epoch, as in the cache:
-        // every epoch change gives a new stamp).
+        // Unvalidated, awaiting an answer, validated and still admitting, or validated and since
+        // replaced or dropped (no longer admitting).
         positionValidator: {
           entryOf: (topic, partition) =>
             coin(2)(topic, partition)
               ? undefined
               : {
-                  validatedAgainst: (partition % 3) - (coin(4)(topic, partition) ? 1 : 0),
-                  routing:
-                    coin(4)(topic, partition) || coin(5)(topic, partition) ? -1 : partition % 2,
+                  validatedAgainst: coin(5)(topic, partition) ? undefined : partition % 3,
+                  admitted: !coin(4)(topic, partition) && !coin(5)(topic, partition),
                 },
         },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
-        cluster: {
-          leaderEpoch: (topic, partition) => partition % 3,
-          routingStamp: (topic, partition) => partition % 2,
-        },
+        cluster: { leaderEpoch: (topic, partition) => partition % 3 },
       })
       // Node-filtered parts as a round sees them: every topic, a subset of its partitions.
       const parts = state.assigned().map(({ topic, partitions }) => ({
@@ -544,7 +534,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     const cluster = { findTopicPartitionMetadata: () => rows, leaderEpoch: () => 0 }
     const state = new SubscriptionState()
     state.assign([{ topic: 't', partitions: [0, 1, 2] }])
-    const validated = { validatedAgainst: 0 }
+    const validated = { validatedAgainst: 0, admitted: true }
     const group = derivationGroup({
       cluster,
       subscriptionState: state,
@@ -625,7 +615,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { entryOf: () => ({ validatedAgainst: 0 }) },
+      positionValidator: { entryOf: () => ({ validatedAgainst: 0, admitted: true }) },
       cluster: { leaderEpoch: () => 0 },
     })
     const parts = assignment.map(({ topic }) => ({
@@ -735,9 +725,9 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
     const batches = await rig.group.fetch(NODE_ID)
 
     expect(batches).toHaveLength(300)
-    // Per request entry: the admission check where the frame is written, the encoder, the counted
-    // coverage check and the one index the answer's rows are looked up in; plus the in-order
-    // coverage check's first comparison.
-    expect(reads.count).toBe(4 * partitions.length + 1)
+    // Per request entry: the encoder, the counted coverage check and the one index the answer's
+    // rows are looked up in; plus the in-order coverage check's first comparison. The admission
+    // checks at the write and at receipt read the entry's validation token, not its partition.
+    expect(reads.count).toBe(3 * partitions.length + 1)
   })
 })

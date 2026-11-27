@@ -890,9 +890,9 @@ const buildConsumerGroup = ({
  * @param {number} [options.leaderEpoch] what `cluster.leaderEpoch` answers, and the epoch the
  *   metadata cache starts at
  * @param {boolean} [options.liveRouting] when true, the metadata cache is the one routing source:
- *   `cluster.leaderEpoch`, `cluster.routingStamp`, `findLeaderForPartitions` and
- *   `findTopicPartitionMetadata` read it, so
- *   `installRouting` and an accepted leader hint move the leader and epoch the group sees;
+ *   `cluster.leaderEpoch`, `cluster.routingStamp`, `cluster.onPartitionRouted`,
+ *   `findLeaderForPartitions` and `findTopicPartitionMetadata` read it, so `installRouting` and
+ *   an accepted leader hint move the leader and epoch the group sees;
  *   `cluster.applyLeaderHint` resolves to the cache's verdict (the two hint options are unused)
  *   and `cluster.forgetLeaderEpoch` forgets the epoch there. By default the epoch stays
  *   `leaderEpoch`, routing follows `leaders`, and the forget only records the call
@@ -1146,9 +1146,12 @@ const createFetchGroup = async ({
     leaderEpoch: liveRouting
       ? (topic, partition) => metadataCache.leaderEpoch(topic, partition)
       : () => leaderEpoch,
-    // Only live routing moves: a fixed epoch has no routing changes to stamp.
+    // Only live routing moves: a fixed epoch has no routing changes to stamp or report.
     routingStamp: liveRouting
       ? (topic, partition) => metadataCache.routingStamp(topic, partition)
+      : undefined,
+    onPartitionRouted: liveRouting
+      ? (handler) => metadataCache.onPartitionRouted(handler)
       : undefined,
     cachedLeader: (topic, partition) => metadataCache.leader(topic, partition),
     forgetLeaderEpoch: jest.fn(
@@ -1156,21 +1159,25 @@ const createFetchGroup = async ({
         ? (topic, partition) => metadataCache.forgetLeaderEpoch(topic, partition)
         : () => true
     ),
-    applyLeaderHint: jest.fn(async ({ topic, partition, leaderId, leaderEpoch: hintEpoch }) => {
-      if (liveRouting) {
-        const applied = metadataCache.applyLeaderHint(topic, partition, {
-          leaderId,
-          leaderEpoch: hintEpoch,
-        })
-        if (applied) leaders.set(partition, leaderId)
-        return applied
+    applyLeaderHint: jest.fn(
+      async ({ topic, partition, leaderId, leaderEpoch: hintEpoch, topicId }) => {
+        if (liveRouting) {
+          // As `Cluster#applyLeaderHint`: the cache write checks the hint's topic incarnation.
+          const applied = metadataCache.applyLeaderHint(topic, partition, {
+            leaderId,
+            leaderEpoch: hintEpoch,
+            topicId,
+          })
+          if (applied) leaders.set(partition, leaderId)
+          return applied
+        }
+        if (applyLeaderHintResolves && applyLeaderHintMovesLeaderTo != null) {
+          leaders.set(partition, applyLeaderHintMovesLeaderTo)
+        }
+        metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch: hintEpoch })
+        return applyLeaderHintResolves
       }
-      if (applyLeaderHintResolves && applyLeaderHintMovesLeaderTo != null) {
-        leaders.set(partition, applyLeaderHintMovesLeaderTo)
-      }
-      metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch: hintEpoch })
-      return applyLeaderHintResolves
-    }),
+    ),
     hasNode: jest.fn((nodeId) => knownNodes.includes(Number(nodeId))),
     getNodeIds: () => knownNodes,
     removeBroker: jest.fn(),

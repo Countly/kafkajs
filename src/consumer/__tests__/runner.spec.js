@@ -1731,12 +1731,14 @@ describe('Consumer > Runner', () => {
       )
 
     /**
-     * What the metadata cache does on an accepted leader or epoch change: the epoch is set, the
-     * partition gets a new routing stamp and routing moves on.
+     * What an accepted leader or epoch change does: the cache sets the epoch and a new routing
+     * stamp, the run's partition listener revokes the partition's validation entry, and routing
+     * moves on.
      */
     const moveEpoch = (partitionId, epoch) => {
       epochs[partitionId] = epoch
       stamps[partitionId] = Math.max(...Object.values(stamps)) + 1
+      positionValidator.revoke(topicName, partitionId)
       consumerGroup.routingVersion += 1
     }
 
@@ -1806,7 +1808,6 @@ describe('Consumer > Runner', () => {
         positionValidator,
         routingVersion: 0,
         admissionEntry: ConsumerGroup.prototype.admissionEntry,
-        validationVersion: ConsumerGroup.prototype.validationVersion,
         heartbeatIdle: jest.fn(() => true),
       })
       instrumentationEmitter.addListener(START_BATCH_PROCESS, ({ payload }) =>

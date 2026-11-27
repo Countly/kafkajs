@@ -5,7 +5,7 @@ const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const RequestQueue = require('../../network/requestQueue')
 const { currentDeadline, shareMetadata } = require('../../admin/deadline')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
-const { newLogger } = require('testHelpers')
+const { newLogger, connectionOpts } = require('testHelpers')
 
 const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
@@ -929,6 +929,111 @@ describe('Cluster > MetadataCache', () => {
 
       expect(stamp()).toBeGreaterThan(0)
       expect(stamp()).not.toBe(first)
+    })
+  })
+
+  describe('onPartitionRouted', () => {
+    /** Subscribes and returns the calls received, as `[topic, partition]` pairs. */
+    const listen = () => {
+      const calls = []
+      cache.onPartitionRouted((topic, partition) => calls.push([topic, partition]))
+      return calls
+    }
+
+    test('reports a learned partition, an accepted bump, hint and forget, and nothing for a repeat, a stale refresh or a rejected hint', () => {
+      const calls = listen()
+
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      cache.update(response({ leader: 2, leaderEpoch: 4 }))
+      expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 5 })).toBe(false)
+      expect(calls).toEqual([['test-topic', 0]])
+
+      cache.update(response({ leader: 1, leaderEpoch: 6 }))
+      expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 7 })).toBe(true)
+      expect(cache.forgetLeaderEpoch('test-topic', 0)).toBe(true)
+      expect(calls).toEqual([
+        ['test-topic', 0],
+        ['test-topic', 0],
+        ['test-topic', 0],
+        ['test-topic', 0],
+      ])
+    })
+
+    test('reports a whole topic when it is forgotten or recreated, and everything on clear', () => {
+      cache.update(response({ topicId: ID_A }))
+      const calls = listen()
+
+      cache.update(response({ topicId: ID_B }))
+      expect(calls).toEqual([
+        ['test-topic', undefined],
+        ['test-topic', 0],
+      ])
+
+      calls.length = 0
+      cache.forget('test-topic')
+      cache.clear()
+      expect(calls).toEqual([
+        ['test-topic', undefined],
+        [undefined, undefined],
+      ])
+    })
+
+    test('an unsubscribed listener hears nothing more', () => {
+      const calls = []
+      const unsubscribe = cache.onPartitionRouted((topic, partition) =>
+        calls.push([topic, partition])
+      )
+      unsubscribe()
+
+      cache.update(response())
+
+      expect(calls).toEqual([])
+    })
+  })
+
+  describe('a leader hint for another incarnation of the topic', () => {
+    test('is refused by the cache', () => {
+      cache.update(response({ topicId: ID_B, leader: 1, leaderEpoch: 0 }))
+
+      expect(
+        cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 7, topicId: ID_A })
+      ).toBe(false)
+      expect([cache.leader('test-topic', 0), cache.leaderEpoch('test-topic', 0)]).toEqual([1, 0])
+      expect(
+        cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 7, topicId: ID_B })
+      ).toBe(true)
+    })
+
+    test('Cluster#applyLeaderHint publishes nothing when the topic was recreated while its endpoints were installed', async () => {
+      const cluster = new Cluster({
+        ...connectionOpts(),
+        logger: newLogger(),
+        retry: { retries: 0 },
+      })
+      cluster.metadataCache.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+      let endpointsInstalled
+      jest
+        .spyOn(cluster.brokerPool, 'applyNodeEndpoints')
+        .mockImplementation(() => new Promise((resolve) => (endpointsInstalled = resolve)))
+
+      const hint = cluster.applyLeaderHint({
+        topic: 'test-topic',
+        partition: 0,
+        leaderId: 2,
+        leaderEpoch: 7,
+        topicId: ID_A,
+        nodeEndpoints: [{ nodeId: 2, host: '127.0.0.1', port: 9094, rack: null }],
+      })
+      // The topic is recreated under ID_B, at epoch 0, while the endpoint work waits.
+      cluster.metadataCache.update(response({ topicId: ID_B, leader: 1, leaderEpoch: 0 }))
+      endpointsInstalled()
+
+      await expect(hint).resolves.toBe(false)
+      expect([
+        cluster.metadataCache.leader('test-topic', 0),
+        cluster.metadataCache.leaderEpoch('test-topic', 0),
+      ]).toEqual([1, 0])
     })
   })
 
