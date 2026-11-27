@@ -800,7 +800,7 @@ module.exports = class Runner extends EventEmitter {
           error: error.message,
         })
       }
-      if (ownership?.refusal(ownership.token())) {
+      if (ownership?.lost(ownership.token())) {
         return this.resolveRebalanceVerdict({
           kind: 'lost',
           reason: 'lost',
@@ -1108,7 +1108,7 @@ module.exports = class Runner extends EventEmitter {
     episode.invoked = true
     const group = this.consumerGroup
     const { ownership } = group
-    const lost = Boolean(ownership?.refusal(ownership.token()))
+    const lost = Boolean(ownership?.lost(ownership.token()))
     const deadlineAt = Math.min(
       performance.now() + group.rebalanceTimeout,
       operation?.deadlineAt ?? Infinity
@@ -2176,7 +2176,7 @@ module.exports = class Runner extends EventEmitter {
         error: error.message,
       })
     }
-    return Boolean(ownership?.refusal(ownership.token()))
+    return Boolean(ownership?.lost(ownership.token()))
   }
 
   /** Ends the admission-only stop of an eager listener round. @returns {void} */

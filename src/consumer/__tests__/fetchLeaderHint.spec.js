@@ -42,7 +42,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
         leaderEpoch: 9,
         nodeEndpoints: [{ nodeId: 2, host: 'kafka2', port: 9095, rack: null }],
       },
-      { fence: group.idleWait.fence }
+      { fence: group.authority }
     )
     // A usable hint is the refresh: nothing else is needed this round.
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
@@ -65,7 +65,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
     expect(cluster.hasNode).toHaveBeenCalledWith(2)
     expect(cluster.applyLeaderHint).toHaveBeenCalledWith(
       expect.objectContaining({ leaderId: 2, leaderEpoch: 9, nodeEndpoints: undefined }),
-      { fence: group.idleWait.fence }
+      { fence: group.authority }
     )
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
@@ -149,7 +149,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
     expect(cluster.hasNode).toHaveBeenCalledWith(2)
     expect(cluster.applyLeaderHint).toHaveBeenCalledWith(
       expect.objectContaining({ leaderId: 2, nodeEndpoints: otherNodeEndpoints }),
-      { fence: group.idleWait.fence }
+      { fence: group.authority }
     )
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
@@ -217,7 +217,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
     expect(cluster.hasNode).toHaveBeenCalledWith(2)
     expect(cluster.applyLeaderHint).toHaveBeenCalledWith(
       expect.objectContaining({ leaderId: 2, leaderEpoch: 9, nodeEndpoints: undefined }),
-      { fence: group.idleWait.fence }
+      { fence: group.authority }
     )
     expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })

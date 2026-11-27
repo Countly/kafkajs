@@ -786,8 +786,8 @@ class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e
    * @param {object} options
-   * @param {'membership-lost'|'poll-interval-exceeded'|'stale-assignment'} options.reason
-   * @param {Error} [options.cause] the loss; absent for a stale handler or a seek
+   * @param {'membership-lost'|'poll-interval-exceeded'|'stale-assignment'|'assignment-refused'} options.reason
+   * @param {Error} [options.cause] the loss or the refusal; absent for a stale handler or a seek
    */
   constructor(e, { reason, cause } = {}) {
     super(e, { cause })

@@ -10233,6 +10233,7 @@
         "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states a loss of a withheld token wins: lost returns the loss and the refusal says membership-lost",
         "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states a poll expiry of a withheld token still reports poll-interval-exceeded",
         "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states a renew after a withhold starts a fresh token; a retained withheld token stays assignment-refused",
+        "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states a retained withheld token is lost once the run is abandoned under a later token",
         "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states a withhold keeps the current token and refuses it as assignment-refused with the refusal as cause",
         "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states a withhold of a lost token keeps it lost",
         "src/consumer/__tests__/withheldAssignment.spec.js \u203a assignment ownership states an abandoned run is lost for every token, withheld or not",

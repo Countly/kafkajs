@@ -227,7 +227,21 @@ describe('assignment ownership states', () => {
     expect(ownership.refusal(fresh)).toBeNull()
     expect(ownership.refusal(retained).reason).toBe('assignment-refused')
     release()
+    expect(ownership.withheld(retained)).toBe(false)
     expect(ownership.refusal(retained).reason).toBe('stale-assignment')
+  })
+
+  test('a retained withheld token is lost once the run is abandoned under a later token', () => {
+    const ownership = new GroupOwnership()
+    const withheld = ownership.token()
+    const release = ownership.retain(withheld)
+    ownership.withhold(refusal())
+    const fatal = brokerError(82)
+    ownership.abandon(fatal, ownership.renew())
+    expect(ownership.withheld(withheld)).toBe(false)
+    expect(ownership.lost(withheld)).toBe(fatal)
+    expect(ownership.refusal(withheld).reason).toBe('membership-lost')
+    release()
   })
 
   test('a withhold of a lost token keeps it lost', () => {

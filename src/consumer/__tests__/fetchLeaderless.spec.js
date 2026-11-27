@@ -241,28 +241,28 @@ describe('a routing refresh and its run', () => {
   /**
    * Starts a fetch round of an all-leaderless group and waits until its refresh was dispatched.
    * @param {number} [node] the node that asks
-   * @returns {Promise<{ round: Promise<object[]>, held: object, run: object }>} the round, the held
-   *   refresh and the run that owns it
+   * @returns {Promise<{ round: Promise<object[]>, held: object, fence: object }>} the round, the
+   *   held refresh and the fetch authority of the run that owns it
    */
   const heldRound = async (node = NODE_ID) => {
     const held = holdRefreshes(harness.cluster)
-    const run = harness.group.idleWait
+    const fence = harness.group.authority
     const round = harness.group.fetch(node)
     for (let attempt = 0; attempt < 10 && held.options.length === 0; attempt++) await turn()
-    return { round, held, run }
+    return { round, held, fence }
   }
 
   it('binds the refresh to the run and settles the round when the run stops', async () => {
     harness = await createFetchGroup({ partitions: [0], partitionLeaders: { 0: -1 } })
-    const { round, held, run } = await heldRound()
+    const { round, held, fence } = await heldRound()
 
-    expect(held.options[0]).toMatchObject({ fence: run.fence })
-    expect(run.fence.closed).toBe(false)
+    expect(held.options[0]).toMatchObject({ fence })
+    expect(fence.closed).toBe(false)
 
     harness.group.onStopRequested()
 
     expect(await settled(round)).toEqual([])
-    expect(run.fence.closed).toBe(true)
+    expect(fence.closed).toBe(true)
     held.release()
     await turn()
     expect(harness.requestRejoin).not.toHaveBeenCalled()
@@ -270,10 +270,10 @@ describe('a routing refresh and its run', () => {
 
   it('starts no refresh for a run that already stopped', async () => {
     harness = await createFetchGroup({ partitions: [0], partitionLeaders: { 0: -1 } })
-    const run = harness.group.idleWait
+    const fence = harness.group.authority
     harness.group.onStopRequested()
 
-    await harness.group.refreshLeaderlessMetadata(run)
+    await harness.group.refreshLeaderlessMetadata(fence)
 
     expect(harness.cluster.refreshMetadata).not.toHaveBeenCalled()
   })
@@ -286,12 +286,12 @@ describe('a routing refresh and its run', () => {
     })
     const old = await heldRound()
     harness.group.startIdleWait()
-    const replacement = harness.group.idleWait
+    const replacement = harness.group.authority
 
     const next = harness.group.fetch(NODE_ID)
     for (let attempt = 0; attempt < 10 && old.held.options.length < 2; attempt++) await turn()
     expect(old.held.options).toHaveLength(2)
-    expect(old.held.options[1]).toMatchObject({ fence: replacement.fence })
+    expect(old.held.options[1]).toMatchObject({ fence: replacement })
     const pending = harness.group.leaderlessRefresh
 
     expect(await settled(old.round)).toEqual([])
@@ -309,13 +309,13 @@ describe('a routing refresh and its run', () => {
 
   it('does not let a stale run share the replacement run refresh', async () => {
     harness = await createFetchGroup({ partitions: [0], partitionLeaders: { 0: -1 } })
-    const oldRun = harness.group.idleWait
+    const oldFence = harness.group.authority
     harness.group.startIdleWait()
     const held = holdRefreshes(harness.cluster)
 
-    const current = harness.group.refreshLeaderlessMetadata(harness.group.idleWait)
+    const current = harness.group.refreshLeaderlessMetadata(harness.group.authority)
     await turn()
-    await harness.group.refreshLeaderlessMetadata(oldRun)
+    await harness.group.refreshLeaderlessMetadata(oldFence)
 
     expect(held.options).toHaveLength(1)
     held.release()

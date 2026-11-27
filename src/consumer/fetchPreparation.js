@@ -17,7 +17,8 @@ class PreparationSuperseded extends KafkaJSError {
  * they were prepared under. Holds one small record per attempt, never a per-partition cache.
  *
  * `guard()` is the private, immutable identity every descendant of the preparation checks, up to
- * the transport's final write: the run is still open and the assignment, ownership token and
+ * the transport's final write: the fetch authority it was captured under is still open (it closes
+ * with the run and when the assignment is withheld) and the assignment, ownership token and
  * offset manager are the captured ones. Under the consumer protocol it also requires an installed
  * offset manager and an ownership that carries no loss, so a Fetch is never admitted for a member
  * that has learned it was fenced, even before the round that replaces the membership runs.
@@ -27,16 +28,17 @@ class PreparationSuperseded extends KafkaJSError {
 class FetchPreparation {
   /**
    * @param {import('./consumerGroup')} group the group whose state is captured, after the filter
-   * @param {import('./idleWait')} run the run that owns this fetch
+   * @param {import('../producer/generation')} fence the fetch authority the fetch captured at
+   *   entry; every wait, lookup and continuation of this preparation is bound to it
    * @param {import('../../types').TopicPartitions[]} parts the node-filtered assignment
    * @param {number} expiresAt earliest effective preferred-replica expiry in `parts`, or Infinity
    * @param {number} ownershipToken the membership identity the fetch captured before any await
    * @param {boolean} [leaderless=false] whether an assigned partition had no leader when `parts`
    *   was filtered
    */
-  constructor(group, run, parts, expiresAt, ownershipToken, leaderless = false) {
+  constructor(group, fence, parts, expiresAt, ownershipToken, leaderless = false) {
     this.group = group
-    this.run = run
+    this.fence = fence
     this.parts = parts
     this.expiresAt = expiresAt
     this.ownershipToken = ownershipToken
@@ -49,17 +51,13 @@ class FetchPreparation {
     this.superseded = null
   }
 
-  /** @returns {import('../producer/generation')} the run's terminal fence */
-  get fence() {
-    return this.run.fence
-  }
-
   /**
-   * @returns {Error|null} the stopping error of a retired run, the supersession of a replaced
-   *   assignment, or null while the preparation still owns what it operates on
+   * @returns {Error|null} the close error of its fetch authority (a retired run, a withheld
+   *   assignment), the supersession of a replaced assignment, or null while the preparation still
+   *   owns what it operates on
    */
   guard = () => {
-    if (this.run.fence.closed) return this.run.fence.error
+    if (this.fence.closed) return this.fence.error
     if (this.superseded) return this.superseded
     const { group } = this
     if (

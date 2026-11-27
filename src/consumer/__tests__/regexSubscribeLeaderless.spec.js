@@ -111,7 +111,7 @@ describe('Consumer > the fetch grouping, for a partition whose cached leader is 
 
     expect(batches.map(({ partition }) => partition)).toEqual([0])
     expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
-    expect(findBrokerCalls).toEqual([{ nodeId: NODE_ID, fence: group.idleWait.fence }])
+    expect(findBrokerCalls).toEqual([{ nodeId: NODE_ID, fence: group.authority }])
   })
 
   test.each([-1, -2])(

@@ -764,8 +764,11 @@ const boundLimit: number | undefined = boundError.limit
 new KafkaJSCorruptRecordError('x', { reason: 'bomb' })
 const commitError = new KafkaJSCommitFailedError('x', { reason: 'membership-lost', cause })
 const commitIsNonRetriable: KafkaJSNonRetriableError = commitError
-const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment' =
-  commitError.reason
+const commitReason:
+  | 'membership-lost'
+  | 'poll-interval-exceeded'
+  | 'stale-assignment'
+  | 'assignment-refused' = commitError.reason
 const commitCause: Error | undefined = commitError.cause
 const commitType: string | undefined = commitError.type
 const commitCode: number | string | undefined = commitError.code

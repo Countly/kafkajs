@@ -722,18 +722,35 @@ module.exports = class ConsumerGroup {
    * unsubscribe: disposing it removes the listener synchronously, so a stopped, restarted or
    * disposed consumer leaves none behind.
    * A cluster without `onRoutingChange` publishes nothing: such a run is woken only by its own
-   * lifecycle events.
+   * lifecycle events. The run also gets its fetch authority (`openAuthority`).
    * @private
    * @returns {IdleWait} an open run with its routing subscription registered on its fence
    */
   createRun() {
     const run = new IdleWait()
+    this.openAuthority(run)
     const unsubscribe = this.cluster.onRoutingChange?.(() => {
       if (!run.fence.closed) this.routingChanged()
     })
     if (unsubscribe) run.fence.register(unsubscribe)
     run.fence.register(this.operations.onRelease(() => run.wake()))
     return run
+  }
+
+  /**
+   * Opens the fetch authority: the one fence every Fetch captures at entry and checks wherever it
+   * would otherwise check the run's fence. At most one is open. It closes with its run, or earlier
+   * when the assignment is withheld (`withholdAssignment`), and only the first usable install after
+   * that opens the next; an ordinary install keeps it, so a rebalance resets no Fetch session.
+   * @private
+   * @param {IdleWait} run the run it closes with; one registration per authority
+   * @returns {void}
+   */
+  openAuthority(run) {
+    const authority = new Generation()
+    /** @type {Generation} */
+    this.authority = authority
+    this.releaseAuthority = run.fence.register((error) => authority.close(error))
   }
 
   /**
@@ -1097,7 +1114,7 @@ module.exports = class ConsumerGroup {
         (this.groupMembership.state === 'FATAL'
           ? this.groupMembership.fatalError
           : this.groupMembership.state === 'FENCED' || !lost
-            ? this.ownership?.refusal(this.ownership.token())?.cause
+            ? this.ownership?.lost(this.ownership.token())
             : null)
       const error = round?.guard() || membershipError
       if (error) {
@@ -1189,14 +1206,88 @@ module.exports = class ConsumerGroup {
       check()
     }
 
+    check()
+    this.ownership?.renew()
+    if (this.authority.closed) this.openAuthority(this.idleWait)
+    this.coordinatorLookup.detach()
+    this.publishAssignment(currentMemberAssignment, {
+      identity: { groupId, generationId, memberId, coordinator },
+      rebuildOffsets,
+      added,
+      revoked,
+      round,
+      additionHold,
+      userData: result.userData,
+      unionSnapshot: result.unionSnapshot,
+    })
+    return { assignment: currentMemberAssignment, added, revoked }
+  }
+
+  /**
+   * Refuses the current assignment synchronously, without awaiting anything or calling user code,
+   * and keeps the membership: the ownership token is withheld, not renewed, so answers stamped with
+   * it stay current, while every commit, resolution and seek under it is refused as
+   * `assignment-refused`. The fetch authority closes with `cause`, so a Fetch that crossed it
+   * publishes nothing, and every later Fetch parks until the next usable install opens a new one.
+   * The partitions are given up through the install's own core with an empty assignment: their
+   * acquisitions retired, queued seeks popped, halts, fetch errors, validations and preferred
+   * replicas cleared, an empty offset manager installed (`uncommittedOffsets()` is `{ topics: [] }`)
+   * and nothing advertised as owned. Assigners are not notified.
+   * @param {Error} cause the refusal
+   * @returns {void}
+   */
+  withholdAssignment(cause) {
+    const lost = this.subscriptionState.assigned()
+    this.ownership.withhold(cause)
+    this.releaseAuthority()
+    this.authority.close(cause)
+    this.publishAssignment([], {
+      identity: this,
+      rebuildOffsets: true,
+      added: [],
+      revoked: lost,
+      notify: false,
+    })
+  }
+
+  /**
+   * The one synchronous core of an install and of a withhold: publishes `currentMemberAssignment`
+   * as the member's assignment, rebuilding the offsets (eager) or updating them (cooperative), and
+   * retiring the acquisitions it ends before dropping them.
+   * @private
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} currentMemberAssignment
+   * @param {object} options
+   * @param {{groupId: string, generationId: number, memberId: string, coordinator: object}} options.identity
+   *   the membership the offset manager commits under
+   * @param {boolean} options.rebuildOffsets a fresh offset manager instead of an incremental update
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} options.added
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} options.revoked
+   * @param {object} [options.round] the round, whose pinned subscription is published
+   * @param {object} [options.additionHold] holds the added partitions until released
+   * @param {Buffer|null} [options.userData] the assignment's user data for the assigners
+   * @param {Map<string, number[]>} [options.unionSnapshot] the leader's union snapshot to watch
+   * @param {boolean} [options.notify=true] whether the assigners are told of the assignment
+   * @returns {void}
+   */
+  publishAssignment(
+    currentMemberAssignment,
+    {
+      identity: { groupId, generationId, memberId, coordinator },
+      rebuildOffsets,
+      added,
+      revoked,
+      round,
+      additionHold,
+      userData,
+      unionSnapshot,
+      notify = true,
+    }
+  ) {
+    if (round?.pin) this.publishSubscription(round.pin)
+    this.topics = currentMemberAssignment.map(({ topic }) => topic)
     // Narrowed before the apply mutates anything: a revoked partition must stop being advertised
     // and stop accepting resolved offsets the instant the apply decides it is gone. `setOwned`
     // below is the widening half.
-    check()
-    this.ownership?.renew()
-    this.coordinatorLookup.detach()
-    if (round?.pin) this.publishSubscription(round.pin)
-    this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.groupMembership.narrowOwned(currentMemberAssignment)
 
     const memberAssignment = dictionary(
@@ -1324,20 +1415,20 @@ module.exports = class ConsumerGroup {
 
     // A copy: the assignment reaches third-party assigners here, and one that sorts or splices
     // its argument would otherwise corrupt the ownership set `setOwned` retains below.
-    this.groupMembership.notifyAssignment({
-      partitions: currentMemberAssignment.map(({ topic, partitions }) => ({
-        topic,
-        partitions: [...partitions],
-      })),
-      userData: result.userData == null ? null : result.userData,
-    })
+    if (notify) {
+      this.groupMembership.notifyAssignment({
+        partitions: currentMemberAssignment.map(({ topic, partitions }) => ({
+          topic,
+          partitions: [...partitions],
+        })),
+        userData: userData == null ? null : userData,
+      })
+    }
 
     this.groupMembership.setOwned(currentMemberAssignment)
     this.clearStaleAssignmentPending()
-    this.leaderUnionWatch.arm(result.unionSnapshot)
+    this.leaderUnionWatch.arm(unionSnapshot)
     this.pruneAssignmentState()
-
-    return { assignment: currentMemberAssignment, added, revoked }
   }
 
   /**
@@ -2452,9 +2543,13 @@ module.exports = class ConsumerGroup {
    * snapshot is built. A stop or restart of the run, or a preparation replaced under it, returns
    * an empty round without error; an idle round sleeps only while its snapshot is current.
    *
-   * The run's fence follows the call to its end: every refresh, hint and recovery the response
-   * starts is bound to it, and each continuation checks it before it publishes, so a response
-   * still being processed at stop changes nothing in a replacement run and returns no batch.
+   * The fetch authority captured at entry (`openAuthority`) follows the call to its end: every
+   * refresh, hint and recovery the response starts is bound to it, and each continuation checks it
+   * before it publishes. It closes with the run and when the assignment is withheld, so a response
+   * still being processed then changes nothing, returns no batch and resets only its own pending
+   * session; an ordinary install keeps it, so the response of a rebalance-crossing call is used.
+   * While the current authority is closed (withheld), the call sends nothing: it waits up to
+   * `maxWaitTime` for an install or the end of the run and returns an empty round.
    *
    * @param {number} nodeId the broker to fetch from
    * @returns {Promise<Batch[]>} one batch per fetched partition; empty when nothing was owed,
@@ -2462,11 +2557,20 @@ module.exports = class ConsumerGroup {
    */
   async fetch(nodeId) {
     const run = this.idleWait
+    const authority = this.authority
+    if (authority.closed) {
+      await run.wait(
+        this.maxWaitTime,
+        () => this.authority === authority && !run.fence.closed,
+        run.fence
+      )
+      return []
+    }
     const ownershipToken = this.ownership.token()
     let prepared = null
     let requestClock
     try {
-      prepared = await this.prepareFetch(nodeId, run, ownershipToken)
+      prepared = await this.prepareFetch(nodeId, authority, ownershipToken)
       if (!prepared) return []
 
       // The request is built from the positions as they stand now; a corruption marker in its
@@ -2511,7 +2615,7 @@ module.exports = class ConsumerGroup {
         })
       }
 
-      const broker = await run.fence.wait(this.cluster.findBroker({ nodeId, fence: run.fence }))
+      const broker = await authority.wait(this.cluster.findBroker({ nodeId, fence: authority }))
       prepared.check()
 
       let tracked = null
@@ -2550,9 +2654,9 @@ module.exports = class ConsumerGroup {
           forgottenTopics: tracked?.wire.forgottenTopics,
         })
       } catch (error) {
-        // A retired run's failure may only reset the session whose epoch it left unknown: replica
-        // hints and routing belong to the run that replaced it.
-        if (tracked && run.fence.closed) {
+        // A closed authority's failure may only reset the session whose epoch it left unknown:
+        // replica hints and routing belong to whoever holds the next one.
+        if (tracked && authority.closed) {
           tracked.session.handleError(tracked.token)
           return []
         }
@@ -2561,10 +2665,10 @@ module.exports = class ConsumerGroup {
         throw error
       }
 
-      // A response that outlived its run is dropped whole: it must not apply hints, preferred
-      // replicas or offsets to a replacement run, and the wire request is not cancelled. The
-      // broker may have advanced its epoch for it, so a session still waiting on it starts over.
-      if (run.fence.closed) {
+      // A response that outlived its authority (a stop, a withheld assignment) is dropped whole: it
+      // must not apply hints, preferred replicas or offsets, and the wire request is not cancelled.
+      // The broker may have advanced its epoch for it, so a session still waiting on it starts over.
+      if (authority.closed) {
         tracked?.session.handleError(tracked.token)
         return []
       }
@@ -2574,7 +2678,7 @@ module.exports = class ConsumerGroup {
         // the session and is handled below its own contract.
         if (!tracked.session.current(tracked.token)) return []
         if (!tracked.session.handleResponse(tracked.token, response)) {
-          await this.refuseTrackedResponse(response, run.fence)
+          await this.refuseTrackedResponse(response, authority)
           return []
         }
       }
@@ -2584,7 +2688,7 @@ module.exports = class ConsumerGroup {
       // The top-level code is only decoded from Fetch v7 up, so an older response carries none -
       // and `failure(undefined)` is true, which is why the guard is on the field's presence.
       if (topLevelErrorCode != null && failure(topLevelErrorCode)) {
-        await this.handleFetchTopLevelError(topLevelErrorCode, run.fence)
+        await this.handleFetchTopLevelError(topLevelErrorCode, authority)
         return []
       }
 
@@ -2629,25 +2733,25 @@ module.exports = class ConsumerGroup {
           assignmentEpoch,
           requestClock,
           prepared,
-          fence: run.fence,
+          fence: authority,
         }
 
         for (const partitionData of partitions) {
           const partitionNeedsRefresh = await this.handleFetchedPartition(partitionData, context)
-          run.fence.check()
+          authority.check()
           needsRefresh = needsRefresh || partitionNeedsRefresh
         }
       }
 
       if (needsRefresh) {
-        await this.refreshCluster({ fence: run.fence })
-        run.fence.check()
+        await this.refreshCluster({ fence: authority })
+        authority.check()
       } else if (missing) {
-        await this.refreshMissingTopicIds(run)
-        run.fence.check()
+        await this.refreshMissingTopicIds(authority)
+        authority.check()
       } else if (prepared.leaderless) {
-        await this.refreshLeaderlessMetadata(run)
-        run.fence.check()
+        await this.refreshLeaderlessMetadata(authority)
+        authority.check()
       }
 
       for (const batch of batches) {
@@ -2659,18 +2763,18 @@ module.exports = class ConsumerGroup {
 
       return batches
     } catch (e) {
-      // A retired run, or a preparation replaced under it, is a local outcome, not a failure.
-      if (run.fence.closed || prepared?.isSuperseded(e)) return []
+      // A closed authority, or a preparation replaced under it, is a local outcome, not a failure.
+      if (authority.closed || prepared?.isSuperseded(e)) return []
       stampOwnership(e, ownershipToken)
       if (obsoleteOwnership(this.ownership, e)) throw e
       try {
         await this.recoverFromFetch(
           e,
-          run.fence,
+          authority,
           ...(prepared ? [this.fetchedResetContext(prepared, requestClock)] : [])
         )
       } catch (recoveryError) {
-        if (run.fence.closed) return []
+        if (authority.closed) return []
         throw recoveryError
       }
       return []
@@ -2678,23 +2782,24 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Waits out a round with nothing to ask this node: it sleeps while its snapshot stays current,
-   * after asking for the metadata of partitions that have no leader or no topic id.
+   * Waits out a round with nothing to ask this node: it sleeps while its snapshot stays current
+   * and its fetch authority open, after asking for the metadata of partitions that have no leader
+   * or no topic id.
    * @private
-   * @param {FetchPreparation} prepared the round's snapshot
+   * @param {FetchPreparation} prepared the round's snapshot, bound to the round's authority
    * @param {IdleWait} run the run that owns the round
    * @param {boolean} [missingIds=false] whether a topic was left out for a missing topic id
    * @returns {Promise<Batch[]>} always empty
    * @throws {Error} a terminal topic refusal learned for a missing id, see `refreshMissingTopicIds`
    */
   async idleFetchRound(prepared, run, missingIds = false) {
-    if (missingIds) await this.refreshMissingTopicIds(run)
-    else if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
+    if (missingIds) await this.refreshMissingTopicIds(prepared.fence)
+    else if (prepared.leaderless) await this.refreshLeaderlessMetadata(prepared.fence)
     // Registers only while the snapshot is current: an invalidated one returns through the
     // fetcher's yield floor and a fresh snapshot is captured next round.
     await run.wait(
       prepared.idleDuration(this.maxWaitTime),
-      () => !run.fence.closed && prepared.isCurrent()
+      () => !prepared.fence.closed && prepared.isCurrent()
     )
     return []
   }
@@ -2819,47 +2924,52 @@ module.exports = class ConsumerGroup {
    * moved again: it never substitutes a newer filter result or admits a partition it did not
    * prepare. The unchanged path costs one filter and scalar checks.
    *
-   * Every wait is released when the run's fence closes, and every continuation checks the
-   * snapshot's guard, so a pending preparation never outlives a stop or restart.
+   * Every wait is released when the fetch authority closes, and every continuation checks the
+   * snapshot's guard, so a pending preparation never outlives a stop, a restart or a withheld
+   * assignment.
    *
    * @private
    * @param {number} nodeId the broker this round fetches from
-   * @param {IdleWait} run the run that owns this call, captured at entry
+   * @param {Generation} fence the fetch authority the call captured at entry
    * @param {number} ownershipToken the membership identity captured before any await
    * @returns {Promise<FetchPreparation|null>} the prepared snapshot, or null when there is
-   *   nothing safe to send: the run was retired or the last preparation was replaced
-   * @throws {Error} a real failure of the live run, for `recoverFromFetch`
+   *   nothing safe to send: the authority closed or the last preparation was replaced
+   * @throws {Error} a real failure of the live run, for `recoverFromFetch`, or the authority's
+   *   close error when it was closed at entry
    */
-  async prepareFetch(nodeId, run, ownershipToken) {
-    run.fence.check()
-    await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary: true }))
-    run.fence.check()
+  async prepareFetch(nodeId, fence, ownershipToken) {
+    fence.check()
+    await fence.wait(this.refreshCluster({ fence, ifNecessary: true }))
+    fence.check()
     this.checkSubscriptionChange()
     this.groupMembership.recheckHeldTopics?.()
-    if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
+    if (this.leaderUnionWatch.armed) {
+      await this.pollLeaderUnion(fence)
+      fence.check()
+    }
     this.checkForStaleAssignment()
 
     let prepared = null
     for (let attempt = 1; attempt <= MAX_PREPARATION_ATTEMPTS; attempt++) {
       // Captured before anything is awaited: this is the assignment the request is built from,
       // and it is what every batch this round produces is stamped with.
-      const snapshot = this.captureFetchPreparation(nodeId, run, ownershipToken)
+      const snapshot = this.captureFetchPreparation(nodeId, fence, ownershipToken)
       prepared = null
       try {
         snapshot.check()
-        await run.fence.wait(this.seekOffsets(snapshot.parts, snapshot))
+        await fence.wait(this.seekOffsets(snapshot.parts, snapshot))
         snapshot.check()
-        await run.fence.wait(this.validatePositions(snapshot.parts, snapshot))
+        await fence.wait(this.validatePositions(snapshot.parts, snapshot))
         snapshot.check()
         prepared = snapshot
       } catch (error) {
-        if (run.fence.closed) return null
+        if (fence.closed) return null
         if (!snapshot.isSuperseded(error)) throw error
       }
 
       if ((prepared && prepared.isCurrent()) || attempt === MAX_PREPARATION_ATTEMPTS) break
-      await fencedDelay(run.fence)
-      run.fence.check()
+      await fencedDelay(fence)
+      fence.check()
     }
 
     return prepared
@@ -2871,16 +2981,16 @@ module.exports = class ConsumerGroup {
    * does not invalidate the snapshot it belongs to.
    * @private
    * @param {number} nodeId the broker this round fetches from
-   * @param {IdleWait} run the owning run
+   * @param {Generation} fence the fetch authority captured by `fetch`
    * @param {number} ownershipToken the membership identity captured by `fetch`
    * @returns {FetchPreparation} the snapshot with its stamps
    */
-  captureFetchPreparation(nodeId, run, ownershipToken) {
+  captureFetchPreparation(nodeId, fence, ownershipToken) {
     const routing = { expiresAt: Infinity, leaderless: false }
     const parts = this.filterPartitionsByNode(nodeId, this.subscriptionState.assigned(), routing)
     return new FetchPreparation(
       this,
-      run,
+      fence,
       parts,
       routing.expiresAt,
       ownershipToken,
@@ -4619,26 +4729,28 @@ module.exports = class ConsumerGroup {
    * refresh, an early one returns at once. There is no retry timer: the next round that finds a
    * leader or an id missing and the interval elapsed asks again.
    *
-   * The refresh is bound to the run's fence, so a stop or restart settles every caller and the
-   * refresh publishes nothing afterwards. A failure is logged at debug level and never becomes a
-   * membership verdict by itself; it is returned to every caller that waited for it, so a caller
-   * can judge it for its own reason.
+   * The refresh is bound to the fetch authority that started it, so a stop, a restart or a
+   * withheld assignment settles every caller and the refresh publishes nothing afterwards. A caller
+   * joins only a refresh started under its own authority, so one admitted after a heal never waits
+   * for a cancelled one. A failure is logged at debug level and never becomes a membership verdict
+   * by itself; it is returned to every caller that waited for it, so a caller can judge it for its
+   * own reason.
    * @private
-   * @param {IdleWait} run the run that owns the calling round, captured before any await
+   * @param {Generation} fence the calling round's fetch authority, captured before any await
    * @returns {Promise<Error|undefined>} the failure of the refresh this caller waited for, if it
    *   failed; undefined when it succeeded or was not due
    */
-  async refreshLeaderlessMetadata(run) {
-    if (run.fence.closed) return
+  async refreshLeaderlessMetadata(fence) {
+    if (fence.closed) return
     let attempt = this.leaderlessRefresh
-    if (!attempt) {
+    if (attempt?.fence !== fence) {
       const now = performance.now()
       if (now - this.leaderlessRefreshAt < this.leaderlessRefreshInterval) return
       this.leaderlessRefreshAt = now
-      attempt = { promise: null }
-      attempt.promise = this.refreshCluster({ fence: run.fence })
+      attempt = { promise: null, fence }
+      attempt.promise = this.refreshCluster({ fence })
         .catch((error) => {
-          if (!run.fence.closed) {
+          if (!fence.closed) {
             this.logger.debug('Metadata refresh for unavailable leaders failed', {
               groupId: this.groupId,
               memberId: this.memberId,
@@ -4652,7 +4764,7 @@ module.exports = class ConsumerGroup {
         })
       this.leaderlessRefresh = attempt
     }
-    await run.fence.wait(attempt.promise).catch(() => {})
+    await fence.wait(attempt.promise).catch(() => {})
     return attempt.error
   }
 
@@ -4662,12 +4774,12 @@ module.exports = class ConsumerGroup {
    * `INVALID_TOPIC_EXCEPTION`), as a conditional refresh before the round would. Other failures
    * are waited out: the next refresh may bring the id.
    * @private
-   * @param {IdleWait} run the run that owns the calling round
+   * @param {Generation} fence the calling round's fetch authority
    * @returns {Promise<void>}
    * @throws {Error} the refresh's terminal topic refusal
    */
-  async refreshMissingTopicIds(run) {
-    const error = await this.refreshLeaderlessMetadata(run)
+  async refreshMissingTopicIds(fence) {
+    const error = await this.refreshLeaderlessMetadata(fence)
     if (isFatalTopicError(error)) throw error
   }
 }

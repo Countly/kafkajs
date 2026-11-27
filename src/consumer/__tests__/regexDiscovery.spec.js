@@ -510,7 +510,7 @@ describe('discovery refreshes and their scope', () => {
 
     harness.set('orders-1', ID_A)
     const forced = harness.cluster.refreshMetadata.mock.calls.length
-    await group.prepareFetch(0, group.idleWait, group.ownership.token())
+    await group.prepareFetch(0, group.authority, group.ownership.token())
 
     expect(harness.cluster.refreshMetadata).toHaveBeenCalledTimes(forced)
     expect(harness.cluster.refreshMetadataIfNecessary).toHaveBeenLastCalledWith(
