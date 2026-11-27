@@ -20,7 +20,7 @@ const Encoder = require('../../protocol/encoder')
 const { INT_32_MAX_VALUE } = require('../../constants')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
-const { owned, sentRecords } = require('./fixtures/bufferHarness')
+const { owned, sentRecords, takeSent } = require('./fixtures/bufferHarness')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSDeliveryTimeout,
@@ -2351,22 +2351,27 @@ describe('Producer > the idempotent drain loop', () => {
 
     test('a batch the broker wrote but answered retriably is re-sent inside the broker’s 5-batch window and completes as a duplicate', async () => {
       const log = createPartitionLog()
+      const appended = []
       let calls = 0
       const harness = createHarness({
         layout: { [TOPIC]: { 0: 1 } },
-        answer: async (request, nodeId) => {
+        answer: (request, nodeId) => {
           calls += 1
           const call = calls
           const errors = {}
-          for (const { topic, partition, firstSequence, records } of await sentRecords(request)) {
+          const sent = takeSent(request)
+          for (const [at, { topic, partition, firstSequence, count }] of sent.batches.entries()) {
             const key = `${topic}/${partition}`
             const code = log.append(
               key,
               request.producerEpoch,
               firstSequence,
-              records.length,
-              String(records[0].value)
+              count,
+              `s${firstSequence}`
             )
+            if (code === 0) {
+              appended.push({ sent, at })
+            }
             if (code === OUT_OF_ORDER_SEQUENCE_NUMBER) {
               errors[key] = code
             } else if (code === 'duplicate') {
@@ -2390,7 +2395,13 @@ describe('Producer > the idempotent drain loop', () => {
       )
 
       await expect(Promise.all(sends)).resolves.toHaveLength(10)
-      expect(log.written).toEqual(Array.from({ length: 10 }, (_, index) => `topic-a/0:m${index}`))
+      expect(log.written).toEqual(Array.from({ length: 10 }, (_, index) => `topic-a/0:s${index}`))
+      const values = await Promise.all(
+        appended.map(async ({ sent, at }) =>
+          (await sent.read())[at].records.map(({ value }) => String(value))
+        )
+      )
+      expect(values).toEqual(Array.from({ length: 10 }, (_, index) => [`m${index}`]))
     })
 
     test('a fault in a pass fails the live sends with it, and the next send starts the loop again', async () => {

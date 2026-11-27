@@ -10,7 +10,7 @@ const {
   deferred,
   flushAll,
   quiescent,
-  sentRecords,
+  takeSent,
   succeeded,
   transactionalProducer,
   watch,
@@ -588,7 +588,8 @@ describe('Producer > the buffer > release at the terminal owner', () => {
     await flushAll()
 
     expect(calls).toHaveLength(1)
-    expect((await sentRecords(calls[0].request))[0].records).toHaveLength(3)
+    const first = takeSent(calls[0].request)
+    expect(first.batches.map(({ count }) => count)).toEqual([3])
     expect([admission.reserved, admission.debts]).toEqual([1536 + 2 * share, 2 * 1024])
     calls[0].answer()
     await flushAll()
@@ -600,6 +601,7 @@ describe('Producer > the buffer > release at the terminal owner', () => {
     expect(sent.state).toBe('fulfilled')
     expect(sent.value).toEqual([expect.objectContaining({ partition: 0, baseOffset: '0' })])
     expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect((await first.read())[0].records).toHaveLength(3)
     await producer.disconnect()
   })
 

@@ -4,7 +4,7 @@ const Kafka = require('../../index')
 const Cluster = require('../../cluster')
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
-const { sentRecords } = require('./fixtures/bufferHarness')
+const { takeSent } = require('./fixtures/bufferHarness')
 const { createErrorFromCode } = require('../../protocol/error')
 const { createLogger, LEVELS } = require('../../loggers')
 const {
@@ -240,24 +240,13 @@ describe('Producer > deliveryTimeout', () => {
   })
 
   test("p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0's write guard accepts once", async () => {
-    const written = []
+    const taken = []
     const cluster = createFakeCluster({
       partitions: 2,
       produce: async (request) => {
         const refusal = request.guard(100)
         if (refusal) throw refusal
-        const read = await sentRecords(request)
-        let index = 0
-        for (const { topic, partitions } of request.topicData)
-          for (const { partition, firstSequence } of partitions) {
-            const { records } = read[index++]
-            written.push({
-              topic,
-              partition,
-              firstSequence,
-              values: records.map(({ value }) => value.toString()),
-            })
-          }
+        taken.push(takeSent(request))
         return {
           topics: request.topicData.map(({ topic, partitions }) => ({
             topicName: topic,
@@ -299,7 +288,20 @@ describe('Producer > deliveryTimeout', () => {
     expect(error.outcome).toBe('unknown')
     expect(error.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
     expect(error.cause.outcome).toBe('unsent')
-    expect(written).toEqual([{ topic: TOPIC, partition: 0, firstSequence: 0, values: ['value-0'] }])
+    const written = await Promise.all(
+      taken.map(async ({ batches, read }) => {
+        const decoded = await read()
+        return batches.map(({ topic, partition, firstSequence }, at) => ({
+          topic,
+          partition,
+          firstSequence,
+          values: decoded[at].records.map(({ value }) => value.toString()),
+        }))
+      })
+    )
+    expect(written.flat()).toEqual([
+      { topic: TOPIC, partition: 0, firstSequence: 0, values: ['value-0'] },
+    ])
   })
 
   test("kafka.producer({ deliveryTimeout }) bounds a send, ahead of the client's longer retry.maxTotalTime", async () => {

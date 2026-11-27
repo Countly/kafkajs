@@ -1,6 +1,6 @@
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
-const { sentRecords } = require('./fixtures/bufferHarness')
+const { batchesOf } = require('./fixtures/bufferHarness')
 const PartitionSequencer = require('../state/partitionSequencer')
 const encodeProduce = require('../../protocol/requests/produce/v12/request')
 const { createErrorFromCode } = require('../../protocol/error')
@@ -1120,13 +1120,14 @@ describe('Producer > the transaction wrapper', () => {
       async (_, level, noNewEpoch) => {
         const partitions = new Map()
         let refuse = false
+        const refused = deferred()
         const { broker, producer } = createTransactionalProducer({
           level,
           linger: 0,
           retry: { retries: 2, initialRetryTime: 5000, maxRetryTime: 5000 },
           produce: async (request) => {
             const { topicData, producerEpoch } = request
-            const counts = (await sentRecords(request)).map(({ records }) => records.length)
+            const counts = batchesOf(request).map(({ messages }) => messages.length)
             return {
               topics: topicData.map(({ topic, partitions: sent }) => ({
                 topicName: topic,
@@ -1137,6 +1138,7 @@ describe('Producer > the transaction wrapper', () => {
                   let errorCode = 0
                   if (refuse) {
                     errorCode = NOT_LEADER_OR_FOLLOWER
+                    refused.resolve()
                   } else if (
                     last !== undefined &&
                     (producerEpoch !== last.epoch
@@ -1171,6 +1173,7 @@ describe('Producer > the transaction wrapper', () => {
         await first.send({ topic: TOPIC, messages: ONE })
         refuse = true
         const resend = first.send({ topic: TOPIC, messages: ONE }).catch((e) => e)
+        await refused.promise
         await settle()
         refuse = false
         await first.abort()

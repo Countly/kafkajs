@@ -1512,9 +1512,13 @@ describe('Producer > the live scenarios harness', () => {
   describe('ProduceLedger and traceCalls', () => {
     test('records what a Produce call carried and what the broker answered', async () => {
       const original = Broker.prototype.produce
+      const lost = new Error('lost')
+      const answered = [
+        { topicName: 't', partition: 0, errorCode: 0, baseOffset: '4', error: null },
+      ]
       Broker.prototype.produce = async function (request) {
-        if (request.fail) throw new Error('lost')
-        return [{ topicName: 't', partition: 0, errorCode: 0, baseOffset: '4', error: null }]
+        if (request.fail) throw lost
+        return answered
       }
       const ledger = new ProduceLedger().install()
       try {
@@ -1524,7 +1528,16 @@ describe('Producer > the live scenarios harness', () => {
             partitions: [{ partition: 0, firstSequence: 3, messages: owned([{ value: 'x' }]) }],
           },
         ]
-        await Broker.prototype.produce({ producerId: 9n, producerEpoch: 1, acks: -1, topicData })
+        const first = Broker.prototype.produce({
+          producerId: 9n,
+          producerEpoch: 1,
+          acks: -1,
+          topicData,
+        })
+        expect(ledger.calls[0].partitions).toEqual([
+          { topic: 't', partition: 0, firstSequence: 3, records: 1, first: 'x' },
+        ])
+        await expect(first).resolves.toBe(answered)
         await expect(
           Broker.prototype.produce({
             producerId: 9n,
@@ -1533,7 +1546,7 @@ describe('Producer > the live scenarios harness', () => {
             topicData,
             fail: true,
           })
-        ).rejects.toThrow('lost')
+        ).rejects.toBe(lost)
       } finally {
         ledger.restore()
         Broker.prototype.produce = original

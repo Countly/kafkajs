@@ -17,7 +17,7 @@ const {
   deferred,
   flushAll,
   quiescent,
-  sentRecords,
+  readBatch,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
 
@@ -610,8 +610,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
 
   /**
    * A producer whose metadata wait is held until `release()`, and whose fake broker encodes each
-   * Produce batch with the record encoder, as the real broker would, and keeps the bytes and the
-   * records a broker reads from them.
+   * Produce batch with the record encoder, as the real broker would, and keeps the bytes.
    */
   const heldProducer = async (options = {}) => {
     const fixture = bufferedProducer({ capacity: 4 * 1048576, ...options })
@@ -619,8 +618,6 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const written = []
     fixture.cluster.refreshMetadataIfNecessary.mockImplementation(() => gate.promise)
     fixture.cluster.broker.produce.mockImplementation(async ({ topicData }) => {
-      const read = sentRecords({ topicData })
-      let index = 0
       for (const { partitions } of topicData) {
         for (const { messages } of partitions) {
           const batch = await buildRecordBatch({
@@ -630,8 +627,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
             producerEpoch: 0,
             firstSequence: 0,
           })
-          const { records } = (await read)[index++]
-          written.push({ messages, records, bytes: batch.buffer })
+          written.push({ messages, bytes: batch.buffer })
         }
       }
       return topicData.flatMap(({ topic, partitions }) =>
@@ -694,7 +690,8 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
 
     expect(sent.state).toBe('fulfilled')
-    const [{ records, bytes }] = written
+    const [{ bytes }] = written
+    const { records } = await readBatch(bytes)
     expect(records).toEqual([
       {
         key: Buffer.from('k'),

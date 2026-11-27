@@ -17,60 +17,114 @@ const { Types: Compression } = require('../../../protocol/message/compression')
 const owned = (messages) => messages
 
 /**
- * The records a broker reads from a request: every batch is written by the producer's batch writer
- * and read back by the consumer's batch decoder. Every batch's records are taken before the first
- * await, so a later change to the request is not seen. The writer runs uncompressed: compression
- * changes the bytes on the wire, not the records read back.
- * @param {{ topicData?: { topic: string, partitions: { partition: number, firstSequence?: number,
- *   messages: object[] }[] }[], batches?: { topic: string, partition: number,
- *   firstSequence?: number, messages: object[] }[] }} request a Produce request (`topicData`) or an
- *   accumulator hand-off (`batches`)
- * @returns {Promise<{ topic: string, partition: number, firstSequence: number, records: {
- *   key: Buffer|null, value: Buffer|null, headers: object, timestamp: string, offset: string }[]
- *   }[]>} one entry per batch, in request order; `offset` is the record's position in its batch
+ * @typedef {{ topicData?: { topic: string, partitions: { partition: number,
+ *   firstSequence?: number, messages: object[] }[] }[], batches?: { topic: string,
+ *   partition: number, firstSequence?: number, messages: object[] }[] }} SentRequest a Produce
+ *   request (`topicData`) or an accumulator hand-off (`batches`)
  */
-const sentRecords = async (request) => {
-  const batches =
+
+/**
+ * @typedef {{ topic: string, partition: number, firstSequence: number, records: {
+ *   key: Buffer|null, value: Buffer|null, headers: object, timestamp: string, offset: string }[]
+ *   }} ReadBatch a batch as a broker reads it; `offset` is the record's position in its batch
+ */
+
+/**
+ * The batches a request carries, read synchronously, in request order, each with its own copy of
+ * its record list. The one place a fixture reads a request's records, for a fake broker or probe
+ * that decides or labels by them at the instant the request arrives.
+ * @param {SentRequest} request
+ * @returns {{ topic: string, partition: number, firstSequence: number|undefined,
+ *   messages: object[] }[]}
+ */
+const batchesOf = (request) =>
+  (
     request.batches ??
     request.topicData.flatMap(({ topic, partitions }) =>
-      partitions.map(({ partition, firstSequence, messages }) => ({
-        topic,
-        partition,
-        firstSequence,
-        messages,
-      }))
+      partitions.map((entry) => ({ topic, ...entry }))
     )
-  const taken = batches.map(({ topic, partition, firstSequence, messages }) => ({
+  ).map(({ topic, partition, firstSequence, messages }) => ({
     topic,
     partition,
     firstSequence,
     messages: [...messages],
   }))
-  return Promise.all(
-    taken.map(async ({ topic, partition, firstSequence, messages }) => {
-      const { buffer } = await buildRecordBatch({
-        compression: Compression.None,
-        messages,
-        firstSequence,
-      })
-      const batch = await decodeRecordBatch(new Decoder(buffer), {
-        maxDecompressedBatchBytes: Number.MAX_SAFE_INTEGER,
-      })
-      return {
-        topic,
-        partition,
-        firstSequence: batch.firstSequence,
-        records: batch.records.map(({ key, value, headers, timestamp, offset }) => ({
-          key,
-          value,
-          headers,
-          timestamp,
-          offset,
-        })),
-      }
-    })
-  )
+
+/**
+ * Reads one record batch with the consumer's batch decoder, CRC included.
+ * @param {Buffer} buffer the batch's bytes
+ * @returns {Promise<{ firstSequence: number, records: ReadBatch['records'] }>}
+ * @throws {import('../../../errors').KafkaJSCorruptRecordError} for bytes that are not a valid
+ *   batch, such as a payload byte changed under its CRC
+ */
+const readBatch = async (buffer) => {
+  const { firstSequence, records } = await decodeRecordBatch(new Decoder(buffer), {
+    maxDecompressedBatchBytes: Number.MAX_SAFE_INTEGER,
+  })
+  return {
+    firstSequence,
+    records: records.map(({ key, value, headers, timestamp, offset }) => ({
+      key,
+      value,
+      headers,
+      timestamp,
+      offset,
+    })),
+  }
 }
+
+/**
+ * Takes what a request carries at this instant without waiting: each batch's place, the request's
+ * first sequence and record count, and the batch's bytes, written at once by the producer's batch
+ * writer. Only `read()` decodes, so a fake broker or probe that takes a request decides, records
+ * and answers at the same instant as one that reads nothing, and a later change to the request or
+ * its records is not seen.
+ *
+ * What a read checks is the record content: keys, values, headers, timestamps, order and offsets,
+ * through a CRC-checked decode, and that the bytes hold `count` records. The batch is written
+ * uncompressed with the default producer id and epoch and no transaction flag, so it says nothing
+ * of the request's envelope, compression, producer identity or transaction attribute; tests check
+ * those on the request or the wire.
+ * @param {SentRequest} request
+ * @returns {{ batches: { topic: string, partition: number, firstSequence: number|undefined,
+ *   count: number }[], read: () => Promise<ReadBatch[]> }} `read` settles once and rejects with
+ *   what writing or decoding threw
+ */
+const takeSent = (request) => {
+  const taken = batchesOf(request)
+  const written = taken.map(({ messages, firstSequence }) =>
+    buildRecordBatch({ compression: Compression.None, messages, firstSequence })
+  )
+  written.forEach((batch) => batch.catch(() => {}))
+  const batches = taken.map(({ topic, partition, firstSequence, messages }) => ({
+    topic,
+    partition,
+    firstSequence,
+    count: messages.length,
+  }))
+  let reading = null
+  const read = () =>
+    (reading ??= Promise.all(
+      written.map(async (batch, at) => {
+        const { topic, partition, count } = batches[at]
+        const { firstSequence, records } = await readBatch((await batch).buffer)
+        if (records.length !== count) {
+          throw new Error(
+            `${topic}/${partition} held ${count} records, its bytes ${records.length}`
+          )
+        }
+        return { topic, partition, firstSequence, records }
+      })
+    ))
+  return { batches, read }
+}
+
+/**
+ * The records a broker reads from a request, taken now (`takeSent`) and decoded.
+ * @param {SentRequest} request
+ * @returns {Promise<ReadBatch[]>} one entry per batch, in request order
+ */
+const sentRecords = (request) => takeSent(request).read()
 
 /**
  * Creates a promise whose owner can resolve or reject it explicitly.
@@ -248,6 +302,9 @@ const transactionalProducer = async (options = {}) => {
 
 module.exports = {
   owned,
+  batchesOf,
+  readBatch,
+  takeSent,
   sentRecords,
   succeeded,
   transactionalProducer,

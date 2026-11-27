@@ -9,7 +9,7 @@ const Broker = require('../../broker')
 const Accumulator = require('../state/accumulator')
 const PartitionSequencer = require('../state/partitionSequencer')
 const { RequestBudget } = require('../state/recordSize')
-const { owned, sentRecords } = require('./fixtures/bufferHarness')
+const { owned, takeSent } = require('./fixtures/bufferHarness')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 
@@ -699,8 +699,10 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
     })
     await new Promise((resolve) => setImmediate(resolve))
 
-    const chunks = await sentRecords({ batches: handed })
-    expect(handed.map(({ wire }, index) => [chunks[index].records.length, wire])).toEqual([
+    const taken = takeSent({ batches: handed })
+    const wires = handed.map(({ wire }) => wire)
+    const chunks = await taken.read()
+    expect(wires.map((wire, index) => [chunks[index].records.length, wire])).toEqual([
       [3, 675],
       [3, 675],
       [3, 675],
@@ -761,8 +763,8 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
       { resolve: (v) => outside.resolved.push(v), reject: (e) => outside.rejected.push(e) },
     ]
     const [head, tail] = Accumulator.cut({ ...batch, settlers }, 1)
-    const halves = await sentRecords({ batches: [head, tail] })
-    expect(halves.map(({ records }) => records.length)).toEqual([1, 3])
+    const halves = takeSent({ batches: [head, tail] })
+    expect(halves.batches.map(({ count }) => count)).toEqual([1, 3])
     head.settlers.forEach((settler) =>
       settler.resolve({ topicName: TOPIC, partition: 0, baseOffset: '10' })
     )
@@ -779,6 +781,7 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
     tail.retire()
     tail.retire()
     batch.retire()
+    expect((await halves.read()).map(({ records }) => records.length)).toEqual([1, 3])
   })
 })
 

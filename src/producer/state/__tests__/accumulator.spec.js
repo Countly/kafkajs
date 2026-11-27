@@ -11,7 +11,7 @@ const apiKeys = require('../../../protocol/requests/apiKeys')
 const { createErrorFromCode } = require('../../../protocol/error')
 const { parse: parseProduce } = require('../../../protocol/requests/produce/partitionResults')
 const { createFakeCluster } = require('../../__tests__/fixtures/fakeCluster')
-const { sentRecords } = require('../../__tests__/fixtures/bufferHarness')
+const { batchesOf, sentRecords, takeSent } = require('../../__tests__/fixtures/bufferHarness')
 const { createGroupApiBroker } = require('../../../broker/__tests__/fixtures/groupApiHarness')
 const {
   KafkaJSApplicationRecoverableError,
@@ -157,8 +157,10 @@ const createAccumulator = ({
   deadline,
 } = {}) => {
   const calls = []
+  const taken = []
   const answer = async (request) => {
     calls.push(request)
+    taken.push(takeSent(request))
     return request.batches.map(({ topic, partition: id, settlers }) => {
       const metadata = { topicName: topic, partition: id, errorCode: 0, baseOffset: '100' }
       settlers.forEach((settler) => settler.resolve(metadata))
@@ -175,9 +177,9 @@ const createAccumulator = ({
     leaderOf,
     deadline,
   })
-  /** The values of each call's batches, as a broker reads them. */
+  /** The values of each call's batches, taken at the hand-off, as a broker reads them. */
   const sent = async () =>
-    (await Promise.all(calls.map(sentRecords))).map((batches) =>
+    (await Promise.all(taken.map(({ read }) => read()))).map((batches) =>
       batches.map(({ topic, partition: id, records }) => ({
         [`${topic}/${id}`]: records.map(textOf),
       }))
@@ -266,24 +268,31 @@ const createLingeringProducer = ({ produce, partitions = 2, level = 2, ...option
     retry: { retries: 3, initialRetryTime: 10, maxRetryTime: 40, factor: 0 },
     ...options,
   })
-  /** What each Produce request carried, its values as a broker reads them. */
-  const produced = async () => {
-    const requests = cluster.broker.produce.mock.calls.map(([request]) => request)
-    const read = await Promise.all(requests.map(sentRecords))
-    return requests.map((request, index) => ({
+  /** What each Produce request carried, read now, without its records' content. */
+  const requested = () =>
+    cluster.broker.produce.mock.calls.map(([request]) => ({
       acks: request.acks,
       compression: request.compression,
       producerId: request.producerId,
-      partitions: request.topicData
-        .flatMap(({ partitions: written }) => written)
-        .map(({ partition, firstSequence }, at) => ({
-          partition,
-          firstSequence,
-          values: read[index][at].records.map(textOf),
-        })),
+      partitions: batchesOf(request).map(({ partition, firstSequence }) => ({
+        partition,
+        firstSequence,
+      })),
+    }))
+  /** What each Produce request carried, taken now, its values as a broker reads them. */
+  const produced = async () => {
+    const requests = requested()
+    const taken = cluster.broker.produce.mock.calls.map(([request]) => takeSent(request))
+    const read = await Promise.all(taken.map(({ read: decode }) => decode()))
+    return requests.map(({ partitions, ...request }, index) => ({
+      ...request,
+      partitions: partitions.map((entry, at) => ({
+        ...entry,
+        values: read[index][at].records.map(textOf),
+      })),
     }))
   }
-  return { cluster, producer, produced }
+  return { cluster, producer, requested, produced }
 }
 
 /**
@@ -349,13 +358,13 @@ describe('Producer > the accumulator', () => {
     })
 
     test('the records of several sends to one partition go out together, in arrival order, once linger has elapsed', async () => {
-      const { accumulator, sent } = createAccumulator()
+      const { accumulator, calls, sent } = createAccumulator()
 
       const first = append(accumulator, records(0, 'a', 2))
       const second = append(accumulator, records(0, 'b'))
       const third = append(accumulator, records(0, 'c'))
       await jest.advanceTimersByTimeAsync(LINGER - 1)
-      expect(await sent()).toEqual([])
+      expect(calls).toEqual([])
       expect(jest.getTimerCount()).toBe(1)
 
       await jest.advanceTimersByTimeAsync(1)
@@ -1023,7 +1032,7 @@ describe('Producer > the accumulator', () => {
       const answer = deferred()
       const calls = []
       const sendPartitioned = jest.fn(async (request) => {
-        calls.push(request)
+        calls.push(takeSent(request))
         if (calls.length === 1) {
           await answer.promise
         }
@@ -1032,14 +1041,14 @@ describe('Producer > the accumulator', () => {
         )
       })
       const values = async () =>
-        (await Promise.all(calls.map(sentRecords))).map((batches) =>
+        (await Promise.all(calls.map(({ read }) => read()))).map((batches) =>
           batches.map(({ records }) => textOf(records[0]))
         )
       return { answer, sendPartitioned, values }
     }
 
     test('batches of partitions one broker leads, made 1 ms apart, leave in one hand-off and leave no timer', async () => {
-      const { accumulator, sent } = createAccumulator({
+      const { accumulator, calls, sent } = createAccumulator({
         linger: MERGE_LINGER,
         leaderOf: ledByOne({ 0: 1, 1: 1 }),
       })
@@ -1048,7 +1057,7 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
-      expect(await sent()).toEqual([])
+      expect(calls).toEqual([])
 
       await jest.advanceTimersByTimeAsync(1)
 
@@ -1116,7 +1125,7 @@ describe('Producer > the accumulator', () => {
     })
 
     test('a batch whose linger has run out when another expires takes its broker’s waiting batches too', async () => {
-      const { accumulator, sent } = createAccumulator({
+      const { accumulator, calls, sent } = createAccumulator({
         linger: MERGE_LINGER,
         leaderOf: ledByOne({ 0: 1, 1: 2, 2: 2 }),
       })
@@ -1128,7 +1137,7 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(2, 'c'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 2)
-      expect(await sent()).toEqual([])
+      expect(calls).toEqual([])
 
       await jest.advanceTimersByTimeAsync(1)
 
@@ -1183,7 +1192,7 @@ describe('Producer > the accumulator', () => {
     })
 
     test('a merged partition starts a fresh batch on its own linger', async () => {
-      const { accumulator, sent } = createAccumulator({
+      const { accumulator, calls, sent } = createAccumulator({
         linger: MERGE_LINGER,
         leaderOf: ledByOne({ 0: 1, 1: 1 }),
       })
@@ -1191,11 +1200,11 @@ describe('Producer > the accumulator', () => {
       await jest.advanceTimersByTimeAsync(1)
       append(accumulator, records(1, 'b'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(await sent()).toHaveLength(1)
+      expect(calls).toHaveLength(1)
 
       append(accumulator, records(1, 'c'))
       await jest.advanceTimersByTimeAsync(MERGE_LINGER - 1)
-      expect(await sent()).toHaveLength(1)
+      expect(calls).toHaveLength(1)
       await jest.advanceTimersByTimeAsync(1)
 
       expect(await sent()).toEqual([[batchOf(0, 'a-0'), batchOf(1, 'b-0')], [batchOf(1, 'c-0')]])
@@ -1521,7 +1530,7 @@ describe('Producer > the accumulator', () => {
       const shared = []
       const sendPartitioned = jest.fn((request) => {
         const batches = request.batches.filter(({ partition }) => partition === 0)
-        shared.push(sentRecords({ batches }))
+        shared.push(takeSent({ batches }))
         return settle(request)
       })
       const { accumulator } = createAccumulator({ sendPartitioned })
@@ -1533,7 +1542,7 @@ describe('Producer > the accumulator', () => {
         LINGER
       )
 
-      const read = (await Promise.all(shared)).flat()
+      const read = (await Promise.all(shared.map((sent) => sent.read()))).flat()
       expect(read.map(({ records }) => records.map(textOf))).toEqual([['a-0', 'c-0']])
       expect(partly).toBeInstanceOf(KafkaJSDeliveryTimeout)
       expect(partly).toMatchObject({ outcome: 'unknown' })
@@ -1875,14 +1884,14 @@ describe('Producer > the accumulator', () => {
       ['an idempotent: false producer', false],
     ])('%s', (_, idempotent) => {
       test('without linger or batchSize, sends wait 5 ms and go out together, batches up to 16384 bytes', async () => {
-        const { producer, produced } = createLingeringProducer({ idempotent })
+        const { producer, requested, produced } = createLingeringProducer({ idempotent })
         await producer.connect()
 
         const sends = ['a', 'b'].map((value) =>
           producer.send({ topic: TOPIC, messages: [{ value }] })
         )
         await jest.advanceTimersByTimeAsync(4)
-        expect(await produced()).toEqual([])
+        expect(requested()).toEqual([])
         await settledWithin(Promise.all(sends), 1)
         expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
           ['a', 'b'],
@@ -1890,7 +1899,7 @@ describe('Producer > the accumulator', () => {
 
         const full = producer.send({ topic: TOPIC, messages: [{ value: 'x'.repeat(16383) }] })
         await jest.advanceTimersByTimeAsync(0)
-        expect(await produced()).toHaveLength(1)
+        expect(requested()).toHaveLength(1)
         producer.send({ topic: TOPIC, messages: [{ value: 'y' }] })
         await jest.advanceTimersByTimeAsync(0)
         expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([
@@ -2132,14 +2141,14 @@ describe('Producer > the accumulator', () => {
       })
 
       test('connect() after disconnect() accumulates and sends again', async () => {
-        const { producer, produced } = createLingeringProducer({ idempotent })
+        const { producer, requested, produced } = createLingeringProducer({ idempotent })
         await producer.connect()
         await settledWithin(producer.disconnect())
         await producer.connect()
 
         const sent = producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })
         await jest.advanceTimersByTimeAsync(0)
-        expect(await produced()).toEqual([])
+        expect(requested()).toEqual([])
 
         await expect(settledWithin(sent, LINGER)).resolves.toHaveLength(1)
         expect((await produced()).map(({ partitions }) => partitions[0].values)).toEqual([['a']])
@@ -2337,11 +2346,11 @@ describe('Producer > the accumulator', () => {
         }
       }
 
-      const partitionsSent = async (produced) =>
-        (await produced()).map(({ partitions }) => partitions.map(({ partition }) => partition))
+      const partitionsSent = (requested) =>
+        requested().map(({ partitions }) => partitions.map(({ partition }) => partition))
 
       test('a partition answered with a non-retriable error rejects only the sends its batch carries', async () => {
-        const { producer, produced } = createLingeringProducer({
+        const { producer, requested } = createLingeringProducer({
           idempotent: false,
           createPartitioner:
             () =>
@@ -2361,11 +2370,11 @@ describe('Producer > the accumulator', () => {
         ])
         expect(await a).toBeInstanceOf(KafkaJSProtocolError)
         expect(await a).toMatchObject({ code: MESSAGE_TOO_LARGE, partition: 0 })
-        expect(await partitionsSent(produced)).toEqual([[0, 1]])
+        expect(partitionsSent(requested)).toEqual([[0, 1]])
       })
 
       test('only a partition answered with a retriable error is sent again; one answered OK is written once', async () => {
-        const { producer, produced } = createLingeringProducer({
+        const { producer, requested } = createLingeringProducer({
           idempotent: false,
           createPartitioner:
             () =>
@@ -2385,13 +2394,13 @@ describe('Producer > the accumulator', () => {
           [expect.objectContaining({ partition: 0 })],
           [expect.objectContaining({ partition: 1 })],
         ])
-        expect(await partitionsSent(produced)).toEqual([[0, 1], [0], [0]])
+        expect(partitionsSent(requested)).toEqual([[0, 1], [0], [0]])
       })
 
       test('a partition missing from the answer is sent again', async () => {
         const answer = answering(() => 0)
         let count = 0
-        const { producer, produced } = createLingeringProducer({
+        const { producer, requested } = createLingeringProducer({
           idempotent: false,
           createPartitioner:
             () =>
@@ -2416,11 +2425,11 @@ describe('Producer > the accumulator', () => {
           [expect.objectContaining({ partition: 0 })],
           [expect.objectContaining({ partition: 1, baseOffset: '0' })],
         ])
-        expect(await partitionsSent(produced)).toEqual([[0, 1], [1]])
+        expect(partitionsSent(requested)).toEqual([[0, 1], [1]])
       })
 
       test('a broker that cannot be reached leaves only its own partitions for the next attempt', async () => {
-        const { cluster, producer, produced } = createLingeringProducer({
+        const { cluster, producer, requested } = createLingeringProducer({
           idempotent: false,
           createPartitioner:
             () =>
@@ -2448,14 +2457,14 @@ describe('Producer > the accumulator', () => {
           expect.objectContaining({ partition: 0 }),
         ])
         expect(await settledWithin(b, 200)).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
-        expect(await partitionsSent(produced)).toEqual([[0]])
+        expect(partitionsSent(requested)).toEqual([[0]])
         expect(
           cluster.findBroker.mock.calls.filter(([{ nodeId }]) => Number(nodeId) === 1)
         ).toHaveLength(4)
       })
 
       test('a broker lookup that fails for good rejects only that broker’s partitions, at once, while the others retry', async () => {
-        const { cluster, producer, produced } = createLingeringProducer({
+        const { cluster, producer, requested } = createLingeringProducer({
           idempotent: false,
           partitions: 3,
           createPartitioner:
@@ -2488,12 +2497,12 @@ describe('Producer > the accumulator', () => {
         expect(b).toBe(refused)
         expect(a).toEqual([expect.objectContaining({ partition: 0 })])
         expect(c).toEqual([expect.objectContaining({ partition: 2 })])
-        expect(await partitionsSent(produced)).toEqual([[0, 2], [2]])
+        expect(partitionsSent(requested)).toEqual([[0, 2], [2]])
         expect(cluster.findBroker).toHaveBeenCalledTimes(4)
       })
 
       test('a topic that has lost its metadata leaves only its own partitions for the next attempt', async () => {
-        const { cluster, producer, produced } = createLingeringProducer({
+        const { cluster, producer, requested } = createLingeringProducer({
           idempotent: false,
           produce: answering(() => 0),
         })
@@ -2516,7 +2525,7 @@ describe('Producer > the accumulator', () => {
             topicData.map(({ topic }) => topic)
           )
         ).toEqual([[TOPIC], [OTHER_TOPIC]])
-        expect(await produced()).toHaveLength(2)
+        expect(requested()).toHaveLength(2)
       })
 
       test('the delivery deadline counts from the send, through the wait for its metadata', async () => {
@@ -2601,14 +2610,14 @@ describe('Producer > the accumulator', () => {
             .send({ topic: TOPIC, messages: [{ partition, value: `p${partition}` }] })
             .catch((e) => e)
 
-        const partitionsSent = async (produced) =>
-          (await produced()).map(({ partitions }) => partitions.map(({ partition }) => partition))
+        const partitionsSent = (requested) =>
+          requested().map(({ partitions }) => partitions.map(({ partition }) => partition))
 
         const lateMessage = (partition) =>
           `Gave up on ${TOPIC} partition ${partition} before sending it: its ${DEADLINE} ms delivery deadline passed`
 
         test('a batch pulled in from another partition is sent when only the oldest batch is past its deadline', async () => {
-          const { producer, produced } = agingProducer()
+          const { producer, requested } = agingProducer()
           await producer.connect()
 
           const older = sendTo(producer, 0)
@@ -2623,11 +2632,11 @@ describe('Producer > the accumulator', () => {
           expect(late).toBeInstanceOf(KafkaJSDeliveryTimeout)
           expect(late.message).toEqual(lateMessage(0))
           expect(sent).toEqual([expect.objectContaining({ partition: 1 })])
-          expect(await partitionsSent(produced)).toEqual([[1]])
+          expect(partitionsSent(requested)).toEqual([[1]])
         })
 
         test('a batch for another broker is left to its own linger and is sent', async () => {
-          const { producer, produced } = agingProducer({
+          const { producer, requested } = agingProducer({
             cachedLeader: (_, partition) => partition,
           })
           await producer.connect()
@@ -2644,16 +2653,16 @@ describe('Producer > the accumulator', () => {
             expect.objectContaining({ message: lateMessage(0) })
           )
           expect(youngerSettled()).toBe(false)
-          expect(await partitionsSent(produced)).toEqual([])
+          expect(partitionsSent(requested)).toEqual([])
 
           expect(await settledWithin(younger, 1)).toEqual([
             expect.objectContaining({ partition: 1 }),
           ])
-          expect(await partitionsSent(produced)).toEqual([[1]])
+          expect(partitionsSent(requested)).toEqual([[1]])
         })
 
         test('two batches that are both due go out together when only the older is past its deadline', async () => {
-          const { producer, produced } = agingProducer({
+          const { producer, requested } = agingProducer({
             cachedLeader: (_, partition) => partition,
           })
           await producer.connect()
@@ -2670,7 +2679,7 @@ describe('Producer > the accumulator', () => {
           expect(late).toBeInstanceOf(KafkaJSDeliveryTimeout)
           expect(late.message).toEqual(lateMessage(0))
           expect(sent).toEqual([expect.objectContaining({ partition: 1 })])
-          expect(await partitionsSent(produced)).toEqual([[1]])
+          expect(partitionsSent(requested)).toEqual([[1]])
         })
 
         test('the batches that are sent each retry until their own delivery deadline', async () => {
@@ -2706,7 +2715,7 @@ describe('Producer > the accumulator', () => {
       })
 
       test('a partition the metadata does not list yet waits for it within its retries', async () => {
-        const { cluster, producer, produced } = createLingeringProducer({
+        const { cluster, producer, requested } = createLingeringProducer({
           idempotent: false,
           produce: answering(() => 0),
         })
@@ -2720,11 +2729,11 @@ describe('Producer > the accumulator', () => {
 
         await expect(settledWithin(sent, 100)).resolves.toHaveLength(1)
         expect(lookups).toBe(2)
-        expect(await produced()).toHaveLength(1)
+        expect(requested()).toHaveLength(1)
       })
 
       test('a hand-off whose topic has lost its metadata waits for it within its retries', async () => {
-        const { cluster, producer, produced } = createLingeringProducer({ idempotent: false })
+        const { cluster, producer, requested } = createLingeringProducer({ idempotent: false })
         const { findTopicPartitionMetadata } = cluster
         let lookups = 0
         cluster.findTopicPartitionMetadata = (topic) =>
@@ -2738,7 +2747,7 @@ describe('Producer > the accumulator', () => {
         ])
         expect(lookups).toBe(3)
         expect(cluster.refreshMetadata).toHaveBeenCalled()
-        expect(await produced()).toHaveLength(1)
+        expect(requested()).toHaveLength(1)
       })
 
       test('a send whose records an older batch carries rejects once every partition it wrote to has settled', async () => {
@@ -3265,7 +3274,7 @@ describe('Producer > the accumulator', () => {
          */
         const expireInBackoff = async (level) => {
           let failed = 0
-          const { cluster, producer, produced } = transactionalProducer({
+          const { cluster, producer, requested, produced } = transactionalProducer({
             level,
             linger: 5,
             deliveryTimeout: 300,
@@ -3295,7 +3304,7 @@ describe('Producer > the accumulator', () => {
           expect(error.outcome).toBe('unsent')
           expect(error.cause).toBeUndefined()
           expect(failed).toBe(3)
-          expect(await produced()).toEqual([])
+          expect(requested()).toEqual([])
           return { cluster, producer, produced, transaction }
         }
 

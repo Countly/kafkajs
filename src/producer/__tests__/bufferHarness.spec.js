@@ -1,4 +1,6 @@
-const { owned, sentRecords } = require('./fixtures/bufferHarness')
+const buildRecordBatch = require('../../protocol/requests/produce/buildRecordBatch')
+const { Types: Compression } = require('../../protocol/message/compression')
+const { owned, readBatch, sentRecords, takeSent } = require('./fixtures/bufferHarness')
 
 describe('Producer > fixtures > bufferHarness', () => {
   test('owned gives the records a batch holds, the same values in the same order', () => {
@@ -93,5 +95,74 @@ describe('Producer > fixtures > bufferHarness', () => {
     const [{ records }] = await read
 
     expect(records.map(({ value }) => String(value))).toEqual(['kept'])
+  })
+
+  test('takeSent gives every batch’s place, first sequence and record count at once, without decoding', () => {
+    const sent = takeSent({
+      topicData: [
+        {
+          topic: 'topic-a',
+          partitions: [
+            { partition: 3, firstSequence: 4, messages: [{ value: 'a' }, { value: 'b' }] },
+            { partition: 1, messages: [{ value: 'c' }] },
+          ],
+        },
+      ],
+    })
+
+    expect(sent.batches).toEqual([
+      { topic: 'topic-a', partition: 3, firstSequence: 4, count: 2 },
+      { topic: 'topic-a', partition: 1, firstSequence: undefined, count: 1 },
+    ])
+    expect(sent.read()).toBe(sent.read())
+  })
+
+  test('takeSent fixes every batch at the call: later changes to any batch list, record or buffer are not read', async () => {
+    const buffer = Buffer.from('first')
+    const second = { value: 'second', timestamp: 2 }
+    const head = [{ value: buffer, timestamp: 1 }]
+    const tail = [second]
+    const sent = takeSent({
+      topicData: [
+        {
+          topic: 'topic-a',
+          partitions: [
+            { partition: 1, messages: head },
+            { partition: 0, messages: tail },
+          ],
+        },
+      ],
+    })
+    buffer.fill('x')
+    head.push({ value: 'later' })
+    second.value = 'changed'
+    tail.length = 0
+
+    const read = await sent.read()
+
+    expect(read.map(({ topic, partition }) => [topic, partition])).toEqual([
+      ['topic-a', 1],
+      ['topic-a', 0],
+    ])
+    expect(read.map(({ records }) => records.map(({ value }) => String(value)))).toEqual([
+      ['first'],
+      ['second'],
+    ])
+  })
+
+  test('readBatch refuses a batch with one payload byte changed under its CRC', async () => {
+    const { buffer } = await buildRecordBatch({
+      compression: Compression.None,
+      messages: [{ value: 'payload', timestamp: 1 }],
+    })
+    const intact = Buffer.from(buffer)
+    const changed = Buffer.from(buffer)
+    changed[changed.indexOf(Buffer.from('payload'))] ^= 0xff
+
+    expect((await readBatch(intact)).records.map(({ value }) => String(value))).toEqual(['payload'])
+    await expect(readBatch(changed)).rejects.toMatchObject({
+      name: 'KafkaJSCorruptRecordError',
+      reason: 'checksum',
+    })
   })
 })
