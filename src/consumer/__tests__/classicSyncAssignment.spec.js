@@ -97,20 +97,27 @@ describe('Consumer > classic group answers no coordinator sends', () => {
   /**
    * A classic consumer group whose coordinator is a real broker over a scripted socket. Each
    * JoinGroup and SyncGroup takes the next answer of its list.
-   * @param {{ joins: Buffer[], syncs: Buffer[], retries?: number, logger?: object,
-   *   syncMaxVersion?: number }} script
+   * @param {{ joins: Buffer[], syncs: Buffer[], retries?: number, maxTotalTime?: number,
+   *   logger?: object, syncMaxVersion?: number }} script
    * @returns {{ group: ConsumerGroup, apis: () => number[], joinedAs: () => string[],
    *   syncVersions: () => number[] }} `apis` is the API key of every request written, `joinedAs`
    *   the member id of every JoinGroup, `syncVersions` the version of every SyncGroup
    */
-  const exchange = ({ joins, syncs, retries = 1, logger = newLogger(), syncMaxVersion = 3 }) => {
+  const exchange = ({
+    joins,
+    syncs,
+    retries = 1,
+    maxTotalTime,
+    logger = newLogger(),
+    syncMaxVersion = 3,
+  }) => {
     const harness = createGroupApiBroker({
       versions: versionsUpTo(syncMaxVersion),
       respond: ({ apiKey }) => (apiKey === apiKeys.JoinGroup ? joins : syncs).shift(),
     })
     harnesses.push(harness)
     const group = new ConsumerGroup({
-      retry: { retries },
+      retry: { retries, ...(maxTotalTime === undefined ? {} : { maxTotalTime }) },
       cluster: {
         connect: async () => {},
         refreshMetadata: async () => {},
@@ -373,6 +380,25 @@ describe('Consumer > classic group answers no coordinator sends', () => {
       `Group ${GROUP_ID} member ${MEMBER}: the join retries ran out on an answer no coordinator sends: SyncGroup response carries an assignment shorter than its version`
     )
     expect(apis()).toEqual([JOIN, SYNC, JOIN, SYNC])
+  })
+
+  test('an assignment refused until retry.maxTotalTime would pass fails the join the same way', async () => {
+    const { group, apis } = exchange({
+      // The first backoff is longer than 1 ms, so the deadline ends the join after one attempt.
+      retries: 5,
+      maxTotalTime: 1,
+      joins: [joinAnswer()],
+      syncs: [syncAnswer(Buffer.from([0]))],
+    })
+
+    const failure = await group.joinAndSync().catch((error) => error)
+
+    expect(failure).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(failure).toMatchObject({ retriable: false, cause: undefined })
+    expect(failure.message).toBe(
+      `Group ${GROUP_ID} member ${MEMBER}: the join retries ran out on an answer no coordinator sends: SyncGroup response carries an assignment shorter than its version`
+    )
+    expect(apis()).toEqual([JOIN, SYNC])
   })
 
   test('an assignment of a later version with bytes after its user data is applied from the fields this member reads', async () => {

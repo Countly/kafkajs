@@ -5778,6 +5778,7 @@
         "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment naming partition -1 is refused and the member joins again",
         "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment of a later version with bytes after its user data is applied from the fields this member reads",
         "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment refused on every attempt fails the join once the retries run out, naming the refusal",
+        "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment refused until retry.maxTotalTime would pass fails the join the same way",
         "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment row with a null partition list is refused and the member joins again",
         "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment row with an empty partition list is applied with no partitions of that topic",
         "src/consumer/__tests__/classicSyncAssignment.spec.js \u203a Consumer > classic group answers no coordinator sends an assignment row with an empty topic is refused and the member joins again",
