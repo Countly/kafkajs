@@ -91,7 +91,10 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
     socket.destroy = (error) => {
       if (!socket.destroyed) {
         socket.destroyed = true
-        clearImmediate(connecting)
+        if (connecting) {
+          clearImmediate(connecting)
+          connecting = null
+        }
         queueMicrotask(() => {
           if (error) {
             socket.emit('error', error)
@@ -108,7 +111,11 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
     state.issuedByEndpoint.set(key, (state.issuedByEndpoint.get(key) ?? 0) + 1)
     state.socket = socket
     state.sockets.push(socket)
-    connecting = setImmediate(onConnect)
+    // Held only until it runs: an Immediate keeps the async context it was created in.
+    connecting = setImmediate(() => {
+      connecting = null
+      onConnect()
+    })
     return socket
   }
 
