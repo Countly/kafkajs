@@ -629,22 +629,28 @@ describe('Consumer > how a classic run ends', () => {
 
   describe('a poll-interval expiry while the handler is stuck', () => {
     /**
-     * Starts a member whose first handler call parks on `held` (and then throws `error`, if
-     * given), and waits for the expiry.
+     * Starts a member whose first handler call parks on `held` and then runs `settle`, and waits
+     * for the expiry.
      * @param {object} [options]
+     * @param {object} [options.retry] the consumer's retry options
+     * @param {(payload: object, run: object) => Promise<void>} [options.settle] what the first
+     *   handler call does once `held` resolves
      * @param {(run: object) => void} [options.beforeExpiry] runs once the member is started
      */
-    const expire = async ({ instance = false, error, beforeExpiry } = {}) => {
+    const expire = async ({ instance = false, retry, settle, beforeExpiry } = {}) => {
+      const ref = {}
       const run = await begin({
         instance,
+        retry,
         config: { maxPollInterval: 4000, heartbeatInterval: 500 },
         records: { 'topic-a|0': [40] },
-        eachMessage: async (_payload, held, call) => {
+        eachMessage: async (payload, held, call) => {
           if (call !== 1) return
           await held.promise
-          if (error) throw error
+          await settle?.(payload, ref.run)
         },
       })
+      ref.run = run
       beforeExpiry?.(run)
       await advanceUntil(() => trail(run).includes('POLL_INTERVAL_EXCEEDED'), 10000)
       return run
@@ -676,8 +682,110 @@ describe('Consumer > how a classic run ends', () => {
       30000
     )
 
-    it('then a failure of that handler is taken by the rejoin: no CRASH, no commit, one LeaveGroup', async () => {
-      const run = await expire({ error: failure(false) })
+    it.each([
+      ['a non-retriable', 'KafkaJSNonRetriableError', () => failure(false)],
+      ['a TypeError', 'KafkaJSNonRetriableError', () => new TypeError('the handler failed')],
+      ['a retriable', 'KafkaJSNumberOfRetriesExceeded', () => failure(true)],
+      ['a plain Error', 'KafkaJSNumberOfRetriesExceeded', () => new Error('the handler failed')],
+    ])(
+      'then %s failure of that handler is reported after the rejoin as %s: one CRASH, restartOnFailure asked once, no commit and a second LeaveGroup from the crash cleanup',
+      async (_kind, wrapper, make) => {
+        const error = make()
+        const policy = jest.fn(async () => false)
+        const run = await expire({
+          retry: { ...RETRY, restartOnFailure: policy },
+          settle: async () => {
+            throw error
+          },
+        })
+        await jest.advanceTimersByTimeAsync(1000)
+        expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
+        expect(run.crashes).toEqual([])
+
+        run.held.resolve()
+        await advanceUntil(() => run.crashes.length > 0, 5000)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(trail(run)).toEqual([
+          'POLL_INTERVAL_EXCEEDED',
+          'leave member-1 null',
+          'final commit',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          'CRASH restart false',
+        ])
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+        expect(run.delivered).toEqual(['0|40'])
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.name).toBe(wrapper)
+        expect(run.crashes[0].error.cause).toBe(error)
+        expect(policy).toHaveBeenCalledTimes(1)
+        expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
+        expect(run.started).toMatchObject({ done: true, value: undefined })
+        expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+
+    it('then a retriable failure each time the handler overruns spends one retry per rejoin, and CRASH reports KafkaJSNumberOfRetriesExceeded once the retries run out', async () => {
+      const error = failure(true)
+      const policy = jest.fn(async () => false)
+      const run = await begin({
+        config: { maxPollInterval: 4000, heartbeatInterval: 500 },
+        retry: { ...RETRY, retries: 1, restartOnFailure: policy },
+        records: { 'topic-a|0': [40] },
+        eachMessage: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 6000))
+          throw error
+        },
+      })
+      await advanceUntil(() => run.delivered.length === 2, 15000)
+
+      expect(run.crashes).toEqual([])
+      expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+
+      await advanceUntil(() => run.crashes.length > 0, 15000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(trail(run)).toEqual([
+        'POLL_INTERVAL_EXCEEDED',
+        'leave member-1 null',
+        'POLL_INTERVAL_EXCEEDED',
+        'leave member-1 null',
+        'final commit',
+        'leave member-1 null',
+        'STOP',
+        'DISCONNECT',
+        'CRASH restart false',
+      ])
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+      expect(run.delivered).toEqual(['0|40', '0|40'])
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+      expect(run.crashes[0].error.cause).toBe(error)
+      expect(run.crashes[0].error.retryCount).toBe(1)
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
+      expect(jest.getTimerCount()).toBe(0)
+    }, 60000)
+
+    it('then a failure of that handler rethrowing the refusal of its own commit stays part of the rejoin: no CRASH, and the record is redelivered', async () => {
+      let refused = null
+      const policy = jest.fn(async () => false)
+      const run = await expire({
+        retry: { ...RETRY, restartOnFailure: policy },
+        settle: async ({ topic, partition }, started) => {
+          try {
+            await started.consumer.commitOffsets([{ topic, partition, offset: '41' }])
+          } catch (error) {
+            refused = error
+            throw error
+          }
+        },
+      })
       await jest.advanceTimersByTimeAsync(1000)
       expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
 
@@ -685,10 +793,12 @@ describe('Consumer > how a classic run ends', () => {
       await advanceUntil(() => run.delivered.length === 2, 5000)
       await jest.advanceTimersByTimeAsync(1000)
 
+      expect(refused?.name).toBe('KafkaJSCommitFailedError')
       expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
       expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
       expect(run.delivered).toEqual(['0|40', '0|40'])
       expect(run.crashes).toEqual([])
+      expect(policy).not.toHaveBeenCalled()
       await closeClean(run)
     }, 30000)
 
@@ -917,7 +1027,7 @@ describe('Consumer > how a classic run ends', () => {
   })
 
   describe('a REBALANCE_IN_PROGRESS heartbeat answer while the handler runs', () => {
-    it('then a non-retriable failure of that handler is taken by the eager rejoin: no CRASH, and the record is redelivered', async () => {
+    it('then a non-retriable failure of that handler is reported after the eager rejoin: one CRASH carries it, nothing is redelivered and the crash cleanup leaves the new membership', async () => {
       const error = failure(false)
       const policy = jest.fn(async () => false)
       const run = await begin({
@@ -941,15 +1051,25 @@ describe('Consumer > how a classic run ends', () => {
       expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
 
       run.held.resolve()
-      await advanceUntil(() => run.delivered.length === 3, 2000)
+      await advanceUntil(() => run.crashes.length > 0, 2000)
       await jest.advanceTimersByTimeAsync(1000)
 
-      expect(trail(run)).toEqual(['commit topic-a|0 41'])
+      expect(trail(run)).toEqual([
+        'commit topic-a|0 41',
+        'final commit',
+        'leave member-1 null',
+        'STOP',
+        'DISCONNECT',
+        'CRASH restart false',
+      ])
       expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
-      expect(run.delivered).toEqual(['0|40', '0|41', '0|41'])
-      expect(run.crashes).toEqual([])
-      expect(policy).not.toHaveBeenCalled()
-      await closeClean(run)
+      expect(run.delivered).toEqual(['0|40', '0|41'])
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error.name).toBe('KafkaJSNonRetriableError')
+      expect(run.crashes[0].error.cause).toBe(error)
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
+      expect(jest.getTimerCount()).toBe(0)
     }, 30000)
   })
 
@@ -1196,6 +1316,76 @@ describe('Consumer > how a consumer-protocol run ends', () => {
     ).toEqual([['KafkaJSNonRetriableError', true, false]])
     expect(leaves(run)).toEqual([-1, -1])
     expect(run.calls).toEqual(['40'])
+    expect(jest.getTimerCount()).toBe(0)
+  }, 60000)
+
+  it.each([
+    ['a retriable', 'KafkaJSNumberOfRetriesExceeded', () => failure(true)],
+    ['a TypeError', 'KafkaJSNonRetriableError', () => new TypeError('the handler failed')],
+    ['a plain Error', 'KafkaJSNumberOfRetriesExceeded', () => new Error('the handler failed')],
+  ])(
+    'a poll expiry, then %s failure of the stuck handler: the member rejoins first and then CRASH reports it as %s, restartOnFailure is asked once, with a second leave from the crash cleanup',
+    async (_kind, wrapper, make) => {
+      const failed = make()
+      const policy = jest.fn(async () => false)
+      const run = await begin(
+        async (_payload, held, call) => {
+          if (call !== 1) return
+          await held.promise
+          throw failed
+        },
+        { retry: { ...RETRY, restartOnFailure: policy } }
+      )
+      const joins = beats(run, false)
+      await advanceUntil(() => leaves(run).length === 1, 10000)
+      await jest.advanceTimersByTimeAsync(500)
+      expect(run.crashes).toEqual([])
+
+      run.held.resolve()
+      await advanceUntil(() => run.crashes.length > 0, 5000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(beats(run, false)).toBe(joins + 1)
+      expect(
+        run.crashes.map(({ error, restart }) => [error.name, error.cause === failed, restart])
+      ).toEqual([[wrapper, true, false]])
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
+      expect(leaves(run)).toEqual([-1, -1])
+      expect(run.calls).toEqual(['40'])
+      expect(jest.getTimerCount()).toBe(0)
+    },
+    60000
+  )
+
+  it('a retriable failure each time the stuck handler overruns spends one retry per rejoin, and CRASH reports KafkaJSNumberOfRetriesExceeded once the retries run out', async () => {
+    const failed = failure(true)
+    const policy = jest.fn(async () => false)
+    const run = await begin(
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 6000))
+        throw failed
+      },
+      { retry: { ...RETRY, retries: 1, restartOnFailure: policy } }
+    )
+    const joins = beats(run, false)
+    await advanceUntil(() => run.calls.length === 2, 15000)
+
+    expect(run.crashes).toEqual([])
+    expect(leaves(run)).toEqual([-1])
+    expect(beats(run, false)).toBe(joins + 1)
+
+    await advanceUntil(() => run.crashes.length > 0, 15000)
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(
+      run.crashes.map(({ error, restart }) => [error.name, error.cause === failed, restart])
+    ).toEqual([['KafkaJSNumberOfRetriesExceeded', true, false]])
+    expect(run.crashes[0].error.retryCount).toBe(1)
+    expect(policy).toHaveBeenCalledTimes(1)
+    expect(beats(run, false)).toBe(joins + 2)
+    expect(leaves(run)).toEqual([-1, -1, -1])
+    expect(run.calls).toEqual(['40', '40'])
     expect(jest.getTimerCount()).toBe(0)
   }, 60000)
 })
