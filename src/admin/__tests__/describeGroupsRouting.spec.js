@@ -10,7 +10,12 @@ const Encoder = require('../../protocol/encoder')
 const Decoder = require('../../protocol/decoder')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
-const { KafkaJSConnectionError, KafkaJSError } = require('../../errors')
+const {
+  KafkaJSConnectionError,
+  KafkaJSError,
+  KafkaJSRequestTimeoutError,
+  KafkaJSTimeout,
+} = require('../../errors')
 
 const GROUP_ID_NOT_FOUND = 69
 const UNSUPPORTED_VERSION = 35
@@ -1799,12 +1804,12 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
   const sent = () => harness.requests.map(({ apiKey, body }) => [apiKey, askedIn(body)])
 
   test.each([
-    ['COORDINATOR_LOAD_IN_PROGRESS', COORDINATOR_LOAD_IN_PROGRESS, ['a', 'b']],
-    ['COORDINATOR_NOT_AVAILABLE', COORDINATOR_NOT_AVAILABLE, ['a', 'b', 'b']],
-    ['NOT_COORDINATOR', NOT_COORDINATOR, ['a', 'b', 'b']],
+    ['COORDINATOR_LOAD_IN_PROGRESS', COORDINATOR_LOAD_IN_PROGRESS, ['a', 'b'], 0],
+    ['COORDINATOR_NOT_AVAILABLE', COORDINATOR_NOT_AVAILABLE, ['a', 'b', 'b'], 1],
+    ['NOT_COORDINATOR', NOT_COORDINATOR, ['a', 'b', 'b'], 1],
   ])(
     'keeps the group an answer describes when the same answer gives its sibling %s, and asks again only for the sibling',
-    async (_name, code, lookups) => {
+    async (_name, code, lookups, refreshes) => {
       const { admin, found, cluster } = adminOver((asked, index) =>
         asked.map((groupId) =>
           index === 0 && groupId === 'b'
@@ -1822,8 +1827,8 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
         [apiKeys.DescribeGroups, ['b']],
       ])
       expect(found).toEqual(lookups)
-      // The lookup finds a moved coordinator by itself; no metadata request is added.
-      expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+      // A move refreshes metadata once before the moved id is looked up again; a load does not.
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(refreshes)
       expect(
         outcome.value.groups.map(({ groupId, groupType, errorCode, members }) => [
           groupId,
@@ -1889,7 +1894,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
   })
 
   /** `a` routed to node 0 and every other id to node 1, each node with its own stubs. */
-  const twoCoordinators = (forA, forOthers) => {
+  const twoCoordinators = (forA, forOthers, adminOptions = {}) => {
     const found = []
     const nodes = [
       { nodeId: 0, describeGroups: jest.fn(), ...forA },
@@ -1902,7 +1907,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
         return nodes[groupId === 'a' ? 0 : 1]
       }),
     }
-    const admin = createAdmin({ logger: newLogger(), retry: tenMsRetry, cluster })
+    const admin = createAdmin({ logger: newLogger(), retry: tenMsRetry, cluster, ...adminOptions })
     return { admin, cluster, found, nodes }
   }
 
@@ -2145,5 +2150,251 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
     expect(nodes[1].consumerGroupDescribe).toHaveBeenCalledTimes(2)
     // The retry waits for the 50 ms request of the other coordinator, then the 10 ms backoff.
     expect(askedAt[1]).toBeGreaterThanOrEqual(60)
+  })
+
+  test('asks every unresolved id again after the request of one coordinator times out', async () => {
+    const started = performance.now()
+    const askedAt = []
+    const { admin, nodes } = twoCoordinators(
+      {
+        consumerGroupDescribe: jest.fn(async ({ groupIds }) => {
+          if (nodes[0].consumerGroupDescribe.mock.calls.length === 1) {
+            await after(50)
+            throw new KafkaJSRequestTimeoutError('Request ConsumerGroupDescribe timed out')
+          }
+          return { groups: groupIds.map((groupId) => consumerGroupRow(groupId)) }
+        }),
+      },
+      {
+        consumerGroupDescribe: jest.fn(async ({ groupIds }) => {
+          askedAt.push(performance.now() - started)
+          return {
+            groups: groupIds.map((groupId) =>
+              askedAt.length === 1
+                ? { ...consumerGroupRow(groupId), errorCode: COORDINATOR_LOAD_IN_PROGRESS }
+                : consumerGroupRow(groupId)
+            ),
+          }
+        }),
+      }
+    )
+
+    const outcome = observe(admin.describeGroups(['a', 'b']))
+    await driveUntilSettled(outcome)
+
+    expect(outcome.error).toBeUndefined()
+    expect(nodes[0].consumerGroupDescribe).toHaveBeenCalledTimes(2)
+    expect(nodes[1].consumerGroupDescribe).toHaveBeenCalledTimes(2)
+    expect(askedAt[1]).toBeGreaterThanOrEqual(60)
+    expect(outcome.value.groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
+      ['a', 0],
+      ['b', 0],
+    ])
+  })
+
+  test('ends the call with the GROUP_AUTHORIZATION_FAILED one coordinator answered before the deadline while the request of another is held past it', async () => {
+    let releaseA
+    const heldA = new Promise((resolve) => {
+      releaseA = resolve
+    })
+    const { admin, nodes } = twoCoordinators(
+      {
+        consumerGroupDescribe: notConsumerGroups,
+        describeGroups: jest.fn(() => heldA),
+      },
+      {
+        consumerGroupDescribe: notConsumerGroups,
+        describeGroups: jest.fn(async ({ groupIds }) => {
+          await after(10)
+          return parseDescribeGroupsV6({
+            groups: groupIds.map((groupId) => ({
+              ...classicGroupRow(groupId),
+              errorCode: GROUP_AUTHORIZATION_FAILED,
+              members: [],
+            })),
+          })
+        }),
+      },
+      { apiTimeout: 50 }
+    )
+
+    const outcome = observe(admin.describeGroups(['a', 'b']))
+    await driveUntilSettled(outcome)
+
+    expect(outcome.error).toMatchObject({
+      name: 'KafkaJSNonRetriableError',
+      type: 'GROUP_AUTHORIZATION_FAILED',
+      code: GROUP_AUTHORIZATION_FAILED,
+    })
+
+    // The held request answers late: nothing changes and nothing is sent again.
+    releaseA({ groups: [classicGroupRow('a')] })
+    for (let step = 0; step < 5; step++) {
+      await new Promise(setImmediate)
+      await jest.advanceTimersByTimeAsync(100)
+    }
+    expect(outcome.error).toMatchObject({ code: GROUP_AUTHORIZATION_FAILED })
+    expect(outcome.value).toBeUndefined()
+    expect(nodes[0].describeGroups).toHaveBeenCalledTimes(1)
+    expect(nodes[1].describeGroups).toHaveBeenCalledTimes(1)
+  })
+
+  test('does not start the classic fallback once the deadline passed during the consumer-protocol request', async () => {
+    const { admin, nodes } = twoCoordinators(
+      {
+        consumerGroupDescribe: jest.fn(async (request) => {
+          await after(40)
+          return notConsumerGroups(request)
+        }),
+        describeGroups: jest.fn(async ({ groupIds }) => ({
+          groups: groupIds.map(classicGroupRow),
+        })),
+      },
+      {},
+      { apiTimeout: 30 }
+    )
+
+    const outcome = observe(admin.describeGroups(['a']))
+    await driveUntilSettled(outcome)
+    for (let step = 0; step < 5; step++) {
+      await new Promise(setImmediate)
+      await jest.advanceTimersByTimeAsync(100)
+    }
+
+    expect(outcome.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(outcome.value).toBeUndefined()
+    expect(nodes[0].consumerGroupDescribe).toHaveBeenCalledTimes(1)
+    expect(nodes[0].describeGroups).not.toHaveBeenCalled()
+  })
+})
+
+describe('Admin > describeGroups > a coordinator node that moved to another address', () => {
+  const { Kafka } = require('../../..')
+  const Broker = require('../../broker')
+  const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+
+  // The scripted sockets deliver data and closes through queueMicrotask, which must stay real.
+  beforeEach(() => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+  })
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+  })
+
+  const A = { id: 0, host: 'node-a', port: 9092 }
+  const OLD = { id: 1, host: 'node-b-old', port: 9092 }
+  const NEW = { id: 1, host: 'node-b-new', port: 9092 }
+
+  /**
+   * A real Kafka admin over a cluster whose node 1 is the coordinator of every group, at `OLD`
+   * until `state.moved`, then at `NEW`; both addresses stay up and answer as node 1. Metadata and
+   * FindCoordinator name node 1 at its current address. ConsumerGroupDescribe is answered by
+   * `answer(host, groupId, call)` on the real broker the client picked, by that broker's address.
+   */
+  const movingCluster = (answer) => {
+    const state = { moved: false }
+    const at = () => (state.moved ? NEW : OLD)
+    const scripted = createScriptedCluster({ nodes: [A, OLD, NEW] })
+      .answer('Metadata', () => ({
+        brokers: [A, at()].map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+        controllerId: A.id,
+        topics: [],
+      }))
+      .answer('FindCoordinator', ({ coordinatorKeys }) => ({
+        coordinators: coordinatorKeys.map((key) => ({
+          key,
+          nodeId: at().id,
+          host: at().host,
+          port: at().port,
+          errorCode: 0,
+          errorMessage: null,
+        })),
+      }))
+    const asked = []
+    jest.spyOn(Broker.prototype, 'consumerGroupDescribe').mockImplementation(async function ({
+      groupIds,
+    }) {
+      asked.push([this.connectionPool.host, ...groupIds])
+      return {
+        groups: groupIds.flatMap((groupId) =>
+          answer(this.connectionPool.host, groupId, asked.length)
+        ),
+      }
+    })
+    const admin = new Kafka(
+      scripted.kafkaOptions({ brokers: [`${A.host}:${A.port}`], retry: tenMsRetry })
+    ).admin()
+    const metadataRequests = () => scripted.requests().filter(({ api }) => api === 'Metadata')
+    return { scripted, admin, state, asked, metadataRequests }
+  }
+
+  const run = async ({ scripted, admin }, work) => {
+    try {
+      await admin.connect()
+      const outcome = observe(work())
+      await driveUntilSettled(outcome)
+      return outcome
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  }
+
+  test('sends the next request to the new address after the old address answers NOT_COORDINATOR, with one metadata refresh', async () => {
+    const fixture = movingCluster((host, groupId) =>
+      host === OLD.host
+        ? [{ ...consumerGroupRow(groupId), errorCode: NOT_COORDINATOR, members: [] }]
+        : [consumerGroupRow(groupId)]
+    )
+    let before
+    const outcome = await run(fixture, () => {
+      fixture.state.moved = true
+      before = fixture.metadataRequests().length
+      return fixture.admin.describeGroups(['g'])
+    })
+
+    expect(outcome.error).toBeUndefined()
+    expect(fixture.asked).toEqual([
+      [OLD.host, 'g'],
+      [NEW.host, 'g'],
+    ])
+    expect(fixture.metadataRequests().length - before).toBe(1)
+    expect(outcome.value.groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
+      ['g', 0],
+    ])
+  })
+
+  test.each([
+    [
+      'a COORDINATOR_LOAD_IN_PROGRESS row',
+      (host, groupId, call) =>
+        call === 1
+          ? [{ ...consumerGroupRow(groupId), errorCode: COORDINATOR_LOAD_IN_PROGRESS, members: [] }]
+          : [consumerGroupRow(groupId)],
+      [
+        [OLD.host, 'g'],
+        [OLD.host, 'g'],
+      ],
+    ],
+    [
+      'a NOT_COORDINATOR row for an id the request did not ask',
+      (host, groupId) => [
+        consumerGroupRow(groupId),
+        { ...consumerGroupRow('other'), errorCode: NOT_COORDINATOR, members: [] },
+      ],
+      [[OLD.host, 'g']],
+    ],
+  ])('refreshes no metadata after %s', async (_label, answer, asked) => {
+    const fixture = movingCluster(answer)
+    let before
+    const outcome = await run(fixture, () => {
+      before = fixture.metadataRequests().length
+      return fixture.admin.describeGroups(['g'])
+    })
+
+    expect(outcome.error).toBeUndefined()
+    expect(fixture.asked).toEqual(asked)
+    expect(fixture.metadataRequests().length - before).toBe(0)
   })
 })

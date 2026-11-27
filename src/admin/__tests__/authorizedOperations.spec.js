@@ -25,6 +25,7 @@ describe('authorized operations', () => {
         })),
       }))
       const cluster = {
+        refreshMetadata: jest.fn(async () => {}),
         findGroupCoordinator: jest.fn(async ({ groupId }) => targets[Number(groupId.slice(1)) % 2]),
       }
       const ids = ['g0', 'g1', 'g2', 'g3', 'g4']
@@ -73,7 +74,10 @@ describe('authorized operations', () => {
           })),
         })),
       }
-      const cluster = { findGroupCoordinator: jest.fn(async () => coordinator) }
+      const cluster = {
+        refreshMetadata: jest.fn(async () => {}),
+        findGroupCoordinator: jest.fn(async () => coordinator),
+      }
       const descriptions = createGroupDescriptions({ cluster, logger })
       const ids = masks.map((_, index) => `g${index}`)
       const { groups } = await descriptions.describe(ids, {
@@ -134,7 +138,7 @@ describe('authorized operations', () => {
     }).describe(['g'])
     expect(groups[0].groupId).toBe('g')
     expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
-    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     expect(original.describeGroups).toHaveBeenCalledTimes(1)
     expect(replacement.describeGroups).toHaveBeenCalledTimes(1)
   })

@@ -734,6 +734,7 @@ describe('Admin > setOffsets > commits the offsets itself, over a stub coordinat
     }
     const cluster = {
       addTargetTopic: async () => {},
+      refreshMetadata: async () => {},
       refreshMetadataIfNecessary: async () => {},
       findTopicPartitionMetadata: () => [{ partitionId: 0 }, { partitionId: 1 }],
       findGroupCoordinator: findGroupCoordinator
