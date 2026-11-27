@@ -1,4 +1,5 @@
 const Decoder = require('../../../decoder')
+const Encoder = require('../../../encoder')
 const { parse } = require('../v2/response')
 const { KafkaJSInvariantViolation } = require('../../../../errors')
 
@@ -46,8 +47,10 @@ const decode = async (rawData, options = {}) => {
 
   if (options.groups !== undefined) {
     const { exact, validateTopics } = require('../responseIdentity')
-    exact(groups, options.groups, 'groupId', 'OffsetFetch group')
-    const requestedGroups = new Map(options.groups.map((row) => [row.groupId, row]))
+    exact(groups, options.groups, 'groupId', 'OffsetFetch group', Encoder.sentForm)
+    const requestedGroups = new Map(
+      options.groups.map((row) => [Encoder.sentForm(row.groupId), row])
+    )
     for (const group of groups) validateTopics(group, requestedGroups.get(group.groupId).topics)
     return { throttleTime: 0, clientSideThrottleTime: throttleTime, groups }
   }
