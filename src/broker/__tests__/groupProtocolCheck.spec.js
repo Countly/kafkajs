@@ -27,13 +27,14 @@ const joinAnswer = ({
   protocolType = 'consumer',
   protocolName = 'p',
   errorCode = 0,
+  generationId = 5,
   leader = 'someone-else',
   memberId = 'm',
 } = {}) => ({
   hex: new Encoder()
     .writeInt32(0)
     .writeInt16(errorCode)
-    .writeInt32(5)
+    .writeInt32(generationId)
     .writeUVarIntString(protocolType)
     .writeUVarIntString(protocolName)
     .writeUVarIntString(leader)
@@ -95,7 +96,15 @@ describe('Broker > the protocol the coordinator reports', () => {
 
     test('checks the answer to the retry that a MEMBER_ID_REQUIRED answer asks for, too', async () => {
       const answers = [
-        joinAnswer({ errorCode: 79, memberId: 'made-up' }),
+        // The coordinator's MEMBER_ID_REQUIRED answer: the new id and the error defaults.
+        joinAnswer({
+          errorCode: 79,
+          generationId: -1,
+          protocolType: null,
+          protocolName: null,
+          leader: '',
+          memberId: 'made-up',
+        }),
         joinAnswer({ protocolType: 'connect', memberId: 'made-up' }),
       ]
       harness = createGroupApiBroker({

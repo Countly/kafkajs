@@ -76,5 +76,18 @@ describe('Consumer > assignerProtocol', () => {
       })
       expect(MemberAssignment.decode(Buffer.from([0]))).toBe(null)
     })
+
+    test('decode keeps reading a null partition list as no partitions', () => {
+      const nullPartitions = new Encoder()
+        .writeInt16(1)
+        .writeArray([new Encoder().writeString('topic-test').writeInt32(-1)])
+        .writeBytes(Buffer.alloc(0)).buffer
+
+      expect(MemberAssignment.decode(nullPartitions)).toEqual({
+        version: 1,
+        assignment: { 'topic-test': [] },
+        userData: Buffer.alloc(0),
+      })
+    })
   })
 })

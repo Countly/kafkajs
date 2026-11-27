@@ -5,6 +5,7 @@ const Encoder = require('../../protocol/encoder')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { createFakeCoordinator } = require('./fixtures/fetchHarness')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
+const { COOPERATIVE } = require('../groupProtocol/interface')
 const ConsumerGroup = require('../consumerGroup')
 const IdleWait = require('../idleWait')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
@@ -555,6 +556,85 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     expect(() => protocol.assertNoDoubleAssignment({ members, assignment })).toThrow(
       'a-0 to m2 while m1 still owns it'
     )
+  })
+
+  /**
+   * A cooperative leader `m1` whose custom assigner hands `m3` the rows `a:[0]` then `a:[1]`, as a
+   * coordinator relays them unread, while `m2` advertises `owned` of topic `a`.
+   * @param {number[]} owned
+   * @returns {{ protocol: ClassicGroupProtocol, syncGroup: jest.Mock }}
+   */
+  const cooperativeLeader = (owned) => {
+    const rows = new Encoder()
+      .writeInt16(1)
+      .writeArray([
+        new Encoder().writeString('a').writeArray([0]),
+        new Encoder().writeString('a').writeArray([1]),
+      ])
+      .writeBytes(Buffer.alloc(0)).buffer
+    const protocol = leader({
+      mode: COOPERATIVE,
+      assigners: [
+        {
+          name: 'custom',
+          assign: async () => [
+            { memberId: 'm1', memberAssignment: Buffer.alloc(0) },
+            { memberId: 'm2', memberAssignment: Buffer.alloc(0) },
+            { memberId: 'm3', memberAssignment: rows },
+          ],
+        },
+      ],
+    })
+    const subscription = (ownedPartitions) =>
+      MemberMetadata.encode({
+        version: 1,
+        topics: ['a'],
+        userData: Buffer.alloc(0),
+        ownedPartitions,
+      })
+    protocol.members = [
+      { memberId: 'm1', memberMetadata: subscription([]) },
+      {
+        memberId: 'm2',
+        memberMetadata: subscription(owned.length ? [{ topic: 'a', partitions: owned }] : []),
+      },
+      { memberId: 'm3', memberMetadata: subscription([]) },
+    ]
+    const syncGroup = jest.fn(async () => ({ memberAssignment: Buffer.alloc(0) }))
+    protocol.coordinator = { syncGroup }
+    return { protocol, syncGroup }
+  }
+
+  it('checks a cooperative assignment against every row of a repeated topic, and sends no SyncGroup while another member owns a partition of an earlier row', async () => {
+    const { protocol, syncGroup } = cooperativeLeader([0])
+
+    await expect(
+      protocol.sync({
+        topics: ['a'],
+        topicsSubscribed: ['a'],
+        beforeSync: jest.fn(),
+        round: fakeRound(),
+      })
+    ).rejects.toThrow('a-0 to m3 while m2 still owns it')
+    expect(syncGroup).not.toHaveBeenCalled()
+  })
+
+  it('sends the same repeated rows once no other member owns their partitions', async () => {
+    const { protocol, syncGroup } = cooperativeLeader([])
+
+    await expect(
+      protocol.sync({
+        topics: ['a'],
+        topicsSubscribed: ['a'],
+        beforeSync: jest.fn(),
+        round: fakeRound(),
+      })
+    ).resolves.toMatchObject({ assignment: {} })
+    expect(syncGroup).toHaveBeenCalledTimes(1)
+    expect(syncGroup.mock.calls[0][0].groupAssignment).toContainEqual({
+      memberId: 'm3',
+      memberAssignment: expect.any(Buffer),
+    })
   })
 })
 
