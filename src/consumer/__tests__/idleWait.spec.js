@@ -143,7 +143,8 @@ describe('idle waiter ownership', () => {
   })
 })
 
-const fakeTimers = () => jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] })
+const fakeTimers = () =>
+  jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
 
 /** @returns {Promise<void>} lets virtual time and the continuations it releases run */
 const settle = async () => {

@@ -981,6 +981,7 @@ describe('ConsumerGroup#fetch > a topic id learned during the first OffsetFetch'
       committedOffsets: () => committed,
       topicId: () => state.id,
       leaderEpoch: () => -1,
+      onPartitionRouted: () => () => {},
       hasNode: () => true,
       findTopicPartitionMetadata: () => [{ partitionId: 0, leader: 0 }],
       findBroker: async () => ({ fetch: brokerFetch }),

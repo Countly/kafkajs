@@ -32,6 +32,7 @@ const createGroup = ({ topics = [TOPIC_A], ...options } = {}) => {
     addMultipleTargetTopics: jest.fn(async () => {}),
     registerAssignedTopics: jest.fn(async (names) => names),
     leaderEpoch: () => -1,
+    onPartitionRouted: () => () => {},
   }
 
   const instrumentationEmitter = new InstrumentationEventEmitter()

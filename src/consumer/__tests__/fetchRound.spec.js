@@ -351,9 +351,9 @@ function oracleReadReplicas(topic, partitions, routing) {
 
 /**
  * The request builder this client shipped before, with its whole-assignment active set, kept as
- * the oracle. Its validation filter is the admission rule written out from its definition, not a
- * call to the group's own: an entry that still admits, fetched at the epoch it was validated
- * against.
+ * the oracle. Its validation filter is the admission rule written out from its definition, not
+ * from the token the group reads: a partition is fetched only when its entry was validated against
+ * the epoch the cluster caches now and still admits, and it is fetched at that cached epoch.
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
  * @returns {object[]}
@@ -371,12 +371,16 @@ function oracleBuildFetchRequests(topicPartitions) {
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
         const entry = this.positionValidator.entryOf(topic, partition)
-        const admittedUnder = entry?.admitted === true ? entry : undefined
-        const currentLeaderEpoch = admittedUnder?.validatedAgainst
+        const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
+        const validatedNow =
+          entry !== undefined &&
+          entry.validatedAgainst !== undefined &&
+          entry.validatedAgainst === currentLeaderEpoch &&
+          entry.admitted === true
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          admittedUnder !== undefined &&
+          validatedNow &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -386,7 +390,7 @@ function oracleBuildFetchRequests(topicPartitions) {
             fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
             currentLeaderEpoch,
             maxBytes: this.maxBytesPerPartition,
-            admittedUnder,
+            admittedUnder: entry,
           })
         }
         return requests
@@ -500,7 +504,8 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
         // Unvalidated, awaiting an answer, validated and still admitting, or validated and since
-        // replaced or dropped (no longer admitting).
+        // replaced or dropped (no longer admitting). An entry that admits was validated against the
+        // epoch the cluster caches: every change of that epoch drops the entry at once.
         positionValidator: {
           entryOf: (topic, partition) =>
             coin(2)(topic, partition)

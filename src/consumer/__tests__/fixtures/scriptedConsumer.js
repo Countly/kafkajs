@@ -163,6 +163,7 @@ const buildConsumer = (options = {}) => {
     topicId: (name) => IDS[name],
     topicName: (id) => NAMES[id],
     leaderEpoch: () => -1,
+    onPartitionRouted: () => () => {},
     getNodeIds: () => [0],
     findTopicPartitionMetadata: (topic) =>
       (state.partial.has(topic) ? [0] : [0, 1]).map((partitionId) => ({ partitionId, leader: 0 })),

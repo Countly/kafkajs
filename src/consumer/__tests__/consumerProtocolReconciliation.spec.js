@@ -275,6 +275,7 @@ const buildPattern = (script, { literal = false } = {}) => {
       [...known.keys()].find((topic) => TOPIC_IDS[topic] === topicId) || undefined,
     topicId: (topic) => (known.has(topic) ? TOPIC_IDS[topic] : undefined),
     leaderEpoch: () => -1,
+    onPartitionRouted: () => () => {},
     findTopicPartitionMetadata: (topic) =>
       (known.get(topic) || []).map((partitionId) => ({ partitionId, leader: 0 })),
     findBroker: jest.fn(async () => ({
@@ -1283,6 +1284,7 @@ const buildConsumer = (options = {}) => {
     topicId: (name) => (known(name) ? FULL_IDS[name] : undefined),
     topicName: (id) => (known(FULL_NAMES[id]) ? FULL_NAMES[id] : undefined),
     leaderEpoch: () => -1,
+    onPartitionRouted: () => () => {},
     getNodeIds: () => [0],
     findTopicPartitionMetadata: (topic) =>
       (!known(topic) ? [] : state.partial.has(topic) ? [0] : [0, 1]).map((partitionId) => ({

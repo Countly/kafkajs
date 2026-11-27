@@ -1711,7 +1711,7 @@ describe('Consumer > Runner', () => {
 
   describe('a batch fetched before a leader epoch change', () => {
     const FETCH_EPOCH = 5
-    let epochs, stamps, positionValidator, handled, gate, events
+    let epochs, positionValidator, handled, gate, events
 
     /**
      * A batch of `offsets` fetched at `FETCH_EPOCH` under the partition's current validation entry,
@@ -1731,26 +1731,18 @@ describe('Consumer > Runner', () => {
       )
 
     /**
-     * What an accepted leader or epoch change does: the cache sets the epoch and a new routing
-     * stamp, the run's partition listener revokes the partition's validation entry, and routing
-     * moves on.
+     * What an accepted leader or epoch change does: the cache sets the epoch, the run's partition
+     * listener revokes the partition's validation entry, and routing moves on.
      */
     const moveEpoch = (partitionId, epoch) => {
       epochs[partitionId] = epoch
-      stamps[partitionId] = Math.max(...Object.values(stamps)) + 1
       positionValidator.revoke(topicName, partitionId)
       consumerGroup.routingVersion += 1
     }
 
-    /** A validation redone at the partition's current epoch and stamp: a new entry object. */
+    /** A validation redone at the partition's current epoch: a new entry object. */
     const validateAgain = (partitionId) =>
-      positionValidator.markValidated(
-        topicName,
-        partitionId,
-        epochs[partitionId],
-        undefined,
-        stamps[partitionId]
-      )
+      positionValidator.markValidated(topicName, partitionId, epochs[partitionId])
 
     /** A handler that records what it is given and holds partition 0 until `gate` opens. */
     const recordingHandler = () =>
@@ -1792,7 +1784,6 @@ describe('Consumer > Runner', () => {
 
     beforeEach(() => {
       epochs = { 0: FETCH_EPOCH, 1: FETCH_EPOCH }
-      stamps = { 0: 1, 1: 2 }
       handled = []
       events = []
       let open
@@ -1801,10 +1792,7 @@ describe('Consumer > Runner', () => {
       positionValidator = new PositionValidator({ logger: newLogger() })
       for (const id of [0, 1]) validateAgain(id)
       Object.assign(consumerGroup, {
-        cluster: {
-          leaderEpoch: (_topic, id) => epochs[id],
-          routingStamp: (_topic, id) => stamps[id],
-        },
+        cluster: { leaderEpoch: (_topic, id) => epochs[id] },
         positionValidator,
         routingVersion: 0,
         admissionEntry: ConsumerGroup.prototype.admissionEntry,
@@ -1822,7 +1810,7 @@ describe('Consumer > Runner', () => {
       ['eachMessage', (handler) => ({ eachBatch: undefined, eachMessage: handler })],
       ['eachBatch', (handler) => ({ eachBatch: handler })],
     ])(
-      'a queued batch fetched at epoch 5 is not handed over once the cached epoch is 6, and end_batch_process pairs with start (%s)',
+      'a queued batch fetched at epoch 5 is not handed over once the cached epoch is 6, and emits neither start_batch_process nor end_batch_process (%s)',
       async (name, handlers) => {
         await start(handlers(recordingHandler()))
         const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
@@ -1871,7 +1859,7 @@ describe('Consumer > Runner', () => {
       }
     )
 
-    it('a queued batch is not handed over after its partition was validated again at the same leader epoch, and end_batch_process pairs with start', async () => {
+    it('a queued batch is not handed over after its partition was validated again at the same leader epoch, and emits neither start_batch_process nor end_batch_process', async () => {
       await start({ eachBatch: undefined, eachMessage: recordingHandler() })
       const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
       await until(() => handled.length === 1)
@@ -1880,7 +1868,7 @@ describe('Consumer > Runner', () => {
       gate.open()
       await done
 
-      // Same epoch and stamp, but a new validation entry: the batch's admission ended.
+      // Same epoch, but a new validation entry: the batch's admission ended.
       expect(epochs[1]).toBe(FETCH_EPOCH)
       expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
       expect(resolvedOf(1)).toEqual([])

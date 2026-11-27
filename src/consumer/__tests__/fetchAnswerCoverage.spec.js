@@ -108,6 +108,7 @@ const createGroup = async ({
     committedOffsets: () => ({}),
     topicId: (topic) => topicIds[topic],
     leaderEpoch: () => -1,
+    onPartitionRouted: () => () => {},
     hasNode: () => true,
   }
 

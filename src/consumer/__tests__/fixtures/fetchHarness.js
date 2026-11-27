@@ -4,6 +4,7 @@ const Connection = require('../../../network/connection')
 const Decoder = require('../../../protocol/decoder')
 const Encoder = require('../../../protocol/encoder')
 const ConsumerGroup = require('../../consumerGroup')
+const Cluster = require('../../../cluster')
 const MetadataCache = require('../../../cluster/metadataCache')
 const OffsetManager = require('../../offsetManager')
 const { MemberAssignment } = require('../../assignerProtocol')
@@ -980,12 +981,13 @@ const buildConsumerGroup = ({
  * @param {number} [options.leaderEpoch] what `cluster.leaderEpoch` answers, and the epoch the
  *   metadata cache starts at
  * @param {boolean} [options.liveRouting] when true, the metadata cache is the one routing source:
- *   `cluster.leaderEpoch`, `cluster.routingStamp`, `cluster.onPartitionRouted`,
- *   `findLeaderForPartitions` and `findTopicPartitionMetadata` read it, so `installRouting` and
- *   an accepted leader hint move the leader and epoch the group sees;
+ *   `cluster.leaderEpoch` and `cluster.onPartitionRouted` (the `Cluster` methods),
+ *   `findLeaderForPartitions` and `findTopicPartitionMetadata` read it, so `installRouting` and an
+ *   accepted leader hint move the leader and epoch the group sees and end its admissions;
  *   `cluster.applyLeaderHint` resolves to the cache's verdict (the two hint options are unused)
  *   and `cluster.forgetLeaderEpoch` forgets the epoch there. By default the epoch stays
- *   `leaderEpoch`, routing follows `leaders`, and the forget only records the call
+ *   `leaderEpoch`, routing follows `leaders`, no partition routing change reaches the group, and
+ *   the forget only records the call
  * @param {boolean} [options.validationBrokers] when true, `cluster.findBroker` answers each node
  *   id with its own fake broker and connection (node `NODE_ID` keeps the shared one), so each
  *   leader has its own request queue; every broker answers with the same scripts
@@ -1204,9 +1206,13 @@ const createFetchGroup = async ({
     }),
     offsetCommit: async () => ({}),
   }
+  // With live routing both subscriptions are the `Cluster` methods over this cache, so every change
+  // the cache accepts reaches the group as in production. By default the group sees one fixed
+  // epoch while leaders move, and is told of no partition's routing change.
   const cluster = {
     metadataCache,
-    onRoutingChange: (handler) => metadataCache.onRoutingChange(handler),
+    onRoutingChange: Cluster.prototype.onRoutingChange,
+    onPartitionRouted: liveRouting ? Cluster.prototype.onPartitionRouted : () => () => {},
     refreshMetadataIfNecessary: async () => {},
     refreshMetadata: jest.fn(async () => {}),
     findBroker: async (args) => {
@@ -1235,16 +1241,7 @@ const createFetchGroup = async ({
     committedOffsets: () => ({}),
     defaultOffset: () => '-2',
     topicId: () => TOPIC_ID,
-    leaderEpoch: liveRouting
-      ? (topic, partition) => metadataCache.leaderEpoch(topic, partition)
-      : () => leaderEpoch,
-    // Only live routing moves: a fixed epoch has no routing changes to stamp or report.
-    routingStamp: liveRouting
-      ? (topic, partition) => metadataCache.routingStamp(topic, partition)
-      : undefined,
-    onPartitionRouted: liveRouting
-      ? (handler) => metadataCache.onPartitionRouted(handler)
-      : undefined,
+    leaderEpoch: liveRouting ? Cluster.prototype.leaderEpoch : () => leaderEpoch,
     cachedLeader: (topic, partition) => metadataCache.leader(topic, partition),
     forgetLeaderEpoch: jest.fn(
       liveRouting
