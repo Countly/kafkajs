@@ -275,8 +275,9 @@ class GroupDescriptions {
    * settled, so no work of an attempt outlives it. Each id of a request then has one outcome:
    * settled for good, or a failure that leaves it pending; an id the coordinator answered with no
    * row is done without a value. A failure coded 15 or 16, on a row or from a request, drops that
-   * id's coordinator, and the next attempt refreshes metadata and looks it up again; after any
-   * other failure (14 included) the id is asked again where it is. An id whose lookup failed stays
+   * id's coordinator, and the next attempt looks it up again (`findGroupCoordinator` reaches a
+   * coordinator it does not know at the address FindCoordinator gives, refreshing metadata itself
+   * when it must); after any other failure (14 included) the id is asked again where it is. An id whose lookup failed stays
    * pending with that failure.
    *
    * While any id is pending the attempt throws one failure: the first that ends the call
@@ -297,22 +298,10 @@ class GroupDescriptions {
   async #resolve(ids, context, api) {
     const pending = new Set(ids)
     const settled = new Map()
-    let moved = false
     this.#checked(
       context,
       await this.#wait(context, async () =>
         this.#retrier(context)(async () => {
-          if (moved) {
-            moved = false
-            this.#checked(
-              context,
-              await this.#wait(context, async () =>
-                this.cluster.refreshMetadata(
-                  ...(context.consumerOperation ? [{ fence: context.consumerOperation }] : [])
-                )
-              )
-            )
-          }
           const { batches, unlocated } = this.#checked(
             context,
             await this.#wait(context, async () => this.#groupByCoordinator([...pending], context))
@@ -340,10 +329,7 @@ class GroupDescriptions {
                 continue
               }
               failures.push(outcome.error)
-              if (RE_FINDS_COORDINATOR.has(outcome.error.code)) {
-                context.coordinators.delete(groupId)
-                moved = true
-              }
+              if (RE_FINDS_COORDINATOR.has(outcome.error.code)) context.coordinators.delete(groupId)
             }
             for (const groupId of batchIds) {
               if (!outcomes.has(groupId)) pending.delete(groupId)

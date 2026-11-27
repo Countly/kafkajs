@@ -1799,12 +1799,12 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
   const sent = () => harness.requests.map(({ apiKey, body }) => [apiKey, askedIn(body)])
 
   test.each([
-    ['COORDINATOR_LOAD_IN_PROGRESS', COORDINATOR_LOAD_IN_PROGRESS, ['a', 'b'], 0],
-    ['COORDINATOR_NOT_AVAILABLE', COORDINATOR_NOT_AVAILABLE, ['a', 'b', 'b'], 1],
-    ['NOT_COORDINATOR', NOT_COORDINATOR, ['a', 'b', 'b'], 1],
+    ['COORDINATOR_LOAD_IN_PROGRESS', COORDINATOR_LOAD_IN_PROGRESS, ['a', 'b']],
+    ['COORDINATOR_NOT_AVAILABLE', COORDINATOR_NOT_AVAILABLE, ['a', 'b', 'b']],
+    ['NOT_COORDINATOR', NOT_COORDINATOR, ['a', 'b', 'b']],
   ])(
     'keeps the group an answer describes when the same answer gives its sibling %s, and asks again only for the sibling',
-    async (_name, code, lookups, refreshes) => {
+    async (_name, code, lookups) => {
       const { admin, found, cluster } = adminOver((asked, index) =>
         asked.map((groupId) =>
           index === 0 && groupId === 'b'
@@ -1822,7 +1822,8 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
         [apiKeys.DescribeGroups, ['b']],
       ])
       expect(found).toEqual(lookups)
-      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(refreshes)
+      // The lookup finds a moved coordinator by itself; no metadata request is added.
+      expect(cluster.refreshMetadata).not.toHaveBeenCalled()
       expect(
         outcome.value.groups.map(({ groupId, groupType, errorCode, members }) => [
           groupId,
@@ -1867,7 +1868,7 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
 
     expect(outcome.error).toMatchObject({
       name: 'KafkaJSNumberOfRetriesExceeded',
-      type: 'COORDINATOR_LOAD_IN_PROGRESS',
+      type: 'GROUP_LOAD_IN_PROGRESS',
       code: COORDINATOR_LOAD_IN_PROGRESS,
     })
     expect(sent()).toEqual([

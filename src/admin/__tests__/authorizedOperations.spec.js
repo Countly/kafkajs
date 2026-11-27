@@ -121,6 +121,7 @@ describe('authorized operations', () => {
       }),
     }
     const cluster = {
+      refreshMetadata: jest.fn(async () => {}),
       findGroupCoordinator: jest
         .fn()
         .mockResolvedValueOnce(original)
@@ -133,6 +134,7 @@ describe('authorized operations', () => {
     }).describe(['g'])
     expect(groups[0].groupId).toBe('g')
     expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
     expect(original.describeGroups).toHaveBeenCalledTimes(1)
     expect(replacement.describeGroups).toHaveBeenCalledTimes(1)
   })
