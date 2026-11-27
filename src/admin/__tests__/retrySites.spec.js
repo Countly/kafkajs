@@ -20,8 +20,8 @@ const sites = [
   'deleteAcls',
   'alterPartitionReassignments',
   'listPartitionReassignments',
-  'GroupDescriptions.describeBatch',
-  'GroupDescriptions.describeClassicBatch',
+  'GroupDescriptions.#askConsumer',
+  'GroupDescriptions.#askClassic',
 ]
 
 describe('admin retry ownership', () => {
@@ -43,7 +43,9 @@ describe('admin retry ownership', () => {
       ])
     }
     expect([...counts.values()].reduce((sum, count) => sum + count, 0)).toBe(22)
-    expect(groups.match(/this\.#retrier\(context\)\(async/g)).toHaveLength(2)
+    // Both group describe calls share the one retry loop in #resolve.
+    expect(groups.match(/this\.#retrier\(context\)\(async/g)).toHaveLength(1)
+    expect(groups.match(/this\.#resolve\(/g)).toHaveLength(2)
     for (const method of sites.slice(0, 18))
       expect(index).toMatch(new RegExp(`const ${method} = async`))
   })
