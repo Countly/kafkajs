@@ -532,7 +532,8 @@ module.exports = class BrokerPool {
    * - **An endpoint with no usable address.** A blank host or a non-positive port is exactly the
    *   input `connectionPoolBuilder` treats as "no destination given" and answers with the next
    *   configured bootstrap broker - silently pointing this node id at an unrelated broker. Such an
-   *   endpoint is skipped.
+   *   endpoint is skipped, as is one whose node id is not an integer of 0 or more (a broker that
+   *   names no node says -1).
    * - **A world that moved on underneath one `await`.** Between reading the current broker and the
    *   built replacement pool becoming ready, a concurrent rebootstrap/disconnect can empty
    *   `this.brokers` or install another seed, or a second hint for the same node id can already
@@ -560,7 +561,13 @@ module.exports = class BrokerPool {
     }
 
     for (const { nodeId, host, port, rack } of nodeEndpoints) {
-      if (!host || !Number.isInteger(port) || port <= 0) {
+      if (
+        !Number.isInteger(nodeId) ||
+        nodeId < 0 ||
+        !host ||
+        !Number.isInteger(port) ||
+        port <= 0
+      ) {
         continue
       }
 

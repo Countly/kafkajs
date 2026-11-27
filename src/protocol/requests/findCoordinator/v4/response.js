@@ -1,6 +1,7 @@
 const Decoder = require('../../../decoder')
+const Encoder = require('../../../encoder')
 const { failure, createErrorFromCode, failIfVersionNotSupported } = require('../../../error')
-const { KafkaJSPartialMessageError } = require('../../../../errors')
+const { KafkaJSError, KafkaJSPartialMessageError } = require('../../../../errors')
 
 /**
  * FindCoordinatorResponse (Version: 4) - flexible (KIP-482), response header v1
@@ -32,7 +33,18 @@ const decodeCoordinator = (decoder) => {
   return coordinator
 }
 
-const decode = async (rawData) => {
+/**
+ * @param {Buffer} rawData
+ * @param {object} [expected]
+ * @param {string} [expected.key] the key the request asked for. A broker echoes it on every
+ *   answer, errors included, as the request wrote it (a lone surrogate comes back as U+FFFD), so
+ *   any other key is refused; left out, the key is not checked
+ * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number, errorCode: number,
+ *   errorMessage: string|null, coordinator: { nodeId: number, host: string, port: number } }>}
+ * @throws {KafkaJSPartialMessageError} unless the answer holds exactly one coordinator
+ * @throws {import('../../../../errors').KafkaJSError} retriable, when the answer is for another key
+ */
+const decode = async (rawData, { key } = {}) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
   const coordinators = decoder.readUVarIntArray(decodeCoordinator) || []
@@ -45,10 +57,17 @@ const decode = async (rawData) => {
     )
   }
 
-  // `Key` is decoded and dropped: this client sent it, and adding it to the returned object
-  // would be a new decoded key with no consumer.
-  const [{ nodeId, host, port, errorCode, errorMessage }] = coordinators
+  // `Key` is checked and not returned: adding it to the returned object would be a new decoded key
+  // with no consumer.
+  const [{ key: answeredKey, nodeId, host, port, errorCode, errorMessage }] = coordinators
   failIfVersionNotSupported(errorCode)
+
+  if (key !== undefined && !Encoder.isEchoOf(answeredKey, key)) {
+    throw new KafkaJSError(
+      `FindCoordinator response is for key ${answeredKey}, not the requested key ${key}`,
+      { retriable: true }
+    )
+  }
 
   return {
     throttleTime: 0,
