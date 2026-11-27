@@ -589,6 +589,9 @@ const createFakeBroker = (answer, chunks) => {
     },
     send: async (protocolRequest) => {
       const promise = connection.send(protocolRequest)
+      // A close (such as teardown) can reject before the pump below returns; the caller still
+      // receives it.
+      promise.catch(() => {})
       await new Promise(setImmediate)
       await pump()
       return promise
