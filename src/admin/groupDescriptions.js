@@ -1,7 +1,7 @@
 const { MemberAssignment } = require('../consumer/assignerProtocol')
-const Encoder = require('../protocol/encoder')
 const { createErrorFromCode } = require('../protocol/error')
 const { retrierOf, currentDeadline, withConsumerOperation } = require('./deadline')
+const { WireNames } = require('./wireNames')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const GROUP_ID_NOT_FOUND = 69
@@ -50,54 +50,34 @@ const doesNotSupportApiKey = (error) => {
 }
 
 /**
- * Names the ids as a request writes them. A lone surrogate is written as U+FFFD, so the broker
- * answers a row for the written name, not for the id the caller gave; every id is sent, looked up,
- * retried and matched by its written name and `named` gives the rows back under the caller's ids.
- *
- * Ids written as the same bytes (a lone surrogate and a literal U+FFFD, or two different lone
- * surrogates) are sent as two identical ids are and describe one group. `named` answers every
- * distinct spelling the caller gave: the rows of one written name go to the caller's entries for it
- * in order, so a spelling given twice keeps two rows where a repeated id has two; when fewer rows
- * came back than spellings (a classic describe answers a written name once) the last row is
- * repeated under each spelling still unanswered. A well-formed spelling is never renamed.
- *
- * When no id changes when written, the ids are returned as given and `named` returns the rows it is
- * given, building no collection.
- * @param {string[]} groupIds ids as the caller gave them
- * @returns {{ ids: string[], named: (rows: object[]) => object[] }} the written names, and a
- *   function that gives rows the caller's spellings, leaving a row of any other name as it is
+ * How much a ConsumerGroupDescribe entry settles its group id; the entry with the highest rank wins.
+ * A described group beats an error row, an error row beats "ask the older API" (69 or 35), and a 69
+ * beats a 35 or no answer, because only a 69 carries the message to report when both APIs miss.
+ * @param {{ needsFallback: boolean, row?: object, error?: object }} entry
+ * @returns {number}
  */
-const sentNames = (groupIds) => {
-  if (!groupIds.some((groupId) => Encoder.sentForm(groupId) !== groupId)) {
-    return { ids: groupIds, named: (rows) => rows }
+const rank = ({ needsFallback, row, error }) => {
+  if (needsFallback) return error ? 1 : 0
+  return row.errorCode === 0 ? 3 : 2
+}
+
+/**
+ * Settles ONE entry per group id from everything the coordinators answered for it. A broker can
+ * answer a written id more than once in one reply, and not consistently: Kafka 4.0.0 hands every
+ * offsets shard the whole id list, so the shard that owns a group answers it described while the
+ * others answer it unknown (69); 4.4.0 hands each shard its own ids only. An entry that outranks
+ * the others (see `rank`) is the answer; of equal rank the first is. The map keeps ids in the
+ * order they first appear in the answers.
+ * @param {Array<{ groupId: string, needsFallback: boolean, row?: object, error?: object }>} entries
+ * @returns {Map<string, { groupId: string, needsFallback: boolean, row?: object, error?: object }>}
+ */
+const settle = (entries) => {
+  const settled = new Map()
+  for (const entry of entries) {
+    const held = settled.get(entry.groupId)
+    if (held === undefined || rank(entry) > rank(held)) settled.set(entry.groupId, entry)
   }
-  const ids = groupIds.map((groupId) => Encoder.sentForm(groupId))
-  const entries = new Map()
-  ids.forEach((sent, index) => {
-    const callers = entries.get(sent)
-    if (callers) callers.push(groupIds[index])
-    else entries.set(sent, [groupIds[index]])
-  })
-  const named = (rows) => {
-    const last = new Map(rows.map((row, index) => [row.groupId, index]))
-    const taken = new Map()
-    return rows.flatMap((row, index) => {
-      const callers = entries.get(row.groupId)
-      if (callers === undefined) return [row]
-      const count = taken.get(row.groupId) ?? 0
-      taken.set(row.groupId, count + 1)
-      const answered = new Set(callers.slice(0, count + 1))
-      const spellings = [callers[Math.min(count, callers.length - 1)]]
-      if (last.get(row.groupId) === index) {
-        for (const spelling of callers) {
-          if (!answered.has(spelling)) spellings.push(spelling)
-          answered.add(spelling)
-        }
-      }
-      return spellings.map((groupId) => (groupId === row.groupId ? row : { ...row, groupId }))
-    })
-  }
-  return { ids, named }
+  return settled
 }
 
 /**
@@ -170,11 +150,16 @@ class GroupDescriptions {
    *         newer API reports stays on that group's row instead; one DescribeGroups reports for an
    *         id that fell back to it fails the call, because that API's own parse throws every
    *         group-level code but GROUP_ID_NOT_FOUND
-   *         Each row carries the id the caller gave, whatever the broker echoed (a lone surrogate is
-   *         written as U+FFFD). Ids written as the same bytes (such as a lone surrogate and a
-   *         literal U+FFFD) are sent like identical ids and describe one group: each distinct
-   *         spelling gets a row, under that exact spelling, and the rows of the one group can be
-   *         equal in all but `groupId`
+   *
+   *         Each written id (a lone surrogate is written as U+FFFD, so the ids a caller gives can
+   *         be written alike) is sent, routed and retried once, whatever spellings and repeats were
+   *         given, and settles ONE outcome: of several rows for it, a described group beats an
+   *         error row, an error row beats a 69 or 35, and the first of equal rank wins. That
+   *         outcome is then given to the caller's spellings under each exact spelling, a
+   *         well-formed one never renamed. An outcome from the consumer protocol gets one row per
+   *         occurrence of an id the caller gave (a repeated id has two rows); one from the classic
+   *         API gets one row per distinct spelling. Rows for spellings of one group are equal in
+   *         all but `groupId`
    */
   async describe(groupIds, options = {}) {
     return withConsumerOperation(options.operation, async () => {
@@ -208,16 +193,21 @@ class GroupDescriptions {
       includeAuthorizedOperations,
       coordinators,
     }
-    const { ids, named } = sentNames(groupIds)
+    const names = new WireNames(groupIds)
     const described = this.#checked(
       context,
-      await this.#wait(context, async () => this.#describeByCoordinator(ids, context))
+      await this.#wait(context, async () => this.#describeByCoordinator(names.ids, context))
     )
-    const rows = described.filter(({ needsFallback }) => !needsFallback).map(({ row }) => row)
-    const fallbacks = described.filter(({ needsFallback }) => needsFallback)
+    const settled = settle(described)
+    const groups = []
+    const fallbacks = []
+    for (const entry of settled.values()) {
+      if (entry.needsFallback) fallbacks.push(entry)
+      else names.project(groups, entry.groupId, entry.row, true)
+    }
 
     if (fallbacks.length === 0) {
-      return { groups: named(rows) }
+      return { groups }
     }
 
     const classic = this.#checked(
@@ -231,18 +221,15 @@ class GroupDescriptions {
     )
     const stashed = new Map(fallbacks.map(({ groupId, error }) => [groupId, error]))
 
-    return {
-      groups: named([
-        ...rows,
-        ...classic.map((row) =>
-          this.#shapeClassicGroup(
-            row,
-            stashed.get(row.groupId),
-            context.includeAuthorizedOperations
-          )
-        ),
-      ]),
+    for (const row of classic) {
+      const shaped = this.#shapeClassicGroup(
+        row,
+        stashed.get(row.groupId),
+        context.includeAuthorizedOperations
+      )
+      names.project(groups, row.groupId, shaped, false)
     }
+    return { groups }
   }
 
   /**

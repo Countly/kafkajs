@@ -158,9 +158,13 @@ class ScramCredentials {
    * The controller answers one result per user. Entries that name one user (two mechanisms, an
    * upsertion and a deletion, or spellings written as the same bytes such as a lone surrogate and a
    * literal U+FFFD) are several changes to one user in one request: the controller applies none of
-   * them and reports one user-level error (`DUPLICATE_RESOURCE`) for the user, and this method
-   * returns that one result. It carries the first spelling of the user in the call (upsertions are
-   * read before deletions), even when that spelling is well formed and a later one is not; a caller
+   * them and reports one user-level error for the user, and this method returns that one result.
+   * The controller reads every deletion and then every upsertion and keeps the first error it finds
+   * for a user: an entry that fails validation first (such as `RESOURCE_NOT_FOUND` for a deletion
+   * of a missing credential) gives that error and later entries for the user are ignored; otherwise
+   * an entry for a user already accepted gives `DUPLICATE_RESOURCE`. The result carries the first
+   * spelling of the user in the call (this method reads upsertions before deletions, whatever the
+   * controller's order), even when that spelling is well formed and a later one is not; a caller
    * finds it under that spelling only.
    * @param {object} options upsertions and deletions
    * @returns {Promise<object[]>} one caller-ordered result per affected user

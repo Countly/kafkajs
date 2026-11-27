@@ -17,6 +17,7 @@ const {
   isAnsweredError,
 } = require('./deadline')
 const { itemRetry } = require('./itemRetry')
+const { WireNames } = require('./wireNames')
 
 /** @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const COORDINATOR_LOAD_IN_PROGRESS = 14
@@ -199,8 +200,7 @@ class ShareGroups {
       typeof includeAuthorizedOperations === 'boolean',
       'includeAuthorizedOperations must be a boolean'
     )
-    const ids = groupIds.slice()
-    const sent = ids.map((id) => Encoder.sentForm(id))
+    const names = new WireNames(groupIds)
     const routes = new Map()
     const relocated = new Set()
     const operation = currentDeadline()
@@ -211,7 +211,7 @@ class ShareGroups {
     try {
       const rows = await itemRetry(
         {
-          items: [...new Set(sent)].map((groupId) => ({ groupId })),
+          items: names.ids.map((groupId) => ({ groupId })),
           keyOf: (row) => row.groupId,
           retry: this.retry,
           retryable: (row) => row.retryCoordinator,
@@ -224,8 +224,8 @@ class ShareGroups {
       checked(rows)
       const results = new Map(rows.map((row) => [row.groupId, row]))
       return {
-        groups: ids.map((id, index) =>
-          this.#description(results.get(sent[index]), includeAuthorizedOperations, id)
+        groups: names.names.map((id, index) =>
+          this.#description(results.get(names.wire[index]), includeAuthorizedOperations, id)
         ),
       }
     } catch (error) {
