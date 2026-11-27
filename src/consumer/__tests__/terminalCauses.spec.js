@@ -225,10 +225,15 @@ describe('Consumer > how a classic run ends', () => {
         const run = await begin({
           instance: kind === 'a static',
           run: { autoCommit },
-          eachMessage: async ({ message }) => {
-            if (message.offset === '41') throw error
+          eachMessage: async ({ message }, held) => {
+            if (message.offset !== '41') return
+            await held.promise
+            throw error
           },
         })
+        await advanceUntil(() => run.delivered.length === 2)
+        expect(trail(run)).toEqual([])
+        run.held.resolve()
         await advanceUntil(() => run.crashes.length > 0)
         await jest.advanceTimersByTimeAsync(1000)
 
@@ -424,11 +429,16 @@ describe('Consumer > how a classic run ends', () => {
               },
             }),
           },
-          eachMessage: async ({ message }, _held, call) => {
-            if (message.offset === '41' && call === 2) throw error
+          eachMessage: async ({ message }, held, call) => {
+            if (message.offset !== '41' || call !== 2) return
+            await held.promise
+            throw error
           },
         })
         seen.run = run
+        await advanceUntil(() => run.delivered.length === 2)
+        expect(trail(run)).toEqual([])
+        run.held.resolve()
         await advanceUntil(() => run.crashes.length > 0)
 
         expect(trail(run)).toEqual([...CLEANUP, `CRASH restart ${restart}`])
@@ -590,10 +600,15 @@ describe('Consumer > how a classic run ends', () => {
         const run = await begin({
           retry: RETRY,
           closeCallback: () => callback.promise,
-          eachMessage: async ({ message }, _held, call) => {
-            if (message.offset === '41' && call === 2) throw error
+          eachMessage: async ({ message }, held, call) => {
+            if (message.offset !== '41' || call !== 2) return
+            await held.promise
+            throw error
           },
         })
+        await advanceUntil(() => run.delivered.length === 2)
+        expect(trail(run)).toEqual([])
+        run.held.resolve()
         await advanceUntil(() => trail(run).includes('revoked callback'))
         expect(trail(run)).toEqual(['commit topic-a|0 41', 'revoked callback'])
 
