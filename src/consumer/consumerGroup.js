@@ -751,15 +751,21 @@ module.exports = class ConsumerGroup {
    * unwatched; `onStopRequested` ends the subscription, after which nothing is fetched or
    * delivered, and a stopped group does not subscribe again.
    * @private
-   * @returns {true}
+   * @param {{partitions: number[]}[]} topicPartitions the partitions about to be validated; with
+   *   none there is nothing to record and no subscription is made yet
+   * @returns {void}
+   * @throws {TypeError} when the cluster has no `onPartitionRouted`
    */
-  watchRouting() {
-    if (this.unwatchRouting === null && !this.idleWait.fence.closed) {
+  watchRouting(topicPartitions) {
+    if (
+      this.unwatchRouting === null &&
+      !this.idleWait.fence.closed &&
+      topicPartitions.some(({ partitions }) => partitions.length !== 0)
+    ) {
       this.unwatchRouting = this.cluster.onPartitionRouted((topic, partition) =>
         this.positionValidator.revoke(topic, partition)
       )
     }
-    return true
   }
 
   /**
@@ -4197,8 +4203,11 @@ module.exports = class ConsumerGroup {
   async validatePositions(topicPartitions, preparation) {
     let awaiting
     let unregister
-    let watching = false
     const manager = preparation ? preparation.manager : this.offsetManager
+
+    // Outside the fail-open handling below: a cluster that cannot report routing changes must fail
+    // the round loudly, not leave every partition unadmitted and the consumer fetching nothing.
+    if (this.unwatchRouting === null) this.watchRouting(topicPartitions)
 
     try {
       for (const { topic, partitions } of topicPartitions) {
@@ -4210,8 +4219,6 @@ module.exports = class ConsumerGroup {
             continue
           }
 
-          // Before the first epoch is read and anything is recorded against it.
-          watching ||= this.watchRouting()
           const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
 
           // Asked before anything is read or allocated: the steady state of a round is that every
