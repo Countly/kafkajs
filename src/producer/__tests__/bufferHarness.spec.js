@@ -277,6 +277,48 @@ describe('Producer > fixtures > bufferHarness', () => {
     expect(calls).toEqual(new Array(12).fill(0))
   })
 
+  describe('takeSent writes what the batch writer writes for the original record', () => {
+    beforeEach(() => {
+      jest.spyOn(Date, 'now').mockReturnValue(1800000000000)
+    })
+
+    afterEach(() => {
+      jest.restoreAllMocks()
+    })
+
+    test.each([
+      ['an absent timestamp', { value: 'v' }],
+      ['an undefined timestamp', { value: 'v', timestamp: undefined }],
+      ['a null timestamp', { value: 'v', timestamp: null }],
+      ['the number 0', { value: 'v', timestamp: 0 }],
+      ['the string 0', { value: 'v', timestamp: '0' }],
+      ['the Date of the epoch', { value: 'v', timestamp: new Date(0) }],
+      ['a Long of 0', { value: 'v', timestamp: Long.fromNumber(0) }],
+      ['the BigInt 0', { value: 'v', timestamp: 0n }],
+      ['a number', { value: 'v', timestamp: 1700000000001 }],
+      ['a numeric string', { value: 'v', timestamp: '1700000000002' }],
+      ['a Date', { value: 'v', timestamp: new Date(1700000000003) }],
+      ['a Long', { value: 'v', timestamp: Long.fromValue(1700000000004n) }],
+      ['a Long of the int64 maximum', { value: 'v', timestamp: Long.fromValue(2n ** 63n - 1n) }],
+      ['an empty string key', { key: '', value: 'v', timestamp: 1 }],
+      ['an empty Buffer value', { value: Buffer.alloc(0), timestamp: 1 }],
+      ['a null value', { key: 'k', value: null, timestamp: 1 }],
+      ['a header with an empty value', { value: 'v', headers: { h: '', b: Buffer.alloc(0) } }],
+    ])('%s', async (_, record) => {
+      const { buffer } = await buildRecordBatch({
+        compression: Compression.None,
+        messages: [record],
+      })
+      const expected = (await readBatch(buffer)).records
+
+      const [{ records }] = await takeSent({
+        batches: [{ topic: 'topic-a', partition: 0, messages: [record] }],
+      }).read()
+
+      expect(records).toEqual(expected)
+    })
+  })
+
   test('readBatch refuses a batch with one payload byte changed under its CRC', async () => {
     const { buffer } = await buildRecordBatch({
       compression: Compression.None,

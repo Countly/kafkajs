@@ -105,13 +105,14 @@ const headersOf = (headers) => {
 }
 
 /**
- * A timestamp as it is now: a `Date` as its milliseconds, a `Long` as a new `Long` of its value;
- * the batch writer reads both forms the same way.
+ * A timestamp as it is now, in the same form: a `Date` as a new `Date` of its time and a `Long` as
+ * a new `Long` of its value, both still objects, so the batch writer's "falsy is the send time"
+ * rule sees what it would see in the original (a `Date` of the epoch stays the literal epoch).
  * @param {*} timestamp
  * @returns {*}
  */
 const timestampOf = (timestamp) => {
-  if (timestamp instanceof Date) return timestamp.getTime()
+  if (timestamp instanceof Date) return new Date(timestamp.getTime())
   if (timestamp instanceof Long) return new Long(timestamp.value)
   return timestamp
 }
@@ -156,16 +157,17 @@ const readBatch = async (buffer) => {
  * happen:
  * - observation, at the call: each batch's place, the request's first sequence, its record count
  *   and every record's key, value, headers and timestamp as they are now (strings and numbers as
- *   they are, Buffer bytes copied, a `Date` or `Long` timestamp as its value), so a later change to
- *   a record list, a record field or a Buffer byte is not seen;
+ *   they are, Buffer bytes copied, a `Date` or `Long` timestamp as a new one of the same value),
+ *   so a later change to a record list, a record field or a Buffer byte is not seen;
  * - encoding, deferred to `read()`: the producer's batch writer writes the observed records and the
  *   consumer's decoder reads them back, CRC checked;
  * - bytes captured at a real write are not this helper's: a test that needs the bytes the producer
  *   itself put on the wire reads them where it captures that write.
  * The call is plain loops, indexed reads and writes, `Buffer.alloc`, `Buffer.isBuffer`,
- * `Array.isArray`, `Object.hasOwn`, `Date#getTime` and `new Long`, so a fake broker or probe that
- * takes a request decides, records and answers at the same instant as one that reads nothing, and
- * a spec spying on another built-in or on the clock sees only the producer's calls.
+ * `Array.isArray`, `Object.hasOwn`, `Date#getTime`, `new Date(time)` and `new Long`, so a fake
+ * broker or probe that takes a request decides, records and answers at the same instant as one
+ * that reads nothing, and a spec spying on another built-in or on the clock sees only the
+ * producer's calls.
  *
  * What a read checks is the record content: keys, values, headers, timestamps, order and offsets,
  * and that the bytes hold `count` records. The batch is written uncompressed with the default
