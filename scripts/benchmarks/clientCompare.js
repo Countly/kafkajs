@@ -10,7 +10,7 @@
  *          [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip]
  *          [--settings defaults|same] [--passes N] [--batch N] [--unawaited N] [--keys index]
  *          [--headers N] [--partitioner default|custom] [--value-type buffer|string]
- *          [--probe on] [--brokers host:port,...]
+ *          [--fork-linger N] [--fork-idempotent true|false] [--probe on] [--brokers host:port,...]
  * `--client` is an npm install prefix that holds `node_modules/<package>`. Defaults: 20000 messages
  * for `produce-latency`, 200000 for the others, 200 bytes per message, 3 partitions, no
  * compression, each package's own consumer defaults, the three brokers of docker-compose.yml.
@@ -28,11 +28,19 @@
  * every other produce-throughput run walks the corpus, the walk starting again at the first record
  * when the measured window starts. `--compression gzip` uses the built-in codec both packages ship
  * (`node:zlib`).
+ * `--fork-linger N` and `--fork-idempotent true|false` (produce-throughput only, not with
+ * `--settings same`) replace the fork's default `linger` (ms) or `idempotent` and nothing else; the
+ * run of kafkajs 2.2.4 ignores them and says so, since it has no linger and is not idempotent by
+ * default. The run reports what each arm applied or ignored as `settings.overrides` or
+ * `settings.ignoredOverrides`.
  * `--probe on` (produce-throughput only) adds what costs the run something to measure: the time of
  * each `send()` call, the peak memory and the garbage collections of the measured window (a
- * collection counts, with its whole pause, when it started inside the window). A run without it
- * adds no clock read, timer or observer of its own; the timed window still reads its clock once per
- * round, as it always did. `--partitioner custom` starts its count again at 0 when the measured
+ * collection counts, with its whole pause, when it started inside the window), and the Produce
+ * requests each round (one awaited round of sends) took, counted from the producer's own
+ * `producer.network.request` event, which both packages emit and which names no partitions, so the
+ * partition batches per request are not counted. A run without it adds no clock read, timer,
+ * observer or event listener of its own; the timed window still reads its clock once per round, as
+ * it always did. `--partitioner custom` starts its count again at 0 when the measured
  * window starts, like the record numbering.
  * `--duration-ms` (produce workloads only, never with `--messages`) sends for a fixed measured
  * window after a 5-second warm-up that is not measured. A consume run excludes the first tenth of
@@ -57,9 +65,11 @@
  * the request already built and the promise not awaited), `peakRssBytes` and `peakArrayBuffers`
  * (the largest of the readings taken every 100 ms and at the window's two ends) and the garbage
  * collections of any kind that started in the window, as a count and a total pause (ms) per
- * 10,000 messages; `consume-throughput` messagesPerSecond, cpuMicrosPerMessage (user plus system),
- * event-loop delay p50, p99 and max (ms), Fetch requests, bytes and messages per Fetch, all over the
- * measured window, plus the Fetch version, the passes and the LZ4 codec. A consume run also
+ * 10,000 messages, and `produceRequestsPerRoundP50` and `produceRequestsPerRoundMax` (the median
+ * and the most Produce requests completed in one round); `consume-throughput` messagesPerSecond,
+ * cpuMicrosPerMessage (user plus system), event-loop delay p50, p99 and max (ms), Fetch requests,
+ * bytes and messages per Fetch, all over the measured window, plus the Fetch version, the passes
+ * and the LZ4 codec. A consume run also
  * reports mainThreadCpuMicrosPerMessage (the JavaScript thread only, from `process.threadCpuUsage`;
  * absent on a Node without it, which threadCpuUsageSupported says), fullGcCount (major
  * collections that started in the measured window) and the corpus layout. Each also reports elapsedMs, measuredMessages and the producer or consumer
@@ -100,6 +110,9 @@ const VALUE_TYPES = ['buffer', 'string']
 const KEY_MODES = ['index']
 const PARTITIONERS = ['default', 'custom']
 const PROBE_MODES = ['on']
+const IDEMPOTENT_MODES = ['true', 'false']
+/** The package name of the fork, the only arm the `--fork-*` flags apply to. */
+const FORK_PACKAGE = '@countly/kafkajs'
 /** Digits of a `--keys index` key, so every key has the same length. */
 const KEY_DIGITS = 7
 /** The `CompressionTypes` member each compression names, for the codecs a send can ask for. */
@@ -132,6 +145,8 @@ const FLAGS = [
   '--headers',
   '--partitioner',
   '--value-type',
+  '--fork-linger',
+  '--fork-idempotent',
   '--probe',
   '--brokers',
 ]
@@ -143,10 +158,12 @@ const APPLIES_TO = {
   '--headers': ['produce-throughput'],
   '--partitioner': ['produce-throughput'],
   '--value-type': ['produce-latency', 'produce-throughput'],
+  '--fork-linger': ['produce-throughput'],
+  '--fork-idempotent': ['produce-throughput'],
   '--probe': ['produce-throughput'],
 }
 const USAGE =
-  'usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <name> --workload <produce-latency|produce-throughput|consume-throughput> [--messages N] [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip] [--settings defaults|same] [--passes N] [--batch N] [--unawaited N] [--keys index] [--headers N] [--partitioner default|custom] [--value-type buffer|string] [--probe on] [--brokers host:port,...]'
+  'usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <name> --workload <produce-latency|produce-throughput|consume-throughput> [--messages N] [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip] [--settings defaults|same] [--passes N] [--batch N] [--unawaited N] [--keys index] [--headers N] [--partitioner default|custom] [--value-type buffer|string] [--fork-linger N] [--fork-idempotent true|false] [--probe on] [--brokers host:port,...]'
 
 /**
  * The one explicit consumer configuration of `--settings same`: kafkajs 2.2.4's defaults, with the
@@ -288,17 +305,29 @@ const positive = (text) => {
 }
 
 /**
+ * @param {string|undefined} text
+ * @returns {number|undefined} the integer (0 included) `text` holds, undefined when absent
+ * @throws {UsageError} when present and not written as a non-negative integer
+ */
+const nonNegative = (text) => {
+  if (text === undefined) return undefined
+  if (!/^\d+$/.test(text)) throw new UsageError(USAGE)
+  return Number(text)
+}
+
+/**
  * @param {string[]} argv
  * @returns {{ client: string, package: string, workload: string, messages: number|null,
  *   durationMs: number|null, size: number, partitions: number, compression: 'none'|'lz4'|'gzip',
  *   settings: 'defaults'|'same', passes: number, batch?: number, unawaited?: number,
  *   keys?: 'index', headers?: number, partitioner?: 'default'|'custom',
- *   valueType?: 'buffer'|'string', probe?: 'on', brokers: string[] }} the optional fields are
- *   absent unless their flag was given
+ *   valueType?: 'buffer'|'string', forkLinger?: number, forkIdempotent?: boolean, probe?: 'on',
+ *   brokers: string[] }} the optional fields are absent unless their flag was given
  * @throws {UsageError} for a missing, repeated or unknown flag, an unknown workload, compression,
- *   settings, key mode, partitioner, value type or probe mode, a count that is not a positive integer,
- *   `--duration-ms` with `--messages`, a flag on a workload it does not apply to, `--batch` with
- *   `--unawaited`, or `--partitioner custom` with `--settings same`
+ *   settings, key mode, partitioner, value type, idempotence or probe mode, a count that is not a
+ *   positive integer (a linger that is not a non-negative one), `--duration-ms` with `--messages`,
+ *   a flag on a workload it does not apply to, `--batch` with `--unawaited`, or `--partitioner
+ *   custom`, `--fork-linger` or `--fork-idempotent` with `--settings same`
  */
 const parseArgs = (argv) => {
   const flags = {}
@@ -316,6 +345,7 @@ const parseArgs = (argv) => {
   const keys = flags['--keys']
   const partitioner = flags['--partitioner']
   const probe = flags['--probe']
+  const idempotent = flags['--fork-idempotent']
   const oneOf = (choices, value) => value === undefined || choices.includes(value)
   const known =
     WORKLOADS.includes(workload) &&
@@ -324,6 +354,7 @@ const parseArgs = (argv) => {
     oneOf(VALUE_TYPES, valueType) &&
     oneOf(KEY_MODES, keys) &&
     oneOf(PARTITIONERS, partitioner) &&
+    oneOf(IDEMPOTENT_MODES, idempotent) &&
     oneOf(PROBE_MODES, probe)
   if (!flags['--client'] || !flags['--package'] || !known) throw new UsageError(USAGE)
   const durationMs = positive(flags['--duration-ms']) ?? null
@@ -333,9 +364,11 @@ const parseArgs = (argv) => {
   const misapplied = Object.entries(APPLIES_TO).some(
     ([flag, workloads]) => flags[flag] !== undefined && !workloads.includes(workload)
   )
+  const forkFlagged = flags['--fork-linger'] !== undefined || idempotent !== undefined
   const conflicting =
     (flags['--batch'] !== undefined && flags['--unawaited'] !== undefined) ||
-    (partitioner === 'custom' && settings === 'same')
+    (partitioner === 'custom' && settings === 'same') ||
+    (forkFlagged && settings === 'same')
   if (
     misplaced ||
     misapplied ||
@@ -362,6 +395,8 @@ const parseArgs = (argv) => {
     headers: positive(flags['--headers']),
     partitioner,
     valueType,
+    forkLinger: nonNegative(flags['--fork-linger']),
+    forkIdempotent: idempotent === undefined ? undefined : idempotent === 'true',
     probe,
     brokers: (flags['--brokers'] ?? DEFAULT_BROKERS).split(','),
   }
@@ -766,7 +801,9 @@ const sendFor = async (clock, started, ms, send) => {
  * next to the reads of the rate clock, so the window is the one the rate is measured over; the
  * collection observer takes its start last in `start()` and its end first in `stop()`. Nothing is
  * kept per call (the times go into a fixed-size histogram) and `close()` releases the sampling
- * timer and the collection observer when a run fails before `finish()`.
+ * timer and the collection observer when a run fails before `finish()`. It also counts the Produce
+ * requests the producer completed in each round (`watch`, `beginRound`, `endRound`), keeping one
+ * counter per distinct count rather than one entry per round.
  */
 class ProduceProbe {
   #timing
@@ -776,6 +813,10 @@ class ProduceProbe {
   #peakArrayBuffers = 0
   #timer = null
   #gcs = null
+  #requests = 0
+  #roundFrom = null
+  /** @type {Map<number, number>} rounds by the number of Produce requests they took */
+  #rounds = new Map()
 
   /** @param {Timing} timing the clocks, memory reading, interval timers and GC recorder */
   constructor(timing) {
@@ -785,6 +826,30 @@ class ProduceProbe {
   /** @returns {boolean} whether the window is open: only then is a call worth timing */
   get measuring() {
     return this.#measuring
+  }
+
+  /**
+   * Starts counting the Produce requests the producer completes (its `request` instrumentation
+   * event, which kafkajs 2.2.4 and the fork both emit) while the window is open.
+   * @param {{ on: Function, events: { REQUEST: string } }} producer
+   */
+  watch(producer) {
+    producer.on(producer.events.REQUEST, ({ payload }) => {
+      if (this.#measuring && payload.apiName === 'Produce') this.#requests++
+    })
+  }
+
+  /** Marks the start of a round of sends; nothing counts outside an open window. */
+  beginRound() {
+    this.#roundFrom = this.#measuring ? this.#requests : null
+  }
+
+  /** Closes the round `beginRound` opened and files the Produce requests it completed. */
+  endRound() {
+    if (this.#roundFrom === null) return
+    const requests = this.#requests - this.#roundFrom
+    this.#roundFrom = null
+    this.#rounds.set(requests, (this.#rounds.get(requests) ?? 0) + 1)
   }
 
   /**
@@ -823,12 +888,15 @@ class ProduceProbe {
    * entries; the window itself ended at `stop`.
    * @param {number} messages the messages sent in the window
    * @returns {Promise<{ sendCallMicrosP50: number, sendCallMicrosP99: number, peakRssBytes: number,
-   *   peakArrayBuffers: number, gcCountPer10kMessages: number, gcPauseMsPer10kMessages: number }>}
+   *   peakArrayBuffers: number, gcCountPer10kMessages: number, gcPauseMsPer10kMessages: number,
+   *   produceRequestsPerRoundP50?: number, produceRequestsPerRoundMax?: number }>} the two request
+   *   figures are absent when no round was counted
    */
   async finish(messages) {
     this.#stopSampling()
     this.#sample()
     const { count, pauseMs } = await this.#gcs.result()
+    const perRound = this.#requestsPerRound()
     return {
       sendCallMicrosP50: this.#calls.percentile(50) / 1000,
       sendCallMicrosP99: this.#calls.percentile(99) / 1000,
@@ -836,6 +904,7 @@ class ProduceProbe {
       peakArrayBuffers: this.#peakArrayBuffers,
       gcCountPer10kMessages: (count * 10000) / messages,
       gcPauseMsPer10kMessages: (pauseMs * 10000) / messages,
+      ...perRound,
     }
   }
 
@@ -850,6 +919,30 @@ class ProduceProbe {
     if (this.#timer === null) return
     this.#timing.clearInterval(this.#timer)
     this.#timer = null
+  }
+
+  /**
+   * @returns {{ produceRequestsPerRoundP50?: number, produceRequestsPerRoundMax?: number }} the
+   *   median (the value at half the rounds in ascending order, as `percentile` takes it) and the
+   *   largest Produce request count of a round; empty when no round was counted
+   */
+  #requestsPerRound() {
+    const counts = [...this.#rounds].sort(([a], [b]) => a - b)
+    if (counts.length === 0) return {}
+    const middle = Math.floor(counts.reduce((sum, [, rounds]) => sum + rounds, 0) / 2)
+    let seen = 0
+    let median
+    for (const [requests, rounds] of counts) {
+      seen += rounds
+      if (seen > middle) {
+        median = requests
+        break
+      }
+    }
+    return {
+      produceRequestsPerRoundP50: median,
+      produceRequestsPerRoundMax: counts[counts.length - 1][0],
+    }
   }
 
   #sample() {
@@ -917,9 +1010,10 @@ const produceLatency = (
  * window starts, so both packages send the same records in the window whatever their warm-up
  * managed. A run with none of the shape flags and a `durationMs` window sends the first values of
  * the corpus on every send, as it always did; any other run walks the corpus. With `probe` the
- * window also reports the time of each `send()` call, the peak memory and the garbage collections
- * of the window the rate is measured over, whose two clock readings the probe is given
- * (`ProduceProbe`); without it the run adds no clock read, timer or observer of its own. With
+ * window also reports the time of each `send()` call, the peak memory, the garbage collections and
+ * the Produce requests each round took, over the window the rate is measured over, whose two clock
+ * readings the probe is given (`ProduceProbe`); without it the run adds no clock read, timer,
+ * observer or event listener of its own. With
  * `routing` the custom partitioner's count starts again at 0 when the window starts, like the
  * record numbering.
  * @param {object} kafka
@@ -972,11 +1066,14 @@ const produceThroughput = (kafka, target, options, timing) =>
       const perRound = unawaited ?? batch
       const send = async (limit = Infinity) => {
         const count = Math.min(perRound, limit)
+        probe?.beginRound()
         if (unawaited) await Promise.all(Array.from({ length: count }, () => call(1)))
         else await call(count)
+        probe?.endRound()
         return count
       }
       try {
+        probe?.watch(producer)
         await call(1)
         if (durationMs !== null) await sendFor(now, now(), WARMUP_MS, send)
         issued = 0
@@ -1218,11 +1315,15 @@ const RUNNERS = {
  * @param {{ messages: number, durationMs?: number|null, size: number, partitions?: number,
  *   compression?: 'none'|'lz4'|'gzip', settings?: 'defaults'|'same', passes?: number,
  *   batch?: number, unawaited?: number, keys?: 'index', headers?: number,
- *   partitioner?: 'default'|'custom', valueType?: 'buffer'|'string', probe?: 'on',
- *   brokers: string[] }} options
+ *   partitioner?: 'default'|'custom', valueType?: 'buffer'|'string', forkLinger?: number,
+ *   forkIdempotent?: boolean, probe?: 'on', brokers: string[] }} options `forkLinger` and
+ *   `forkIdempotent` become the producer's `linger` and `idempotent` on the fork (client name
+ *   `@countly/kafkajs`) only
  * @param {Partial<Timing>} [timing]
  * @returns {Promise<object>} the workload's metrics, with the consumer (consume) or producer
- *   (produce) `settings` in force, an LZ4 or gzip run's `codec`, and, when any of `batch`,
+ *   (produce) `settings` in force (the fork's `forkLinger` and `forkIdempotent` as
+ *   `settings.overrides`, any other package's as `settings.ignoredOverrides`), an LZ4 or gzip
+ *   run's `codec`, and, when any of `batch`,
  *   `unawaited`, `keys`, `headers`, `partitioner` or `valueType` was given, those as `shape`
  * @throws {Error} for an unknown workload, or whatever the client throws
  */
@@ -1246,6 +1347,12 @@ const runWorkload = async (client, workload, options, timing = {}) => {
   const same = settings === 'same'
   const consumerSettings = same ? SAME_SETTINGS : {}
   const routing = partitioner === 'custom' ? customRouting() : undefined
+  const requested = Object.fromEntries(
+    Object.entries({ linger: options.forkLinger, idempotent: options.forkIdempotent }).filter(
+      ([, value]) => value !== undefined
+    )
+  )
+  const forked = client.name === FORK_PACKAGE
   const producerSettings = {
     ...(same &&
       !consume && {
@@ -1253,6 +1360,7 @@ const runWorkload = async (client, workload, options, timing = {}) => {
         createPartitioner: client.Partitioners.DefaultPartitioner,
       }),
     ...(routing && { createPartitioner: routing.createPartitioner }),
+    ...(forked && requested),
   }
   const shape = Object.fromEntries(
     Object.entries({ batch, unawaited, keys, headers, partitioner, valueType }).filter(
@@ -1265,7 +1373,12 @@ const runWorkload = async (client, workload, options, timing = {}) => {
           ? SAME_SETTINGS
           : { ...SAME_PRODUCER_SETTINGS, partitioner: 'DefaultPartitioner' },
       }
-    : { defaults: (consume ? PACKAGE_DEFAULTS : PRODUCER_DEFAULTS)[client.name] ?? null }
+    : {
+        defaults: (consume ? PACKAGE_DEFAULTS : PRODUCER_DEFAULTS)[client.name] ?? null,
+        ...(Object.keys(requested).length > 0 && {
+          [forked ? 'overrides' : 'ignoredOverrides']: requested,
+        }),
+      }
   const clock = { ...DEFAULT_TIMING, ...timing }
   const admin = kafka.admin()
   try {

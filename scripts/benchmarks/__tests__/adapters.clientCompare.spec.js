@@ -106,6 +106,15 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-fanout-100p': produce('50', 'none', '100'),
         'compare-produce-throughput-custom': produce('200', 'none', '12'),
         'compare-produce-throughput-headers': produce('200'),
+        'compare-produce-throughput-linger0': produce('200'),
+        'compare-produce-throughput-12p-linger0': produce('200', 'none', '12'),
+        'compare-produce-throughput-12p-keyed-linger0': produce('200', 'none', '12'),
+        'compare-produce-throughput-fanout-100p-linger0': produce('50', 'none', '100'),
+        'compare-produce-throughput-custom-linger0': produce('200', 'none', '12'),
+        'compare-produce-throughput-coalesced-linger0': produce('200', 'none', '1'),
+        'compare-produce-throughput-12p-keyed-linger0-plain': produce('200', 'none', '12'),
+        'compare-produce-throughput-fanout-100p-linger0-plain': produce('50', 'none', '100'),
+        'compare-produce-throughput-custom-linger0-plain': produce('200', 'none', '12'),
         'compare-consume-throughput': ['consume-throughput', '200', 'none', '3', 'defaults'],
         'compare-consume-throughput-same': ['consume-throughput', '200', 'none', '3', 'same'],
         'compare-consume-throughput-1k': ['consume-throughput', '1024', 'none', '3', 'defaults'],
@@ -193,6 +202,15 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-fanout-100p': { '--keys': 'index' },
         'compare-produce-throughput-custom': { '--partitioner': 'custom' },
         'compare-produce-throughput-headers': { '--headers': '20' },
+        'compare-produce-throughput-linger0': {},
+        'compare-produce-throughput-12p-linger0': {},
+        'compare-produce-throughput-12p-keyed-linger0': { '--keys': 'index' },
+        'compare-produce-throughput-fanout-100p-linger0': { '--keys': 'index' },
+        'compare-produce-throughput-custom-linger0': { '--partitioner': 'custom' },
+        'compare-produce-throughput-coalesced-linger0': { '--unawaited': '100' },
+        'compare-produce-throughput-12p-keyed-linger0-plain': { '--keys': 'index' },
+        'compare-produce-throughput-fanout-100p-linger0-plain': { '--keys': 'index' },
+        'compare-produce-throughput-custom-linger0-plain': { '--partitioner': 'custom' },
       })
     })
 
@@ -273,6 +291,8 @@ describe('Benchmark report clientCompare adapter', () => {
               { key: 'peakArrayBuffers', unit: 'bytes' },
               { key: 'gcCountPer10kMessages', unit: 'collections' },
               { key: 'gcPauseMsPer10kMessages', unit: 'ms' },
+              { key: 'produceRequestsPerRoundP50', unit: 'requests' },
+              { key: 'produceRequestsPerRoundMax', unit: 'requests' },
             ],
           },
         ])
@@ -349,8 +369,85 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-fanout-100p',
         'compare-produce-throughput-custom',
         'compare-produce-throughput-headers',
+        'compare-produce-throughput-linger0',
+        'compare-produce-throughput-12p-linger0',
+        'compare-produce-throughput-12p-keyed-linger0',
+        'compare-produce-throughput-fanout-100p-linger0',
+        'compare-produce-throughput-custom-linger0',
+        'compare-produce-throughput-coalesced-linger0',
+        'compare-produce-throughput-12p-keyed-linger0-plain',
+        'compare-produce-throughput-fanout-100p-linger0-plain',
+        'compare-produce-throughput-custom-linger0-plain',
       ])
       expect(compareRows.filter((row) => 'namedOnly' in row && row.namedOnly !== true)).toEqual([])
+    })
+
+    test('each -linger0 row is its twin row with --fork-linger 0 added and run only when named, nothing else changed, and each -plain row is the -linger0 row with --fork-idempotent false added', () => {
+      const byName = (name) => compareRows.find((row) => row.name === name)
+      const lingerTwins = {
+        'compare-produce-throughput-linger0': 'compare-produce-throughput',
+        'compare-produce-throughput-12p-linger0': 'compare-produce-throughput-12p',
+        'compare-produce-throughput-12p-keyed-linger0': 'compare-produce-throughput-12p-keyed',
+        'compare-produce-throughput-fanout-100p-linger0': 'compare-produce-throughput-fanout-100p',
+        'compare-produce-throughput-custom-linger0': 'compare-produce-throughput-custom',
+        'compare-produce-throughput-coalesced-linger0': 'compare-produce-throughput-coalesced',
+      }
+      const plainTwins = {
+        'compare-produce-throughput-12p-keyed-linger0-plain':
+          'compare-produce-throughput-12p-keyed-linger0',
+        'compare-produce-throughput-fanout-100p-linger0-plain':
+          'compare-produce-throughput-fanout-100p-linger0',
+        'compare-produce-throughput-custom-linger0-plain':
+          'compare-produce-throughput-custom-linger0',
+      }
+
+      for (const [name, twin] of Object.entries(lingerTwins)) {
+        const original = byName(twin)
+        expect([name, byName(name)]).toEqual([
+          name,
+          {
+            ...original,
+            name,
+            command: [...original.command, '--fork-linger', '0'],
+            namedOnly: true,
+          },
+        ])
+      }
+      for (const [name, twin] of Object.entries(plainTwins)) {
+        const original = byName(twin)
+        expect([name, byName(name)]).toEqual([
+          name,
+          { ...original, name, command: [...original.command, '--fork-idempotent', 'false'] },
+        ])
+      }
+    })
+
+    test('only the nine twin rows set the fork-only flags: --fork-linger 0 on all nine, --fork-idempotent false on the three -plain rows', () => {
+      const withFlag = (flag) =>
+        compareRows
+          .filter((row) => row.command.includes(flag))
+          .map((row) => [row.name, valueOf(row.command, flag)])
+
+      expect(withFlag('--fork-linger')).toEqual(
+        [
+          'compare-produce-throughput-linger0',
+          'compare-produce-throughput-12p-linger0',
+          'compare-produce-throughput-12p-keyed-linger0',
+          'compare-produce-throughput-fanout-100p-linger0',
+          'compare-produce-throughput-custom-linger0',
+          'compare-produce-throughput-coalesced-linger0',
+          'compare-produce-throughput-12p-keyed-linger0-plain',
+          'compare-produce-throughput-fanout-100p-linger0-plain',
+          'compare-produce-throughput-custom-linger0-plain',
+        ].map((name) => [name, '0'])
+      )
+      expect(withFlag('--fork-idempotent')).toEqual(
+        [
+          'compare-produce-throughput-12p-keyed-linger0-plain',
+          'compare-produce-throughput-fanout-100p-linger0-plain',
+          'compare-produce-throughput-custom-linger0-plain',
+        ].map((name) => [name, 'false'])
+      )
     })
 
     test('the 1 KiB same-settings consume row is the 1 KiB consume row with --settings same', () => {
@@ -388,7 +485,7 @@ describe('Benchmark report clientCompare adapter', () => {
         rows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
       const limit = workflow.jobs.bench['timeout-minutes']
 
-      expect(Math.round(minutesOf(compareRows.filter((row) => row.namedOnly)))).toBe(96)
+      expect(Math.round(minutesOf(compareRows.filter((row) => row.namedOnly)))).toBe(163)
       expect(minutesOf(compareRows.filter((row) => row.namedOnly)) + 20).toBeLessThanOrEqual(limit)
       expect(minutesOf(compareRows) + 20).toBeGreaterThan(limit)
     })
@@ -698,6 +795,30 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(detail.notes.slice(1)).toEqual([
         "gzip: zlib@1.3.1, the package's built-in codec",
         'workload shape (the same on both arms): batch=8, keys="index", headers=20, partitioner="custom", valueType="string"',
+      ])
+    })
+
+    test('an arm notes the overrides it applied, and an arm that ignored the fork-only overrides of its row says so', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const overrides = { linger: 0, idempotent: false }
+      const forked = output(1, 30000, { settings: { defaults: { linger: 5 }, overrides } })
+      const baseline = output(1, 30000, {
+        settings: { defaults: { linger: 'none' }, ignoredOverrides: overrides },
+      })
+
+      const fork = adapter.rows(produce, 'fork', { outputs: [forked] }, 1)
+      const old = adapter.rows(produce, 'kafkajs@2.2.4', { outputs: [baseline] }, 1)
+
+      expect(fork.detail.notes.slice(1)).toEqual([
+        "producer settings in force (this package's defaults): linger=5",
+        'producer overrides in force on this arm only, each replacing the default of the same name: linger=0, idempotent=false',
+      ])
+      expect(old.detail.notes.slice(1)).toEqual([
+        'producer settings in force (this package\'s defaults): linger="none"',
+        "this arm ran with its own defaults: the row's fork-only overrides (linger=0, idempotent=false) do not apply to it",
       ])
     })
 
