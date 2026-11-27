@@ -46,6 +46,49 @@ const ASKS_AGAIN = new Set([COORDINATOR_LOAD_IN_PROGRESS, ...RE_FINDS_COORDINATO
 const endsDescribe = (error) => !isRetriable(error) || endsCall(error) || isAnsweredError(error)
 
 /**
+ * Waits until every one of `work` has settled, unless a failure that ends the call comes first (a
+ * rejection `endsDescribe` accepts, or one `terminalOf` finds in a fulfilled value): then it rejects
+ * with that failure at once, so work still in flight cannot hold back a refusal already received
+ * until the call's deadline. Of several such failures the first to arrive is the one. Every promise
+ * keeps its handlers, so the work left running settles later without an unhandled rejection, and
+ * nothing reads its result.
+ * @template T
+ * @param {Promise<T>[]} work
+ * @param {(value: T) => Error|undefined} terminalOf
+ * @returns {Promise<PromiseSettledResult<T>[]>}
+ */
+const settledUnlessEnded = (work, terminalOf) =>
+  new Promise((resolve, reject) => {
+    for (const promise of work) {
+      promise.then(
+        (value) => {
+          const ended = terminalOf(value)
+          if (ended) reject(ended)
+        },
+        (error) => {
+          if (endsDescribe(error)) reject(error)
+        }
+      )
+    }
+    Promise.allSettled(work).then(resolve)
+  })
+
+/**
+ * The failure among one request's outcomes that ends the call, if there is one.
+ * @param {Map<string, { value?: any, error?: Error }>} outcomes
+ * @returns {Error|undefined}
+ */
+const endingFailureOf = (outcomes) => {
+  for (const { error } of outcomes.values()) {
+    if (error !== undefined && endsDescribe(error)) return error
+  }
+  return undefined
+}
+
+/** A lookup's coordinator never ends the call; only its rejection can. */
+const noEndingFailure = () => undefined
+
+/**
  * Whether `error`, or any error it wraps, is the rejection `lookupRequest` raises for an API key
  * the broker does not advertise.
  *
@@ -271,20 +314,27 @@ class GroupDescriptions {
    * phase: which ids are pending and the one settled value of each settled id.
    *
    * One attempt finds the coordinator of every pending id and sends each coordinator one request
-   * for its ids (`#request`), and decides nothing until every lookup and request of the attempt has
-   * settled, so no work of an attempt outlives it. Each id of a request then has one outcome:
-   * settled for good, or a failure that leaves it pending; an id the coordinator answered with no
-   * row is done without a value. A failure coded 15 or 16, on a row or from a request, drops that
-   * id's coordinator, and the next attempt looks it up again (`findGroupCoordinator` reaches a
-   * coordinator it does not know at the address FindCoordinator gives, refreshing metadata itself
-   * when it must); after any other failure (14 included) the id is asked again where it is. An id whose lookup failed stays
+   * for its ids (`#request`). A failure that ends the call (`endsDescribe`), from a lookup or in a
+   * request's outcomes, ends the attempt as soon as it arrives, so the call ends with it whatever
+   * the other requests of the attempt still do, and its ids are never sent again (the work still
+   * running settles later and changes nothing). Otherwise the attempt decides nothing until every
+   * lookup and request of it has settled, so no work of an attempt outlives a retry. Each id of a
+   * request then has one outcome: settled for good, or a failure that leaves it pending; an id
+   * the coordinator answered with no row is done without a value. An id whose lookup failed stays
    * pending with that failure.
    *
-   * While any id is pending the attempt throws one failure: the first that ends the call
-   * (`endsDescribe`) if there is one, so the call ends with it whichever request finished first and
-   * its ids are never sent again; otherwise the first lookup failure, else the first failure in
-   * coordinator order, which the retrier counts and backs off on. Because the next attempt waits for every request of this one, a slow
-   * coordinator delays asking another coordinator's ids again, by at most that request's timeout.
+   * A failure coded 15 or 16, on a row or from a request, drops that id's coordinator, and the next
+   * attempt refreshes metadata once, under the consumer's fence when there is one, before it looks
+   * the moved ids up again: `findGroupCoordinator` reuses the broker it holds for a node id it
+   * already knows, so only a refresh moves a known node to a new address. After any other failure
+   * (14 included) the id is asked again where it is, and no metadata is refreshed; a row for an id
+   * the request did not ask never counts.
+   *
+   * While any id is pending the attempt throws the first lookup failure, else the first failure in
+   * coordinator order, which the retrier counts and backs off on. Because a retry waits for every
+   * request of the attempt, a slow coordinator delays asking another coordinator's ids again until
+   * that request ends: at its request timeout when one is enforced, and in any case at the call's
+   * deadline, which is the outer bound.
    * @private
    * @param {string[]} ids the written ids, each once
    * @param {object} context captured operation and per-call coordinator map
@@ -298,10 +348,22 @@ class GroupDescriptions {
   async #resolve(ids, context, api) {
     const pending = new Set(ids)
     const settled = new Map()
+    let moved = false
     this.#checked(
       context,
       await this.#wait(context, async () =>
         this.#retrier(context)(async () => {
+          if (moved) {
+            moved = false
+            this.#checked(
+              context,
+              await this.#wait(context, async () =>
+                this.cluster.refreshMetadata(
+                  ...(context.consumerOperation ? [{ fence: context.consumerOperation }] : [])
+                )
+              )
+            )
+          }
           const { batches, unlocated } = this.#checked(
             context,
             await this.#wait(context, async () => this.#groupByCoordinator([...pending], context))
@@ -309,10 +371,11 @@ class GroupDescriptions {
           const requests = this.#checked(
             context,
             await this.#wait(context, async () =>
-              Promise.allSettled(
+              settledUnlessEnded(
                 batches.map(({ coordinator, ids: batchIds }) =>
                   this.#request(coordinator, batchIds, context, api)
-                )
+                ),
+                endingFailureOf
               )
             )
           )
@@ -329,7 +392,10 @@ class GroupDescriptions {
                 continue
               }
               failures.push(outcome.error)
-              if (RE_FINDS_COORDINATOR.has(outcome.error.code)) context.coordinators.delete(groupId)
+              if (RE_FINDS_COORDINATOR.has(outcome.error.code)) {
+                context.coordinators.delete(groupId)
+                moved = true
+              }
             }
             for (const groupId of batchIds) {
               if (!outcomes.has(groupId)) pending.delete(groupId)
@@ -549,8 +615,9 @@ class GroupDescriptions {
   /**
    * FindCoordinator for every id, then one batch per distinct coordinator node - the shape this
    * client has always used, kept so N ids do not become N round trips. Every lookup settles before
-   * this returns, so a lookup never outlives the attempt that started it; an id whose lookup failed
-   * is in no batch, and its failure is returned.
+   * this returns, so a lookup never outlives an attempt that goes on to a retry; only a lookup
+   * failure that ends the call returns at once (see `settledUnlessEnded`). An id whose lookup
+   * failed is in no batch, and its failure is returned.
    * @private
    * @param {string[]} groupIds
    * @param {object} context captured operation and per-call coordinator map
@@ -560,7 +627,7 @@ class GroupDescriptions {
     const located = this.#checked(
       context,
       await this.#wait(context, async () =>
-        Promise.allSettled(
+        settledUnlessEnded(
           groupIds.map(async (groupId) => {
             let coordinator = context.coordinators.get(groupId)
             if (!coordinator) {
@@ -577,7 +644,8 @@ class GroupDescriptions {
               context.coordinators.set(groupId, coordinator)
             }
             return { groupId, coordinator }
-          })
+          }),
+          noEndingFailure
         )
       )
     )
