@@ -7,6 +7,7 @@ const {
   apiVersionsBody,
   createFakeBroker,
   createFetchGroup,
+  decodeOffsetForLeaderEpochRequests,
   offsetForLeaderEpochResponse,
   scriptedEpochLog,
 } = require('./fixtures/fetchHarness')
@@ -231,9 +232,13 @@ describe('Test harness > scripted OffsetForLeaderEpoch answers', () => {
         ],
         logEnd: 20,
       },
-      /epoch -1 at 0 is negative/,
+      /cached epoch -1 is not an integer/,
     ],
-    ['a negative cached start', { epochs: [[5, -1]], logEnd: 20 }, /epoch 5 at -1 is negative/],
+    [
+      'a negative cached start',
+      { epochs: [[5, -1]], logEnd: 20 },
+      /epoch 5 start -1 is not an exact int64/,
+    ],
     [
       'a leader whose epoch is not its latest cached one',
       {
@@ -260,8 +265,79 @@ describe('Test harness > scripted OffsetForLeaderEpoch answers', () => {
       /leader epoch 4/,
     ],
     ['a negative leader epoch', { epochs: [], logEnd: 0, leaderEpoch: -1 }, /leader epoch -1/],
+    // LeaderEpoch is an int32 and EndOffset an int64 (OffsetForLeaderEpochResponse.json, 4.0.0
+    // and 4.4.0, lines 38-47); a log end, like a start, is 0 or more.
+    [
+      'a log end beyond the int64 range',
+      { epochs: [[5, '0']], logEnd: '9223372036854775808' },
+      /log end 9223372036854775808 is not an exact int64/,
+    ],
+    ['a negative log end of an empty cache', { epochs: [], logEnd: '-1' }, /log end -1/],
+    ['an unsafe numeric log end', { epochs: [], logEnd: 2 ** 53 + 2 }, /log end 9007199254740994/],
+    ['a fractional cached epoch', { epochs: [[5.5, 0]], logEnd: 10 }, /cached epoch 5.5/],
+    ['a cached epoch that is not a number', { epochs: [[NaN, 0]], logEnd: 10 }, /cached epoch NaN/],
+    [
+      'a cached epoch beyond the int32 range',
+      { epochs: [[2 ** 31, 0]], logEnd: 10 },
+      /cached epoch 2147483648/,
+    ],
+    ['a fractional cached start', { epochs: [[5, 1.5]], logEnd: 10 }, /epoch 5 start 1.5/],
+    [
+      'a fractional leader epoch',
+      { epochs: [], logEnd: 0, leaderEpoch: 5.5 },
+      /leader epoch 5.5 is not an integer/,
+    ],
+    [
+      'a leader epoch beyond the int32 range',
+      { epochs: [], logEnd: 0, leaderEpoch: 2 ** 31 },
+      /leader epoch 2147483648 is not an integer/,
+    ],
   ])('scriptedEpochLog refuses %s', (_case, log, message) => {
     expect(() => scriptedEpochLog(log)).toThrow(message)
+  })
+
+  test('scriptedEpochLog refuses a requested epoch that is not an int32', () => {
+    expect(() => scriptedEpochLog(CACHE).endOffsetFor(1.5)).toThrow(/requested epoch 1.5/)
+  })
+
+  test('scriptedEpochLog keeps offsets beyond the safe integer range exact in the encoded answer', async () => {
+    const body = scriptedEpochLog({
+      epochs: [
+        [4, '9007199254740993'],
+        [5, '9223372036854775806'],
+      ],
+      logEnd: '9223372036854775807',
+    }).answer([0, 1], {
+      partitions: [
+        { partition: 0, currentLeaderEpoch: 5, leaderEpoch: 5 },
+        { partition: 1, currentLeaderEpoch: 5, leaderEpoch: 4 },
+      ],
+    })
+
+    expect((await decode(body)).topics[0].partitions).toEqual([
+      { errorCode: 0, partition: 0, leaderEpoch: 5, endOffset: '9223372036854775807' },
+      { errorCode: 0, partition: 1, leaderEpoch: 4, endOffset: '9223372036854775806' },
+    ])
+  })
+
+  test.each([
+    ['a leader epoch below -1', { partition: 0, leaderEpoch: -2 }, /leader epoch -2/],
+    ['a fractional leader epoch', { partition: 0, leaderEpoch: 4.5 }, /leader epoch 4.5/],
+    ['an end offset below -1', { partition: 0, endOffset: '-2' }, /end offset -2/],
+    [
+      'an end offset beyond the int64 range',
+      { partition: 0, endOffset: '9223372036854775808' },
+      /end offset 9223372036854775808/,
+    ],
+    [
+      'an unsafe numeric end offset',
+      { partition: 0, endOffset: 2 ** 53 + 2 },
+      /end offset 9007199254740994/,
+    ],
+    ['a negative partition', { partition: -1 }, /partition -1/],
+    ['an error code beyond int16', { partition: 0, errorCode: 2 ** 15 }, /error code 32768/],
+  ])('offsetForLeaderEpochResponse refuses %s', (_case, row, message) => {
+    expect(() => offsetForLeaderEpochResponse([row])).toThrow(message)
   })
 })
 
@@ -323,18 +399,68 @@ describe('Test harness > withheld broker answers', () => {
     }
   })
 
-  test('a rejected withheld answer closes the connection, so its request fails instead of waiting', async () => {
+  test('a rejected withheld answer fails the request it answers with the rejection', async () => {
+    const cancelled = new Error('answer cancelled')
     const { broker } = createFakeBroker((header) =>
-      header.apiKey === apiKeys.ApiVersions
-        ? apiVersionsBody(18)
-        : Promise.reject(new Error('answer cancelled'))
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : Promise.reject(cancelled)
     )
     await broker.connect()
 
     try {
-      await expect(broker.offsetForLeaderEpoch(validationRequest(0, 4))).rejects.toMatchObject({
-        name: 'KafkaJSConnectionClosedError',
-      })
+      await expect(broker.offsetForLeaderEpoch(validationRequest(0, 4))).rejects.toBe(cancelled)
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  test('an assertion that throws while a withheld answer is played back fails the request it answers', async () => {
+    let release
+    const withheld = new Promise((resolve) => (release = resolve))
+    const layout = new Error('the response frame has the wrong layout')
+    const { broker } = createFakeBroker(
+      (header) => (header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : withheld),
+      (frame, header) => {
+        if (header.apiKey === apiKeys.OffsetForLeaderEpoch) throw layout
+        return [frame]
+      }
+    )
+    await broker.connect()
+
+    try {
+      const outcome = broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => 'answered',
+        (error) => error
+      )
+      release(offsetForLeaderEpochResponse([{ partition: 0 }]))
+
+      expect(await outcome).toBe(layout)
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  test('an answer that throws fails the request it answers, not one answered in the same pump', async () => {
+    const refused = new Error('no answer for partition 1')
+    const { broker } = createFakeBroker((header, frame) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      const [{ topics }] = decodeOffsetForLeaderEpochRequests([frame])
+      if (topics[0].partitions[0].partition === 1) throw refused
+      return offsetForLeaderEpochResponse([{ partition: 0, leaderEpoch: 4, endOffset: '20' }])
+    })
+    await broker.connect()
+
+    try {
+      const [first, second] = await Promise.allSettled([
+        broker.offsetForLeaderEpoch(validationRequest(0, 4)),
+        broker.offsetForLeaderEpoch(validationRequest(1, 4)),
+      ])
+
+      expect(first.status).toBe('fulfilled')
+      expect(first.value.topics[0].partitions).toEqual([
+        { errorCode: 0, partition: 0, leaderEpoch: 4, endOffset: '20' },
+      ])
+      expect(second.status).toBe('rejected')
+      expect(second.reason).toBe(refused)
     } finally {
       await broker.disconnect({ drainTimeout: 0 })
     }
@@ -544,6 +670,46 @@ describe('Test harness > fetch group teardown', () => {
 
     await teardown()
 
+    expect(await lookup).toBe('fetch harness torn down')
+  })
+
+  test('teardown refuses a lookup whose node was still connecting', async () => {
+    const { cluster, teardown } = await fetchGroup({ knownNodes: [0, 1], validationBrokers: true })
+    // Node 1's broker is created by this lookup and connects over later turns.
+    const lookup = cluster.findBroker({ nodeId: 1 }).then(
+      () => 'found',
+      (error) => error.message
+    )
+
+    await teardown()
+
+    expect(await lookup).toBe('fetch harness torn down')
+  })
+
+  test('concurrent teardown callers wait for the same cleanup, which runs once', async () => {
+    const { broker, cluster, teardown } = await fetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    const disconnect = broker.disconnect.bind(broker)
+    let closed = false
+    const disconnects = jest.spyOn(broker, 'disconnect').mockImplementation(async (options) => {
+      await disconnect(options)
+      closed = true
+    })
+    const lookup = cluster.findBroker({ nodeId: 1 }).then(
+      () => 'found',
+      (error) => error.message
+    )
+
+    const first = teardown()
+    const second = teardown()
+    expect(second).toBe(first)
+    await second
+
+    expect(closed).toBe(true)
+    expect(disconnects).toHaveBeenCalledTimes(1)
+    expect(disconnects).toHaveBeenCalledWith({ drainTimeout: 0 })
     expect(await lookup).toBe('fetch harness torn down')
   })
 })
