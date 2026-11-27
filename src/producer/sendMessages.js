@@ -666,12 +666,13 @@ class DrainLoop {
    * settled with its batch: resolved with the batch's `RecordMetadata`, or rejected with its error.
    * A transactional producer registers each partition with the transaction here, before anything
    * is drained.
-   * @param {{ acks: number, timeout: number, compression: number,
+   * @param {{ acks: number, timeout: number, compression: number, codec?: ?Function,
    *   batches: { topic: string, partition: number, messages: object[], settlers?: object[],
-   *   createdAt?: number }[] }} request
+   *   createdAt?: number }[] }} request `codec` is the send's pinned codec factory, which every
+   *   batch carries and every request built from it uses
    * @returns {Promise<object[]>}
    */
-  send({ acks, timeout, compression, batches }) {
+  send({ acks, timeout, compression, codec, batches }) {
     const manager = this.#eosManager.stateManager
     const send = new Send(batches.length, this.#settled)
     const now = Date.now()
@@ -703,6 +704,7 @@ class DrainLoop {
           acks,
           timeout,
           compression,
+          codec,
           firstSequence: null,
           producerId: null,
           producerEpoch: null,
@@ -1202,7 +1204,7 @@ class DrainLoop {
     })
     const refused = attempt.guard()
     if (refused) throw refused
-    const [{ acks, timeout, compression, producerId, producerEpoch }] = batches
+    const [{ acks, timeout, compression, codec, producerId, producerEpoch }] = batches
     const topicData = topicDataOf(batches)
     const transactional = this.#eosManager.isTransactional()
 
@@ -1213,6 +1215,7 @@ class DrainLoop {
       acks,
       timeout,
       compression,
+      compressionCodec: codec,
       compressionLevel:
         compression === Compression.GZIP
           ? this.#compressionLevels?.gzip
@@ -1994,17 +1997,18 @@ const createSendMessages = ({
    * @param {object} request
    * @param {number} request.acks
    * @param {number} request.timeout
-   * @param {number} request.compression
+   * @param {number} request.compression the batch attribute bits
+   * @param {?Function} [request.codec] the codec factory pinned at the call; absent, the registry's
    * @param {{ topic: string, partition: number, messages: object[], settlers?: object[],
    *   createdAt?: number }[]} request.batches `createdAt` starts the delivery deadline; now when
    *   absent
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch
    * @throws {KafkaJSInvariantViolation} an idempotent send whose `acks` is not -1
    */
-  const sendPartitioned = async ({ acks, timeout, compression, batches }) =>
+  const sendPartitioned = async ({ acks, timeout, compression, codec, batches }) =>
     isIdempotent()
-      ? sendIdempotent({ acks, timeout, compression, batches })
-      : sendPartitionedPlain({ acks, timeout, compression, batches })
+      ? sendIdempotent({ acks, timeout, compression, codec, batches })
+      : sendPartitionedPlain({ acks, timeout, compression, codec, batches })
 
   /**
    * The idempotent half of `sendPartitioned`: the batches go through the drain loop, created on
@@ -2013,7 +2017,7 @@ const createSendMessages = ({
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvariantViolation} an `acks` other than -1
    */
-  const sendIdempotent = async ({ acks, timeout, compression, batches }) => {
+  const sendIdempotent = async ({ acks, timeout, compression, codec, batches }) => {
     if (batches.length === 0) {
       return []
     }
@@ -2038,7 +2042,7 @@ const createSendMessages = ({
         generation,
       })
     }
-    return loop.send({ acks, timeout, compression, batches })
+    return loop.send({ acks, timeout, compression, codec, batches })
   }
 
   /** ms from a send's start to its delivery deadline, the producer's */
@@ -2093,7 +2097,7 @@ const createSendMessages = ({
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch, once all have settled;
    *   rejects with the first error a batch failed with
    */
-  const sendPartitionedPlain = ({ acks, timeout, compression, batches }) => {
+  const sendPartitionedPlain = ({ acks, timeout, compression, codec, batches }) => {
     const generation = getGeneration()
     let callbacks = 0
     let workEnded = false
@@ -2243,6 +2247,7 @@ const createSendMessages = ({
         acks,
         timeout,
         compression,
+        compressionCodec: codec,
         compressionLevel:
           compression === Compression.GZIP
             ? compressionLevels?.gzip

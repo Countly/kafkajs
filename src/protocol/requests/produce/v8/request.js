@@ -28,6 +28,7 @@ module.exports = ({
   producerEpoch,
   compression,
   compressionLevel,
+  compressionCodec,
   topicData,
 }) =>
   Object.assign(
@@ -39,6 +40,7 @@ module.exports = ({
       producerEpoch,
       compression,
       compressionLevel,
+      compressionCodec,
       topicData,
     }),
     { apiVersion: 8 }

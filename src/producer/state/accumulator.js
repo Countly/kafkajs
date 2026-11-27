@@ -422,6 +422,25 @@ const offsetBy = (metadata, index) =>
     ? metadata
     : { ...metadata, baseOffset: String(BigInt(metadata.baseOffset) + BigInt(index)) }
 
+/** @type {WeakMap<Function, number>} an id per codec factory a batch key has named */
+const CODEC_IDS = new WeakMap()
+let nextCodecId = 1
+
+/**
+ * Tells codec factories apart in a batch key by identity, without keeping a factory alive.
+ * @param {?Function} [codec] a send's pinned codec factory
+ * @returns {number} 0 for none; otherwise the same id for the same factory
+ */
+const codecId = (codec) => {
+  if (codec == null) return 0
+  let id = CODEC_IDS.get(codec)
+  if (id === undefined) {
+    id = nextCodecId++
+    CODEC_IDS.set(codec, id)
+  }
+  return id
+}
+
 /** Sorts `RecordMetadata` by topic name, then partition. */
 const byTopicThenPartition = (a, b) =>
   a.topicName < b.topicName ? -1 : a.topicName > b.topicName ? 1 : a.partition - b.partition
@@ -787,7 +806,10 @@ class PendingSend {
     this.entries = null
     /** @type {?(outcome: Promise<object[]>) => void} resolves the send; set while it is held */
     this.resolve = null
-    /** @type {?{ acks: number, timeout?: number, compression?: number }} its request options */
+    /**
+     * @type {?{ acks: number, timeout?: number, compression?: number, codec?: ?Function }} its
+     *   request options
+     */
     this.options = null
     /**
      * whether the partitioner call of its current partitioning attempt failed, which queued
@@ -918,12 +940,13 @@ class PendingSend {
 /**
  * @typedef {object} PendingBatch
  * @property {string} key the batch's topic and partition
- * @property {string} options its `acks`, `timeout` and `compression`, as one key
+ * @property {string} options its `acks`, `timeout`, `compression` and codec identity, as one key
  * @property {string} topic
  * @property {number} partition
  * @property {number} acks
  * @property {number} [timeout]
  * @property {number} [compression]
+ * @property {?Function} [codec] the codec factory pinned by its sends
  * @property {object[]|null} messages null once the batch has detached
  * @property {Settler[]} settlers one per append whose records it carries, in arrival order
  * @property {number} bytes its keys' and values' bytes
@@ -1023,7 +1046,8 @@ class Accumulator {
    *   assigns every record its partition once; it reads the records from `send.records` after each
    *   await and stops when that is `null`
    * @param {(request: { acks: number, timeout?: number, compression?: number,
-   *   batches: PendingBatch[] }) => Promise<object[]>} options.sendPartitioned sends the batches
+   *   codec?: ?Function, batches: PendingBatch[] }) => Promise<object[]>} options.sendPartitioned
+   *   sends the batches
    *   and settles each one's `settlers` as it settles; it must enqueue them before it returns, so
    *   that a flush is complete when `flush()` returns
    * @param {() => boolean} [options.lingers] whether a batch that forms now may wait for `linger`
@@ -1179,7 +1203,9 @@ class Accumulator {
    * @param {object} request
    * @param {number} request.acks
    * @param {number} [request.timeout]
-   * @param {number} [request.compression]
+   * @param {number} [request.compression] the batch attribute bits of its codec
+   * @param {?Function} [request.codec] the codec factory pinned at the call; every batch, size
+   *   plan and request of the send uses it, never the registry
    * @param {{ topic: string, messages: object[] }[]} request.topicMessages the producer's own
    *   copy, which nothing changes afterwards
    * @param {number} [request.startedAt] when the public call began, in epoch ms; now when absent
@@ -1192,7 +1218,7 @@ class Accumulator {
    * @throws {import('../../errors').KafkaJSBufferExhaustedError} no room within `maxBlockMs`, or
    *   too many bytes already waiting
    */
-  async append({ acks, timeout, compression, topicMessages, startedAt = Date.now() }) {
+  async append({ acks, timeout, compression, codec, topicMessages, startedAt = Date.now() }) {
     for (const { topic, messages } of topicMessages) {
       assertEncodable(topic, messages)
     }
@@ -1216,7 +1242,7 @@ class Accumulator {
     this.#order.enter(send)
     this.track(send)
     try {
-      this.#assertFits(topicMessages, compression)
+      this.#assertFits(topicMessages, compression, codec)
       const charge = chargeOf(topicMessages, this.#admission.capacity)
       const granted = this.#admission.acquire(charge.total, send.deadline)
       send.admit(granted instanceof Promise ? this.#granted(await granted) : granted, charge)
@@ -1229,7 +1255,7 @@ class Accumulator {
       this.#order.passed(send)
       throw this.#expired(error)
     }
-    return this.#hold(send, { acks, timeout, compression })
+    return this.#hold(send, { acks, timeout, compression, codec })
   }
 
   /**
@@ -1321,12 +1347,13 @@ class Accumulator {
    * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @param {number} [compression]
+   * @param {?Function} [codec] the send's pinned codec factory
    * @returns {void}
    * @throws {KafkaJSRecordTooLargeError} `reason: 'maxRequestSize'`, `scope: 'record'`
    */
-  #assertFits(topicMessages, compression) {
+  #assertFits(topicMessages, compression, codec) {
     for (const { topic, messages } of topicMessages) {
-      const limit = this.#budget.chunkCapacity(topic, compression)
+      const limit = this.#budget.chunkCapacity(topic, compression, codec)
       if (limit === Infinity) {
         continue
       }
@@ -1351,7 +1378,7 @@ class Accumulator {
    * deadline even while the assignment never returns or it waits for an earlier send: its records
    * are dropped, and what the assignment does afterwards is ignored.
    * @param {PendingSend} send
-   * @param {{ acks: number, timeout?: number, compression?: number }} options
+   * @param {{ acks: number, timeout?: number, compression?: number, codec?: ?Function }} options
    * @returns {Promise<object[]>} the send's outcome, as `append()` describes it
    */
   #hold(send, options) {
@@ -1525,16 +1552,17 @@ class Accumulator {
    * Each batch takes the shares of the send's records it carries (see `PendingSend#share`), and a
    * batch created here debits its own charge from the buffer, without waiting.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
-   * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
+   * @param {{ acks: number, timeout?: number, compression?: number, codec?: ?Function,
+   *   createdAt: number }} options
    * @param {PendingSend} holder the send whose records these are
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
    */
-  #join(entries, { acks, timeout, compression, createdAt }, holder) {
+  #join(entries, { acks, timeout, compression, codec, createdAt }, holder) {
     let send
     const appended = new Promise((resolve, reject) => {
       send = new AppendedSend(holder, resolve, reject)
     })
-    const options = `${acks}/${timeout}/${compression}`
+    const options = `${acks}/${timeout}/${compression}/${codecId(codec)}`
     // One due time for every batch this append creates, so they fall due together.
     const dueAt = Date.now() + this.#linger
     /** @type {PendingBatch[]} the batches this append fills, out of the pending ones */
@@ -1542,7 +1570,7 @@ class Accumulator {
     /** @type {PendingBatch[]} the other batches carrying its records, still pending */
     const joined = []
     for (const { topic, partition, messages } of entries) {
-      const capacity = this.#budget.chunkCapacity(topic, compression)
+      const capacity = this.#budget.chunkCapacity(topic, compression, codec)
       const bytes = recordsBytes(messages)
       const chunks =
         bytes <= capacity ? [{ messages, wire: bytes, origin: 0 }] : chunksOf(messages, capacity)
@@ -1552,6 +1580,7 @@ class Accumulator {
           acks,
           timeout,
           compression,
+          codec,
           createdAt,
           dueAt,
         })
@@ -1599,11 +1628,11 @@ class Accumulator {
    * @param {PendingSend} holder
    * @param {AppendedSend} send
    * @param {{ options: string, acks: number, timeout?: number, compression?: number,
-   *   createdAt: number, dueAt: number }} shape
+   *   codec?: ?Function, createdAt: number, dueAt: number }} shape
    * @returns {PendingBatch} the batch now carrying the chunk, still pending
    */
   #add(topic, partition, { messages, wire: wireBytes, origin }, capacity, holder, send, shape) {
-    const { options, acks, timeout, compression, createdAt, dueAt } = shape
+    const { options, acks, timeout, compression, codec, createdAt, dueAt } = shape
     const key = `${topic}/${partition}`
     const bytes = sizeOf(messages)
     let batch = this.#pending.get(key)
@@ -1625,6 +1654,7 @@ class Accumulator {
         acks,
         timeout,
         compression,
+        codec,
         messages: [],
         settlers: [],
         bytes: 0,
@@ -1950,8 +1980,8 @@ class Accumulator {
         )
       )
     }
-    const [{ acks, timeout, compression }] = batches
-    return this.#sendPartitioned({ acks, timeout, compression, batches }).then(
+    const [{ acks, timeout, compression, codec }] = batches
+    return this.#sendPartitioned({ acks, timeout, compression, codec, batches }).then(
       () => {},
       (error) => {
         for (const batch of batches) {

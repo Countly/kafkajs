@@ -195,6 +195,8 @@ await producer.send({
 | timeout            | The time to await a response in ms                                                                                                                                                                                                                                                                                                         | `30000`                            |
 | compression        | Compression codec                                                                                                                                                                                                                                                                                                                          | `CompressionTypes.None`            |
 
+`acks`, `timeout` and `compression` are read once and converted once when `send()` or `sendBatch()` is called, before anything is queued; a retry or a split send never reads or converts them again. Inputs kafkajs 2.2.4 sent keep their 2.2.4 wire value (`acks: '1'` is 1, `timeout: '1000'` is 1000, `timeout: null` is 0). `acks` must give -1, 0 or 1 after truncation toward zero; it gives 0 only for the number 0 or text that is a zero literal (`'0'`, `' 0 '`, `'0x0'`), and such a send resolves once its request is written. `timeout` must lie between -2147483648 and 2147483647; omitted, the broker default of 30000 ms is sent. `compression` must name a registered codec whose batch header bits are 1 to 4, and the codec registered under the key must be the codec of those bits (`CompressionCodecs[9] = CompressionCodecs[1]` makes `compression: 9` gzip). Anything else rejects the send at the call with `KafkaJSInvalidConfigurationError`, a conversion that throws as its `cause`. The codec is looked up once, at the call, and that send's batches are compressed, grouped and sized with it even if `CompressionCodecs` changes afterwards.
+
 
 ### Message structure
 
@@ -542,6 +544,8 @@ Now that we have the codec object, we can wrap it in a function and add it to th
 const { CompressionTypes, CompressionCodecs } = require('@countly/kafkajs')
 CompressionCodecs[CompressionTypes.Snappy] = () => MyCustomSnappyCodec
 ```
+
+Register the codec before the sends that use it: each send looks the codec up once, when it is called, and keeps it for its retries, so replacing it later changes later sends only. `send()` never calls the factory itself; it is called when a batch is compressed.
 
 The new codec can now be used with the `send` method, example:
 

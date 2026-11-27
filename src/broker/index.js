@@ -956,6 +956,9 @@ module.exports = class Broker {
    * @param {number} [request.producerEpoch=0] Broker assigned producerEpoch
    * @param {import("../../types").CompressionTypes} [request.compression=CompressionTypes.None] Compression codec
    * @param {number} [request.compressionLevel] optional level for the selected codec
+   * @param {?Function} [request.compressionCodec] the codec factory a producer send pinned at its
+   *   call, used instead of the registry; absent, the registry's factory for `compression` at
+   *   encode. Internal: serves the producer's send path; not typed.
    * @param {Map<string, string>} [request.topicIds] topic name to topic id. When every topic in
    *   this request has one, the request can be negotiated at v13, which keys topics by id
    *   (KIP-516); the inverse map is derived here and bound onto the response codec so the decoded
@@ -992,6 +995,7 @@ module.exports = class Broker {
     timeout = 30000,
     compression = Compression.None,
     compressionLevel,
+    compressionCodec,
     maxVersion,
     transactionVersion = 1,
     perPartitionResults = false,
@@ -1048,6 +1052,7 @@ module.exports = class Broker {
       timeout,
       compression,
       compressionLevel,
+      compressionCodec,
       topicData,
       topicIds,
       topicNames,

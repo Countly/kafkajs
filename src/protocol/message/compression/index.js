@@ -36,6 +36,24 @@ const Codecs = {
   },
 }
 
+/** The factories registered at load, by which a built-in codec is told from one registered later. */
+const BUILT_IN = Object.freeze({ ...Codecs })
+
+/**
+ * Why a built-in codec factory cannot run on this platform, found without calling it.
+ * @param {Function} factory a registry factory
+ * @returns {?string} the codec's `NOT_SUPPORTED_MESSAGE`; null when it runs or is not LZ4 or ZSTD
+ */
+const unsupportedReason = (factory) => {
+  const codec =
+    factory === BUILT_IN[Types.LZ4]
+      ? require('./lz4')
+      : factory === BUILT_IN[Types.ZSTD]
+        ? require('./zstd')
+        : null
+  return codec === null || codec.isSupported ? null : codec.NOT_SUPPORTED_MESSAGE
+}
+
 /**
  * @param {number} type one of `Types`
  * @returns {?object} the codec, or `null` for `Types.None`/an unregistered type
@@ -116,6 +134,8 @@ const decompressBounded = async (codec, attributes, buffer, limit) => {
 module.exports = {
   Types,
   Codecs,
+  BUILT_IN,
+  unsupportedReason,
   lookupCodec,
   lookupCodecByAttributes,
   decompressBounded,

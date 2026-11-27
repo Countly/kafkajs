@@ -4,6 +4,7 @@ const Accumulator = require('./state/accumulator')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
+const { classifyAcks, classifyTimeout, classifyCompression } = require('./sendOptions')
 
 /**
  * `send()`/`sendBatch()` over one eosManager: validation, the `acks` rule of an idempotent
@@ -231,16 +232,36 @@ module.exports = ({
    * @property {number} [timeout=30000] The time to await a response in ms
    * @property {Compression.Types} [compression=Compression.Types.None] Compression codec
    *
+   * Each option is read once and converted once, here, before anything is admitted (see
+   * `sendOptions.js`); the codec factory is taken from the registry here and pinned to the send.
    * The records are read once, at this call (`Accumulator.snapshot`): changing a record, its
    * headers or a `Date` or `Long` timestamp afterwards changes neither what is sent nor what is
    * charged against `bufferMemory`. The bytes of a Buffer are not copied, except a small view of a
    * large backing store: all of those in the send are copied into one store (`SendCopy`).
-   * @param {SendBatchRequest}
+   * @param {SendBatchRequest} request
    * @returns {Promise}
+   * @throws {KafkaJSInvalidConfigurationError} as a rejection, an option `sendOptions.js` refuses
    */
-  const sendBatch = async ({ acks = -1, timeout, compression, topicMessages: given = [] }) => {
-    // The delivery deadline counts from here, validation included.
+  const sendBatch = async (request) => {
+    // The delivery deadline counts from here, the option reads included.
     const startedAt = Date.now()
+    const { acks, timeout, compression, topicMessages = [] } = request
+    return produce(startedAt, acks, timeout, compression, topicMessages)
+  }
+
+  /**
+   * Converts a send's options, validates it and appends it to the accumulator.
+   * @param {number} startedAt when the public call began, in epoch ms
+   * @param {*} acksOption
+   * @param {*} timeoutOption
+   * @param {*} compressionOption
+   * @param {TopicMessages[]} given the caller's records
+   * @returns {Promise<object[]>}
+   */
+  const produce = (startedAt, acksOption, timeoutOption, compressionOption, given) => {
+    const acks = classifyAcks(acksOption)
+    const timeout = classifyTimeout(timeoutOption)
+    const { bits: compression, factory: codec } = classifyCompression(compressionOption)
     // Every check below, the charge and the encoder read this copy, never the caller's records.
     const topicMessages = Accumulator.snapshot(given)
 
@@ -299,14 +320,17 @@ module.exports = ({
       acks,
       timeout,
       compression,
+      codec,
       topicMessages: mergedTopicMessages,
       startedAt,
     })
   }
 
   /**
-   * @param {ProduceRequest} ProduceRequest
+   * One topic's `sendBatch`, its options read and converted the same way.
+   * @param {ProduceRequest} request
    * @returns {Promise}
+   * @throws {KafkaJSInvalidConfigurationError} as a rejection, an option `sendOptions.js` refuses
    *
    * @typedef {Object} ProduceRequest
    * @property {string} topic
@@ -319,14 +343,10 @@ module.exports = ({
    * @property {number} [timeout=30000] The time to await a response in ms
    * @property {Compression.Types} [compression=Compression.Types.None] Compression codec
    */
-  const send = async ({ acks, timeout, compression, topic, messages }) => {
-    const topicMessage = { topic, messages }
-    return sendBatch({
-      acks,
-      timeout,
-      compression,
-      topicMessages: [topicMessage],
-    })
+  const send = async (request) => {
+    const startedAt = Date.now()
+    const { acks, timeout, compression, topic, messages } = request
+    return produce(startedAt, acks, timeout, compression, [{ topic, messages }])
   }
 
   return {

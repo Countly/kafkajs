@@ -1745,11 +1745,18 @@ interface RecordBatchEntry {
 
 export type KafkaMessage = MessageSetEntry | RecordBatchEntry
 
+/**
+ * A send's options are read and converted once, when `send()` is called; a value that does not
+ * convert to a valid one rejects the call with `KafkaJSInvalidConfigurationError`.
+ */
 export interface ProducerRecord {
   topic: string
   messages: Message[]
+  /** -1 (all in-sync replicas, the default), 1 (the leader) or 0 (none: resolves once written). */
   acks?: number
+  /** Broker wait in ms, -2147483648 to 2147483647; omitted, the broker default of 30000. */
   timeout?: number
+  /** The codec, looked up in `CompressionCodecs` once, at the call, and kept for this send. */
   compression?: CompressionTypes
 }
 
@@ -1769,9 +1776,13 @@ export interface TopicMessages {
   messages: Message[]
 }
 
+/** The options of `sendBatch()`, read and converted once as `ProducerRecord`'s are. */
 export interface ProducerBatch {
+  /** -1 (all in-sync replicas, the default), 1 (the leader) or 0 (none: resolves once written). */
   acks?: number
+  /** Broker wait in ms, -2147483648 to 2147483647; omitted, the broker default of 30000. */
   timeout?: number
+  /** The codec, looked up in `CompressionCodecs` once, at the call, and kept for this send. */
   compression?: CompressionTypes
   topicMessages?: TopicMessages[]
 }
