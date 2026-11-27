@@ -235,6 +235,18 @@ describe('Protocol > RecordBatch > entries', () => {
     expect(capturing).toThrow('Invalid message at index 1: it must be an object')
   })
 
+  test.each([
+    ['undefined', () => undefined],
+    ['an array-like object', () => ({ length: 1, 0: { value: 'v' } })],
+    ['a string', () => 'ab'],
+    ['entries already captured', () => capture([{ value: 'v' }])],
+  ])('%s in place of the records is refused', (_, records) => {
+    const capturing = () => capture(records())
+
+    expect(capturing).toThrow(KafkaJSNonRetriableError)
+    expect(capturing).toThrow('Invalid messages: they must be an array')
+  })
+
   test('a string headers container gives one header per UTF-16 code unit; holes in a value array are skipped', () => {
     const [strings, holes, single] = decoded(
       capture([

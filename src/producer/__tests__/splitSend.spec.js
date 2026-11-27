@@ -441,7 +441,16 @@ describe('Producer > a send larger than one request', () => {
   test.each(PATHS)(
     'a batch of several never-written records an expanding codec takes past the cap is split, the oversized attempt is never written, and every record is delivered once, %s',
     async (_, path) => {
-      const calls = attempts()
+      const carried = []
+      const produce = Broker.prototype.produce
+      jest.spyOn(Broker.prototype, 'produce').mockImplementation(function (request) {
+        carried.push(
+          request.topicData.flatMap(({ partitions }) =>
+            partitions.map(({ messages }) => messages.length)
+          )
+        )
+        return produce.call(this, request)
+      })
       CompressionCodecs[CompressionTypes.Snappy] = () => ({
         compress: async ({ buffer }) => Buffer.concat([buffer, Buffer.alloc(buffer.length)]),
         decompress: async (buffer) => buffer,
@@ -464,8 +473,8 @@ describe('Producer > a send larger than one request', () => {
         messages,
       })
 
-      expect(calls[0].topicData[0].partitions[0].messages).toHaveLength(4)
-      expect(calls.length).toBeGreaterThan(frames.length)
+      expect(carried[0]).toEqual([4])
+      expect(carried.length).toBeGreaterThan(frames.length)
       expect(Math.max(...frames)).toBeLessThanOrEqual(CAP)
       expect(log.written.map(({ records: count }) => count).reduce((a, b) => a + b, 0)).toBe(4)
       expect(log.written.every(({ errorCode }) => errorCode === 0)).toBe(true)

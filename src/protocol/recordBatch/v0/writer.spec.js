@@ -3,7 +3,7 @@ const Decoder = require('../../decoder')
 const recordBatchDecoder = require('./decoder')
 const { writeRecordBatch } = require('./writer')
 const buildRecordBatch = require('../../requests/produce/buildRecordBatch')
-const { captureEntries } = require('../entries')
+const { captureEntries, RecordEntries } = require('../entries')
 const { Types, Codecs } = require('../../message/compression')
 const { KafkaJSNonRetriableError } = require('../../../errors')
 const { oracleRecordBatch } = require('../../requests/produce/fixtures/recordBatchOracle')
@@ -323,6 +323,7 @@ describe('Protocol > RecordBatch > v0 > writer', () => {
     '%s: buildRecordBatch writes the same bytes from plain records and from entries captured earlier',
     async (_, messages) => {
       const options = { ...IDENTITY, compression: Types.None }
+      const oracle = await outcome(oracleRecordBatch({ ...options, messages: messages() }))
       const plain = await buildRecordBatch({ ...options, messages: messages() })
       const entries = captureEntries(messages(), { now: SEND_TIME })
       Date.now.mockReturnValue(SEND_TIME + 1)
@@ -331,11 +332,26 @@ describe('Protocol > RecordBatch > v0 > writer', () => {
 
       expect(captured.size()).toBe(captured.buffer.length)
       expect(captured.buffer.toString('hex')).toBe(plain.buffer.toString('hex'))
-      expect(plain.buffer.toString('hex')).toBe(
-        (await outcome(oracleRecordBatch({ ...options, messages: messages() }))).bytes
-      )
+      expect(plain.buffer.toString('hex')).toBe(oracle.bytes)
     }
   )
+
+  test('entries captured by another copy of the module are recognised and written as they are', async () => {
+    let isolated
+    jest.isolateModules(() => {
+      isolated = require('../entries')
+    })
+    const messages = () => [{ key: 'k', value: 'v', timestamp: 5 }, { value: null }]
+    const options = { ...IDENTITY, compression: Types.None }
+    const plain = await buildRecordBatch({ ...options, messages: messages() })
+    const entries = isolated.captureEntries(messages(), { now: SEND_TIME })
+
+    const captured = await buildRecordBatch({ ...options, messages: entries })
+
+    expect(entries).not.toBeInstanceOf(RecordEntries)
+    expect(RecordEntries.is(entries)).toBe(true)
+    expect(captured.buffer.toString('hex')).toBe(plain.buffer.toString('hex'))
+  })
 
   test('what a codec does to its input or output after answering changes nothing written', async () => {
     const later = []
