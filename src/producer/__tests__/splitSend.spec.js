@@ -2,6 +2,7 @@ const crypto = require('crypto')
 const { Kafka, CompressionTypes, CompressionCodecs } = require('../../../index')
 const {
   KafkaJSDeliveryTimeout,
+  KafkaJSNonRetriableError,
   KafkaJSProtocolError,
   KafkaJSRecordTooLargeError,
 } = require('../../errors')
@@ -11,7 +12,9 @@ const Encoder = require('../../protocol/encoder')
 const createRequest = require('../../protocol/request')
 const { oracleRecordBatch } = require('../../protocol/requests/produce/fixtures/recordBatchOracle')
 const Accumulator = require('../state/accumulator')
+const { Admission } = require('../state/admission')
 const PartitionSequencer = require('../state/partitionSequencer')
+const { countersOf, quiescent } = require('./fixtures/bufferHarness')
 const { RequestBudget } = require('../state/recordSize')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
@@ -467,6 +470,76 @@ describe('Producer > a send larger than one request', () => {
       expect(log.written.map(({ records: count }) => count).reduce((a, b) => a + b, 0)).toBe(4)
       expect(log.written.every(({ errorCode }) => errorCode === 0)).toBe(true)
       expect(metadata).toEqual([expect.objectContaining({ partition: 0, baseOffset: '0' })])
+    }
+  )
+
+  test.each(PATHS)(
+    'a send whose Buffer was transferred after the call fails alone: the send it was handed on with is written and acknowledged, the buffer is released, and the next send to its partition is accepted, %s',
+    async (_, path) => {
+      const admissions = new Set()
+      const acquire = Admission.prototype.acquire
+      jest.spyOn(Admission.prototype, 'acquire').mockImplementation(function (...args) {
+        admissions.add(this)
+        return acquire.apply(this, args)
+      })
+      const calls = attempts()
+      const { log } = await start(
+        { topics: [{ name: TOPIC, leaders: [0, 0] }] },
+        { ...path, linger: 100 }
+      )
+      const expected = new Map()
+      log.verdict = ({ topic, partition, batch }) => {
+        if (batch.producerId === '-1') return 0
+        const key = `${batch.producerId}/${batch.producerEpoch}/${topic}/${partition}`
+        const next = expected.get(key) ?? 0
+        if (batch.baseSequence !== next) return 45
+        expected.set(key, next + batch.recordCount)
+        return 0
+      }
+      const store = new ArrayBuffer(4)
+      const value = new Uint8Array(store)
+      value.set([1, 2, 3, 4])
+      Object.setPrototypeOf(value, Buffer.prototype)
+
+      const bystander = producer.send({
+        topic: TOPIC,
+        messages: [{ value: 'bystander', partition: 0 }],
+      })
+      const offender = producer.send({ topic: TOPIC, messages: [{ value, partition: 1 }] })
+      structuredClone(store, { transfer: [store] })
+      const [kept, refused] = await Promise.allSettled([bystander, offender])
+
+      expect(kept).toEqual({
+        status: 'fulfilled',
+        value: [expect.objectContaining({ partition: 0, errorCode: 0 })],
+      })
+      expect(refused.status).toBe('rejected')
+      expect(refused.reason).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(refused.reason.message).toBe('A Buffer changed size while its send was being read')
+      expect(calls).toHaveLength(1)
+      expect(
+        log.written.map(({ partition, records: count, errorCode }) => [partition, count, errorCode])
+      ).toEqual([[0, 1, 0]])
+
+      const next = await producer.send({
+        topic: TOPIC,
+        messages: [{ value: 'next', partition: 1 }],
+      })
+
+      expect(next).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
+      expect(
+        log.written.map(({ partition, records: count, errorCode }) => [partition, count, errorCode])
+      ).toEqual([
+        [0, 1, 0],
+        [1, 1, 0],
+      ])
+      if (path.idempotent) expect(log.written[1].batch.baseSequence).toBe(0)
+      const [admission] = admissions
+      expect(admissions.size).toBe(1)
+      await until(
+        () => JSON.stringify(countersOf(admission)) === JSON.stringify(quiescent(admission))
+      )
+      expect(countersOf(admission)).toEqual(quiescent(admission))
     }
   )
 
