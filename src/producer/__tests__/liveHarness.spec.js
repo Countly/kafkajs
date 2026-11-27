@@ -1565,6 +1565,43 @@ describe('Producer > the live scenarios harness', () => {
       expect(ledger.calls[1].error.message).toBe('lost')
     })
 
+    test('a Produce call its guard refuses at the broker is recorded at once and rejects with the refusal itself', async () => {
+      const original = Broker.prototype.produce
+      const refusal = new Error('refused by the guard')
+      const guard = jest.fn(() => refusal)
+      Broker.prototype.produce = async function ({ guard: check }) {
+        this.throwIfRefused(check)
+        return []
+      }
+      const ledger = new ProduceLedger().install()
+      try {
+        const refused = Broker.prototype.produce({
+          producerId: 9n,
+          producerEpoch: 1,
+          acks: -1,
+          guard,
+          topicData: [
+            {
+              topic: 't',
+              partitions: [{ partition: 0, firstSequence: 3, messages: owned([{ value: 'x' }]) }],
+            },
+          ],
+        })
+        expect(ledger.calls).toHaveLength(1)
+        expect(ledger.calls[0].partitions).toEqual([
+          { topic: 't', partition: 0, firstSequence: 3, records: 1, first: 'x' },
+        ])
+        await expect(refused).rejects.toBe(refusal)
+      } finally {
+        ledger.restore()
+        Broker.prototype.produce = original
+      }
+
+      expect(guard).toHaveBeenCalledTimes(1)
+      expect(ledger.calls[0].results).toBeNull()
+      expect(ledger.calls[0].error).toBe(refusal)
+    })
+
     test('traceCalls keeps the calls describe selects and the error each one ended with', async () => {
       class Target {
         async run(value) {

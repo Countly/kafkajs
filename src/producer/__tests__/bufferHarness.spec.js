@@ -1,5 +1,6 @@
 const buildRecordBatch = require('../../protocol/requests/produce/buildRecordBatch')
 const { Types: Compression } = require('../../protocol/message/compression')
+const Long = require('../../utils/long')
 const { owned, readBatch, sentRecords, takeSent } = require('./fixtures/bufferHarness')
 
 describe('Producer > fixtures > bufferHarness', () => {
@@ -97,7 +98,7 @@ describe('Producer > fixtures > bufferHarness', () => {
     expect(records.map(({ value }) => String(value))).toEqual(['kept'])
   })
 
-  test('takeSent gives every batch’s place, first sequence and record count at once, without decoding', () => {
+  test('takeSent gives every batch’s place, first sequence and record count at once, without decoding', async () => {
     const sent = takeSent({
       topicData: [
         {
@@ -114,7 +115,88 @@ describe('Producer > fixtures > bufferHarness', () => {
       { topic: 'topic-a', partition: 3, firstSequence: 4, count: 2 },
       { topic: 'topic-a', partition: 1, firstSequence: undefined, count: 1 },
     ])
-    expect(sent.read()).toBe(sent.read())
+    const reading = sent.read()
+    expect(sent.read()).toBe(reading)
+    const read = await reading
+    expect(read.map(({ records }) => records.map(({ value }) => String(value)))).toEqual([
+      ['a', 'b'],
+      ['c'],
+    ])
+  })
+
+  test('takeSent observes a record field as it is at each call: a later replacement shows only in a later observation', async () => {
+    const record = { key: 'k1', value: 'v1', headers: { h: 'x' }, timestamp: new Date(1000) }
+    const request = { batches: [{ topic: 'topic-a', partition: 0, messages: [record] }] }
+
+    const before = takeSent(request)
+    record.key = 'k2'
+    record.value = 'v2'
+    record.headers = { h: 'y' }
+    record.timestamp.setTime(2000)
+    const after = takeSent(request)
+
+    const [[{ records: early }], [{ records: late }]] = await Promise.all([
+      before.read(),
+      after.read(),
+    ])
+    expect(early).toEqual([
+      {
+        key: Buffer.from('k1'),
+        value: Buffer.from('v1'),
+        headers: { h: Buffer.from('x') },
+        timestamp: '1000',
+        offset: '0',
+      },
+    ])
+    expect(late).toEqual([
+      {
+        key: Buffer.from('k2'),
+        value: Buffer.from('v2'),
+        headers: { h: Buffer.from('y') },
+        timestamp: '2000',
+        offset: '0',
+      },
+    ])
+  })
+
+  test('takeSent observes Buffer bytes as they are at each call: a later byte change shows only in a later observation', async () => {
+    const value = Buffer.from('aaaa')
+    const listed = Buffer.from('l1')
+    const record = {
+      value,
+      headers: { many: [Buffer.from('l0'), listed] },
+      timestamp: Long.fromValue(5n),
+    }
+    const request = { batches: [{ topic: 'topic-a', partition: 0, messages: [record] }] }
+
+    const before = takeSent(request)
+    value[0] = 0x62
+    listed[1] = 0x32
+    record.timestamp.value = 6n
+    const after = takeSent(request)
+
+    const [[{ records: early }], [{ records: late }]] = await Promise.all([
+      before.read(),
+      after.read(),
+    ])
+    expect(early).toEqual([
+      {
+        key: null,
+        value: Buffer.from('aaaa'),
+        headers: { many: [Buffer.from('l0'), Buffer.from('l1')] },
+        timestamp: '5',
+        offset: '0',
+      },
+    ])
+    expect(late).toEqual([
+      {
+        key: null,
+        value: Buffer.from('baaa'),
+        headers: { many: [Buffer.from('l0'), Buffer.from('l2')] },
+        timestamp: '6',
+        offset: '0',
+      },
+    ])
   })
 
   test('takeSent fixes every batch’s record list at the call: later changes to either list are not read', async () => {
@@ -147,34 +229,52 @@ describe('Producer > fixtures > bufferHarness', () => {
     ])
   })
 
-  test('takeSent at the call runs none of the built-ins the producer specs spy on, nor the clock', () => {
+  test('takeSent at the call, its record snapshot included, calls none of Array every, flatMap, shift, map or forEach, Promise.all, Map set, Date.now, performance.now, Math.random, setTimeout or Buffer.from', () => {
+    const records = [
+      {
+        key: Buffer.from('k'),
+        value: Buffer.from('a'),
+        headers: { one: Buffer.from('x'), many: ['1', Buffer.from('2')] },
+        timestamp: new Date(1000),
+      },
+      { value: 'b', headers: { h: 'y' }, timestamp: Long.fromValue(1001n) },
+      { value: null, timestamp: '1002' },
+    ]
     const spies = [
       jest.spyOn(Array.prototype, 'every'),
       jest.spyOn(Array.prototype, 'flatMap'),
       jest.spyOn(Array.prototype, 'shift'),
+      jest.spyOn(Array.prototype, 'map'),
+      jest.spyOn(Array.prototype, 'forEach'),
       jest.spyOn(Promise, 'all'),
+      jest.spyOn(Map.prototype, 'set'),
       jest.spyOn(Date, 'now'),
+      jest.spyOn(performance, 'now'),
+      jest.spyOn(Math, 'random'),
+      jest.spyOn(global, 'setTimeout'),
+      jest.spyOn(Buffer, 'from'),
     ]
     const calls = []
     try {
+      for (let at = 0; at < spies.length; at++) calls[at] = -spies[at].mock.calls.length
       takeSent({
         topicData: [
           {
             topic: 'topic-a',
             partitions: [
-              { partition: 0, messages: [{ value: 'a' }, { value: 'b' }] },
+              { partition: 0, messages: records },
               { partition: 1, messages: [{ value: 'c' }] },
             ],
           },
         ],
       })
-      takeSent({ batches: [{ topic: 'topic-a', partition: 0, messages: [{ value: 'd' }] }] })
-      for (let at = 0; at < spies.length; at++) calls[at] = spies[at].mock.calls.length
+      takeSent({ batches: [{ topic: 'topic-a', partition: 0, messages: records }] })
+      for (let at = 0; at < spies.length; at++) calls[at] += spies[at].mock.calls.length
     } finally {
       for (let at = 0; at < spies.length; at++) spies[at].mockRestore()
     }
 
-    expect(calls).toEqual([0, 0, 0, 0, 0])
+    expect(calls).toEqual(new Array(12).fill(0))
   })
 
   test('readBatch refuses a batch with one payload byte changed under its CRC', async () => {

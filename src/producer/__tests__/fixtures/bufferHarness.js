@@ -8,6 +8,7 @@ const Decoder = require('../../../protocol/decoder')
 const decodeRecordBatch = require('../../../protocol/recordBatch/v0/decoder')
 const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
 const { Types: Compression } = require('../../../protocol/message/compression')
+const Long = require('../../../utils/long')
 
 /**
  * A batch's records, for a test that builds a batch itself, in the form batches hold them.
@@ -69,6 +70,65 @@ const batchesOf = (request) => {
 }
 
 /**
+ * A copy of a record field as it is now: a Buffer's bytes are copied with indexed writes, any
+ * other value is kept as it is.
+ * @param {*} field
+ * @returns {*}
+ */
+const fieldOf = (field) => {
+  if (!Buffer.isBuffer(field)) return field
+  const copy = Buffer.alloc(field.length)
+  for (let at = 0; at < field.length; at++) copy[at] = field[at]
+  return copy
+}
+
+/**
+ * A copy of a record's headers as they are now, header-value arrays included.
+ * @param {object|null|undefined} headers
+ * @returns {object|null|undefined}
+ */
+const headersOf = (headers) => {
+  if (headers === null || typeof headers !== 'object') return headers
+  const copy = {}
+  for (const name in headers) {
+    if (!Object.hasOwn(headers, name)) continue
+    const entry = headers[name]
+    if (Array.isArray(entry)) {
+      const list = new Array(entry.length)
+      for (let at = 0; at < entry.length; at++) list[at] = fieldOf(entry[at])
+      copy[name] = list
+    } else {
+      copy[name] = fieldOf(entry)
+    }
+  }
+  return copy
+}
+
+/**
+ * A timestamp as it is now: a `Date` as its milliseconds, a `Long` as a new `Long` of its value;
+ * the batch writer reads both forms the same way.
+ * @param {*} timestamp
+ * @returns {*}
+ */
+const timestampOf = (timestamp) => {
+  if (timestamp instanceof Date) return timestamp.getTime()
+  if (timestamp instanceof Long) return new Long(timestamp.value)
+  return timestamp
+}
+
+/**
+ * A record's encoded fields as they are now: key, value, headers and timestamp.
+ * @param {object} message
+ * @returns {{ key: *, value: *, headers: *, timestamp: * }}
+ */
+const recordOf = (message) => ({
+  key: fieldOf(message.key),
+  value: fieldOf(message.value),
+  headers: headersOf(message.headers),
+  timestamp: timestampOf(message.timestamp),
+})
+
+/**
  * Reads one record batch with the consumer's batch decoder, CRC included.
  * @param {Buffer} buffer the batch's bytes
  * @returns {Promise<{ firstSequence: number, records: ReadBatch['records'] }>}
@@ -92,19 +152,26 @@ const readBatch = async (buffer) => {
 }
 
 /**
- * Takes what a request carries at this instant without waiting: each batch's place, the request's
- * first sequence, its record count and its own copy of the record list (`batchesOf`), and nothing
- * else. Writing and decoding run only in `read()`, so a fake broker or probe that takes a request
- * decides, records and answers at the same instant, and calls the same built-ins, as one that
- * reads nothing. A later change to a batch's record list is not seen; the records themselves are
- * the producer's own and are read when `read()` runs, so a test does not change them after the
- * call.
+ * Takes what a request carries at this instant without waiting. Three things differ in when they
+ * happen:
+ * - observation, at the call: each batch's place, the request's first sequence, its record count
+ *   and every record's key, value, headers and timestamp as they are now (strings and numbers as
+ *   they are, Buffer bytes copied, a `Date` or `Long` timestamp as its value), so a later change to
+ *   a record list, a record field or a Buffer byte is not seen;
+ * - encoding, deferred to `read()`: the producer's batch writer writes the observed records and the
+ *   consumer's decoder reads them back, CRC checked;
+ * - bytes captured at a real write are not this helper's: a test that needs the bytes the producer
+ *   itself put on the wire reads them where it captures that write.
+ * The call is plain loops, indexed reads and writes, `Buffer.alloc`, `Buffer.isBuffer`,
+ * `Array.isArray`, `Object.hasOwn`, `Date#getTime` and `new Long`, so a fake broker or probe that
+ * takes a request decides, records and answers at the same instant as one that reads nothing, and
+ * a spec spying on another built-in or on the clock sees only the producer's calls.
  *
  * What a read checks is the record content: keys, values, headers, timestamps, order and offsets,
- * written by the producer's batch writer and read through a CRC-checked decode, and that the bytes
- * hold `count` records. The batch is written uncompressed with the default producer id and epoch
- * and no transaction flag, so it says nothing of the request's envelope, compression, producer
- * identity or transaction attribute; tests check those on the request or the wire.
+ * and that the bytes hold `count` records. The batch is written uncompressed with the default
+ * producer id and epoch and no transaction flag, so it says nothing of the request's envelope,
+ * compression, producer identity or transaction attribute; tests check those on the request or
+ * the wire.
  * @param {SentRequest} request
  * @returns {{ batches: { topic: string, partition: number, firstSequence: number|undefined,
  *   count: number }[], read: () => Promise<ReadBatch[]> }} `read` settles once and rejects with
@@ -113,18 +180,22 @@ const readBatch = async (buffer) => {
 const takeSent = (request) => {
   const taken = batchesOf(request)
   const batches = new Array(taken.length)
+  const observed = new Array(taken.length)
   for (let at = 0; at < taken.length; at++) {
     const { topic, partition, firstSequence, messages } = taken[at]
     batches[at] = { topic, partition, firstSequence, count: messages.length }
+    observed[at] = new Array(messages.length)
+    for (let index = 0; index < messages.length; index++) {
+      observed[at][index] = recordOf(messages[index])
+    }
   }
   let reading = null
   const read = () =>
     (reading ??= Promise.all(
-      taken.map(async ({ messages, firstSequence }, at) => {
-        const { topic, partition, count } = batches[at]
+      batches.map(async ({ topic, partition, firstSequence, count }, at) => {
         const { buffer } = await buildRecordBatch({
           compression: Compression.None,
-          messages,
+          messages: observed[at],
           firstSequence,
         })
         const { firstSequence: written, records } = await readBatch(buffer)
