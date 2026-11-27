@@ -2,6 +2,7 @@ const apiKeys = require('../../protocol/requests/apiKeys')
 const { decode } = require('../../protocol/requests/offsetForLeaderEpoch/v4/response')
 const { readRequestHeader } = require('testHelpers')
 const {
+  FixtureTracker,
   NODE_ID,
   TOPIC,
   apiVersionsBody,
@@ -837,5 +838,209 @@ describe('Test harness > fetch group teardown', () => {
     expect(disconnects).toHaveBeenCalledTimes(1)
     expect(disconnects).toHaveBeenCalledWith({ drainTimeout: 0 })
     expect(await lookup).toBe('fetch harness torn down')
+  })
+})
+
+/**
+ * A second copy of the harness with a tracker of its own, so a test can run the hooks by hand
+ * without touching the tracker of the test that is running.
+ * @returns {object} the harness module
+ */
+const isolatedHarness = () => {
+  let isolated
+  jest.isolateModules(() => {
+    isolated = require('./fixtures/fetchHarness')
+  })
+  return isolated
+}
+
+/** @returns {{ hooks: { before?: Function, after?: Function }, api: object }} hooks to pass to `trackFixtures` */
+const manualHooks = () => {
+  const hooks = {}
+  return {
+    hooks,
+    api: {
+      beforeEach: (fn) => {
+        hooks.before = fn
+      },
+      afterEach: (fn) => {
+        hooks.after = fn
+      },
+    },
+  }
+}
+
+describe('Test harness > fixture tracking', () => {
+  /** @returns {() => boolean} always released */
+  const released = () => true
+
+  test('releases the fixtures last created first', async () => {
+    const order = []
+    const tracker = new FixtureTracker()
+    for (const name of ['first', 'second', 'third']) {
+      tracker.add(
+        name,
+        async () => {
+          order.push(name)
+        },
+        released
+      )
+    }
+
+    await tracker.releaseAll()
+
+    expect(order).toEqual(['third', 'second', 'first'])
+  })
+
+  test('a failing release does not stop the others, and the first failure is rethrown', async () => {
+    const order = []
+    const early = new Error('the last created fixture failed')
+    const late = new Error('the middle fixture failed')
+    const tracker = new FixtureTracker()
+    tracker.add('first', async () => order.push('first'), released)
+    tracker.add(
+      'second',
+      async () => {
+        order.push('second')
+        throw late
+      },
+      released
+    )
+    tracker.add(
+      'third',
+      async () => {
+        order.push('third')
+        throw early
+      },
+      released
+    )
+
+    await expect(tracker.releaseAll()).rejects.toBe(early)
+
+    expect(order).toEqual(['third', 'second', 'first'])
+  })
+
+  test('a fixture still not released after its teardown fails the test, naming its creator', async () => {
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'createFetchGroup',
+      async () => {},
+      () => false
+    )
+
+    await expect(tracker.releaseAll()).rejects.toThrow(
+      'createFetchGroup: the fixture is not released after its teardown'
+    )
+  })
+
+  test('a fixture created while the others are released is released too', async () => {
+    const order = []
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'creating',
+      async () => {
+        order.push('creating')
+        tracker.add('late', async () => order.push('late'), released)
+      },
+      released
+    )
+
+    await tracker.releaseAll()
+
+    expect(order).toEqual(['creating', 'late'])
+  })
+
+  test('trackFixtures tears down every fixture a test created when the test ends, last created first', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+
+    const group = await harness.createFetchGroup()
+    const fake = harness.createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18, false) : Buffer.alloc(0)
+    )
+    await fake.broker.connect()
+    const order = []
+    for (const [name, broker] of [
+      ['group', group.broker],
+      ['fake', fake.broker],
+    ]) {
+      const disconnect = broker.disconnect.bind(broker)
+      jest.spyOn(broker, 'disconnect').mockImplementation(async (options) => {
+        order.push(name)
+        await disconnect(options)
+      })
+    }
+    expect(fake.state.socket.destroyed).toBe(false)
+
+    await hooks.after()
+
+    expect(order).toEqual(['fake', 'group'])
+    expect(fake.state.socket.destroyed).toBe(true)
+    await expect(group.cluster.findBroker({ nodeId: 0 })).rejects.toThrow('fetch harness torn down')
+  })
+
+  test.each([
+    ['no tracker installed', false],
+    ['a tracker installed and no test running', true],
+  ])(
+    'createFetchGroup, createFakeBroker and createFakeCoordinator throw naming themselves with %s',
+    async (_label, installed) => {
+      const harness = isolatedHarness()
+      if (installed) harness.trackFixtures(manualHooks().api)
+      const answer = () => Buffer.alloc(0)
+
+      await expect(harness.createFetchGroup()).rejects.toThrow(
+        'createFetchGroup() ran outside a tracked test'
+      )
+      expect(() => harness.createFakeBroker(answer)).toThrow(
+        'createFakeBroker() ran outside a tracked test'
+      )
+      await expect(harness.createFakeCoordinator(answer)).rejects.toThrow(
+        'createFakeCoordinator() ran outside a tracked test'
+      )
+    }
+  )
+
+  test('trackFixtures called twice in one spec file throws', () => {
+    const harness = isolatedHarness()
+    const { api } = manualHooks()
+    harness.trackFixtures(api)
+
+    expect(() => harness.trackFixtures(api)).toThrow(
+      'trackFixtures() was called twice in one spec file'
+    )
+  })
+
+  test('createFakeCoordinator hands back the close of its fake broker, which stops it answering, and the test end tears it down', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const asked = []
+    const { state, close } = await harness.createFakeCoordinator((header) => {
+      asked.push(header.apiKey)
+      return new Promise(() => {})
+    })
+    // The ApiVersions frame the connect wrote, relabelled as a Heartbeat so the coordinator
+    // hands it to this answer.
+    const [connectFrame] = state.writes.slice(-1)
+    const heartbeat = Buffer.from(connectFrame)
+    heartbeat.writeInt16BE(apiKeys.Heartbeat, 4)
+
+    state.socket.write(heartbeat)
+    await nextTurn()
+    expect(asked).toEqual([apiKeys.Heartbeat])
+
+    close()
+    state.socket.write(heartbeat)
+    await nextTurn()
+    await nextTurn()
+    expect(asked).toEqual([apiKeys.Heartbeat])
+
+    expect(state.socket.destroyed).toBe(false)
+    await hooks.after()
+    expect(state.socket.destroyed).toBe(true)
   })
 })
