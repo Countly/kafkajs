@@ -8,7 +8,9 @@ const {
   createFakeBroker,
   createFetchGroup,
   decodeOffsetForLeaderEpochRequests,
+  offsetForLeaderEpochRawResponse,
   offsetForLeaderEpochResponse,
+  withheldAnswer,
   scriptedEpochLog,
 } = require('./fixtures/fetchHarness')
 
@@ -336,21 +338,62 @@ describe('Test harness > scripted OffsetForLeaderEpoch answers', () => {
     ],
     ['a negative partition', { partition: -1 }, /partition -1/],
     ['an error code beyond int16', { partition: 0, errorCode: 2 ** 15 }, /error code 32768/],
+    // An error row carries partition and code alone, so both fields keep their -1 defaults; a
+    // successful lookup is a found pair or -1 with -1 (Partition.scala 4.0.0:1716-1738,
+    // 4.4.0:1585-1607; UnifiedLog 4.0.0:944-951, 4.4.0:1316-1325).
+    [
+      'an error row with a defined epoch and end offset',
+      { partition: 0, errorCode: 6, leaderEpoch: 4, endOffset: '20' },
+      /error 6 with LeaderEpoch 4 and EndOffset 20 is no broker answer/,
+    ],
+    [
+      'an undefined end offset with a defined epoch',
+      { partition: 0, leaderEpoch: 4, endOffset: '-1' },
+      /LeaderEpoch 4 and EndOffset -1 is no broker answer/,
+    ],
+    [
+      'an undefined epoch with a defined end offset',
+      { partition: 0, leaderEpoch: -1, endOffset: '20' },
+      /LeaderEpoch -1 and EndOffset 20 is no broker answer/,
+    ],
   ])('offsetForLeaderEpochResponse refuses %s', (_case, row, message) => {
     expect(() => offsetForLeaderEpochResponse([row])).toThrow(message)
+  })
+
+  test('offsetForLeaderEpochResponse gives an error row LeaderEpoch -1 and EndOffset -1 by default', async () => {
+    const body = offsetForLeaderEpochResponse([{ partition: 0, errorCode: 6 }])
+
+    expect((await decode(body)).topics).toEqual([
+      { topic: TOPIC, partitions: [{ errorCode: 6, partition: 0, ...UNDEFINED }] },
+    ])
+  })
+
+  test('offsetForLeaderEpochRawResponse encodes a malformed answer exactly as scripted', async () => {
+    const row = { partition: 0, errorCode: 0, leaderEpoch: 4, endOffset: '-1' }
+
+    expect((await decode(offsetForLeaderEpochRawResponse([row]))).topics).toEqual([
+      { topic: TOPIC, partitions: [row] },
+    ])
+  })
+
+  test('scriptedEpochLog refuses to answer a request for an epoch below -1', () => {
+    const { answer } = scriptedEpochLog(CACHE)
+
+    expect(() =>
+      answer([0], { partitions: [{ partition: 0, currentLeaderEpoch: 8, leaderEpoch: -5 }] })
+    ).toThrow(/asks for epoch -5, which no client sends/)
   })
 })
 
 describe('Test harness > withheld broker answers', () => {
   test('a withheld answer lets a later answer on the same connection through, and arrives when released', async () => {
-    let release
-    const withheld = new Promise((resolve) => (release = resolve))
+    const withheld = withheldAnswer()
     let validations = 0
     const { broker } = createFakeBroker((header) => {
       if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
       validations += 1
       return validations === 1
-        ? withheld
+        ? withheld.promise
         : offsetForLeaderEpochResponse([{ partition: 1, leaderEpoch: 4, endOffset: '30' }])
     })
     await broker.connect()
@@ -367,7 +410,9 @@ describe('Test harness > withheld broker answers', () => {
       expect(validations).toBe(2)
       expect(firstSettled).not.toHaveBeenCalled()
 
-      release(offsetForLeaderEpochResponse([{ partition: 0, leaderEpoch: 4, endOffset: '20' }]))
+      withheld.resolve(
+        offsetForLeaderEpochResponse([{ partition: 0, leaderEpoch: 4, endOffset: '20' }])
+      )
       expect((await first).topics[0].partitions).toEqual([
         { errorCode: 0, partition: 0, leaderEpoch: 4, endOffset: '20' },
       ])
@@ -408,17 +453,38 @@ describe('Test harness > withheld broker answers', () => {
 
     try {
       await expect(broker.offsetForLeaderEpoch(validationRequest(0, 4))).rejects.toBe(cancelled)
+      // The failed request left the connection's queue, so an ordinary disconnect drains.
+      await broker.disconnect()
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  test('a withheld answer rejected before the fake broker asks for it fails its request', async () => {
+    const withheld = withheldAnswer()
+    const cancelled = new Error('cancelled before the answer was asked for')
+    const { broker } = createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : withheld.promise
+    )
+    await broker.connect()
+
+    try {
+      const request = broker.offsetForLeaderEpoch(validationRequest(0, 4))
+      // Same turn: the fake broker answers the frame only a turn after it is written.
+      withheld.reject(cancelled)
+
+      await expect(request).rejects.toBe(cancelled)
+      await broker.disconnect()
     } finally {
       await broker.disconnect({ drainTimeout: 0 })
     }
   })
 
   test('an assertion that throws while a withheld answer is played back fails the request it answers', async () => {
-    let release
-    const withheld = new Promise((resolve) => (release = resolve))
+    const withheld = withheldAnswer()
     const layout = new Error('the response frame has the wrong layout')
     const { broker } = createFakeBroker(
-      (header) => (header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : withheld),
+      (header) => (header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : withheld.promise),
       (frame, header) => {
         if (header.apiKey === apiKeys.OffsetForLeaderEpoch) throw layout
         return [frame]
@@ -431,15 +497,16 @@ describe('Test harness > withheld broker answers', () => {
         () => 'answered',
         (error) => error
       )
-      release(offsetForLeaderEpochResponse([{ partition: 0 }]))
+      withheld.resolve(offsetForLeaderEpochResponse([{ partition: 0 }]))
 
       expect(await outcome).toBe(layout)
+      await broker.disconnect()
     } finally {
       await broker.disconnect({ drainTimeout: 0 })
     }
   })
 
-  test('an answer that throws fails the request it answers, not one answered in the same pump', async () => {
+  test('an answer that throws fails the request it answers alone, and the connection stays usable and drains', async () => {
     const refused = new Error('no answer for partition 1')
     const { broker } = createFakeBroker((header, frame) => {
       if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
@@ -461,6 +528,12 @@ describe('Test harness > withheld broker answers', () => {
       ])
       expect(second.status).toBe('rejected')
       expect(second.reason).toBe(refused)
+
+      const after = await broker.offsetForLeaderEpoch(validationRequest(0, 4))
+      expect(after.topics[0].partitions).toEqual([
+        { errorCode: 0, partition: 0, leaderEpoch: 4, endOffset: '20' },
+      ])
+      await broker.disconnect()
     } finally {
       await broker.disconnect({ drainTimeout: 0 })
     }
