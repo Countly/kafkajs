@@ -4272,8 +4272,9 @@ module.exports = class ConsumerGroup {
       if (preparation?.guard()) {
         this.positionValidator.release(awaiting || [])
       } else {
-        // Only an entry still this round's own: one a routing change or another round replaced
-        // carries a different epoch than the one captured here.
+        // Only an entry still this round's own and still awaiting: one a routing change or another
+        // round replaced carries a different epoch than the one captured here, and one whose
+        // answer was applied or discarded is settled already.
         for (const {
           topic,
           partition,
@@ -4282,7 +4283,7 @@ module.exports = class ConsumerGroup {
           routing,
           entry,
         } of awaiting || []) {
-          if (this.positionValidator.entryOf(topic, partition) === entry) {
+          if (this.positionValidator.isAwaitingWith(topic, partition, entry)) {
             this.positionValidator.markValidated(
               topic,
               partition,
@@ -4431,7 +4432,7 @@ module.exports = class ConsumerGroup {
 
       for (const { topic, entries } of pending) {
         for (const { partition, currentLeaderEpoch, generation, routing, entry } of entries) {
-          if (this.positionValidator.entryOf(topic, partition) !== entry) {
+          if (!this.positionValidator.isAwaitingWith(topic, partition, entry)) {
             continue
           }
 
@@ -4601,8 +4602,9 @@ module.exports = class ConsumerGroup {
    *
    * Each entry is marked under the generation it was requested with, so an entry belonging to a
    * previous assignment is a no-op rather than a claim about the current one, and only while the
-   * partition's entry is still the attempt's own: one a routing change dropped, or another attempt
-   * or answer replaced, carries nothing this attempt could claim.
+   * partition's entry is still the attempt's own and still awaiting: one a routing change dropped,
+   * another attempt or answer replaced, or an answer discarded, carries nothing this attempt could
+   * claim.
    *
    * @private
    * @param {{topic: string, entries: object[]}[]} topics
@@ -4611,7 +4613,7 @@ module.exports = class ConsumerGroup {
   markAllValidated(topics) {
     for (const { topic, entries } of topics) {
       for (const { partition, currentLeaderEpoch, generation, routing, entry } of entries) {
-        if (this.positionValidator.entryOf(topic, partition) !== entry) continue
+        if (!this.positionValidator.isAwaitingWith(topic, partition, entry)) continue
         this.positionValidator.markValidated(
           topic,
           partition,

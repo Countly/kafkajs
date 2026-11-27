@@ -330,6 +330,19 @@ module.exports = class PositionValidator {
   }
 
   /**
+   * Whether `entry`, captured when its request was made, is still the partition's entry and still
+   * awaiting that answer: not replaced, dropped, completed or discarded since. Only then may a
+   * caller that never got a usable answer move the partition on.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {object} entry the entry `entryOf` returned after `request()`
+   * @returns {boolean}
+   */
+  isAwaitingWith(topic, partition, entry) {
+    return this.entries.get(this.getKey(topic, partition)) === entry && entry.pending !== null
+  }
+
+  /**
    * @param {string} topic
    * @param {number} partition
    * @returns {boolean} whether a request for this partition is in flight
