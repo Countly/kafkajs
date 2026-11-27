@@ -630,7 +630,8 @@ const createProducer = ({
 
     /**
      * Abort the ongoing transaction: rejects the batches still queued - accumulated ones
-     * included - waits for the rest of the transaction's operations, then aborts it. It ends the
+     * included, and a send whose join a record accessor interrupted with this abort - waits for
+     * the rest of the transaction's operations, then aborts it. It ends the
      * transaction even when the abort fails, unless the producer is unusable. A rejected batch
      * that was already sent once leaves its sequence spent, so the abort then moves the producer
      * to a new epoch (see `abort()` on the eosManager). Called while a `commit()` of the
@@ -646,14 +647,16 @@ const createProducer = ({
     const abort = () => {
       // The accumulated batches join the queue, so the abort rejects them with the rest.
       transactionalMessageProducer.flush()
-      const dropped =
-        ending === null && stateManager.state() === IN_TRANSACTION
-          ? stateManager.sequencer.abortQueued(
-              new KafkaJSTransactionAbortableError(
-                'The transaction was aborted while this batch was waiting to be sent'
-              )
-            )
-          : []
+      let dropped = []
+      if (ending === null && stateManager.state() === IN_TRANSACTION) {
+        const error = new KafkaJSTransactionAbortableError(
+          'The transaction was aborted while this batch was waiting to be sent'
+        )
+        // A send this abort interrupted while it joined its batches, from a record accessor, is
+        // dropped with them rather than written after them.
+        transactionalMessageProducer.abortJoins(error)
+        dropped = stateManager.sequencer.abortQueued(error)
+      }
       const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
       const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
       transactionalMessageProducer.flush(ended)
