@@ -1021,7 +1021,6 @@ describe('stop during an unresolved preparation', () => {
         const gates = [gate(), gate()]
         const queue = [...gates]
         h.broker.offsetForLeaderEpoch = jest.fn(() => queue.shift().promise)
-        jest.spyOn(h.offsetManager, 'reposition')
         return {
           late: {
             topics: [
@@ -1032,8 +1031,8 @@ describe('stop during an unresolved preparation', () => {
             ],
           },
           gates,
-          effect: () => h.offsetManager.reposition.mock.calls.length,
-          untouched: 0,
+          effect: () => h.offsetManager.positionOf(TOPIC, 0),
+          untouched: '10',
         }
       },
     },
@@ -1639,13 +1638,30 @@ describe('validation response continuation', () => {
       group.offsetManager.committedOffsets()[topic][partition]
     group.offsetManager.peekNextOffset = () => ({ toString: () => '0' })
     group.offsetManager.lastConsumedEpoch = () => 1
-    group.offsetManager.reposition = async () => true
-    group.markChanged = () => {}
+    group.offsetManager.owns = () => true
+    group.offsetManager.seekLocally = () => true
+    group.cluster.leaderEpoch = () => 2
+    group.acquired.set('orders|1', { acquiredAt: 0, changedAt: 0, soughtAt: 0, recreatedAt: 0 })
+    const validator = group.positionValidator
+    const awaiting = (partition) => {
+      const { generation } = validator.request('orders', partition, {
+        offset: '0',
+        trackedEpoch: 1,
+        currentLeaderEpoch: 2,
+      })
+      return {
+        partition,
+        generation,
+        currentLeaderEpoch: 2,
+        requestClock: group.acquireClock,
+        entry: validator.entryOf('orders', partition),
+      }
+    }
     group.logger.warn = jest.fn()
     jest
       .spyOn(group.positionValidator, 'complete')
       .mockReturnValueOnce({ action: 'fatal' })
-      .mockReturnValueOnce({ action: 'truncated', divergingOffset: '0' })
+      .mockReturnValueOnce({ action: 'truncated', divergingOffset: '0', leaderEpoch: 1 })
     group.instrumentationEmitter = new InstrumentationEventEmitter()
     group.instrumentationEmitter.addListener(
       require('../instrumentationEvents').events.LOG_TRUNCATION,
@@ -1661,10 +1677,7 @@ describe('validation response continuation', () => {
         [
           {
             topic: 'orders',
-            entries: [
-              { partition: 0, generation: 0 },
-              { partition: 1, generation: 0 },
-            ],
+            entries: [awaiting(0), awaiting(1)],
           },
         ],
         {

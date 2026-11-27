@@ -1,4 +1,7 @@
+const { newLogger } = require('testHelpers')
 const apiKeys = require('../../protocol/requests/apiKeys')
+const Batch = require('../batch')
+const Runner = require('../runner')
 const {
   events: { LOG_TRUNCATION },
 } = require('../instrumentationEvents')
@@ -8,6 +11,7 @@ const {
   prepareRecordBatches,
   fetchResponse,
   offsetForLeaderEpochResponse,
+  scriptedEpochLog,
   createFetchGroup,
 } = require('./fixtures/fetchHarness')
 
@@ -191,11 +195,13 @@ describe('Consumer > position validation', () => {
     expect(requestRejoin).not.toHaveBeenCalled()
   })
 
-  test('a reposition that fails leaves the partition unvalidated, and the next round applies it', async () => {
+  test('a rewind that fails leaves the partition unvalidated, and the next round applies it', async () => {
     const events = []
     const { group, offsetManager } = await createGroup({ validationScenario: 'truncated' })
     group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-    jest.spyOn(offsetManager, 'reposition').mockRejectedValueOnce(new Error('coordinator is down'))
+    jest.spyOn(offsetManager, 'seekLocally').mockImplementationOnce(() => {
+      throw new Error('the position could not be written')
+    })
 
     await group.fetch(NODE_ID)
 
@@ -284,107 +290,83 @@ describe('Consumer > position validation', () => {
 
     test('undefined: reset per fromBeginning and emit the event with a null diverging offset', async () => {
       const events = []
-      const { group, offsetManager } = await createGroup({ validationScenario: 'reset' })
+      const { group, offsetManager, offsetCommit } = await createGroup({
+        validationScenario: 'reset',
+      })
+      const resetLocally = jest.spyOn(offsetManager, 'resetLocally')
       const setDefaultOffset = jest.spyOn(offsetManager, 'setDefaultOffset')
       group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
 
       await group.fetch(NODE_ID)
 
-      expect(setDefaultOffset).toHaveBeenCalledWith(
-        { topic: TOPIC, partition: 0 },
-        expect.objectContaining({ guard: expect.any(Function) })
-      )
+      expect(resetLocally).toHaveBeenCalledWith(TOPIC, 0)
+      expect(setDefaultOffset).not.toHaveBeenCalled()
+      expect(offsetCommit).not.toHaveBeenCalled()
       expect(events).toEqual([
         { topic: TOPIC, partition: 0, offset: '120', divergingOffset: null, leaderEpoch: -1 },
       ])
     })
 
-    test('truncated: a reposition that a newer seek superseded emits no LOG_TRUNCATION and marks nothing changed, while one that applies emits exactly one', async () => {
+    test('truncated: a partition reset or sought while its answer was in flight is not rewound and emits nothing, while its sibling is rewound and emits exactly one', async () => {
       const events = []
-      const { group, offsetManager, offsetCommit } = await createGroup({
+      const { group, offsetManager, offsetCommit, setValidationResponse } = await createGroup({
         validationScenario: 'truncated',
-        autoCommit: true,
         partitions: [0, 1],
       })
       group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-      const markChanged = jest.spyOn(group, 'markChanged')
-      const reposition = jest.spyOn(offsetManager, 'reposition')
-      // Partition 0's commit is answered after a seek to the earliest offset was applied to the
-      // same partition. That newer operation supersedes the reposition, which resolves false.
-      offsetCommit.mockImplementationOnce(async () => {
-        await offsetManager.seek({ topic: TOPIC, partition: 0, offset: '-2' })
-        return { topics: [] }
+      const markSought = jest.spyOn(group, 'markSought')
+      setValidationResponse((partitions) => {
+        // What applying a reset or a seek of partition 0 stamps while the answer is on its way.
+        group.markChanged(TOPIC, 0)
+        return offsetForLeaderEpochResponse(
+          partitions.map((partition) => ({ partition, endOffset: '100' }))
+        )
       })
 
       await group.validatePositions([{ topic: TOPIC, partitions: [0, 1] }])
 
-      expect(reposition.mock.calls.map(([{ partition }]) => partition)).toEqual([0, 1])
-      await expect(reposition.mock.results[0].value).resolves.toBe(false)
-      await expect(reposition.mock.results[1].value).resolves.toBe(true)
       expect(events).toEqual([
         { topic: TOPIC, partition: 1, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
       ])
-      expect(markChanged.mock.calls).toEqual([[TOPIC, 1]])
-    })
-
-    test('truncated: a reposition superseded by a newer publication at the same position still emits LOG_TRUNCATION and marks the partition changed', async () => {
-      const events = []
-      const { group, offsetManager, offsetCommit } = await createGroup({
-        validationScenario: 'truncated',
-        autoCommit: true,
-      })
-      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-      const markChanged = jest.spyOn(group, 'markChanged')
-      const reposition = jest.spyOn(offsetManager, 'reposition')
-      // While the rewind's commit is held, another participant of the group (a transactional
-      // producer) begins and confirms a newer offset publication for the same cell at 120, the
-      // position the truncation was detected at. It supersedes the rewind without moving it.
-      offsetCommit.mockImplementationOnce(async () => {
-        const ledger = offsetManager.operations
-        const ticket = ledger.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
-        ledger.publish(ticket, TOPIC, 0, '120')
-        ledger.apply(ticket, TOPIC, 0)
-        ledger.end(ticket)
-        return { topics: [] }
-      })
-
-      await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
-
-      await expect(reposition.mock.results[0].value).resolves.toBe(false)
+      expect(markSought.mock.calls).toEqual([[TOPIC, 1]])
       expect(offsetManager.positionOf(TOPIC, 0)).toEqual('120')
-      expect(events).toEqual([
-        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
-      ])
-      expect(markChanged.mock.calls).toEqual([[TOPIC, 0]])
+      expect(offsetManager.positionOf(TOPIC, 1)).toEqual('100')
+      expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
+      expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+      expect(offsetCommit).not.toHaveBeenCalled()
     })
 
-    test('truncated: a newer publication of the same offset in another spelling still emits LOG_TRUNCATION and marks the partition changed', async () => {
-      const events = []
-      const { group, offsetManager, offsetCommit } = await createGroup({
-        validationScenario: 'truncated',
-        autoCommit: true,
-      })
-      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-      const markChanged = jest.spyOn(group, 'markChanged')
-      const reposition = jest.spyOn(offsetManager, 'reposition')
-      offsetCommit.mockImplementationOnce(async () => {
-        const ledger = offsetManager.operations
-        const ticket = ledger.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
-        ledger.publish(ticket, TOPIC, 0, '0120')
-        ledger.apply(ticket, TOPIC, 0)
-        ledger.end(ticket)
-        return { topics: [] }
-      })
+    test.each(['120', '0120'])(
+      'truncated: a newer group publication of the same position as %s while the answer is in flight does not stop the rewind, and validation writes no commit',
+      async (spelling) => {
+        const events = []
+        const { group, offsetManager, offsetCommit, setValidationResponse } = await createGroup({
+          validationScenario: 'truncated',
+          autoCommit: true,
+        })
+        group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+        // Another participant of the group (a transactional producer) confirms an offset
+        // publication for the same cell at the position the check was asked for.
+        setValidationResponse((partitions) => {
+          const ledger = offsetManager.operations
+          const ticket = ledger.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+          ledger.publish(ticket, TOPIC, 0, spelling)
+          ledger.apply(ticket, TOPIC, 0)
+          ledger.end(ticket)
+          return offsetForLeaderEpochResponse(
+            partitions.map((partition) => ({ partition, endOffset: '100' }))
+          )
+        })
 
-      await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+        await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
 
-      await expect(reposition.mock.results[0].value).resolves.toBe(false)
-      expect(BigInt(offsetManager.positionOf(TOPIC, 0))).toEqual(120n)
-      expect(events).toEqual([
-        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
-      ])
-      expect(markChanged.mock.calls).toEqual([[TOPIC, 0]])
-    })
+        expect(offsetManager.positionOf(TOPIC, 0)).toEqual('100')
+        expect(events).toEqual([
+          { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+        ])
+        expect(offsetCommit).not.toHaveBeenCalled()
+      }
+    )
 
     test('retriable exhausted: the epoch is cleared, the offset is not moved, the partition is fetched', async () => {
       const { group, offsetManager } = await createGroup({
@@ -413,10 +395,10 @@ describe('Consumer > position validation', () => {
     expect(fetchRequestOffsets()).toEqual(['100'])
   })
 
-  test('with autoCommit the truncated partition is dropped from this round and resumes from the corrected offset', async () => {
+  test('with autoCommit the truncated partition is fetched from the divergence point in the same round, and nothing is committed', async () => {
     const {
       group,
-      broker,
+      offsetCommit,
       fetchRequestPartitions,
       fetchRequestOffsets,
       setResponse,
@@ -429,14 +411,6 @@ describe('Consumer > position validation', () => {
         partitions.map((partition) => ({ partition, endOffset: partition === 0 ? '100' : '200' }))
       )
     )
-    setResponse(fetchResponse([{ partition: 1, errorCode: 0 }]))
-
-    await group.fetch(NODE_ID)
-    expect(fetchRequestPartitions()).toEqual([1]) // the committed-offset filter dropped it
-
-    jest.spyOn(broker, 'offsetFetch').mockResolvedValue({
-      responses: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '100', metadata: '' }] }],
-    })
     setResponse(
       fetchResponse([
         { partition: 0, errorCode: 0 },
@@ -445,7 +419,10 @@ describe('Consumer > position validation', () => {
     )
 
     await group.fetch(NODE_ID)
-    expect(fetchRequestOffsets()).toContain('100')
+
+    expect(fetchRequestPartitions()).toEqual([0, 1])
+    expect(fetchRequestOffsets()).toEqual(['100', '120'])
+    expect(offsetCommit).not.toHaveBeenCalled()
   })
 
   test('a queued seek wins over the validation outcome, and a partition carrying one is not validated', async () => {
@@ -676,5 +653,352 @@ describe('Consumer > position validation', () => {
 
     expect(request).not.toHaveBeenCalled()
     expect(nextOffset).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * A batch of partition 0 stamped as `ConsumerGroup#fetch` stamps one, under the group's current
+ * acquisition clock: a batch fetched before whatever the case does next.
+ * @param {import('../consumerGroup')} group
+ * @param {string[]} offsets the records' offsets, all of leader epoch 4
+ * @returns {Batch}
+ */
+const fetchedBatch = (group, offsets) => {
+  const batch = new Batch(TOPIC, offsets[0], {
+    partition: 0,
+    highWatermark: '200',
+    abortedTransactions: [],
+    messages: offsets.map((offset) => ({
+      offset,
+      key: null,
+      value: Buffer.from('v'),
+      headers: {},
+      isControlRecord: false,
+      batchContext: { partitionLeaderEpoch: 4 },
+    })),
+  })
+  const key = `${TOPIC}|0`
+  batch.assignmentEpoch = group.assignmentEpoch
+  batch.acquireClock = group.acquireClock
+  batch.ownershipKey = key
+  batch.acquisition = group.acquisitionAt(key, group.acquireClock)
+  return batch
+}
+
+/**
+ * A real `Runner` over the harness group, with heartbeats and auto-commits stubbed out: the cases
+ * drive its handler paths directly.
+ * @param {import('../consumerGroup')} group
+ * @param {object} handlers `eachBatch`, `eachMessage` and `eachBatchAutoResolve`
+ * @returns {Runner}
+ */
+const runnerOver = (group, handlers) => {
+  const runner = new Runner({
+    consumerGroup: group,
+    instrumentationEmitter: group.instrumentationEmitter,
+    logger: newLogger(),
+    concurrency: 1,
+    maxPollInterval: 300000,
+    onCrash: jest.fn(),
+    ...handlers,
+  })
+  runner.running = true
+  runner.heartbeat = jest.fn(async () => {})
+  runner.autoCommitOffsetsIfNecessary = jest.fn(async () => {})
+  return runner
+}
+
+/** @returns {{ promise: Promise<void>, release: () => void }} a gate a handler waits on */
+const handlerGate = () => {
+  let release
+  const promise = new Promise((resolve) => (release = resolve))
+  return { promise, release }
+}
+
+/**
+ * Spies on every offset manager path that writes an OffsetCommit for a single cell.
+ * @param {import('../offsetManager')} offsetManager
+ * @returns {jest.SpyInstance[]}
+ */
+const commitPaths = (offsetManager) =>
+  ['reposition', 'setDefaultOffset', 'commitAndClear', 'commitSeek', 'publishSeek'].map((name) =>
+    jest.spyOn(offsetManager, name)
+  )
+
+/**
+ * The harness with an undefined validation answer, a coordinator that still holds the committed
+ * offset 120 with epoch 4, and a ListOffsets that answers 150 for every partition.
+ * @param {object} [options] over `createGroup`
+ * @returns {Promise<object>} the harness plus `events`, the LOG_TRUNCATION payloads
+ */
+const resetHarness = async (options = {}) => {
+  const harness = await createGroup({ validationScenario: 'reset', ...options })
+  const events = []
+  harness.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+  harness.cluster.fetchTopicsOffset = jest.fn(async (requests) =>
+    requests.map(({ topic, partitions }) => ({
+      topic,
+      partitions: partitions.map(({ partition }) => ({ partition, offset: '150' })),
+    }))
+  )
+  jest.spyOn(harness.broker, 'offsetFetch').mockResolvedValue({
+    responses: [
+      {
+        topic: TOPIC,
+        partitions: [{ partition: 0, offset: '120', committedLeaderEpoch: 4, metadata: '' }],
+      },
+    ],
+  })
+  return { ...harness, events }
+}
+
+describe('Consumer > validation outcome publication', () => {
+  test('a rewind writes no OffsetCommit frame, and the next auto-commit writes the divergence point with the leader epoch', async () => {
+    const harness = await createGroup({ position: '120', autoCommit: true })
+    try {
+      const { group, offsetManager, offsetCommit, setValidationResponse } = harness
+      // The leader holds epoch 3 from offset 0 and epoch 5 from offset 100, so the consumed epoch 4
+      // ends at 100, answered with the epoch 3 that precedes it.
+      setValidationResponse(
+        scriptedEpochLog({
+          epochs: [
+            [3, 0],
+            [5, 100],
+          ],
+          logEnd: 150,
+        }).answer
+      )
+      const paths = commitPaths(offsetManager)
+
+      await group.fetch(NODE_ID)
+
+      expect(offsetCommit).not.toHaveBeenCalled()
+      for (const path of paths) expect(path).not.toHaveBeenCalled()
+      expect(offsetManager.positionOf(TOPIC, 0)).toEqual('100')
+      expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(3)
+
+      await offsetManager.commitOffsets({}, { auto: true })
+
+      expect(offsetCommit).toHaveBeenCalledTimes(1)
+      expect(offsetCommit.mock.calls[0][0].topics).toEqual([
+        { topic: TOPIC, partitions: [{ partition: '0', offset: '100', leaderEpoch: 3 }] },
+      ])
+    } finally {
+      await harness.teardown()
+    }
+  })
+
+  test.each(['eachBatch resolveOffset', 'eachBatch auto-resolve', 'eachMessage in progress'])(
+    '%s: a handler of a batch fetched before a rewind cannot move the position past it, and the next Fetch frame asks for the divergence point',
+    async (mode) => {
+      const harness = await createGroup({ validationScenario: 'truncated' })
+      try {
+        const { group, offsetManager, fetchRequestOffsets } = harness
+        const batch = fetchedBatch(group, ['120', '121'])
+        const gate = handlerGate()
+        const eachMessage = jest.fn(() => gate.promise)
+        const runner = runnerOver(group, {
+          eachBatchAutoResolve: mode === 'eachBatch auto-resolve',
+          eachBatch: async ({ resolveOffset }) => {
+            await gate.promise
+            if (mode === 'eachBatch resolveOffset') resolveOffset('121')
+          },
+          eachMessage,
+        })
+        const handling =
+          mode === 'eachMessage in progress'
+            ? runner.processEachMessage(batch)
+            : runner.processEachBatch(batch)
+
+        await group.fetch(NODE_ID)
+        expect(offsetManager.positionOf(TOPIC, 0)).toEqual('100')
+        gate.release()
+        await handling
+
+        expect(offsetManager.positionOf(TOPIC, 0)).toEqual('100')
+        expect(offsetManager.lastConsumedEpoch(TOPIC, 0)).toEqual(4)
+        if (mode === 'eachMessage in progress') expect(eachMessage).toHaveBeenCalledTimes(1)
+        await group.fetch(NODE_ID)
+        expect(fetchRequestOffsets()).toEqual(['100'])
+      } finally {
+        await harness.teardown()
+      }
+    }
+  )
+
+  test('after a rewind, an older eachBatch payload reports isStale() true', async () => {
+    const harness = await createGroup({ validationScenario: 'truncated' })
+    try {
+      const { group } = harness
+      const gate = handlerGate()
+      const stale = []
+      const runner = runnerOver(group, {
+        eachBatch: async ({ isStale }) => {
+          stale.push(isStale())
+          await gate.promise
+          stale.push(isStale())
+        },
+      })
+      const handling = runner.processEachBatch(fetchedBatch(group, ['120', '121']))
+
+      await group.fetch(NODE_ID)
+      gate.release()
+      await handling
+
+      expect(stale).toEqual([false, true])
+    } finally {
+      await harness.teardown()
+    }
+  })
+
+  test('a fatal sibling row does not mark validated a partition whose rewind was refused', async () => {
+    const events = []
+    const { group, cluster, offsetManager, setValidationResponse } = await createGroup({
+      validationScenario: 'truncated',
+      partitions: [0, 1],
+    })
+    group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+    setValidationResponse((partitions) => {
+      // Partition 0's leader epoch moves while the answer is on its way, so its rewind is refused;
+      // partition 1 is answered TOPIC_AUTHORIZATION_FAILED.
+      cluster.leaderEpoch = (topic, partition) => (partition === 0 ? 6 : 5)
+      return offsetForLeaderEpochResponse(
+        partitions.map((partition) =>
+          partition === 0 ? { partition, endOffset: '100' } : { partition, errorCode: 29 }
+        )
+      )
+    })
+
+    await group.validatePositions([{ topic: TOPIC, partitions: [0, 1] }])
+
+    expect(events).toEqual([])
+    expect(offsetManager.positionOf(TOPIC, 0)).toEqual('120')
+    expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
+    expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+    expect(group.positionValidator.validatedAgainst(TOPIC, 1)).toEqual(5)
+  })
+
+  test('a Fetch built by a second node in the same turn as the answer uses the rewound position', async () => {
+    const { group } = await createGroup({ validationScenario: 'truncated', autoCommit: true })
+    const validator = group.positionValidator
+    const complete = validator.complete.bind(validator)
+    let built
+    jest.spyOn(validator, 'complete').mockImplementation((...args) => {
+      const outcome = complete(...args)
+      Promise.resolve().then(() => {
+        built = group.buildFetchRequests([{ topic: TOPIC, partitions: [0] }])
+      })
+      return outcome
+    })
+
+    await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+    expect(built).toEqual([
+      { topic: TOPIC, partitions: [expect.objectContaining({ partition: 0, fetchOffset: '100' })] },
+    ])
+  })
+
+  test('an undefined answer under latest installs a local reset: no OffsetCommit frame, a ListOffsets in the next preparation, the next Fetch frame at the reset offset, and one LOG_TRUNCATION with divergingOffset null', async () => {
+    const harness = await resetHarness()
+    try {
+      const { group, cluster, offsetManager, offsetCommit, fetchRequestOffsets, events } = harness
+      const paths = commitPaths(offsetManager)
+
+      await group.fetch(NODE_ID)
+
+      expect(cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+      expect(offsetCommit).not.toHaveBeenCalled()
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: null, leaderEpoch: -1 },
+      ])
+
+      await group.fetch(NODE_ID)
+
+      expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+      expect(cluster.fetchTopicsOffset.mock.calls[0][0]).toEqual([
+        { topic: TOPIC, partitions: [{ partition: 0 }], fromBeginning: false },
+      ])
+      expect(fetchRequestOffsets()).toEqual(['150'])
+      expect(offsetCommit).not.toHaveBeenCalled()
+      for (const path of paths) expect(path).not.toHaveBeenCalled()
+      expect(events).toHaveLength(1)
+    } finally {
+      await harness.teardown()
+    }
+  })
+
+  test('an idle reset with no later record leaves nothing for the next commit to write', async () => {
+    const harness = await resetHarness({ autoCommit: true })
+    try {
+      const { group, offsetManager, offsetCommit, fetchRequestOffsets } = harness
+
+      await group.fetch(NODE_ID)
+      await group.fetch(NODE_ID)
+      expect(fetchRequestOffsets()).toEqual(['150'])
+
+      expect(offsetManager.uncommittedOffsets().topics).toEqual([])
+      await offsetManager.commitOffsets({}, { auto: true })
+      expect(offsetCommit).not.toHaveBeenCalled()
+    } finally {
+      await harness.teardown()
+    }
+  })
+
+  test('an undefined answer under a by_duration policy resolves the policy timestamp in the next preparation and commits nothing', async () => {
+    const harness = await resetHarness({ autoCommit: true })
+    try {
+      const { group, cluster, offsetManager, offsetCommit, fetchRequestOffsets } = harness
+      const policy = { resetPolicy: { kind: 'by_duration', durationMs: 60000 } }
+      group.topicConfigurations[TOPIC] = policy
+      offsetManager.topicConfigurations[TOPIC] = policy
+
+      await group.fetch(NODE_ID)
+
+      expect(cluster.fetchTopicsOffset).not.toHaveBeenCalled()
+      expect(offsetCommit).not.toHaveBeenCalled()
+
+      await group.fetch(NODE_ID)
+
+      expect(cluster.fetchTopicsOffset.mock.calls[0][0]).toEqual([
+        {
+          topic: TOPIC,
+          partitions: [{ partition: 0, timestamp: expect.any(Number) }],
+          fromBeginning: false,
+        },
+      ])
+      expect(fetchRequestOffsets()).toEqual(['150'])
+      expect(offsetCommit).not.toHaveBeenCalled()
+    } finally {
+      await harness.teardown()
+    }
+  })
+
+  test('a LOG_TRUNCATION listener sees the rewound position and its fence, and a seek it makes replaces the rewound position', async () => {
+    const harness = await createGroup({ validationScenario: 'truncated' })
+    try {
+      const { group, offsetManager, fetchRequestOffsets } = harness
+      const clock = group.acquireClock
+      const seen = []
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, () => {
+        seen.push({
+          position: offsetManager.positionOf(TOPIC, 0),
+          epoch: offsetManager.lastConsumedEpoch(TOPIC, 0),
+          sought: group.acquired.get(`${TOPIC}|0`).soughtAt > clock,
+          validated: group.positionValidator.validatedAgainst(TOPIC, 0),
+        })
+        group.seek({ topic: TOPIC, partition: 0, offset: '500' })
+      })
+
+      await group.fetch(NODE_ID)
+
+      expect(seen).toEqual([{ position: '100', epoch: 4, sought: true, validated: 5 }])
+
+      await group.fetch(NODE_ID)
+
+      expect(fetchRequestOffsets()).toEqual(['500'])
+      expect(seen).toHaveLength(1)
+    } finally {
+      await harness.teardown()
+    }
   })
 })

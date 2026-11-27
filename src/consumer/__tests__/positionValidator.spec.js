@@ -109,7 +109,9 @@ describe('Consumer > PositionValidator', () => {
           generation,
         })
       ).toEqual({ action: 'truncated', divergingOffset: '100', leaderEpoch: 4 })
-      expect(validator.isAwaiting(TOPIC, 0)).toBe(false)
+      // Left awaiting: the consumer group validates it only once the rewind is in place.
+      expect(validator.isAwaiting(TOPIC, 0)).toBe(true)
+      expect(validator.validatedAgainst(TOPIC, 0)).toBeUndefined()
     })
 
     it.each([
@@ -302,8 +304,6 @@ describe('Consumer > PositionValidator', () => {
 
       it.each([
         ['validated', {}, position('10', 4)],
-        ['truncated', { endOffset: '5' }, position('10', 4)],
-        ['reset', { endOffset: '-1' }, position('10', 4)],
         ['discarded', {}, position('55', 4)],
       ])('%s is an exit complete performs itself', (action, overrides, currentPosition) => {
         const { validator, generation } = awaiting(create())
@@ -317,6 +317,8 @@ describe('Consumer > PositionValidator', () => {
       it.each([
         ['retry', { errorCode: 6 }],
         ['fatal', { errorCode: 29 }],
+        ['truncated', { endOffset: '5' }],
+        ['reset', { endOffset: '-1' }],
       ])(
         '%s keeps the request in flight, and every caller-side exit ends it',
         (action, overrides) => {

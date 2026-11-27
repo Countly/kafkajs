@@ -181,6 +181,50 @@ describe('Consumer > committed leader epoch', () => {
       manager.resetOffset({ topic: TOPIC, partition: 0 })
       expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(-1)
     })
+
+    describe('a validation rewind and the next default commit', () => {
+      /**
+       * Consumes up to offset 119 at epoch 4, then rewinds locally to 100 with the leader's epoch 3,
+       * as position validation does, over the given committed baseline.
+       * @param {string} [committed] the group's committed offset, none when undefined
+       * @returns {OffsetManager}
+       */
+      const rewound = (committed) => {
+        const manager = createManager({})
+        if (committed !== undefined) manager.committedOffsets()[TOPIC][0] = committed
+        manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '119', leaderEpoch: 4 })
+        manager.seekLocally(TOPIC, 0, '100', 3)
+        return manager
+      }
+
+      it('over an older committed offset, it sends the divergence point with the leader epoch', () => {
+        expect(rewound('120').uncommittedOffsets().topics).toEqual([
+          { topic: TOPIC, partitions: [{ partition: '0', offset: '100', leaderEpoch: 3 }] },
+        ])
+      })
+
+      it('with no committed offset, it sends the divergence point with the leader epoch', () => {
+        expect(rewound(undefined).uncommittedOffsets().topics).toEqual([
+          { topic: TOPIC, partitions: [{ partition: '0', offset: '100', leaderEpoch: 3 }] },
+        ])
+      })
+
+      it('over a committed offset equal to the divergence point, it selects nothing: offsets are compared, not epochs', () => {
+        const manager = rewound('100')
+
+        expect(manager.lastConsumedEpoch(TOPIC, 0)).toEqual(3)
+        expect(manager.uncommittedOffsets().topics).toEqual([])
+      })
+
+      it('after records consumed past the divergence point, it sends their offset and epoch', () => {
+        const manager = rewound('120')
+        manager.resolveOffset({ topic: TOPIC, partition: 0, offset: '109', leaderEpoch: 5 })
+
+        expect(manager.uncommittedOffsets().topics).toEqual([
+          { topic: TOPIC, partitions: [{ partition: '0', offset: '110', leaderEpoch: 5 }] },
+        ])
+      })
+    })
   })
 
   describe('read-back on assignment, on a mixed assignment', () => {
