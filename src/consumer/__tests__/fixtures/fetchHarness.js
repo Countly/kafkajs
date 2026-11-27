@@ -593,6 +593,8 @@ const createFakeBroker = (answer, chunks) => {
       const promise = connection.send(
         options?.guard ? { ...protocolRequest, guard: options.guard } : protocolRequest
       )
+      // A guard refusal can reject before the pump below returns; the caller still receives it.
+      promise.catch(() => {})
       await new Promise(setImmediate)
       await pump()
       return promise
