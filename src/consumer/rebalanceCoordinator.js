@@ -301,6 +301,9 @@ module.exports = class RebalanceCoordinator {
       if (this.runner.stopRequested) {
         return
       }
+      // A run whose refused assignments ended it joins no more.
+      const ended = this.consumerGroup.refusal?.error
+      if (ended) throw ended
 
       this.chargeRound(reason)
 
@@ -348,6 +351,11 @@ module.exports = class RebalanceCoordinator {
 
         const roundStartedAt = Date.now()
         const result = await this.consumerGroup.joinAndSync(round)
+        if (result?.refused) {
+          await this.holdNothing({ round, kind, previous, cooperative, additionHold, result })
+          ;({ kind, reason } = await this.followUp(false))
+          continue
+        }
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
@@ -365,6 +373,7 @@ module.exports = class RebalanceCoordinator {
         // partitions.
         const refusal = round.guard()
         if (refusal) throw refusal
+        this.consumerGroup.refusal?.installed()
         const assignment = this.consumerGroup.assigned()
         const reportsDelta = cooperative && kind !== 'lost'
         const gaveUp = kind === 'lost' ? [] : reportsDelta ? revoked : previous
@@ -426,6 +435,72 @@ module.exports = class RebalanceCoordinator {
         round.retire()
       }
     } while (reason)
+  }
+
+  /**
+   * Ends a classic round whose assignment this member refused: nothing of it is installed and the
+   * member holds no partitions until a later round brings a usable one (see `RefusalEpisode`).
+   *
+   * What it held is released at once. A cooperative round still held its previous partitions, so
+   * they go through the lost path: ownership is lost (no handler may commit for them), then
+   * `PARTITIONS_LOST`, the lost callback and its quiescence, and the uncommitted offsets are
+   * discarded. An eager round gave them up before it joined, with its final commit and revoked
+   * callback, so only `PARTITIONS_REVOKED` is reported, as its apply would have. A lost round
+   * reported them before it joined. The empty assignment is then applied as a rebuild, so no batch
+   * fetched before is delivered, and the heartbeat is started. No `GROUP_JOIN` is emitted and no
+   * assigned callback runs: the round joined nothing usable.
+   * @private
+   * @param {object} options
+   * @param {object} options.round the captured round
+   * @param {'lost'|'revoked'|'initial'} options.kind the round kind
+   * @param {Array<import('./groupProtocol/interface').TopicPartitions>} options.previous the assignment held before the round
+   * @param {boolean} options.cooperative whether the round is cooperative
+   * @param {object|null} options.additionHold the listener round's hold token
+   * @param {{ refused: Error }} options.result the refused sync result
+   * @returns {Promise<void>}
+   * @throws {Error} the round's refusal, or a callback failure as a round reports it
+   */
+  async holdNothing({ round, kind, previous, cooperative, additionHold, result }) {
+    const group = this.consumerGroup
+    const hooks = group.rebalanceHooks
+    if (previous.length && kind !== 'lost') {
+      if (cooperative) {
+        group.ownership?.lose(result.refused, group.ownership.token())
+        this.emitPartitions(PARTITIONS_LOST, previous)
+        if (hooks) {
+          await group.invokeHook(
+            round,
+            'onPartitionsLost',
+            previous,
+            group.hookIdentity(round, previous)
+          )
+          await this.runner.quiesceRun({
+            deadlineAt: round.roundDeadlineAt,
+            identity: { round, membership: group.ownership.token() },
+          })
+        }
+        group.discardUncommittedOffsets()
+      } else {
+        this.emitPartitions(PARTITIONS_REVOKED, previous)
+      }
+    }
+    group.forgetOwnedPartitions()
+
+    const applyNothing = () =>
+      group.applyRebalanceResult(
+        { assignment: {}, userData: null, unionSnapshot: null },
+        { round, ...(additionHold && { additionHold }) }
+      )
+    await (hooks ? applyNothing() : round.wait(applyNothing))
+    const refusal = round.guard()
+    if (refusal) throw refusal
+
+    this.pollTimer.reset()
+    if (!this.runner.stopRequested) {
+      this.heartbeatManager.ensureStarted()
+    }
+    const listenerFailure = hooks && group.takeListenerFailure(round)
+    if (listenerFailure) throw listenerFailure
   }
 
   /**

@@ -52,9 +52,10 @@ const readAssignmentRows = (buffer) => {
  * may be another client or a custom assigner, and Kafka relays them as written. Zero bytes mean
  * nothing assigned. A topic named in several rows gets the partitions of all of them, and a
  * repeated partition is kept once, in its first place, as the Java client's sets do; the repeats
- * are returned so the caller can warn about them. The cooperative ownership check of a leader
- * reads the assignments it uploads through this same function.
+ * are returned so the caller can warn about them. A leader reads what its own assigner wrote for
+ * each member through this same function before it sends it.
  * @param {Buffer|null} bytes the answer's assignment
+ * @param {string} [subject] what the refusal names as the source of the bytes
  * @returns {{ assignment: Object<string, number[]>, userData: Buffer|null,
  *   repeatedTopics: string[], repeated: { topic: string, partition: number }[] }}
  *   `repeatedTopics` names each topic of more than one row once
@@ -62,9 +63,9 @@ const readAssignmentRows = (buffer) => {
  *   bytes, a truncated assignment, a null topic list, a row without a topic name, a null partition
  *   list or a negative partition
  */
-const readSyncAssignment = (bytes) => {
+const readSyncAssignment = (bytes, subject = 'SyncGroup response') => {
   if (!Buffer.isBuffer(bytes)) {
-    throw malformedGroupAnswer('SyncGroup response carries no assignment')
+    throw malformedGroupAnswer(`${subject} carries no assignment`)
   }
   if (bytes.length === 0)
     return { assignment: {}, userData: null, repeatedTopics: [], repeated: [] }
@@ -74,15 +75,13 @@ const readSyncAssignment = (bytes) => {
     rows = readAssignmentRows(bytes)
   } catch (error) {
     if (!(error instanceof KafkaJSPartialMessageError)) throw error
-    throw malformedGroupAnswer(
-      `SyncGroup response carries a truncated assignment: ${error.message}`
-    )
+    throw malformedGroupAnswer(`${subject} carries a truncated assignment: ${error.message}`)
   }
   if (rows === null) {
-    throw malformedGroupAnswer('SyncGroup response carries an assignment shorter than its version')
+    throw malformedGroupAnswer(`${subject} carries an assignment shorter than its version`)
   }
   if (rows.topics === null) {
-    throw malformedGroupAnswer('SyncGroup response carries an assignment with a null topic list')
+    throw malformedGroupAnswer(`${subject} carries an assignment with a null topic list`)
   }
 
   const partitionsOf = new Map()
@@ -90,21 +89,17 @@ const readSyncAssignment = (bytes) => {
   const repeated = []
   for (const { topic, partitions } of rows.topics) {
     if (typeof topic !== 'string' || topic === '') {
-      throw malformedGroupAnswer('SyncGroup response carries an assignment row with no topic')
+      throw malformedGroupAnswer(`${subject} carries an assignment row with no topic`)
     }
     if (partitions === null) {
-      throw malformedGroupAnswer(
-        `SyncGroup response carries a null partition list for topic ${topic}`
-      )
+      throw malformedGroupAnswer(`${subject} carries a null partition list for topic ${topic}`)
     }
     let kept = partitionsOf.get(topic)
     if (kept === undefined) partitionsOf.set(topic, (kept = new Set()))
     else repeatedTopics.add(topic)
     for (const partition of partitions) {
       if (partition < 0) {
-        throw malformedGroupAnswer(
-          `SyncGroup response assigns partition ${partition} of topic ${topic}`
-        )
+        throw malformedGroupAnswer(`${subject} assigns partition ${partition} of topic ${topic}`)
       }
       if (kept.has(partition)) repeated.push({ topic, partition })
       else kept.add(partition)
@@ -121,32 +116,4 @@ const readSyncAssignment = (bytes) => {
   }
 }
 
-/**
- * Every partition a reader of these assignment bytes may apply: each row read before the bytes
- * end or break, every row of a repeated topic, a null list as none. This covers what
- * `readSyncAssignment` applies, what `MemberAssignment.decode` and older kafkajs readers apply
- * (the last row of a topic, null lists as empty), and the rows they read before a later field
- * fails, so a leader can check ownership before it sends bytes other members decode their own way.
- * @param {Buffer|null} bytes
- * @returns {{ topic: string|null, partition: number }[]} in row order, repeats included
- */
-const claimedPartitions = (bytes) => {
-  const claimed = []
-  if (!Buffer.isBuffer(bytes)) return claimed
-  const decoder = new Decoder(bytes)
-  try {
-    if (!decoder.canReadInt16()) return claimed
-    decoder.readInt16()
-    // Each row takes at least six bytes, so a count larger than the bytes ends at their end.
-    const count = decoder.readInt32()
-    for (let row = 0; row < count; row++) {
-      const { topic, partitions } = readRow(decoder)
-      for (const partition of partitions ?? []) claimed.push({ topic, partition })
-    }
-  } catch (error) {
-    if (!(error instanceof KafkaJSPartialMessageError)) throw error
-  }
-  return claimed
-}
-
-module.exports = { readAssignmentRows, readSyncAssignment, claimedPartitions }
+module.exports = { readAssignmentRows, readSyncAssignment }

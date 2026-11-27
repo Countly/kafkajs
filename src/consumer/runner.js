@@ -22,6 +22,7 @@ const {
 const createFetchManager = require('./fetchManager')
 const RebalanceCoordinator = require('./rebalanceCoordinator')
 const PollTimer = require('./pollTimer')
+const RefusalEpisode = require('./refusalEpisode')
 const Outage = require('./outage')
 const { FetchOutage } = Outage
 const HeartbeatManager = require('./heartbeatManager')
@@ -178,6 +179,13 @@ module.exports = class Runner extends EventEmitter {
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
     this.quiescing = false
     this.pollTimer = new PollTimer({ pollDeadline: maxPollInterval })
+    /** The run's episode of assignments this classic member cannot use. */
+    this.refusal = new RefusalEpisode({
+      maxPollInterval,
+      groupId: consumerGroup.groupId,
+      logger: this.logger,
+      onExpired: (error) => this.expireRefusal(error),
+    })
     this.heartbeatManager = new HeartbeatManager({
       groupMembership: consumerGroup,
       pollTimer: this.pollTimer,
@@ -191,7 +199,8 @@ module.exports = class Runner extends EventEmitter {
           elapsedMs,
           isStatic: Boolean(this.consumerGroup.groupInstanceId),
         }),
-      isRebalancing: () => this.rebalanceCoordinator.isRebalancing(),
+      isRebalancing: () =>
+        this.rebalanceCoordinator.isRebalancing() || this.refusal.suspendsPollDeadline,
       guard: () => this.retirement ?? null,
       onAccepted: () => this.heartbeatAccepted(),
       detachOnStop: consumerGroup.kind === 'consumer',
@@ -212,7 +221,28 @@ module.exports = class Runner extends EventEmitter {
       rebalanceCoordinator: this.rebalanceCoordinator,
       heartbeatManager: this.heartbeatManager,
       onHeartbeatFatal: (error) => this.reserveFatal(error),
+      refusal: this.refusal,
     })
+  }
+
+  /**
+   * Ends a run whose wait for a usable assignment passed its deadline: a round in flight is
+   * retired with `error`, so it installs nothing, and the fetch loop is stopped and its idle fetch
+   * rounds woken, so it ends with `error`. The crash report that follows stops the run, and its
+   * stop leaves the group once.
+   * @private
+   * @param {Error} error the non-retriable error the episode ended with
+   * @returns {void}
+   */
+  expireRefusal(error) {
+    if (!this.running || this.stopRequested) return
+    this.consumerGroup.roundContext?.retire(error)
+    this.fetchManager.stop().catch((failure) =>
+      this.logger.debug('Error while stopping the fetch manager after a refused assignment', {
+        error: describeThrown(failure),
+      })
+    )
+    this.consumerGroup.idleWait.wake()
   }
 
   /**
@@ -452,12 +482,14 @@ module.exports = class Runner extends EventEmitter {
       if (!this.running) {
         return
       }
+      // A run its refused assignments ended reports that error, unwrapped.
+      if (this.refusal.error) return bail(this.refusal.error)
 
       /**
        * Runs one rebalance for the loop. A failed awaited callback, a classic chain refused at its
-       * round limit and a heartbeat answer marked fatal end the loop through `bail`, so the
-       * retrier hands the typed error to the crash policy unchanged instead of retrying it or
-       * wrapping it.
+       * round limit, a heartbeat answer marked fatal and the end of the run's refusal episode end
+       * the loop through `bail`, so the retrier hands the typed error to the crash policy
+       * unchanged instead of retrying it or wrapping it.
        */
       const rebalance = async (verdict) => {
         try {
@@ -466,7 +498,8 @@ module.exports = class Runner extends EventEmitter {
           if (
             error instanceof KafkaJSRebalanceListenerError ||
             error instanceof KafkaJSRebalanceNotConvergedError ||
-            isHeartbeatFatal(error)
+            isHeartbeatFatal(error) ||
+            (error !== null && error === this.refusal.error)
           ) {
             bail(error)
             return true
@@ -824,6 +857,11 @@ module.exports = class Runner extends EventEmitter {
    * the static leave epoch (-2), so the coordinator can hand its partitions to a returning
    * instance without waiting.
    *
+   * The stop of a run that refused assignments ended (`RefusalEpisode`: its wait passed, a join
+   * ended on a refused JoinGroup answer, or the leader's own assigner wrote an unusable assignment)
+   * leaves by default under the classic protocol, a static member included, so the rest of the
+   * group takes its partitions at once; the leave is sent once and sends nothing without a member id.
+   *
    * `options.leaveGroup` overrides the default (KIP-1092): `true` removes the member from the
    * group at once, `false` keeps it there until its session expires, `undefined` is the default.
    * Every value but `undefined` goes to the group's own `leave`, which knows what it means for its
@@ -912,10 +950,12 @@ module.exports = class Runner extends EventEmitter {
 
       // KIP-345's "a static member sends no LeaveGroup" is a CLASSIC rule. A KIP-848 member tells
       // the coordinator it is gone by default; the protocol picks epoch -1 or -2 from
-      // `groupInstanceId`.
+      // `groupInstanceId`. A run its refused assignments ended leaves by default, static or not,
+      // so the rest of the group takes its partitions at once.
       // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol
+      const leaveGroup = options?.leaveGroup ?? (this.refusal.error ? true : undefined)
       if (
-        options?.leaveGroup === undefined &&
+        leaveGroup === undefined &&
         this.consumerGroup.kind === 'classic' &&
         this.consumerGroup.groupInstanceId
       ) {
@@ -923,9 +963,7 @@ module.exports = class Runner extends EventEmitter {
         scope.check()
         this.consumerGroup.forgetMemberId()
       } else {
-        await scope.wait(() =>
-          this.consumerGroup.leave({ leaveGroup: options?.leaveGroup, operation: scope })
-        )
+        await scope.wait(() => this.consumerGroup.leave({ leaveGroup, operation: scope }))
       }
     } catch (e) {
       // The shutdown continues either way: the runner is already stopped by this point.
@@ -1033,6 +1071,7 @@ module.exports = class Runner extends EventEmitter {
     this.running = false
     // Ends the inter-round yield at once, so a chain waiting one out does not hold this stop open.
     this.rebalanceCoordinator.notifyStopRequested()
+    this.refusal.close()
     // Before the manager is stopped, deliberately: a join waiting on its first heartbeat response
     // is only retried by the chain this next line cancels, so the rejection has to be in flight
     // first or `idle()` never resolves.

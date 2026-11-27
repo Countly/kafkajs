@@ -25,7 +25,8 @@ const assertSameProtocol = (received, sent) => {
 /**
  * The refusal of a JoinGroup answer no coordinator sends, or of a SyncGroup assignment this member
  * cannot use (the coordinator relays the leader's bytes unread). Retriable, with the type
- * `MALFORMED_GROUP_ANSWER`, so the consumer's join retrier joins again instead of using it.
+ * `MALFORMED_GROUP_ANSWER`: the join retrier joins again after a refused JoinGroup answer, and a
+ * refused assignment opens the run's wait for a usable one.
  * @param {string} message names the API and what is wrong
  * @returns {KafkaJSError}
  */
@@ -40,6 +41,12 @@ const malformedGroupAnswer = (message) => {
  * @returns {boolean} whether `error` is a refusal from `malformedGroupAnswer`
  */
 const isMalformedGroupAnswer = (error) => error?.type === MALFORMED_GROUP_ANSWER
+
+/**
+ * The `type` of the non-retriable error a group leader stops with when its own assigner wrote an
+ * assignment no member could use.
+ */
+const INVALID_ASSIGNER_OUTPUT = 'INVALID_ASSIGNER_OUTPUT'
 
 /**
  * Refuses a successful JoinGroup answer no Kafka 4.x coordinator sends: it always names a member
@@ -92,4 +99,5 @@ module.exports = {
   assertJoinAnswer,
   malformedGroupAnswer,
   isMalformedGroupAnswer,
+  INVALID_ASSIGNER_OUTPUT,
 }

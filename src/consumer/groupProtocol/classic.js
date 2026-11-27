@@ -3,7 +3,11 @@ const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
 const { MemberMetadata } = require('../assignerProtocol')
-const { readSyncAssignment, claimedPartitions } = require('../assignmentRows')
+const { readSyncAssignment } = require('../assignmentRows')
+const {
+  isMalformedGroupAnswer,
+  INVALID_ASSIGNER_OUTPUT,
+} = require('../../protocol/requests/groupProtocolCheck')
 const Encoder = require('../../protocol/encoder')
 const {
   KafkaJSNonRetriableError,
@@ -402,8 +406,9 @@ module.exports = class ClassicGroupProtocol {
   /**
    * One JoinGroup followed by one SyncGroup.
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void, round: object }} context
-   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded member
-   *   assignment, `{}` when the coordinator assigned nothing
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }|{ refused: Error }>} the
+   *   decoded member assignment, `{}` when the coordinator assigned nothing, or the refusal of an
+   *   assignment this member cannot use (see `sync`)
    */
   async rebalance({ topics, topicsSubscribed, beforeSync, round }) {
     await round.wait(() => this.join({ topicsSubscribed, round }))
@@ -613,13 +618,14 @@ module.exports = class ClassicGroupProtocol {
    * the caller refreshes the partitions it knows about for its subscribed topics.
    * @param {{ topics: string[], topicsSubscribed: string[], beforeSync: () => void, round: object }} context
    * @returns {Promise<{ assignment: Object, userData: Buffer|null,
+   *   unionSnapshot: Map<string, number[]>|null }|{ refused: Error,
    *   unionSnapshot: Map<string, number[]>|null }>} `unionSnapshot` is the leader's partition sets
    *   of the topics only other members subscribe to, for `LeaderUnionWatch`; null for a follower
-   *   or when every member shares the leader's subscription
+   *   or when every member shares the leader's subscription. `refused` replaces the assignment
+   *   when this member cannot use the bytes it was sent (see `readAssignment`)
    * @throws {KafkaJSNonRetriableError} when the coordinator picked an assignor this member does
-   *   not have
-   * @throws {KafkaJSError} retriable, type `MALFORMED_GROUP_ANSWER`, for assignment bytes this
-   *   member cannot use (`readSyncAssignment`); repeated partitions are kept once, with a warning
+   *   not have, or with the type `INVALID_ASSIGNER_OUTPUT` when this leader's own assigner wrote an
+   *   assignment no member could use (see `readAssignerOutput`)
    */
   async sync({ topics, topicsSubscribed, beforeSync, round }) {
     let assignment = []
@@ -672,6 +678,7 @@ module.exports = class ClassicGroupProtocol {
           groupTopicMetadata,
         })
       )
+      const assigned = this.readAssignerOutput(assigner, assignment)
 
       // An incremental rebalance must never hand a partition to a member while another member
       // still owns it: the new owner would fetch it while the old one is still delivering.
@@ -679,7 +686,7 @@ module.exports = class ClassicGroupProtocol {
       // other assignor configured under this mode has to be checked.
       // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
       if (this.mode === COOPERATIVE && groupProtocol !== 'cooperative-sticky') {
-        this.assertNoDoubleAssignment({ members, assignment })
+        this.assertNoDoubleAssignment({ members, assigned })
       }
 
       this.logger.debug('Group assignment', {
@@ -712,19 +719,104 @@ module.exports = class ClassicGroupProtocol {
       )
     )
 
+    return this.readAssignment(memberAssignment, unionSnapshot)
+  }
+
+  /**
+   * Asks the coordinator once more for this member's assignment in the generation it holds: a
+   * SyncGroup that uploads no assignments. A stable group answers with the bytes it stored for this
+   * member and does not rebalance; a group already rebalancing answers with an error.
+   * @see https://github.com/apache/kafka/blob/4.4.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+   * @param {{ round: object }} context the round the refused assignment belongs to
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null, unionSnapshot: null }|
+   *   { refused: Error, unionSnapshot: null }>} as `sync`
+   * @throws {Error} the coordinator's error or the round's refusal
+   */
+  async syncAgain({ round }) {
     const {
-      assignment: own,
-      userData,
-      repeatedTopics,
-      repeated,
-    } = readSyncAssignment(memberAssignment)
+      groupId,
+      generationId,
+      memberId,
+      groupProtocol,
+      protocolType,
+      coordinator,
+      sessionTimeout,
+      rebalanceTimeout,
+      groupInstanceId,
+    } = this
+    const { memberAssignment } = await round.wait(() =>
+      coordinator.syncGroup(
+        {
+          groupId,
+          generationId,
+          memberId,
+          groupInstanceId,
+          protocolType,
+          protocolName: groupProtocol,
+          groupAssignment: [],
+          sessionTimeout,
+          rebalanceTimeout,
+        },
+        { guard: round.guard }
+      )
+    )
+    return this.readAssignment(memberAssignment, null)
+  }
+
+  /**
+   * Decides whether this member can use the assignment bytes a SyncGroup answer handed it
+   * (`readSyncAssignment`). Repeated partitions are kept once, with a warning.
+   * @private
+   * @param {Buffer|null} memberAssignment the answer's assignment
+   * @param {Map<string, number[]>|null} unionSnapshot passed through, see `sync`
+   * @returns {{ assignment: Object, userData: Buffer|null, unionSnapshot: Map|null }|
+   *   { refused: Error, unionSnapshot: Map|null }} `refused` is the retriable
+   *   `MALFORMED_GROUP_ANSWER` error naming what is wrong; nothing of the bytes is returned
+   */
+  readAssignment(memberAssignment, unionSnapshot) {
+    let read
+    try {
+      read = readSyncAssignment(memberAssignment)
+    } catch (error) {
+      if (!isMalformedGroupAnswer(error)) throw error
+      return { refused: error, unionSnapshot }
+    }
+    const { assignment, userData, repeatedTopics, repeated } = read
     if (repeatedTopics.length > 0 || repeated.length > 0) {
+      const { groupId, memberId, groupProtocol } = this
       this.logger.warn(
         'The assignment from the group leader repeats topics or partitions; each partition is used once',
         { groupId, memberId, groupProtocol, repeatedTopics, repeated }
       )
     }
-    return { assignment: own, userData, unionSnapshot }
+    return { assignment, userData, unionSnapshot }
+  }
+
+  /**
+   * Reads every assignment this leader's assigner wrote with the reader each member applies to
+   * what it is sent (`readSyncAssignment`), before any of it is sent: a defect in the assigner is
+   * reported by the member that runs it, and no member is sent bytes it would refuse.
+   * @param {{ name: string }} assigner the assigner the coordinator chose
+   * @param {Array<{memberId: string, memberAssignment: Buffer}>} assignment what it wrote
+   * @returns {Array<{ memberId: string, assignment: Object<string, number[]> }>} each member's
+   *   assignment as that member reads it
+   * @throws {KafkaJSNonRetriableError} type `INVALID_ASSIGNER_OUTPUT`, naming the assigner, the
+   *   member and what is wrong
+   */
+  readAssignerOutput(assigner, assignment) {
+    return assignment.map(({ memberId, memberAssignment }) => {
+      try {
+        const subject = `its output for member ${memberId}`
+        return { memberId, assignment: readSyncAssignment(memberAssignment, subject).assignment }
+      } catch (error) {
+        if (!isMalformedGroupAnswer(error)) throw error
+        const failure = new KafkaJSNonRetriableError(
+          `Partition assigner "${assigner.name}" produced an unusable assignment: ${error.message}`
+        )
+        failure.type = INVALID_ASSIGNER_OUTPUT
+        throw failure
+      }
+    })
   }
 
   /**
@@ -733,16 +825,15 @@ module.exports = class ClassicGroupProtocol {
    *
    * A member whose subscription carries no owned partitions - a v0 subscription, or one this
    * member cannot decode - contributes nothing to the ownership set, so an unknown owner is never
-   * treated as a conflict. Each assigned buffer counts every partition any member's reader may
-   * apply from it (`claimedPartitions`), including members on an older client that read bytes this
-   * client refuses.
+   * treated as a conflict. The assignments are those `readAssignerOutput` read, which keep every
+   * row of a repeated topic, so they cover what any member's reader applies from the bytes sent.
    *
    * @param {{ members: Array<{memberId: string, memberMetadata: Buffer}>,
-   *   assignment: Array<{memberId: string, memberAssignment: Buffer}> }} round
+   *   assigned: Array<{memberId: string, assignment: Object<string, number[]>}> }} round
    * @returns {void}
    * @throws {KafkaJSNonRetriableError} naming the topic, the partition and both member ids
    */
-  assertNoDoubleAssignment({ members, assignment }) {
+  assertNoDoubleAssignment({ members, assigned }) {
     const ownerOf = new Map()
 
     for (const { memberId, memberMetadata } of members) {
@@ -754,14 +845,16 @@ module.exports = class ClassicGroupProtocol {
       }
     }
 
-    for (const { memberId, memberAssignment } of assignment) {
-      for (const { topic, partition } of claimedPartitions(memberAssignment)) {
-        const owner = ownerOf.get(`${topic}|${partition}`)
+    for (const { memberId, assignment } of assigned) {
+      for (const [topic, partitions] of Object.entries(assignment)) {
+        for (const partition of partitions) {
+          const owner = ownerOf.get(`${topic}|${partition}`)
 
-        if (owner !== undefined && owner !== memberId) {
-          throw new KafkaJSNonRetriableError(
-            `Cooperative rebalance would assign ${topic}-${partition} to ${memberId} while ${owner} still owns it; use the cooperative-sticky assigner or an assignor that withholds moved partitions`
-          )
+          if (owner !== undefined && owner !== memberId) {
+            throw new KafkaJSNonRetriableError(
+              `Cooperative rebalance would assign ${topic}-${partition} to ${memberId} while ${owner} still owns it; use the cooperative-sticky assigner or an assignor that withholds moved partitions`
+            )
+          }
         }
       }
     }
