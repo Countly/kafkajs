@@ -10,8 +10,9 @@ const { parse } = require('../v0/response')
  * Assignment => COMPACT_BYTES
  * TAG_BUFFER
  *
- * v3's fields in compact framing, decoded to v3's keys. A compact null assignment decodes to an
- * empty buffer, which `MemberAssignment.decode` reads as "nothing assigned". v5 adds
+ * v3's fields in compact framing, decoded to v3's keys. `Assignment` is not nullable and no
+ * coordinator writes its null, so a compact null decodes to null, as v0-v3's null bytes do, for
+ * the consumer to refuse; a zero-length one is an empty buffer, nothing assigned. v5 adds
  * `ProtocolType` and `ProtocolName` before `Assignment`, which `buildDecode(true)` reads.
  * @see https://kafka.apache.org/43/design/protocol
  * @see clients/src/main/resources/common/message/SyncGroupResponse.json (Apache Kafka 4.3.1)
@@ -34,7 +35,7 @@ const buildDecode = (withProtocol) => async (rawData) => {
     decoded.protocolName = decoder.readUVarIntString()
   }
 
-  decoded.memberAssignment = decoder.readUVarIntBytes() || Buffer.alloc(0)
+  decoded.memberAssignment = decoder.readUVarIntBytes()
   decoder.readTaggedFields()
   return decoded
 }

@@ -126,8 +126,8 @@ const MemberAssignment = {
 
   /**
    * Decodes an assignment as kafkajs always has: a topic named in two rows keeps the last row's
-   * partitions, and a null topic list reads as no topics. The consumer's own SyncGroup path checks
-   * the rows first (`readSyncAssignment`).
+   * partitions, and a null topic or partition list reads as none. The consumer's own SyncGroup
+   * path checks the rows first (`readSyncAssignment`).
    * @param {Buffer} buffer
    * @returns {Object|null} null when the buffer is shorter than its version
    */
@@ -140,7 +140,7 @@ const MemberAssignment = {
     return {
       version: rows.version,
       assignment: Object.fromEntries(
-        (rows.topics ?? []).map(({ topic, partitions }) => [topic, partitions])
+        (rows.topics ?? []).map(({ topic, partitions }) => [topic, partitions ?? []])
       ),
       userData: rows.userData,
     }

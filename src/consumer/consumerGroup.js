@@ -66,6 +66,7 @@ const {
   KafkaJSRebalanceListenerError,
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSNoOffsetError,
+  KafkaJSPartialMessageError,
   isRebalancing,
   isLostMember,
   isFatalMembership,
@@ -1714,13 +1715,40 @@ module.exports = class ConsumerGroup {
   /**
    * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error and
    * on a refused answer no coordinator sends (`MALFORMED_GROUP_ANSWER`), which counts against the
-   * retries like any other.
+   * retries like any other. When the retries or `retry.maxTotalTime` run out on such an answer,
+   * the failure is a non-retriable `KafkaJSPartialMessageError` naming the group, the member and
+   * the refusal: the leader or coordinator that wrote it would answer a restarted member the same.
    * @private
    * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
    * @throws {Error} what the retrier gave up with
    * @param {object} round original round; retries create attempts without renewing its time
    */
-  joinAndSyncAttempt(round) {
+  async joinAndSyncAttempt(round) {
+    try {
+      return await this.joinAndSyncRetried(round)
+    } catch (error) {
+      const refused = error?.name === 'KafkaJSDeliveryTimeout' ? error.cause : error
+      if (
+        (error?.name === 'KafkaJSNumberOfRetriesExceeded' ||
+          error?.name === 'KafkaJSDeliveryTimeout') &&
+        isMalformedGroupAnswer(refused)
+      ) {
+        // No cause: the crash policy restarts on a retriable cause, and the refusal is one.
+        throw new KafkaJSPartialMessageError(
+          `Group ${this.groupId} member ${this.memberId || '(no id yet)'}: the join retries ran out on an answer no coordinator sends: ${refused.message}`
+        )
+      }
+      throw error
+    }
+  }
+
+  /**
+   * The join retrier itself, for `joinAndSyncAttempt`.
+   * @private
+   * @param {object} round
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>}
+   */
+  joinAndSyncRetried(round) {
     return this.retrier(async (bail) => {
       const { membershipRevision } = this.groupMembership
       const attempt = round.attempt()
@@ -1777,10 +1805,11 @@ module.exports = class ConsumerGroup {
         }
 
         // A JoinGroup or SyncGroup answer no coordinator sends was refused before it changed
-        // anything; join again, as after a rebalance.
+        // anything; join again while retries are left, as after a rebalance.
         if (isMalformedGroupAnswer(e)) {
-          this.logger.warn('Refused a group answer, joining again', {
+          this.logger.warn('Refused a group answer no coordinator sends', {
             groupId: this.groupId,
+            memberId: this.memberId,
             error: e.message,
           })
           throw e

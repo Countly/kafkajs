@@ -2,8 +2,9 @@ const partitionMetadata = require('../assigners/partitionMetadata')
 const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
-const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
+const { MemberMetadata } = require('../assignerProtocol')
 const { readSyncAssignment } = require('../assignmentRows')
+const { isMalformedGroupAnswer } = require('../../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSNonRetriableError,
   KafkaJSConnectionError,
@@ -44,6 +45,20 @@ const losesCoordinator = (error) =>
   error instanceof KafkaJSConnectionError ||
   error instanceof KafkaJSRequestTimeoutError ||
   isStaleCoordinator(error)
+
+/**
+ * The partitions a member applies from assignment bytes, read as SyncGroup reads them.
+ * @param {Buffer} bytes
+ * @returns {Object<string, number[]>} nothing for bytes the member refuses
+ */
+const applied = (bytes) => {
+  try {
+    return readSyncAssignment(bytes).assignment
+  } catch (error) {
+    if (isMalformedGroupAnswer(error)) return {}
+    throw error
+  }
+}
 
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
@@ -710,11 +725,16 @@ module.exports = class ClassicGroupProtocol {
       )
     )
 
-    const { assignment: own, userData, repeated } = readSyncAssignment(memberAssignment)
-    if (repeated.length > 0) {
+    const {
+      assignment: own,
+      userData,
+      repeatedTopics,
+      repeated,
+    } = readSyncAssignment(memberAssignment)
+    if (repeatedTopics.length > 0 || repeated.length > 0) {
       this.logger.warn(
-        'The assignment from the group leader repeats partitions; each is used once',
-        { groupId, memberId, groupProtocol, repeated }
+        'The assignment from the group leader repeats topics or partitions; each partition is used once',
+        { groupId, memberId, groupProtocol, repeatedTopics, repeated }
       )
     }
     return { assignment: own, userData, unionSnapshot }
@@ -726,7 +746,9 @@ module.exports = class ClassicGroupProtocol {
    *
    * A member whose subscription carries no owned partitions - a v0 subscription, or one this
    * member cannot decode - contributes nothing to the ownership set, so an unknown owner is never
-   * treated as a conflict.
+   * treated as a conflict. Each assigned buffer is read as SyncGroup applies it
+   * (`readSyncAssignment`): every row of a repeated topic counts, and bytes a member refuses
+   * assign it nothing.
    *
    * @param {{ members: Array<{memberId: string, memberMetadata: Buffer}>,
    *   assignment: Array<{memberId: string, memberAssignment: Buffer}> }} round
@@ -746,8 +768,7 @@ module.exports = class ClassicGroupProtocol {
     }
 
     for (const { memberId, memberAssignment } of assignment) {
-      const decoded = MemberAssignment.decode(memberAssignment)
-      for (const [topic, partitions] of Object.entries(decoded ? decoded.assignment : {})) {
+      for (const [topic, partitions] of Object.entries(applied(memberAssignment))) {
         for (const partition of partitions) {
           const owner = ownerOf.get(`${topic}|${partition}`)
 

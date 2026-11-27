@@ -7,10 +7,25 @@ const NULL_COUNT = -1
 /** @param {Decoder} decoder @returns {number} */
 const readPartition = (decoder) => decoder.readInt32()
 
-/** @param {Decoder} decoder @returns {{ topic: string|null, partitions: number[] }} */
+/**
+ * An INT32-counted array that keeps the null array (count -1) as null, which `readArray` reads as
+ * empty.
+ * @param {Decoder} decoder
+ * @param {(decoder: Decoder) => *} reader
+ * @returns {Array|null}
+ */
+const readNullableArray = (decoder, reader) => {
+  if (decoder.canReadInt32() && decoder.buffer.readInt32BE(decoder.offset) === NULL_COUNT) {
+    decoder.readInt32()
+    return null
+  }
+  return decoder.readArray(reader)
+}
+
+/** @param {Decoder} decoder @returns {{ topic: string|null, partitions: number[]|null }} */
 const readRow = (decoder) => ({
   topic: decoder.readString(),
-  partitions: decoder.readArray(readPartition),
+  partitions: readNullableArray(decoder, readPartition),
 })
 
 /**
@@ -18,9 +33,9 @@ const readRow = (decoder) => ({
  * rows that name one topic, so a caller can check them before building a topic map.
  * @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/ConsumerProtocolAssignment.json
  * @param {Buffer} buffer
- * @returns {{ version: number, topics: { topic: string|null, partitions: number[] }[]|null,
- *   userData: Buffer|null }|null} null when the buffer is shorter than its version; `topics` is
- *   null for the null array
+ * @returns {{ version: number, topics: { topic: string|null, partitions: number[]|null }[]|null,
+ *   userData: Buffer|null }|null} null when the buffer is shorter than its version; `topics` and a
+ *   row's `partitions` are null for the null array
  * @throws {KafkaJSPartialMessageError} when the buffer ends inside a field
  */
 const readAssignmentRows = (buffer) => {
@@ -28,12 +43,7 @@ const readAssignmentRows = (buffer) => {
   if (!decoder.canReadInt16()) return null
 
   const version = decoder.readInt16()
-  let topics = null
-  if (decoder.canReadInt32() && buffer.readInt32BE(decoder.offset) === NULL_COUNT) {
-    decoder.readInt32()
-  } else {
-    topics = decoder.readArray(readRow)
-  }
+  const topics = readNullableArray(decoder, readRow)
   return { version, topics, userData: decoder.readBytes() }
 }
 
@@ -42,19 +52,22 @@ const readAssignmentRows = (buffer) => {
  * may be another client or a custom assigner, and Kafka relays them as written. Zero bytes mean
  * nothing assigned. A topic named in several rows gets the partitions of all of them, and a
  * repeated partition is kept once, in its first place, as the Java client's sets do; the repeats
- * are returned so the caller can warn about them.
+ * are returned so the caller can warn about them. The cooperative ownership check of a leader
+ * reads the assignments it uploads through this same function.
  * @param {Buffer|null} bytes the answer's assignment
  * @returns {{ assignment: Object<string, number[]>, userData: Buffer|null,
- *   repeated: { topic: string, partition: number }[] }}
+ *   repeatedTopics: string[], repeated: { topic: string, partition: number }[] }}
+ *   `repeatedTopics` names each topic of more than one row once
  * @throws {import('../errors').KafkaJSError} retriable, type `MALFORMED_GROUP_ANSWER`, for null
- *   bytes, a truncated assignment, a null topic list, a row without a topic name or a negative
- *   partition
+ *   bytes, a truncated assignment, a null topic list, a row without a topic name, a null partition
+ *   list or a negative partition
  */
 const readSyncAssignment = (bytes) => {
   if (!Buffer.isBuffer(bytes)) {
     throw malformedGroupAnswer('SyncGroup response carries no assignment')
   }
-  if (bytes.length === 0) return { assignment: {}, userData: null, repeated: [] }
+  if (bytes.length === 0)
+    return { assignment: {}, userData: null, repeatedTopics: [], repeated: [] }
 
   let rows
   try {
@@ -73,13 +86,20 @@ const readSyncAssignment = (bytes) => {
   }
 
   const partitionsOf = new Map()
+  const repeatedTopics = new Set()
   const repeated = []
   for (const { topic, partitions } of rows.topics) {
     if (typeof topic !== 'string' || topic === '') {
       throw malformedGroupAnswer('SyncGroup response carries an assignment row with no topic')
     }
+    if (partitions === null) {
+      throw malformedGroupAnswer(
+        `SyncGroup response carries a null partition list for topic ${topic}`
+      )
+    }
     let kept = partitionsOf.get(topic)
     if (kept === undefined) partitionsOf.set(topic, (kept = new Set()))
+    else repeatedTopics.add(topic)
     for (const partition of partitions) {
       if (partition < 0) {
         throw malformedGroupAnswer(
@@ -96,6 +116,7 @@ const readSyncAssignment = (bytes) => {
       Array.from(partitionsOf, ([topic, kept]) => [topic, Array.from(kept)])
     ),
     userData: rows.userData,
+    repeatedTopics: Array.from(repeatedTopics),
     repeated,
   }
 }
