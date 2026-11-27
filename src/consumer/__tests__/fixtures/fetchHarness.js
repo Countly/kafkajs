@@ -9,6 +9,7 @@ const OffsetManager = require('../../offsetManager')
 const { MemberAssignment } = require('../../assignerProtocol')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const apiKeys = require('../../../protocol/requests/apiKeys')
+const { KafkaJSConnectionError } = require('../../../errors')
 const { errorCodes } = require('../../../protocol/error')
 const { responseHeaderVersion } = require('../../../protocol/headers')
 const { RecordBatch } = require('../../../protocol/recordBatch/v0')
@@ -690,64 +691,132 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
     })
 
 /**
+ * Hands what `thenable` settles with to `handlers` until detached: `deliver` gets the value, and
+ * `fail` the rejection or whatever `deliver` threw. Detaching drops the handlers, so a late
+ * settlement runs nothing and holds nothing of the caller.
+ * @param {PromiseLike<*>} thenable
+ * @param {{ deliver: (value: *) => void, fail: (error: *) => void }} handlers
+ * @returns {() => void} the detach
+ */
+const subscribe = (thenable, handlers) => {
+  let current = handlers
+  Promise.resolve(thenable)
+    .then((value) => current?.deliver(value))
+    .catch((error) => current?.fail(error))
+  return () => {
+    current = null
+  }
+}
+
+/**
  * Builds a real `Broker` wired to a real `Connection` over the fake socket from `testHelpers`.
  * `answer` receives each outgoing request's header and the exact frame it answers, and returns the
  * response body to play back; each response carries that request's correlation id, is framed with
  * the header version its api key and version imply, and goes to the socket the frame was written
- * to, never to another: a destroyed socket gets nothing.
+ * to, never to another.
  *
  * Playback is driven by the writes themselves: each frame written to a socket is answered one
  * `setImmediate` later, in write order, whoever wrote it. A frame is owned by its socket and the
- * correlation id in its header, and nothing else.
+ * correlation id in its header, and nothing else. A frame whose header cannot be read has no
+ * request to answer or fail, so the fake broker drops that socket, as a broker drops a connection
+ * it cannot read, and the connection fails every request on it.
  *
- * The fake broker owns every playback it schedules. `close()` cancels the ones still queued and
- * stops it answering: a frame written afterwards is recorded and never answered, and a withheld
- * answer settling afterwards neither answers nor fails its request, which stays in flight until
- * the connection closes. No answer may run after its test, so `createFakeBroker` closes it when
- * the test ends.
+ * Each socket owns the work queued for it: the playback of every frame written to it and the
+ * subscription to every withheld answer of those frames. When the socket is destroyed (an
+ * ordinary disconnect, a failed generation, `close()`), that work is cancelled: nothing is
+ * answered or failed on a dead socket, and nothing of it runs on a later turn.
+ *
+ * The fake broker is open until `close()`, then closed for good. `close()` is idempotent and
+ * every caller gets the same promise. At once, it refuses every later connect, connection,
+ * request and socket (`KafkaJSConnectionError` 'The fake broker was closed'), and cancels all
+ * queued work; it then closes the connection without draining, which rejects every request the
+ * broker never answered (queued, withheld, or mid-handshake) with `KafkaJSConnectionClosedError`
+ * and aborts a connect still in progress. It resolves once the connection is closed. A frame
+ * written to a socket afterwards is recorded and never answered. No answer may run after its
+ * test, so `createFakeBroker` closes it when the test ends.
  *
  * A Buffer is played back at once. A thenable is a withheld answer: it is played back when it
  * resolves, and later requests are answered meanwhile. A broker answers one connection in order;
  * overtaking here stands in for the separate connection the real pool gives Fetch. A thenable
  * created before `answer` returns it must come from `withheldAnswer()`, which is handled from
- * creation, so rejecting it early is never an unhandled rejection.
+ * creation, so rejecting it early is never an unhandled rejection. The thenable, and any timer or
+ * side effect behind it, belongs to the test that made it.
  *
  * A playback failure (`answer` throwing, a withheld answer rejecting, or the playback of an answer
  * throwing, a `chunks` assertion say) fails exactly the request the frame belongs to, with the
  * error itself, through the connection's own in-flight entry: the entry leaves the queue as an
- * answered one does, so the connection stays usable and an ordinary `disconnect()` drains. A
- * failure after its request has settled (a withheld answer rejected after a close) changes nothing.
- * `broker.disconnect({ drainTimeout: 0 })` closes at once and fails every request still waiting.
+ * answered one does, so the connection stays usable and an ordinary `disconnect()` drains.
+ * `broker.disconnect({ drainTimeout: 0 })` closes at once and fails every request still waiting;
+ * the broker stays usable and answers again on its next socket.
  * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
  *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
- * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void,
- *   isClosed: () => boolean }}
+ * @returns {{ broker: Broker, state: { writes: Buffer[], sockets: object[] },
+ *   close: () => Promise<void>, isClosed: () => boolean }}
  */
 const buildFakeBroker = (answer, chunks) => {
   const { factory: socketFactory, state } = createFakeSocketFactory()
-  /** @type {Set<NodeJS.Immediate>} playbacks scheduled and not yet run */
-  const playbacks = new Set()
+  /**
+   * The work each live socket owns: its queued playbacks and its withheld-answer subscriptions.
+   * @type {Map<object, { playbacks: Set<NodeJS.Immediate>, detaches: Set<() => void> }>}
+   */
+  const owned = new Map()
   let closed = false
+  /** @type {Promise<void>|null} */
+  let closing = null
+
+  /**
+   * @returns {void}
+   * @throws {KafkaJSConnectionError} once the fake broker is closed
+   */
+  const refuseIfClosed = () => {
+    if (closed) {
+      throw new KafkaJSConnectionError('The fake broker was closed', { broker: '127.0.0.1:9092' })
+    }
+  }
+
+  /**
+   * Cancels the work `socket` owns; nothing more is answered or failed on it.
+   * @param {object} socket
+   * @returns {void}
+   */
+  const release = (socket) => {
+    const work = owned.get(socket)
+    if (!work) return
+    owned.delete(socket)
+    for (const playback of work.playbacks) clearImmediate(playback)
+    for (const detach of work.detaches) detach()
+    work.playbacks.clear()
+    work.detaches.clear()
+  }
+
   /**
    * The fake socket factory, with every recorded write answered one `setImmediate` later while
-   * the fake broker is open.
+   * its socket lives.
    * @param {object} options what `Connection` passes the socket factory
    * @returns {object} the fake socket
+   * @throws {KafkaJSConnectionError} once the fake broker is closed
    */
   const factory = (options) => {
+    refuseIfClosed()
     const socket = socketFactory(options)
-    const write = socket.write
+    const work = { playbacks: new Set(), detaches: new Set() }
+    owned.set(socket, work)
+    const { write, destroy } = socket
+    socket.destroy = (error) => {
+      release(socket)
+      return destroy(error)
+    }
     socket.write = (...args) => {
       const written = write(...args)
-      if (!closed) {
+      if (owned.has(socket)) {
         const frame = socket.writes[socket.writes.length - 1]
         const playback = setImmediate(() => {
-          playbacks.delete(playback)
-          playBack(socket, frame)
+          work.playbacks.delete(playback)
+          playBack(socket, frame, work)
         })
-        playbacks.add(playback)
+        work.playbacks.add(playback)
       }
       return written
     }
@@ -814,29 +883,58 @@ const buildFakeBroker = (answer, chunks) => {
   }
 
   /**
-   * Answers one written frame on its socket; a failure fails that frame's request alone.
+   * Answers one written frame on its live socket; a failure fails that frame's request alone.
    * @param {object} socket
    * @param {Buffer} frame
+   * @param {{ detaches: Set<() => void> }} work what `socket` owns
    * @returns {void}
    */
-  const playBack = (socket, frame) => {
-    const header = readRequestHeader(frame)
-    const fail = (error) => {
-      if (!closed) failRequest(socket, header.correlationId, error)
+  const playBack = (socket, frame, work) => {
+    let header
+    try {
+      header = readRequestHeader(frame)
+    } catch (cause) {
+      socket.destroy(new Error('The fake broker could not read a request frame', { cause }))
+      return
     }
+    const fail = (error) => failRequest(socket, header.correlationId, error)
     const deliver = (body) => {
-      if (!closed && !socket.destroyed) reply({ socket }, header, body)
+      // `answer` may have closed the broker before returning.
+      if (!socket.destroyed) reply({ socket }, header, body)
     }
     try {
       const body = answer(header, frame)
       if (typeof body?.then === 'function') {
-        Promise.resolve(body).then(deliver).catch(fail)
+        const detach = subscribe(body, {
+          deliver: (value) => {
+            work.detaches.delete(detach)
+            deliver(value)
+          },
+          fail: (error) => {
+            work.detaches.delete(detach)
+            fail(error)
+          },
+        })
+        if (owned.has(socket)) work.detaches.add(detach)
+        else detach()
       } else {
         deliver(body)
       }
     } catch (error) {
       fail(error)
     }
+  }
+
+  /**
+   * The connection, connected, while the fake broker is open.
+   * @returns {Promise<Connection>}
+   * @throws {KafkaJSConnectionError} once the fake broker is closed
+   */
+  const connected = async () => {
+    refuseIfClosed()
+    await connection.connect()
+    refuseIfClosed()
+    return connection
   }
 
   const connectionPool = setupPool({
@@ -846,56 +944,42 @@ const buildFakeBroker = (answer, chunks) => {
     generation: 0,
     connectionTimeout: 120000,
     isConnected: () => connection.isConnected(),
-    throwIfRetired: () => {},
+    throwIfRetired: refuseIfClosed,
     isAuthenticated: () => true,
-    getConnection: async () => {
-      await connection.connect()
-      return connection
+    getConnection: connected,
+    getConnectionByRequest: connected,
+    send: async (protocolRequest) => {
+      refuseIfClosed()
+      return connection.send(protocolRequest)
     },
-    getConnectionByRequest: async () => {
-      await connection.connect()
-      return connection
-    },
-    send: (protocolRequest) => connection.send(protocolRequest),
     setVersions: () => {},
     destroy: async (options) => connection.disconnect(options),
   })
+  const broker = new Broker({ connectionPool, logger: newLogger() })
 
   /**
-   * Stops answering: cancels every queued playback, and nothing written or settled later answers.
-   * @returns {void}
+   * Closes the fake broker for good, as the factory's documentation says.
+   * @returns {Promise<void>} the one close every caller shares
    */
-  const close = () => {
-    closed = true
-    for (const playback of playbacks) clearImmediate(playback)
-    playbacks.clear()
-  }
+  const close = () =>
+    (closing ??= (async () => {
+      closed = true
+      for (const socket of [...owned.keys()]) release(socket)
+      await broker.disconnect({ drainTimeout: 0 })
+    })())
 
-  return {
-    broker: new Broker({ connectionPool, logger: newLogger() }),
-    state,
-    close,
-    isClosed: () => closed,
-  }
+  return { broker, state, close, isClosed: () => closed }
 }
 
 /**
- * Registers a fake broker with the running test, which closes it and disconnects its connection
- * when it ends.
+ * Registers a fake broker with the running test, which closes it when it ends.
  * @param {string} creator the public creator's name, for the messages
  * @param {FixtureTracker} tracker
- * @param {{ broker: Broker, close: () => void, isClosed: () => boolean }} fake
+ * @param {{ close: () => Promise<void>, isClosed: () => boolean }} fake
  * @returns {void}
  */
-const trackFakeBroker = (creator, tracker, { broker, close, isClosed }) => {
-  tracker.add(
-    creator,
-    async () => {
-      close()
-      await broker.disconnect({ drainTimeout: 0 })
-    },
-    isClosed
-  )
+const trackFakeBroker = (creator, tracker, { close, isClosed }) => {
+  tracker.add(creator, close, isClosed)
 }
 
 /**
@@ -904,8 +988,8 @@ const trackFakeBroker = (creator, tracker, { broker, close, isClosed }) => {
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
  *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
- * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void }} `close` stops the
- *   answering earlier than the end of the test
+ * @returns {{ broker: Broker, state: { writes: Buffer[], sockets: object[] },
+ *   close: () => Promise<void> }} `close` closes it earlier than the end of the test
  * @throws {Error} naming this creator when no tracked test is running
  */
 const createFakeBroker = (answer, chunks) => {
@@ -1169,6 +1253,7 @@ const buildConsumerGroup = ({
  *   findBrokerCalls: {nodeId: number}[], sync: () => Promise<void>,
  *   requests: () => object[], validationRequests: () => object[],
  *   validationRequestsTo: (nodeId: number) => object[], writesTo: (nodeId: number) => Buffer[],
+ *   socketsTo: (nodeId: number) => object[],
  *   fetchRequestPartitions: () => number[], fetchRequestOffsets: () => string[],
  *   lastFetchRequest: () => object[],
  *   lastFetchApiVersion: () => number, lastFetchHeaderFields: () => object,
@@ -1234,8 +1319,8 @@ const createFetchGroup = async ({
    * One fake broker answering for `nodeId` with the shared scripts. The fixture's teardown closes
    * it, so it is not tracked on its own.
    * @param {number} nodeId
-   * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void,
-   *   isClosed: () => boolean }}
+   * @returns {{ broker: Broker, state: { writes: Buffer[], sockets: object[] },
+   *   close: () => Promise<void>, isClosed: () => boolean }}
    */
   const createNodeBroker = (nodeId) => {
     return buildFakeBroker((header, frame) => {
@@ -1257,8 +1342,8 @@ const createFetchGroup = async ({
 
   const { broker, state, close, isClosed } = createNodeBroker(NODE_ID)
 
-  /** @type {Map<number, { broker: Broker, state: { writes: Buffer[] }, close: () => void,
-   *   isClosed: () => boolean, ready: Promise<void> }>} */
+  /** @type {Map<number, { broker: Broker, state: { writes: Buffer[], sockets: object[] },
+   *   close: () => Promise<void>, isClosed: () => boolean, ready: Promise<void> }>} */
   const nodeBrokers = new Map([
     [NODE_ID, { broker, state, close, isClosed, ready: Promise.resolve() }],
   ])
@@ -1269,13 +1354,13 @@ const createFetchGroup = async ({
   /** @type {Promise<void>|null} */
   let tearingDown = null
   /**
-   * Ends the fixture: every held or later broker lookup rejects; each node's fake broker stops
-   * answering, with no answer left queued for a later turn, once the node has finished connecting
-   * (a connected node at once); and every node's connection closes at once, failing the requests
-   * still waiting for an answer. The test's tracker runs it when the test ends, so a failed
-   * assertion cannot leave a withheld answer or a held lookup pending, and no answer runs after the
-   * test; a spec may call it earlier. The cleanup runs once; every caller waits for that same
-   * cleanup.
+   * Ends the fixture: every held or later broker lookup rejects, and every node's fake broker
+   * closes (see `buildFakeBroker`), a node still connecting included, without waiting for its
+   * handshake: its connect is aborted, every request no answer reached is rejected, and nothing
+   * queued runs on a later turn. The test's tracker runs it when the test ends, so a failed
+   * assertion cannot leave a withheld answer or a held lookup pending; a spec may call it earlier.
+   * The cleanup runs once; every caller waits for that same cleanup, which closes every node
+   * before it rejects with the first close failure.
    * @returns {Promise<void>}
    */
   const teardown = () =>
@@ -1284,16 +1369,10 @@ const createFetchGroup = async ({
       for (const holds of [...heldLookups.values()]) {
         for (const hold of [...holds]) hold.release()
       }
-      await Promise.all(
-        [...nodeBrokers.values()].map(async (node) => {
-          // A connecting node needs its ApiVersions answer to finish; closing it earlier would
-          // leave its connect pending.
-          await node.ready.catch(() => {})
-          node.close()
-          await node.broker.disconnect({ drainTimeout: 0 })
-        })
-      )
+      const closes = await Promise.allSettled([...nodeBrokers.values()].map(({ close }) => close()))
       cleaned = nodeBrokers.size > 0 && [...nodeBrokers.values()].every((node) => node.isClosed())
+      const failure = closes.find(({ status }) => status === 'rejected')
+      if (failure) throw failure.reason
     })())
   tracker.add('createFetchGroup', teardown, () => cleaned)
   await broker.connect()
@@ -1335,6 +1414,11 @@ const createFetchGroup = async ({
     return node.broker
   }
   const writesTo = (nodeId) => nodeBrokers.get(nodeId)?.state.writes ?? []
+  const socketsTo = (nodeId) => nodeBrokers.get(nodeId)?.state.sockets ?? []
+  /** @throws {Error} once the fixture is torn down */
+  const refuseAfterTeardown = () => {
+    if (tornDown) throw new Error('fetch harness torn down')
+  }
 
   const leaders = new Map(
     partitions.map((partition) => [
@@ -1401,17 +1485,23 @@ const createFetchGroup = async ({
     refreshMetadata: jest.fn(async () => {}),
     findBroker: async (args) => {
       findBrokerCalls.push(args)
-      if (tornDown) throw new Error('fetch harness torn down')
+      refuseAfterTeardown()
       // The default path resolves in the same turns it always did.
       if (!validationBrokers && heldLookups.size === 0) return broker
       const nodeId = Number(args.nodeId)
       while (heldLookups.has(nodeId)) {
         await heldLookups.get(nodeId).values().next().value.released
       }
-      if (tornDown) throw new Error('fetch harness torn down')
-      const found = await brokerFor(nodeId)
-      // The node may have connected while teardown was closing it.
-      if (tornDown) throw new Error('fetch harness torn down')
+      refuseAfterTeardown()
+      let found
+      try {
+        found = await brokerFor(nodeId)
+      } catch (error) {
+        // Teardown aborts a node that was still connecting.
+        refuseAfterTeardown()
+        throw error
+      }
+      refuseAfterTeardown()
       return found
     },
     findGroupCoordinator: async () => coordinator,
@@ -1517,6 +1607,8 @@ const createFetchGroup = async ({
     findBrokerCalls,
     /** Every frame written to `nodeId`'s broker, oldest first; empty before its first lookup. */
     writesTo,
+    /** Every socket `nodeId`'s broker opened, oldest first; empty before its first lookup. */
+    socketsTo,
     /** Every OffsetForLeaderEpoch frame written to `nodeId`'s broker, decoded, oldest first. */
     validationRequestsTo: (nodeId) => decodeOffsetForLeaderEpochRequests(writesTo(nodeId)),
     /** Drives the real join/sync sequence, and the apply that used to live inside it. */
