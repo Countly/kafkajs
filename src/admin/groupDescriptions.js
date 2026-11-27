@@ -50,26 +50,32 @@ const doesNotSupportApiKey = (error) => {
 }
 
 /**
- * How much a ConsumerGroupDescribe entry settles its group id; the entry with the highest rank wins.
- * A described group beats an error row, an error row beats "ask the older API" (69 or 35), and a 69
- * beats a 35 or no answer, because only a 69 carries the message to report when both APIs miss.
- * @param {{ needsFallback: boolean, row?: object, error?: object }} entry
+ * How much one row of a ConsumerGroupDescribe answer settles its group id; the highest rank wins.
+ * A described group beats an error row that names a code instead of a group, that beats "ask again"
+ * (14, 15, 16), that beats "ask the older API" (69, or 35 for a cluster with the consumer protocol
+ * off), and a 69 beats a 35 or no answer because only a 69 carries the message to report when both
+ * APIs miss. The ranks stay inside one answer: an id settled by an earlier attempt is never
+ * ranked against a later one.
+ * @param {{ retry?: number, needsFallback: boolean, row?: object, error?: object }} entry
  * @returns {number}
  */
-const rank = ({ needsFallback, row, error }) => {
+const rank = ({ retry, needsFallback, row, error }) => {
+  if (retry !== undefined) return 2
   if (needsFallback) return error ? 1 : 0
-  return row.errorCode === 0 ? 3 : 2
+  return row.errorCode === 0 ? 4 : 3
 }
 
 /**
- * Settles ONE entry per group id from everything the coordinators answered for it. A broker can
- * answer a written id more than once in one reply, and not consistently: Kafka 4.0.0 hands every
- * offsets shard the whole id list, so the shard that owns a group answers it described while the
- * others answer it unknown (69); 4.4.0 hands each shard its own ids only. An entry that outranks
- * the others (see `rank`) is the answer; of equal rank the first is. The map keeps ids in the
- * order they first appear in the answers.
- * @param {Array<{ groupId: string, needsFallback: boolean, row?: object, error?: object }>} entries
- * @returns {Map<string, { groupId: string, needsFallback: boolean, row?: object, error?: object }>}
+ * Settles ONE entry per group id from the rows of one answer. A broker can answer an id more than
+ * once in one reply, and not consistently: Kafka 4.0.0 hands every offsets shard the whole id list
+ * (`GroupCoordinatorService.consumerGroupDescribe` passes `groupIds`, not the shard's `groupList`),
+ * so the shard that owns a group answers it described while the others answer it unknown (69),
+ * and a shard that cannot serve its own ids answers 14, 15 or 16 for those only; 4.4.0 hands each
+ * shard its own ids. A row that outranks the others (see `rank`) is the answer; of equal rank the
+ * first is, as Java's handler keys its results by group id. The map keeps ids in the order they
+ * first appear in the answer.
+ * @param {Array<{ groupId: string, retry?: number, needsFallback: boolean, row?: object, error?: object }>} entries
+ * @returns {Map<string, { groupId: string, retry?: number, needsFallback: boolean, row?: object, error?: object }>}
  */
 const settle = (entries) => {
   const settled = new Map()
@@ -153,13 +159,15 @@ class GroupDescriptions {
    *
    *         Each written id (a lone surrogate is written as U+FFFD, so the ids a caller gives can
    *         be written alike) is sent, routed and retried once, whatever spellings and repeats were
-   *         given, and settles ONE outcome: of several rows for it, a described group beats an
-   *         error row, an error row beats a 69 or 35, and the first of equal rank wins. That
-   *         outcome is then given to the caller's spellings under each exact spelling, a
-   *         well-formed one never renamed. An outcome from the consumer protocol gets one row per
-   *         occurrence of an id the caller gave (a repeated id has two rows); one from the classic
-   *         API gets one row per distinct spelling. Rows for spellings of one group are equal in
-   *         all but `groupId`
+   *         given, and settles ONE outcome from one answer: of several rows for it, a described
+   *         group beats an error row, an error row beats a 14, 15 or 16, that beats a 69 or 35, and
+   *         the first of equal rank wins. An id that was answered 14, 15 or 16, or whose request
+   *         threw, is the only one asked again; ids already settled keep their answer, and only the
+   *         ids that moved are looked up again. The outcome is then given to the caller's
+   *         spellings under each exact spelling, a well-formed one never renamed. An outcome from
+   *         the consumer protocol gets one row per occurrence of an id the caller gave (a repeated
+   *         id has two rows); one from the classic API gets one row per distinct spelling. Each row
+   *         beyond the first for an id is an independent copy: changing one never changes another
    */
   async describe(groupIds, options = {}) {
     return withConsumerOperation(options.operation, async () => {
@@ -196,12 +204,15 @@ class GroupDescriptions {
     const names = new WireNames(groupIds)
     const described = this.#checked(
       context,
-      await this.#wait(context, async () => this.#describeByCoordinator(names.ids, context))
+      await this.#wait(context, async () =>
+        this.#resolve(names.ids, context, (coordinator, ids) =>
+          this.#askConsumer(coordinator, ids, context)
+        )
+      )
     )
-    const settled = settle(described)
     const groups = []
     const fallbacks = []
-    for (const entry of settled.values()) {
+    for (const entry of described) {
       if (entry.needsFallback) fallbacks.push(entry)
       else names.project(groups, entry.groupId, entry.row, true)
     }
@@ -213,9 +224,10 @@ class GroupDescriptions {
     const classic = this.#checked(
       context,
       await this.#wait(context, async () =>
-        this.#describeClassicByCoordinator(
+        this.#resolve(
           fallbacks.map(({ groupId }) => groupId),
-          context
+          context,
+          (coordinator, ids) => this.#askClassic(coordinator, ids, context)
         )
       )
     )
@@ -233,149 +245,163 @@ class GroupDescriptions {
   }
 
   /**
-   * One ConsumerGroupDescribe per coordinator, with each id's row either shaped or marked for the
-   * classic fallback. A coordinator that does not implement key 69 sends every one of its ids to
-   * the fallback in one go.
+   * Resolves every id through `ask`, one request per coordinator, and asks again only for the ids
+   * still unresolved. One attempt sends each coordinator its pending ids, settles each id from the
+   * answer it got (see `rank`) and keeps the ids it settled for good; an id that was answered 14,
+   * 15 or 16 stays pending, and so does every id of a request that threw, while the ids of the other
+   * requests of the attempt keep their answers. The next attempt, after the retrier's backoff, finds
+   * the coordinator again for the ids whose coordinator moved (15, 16) and re-groups the pending
+   * ids by coordinator, so a move that splits ids across brokers is followed; an id that was loading
+   * (14) is asked again where it is. The budget is the call's own: the attempts of this loop, whose
+   * last failure is what the caller sees when it runs out.
    * @private
-   * @param {string[]} groupIds
+   * @param {string[]} ids the written ids, each once
    * @param {object} context captured operation and per-call coordinator map
-   * @returns {Promise<Array<{ groupId: string, row?: object, needsFallback: boolean, error?: {errorCode: number, errorMessage: string|null} }>>}
+   * @param {(coordinator: object, ids: string[]) => Promise<Array<{ groupId: string, value?: any, retry?: number }>>} ask
+   *   one request for `ids`; a cell has either the settled `value` for its group id, or the
+   *   `retry` code that leaves the id pending. An id of `ids` it gives no cell is left unresolved
+   *   without a retry; a cell for an id not in `ids` is kept as it is
+   * @returns {Promise<any[]>} the settled values, in the order the attempts settled them: each
+   *   attempt in coordinator order, then in the order of each answer
+   * @throws {Error} the last retriable code as an error once the budget is spent, and whatever a
+   *   request, a lookup, the retrier or the operation raises
    */
-  async #describeByCoordinator(groupIds, context) {
-    const batches = this.#checked(
-      context,
-      await this.#wait(context, async () => this.#groupByCoordinator(groupIds, context))
-    )
-    const perBatch = this.#checked(
+  async #resolve(ids, context, ask) {
+    const requested = new Set(ids)
+    const pending = new Set(ids)
+    const settled = new Map()
+    let moved = false
+    this.#checked(
       context,
       await this.#wait(context, async () =>
-        Promise.all(batches.map((batch) => this.#describeBatch(batch, context)))
-      )
-    )
-
-    return perBatch.flat()
-  }
-
-  /**
-   * One coordinator's ConsumerGroupDescribe, retried on the coordinator's own codes.
-   *
-   * `parse` returns group-level codes rather than throwing them, so a coordinator that is still
-   * loading (14) or has moved (15, 16) is turned into a throw here and the batch is re-sent by the
-   * configured retrier - the budget and exponential backoff this call has always run under. A
-   * moved coordinator is looked up again before the next attempt; a loading one is asked again
-   * where it is. When the budget runs out the retrier's error is what the caller sees.
-   *
-   * @private
-   * @param {{ coordinator: object, ids: string[] }} batch
-   * @param {object} context captured operation and per-call coordinator map
-   * @returns {Promise<Array<{ groupId: string, row?: object, needsFallback: boolean, error?: object }>>}
-   * @throws {KafkaJSNumberOfRetriesExceeded} when the coordinator never settles within the budget
-   */
-  async #describeBatch({ coordinator, ids }, context) {
-    let target = coordinator
-    let batchIds = ids
-    let coordinatorMoved = false
-    let response
-
-    try {
-      response = this.#checked(
-        context,
-        await this.#wait(context, async () =>
-          this.#retrier(context)(async () => {
-            if (coordinatorMoved) {
-              this.#checked(
-                context,
-                await this.#wait(context, async () =>
-                  this.cluster.refreshMetadata(
-                    ...(context.consumerOperation ? [{ fence: context.consumerOperation }] : [])
-                  )
-                )
-              )
-              // Regrouped, not re-pointed at the first id's new coordinator: a `__consumer_offsets`
-              // leader move can split ids that shared a coordinator across two brokers, and sending
-              // the whole batch to one of them would keep drawing NOT_COORDINATOR for the rest until
-              // the budget ran out. Each sub-batch retries on its own from here.
-              for (const id of batchIds) context.coordinators.delete(id)
-              const regrouped = this.#checked(
-                context,
-                await this.#wait(context, async () => this.#groupByCoordinator(batchIds, context))
-              )
-
-              if (regrouped.length > 1) {
-                const perBatch = this.#checked(
-                  context,
-                  await this.#wait(context, async () =>
-                    Promise.all(regrouped.map((batch) => this.#describeBatch(batch, context)))
-                  )
-                )
-                return { split: perBatch.flat() }
-              }
-
-              target = regrouped[0].coordinator
-              batchIds = regrouped[0].ids
-              coordinatorMoved = false
-            }
-
-            const answer = this.#checked(
+        this.#retrier(context)(async () => {
+          if (moved) {
+            moved = false
+            this.#checked(
               context,
               await this.#wait(context, async () =>
-                target.consumerGroupDescribe({
-                  groupIds: batchIds,
-                  ...(context.consumerOperation && { guard: context.consumerOperation.guard }),
-                  includeAuthorizedOperations: context.includeAuthorizedOperations,
+                this.cluster.refreshMetadata(
+                  ...(context.consumerOperation ? [{ fence: context.consumerOperation }] : [])
+                )
+              )
+            )
+          }
+          const batches = this.#checked(
+            context,
+            await this.#wait(context, async () => this.#groupByCoordinator([...pending], context))
+          )
+          const answers = new Array(batches.length)
+          let failure
+          let failed = false
+          this.#checked(
+            context,
+            await this.#wait(context, async () =>
+              Promise.allSettled(
+                batches.map(async ({ coordinator, ids: batchIds }, index) => {
+                  try {
+                    answers[index] = this.#checked(
+                      context,
+                      await this.#wait(context, async () => ask(coordinator, batchIds))
+                    )
+                  } catch (error) {
+                    if (!failed) {
+                      failed = true
+                      failure = error
+                    }
+                    if (RE_FINDS_COORDINATOR.has(error.code)) {
+                      for (const id of batchIds) context.coordinators.delete(id)
+                    }
+                    throw error
+                  }
                 })
               )
             )
-            const unsettled = answer.groups.find(({ errorCode }) => RETRIES_BATCH.has(errorCode))
-
-            if (unsettled) {
-              coordinatorMoved = RE_FINDS_COORDINATOR.has(unsettled.errorCode)
-              throw createErrorFromCode(unsettled.errorCode)
+          )
+          let retryCode
+          batches.forEach(({ ids: batchIds }, index) => {
+            if (answers[index] === undefined) return
+            for (const id of batchIds) pending.delete(id)
+            for (const cell of answers[index]) {
+              if (cell.retry === undefined) {
+                settled.set(cell.groupId, cell.value)
+              } else if (requested.has(cell.groupId)) {
+                pending.add(cell.groupId)
+                retryCode ??= cell.retry
+                if (RE_FINDS_COORDINATOR.has(cell.retry)) {
+                  context.coordinators.delete(cell.groupId)
+                  moved = true
+                }
+              }
             }
+          })
+          if (failed) throw failure
+          if (pending.size > 0) throw createErrorFromCode(retryCode)
+        })
+      )
+    )
+    return [...settled.values()]
+  }
 
-            return answer
+  /**
+   * One ConsumerGroupDescribe for `ids` on one coordinator: each id's row either shaped, marked
+   * for the classic fallback, or left to be asked again. A coordinator that does not implement
+   * key 69 sends every one of its ids to the fallback in one go, and so does an id the answer
+   * leaves out, with no error to carry forward, rather than being dropped from the result.
+   * @private
+   * @param {object} coordinator
+   * @param {string[]} ids
+   * @param {object} context captured operation and requested authorization flag
+   * @returns {Promise<Array<{ groupId: string, value?: object, retry?: number }>>}
+   */
+  async #askConsumer(coordinator, ids, context) {
+    let answer
+    try {
+      answer = this.#checked(
+        context,
+        await this.#wait(context, async () =>
+          coordinator.consumerGroupDescribe({
+            groupIds: ids,
+            ...(context.consumerOperation && { guard: context.consumerOperation.guard }),
+            includeAuthorizedOperations: context.includeAuthorizedOperations,
           })
         )
       )
     } catch (e) {
-      if (doesNotSupportApiKey(e)) {
-        this.logger.debug('Broker does not offer ConsumerGroupDescribe, describing as classic', {
-          nodeId: coordinator.nodeId,
-          groupIds: ids,
-        })
-
-        return ids.map((groupId) => ({ groupId, needsFallback: true }))
-      }
-
-      throw e
+      if (!doesNotSupportApiKey(e)) throw e
+      this.logger.debug('Broker does not offer ConsumerGroupDescribe, describing as classic', {
+        nodeId: coordinator.nodeId,
+        groupIds: ids,
+      })
+      return ids.map((groupId) => ({ groupId, value: { groupId, needsFallback: true } }))
     }
 
-    // The batch split across coordinators: the sub-batches above already produced the routed rows.
-    if (response.split) {
-      return response.split
+    const settled = settle(answer.groups.map((row) => this.#routeRow(row, context)))
+    const cells = [...settled.values()].map((entry) =>
+      entry.retry === undefined
+        ? { groupId: entry.groupId, value: entry }
+        : { groupId: entry.groupId, retry: entry.retry }
+    )
+    for (const groupId of ids) {
+      if (!settled.has(groupId)) cells.push({ groupId, value: { groupId, needsFallback: true } })
     }
-
-    const answered = new Set(response.groups.map(({ groupId }) => groupId))
-
-    return [
-      ...response.groups.map((row) => this.#routeRow(row, context)),
-      // An id the coordinator left out of its answer is described through the older API instead,
-      // with no error to carry forward, rather than being dropped from the result.
-      ...batchIds
-        .filter((groupId) => !answered.has(groupId))
-        .map((groupId) => ({ groupId, needsFallback: true })),
-    ]
+    return cells
   }
 
   /**
-   * What to do with one ConsumerGroupDescribe row: shape it, or route it to the older API.
+   * What to do with one ConsumerGroupDescribe row: shape it, route it to the older API, or ask
+   * again. `parse` returns group-level codes rather than throwing them, so a coordinator that is
+   * still loading (14) or has moved (15, 16) is marked `retry`.
    * @private
    * @param {object} row
    * @param {object} context captured operation and requested authorization flag
-   * @returns {{ groupId: string, row?: object, needsFallback: boolean, error?: object }}
+   * @returns {{ groupId: string, retry?: number, row?: object, needsFallback: boolean, error?: object }}
    */
   #routeRow(row, context) {
     const { groupId, errorCode, errorMessage } = row
+
+    if (RETRIES_BATCH.has(errorCode)) {
+      return { groupId, needsFallback: false, retry: errorCode }
+    }
 
     if (ROUTES_TO_CLASSIC.has(errorCode)) {
       // Only a 69 is stashed, because a double miss reports its message; a 35 is about the cluster,
@@ -397,86 +423,26 @@ class GroupDescriptions {
   }
 
   /**
-   * One DescribeGroups per coordinator for the ids that routed.
+   * One DescribeGroups for `ids` on one coordinator. Its own parse throws every group-level code
+   * but GROUP_ID_NOT_FOUND, so a row is never a reason to ask again; a throw is.
    * @private
-   * @param {string[]} groupIds
-   * @param {object} context captured operation and per-call coordinator map
-   * @returns {Promise<object[]>} the raw key-15 rows
+   * @param {object} coordinator
+   * @param {string[]} ids
+   * @param {object} context captured operation and requested authorization flag
+   * @returns {Promise<Array<{ groupId: string, value: object }>>} the raw key-15 rows
    */
-  async #describeClassicByCoordinator(groupIds, context) {
-    const batches = this.#checked(
-      context,
-      await this.#wait(context, async () => this.#groupByCoordinator(groupIds, context))
-    )
-    return this.#checked(
+  async #askClassic(coordinator, ids, context) {
+    const { groups } = this.#checked(
       context,
       await this.#wait(context, async () =>
-        Promise.all(batches.map((batch) => this.#describeClassicBatch(batch.ids, context)))
-      )
-    ).flat()
-  }
-
-  /**
-   * Retries only unresolved classic ids using their located coordinators; a move can split a batch.
-   * @param {string[]} ids original ids on one initial coordinator
-   * @param {object} context original consumer/admin operation and per-call map
-   * @returns {Promise<object[]>} raw classic rows
-   * @throws {Error} original retry exhaustion, response error, or operation refusal
-   */
-  async #describeClassicBatch(ids, context) {
-    const pending = new Set(ids)
-    const completed = new Map()
-    this.#checked(
-      context,
-      await this.#wait(context, async () =>
-        this.#retrier(context)(async () => {
-          const batches = this.#checked(
-            context,
-            await this.#wait(context, async () => this.#groupByCoordinator([...pending], context))
-          )
-          let failure
-          let failed = false
-          this.#checked(
-            context,
-            await this.#wait(context, async () =>
-              Promise.allSettled(
-                batches.map(async ({ coordinator, ids: batchIds }) => {
-                  try {
-                    const { groups } = this.#checked(
-                      context,
-                      await this.#wait(context, async () =>
-                        coordinator.describeGroups({
-                          groupIds: batchIds,
-                          ...(context.consumerOperation && {
-                            guard: context.consumerOperation.guard,
-                          }),
-                          includeAuthorizedOperations: context.includeAuthorizedOperations,
-                        })
-                      )
-                    )
-                    for (const row of groups) {
-                      completed.set(row.groupId, row)
-                      pending.delete(row.groupId)
-                    }
-                  } catch (error) {
-                    if (!failed) {
-                      failed = true
-                      failure = error
-                    }
-                    if (RE_FINDS_COORDINATOR.has(error.code)) {
-                      for (const id of batchIds) context.coordinators.delete(id)
-                    }
-                    throw error
-                  }
-                })
-              )
-            )
-          )
-          if (failed) throw failure
+        coordinator.describeGroups({
+          groupIds: ids,
+          ...(context.consumerOperation && { guard: context.consumerOperation.guard }),
+          includeAuthorizedOperations: context.includeAuthorizedOperations,
         })
       )
     )
-    return [...completed.values()]
+    return groups.map((row) => ({ groupId: row.groupId, value: row }))
   }
 
   /**

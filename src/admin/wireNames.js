@@ -1,6 +1,26 @@
 const Encoder = require('../protocol/encoder')
 
 /**
+ * An independent copy of plain data: arrays, plain objects and Buffers are copied at every depth,
+ * and any other value (a string, a number, a boolean, null, a Long) is returned as it is, because
+ * it cannot be changed through the copy. Fields are not listed, so a field added to a description
+ * is copied as long as it is made of these.
+ * @param {any} value
+ * @returns {any}
+ */
+const copyOf = (value) => {
+  if (Buffer.isBuffer(value)) return Buffer.from(value)
+  if (Array.isArray(value)) return value.map(copyOf)
+  if (value !== null && typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype === Object.prototype || prototype === null) {
+      return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, copyOf(field)]))
+    }
+  }
+  return value
+}
+
+/**
  * The names a caller gave in one call and the distinct names a request writes for them.
  *
  * A lone surrogate is written as U+FFFD, so a broker answers for the written name, which can be the
@@ -11,9 +31,13 @@ const Encoder = require('../protocol/encoder')
  *
  * A call whose names are all well formed and distinct builds no per-name lookups and renames no
  * row: it holds one copy of the array and one Set that finds the repeats, and `project` hands the
- * row back as it is.
+ * row back as it is. The per-name lookups of `project` are built when it is first used with
+ * a repeated or rewritten name.
  */
 class WireNames {
+  #occurrences = null
+  #spellings = null
+
   /**
    * @param {string[]} names the names as the caller gave them; copied, so a later change of the
    *   caller's array does not change the call
@@ -25,29 +49,35 @@ class WireNames {
     /** @type {string[]} the written form of each name, parallel to `names` */
     this.wire = changed ? this.names.map((name) => Encoder.sentForm(name)) : this.names
     const distinct = new Set(this.wire)
+    /** @type {boolean} whether every name is written as it is and no name is repeated */
     this.plain = !changed && distinct.size === this.names.length
     /** @type {string[]} each written name once, in the order it first appears */
     this.ids = this.plain ? this.wire : [...distinct]
-    this.occurrences = null
-    this.spellings = null
-    if (!this.plain) {
-      this.occurrences = new Map()
-      this.names.forEach((name, index) => {
-        const callers = this.occurrences.get(this.wire[index])
-        if (callers) callers.push(name)
-        else this.occurrences.set(this.wire[index], [name])
-      })
-      this.spellings = new Map(
-        [...this.occurrences].map(([id, callers]) => [id, [...new Set(callers)]])
-      )
-    }
+  }
+
+  /**
+   * Builds, once, the caller's names for each written name.
+   * @returns {void}
+   */
+  #index() {
+    if (this.#occurrences !== null) return
+    this.#occurrences = new Map()
+    this.names.forEach((name, index) => {
+      const callers = this.#occurrences.get(this.wire[index])
+      if (callers) callers.push(name)
+      else this.#occurrences.set(this.wire[index], [name])
+    })
+    this.#spellings = new Map(
+      [...this.#occurrences].map(([id, callers]) => [id, [...new Set(callers)]])
+    )
   }
 
   /**
    * Adds the rows for one written name's outcome, one per name the caller gave for it: one per
    * occurrence in call order (`repeats`), or one per distinct spelling in the order each first
-   * appears. A row already under the caller's spelling is added as it is and the first time only;
-   * every other row is a shallow copy under that spelling, so no spelling is renamed to another.
+   * appears. A row already under the caller's spelling is added as it is, the first time only; every
+   * other row is an independent copy of it (nested arrays, objects and Buffers included) under that
+   * spelling, so changing one row never changes another and no spelling is renamed to another.
    * A row for a name the caller did not give is added as it is.
    * @param {object[]} out receives the rows
    * @param {string} wireId the written name the row answers
@@ -57,7 +87,10 @@ class WireNames {
    */
   project(out, wireId, row, repeats) {
     let callers
-    if (!this.plain) callers = (repeats ? this.occurrences : this.spellings).get(wireId)
+    if (!this.plain) {
+      this.#index()
+      callers = (repeats ? this.#occurrences : this.#spellings).get(wireId)
+    }
     if (callers === undefined) {
       out.push(row)
       return
@@ -68,10 +101,12 @@ class WireNames {
         used = true
         out.push(row)
       } else {
-        out.push({ ...row, groupId })
+        const copy = copyOf(row)
+        copy.groupId = groupId
+        out.push(copy)
       }
     }
   }
 }
 
-module.exports = { WireNames }
+module.exports = { WireNames, copyOf }
