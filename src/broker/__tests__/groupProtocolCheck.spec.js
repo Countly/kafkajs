@@ -22,18 +22,19 @@ const JOIN = {
 }
 const SYNC = { groupId: 'test-group', generationId: 5, memberId: 'm', groupAssignment: [] }
 
-/** A JoinGroup v8 answer, as the hex the harness frames. */
+/** A JoinGroup v8 answer to a follower, as the hex the harness frames. */
 const joinAnswer = ({
   protocolType = 'consumer',
   protocolName = 'p',
   errorCode = 0,
-  leader = 'm',
+  generationId = 5,
+  leader = 'someone-else',
   memberId = 'm',
 } = {}) => ({
   hex: new Encoder()
     .writeInt32(0)
     .writeInt16(errorCode)
-    .writeInt32(5)
+    .writeInt32(generationId)
     .writeUVarIntString(protocolType)
     .writeUVarIntString(protocolName)
     .writeUVarIntString(leader)
@@ -95,8 +96,16 @@ describe('Broker > the protocol the coordinator reports', () => {
 
     test('checks the answer to the retry that a MEMBER_ID_REQUIRED answer asks for, too', async () => {
       const answers = [
-        joinAnswer({ errorCode: 79, memberId: 'made-up' }),
-        joinAnswer({ protocolType: 'connect' }),
+        // The coordinator's MEMBER_ID_REQUIRED answer: the new id and the error defaults.
+        joinAnswer({
+          errorCode: 79,
+          generationId: -1,
+          protocolType: null,
+          protocolName: null,
+          leader: '',
+          memberId: 'made-up',
+        }),
+        joinAnswer({ protocolType: 'connect', memberId: 'made-up' }),
       ]
       harness = createGroupApiBroker({
         versions: { [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: 8 } },
@@ -126,7 +135,7 @@ describe('Broker > the protocol the coordinator reports', () => {
         .writeInt16(0)
         .writeInt32(5)
         .writeUVarIntString('p')
-        .writeUVarIntString('m')
+        .writeUVarIntString('someone-else')
         .writeUVarIntString('m')
         .writeUVarIntArray([])
         .writeTaggedFields()
@@ -292,11 +301,6 @@ describe('Broker > the protocol the coordinator reports', () => {
           [5, true],
         ],
         [
-          'stays at v4 when the join answer names no protocol name',
-          { protocolType: 'consumer', protocolName: null },
-          [4, false],
-        ],
-        [
           'stays at v4 when the join answer names no protocol type',
           { protocolType: null, protocolName: 'RoundRobinAssigner' },
           [4, false],
@@ -325,6 +329,24 @@ describe('Broker > the protocol the coordinator reports', () => {
           [apiKeys.JoinGroup, 8, null],
           [apiKeys.SyncGroup, version, syncBytes(withProtocol)],
         ])
+      })
+
+      test('refuses a join answer that names no protocol, before any SyncGroup', async () => {
+        harness = createGroupApiBroker({
+          versions: {
+            [apiKeys.JoinGroup]: { minVersion: 0, maxVersion: 9 },
+            [apiKeys.SyncGroup]: { minVersion: 0, maxVersion: 5 },
+          },
+          respond: ({ apiKey, apiVersion }) =>
+            apiKey === apiKeys.JoinGroup
+              ? Buffer.from(joinAnswer({ protocolName: null }).hex, 'hex')
+              : emptySyncAnswer(apiVersion),
+        })
+
+        await expect(
+          rebalance(protocolFor({ findGroupCoordinator: async () => harness.broker }))
+        ).rejects.toMatchObject({ retriable: true, type: 'MALFORMED_GROUP_ANSWER' })
+        expect(harness.requests.map(({ apiKey }) => apiKey)).toEqual([apiKeys.JoinGroup])
       })
     })
   })

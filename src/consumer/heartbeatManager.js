@@ -39,8 +39,9 @@ module.exports = class HeartbeatManager {
    * @param {(details: { elapsedMs: number }) => Promise<void>} options.onPollExpired the sequence
    *   a poll-interval overrun runs. It owns everything an overrun implies, including stopping
    *   this manager, so the tick awaits it and then evaluates nothing further.
-   * @param {() => boolean} [options.isRebalancing] whether a rebalance round is running right now;
-   *   the poll deadline is not evaluated while one is
+   * @param {() => boolean} [options.isRebalancing] whether the poll deadline is suspended right
+   *   now: a rebalance round is running, or (as the runner reports it) the member holds nothing while
+   *   it waits for a usable assignment; the deadline is not evaluated meanwhile
    * @param {() => Error|null} [options.guard] the owner's refusal, handed to every heartbeat so a
    *   request still awaiting its coordinator lookup sends nothing once the owner is retired
    * @param {() => void} [options.onAccepted] the owner's success effect, handed to every heartbeat;

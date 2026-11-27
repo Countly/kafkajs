@@ -66,6 +66,7 @@ const {
   KafkaJSRebalanceListenerError,
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSNoOffsetError,
+  KafkaJSPartialMessageError,
   isRebalancing,
   isLostMember,
   isFatalMembership,
@@ -81,6 +82,10 @@ const {
 } = require('./fetchErrorContract')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
+const {
+  isMalformedGroupAnswer,
+  INVALID_ASSIGNER_OUTPUT,
+} = require('../protocol/requests/groupProtocolCheck')
 const ClassicGroupProtocol = require('./groupProtocol/classic')
 const ConsumerGroupProtocol = require('./groupProtocol/consumer')
 const ManualGroupProtocol = require('./groupProtocol/manual')
@@ -497,6 +502,8 @@ module.exports = class ConsumerGroup {
 
     /** @type {Object|null} set by `attach`, absent until a `Runner` exists */
     this.rebalanceCoordinator = null
+    /** @type {import('./refusalEpisode')|null} set by `attach`, absent until a `Runner` exists */
+    this.refusal = null
 
     /**
      * Bumped every time the assignment is applied in a way that replaces the offsets, so a batch
@@ -519,12 +526,15 @@ module.exports = class ConsumerGroup {
    * The membership is also given the pre-release commit, because a leave at epoch > 0 has to
    * commit before it gives its partitions up and the membership cannot reach an offset manager.
    * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object,
-   *   onHeartbeatFatal?: (error: Error) => void }} deps `onHeartbeatFatal` is forwarded to a
-   *   membership that hands its fatal heartbeat answers to the run
+   *   onHeartbeatFatal?: (error: Error) => void,
+   *   refusal?: import('./refusalEpisode') }} deps `onHeartbeatFatal` is forwarded to a
+   *   membership that hands its fatal heartbeat answers to the run; `refusal` is the run's episode
+   *   of refused assignments
    * @returns {void}
    */
-  attach({ rebalanceCoordinator, heartbeatManager, onHeartbeatFatal }) {
+  attach({ rebalanceCoordinator, heartbeatManager, onHeartbeatFatal, refusal = null }) {
     this.rebalanceCoordinator = rebalanceCoordinator
+    this.refusal = refusal
     this.groupMembership.attach({
       rebalanceCoordinator,
       heartbeatManager,
@@ -1673,15 +1683,63 @@ module.exports = class ConsumerGroup {
    * whether it is seen when such an attempt fails (even past the session timeout) or after the
    * pause. A consumer-protocol member keeps the retrier's counted attempts.
    *
+   * A classic assignment this member cannot use is not retried: the sync result carries `refused`
+   * instead and is recorded in the run's refusal episode. The first refused assignment of an
+   * episode is asked for once more in the same generation (`verifyAssignment`); the answer to that
+   * replaces the refused result.
+   *
    * Applying the result and reporting the round belong to the caller: this method performs one
    * exchange and returns what it decoded.
-   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }|{ refused: Error }>} the
+   *   decoded sync result, or the refusal of an assignment this member cannot use
    * @throws {Error} what the join retrier gave up with, when it is not a loss this method rides out
    *   or the outage has lasted the session timeout; `CONSUMER_STOPPING` when a stop came during one
    * @param {object} [round] original pre-callback round identity and deadline
    */
   async joinAndSync(round = this.beginRebalanceRound()) {
     if (this.kind === 'consumer') return this.joinAndSyncAttempt(round)
+    const result = await this.joinAndSyncRiding(round)
+    if (!result?.refused || this.refusal?.refuse(result.refused, this) !== 'verify') return result
+
+    const verified = await this.verifyAssignment(round)
+    if (verified && !verified.refused) return { ...verified, unionSnapshot: result.unionSnapshot }
+    this.refusal.refuse(verified ? verified.refused : result.refused, this)
+    return verified ?? result
+  }
+
+  /**
+   * Asks once more, in the generation this member holds, for the assignment it just refused: a
+   * stable group answers with the bytes it stored and does not rebalance, so this heals bytes
+   * damaged on their way. Any failure other than the round's own refusal counts as no answer; a
+   * rebalance it reveals reaches the member through its heartbeat.
+   * @private
+   * @param {object} round the round the refused assignment belongs to
+   * @returns {Promise<object|null>} the sync result as `joinAndSync` returns it; null when no answer
+   *   came
+   * @throws {Error} the round's refusal: a stop, a replacement or its deadline
+   */
+  async verifyAssignment(round) {
+    try {
+      return await this.groupMembership.syncAgain({ round })
+    } catch (error) {
+      const refusal = round.guard()
+      if (refusal) throw refusal
+      this.logger.debug('Asking again for a refused assignment got no answer', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        error: describeThrown(error),
+      })
+      return null
+    }
+  }
+
+  /**
+   * The classic join retrier, riding out a lost coordinator as `joinAndSync` describes.
+   * @private
+   * @param {object} round
+   * @returns {Promise<object>} the sync result
+   */
+  async joinAndSyncRiding(round) {
     const outage = new Outage(this.sessionTimeout)
 
     while (true) {
@@ -1711,13 +1769,61 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error.
+   * One run of the join retrier: JoinGroup and SyncGroup, retried on a rebalance-class error and
+   * on a refused JoinGroup answer (`MALFORMED_GROUP_ANSWER`), which counts against the retries like
+   * any other. A join that ends while the last JoinGroup answer it received was refused - the
+   * retries or `retry.maxTotalTime` run out, or the round's deadline passes in the backoff or in a
+   * later attempt that got no answer - fails with a non-retriable `KafkaJSPartialMessageError`
+   * naming the group, the member and the refusal: the coordinator that wrote it may answer a
+   * restarted member the same. A stop, or a round another one replaced, ends it as before, and so
+   * does a join whose last answer was not refused. That error, and a leader's own assigner output
+   * it cannot send (`INVALID_ASSIGNER_OUTPUT`), end the run's refusal episode, so the run's stop
+   * leaves the group. A refused SyncGroup assignment is a result, not a failure (`joinAndSync`).
    * @private
-   * @returns {Promise<{ assignment: Object, userData: Buffer|null }>} the decoded sync result
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }|{ refused: Error }>} the
+   *   decoded sync result
    * @throws {Error} what the retrier gave up with
    * @param {object} round original round; retries create attempts without renewing its time
    */
-  joinAndSyncAttempt(round) {
+  async joinAndSyncAttempt(round) {
+    const last = { refused: null }
+    try {
+      return await this.joinAndSyncRetried(round, last)
+    } catch (error) {
+      if (error?.type === INVALID_ASSIGNER_OUTPUT) {
+        this.refusal?.end(error)
+        throw error
+      }
+      // Only the round's own deadline, or nothing, may have ended it: a stop and a replacement win.
+      const ended = round.guard()
+      if (
+        last.refused === null ||
+        this.isStopping() ||
+        this.idleWait !== round.run ||
+        round.run.disposed ||
+        this.roundContext !== round ||
+        (ended !== null && ended.type !== 'JOIN_DEADLINE_EXCEEDED')
+      ) {
+        throw error
+      }
+      // No cause: the crash policy restarts on a retriable cause, and the refusal is one.
+      const stop = new KafkaJSPartialMessageError(
+        `Group ${this.groupId} member ${this.memberId || '(no id yet)'}: the join ended on a refused group answer: ${last.refused.message}`
+      )
+      this.refusal?.end(stop)
+      throw stop
+    }
+  }
+
+  /**
+   * The join retrier itself, for `joinAndSyncAttempt`.
+   * @private
+   * @param {object} round
+   * @param {{ refused: Error|null }} last the refusal of the last JoinGroup answer received, null
+   *   when that answer was not refused
+   * @returns {Promise<{ assignment: Object, userData: Buffer|null }|{ refused: Error }>}
+   */
+  joinAndSyncRetried(round, last) {
     return this.retrier(async (bail) => {
       const { membershipRevision } = this.groupMembership
       const attempt = round.attempt()
@@ -1744,6 +1850,9 @@ module.exports = class ConsumerGroup {
         )
       } catch (e) {
         const refusal = attempt.guard()
+        // The round's own end is no answer: it keeps the last refusal.
+        if (isMalformedGroupAnswer(e)) last.refused = e
+        else if (!refusal) last.refused = null
         if (refusal || isHeartbeatFatal(e)) return bail(e)
         if (isRebalancing(e)) {
           throw new KafkaJSError(e)
@@ -1771,6 +1880,17 @@ module.exports = class ConsumerGroup {
         // the round's own expiry is terminal for this chain.
         if (e.type === 'JOIN_DEADLINE_EXCEEDED') {
           throw new KafkaJSError(e)
+        }
+
+        // A JoinGroup answer no coordinator sends was refused before it changed anything; join
+        // again while retries are left, as after a rebalance.
+        if (isMalformedGroupAnswer(e)) {
+          this.logger.warn('Refused a group answer this member cannot use', {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            error: e.message,
+          })
+          throw e
         }
 
         bail(e)
@@ -2834,10 +2954,14 @@ module.exports = class ConsumerGroup {
     run.fence.check()
     await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary: true }))
     run.fence.check()
-    this.checkSubscriptionChange()
-    this.groupMembership.recheckHeldTopics?.()
-    if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
-    this.checkForStaleAssignment()
+    // A member waiting for a usable assignment asks for no rejoin of its own: it joins the
+    // rebalances the coordinator starts, and their join carries the newest subscription.
+    if (!this.refusal?.open) {
+      this.checkSubscriptionChange()
+      this.groupMembership.recheckHeldTopics?.()
+      if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
+      this.checkForStaleAssignment()
+    }
 
     let prepared = null
     for (let attempt = 1; attempt <= MAX_PREPARATION_ATTEMPTS; attempt++) {

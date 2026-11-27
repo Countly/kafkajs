@@ -1,5 +1,6 @@
 const Encoder = require('../protocol/encoder')
 const Decoder = require('../protocol/decoder')
+const { readAssignmentRows } = require('./assignmentRows')
 
 /**
  * `ConsumerProtocolSubscription`, versions 0-3. `validVersions 0-3`, `flexibleVersions none`.
@@ -124,26 +125,24 @@ const MemberAssignment = {
   },
 
   /**
+   * Decodes an assignment as kafkajs always has: a topic named in two rows keeps the last row's
+   * partitions, and a null topic or partition list reads as none. The consumer's own SyncGroup
+   * path checks the rows first (`readSyncAssignment`).
    * @param {Buffer} buffer
-   * @returns {Object|null}
+   * @returns {Object|null} null when the buffer is shorter than its version
    */
   decode(buffer) {
-    const decoder = new Decoder(buffer)
-    const decodePartitions = (d) => d.readInt32()
-    const decodeAssignment = (d) => ({
-      topic: d.readString(),
-      partitions: d.readArray(decodePartitions),
-    })
-    if (!decoder.canReadInt16()) {
+    const rows = readAssignmentRows(buffer)
+    if (rows === null) {
       return null
     }
 
     return {
-      version: decoder.readInt16(),
+      version: rows.version,
       assignment: Object.fromEntries(
-        decoder.readArray(decodeAssignment).map(({ topic, partitions }) => [topic, partitions])
+        (rows.topics ?? []).map(({ topic, partitions }) => [topic, partitions ?? []])
       ),
-      userData: decoder.readBytes(),
+      userData: rows.userData,
     }
   },
 }

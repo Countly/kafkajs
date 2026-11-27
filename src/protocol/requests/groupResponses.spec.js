@@ -186,10 +186,14 @@ describe('Protocol > Requests > the classic group response codecs', () => {
     )
 
     test.each([4, 5])(
-      'v%i reads a compact null assignment as an empty buffer, which MemberAssignment reads as none',
+      'v%i reads a compact null assignment as null and a zero-length one as an empty buffer',
       async (version) => {
         expect(
           (await syncGroup[version].decode(body(version, { assignment: null }))).memberAssignment
+        ).toBeNull()
+        expect(
+          (await syncGroup[version].decode(body(version, { assignment: Buffer.alloc(0) })))
+            .memberAssignment
         ).toEqual(Buffer.alloc(0))
       }
     )

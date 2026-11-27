@@ -17,4 +17,26 @@ describe('Protocol > Requests > LeaveGroup > v3', () => {
     })
     await expect(parse(data)).resolves.toBeTruthy()
   })
+
+  test('a top-level error beside a member error rejects with the top-level error and leaves no unhandled rejection', async () => {
+    const unhandled = []
+    const onUnhandled = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      await expect(
+        parse({
+          throttleTime: 0,
+          clientSideThrottleTime: 0,
+          errorCode: 15,
+          members: [{ memberId: 'member-1', groupInstanceId: null, errorCode: 25 }],
+        })
+      ).rejects.toMatchObject({ code: 15 })
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+
+    expect(unhandled).toEqual([])
+  })
 })
