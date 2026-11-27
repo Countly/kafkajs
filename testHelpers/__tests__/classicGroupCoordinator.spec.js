@@ -7,20 +7,6 @@ const PLAN_A = Buffer.from('plan-a')
 const PLAN_B = Buffer.from('plan-b')
 
 /**
- * Lets the scripted sockets and the coordinator take turns until `done` holds.
- * @param {() => boolean} done
- * @param {string} what names the wait in the failure
- * @returns {Promise<void>}
- */
-const until = async (done, what) => {
-  for (let turn = 0; turn < 200; turn++) {
-    if (done()) return
-    await new Promise(setImmediate)
-  }
-  throw new Error(`Still waiting for ${what}`)
-}
-
-/**
  * @param {Promise<*>} promise
  * @returns {{ settled: () => boolean, promise: Promise<*> }} the promise, marked handled, and
  *   whether it has settled
@@ -103,13 +89,13 @@ describe('ClassicGroupCoordinator', () => {
     const watched = watch(
       sync(b.broker, { memberId: b.memberId, generationId: 2, groupInstanceId: 'b' })
     )
-    const accepted = () =>
-      coordinator.requests.some(
-        ({ api, request }) => api === 'SyncGroup' && request.memberId === b.memberId
-      )
-    await until(accepted, "b's SyncGroup")
+    await coordinator.whenAccepted('SyncGroup', ({ memberId }) => memberId === b.memberId)
     return watched
   }
+
+  /** @returns {Promise<object>} once the coordinator has accepted a JoinGroup of instance `b` */
+  const instanceBJoined = () =>
+    coordinator.whenAccepted('JoinGroup', ({ groupInstanceId }) => groupInstanceId === 'b')
 
   /**
    * A stable group of one static member, instance `a`, holding PLAN_A in generation 1.
@@ -137,7 +123,8 @@ describe('ClassicGroupCoordinator', () => {
     const a = await stableLeader()
     const b = { broker: client() }
     const bJoin = join(b.broker, { groupInstanceId: 'b' })
-    await until(() => coordinator.describe().state === STATES.PREPARING, 'the rebalance')
+    await instanceBJoined()
+    expect(coordinator.describe().state).toBe(STATES.PREPARING)
     await expect(
       heartbeat(a.broker, { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' })
     ).rejects.toMatchObject({ type: 'REBALANCE_IN_PROGRESS' })
@@ -197,8 +184,12 @@ describe('ClassicGroupCoordinator', () => {
           groupProtocols: [{ name: PROTOCOL, metadata: Buffer.from('metadata-b') }],
         })
       )
-      await until(() => coordinator.describe().state === STATES.PREPARING, 'the rebalance')
-      await new Promise(setImmediate)
+      await instanceBJoined()
+      const bId = coordinator.describe().members[1].memberId
+      expect(coordinator.describe()).toMatchObject({
+        state: STATES.PREPARING,
+        awaitingJoin: [bId],
+      })
       expect(bJoin.settled()).toBe(false)
 
       const changed = Buffer.from('metadata-a-2')
@@ -231,11 +222,18 @@ describe('ClassicGroupCoordinator', () => {
         const aAnswer = await join(a, { rebalanceTimeout: 5000 })
         await sync(a, { memberId: aAnswer.memberId, generationId: 1 })
         const bJoin = watch(join(client(), { rebalanceTimeout: 5000 }))
-        await until(() => coordinator.describe().state === STATES.PREPARING, 'the rebalance')
+        const { memberId: bId } = await coordinator.whenAccepted(
+          'JoinGroup',
+          ({ memberId }) => memberId !== '' && memberId !== aAnswer.memberId
+        )
+        expect(coordinator.describe().state).toBe(STATES.PREPARING)
 
         jest.advanceTimersByTime(4999)
-        await new Promise(setImmediate)
-        expect(bJoin.settled()).toBe(false)
+        expect(coordinator.describe()).toMatchObject({
+          state: STATES.PREPARING,
+          generationId: 1,
+          awaitingJoin: [bId],
+        })
         jest.advanceTimersByTime(1)
         const bAnswer = await bJoin.promise
 
@@ -318,7 +316,8 @@ describe('ClassicGroupCoordinator', () => {
     test('a SyncGroup while the group prepares a rebalance is answered 27', async () => {
       const a = await stableLeader()
       watch(join(client(), { groupInstanceId: 'b' }))
-      await until(() => coordinator.describe().state === STATES.PREPARING, 'the rebalance')
+      await instanceBJoined()
+      expect(coordinator.describe().state).toBe(STATES.PREPARING)
 
       await expect(
         sync(a.broker, { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' })
@@ -328,7 +327,10 @@ describe('ClassicGroupCoordinator', () => {
     test("a follower's SyncGroup waits for the leader's, which stores its plan once: a later leader SyncGroup gets the stored bytes", async () => {
       const { a, b } = await completingPair()
       const bSync = await followerSync(b)
-      await new Promise(setImmediate)
+      expect(coordinator.describe()).toMatchObject({
+        state: STATES.COMPLETING,
+        awaitingSync: [b.memberId],
+      })
       expect(bSync.settled()).toBe(false)
 
       const leaderSync = await sync(a.broker, {
@@ -412,7 +414,8 @@ describe('ClassicGroupCoordinator', () => {
       await expect(beat({})).resolves.toMatchObject({ errorCode: 0 })
 
       watch(join(client(), { groupInstanceId: 'b' }))
-      await until(() => coordinator.describe().state === STATES.PREPARING, 'the rebalance')
+      await instanceBJoined()
+      expect(coordinator.describe().state).toBe(STATES.PREPARING)
       await expect(beat({})).rejects.toMatchObject({ type: 'REBALANCE_IN_PROGRESS' })
     })
   })
@@ -468,8 +471,9 @@ describe('ClassicGroupCoordinator', () => {
       await stableLeader()
       const b = client()
       const bJoin = watch(join(b, { groupInstanceId: 'b' }))
-      await until(() => coordinator.describe().members.length === 2, "b's JoinGroup")
+      await instanceBJoined()
       const bId = coordinator.describe().members[1].memberId
+      expect(coordinator.describe().awaitingJoin).toEqual([bId])
 
       await client().leaveGroup({
         groupId: GROUP,
@@ -518,7 +522,12 @@ describe('ClassicGroupCoordinator', () => {
       ).resolves.toMatchObject({ errorCode: 0 })
 
       held.release()
-      await until(() => coordinator.describe().state === STATES.PREPARING, 'the rebalance')
+      await instanceBJoined()
+      const bId = coordinator.describe().members[1].memberId
+      expect(coordinator.describe()).toMatchObject({
+        state: STATES.PREPARING,
+        awaitingJoin: [bId],
+      })
       expect(bJoin.settled()).toBe(false)
     })
 
@@ -561,14 +570,17 @@ describe('ClassicGroupCoordinator', () => {
     test('unloading answers a parked JoinGroup with 16, and every later request too', async () => {
       const a = await stableLeader()
       const bJoin = watch(join(client(), { groupInstanceId: 'b' }))
-      await until(() => coordinator.describe().members.length === 2, "b's JoinGroup")
+      await instanceBJoined()
+      expect(coordinator.describe().awaitingJoin).toHaveLength(1)
 
       coordinator.unload()
 
-      await expect(bJoin.promise).rejects.toMatchObject({ type: 'NOT_COORDINATOR' })
+      // kafkajs names code 16 NOT_COORDINATOR_FOR_GROUP.
+      const notCoordinator = { type: 'NOT_COORDINATOR_FOR_GROUP', code: 16 }
+      await expect(bJoin.promise).rejects.toMatchObject(notCoordinator)
       await expect(
         heartbeat(a.broker, { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' })
-      ).rejects.toMatchObject({ type: 'NOT_COORDINATOR' })
+      ).rejects.toMatchObject(notCoordinator)
     })
   })
 })

@@ -174,6 +174,10 @@ class ClassicGroupCoordinator {
     this.nextId = 0
     /** @type {{ api: string, connection: number, request: object }[]} */
     this.requests = []
+    /** @type {{ api: string, request: object }[]} every request the coordinator accepted */
+    this.accepted = []
+    /** @type {{ api: string, match: Function, resolve: Function }[]} */
+    this.acceptWaiters = []
     /** @type {Error[]} */
     this.failures = []
     this.gates = []
@@ -291,6 +295,19 @@ class ClassicGroupCoordinator {
   }
 
   /**
+   * Resolves once the coordinator has accepted a request of `api` that `match` selects (at once
+   * when it already has), so the group already shows its effect.
+   * @param {'JoinGroup'|'SyncGroup'|'Heartbeat'|'LeaveGroup'} api
+   * @param {(request: object) => boolean} [match]
+   * @returns {Promise<object>} the decoded request
+   */
+  whenAccepted(api, match = () => true) {
+    const done = this.accepted.find((each) => each.api === api && match(each.request))
+    if (done) return Promise.resolve(done.request)
+    return new Promise((resolve) => this.acceptWaiters.push({ api, match, resolve }))
+  }
+
+  /**
    * The member's session expires: Kafka's heartbeat expiry. A pending member is removed; a member
    * is removed unless it awaits a JoinGroup or SyncGroup answer and joined before the current
    * generation (Kafka's `hasSatisfiedHeartbeat`).
@@ -345,7 +362,9 @@ class ClassicGroupCoordinator {
   /**
    * @returns {{ state: string, generationId: number, leaderId: string|null,
    *   protocolName: string|null, members: { memberId: string, groupInstanceId: string|null,
-   *   assignment: Buffer }[], pending: string[] }} the group as the coordinator holds it
+   *   assignment: Buffer }[], pending: string[], awaitingJoin: string[],
+   *   awaitingSync: string[] }} the group as the coordinator holds it; `awaitingJoin` and
+   *   `awaitingSync` name the members whose JoinGroup or SyncGroup is parked
    */
   describe() {
     return {
@@ -359,6 +378,12 @@ class ClassicGroupCoordinator {
         assignment,
       })),
       pending: Array.from(this.pendingJoin),
+      awaitingJoin: Array.from(this.members.values())
+        .filter(({ join }) => join)
+        .map(({ memberId }) => memberId),
+      awaitingSync: Array.from(this.members.values())
+        .filter(({ sync }) => sync)
+        .map(({ memberId }) => memberId),
     }
   }
 
@@ -392,7 +417,14 @@ class ClassicGroupCoordinator {
     await this.passGate(wire.api, 'acceptance', request)
     if (socket.destroyed) return
 
-    let answer = await this.accept(header.apiKey, request)
+    const answered = this.accept(header.apiKey, request)
+    this.accepted.push({ api: wire.api, request })
+    this.acceptWaiters = this.acceptWaiters.filter((waiter) => {
+      if (waiter.api !== wire.api || !waiter.match(request)) return true
+      waiter.resolve(request)
+      return false
+    })
+    let answer = await answered
     await this.passGate(wire.api, 'reply', request)
     const fault = this.faults.findIndex(
       ({ api, memberId }) =>
