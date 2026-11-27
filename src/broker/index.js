@@ -11,7 +11,7 @@ const { Types: Compression } = require('../protocol/message/compression')
 const Encoder = require('../protocol/encoder')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
-const { captureEntries } = require('../protocol/recordBatch/entries')
+const { captureEntries, RecordEntries, OWNED_RECORDS } = require('../protocol/recordBatch/entries')
 const { requireCoverage } = require('../protocol/requests/responseCoverage')
 const { validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
@@ -173,8 +173,9 @@ const produceCeiling = ({ transactionalId, transactionVersion, topicIds }) => {
 /**
  * The library's own copy of a Produce request's `topicData`, read once by index: each topic's
  * name and partitions, each partition's index and first sequence, and its records taken over as
- * owned entries (`captureEntries`), the ones without a timestamp at `now`. Nothing the caller
- * passed is read again.
+ * owned entries (`captureEntries`), the ones without a timestamp at `now`. A partition the
+ * producer already took over carries its entries under `OWNED_RECORDS`, and they are used as they
+ * are. Nothing the caller passed is read again.
  * @param {{ topic: string, partitions: { partition: number, firstSequence?: number,
  *   messages: object[] }[] }[]} topicData
  * @param {number} now
@@ -191,8 +192,12 @@ const captureTopicData = (topicData, now) => {
     const { topic, partitions: sent } = topicData[t]
     const partitions = []
     for (let p = 0, length = sent.length; p < length; p++) {
-      const { partition, firstSequence, messages } = sent[p]
-      partitions.push({ partition, firstSequence, messages: captureEntries(messages, { now }) })
+      const { partition, firstSequence, messages, [OWNED_RECORDS]: owned } = sent[p]
+      partitions.push({
+        partition,
+        firstSequence,
+        messages: RecordEntries.is(owned) ? owned : captureEntries(messages, { now }),
+      })
     }
     topics.push({ topic, partitions })
   }

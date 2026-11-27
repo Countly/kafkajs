@@ -39,6 +39,11 @@ const Bytes = Uint8Array
 const CHANGED = 'A Buffer changed size while its send was being read'
 /** Marks a `RecordEntries` in every loaded copy of this module. */
 const BRAND = Symbol.for('@countly/kafkajs.RecordEntries')
+/**
+ * The key under which the producer hands `Broker#produce` a partition's records already taken
+ * over, beside the plain `messages` it keeps for everything else.
+ */
+const OWNED_RECORDS = Symbol('owned records')
 
 /** What each field of a record must be. */
 const ENCODABLE = {
@@ -547,4 +552,5 @@ module.exports = {
   lengthOf,
   assertWritten,
   writeTimestamp,
+  OWNED_RECORDS,
 }
