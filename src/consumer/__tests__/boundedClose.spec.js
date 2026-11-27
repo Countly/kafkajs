@@ -1301,6 +1301,8 @@ describe('a runner stopped while its connection is held', () => {
       beginRebalanceRound: jest.fn(),
       clearAssignerState: jest.fn(),
       leave: jest.fn(),
+      retireCoordinatorLookup: jest.fn(),
+      retireFetchSessions: jest.fn(),
     }
     const onCrash = jest.fn()
     const runner = new Runner({
@@ -1349,5 +1351,23 @@ describe('a runner stopped while its connection is held', () => {
     await starting
     expect(onCrash).not.toHaveBeenCalled()
     expect(runner.rebalanceCoordinator.runRound).not.toHaveBeenCalled()
+  })
+
+  test('a run retired while its connection is held, then stopped, owes the next run no assigner clear', async () => {
+    const connect = gate()
+    const { runner, group, onCrash } = buildRunner(connect)
+    const starting = runner.start()
+    await flush()
+    expect(group.connect).toHaveBeenCalledTimes(1)
+    runner.retire(Object.assign(new Error('stopping'), { type: 'CONSUMER_STOPPING' }))
+    expect(runner.retirement).not.toBeNull()
+    await runner.stop()
+    connect.resolve()
+    await starting
+    expect(runner.running).toBe(false)
+    expect(runner.assignersOwed).toBe(false)
+    expect(group.clearAssignerState).not.toHaveBeenCalled()
+    expect(runner.rebalanceCoordinator.runRound).not.toHaveBeenCalled()
+    expect(onCrash).not.toHaveBeenCalled()
   })
 })

@@ -218,6 +218,35 @@ describe('Broker > offsetFetch answer coverage', () => {
     }
   )
 
+  // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+  test.each([[8], [9], [10]])(
+    'a group id with a lone surrogate answered as the bytes sent resolves at v%i',
+    async (version) => {
+      const response = await fetch(
+        version,
+        { entries: [ASKED], groupId: 'team-�' },
+        { groupId: 'team-\uD800' }
+      )
+
+      expect(response.responses[0].partitions.map(({ partition }) => partition)).toEqual([0, 1])
+      expect(versionsSent()).toEqual([version])
+    }
+  )
+
+  test.each([[8], [9], [10]])(
+    'a group id with a lone surrogate is still refused at v%i for an answer for another group',
+    async (version) => {
+      for (const [asked, answered] of [
+        ['team-\uD800', 'team-B'],
+        ['team-A', 'team-�'],
+      ]) {
+        await expect(
+          fetch(version, { entries: [ASKED], groupId: answered }, { groupId: asked })
+        ).rejects.toMatchObject({ name: 'KafkaJSInvariantViolation' })
+      }
+    }
+  )
+
   test('an answer that covers the request resolves at every version, rows in any order', async () => {
     const reordered = [topic(TOPIC, TOPIC_ID, cell(1, '11'), cell(0, '10'))]
     for (const version of [1, 5, ...VERSIONS]) {

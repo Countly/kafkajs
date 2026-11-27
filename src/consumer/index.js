@@ -964,8 +964,9 @@ module.exports = (params) => {
   let stopping = null
 
   /**
-   * Whether a stopped run's close deadline cut its stop before the assigners were told to forget
-   * their state; the next run tells them before its first join.
+   * Whether a stopped classic run ended without telling the assigners to forget their state,
+   * because its close deadline cut its stop or had passed before the stop began; the next classic
+   * run tells them before its first join, and a manual-assignment run in between leaves it owed.
    */
   let assignersOwed = false
 
@@ -1387,7 +1388,7 @@ module.exports = (params) => {
         RebalanceHooks.outside(() => {
           // After the runner is published: an assigner that stops or disconnects the consumer from
           // this callback latches that runner, so its start joins nothing.
-          if (assignersOwed) {
+          if (assignersOwed && group.kind === 'classic') {
             assignersOwed = false
             try {
               group.clearAssignerState()
