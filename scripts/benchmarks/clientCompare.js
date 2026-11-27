@@ -7,11 +7,20 @@
  *
  * Usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <@countly/kafkajs|kafkajs>
  *          --workload <produce-latency|produce-throughput|consume-throughput> [--messages N]
- *          [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4]
- *          [--settings defaults|same] [--passes N] [--brokers host:port,...]
+ *          [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip]
+ *          [--settings defaults|same] [--passes N] [--batch N] [--concurrency N] [--keys N]
+ *          [--value-type buffer|string] [--max-request-bytes N] [--brokers host:port,...]
  * `--client` is an npm install prefix that holds `node_modules/<package>`. Defaults: 20000 messages
  * for `produce-latency`, 200000 for the others, 200 bytes per message, 3 partitions, no
  * compression, each package's own consumer defaults, the three brokers of docker-compose.yml.
+ * `--batch N` (`produce-throughput` only) puts N records in each send (500 by default),
+ * `--concurrency N` (same) keeps N sends in flight at once (1 by default), and `--keys N` (same)
+ * gives record `n` the string key `key-<n % N>` so the partitioner places it by key; without it
+ * records have no key. `--value-type string` (produce workloads) sends each value as a string
+ * instead of a Buffer. `--max-request-bytes N` (produce workloads) creates the topic with
+ * `max.message.bytes` N and gives the producer `maxRequestSize` N, for records the defaults (1 MiB)
+ * refuse; kafkajs 2.2.4 has no such producer option and ignores it, as it ignores `linger`.
+ * `--compression gzip` uses the built-in codec both packages ship (`node:zlib`).
  * `--duration-ms` (produce workloads only, never with `--messages`) sends for a fixed measured
  * window after a 5-second warm-up that is not measured. A consume run excludes the first tenth of
  * the corpus as its warm-up; `--passes N` (consume only) reads the corpus N times, seeking each
@@ -66,13 +75,17 @@ const DEFAULT_MESSAGES = {
 const DEFAULT_BROKERS = 'localhost:9092,localhost:9095,localhost:9098'
 const DEFAULT_SIZE = 200
 const DEFAULT_PARTITIONS = 3
-const COMPRESSIONS = ['none', 'lz4']
+const COMPRESSIONS = ['none', 'lz4', 'gzip']
 const SETTINGS = ['defaults', 'same']
+const VALUE_TYPES = ['buffer', 'string']
+/** The `CompressionTypes` member each compression names, for the codecs a send can ask for. */
+const COMPRESSION_TYPE = { lz4: 'LZ4', gzip: 'GZIP' }
 const BATCH = 500
 const CORPUS_CONCURRENCY = 8
 const WARMUP_MS = 5000
 const WARMUP_FRACTION = 0.1
 const POOL_SIZE = 1024
+const POOL_BYTES = 64 * 1024 * 1024
 const CONSUME_TIMEOUT_MS = 300000
 const LEADER_WAIT_MS = 30000
 const LEADER_POLL_MS = 100
@@ -88,10 +101,23 @@ const FLAGS = [
   '--compression',
   '--settings',
   '--passes',
+  '--batch',
+  '--concurrency',
+  '--keys',
+  '--value-type',
+  '--max-request-bytes',
   '--brokers',
 ]
+/** The workloads each optional flag applies to; the flag is a usage error on any other. */
+const APPLIES_TO = {
+  '--batch': ['produce-throughput'],
+  '--concurrency': ['produce-throughput'],
+  '--keys': ['produce-throughput'],
+  '--value-type': ['produce-latency', 'produce-throughput'],
+  '--max-request-bytes': ['produce-latency', 'produce-throughput'],
+}
 const USAGE =
-  'usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <name> --workload <produce-latency|produce-throughput|consume-throughput> [--messages N] [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4] [--settings defaults|same] [--passes N] [--brokers host:port,...]'
+  'usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <name> --workload <produce-latency|produce-throughput|consume-throughput> [--messages N] [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip] [--settings defaults|same] [--passes N] [--batch N] [--concurrency N] [--keys N] [--value-type buffer|string] [--max-request-bytes N] [--brokers host:port,...]'
 
 /**
  * The one explicit consumer configuration of `--settings same`: kafkajs 2.2.4's defaults, with the
@@ -235,11 +261,13 @@ const positive = (text) => {
 /**
  * @param {string[]} argv
  * @returns {{ client: string, package: string, workload: string, messages: number|null,
- *   durationMs: number|null, size: number, partitions: number, compression: 'none'|'lz4',
- *   settings: 'defaults'|'same', passes: number, brokers: string[] }}
- * @throws {UsageError} for a missing, repeated or unknown flag, an unknown workload, compression or
- *   settings, a count that is not a positive integer, or `--duration-ms` with `--messages`, or
- *   `--duration-ms` or `--passes` on a workload they do not apply to
+ *   durationMs: number|null, size: number, partitions: number, compression: 'none'|'lz4'|'gzip',
+ *   settings: 'defaults'|'same', passes: number, batch?: number, concurrency?: number,
+ *   keys?: number, valueType?: 'buffer'|'string', maxRequestBytes?: number, brokers: string[] }}
+ *   the optional fields are absent unless their flag was given
+ * @throws {UsageError} for a missing, repeated or unknown flag, an unknown workload, compression,
+ *   settings or value type, a count that is not a positive integer, or `--duration-ms` with
+ *   `--messages`, or a flag on a workload it does not apply to
  */
 const parseArgs = (argv) => {
   const flags = {}
@@ -253,16 +281,21 @@ const parseArgs = (argv) => {
   const workload = flags['--workload']
   const compression = flags['--compression'] ?? 'none'
   const settings = flags['--settings'] ?? 'defaults'
+  const valueType = flags['--value-type']
   const known =
     WORKLOADS.includes(workload) &&
     COMPRESSIONS.includes(compression) &&
-    SETTINGS.includes(settings)
+    SETTINGS.includes(settings) &&
+    (valueType === undefined || VALUE_TYPES.includes(valueType))
   if (!flags['--client'] || !flags['--package'] || !known) throw new UsageError(USAGE)
   const durationMs = positive(flags['--duration-ms']) ?? null
   const consume = workload === 'consume-throughput'
   const passes = positive(flags['--passes']) ?? 1
   const misplaced = consume ? durationMs !== null : flags['--passes'] !== undefined
-  if (misplaced || (durationMs !== null && flags['--messages'] !== undefined)) {
+  const misapplied = Object.entries(APPLIES_TO).some(
+    ([flag, workloads]) => flags[flag] !== undefined && !workloads.includes(workload)
+  )
+  if (misplaced || misapplied || (durationMs !== null && flags['--messages'] !== undefined)) {
     throw new UsageError(USAGE)
   }
   return {
@@ -277,6 +310,11 @@ const parseArgs = (argv) => {
     compression,
     settings,
     passes,
+    batch: positive(flags['--batch']),
+    concurrency: positive(flags['--concurrency']),
+    keys: positive(flags['--keys']),
+    valueType,
+    maxRequestBytes: positive(flags['--max-request-bytes']),
     brokers: (flags['--brokers'] ?? DEFAULT_BROKERS).split(','),
   }
 }
@@ -372,6 +410,21 @@ const useLz4 = (client, load = createRequire(path.join(ROOT, 'package.json'))) =
 }
 
 /**
+ * @param {Parameters<typeof useLz4>[0]} client
+ * @param {'none'|'lz4'|'gzip'} compression
+ * @returns {object|undefined} what the run compresses with, for its report: the LZ4 codec's
+ *   package (see `useLz4`), or for gzip the `node:zlib` both packages ship, which needs nothing
+ *   registered; undefined without compression
+ */
+const codecOf = (client, compression) => {
+  if (compression === 'lz4') return useLz4(client)
+  if (compression === 'gzip') {
+    return { name: 'gzip', codec: 'built-in', package: 'zlib', version: process.versions.zlib }
+  }
+  return undefined
+}
+
+/**
  * @param {number[]} sorted values in ascending order
  * @param {number} p fraction between 0 and 1
  * @returns {number} the value at that fraction of the list
@@ -459,16 +512,18 @@ const DEFAULT_TIMING = {
 }
 
 /**
- * Corpus values: `POOL_SIZE` distinct records of `size` bytes, words from a fixed vocabulary in a
- * seeded order, so a compressed batch holds text that compresses the way logs do rather than one
- * repeated byte.
+ * Corpus values: `POOL_SIZE` distinct records of `size` bytes (fewer when that would hold more than
+ * `POOL_BYTES`, so a large record size does not fill the process with its corpus), words from a
+ * fixed vocabulary in a seeded order, so a compressed batch holds text that compresses the way logs
+ * do rather than one repeated byte.
  * @param {number} size bytes per value
  * @returns {Buffer[]}
  */
 const valuePool = (size) => {
   const words = ['event', 'user', 'session', 'view', 'click', 'app', 'id', 'ts', 'ok', 'error']
+  const count = Math.min(POOL_SIZE, Math.max(1, Math.floor(POOL_BYTES / size)))
   let seed = 1
-  return Array.from({ length: POOL_SIZE }, (_, i) => {
+  return Array.from({ length: count }, (_, i) => {
     let text = `{"n":${i}`
     while (text.length < size) {
       seed = (seed * 1103515245 + 12345) % 2147483648
@@ -493,24 +548,56 @@ const messagesOf = (values, from, count, partitions) =>
   )
 
 /**
- * Sends `messages` messages in sends of at most `BATCH`, `concurrency` sends at a time.
+ * @param {(Buffer|string)[]} values the corpus values
+ * @param {string[]} keys the keys, each used for every `keys.length`th message
+ * @param {number} from index of the first message
+ * @param {number} count
+ * @returns {{ key: string, value: Buffer|string }[]} `count` messages cycling through `values` and
+ *   `keys`, message `n` with key `keys[n % keys.length]`
+ */
+const keyedMessagesOf = (values, keys, from, count) =>
+  Array.from({ length: count }, (_, i) => ({
+    key: keys[(from + i) % keys.length],
+    value: values[(from + i) % values.length],
+  }))
+
+/**
+ * @param {number} count
+ * @returns {string[]} `count` distinct keys, `key-0` to `key-<count - 1>`
+ */
+const keyPool = (count) => Array.from({ length: count }, (_, i) => `key-${i}`)
+
+/**
+ * Sends `messages` messages in sends of at most `perSend`, `concurrency` sends at a time.
  * @param {object} producer a connected producer
  * @param {{ topic: string, compression?: number }} target topic and codec of every send
  * @param {number} messages
- * @param {Buffer[]} values
+ * @param {(Buffer|string)[]} values
  * @param {number} [concurrency]
  * @param {number} [partitions] when given, message `n` goes to partition `n % partitions`
+ * @param {{ perSend?: number, keys?: string[] }} [shape] records per send (`BATCH` by default) and,
+ *   when given, the keys the messages carry
  * @returns {Promise<void>}
  */
-const sendAll = async (producer, target, messages, values, concurrency = 1, partitions) => {
+const sendAll = async (
+  producer,
+  target,
+  messages,
+  values,
+  concurrency = 1,
+  partitions,
+  { perSend = BATCH, keys } = {}
+) => {
   let next = 0
   const lane = async () => {
     while (next < messages) {
       const from = next
-      next += Math.min(BATCH, messages - from)
+      next += Math.min(perSend, messages - from)
       await producer.send({
         ...target,
-        messages: messagesOf(values, from, next - from, partitions),
+        messages: keys
+          ? keyedMessagesOf(values, keys, from, next - from)
+          : messagesOf(values, from, next - from, partitions),
       })
     }
   }
@@ -546,6 +633,22 @@ const sendFor = async (clock, started, ms, send) => {
   let sent = 0
   while (Number(clock() - started) / 1e6 < ms) sent += await send()
   return sent
+}
+
+/**
+ * Runs `sendFor` in `lanes` concurrent loops that share one window.
+ * @param {number} lanes sends in flight at once
+ * @param {() => bigint} clock
+ * @param {bigint} started
+ * @param {number} ms
+ * @param {() => Promise<number>} send one send; resolves to the messages it carried
+ * @returns {Promise<number>} the messages every lane sent
+ */
+const sendForLanes = async (lanes, clock, started, ms, send) => {
+  const sent = await Promise.all(
+    Array.from({ length: lanes }, () => sendFor(clock, started, ms, send))
+  )
+  return sent.reduce((total, n) => total + n, 0)
 }
 
 /**
@@ -597,13 +700,15 @@ const produceLatency = (
   )
 
 /**
- * Batched sends of `BATCH` messages, after an untimed warm-up: one send that pays for metadata, or
- * `WARMUP_MS` of batches with `durationMs`. With `durationMs` the measured window is that long;
- * otherwise it is `messages` messages.
+ * Batched sends of `batch` messages (`BATCH` by default), `concurrency` sends at a time (one by
+ * default), after an untimed warm-up: one send that pays for metadata, or `WARMUP_MS` of batches
+ * with `durationMs`. With `durationMs` the measured window is that long; otherwise it is
+ * `messages` messages. With `keys` message `n` of the run carries key `key-<n % keys>`; without it
+ * messages have no key.
  * @param {object} kafka
  * @param {object} target topic and codec of every send
- * @param {{ messages: number, durationMs: number|null, values: Buffer[],
- *   producerSettings: object }} options
+ * @param {{ messages: number, durationMs: number|null, values: (Buffer|string)[],
+ *   producerSettings: object, batch?: number, concurrency?: number, keys?: number }} options
  * @param {Timing} timing
  * @returns {Promise<object>} messagesPerSecond, cpuMicrosPerMessage, measuredMessages and elapsedMs
  */
@@ -611,19 +716,32 @@ const produceThroughput = (kafka, target, options, timing) =>
   withProducer(
     kafka,
     async (producer) => {
-      const { messages, durationMs, values } = options
+      const { messages, durationMs, values, batch = BATCH, concurrency = 1 } = options
       const { now, cpuUsage } = timing
-      const batch = async () => {
-        await producer.send({ ...target, messages: messagesOf(values, 0, BATCH) })
-        return BATCH
+      const keys = options.keys === undefined ? undefined : keyPool(options.keys)
+      let sent = 0
+      const nextMessages = () => {
+        if (keys === undefined) return messagesOf(values, 0, batch)
+        sent += batch
+        return keyedMessagesOf(values, keys, sent - batch, batch)
+      }
+      const send = async () => {
+        await producer.send({ ...target, messages: nextMessages() })
+        return batch
       }
       await producer.send({ ...target, messages: messagesOf(values, 0, 1) })
-      if (durationMs !== null) await sendFor(now, now(), WARMUP_MS, batch)
+      if (durationMs !== null) await sendForLanes(concurrency, now, now(), WARMUP_MS, send)
       const started = now()
       const cpu = cpuUsage()
       let measuredMessages = messages
-      if (durationMs !== null) measuredMessages = await sendFor(now, started, durationMs, batch)
-      else await sendAll(producer, target, messages, values)
+      if (durationMs !== null) {
+        measuredMessages = await sendForLanes(concurrency, now, started, durationMs, send)
+      } else {
+        await sendAll(producer, target, messages, values, concurrency, undefined, {
+          perSend: batch,
+          keys,
+        })
+      }
       const elapsedMs = Number(now() - started) / 1e6
       const { user, system } = cpuUsage(cpu)
       return {
@@ -823,32 +941,47 @@ const RUNNERS = {
  *   CompressionCodecs?: object, Partitioners?: object, lz4Version?: string|null }} client
  * @param {string} workload one of `WORKLOADS`
  * @param {{ messages: number, durationMs?: number|null, size: number, partitions?: number,
- *   compression?: 'none'|'lz4', settings?: 'defaults'|'same', passes?: number,
- *   brokers: string[] }} options
+ *   compression?: 'none'|'lz4'|'gzip', settings?: 'defaults'|'same', passes?: number,
+ *   batch?: number, concurrency?: number, keys?: number, valueType?: 'buffer'|'string',
+ *   maxRequestBytes?: number, brokers: string[] }} options
  * @param {Partial<Timing>} [timing]
  * @returns {Promise<object>} the workload's metrics, with the consumer (consume) or producer
- *   (produce) `settings` in force, and an LZ4 run's `codec`
+ *   (produce) `settings` in force, an LZ4 or gzip run's `codec`, and, when any of `batch`,
+ *   `concurrency`, `keys`, `valueType` or `maxRequestBytes` was given, those as `shape`
  * @throws {Error} for an unknown workload, or whatever the client throws
  */
 const runWorkload = async (client, workload, options, timing = {}) => {
   if (!RUNNERS[workload]) throw new Error(`unknown workload ${workload}`)
   const { Kafka, logLevel } = client
   const { partitions = DEFAULT_PARTITIONS, compression = 'none', settings = 'defaults' } = options
+  const { batch, concurrency, keys, valueType, maxRequestBytes } = options
   const consume = workload === 'consume-throughput'
-  const codec = compression === 'lz4' ? useLz4(client) : undefined
+  const codec = codecOf(client, compression)
   const kafka = new Kafka({
     clientId: `bench-compare-${workload}`,
     brokers: options.brokers,
     logLevel: logLevel.NOTHING,
   })
   const topic = `bench-compare-${workload}-${process.pid}-${Date.now()}`
-  const target = codec ? { topic, compression: client.CompressionTypes.LZ4 } : { topic }
+  const target =
+    compression === 'none'
+      ? { topic }
+      : { topic, compression: client.CompressionTypes[COMPRESSION_TYPE[compression]] }
   const same = settings === 'same'
   const consumerSettings = same ? SAME_SETTINGS : {}
-  const producerSettings =
-    same && !consume
-      ? { ...SAME_PRODUCER_SETTINGS, createPartitioner: client.Partitioners.DefaultPartitioner }
-      : {}
+  const producerSettings = {
+    ...(same &&
+      !consume && {
+        ...SAME_PRODUCER_SETTINGS,
+        createPartitioner: client.Partitioners.DefaultPartitioner,
+      }),
+    ...(maxRequestBytes !== undefined && { maxRequestSize: maxRequestBytes }),
+  }
+  const shape = Object.fromEntries(
+    Object.entries({ batch, concurrency, keys, valueType, maxRequestBytes }).filter(
+      ([, value]) => value !== undefined
+    )
+  )
   const inForce = same
     ? {
         same: consume
@@ -867,13 +1000,19 @@ const runWorkload = async (client, workload, options, timing = {}) => {
             topic,
             numPartitions: partitions,
             ...(consume && { replicationFactor: 1 }),
-            configEntries: [{ name: 'file.delete.delay.ms', value: '1000' }],
+            configEntries: [
+              { name: 'file.delete.delay.ms', value: '1000' },
+              ...(maxRequestBytes !== undefined
+                ? [{ name: 'max.message.bytes', value: String(maxRequestBytes) }]
+                : []),
+            ],
           },
         ],
         waitForLeaders: false,
       })
       await waitForLeaders(admin, topic, partitions, clock)
-      const values = valuePool(options.size)
+      const pool = valuePool(options.size)
+      const values = valueType === 'string' ? pool.map((value) => value.toString()) : pool
       const run = {
         durationMs: null,
         ...options,
@@ -884,7 +1023,12 @@ const runWorkload = async (client, workload, options, timing = {}) => {
         admin,
       }
       const metrics = await RUNNERS[workload](kafka, target, run, clock)
-      return { ...metrics, settings: inForce, ...(codec && { codec }) }
+      return {
+        ...metrics,
+        settings: inForce,
+        ...(codec && { codec }),
+        ...(Object.keys(shape).length > 0 && { shape }),
+      }
     } finally {
       if (consume) {
         await admin

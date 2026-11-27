@@ -4,9 +4,9 @@
  * alike. Each run excludes its own warm-up. An arm with a run whose measured window is shorter
  * than 30 seconds is `inconclusive`: a shorter window does not mean anything in either direction.
  * Beside the rows, each arm shows the median, minimum, maximum and spread of every metric, and,
- * from its first run, the producer or consumer settings in force, the LZ4 codec, the Fetch
- * version, the consume passes and the consume corpus layout, so a ratio can be read from the
- * report alone. A row with `profile` names each arm's CPU profile, taken in one extra run outside
+ * from its first run, the producer or consumer settings in force, the LZ4 or gzip codec, the
+ * workload shape, the Fetch version, the consume passes and the consume corpus layout, so a ratio
+ * can be read from the report alone. A row with `profile` names each arm's CPU profile, taken in one extra run outside
  * the medians. A metric in `OPTIONAL_METRICS` is left out of an arm's rows, with a note, only when
  * every run of the arm says its Node cannot measure it; a run that can but did not report it makes
  * the metric, and the arm, an error.
@@ -83,8 +83,9 @@ const plannedSeconds = ({ command, arms, profile }, runs = RUNS) => {
 /**
  * @param {object} output one run's JSON line
  * @param {string} workload the row's `--workload`
- * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 codec, Fetch
- *   version, passes and corpus layout
+ * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 or gzip codec, the
+ *   workload's shape (records per send, sends in flight, keys, value type, request size limit),
+ *   Fetch version, passes and corpus layout
  */
 const notesOf = (output, workload) => {
   const pairs = (settings) =>
@@ -108,7 +109,12 @@ const notesOf = (output, workload) => {
       output.codec.codec === 'built-in'
         ? "the package's built-in codec"
         : 'a frame codec this benchmark registers through CompressionCodecs (2.2.4 has no built-in LZ4)'
-    notes.push(`lz4: ${output.codec.package}@${output.codec.version}, ${how}`)
+    notes.push(
+      `${output.codec.name ?? 'lz4'}: ${output.codec.package}@${output.codec.version}, ${how}`
+    )
+  }
+  if (output.shape) {
+    notes.push(`workload shape (the same on both arms): ${pairs(output.shape)}`)
   }
   if (output.fetchVersion !== undefined) notes.push(`Fetch version: ${output.fetchVersion}`)
   if (output.passes > 1) {

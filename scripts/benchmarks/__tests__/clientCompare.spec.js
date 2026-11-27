@@ -274,10 +274,33 @@ const fakeKafka = ({
   const client = {
     Kafka,
     logLevel: { NOTHING: 0 },
-    CompressionTypes: { LZ4: 3 },
+    CompressionTypes: { GZIP: 1, LZ4: 3 },
     Partitioners: { DefaultPartitioner: legacyPartitioner },
   }
   return { client, state, timing }
+}
+
+/**
+ * Counts, for the producers a fake client creates from now on, how many sends are in flight at
+ * once: `peak` is the most any producer had unanswered together.
+ */
+const trackInFlight = ({ client }) => {
+  const tracker = { inFlight: 0, peak: 0 }
+  const create = client.Kafka.prototype.producer
+  client.Kafka.prototype.producer = function producer(config) {
+    const created = create.call(this, config)
+    const send = created.send
+    created.send = async (request) => {
+      tracker.peak = Math.max(tracker.peak, ++tracker.inFlight)
+      try {
+        return await send(request)
+      } finally {
+        tracker.inFlight--
+      }
+    }
+    return created
+  }
+  return tracker
 }
 
 describe('Benchmarks > clientCompare', () => {
@@ -453,10 +476,67 @@ describe('Benchmarks > clientCompare', () => {
       for (const bad of [
         ['--workload', 'produce-throughput', '--duration-ms', '30000', '--messages', '5'],
         ['--workload', 'consume-throughput', '--duration-ms', '30000'],
-        ['--workload', 'produce-throughput', '--compression', 'gzip'],
+        ['--workload', 'produce-throughput', '--compression', 'zstd'],
         ['--workload', 'consume-throughput', '--settings', 'other'],
         ['--workload', 'produce-throughput', '--partitions', '0'],
         ['--workload', 'produce-throughput', '--duration-ms', '1.5'],
+      ]) {
+        expect(() => parse(...bad)).toThrow(/usage/)
+      }
+    })
+
+    test('parseArgs reads --batch, --concurrency, --keys, --value-type and --max-request-bytes on the produce workloads, gzip as a compression, and leaves the flags absent otherwise', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      expect(
+        parse(
+          '--workload',
+          'produce-throughput',
+          '--batch',
+          '8',
+          '--concurrency',
+          '4',
+          '--keys',
+          '1024',
+          '--value-type',
+          'string',
+          '--max-request-bytes',
+          '2097152',
+          '--compression',
+          'gzip'
+        )
+      ).toMatchObject({
+        batch: 8,
+        concurrency: 4,
+        keys: 1024,
+        valueType: 'string',
+        maxRequestBytes: 2097152,
+        compression: 'gzip',
+      })
+      expect(
+        parse('--workload', 'produce-latency', '--value-type', 'buffer', '--max-request-bytes', '9')
+      ).toMatchObject({ valueType: 'buffer', maxRequestBytes: 9 })
+      const plain = parse('--workload', 'produce-throughput')
+      for (const key of ['batch', 'concurrency', 'keys', 'valueType', 'maxRequestBytes']) {
+        expect([key, plain[key]]).toEqual([key, undefined])
+      }
+    })
+
+    test('parseArgs refuses --batch, --concurrency and --keys outside produce-throughput, the other new flags on consume, and a bad value type or count', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      for (const bad of [
+        ['--workload', 'consume-throughput', '--batch', '8'],
+        ['--workload', 'consume-throughput', '--concurrency', '2'],
+        ['--workload', 'consume-throughput', '--keys', '2'],
+        ['--workload', 'consume-throughput', '--value-type', 'string'],
+        ['--workload', 'consume-throughput', '--max-request-bytes', '1048576'],
+        ['--workload', 'produce-latency', '--batch', '8'],
+        ['--workload', 'produce-latency', '--concurrency', '8'],
+        ['--workload', 'produce-latency', '--keys', '8'],
+        ['--workload', 'produce-throughput', '--value-type', 'bytes'],
+        ['--workload', 'produce-throughput', '--batch', '0'],
+        ['--workload', 'produce-throughput', '--keys', '1.5'],
       ]) {
         expect(() => parse(...bad)).toThrow(/usage/)
       }
@@ -675,6 +755,66 @@ describe('Benchmarks > clientCompare', () => {
         cpuMicrosPerMessage: 1500 / 150000,
         settings: { defaults: null },
       })
+    })
+
+    test('produce-throughput with --batch sends that many records per send, warm-up and window alike', async () => {
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 8 },
+        fakeKafka({ sendMs: 100 })
+      )
+
+      expect(state.sends).toEqual([1, ...Array(350).fill(8)])
+      expect(metrics).toMatchObject({ elapsedMs: 30000, measuredMessages: 300 * 8 })
+      expect(metrics.messagesPerSecond).toBeCloseTo(80, 6)
+    })
+
+    test('produce-throughput with --concurrency keeps that many sends in flight, and the window counts every lane', async () => {
+      const kafka = fakeKafka({ sendMs: 100 })
+      const flight = trackInFlight(kafka)
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 1, concurrency: 4 },
+        kafka
+      )
+
+      expect(flight.peak).toBe(4)
+      expect(state.sends).toEqual([1, ...Array(350).fill(1)])
+      expect(metrics).toMatchObject({ elapsedMs: 30000, measuredMessages: 300 })
+    })
+
+    test('produce-throughput sends one send at a time unless --concurrency says otherwise', async () => {
+      const kafka = fakeKafka({ sendMs: 100 })
+      const flight = trackInFlight(kafka)
+
+      await runWith('produce-throughput', { messages: 1200, durationMs: null }, kafka)
+
+      expect(flight.peak).toBe(1)
+    })
+
+    test('produce-throughput with --keys gives message n the key key-<n % keys> across sends, and no key without it', async () => {
+      const keyed = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 3, keys: 4 },
+        fakeKafka({ sendMs: 100 })
+      )
+      const sized = await runWith('produce-throughput', { messages: 25, batch: 7, keys: 10 })
+      const plain = await runWith('produce-throughput', { messages: 5 })
+
+      const logOf = ({ state }) => state.topics.values().next().value
+      const [warmup, ...records] = logOf(keyed)
+      expect('key' in warmup).toBe(false)
+      expect(records).toHaveLength(350 * 3)
+      expect(records.map(({ key }) => key)).toEqual(
+        Array.from({ length: records.length }, (_, n) => `key-${n % 4}`)
+      )
+      expect(sized.state.sends).toEqual([1, 7, 7, 7, 4])
+      expect(logOf(sized).map(({ key }) => key)).toEqual([
+        undefined,
+        ...Array.from({ length: 25 }, (_, n) => `key-${n % 10}`),
+      ])
+      expect(logOf(plain).some((record) => 'key' in record)).toBe(false)
     })
 
     test('produce-latency with --duration-ms times single sends only after the warm-up', async () => {
@@ -1027,6 +1167,92 @@ describe('Benchmarks > clientCompare', () => {
       })
       expect(builtIn.client.CompressionCodecs).toEqual({})
       expect(kept.state.compressions).toEqual([3, 3])
+    })
+
+    test('gzip compresses every send with the built-in codec, registers nothing and reports the codec', async () => {
+      const kafka = fakeKafka()
+      kafka.client.CompressionCodecs = {}
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 5, compression: 'gzip' },
+        kafka
+      )
+
+      expect(state.compressions).toEqual([1, 1])
+      expect(kafka.client.CompressionCodecs).toEqual({})
+      expect(metrics.codec).toEqual({
+        name: 'gzip',
+        codec: 'built-in',
+        package: 'zlib',
+        version: process.versions.zlib,
+      })
+    })
+
+    test('produce workloads with --value-type string send string values with the corpus text, and Buffers otherwise', async () => {
+      const asString = await runWith('produce-throughput', { messages: 5, valueType: 'string' })
+      const asLatency = await runWith('produce-latency', { messages: 3, valueType: 'string' })
+      const asBuffer = await runWith('produce-throughput', { messages: 5 })
+      const logOf = ({ state }) => state.topics.values().next().value
+
+      expect(logOf(asString).map(({ value }) => typeof value)).toEqual(Array(6).fill('string'))
+      expect(logOf(asLatency).map(({ value }) => typeof value)).toEqual(Array(4).fill('string'))
+      expect(logOf(asString)[0].value).toBe(valuePool(8)[0].toString())
+      expect(logOf(asBuffer).every(({ value }) => Buffer.isBuffer(value))).toBe(true)
+    })
+
+    test('produce workloads with --max-request-bytes create the topic with that max.message.bytes and give the producer that maxRequestSize, and set neither without it', async () => {
+      const limited = await runWith('produce-throughput', { messages: 5, maxRequestBytes: 2097152 })
+      const same = await runWith('produce-latency', {
+        messages: 2,
+        settings: 'same',
+        maxRequestBytes: 4096,
+      })
+      const plain = await runWith('produce-throughput', { messages: 5 })
+
+      expect(limited.state.createdTopics[0].configEntries).toEqual([
+        { name: 'file.delete.delay.ms', value: '1000' },
+        { name: 'max.message.bytes', value: '2097152' },
+      ])
+      expect(limited.state.producerConfigs).toEqual([{ maxRequestSize: 2097152 }])
+      expect(same.state.producerConfigs).toEqual([
+        { ...SAME_PRODUCER_SETTINGS, createPartitioner: legacyPartitioner, maxRequestSize: 4096 },
+      ])
+      expect(plain.state.createdTopics[0].configEntries).toEqual([
+        { name: 'file.delete.delay.ms', value: '1000' },
+      ])
+      expect(plain.state.producerConfigs).toEqual([{}])
+    })
+
+    test('a run reports its shape flags as shape, and no shape when none was given', async () => {
+      const plain = await runWith('produce-throughput', { messages: 5 })
+      const shaped = await runWith('produce-throughput', {
+        messages: 5,
+        batch: 2,
+        concurrency: 3,
+        keys: 4,
+        valueType: 'string',
+        maxRequestBytes: 4096,
+      })
+      const partial = await runWith('produce-throughput', { messages: 5, batch: 2 })
+
+      expect(Object.hasOwn(plain.metrics, 'shape')).toBe(false)
+      expect(shaped.metrics.shape).toEqual({
+        batch: 2,
+        concurrency: 3,
+        keys: 4,
+        valueType: 'string',
+        maxRequestBytes: 4096,
+      })
+      expect(partial.metrics.shape).toEqual({ batch: 2 })
+    })
+
+    test('the corpus holds at most 64 MiB: a 1 MiB record size gives 64 values of that size', () => {
+      const values = valuePool(1048576)
+
+      expect(values).toHaveLength(64)
+      expect(values.every((value) => value.length === 1048576)).toBe(true)
+      expect(values[0].equals(values[1])).toBe(false)
     })
 
     test('the fork consumer defaults it reports are the ones its source sets', () => {

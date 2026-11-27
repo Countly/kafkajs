@@ -66,7 +66,7 @@ describe('Benchmark report clientCompare adapter', () => {
       }
     })
 
-    test('the compare rows cover 200-byte and 1 KiB records, lz4, 12 partitions and a same-settings consume row', () => {
+    test('the compare rows cover 200-byte, 1 KiB, 16 KiB, 100 KiB and 1 MiB records, lz4, gzip, 12 partitions and a same-settings consume row', () => {
       const shape = (row) => [
         valueOf(row.command, '--workload'),
         valueOf(row.command, '--size') ?? '200',
@@ -83,6 +83,56 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-1k': ['produce-throughput', '1024', 'none', '3', 'defaults'],
         'compare-produce-throughput-lz4': ['produce-throughput', '200', 'lz4', '3', 'defaults'],
         'compare-produce-throughput-12p': ['produce-throughput', '200', 'none', '12', 'defaults'],
+        'compare-produce-throughput-100k': [
+          'produce-throughput',
+          '102400',
+          'none',
+          '3',
+          'defaults',
+        ],
+        'compare-produce-throughput-1m': ['produce-throughput', '1048576', 'none', '3', 'defaults'],
+        'compare-produce-throughput-16k-under': [
+          'produce-throughput',
+          '16320',
+          'none',
+          '3',
+          'defaults',
+        ],
+        'compare-produce-throughput-16k-over': [
+          'produce-throughput',
+          '16448',
+          'none',
+          '3',
+          'defaults',
+        ],
+        'compare-produce-throughput-12p-keyed': [
+          'produce-throughput',
+          '200',
+          'none',
+          '12',
+          'defaults',
+        ],
+        'compare-produce-throughput-string-1k': [
+          'produce-throughput',
+          '1024',
+          'none',
+          '3',
+          'defaults',
+        ],
+        'compare-produce-throughput-100k-gzip': [
+          'produce-throughput',
+          '102400',
+          'gzip',
+          '3',
+          'defaults',
+        ],
+        'compare-produce-throughput-concurrent': [
+          'produce-throughput',
+          '200',
+          'none',
+          '3',
+          'defaults',
+        ],
         'compare-consume-throughput': ['consume-throughput', '200', 'none', '3', 'defaults'],
         'compare-consume-throughput-same': ['consume-throughput', '200', 'none', '3', 'same'],
         'compare-consume-throughput-1k': ['consume-throughput', '1024', 'none', '3', 'defaults'],
@@ -130,6 +180,68 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(compareRows.filter((row) => 'profile' in row && row.profile !== true)).toEqual([])
     })
 
+    test('the large-value, keyed, string and concurrent produce rows set the flags their shape needs and no other', () => {
+      const shapeFlags = [
+        '--batch',
+        '--concurrency',
+        '--keys',
+        '--value-type',
+        '--max-request-bytes',
+      ]
+      const extras = (name) => {
+        const row = compareRows.find((candidate) => candidate.name === name)
+        return Object.fromEntries(
+          shapeFlags
+            .filter((flag) => valueOf(row.command, flag) !== undefined)
+            .map((flag) => [flag, valueOf(row.command, flag)])
+        )
+      }
+      const names = compareRows
+        .map(({ name }) => name)
+        .filter((name) => name.startsWith('compare-produce-throughput'))
+
+      expect(Object.fromEntries(names.map((name) => [name, extras(name)]))).toEqual({
+        'compare-produce-throughput': {},
+        'compare-produce-throughput-same': {},
+        'compare-produce-throughput-1k': {},
+        'compare-produce-throughput-lz4': {},
+        'compare-produce-throughput-12p': {},
+        'compare-produce-throughput-100k': { '--batch': '8' },
+        'compare-produce-throughput-1m': { '--batch': '1', '--max-request-bytes': '2097152' },
+        'compare-produce-throughput-16k-under': { '--batch': '32' },
+        'compare-produce-throughput-16k-over': { '--batch': '32' },
+        'compare-produce-throughput-12p-keyed': { '--keys': '1024' },
+        'compare-produce-throughput-string-1k': { '--value-type': 'string' },
+        'compare-produce-throughput-100k-gzip': { '--batch': '8' },
+        'compare-produce-throughput-concurrent': { '--batch': '1', '--concurrency': '256' },
+      })
+    })
+
+    test('a send of every produce-throughput row fits the request and topic limit in force, even when every record goes to one partition', () => {
+      // The producer's default maxRequestSize and the topic's default max.message.bytes are 1 MiB;
+      // a row that needs more sets --max-request-bytes. 100 bytes per record cover the record framing.
+      const DEFAULT_LIMIT = 1048576
+      const produceRows = compareRows.filter(
+        (row) => valueOf(row.command, '--workload') === 'produce-throughput'
+      )
+
+      expect(produceRows.length).toBeGreaterThan(0)
+      for (const row of produceRows) {
+        const size = Number(valueOf(row.command, '--size') ?? 200)
+        const batch = Number(valueOf(row.command, '--batch') ?? 500)
+        const limit = Number(valueOf(row.command, '--max-request-bytes') ?? DEFAULT_LIMIT)
+        expect([row.name, batch * (size + 100) <= limit]).toEqual([row.name, true])
+      }
+    })
+
+    test('the 16 KiB rows put their values 32 bytes or more under and over 16 KiB', () => {
+      const sizeOf = (name) =>
+        Number(valueOf(compareRows.find((row) => row.name === name).command, '--size'))
+
+      expect(16384 - sizeOf('compare-produce-throughput-16k-under')).toBeGreaterThanOrEqual(32)
+      expect(sizeOf('compare-produce-throughput-16k-over') - 16384).toBeGreaterThanOrEqual(32)
+    })
+
     test('the 1 KiB same-settings consume row is the 1 KiB consume row with --settings same', () => {
       const byName = (name) => compareRows.find((row) => row.name === name)
       const defaults = byName('compare-consume-throughput-1k')
@@ -149,7 +261,7 @@ describe('Benchmark report clientCompare adapter', () => {
       )
       const minutes = compareRows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
 
-      expect(Math.round(minutes)).toBe(208)
+      expect(Math.round(minutes)).toBe(258)
       expect(minutes + 20).toBeLessThanOrEqual(workflow.jobs.bench['timeout-minutes'])
     })
   })
@@ -299,6 +411,30 @@ describe('Benchmark report clientCompare adapter', () => {
       ])
       expect(consumed.detail.notes.slice(1)).toEqual([
         'the corpus is read 4 times: each partition is sought back to its first offset after its last record',
+      ])
+    })
+
+    test('a produce arm notes its workload shape and a built-in gzip codec', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const extra = {
+        codec: { name: 'gzip', codec: 'built-in', package: 'zlib', version: '1.3.1' },
+        shape: {
+          batch: 8,
+          concurrency: 4,
+          keys: 1024,
+          valueType: 'string',
+          maxRequestBytes: 2097152,
+        },
+      }
+
+      const { detail } = adapter.rows(produce, 'fork', { outputs: [output(1, 30000, extra)] }, 1)
+
+      expect(detail.notes.slice(1)).toEqual([
+        "gzip: zlib@1.3.1, the package's built-in codec",
+        'workload shape (the same on both arms): batch=8, concurrency=4, keys=1024, valueType="string", maxRequestBytes=2097152',
       ])
     })
 
