@@ -369,9 +369,12 @@ const countRecords = (cluster) => {
  */
 const recordCounts = (cluster) => noted.get(cluster)
 
+/** An explicitly idempotent producer refuses `retries: 0`; a terminal answer needs no retry. */
+const ONE_RETRY = { retries: 1, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
+
 const PATHS = [
-  ['idempotent', true],
-  ['plain', false],
+  ['idempotent', true, ONE_RETRY],
+  ['plain', false, { retries: 0 }],
 ]
 
 describe('Producer > the record errors of a shared batch', () => {
@@ -422,9 +425,9 @@ describe('Producer > the record errors of a shared batch', () => {
     return sends
   }
 
-  describe.each(PATHS)('%s', (_, idempotent) => {
+  describe.each(PATHS)('%s', (_, idempotent, retry) => {
     test('two coalesced sends, the broker rejects one record of the first: only the first gets it, each its own error', async () => {
-      const { producer, cluster } = await start({ idempotent })
+      const { producer, cluster } = await start({ idempotent, retry })
       const answer = answerError(INVALID_RECORD, [0])
       cluster.broker.produce.mockImplementation(async (request) =>
         resultsOf(request, { 0: answer })
@@ -451,7 +454,7 @@ describe('Producer > the record errors of a shared batch', () => {
     })
 
     test('one error object answering two partitions of a response is ambiguous: both sends get it raw', async () => {
-      const { producer, cluster } = await start({ idempotent, partitions: 2 })
+      const { producer, cluster } = await start({ idempotent, retry, partitions: 2 })
       const answer = answerError(INVALID_RECORD, [0])
       cluster.broker.produce.mockImplementation(async (request) =>
         resultsOf(request, { 0: answer, 1: answer })
@@ -798,7 +801,7 @@ describe('Producer > the record errors of a shared batch', () => {
         logger: newLogger(),
         idempotent: true,
         linger: 0,
-        retry: { retries: 0 },
+        retry: ONE_RETRY,
       })
       producers.push(producer)
       await producer.connect()
