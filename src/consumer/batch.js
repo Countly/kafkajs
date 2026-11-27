@@ -83,16 +83,16 @@ module.exports = class Batch {
   }
 
   /**
-   * The admission the Fetch that produced `batch` was built under: its leader epoch and the
-   * validation entry it was admitted under. Kept off the batch's own properties, so the
-   * `eachBatch` payload does not show it.
+   * The validation entry the Fetch that produced `batch` was admitted under. Kept off the batch's
+   * own properties, so the `eachBatch` payload does not show it.
    * @param {object} batch
-   * @returns {{epoch: number, entry: object|undefined}|undefined} `undefined` for a batch built
-   *   outside a fetch, including an object that is not a `Batch`
+   * @returns {object|null|undefined} the entry; `null` for a fetched batch that names none, which
+   *   no entry admits; `undefined` for a batch built outside a fetch (it has no fetch epoch),
+   *   including an object that is not a `Batch`
    */
   static admissionOf(batch) {
     if (!(#fetchEpoch in batch) || batch.#fetchEpoch === undefined) return undefined
-    return { epoch: batch.#fetchEpoch, entry: batch.#admittedUnder }
+    return batch.#admittedUnder ?? null
   }
 
   /**

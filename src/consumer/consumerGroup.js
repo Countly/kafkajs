@@ -45,7 +45,10 @@ const isChangedSince = (acquired, clock) => acquired.changedAt > clock || acquir
  */
 const indexFirstBy = (items, field) => {
   const index = new Map()
-  for (const item of items) if (!index.has(item[field])) index.set(item[field], item)
+  for (const item of items) {
+    const key = item[field]
+    if (!index.has(key)) index.set(key, item)
+  }
   return index
 }
 
@@ -2903,45 +2906,47 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * The one rule for using fetched data: data fetched at leader epoch `epoch` may be requested,
-   * written to the wire, accepted or handed to a handler only while the cached leader epoch is
-   * still `epoch` and the partition's position is validated against it under the partition's
-   * current routing stamp (`Cluster#routingStamp`), which changes on every accepted leader or
-   * epoch change: a partition whose leader moved away and back to the same epoch is not admitted
-   * by its earlier validation. Epochs compare as numbers; -1 (unknown) is a value like any other,
-   * and a partition with no validation entry is never admitted.
+   * The one rule for using fetched data: the validation entry a partition's data may be fetched,
+   * written to the wire, accepted or handed to a handler under, or `undefined` when there is none.
+   * An entry admits while it is validated (not awaiting an answer) and was validated under the
+   * partition's current routing stamp (`Cluster#routingStamp`). The cache changes that stamp on
+   * every accepted leader or leader-epoch change and never reuses one, and an entry records the
+   * stamp read together with the epoch it validated, so the stamp alone also answers whether the
+   * cached epoch is still `validatedAgainst`; a leader that moved away and back to the same epoch
+   * is a change. A cluster without routing stamps (a test double; the client's always has them) is
+   * asked for the epoch instead.
    *
-   * The entry returned is the admission identity: a request and its batch record it, and they are
-   * used only while the partition is still validated under that same entry, so data fetched before
-   * a validation that was redone at the same epoch is not.
+   * The entry is the admission identity: a request and its batch record it, fetch at its
+   * `validatedAgainst` epoch, and are used only while this still returns that same entry, so data
+   * fetched before a validation that was redone at the same epoch is not.
    * @param {string} topic
    * @param {number} partition
-   * @param {number} epoch the leader epoch the data was, or is about to be, fetched at
-   * @returns {object|undefined} the validator entry the data is admitted under, or `undefined`
+   * @returns {{validatedAgainst: number}|undefined} the admitting validator entry
    */
-  admissionEntry(topic, partition, epoch) {
-    if (this.cluster.leaderEpoch(topic, partition) !== epoch) return undefined
+  admissionEntry(topic, partition) {
     const entry = this.positionValidator.entryOf(topic, partition)
-    return entry !== undefined &&
-      entry.validatedAgainst === epoch &&
-      entry.routing === this.cluster.routingStamp?.(topic, partition)
-      ? entry
-      : undefined
+    if (entry === undefined || entry.validatedAgainst === undefined) return undefined
+    const stamp = this.cluster.routingStamp?.(topic, partition)
+    const current =
+      stamp === undefined
+        ? this.cluster.leaderEpoch(topic, partition) === entry.validatedAgainst
+        : entry.routing === stamp
+    return current ? entry : undefined
   }
 
   /**
    * Checks the round's whole logical request against `admissionEntry` at the moment its frame is
    * about to be written, including the partitions a Fetch session carries without sending them.
    * @private
-   * @param {{topic: string, partitions: {partition: number, currentLeaderEpoch: number,
-   *   admittedUnder: object}[]}[]} requests the round's request entries
+   * @param {{topic: string, partitions: {partition: number, admittedUnder: object}[]}[]} requests
+   *   the round's request entries
    * @returns {KafkaJSError|null} the refusal when a partition is no longer admitted under the
    *   entry it was built with, so the frame is not written; null otherwise
    */
   lapsedAdmission(requests) {
     for (const { topic, partitions } of requests) {
-      for (const { partition, currentLeaderEpoch, admittedUnder } of partitions) {
-        if (this.admissionEntry(topic, partition, currentLeaderEpoch) !== admittedUnder) {
+      for (const { partition, admittedUnder } of partitions) {
+        if (this.admissionEntry(topic, partition) !== admittedUnder) {
           return new KafkaJSError(
             `Fetch not sent: ${topic} partition ${partition} changed leader epoch or validation after the request was built`,
             { retriable: true }
@@ -2953,18 +2958,8 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * @param {string} topic
-   * @param {number} partition
-   * @param {number} epoch the leader epoch the data was fetched at
-   * @returns {boolean} whether data fetched at `epoch` may still be used, see `admissionEntry`
-   */
-  validationAllows(topic, partition, epoch) {
-    return this.admissionEntry(topic, partition, epoch) !== undefined
-  }
-
-  /**
-   * A count that grows on every change of a validation entry. With the cached leader epoch, it is
-   * everything `validationAllows` reads: while neither changed, its answer has not changed.
+   * A count that grows on every change of a validation entry. With the routing stamp, it is
+   * everything `admissionEntry` reads: while neither changed, its answer has not changed.
    * @returns {number}
    */
   validationVersion() {
@@ -3014,8 +3009,7 @@ module.exports = class ConsumerGroup {
           ) {
             return requests
           }
-          const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
-          const admittedUnder = this.admissionEntry(topic, partition, currentLeaderEpoch)
+          const admittedUnder = this.admissionEntry(topic, partition)
           if (
             admittedUnder !== undefined &&
             (this.haltedPartitions.size === 0 ||
@@ -3025,7 +3019,8 @@ module.exports = class ConsumerGroup {
             requests.push({
               partition,
               fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-              currentLeaderEpoch,
+              // The cached epoch: the admitting entry was validated against it.
+              currentLeaderEpoch: admittedUnder.validatedAgainst,
               maxBytes: this.maxBytesPerPartition,
               admittedUnder,
             })
@@ -3171,13 +3166,14 @@ module.exports = class ConsumerGroup {
       this.offsetManager.positionOf(topicName, partition) !== String(requested.fetchOffset)
     ) {
       dropped = 'moved'
-    } else if (
-      this.admissionEntry(topicName, partition, requested.currentLeaderEpoch) !==
-      requested.admittedUnder
-    ) {
-      dropped = this.validationAllows(topicName, partition, requested.currentLeaderEpoch)
-        ? 'readmitted'
-        : 'validation'
+    } else {
+      const admitted = this.admissionEntry(topicName, partition)
+      if (admitted !== requested.admittedUnder) {
+        dropped =
+          admitted !== undefined && admitted.validatedAgainst === requested.currentLeaderEpoch
+            ? 'readmitted'
+            : 'validation'
+      }
     }
     if (dropped !== null) {
       this.logger.debug('Dropping fetched partition', {

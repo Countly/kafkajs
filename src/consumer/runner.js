@@ -1758,22 +1758,21 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether the batch's data may still be used: at the leader epoch its Fetch was built at, its
-   * partition is still admitted under the same validation entry the Fetch was admitted under
-   * (`ConsumerGroup#admissionEntry`), so a new leader epoch, a leader that moved away and back, or
-   * a validation redone at the same epoch all stop it. A batch built outside a fetch carries no
-   * fetch epoch, and a group without the rule (a test double; the consumer group always has it)
-   * admits everything.
+   * Whether the batch's data may still be used: its partition is still admitted under the same
+   * validation entry its Fetch was admitted under (`ConsumerGroup#admissionEntry`), so a new leader
+   * epoch, a leader that moved away and back, or a validation redone at the same epoch all stop
+   * it. A batch built outside a fetch carries no fetch epoch, and a group without the rule (a test
+   * double; the consumer group always has it) admits everything.
    * @param {import('./batch')} batch
    * @returns {boolean}
    */
   #admitted(batch) {
-    const admission = Batch.admissionOf(batch)
+    const entry = Batch.admissionOf(batch)
     const group = this.consumerGroup
     return (
-      admission === undefined ||
+      entry === undefined ||
       typeof group.admissionEntry !== 'function' ||
-      group.admissionEntry(batch.topic, batch.partition, admission.epoch) === admission.entry
+      group.admissionEntry(batch.topic, batch.partition) === entry
     )
   }
 

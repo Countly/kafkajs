@@ -1806,7 +1806,6 @@ describe('Consumer > Runner', () => {
         positionValidator,
         routingVersion: 0,
         admissionEntry: ConsumerGroup.prototype.admissionEntry,
-        validationAllows: ConsumerGroup.prototype.validationAllows,
         validationVersion: ConsumerGroup.prototype.validationVersion,
         heartbeatIdle: jest.fn(() => true),
       })

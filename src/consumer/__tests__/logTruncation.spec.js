@@ -1088,9 +1088,9 @@ describe('Consumer > answers from before a leader epoch change', () => {
           // handed over or resolved from it.
           h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
           const admission = Batch.admissionOf(queued)
-          expect(admission.epoch).toBe(5)
-          expect(admission.entry).toBe(h.group.positionValidator.entryOf(TOPIC, 0))
-          expect(h.group.admissionEntry(TOPIC, 0, admission.epoch)).toBeUndefined()
+          expect(admission.validatedAgainst).toBe(5)
+          expect(admission).toBe(h.group.positionValidator.entryOf(TOPIC, 0))
+          expect(h.group.admissionEntry(TOPIC, 0)).toBeUndefined()
 
           h.setResponse(fetchResponse([ROWS.records, IDLE], answering(fetchSessions)))
           const replay = await h.group.fetch(NODE_ID)
