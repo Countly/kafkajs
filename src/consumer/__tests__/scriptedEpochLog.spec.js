@@ -1102,8 +1102,12 @@ const manualHooks = () => {
 }
 
 describe('Test harness > fixture tracking', () => {
-  /** @returns {() => boolean} always released */
-  const released = () => true
+  /**
+   * @param {() => void|Promise<void>} release
+   * @returns {{ release: () => void|Promise<void>, remains: () => string[] }} a fixture that
+   *   holds nothing once released and had no work in flight
+   */
+  const fixture = (release) => ({ release, remains: () => [] })
 
   test('releases the fixtures last created first', async () => {
     const order = []
@@ -1111,10 +1115,9 @@ describe('Test harness > fixture tracking', () => {
     for (const name of ['first', 'second', 'third']) {
       tracker.add(
         name,
-        async () => {
+        fixture(async () => {
           order.push(name)
-        },
-        released
+        })
       )
     }
 
@@ -1128,22 +1131,23 @@ describe('Test harness > fixture tracking', () => {
     const early = new Error('the last created fixture failed')
     const late = new Error('the middle fixture failed')
     const tracker = new FixtureTracker()
-    tracker.add('first', async () => order.push('first'), released)
+    tracker.add(
+      'first',
+      fixture(async () => order.push('first'))
+    )
     tracker.add(
       'second',
-      async () => {
+      fixture(async () => {
         order.push('second')
         throw late
-      },
-      released
+      })
     )
     tracker.add(
       'third',
-      async () => {
+      fixture(async () => {
         order.push('third')
         throw early
-      },
-      released
+      })
     )
 
     await expect(tracker.releaseAll()).rejects.toBe(early)
@@ -1153,14 +1157,13 @@ describe('Test harness > fixture tracking', () => {
 
   test('a fixture still not released after its teardown fails the test, naming its creator', async () => {
     const tracker = new FixtureTracker()
-    tracker.add(
-      'createFetchGroup',
-      async () => {},
-      () => false
-    )
+    tracker.add('createFetchGroup', {
+      release: async () => {},
+      remains: () => ['1 live socket at node 0'],
+    })
 
     await expect(tracker.releaseAll()).rejects.toThrow(
-      'createFetchGroup: the fixture is not released after its teardown'
+      'createFetchGroup: after its teardown it still holds 1 live socket at node 0'
     )
   })
 
@@ -1169,16 +1172,153 @@ describe('Test harness > fixture tracking', () => {
     const tracker = new FixtureTracker()
     tracker.add(
       'creating',
-      async () => {
+      fixture(async () => {
         order.push('creating')
-        tracker.add('late', async () => order.push('late'), released)
-      },
-      released
+        tracker.add(
+          'late',
+          fixture(async () => order.push('late'))
+        )
+      })
     )
 
     await tracker.releaseAll()
 
     expect(order).toEqual(['creating', 'late'])
+  })
+
+  test('a fixture a release creates is released before the older ones, and every release runs when one throws', async () => {
+    const order = []
+    const early = new Error('the second fixture failed')
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'first',
+      fixture(async () => {
+        order.push('first')
+        throw new Error('the first fixture failed too')
+      })
+    )
+    tracker.add(
+      'second',
+      fixture(async () => {
+        order.push('second')
+        // Built from the first fixture, so it must go before it.
+        tracker.add(
+          'third',
+          fixture(async () => order.push('third'))
+        )
+        throw early
+      })
+    )
+
+    await expect(tracker.releaseAll()).rejects.toBe(early)
+
+    expect(order).toEqual(['second', 'third', 'first'])
+  })
+
+  test('a fixture registered after the release finished is refused, naming its creator', async () => {
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'first',
+      fixture(async () => {})
+    )
+    await tracker.releaseAll()
+
+    expect(() =>
+      tracker.add(
+        'createFakeBroker',
+        fixture(async () => {})
+      )
+    ).toThrow("createFakeBroker() ran after its test's fixtures were torn down")
+  })
+
+  test('a test that ends with a request in flight fails at teardown, naming the creator, request, correlation id and endpoint, once the request is rejected', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const asked = []
+    const { broker, state } = harness.createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return new Promise(() => {})
+    })
+    await broker.connect()
+    const outcome = jest.fn()
+    broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+      () => outcome('answered'),
+      (error) => outcome(error.name)
+    )
+    while (asked.length === 0) await nextTurn()
+
+    await expect(hooks.after()).rejects.toThrow(
+      'createFakeBroker: the test ended with work in flight, which its teardown abandoned: ' +
+        `OffsetForLeaderEpoch request (correlation id ${asked[0]}) at 127.0.0.1:9092`
+    )
+    await nextTurn()
+
+    expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+    expect(state.sockets.map(({ destroyed }) => destroyed)).toEqual([true])
+  })
+
+  test('a fetch group that ends with a validation request in flight fails at teardown, naming the node', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const h = await harness.createFetchGroup()
+    h.setValidationResponse(() => new Promise(() => {}))
+    const outcome = jest.fn()
+    h.broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+      () => outcome('answered'),
+      (error) => outcome(error.name)
+    )
+    while (h.validationRequests().length === 0) await nextTurn()
+    const [frame] = h.writes().slice(-1)
+
+    await expect(hooks.after()).rejects.toThrow(
+      'createFetchGroup: the test ended with work in flight, which its teardown abandoned: ' +
+        `OffsetForLeaderEpoch request (correlation id ${readRequestHeader(frame).correlationId}) ` +
+        'at node 0'
+    )
+    await nextTurn()
+
+    expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+  })
+
+  test('a fixture whose disconnect returns without closing its socket fails at teardown, naming what it still holds', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const { broker, state } = harness.createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : Buffer.alloc(0)
+    )
+    await broker.connect()
+    const disconnect = jest.spyOn(broker, 'disconnect').mockResolvedValue()
+
+    try {
+      await expect(hooks.after()).rejects.toThrow(
+        'createFakeBroker: after its teardown it still holds 1 live socket at 127.0.0.1:9092'
+      )
+      expect(disconnect).toHaveBeenCalledWith({ drainTimeout: 0 })
+    } finally {
+      disconnect.mockRestore()
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+    expect(state.sockets.map(({ destroyed }) => destroyed)).toEqual([true])
+  })
+
+  test("a second copy of the harness shares the running test's tracker, and refuses a second trackFixtures", async () => {
+    const harness = isolatedHarness()
+
+    const { broker } = harness.createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : Buffer.alloc(0)
+    )
+    await broker.connect()
+
+    expect(() => harness.trackFixtures()).toThrow(
+      'trackFixtures() was called twice in one spec file'
+    )
   })
 
   test('trackFixtures tears down every fixture a test created when the test ends, last created first', async () => {
@@ -1213,13 +1353,18 @@ describe('Test harness > fixture tracking', () => {
   })
 
   test.each([
-    ['no tracker installed', false],
-    ['a tracker installed and no test running', true],
+    ['a tracker installed and no test running', false],
+    ['its tracked test already ended', true],
   ])(
     'createFetchGroup, createFakeBroker and createFakeCoordinator throw naming themselves with %s',
-    async (_label, installed) => {
+    async (_label, ended) => {
       const harness = isolatedHarness()
-      if (installed) harness.trackFixtures(manualHooks().api)
+      const { hooks, api } = manualHooks()
+      harness.trackFixtures(api)
+      if (ended) {
+        hooks.before()
+        await hooks.after()
+      }
       const answer = () => Buffer.alloc(0)
 
       await expect(harness.createFetchGroup()).rejects.toThrow(
