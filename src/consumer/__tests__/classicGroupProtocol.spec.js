@@ -15,7 +15,7 @@ const {
 const { newLogger } = require('testHelpers')
 const Generation = require('../../producer/generation')
 const GroupOwnership = require('../groupOwnership')
-const { KafkaJSConnectionError } = require('../../errors')
+const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const sleep = require('../../utils/sleep')
 
@@ -535,7 +535,7 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     expect(syncGroup).not.toHaveBeenCalled()
   })
 
-  it('ignores an undecodable assigned buffer and still names the owners of a real conflict', () => {
+  it('passes a member assigned nothing and still names the owners of a real conflict', () => {
     const protocol = leader()
     const owned = MemberMetadata.encode({
       version: 1,
@@ -544,18 +544,41 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
       ownedPartitions: [{ topic: 'a', partitions: [0] }],
     })
     const members = [{ memberId: 'm1', memberMetadata: owned }]
-    const taken = MemberAssignment.encode({
-      version: 1,
-      assignment: { a: [0] },
-      userData: Buffer.alloc(0),
-    })
-    const assignment = [
-      { memberId: 'm3', memberAssignment: Buffer.alloc(0) },
-      { memberId: 'm2', memberAssignment: taken },
+    const assigned = [
+      { memberId: 'm3', assignment: {} },
+      { memberId: 'm2', assignment: { a: [0] } },
     ]
-    expect(() => protocol.assertNoDoubleAssignment({ members, assignment })).toThrow(
+    expect(() => protocol.assertNoDoubleAssignment({ members, assigned })).toThrow(
       'a-0 to m2 while m1 still owns it'
     )
+  })
+
+  it('an eager leader whose own assigner writes one byte for a member stops before SyncGroup, naming the assigner and the member', async () => {
+    const syncGroup = jest.fn()
+    const protocol = leader({
+      assigners: [
+        {
+          name: 'custom',
+          assign: async () => [
+            { memberId: 'm1', memberAssignment: Buffer.alloc(0) },
+            { memberId: 'm2', memberAssignment: Buffer.from([0]) },
+          ],
+        },
+      ],
+    })
+    protocol.coordinator = { syncGroup }
+
+    const failure = await protocol
+      .sync({ topics: ['a'], topicsSubscribed: ['a'], beforeSync: jest.fn(), round: fakeRound() })
+      .catch((error) => error)
+
+    expect(failure).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect({ type: failure.type, message: failure.message }).toEqual({
+      type: 'INVALID_ASSIGNER_OUTPUT',
+      message:
+        'Partition assigner "custom" produced an unusable assignment: its output for member m2 carries an assignment shorter than its version',
+    })
+    expect(syncGroup).not.toHaveBeenCalled()
   })
 
   /** The rows `a:[0]` then `a:[1]`. */
@@ -652,37 +675,29 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     })
   })
 
-  it('checks the rows an older reader applies from bytes this member refuses, and sends no SyncGroup while another member owns one of them', async () => {
-    const { protocol, syncGroup } = cooperativeLeader([0], nullListRows)
+  it.each([
+    ['owns one of its partitions', [0]],
+    ['owns none of its partitions', []],
+  ])(
+    'a cooperative leader refuses bytes its own assigner wrote that a member cannot use while another member %s, and sends no SyncGroup',
+    async (_, owned) => {
+      const { protocol, syncGroup } = cooperativeLeader(owned, nullListRows)
 
-    await expect(
-      protocol.sync({
-        topics: ['a'],
-        topicsSubscribed: ['a'],
-        beforeSync: jest.fn(),
-        round: fakeRound(),
+      await expect(
+        protocol.sync({
+          topics: ['a'],
+          topicsSubscribed: ['a'],
+          beforeSync: jest.fn(),
+          round: fakeRound(),
+        })
+      ).rejects.toMatchObject({
+        type: 'INVALID_ASSIGNER_OUTPUT',
+        message:
+          'Partition assigner "custom" produced an unusable assignment: its output for member m3 carries a null partition list for topic b',
       })
-    ).rejects.toThrow('a-0 to m3 while m2 still owns it')
-    expect(syncGroup).not.toHaveBeenCalled()
-  })
-
-  it('sends bytes this member refuses unchanged when no other member owns a partition an older reader applies from them', async () => {
-    const { protocol, syncGroup } = cooperativeLeader([], nullListRows)
-
-    await expect(
-      protocol.sync({
-        topics: ['a'],
-        topicsSubscribed: ['a'],
-        beforeSync: jest.fn(),
-        round: fakeRound(),
-      })
-    ).resolves.toMatchObject({ assignment: {} })
-    expect(syncGroup).toHaveBeenCalledTimes(1)
-    expect(syncGroup.mock.calls[0][0].groupAssignment).toContainEqual({
-      memberId: 'm3',
-      memberAssignment: nullListRows,
-    })
-  })
+      expect(syncGroup).not.toHaveBeenCalled()
+    }
+  )
 })
 
 describe('Consumer > classic group protocol > coordinator publication', () => {

@@ -6,10 +6,14 @@ const syncGroupV5 = require('../../../testHelpers/wire/syncGroupV5')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 const createConsumer = require('../index')
 const ConsumerGroup = require('../consumerGroup')
+const RefusalEpisode = require('../refusalEpisode')
 const OffsetOperations = require('../offsetManager/offsetOperations')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
-const { assertJoinAnswer } = require('../../protocol/requests/groupProtocolCheck')
+const {
+  assertJoinAnswer,
+  malformedGroupAnswer,
+} = require('../../protocol/requests/groupProtocolCheck')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   KafkaJSNonRetriableError,
@@ -207,24 +211,32 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     ['an assignment row with an empty topic', rowsOf([{ topic: '', partitions: [0] }])],
     ['an assignment naming partition -1', rowsOf([{ topic: TOPIC, partitions: [-1] }])],
     ['an assignment row with a null partition list', rowsOf([{ topic: TOPIC, partitions: null }])],
-  ])('%s is refused and the member joins again', async (_, bytes) => {
+  ])('%s is refused: the join returns the refusal and joins no more', async (_, bytes) => {
     const { group, apis, joinedAs } = exchange({
       joins: [joinAnswer(), joinAnswer()],
       syncs: [syncAnswer(bytes), syncAnswer(VALID)],
     })
 
-    await expect(group.joinAndSync()).resolves.toMatchObject({ assignment: { [TOPIC]: [0, 1] } })
+    const result = await group.joinAndSync()
 
-    expect(apis()).toEqual([JOIN, SYNC, JOIN, SYNC])
-    // The refused SyncGroup came after a JoinGroup that gave the member its id.
-    expect(joinedAs()).toEqual(['', MEMBER])
+    expect(result).toEqual({
+      refused: expect.objectContaining({ type: 'MALFORMED_GROUP_ANSWER', retriable: true }),
+      unionSnapshot: null,
+    })
+    expect(apis()).toEqual([JOIN, SYNC])
+    expect(joinedAs()).toEqual([''])
+    // The JoinGroup before the refused SyncGroup gave the member its id and generation.
+    expect({ memberId: group.memberId, generationId: group.generationId }).toEqual({
+      memberId: MEMBER,
+      generationId: 1,
+    })
   })
 
   test.each([
     ['v5', 5, 'consumer'],
     ['v4', 4, null],
   ])(
-    'a compact null assignment in a SyncGroup %s answer is refused with a warning and the member joins again',
+    'a compact null assignment in a SyncGroup %s answer is refused, and the join returns the refusal',
     async (_, version, protocolType) => {
       const lines = []
       const { group, apis, syncVersions } = exchange({
@@ -235,21 +247,103 @@ describe('Consumer > classic group answers no coordinator sends', () => {
         logger: warnLogger(lines),
       })
 
+      const result = await group.joinAndSync()
+
+      expect(result.refused).toMatchObject({
+        type: 'MALFORMED_GROUP_ANSWER',
+        message: 'SyncGroup response carries no assignment',
+      })
+      expect(apis()).toEqual([JOIN, SYNC])
+      expect(syncVersions()).toEqual([version])
+      // The JoinGroup refusal warning is not the assignment's.
+      expect(lines.filter(({ log }) => log.message.startsWith('Refused a group answer'))).toEqual(
+        []
+      )
+    }
+  )
+
+  /**
+   * A run's refusal episode attached to `group`, as the runner attaches it.
+   * @param {ConsumerGroup} group
+   * @param {object[]} errors where its error logs are pushed
+   * @returns {RefusalEpisode}
+   */
+  const attachEpisode = (group, errors) =>
+    (group.refusal = new RefusalEpisode({
+      maxPollInterval: 60000,
+      groupId: GROUP_ID,
+      logger: newLogger({
+        level: LEVELS.ERROR,
+        logCreator: () => (entry) => errors.push(entry.log),
+      }),
+      onExpired: () => {},
+    }))
+
+  test("a run's first refused assignment is asked for once more in the same generation, uploading nothing, and a usable answer is returned", async () => {
+    const errors = []
+    const { group, apis, bodies } = exchange({
+      syncMaxVersion: 5,
+      joins: [joinAnswer({ generationId: 4 })],
+      syncs: [syncAnswer(Buffer.from([0]), 5), syncAnswer(VALID, 5)],
+    })
+    const episode = attachEpisode(group, errors)
+
+    try {
       await expect(group.joinAndSync()).resolves.toMatchObject({
         assignment: { [TOPIC]: [0, 1] },
       })
 
-      expect(apis()).toEqual([JOIN, SYNC, JOIN, SYNC])
-      expect(syncVersions()).toEqual([version, version])
-      const refused = lines.filter(({ log }) => log.message.startsWith('Refused a group answer'))
-      expect(refused).toHaveLength(1)
-      expect(refused[0].log).toMatchObject({
-        groupId: GROUP_ID,
-        memberId: MEMBER,
-        error: 'SyncGroup response carries no assignment',
-      })
+      expect(apis()).toEqual([JOIN, SYNC, SYNC])
+      expect(
+        bodies(SYNC).map((body) => {
+          const { generationId, memberId, groupAssignment } = syncGroupV5.readRequest(body)
+          return { generationId, memberId, groupAssignment }
+        })
+      ).toEqual([
+        { generationId: 4, memberId: MEMBER, groupAssignment: [] },
+        { generationId: 4, memberId: MEMBER, groupAssignment: [] },
+      ])
+      expect(errors).toEqual([
+        expect.objectContaining({
+          message: 'Refused an assignment this member cannot use; it holds no partitions',
+          groupId: GROUP_ID,
+          memberId: MEMBER,
+          generationId: 4,
+          error: 'SyncGroup response carries an assignment shorter than its version',
+        }),
+      ])
+      // Only an installed assignment ends the episode, and the caller installs it.
+      expect(episode.open).toBe(true)
+    } finally {
+      episode.close()
     }
-  )
+  })
+
+  test('a run whose assignment is refused again in the same generation returns the refusal, logs once and asks no more', async () => {
+    const errors = []
+    const { group, apis } = exchange({
+      joins: [joinAnswer(), joinAnswer()],
+      syncs: [syncAnswer(Buffer.from([0])), syncAnswer(Buffer.from([0])), syncAnswer(VALID)],
+    })
+    const episode = attachEpisode(group, errors)
+
+    try {
+      const result = await group.joinAndSync()
+
+      expect(result.refused).toMatchObject({
+        type: 'MALFORMED_GROUP_ANSWER',
+        message: 'SyncGroup response carries an assignment shorter than its version',
+      })
+      expect(apis()).toEqual([JOIN, SYNC, SYNC])
+      expect(errors).toHaveLength(1)
+      expect({ open: episode.open, state: episode.state }).toEqual({
+        open: true,
+        state: 'waiting',
+      })
+    } finally {
+      episode.close()
+    }
+  })
 
   test.each([
     ['v5', 5, 'consumer'],
@@ -383,38 +477,20 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     })
   })
 
-  test('an assignment refused on every attempt fails the join once the retries run out, naming the refusal', async () => {
+  test('a refused assignment spends no join retry and is not stopped by retry.maxTotalTime: the join returns it at once', async () => {
     const { group, apis } = exchange({
-      joins: [joinAnswer(), joinAnswer()],
-      syncs: [syncAnswer(Buffer.from([0])), syncAnswer(Buffer.from([0]))],
-    })
-
-    const failure = await group.joinAndSync().catch((error) => error)
-
-    expect(failure).toBeInstanceOf(KafkaJSPartialMessageError)
-    expect(failure).toMatchObject({ retriable: false, cause: undefined })
-    expect(failure.message).toBe(
-      `Group ${GROUP_ID} member ${MEMBER}: the join ended on a refused group answer: SyncGroup response carries an assignment shorter than its version`
-    )
-    expect(apis()).toEqual([JOIN, SYNC, JOIN, SYNC])
-  })
-
-  test('an assignment refused until retry.maxTotalTime would pass fails the join the same way', async () => {
-    const { group, apis } = exchange({
-      // The first backoff is longer than 1 ms, so the deadline ends the join after one attempt.
-      retries: 5,
+      retries: 0,
       maxTotalTime: 1,
       joins: [joinAnswer()],
       syncs: [syncAnswer(Buffer.from([0]))],
     })
 
-    const failure = await group.joinAndSync().catch((error) => error)
+    const result = await group.joinAndSync()
 
-    expect(failure).toBeInstanceOf(KafkaJSPartialMessageError)
-    expect(failure).toMatchObject({ retriable: false, cause: undefined })
-    expect(failure.message).toBe(
-      `Group ${GROUP_ID} member ${MEMBER}: the join ended on a refused group answer: SyncGroup response carries an assignment shorter than its version`
-    )
+    expect(result.refused).toMatchObject({
+      type: 'MALFORMED_GROUP_ANSWER',
+      message: 'SyncGroup response carries an assignment shorter than its version',
+    })
     expect(apis()).toEqual([JOIN, SYNC])
   })
 
@@ -511,11 +587,14 @@ describe('Consumer > classic group answers no coordinator sends', () => {
   })
 })
 
-describe('Consumer > classic group answers refused until the join retries run out', () => {
+describe('Consumer > classic group answers refused over a run', () => {
   const HEALTHY = 'member-healthy'
   const REFUSED = 'member-refused'
+  const THIRD = 'member-third'
   const RESTART_DELAY = 300
   const REBALANCE_IN_PROGRESS = 27
+  const SHORTER = 'SyncGroup response carries an assignment shorter than its version'
+  const INVALID = Buffer.from([0])
   const consumers = []
   let currentGroup = null
 
@@ -542,7 +621,9 @@ describe('Consumer > classic group answers refused until the join retries run ou
 
   /**
    * Creates a group with a participating leader for the paired cases. In the single-member
-   * cases the coordinator scripts an external leader's assignments.
+   * cases the coordinator scripts an external leader's assignments. `relayed` is what the
+   * coordinator hands a member for the bytes its leader published: a case replaces it to stand for
+   * a leader on another client that writes bytes this client refuses.
    * @param {string} [leaderId] id of the participating leader
    * @returns {object} coordinator state and the ordered test journal
    */
@@ -552,8 +633,11 @@ describe('Consumer > classic group answers refused until the join retries run ou
       members: new Map(),
       generation: 0,
       joining: null,
+      joined: new Set(),
+      onJoin: null,
       assignments: null,
       rejoining: false,
+      relayed: (memberId, bytes) => bytes,
       fetches: [],
       events: [],
       fetchRounds: {},
@@ -592,23 +676,42 @@ describe('Consumer > classic group answers refused until the join retries run ou
    * A real classic consumer of `group`, over a double of the Broker's group calls. A dynamic
    * member's first JoinGroup goes through the MEMBER_ID_REQUIRED handshake the Broker performs
    * (`onMemberIdRequired` with the new id, then the answer), a static one gets its id at once.
-   * The answers pass the Broker's own check. In the paired cases the leader publishes the
-   * assignments for the generation. With an external leader SyncGroup draws from `assignment`.
+   * The answers pass the Broker's own check. In the paired cases a new member starts a rebalance:
+   * a follower's JoinGroup then waits for the leader's, which waits until every known member has
+   * joined, and the leader publishes the assignments for the generation; outside a rebalance a
+   * known follower keeps its generation and a SyncGroup returns the stored bytes, as in a stable
+   * group. With an external leader each JoinGroup starts a generation and SyncGroup draws from
+   * `assignment`.
    * @param {object} group from `createGroup`
    * @param {string} memberId the id the coordinator gives this member
    * @param {{ assignment?: Buffer|Buffer[], join?: object, retry?: object,
-   *   groupInstanceId?: string|null, maxPollInterval?: number,
+   *   groupInstanceId?: string|null, maxPollInterval?: number, maxWaitTimeInMs?: number,
    *   assigners?: Function[] }} options `join` overrides fields of the JoinGroup answer;
    *   `assigners` replaces the one assigner
-   * @returns {{ consumer: object, coordinator: object, crashes: object[], refused: string[] }}
+   * @returns {{ consumer: object, coordinator: object, crashes: object[], refused: string[],
+   *   refusals: object[], leaves: object[], events: Object<string, object[]> }} `refused` holds the
+   *   JoinGroup refusal warnings, `refusals` the refused-assignment error logs with their fake
+   *   time, `leaves` each LeaveGroup with its fake time, `events` the payloads of the partition
+   *   and poll events
    */
   const createMember = (
     group,
     memberId,
-    { assignment, join = {}, retry = {}, groupInstanceId, maxPollInterval, assigners }
+    {
+      assignment,
+      join = {},
+      retry = {},
+      groupInstanceId,
+      maxPollInterval,
+      maxWaitTimeInMs,
+      assigners,
+    }
   ) => {
     const crashes = []
     const refused = []
+    const refusals = []
+    const leaves = []
+    const events = { lost: [], revoked: [], pollExpired: [] }
     const assignments = [].concat(assignment)
     let fetchedGeneration = null
     let heartbeatGeneration = null
@@ -641,21 +744,29 @@ describe('Consumer > classic group answers refused until the join retries run ou
         }
 
         if (group.leaderId) {
-          // Id allocation does not add a member. A confirmed new follower waits for the
-          // leader, and an unchanged follower rejoin in the stable group keeps its generation.
+          // Id allocation does not add a member; a confirmed new one starts a rebalance.
           if (!group.members.has(memberId)) {
             group.members.set(memberId, {
               memberId,
               groupInstanceId: request.groupInstanceId,
               memberMetadata: request.groupProtocols[0].metadata,
             })
-            if (!isLeader) {
-              group.rejoining = true
-              const joining = (group.joining = heldAnswer())
-              await joining.promise
-            }
+            group.rejoining = true
+          }
+          if (!isLeader && group.rejoining) {
+            group.joined.add(memberId)
+            group.onJoin?.()
+            const joining = (group.joining ??= heldAnswer())
+            await joining.promise
           }
           if (isLeader) {
+            const everyoneJoined = () =>
+              [...group.members.keys()].every((id) => id === memberId || group.joined.has(id))
+            while (group.rejoining && !everyoneJoined()) {
+              await new Promise((resolve) => (group.onJoin = resolve))
+            }
+            group.onJoin = null
+            group.joined.clear()
             group.generation += 1
             group.assignments = heldAnswer()
             group.rejoining = false
@@ -664,6 +775,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
           }
         } else {
           group.generation += 1
+          group.rejoining = false
         }
 
         const answer = {
@@ -685,7 +797,10 @@ describe('Consumer > classic group answers refused until the join retries run ou
         if (group.leaderId) {
           if (isLeader) group.assignments.resolve(groupAssignment)
           const published = await group.assignments.promise
-          memberAssignment = published.find((row) => row.memberId === memberId).memberAssignment
+          memberAssignment = group.relayed(
+            memberId,
+            published.find((row) => row.memberId === memberId).memberAssignment
+          )
         } else {
           memberAssignment = assignments.length > 1 ? assignments.shift() : assignments[0]
         }
@@ -704,9 +819,15 @@ describe('Consumer > classic group answers refused until the join retries run ou
           note(`Heartbeat generation=${generationId} answered success`)
         }
       }),
-      leaveGroup: jest.fn(async () => {
-        note('LeaveGroup')
+      leaveGroup: jest.fn(async (request) => {
+        note(`LeaveGroup as ${request.memberId}`)
+        leaves.push({
+          at: Date.now(),
+          memberId: request.memberId,
+          groupInstanceId: request.groupInstanceId || null,
+        })
         if (group.members.delete(memberId)) group.rejoining = group.members.size > 0
+        group.onJoin?.()
       }),
     }
     const broker = {
@@ -761,6 +882,9 @@ describe('Consumer > classic group answers refused until the join retries run ou
           ({ log }) => {
             note(log.message)
             if (log.message.startsWith('Refused a group answer')) refused.push(log.error)
+            if (log.message.startsWith('Refused an assignment')) {
+              refusals.push({ at: Date.now(), generationId: log.generationId, error: log.error })
+            }
           },
       }),
       instrumentationEmitter: cluster.instrumentationEmitter,
@@ -770,6 +894,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
       retry: { initialRetryTime: RESTART_DELAY, retries: 2, factor: 0, ...retry },
       ...(groupInstanceId ? { groupInstanceId } : {}),
       ...(maxPollInterval === undefined ? {} : { maxPollInterval }),
+      ...(maxWaitTimeInMs === undefined ? {} : { maxWaitTimeInMs }),
     })
     consumer.on(consumer.events.CRASH, ({ payload }) => {
       note(`CRASH ${payload.error.name} restart=${payload.restart}: ${payload.error.message}`)
@@ -778,20 +903,34 @@ describe('Consumer > classic group answers refused until the join retries run ou
     consumer.on(consumer.events.GROUP_JOIN, () => note('GROUP_JOIN'))
     consumer.on(consumer.events.REBALANCING, () => note('REBALANCING'))
     consumer.on(consumer.events.STOP, () => note('STOP'))
+    consumer.on(consumer.events.PARTITIONS_LOST, ({ payload }) => {
+      note('PARTITIONS_LOST')
+      events.lost.push(payload.partitions)
+    })
+    consumer.on(consumer.events.PARTITIONS_REVOKED, ({ payload }) => {
+      note('PARTITIONS_REVOKED')
+      events.revoked.push(payload.partitions)
+    })
+    consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, ({ payload }) => {
+      note('POLL_INTERVAL_EXCEEDED')
+      events.pollExpired.push(payload)
+    })
     consumers.push(consumer)
-    return { consumer, coordinator, crashes, refused }
+    return { consumer, coordinator, crashes, refused, refusals, leaves, events }
   }
 
   /**
    * @param {string} name
    * @param {Function} [assign] how the leader assigns its members
-   * @returns {Function} the factory of an eager assigner named `name`
+   * @param {string[]} [protocols] the rebalance protocols it supports
+   * @returns {Function} the factory of an assigner named `name`, eager unless `protocols` says
    */
   const assignerNamed =
-    (name, assign = async () => []) =>
+    (name, assign = async () => [], protocols = ['eager']) =>
     () => ({
       name,
       version: 0,
+      supportedProtocols: () => protocols,
       protocol: ({ topics }) => ({ name, metadata: MemberMetadata.encode({ version: 0, topics }) }),
       assign,
     })
@@ -808,9 +947,10 @@ describe('Consumer > classic group answers refused until the join retries run ou
    * @param {string} stage what the case is waiting for
    * @param {number} budget fake milliseconds to advance at most
    * @param {() => boolean} [done] omit to observe the whole fake interval
+   * @param {number} [step] fake milliseconds per tick
    * @returns {Promise<void>}
    */
-  const drive = async (stage, budget, done) => {
+  const drive = async (stage, budget, done, step = 25) => {
     let alarm
     const cancellation = new AbortController()
     const watchdog = new Promise((_, reject) => {
@@ -820,7 +960,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
       const deadline = Date.now() + budget
       await new Promise(setImmediate)
       while (!cancellation.signal.aborted && !done?.() && Date.now() < deadline) {
-        jest.advanceTimersByTime(Math.min(25, deadline - Date.now()))
+        jest.advanceTimersByTime(Math.min(step, deadline - Date.now()))
         await new Promise(setImmediate)
       }
       if (!cancellation.signal.aborted && done && !done()) {
@@ -850,157 +990,378 @@ describe('Consumer > classic group answers refused until the join retries run ou
   /** @param {object} group @param {string} memberId @returns {number} */
   const fetchesOf = (group, memberId) => group.fetches.filter((id) => id === memberId).length
 
+  /** @param {object} member @returns {Array<[number, Array]>} each SyncGroup's generation and upload */
+  const syncsOf = (member) =>
+    member.coordinator.syncGroup.mock.calls.map(([request]) => [
+      request.generationId,
+      request.groupAssignment,
+    ])
+
+  /** @param {object} member @returns {Array<[number, string]>} each refused generation and reason */
+  const refusalsOf = (member) =>
+    member.refusals.map(({ generationId, error }) => [generationId, error])
+
+  /** @param {object} member @returns {Array<[string, string|null]>} each LeaveGroup's two ids */
+  const leavesOf = (member) =>
+    member.leaves.map(({ memberId, groupInstanceId }) => [memberId, groupInstanceId])
+
+  /** @param {number} wait @returns {string} the stop's message after a never-usable assignment */
+  const expiredMessage = (wait) =>
+    `Group ${GROUP_ID} member ${REFUSED}: no usable assignment within ${wait} ms of the first refused one: ${SHORTER}`
+
   /**
-   * Starts a healthy member, lets it fetch, then starts a member whose every assignment is
-   * refused and pumps fake time until its first run settles.
-   * @param {object} group shared coordinator state
-   * @param {string|null} groupInstanceId the refused member's
-   * @param {object} [options] more `createMember` options for the refused member
-   * @returns {Promise<{ group: object, healthy: object, refused: object }>}
+   * The healthy leader's assigner: partition 0 to itself and 1 to the refused member, both to a
+   * lone member, and nothing to anyone else.
    */
-  const refusedBesideHealthy = async (group, groupInstanceId, options = {}) => {
-    const invalidAssignment = Buffer.from([0])
-    const healthy = createMember(group, HEALTHY, {
-      assigners: [
-        assignerNamed(PROTOCOL, async ({ members }) =>
-          members.map(({ memberId }) => ({
-            memberId,
-            memberAssignment: memberId === HEALTHY ? assignmentOf([0]) : invalidAssignment,
-          }))
-        ),
-      ],
-    })
-    const refused = createMember(group, REFUSED, {
-      groupInstanceId,
-      ...options,
-    })
+  const healthyAssigner = assignerNamed(PROTOCOL, async ({ members }) =>
+    members.map(({ memberId }) => ({
+      memberId,
+      memberAssignment: assignmentOf(
+        members.length === 1 ? [0, 1] : memberId === HEALTHY ? [0] : memberId === REFUSED ? [1] : []
+      ),
+    }))
+  )
+
+  /**
+   * Starts a healthy leader and lets it fetch, then starts a member whose assignment the
+   * coordinator relays as one byte, as a leader on another client may write it, and pumps fake
+   * time until that member's first round has settled with its first refusal.
+   * @param {object} group from `createGroup(HEALTHY)`
+   * @param {object} [options] more `createMember` options for the refused member
+   * @returns {Promise<{ healthy: object, refused: object, healthyJoins: number }>} `healthyJoins`
+   *   is the leader's JoinGroup count once the refused member waits
+   */
+  const besideOldLeader = async (group, options = {}) => {
+    group.relayed = (memberId, bytes) => (memberId === REFUSED ? INVALID : bytes)
+    const healthy = createMember(group, HEALTHY, { assigners: [healthyAssigner] })
+    const refused = createMember(group, REFUSED, options)
     await settle('healthy run', start(healthy), 2000)
     await drive('first healthy Fetch', 2000, () => fetchesOf(group, HEALTHY) > 0)
-    expect(fetchesOf(group, HEALTHY)).toBeGreaterThan(0)
-    await settle('refused run and crash cleanup', start(refused), 10000)
-    expect(refused.crashes.map(({ error, restart }) => [error.name, restart])).toEqual([
-      ['KafkaJSPartialMessageError', false],
-    ])
-    return { group, healthy, refused }
+    await settle('refused run', start(refused), 10000)
+    expect(refusalsOf(refused)).toEqual([[2, SHORTER]])
+    return { healthy, refused, healthyJoins: healthy.coordinator.joinGroup.mock.calls.length }
   }
 
   /**
-   * Checks the stop itself, then that for `observeMs` after the cleanup settled the refused member
-   * joins no more and the healthy member keeps fetching without joining again.
-   * @param {{ group: object, healthy: object, refused: object }} members
-   * @param {{ joins: number, groupInstanceId: string|null, reason: string, observeMs: number }} expected
+   * Pumps fake time to just before the refused member's deadline and checks it is still waiting,
+   * then to its stop, and checks the leave, the crash and how long it waited.
+   * @param {object} refused the member from `createMember`
+   * @param {{ wait: number, groupInstanceId?: string|null, step?: number }} expected
    * @returns {Promise<void>}
    */
-  const expectOneStop = async ({ group, healthy, refused }, expected) => {
-    const [{ error, groupId }] = refused.crashes
+  const expectStopAtDeadline = async (refused, { wait, groupInstanceId = null, step = 25 }) => {
+    const firstRefusal = refused.refusals[0].at
+    await drive('wait before its deadline', firstRefusal + wait - 50 - Date.now(), undefined, step)
     expect({
-      joinIds: refused.coordinator.joinGroup.mock.calls.map(([request]) => request.memberId),
-      syncGenerations: refused.coordinator.syncGroup.mock.calls.map(
-        ([request]) => request.generationId
-      ),
-      refusals: refused.refused,
-      // The crash cleanup leaves for a dynamic member; a static one keeps its slot.
-      leaves: refused.coordinator.leaveGroup.mock.calls.length,
-      groupId,
+      crashes: refused.crashes.length,
+      leaves: refused.leaves.length,
+      pollExpired: refused.events.pollExpired.length,
+    }).toEqual({ crashes: 0, leaves: 0, pollExpired: 0 })
+
+    await drive('the stop at the deadline', 2000, () => refused.crashes.length > 0)
+    const [{ error, groupId, restart }] = refused.crashes
+    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect({
+      leaves: leavesOf(refused),
       retriable: error.retriable,
       message: error.message,
+      groupId,
+      restart,
+      pollExpired: refused.events.pollExpired.length,
     }).toEqual({
-      joinIds: ['', ...Array(expected.joins - 1).fill(REFUSED)],
-      syncGenerations: Array(expected.joins).fill(2),
-      refusals: Array(expected.joins).fill(expected.reason),
-      leaves: expected.groupInstanceId ? 0 : 1,
-      groupId: GROUP_ID,
+      leaves: [[REFUSED, groupInstanceId]],
       retriable: false,
-      message: `Group ${GROUP_ID} member ${REFUSED}: the join ended on a refused group answer: ${expected.reason}`,
+      message: expiredMessage(wait),
+      groupId: GROUP_ID,
+      restart: false,
+      pollExpired: 0,
     })
-
-    // Let the leader rejoin after a dynamic member leaves. A static member keeps its slot.
-    await drive('healthy member after cleanup', 2000)
-    const healthyJoins = healthy.coordinator.joinGroup.mock.calls.length
-    expect(healthyJoins).toBe(expected.groupInstanceId ? 2 : 3)
-    const healthyFetches = fetchesOf(group, HEALTHY)
-    const observedFrom = Date.now()
-    await drive('observe stopped member', expected.observeMs)
-
-    expect({
-      observedMs: Date.now() - observedFrom,
-      refusedJoins: refused.coordinator.joinGroup.mock.calls.length,
-      refusedCrashes: refused.crashes.length,
-      healthyJoins: healthy.coordinator.joinGroup.mock.calls.length,
-      healthyCrashes: healthy.crashes.length,
-      healthyFetchedMore: fetchesOf(group, HEALTHY) > healthyFetches,
-    }).toEqual({
-      observedMs: expected.observeMs,
-      refusedJoins: expected.joins,
-      refusedCrashes: 1,
-      healthyJoins,
-      healthyCrashes: 0,
-      healthyFetchedMore: true,
-    })
+    const waited = refused.leaves[0].at - firstRefusal
+    expect(waited).toBeGreaterThanOrEqual(wait)
+    expect(waited).toBeLessThan(wait + 1000)
   }
 
-  const SHORTER = 'SyncGroup response carries an assignment shorter than its version'
-
   test.each([
     ['dynamic', null],
     ['static', 'instance-refused'],
   ])(
-    'a %s member whose assignment is refused on every attempt crashes once with restart false and joins no more, while a healthy member keeps fetching',
+    'a %s member whose assignment is never usable holds nothing until its deadline, then leaves once and stops with restart false, causing one rebalance while a healthy member keeps fetching',
     async (_, groupInstanceId) => {
       const group = createGroup(HEALTHY)
       await withJournal(group, async () => {
-        const members = await refusedBesideHealthy(group, groupInstanceId)
-        // The Broker's dynamic id handshake is part of the first of three join attempts.
-        await expectOneStop(members, {
-          joins: 3,
+        const { healthy, refused, healthyJoins } = await besideOldLeader(group, {
           groupInstanceId,
-          reason: SHORTER,
-          observeMs: RESTART_DELAY * 10,
+          maxPollInterval: 3000,
+        })
+
+        await expectStopAtDeadline(refused, { wait: 3000, groupInstanceId })
+        expect({
+          joinIds: refused.coordinator.joinGroup.mock.calls.map(([request]) => request.memberId),
+          // The first answer and the one same-generation check, which uploads nothing.
+          syncs: syncsOf(refused),
+          refusals: refusalsOf(refused),
+          fetched: fetchesOf(group, REFUSED),
+        }).toEqual({
+          joinIds: [''],
+          syncs: [
+            [2, []],
+            [2, []],
+          ],
+          refusals: [[2, SHORTER]],
+          fetched: 0,
+        })
+
+        const healthyFetches = fetchesOf(group, HEALTHY)
+        await drive('the group after the stop', 3000)
+        expect({
+          refusedJoins: refused.coordinator.joinGroup.mock.calls.length,
+          refusedLeaves: refused.leaves.length,
+          refusedCrashes: refused.crashes.length,
+          // The one rebalance the refused member caused: its leave.
+          healthyJoinsSinceRefusal: healthy.coordinator.joinGroup.mock.calls.length - healthyJoins,
+          healthyCrashes: healthy.crashes.length,
+          healthyFetchedMore: fetchesOf(group, HEALTHY) > healthyFetches,
+        }).toEqual({
+          refusedJoins: 1,
+          refusedLeaves: 1,
+          refusedCrashes: 1,
+          healthyJoinsSinceRefusal: 1,
+          healthyCrashes: 0,
+          healthyFetchedMore: true,
         })
       })
     }
   )
 
   test.each([
-    ['dynamic', null],
-    ['static', 'instance-refused'],
+    [3000, 3000],
+    [300000, 600000],
   ])(
-    'a %s member whose round deadline passes in the backoff after a refused assignment crashes once with restart false and joins no more, while a healthy member keeps fetching',
-    async (_, groupInstanceId) => {
-      const group = createGroup(HEALTHY)
+    'the wait for a usable assignment ends %s ms after the first refused one for a maxPollInterval of %s ms',
+    async (wait, maxPollInterval) => {
+      const group = createGroup()
       await withJournal(group, async () => {
-        // The round ends at 5 s while the first 10 s backoff is still pending.
-        const members = await refusedBesideHealthy(group, groupInstanceId, {
-          maxPollInterval: 5000,
-          retry: { initialRetryTime: 10000, retries: 5 },
-        })
+        const member = createMember(group, REFUSED, { assignment: INVALID, maxPollInterval })
+        await settle('member run', start(member), 5000)
 
-        await expectOneStop(members, {
-          joins: 1,
-          groupInstanceId,
-          reason: SHORTER,
-          observeMs: 30000,
-        })
+        await expectStopAtDeadline(member, { wait, step: wait > 10000 ? 1000 : 25 })
+        expect(member.coordinator.joinGroup).toHaveBeenCalledTimes(1)
       })
     }
   )
 
-  test('a member whose assignment is refused once and then accepted in the same join fetches and does not crash', async () => {
+  test('a member holding nothing past maxPollInterval between its fetch rounds raises no poll-interval expiry and leaves only at its deadline', async () => {
+    const group = createGroup()
+    await withJournal(group, async () => {
+      // Idle fetch rounds of 10 s never poll inside the 2 s poll deadline.
+      const member = createMember(group, REFUSED, {
+        assignment: INVALID,
+        maxPollInterval: 2000,
+        maxWaitTimeInMs: 10000,
+      })
+      await settle('member run', start(member), 5000)
+
+      await expectStopAtDeadline(member, { wait: 2000 })
+      expect(member.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  test('a refused assignment that the same generation answers usably when asked once more is installed with no rebalance and no second error, and the member fetches', async () => {
     const group = createGroup()
     await withJournal(group, async () => {
       const member = createMember(group, REFUSED, {
-        assignment: [Buffer.from([0]), assignmentOf([1])],
+        assignment: [INVALID, assignmentOf([1])],
+        maxPollInterval: 3000,
+      })
+      await settle('member run', start(member), 5000)
+      await drive('first member Fetch', 5000, () => fetchesOf(group, REFUSED) > 0)
+      await drive('past the deadline the refusal opened', 4000)
+
+      expect({
+        joins: member.coordinator.joinGroup.mock.calls.length,
+        generation: group.generation,
+        syncs: syncsOf(member),
+        refusals: refusalsOf(member),
+        crashes: member.crashes.length,
+        leaves: member.leaves.length,
+        fetched: fetchesOf(group, REFUSED) > 0,
+      }).toEqual({
+        joins: 1,
+        generation: 1,
+        syncs: [
+          [1, []],
+          [1, []],
+        ],
+        refusals: [[1, SHORTER]],
+        crashes: 0,
+        leaves: 0,
+        fetched: true,
+      })
+    })
+  })
+
+  test('a refused assignment healed by a later generation another member starts inside the wait is installed: the member fetches, does not crash and is not restarted', async () => {
+    const group = createGroup(HEALTHY)
+    await withJournal(group, async () => {
+      const { healthy, refused } = await besideOldLeader(group, {
+        maxPollInterval: 10000,
+        maxWaitTimeInMs: 200,
+      })
+      const firstRefusal = refused.refusals[0].at
+      await drive('waiting', 1000)
+
+      // The leader's bytes are usable from now on, and a third member's join starts a generation.
+      group.relayed = (memberId, bytes) => bytes
+      const third = createMember(group, THIRD, {})
+      await settle('third run', start(third), 10000)
+      await drive('refused member fetches', 5000, () => fetchesOf(group, REFUSED) > 0)
+      await drive('past the first deadline', firstRefusal + 11000 - Date.now())
+
+      expect({
+        joins: refused.coordinator.joinGroup.mock.calls.length,
+        syncGenerations: syncsOf(refused).map(([generationId]) => generationId),
+        refusals: refusalsOf(refused),
+        crashes: refused.crashes.length,
+        leaves: refused.leaves.length,
+        healthyCrashes: healthy.crashes.length,
+        thirdCrashes: third.crashes.length,
+      }).toEqual({
+        joins: 2,
+        syncGenerations: [2, 2, 3],
+        refusals: [[2, SHORTER]],
+        crashes: 0,
+        leaves: 0,
+        healthyCrashes: 0,
+        thirdCrashes: 0,
+      })
+    })
+  })
+
+  test('a rebalance in progress and a new generation inside the wait do not restart it: the member asks no more in the new generation and stops at the first deadline', async () => {
+    const group = createGroup(HEALTHY)
+    await withJournal(group, async () => {
+      const { refused } = await besideOldLeader(group, {
+        maxPollInterval: 4000,
+        maxWaitTimeInMs: 200,
+      })
+      await drive('waiting', 1500)
+
+      // A third member's join makes the coordinator answer heartbeats REBALANCE_IN_PROGRESS.
+      const third = createMember(group, THIRD, {})
+      await settle('third run', start(third), 2000)
+      await drive('the refusal in the new generation', 1000, () => refused.refusals.length > 1)
+      expect(refusalsOf(refused)).toEqual([
+        [2, SHORTER],
+        [3, SHORTER],
+      ])
+
+      await expectStopAtDeadline(refused, { wait: 4000 })
+      expect({
+        joins: refused.coordinator.joinGroup.mock.calls.length,
+        syncGenerations: syncsOf(refused).map(([generationId]) => generationId),
+        thirdCrashes: third.crashes.length,
+      }).toEqual({ joins: 2, syncGenerations: [2, 2, 3], thirdCrashes: 0 })
+    })
+  })
+
+  test('a cooperative member releases the partitions it held as lost at its first refused assignment and fetches nothing while it waits', async () => {
+    const group = createGroup()
+    await withJournal(group, async () => {
+      const member = createMember(group, REFUSED, {
+        assignment: [assignmentOf([0, 1]), INVALID],
+        maxPollInterval: 10000,
+        assigners: [assignerNamed(PROTOCOL, undefined, ['eager', 'cooperative'])],
       })
       await settle('member run', start(member), 5000)
       await drive('first member Fetch', 5000, () => fetchesOf(group, REFUSED) > 0)
 
+      // The coordinator starts a rebalance, as another member's join would.
+      group.rejoining = true
+      await drive('the refusal', 5000, () => member.refusals.length > 0)
+      await drive('the release', 500)
+      const fetched = fetchesOf(group, REFUSED)
+      await drive('holding nothing', 2000)
+
       expect({
+        lost: member.events.lost,
+        revoked: member.events.revoked,
+        fetchedWhileWaiting: fetchesOf(group, REFUSED) - fetched,
         joins: member.coordinator.joinGroup.mock.calls.length,
-        syncs: member.coordinator.syncGroup.mock.calls.length,
-        refusals: member.refused,
+        refusals: refusalsOf(member),
         crashes: member.crashes.length,
-        fetched: fetchesOf(group, REFUSED) > 0,
-      }).toEqual({ joins: 2, syncs: 2, refusals: [SHORTER], crashes: 0, fetched: true })
+        leaves: member.leaves.length,
+      }).toEqual({
+        lost: [[{ topic: TOPIC, partitions: [0, 1] }]],
+        revoked: [],
+        fetchedWhileWaiting: 0,
+        joins: 2,
+        refusals: [[2, SHORTER]],
+        crashes: 0,
+        leaves: 0,
+      })
+    })
+  })
+
+  test('a stop while a member waits for a usable assignment ends the run without a crash, and its deadline never fires', async () => {
+    const group = createGroup()
+    await withJournal(group, async () => {
+      const member = createMember(group, REFUSED, { assignment: INVALID, maxPollInterval: 5000 })
+      await settle('member run', start(member), 5000)
+      await drive('waiting', 1000)
+
+      await settle('stop', member.consumer.stop(), 3000)
+      await drive('past the deadline', 6000)
+
+      expect({
+        crashes: member.crashes.length,
+        // A dynamic member's ordinary stop leaves, as before.
+        leaves: leavesOf(member),
+        joins: member.coordinator.joinGroup.mock.calls.length,
+        refusals: refusalsOf(member),
+      }).toEqual({
+        crashes: 0,
+        leaves: [[REFUSED, null]],
+        joins: 1,
+        refusals: [[1, SHORTER]],
+      })
+    })
+  })
+
+  test('a static leader whose own assigner writes an assignment no member can use stops before its SyncGroup with an error naming the assigner, and leaves once with its instance id', async () => {
+    const group = createGroup(REFUSED)
+    await withJournal(group, async () => {
+      const leader = createMember(group, REFUSED, {
+        groupInstanceId: 'instance-refused',
+        assigners: [
+          assignerNamed(PROTOCOL, async ({ members }) =>
+            members.map(({ memberId }) => ({ memberId, memberAssignment: INVALID }))
+          ),
+        ],
+      })
+      await settle('leader run and crash cleanup', start(leader), 10000)
+
+      const [{ error, groupId, restart }] = leader.crashes
+      expect({
+        name: error.name,
+        type: error.type,
+        retriable: error.retriable,
+        message: error.message,
+        groupId,
+        restart,
+        crashes: leader.crashes.length,
+        syncs: leader.coordinator.syncGroup.mock.calls.length,
+        leaves: leavesOf(leader),
+      }).toEqual({
+        name: 'KafkaJSNonRetriableError',
+        type: 'INVALID_ASSIGNER_OUTPUT',
+        retriable: false,
+        message: `Partition assigner "${PROTOCOL}" produced an unusable assignment: its output for member ${REFUSED} carries an assignment shorter than its version`,
+        groupId: GROUP_ID,
+        restart: false,
+        crashes: 1,
+        syncs: 0,
+        leaves: [[REFUSED, 'instance-refused']],
+      })
     })
   })
 
@@ -1050,24 +1411,147 @@ describe('Consumer > classic group answers refused until the join retries run ou
     })
   })
 
-  test('a restartOnFailure that returns true receives the stop and restarts the member, as for any crash it decides', async () => {
+  test('a restartOnFailure that returns true receives the stop after the wait and restarts the member, whose new run starts a new wait', async () => {
     const restartOnFailure = jest.fn(async () => true)
     const group = createGroup()
     await withJournal(group, async () => {
       const refused = createMember(group, REFUSED, {
-        assignment: Buffer.from([0]),
+        assignment: INVALID,
+        maxPollInterval: 2000,
         retry: { restartOnFailure },
       })
-      await settle('refused run and crash cleanup', start(refused), 10000)
+      await settle('refused run', start(refused), 5000)
+      await drive('the stop', 5000, () => refused.crashes.length > 0)
 
       expect(restartOnFailure).toHaveBeenCalledTimes(1)
       const [[error]] = restartOnFailure.mock.calls
       expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect(error.message).toBe(expiredMessage(2000))
       expect(refused.crashes).toEqual([{ error, groupId: GROUP_ID, restart: true }])
 
-      const restarted = () => refused.coordinator.joinGroup.mock.calls.length > 3
-      await drive('member restart', RESTART_DELAY * 4, restarted)
-      expect(refused.coordinator.joinGroup.mock.calls.length).toBeGreaterThan(3)
+      await drive(
+        'the restarted run refuses again',
+        RESTART_DELAY * 4 + 2000,
+        () => refused.refusals.length > 1
+      )
+      expect({
+        joins: refused.coordinator.joinGroup.mock.calls.length,
+        leaves: refused.leaves.length,
+        crashes: refused.crashes.length,
+        refusals: refusalsOf(refused),
+      }).toEqual({
+        joins: 2,
+        leaves: 1,
+        crashes: 1,
+        refusals: [
+          [1, SHORTER],
+          [2, SHORTER],
+        ],
+      })
     })
+  })
+})
+
+describe('Consumer > classic refused-assignment episode', () => {
+  const REFUSAL = malformedGroupAnswer(
+    'SyncGroup response carries an assignment shorter than its version'
+  )
+
+  beforeEach(() =>
+    jest.useFakeTimers({ now: 0, doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+  )
+  afterEach(() => jest.useRealTimers())
+
+  /**
+   * @param {number} maxPollInterval
+   * @returns {{ episode: RefusalEpisode, expired: Error[], errors: object[] }} `expired` holds what
+   *   `onExpired` received, `errors` the error logs
+   */
+  const episodeOf = (maxPollInterval) => {
+    const expired = []
+    const errors = []
+    const episode = new RefusalEpisode({
+      maxPollInterval,
+      groupId: GROUP_ID,
+      logger: newLogger({
+        level: LEVELS.ERROR,
+        logCreator: () => (entry) => errors.push(entry.log),
+      }),
+      onExpired: (error) => expired.push(error),
+    })
+    return { episode, expired, errors }
+  }
+
+  test.each([
+    [2000, 2000],
+    [300000, 600000],
+  ])(
+    'ends %s ms after its first refused assignment for a maxPollInterval of %s ms, whatever generations are refused meanwhile',
+    (wait, maxPollInterval) => {
+      const { episode, expired, errors } = episodeOf(maxPollInterval)
+
+      expect(episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 1 })).toBe('verify')
+      expect(episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 1 })).toBe('wait')
+      jest.advanceTimersByTime(wait - 1)
+      expect(episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 2 })).toBe('wait')
+      expect(expired).toEqual([])
+
+      jest.advanceTimersByTime(1)
+      expect(expired).toHaveLength(1)
+      expect(expired[0]).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect({
+        message: expired[0].message,
+        retriable: expired[0].retriable,
+        error: episode.error,
+        open: episode.open,
+        loggedGenerations: errors.map(({ generationId }) => generationId),
+      }).toEqual({
+        message: `Group ${GROUP_ID} member ${MEMBER}: no usable assignment within ${wait} ms of the first refused one: ${REFUSAL.message}`,
+        retriable: false,
+        error: expired[0],
+        open: false,
+        loggedGenerations: [1, 2],
+      })
+    }
+  )
+
+  test('an installed assignment ends the episode, and a later refusal opens a new one with its own deadline', () => {
+    const { episode, expired } = episodeOf(2000)
+
+    episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 1 })
+    jest.advanceTimersByTime(1500)
+    episode.installed()
+    jest.advanceTimersByTime(1000)
+    expect({ expired: expired.length, open: episode.open }).toEqual({ expired: 0, open: false })
+
+    expect(episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 3 })).toBe('verify')
+    jest.advanceTimersByTime(1999)
+    expect(expired).toHaveLength(0)
+    jest.advanceTimersByTime(1)
+    expect(expired).toHaveLength(1)
+  })
+
+  test('a closed episode never expires, keeps no error and ignores a later end; an ended one keeps its first error', () => {
+    const closed = episodeOf(2000)
+    closed.episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 1 })
+    closed.episode.close()
+    jest.advanceTimersByTime(5000)
+    closed.episode.end(new Error('late'))
+    expect({
+      expired: closed.expired.length,
+      error: closed.episode.error,
+      suspendsPollDeadline: closed.episode.suspendsPollDeadline,
+    }).toEqual({ expired: 0, error: null, suspendsPollDeadline: false })
+
+    const ended = episodeOf(2000)
+    const first = new Error('first')
+    ended.episode.end(first)
+    ended.episode.end(new Error('second'))
+    ended.episode.close()
+    expect({
+      error: ended.episode.error,
+      suspendsPollDeadline: ended.episode.suspendsPollDeadline,
+      verdict: ended.episode.refuse(REFUSAL, { memberId: MEMBER, generationId: 1 }),
+    }).toEqual({ error: first, suspendsPollDeadline: true, verdict: 'wait' })
   })
 })
