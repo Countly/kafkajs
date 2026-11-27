@@ -343,6 +343,49 @@ describe('Consumer > broker outages', () => {
     expect(events.crashes).toEqual([])
   })
 
+  it('a coordinator that keeps its node id and moves to a new address while the old one stays up is reached there, without a rejoin', async () => {
+    // The coordinator's new address; the scripted cluster names this endpoint node 2.
+    const moved = { id: 2, host: 'node1-moved', port: 9092 }
+    const [seed] = NODES
+    const { cluster, events } = scenario(
+      {},
+      { brokers: [`${seed.host}:${seed.port}`] },
+      { nodes: [...NODES, moved] }
+    )
+    const listed = cluster.answerers.get('Metadata')
+    cluster.answer('Metadata', (...args) => {
+      const answer = listed(...args)
+      return { ...answer, brokers: answer.brokers.filter(({ nodeId }) => nodeId !== moved.id) }
+    })
+    await start(events)
+    await until(() => events.records.length === 1, 'the first record')
+
+    const movedAt = cluster.requests().length
+    cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+      coordinators: coordinatorKeys.map((key) => ({
+        key,
+        nodeId: COORDINATOR,
+        host: moved.host,
+        port: moved.port,
+        errorCode: 0,
+        errorMessage: null,
+      })),
+    }))
+    cluster.answer('Heartbeat', (_fields, { node }) =>
+      node === COORDINATOR ? { errorCode: NOT_COORDINATOR } : {}
+    )
+    await until(
+      () => wire(cluster, 'Heartbeat', movedAt).some(({ node }) => node === moved.id),
+      'a heartbeat to the moved address',
+      400
+    )
+
+    expect(wire(cluster, 'Heartbeat', movedAt).some(({ node }) => node === COORDINATOR)).toBe(true)
+    expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
+    expect(events.rebalancing).toEqual([])
+    expect(events.crashes).toEqual([])
+  })
+
   it.each([
     ['an eager', {}],
     ['a cooperative', { partitionAssigners: [PartitionAssigners.cooperativeSticky] }],
