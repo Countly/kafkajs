@@ -1,4 +1,5 @@
 const Batch = require('../batch')
+const Long = require('../../utils/long')
 const Decoder = require('../../protocol/decoder')
 const Encoder = require('../../protocol/encoder')
 const decodeMessages = require('../../protocol/requests/fetch/v4/decodeMessages')
@@ -187,6 +188,60 @@ describe('Consumer > Batch', () => {
       })
 
       expect(batch.isEmptyControlRecord()).toEqual(true)
+    })
+  })
+
+  describe('#leaderEpochAt', () => {
+    /** Records 120 and 121 carry different epochs, so the answer names which record it read. */
+    const batch = () =>
+      new Batch(topic, '119', {
+        partition: 0,
+        highWatermark: '200',
+        messages: [
+          { offset: '119', batchContext: { partitionLeaderEpoch: 6 } },
+          { offset: '120', batchContext: { partitionLeaderEpoch: 7 } },
+          { offset: '121', batchContext: { partitionLeaderEpoch: 8 } },
+        ],
+      })
+
+    it.each([
+      ['the string 120', '120'],
+      ['the number 120', 120],
+      ['a Long of 120', Long.fromValue('120')],
+      ['the string 0120', '0120'],
+    ])('answers the leader epoch of record 120 for %s', (_label, offset) => {
+      expect(batch().leaderEpochAt(offset)).toBe(7)
+    })
+
+    it('answers the last record by value as well', () => {
+      expect(batch().leaderEpochAt(121)).toBe(8)
+    })
+
+    it('answers -1 for an offset that is not in the batch or is not a number', () => {
+      const fetched = batch()
+
+      expect(fetched.leaderEpochAt(122)).toBe(-1)
+      expect(fetched.leaderEpochAt('not a number')).toBe(-1)
+    })
+
+    // Record 0 is in the batch and is not its last record, so reading the value as 0 would answer 3.
+    it.each([
+      ['the string NaN', 'NaN'],
+      ['the number NaN', NaN],
+      ['the string Infinity', 'Infinity'],
+      ['the number Infinity', Infinity],
+    ])('answers -1 for %s, not the epoch of record 0', (_label, offset) => {
+      const fromZero = new Batch(topic, '0', {
+        partition: 0,
+        highWatermark: '200',
+        messages: [
+          { offset: '0', batchContext: { partitionLeaderEpoch: 3 } },
+          { offset: '1', batchContext: { partitionLeaderEpoch: 4 } },
+        ],
+      })
+
+      expect(fromZero.leaderEpochAt('0')).toBe(3)
+      expect(fromZero.leaderEpochAt(offset)).toBe(-1)
     })
   })
 

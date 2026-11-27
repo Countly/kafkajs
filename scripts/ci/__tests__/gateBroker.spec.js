@@ -66,13 +66,14 @@ describe('exit gate broker', () => {
     for (const { kafkaVersion } of floors) expect(kafkaVersion).toBe('4.0.2')
   })
 
-  test('only the floor checks and the old-broker controls pin a broker version', () => {
+  test('only the floor checks, the log-truncation lane on the floor and the old-broker controls pin a broker version', () => {
     const pins = Object.fromEntries(
       gate.checks
         .filter((entry) => entry.kafkaVersion)
         .map(({ id, kafkaVersion }) => [id, kafkaVersion])
     )
     expect(pins).toEqual({
+      'e2e-log-truncation-k40': '4.0.2',
       'floor-conditional': '4.0.2',
       'floor-core': '4.0.2',
       'floor-gssapi': '4.0.2',

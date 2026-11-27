@@ -607,9 +607,10 @@ describe('Consumer > ConsumerGroup > buildFetchRequests', () => {
 
   it('fetches every assigned partition from the offset manager, and takes no options', async () => {
     const group = await createFetchingGroup()
-    const [{ topic, partitions }] = group.buildFetchRequests([
-      { topic: TOPIC_A, partitions: [0, 1] },
-    ])
+    const parts = [{ topic: TOPIC_A, partitions: [0, 1] }]
+    // Every fetch round validates the positions it is about to request first.
+    await group.validatePositions(parts)
+    const [{ topic, partitions }] = group.buildFetchRequests(parts)
 
     expect(group.buildFetchRequests).toHaveLength(1)
     expect(topic).toEqual(TOPIC_A)

@@ -42,11 +42,17 @@ const entered = async () => {
   for (let n = 0; n < 12; n++) await Promise.resolve()
 }
 
-/** @returns {number[]} the partitions the group would put in its next Fetch */
-const fetched = (group) =>
-  group
-    .buildFetchRequests(group.subscriptionState.assigned())
+/**
+ * Validates the assigned positions, as every fetch round does first, then builds the request.
+ * @returns {Promise<number[]>} the partitions the group would put in its next Fetch
+ */
+const fetched = async (group) => {
+  const assigned = group.subscriptionState.assigned()
+  await group.validatePositions(assigned)
+  return group
+    .buildFetchRequests(assigned)
     .flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+}
 
 describe('pause across a rebalance on the real apply paths', () => {
   let h
@@ -73,13 +79,13 @@ describe('pause across a rebalance on the real apply paths', () => {
       h.group.partitionsPerSubscribedTopic = h.group.generatePartitionsPerSubscribedTopic()
       await apply([0, 1], options)
       h.group.pause([{ topic: TOPIC, partitions: [0] }])
-      expect(fetched(h.group)).toEqual([1])
+      expect(await fetched(h.group)).toEqual([1])
 
       await apply([], options)
       expect(h.group.paused()).toEqual([])
       await apply([0, 1], options)
       expect(h.group.paused()).toEqual([{ topic: TOPIC, partitions: [0] }])
-      expect(fetched(h.group)).toEqual([1])
+      expect(await fetched(h.group)).toEqual([1])
 
       h.group.resume([{ topic: TOPIC, partitions: [0] }])
       h.group.pause([{ topic: TOPIC }])
@@ -87,7 +93,7 @@ describe('pause across a rebalance on the real apply paths', () => {
       await apply([], options)
       await apply([0, 1], options)
       expect(h.group.paused()).toEqual([{ topic: TOPIC, partitions: [0] }])
-      expect(fetched(h.group)).toEqual([1])
+      expect(await fetched(h.group)).toEqual([1])
     })
   })
 
@@ -111,12 +117,12 @@ describe('pause across a rebalance on the real apply paths', () => {
       "%s: a handler's pause() of p0 under a topic pause leaves neither p0 nor p1 in the next Fetch",
       async (_, groupProtocol, options) => {
         await pauseTopicThenPartition(groupProtocol, options)
-        expect(fetched(h.group)).toEqual([])
+        expect(await fetched(h.group)).toEqual([])
 
         await apply([], options)
         await apply([0, 1], options)
         expect(h.group.paused()).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
-        expect(fetched(h.group)).toEqual([])
+        expect(await fetched(h.group)).toEqual([])
       }
     )
 
@@ -127,7 +133,7 @@ describe('pause across a rebalance on the real apply paths', () => {
         h.group.resume([{ topic: TOPIC }])
 
         expect(h.group.paused()).toEqual([])
-        expect(fetched(h.group)).toEqual([0, 1])
+        expect(await fetched(h.group)).toEqual([0, 1])
       }
     )
   })
@@ -150,7 +156,7 @@ describe('pause across a rebalance on the real apply paths', () => {
         await apply([0, 1], options)
       }
       expect(group.paused()).toEqual([{ topic: TOPIC, partitions: [0] }])
-      expect(fetched(group)).toEqual([1])
+      expect(await fetched(group)).toEqual([1])
 
       const token = {}
       state.hold([{ topic: TOPIC, partitions: [0, 1] }], token)

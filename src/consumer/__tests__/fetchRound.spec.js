@@ -350,8 +350,10 @@ function oracleReadReplicas(topic, partitions, routing) {
 }
 
 /**
- * The request builder this client shipped before, with its whole-assignment active set, kept
- * verbatim as the oracle.
+ * The request builder this client shipped before, with its whole-assignment active set, kept as
+ * the oracle. Its validation filter is the admission rule written out from its definition, not a
+ * call to the group's own: an entry that still admits, fetched at the epoch it was validated
+ * against.
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
  * @returns {object[]}
@@ -368,10 +370,13 @@ function oracleBuildFetchRequests(topicPartitions) {
       topic,
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
+        const entry = this.positionValidator.entryOf(topic, partition)
+        const admittedUnder = entry?.admitted === true ? entry : undefined
+        const currentLeaderEpoch = admittedUnder?.validatedAgainst
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          !this.positionValidator.isAwaiting(topic, partition) &&
+          admittedUnder !== undefined &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -379,8 +384,9 @@ function oracleBuildFetchRequests(topicPartitions) {
           requests.push({
             partition,
             fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-            currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+            currentLeaderEpoch,
             maxBytes: this.maxBytesPerPartition,
+            admittedUnder,
           })
         }
         return requests
@@ -493,7 +499,17 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        positionValidator: { isAwaiting: coin(2) },
+        // Unvalidated, awaiting an answer, validated and still admitting, or validated and since
+        // replaced or dropped (no longer admitting).
+        positionValidator: {
+          entryOf: (topic, partition) =>
+            coin(2)(topic, partition)
+              ? undefined
+              : {
+                  validatedAgainst: coin(5)(topic, partition) ? undefined : partition % 3,
+                  admitted: !coin(4)(topic, partition) && !coin(5)(topic, partition),
+                },
+        },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
@@ -518,12 +534,13 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     const cluster = { findTopicPartitionMetadata: () => rows, leaderEpoch: () => 0 }
     const state = new SubscriptionState()
     state.assign([{ topic: 't', partitions: [0, 1, 2] }])
+    const validated = { validatedAgainst: 0, admitted: true }
     const group = derivationGroup({
       cluster,
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { entryOf: () => validated },
     })
     const route = () => group.filterPartitionsByNode(1, state.assigned())[0].partitions
     const fetched = () =>
@@ -551,7 +568,15 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     expect(group.buildFetchRequests([{ topic: 't', partitions: [0, 1] }])).toEqual([
       {
         topic: 't',
-        partitions: [{ partition: 1, fetchOffset: '0', currentLeaderEpoch: 0, maxBytes: 1024 }],
+        partitions: [
+          {
+            partition: 1,
+            fetchOffset: '0',
+            currentLeaderEpoch: 0,
+            maxBytes: 1024,
+            admittedUnder: validated,
+          },
+        ],
       },
     ])
   })
@@ -590,7 +615,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { entryOf: () => ({ validatedAgainst: 0, admitted: true }) },
       cluster: { leaderEpoch: () => 0 },
     })
     const parts = assignment.map(({ topic }) => ({
@@ -686,13 +711,23 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
           })
         }),
       }))
-    rig.setResponse(
-      fetchResponse(partitions.map((partition) => ({ partition, errorCode: 0, records: true })))
+    // Answered in the reverse of the frame's (shuffled) order, so the in-order coverage check
+    // fails on its first row and the counted check runs.
+    rig.setResponse(() =>
+      fetchResponse(
+        rig
+          .fetchRequestPartitions()
+          .reverse()
+          .map((partition) => ({ partition, errorCode: 0, records: true }))
+      )
     )
 
     const batches = await rig.group.fetch(NODE_ID)
 
     expect(batches).toHaveLength(300)
-    expect(reads.count).toBeLessThanOrEqual(5 * partitions.length)
+    // Per request entry: the encoder, the counted coverage check and the one index the answer's
+    // rows are looked up in; plus the in-order coverage check's first comparison. The admission
+    // checks at the write and at receipt read the entry's validation token, not its partition.
+    expect(reads.count).toBe(3 * partitions.length + 1)
   })
 })

@@ -380,6 +380,73 @@ describe('Consumer > PositionValidator', () => {
         validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 }).action
       ).toEqual('unchanged')
     })
+
+    it('an entry admits from markValidated until it is replaced or dropped, and a pending one never does', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5)
+      const first = validator.entryOf(TOPIC, 0)
+      expect(first.admitted).toBe(true)
+
+      validator.markValidated(TOPIC, 0, 5)
+      const second = validator.entryOf(TOPIC, 0)
+      expect([first.admitted, second.admitted]).toEqual([false, true])
+
+      validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 6 })
+      const pending = validator.entryOf(TOPIC, 0)
+      expect([second.admitted, pending.admitted]).toEqual([false, false])
+
+      validator.release([{ topic: TOPIC, partition: 0, entry: pending }])
+      expect(validator.entryOf(TOPIC, 0)).toBeUndefined()
+    })
+
+    it('revoke drops one partition, every partition of a topic, or everything, and each dropped entry stops admitting', () => {
+      const validator = create()
+      for (const [topic, partition] of [
+        [TOPIC, 0],
+        [TOPIC, 1],
+        ['other', 0],
+      ]) {
+        validator.markValidated(topic, partition, 5)
+      }
+      const [a, b, c] = [
+        validator.entryOf(TOPIC, 0),
+        validator.entryOf(TOPIC, 1),
+        validator.entryOf('other', 0),
+      ]
+
+      validator.revoke(TOPIC, 0)
+      expect([a.admitted, b.admitted, c.admitted]).toEqual([false, true, true])
+      expect(validator.entryOf(TOPIC, 0)).toBeUndefined()
+
+      validator.revoke(TOPIC)
+      expect([b.admitted, c.admitted]).toEqual([false, true])
+
+      validator.revoke()
+      expect(c.admitted).toBe(false)
+      expect(validator.entryOf('other', 0)).toBeUndefined()
+    })
+
+    it('is true at the same epoch under another routing stamp, and request() then asks again under the new stamp', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5, undefined, 1)
+
+      expect(validator.needsValidation(TOPIC, 0, 5, 1)).toBe(false)
+      expect(validator.needsValidation(TOPIC, 0, 5, 3)).toBe(true)
+      expect(
+        validator.request(TOPIC, 0, {
+          offset: '10',
+          trackedEpoch: 4,
+          currentLeaderEpoch: 5,
+          routing: 3,
+        }).action
+      ).toEqual('awaiting')
+      expect(validator.entryOf(TOPIC, 0).pending).toEqual({
+        offset: '10',
+        trackedEpoch: 4,
+        currentLeaderEpoch: 5,
+        routing: 3,
+      })
+    })
   })
 
   describe('lifetime', () => {
