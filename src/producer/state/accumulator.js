@@ -114,6 +114,20 @@ const assertEncodable = (topic, message) => {
 }
 
 /**
+ * `assertEncodable` for each record of a topic. A function of its own, so the loop's iterator and
+ * temporaries stay out of `append`, whose frame a send waiting for room keeps.
+ * @param {string} topic
+ * @param {object[]} messages
+ * @returns {void}
+ * @throws {KafkaJSInvalidConfigurationError} for the first record the encoder cannot write
+ */
+const assertAllEncodable = (topic, messages) => {
+  for (const message of messages) {
+    assertEncodable(topic, message)
+  }
+}
+
+/**
  * Reads the list by index, at the length it had when the check began and with an absent entry
  * skipped, as `some` reads it: a record array's accessors may change the list meanwhile.
  * @param {{ messages: object[] }[]} topicMessages
@@ -757,8 +771,6 @@ class PendingSend {
     this.reject = null
     /** @type {?import('./admission').Reservation} the send's bytes in the buffer, once admitted */
     this.reservation = null
-    /** the bytes it was admitted with: what its records as their batches carry them may take */
-    this.charged = 0
     /** the bytes of its records' shares that no batch has taken yet */
     this.payload = 0
     /** how many batches carry a share of its records and have not retired */
@@ -837,8 +849,15 @@ class PendingSend {
    */
   admit(reservation, { total, shell }) {
     this.reservation = reservation
-    this.charged = total
     this.payload = total - shell
+  }
+
+  /**
+   * @returns {number} what it was admitted with, while its records have not joined a batch: no
+   *   part of the reservation is given back before then
+   */
+  get charged() {
+    return this.reservation.remaining
   }
 
   /**
@@ -1195,9 +1214,7 @@ class Accumulator {
    */
   async append({ acks, timeout, compression, topicMessages, startedAt = Date.now() }) {
     for (const { topic, messages } of topicMessages) {
-      for (const message of messages) {
-        assertEncodable(topic, message)
-      }
+      assertAllEncodable(topic, messages)
     }
     if (!hasRecords(topicMessages)) {
       return []

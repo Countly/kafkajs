@@ -98,7 +98,7 @@ const walk = ({ key, value, headers }, tally) => {
     }
   }
   tally.headers = count
-  tally.payload = Math.max(0, keyBytes) + Math.max(0, valueBytes)
+  tally.payload = (keyBytes < 0 ? 0 : keyBytes) + (valueBytes < 0 ? 0 : valueBytes)
   return size + varintSize(count)
 }
 
