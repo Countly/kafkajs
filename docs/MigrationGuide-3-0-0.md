@@ -724,7 +724,10 @@ says so, `groupProtocol: 'consumer'`.
   overrunning handler. A single stuck handler does not trip it while another broker's fetcher keeps
   polling or another partition keeps flowing — in practice that means a single-broker assignment
   with `partitionsConsumedConcurrently: 1`. The batch the overrunning handler finally returns is
-  dropped, so that work is redelivered after the rejoin.
+  dropped, so that work is redelivered after the rejoin. If that handler fails, the failure still
+  counts against `retry.retries` as in 2.2.4, or crashes the consumer when it is non-retriable,
+  but only after the rejoin, so the crash cleanup of a dynamic member then leaves the group a second
+  time.
   In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
   handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
 - An error thrown by your `POLL_INTERVAL_EXCEEDED` listener is logged and no longer stops cleanup or the rejoin. There is no option to restore a listener’s ability to strand the consumer.

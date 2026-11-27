@@ -423,7 +423,8 @@ module.exports = class Runner extends EventEmitter {
    * success (see `Outage`): the next round reconnects, and the heartbeat and the commit look the
    * coordinator up again. The ride runs the attempt again inside the same retrier attempt, so it
    * does not refill the retries that other errors have spent. A handler's errors, whatever they
-   * are, count as before.
+   * are, count as before, also when a rebalance verdict the failure did not cause was waiting:
+   * that rebalance runs first.
    * @returns {void}
    */
   scheduleFetchManager() {
@@ -505,10 +506,10 @@ module.exports = class Runner extends EventEmitter {
           const independent = !thrown && this.isIndependentHandlerFailure(e, pending)
           const bailed = await rebalance(merged)
           // A fatal verdict the recovery left in the slot is the outcome: the next attempt acts
-          // on it. A recoverable one is not, and the crash's stop clears it.
+          // on it. A recoverable one is not, and the crash's stop clears it. An independent
+          // failure goes on below, as if no verdict had been waiting.
           const settled = !bailed && !this.rebalanceCoordinator.hasFatalVerdict()
-          if (independent && settled && this.running && !this.stopRequested) throw e
-          return
+          if (!independent || !settled || !this.running || this.stopRequested) return
         }
 
         // An answer for a membership a completed round already replaced changes nothing.
@@ -588,22 +589,22 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether a handler's own non-retriable failure arrived together with a recoverable
-   * consumer-protocol loss it did not cause. The loss recovery runs first; this failure then
-   * still ends the run, instead of being consumed by the loss. Ownership refusals, OffsetCommit
-   * errors and errors wrapping the loss are the loss itself, not independent of it.
+   * Whether a handler's own failure arrived together with a rebalance verdict it did not cause,
+   * under either group protocol. The rebalance runs first; the failure then goes to the fetch
+   * retrier as it would have without the verdict, so it crashes or spends a retry by the ordinary
+   * rules instead of being consumed by the rebalance. Ownership refusals, OffsetCommit errors and
+   * errors wrapping the verdict's error are the rebalance itself, and a fatal consumer-protocol
+   * verdict is the run's outcome.
    * @private
    * @param {unknown} error what the fetch attempt threw, with no verdict of its own
    * @param {import('./rebalanceCoordinator').Verdict} pending the slot entry
    * @returns {boolean}
    */
   isIndependentHandlerFailure(error, pending) {
-    if (this.consumerGroup.kind !== 'consumer' || pending.kind !== 'lost') return false
-    if (isConsumerProtocolFatal(pending.error) || this.requestClasses.get(error) !== 'handler') {
+    if (this.requestClasses.get(error) !== 'handler' || isConsumerProtocolFatal(pending.error)) {
       return false
     }
-    if (error.retriable !== false || error instanceof KafkaJSCommitFailedError) return false
-    if (isOffsetCommitError(error)) return false
+    if (error instanceof KafkaJSCommitFailedError || isOffsetCommitError(error)) return false
     for (let cause = error, depth = 0; cause && depth < 8; cause = cause.cause, depth++) {
       if (cause === pending.error) return false
     }
