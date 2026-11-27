@@ -320,12 +320,54 @@ const decodeFetchRequest = (writes) => {
   }
 }
 
+const INT32_MIN = -(2 ** 31)
+const INT32_MAX = 2 ** 31 - 1
+const INT64_MAX = 2n ** 63n - 1n
+
 /**
- * An OffsetForLeaderEpoch v4 response body: one topic, one entry per partition.
+ * @param {number} value
+ * @param {string} name what the value is, for the error
+ * @param {number} min
+ * @param {number} [max] the int32 maximum by default
+ * @returns {number} `value`
+ * @throws {Error} unless `value` is an integer from `min` to `max`
+ */
+const integer = (value, name, min, max = INT32_MAX) => {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} ${value} is not an integer from ${min} to ${max}`)
+  }
+  return value
+}
+
+/**
+ * An int64 given as a safe integer, a decimal string or a bigint, kept exact.
+ * @param {number|string|bigint} value
+ * @param {string} name what the value is, for the error
+ * @param {bigint} min
+ * @returns {bigint} the exact value
+ * @throws {Error} unless `value` is exactly an integer from `min` to the int64 maximum
+ */
+const int64 = (value, name, min) => {
+  let exact = null
+  if (typeof value === 'bigint') exact = value
+  else if (typeof value === 'string' && /^-?\d+$/.test(value)) exact = BigInt(value)
+  else if (Number.isSafeInteger(value)) exact = BigInt(value)
+  if (exact === null || exact < min || exact > INT64_MAX) {
+    throw new Error(`${name} ${String(value)} is not an exact int64 from ${min} to ${INT64_MAX}`)
+  }
+  return exact
+}
+
+/**
+ * An OffsetForLeaderEpoch v4 response body: one topic, one entry per partition. Each field must
+ * be a value a broker can send: a partition of 0 or more, an int16 error code from -1, and a
+ * `LeaderEpoch` (int32) and `EndOffset` (int64) of -1 or more.
  *
  * @see clients/src/main/resources/common/message/OffsetForLeaderEpochResponse.json (Apache Kafka 4.3.1)
- * @param {{ partition: number, errorCode?: number, leaderEpoch?: number, endOffset?: string }[]} partitions
+ * @param {{ partition: number, errorCode?: number, leaderEpoch?: number,
+ *   endOffset?: number|string|bigint }[]} partitions
  * @returns {Buffer}
+ * @throws {Error} for a field value no broker sends
  */
 const offsetForLeaderEpochResponse = (partitions) =>
   new Encoder()
@@ -336,10 +378,10 @@ const offsetForLeaderEpochResponse = (partitions) =>
         .writeUVarIntArray(
           partitions.map(({ partition, errorCode = 0, leaderEpoch = 4, endOffset = '20' }) =>
             new Encoder()
-              .writeInt16(errorCode)
-              .writeInt32(partition)
-              .writeInt32(leaderEpoch)
-              .writeInt64(endOffset)
+              .writeInt16(integer(errorCode, 'error code', -1, 2 ** 15 - 1))
+              .writeInt32(integer(partition, 'partition', 0))
+              .writeInt32(integer(leaderEpoch, 'leader epoch', -1))
+              .writeInt64(int64(endOffset, 'end offset', -1n).toString())
               .writeTaggedFields()
           )
         )
@@ -374,10 +416,12 @@ const codeOf = (type) => errorCodes.find((error) => error.type === type).code
  * The cache must be one a broker can hold: every assignment removes the entries at or above the
  * new epoch or start, and refuses a negative epoch or start (`LeaderEpochFileCache#assign`), so
  * epochs and starts both rise strictly. A leader assigns its epoch at its log end on election, so
- * its leader epoch is its latest cached one; no replica's is below that.
+ * its leader epoch is its latest cached one; no replica's is below that. Epochs are int32 and
+ * offsets int64 (the response's `LeaderEpoch` and `EndOffset`), both 0 or more; an offset beyond
+ * the safe integer range is given as a string or bigint and kept exact.
  *
- * @param {{ epochs: [number, number|string][], logEnd: number|string, leader?: boolean,
- *   leaderEpoch?: number }} log `[epoch, start]` pairs, the log end offset, whether this broker
+ * @param {{ epochs: [number, number|string|bigint][], logEnd: number|string|bigint,
+ *   leader?: boolean, leaderEpoch?: number }} log `[epoch, start]` pairs, the log end offset, whether this broker
  *   leads (default true), and its leader epoch (default the latest cached epoch; required to
  *   answer a current epoch from an empty cache)
  * @returns {{ endOffsetFor: (requestedEpoch: number) => { leaderEpoch: number, endOffset: string },
@@ -388,22 +432,23 @@ const codeOf = (type) => errorCodes.find((error) => error.type === type).code
  *   current epoch or one it cannot check
  */
 const scriptedEpochLog = ({ epochs, logEnd, leader = true, leaderEpoch }) => {
-  const cache = epochs.map(([epoch, start]) => ({ epoch, start: BigInt(start) }))
-  const end = BigInt(logEnd)
+  const cache = epochs.map(([epoch, start]) => ({
+    epoch: integer(epoch, 'cached epoch', 0),
+    start: int64(start, `epoch ${epoch} start`, 0n),
+  }))
+  const end = int64(logEnd, 'log end', 0n)
   cache.forEach(({ epoch, start }, i) => {
     const previous = cache[i - 1]
-    if (epoch < 0 || start < 0n) throw new Error(`epoch ${epoch} at ${start} is negative`)
     if (previous && (epoch <= previous.epoch || start <= previous.start)) {
       throw new Error(`epoch ${epoch} at ${start} does not follow epoch ${previous.epoch}`)
     }
     if (start > end) throw new Error(`epoch ${epoch} starts at ${start}, past the log end ${end}`)
   })
   const latest = cache[cache.length - 1]
+  if (leaderEpoch !== undefined) integer(leaderEpoch, 'leader epoch', 0)
   if (
     leaderEpoch !== undefined &&
-    (leaderEpoch < 0 ||
-      (latest && leaderEpoch < latest.epoch) ||
-      (leader && latest && leaderEpoch !== latest.epoch))
+    ((latest && leaderEpoch < latest.epoch) || (leader && latest && leaderEpoch !== latest.epoch))
   ) {
     throw new Error(
       `leader epoch ${leaderEpoch} cannot go with a latest cached epoch ${latest?.epoch}`
@@ -413,6 +458,7 @@ const scriptedEpochLog = ({ epochs, logEnd, leader = true, leaderEpoch }) => {
 
   const undefinedAnswer = { leaderEpoch: -1, endOffset: '-1' }
   const endOffsetFor = (requestedEpoch) => {
+    integer(requestedEpoch, 'requested epoch', INT32_MIN)
     if (requestedEpoch === -1) return undefinedAnswer
     if (latest && latest.epoch === requestedEpoch) {
       return { leaderEpoch: requestedEpoch, endOffset: end.toString() }
@@ -501,8 +547,13 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  *
  * A Buffer is played back at once. A thenable is a withheld answer: it is played back when it
  * resolves, and later requests are answered meanwhile. A broker answers one connection in order;
- * overtaking here stands in for the separate connection the real pool gives Fetch. A rejected
- * thenable closes that socket, so the request fails as on a dropped connection instead of waiting.
+ * overtaking here stands in for the separate connection the real pool gives Fetch.
+ *
+ * A playback failure fails the request it belongs to, with the error itself, and nothing is
+ * played back for it: `answer` throwing, a withheld answer rejecting, or the playback of an answer
+ * throwing (a `chunks` assertion, say), at once or later. Every frame is tied to the send that
+ * wrote it, so a failure never lands on another request answered in the same pump. A failure after
+ * its request has settled (a withheld answer rejected after a close) changes nothing.
  * `broker.disconnect({ drainTimeout: 0 })` closes at once and fails every request still waiting.
  * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
@@ -511,7 +562,27 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
  */
 const createFakeBroker = (answer, chunks) => {
-  const { factory, state } = createFakeSocketFactory()
+  const { factory: socketFactory, state } = createFakeSocketFactory()
+  /** @type {((error: Error) => void)|null} the failure route of the send writing its frame now */
+  let writing = null
+  /** @type {WeakMap<Buffer, (error: Error) => void>} each recorded frame's failure route */
+  const failureRoutes = new WeakMap()
+  /**
+   * The fake socket factory, with each write tied to the send that made it.
+   * @param {object} options what `Connection` passes the socket factory
+   * @returns {object} the fake socket
+   */
+  const factory = (options) => {
+    const socket = socketFactory(options)
+    const write = socket.write
+    socket.write = (...args) => {
+      const written = write(...args)
+      if (writing) failureRoutes.set(socket.writes[socket.writes.length - 1], writing)
+      writing = null
+      return written
+    }
+    return socket
+  }
   const connection = new Connection({
     host: '127.0.0.1',
     port: 9092,
@@ -549,24 +620,42 @@ const createFakeBroker = (answer, chunks) => {
     )
   }
 
+  /**
+   * Answers one frame on the socket it was written to; any failure goes to `fail`.
+   * @param {object} socket
+   * @param {Buffer} frame
+   * @param {(error: Error) => void} fail the failure route of the frame's send
+   * @returns {void}
+   */
+  const playBack = (socket, frame, fail) => {
+    const header = readRequestHeader(frame)
+    const deliver = (body) => {
+      if (!socket.destroyed) reply({ socket }, header, body)
+    }
+    try {
+      const body = answer(header, frame)
+      if (typeof body?.then === 'function') {
+        Promise.resolve(body).then(deliver).catch(fail)
+      } else {
+        deliver(body)
+      }
+    } catch (error) {
+      fail(error)
+    }
+  }
+
   let answered = 0
   const pump = async () => {
     while (answered < state.writes.length) {
       const frame = state.writes[answered]
-      const socket = state.sockets.find(({ writes }) => writes.includes(frame))
-      const header = readRequestHeader(frame)
       answered += 1
-      const body = answer(header, frame)
-      if (typeof body?.then === 'function') {
-        body.then(
-          (settled) => {
-            if (!socket.destroyed) reply({ socket }, header, settled)
-          },
-          () => socket.destroy()
-        )
-      } else if (!socket.destroyed) {
-        reply({ socket }, header, body)
-      }
+      const fail = failureRoutes.get(frame)
+      if (!fail) throw new Error('fake broker: a frame was written outside the pool send')
+      playBack(
+        state.sockets.find(({ writes }) => writes.includes(frame)),
+        frame,
+        fail
+      )
     }
   }
 
@@ -588,13 +677,22 @@ const createFakeBroker = (answer, chunks) => {
       return connection
     },
     send: async (protocolRequest) => {
-      const promise = connection.send(protocolRequest)
-      // A close (such as teardown) can reject before the pump below returns; the caller still
-      // receives it.
-      promise.catch(() => {})
+      let fail
+      const failed = new Promise((_resolve, reject) => (fail = reject))
+      const answered = connection.send({
+        ...protocolRequest,
+        onWrite: () => {
+          protocolRequest.onWrite?.()
+          writing = fail
+        },
+      })
+      const outcome = Promise.race([answered, failed])
+      // Returned below, so the caller receives every rejection; until then a close or a playback
+      // failure must not count as unhandled.
+      outcome.catch(() => {})
       await new Promise(setImmediate)
       await pump()
-      return promise
+      return outcome
     },
     setVersions: () => {},
     destroy: async (options) => connection.disconnect(options),
@@ -1025,7 +1123,10 @@ const createFetchGroup = async ({
         await heldLookups.get(nodeId).values().next().value.released
       }
       if (tornDown) throw new Error('fetch harness torn down')
-      return brokerFor(nodeId)
+      const found = await brokerFor(nodeId)
+      // The node may have connected while teardown was closing it.
+      if (tornDown) throw new Error('fetch harness torn down')
+      return found
     },
     findGroupCoordinator: async () => coordinator,
     findTopicPartitionMetadata: () =>
@@ -1111,25 +1212,28 @@ const createFetchGroup = async ({
   const requestRejoin = jest.fn()
   group.attach({ rebalanceCoordinator: { requestRejoin }, heartbeatManager: null })
 
+  /** @type {Promise<void>|null} */
+  let tearingDown = null
   /**
    * Ends the fixture: every held or later broker lookup rejects, and every node's connection
    * closes at once, failing the requests still waiting for an answer. For `finally` and
    * `afterEach`, so a failed assertion cannot leave a withheld answer or a held lookup pending.
+   * The cleanup runs once; every caller waits for that same cleanup.
    * @returns {Promise<void>}
    */
-  const teardown = async () => {
-    if (tornDown) return
-    tornDown = true
-    for (const holds of [...heldLookups.values()]) {
-      for (const hold of [...holds]) hold.release()
-    }
-    await Promise.all(
-      [...nodeBrokers.values()].map(async (node) => {
-        await node.ready.catch(() => {})
-        await node.broker.disconnect({ drainTimeout: 0 })
-      })
-    )
-  }
+  const teardown = () =>
+    (tearingDown ??= (async () => {
+      tornDown = true
+      for (const holds of [...heldLookups.values()]) {
+        for (const hold of [...holds]) hold.release()
+      }
+      await Promise.all(
+        [...nodeBrokers.values()].map(async (node) => {
+          await node.ready.catch(() => {})
+          await node.broker.disconnect({ drainTimeout: 0 })
+        })
+      )
+    })())
 
   return {
     teardown,
