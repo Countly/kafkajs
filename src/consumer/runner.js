@@ -43,6 +43,18 @@ const { COOPERATIVE, ConsumerOperation, isCallDeadline } = require('./groupProto
 const NOT_COORDINATOR = 16
 
 const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.fromValue(offsetB))
+
+/**
+ * Whether a batch's data may still be used, from its admission (`Batch.admissionOf`): the
+ * validation entry its Fetch was admitted under still admits. The validator and the run's routing
+ * listener clear that field synchronously when the entry is replaced or dropped, which a new leader
+ * or leader epoch, a leader that moved away and back, and a validation redone at the same epoch all
+ * do (`ConsumerGroup#admissionEntry`). A batch built outside a fetch has no admission and is used.
+ * @param {{admitted: boolean}|null|undefined} admission
+ * @returns {boolean}
+ */
+const admits = (admission) =>
+  admission === undefined || (admission !== null && admission.admitted === true)
 const CONSUMING_START = 'consuming-start'
 const CONSUMING_STOP = 'consuming-stop'
 const HANDLERS_IDLE = 'handlers-idle'
@@ -1387,25 +1399,17 @@ module.exports = class Runner extends EventEmitter {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
       return () => this.consumerGroup.resume([{ topic, partitions: [partition] }])
     }
-    // The admission rule is asked again whenever what it reads changed: the partition's routing
-    // stamp (it changes with the cached leader or leader epoch), read on every message, or a
-    // validation entry.
-    let checkedVersion = null
-    let checkedRouting = null
+    // Read once: the batch's validation entry, whose `admitted` field is the admission rule's
+    // answer for this batch from now on.
+    const admission = Batch.admissionOf(batch)
     for (const message of batch.messages) {
       if (
         !this.running ||
         this.consumerGroup.hasSeekOffset({ topic, partition }) ||
-        this.isBatchStale(batch)
+        this.isBatchStale(batch) ||
+        !admits(admission)
       ) {
         break
-      }
-      const version = this.consumerGroup.validationVersion?.()
-      const routing = this.consumerGroup.cluster?.routingStamp?.(topic, partition)
-      if (version !== checkedVersion || routing !== checkedRouting) {
-        if (!this.#admitted(batch)) break
-        checkedVersion = version
-        checkedRouting = routing
       }
 
       try {
@@ -1758,25 +1762,6 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether the batch's data may still be used: its partition is still admitted under the same
-   * validation entry its Fetch was admitted under (`ConsumerGroup#admissionEntry`), so a new leader
-   * epoch, a leader that moved away and back, or a validation redone at the same epoch all stop
-   * it. A batch built outside a fetch carries no fetch epoch, and a group without the rule (a test
-   * double; the consumer group always has it) admits everything.
-   * @param {import('./batch')} batch
-   * @returns {boolean}
-   */
-  #admitted(batch) {
-    const entry = Batch.admissionOf(batch)
-    const group = this.consumerGroup
-    return (
-      entry === undefined ||
-      typeof group.admissionEntry !== 'function' ||
-      group.admissionEntry(batch.topic, batch.partition) === entry
-    )
-  }
-
-  /**
    * Whether the batch's records were superseded after it was fetched: its topic was deleted and
    * recreated, so they belong to an incarnation this member no longer reads, its partition was
    * sought (`ConsumerGroup#seek`), so they are not at the position the application asked for, or
@@ -1930,7 +1915,7 @@ module.exports = class Runner extends EventEmitter {
     // Likewise a batch no longer admitted under the validation it was fetched under (its leader or
     // leader epoch moved, or it was validated again while it waited): the next round validates the
     // position first and fetches it again from there.
-    if (!this.#admitted(batch)) {
+    if (!admits(Batch.admissionOf(batch))) {
       this.logger.debug('Dropping a queued batch fetched before a leader epoch change', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
@@ -1996,7 +1981,7 @@ module.exports = class Runner extends EventEmitter {
 
         // A START_BATCH_PROCESS listener can pause the partition or move its leader epoch:
         // nothing is resolved, and END_BATCH_PROCESS still pairs with START.
-        if (this.#paused(batch) || !this.#admitted(batch)) {
+        if (this.#paused(batch) || !admits(Batch.admissionOf(batch))) {
           this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
             ...payload,
             duration: Date.now() - startBatchProcess,
@@ -2044,7 +2029,7 @@ module.exports = class Runner extends EventEmitter {
           topic,
           partition,
         })
-      } else if (!this.#admitted(batch)) {
+      } else if (!admits(Batch.admissionOf(batch))) {
         this.logger.debug('Not handing over a batch fetched before a leader epoch change', {
           topic,
           partition,

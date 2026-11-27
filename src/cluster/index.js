@@ -1619,6 +1619,8 @@ module.exports = class Cluster {
    * @param {number} hint.leaderId
    * @param {number} hint.leaderEpoch
    * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [hint.nodeEndpoints]
+   * @param {string} [hint.topicId] the topic id of the answer that carried the hint; the cache
+   *   write, after the endpoint work, refuses the hint when the topic is known under another id
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; its
    *   close prevents endpoint installation and a later cache update
@@ -1628,7 +1630,7 @@ module.exports = class Cluster {
    * @throws {Error} the lifecycle's close error
    */
   async applyLeaderHint(
-    { topic, partition, leaderId, leaderEpoch, nodeEndpoints },
+    { topic, partition, leaderId, leaderEpoch, nodeEndpoints, topicId },
     { fence } = {}
   ) {
     fence?.check()
@@ -1651,6 +1653,7 @@ module.exports = class Cluster {
     return this.metadataCache.applyLeaderHint(topic, partition, {
       leaderId,
       leaderEpoch,
+      topicId,
     })
   }
 

@@ -30,6 +30,12 @@ const UNKNOWN_EPOCH = -1
  *   differs from them, so a partition whose leader moved away and back to the same epoch is checked
  *   again.
  *
+ * A validated entry is also the admission token of the data fetched under it: its `admitted` field
+ * is true from the moment it is recorded until it is replaced or dropped, which every mutation
+ * here does synchronously, and `revoke()` drops it when the partition's cached leader or leader
+ * epoch changes. A holder of the entry therefore answers "may this data still be used" with one
+ * field read.
+ *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
  * invariant, so no lock is taken and a duplicate reply is a no-op through the guards in
@@ -47,8 +53,31 @@ module.exports = class PositionValidator {
     this.entries = new Map()
     this.assignmentGeneration = 0
     this.disabled = false
-    /** Advances on every change of an entry, so a cached answer about entries can tell it is stale. */
-    this.version = 0
+  }
+
+  /**
+   * Sets the entry of `key`. The entry it replaces stops admitting at once, so whoever holds it
+   * learns that from the entry itself.
+   * @param {string} key
+   * @param {object} next
+   * @returns {void}
+   */
+  #put(key, next) {
+    const previous = this.entries.get(key)
+    if (previous !== undefined) previous.admitted = false
+    this.entries.set(key, next)
+  }
+
+  /**
+   * Removes the entry of `key`; it stops admitting at once.
+   * @param {string} key
+   * @returns {void}
+   */
+  #drop(key) {
+    const previous = this.entries.get(key)
+    if (previous === undefined) return
+    previous.admitted = false
+    this.entries.delete(key)
   }
 
   /**
@@ -90,12 +119,12 @@ module.exports = class PositionValidator {
       return { action: 'validated', generation }
     }
 
-    this.entries.set(key, {
+    this.#put(key, {
       validatedAgainst: undefined,
       routing: undefined,
+      admitted: false,
       pending: { offset, trackedEpoch, currentLeaderEpoch, routing },
     })
-    this.version += 1
 
     return { action: 'awaiting', generation }
   }
@@ -132,12 +161,12 @@ module.exports = class PositionValidator {
       return false
     }
 
-    this.entries.set(this.getKey(topic, partition), {
+    this.#put(this.getKey(topic, partition), {
       validatedAgainst: currentLeaderEpoch,
       routing,
+      admitted: true,
       pending: null,
     })
-    this.version += 1
 
     return true
   }
@@ -230,7 +259,6 @@ module.exports = class PositionValidator {
 
     if (seekQueued || positionMoved) {
       entry.pending = null
-      this.version += 1
       return this.discard(topic, partition, seekQueued ? 'seek queued' : 'position moved')
     }
 
@@ -277,9 +305,28 @@ module.exports = class PositionValidator {
   release(entries) {
     for (const { topic, partition, entry } of entries) {
       const key = this.getKey(topic, partition)
-      if (this.entries.get(key) === entry) this.entries.delete(key)
+      if (this.entries.get(key) === entry) this.#drop(key)
     }
-    this.version += 1
+  }
+
+  /**
+   * Drops the state of one partition whose cached leader or leader epoch changed, or of every
+   * partition of `topic` (no `partition`), or of every partition (no `topic`), so it is validated
+   * again before it is fetched. A request in flight for it is dropped with it: its reply finds no
+   * entry of its own and applies nothing.
+   * @param {string} [topic]
+   * @param {number} [partition]
+   * @returns {void}
+   */
+  revoke(topic, partition) {
+    if (partition !== undefined) {
+      this.#drop(this.getKey(topic, partition))
+      return
+    }
+    const prefix = topic === undefined ? '' : `${topic}|`
+    for (const key of [...this.entries.keys()]) {
+      if (key.startsWith(prefix)) this.#drop(key)
+    }
   }
 
   /**
@@ -331,9 +378,8 @@ module.exports = class PositionValidator {
    */
   forgetTopic(topic, partitions) {
     for (const partition of partitions || []) {
-      this.entries.delete(this.getKey(topic, partition))
+      this.#drop(this.getKey(topic, partition))
     }
-    this.version += 1
   }
 
   /**
@@ -352,10 +398,9 @@ module.exports = class PositionValidator {
   forgetPartitions(topicPartitions) {
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
-        this.entries.delete(this.getKey(topic, partition))
+        this.#drop(this.getKey(topic, partition))
       }
     }
-    this.version += 1
   }
 
   /**
@@ -366,10 +411,10 @@ module.exports = class PositionValidator {
    * @returns {void}
    */
   clear() {
+    for (const entry of this.entries.values()) entry.admitted = false
     this.entries.clear()
     this.disabled = false
     this.assignmentGeneration++
-    this.version += 1
   }
 
   /**
