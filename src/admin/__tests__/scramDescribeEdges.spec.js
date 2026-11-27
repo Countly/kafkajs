@@ -245,63 +245,128 @@ describe('SCRAM credential alteration of a user name with a lone surrogate', () 
     expect(cluster.findControllerBroker).not.toHaveBeenCalled()
   })
 
-  test('answers once for two mechanisms of users with the same bytes, as for one user', async () => {
-    const { admin, sent } = controller()
-
-    const rows = await admin.alterUserScramCredentials({
-      deletions: [remove('a\uD800'), remove('a\uD801', SHA512)],
-    })
-
-    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a\uD800', 0]])
-    expect(sent.map(echoOf)).toEqual(['a�', 'a�'])
+  const RESOURCE_NOT_FOUND = 91
+  const DUPLICATE_RESOURCE = 92
+  const upsert = (user, mechanism = 'SCRAM-SHA-256') => ({
+    user,
+    mechanism,
+    iterations: 4096,
+    password: 'secret',
   })
 
-  // The controller answers one result per user, so two mechanisms of one written name are one result.
-  test('answers once under a literal U+FFFD name given before a lone-surrogate name with the same bytes', async () => {
-    const { admin, sent } = controller()
+  /**
+   * A controller that answers as Kafka 4.4.0's `ScramControlManager#alterCredentials` does, for a
+   * cluster holding the credentials in `existing` (`name/mechanism`, both as written): it reads
+   * every deletion and then every upsertion in the order sent, skips every entry of a user that
+   * already has an error, gives RESOURCE_NOT_FOUND to a deletion of a credential that is not there,
+   * and gives DUPLICATE_RESOURCE to an entry for a user an earlier entry was accepted for, dropping
+   * that acceptance. It answers accepted deletions, then accepted upsertions, then errors.
+   */
+  const kafkaController = (existing = []) => {
+    const credentials = new Set(existing)
+    const sent = []
+    const broker = {
+      alterUserScramCredentials: jest.fn(async ({ upsertions, deletions }) => {
+        const deleted = new Set()
+        const upserted = new Set()
+        const errors = new Map()
+        for (const { name, mechanism } of deletions) {
+          sent.push(name)
+          if (errors.has(name)) continue
+          if (deleted.delete(name)) errors.set(name, DUPLICATE_RESOURCE)
+          else if (!credentials.has(`${name}/${mechanism}`)) errors.set(name, RESOURCE_NOT_FOUND)
+          else deleted.add(name)
+        }
+        for (const { name } of upsertions) {
+          sent.push(name)
+          if (errors.has(name)) continue
+          if (deleted.delete(name) || upserted.delete(name)) errors.set(name, DUPLICATE_RESOURCE)
+          else upserted.add(name)
+        }
+        return {
+          results: [
+            ...[...deleted, ...upserted].map((name) => ({ user: echoOf(name), errorCode: 0 })),
+            ...[...errors].map(([name, errorCode]) => ({ user: echoOf(name), errorCode })),
+          ],
+        }
+      }),
+    }
+    const cluster = {
+      refreshMetadata: jest.fn(async () => {}),
+      findControllerBroker: jest.fn(async () => broker),
+    }
+    return { sent, broker, admin: createAdmin({ cluster, logger, retry }) }
+  }
 
-    const rows = await admin.alterUserScramCredentials({
-      deletions: [remove('a�'), remove('a\uD800', SHA512)],
-    })
+  // The controller answers one result per user, so two mechanisms of one written name are one
+  // result, under the first spelling the call gave for the user.
+  const twoDeletions = [
+    ['one ordinary user', [remove('alice'), remove('alice', SHA512)], 'alice'],
+    [
+      'a literal U+FFFD name given before a lone-surrogate name with the same bytes',
+      [remove('a�'), remove('a\uD800', SHA512)],
+      'a�',
+    ],
+    [
+      'a lone-surrogate name given before a literal U+FFFD name with the same bytes',
+      [remove('a\uD800'), remove('a�', SHA512)],
+      'a\uD800',
+    ],
+    [
+      'two lone-surrogate names with the same bytes',
+      [remove('a\uD800'), remove('a\uD801', SHA512)],
+      'a\uD800',
+    ],
+  ]
 
-    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a�', 0]])
-    expect(sent.map(echoOf)).toEqual(['a�', 'a�'])
-  })
+  test.each(twoDeletions)(
+    'answers DUPLICATE_RESOURCE once for two deletions of %s when the first credential exists, under the first spelling',
+    async (_label, deletions, first) => {
+      const { admin, sent, broker } = kafkaController([`${echoOf(first)}/1`])
 
-  test('answers once under a lone-surrogate name given before a literal U+FFFD name with the same bytes', async () => {
-    const { admin } = controller()
+      const rows = await admin.alterUserScramCredentials({ deletions })
 
-    const rows = await admin.alterUserScramCredentials({
-      deletions: [remove('a\uD800'), remove('a�', SHA512)],
-    })
+      expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([
+        [first, DUPLICATE_RESOURCE],
+      ])
+      expect(sent).toEqual([echoOf(first), echoOf(first)])
+      expect(broker.alterUserScramCredentials).toHaveBeenCalledTimes(1)
+    }
+  )
 
-    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a\uD800', 0]])
-  })
+  test.each(twoDeletions)(
+    'answers RESOURCE_NOT_FOUND once for two deletions of %s when the first credential is missing, under the first spelling',
+    async (_label, deletions, first) => {
+      const { admin, broker } = kafkaController([`${echoOf(first)}/2`])
 
-  test('keeps the first spelling on the user-level error for names with the same bytes, in either order', async () => {
-    const literalFirst = await controller(41).admin.alterUserScramCredentials({
-      deletions: [remove('a�'), remove('a\uD800', SHA512)],
-    })
-    const surrogateFirst = await controller(41).admin.alterUserScramCredentials({
-      deletions: [remove('a\uD800'), remove('a�', SHA512)],
-    })
+      const rows = await admin.alterUserScramCredentials({ deletions })
 
-    expect(literalFirst.map(({ user, errorCode }) => [user, errorCode])).toEqual([['a�', 41]])
-    expect(surrogateFirst.map(({ user, errorCode }) => [user, errorCode])).toEqual([
-      ['a\uD800', 41],
-    ])
-  })
+      expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([
+        [first, RESOURCE_NOT_FOUND],
+      ])
+      expect(broker.alterUserScramCredentials).toHaveBeenCalledTimes(1)
+    }
+  )
 
-  test('answers once for two mechanisms of one ordinary user, under that name', async () => {
-    const { admin, sent } = controller()
+  // The client names the result by the upsertion, which it reads first; the controller reads the
+  // deletion first, so the deletion decides the error.
+  test.each([
+    ['DUPLICATE_RESOURCE when the deleted credential exists', ['a�/1'], DUPLICATE_RESOURCE],
+    ['RESOURCE_NOT_FOUND when it is missing', [], RESOURCE_NOT_FOUND],
+  ])(
+    'names the result of an upsertion and a deletion of one user by the upsertion, and answers %s',
+    async (_label, existing, errorCode) => {
+      const { admin, sent } = kafkaController(existing)
 
-    const rows = await admin.alterUserScramCredentials({
-      deletions: [remove('alice'), remove('alice', SHA512)],
-    })
+      const rows = await admin.alterUserScramCredentials({
+        deletions: [remove('a�')],
+        upsertions: [upsert('a\uD800', SHA512)],
+      })
 
-    expect(rows.map(({ user, errorCode }) => [user, errorCode])).toEqual([['alice', 0]])
-    expect(sent).toEqual(['alice', 'alice'])
-  })
+      expect(rows.map((row) => [row.user, row.errorCode])).toEqual([['a\uD800', errorCode]])
+      expect(sent).toEqual(['a�', 'a�'])
+    }
+  )
 
   test.each([['bob'], ['team-��']])('is still refused an answer row for %s', async (answered) => {
     const broker = {

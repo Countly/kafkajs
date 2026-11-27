@@ -9,6 +9,7 @@ const { createScriptedCluster, groupScript } = require('../../../testHelpers/scr
 const { RecordBatch } = require('../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../protocol/recordBatch/record/v0')
 const { createGroupDescriptions } = require('../../admin/groupDescriptions')
+const { UNCHECKED_ROWS } = require('../../broker/privateOptions')
 const { TOPIC } = require('./fixtures/fetchHarness')
 const {
   KafkaJSDeliveryTimeout,
@@ -1264,7 +1265,8 @@ describe('describeGroup under a consumer operation', () => {
     const { groups } = await describer(cluster).describe(['g'], { operation })
     expect(groups).toHaveLength(1)
     expect(coordinator.describeGroups).toHaveBeenCalledWith(
-      expect.objectContaining({ guard: operation.guard })
+      expect.objectContaining({ guard: operation.guard }),
+      { [UNCHECKED_ROWS]: true }
     )
     expect(cluster.findGroupCoordinator).toHaveBeenCalledWith(
       expect.objectContaining({ fence: operation })
@@ -1272,10 +1274,13 @@ describe('describeGroup under a consumer operation', () => {
     operation.finish()
     coordinator.describeGroups.mockClear()
     await describer(cluster).describe(['g'])
-    expect(coordinator.describeGroups).toHaveBeenCalledWith({
-      groupIds: ['g'],
-      includeAuthorizedOperations: false,
-    })
+    expect(coordinator.describeGroups).toHaveBeenCalledWith(
+      {
+        groupIds: ['g'],
+        includeAuthorizedOperations: false,
+      },
+      { [UNCHECKED_ROWS]: true }
+    )
     expect(cluster.findGroupCoordinator).toHaveBeenLastCalledWith({ groupId: 'g' })
   })
 })

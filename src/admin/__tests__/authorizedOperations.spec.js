@@ -2,6 +2,7 @@ const { createGroupDescriptions } = require('../groupDescriptions')
 const createAdmin = require('..')
 const Metadata = require('../../protocol/requests/metadata')
 const { createErrorFromCode } = require('../../protocol/error')
+const { UNCHECKED_ROWS } = require('../../broker/privateOptions')
 const logger = { namespace: () => logger, debug() {}, info() {}, warn() {}, error() {} }
 
 describe('authorized operations', () => {
@@ -42,7 +43,8 @@ describe('authorized operations', () => {
           expect.objectContaining({ includeAuthorizedOperations: requested })
         )
         expect(target.describeGroups).toHaveBeenCalledWith(
-          expect.objectContaining({ includeAuthorizedOperations: requested })
+          expect.objectContaining({ includeAuthorizedOperations: requested }),
+          { [UNCHECKED_ROWS]: true }
         )
       }
     }
